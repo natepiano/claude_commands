@@ -14,7 +14,9 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from enum import Enum
-from typing import Literal, NamedTuple, cast
+from decimal import Decimal
+import time
+from typing import TYPE_CHECKING, Literal, NamedTuple, cast
 
 import ci
 import holds
@@ -27,6 +29,8 @@ import store
 import record
 import sync
 import rust_release
+import aws_report
+import mac_test
 from mac_outcome import (
     DECLINE_REASONS,
     CacheReuse,
@@ -42,10 +46,13 @@ from mac_outcome import (
     OffloadRecord,
     RunnerResultUnavailable,
     is_mac_candidate,
-    natedev_step_predicate,
     offload_record,
     offload_seconds,
     usable_share,
+    natedev_step_predicate,
+    natedev_host_predicate,
+    target_predicate_scope,
+    local_target_names,
 )
 
 import sys
@@ -53,6 +60,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import conf
 from user_zone import user_zone  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if TYPE_CHECKING:
+    from ..aws_target import measurement
+    from ..build_targets.target_config import SshTarget, is_aws_target, read_targets
+else:
+    from scripts.aws_target import measurement
+    from scripts.build_targets.target_config import SshTarget, is_aws_target, read_targets
+
 
 KIND_ORDER = ["fmt", "check", "clippy", "mend", "doc", "nextest", "sweep"]
 CALLER_LABELS = {
@@ -438,8 +453,10 @@ def fetch(connection: sqlite3.Connection, sql: str, *params: object) -> list[Row
 
 
 def natedev_call_predicate(call: str = "calls") -> str:
-    """SQL leaving out calls whose test command completed on the Mac."""
-    return f"coalesce({call}.mac, '') NOT IN ('failed', 'passed_filter', 'passed_full')"
+    """Exclude remote calls from local call summaries."""
+    targets = ','.join("'" + name.replace("'", "''") + "'" for name in local_target_names())
+    return (f"coalesce({call}.mac, '') NOT IN ('failed', 'passed_filter', 'passed_full')"
+            + f" AND CASE WHEN {call}.target > '' THEN {call}.target IN ({targets}) ELSE 1 END")
 
 
 def kinds(connection: sqlite3.Connection, day: str) -> list[str]:
@@ -915,7 +932,7 @@ def timed_samples(
     query = ("SELECT * FROM samples WHERE julianday(at) >= julianday(?)"
              + " AND julianday(at) <= julianday(?)")
     if natedev_only:
-        query += f" AND {natedev_step_predicate('samples')}"
+        query += " AND " + natedev_host_predicate("samples")
     cursor = connection.execute(query, ((bounds.start - timedelta(seconds=1)).isoformat(),
                                         (bounds.end + timedelta(seconds=1)).isoformat()))
     names = [item[0] for item in cursor.description]
@@ -1139,8 +1156,11 @@ def memory_pressure_section(connection: sqlite3.Connection, day: str, hosts: int
         + " FROM samples WHERE date(at, 'localtime') = ? ORDER BY host, at",
         day,
     )
-    instrument_predicate = "date({column}, 'localtime') = ? AND " + natedev_step_predicate().removeprefix("steps.")
-    instruments = memory.instrument_lines(connection, instrument_predicate, (day,))
+    instrument_date = "date({column}, 'localtime') = ? AND "
+    predicates = memory.InstrumentPredicates(instrument_date + natedev_host_predicate('samples'),
+                                             instrument_date + natedev_step_predicate(),
+                                             instrument_date + natedev_step_predicate('calls'))
+    instruments = memory.instrument_lines(connection, predicates, (day,))
     section = ["### Memory pressure", "", "Source: 60 s machine samples and step cgroup stall counters.", ""]
     section += [memory_held_line(connection, day if usage_day is None else usage_day), ""]
     if longest:
@@ -1285,7 +1305,9 @@ def profile_step_durations(
 def rate_text(value: float | moments.RateUnavailable, row: moments.RateRow) -> str:
     if isinstance(value, moments.RateUnavailable):
         return "—"
-    suffix = {"hours": " h", "runs": "", "percent": "%", "per_phase": " /phase"}[row.unit]
+    suffix = {"hours": " h /day", "runs": " /day", "percent": "%",
+              "runs_per_phase": " /phase", "hours_per_phase": " h /phase",
+              "per_run_hour": " h wait / h run"}[row.unit]
     return f"{value:.1f}{suffix}"
 
 
@@ -1312,27 +1334,37 @@ def rate_with_baseline(value: float | moments.RateUnavailable, row: moments.Rate
     return text
 
 
+def rate_change(before: float | moments.RateUnavailable, after: float | moments.RateUnavailable) -> str:
+    if isinstance(before, (int, float)) and isinstance(after, (int, float)) and before > 0:
+        return f"{(after-before)/before:+.0%}".replace("-", "−")
+    return "—"
+
+
+def rate_window_days(before_days: float, after_days: float) -> str:
+    before_thin = " (thin)" if before_days < MIN_RATE_WINDOW_DAYS else ""
+    after_thin = " (thin)" if after_days < MIN_RATE_WINDOW_DAYS else ""
+    return f"Before: {before_days:.3f} days{before_thin}; after: {after_days:.3f} days{after_thin}."
+
+
 def moment_rate_table(before: moments.WindowRates, after: moments.WindowRates,
                       moment: moments.BuildMoment) -> list[str]:
-    lines = ["| Rate | Before/day | After/day | Change |", "|---|--:|--:|--:|"]
+    body: list[list[str]] = []
+    # Compare Moment 1's quoted baseline with the full week below.
+    baseline = (moments.NoSdlcBaseline() if isinstance(moment.baseline, moments.SdlcBaseline)
+                and moment.baseline.window == "week" else moment.baseline)
     for row in moments.RATE_ROWS:
         if moment.scope == "hana" and row.scope != "hana":
             continue
         left, right = before.rates[row.key], after.rates[row.key]
-        change = "—"
-        if isinstance(left, float) and isinstance(right, float) and left > 0:
-            change = f"{(right-left)/left:+.0%}".replace("-", "−")
-        # Moment 1's quoted week is compared below against the full week,
-        # rather than against this adjacent-moment slice.
-        baseline = (moments.NoSdlcBaseline() if isinstance(moment.baseline, moments.SdlcBaseline)
-                    and moment.baseline.window == "week" else moment.baseline)
-        lines.append("| " + " | ".join((row.label,
+        body.append([row.label,
             rate_with_baseline(left, row, baseline, "before", before.days),
-            rate_with_baseline(right, row, baseline, "after", after.days), change)) + " |")
-    before_thin = " (thin)" if before.days < MIN_RATE_WINDOW_DAYS else ""
-    after_thin = " (thin)" if after.days < MIN_RATE_WINDOW_DAYS else ""
-    lines += [f"Before: {before.days:.3f} days{before_thin}; after: {after.days:.3f} days{after_thin}.", ""]
-    return lines
+            rate_with_baseline(right, row, baseline, "after", after.days), rate_change(left, right)])
+    return [*table(["Rate", "Before", "After", "Change"], body),
+            rate_window_days(before.days, after.days),
+            f"Hana phases finished: before {before.phase_count}, after {after.phase_count}.",
+            "Per-day rows follow load; per-phase counts do not. "
+            + "Per-phase hours still fall on a quieter machine. "
+            + "We assume phases have about the same size on both sides.", ""]
 
 
 def moment_p50_table(before: dict[tuple[str, str, str], list[float]],
@@ -1442,14 +1474,9 @@ def memory_moment_table(before: Sequence[MemoryRateRow], after: Sequence[MemoryR
                         before_days: float, after_days: float) -> list[str]:
     body: list[list[str]] = []
     for left, right in zip(before, after, strict=True):
-        change = "—"
-        if isinstance(left.value, (int, float)) and isinstance(right.value, (int, float)) and left.value > 0:
-            change = f"{(right.value-left.value)/left.value:+.0%}".replace("-", "−")
-        body.append([left.label, memory_row_text(left), memory_row_text(right), change])
-    thin_before = " (thin)" if before_days < MIN_RATE_WINDOW_DAYS else ""
-    thin_after = " (thin)" if after_days < MIN_RATE_WINDOW_DAYS else ""
+        body.append([left.label, memory_row_text(left), memory_row_text(right), rate_change(left.value, right.value)])
     return [*table(["Memory", "Before", "After", "Change"], body),
-            f"Before: {before_days:.3f} days{thin_before}; after: {after_days:.3f} days{thin_after}.", ""]
+            rate_window_days(before_days, after_days), ""]
 
 
 def memory_overlap_lines(window: moments.ComparisonWindow, events: Sequence[moments.Moment]) -> list[str]:
@@ -1488,14 +1515,16 @@ def moments_section(connection: sqlite3.Connection, day: str) -> list[str]:
         "Reruns: start 0–10 min after the previous nextest end in the same folder (cwd without /target/verify-doc).",
         "Queue-hidden repeats: submit (start − mem_wait_s) at most 600 s after the previous nextest end in that folder, different call_id, no lower bound.",
         "Same-worker reruns: consecutive nextest steps in the same session, submit at most 60 min after the previous end, no lower bound; after a pass means both passed, fail then fail means both failed. Hours count the later step.",
-        "Load ratios divide hana nextest or clippy counts by phase_finished events in natedev's progress history whose working_dir matches the hana name patterns; the Mac's phases are not counted. Repeated phase_instance_id counts once.",
+        "Per-phase rows divide totals by finished hana phases in natedev's progress history. "
+        + "The working_dir must match the hana name patterns. The Mac's phases are not counted. Repeated phase_instance_id counts once.",
+        "Hana wait hours / run hour divides hana wait hours by hana run hours.",
         "Clone rebuilds: hana nextest with crates_compiled >= 300; clone repeats are the percentage whose previous nextest in the same session was also a clone rebuild ending at most 4 h before, no lower bound.",
-        f"Per-day = total ÷ window days; percentages and /phase ratios are not divided by days. A window shorter than {MIN_RATE_WINDOW_DAYS} day is thin; — means no denominator.",
+        f"Per-day = total ÷ window days; other rows are not divided by days. A window shorter than {MIN_RATE_WINDOW_DAYS} day is thin; — means no denominator.",
         "Windows: before covers 7 days cut at the previous moment on the same track; after ends at the next moment on that track or report end. Build and memory moments do not cut each other's windows. Pair histories and hana classification use each measured window.", "",
     ]
     if any(isinstance(window.moment, moments.MemoryMoment) for window in windows):
         lines += [
-            f"Earlyoom kills/day, builds: oom_score_adj {conf.whole("lint", "build_oom_score_adj")}, plus any other adjustment whose cmdline program is under /target/; the latter are outside the build gate. Others are every remaining kill; journal unavailable is not zero.",
+            f"Earlyoom kills/day, builds: oom_score_adj {conf.read("lint").whole("build_oom_score_adj")}, plus any other adjustment whose cmdline program is under /target/; the latter are outside the build gate. Others are every remaining kill; journal unavailable is not zero.",
             "Full memory stall: stall_full_us deltas ÷ sampled elapsed microseconds, natedev's 60 s samples; resets, boot changes and gaps are unknown.",
             "Memory wait p90: nearest-rank 90th percentile of recorded mem_wait_s on natedev steps started in the window, zero waits included.",
             "Memory-kill retries/day: (sum(mem_kills) − sum(mem_kill_stopped)) ÷ window days on natedev calls started in the window; stopped calls are in brackets, per day.", "",
@@ -1542,12 +1571,11 @@ def moments_section(connection: sqlite3.Connection, day: str) -> list[str]:
         if isinstance(moment.baseline, moments.SdlcBaseline):
             if moment.baseline.window == "week":
                 week = measured(moment.at - timedelta(days=7), moment.at)
+                body = [[row.label, rate_with_baseline(
+                    week.rates[row.key], row, moment.baseline, "before", week.days)] for row in moments.RATE_ROWS]
                 lines += ["7-day baseline before Moment 1 (uncut):", "",
-                          "| Rate | Before/day |", "|---|--:|"]
-                for row in moments.RATE_ROWS:
-                    lines.append(f"| {row.label} | " + rate_with_baseline(
-                        week.rates[row.key], row, moment.baseline, "before", week.days) + " |")
-                lines += [f"Natedev hana phases in the baseline: {week.phase_count}.", ""]
+                          *table(["Rate", "Before"], body),
+                          f"Hana phases finished in the baseline: {week.phase_count}.", ""]
             lines += [*moment.baseline.notes, ""]
     return lines
 
@@ -2186,29 +2214,21 @@ def tests_per_edit_section(connection: sqlite3.Connection, day: str) -> list[str
     ]
 
 
-SUMMARIES = [("successes", "status = 0", False), ("failures", "status <> 0", False), ("all", "1", True)]
-
-
-def summary(connection: sqlite3.Connection, day: str, found: list[str], which: str, with_failed: bool) -> list[str]:
-    """One row per kind, every caller together, then the total; kinds with no runs in the set are left out."""
-    select = "count(*), sum(status <> 0), sum(duration_s), avg(duration_s), group_concat(duration_s), max(peak_mem_bytes)"
-    start, end = day_range(day)
-    where = f"started_at >= ? AND started_at < ? AND {which} AND {natedev_step_predicate()}"
-    rows = {
-        cast(str, row[0]): row[1:]
-        for row in fetch(connection, f"SELECT step, {select} FROM steps WHERE {where} GROUP BY step", start, end)
-    }
-    if not rows:
-        return ["None."]
-    durations = [value for row in rows.values() for value in percentile_values(row[4])]
-    failed = [row[1] for row in rows.values() if isinstance(row[1], int)]
-    peaks = [row[5] for row in rows.values() if isinstance(row[5], int | float)]
-    total: Row = (
-        sum(cast(int, row[0]) for row in rows.values()), sum(failed) if failed else None,
+def combined_summary(rows: Sequence[Row]) -> Row:
+    durations = [value for row in rows for value in percentile_values(row[4])]
+    failed = [row[1] for row in rows if isinstance(row[1], int)]
+    peaks = [row[5] for row in rows if isinstance(row[5], int | float)]
+    return (
+        sum(cast(int, row[0]) for row in rows), sum(failed) if failed else None,
         sum(durations) if durations else None,
         sum(durations) / len(durations) if durations else None,
         ",".join(str(value) for value in durations), max(peaks) if peaks else None,
     )
+
+
+def summary(found: list[str], rows: dict[str, Row], with_failed: bool) -> list[str]:
+    """Render each measured kind and the total for one result group."""
+    total = combined_summary(list(rows.values()))
     if not total[0]:
         return ["None."]
 
@@ -2219,6 +2239,31 @@ def summary(connection: sqlite3.Connection, day: str, found: list[str], which: s
     body = [line(kind, rows[kind]) for kind in found if kind in rows] + [line("**All steps**", total)]
     head = ["Kind", "Runs", *(["Failed"] if with_failed else []), "Total", "Avg", "p95", "Peak memory"]
     return table(head, body)
+
+
+def summary_sections(connection: sqlite3.Connection, day: str, found: list[str]) -> list[str]:
+    """Read the day's local steps once for all three result groups."""
+    start, end = day_range(day)
+    select = "count(*), sum(status <> 0), sum(duration_s), avg(duration_s), group_concat(duration_s), max(peak_mem_bytes)"
+    measured = fetch(connection, f"SELECT step, status = 0, {select} FROM steps"
+                     + f" WHERE started_at >= ? AND started_at < ? AND {natedev_step_predicate()}"
+                     + " GROUP BY step, status = 0", start, end)
+    successes: dict[str, Row] = {}
+    failures: dict[str, Row] = {}
+    groups: dict[str, list[Row]] = {}
+    for row in measured:
+        kind = cast(str, row[0])
+        values = row[2:]
+        groups.setdefault(kind, []).append(values)
+        if row[1] == 1:
+            successes[kind] = values
+        elif row[1] == 0:
+            failures[kind] = values
+    all_steps = {kind: combined_summary(values) for kind, values in groups.items()}
+    lines: list[str] = []
+    for name, rows, with_failed in (("successes", successes, False), ("failures", failures, False), ("all", all_steps, True)):
+        lines += [f"### Summary: {name}", "", *summary(found, rows, with_failed), ""]
+    return lines
 
 
 def disk_section() -> list[str]:
@@ -2241,18 +2286,96 @@ def disk_section() -> list[str]:
     ]
 
 
-def mac_note() -> str:
+def peer_sync_lines() -> list[str]:
+    current = datetime.now()
     paused = sync.read_pause()
-    prefix = ""
-    if isinstance(paused, sync.SyncPaused):
-        since = sync.sync_time(paused.since, datetime.now()) if paused.since != "unknown" else paused.since
-        prefix = f"Mac: sync paused since {since} ({paused.why}). "
-    status = sync.read_status()
-    if isinstance(status, sync.NeverSynced):
-        return prefix + "Mac: not synced yet."
-    last = status.last_good
-    when = sync.sync_time(last.at, datetime.now()) if isinstance(last, sync.LastSynced) else "never"
-    return prefix + (f"Mac rows as of the {when} sync." if status.ok else f"Mac: the last sync failed; last good sync {when}.")
+    lines: list[str] = []
+    for exchange in sync.peer_exchanges():
+        peer, status = exchange.peer, exchange.status
+        label = f'{peer.target} ({peer.host})'
+        prefix = f'{label}: '
+        if isinstance(paused, sync.SyncPaused):
+            prefix += f'sync globally paused ({paused.why}); run buildlog sync resume. '
+        if isinstance(status, sync.NeverSynced):
+            lines.append(prefix + 'never synchronized; run buildlog sync.')
+            continue
+        good = sync.sync_time(status.last_good.at, current) if isinstance(status.last_good, sync.LastSynced) else 'never'
+        failure = (sync.sync_time(status.last_failure.at, current)
+                   if isinstance(status.last_failure, sync.SyncFailure) else 'none')
+        state = 'failed'
+        if status.ok:
+            state = 'current'
+            if isinstance(status.last_failure, sync.SyncFailure):
+                state = 'recovered'
+        lines.append(prefix + f'last successful exchange {good}; latest failure {failure}; {state}.'
+                     + (' Run buildlog sync.' if not status.ok else ''))
+    return lines
+
+
+def aws_section(connection: sqlite3.Connection, day: str) -> list[str]:
+    """Render local costs and comparison estimates without contacting AWS or a peer."""
+    configured = tuple(item for item in read_targets() if isinstance(item, SshTarget) and is_aws_target(item))
+    return [line for target in configured for line in aws_target_section(connection, day, target, len(configured) > 1)]
+
+
+def aws_target_section(connection: sqlite3.Connection, day: str, configured: SshTarget, multiple: bool) -> list[str]:
+    target = configured.name
+    directory = mac_test.state_paths(target).directory
+    instant = int(time.time())
+    try:
+        inputs = measurement.read_inputs(configured.settings, directory)
+        snapshot = measurement.read_measurement(configured.settings, directory, instant, inputs=inputs)
+        usage = measurement.daily_usage(configured.settings, directory, day, instant, inputs=inputs)
+    except (OSError, ValueError, ArithmeticError) as error:
+        snapshot = measurement.MeasurementUnavailable(str(error))
+        usage = measurement.MeasurementUnavailable(str(error))
+    saving = aws_report.estimate_wait_saved(connection, day, target, bounds=day_range(day))
+    lines = [f'### AWS: {target}' if multiple else '### AWS', '']
+    dollars = uptime = 'unavailable'
+    ratio = 'cost per saved hour unavailable'
+    if isinstance(usage, measurement.DailyUsage):
+        dollars = f'{usage.usd:.2f}'
+        uptime = f'{usage.uptime_s / 3600:.2f}'
+    saved = 'queue wait saved unavailable'
+    if isinstance(saving.queue_saved_s, Decimal):
+        hours = saving.queue_saved_s / Decimal(3600)
+        saved = f'about {hours:.2f} h of queue wait saved'
+        ratio = 'unavailable per saved hour'
+        if isinstance(usage, measurement.DailyUsage) and hours > 0:
+            ratio = f'${usage.usd / hours:.2f} per saved hour'
+    lines.append(f'AWS: up {uptime} h, {saving.steps} steps, {saved} for ${dollars} ({ratio}, estimated).')
+    if isinstance(saving.run_saved_s, Decimal):
+        lines.append(f'Estimated run time saved: {saving.run_saved_s / Decimal(3600):.2f} h. Negative differences remain included.')
+    else:
+        lines.append('Estimated run time saved: unavailable; matching command comparisons are missing.')
+    if isinstance(snapshot, measurement.MeasurementUnavailable):
+        lines.append(f'AWS measurement unavailable: {snapshot.reason}.')
+    else:
+        for reading in snapshot.charge_reads:
+            if reading.day == day:
+                lines.append(f'Actual charges: ${reading.actual_usd:.2f}; reconciliation difference '
+                             + f'${reading.difference_usd:.2f}; query cost ${reading.query_usd:.2f}.')
+        if isinstance(snapshot.go_live_at, int):
+            boundary = store.utc_iso(snapshot.go_live_at)
+            periods: list[list[object]] = []
+            for relation in ('<', '>='):
+                rows = fetch(connection, "SELECT sum(coalesce(mem_wait_s,0)) FROM steps WHERE "
+                             + natedev_step_predicate() + f' AND started_at {relation} ?'
+                             + " GROUP BY date(started_at,'localtime') ORDER BY date(started_at,'localtime')", boundary)
+                periods.append([row[0] for row in rows])
+            before, after = periods
+            lines.append('Natedev daily summed queue wait before go-live: '
+                         + (', '.join(seconds(value) for value in before) if before else 'unavailable')
+                         + '; after go-live: ' + (', '.join(seconds(value) for value in after) if after else 'unavailable')
+                         + '; unmatched for load.')
+        else:
+            lines.append('Natedev daily queue wait before and after go-live: unavailable; unmatched for load.')
+    status = sync.read_status(target)
+    if isinstance(status, sync.SyncStatus) and isinstance(status.last_good, sync.LastSynced):
+        lines.append(f'AWS report data synchronized at {sync.sync_time(status.last_good.at, datetime.fromtimestamp(instant))}.')
+    else:
+        lines.append('AWS report data never synchronized; run buildlog sync.')
+    return [*lines, '']
 
 
 def lead_block(
@@ -2356,6 +2479,7 @@ def recorder_health_lines(day: str) -> list[str]:
     return lines
 
 
+@target_predicate_scope()
 def report(connection: sqlite3.Connection, day: str, *, usage_day: str | None = None) -> str:
     found = kinds(connection, day)
     hosts = cast(
@@ -2389,6 +2513,7 @@ def report(connection: sqlite3.Connection, day: str, *, usage_day: str | None = 
         + moments_section(connection, day)
         + tests_by_target_lines(test_calls)
         + mac_section(connection, day)
+        + aws_section(connection, day)
         + mac_copies_lines(copies)
         + port_lint
         + ci
@@ -2396,13 +2521,12 @@ def report(connection: sqlite3.Connection, day: str, *, usage_day: str | None = 
         + disk_section()
     )
     if found:
-        for name, which, with_failed in SUMMARIES:
-            lines += [f"### Summary: {name}", "", *summary(connection, day, found, which, with_failed), ""]
+        lines += summary_sections(connection, day, found)
     else:
         lines += ["### Summary", "", "No build steps recorded.", ""]
     lines += [calls_line, *port_lint_line, ci_line, *rust_release.report_line()]
     notes = [
-        mac_note(),
+        *peer_sync_lines(),
         "Peak memory is measured on natedev only. It counts files the step read or wrote that stayed in RAM, so it runs above what the step's processes used.",
     ]
     lines += ["", *(f"- {note}" for note in notes)]

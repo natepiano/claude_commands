@@ -15,6 +15,7 @@ import unittest
 from pathlib import Path
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
+from scripts.lib.nix_env_test_support import NixFixture
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
 else:
@@ -32,6 +33,29 @@ else:
 INVOKE = Path(__file__).with_name("invoke.sh")
 LINT_CONFIG_READER = INVOKE.with_name("lint_config.sh")
 OOM_SCORE_ADJ = "/proc/self/oom_score_adj"
+
+
+class VerifyTemporaryParentTests(NixFixture):
+    def test_verify_creates_missing_tmpdir_before_environment_loading(self) -> None:
+        missing = self.root / "session with spaces" / "tmp"
+        _ = self.envrc(self.work)
+        self.env.update({"TMPDIR": str(missing), "CLAUDE_PYTHON": sys.executable})
+        self.script(self.bin / "direnv", '''import os, sys
+from pathlib import Path
+if sys.argv[1] == "allow":
+    raise SystemExit(0)
+Path(os.environ["TMPDIR"], "environment-probe").write_text("environment loaded")
+print("environment probe complete", file=sys.stderr)
+raise SystemExit(7)
+''')
+        verify = INVOKE.parent.parent / "direct/verify.sh"
+        result = subprocess.run(["bash", str(verify), "check", "sample"], cwd=self.work,
+                                env=self.env, text=True, capture_output=True,
+                                timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual((missing / "environment-probe").read_text(), "environment loaded")
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, f"nix_env: {self.work}: environment probe complete\n")
 
 
 @dataclass(frozen=True)
@@ -93,7 +117,7 @@ def require_score_below_500(test: unittest.TestCase) -> None:
 class BuildOomScoreAdjReaderTests(unittest.TestCase):
     python_reader: list[str] = [
         sys.executable, "-c", "from scripts.lib import conf; "
-        + 'print(conf.whole("lint", "build_oom_score_adj"))',
+        + 'print(conf.read("lint").whole("build_oom_score_adj"))',
     ]
 
     def read_config(self, config: Path, command: list[str]) -> subprocess.CompletedProcess[str]:

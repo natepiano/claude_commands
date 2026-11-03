@@ -4,14 +4,18 @@ from __future__ import annotations
 from dataclasses import replace
 import os
 from pathlib import Path
+import select
 import subprocess
+import sys
 import tomllib
+import unittest
 from typing import cast
 from unittest import mock
 from unittest.mock import patch
 
-from scripts.lib import atomic_file
+from scripts.lib import atomic_file, git_exclude
 from scripts.lib.git_exclude import ExcludeRefused
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import unit_config as config
 from scripts.production.unit_config_test_support import UnitConfigFixture
 from scripts.production.unit_config_format_test_support import (
@@ -19,7 +23,347 @@ from scripts.production.unit_config_format_test_support import (
 )
 
 
+class UnitPortCellTests(unittest.TestCase):
+    def test_raw_port_cells_accept_absence_numbers_and_history_notes(self) -> None:
+        for raw in ("—", "-", "none", "", " `—` "):
+            with self.subTest(raw=raw):
+                self.assertEqual(config.parse_port_cell(raw), config.NoAppPort())
+        for raw in ("15733", "15733 (note)", "`15733`", "`15733` (note)",
+                    "15733 (after it clashed with startup on 15731, 2026-10-02)",
+                    "1", "65535"):
+            with self.subTest(raw=raw):
+                expected = 1 if raw == "1" else 65535 if raw == "65535" else 15733
+                self.assertEqual(config.parse_port_cell(raw), config.AppPort(expected))
+
+    def test_invalid_port_cells_keep_the_raw_text_in_the_refusal(self) -> None:
+        for raw in ("0", "70000", "15733 extra", "abc", "`70000`", "`15733 extra`"):
+            with self.subTest(raw=raw), self.assertRaises(config.ConfigRefused) as caught:
+                _ = config.parse_port_cell(raw)
+            self.assertIn(raw, str(caught.exception))
+
+
+class UnitPortRepairTests(UnitConfigFixture):
+    def test_active_repair_preserves_other_fields_and_an_unchanged_rerun_preserves_bytes(self) -> None:
+        binary = require_taplo(self)
+        _ = write_aligning_config(self.worktree)
+        original = self.config()
+        _ = config.write(self.worktree, original)
+        settled = config.AppPort(8234)
+        target = config.InWorktree(self.source)
+        with patch.object(atomic_file, "write_bytes_atomic", wraps=atomic_file.write_bytes_atomic) as publications:
+            self.assertIsInstance(config.repair_port(target, original.port, settled), config.Published)
+        self.assertEqual(publications.call_count, 1)
+        self.assertEqual(publications.call_args.args[0], self.source)
+        self.assertEqual(config.read(self.worktree), replace(original, port=settled))
+        result = check_format(binary, self.source, self.worktree)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        complete = self.file_versions()
+        with patch.object(atomic_file, "write_bytes_atomic", wraps=atomic_file.write_bytes_atomic) as writes:
+            self.assertIsInstance(config.repair_port(target, original.port, settled), config.AlreadyCurrent)
+        writes.assert_not_called()
+        self.assertEqual(self.file_versions(), complete)
+
+    def test_parked_repair_keeps_retirement_and_saved_formatting_after_worktree_removal(self) -> None:
+        binary = require_taplo(self)
+        _ = write_aligning_config(self.worktree)
+        self.park_config()
+        saved = config.read_parked(self.unit)
+        assert isinstance(saved, config.UnitConfig)
+        removed = self.root / "removed-start-folder"
+        saved = replace(saved, retired=replace(self.retirement(), start_folder=config.RecordedStartFolder(removed)))
+        self.parked.unlink()
+        _ = config.write_parked(self.unit, saved)
+        self.assertFalse(removed.exists())
+        source = self.source.read_bytes(), self.source.stat().st_mtime_ns
+        target = config.Parked(self.parked)
+        settled = config.AppPort(8234)
+        self.assertIsInstance(config.repair_port(target, saved.port, settled), config.Published)
+        repaired = config.read_parked(self.unit)
+        self.assertEqual(repaired, replace(saved, port=settled))
+        assert isinstance(repaired, config.UnitConfig)
+        self.assertEqual(repaired.formatting, saved.formatting)
+        self.assertEqual((self.source.read_bytes(), self.source.stat().st_mtime_ns), source)
+        result = check_format(binary, self.parked, self.worktree)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        complete = self.file_versions()
+        self.assertIsInstance(config.repair_port(target, saved.port, settled), config.AlreadyCurrent)
+        self.assertEqual(self.file_versions(), complete)
+
+    def test_repair_accepts_recorded_no_app_port_and_can_settle_no_app_port(self) -> None:
+        for parked in (False, True):
+            with self.subTest(parked=parked):
+                original = replace(self.config(), port=config.NoAppPort())
+                if parked:
+                    original = replace(original, retired=self.retirement())
+                    _ = config.write_parked(self.unit, original)
+                    target = config.Parked(self.parked)
+                else:
+                    _ = config.write(self.worktree, original)
+                    target = config.InWorktree(self.source)
+                self.assertIsInstance(config.repair_port(target, config.NoAppPort(), config.AppPort(8234)), config.Published)
+                self.assertIsInstance(config.repair_port(target, config.AppPort(8234), config.NoAppPort()), config.Published)
+                actual = config.read_parked(self.unit) if parked else config.read(self.worktree)
+                self.assertEqual(actual, original)
+
+    def test_third_port_refuses_before_any_publication_for_active_and_parked_configs(self) -> None:
+        self.park_config()
+        before = self.file_versions()
+        for target in (config.InWorktree(self.source), config.Parked(self.parked)):
+            with (self.subTest(target=target),
+                  patch.object(atomic_file, "write_bytes_atomic", wraps=atomic_file.write_bytes_atomic) as writes):
+                with self.assertRaises(config.ConfigRefused) as caught:
+                    _ = config.repair_port(target, config.AppPort(8001), config.AppPort(8002))
+            self.assertIn(str(target.path), str(caught.exception))
+            self.assertIn("port", str(caught.exception))
+            writes.assert_not_called()
+            self.assertEqual(self.file_versions(), before)
+
+    def test_missing_or_malformed_config_cannot_supply_a_port(self) -> None:
+        for target in (config.InWorktree(self.source), config.Parked(self.parked)):
+            with self.subTest(target=target, state="missing"):
+                with self.assertRaises(config.ConfigRefused):
+                    _ = config.repair_port(target, config.NoAppPort(), config.AppPort(8234))
+                self.assertFalse(target.path.exists())
+            atomic_file.write_text_atomic(target.path, 'plan = "standby"\nport = "unknown"\nresponsibilities = []\n')
+            before = target.path.read_bytes(), target.path.stat().st_mtime_ns
+            with self.subTest(target=target, state="malformed"):
+                with self.assertRaises(config.ConfigRefused):
+                    _ = config.repair_port(target, config.NoAppPort(), config.AppPort(8234))
+                self.assertEqual((target.path.read_bytes(), target.path.stat().st_mtime_ns), before)
+
+    def test_interrupted_repair_before_or_after_publication_recovers_once(self) -> None:
+        real_replace = os.replace
+        settled = config.AppPort(8234)
+        for parked in (False, True):
+            for published in (False, True):
+                with self.subTest(parked=parked, published=published):
+                    self.parked.unlink(missing_ok=True)
+                    self.park_config()
+                    target = config.Parked(self.parked) if parked else config.InWorktree(self.source)
+                    original = config.read_parked(self.unit) if parked else config.read(self.worktree)
+                    assert isinstance(original, config.UnitConfig)
+                    other = self.source if parked else self.parked
+                    other_before = other.read_bytes(), other.stat().st_mtime_ns
+                    target_before = target.path.read_bytes()
+
+                    def interrupt(temporary: Path, destination: Path) -> None:
+                        if destination == target.path:
+                            if published:
+                                real_replace(temporary, destination)
+                            raise OSError("stopped at port publication")
+                        real_replace(temporary, destination)
+
+                    with patch.object(os, "replace", side_effect=interrupt):
+                        with self.assertRaisesRegex(OSError, "stopped at port publication"):
+                            _ = config.repair_port(target, original.port, settled)
+                    actual = config.read_parked(self.unit) if parked else config.read(self.worktree)
+                    self.assertEqual(actual, replace(original, port=settled) if published else original)
+                    if not published:
+                        self.assertEqual(target.path.read_bytes(), target_before)
+                    self.assertEqual((other.read_bytes(), other.stat().st_mtime_ns), other_before)
+                    expected = config.AlreadyCurrent if published else config.Published
+                    self.assertIsInstance(config.repair_port(target, original.port, settled), expected)
+                    self.assertEqual(config.read_parked(self.unit) if parked else config.read(self.worktree),
+                                     replace(original, port=settled))
+                    complete = self.file_versions()
+                    self.assertIsInstance(config.repair_port(target, original.port, settled), config.AlreadyCurrent)
+                    self.assertEqual(self.file_versions(), complete)
+                    self.assertEqual(list(target.path.parent.glob(f".{target.path.name}.*.tmp")), [])
+
+    def test_regular_parked_writer_still_refuses_a_port_change(self) -> None:
+        self.park_config()
+        original = config.read_parked(self.unit)
+        assert isinstance(original, config.UnitConfig)
+        before = self.file_versions()
+        with self.assertRaisesRegex(config.ConfigRefused, "port"):
+            _ = config.write_parked(self.unit, replace(original, port=config.AppPort(8234)))
+        self.assertEqual(self.file_versions(), before)
+
+    def test_active_repair_refuses_a_tracked_configuration_without_changing_it(self) -> None:
+        _ = config.write(self.worktree, self.config())
+        _ = self.git("add", "-f", ".unit.toml")
+        before = self.file_versions()
+        with self.assertRaises((ExcludeRefused, config.ConfigRefused)):
+            _ = config.repair_port(config.InWorktree(self.source), self.config().port, config.AppPort(8234))
+        self.assertEqual(self.file_versions(), before)
+
+    def test_repair_refuses_a_port_that_changes_before_publication(self) -> None:
+        _ = config.write(self.worktree, self.config())
+        competing = self.source.read_text().replace("8123", "8999")
+        real_check = git_exclude.require_untracked_ignored
+
+        def publish_competing_port(worktree: Path, name: str) -> None:
+            real_check(worktree, name)
+            atomic_file.write_text_atomic(self.source, competing)
+
+        with patch.object(git_exclude, "require_untracked_ignored", side_effect=publish_competing_port):
+            with self.assertRaises(config.ConfigRefused):
+                _ = config.repair_port(config.InWorktree(self.source), self.config().port, config.AppPort(8234))
+        self.assertEqual(self.source.read_text(), competing)
+        self.assertEqual(config.read(self.worktree), replace(self.config(), port=config.AppPort(8999)))
+
+    def test_writer_after_the_repair_guard_cannot_lose_its_third_port(self) -> None:
+        writer = """
+from dataclasses import replace
+import fcntl
+from pathlib import Path
+import sys
+from scripts.production import unit_config as config
+from scripts.production.staff import StaffId
+
+lock_path = Path.home() / '.local/state/staff/unit-config.lock'
+lock_path.parent.mkdir(parents=True, exist_ok=True)
+with lock_path.open('a+b') as lock:
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(75)
+    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+path = Path(sys.argv[2])
+if sys.argv[1] == 'parked':
+    value = config.read_parked(StaffId(sys.argv[3]), cleanup=False)
+    assert isinstance(value, config.UnitConfig)
+    config.repair_port(config.Parked(path), value.port, config.AppPort(8999))
+else:
+    value = config.read(path.parent, cleanup=False)
+    assert isinstance(value, config.UnitConfig)
+    config.write(path.parent, replace(value, port=config.AppPort(8999)))
+"""
+        real_read_bytes = Path.read_bytes
+        for parked in (False, True):
+            with self.subTest(parked=parked):
+                self.parked.unlink(missing_ok=True)
+                self.park_config()
+                target = config.Parked(self.parked) if parked else config.InWorktree(self.source)
+                original = config.read_parked(self.unit) if parked else config.read(self.worktree)
+                assert isinstance(original, config.UnitConfig)
+                attempts: list[subprocess.CompletedProcess[str]] = []
+                reads = 0
+
+                def start_writer_after_guard(path: Path) -> bytes:
+                    nonlocal reads
+                    observed = real_read_bytes(path)
+                    if path == target.path:
+                        reads += 1
+                        if reads == 2:
+                            attempts.append(subprocess.run(
+                                [sys.executable, "-B", "-c", writer, "parked" if parked else "active",
+                                 str(target.path), self.unit],
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+                            ))
+                    return observed
+
+                with patch.object(Path, "read_bytes", start_writer_after_guard):
+                    try:
+                        outcome = config.repair_port(target, original.port, config.AppPort(8234))
+                    except config.ConfigRefused as error:
+                        outcome = error
+                self.assertEqual(len(attempts), 1)
+                self.assertIn(attempts[0].returncode, (0, 75), attempts[0].stderr)
+                if attempts[0].returncode == 0:
+                    self.assertIsInstance(outcome, config.ConfigRefused)
+                    expected = replace(original, port=config.AppPort(8999))
+                else:
+                    self.assertIsInstance(outcome, config.Published)
+                    expected = replace(original, port=config.AppPort(8234))
+                actual = config.read_parked(self.unit) if parked else config.read(self.worktree)
+                self.assertEqual(actual, expected)
+
+    def test_active_and_parked_writers_enter_after_the_repair_publishes(self) -> None:
+        writer = """
+from dataclasses import replace
+import fcntl
+import os
+from pathlib import Path
+import sys
+from scripts.production import unit_config as config
+
+path = Path(sys.argv[2])
+lock_path = Path.home() / '.local/state/staff/unit-config.lock'
+real_flock = fcntl.flock
+def observe_lock(descriptor, operation):
+    number = descriptor if isinstance(descriptor, int) else descriptor.fileno()
+    if operation == fcntl.LOCK_EX and os.path.samestat(os.fstat(number), lock_path.stat()):
+        print('attempt', flush=True)
+        real_flock(descriptor, operation)
+        assert config.parse(path.read_text()).port == config.AppPort(8234)
+        print('acquired', flush=True)
+    else:
+        real_flock(descriptor, operation)
+fcntl.flock = observe_lock
+if sys.argv[1] == 'parked':
+    config.repair_port(config.Parked(path), config.AppPort(8234), config.AppPort(8999))
+else:
+    value = config.read(path.parent, cleanup=False)
+    assert isinstance(value, config.UnitConfig)
+    config.write(path.parent, replace(value, port=config.AppPort(8999)))
+print('complete', flush=True)
+"""
+        real_read_bytes = Path.read_bytes
+        for parked in (False, True):
+            with self.subTest(parked=parked):
+                self.parked.unlink(missing_ok=True)
+                self.park_config()
+                target = config.Parked(self.parked) if parked else config.InWorktree(self.source)
+                original = config.read_parked(self.unit) if parked else config.read(self.worktree)
+                assert isinstance(original, config.UnitConfig)
+                processes: list[subprocess.Popen[str]] = []
+                results: list[tuple[str, str]] = []
+                reads = 0
+
+                def start_public_writer(path: Path) -> bytes:
+                    nonlocal reads
+                    observed = real_read_bytes(path)
+                    if path == target.path:
+                        reads += 1
+                        if reads == 2:
+                            process = subprocess.Popen(
+                                [sys.executable, "-B", "-c", writer, "parked" if parked else "active", str(target.path)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            )
+                            processes.append(process)
+                            assert process.stdout is not None
+                            ready, _, _ = select.select([process.stdout], [], [], TEST_HANG_GUARD_SECS)
+                            self.assertTrue(ready, "The competing writer must attempt its lock.")
+                            self.assertEqual(process.stdout.readline(), "attempt\n")
+                    return observed
+
+                try:
+                    with patch.object(Path, "read_bytes", start_public_writer):
+                        self.assertIsInstance(config.repair_port(target, original.port, config.AppPort(8234)), config.Published)
+                finally:
+                    for process in processes:
+                        try:
+                            results.append(process.communicate(timeout=TEST_HANG_GUARD_SECS))
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            _ = process.communicate()
+                            raise
+                self.assertEqual(len(processes), 1)
+                output, errors = results[0]
+                self.assertEqual(processes[0].returncode, 0, errors)
+                self.assertEqual(output, "acquired\ncomplete\n")
+                self.assertEqual(config.read_parked(self.unit) if parked else config.read(self.worktree),
+                                 replace(original, port=config.AppPort(8999)))
+
+
 class UnitConfigTests(UnitConfigFixture):
+    def test_remote_configuration_fields_preserve_retirement_and_reject_invalid_values(self) -> None:
+        fields: dict[str, object] = {
+            "plan": "docs/plans/worker.md", "port": 8123,
+            "responsibilities": ["nightly-review", "build-check"],
+            "retired": {"date": "2026-10-31", "session": "session-before-retire",
+                        "folder": str(self.worktree), "branch": "feature/worker"},
+        }
+        self.assertEqual(config.decode(fields), replace(self.config(), retired=self.retirement()))
+        for key, invalid in (("port", True), ("responsibilities", "nightly-review"),
+                             ("retired", {"session": "session-before-retire"})):
+            with self.subTest(key=key):
+                with self.assertRaises(config.ConfigRefused):
+                    _ = config.decode({**fields, key: invalid})
+        self.assertFalse(self.source.exists())
+        self.assertFalse(self.parked.exists())
+
     def test_launcher_subprocess_fake_does_not_replace_taplo_for_live_or_parked_writes(self) -> None:
         binary = require_taplo(self)
         _ = write_aligning_config(self.worktree)

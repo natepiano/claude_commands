@@ -25,7 +25,7 @@
 User-approved 2026-11-02 via the sdlc showrunner. User requirements (these override the design below where they differ):
 
 1. Use the four-agent form. Keep the Agent tool. Remove Edit, Write and NotebookEdit, and use plan mode.
-2. Never drop a finding. A finding that changes behavior or reaches outside the phase is held for the user. The director lists it in the checkpoint notice. The showrunner files it as a user question and never settles it.
+2. Never drop a finding. A finding that changes behavior or reaches outside the phase is held. The director lists it in the checkpoint notice. It reaches the user only when it touches money, safety, product behavior the user sees, or an act that cannot be undone; the director settles every other held item.
 3. The live check proves that the four agents start and that no file changes.
 4. No settings.json change is planned. If the live check shows one is needed, ask the sdlc showrunner before changing it.
 5. An on/off key in config, read at use.
@@ -58,8 +58,9 @@ No code changes after review without a closure review and a gate.
 Items held for a decision (user, 2026-11-02, via Morty: "these changes may be desirable"):
 
 1. The director sends each held item to the showrunner. It goes in the phase's checkpoint notice, with its finding id, the files and the change it proposes.
-2. The showrunner files each item as a question for the user with `/showrunner:question`, led by the unit.
-   The showrunner does not settle these items itself. This is a stated exception to its usual design authority.
+2. A held item goes to the user only when it touches money, safety, product behavior the user sees, or an act that cannot be undone. The showrunner files only those as user questions with `/showrunner:question`, led by the unit.
+   The director settles every other held item under DecisionEconomy and states the call in one line
+   (user, 2026-11-02, via builds: "you're asking me a bunch of questions that seem obvious - and design oriented - which ones really need me?").
 3. The status line count and `/next question` show the item. The user approves or declines it.
 4. Approved: the showrunner sends it to the owning unit as a `next` item, or as a phase when it is large.
    Declined: the finding closes with the user's words. In both cases nothing is applied before the answer.
@@ -85,7 +86,8 @@ The user's extra words come from two places:
 - Words for one unit: the showrunner relays them as now, `From the user (via the showrunner): ...`.
   The director passes them to its next simplify launch, and the saved prompt file records them.
 
-Rerun: the summary is keyed by phase, pass and diff hash. A second launch on the same diff exits 0 with no new run.
+Every simplify launch starts a fresh review, including a retry after failure.
+The phase launch lock protects the active report and status from a second launch.
 A failed or busy Claude run reports `error`. <DualReview/> step 6 names the missing lens and the phase goes on.
 
 No worktree writes: plan mode and the removed tools stop edits. review.sh already fails a review when a file changes.
@@ -121,13 +123,13 @@ The trial is the only measure so far. The review-trial line records minutes and 
 2b. `~/.claude/commands/showrunner/produce.md`: the showrunner files each held simplify item with `/showrunner:question`, and never settles one itself.
 3. `~/.claude/scripts/usage/agents_log.py`: add `simplify` to the `Lens` type, so `assign.py` and `findings.py` accept it.
 4. `~/.claude/scripts/direct/assign.py`: route lens `simplify` through `agent_exec.sh` with the removed tools.
-   Write the prompt file. Reuse an existing summary for the same diff hash and exit 0.
+   Write the prompt file before each fresh review.
 5. `~/.claude/config/agents.conf`: one row with the Claude model and effort for the simplify run.
 6. `~/.claude/config/direct.conf`: `SIMPLIFY_LENS=on|off`, read by `assign.py` at launch.
 7. `~/.claude/config/review/simplify.md` (new): the report-only output form and the user's standing words.
 8. `~/.claude/scripts/direct/progress_history.py` and `merge_checkpoint.py`: the review-trial line
    counts simplify findings and minutes on their own field, and `review_numbers` reads it.
-9. Tests beside `assign.py`: the argv in `AGENT_EXEC_DRY_RUN` mode, the rerun with no new run, the `off` switch.
+9. Tests beside `assign.py`: the argv in `AGENT_EXEC_DRY_RUN` mode, a fresh review on the same diff, the `off` switch.
 
 No change: `settings.json`, `checkpoint.md`, `session_pane.py`.
 `production_format.md` gets one line only if the checkpoint notice format lives there and not in `phase_end.md`.
@@ -158,10 +160,97 @@ The phase took items 14 and 22 although they reach `review.sh` and `test_agent_e
 
 The second live simplify run (2026-11-02, pass 1 through `review.sh`) raised 25 items. Item 1 was the same as closure finding F018, which the phase fixed. The phase took items 2-17 and item 24. Item 24 makes a failed usage-log write not stop the review; that write is new in this phase, and `prepare_session.sh` and `agent_bg.sh` already treat it this way. Seven items were held for the user's decision. The report text is in the phase's `review_findings_1_simplify.txt`.
 
-2. Item 18, `review.sh:521-533`, `assign.py:671-674`: publish the simplify cache only when the status reads `reviewed`, as a plain atomic copy of the summary. Effect: a failed run runs again on the same diff, and does not replay `error`. Status: approved by the user 2026-11-02; applied in phase simplify-empty.
-3. Item 19, `assign.py:663-708`, `review.sh:521-539`: give `review.sh` one `--cache <file>` option that owns the lock, the replay and the publish. Effect: changes how a group SIGKILL stops a run. Status: replaced 2026-11-02 by the showrunner's design: `assign.py` hands control to `review.sh` with exec, and `review.sh` owns the lock, the reuse and the save. Applied in phase simplify-empty.
+2. Item 18, `review.sh:521-533`, `assign.py:671-674`: a failed review runs again on the same diff. Status: approved by the user 2026-11-02. The user later approved a fresh run for every simplify review.
+3. Item 19, `assign.py:663-708`, `review.sh:521-539`: one process owns each simplify review. Status: replaced by the exec design in phase simplify-empty. `review.sh` owns the phase launch lock and result files.
 4. Item 20, `assign.py:684-700`: install `interrupt` for three signals and remove the restore loop and the `try/finally`. Effect: a forwarded SIGINT or SIGHUP no longer sends a second SIGTERM. Status: removed by the exec design in phase simplify-empty; no signal handlers remain.
-5. Item 21, `progress_history.py:6135-6223`: take simplify minutes from `pass_elapsed_seconds` on `pass_finished` events with `called_task` `direct.simplify`. Effect: one key and one clock; minute values change by a small amount. Status: approved by the user 2026-11-02; filed in `docs/plans/sdlc-phases-next.md` for a later phase.
+5. Item 21, `progress_history.py:6135-6223`: take simplify minutes from `pass_elapsed_seconds` on `pass_finished` events with `called_task` `direct.simplify`. Effect: one key and one clock; minute values change by a small amount. Status: settled by standing rule (one clock; two sources for one number is a copy; sdlc 2026-11-02); listed in `docs/plans/sdlc-phases-next.md` for the next fixes.
 6. Item 22, `findings.py:724-729`: let `--held-for-decision` take any lens and refuse `--severity blocker`. Effect: the held state is open to all lenses; four doc lines change. Status: declined by the user 2026-11-02: "i haven't needed it so far so we're only making the exception for simplify for the time being - we may make it auto in the future".
 7. Item 23, `review.sh:735`: do not give the simplify run the pending fast-track diffs. Effect: changes the documented rule that every broad review gets them (`docs/plans/sdlc-devtools-tests.md:303`). Status: declined by the user 2026-11-02: "i don't agree - simplify is now a standard review process".
 8. Item 25, `review_regime.py:85-125`: add `optional_float` beside `optional_int` and use it for the four minute fields. Effect: edits three lines from before this phase. Status: approved by the user 2026-11-02 ("you never have to ask me to remove duplication"); filed in `docs/plans/sdlc-phases-next.md` for a later phase.
+
+### Phase 2 — findings.py records the user's answer over a withdrawn ruling  · status: done
+
+#### Work Order
+
+**Goal:** `findings.py decision` records the user's own answer on a finding that already holds a withdrawn or non-user ruling, keeps both rulings in the history, and `verdict` can close a finding after its decision.
+
+**Spec:**
+1. Today `_decision` (`scripts/direct/findings.py:1219`) refuses any finding whose state is not `held_for_decision`. A finding that holds a showrunner ruling (state `decided`) cannot take the user's answer. Seen on simplify-empty F022, and on builds aws Phase 8 F038-F040.
+2. Add `--withdraw "<why the current ruling no longer stands>"` to `decision`. With it, a `decided` finding takes the new answer:
+   - move the current `decision` object into a `decision_history` list on the finding, adding `withdrawn_epoch` and `withdraw_reason`;
+   - store the new answer as `decision`;
+   - append one `finding_decision` event that carries `withdrew` (the old decision object).
+3. Without `--withdraw`, a `decided` finding still refuses, and the message names `--withdraw`. `--withdraw` on a `held_for_decision` finding is refused. Every other state refuses as now.
+4. Today `_verdict` (`findings.py:787-788`) refuses `decided` findings. Change it:
+   - `held_for_decision` still refuses;
+   - a `decided` finding with answer `approved` accepts `verdict` like an open finding (the repair was applied; this was simplify-follow F033);
+   - a `decided` finding with answer `declined` refuses `verdict` with a message that it is closed by the decision.
+5. `status` shows `decision_history` when present. The `gate` result and batches do not change.
+6. Update the `decision` row in `~/.claude/commands/unit/direct.md` <FindingsLedger/> (in this repo: `commands/unit/direct.md`) to name `--withdraw`.
+7. Tests in `scripts/direct/test_findings.py`: decision over a decided finding with and without `--withdraw`; the history keeps both; `--withdraw` on a held finding is refused; verdict after an approved decision is accepted; verdict after a declined decision is refused; verdict on a held finding is refused.
+
+**Files:**
+- `scripts/direct/findings.py` — `_decision`, `_verdict`, the `decision` parser, `status`
+- `scripts/direct/test_findings.py` — the tests in Spec item 7
+- `commands/unit/direct.md` — the `decision` row
+
+**Workers:** 1 writer; the change is one module and its tests.
+- `impl` — all three files
+
+**State:** the findings ledger state file and its event log (`decision_history`, `finding_decision` events).
+
+**Constraints from prior phases:** `decision` never applies the proposed change; it records words only. Only the user's own words go into `--user-words` (memory: record only the user's answer).
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/direct -p test_findings.py` and `test_findings_simplify.py` pass; `basedpyright scripts/direct/findings.py scripts/direct/test_findings.py` reports 0 errors, 0 warnings, 0 notes.
+
+### Phase 4 — test_verify_doc.py leaves no lint sweep after it ends  · status: done
+
+**Depends on:** Phase 3
+
+#### Work Order
+
+**Goal:** `scripts/direct/test_verify_doc.py` passes every run. No detached lint sweep writes into the test's temporary home after the test ends.
+
+**Spec:**
+1. The failure: the temporary home cleanup fails with `Directory not empty: case/home/.local/state/lint-sweep`. A lint sweep child writes after the test ends.
+2. `sweep_after_step` in `scripts/lint/invoke.sh` starts a detached sweep after each step. `LINT_SKIP_SWEEP=1` turns it off. The doc fixture (`scripts/direct/verify_doc_test_support.py`) removes every `LINT_` variable and does not set `LINT_SKIP_SWEEP`. Other verify fixtures set it (`verify_step_routes_test_support.py:69`, `test_verify_checks_fail_closed.py:97`).
+3. Find the process that writes `home/.local/state/lint-sweep`, and confirm that `LINT_SKIP_SWEEP=1` stops it. If a different child writes there, stop that child at its cause.
+4. Set `LINT_SKIP_SWEEP=1` in the doc fixture environment. Add no wait, retry or cleanup loop.
+5. The phase adds no lines to staff or lifecycle code.
+
+**Files:**
+- `scripts/direct/verify_doc_test_support.py` — the fixture environment
+
+**Workers:** 1 writer.
+- `impl` — the fixture change and the proof
+
+**Acceptance gate:** `python3 -m unittest scripts.direct.test_verify_doc` passes 5 runs in a row in one mesh run, and no `lint-sweep` folder is left under the case root; `basedpyright scripts/direct/verify_doc_test_support.py` reports 0 errors, 0 warnings, 0 notes.
+
+### Phase 5 — assertion_guard.py accepts one ruling for a deleted mechanism  · status: in progress
+
+**Depends on:** Phase 4
+
+#### Work Order
+
+**Goal:** one `Assertion-Change` line rules every removed test of a deleted mechanism.
+
+**User ruling (to devtools, 2026-11-03 12:1x):** "yes the guard should accept one line for a whole deleted mechanism".
+
+**Spec:**
+1. The new form: `Assertion-Change: <path>::<test-name-prefix>* — <mechanism> deleted`. The trailing `*` marks a prefix ruling.
+2. A prefix ruling rules each `test removed` finding in `<path>` whose test name starts with the prefix. It does not rule a `removed` or `weaker` assertion in a test that stays.
+3. A prefix ruling that matches no removed test is blocking. The guard prints the ruling and says it matched no removed test.
+4. The output for each ruled finding stays as now: `— ruled: <why>`.
+5. Delete the per-test code that the prefix form replaces where you can. The tool must not grow by much. Net lines in `assertion_guard.py` must be 20 or fewer.
+6. Docs: name the prefix form beside the per-test form in `commands/unit/direct.md` and `docs/as-built/phase-checks.md`. Add text; do not reword pinned phrases (`scripts/hooks/test_direct_command.py` pins them).
+7. Tests, one per behavior, in `scripts/direct/test_assertion_guard.py`: a prefix rules two removed tests; a prefix does not rule a weaker assertion in a kept test; a prefix that matches no removed test blocks.
+
+**Files:**
+- `scripts/direct/assertion_guard.py` — `read_rulings`, `run`
+- `scripts/direct/test_assertion_guard.py` — the tests in Spec item 7
+- `commands/unit/direct.md`, `docs/as-built/phase-checks.md` — the prefix form
+
+**Workers:** 1 writer.
+- `impl` — all files
+
+**Acceptance gate:** `test_assertion_guard.py`, `test_verify_assertion_guard.py` and `scripts/hooks/test_direct_command.py` pass; `basedpyright scripts/direct/assertion_guard.py scripts/direct/test_assertion_guard.py` reports 0 errors, 0 warnings, 0 notes.

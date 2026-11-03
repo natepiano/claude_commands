@@ -7,9 +7,11 @@ Keep only the latest state in both files.
 ## Records
 
 Read `~/.local/state/staff/staff.json` for showrunner names, parents, and production documents.
-Question records currently live at `~/.local/state/showrunner/outstanding/<slug>.json`.
-Resolve production slugs from staff records. Confirm the source if the question-store migration changes these paths.
-Read the schema before counting. Save counts and read time in `open-questions.json`.
+Query each showrunner with `~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py questions-table --production <doc>`.
+Use the production document from its staff row. Count the returned question rows, including deferred questions.
+The old `outstanding/<slug>.json` files now hold reminders. Never use them to count questions.
+Save the table, count, source and read time in `open-questions.json`.
+Report a failed query as unavailable, never as zero.
 Do not restart the old question-message rotation.
 
 For relevant production queues, use the existing next skill and command:

@@ -66,7 +66,7 @@ def option(arguments: list[str], name: str) -> str | None:
 def pane_agents(session: str) -> dict[str, bool]:
     """Read the fixture's surviving shells and agents, without consulting the real host."""
     root = os.environ.get("HERDR_PROC")
-    if sys.platform == "darwin" or os.environ.get("HERDR_PLATFORM") == "darwin" or not root or not Path(root).is_dir():
+    if not root or not Path(root).is_dir():
         return {}
     running: dict[str, bool] = {}
     for directory in Path(root).glob("[0-9]*"):

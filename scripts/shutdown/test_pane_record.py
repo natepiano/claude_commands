@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import math
 import os
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from contextlib import redirect_stderr
 from typing import cast, final, override
 from unittest import mock
 
@@ -212,6 +214,18 @@ class PaneRecordTests(unittest.TestCase):
                 self.assertEqual(pane_record.resume_launch(unknown), unknown)
                 self.assertEqual((path.read_bytes(), record_path.read_bytes(), record_path.stat().st_mtime_ns), before)
 
+    def test_writers_remove_a_legacy_staff_id_and_keep_account_evidence(self) -> None:
+        entry = pane_record.launch("w1:p2", "saved-session", "/work", {}, ["claude", "-n", "saved"])
+        entry["environment"] = {"STAFF_ID": "parent", "ENABLE_TOOL_SEARCH": "true"}
+        with (mock.patch.object(pane_record, "RECORD_DIR", self.records),
+              mock.patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(()))):
+            pane_record.write("agents", entry)
+            self.assertEqual(pane_record.read("agents")["w1:p2"]["environment"], {"ENABLE_TOOL_SEARCH": "true"})
+            pane_record.save("agents", {"w1:p2": entry})
+            self.assertEqual(pane_record.read("agents")["w1:p2"]["environment"], {"ENABLE_TOOL_SEARCH": "true"})
+            self.assertEqual(pane_record.read("agents")["w1:p2"]["config_dir"], entry["config_dir"])
+        self.assertEqual(entry["environment"]["STAFF_ID"], "parent")
+
     def current_owner(self) -> tuple[staff.StaffRow, staff.StaffId, Path]:
         from scripts.production.staff_test_support import isolated_staff_file, isolated_source_readers, source_environment
 
@@ -268,15 +282,36 @@ class PaneRecordTests(unittest.TestCase):
             self.assertEqual([(entry.read_bytes(), entry.stat().st_mtime_ns) for entry in paths], moved)
         self.assertEqual(path.read_bytes(), before)
 
-    def test_folder_move_refuses_an_owner_launch_from_an_unrelated_folder(self) -> None:
+    def test_folder_move_skips_an_owner_launch_from_an_unrelated_folder(self) -> None:
         owner, _current, path = self.current_owner()
         retained = pane_record.launch("w1:p2", owner.id, str(self.root / "unrelated"), {}, ["claude"])
         pane_record.write("agents", retained)
         record_path = self.records / "agents.json"
         before = path.read_bytes(), record_path.read_bytes(), record_path.stat().st_mtime_ns
-        with self.assertRaisesRegex(ValueError, "different working folder"):
+        output = io.StringIO()
+        with redirect_stderr(output):
             pane_record.move_cwd(owner.id, self.root / "old", self.root / "new", staff.snapshot())
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertIn("different working folder", output.getvalue())
         self.assertEqual((path.read_bytes(), record_path.read_bytes(), record_path.stat().st_mtime_ns), before)
+
+    def test_folder_move_updates_later_records_after_a_different_folder_is_skipped(self) -> None:
+        owner, current, path = self.current_owner()
+        old, new = self.root / "old", self.root / "new"
+        skipped = pane_record.launch("w1:p1", owner.id, str(self.root / "elsewhere"), {}, ["claude"])
+        selected = pane_record.launch("w2:p1", current, str(old), {}, ["claude"])
+        pane_record.write("agents", skipped)
+        with pane_record.locked("later"):
+            pane_record.save("later", {"w2:p1": selected})
+        before = path.read_bytes()
+        output = io.StringIO()
+        with redirect_stderr(output):
+            pane_record.move_cwd(owner.id, old, new, staff.snapshot())
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertIn("different working folder", output.getvalue())
+        self.assertEqual(pane_record.read("agents")["w1:p1"], skipped)
+        self.assertEqual(pane_record.read("later")["w2:p1"], {**selected, "cwd": str(new)})
+        self.assertEqual(path.read_bytes(), before)
 
     def test_current_conversation_lookup_projects_only_its_exact_retained_pane_without_writing(self) -> None:
         owner, current, path = self.current_owner()

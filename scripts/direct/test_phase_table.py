@@ -19,12 +19,13 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from scripts.direct import phase_table
+from scripts.message import sessions
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_showrunner, fake_unit_host, showrunners, staff
 from scripts.production.production_units import read_production
 from scripts.production.staff_test_support import (
-    isolated_staff_file, production_membership, showrunner_relationship, unit_membership,
+    isolated_staff_file, production_membership, showrunner_relationship, recorded_showrunner, recorded_unit,
 )
 
 
@@ -153,7 +154,7 @@ class PhaseTableTests(unittest.TestCase):
             **fake_unit_host.environment(self.root),
         }
 
-    def write_production(self) -> Path:
+    def write_production(self, unit: str = "table-unit") -> Path:
         path = self.working_dir / "docs" / "show-production.md"
         _ = path.write_text(
             plan_text(
@@ -170,6 +171,7 @@ class PhaseTableTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        _ = recorded_unit("show", unit, self.working_dir, path, plan="docs/plan.md")
         return path
 
     def write_units_production(
@@ -202,13 +204,16 @@ class PhaseTableTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        production_membership("show", *(row[0] for row in rows if not row[1].startswith("retired")))
+        _ = recorded_showrunner("show", path)
+        for unit, plan, worktree in rows:
+            if not plan.startswith("retired"):
+                _ = recorded_unit("show", unit, worktree, path, plan=plan.split()[0])
         return path
 
     def make_live_worktree(self, name: str) -> Path:
         worktree = self.root / name
         worktree.mkdir()
-        _ = (worktree / ".git").write_text("gitdir: test\n", encoding="utf-8")
+        _ = subprocess.run(["git", "init", "-b", "branch", str(worktree)], check=True, capture_output=True)
         return worktree
 
     def write_run_for_plan(
@@ -390,7 +395,9 @@ class PhaseTableTests(unittest.TestCase):
             self.write_showrunner()
 
     def mark_unit(self, live_name: str = "") -> None:
-        unit = unit_membership("show", "table-unit")
+        owner = showrunner_relationship("show")
+        unit = next(row for row in staff.snapshot().find(kind="unit", parent=owner.id)
+                    if row.name == "table")
         fake_unit_host.write(self.environment(), [fake_unit_host.HostedUnit(
             "table-host", "w1:p1", {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "table-unit"})])
         if not live_name:
@@ -857,7 +864,7 @@ class PhaseTableTests(unittest.TestCase):
             lines += ["**Blocked by:** G2", ""]
         lines += ["### Phase 7 — Last delivery  · status: todo"]
         if production:
-            production_doc = self.write_production()
+            production_doc = self.write_production("unit-a")
             _ = production_doc.write_text(
                 production_doc.read_text(encoding="utf-8")
                 + plan_text(
@@ -3225,7 +3232,6 @@ class PhaseTableTests(unittest.TestCase):
         with (
             patch.dict(os.environ, self.environment()),
             patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier_dir),
-            patch.object(showrunners, "SESSIONS_DIR", self.sessions_dir),
             patch.object(os, "fchmod", side_effect=create_competing_note),
             patch.object(sys, "argv", arguments),
             redirect_stderr(errors),
@@ -3336,10 +3342,9 @@ class PhaseTableTests(unittest.TestCase):
         with (
             patch.dict(os.environ, self.environment()),
             patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier_dir),
-            patch.object(showrunners, "SESSIONS_DIR", self.sessions_dir),
             patch.object(
-                showrunners,
-                "current_name",
+                sessions,
+                "live_sessions",
                 side_effect=OSError("session records unavailable"),
             ),
             patch.object(sys, "argv", arguments),
@@ -3671,14 +3676,18 @@ class PhaseTableTests(unittest.TestCase):
                 "### Phase 1 — Current delivery  · status: todo",
             )
         )
-        _ = staff.move(unit_membership("show", "table-unit").id, showrunner_relationship("other").id)
+        owner = showrunner_relationship("show")
+        unit = next(row for row in staff.snapshot().find(kind="unit", parent=owner.id)
+                    if row.name == "table")
+        recipient = recorded_showrunner("other", other_production)
+        _ = staff.move(unit.id, recipient.id)
         fake_unit_host.write(self.environment(), [fake_unit_host.HostedUnit(
             "table-host", "w1:p1", {"SHOWRUNNER_UNIT": "other", "SHOWRUNNER_UNIT_ID": "table-unit"})])
         live_record = cast(dict[str, object], json.loads(
             (self.sessions_dir / f"record-{self.live_record_number}.json").read_text(encoding="utf-8")
         ))
         fake_unit_host.place_process(self.environment(), cast(int, live_record["pid"]), "w1:p1")
-        session_id = "other-showrunner"
+        session_id = recipient.current_session
         _ = fake_showrunner.write_timer(
             self.notifier_dir,
             "other",

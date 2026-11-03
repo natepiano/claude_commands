@@ -170,7 +170,7 @@ If every open worker is busy, use the same call with `--slot review` in place of
 unit run calls `review.sh` with neither option.
 
 - `review` is the subtask name; it resolves through `[worker.<family>]` in
-  `~/.claude/config/agents.conf` like every other worker subtask. There is no
+  `~/.claude/config/models.conf` like every other worker subtask. There is no
   separate `architect` row: that key named an agent tier rather than a kind of
   work, and every architecture-review pass ever recorded already ran as kind
   `review`. The four subtasks are `impl`, `test`, `fix`, `review`.

@@ -37,7 +37,7 @@ from production_units import Production, read_production
 from production_units import Refusal, cell_value, production_field, unit_table
 
 from scripts.direct import progress_history  # noqa: E402
-from scripts.production import production_doc  # noqa: E402
+from scripts.production import production_doc, staff, staff_sources, unit_lookup  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 import sessions  # noqa: E402
@@ -63,6 +63,17 @@ class PushedTip(NamedTuple):
 
 class NotYetPushed(NamedTuple):
     pass
+
+
+class ChangesReadBeforePush(NamedTuple):
+    changes: list[change_review.PublicationChange]
+
+
+class ReadChangesWhenWriting(NamedTuple):
+    pass
+
+
+_READ_CHANGES_WHEN_WRITING = ReadChangesWhenWriting()
 
 
 class PromotionAlreadyAtTip(NamedTuple):
@@ -177,9 +188,17 @@ class Unit(NamedTuple):
     owns: tuple[str, ...]
 
 
+class UnitRow(NamedTuple):
+    name: str
+    plan: Path
+    branch: str
+    owns: tuple[str, ...]
+    cells: dict[str, str]
+
+
 class MergeRequest(NamedTuple):
     production: Production
-    unit: Unit
+    unit: Unit | UnitRow
     phase: str
     commit: str
     also: tuple[str, ...]
@@ -189,7 +208,7 @@ class MergeRequest(NamedTuple):
     merge_tests: tuple[tuple[str, ...], ...]
     flakes: frozenset[str]
     flaky_tests: frozenset[str]
-    units: tuple[Unit, ...]
+    units: tuple[Unit | UnitRow, ...]
     lines: tuple[str, ...]
     scratch: Path
     trailer: tuple[str, ...]
@@ -274,12 +293,12 @@ def listed_names(lines: list[str], field: str) -> frozenset[str]:
     return frozenset(name.strip() for name in names if name.strip())
 
 
-def parse_units(lines: list[str]) -> tuple[Unit, ...]:
-    result: list[Unit] = []
+def parse_units(lines: list[str]) -> tuple[UnitRow, ...]:
+    result: list[UnitRow] = []
     for cells in unit_table(lines):
-        if not all(heading in cells for heading in ("Unit", "Plan", "Worktree", "Branch", "Owns")):
+        if not all(heading in cells for heading in ("Unit", "Branch", "Owns")):
             continue
-        plan = Path(cell_value(cells["Plan"]).split(" ", 1)[0])
+        plan = Path(cell_value(cells.get("Plan", "")).split(" ", 1)[0])
         owns_cell = cells["Owns"]
         quoted = cast(list[str], re.findall(r"`([^`]+)`", owns_cell))
         plain = owns_cell.split(" — ", 1)[0]
@@ -296,8 +315,9 @@ def parse_units(lines: list[str]) -> tuple[Unit, ...]:
             owns = tuple(owned)
         else:
             owns = tuple(part.strip() for part in plain.split(",") if part.strip())
-        result.append(Unit(cell_value(cells["Unit"]), plan,
-                           Path(cell_value(cells["Worktree"])).expanduser(), cell_value(cells["Branch"]), owns))
+        name = cell_value(cells["Unit"])
+        branch = cell_value(cells["Branch"])
+        result.append(UnitRow(name, plan, branch, owns, cells))
     return tuple(result)
 
 
@@ -352,8 +372,8 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
     bump = user_bump(args)
     production = read_production(Path(cast(str, args.production)))
     lines = production.doc.read_text(encoding="utf-8").splitlines()
-    units = parse_units(lines)
     name = cast(str, args.unit)
+    units = parse_units(lines)
     unit = next((candidate for candidate in units if candidate.name == name), None)
     if unit is None:
         raise Refusal(f"unit {name} not in production doc")
@@ -505,9 +525,7 @@ def change_review_commits(request: MergeRequest) -> list[change_review.Commit]:
     except change_review.ChangeReviewError as error:
         raise Stop("change review", "failed", str(error), "the showrunner will inspect the failed command") from error
     if refused := change_review.missing(commits):
-        raise Stop("change review", "held", "; ".join(refused),
-                   f"commit a checkpoint whose {change_review.TRAILER} lines describe the change and that names each "
-                   + f"listed commit in a `{change_review.TRAILER}-Covers: <hash>` line, push it, and send its hash")
+        raise Stop("change review", "held", "; ".join(refused), change_review.HELD_NEXT_STEP)
     report("change review", "ok", f"{len(commits)} unit commit(s) carry their {change_review.TRAILER} lines")
     return commits
 
@@ -518,12 +536,14 @@ def checkpoint_step_record(checkout: Path, merge_head: str, step: str) -> Path:
     return checkout / path
 
 
-def record_changes(request: MergeRequest, commits: list[change_review.Commit], merge_head: str) -> None:
-    record_publication_changes(request.production, commits, merge_head)
+def record_changes(request: MergeRequest, commits: list[change_review.Commit], merge_head: str,
+                   changes: ChangesReadBeforePush | ReadChangesWhenWriting) -> None:
+    record_publication_changes(request.production, commits, merge_head, changes=changes)
 
 
 def record_publication_changes(production: Production, commits: list[change_review.Commit], merge_head: str,
-                               *, report_unchanged: bool = True) -> None:
+                               *, changes: ChangesReadBeforePush | ReadChangesWhenWriting = _READ_CHANGES_WHEN_WRITING,
+                               report_unchanged: bool = True) -> None:
     """Register each visible change and report merges with missing rows."""
     doc = change_review.list_path(production.doc)
     if doc is None:
@@ -538,14 +558,14 @@ def record_publication_changes(production: Production, commits: list[change_revi
     merged = good(git(production.checkout, "rev-parse", f"--short={change_review.SHORT}", merge_head), "push")
     try:
         # A stop after the list write but before the receipt must not add it twice.
-        changes = change_review.visible(commits)
+        publication = (changes.changes if isinstance(changes, ChangesReadBeforePush)
+                       else change_review.publication_changes(commits, production.doc))
         existing = change_review.pending(doc) if doc.exists() else []
         held = {row["Change"] for row in existing
                 if any(sha.startswith(merged) or merged.startswith(sha)
-                       for sha in cast(list[str], re.findall(r"\b[0-9a-f]{7,40}\b", row.get("Merged", ""))))}
-        rows = [] if changes and all(item.change in held for item in changes) else change_review.append_rows(
-            doc, changes, datetime.now(production.zone).date(), merged, production.doc,
-            owners=change_review.visible_owners(commits, production.doc))
+                       for sha in cast(list[str], change_review._HASH.findall(row.get("Merged", ""))))}  # pyright: ignore[reportPrivateUsage]
+        rows = [] if publication and all(change.item.change in held for change in publication) else change_review.append_rows(
+            doc, publication, datetime.now(production.zone).date(), merged, production.doc)
         done.parent.mkdir(parents=True, exist_ok=True)
         done.touch()
         drifted = change_review.drift(production.checkout, production.merge_branch,
@@ -667,19 +687,38 @@ def conflicts(request: MergeRequest) -> None:
     report("conflicts", "ok", "merge tree is clean")
 
 
+def unit_worktree(production: Production, unit: Unit | UnitRow, record: staff.StaffSnapshot) -> Path:
+    if isinstance(unit, Unit):
+        return unit.worktree
+    member = staff_sources.member(staff_sources.UnitMember(production.slug, unit.name), record)
+    return unit_lookup.plan_worktree(unit.cells, member)
+
+
 def other_units(request: MergeRequest, paths: tuple[str, ...]) -> None:
+    if len(request.units) == 1:
+        report("other units", "ok", "no other units")
+        return
+    try:
+        record = staff.snapshot()
+    except staff.StaffUnreadable as error:
+        record = error
     for unit in request.units:
         if unit.name == request.unit.name:
             continue
         diff = git(request.production.checkout, "diff", "--name-only",
                    f"{request.production.merge_branch}...{unit.branch}")
         branch_paths: set[str] = set(diff.stdout.splitlines()) if diff.returncode == 0 else set()
-        status = git(unit.worktree, "status", "--short")
-        worktree_paths = {line[3:] for line in status.stdout.splitlines() if len(line) >= 4}
+        worktree_paths: set[str] = set()
+        try:
+            if isinstance(record, staff.StaffUnreadable):
+                raise record
+            worktree = unit_worktree(request.production, unit, record)
+            status = git(worktree, "status", "--short")
+            worktree_paths = {line[3:] for line in status.stdout.splitlines() if len(line) >= 4}
+        except (staff.StaffUnreadable, staff.StaffRefused) as error:
+            report("other units", "unavailable", f"{unit.name}: {error}")
         overlap = sorted(set(paths) & (branch_paths | worktree_paths))
         report("other units", "ok", f"{unit.name}: {', '.join(overlap) if overlap else 'no overlap'}")
-    if len(request.units) == 1:
-        report("other units", "ok", "no other units")
 
 
 def gate_names(request: MergeRequest, first_code_merge: bool) -> str:
@@ -1010,9 +1049,10 @@ def remote_path(path: PurePosixPath) -> str:
 
 
 def pull_mac_checkout(mac: PurePosixPath, source: Path) -> None:
+    settings_read = conf.read('merge_checkpoint')
     try:
-        tries = conf.whole("merge_checkpoint", "MAC_PULL_TRIES")
-        retry_seconds = conf.number("merge_checkpoint", "MAC_PULL_RETRY_SECONDS")
+        tries = settings_read.whole("MAC_PULL_TRIES")
+        retry_seconds = settings_read.number("MAC_PULL_RETRY_SECONDS")
     except ValueError as error:
         raise Stop("promote", "failed", str(error), "repair the Mac pull configuration and rerun this checkpoint") from error
     remote = (f"cd {remote_path(mac)} && git pull --ff-only "
@@ -1454,7 +1494,10 @@ def bump_gate_addresses(slug: str, unit: str) -> tuple[str, str]:
 
 def run(request: MergeRequest) -> int:
     try:
-        checkpoint = git(request.unit.worktree, "rev-parse", "--verify", f"{request.commit}^{{commit}}")
+        checkpoint = git(request.production.checkout, "rev-parse", "--verify", f"{request.commit}^{{commit}}")
+        if checkpoint.returncode:
+            checkpoint = git(unit_worktree(request.production, request.unit, staff.snapshot()),
+                             "rev-parse", "--verify", f"{request.commit}^{{commit}}")
         if checkpoint.returncode:
             raise Stop("ancestry", "failed", f"commit {request.commit} is absent",
                        "push the checkpoint and send its hash again")
@@ -1482,12 +1525,26 @@ def run(request: MergeRequest) -> int:
             for step in steps:
                 report(step, "ok", "checkpoint already merged; resuming promotion")
             paths = changed_paths(request, f"{merge_head}^1")
+        changes: ChangesReadBeforePush | ReadChangesWhenWriting = _READ_CHANGES_WHEN_WRITING
+        if isinstance(pushed, NotYetPushed) and change_review.list_path(request.production.doc) is not None:
+            try:
+                changes = ChangesReadBeforePush(change_review.publication_changes(commits, request.production.doc))
+            except (change_review.ChangeReviewError, OSError) as error:
+                undo_unpushed_merge(request.production, merge_head)
+                raise Stop("change review", "failed", f"{error}: the staff record is read before the push",
+                           "The staff record is unreadable; nothing was pushed; repair the staff record and send the checkpoint again.") from error
         if request.bump:
             report("test", "ok", "user bump: the gate runs on the pushed tip in the background")
         elif isinstance(pushed, NotYetPushed):
             try:
                 if isinstance(request.kind, CodeCheckpoint):
-                    with merge_gate_wait(request.unit.worktree, request.phase, request.unit.name, request.commit):
+                    with ExitStack() as wait:
+                        try:
+                            worktree = unit_worktree(request.production, request.unit, staff.snapshot())
+                        except (staff.StaffUnreadable, staff.StaffRefused) as error:
+                            report("wait", "NotRecorded", str(error))
+                        else:
+                            _ = wait.enter_context(merge_gate_wait(worktree, request.phase, request.unit.name, request.commit))
                         tests_green = tests(request, paths, merge_head)
                 else:
                     tests_green = tests(request, paths, merge_head)
@@ -1531,7 +1588,7 @@ def run(request: MergeRequest) -> int:
             if tip:
                 record_pushed_merges(request.production, merge_head, request.commit, tip, phase_id=request.phase,
                                      issue=str(request.unit.plan))
-                record_changes(request, commits, merge_head)
+                record_changes(request, commits, merge_head, changes)
                 notify_published_style(request.production, merge_head, tip)
         promotion_done.parent.mkdir(parents=True, exist_ok=True)
         promotion_done.touch()
@@ -1691,7 +1748,7 @@ def acknowledge_handoff(request: ChildHandoffRequest, merge_head: str) -> None:
         ], capture_output=True, text=True, check=False, timeout=15)
         if result.returncode:
             raise Refusal(f"send.py: {failure_detail(result)}")
-    except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
+    except (Refusal, staff.StaffRefused, OSError, ValueError, subprocess.TimeoutExpired) as error:
         print("hand-off acknowledgment: " + " ".join(str(error).splitlines()), flush=True)
 
 
@@ -1872,7 +1929,7 @@ def main() -> int:
                 return TREE_CHANGED_STATUS
             print("merge_checkpoint: " + " ".join(str(error).splitlines()), flush=True)
             return 1
-        except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
+        except (Refusal, staff.StaffRefused, OSError, ValueError, subprocess.TimeoutExpired) as error:
             print("merge_checkpoint: " + " ".join(str(error).splitlines()), flush=True)
             return 1
     if cast(bool, args.root_self) or cast(str | None, args.checkpoint):
@@ -1883,7 +1940,7 @@ def main() -> int:
         request = request_from(args)
         with merge_lock(request.production.checkout, request.production.slug):
             return run(request)
-    except (Refusal, OSError, ValueError) as error:
+    except (Refusal, staff.StaffRefused, OSError, ValueError) as error:
         report("input", "failed", str(error))
         print(f"send {cast(str, args.unit)}: correct the checkpoint input and resend it")
         return 1

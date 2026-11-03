@@ -22,6 +22,12 @@ from scripts.production.staff_test_support import fixture_runtime_id, StaffTestC
 
 
 class WorkerFillTests(StaffTestCase):
+    def recorded_production(self, slug: str, *units: str) -> Path:
+        doc = self.production(slug, *units)
+        owner = showrunner_relationship(slug)
+        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
+        return doc
+
     def result(self, *, dry_run: bool = False) -> tuple[int, str, str]:
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             code = worker_fill.fill(dry_run=dry_run)
@@ -63,7 +69,7 @@ class WorkerFillTests(StaffTestCase):
                 1, f"note: {note}\nplaced 0; listed 1\n", "damaged source:record ?: source unavailable\n"))
 
     def test_paused_backends_follow_the_live_parent_without_a_run_and_rerun_unchanged(self) -> None:
-        _ = self.production("demo", "models-unit")
+        _ = self.recorded_production("demo", "models-unit")
         parent = unit_membership("demo", "models-unit")
         _ = self.session_record(parent.id, "models-unit")
         self.pane("w1:models", session_id=parent.id, environment={})
@@ -90,7 +96,7 @@ class WorkerFillTests(StaffTestCase):
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
 
     def test_paused_workers_with_surviving_activity_override_unknown_director_evidence(self) -> None:
-        _ = self.production("demo", "models-unit")
+        _ = self.recorded_production("demo", "models-unit")
         parent = unit_membership("demo", "models-unit")
         run = self.worker_run("demo", "models-unit", "gone-director")
         path = self.ledger_worker(run, "demo", "models-unit", "impl", "impl", fixture_runtime_id("loaded-thread"))
@@ -122,7 +128,8 @@ class WorkerFillTests(StaffTestCase):
         self.assertEqual(staff.find(kind="worker"), [])
 
     def test_paused_unreadable_or_incomplete_evidence_is_listed_and_never_counted(self) -> None:
-        _ = self.production("demo", "models-unit")
+        doc = self.recorded_production("demo", "models-unit")
+        _ = staff.set_doc(showrunner_relationship("demo").id, staff.LiveDoc("natedev", doc))
         _ = unit_membership("demo", "models-unit")
         run = self.worker_run("demo", "models-unit", "gone-director")
         path = self.ledger_worker(run, "demo", "models-unit", "impl", "impl", fixture_runtime_id("dead-thread"))
@@ -152,7 +159,8 @@ class WorkerFillTests(StaffTestCase):
         self.assertNotIn("skipped", output)
 
     def test_paused_director_mark_keeps_live_and_unknown_outcomes_distinct(self) -> None:
-        _ = self.production("demo", "models-unit")
+        doc = self.recorded_production("demo", "models-unit")
+        _ = staff.set_doc(showrunner_relationship("demo").id, staff.LiveDoc("natedev", doc))
         parent = unit_membership("demo", "models-unit")
         run = self.worker_run("demo", "models-unit", "former-director")
         path = self.ledger_worker(run, "demo", "models-unit", "impl", "impl", fixture_runtime_id("dead-thread"))
@@ -172,7 +180,7 @@ class WorkerFillTests(StaffTestCase):
         self.assertEqual([row.name for row in staff.find(kind="worker", parent=parent.id)], ["impl"])
 
     def test_missing_director_file_uses_run_started_history_for_active_ownership(self) -> None:
-        _ = self.production("demo", "models-unit")
+        _ = self.recorded_production("demo", "models-unit")
         parent = unit_membership("demo", "models-unit")
         _ = self.session_record(parent.id, "models-unit")
         self.pane("w1:models", session_id=parent.id, environment={})
@@ -189,7 +197,7 @@ class WorkerFillTests(StaffTestCase):
         self.assertEqual(self.result(), (0, "unchanged\n", ""))
 
     def test_fill_places_ledger_roster_and_claude_workers_under_their_unit_once(self) -> None:
-        _ = self.production("demo", "models-unit")
+        _ = self.recorded_production("demo", "models-unit")
         production_membership("demo", "models-unit")
         parent = unit_membership("demo", "models-unit")
         run = self.worker_run("demo", "models-unit", "session-models")
@@ -206,7 +214,7 @@ class WorkerFillTests(StaffTestCase):
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
 
     def test_stale_owner_id_and_production_follow_the_unique_surviving_unit(self) -> None:
-        _ = self.production("demo", "models-unit")
+        _ = self.recorded_production("demo", "models-unit")
         production_membership("demo", "models-unit")
         parent = unit_membership("demo", "models-unit")
         run = self.worker_run("old-production", "models-unit", "director")
@@ -231,7 +239,7 @@ class WorkerFillTests(StaffTestCase):
         self.assertIn("no unique staff entry", errors)
 
     def test_fill_ignores_finished_rosters_and_closed_ledger_workers(self) -> None:
-        _ = self.production("demo", "models-unit")
+        _ = self.recorded_production("demo", "models-unit")
         production_membership("demo", "models-unit")
         parent = unit_membership("demo", "models-unit")
         run = self.worker_run("demo", "models-unit", "director")
@@ -271,7 +279,7 @@ class WorkerFillTests(StaffTestCase):
                 self.assertEqual(staff.find(kind="worker"), [])
 
     def test_dry_run_lists_placements_without_writing_any_staff_bytes(self) -> None:
-        _ = self.production("demo", "models-unit")
+        _ = self.recorded_production("demo", "models-unit")
         production_membership("demo", "models-unit")
         run = self.worker_run("demo", "models-unit", "session-models")
         _ = self.ledger_worker(run, "demo", "models-unit", "impl", "impl", fixture_runtime_id("thread-impl"))
@@ -283,7 +291,7 @@ class WorkerFillTests(StaffTestCase):
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
 
     def test_unplaceable_ledger_is_named_while_complete_workers_still_fill(self) -> None:
-        _ = self.production("demo", "models-unit")
+        _ = self.recorded_production("demo", "models-unit")
         production_membership("demo", "models-unit")
         run = self.worker_run("demo", "models-unit", "session-models")
         _ = self.ledger_worker(run, "demo", "models-unit", "impl", "impl", fixture_runtime_id("thread-impl"))
@@ -295,7 +303,7 @@ class WorkerFillTests(StaffTestCase):
         self.assertEqual({row.name for row in staff.find(kind="worker")}, {"impl"})
 
     def test_showrunner_held_astra_is_placed_under_its_showrunner_once(self) -> None:
-        _ = self.production("demo")
+        _ = self.recorded_production("demo")
         parent = showrunner_relationship("demo")
         _ = self.worker_design("demo", "demo-design-astra-designer", fixture_runtime_id("thread-designer"))
         code, output, errors = self.result()
@@ -307,7 +315,7 @@ class WorkerFillTests(StaffTestCase):
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
 
     def test_renamed_showrunner_holder_uses_its_journal_for_fill_and_admission(self) -> None:
-        _ = self.production("natedev")
+        _ = self.recorded_production("natedev")
         parent = showrunner_relationship("natedev")
         self.write_json(Path(os.environ["SHOWRUNNER_STATE_DIR"]) / "natedev/rename.json",
                         {"old": "build-followups", "new": "natedev"})
@@ -321,8 +329,8 @@ class WorkerFillTests(StaffTestCase):
         self.assertEqual(self.result(), (0, "unchanged\n", ""))
 
     def test_renamed_holder_with_ambiguous_or_unreadable_journals_stays_listed(self) -> None:
-        _ = self.production("first")
-        _ = self.production("second")
+        _ = self.recorded_production("first")
+        _ = self.recorded_production("second")
         production_membership("first")
         production_membership("second")
         root = Path(os.environ["SHOWRUNNER_STATE_DIR"])
@@ -356,7 +364,7 @@ class WorkerFillTests(StaffTestCase):
                 self.assertEqual(staff.find(kind="worker"), [])
 
     def test_mixed_ledger_keeps_the_live_worker_without_importing_dead_entries(self) -> None:
-        _ = self.production("demo", "models-unit")
+        _ = self.recorded_production("demo", "models-unit")
         production_membership("demo", "models-unit")
         parent = unit_membership("demo", "models-unit")
         run = self.worker_run("demo", "models-unit", "gone-director")
@@ -389,7 +397,7 @@ class WorkerFillTests(StaffTestCase):
         self.assertEqual(staff.find(kind="worker"), [])
 
     def test_display_and_seed_use_server_pid_without_opening_a_codex_connection(self) -> None:
-        _ = self.production("demo")
+        _ = self.recorded_production("demo")
         production_membership("demo")
         parent = showrunner_relationship("demo")
         _ = self.session_record(parent.id, "demo")
@@ -407,7 +415,7 @@ class WorkerFillTests(StaffTestCase):
         self.assertIn("3b08f4bb-fc3c-54e2-8bdc-71bce6417158", str(value["members"]))
 
     def test_fill_checks_loaded_threads_once_and_counts_an_empty_live_server(self) -> None:
-        _ = self.production("demo", "models-unit")
+        _ = self.recorded_production("demo", "models-unit")
         production_membership("demo", "models-unit")
         parent = unit_membership("demo", "models-unit")
         run = self.worker_run("demo", "models-unit", "gone-director")
@@ -462,7 +470,7 @@ class WorkerFillTests(StaffTestCase):
         self.assertEqual(staff.find(kind="worker"), [])
 
     def test_inactive_run_cannot_add_a_mesh_astra_worker_back(self) -> None:
-        _ = self.production("demo")
+        _ = self.recorded_production("demo")
         parent = showrunner_relationship("demo")
         _ = self.session_record(parent.id, "demo")
         self.pane("w1:demo", session_id=parent.id, environment={})
@@ -491,7 +499,7 @@ class WorkerFillTests(StaffTestCase):
         self.assertEqual([row.name for row in staff.find(kind="worker", parent=parent.id)], ["impl"])
 
     def test_admission_uses_current_unit_membership_and_is_unchanged_on_retry(self) -> None:
-        _ = self.production("demo", "models-unit")
+        _ = self.recorded_production("demo", "models-unit")
         production_membership("demo", "models-unit")
         parent = unit_membership("demo", "models-unit")
         run = self.worker_run("demo", "models-unit", "director")
@@ -548,7 +556,7 @@ class WorkerFillTests(StaffTestCase):
         self.assertEqual(self.staff_file.read_text(), "{bad record")
 
     def test_refused_staff_write_does_not_leave_a_worker_row(self) -> None:
-        _ = self.production("demo", "models-unit")
+        _ = self.recorded_production("demo", "models-unit")
         production_membership("demo", "models-unit")
         run = self.worker_run("demo", "models-unit", "director")
         before = self.staff_file.read_bytes()
@@ -559,10 +567,10 @@ class WorkerFillTests(StaffTestCase):
         self.assertEqual(self.staff_file.read_bytes(), before)
 
     def test_retired_unit_cannot_admit_a_worker(self) -> None:
-        _ = self.production("demo", "models-unit")
+        _ = self.recorded_production("demo", "models-unit")
         production_membership("demo", "models-unit")
         parent = unit_membership("demo", "models-unit")
-        _ = staff.set_worktree(parent.id, staff.RemovedWorktree("natedev", self.root / "gone"))
+        _ = staff.set_worktree(parent.id, staff.RemovedWorktree("natedev", self.root / "gone"), expected=parent.worktree)
         run = self.worker_run("demo", "models-unit", "director")
         with self.assertRaises(worker_fill.AdmissionRefused):
             _ = worker_fill.admit("impl", run, role='impl')

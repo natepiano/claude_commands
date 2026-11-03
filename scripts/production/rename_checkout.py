@@ -35,8 +35,6 @@ import unit_move  # noqa: E402
 from rename_state import RenameRefused, write_text  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
-import shutdown_record  # noqa: E402
-from shutdown_record import SessionShutdown  # noqa: E402
 
 PARENT_LINE = "- **Parent production:** "
 CHECKOUT_LINE = "- **Showrunner checkout:** "
@@ -190,13 +188,6 @@ def _showrunner_session(instance: Path) -> str:
     raise RenameRefused(f"{instance.name} has no session TARGET")
 
 
-def _session_records(session_id: str) -> list[SessionShutdown]:
-    try:
-        return [saved for saved in shutdown_record.all_session_records() if saved["session"]["session_id"] == session_id]
-    except (shutdown_record.InvalidRecord, OSError) as error:
-        raise RenameRefused(f"shutdown records unreadable: {error}") from error
-
-
 def _push(production: Production) -> None:
     _commit_checkout_line(production.doc, production.checkout)
     branch = production.merge_branch
@@ -229,8 +220,6 @@ def checkout(slug: str, destination: str = "") -> None:
     if not (old / ".git").is_file():
         raise RenameRefused(f"{old} is not a linked worktree; git moves only a linked worktree")
     session_id = _showrunner_session(instance)
-    if _session_records(session_id):
-        raise RenameRefused(f"{slug}'s showrunner already has a shutdown in progress; let it settle first")
     from scripts.shutdown import stop_resume
     stopped = stop_resume.stop(session_id)
     if not isinstance(stopped, (stop_resume.Stopped, stop_resume.NotRunning)):
@@ -239,6 +228,8 @@ def checkout(slug: str, destination: str = "") -> None:
     move(old, new)
     resumed = stop_resume.resume(session_id, why="showrunner checkout moved")
     if not isinstance(resumed, stop_resume.ClaudeUp):
-        reason = resumed.reason if isinstance(resumed, stop_resume.ResumeFailed) else "no local tab"
+        reason = (resumed.reason
+                  if isinstance(resumed, stop_resume.ResumeFailed)
+                  else "no local tab")
         raise RenameRefused(f"{slug}: resume failed: {reason}")
     print(f"{slug}: checkout moved to {new}; run rename.py checkout {slug} again to push the doc commit")

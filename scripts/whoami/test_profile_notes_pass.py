@@ -18,7 +18,8 @@ from typing import cast, override
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
+from scripts.accounts.home_test_support import scratch_accounts_config
 
 from scripts.whoami import profile_notes_pass as profile
 
@@ -69,7 +70,8 @@ class ProfileNotesPassTests(unittest.TestCase):
             "SHOWRUNNERS_CONFIG": str(self.home / "showrunners.json"),
             "USER_ZONE": "UTC", "PYTHONDONTWRITEBYTECODE": "1",
         }, clear=True))
-        _ = write_registry(self.home / "agents.conf")
+        _ = self.enterContext(scratch_accounts_config())
+        _ = write_registry(self.home / "models.conf")
         pass_ = profile.load_pass()
         # Modules may already be imported by another suite. Replace only input paths.
         for entry in profile.state_copies(pass_):
@@ -81,15 +83,15 @@ class ProfileNotesPassTests(unittest.TestCase):
             (self.pass_.quota, "CONFIG", self.home / "showrunners.json"),
             (self.pass_.five, "PROTOCOL", self.home / "quota_alerts.md"),
             (self.pass_.pacer, "SESSIONS", self.home / ".codex/sessions"),
-            (self.pass_.pacer, "AGENTS_CONF", self.home / "agents.conf"),
+            (self.pass_.pacer, "MODELS_CONF", self.home / "models.conf"),
             (self.pass_.pacer, "CODEX_CONFIG", self.home / ".codex/config.toml"),
-            (self.pass_.quota, "REGISTRY", self.home / "agents.conf"),
+            (self.pass_.quota, "REGISTRY", self.home / "models.conf"),
             (self.pass_.quota, "SESSIONS", self.home / "sessions"),
             (self.pass_.quota, "PROTOCOL", self.home / "quota_alerts.md"),
         )
         for module, attribute, value in paths:
             _ = self.enterContext(patch.object(module, attribute, value))
-        for attribute in ("CONFIG", "NOTIFIER_STATE_DIR", "SESSIONS_DIR", "SHOWRUNNER_STATE_DIR"):
+        for attribute in ("CONFIG", "NOTIFIER_STATE_DIR", "SHOWRUNNER_STATE_DIR"):
             _ = self.enterContext(patch.object(self.pass_.showrunners, attribute, self.home / attribute))
         _ = self.enterContext(patch.object(import_module("scripts.message.process_table"), "PS", [str(self.bin / "ps")]))
         _ = (self.home / "showrunners.json").write_text(json.dumps({

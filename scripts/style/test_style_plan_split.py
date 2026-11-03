@@ -6,6 +6,7 @@ import io
 import signal
 import sqlite3
 import subprocess
+from subprocess import run as run_git
 import sys
 import tempfile
 import time
@@ -24,7 +25,7 @@ import approved_renames
 import declarations
 import style_plan
 from scripts.production import showrunners
-from scripts.production.staff_test_support import isolated_staff_file, production_membership
+from scripts.production.staff_test_support import isolated_staff_file, production_membership, recorded_showrunner, recorded_unit
 from scripts.build_hold import build_hold
 from scripts.build_queue import queue_place
 import live_units
@@ -46,7 +47,14 @@ class StylePlanTests(StylePlanFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
-        production_membership("sample-style", "names-unit")
+        _ = recorded_showrunner("sample", self.repo / "docs/product-production.md")
+        _ = recorded_unit("sample-style", "names-unit", self.unit, self.doc,
+                          plan="docs/style-production/units/names-unit.md")
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_member
+        owner = recorded_showrunner("sample-style", self.doc)
+        _ = fixture_member("unit", name="modules", parent=owner.id,
+                           worktree=staff.PresentWorktree("natedev", self.root / "modules"))
 
     def test_split_partitions_the_table_left_total_including_ticketed_and_unselected_findings(self) -> None:
         rule = self.rule("split-population")
@@ -526,9 +534,18 @@ class RefillRecordingTests(unittest.TestCase):
                                       + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
                                       + "| feature-unit | feature.md | /tmp/claude/feature | feature |\n"
                                       + "| retired-names-unit | retired | /tmp/claude/retired | retired |\n")
+            worktree = Path(folder) / "feature"
+            _ = subprocess.run(["git", "init", "-b", "feature", str(worktree)], check=True, capture_output=True)
+            _ = recorded_unit("production", "feature-unit", worktree, production, plan="feature.md")
+            def no_child(command: list[str], *, capture_output: bool, text: bool,
+                         check: bool) -> subprocess.CompletedProcess[str]:
+                if command[0] == "git":
+                    return run_git(command, capture_output=capture_output, text=text, check=check)
+                raise AssertionError("no child for an empty production")
+
             output, errors = io.StringIO(), io.StringIO()
             with (mock.patch.object(unit_lookup, "marked_units", return_value={}),
-                  mock.patch.object(subprocess, "run", side_effect=AssertionError("no child for an empty production")),
+                  mock.patch.object(subprocess, "run", side_effect=no_child),
                   redirect_stdout(output), redirect_stderr(errors)):
                 code = style_plan.main(["split-all", "--production", str(production)])
             self.assertEqual((code, output.getvalue(), errors.getvalue()), (0, "no style units\n", ""))
@@ -556,16 +573,19 @@ class RefillRecordingTests(unittest.TestCase):
                 worktree = root / unit
                 plan = worktree / "docs/retained-plan.md"
                 plan.parent.mkdir(parents=True)
-                _ = (worktree / ".git").write_text("gitdir: unused-child-fixture\n")
+                _ = subprocess.run(["git", "init", "-b", unit, str(worktree)], check=True, capture_output=True)
                 _ = plan.write_text("# Standing unit\n")
                 rows.append(f"| {unit} | docs/retained-plan.md | {worktree} | {unit} |")
             _ = production.write_text("# Production\n\n## Units\n\n"
                                       + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
                                       + "\n".join(rows) + "\n")
             completed: list[str] = []
-            production_membership("production", "names-unit", "types-unit", "values-unit")
+            for unit in ("names-unit", "types-unit", "values-unit"):
+                _ = recorded_unit("production", unit, root / unit, production, plan="docs/retained-plan.md")
 
             def child(command: list[str], *, capture_output: bool, text: bool, check: bool) -> subprocess.CompletedProcess[str]:
+                if command[0] == "git":
+                    return run_git(command, capture_output=capture_output, text=text, check=check)
                 self.assertEqual(command[:8], ["systemd-run", "--user", "--scope", "--slice=builds.slice", "nice", "-n", "19", sys.executable])
                 self.assertTrue(capture_output and text)
                 self.assertFalse(check)
@@ -636,6 +656,22 @@ class RefillRecordingTests(unittest.TestCase):
                                                       "--repo", "/tmp/claude/repo"]), 2)
                 recorded.assert_not_called()
                 self.assertIn(str(error), output.getvalue())
+
+
+
+
+from scripts.production.staff_test_support import StaffTestCase, without_worktree_column
+from scripts.style import unit_files
+
+
+class BranchFileLocationTests(StaffTestCase):
+    def test_file_ownership_uses_the_plan_worktree_without_the_worktree_column(self) -> None:
+        fixture = self.separated_unit_folders()
+        without_worktree_column(fixture.doc)
+        rows = unit_files.unit_worktrees(fixture.doc)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].worktree, fixture.worktree)
+        self.assertEqual(rows[0].unit, "member-unit")
 
 
 if __name__ == "__main__":

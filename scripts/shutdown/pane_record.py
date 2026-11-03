@@ -90,11 +90,11 @@ def launch_for_session(session_id: str) -> PaneLaunch | None:
     return publication.entry if publication is not None else None
 
 
-def publication_for_session(session_id: str) -> pane_launch.LaunchPublication | None:
+def publication_for_session(session_id: str, *, record: staff.StaffSnapshot | None = None) -> pane_launch.LaunchPublication | None:
     """Keep the source file and exact publication for a conversation."""
     from scripts.production import staff
 
-    owner = staff.initial_snapshot().by_current_session(session_id)
+    owner = (staff.initial_snapshot() if record is None else record).by_current_session(session_id)
     reference = owner.id if owner is not None else session_id
     matches = [pane_launch.LaunchPublication(path, entry)
                for path in sorted(record_directory().glob("*.json"))
@@ -139,8 +139,15 @@ def locked(session: str) -> AbstractContextManager[None]:
     return pane_launch.locked(record_path(session))
 
 
+def without_legacy_identity(entry: PaneLaunch) -> PaneLaunch:
+    """Remove the retired identity variable from a retained launch."""
+    current = entry.copy()
+    current["environment"] = {key: value for key, value in entry["environment"].items() if key != "STAFF_ID"}
+    return current
+
+
 def save(session: str, entries: dict[str, PaneLaunch]) -> None:
-    pane_launch.save(record_path(session), entries)
+    pane_launch.save(record_path(session), {pane: without_legacy_identity(entry) for pane, entry in entries.items()})
 
 
 def move_cwd(unit: str, old: Path, new: Path, record: "staff.StaffSnapshot") -> None:
@@ -153,8 +160,9 @@ def move_cwd(unit: str, old: Path, new: Path, record: "staff.StaffSnapshot") -> 
                 owner = record.by_member_reference(entry["session_id"])
                 if owner is None or owner.id != unit:
                     continue
-                if entry["cwd"] not in (str(old), str(new)):
-                    raise ValueError(f"{unit}: retained launch has a different working folder")
+                if entry.get("cwd") not in (str(old), str(new)):
+                    print(f"{unit}: retained launch has a different working folder; skipped", file=sys.stderr)
+                    continue
                 if entry["cwd"] != str(new):
                     entry["cwd"] = str(new)
                     changed = True
@@ -164,7 +172,7 @@ def move_cwd(unit: str, old: Path, new: Path, record: "staff.StaffSnapshot") -> 
 
 def write(session: str, launch: PaneLaunch) -> None:
     """Delegate retained launch publication to the shared writer."""
-    pane_launch.write(record_path(session), launch)
+    pane_launch.write(record_path(session), without_legacy_identity(launch))
 
 
 def retained_environment(launch: PaneLaunch, history: Sequence[PaneLaunch]) -> dict[str, str]:

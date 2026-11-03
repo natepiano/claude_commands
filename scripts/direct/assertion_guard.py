@@ -1309,41 +1309,60 @@ class NoProductionBase:
     """No registered production provides a usable merge-branch base."""
 
 
-def worktree_path_matches(value: str, worktree: Path) -> bool:
-    """Compare absolute worktree paths, ignoring empty cells and retirement notes."""
-    if not value:
-        return False
-    try:
-        path = Path(value).expanduser()
-        return path.is_absolute() and path.resolve() == worktree
-    except (OSError, RuntimeError, ValueError):
-        return False
-
-
 def production_merge_branch(repo: Path) -> ProductionMergeBranch | NoProductionBase:
-    """Match a Units worktree first, then its branch, across registered docs."""
+    """Read the merge branch from the folder owner's row."""
     original_path = sys.path[:]
     try:
         repository_root = Path(__file__).resolve().parents[2]
         sys.path.insert(0, str(repository_root))
         sys.path.insert(0, str(repository_root / "scripts" / "production"))
-        from scripts.production import production_units, showrunners
+        from scripts.production import production_units, session_staff, staff, unit_lookup
+        from scripts.shutdown import remote
     except ImportError:
         return NoProductionBase()
     finally:
         sys.path[:] = original_path
     worktree = Path(git(repo, "rev-parse", "--show-toplevel").strip()).resolve()
+    try:
+        record = staff.snapshot()
+        resolver = session_staff.RowResolver(record)
+        member = resolver.member_by_folder(remote.local_machine(), worktree)
+        if isinstance(member, session_staff.MemberFound):
+            resolved_branch = resolver.merge_branch(member.row)
+            if isinstance(resolved_branch, session_staff.Branch):
+                return ProductionMergeBranch(resolved_branch.name)
+            print(f"assertion_guard: {member.row.name}: {resolved_branch.reason}", file=sys.stderr)
+    except (OSError, ValueError) as error:
+        print(f"assertion_guard: {worktree}: {error}", file=sys.stderr)
+        return NoProductionBase()
     branch = git(repo, "branch", "--show-current").strip()
     branch_match: ProductionMergeBranch | NoProductionBase = NoProductionBase()
-    for doc in dict.fromkeys(showrunners.timer_docs().values()):
+    try:
+        sources = unit_lookup.member_sources()
+        if not sources.productions:
+            return branch_match
+    except staff.StaffUnreadable as error:
+        print(f"assertion_guard: {error}", file=sys.stderr)
+        return branch_match
+    documents = {source.timer.doc: source.document for source in sources.productions.values()}
+    for doc, text in documents.items():
         try:
-            lines = doc.read_text(encoding="utf-8").splitlines()
-            rows = [row for row in production_units.unit_table(lines) if not any(
-                re.search(r"(?:^|[\s(`])(?:retired|removed)\b",
-                          row.get(column, ""), re.IGNORECASE)
-                for column in ("Status", "Worktree"))]
-            worktree_matches = any(worktree_path_matches(
-                production_units.cell_value(row.get("Worktree", "")), worktree) for row in rows)
+            lines = text.splitlines()
+            slug = unit_lookup.production_slug_for_document(doc, record, sources)
+            rows: list[dict[str, str]] = []
+            worktree_matches = False
+            for row in production_units.unit_table(lines):
+                try:
+                    selected = sources.member(unit_lookup.UnitMember(
+                        slug, production_units.cell_value(row.get("Unit", ""))), record)
+                    location = unit_lookup.local_worktree(selected)
+                    if isinstance(location, staff.RemovedWorktree):
+                        continue
+                    branch_tree = unit_lookup.plan_worktree(row, selected)
+                    rows.append(row)
+                    worktree_matches |= branch_tree.resolve() == worktree
+                except (staff.StaffUnreadable, staff.StaffRefused) as error:
+                    print(f"assertion_guard: {error}", file=sys.stderr)
             branch_matches = bool(branch) and any(
                 production_units.cell_value(row.get("Branch", "")) == branch for row in rows)
             if worktree_matches or branch_matches:
@@ -1352,7 +1371,8 @@ def production_merge_branch(repo: Path) -> ProductionMergeBranch | NoProductionB
                     return match
                 if isinstance(branch_match, NoProductionBase):
                     branch_match = match
-        except (OSError, UnicodeError, production_units.Refusal):
+        except (OSError, UnicodeError, production_units.Refusal, staff.StaffRefused) as error:
+            print(f"assertion_guard: {error}", file=sys.stderr)
             continue
     return branch_match
 
@@ -1395,7 +1415,7 @@ def _nearest_remote_base(repo: Path) -> str:
     raise GuardError("cannot determine branch base; set VERIFY_ASSERTION_BASE (or --base)")
 
 
-def _pending_merge_bases(repo: Path) -> tuple[str, ...]:
+def pending_merge_bases(repo: Path) -> tuple[str, ...]:
     merge_head = repo / git(repo, "rev-parse", "--git-path", "MERGE_HEAD").strip()
     try:
         merging = merge_head.read_text(encoding="ascii").splitlines()
@@ -1429,7 +1449,7 @@ def commit_bases(repo: Path, selected_bases: tuple[str, ...] = ("HEAD",), *,
                          f"{base}..{head or 'HEAD'}").splitlines():
             parents.update(dict.fromkeys(merge.split()[2:]))
     if staged:
-        parents.update(dict.fromkeys(_pending_merge_bases(repo)))
+        parents.update(dict.fromkeys(pending_merge_bases(repo)))
     candidates = list(dict.fromkeys([*bases, *parents]))
     independent = set(git(repo, "merge-base", "--independent", *candidates).split())
     if selected_bases:
@@ -1799,6 +1819,17 @@ def run(arguments: list[str]) -> int:
                          for base in bases)
     rulings = read_rulings(args.rulings, messages)
     blocking = 0
+    for (path, test), why in list(rulings.items()):
+        if test.endswith("*"):
+            matches = {(finding.source.path, finding.test) for finding in shared
+                       if finding.kind == "test removed" and finding.source.path == path
+                       and finding.test.startswith(test[:-1])}
+            del rulings[path, test]
+            if not matches:
+                print(f"Assertion-Change: {path}::{test} — {why} — matched no removed test")
+                blocking += 1
+            for key in matches:
+                _ = rulings.setdefault(key, why)
     for finding in aggregate_test_removals(shared):
         why = rulings.get((finding.source.path, finding.test), "")
         prefix = "note: " if finding.kind == "changed" else ""

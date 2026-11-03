@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, recorded_unit
 
 import json
 import os
@@ -136,7 +136,7 @@ class BoardJsonTests(unittest.TestCase):
         checkout.mkdir()
         worktree.mkdir()
         # live_unit_table retains a linked worktree without querying session marks.
-        _ = (worktree / ".git").write_text("gitdir: fixture\n", encoding="utf-8")
+        _ = subprocess.run(["git", "init", "-b", "branch", "--separate-git-dir", str(self.root / f"{slug}-unit-git"), str(worktree)], check=True, capture_output=True)
         plan = worktree / "plan.md"
         document = checkout / f"{slug}-production.md"
         _ = document.write_text("\n".join((
@@ -150,7 +150,7 @@ class BoardJsonTests(unittest.TestCase):
         )), encoding="utf-8")
         fixture = ProductionFixture(slug, checkout, worktree, plan, document)
         self.plan(fixture)
-        production_membership(slug, unit_name)
+        _ = recorded_unit(slug, unit_name, worktree, document, plan="plan.md")
         row = next(row for row in staff.find(kind="showrunner") if row.name == slug)
         _ = staff.set_doc(row.id, staff.LiveDoc("natedev", document))
         _ = fake_showrunner.write_timer(self.notifier, slug, row.id, "UTC", document)
@@ -219,12 +219,16 @@ class BoardJsonTests(unittest.TestCase):
             result = subprocess.run(arguments, capture_output=True, text=True, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
         fixture.plan.unlink()
+        configuration = fixture.worktree / ".unit.toml"
+        configuration_text = configuration.read_text(encoding="utf-8")
+        configuration.unlink()
         (fixture.worktree / ".git").unlink()
         result = subprocess.run(
             ["git", "-C", str(fixture.checkout), "worktree", "add", "--quiet", "--detach",
              str(fixture.worktree), "HEAD"], capture_output=True, text=True, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        _ = configuration.write_text(configuration_text, encoding="utf-8")
         _ = fixture.plan.write_text(
             "> **Standing:** style_plan.py\n\n"
             + f"### Phase {phase_id} — {title} · status: todo\n", encoding="utf-8",
@@ -331,7 +335,7 @@ class BoardJsonTests(unittest.TestCase):
                 module = sys.modules.get(name)
                 if module is not None:
                     for field, value in (
-                        ("NOTIFIER_STATE_DIR", self.notifier), ("SESSIONS_DIR", self.sessions),
+                        ("NOTIFIER_STATE_DIR", self.notifier),
                         ("SESSIONS", self.session_script), ("SHOWRUNNER_STATE_DIR", self.showrunner_state),
                     ):
                         _ = scope.enter_context(patch.object(module, field, value))
@@ -492,7 +496,7 @@ class BoardJsonTests(unittest.TestCase):
         second_parent = next(row for row in staff.find(kind="showrunner") if row.name == second.slug)
         other = self.unit_member(second.slug)
         _ = staff.rename(other.id, "unrelated")
-        _ = staff.set_worktree(other.id, staff.RemovedWorktree("natedev", second.worktree))
+        _ = staff.set_worktree(other.id, staff.RemovedWorktree("natedev", second.worktree), expected=other.worktree)
         moved = staff.move(unit.id, second_parent.id)
         self.staff_launch(moved, moved.id, pane="newer")
 
@@ -669,9 +673,14 @@ class BoardJsonTests(unittest.TestCase):
         root = self.production("root")
         child = self.production("child")
         self.attach(child.slug, root.slug)
-        partial = showrunners.ShowrunnerDiscovery([], (
-            showrunners.ShowrunnerLookupFailure(child.slug, "fixture lookup failed"),))
-        with patch.object(showrunners, "registered_showrunners", return_value=partial):
+        timer_for = showrunners.timer_for
+
+        def read_timer(row: staff.StaffRow, record: staff.StaffSnapshot) -> showrunners.Timer | showrunners.NoTimer:
+            if row.name == child.slug:
+                raise OSError("fixture lookup failed")
+            return timer_for(row, record)
+
+        with patch.object(showrunners, "timer_for", side_effect=read_timer):
             with self.assertRaisesRegex(OSError, "fixture lookup failed"):
                 _ = board_json.main(["--production", root.slug])
         self.assertFalse((self.output / "root.json").exists())
@@ -684,7 +693,10 @@ class BoardJsonTests(unittest.TestCase):
         self.attach(child.slug, root.slug)
         self.attach(grandchild.slug, child.slug)
         child_row = next(row for row in staff.find(kind="showrunner") if row.name == child.slug)
-        _ = fixture_member("showrunner", name="unregistered", parent=child_row.id)
+        document = self.root / "unregistered-production.md"
+        _ = document.write_text("# Production — unregistered\n")
+        _ = fixture_member("showrunner", name="unregistered", parent=child_row.id,
+                           doc=staff.LiveDoc("natedev", document))
         response, documents = self.generate("--production", root.slug)
 
         self.assertEqual([doc["production"] for doc in documents],
@@ -721,6 +733,7 @@ class BoardJsonTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+        _ = recorded_unit(fixture.slug, "alpha-unit", fixture.worktree, fixture.document, plan="as-built.md")
         _, unit = self.unit(fixture)
 
         self.assertEqual(unit["plan"], str(as_built))

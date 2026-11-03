@@ -278,14 +278,12 @@ def recorded_auto_entries() -> RecordedAutoEntries | UnreadableMoveJournal:
     except FileNotFoundError:
         return RecordedAutoEntries(frozenset())
     except (OSError, ValueError, UnicodeError) as error:
-        print(f"account moves: cannot read recorded workers moves: {error}")
+        print(f"account moves: anomaly: cannot read recorded workers moves: {error}")
         return UnreadableMoveJournal()
 
 
 def append_move(entry: MoveEntry) -> None:
     """Append a complete transition while holding the shared writer lock."""
-    if not _valid(entry):
-        raise ValueError("invalid account move")
     entry = _canonical_entry(entry)
     if any(entry.get(field) == "default" for field in ("from", "to", "label")):
         raise ValueError("name the account by number")
@@ -417,8 +415,6 @@ def _routing_owner(value: object) -> str | UnknownFallbackOwner:
 
 def append_routing(entry: RoutingEntry) -> None:
     """Append a routing outcome once, under the account journal's writer lock."""
-    if not _valid(entry):
-        raise ValueError("invalid work routing")
     if entry["owner"] == "default":
         raise ValueError("name the account by number")
     owner = _routing_owner(entry["owner"])

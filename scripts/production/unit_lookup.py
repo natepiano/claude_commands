@@ -26,9 +26,11 @@ import herdr  # noqa: E402
 import sessions  # noqa: E402
 from herdr import HerdrPlace  # noqa: E402
 from sessions import SessionRecord, live_session, sessions_dir as sessions_dir  # noqa: E402
-from scripts.production import staff, showrunners  # noqa: E402
+from scripts.production import staff, showrunners, session_staff, unit_config  # noqa: E402
 import unit_names  # noqa: E402
-from production_units import Refusal, cell_value, unit_table, order_unit_names  # noqa: E402
+from production_units import cell_value, order_unit_names  # noqa: E402
+from scripts.production.unit_table import unit_spellings  # noqa: E402
+from scripts.shutdown import remote
 from scripts.lib import unit_runs  # noqa: E402
 
 USAGE = "usage: unit_lookup.py list <production slug> | pane <production slug> <unit>"
@@ -63,6 +65,55 @@ from scripts.production.session_staff import (
 )
 
 
+def production_slug_for_document(doc: Path, record: staff.StaffSnapshot, sources: MemberSources) -> str:
+    """Resolve a production through its registered document and fixed owner."""
+    owner = record.by_doc(remote.local_machine(), doc.resolve())
+    if owner is None or owner.kind != "showrunner":
+        raise staff.StaffUnreadable(f"{doc}: no showrunner staff row")
+    slugs = [slug for slug, row in sources.showrunner_members(record).items() if row.id == owner.id]
+    if len(slugs) == 1:
+        return slugs[0]
+    if not slugs and record.by_path(owner.name) == owner:
+        return owner.name
+    raise staff.StaffUnreadable(f"{doc}: no unique registered production")
+
+
+def local_worktree(selected: MemberFound | NoSuchMember) -> staff.PresentWorktree | staff.RemovedWorktree:
+    """Require a recorded local location without changing its lifecycle state."""
+    if isinstance(selected, NoSuchMember):
+        raise staff.StaffUnreadable(f"{selected.selector}: no matching staff member")
+    location = selected.row.worktree
+    if isinstance(location, staff.WorktreeUnfilled):
+        raise staff.StaffUnreadable(f"{selected.row.name}: staff worktree is unfilled")
+    if location.machine != remote.local_machine():
+        raise staff.StaffUnreadable(f"{selected.row.name}: staff worktree is on {location.machine}: {location.path}")
+    return location
+
+
+def plan_worktree(cells: dict[str, str], selected: MemberFound | NoSuchMember) -> Path:
+    """Read the branch worktree from the Plan folder, after checking staff ownership."""
+    location = local_worktree(selected)
+    if isinstance(location, staff.RemovedWorktree):
+        raise staff.StaffUnreadable(f"{cells.get('Unit', '')}: staff worktree is removed")
+    plan = cell_value(cells.get("Plan", ""))
+    if not plan or plan in ("—", "-", "standby", "permanent"):
+        raise staff.StaffUnreadable(f"{cells.get('Unit', '')}: Plan folder is unavailable")
+    path = Path(plan).expanduser()
+    if not path.is_absolute():
+        return location.path
+    from scripts.direct.phase_reservation import repository_root
+    try:
+        directory = path if path.is_dir() else path.parent
+        if not directory.is_dir():
+            raise staff.StaffUnreadable(f"{cells.get('Unit', '')}: Plan folder is missing: {directory}")
+        root = repository_root(directory)
+    except (OSError, UnicodeError) as error:
+        raise staff.StaffUnreadable(f"{cells.get('Unit', '')}: cannot read Plan folder: {error}") from error
+    if root is None:
+        raise staff.StaffUnreadable(f"{cells.get('Unit', '')}: Plan folder is outside Git: {path.parent}")
+    return root
+
+
 class ProductionMembers:
     """Recorded membership of a production, read once without probing live panes."""
 
@@ -78,11 +129,12 @@ class ProductionMembers:
             record = self._record if self._record is not None else staff.snapshot()
             sources = member_sources()
             members = production_members(record, sources)
-            self._units = {row.name for row in members.get(showrunners.canonical_slug(self._slug), ())}
+            self._units = {row.name for row in members.get(sources.canonical_slug(self._slug), ())}
             parent = sources.member(ShowrunnerMember(self._slug), record)
             if isinstance(parent, MemberFound):
+                resolver = session_staff.RowResolver(record)
                 self._retired = {row.name for row in record.find(kind="unit", parent=parent.row.id)
-                                 if isinstance(row.worktree, staff.RemovedWorktree)}
+                                 if isinstance(resolver.unit_state(row), session_staff.RetiredUnit)}
         return unit_names.name(unit) in self._units
 
 
@@ -98,61 +150,105 @@ def unit_is_retired(cells: dict[str, str], marks: ProductionMembers) -> bool:
     return bool(unit) and marks.is_retired(unit)
 
 
+@dataclass(frozen=True)
+class UnitProblem:
+    unit_id: staff.StaffId
+    name: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class UnitMetadata:
+    cells: dict[staff.StaffId, dict[str, str]]
+    problems: tuple[UnitProblem, ...]
+
+
 def unit_metadata(record: staff.StaffSnapshot, sources: MemberSources, *,
-                  documents: dict[str, list[str]] | None = None) -> dict[staff.StaffId, dict[str, str]]:
-    """Bind document cells to staff identities, preferring the current parent's row."""
-    members = production_members(record, sources)
-    documents = ({slug: source.document.splitlines() for slug, source in sources.productions.items()}
-                 | (documents or {}))
-    direct: dict[staff.StaffId, dict[str, str]] = {}
-    orphans: dict[str, list[tuple[str, dict[str, str]]]] = {}
-    for slug, lines in documents.items():
-        local = {row.name: row for row in members.get(slug, ())}
+                  slug: str | None = None) -> UnitMetadata:
+    """Return unit facts and problems without writing diagnostics."""
+    productions = production_members(record, sources)
+    rows = (tuple(row for children in productions.values() for row in children) if slug is None
+            else productions.get(sources.canonical_slug(slug), ()))
+    resolver = session_staff.RowResolver(record, rows=rows)
+    metadata: dict[staff.StaffId, dict[str, str]] = {}
+    issues: list[UnitProblem] = []
+    for row in rows:
+        cells = {"Unit": row.name}
+        problems: list[str] = []
+        tree = resolver.unit_worktree(row)
+        if isinstance(tree, staff.WorktreeUnfilled):
+            cells["Worktree"] = "unavailable: the worktree is not recorded"
+            problems.append("the worktree is not recorded")
+        else:
+            cells["Worktree"] = f"`{tree.path}`"
+        branch = resolver.unit_branch(row)
+        cells["Branch"] = branch.name if isinstance(branch, session_staff.Branch) else "unavailable: " + branch.reason
+        if not isinstance(branch, session_staff.Branch):
+            problems.append(branch.reason)
         try:
-            rows = unit_table(lines)
-        except Refusal:
-            continue
-        for cells in rows:
-            try:
-                name = unit_names.name(cell_value(cells.get("Unit", "")))
-            except unit_names.BadName:
-                continue
-            if name in local:
-                direct[local[name].id] = cells
+            config = resolver.unit_config(row)
+        except unit_config.ConfigRefused as error:
+            cells["Plan"] = "unavailable: " + str(error)
+            problems.append(str(error))
+        else:
+            if isinstance(config, unit_config.UnitConfig):
+                if isinstance(config.plan, unit_config.PlanFile):
+                    cells["Plan"] = ("unavailable: the worktree is not recorded"
+                                     if isinstance(tree, staff.WorktreeUnfilled)
+                                     else "active" if config.plan.path == Path("active")
+                                     else str(tree.path / config.plan.path))
+                else:
+                    cells["Plan"] = "standby" if isinstance(config.plan, unit_config.StandbyPlan) else "permanent"
+                if isinstance(config.port, unit_config.AppPort):
+                    cells["Port"] = str(config.port.number)
+                if config.responsibilities:
+                    cells["Owns"] = ", ".join(config.responsibilities)
             else:
-                orphans.setdefault(name, []).append((slug, cells))
-    units = tuple(row for rows in members.values() for row in rows)
-    for row in units:
-        if row.id in direct:
-            continue
-        candidates = orphans.get(row.name, [])
-        if len(candidates) == 1 and sum(other.name == row.name for other in units) == 1:
-            direct[row.id] = candidates[0][1]
-            continue
-        parents = [slug for slug, rows in members.items() if row in rows]
-        production = ", ".join(parents) or str(row.parent)
-        reason = "ambiguous orphan rows" if len(candidates) > 1 else "no unique document binding"
-        print(f"production_units: {production}/{row.name}: metadata unavailable: {reason}", file=sys.stderr)
-    return direct
+                reason = config.reason if not isinstance(config, session_staff.NoUnitConfig) else "no unit configuration"
+                cells["Plan"] = "unavailable: " + reason
+                problems.append(reason)
+        doc = resolver.production_doc(row)
+        if not isinstance(doc, session_staff.ProductionDoc):
+            problems.append(doc.reason)
+        if problems:
+            causes = dict.fromkeys(" ".join(reason.splitlines()) for reason in problems)
+            issues.append(UnitProblem(row.id, row.name, "; ".join(causes)))
+        metadata[row.id] = cells
+    return UnitMetadata(metadata, tuple(issues))
 
 
-def live_unit_table(lines: list[str], slug: str, *, record: staff.StaffSnapshot | None = None) -> list[dict[str, str]]:
+def live_unit_table(lines: list[str], slug: str, *, record: staff.StaffSnapshot | None = None,
+                    sources: MemberSources | None = None) -> list[dict[str, str]]:
     """Staff members with metadata bound by identity; a table cannot change a parent."""
     record = record if record is not None else staff.snapshot()
-    sources = member_sources()
-    slug = showrunners.canonical_slug(slug)
+    sources = sources if sources is not None else member_sources()
+    slug = sources.canonical_slug(slug)
     members = production_members(record, sources).get(slug, ())
-    metadata = unit_metadata(record, sources, documents={slug: lines})
-    rows = {unit_names.unit_id(row.name): {**metadata.get(row.id, {"Worktree": "—", "Plan": "—"}),
-                                          "Unit": metadata.get(row.id, {}).get("Unit", f"`{unit_names.unit_id(row.name)}`")}
-            for row in members}
+    metadata = unit_metadata(record, sources, slug=slug)
+    for problem in metadata.problems:
+        print(f"production_units: {problem.name}: unavailable: {problem.reason}", file=sys.stderr)
+    rows: dict[str, dict[str, str]] = {}
+    spellings = unit_spellings(lines)
+    for row in members:
+        rendered = {key: "—" if value.startswith("unavailable: ") else value
+                    for key, value in metadata.cells[row.id].items()}
+        rendered["Unit"] = spellings.get(row.name, unit_names.unit_id(row.name))
+        rows[rendered["Unit"]] = rendered
     return [rows[name] for name in order_unit_names(lines, rows)]
 
 
-def retired_units(lines: list[str], slug: str, *, record: staff.StaffSnapshot | None = None) -> set[str]:
-    """Document unit names whose retained row has a removed worktree."""
-    marks = ProductionMembers(slug, record=record)
-    return {cell_value(cells.get("Unit", "")) for cells in unit_table(lines) if unit_is_retired(cells, marks)} - {""}
+def retired_units(lines: list[str], slug: str, *, record: staff.StaffSnapshot | None = None,
+                  sources: MemberSources | None = None) -> set[str]:
+    """List retained removed children, including members absent from the table."""
+    record = record if record is not None else staff.snapshot()
+    sources = sources if sources is not None else member_sources()
+    parent = sources.member(ShowrunnerMember(slug), record)
+    if isinstance(parent, NoSuchMember):
+        return set()
+    resolver = session_staff.RowResolver(record)
+    names = {unit_names.unit_id(row.name) for row in record.find(kind="unit", parent=parent.row.id)
+             if isinstance(resolver.unit_state(row), session_staff.RetiredUnit)}
+    return set(order_unit_names(lines, names, offline=names))
 
 
 @dataclass(frozen=True)
@@ -163,22 +259,24 @@ class UnitProduction:
     doc: str
 
 
-def unit_row(unit: str, record: staff.StaffSnapshot, *, staff_id: str = "") -> staff.StaffRow:
-    """Join a pane by durable id, or by its unique legacy name until 2026-11-13."""
-    found = _unit_match(ObservedUnit(unit, staff_id), record, staff_id)
+def unit_row(unit: str, record: staff.StaffSnapshot, *,
+             reference: session_staff.StoredReference | session_staff.LiveSession | session_staff.ByName = session_staff.BY_NAME) -> staff.StaffRow:
+    """Resolve a selected identity without a name fallback."""
+    found = _unit_match(ObservedUnit(unit), record, reference)
     if isinstance(found, NoSuchMember):
-        raise staff.StaffUnreadable(f"{unit or staff_id}: no unique staff entry")
+        raise staff.StaffUnreadable(f"{unit}: no unique staff entry")
     return found.row
 
 
 def row_production(row: staff.StaffRow, record: staff.StaffSnapshot,
                    sources: MemberSources) -> UnitProduction:
     """Resolve a unit's current parent from the caller's owner snapshot."""
-    parents = [slug for slug, parent in sources.showrunner_members(record).items() if parent.id == row.parent]
-    if len(parents) != 1:
-        raise staff.StaffUnreadable(f"{row.name}: staff parent has no unique production document")
-    slug = parents[0]
-    return UnitProduction(slug, str(sources.productions[slug].timer.doc))
+    doc = session_staff.RowResolver(record).production_doc(row)
+    if isinstance(doc, session_staff.ProductionDoc):
+        slugs = [slug for slug, parent in sources.showrunner_members(record).items() if parent.id == row.parent]
+        slug = slugs[0] if len(slugs) == 1 else showrunners.production_slug(str(doc.path))
+        return UnitProduction(slug, str(doc.path))
+    raise staff.StaffUnreadable(f"{row.name}: {doc.reason}")
 
 
 @dataclass(frozen=True)
@@ -201,23 +299,17 @@ def session_showrunner(session_id: str, *, record: staff.StaffSnapshot,
     return NoSessionShowrunner()
 
 
-def unit_parent(unit: str, session_id: str = "", *, record: staff.StaffSnapshot,
-                sources: MemberSources | None = None) -> UnitProduction:
+def unit_parent(unit: str,
+                reference: session_staff.StoredReference | session_staff.LiveSession | session_staff.ByName = session_staff.BY_NAME, *,
+                record: staff.StaffSnapshot, sources: MemberSources) -> UnitProduction:
     """Resolve identity and its current parent without another owner read."""
-    sources = sources if sources is not None else member_sources()
-    owner = record.by_member_reference(session_id) if session_id else None
-    launches = [launch for launch in sources.launches
-                if owner is not None and record.by_member_reference(launch["session_id"]) == owner]
-    environment = max(launches, key=lambda launch: launch["written_at"])["environment"] if launches else {}
-    if owner is not None:
-        if owner.kind != "unit":
-            raise staff.StaffUnreadable(f"{unit or session_id}: no unique staff entry")
-        row = unit_row(environment.get(UNIT_MARK, unit), record, staff_id=owner.current_session)
-    else:
+    if isinstance(reference, session_staff.ByName):
         selected = sources.member(ObservedUnit(unit), record)
         if isinstance(selected, NoSuchMember):
             raise staff.StaffUnreadable(f"{unit}: no unique staff entry")
         row = selected.row
+    else:
+        row = unit_row(unit, record, reference=reference)
     return row_production(row, record, sources)
 
 
@@ -492,15 +584,18 @@ def observed_staff_marks(*, running: Sequence[SessionRecord] | None = None) -> t
         raise OSError(str(error)) from error
 
 
-def every_marked_unit(*, record: staff.StaffSnapshot | None = None) -> MarkedProductions:
+def every_marked_unit(*, record: staff.StaffSnapshot | None = None,
+                      sources: MemberSources | None = None,
+                      running: Sequence[SessionRecord] | None = None) -> MarkedProductions:
     """Read all herdr units once. An unreadable host raises OSError."""
-    return group_marked_units(observed_staff_marks(), record=record)
+    return group_marked_units(observed_staff_marks(running=running), record=record, sources=sources)
 
 
-def marked_units(slug: str, *, record: staff.StaffSnapshot | None = None) -> dict[str, MarkedUnit]:
+def marked_units(slug: str, *, record: staff.StaffSnapshot | None = None,
+                 sources: MemberSources | None = None) -> dict[str, MarkedUnit]:
     """Every unit of the production. Unreadable herdr, or any unit's mark on two sessions, raises OSError."""
     slug = _lookup_slug(slug)
-    found = every_marked_unit(record=record)
+    found = every_marked_unit(record=record, sources=sources)
     if fault := found.production_fault(slug):
         raise OSError(fault)
     return found.units.get(slug, {})

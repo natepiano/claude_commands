@@ -9,7 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import TYPE_CHECKING, final
+from typing import final, override
 from unittest import mock
 from urllib import parse, request
 from urllib.error import URLError
@@ -19,12 +19,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bevy_migration_dependency_check as checker
 
 import crates_io_pacer
-
-if TYPE_CHECKING:
-    from typing import override
-else:
-    def override(method: object) -> object:
-        return method
 
 
 TARGET = "0.20.0"

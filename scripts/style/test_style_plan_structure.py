@@ -20,6 +20,7 @@ import rules
 import style_ledger
 
 from style_plan_test_support import StylePlanFixture
+from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner
 
 
 @final
@@ -230,6 +231,7 @@ class StylePlanTests(StylePlanFixture):
         template = self.style / "docs/style-production/units/names-unit.md"
         _ = template.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** beta\n\n## Phases"))
         _ = self.doc.write_text(self.doc.read_text() + f"| product-unit | docs/product.md | {self.root / 'product'} | product |\n")
+        _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "product-unit", self.root / "product")
 
         self.assertEqual(unit_plans.family_pilot_scopes(self.doc, self.repo), {
             "names": unit_plans.PilotCrates(frozenset({"crates/alpha"})), "modules": unit_plans.AllCrates(),

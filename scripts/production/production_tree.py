@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from scripts.astra import astra_roles  # noqa: E402
-from scripts.production import staff, staff_sources
+from scripts.production import staff, staff_sources, session_staff
 from scripts.production import showrunners  # noqa: E402
 import showrunner_tree
 import unit_lookup  # noqa: E402
@@ -130,7 +130,9 @@ def unit_edges(sessions: dict[str, str], running: set[str], marked: unit_lookup.
             claude = units[unit].claude
             if not isinstance(claude, unit_lookup.LiveClaude) or claude.session_id not in running:
                 continue
-            found = staff_sources.member(staff_sources.ObservedUnit(unit, units[unit].staff_id), record)
+            identity = units[unit].staff_id
+            reference = session_staff.LiveSession(identity) if identity else session_staff.NO_SESSION
+            found = staff_sources.member(staff_sources.ObservedUnit(unit, reference), record)
             if isinstance(found, staff_sources.NoSuchMember) or found.row.parent is None:
                 continue
             manager = managers.get(found.row.parent, "")

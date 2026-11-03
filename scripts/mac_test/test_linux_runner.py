@@ -21,10 +21,12 @@ import unittest
 from unittest import mock
 
 if TYPE_CHECKING:
+    from ..aws_target.runner_test_support import interrupt_runner, seed_runner_permission
     from . import linux_runner, mac_test, offload, test_target_slots
     from ..lint import sweep
     from ..lint.memory_test_support import write_config_fixture
 else:
+    from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
     import linux_runner
     import mac_test
     import offload
@@ -119,10 +121,12 @@ raise SystemExit("Unexpected fake tool: " + tool)
 
 
 class LinuxShellTests(unittest.TestCase):
+    permission_at: int = int(time.time())
     root: Path = Path()
     source: Path = Path()
     mirror: Path = Path()
     settings: Path = Path()
+    permission_directory: Path = Path()
     event_path: Path = Path()
     environment: dict[str, str] = {}
     use_real_sweep: bool = False
@@ -167,6 +171,8 @@ class LinuxShellTests(unittest.TestCase):
         for tool in ("nix", "df", "rm"):
             self.write_tool(tools / tool)
         self.write_tool(self.root / ".claude/scripts/lint/lint")
+        self.permission_directory = seed_runner_permission(self.root, self.settings, self.permission_at, "fixture-boot")
+        _ = self.enterContext(mock.patch.object(linux_runner, "boot_identity", return_value="fixture-boot"))
         self.environment = {
             "HOME": str(self.root), "PATH": f"{tools}:/run/current-system/sw/bin:/usr/bin:/bin",
             "TOOL_EVENTS": str(self.event_path), "BUILD_TARGETS_CONFIG": str(registry),
@@ -211,7 +217,7 @@ class LinuxShellTests(unittest.TestCase):
             offload.read_config(self.settings), request, self.identity, offload.KnownTreeKey("sent-tree-key"),
         )
 
-    def execute(self, request: offload.OffloadRequest) -> subprocess.CompletedProcess[str]:
+    def execute(self, request: offload.OffloadRequest, *, interrupt: bool = False) -> subprocess.CompletedProcess[str]:
         arguments = shlex.split(self.command(request))
         self.assertEqual(arguments[:3], ["python3", ".claude/scripts/mac_test/linux_runner.py", "run"])
         output, errors = io.StringIO(), io.StringIO()
@@ -242,8 +248,11 @@ class LinuxShellTests(unittest.TestCase):
                     else:
                         status = 0
                 return subprocess.CompletedProcess(argv, status, "", "")
-            return real_run(argv, cwd=cwd or self.root, check=check, capture_output=capture_output,
-                            text=True, timeout=timeout, env=env)
+            completed = real_run(argv, cwd=cwd or self.root, check=check, capture_output=capture_output,
+                                 text=True, timeout=timeout, env=env)
+            if interrupt and argv[:2] == ["bash", "-c"]:
+                interrupt_runner(self.permission_directory, self.permission_at)
+            return completed
 
         with mock.patch.dict(os.environ, self.environment, clear=True), \
                 mock.patch.object(sys, "argv", arguments[1:]), \
@@ -283,6 +292,16 @@ class LinuxShellTests(unittest.TestCase):
         self.assertTrue(any(argument.endswith("#ci") for argument in evaluations[0]["args"]))
         self.assertEqual(event["environment"].get("TEST_SHELL_PROOF"), "loaded")
         self.assertEqual(event["cwd"], str(self.mirror))
+
+    def test_sigterm_prints_one_interruption_marker_and_preserves_the_child_status(self) -> None:
+        self.environment["FAKE_LINT_STATUS"] = "143"
+
+        result = self.execute(self.request(), interrupt=True)
+
+        self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
+        lines = result.stdout.splitlines()
+        markers = [line for line in lines if line.startswith(("aws_interrupted=", "mac_exit=", "mac_cleanup="))]
+        self.assertEqual(markers, ["mac_exit=143", "mac_cleanup=kept", "aws_interrupted=fixture-generation"])
 
     def test_unchanged_inputs_reuse_exports_and_the_slot_build_folder(self) -> None:
         _ = self.assert_ran(self.request())
@@ -649,6 +668,10 @@ class LinuxProcessTests(unittest.TestCase):
         self.mirror.mkdir(parents=True)
         self.proc = self.root / "proc"
         self.proc.mkdir()
+        boot_file = self.proc / "sys/kernel/random/boot_id"
+        boot_file.parent.mkdir(parents=True)
+        _ = boot_file.write_text("fixture-boot\n")
+        _ = self.enterContext(mock.patch.object(linux_runner, "boot_identity", return_value="fixture-boot"))
         _ = self.enterContext(mock.patch.object(os, "getpid", return_value=900))
         _ = self.enterContext(mock.patch.object(os, "getpgrp", return_value=900))
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
@@ -667,7 +690,7 @@ class LinuxProcessTests(unittest.TestCase):
 
     def marker(self) -> Path:
         path = self.mirror / ".linux-run.json"
-        lease: linux_runner.SlotRun = {"pid": 100, "start_time": 123, "process_group": 100, "token": "selected-run"}
+        lease: linux_runner.SlotRun = {"pid": 100, "start_time": 123, "process_group": 100, "token": "selected-run", "boot_id": "fixture-boot"}
         _ = path.write_text(json.dumps(lease))
         return path
 
@@ -700,9 +723,10 @@ class LinuxProcessTests(unittest.TestCase):
             _ = proc_root
             return fields(pid, self.proc)
 
-        def private_processes(mirror: Path, proc_root: Path = linux_runner.PROC_ROOT) -> tuple[int, ...]:
+        def private_processes(mirror: Path, proc_root: Path = linux_runner.PROC_ROOT, *,
+                              require_boot_identity: bool = False) -> tuple[int, ...]:
             _ = proc_root
-            return processes(mirror, self.proc)
+            return processes(mirror, self.proc, require_boot_identity=require_boot_identity)
 
         _ = self.enterContext(mock.patch.object(linux_runner, "process_fields", side_effect=private_fields))
         _ = self.enterContext(mock.patch.object(linux_runner, "slot_processes", side_effect=private_processes))
@@ -810,7 +834,6 @@ class LinuxProcessTests(unittest.TestCase):
         self.mirror = dispatch.fixture.root / offload.remote_mirror(identity, "aws", 1)
         self.mirror.mkdir(parents=True)
         self.process(900, group=900, start=123, cwd=self.root)
-        self.process(102, group=102, start=124, cwd=self.root)
         self.deny_reads(environ=(102,), cwd=(102,))
         self.use_private_processes()
         kill_log = self.root / "kill-list"
@@ -842,6 +865,7 @@ class LinuxProcessTests(unittest.TestCase):
             output = io.StringIO()
             with redirect_stdout(output):
                 with linux_runner.slot_run(self.mirror):
+                    self.process(102, group=102, start=124, cwd=self.root)
                     print("mac_exit=0\nmac_cleanup=kept")
             self.assertIn("mac_cleanup=unconfirmed", output.getvalue())
             self.assertNotIn("Traceback", output.getvalue())
@@ -1313,6 +1337,8 @@ class LinuxDispatchTests(unittest.TestCase):
             + "mend=mend fixture\nscripts_commit=fixture-commit\nrc=0\n"
         )
         self.controller = offload.ProcessController()
+        _ = seed_runner_permission(self.fixture.root, self.settings, 1_793_570_400, "fixture-boot")
+        _ = self.enterContext(mock.patch.object(linux_runner, "boot_identity", return_value="fixture-boot"))
         _ = self.enterContext(mock.patch.object(time, "time", return_value=1_793_570_400.0))
         _ = self.enterContext(mock.patch.object(self.controller, "complete_claim", side_effect=self.complete_claim))
         _ = self.enterContext(mock.patch.object(self.controller, "capture", side_effect=self.capture))
@@ -1393,6 +1419,20 @@ class LinuxDispatchTests(unittest.TestCase):
         with redirect_stdout(output), redirect_stderr(errors):
             result = offload.run_offload(self.controller, offload.read_config(self.settings), request, 100.0)
         return result, output.getvalue(), errors.getvalue()
+
+    def test_probe_interruption_keeps_generation_evidence_without_unreachable_backoff(self) -> None:
+        state = offload.state_directory("aws")
+        state.mkdir(parents=True, exist_ok=True)
+        _ = (state / "controller.json").write_text(json.dumps({"generation": "fixture-generation"}))
+        self.probe_wire = "aws_interrupted=fixture-generation\n"
+        result, _, _ = self.run_request(self.request())
+        self.assertIsInstance(result, offload.InterruptedTargetRun)
+        assert isinstance(result, offload.InterruptedTargetRun)
+        self.assertEqual(result.generation, "fixture-generation")
+        self.assertNotIn("run", self.actions)
+        self.assertIn("cleanup", self.actions)
+        self.assertFalse(self.fixture.claims("aws"))
+        self.assertIsInstance(offload.read_backoff(time.time(), "aws"), offload.NoBackoff)
 
     def test_linux_executes_without_mac_settings_during_mac_backoff(self) -> None:
         offload.write_backoff(time.time() + 60, "mac")

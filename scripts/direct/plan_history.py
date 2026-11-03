@@ -11,6 +11,8 @@ from typing import NamedTuple, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import unit_runs  # noqa: E402
+from scripts.production import session_staff, staff  # noqa: E402
+from scripts.shutdown import remote  # noqa: E402
 from scripts.direct.recorder_state import STATE_FILENAME as STATE_FILENAME  # noqa: E402
 
 
@@ -47,10 +49,6 @@ PHASE_REFERENCE_PATTERN = re.compile(
 UNIT_PHASE_PREFIX = re.compile(
     r"(?<![\w-])(?P<quote>`|'|\"|\*\*)?(?P<unit>[\w-]+-unit)"
     + r"(?:['’]s)?(?(quote)(?P=quote))(?:['’]s)?[ \t]+$"
-)
-PLAN_UNIT_HEADER = re.compile(
-    r"^>[ \t]+\*\*Production:(?:\*\*)?[ \t]+[^\n]*?—[ \t]+unit[ \t]+`(?P<unit>[^`\n]+)`",
-    re.MULTILINE,
 )
 BLOCKED_BY_PATTERN = re.compile(r"^\*\*Blocked by:\*\*[ \t]*(?P<gate>G\d+)", re.MULTILINE)
 
@@ -95,9 +93,19 @@ def resolve_plan_path(working_dir: Path, value: str) -> Path:
     return path.resolve() if path.is_absolute() else (working_dir / path).resolve()
 
 
-def plan_phase_details(plan_path: Path) -> tuple[list[PlanPhase], list[str]]:
+def plan_member(plan_path: Path, *, resolver: session_staff.RowResolver | None = None) -> session_staff.MemberFound | session_staff.NoSuchMember:
+    """Resolve the plan folder through the current staff worktree."""
+    resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+    return resolver.member_by_folder(remote.local_machine(), plan_path.expanduser().resolve().parent)
+
+
+def plan_phase_details(plan_path: Path, *, resolver: session_staff.RowResolver | None = None) -> tuple[list[PlanPhase], list[str]]:
     text = plan_path.read_text(encoding="utf-8")
-    unit_header = PLAN_UNIT_HEADER.search(text)
+    try:
+        member = plan_member(plan_path, resolver=resolver)
+    except (OSError, ValueError) as error:
+        print(f"plan_history: {plan_path}: {error}", file=sys.stderr)
+        member = session_staff.NoSuchMember(session_staff.FolderMember(remote.local_machine(), plan_path.parent))
     phases: list[PlanPhase] = []
     seen: set[str] = set()
     duplicates: list[str] = []
@@ -134,7 +142,7 @@ def plan_phase_details(plan_path: Path) -> tuple[list[PlanPhase], list[str]]:
                 # A unit name qualifies only the phase span that follows it.
                 qualifier = UNIT_PHASE_PREFIX.search(dependency_text[: reference.start()])
                 if qualifier is not None and (
-                    unit_header is None or qualifier.group("unit") != unit_header.group("unit")
+                    isinstance(member, session_staff.NoSuchMember) or qualifier.group("unit").removesuffix("-unit") != member.row.name
                 ):
                     continue
                 phase_ids = reference.group("single") or reference.group("list")
@@ -154,9 +162,9 @@ def plan_phase_details(plan_path: Path) -> tuple[list[PlanPhase], list[str]]:
     return phases, duplicates
 
 
-def plan_phases(plan_path: Path) -> list[PlanPhase]:
+def plan_phases(plan_path: Path, *, resolver: session_staff.RowResolver | None = None) -> list[PlanPhase]:
     """Return the plan's unique phase headings in document order."""
-    phases, _ = plan_phase_details(plan_path)
+    phases, _ = plan_phase_details(plan_path, resolver=resolver)
     return phases
 
 

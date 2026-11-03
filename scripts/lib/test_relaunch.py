@@ -165,9 +165,33 @@ class RelaunchTests(ShutdownTestCase):
                 observed = cast(dict[str, object], json.loads(output.read_text()))
                 expected = arguments[1:]
                 if identity == "2d058b83-b9da-46fd-9e87-877cd3f50a52" and not prompt:
-                    expected = [*expected, resume_message("the herdr server restarted")]
+                    expected = [*expected, resume_message("you were stopped and resumed")]
                 self.assertEqual(observed["argv"], expected)
                 self.assertEqual(observed["marks"], marks if identity == "2d058b83-b9da-46fd-9e87-877cd3f50a52" else {})
+
+    def test_pane_delivery_does_not_add_a_second_prompt(self) -> None:
+        from scripts.shutdown import pane_record
+        from scripts.production import session_staff
+
+        entry = pane_record.launch("w1:p2", "session", str(self.root), {}, ["claude"])
+        environment = {"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p2", "RELAUNCH_PROMPT_DELIVERY": "pane"}
+        with (patch.object(pane_record, "matching_launch", return_value=entry),
+              patch.object(session_staff, "record_membership", return_value=entry)):
+            arguments, _ = relaunch.restored_launch(["claude", "--resume", "session"], environment)
+        self.assertEqual(arguments, ["claude", "--resume", "session"])
+
+    def test_enveloped_resume_needs_no_source_record(self) -> None:
+        from scripts.shutdown import pane_record
+        from scripts.production import session_staff
+        from scripts.lib import script_prompts
+
+        entry = pane_record.launch("w1:p2", "session", str(self.root), {}, ["claude"])
+        with (patch.object(pane_record, "matching_launch", return_value=entry),
+              patch.object(session_staff, "record_membership", return_value=entry),
+              patch.object(script_prompts, "record", side_effect=AssertionError("recorded resume"))):
+            arguments, _ = relaunch.restored_launch(["claude", "--resume", "session"],
+                {"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p2"})
+        self.assertTrue(arguments[-1].startswith('<system-reminder source="script">'))
 
     def test_staged_request_relaunches_with_same_parent_pid_and_new_environment(self) -> None:
         process = self.start(self.waiting_child())

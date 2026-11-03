@@ -9,9 +9,10 @@ import sqlite3
 import subprocess
 import sys
 import unittest
-from contextlib import closing
+from unittest import mock
+from contextlib import AbstractContextManager, closing
 from datetime import datetime, timedelta
-from typing import cast, final
+from typing import cast, final, override
 
 from scripts.usage.collect_test_support import (
     CODEX_ACTIVITIES,
@@ -35,10 +36,20 @@ from scripts.usage.collect_test_support import (
     THREAD,
 )
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production.staff_test_support import isolated_source_readers, isolated_staff_file, source_environment
 
 
 @final
 class CollectTests(CollectorFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        environment = source_environment(self.root / "staff-sources")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", environment))
+        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, environment)))
+        _ = self.enterContext(isolated_source_readers())
+        _ = (self.root / "staff.json").write_text('{"schema": 2, "rows": []}\n')
+
     def test_collector_cli_keeps_durable_commits_by_default(self) -> None:
         self.assert_cli_durability([], "PRAGMA synchronous=FULL")
 

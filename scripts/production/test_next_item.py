@@ -30,6 +30,7 @@ from scripts.production import staff
 from scripts.production.staff_test_support import (
     fixture_member, isolated_source_readers, isolated_staff_file, source_environment, unit_membership,
 )
+from scripts.production.test_change_review import producer_rows
 from change_review import Visible
 from next_item import NextError, Queue
 
@@ -91,8 +92,8 @@ class NextItemTests(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             _ = cast(object, stack.enter_context(mock.patch.dict(
                 os.environ, {"NEXT_STATE_DIR": str(self.root / "next"), "NIGHTLY_REVIEW_NOTE": str(self.root / "note.md")})))
-            _ = cast(object, stack.enter_context(mock.patch.object(candidates, "ROOT", self.root)))
-            _ = stack.enter_context(mock.patch.object(change_review, "LISTS", self.root / "change-review"))
+            _ = cast(object, stack.enter_context(mock.patch.object(candidates, "state_root", return_value=self.root)))
+            _ = stack.enter_context(mock.patch.object(change_review, "lists_directory", return_value=self.root / "change-review"))
             self.addCleanup(stack.pop_all().close)
         self.queues = {
             "change": Queue("change-natedev", [Entry("C1", "C1 Old change", since=at(1)),
@@ -215,6 +216,7 @@ class NextItemTests(unittest.TestCase):
             del production
             return path
 
+        _ = fixture_member("showrunner", name="natedev", doc=staff.LiveDoc("natedev", PRODUCTION))
         with mock.patch.object(change_review, "production_list", the_list):
             self.assertEqual(run("show", "--kind", "change", "--production", str(PRODUCTION)), (0, "\n".join([
                 "change", "C1 Panels keep shields", "  How to check: Run `hana`. You see: Each panel has its shield",
@@ -233,12 +235,6 @@ class NextItemTests(unittest.TestCase):
             _ = (self.root / f"{slug}.md").write_text(f"- 2026-10-12 rust/{slug}: {slug}-item gain — proposed\n")
             _ = doc.write_text(f"# {slug}\n\n- **Efficiency ledger:** {self.root / f'{slug}.md'}\n"
                                + f"- **Proposals:** {issues_folder}\n")
-            parent_name = {"kid": "top", "grand": "kid"}.get(slug)
-            parent = next((row.id for row in staff.find(kind="showrunner") if row.name == parent_name), None)
-            owner = fixture_member("showrunner", name=slug, parent=parent, doc=staff.LiveDoc("natedev", doc))
-            timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{slug}"
-            timer.mkdir(parents=True)
-            _ = (timer / "conf").write_text(f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {doc}\n")
             _ = (issues_folder / f"{slug}-item.md").write_text(
                 f"---\nstatus: open\ntags: [issue, proposal]\nproposed_by: {slug}\ndate_created: 2026-10-01\n---\n")
             _ = (outstanding / f"{slug}.json").write_text(f'[{{"since": "2026-10-06T09:00", "text": "{slug}-item"}}]')
@@ -250,6 +246,18 @@ class NextItemTests(unittest.TestCase):
                                           "", plans / f"{slug}-production.md")
         # A row written before the Production column belongs to the list's root.
         _ = path.write_text(path.read_text(encoding="utf-8").replace(" gone |", "  |"), encoding="utf-8")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        producer_rows(self.root, docs, {path: "top", side_list: "side"})
+        for slug, doc in docs.items():
+            parent_name = {"kid": "top", "grand": "kid"}.get(slug)
+            parent = next((row.id for row in staff.find(kind="showrunner") if row.name == parent_name), None)
+            existing = staff.snapshot().by_path(slug)
+            if existing is not None:
+                _ = staff.move(existing.id, parent)
+            owner = fixture_member("showrunner", name=slug, parent=parent, doc=staff.LiveDoc("natedev", doc))
+            timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{slug}"
+            timer.mkdir(parents=True)
+            _ = (timer / "conf").write_text(f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {doc}\n")
         tree = {"top": ["top", "kid", "grand"], "kid": ["kid", "grand"], "grand": ["grand"], "side": ["side"]}
 
         def owner_docs(doc: Path) -> list[Path]:
@@ -309,6 +317,8 @@ class NextItemTests(unittest.TestCase):
                 raise change_review.ChangeReviewError(f"{kid} has no line")
             return path
 
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        producer_rows(self.root, {"top": top, "kid": kid}, {path: "top"})
         with mock.patch.object(change_review, "production_list", the_list), \
                 mock.patch.object(showrunner_tree, "root_of", return_value="top"), \
                 mock.patch.object(showrunners, "timer_docs", return_value={"top": top, "kid": kid}), \
@@ -344,6 +354,12 @@ class NextItemTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(showrunner_tree, "descendants_of", descendants))
         _ = self.enterContext(mock.patch.object(change_review, "production_list",
                                                return_value=folder / "change-review - top.md"))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        listings = {folder / f"change-review - {slug}.md": slug for slug in docs}
+        selected_rows = {path: {row["#"] for row in change_review.pending(path)} for path in listings}
+        if self._testMethodName == "test_stopped_root_keeps_columnless_rows_when_own_list_becomes_current":
+            selected_rows[folder / "change-review - top.md"].difference_update({"C9", "C434"})
+        producer_rows(self.root, docs, listings, selected_rows=selected_rows)
         return docs
 
     def test_attached_earlier_rows_keep_list_names_in_show_move_and_count(self) -> None:

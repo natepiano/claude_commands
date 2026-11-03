@@ -53,8 +53,7 @@ The script lives at
    7. move the unit's state; style productions also move current ledger tickets, sync waits and
       open proposal issues to the new id, keeping ticket ids and history;
    8. retire the old branch when its name changed;
-   9. point the unit's shutdown record at the new names, also each paused Codex worker's launcher
-      folder, and add the new worktree path to each worker's resume prompt;
+   9. update the staff worktree and each paused worker's launcher folder;
    10. relaunch the unit; it resumes each Codex worker's own thread in the new worktree;
    11. verify.
    - **Exit 2** means the unit was still stopping after an hour. Find out why its stop holds, then rerun `apply`.

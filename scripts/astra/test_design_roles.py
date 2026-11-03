@@ -5,7 +5,7 @@ from scripts.production import worker_admission
 from scripts.production.staff_test_support import fixture_runtime_id
 
 from scripts.lib.signal_test_support import install_signal_pid_guard
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 
 import argparse
 import ast
@@ -105,24 +105,25 @@ class DurableRolesTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        from scripts.production.staff_test_support import StaffTestCase, production_membership
+        from scripts.production.staff_test_support import StaffTestCase, production_membership, recorded_showrunner
         membership = StaffTestCase()
         membership.setUp()
         self.addCleanup(membership.doCleanups)
-        _ = membership.production("demo", "design-unit")
+        document = membership.production("demo", "design-unit")
+        _ = recorded_showrunner("demo", document)
         production_membership("demo", "design-unit")
         self.repository = self.root / "checkout"
         self.repository.mkdir()
         _ = (self.repository / "design.md").write_text("# Design\n")
         self.launches, self.dispatches, self.releases = [], [], []
         self.holder_session, self.lose_creation_ack, self.fail_dispatch = '17759e5d-1377-577b-b283-19888bbfc1f5', False, False
-        config = self.root / "agents.conf"
+        config = self.root / "models.conf"
         _ = write_registry(config, {'assignments': {'design_roles': 'codex'}, 'design_roles.codex': {'designer': 'gpt-fixture:xhigh', 'reviewer': 'gpt-review-fixture:high'}, 'codex.agents': {'gpt-fixture': 'xhigh', 'gpt-review-fixture': 'high'}})
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root / "home"), "DESIGN_ROLES_STATE": str(self.root / "roles"),
             "DESIGN_OWNERSHIP_STATE": str(self.root / "ownership"), "DESIGN_ROLES_HOST": "natedev",
             "ASTRA_ROLES_STATE": str(self.root / "holds"), "CODEX_THREAD_ID": self.holder_session,
-            "AGENTS_CONFIG_FILE": str(config),
+            "MODELS_CONFIG_FILE": str(config),
         })))
         _ = self.enterContext(patch.object(design_roles, "authority_request", side_effect=self.authority))
         _ = self.enterContext(patch.object(design_roles, "resolve_holder", side_effect=self.reach))
@@ -604,7 +605,7 @@ class DurableRolesTests(unittest.TestCase):
         self.assertEqual(self.launches, [])
 
     def test_missing_or_disallowed_configured_model_never_uses_a_fallback(self) -> None:
-        config = Path(os.environ["AGENTS_CONFIG_FILE"])
+        config = Path(os.environ["MODELS_CONFIG_FILE"])
         for model in (None, "unlisted-model:xhigh", "gpt-fixture:invalid-effort"):
             with self.subTest(model=model):
                 _ = write_registry(config, {"design_roles.codex": {"designer": model},

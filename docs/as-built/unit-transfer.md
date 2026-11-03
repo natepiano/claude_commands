@@ -26,13 +26,9 @@ script is `scripts/production/transfer_unit.py`, with three actions: `plan`, `ap
 - Each held design the unit holds (`scripts/astra/design_roles.py`) takes the receiving production as
   holder (`design_roles.move_holder`), so resume, rebind and end accept the relaunched unit. The role
   threads, role names, checkout paths and saved prompts stay.
-- The shutdown record's host takes the receiving `production` and `doc`. A herdr session name of
-  the form `<giving slug>-<stem>` takes `<receiving slug>-<stem>`. Its `renamed` field holds the
-  moved note, which `restart.restart_note` puts first in the relaunched session's prompt. The note
-  names the new production doc, merge branch and showrunner address command.
-- The relaunch runs `add_unit.py` with the record's doc, so the unit's marks
-  (`SHOWRUNNER_UNIT`, `SHOWRUNNER_UNIT_ID`) name the receiving production. Status, dailies, panes and
-  merges find the unit there.
+- The staff row names the receiving parent. The current session ID stays the same.
+- The relaunch runs `shutdown.py restart --only ID`.
+  Restart reads the current session and worktree from staff. It sends no work prompt.
 - The phase note follows at the unit's next refresh. The giving showrunner's report state keeps its
   rows as history.
 
@@ -71,7 +67,7 @@ row commit does (user, 2026-10-08). The unit takes the receiving merge branch at
 ## verify
 
 verify fails when the receiving doc has no row, the giving doc still has one, a plan header does
-not name the receiving production, the stretch is still under the giving slug, the shutdown record
+not name the receiving production, the stretch is still under the giving slug, the staff row
 does not name the receiving production, the unit is not live under the receiving slug, a session
 still carries the giving marks, or a held design
 still names the giving production as the unit's holder (`design_roles.holder_failures`).

@@ -65,6 +65,8 @@ STYLE_SINCE=""
 STYLE_UNTIL=""
 STYLE_INPUT_DIR=""
 REQUESTED_LENS=""
+SIMPLIFY_DIFF=""
+SIMPLIFY_SUMMARY=""
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
     --to) FOLLOW_TO="${2:?--to requires a worker}" ;;
@@ -72,6 +74,8 @@ while [[ "${1:-}" == --* ]]; do
     --lens) REQUESTED_LENS="${2:?--lens requires a lens}" ;;
     --style-since) STYLE_SINCE="${2:?--style-since requires a baseline}" ;;
     --style-until) STYLE_UNTIL="${2:?--style-until requires an end commit}" ;;
+    --summary) SIMPLIFY_SUMMARY="${2-}" ;;
+    --diff) SIMPLIFY_DIFF="${2:?--diff requires a diff}" ;;
     --phase) PHASE_ID="${2:?--phase requires a phase id}" ;;
     *) echo "ERROR: unknown review option '$1'." >&2; exit 2 ;;
   esac
@@ -183,7 +187,7 @@ fi
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
-# repo needs >= 3.11.
+# repo needs >= 3.12.
 PY="${SCRIPT_DIR}/../lib/py"
 MESH_SESSION_DIR="${SESSION_DIR}"
 MESH_CLAIMED=0
@@ -220,8 +224,16 @@ PROGRESS_HELPER="${SCRIPT_DIR}/progress_history.py"
 PROGRESS_STATE="${SESSION_DIR}/progress_history_state.json"
 HEARTBEAT_INTERVAL_SECS=60
 
-REVIEW_FAILURE_REASON="${UNIT_REVIEW_FAILURE_REASON:-}"
-SIMPLIFY_DIR="${ARTIFACT_DIR}/simplify"
+REVIEW_FAILURE_REASON=""
+
+write_review_status() {
+  local temporary
+  temporary="$(mktemp "${ARTIFACT_DIR}/.review-status.XXXXXX")" || return 1
+  if ! { printf '%s\n' "$1" > "${temporary}" && mv -f -- "${temporary}" "${STATUS_FILE}"; }; then
+    rm -f -- "${temporary}"
+    return 1
+  fi
+}
 
 review_error() {
   REVIEW_FAILURE_REASON="$1"
@@ -229,17 +241,21 @@ review_error() {
 }
 
 simplify_result() {
-  "$PY" "${SCRIPT_DIR}/simplify_result.py" "$1" --phase-dir "${ARTIFACT_DIR}" "${@:2}"
+  "$PY" "${SCRIPT_DIR}/simplify_result.py" "$1" \
+    --findings-file "${FINDINGS_FILE}" --status-file "${STATUS_FILE}" --log-file "${LOG_FILE}" \
+    --summary-file "${SIMPLIFY_SUMMARY:-${FINDINGS_FILE}}" "${@:2}"
 }
 
 finish_simplify() {
   local code="$1"
   trap - EXIT
-  simplify_result finish --session-dir "${SESSION_DIR}" --phase "${PHASE_ID}" \
-    --reason "${REVIEW_FAILURE_REASON}" --exit-code "${code}" || {
-      echo error > "${STATUS_FILE}"
-      echo "ERROR: unable to finish the simplify result." >&2
-    }
+  local state
+  if ! state="$(simplify_result finish --reason "${REVIEW_FAILURE_REASON}" --exit-code "${code}")"; then
+    state=error
+    echo "ERROR: unable to finish the simplify result." >&2
+  fi
+  write_review_status "${state}"
+  printf 'simplify: %s; summary %s\n' "${state}" "${FINDINGS_FILE}"
   # Review failures let the phase continue. Stop signals retain their exit code.
   if [[ "${code}" -lt 128 ]]; then
     code=0
@@ -248,28 +264,23 @@ finish_simplify() {
 }
 
 if [[ "${TASK}" == direct.simplify ]]; then
-  trap 'finish_simplify $?' EXIT
-  mkdir -p "${SIMPLIFY_DIR}"
-  exec {SIMPLIFY_LOCK}>"${SIMPLIFY_DIR}/launch.lock"
+  review_error() { REVIEW_FAILURE_REASON="$*"; }
+  # Keep the report and status under one owner until its child exits.
+  exec {SIMPLIFY_LOCK}>"${ARTIFACT_DIR}/review_launch_simplify.lock"
   if ! flock -n "${SIMPLIFY_LOCK}"; then
-    review_error "the Claude lens is busy"
-    [[ -z "${UNIT_REVIEW_CACHE_FILE:-}" ]] || rm -f "${PROMPT_FILE}"
-    exit 1
-  fi
-  if [[ -n "${REVIEW_FAILURE_REASON}" ]]; then
-    review_error "${REVIEW_FAILURE_REASON}"
-    printf 'ERROR: %s\n' "${REVIEW_FAILURE_REASON}" > "${FINDINGS_FILE}"
-    exit 1
-  fi
-  if [[ -n "${UNIT_REVIEW_CACHE_FILE:-}" && -e "${UNIT_REVIEW_CACHE_FILE}" ]] && simplify_result reuse; then
-    [[ -z "${UNIT_REVIEW_CACHE_FILE:-}" ]] || rm -f "${PROMPT_FILE}"
-    trap - EXIT
+    printf 'simplify: error: the Claude lens is busy\n' >&2
     exit 0
   fi
-  if [[ -n "${UNIT_REVIEW_CACHE_FILE:-}" ]]; then
-    mv "${PROMPT_FILE}" "${SIMPLIFY_DIR}/prompt.md"
-    PROMPT_FILE="${SIMPLIFY_DIR}/prompt.md"
+  trap 'finish_simplify $?' EXIT
+  write_review_status preparing
+  PREPARE_CODE=0
+  PREPARE_RESULT="$(simplify_result prepare --diff "${SIMPLIFY_DIFF}" --cwd "${WORKING_DIR}" \
+    --source "${PROMPT_FILE}" --prompt-file "${ARTIFACT_DIR}/review_prompt_1_simplify.md" 2>&1)" || PREPARE_CODE=$?
+  if [[ "${PREPARE_CODE}" -ne 0 ]]; then
+    review_error "${PREPARE_RESULT}"
+    exit 1
   fi
+  PROMPT_FILE="${PREPARE_RESULT}"
 fi
 
 # Validate before worker allocation, compaction or any reviewer starts. UX has no
@@ -280,7 +291,7 @@ if [[ -f "${PROGRESS_STATE}" ]]; then
     --prompt-file "${PROMPT_FILE}" --lens "${LENS}" \
     ${PHASE_ID:+--phase-id "${PHASE_ID}"}; then
     echo "ERROR: unable to check the review launch." >&2
-    echo "error" > "${STATUS_FILE}"
+    write_review_status error
     exit 1
   fi
 fi
@@ -305,7 +316,7 @@ initialize_review_artifacts() {
     : > "${FINDINGS_FILE}"
     TURN_FINDINGS_READY=1
   fi
-  echo "reviewing" > "${STATUS_FILE}"
+  write_review_status reviewing
   printf '%s\n' "${TEAM_SLOT}" > "${SLOT_FILE}"
   # Only meaningful while an early launch is showing in the progress report,
   # and read there only if written after the review was armed.
@@ -553,7 +564,7 @@ finish_review_exit() {
   trap - EXIT
   set +e
   if [[ "${code}" -ne 0 && "${TURN_FINDINGS_READY}" -eq 1 ]]; then
-    echo error > "${STATUS_FILE}"
+    write_review_status error
   fi
   if [[ "${TASK}" == direct.simplify && "${PASS_STARTED}" -eq 1 ]]; then
     UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
@@ -565,7 +576,7 @@ finish_review_exit() {
   refresh_turn_thread_id
   if ! write_turn_record; then
     review_error "unable to write review turn record"
-    echo error > "${STATUS_FILE}"
+    write_review_status error
     code=1
   fi
 
@@ -638,15 +649,15 @@ if [[ -n "${STYLE_SINCE}" ]]; then
 fi
 
 # shellcheck source=/dev/null
-source "${SCRIPT_DIR}/../agents/agents_config.sh"
+source "${SCRIPT_DIR}/../agents/models_config.sh"
 if [[ "${TASK}" == direct.simplify && "$(_agents_live_family direct simplify)" != claude ]]; then
   review_error "direct.simplify requires a Claude assignment"
-  echo error > "${STATUS_FILE}"
+  write_review_status error
   exit 1
 fi
 if ! agents_resolve "${TASK}" 2>"${LOG_FILE}"; then
   if [[ -z "${REVIEW_WORKER}" ]]; then
-    echo "error" > "${STATUS_FILE}"
+    write_review_status error
   fi
   exit 1
 fi
@@ -658,9 +669,9 @@ fi
 # shellcheck disable=SC2153  # agents_resolve sets AGENT_MODEL.
 DURABLE_WORKER_MODEL="${AGENT_MODEL}"
 if [[ -n "${NEW_SLOT}" ]]; then
-  IMPLEMENTATION_PAIR="$(_agents_registry_get "direct.${AGENT_FAMILY}" implementation)"
+  IMPLEMENTATION_PAIR="$(_models_registry_get "direct.${AGENT_FAMILY}" implementation)"
   if [[ -z "${IMPLEMENTATION_PAIR}" ]]; then
-    IMPLEMENTATION_PAIR="$(_agents_registry_get "direct.${AGENT_FAMILY}" impl)"
+    IMPLEMENTATION_PAIR="$(_models_registry_get "direct.${AGENT_FAMILY}" impl)"
   fi
   if [[ -z "${IMPLEMENTATION_PAIR}" ]]; then
     echo "ERROR: cannot record review worker ${REVIEW_WORKER}: no implementation model is configured." >&2
@@ -673,7 +684,7 @@ TREE_BASELINE_READY=0
 TURN_IMAGE_ARGS=()
 
 if [[ -n "${REVIEW_WORKER}" ]]; then
-  CODEX_MESH="${UNIT_CODEX_MESH:-$(_agents_registry_get direct.options codex_mesh)}"
+  CODEX_MESH="${UNIT_CODEX_MESH:-$(_models_registry_get direct.options codex_mesh)}"
   if [[ "${AGENT_FAMILY}" != "codex" || "${CODEX_MESH}" != "1" ]]; then
     echo "ERROR: review worker ${REVIEW_WORKER} requires the Codex mesh." >&2
     exit 2
@@ -731,7 +742,7 @@ record_pass_start() {
 if [[ -z "${EARLY_READY_FILE}" ]]; then
   if ! record_pass_start; then
     echo "ERROR: unable to record the review pass start." >&2
-    echo "error" > "${STATUS_FILE}"
+    write_review_status error
     exit 1
   fi
 fi
@@ -848,7 +859,7 @@ if [[ -n "${EARLY_READY_FILE}" ]]; then
       wait "${AGENT_PID}" 2>/dev/null || true
       kill "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
       wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
-      echo "error" > "${STATUS_FILE}"
+      write_review_status error
       exit 1
     fi
   fi
@@ -883,8 +894,7 @@ if [[ "${TREE_BASELINE_READY}" -ne 0 ]]; then
 fi
 
 if [[ "${TASK}" == direct.simplify ]]; then
-  if ! REPORT_ERROR="$("$PY" "${SCRIPT_DIR}/simplify_result.py" check \
-    --report-file "${FINDINGS_FILE}" --log-file "${LOG_FILE}")"; then
+  if ! REPORT_ERROR="$(simplify_result check)"; then
     review_error "${REPORT_ERROR}"
     AGENT_CODE=1
   fi
@@ -903,16 +913,16 @@ if [[ "${AGENT_CODE}" -eq 0 && "${TREE_CHANGED}" -eq 0 ]]; then
   if [[ "${PASS_STARTED}" -eq 0 && -e "${EARLY_READY_FILE}" ]]; then
     if ! record_pass_start; then
       echo "ERROR: unable to record the review pass start." >&2
-      echo "error" > "${STATUS_FILE}"
+      write_review_status error
       exit 1
     fi
   fi
-  echo "reviewed" > "${STATUS_FILE}"
+  write_review_status reviewed
   if [[ -f "${PROGRESS_STATE}" && "${PASS_STARTED}" -eq 1 ]]; then
     if ! UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status completed; then
       echo "ERROR: unable to record the review pass completion." >&2
-      echo "error" > "${STATUS_FILE}"
+      write_review_status error
       exit 1
     fi
     PASS_STARTED=0
@@ -925,7 +935,7 @@ if [[ "${AGENT_CODE}" -eq 0 && "${TREE_CHANGED}" -eq 0 ]]; then
     if [[ ${#FAST_TRACK_COMMITS[@]} -gt 0 ]]; then
       if ! (cd "${WORKING_DIR}" && "$PY" "${FAST_TRACK_SCRIPT}" --mark-reviewed \
         --unit "${FAST_TRACK_UNIT}" --pass "${PHASE_ID}/${PASS_INDEX}/${LENS}" "${FAST_TRACK_COMMITS[@]}"); then
-        echo error > "${STATUS_FILE}"
+        write_review_status error
         echo "ERROR: unable to record the fast-track review completion." >&2
         exit 1
       fi
@@ -936,7 +946,7 @@ if [[ "${AGENT_CODE}" -eq 0 && "${TREE_CHANGED}" -eq 0 ]]; then
   board_post "done" \
     "launcher: ${LENS} review finished; findings in review_findings_${PASS_INDEX}${SUFFIX}.txt"
 else
-  echo "error" > "${STATUS_FILE}"
+  write_review_status error
   # An early reviewer that failed before its pass started recorded nothing;
   # there is no pass to close.
   if [[ -f "${PROGRESS_STATE}" && "${PASS_STARTED}" -eq 1 ]]; then

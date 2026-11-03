@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -59,6 +60,13 @@ class MeshRunsTests(unittest.TestCase):
                                                         "XDG_STATE_HOME": str(self.root / "state"),
                                                         "DESIGN_ROLES_STATE": str(self.root / "astra/design-roles"),
                                                         "BUILDLOG_SCOPE": "0"}))
+        config = self.root / "config"
+        config.mkdir()
+        _ = (config / "mesh_runs.conf").write_text(
+            (Path(__file__).resolve().parents[2] / "config/mesh_runs.conf").read_text())
+        _ = (config / "send.conf").write_text(
+            (Path(__file__).resolve().parents[2] / "config/send.conf").read_text())
+        self.stack.enter_context(patch.dict(os.environ, {"CONF_DIR": str(config)}))
         self.sent = []
         _ = self.stack.enter_context(patch.object(treekey, "tree_key", return_value="key-1"))
 
@@ -218,6 +226,33 @@ class MeshRunsTests(unittest.TestCase):
         self.update_record(path, cwd=os.getcwd(), tree_key="key-1", pid=pid)
         return path
 
+    def seat_runs(self, count: int) -> list[Path]:
+        """Create live supervisors for distinct runs for the fixture worker."""
+        source = self.record(["fixture", "run"])
+        template = source.read_text()
+        source.unlink()
+        paths: list[Path] = []
+        for index in range(count):
+            path = source.with_name(f"live-{index}.json")
+            _ = path.write_text(template)
+            guard = LauncherHangGuard("live-run limit fixture")
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()",
+                 "mesh_runs.py", "supervise", str(path)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            self.addCleanup(child.wait, timeout=guard.remaining())
+            self.addCleanup(child.kill)
+            assert child.stdin is not None and child.stdout is not None
+            self.addCleanup(child.stdin.close)
+            self.addCleanup(child.stdout.close)
+            self.assertTrue(select.select([child.stdout], [], [], guard.remaining())[0])
+            self.assertEqual(child.stdout.readline(), "ready\n")
+            self.update_record(path, run_id=f"live-{index}", label=f"check {index}",
+                               command=["fixture", str(index)], pid=child.pid,
+                               cwd=os.getcwd(), tree_key="key-1")
+            paths.append(path)
+        return paths
+
     def update_record(self, path: Path, **fields: object) -> None:
         record = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
         record.update(fields)
@@ -257,6 +292,213 @@ class MeshRunsTests(unittest.TestCase):
         self.assertEqual(record["command"], ["bash", "verify.sh", "check"])
         self.assertNotIn("port", record)
         self.assertIn("next message", output.getvalue())
+
+    def test_start_refuses_at_the_live_run_limit_without_a_record_or_supervisor(self) -> None:
+        paths = self.seat_runs(3)
+        before = {path: path.read_bytes() for path in paths}
+        with patch.object(subprocess, "Popen") as popen, \
+                contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            code = mesh_runs.main(["start", "--session-dir", str(self.session), "--to", WORKER,
+                                   "--label", "fourth check", "--", "new-check"])
+        self.assertEqual(code, 4)
+        popen.assert_not_called()
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(set(paths[0].parent.glob("*.json")), set(paths))
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
+        self.assertEqual(list(paths[0].parent.glob("*.log")), [])
+        self.assertIn("live-run limit 3", err.getvalue())
+        for index in range(3):
+            self.assertIn(f"live-{index}: check {index}", err.getvalue())
+        self.assertIn("next message", err.getvalue())
+        self.assertIn("more files in one run", err.getvalue())
+
+    def test_a_finished_run_frees_a_place_for_the_next_start(self) -> None:
+        paths = self.seat_runs(3)
+        self.update_record(paths[0], status="finished", exit_code=0)
+        popen, _ = self.start(["new-check"])
+        popen.assert_called_once()
+        self.assertEqual(len(list(paths[0].parent.glob("*.json"))), 4)
+
+    def test_a_gone_supervisor_holds_no_place_at_the_limit(self) -> None:
+        paths = self.seat_runs(3)
+        self.update_record(paths[0], pid=DEAD_PID)
+        popen, _ = self.start(["new-check"])
+        popen.assert_called_once()
+        self.assertEqual(json.loads(paths[0].read_text())["status"], "finished")
+
+    def test_a_live_twin_still_wins_at_the_live_run_limit(self) -> None:
+        paths = self.seat_runs(3)
+        popen, output = self.start(["fixture", "1"])
+        popen.assert_not_called()
+        self.assertIn("run live-1 is already running", output)
+        self.assertEqual(set(paths[0].parent.glob("*.json")), set(paths))
+
+    def test_start_reads_the_live_run_limit_from_config(self) -> None:
+        paths = self.seat_runs(1)
+        config = self.root / "config/mesh_runs.conf"
+        _ = config.write_text("# whole: 1..\nLIVE_RUN_LIMIT=1\n")
+        with patch.object(subprocess, "Popen") as popen, contextlib.redirect_stderr(io.StringIO()) as err:
+            code = mesh_runs.main(["start", "--session-dir", str(self.session), "--to", WORKER,
+                                   "--", "new-check"])
+        self.assertEqual(code, 4)
+        popen.assert_not_called()
+        self.assertIn("live-run limit 1", err.getvalue())
+        _ = config.write_text("# whole: 1..\nLIVE_RUN_LIMIT=2\n")
+        accepted, _ = self.start(["new-check"])
+        accepted.assert_called_once()
+        self.assertEqual(len(list(paths[0].parent.glob("*.json"))), 2)
+
+    def test_another_seat_does_not_use_this_seats_live_run_places(self) -> None:
+        paths = self.seat_runs(3)
+        popen, _ = self.start(["new-check"], to="unit-review")
+        popen.assert_called_once()
+        self.assertEqual(len(list(paths[0].parent.glob("*.json"))), 4)
+
+    def test_parallel_starts_cannot_exceed_one_configured_place(self) -> None:
+        _ = (self.root / "config/mesh_runs.conf").write_text("# whole: 1..\nLIVE_RUN_LIMIT=1\n")
+        runs = self.session / codex_mesh.DETACHED_RUNS_DIR
+        runs.mkdir()
+        script = """
+import sys
+from types import SimpleNamespace
+from unittest.mock import patch
+from scripts.agents import mesh_runs
+print('ready', flush=True)
+input()
+with (patch.object(mesh_runs, 'supervises', return_value=True),
+      patch.object(mesh_runs.treekey, 'tree_key', return_value='fixture-tree'),
+      patch.object(mesh_runs.subprocess, 'Popen', return_value=SimpleNamespace(pid=4321))):
+    code = mesh_runs.main(['start', '--session-dir', sys.argv[1], '--to', sys.argv[2],
+                           '--', 'check', sys.argv[3]])
+sys.exit(code)
+"""
+        guard = LauncherHangGuard("parallel detached starts")
+        with contextlib.ExitStack() as children, (runs / ".start.lock").open("a") as admission:
+            fcntl.flock(admission, fcntl.LOCK_EX)
+            processes = [children.enter_context(subprocess.Popen(
+                [sys.executable, "-c", script, str(self.session), WORKER, str(index)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+                for index in range(4)]
+            for child in processes:
+                assert child.stdin is not None and child.stdout is not None
+                self.assertTrue(select.select([child.stdout], [], [], guard.remaining())[0])
+                self.assertEqual(child.stdout.readline(), "ready\n")
+                _ = child.stdin.write("start\n")
+                child.stdin.flush()
+            fcntl.flock(admission, fcntl.LOCK_UN)
+            for child in processes:
+                _ = child.communicate(timeout=guard.remaining())
+        self.assertCountEqual([child.returncode for child in processes], [0, 4, 4, 4])
+        self.assertEqual(len(list(runs.glob("*.json"))), 1)
+
+    def test_start_and_reap_preserve_an_unpublished_record_under_the_start_lock(self) -> None:
+        _ = (self.root / "config/mesh_runs.conf").write_text("# whole: 1..\nLIVE_RUN_LIMIT=1\n")
+        script = """
+import fcntl
+import sys
+from types import SimpleNamespace
+from unittest.mock import patch
+from scripts.agents import mesh_runs
+flock = fcntl.flock
+def lock(fd, operation):
+    print('locking', flush=True)
+    return flock(fd, operation)
+with (patch.object(fcntl, 'flock', lock),
+      patch.object(mesh_runs, 'deliver', return_value='fixture'),
+      patch.object(mesh_runs.treekey, 'tree_key', return_value='key-1'),
+      patch.object(mesh_runs.subprocess, 'Popen', return_value=SimpleNamespace(pid=4321))):
+    args = [sys.argv[1], '--session-dir', sys.argv[2]]
+    if sys.argv[1] == 'start':
+        args += ['--to', sys.argv[3], '--', 'new-check']
+    code = mesh_runs.main(args)
+sys.exit(code)
+"""
+        for verb, expected in (("start", 4), ("reap", 0)):
+            with self.subTest(verb=verb):
+                path = self.live_run(["fixture", "publishing"])
+                supervisor = cast(int, json.loads(path.read_text())["pid"])
+                guard = LauncherHangGuard("reap during supervisor publication")
+                with contextlib.ExitStack() as children, (path.parent / ".start.lock").open("a") as admission:
+                    fcntl.flock(admission, fcntl.LOCK_EX)
+                    try:
+                        self.update_record(path, pid=0, started_at=time.time() - 600)
+                        unpublished = path.read_bytes()
+                        child = children.enter_context(subprocess.Popen(
+                            [sys.executable, "-c", script, verb, str(self.session), WORKER],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+                        assert child.stdout is not None
+                        self.assertTrue(select.select([child.stdout], [], [], guard.remaining())[0])
+                        self.assertEqual(child.stdout.readline(), "locking\n")
+                        self.assertEqual(path.read_bytes(), unpublished)
+                        self.update_record(path, pid=supervisor)
+                    finally:
+                        fcntl.flock(admission, fcntl.LOCK_UN)
+                    output, errors = child.communicate(timeout=guard.remaining())
+                self.assertEqual(child.returncode, expected, output + errors)
+                self.assertEqual(json.loads(path.read_text())["status"], "running")
+                self.assertEqual(list(path.parent.glob("*.json")), [path])
+
+    def test_a_supervisor_holds_a_place_when_start_exits_before_its_pid_write(self) -> None:
+        _ = (self.root / "config/mesh_runs.conf").write_text("# whole: 1..\nLIVE_RUN_LIMIT=1\n")
+        script = """
+import os
+import sys
+from unittest.mock import patch
+from scripts.agents import mesh_runs
+write_record = mesh_runs._write_record
+def publish(path, record):
+    if record['pid']:
+        os._exit(99)
+    write_record(path, record)
+with (patch.object(mesh_runs, '_write_record', publish),
+      patch.object(mesh_runs.treekey, 'tree_key', return_value='key-1')):
+    mesh_runs.main(sys.argv[1:])
+"""
+        command = """
+import socket
+import sys
+with socket.socket(socket.AF_UNIX) as connection:
+    connection.settimeout(float(sys.argv[2]))
+    connection.connect(sys.argv[1])
+    connection.sendall(b'ready')
+    connection.recv(1)
+sys.exit(1)
+"""
+        guard = LauncherHangGuard("supervisor publication after start exits")
+        address = str(self.root / "ready.sock")
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(address)
+            listener.listen()
+            listener.settimeout(guard.remaining())
+            started = subprocess.run(
+                [sys.executable, "-c", script, "start", "--session-dir", str(self.session), "--to", WORKER,
+                 "--done-message-file", str(self.root / "unused-done-message"), "--", sys.executable,
+                 "-c", command, address, str(guard.remaining())],
+                capture_output=True, text=True, timeout=guard.remaining(), check=False)
+            self.assertEqual(started.returncode, 99, started.stdout + started.stderr)
+            connection = listener.accept()[0]
+            with connection:
+                connection.settimeout(guard.remaining())
+                self.assertEqual(connection.recv(5), b"ready")
+                paths = list((self.session / codex_mesh.DETACHED_RUNS_DIR).glob("*.json"))
+                self.assertEqual(len(paths), 1)
+                record = cast(mesh_runs.RunRecord, json.loads(paths[0].read_text()))
+                self.assertGreater(record["pid"], 0)
+                self.assertTrue(mesh_runs.supervises(record["pid"], paths[0]))
+                supervisor = os.pidfd_open(record["pid"])
+                try:
+                    with patch.object(subprocess, "Popen") as popen, \
+                            contextlib.redirect_stderr(io.StringIO()) as errors:
+                        code = mesh_runs.main(["start", "--session-dir", str(self.session), "--to", WORKER,
+                                               "--", "another-check"])
+                    self.assertEqual(code, 4, errors.getvalue())
+                    popen.assert_not_called()
+                    self.assertEqual(list(paths[0].parent.glob("*.json")), paths)
+                    connection.sendall(b"x")
+                    self.assertTrue(select.select([supervisor], [], [], guard.remaining())[0])
+                finally:
+                    os.close(supervisor)
 
     # hana_catalyst-inspectors started one lint run three times after an interrupt (2026-10-21).
     def test_a_second_identical_start_names_the_live_run_and_starts_nothing(self) -> None:

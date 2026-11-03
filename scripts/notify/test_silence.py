@@ -73,6 +73,57 @@ class SilenceTests(unittest.TestCase):
             self.assertEqual(silence.off(self.runner, lambda _push: 1), 1)
         self.assertIn("1 kept push delivered; 1 failed", output.getvalue())
 
+    def test_manual_off_logs_an_automatic_end_before_releasing_pushes(self) -> None:
+        record: silence.SilenceRecord = {"since": "2026-11-03T06:00:00+00:00", "until": None,
+                                         "timer": None, "auto": True}
+        with silence.locked():
+            silence.write_state(record)
+        _ = silence.keep(PUSH, "Linux")
+        posted: list[silence.KeptPush] = []
+
+        def deliver(push: silence.KeptPush) -> int:
+            path = silence.state_dir() / "auto-silence-events.jsonl"
+            event = cast(dict[str, object], json.loads(path.read_text().splitlines()[0]))
+            self.assertEqual((event["event"], event["cause"], event["silence_id"]),
+                             ("end", "manual_off", record["since"]))
+            self.assertIsNone(silence.read_state())
+            posted.append(push)
+            return 0
+
+        with mock.patch.object(silence, "post_kept", side_effect=deliver):
+            _ = self.main("off")
+        self.assertEqual(posted, [PUSH])
+        self.assertEqual(silence.read_kept(), [])
+
+    def test_manual_off_keeps_automatic_silence_when_the_end_log_fails(self) -> None:
+        import auto_silence
+
+        record: silence.SilenceRecord = {"since": "2026-11-03T06:00:00+00:00", "until": None,
+                                         "timer": None, "auto": True}
+        with silence.locked():
+            silence.write_state(record)
+        _ = silence.keep(PUSH, "Linux")
+        state, kept = silence.state_file().read_bytes(), silence.kept_file().read_bytes()
+        with (mock.patch.object(auto_silence, "append_event", side_effect=OSError("disk full")),
+              mock.patch.object(silence, "post_kept") as deliver,
+              redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO())):
+            self.assertEqual(silence.main(["off"], self.runner, "Linux"), 1)
+        deliver.assert_not_called()
+        self.assertEqual(silence.state_file().read_bytes(), state)
+        self.assertEqual(silence.kept_file().read_bytes(), kept)
+
+    def test_manual_on_preserves_automatic_silence_when_its_end_log_fails(self) -> None:
+        import auto_silence
+
+        record: silence.SilenceRecord = {"since": "2026-11-03T06:00:00+00:00", "until": None,
+                                         "timer": None, "auto": True}
+        with silence.locked():
+            silence.write_state(record)
+        with (mock.patch.object(auto_silence, "append_event", side_effect=OSError("disk full")),
+              redirect_stderr(io.StringIO())):
+            self.assertEqual(silence.on(None, self.runner), 1)
+        self.assertEqual(silence.read_state(), record)
+
     def test_off_retries_failed_and_interrupted_posts_without_reposting_delivered_pushes(self) -> None:
         for interrupted in (False, True):
             with self.subTest(interrupted=interrupted):

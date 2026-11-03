@@ -15,6 +15,10 @@ import unittest
 from pathlib import Path
 from typing import Protocol, cast, override
 
+from scripts.production import change_review
+from scripts.hooks import checkpoint_gate
+from unittest import mock
+
 from scripts.direct.test_assertion_guard import GitRepositoryFixture, MergeInProgressFixture
 
 HOOK = Path(__file__).with_name("pre-tool-use-change-review-gate.py")
@@ -70,6 +74,55 @@ class RefusalTest(unittest.TestCase):
                         f"git -C {self.repo} commit -F {message}"):
             self.assertIn("no Change-Review line", self.refused(command), command)
 
+    def test_merge_messages_use_one_rule_for_all_subjects_and_trailers(self) -> None:
+        message_file = self.repo / "merge-message"
+        for subject in ("checkpoint(u): merge", "Merge topic"):
+            for trailer in (SEE, change_review.COVERS + ": not-a-hash"):
+                message = subject + "\n\n" + trailer
+                _ = message_file.write_text(message)
+                for form in ("-m " + shlex.quote(message), "--no-ff -m " + shlex.quote(message),
+                             "-F " + shlex.quote(str(message_file)), "--no-commit -m " + shlex.quote(message)):
+                    with self.subTest(subject=subject, form=form):
+                        self.assertEqual(self.refused("git merge topic " + form),
+                                         change_review.merge_review_problem(message, is_merge=True))
+        self.assertEqual(self.refused("git merge --squash topic -m " + shlex.quote(SEE)), "")
+        self.assertEqual(self.refused("git merge topic -m 'Merge topic'"), "")
+
+    def test_merge_with_a_none_line_passes(self) -> None:
+        self.assertEqual(self.refused('git merge -m "checkpoint(x): merge" '
+                                     + '-m "Change-Review: none — merge only" topic'), "")
+
+    def test_message_words_do_not_become_options_and_parser_errors_refuse(self) -> None:
+        self.assertIn("Merge commits cannot carry", self.refused("git merge topic -m '--squash' -m " + shlex.quote(SEE)))
+        self.assertEqual(self.refused("git commit -m 'fix: --amend'"), "")
+        self.assertIn("shell expansion", self.refused('git merge topic -m "checkpoint(u): merge" -m "' + SEE + '"'))
+        with mock.patch.object(checkpoint_gate, "git_flags", side_effect=ValueError("broken parser")):
+            self.assertIn("broken parser", self.refused("git commit -m 'checkpoint(u): grid'"))
+        self.assertEqual(self.refused('git commit -m "$MESSAGE"'), "")
+        self.assertIn(checkpoint_gate.OWN_CALL_FIX, self.refused("git add . && git commit -m 'checkpoint(u): grid'"))
+
+    def test_ordinary_chained_and_unreadable_commits_pass_without_cargo(self) -> None:
+        for command in ("git status && git commit -m 'fix: repair'", "git commit",
+                        'git commit -m "$MSG"', "echo $'it\\'s'", "git commit -F - <<'EOF'",
+                        "git commit --fixup -a", "git commit -t message", "git status && git merge topic"):
+            with self.subTest(command=command):
+                self.assertEqual(self.refused(command), "")
+        for flag in ("--abort", "--quit"):
+            self.assertEqual(self.refused("git status && GIT_DIR=other git merge " + flag), "")
+        _ = (self.repo / "Cargo.toml").write_text("[package]\n")
+        self.assertIn("shell expansion", self.refused('git commit -m "$MSG"'))
+        self.assertIn("no Change-Review line", self.refused("git commit -m 'checkpoint(u) grid'"))
+
+    def test_one_quoted_stdin_heredoc_reads_all_file_forms(self) -> None:
+        message = "checkpoint(u): grid\n\nChange-Review: none — scripts only"
+        for option in ("-F -", "--file -", "-F-", "-aF -"):
+            for delimiter in ("<<'EOF'", '<<"EOF"', "<<-'EOF'"):
+                with self.subTest(option=option, delimiter=delimiter):
+                    self.assertEqual(self.refused("git commit " + option + " " + delimiter
+                                                  + "\n" + message + "\nEOF"), "")
+        command = "git merge topic -m \"$(cat <<'EOF'\nMerge topic\n\n" + SEE + "\nEOF\n)\""
+        self.assertEqual(self.refused(command), change_review.merge_review_problem("Merge topic\n" + SEE, is_merge=True))
+
     def test_a_malformed_line_is_refused(self) -> None:
         self.stage("a.py")
         self.assertIn(FORM, self.refused('git commit -m "checkpoint(u): grid" -m "Change-Review: the grid"'))
@@ -86,9 +139,46 @@ class RefusalTest(unittest.TestCase):
 
     def test_a_checkpoint_with_a_line_passes(self) -> None:
         self.stage("a.py")
-        for command in (f'git commit -m "checkpoint(u): grid" -m "{SEE}"',
+        for command in ('git commit -m "checkpoint(u): grid" -m ' + shlex.quote(SEE),
                         "git commit -F - <<'EOF'\ncheckpoint(u): grid\n\nChange-Review: none — scripts only\nEOF"):
             self.assertEqual(self.refused(command), "", command)
+
+    def test_help_passes_each_invocation_without_reading_the_repository(self) -> None:
+        for cargo in (False, True):
+            if cargo:
+                _ = (self.repo / "Cargo.toml").write_text("[package]\n")
+            for merging in (False, True):
+                if merging:
+                    _ = (self.repo / ".git/MERGE_HEAD").write_text("unknown\n")
+                for subcommand in ("commit", "merge"):
+                    for option in ("-h", "--help"):
+                        with self.subTest(cargo=cargo, merging=merging, subcommand=subcommand, option=option):
+                            with mock.patch.object(checkpoint_gate, "commit_directory", side_effect=AssertionError("read repository")):
+                                self.assertEqual(self.refused("git " + subcommand + " " + option), "")
+                if merging:
+                    (self.repo / ".git/MERGE_HEAD").unlink()
+        self.stage("a.py")
+        self.assertEqual(checkpoint_gate.OWN_CALL_FIX, self.refused("git commit -h; git commit -m 'checkpoint(u): grid'"))
+        self.assertIn("Merge commits cannot carry", self.refused("git merge -m '-h' -m " + shlex.quote(SEE)))
+
+    def test_trailers_do_not_replace_checkpoint_amend_or_reuse_messages(self) -> None:
+        self.stage("a.py")
+        self.git("commit", "-qm", "checkpoint(u): grid")
+        for option in ("--trailer ", "--trailer="):
+            for trailer in (SEE, "Change-Review=Visible | Try | See", "Reviewed-by: Person", "Change-Review: none — tests"):
+                argument = option + shlex.quote(trailer)
+                for message in ("-m 'checkpoint(u): grid'", "--amend", "-C HEAD", "--reuse-message=HEAD"):
+                    for arguments in (argument + " " + message, message + " " + argument):
+                        with self.subTest(arguments=arguments):
+                            self.assertEqual(self.refused("git commit " + arguments), checkpoint_gate.TRAILER_FIX)
+        self.assertEqual(checkpoint_gate.commit_message("--amend --trailer 'Reviewed-by: Person'", self.repo, True),
+                         checkpoint_gate.ReadableCommitMessage("checkpoint(u): grid"))
+        self.assertEqual(self.refused("git commit -m 'fix: ordinary' --trailer 'Reviewed-by: Person'"), "")
+        for command in ("git commit -m '$MSG'", 'git commit -m "$MSG"', "git commit -F missing", "git commit --amend"):
+            self.assertEqual(self.refused("git status && " + command + " --trailer 'Reviewed-by: Person'"), checkpoint_gate.TRAILER_FIX)
+        for command in ("git merge topic", "git merge --squash topic"):
+            self.assertEqual(self.refused(command + " --trailer 'Reviewed-by: Person'"), checkpoint_gate.TRAILER_FIX)
+        self.assertEqual(self.refused("git -C missing commit -m 'fix: ordinary' --trailer 'Reviewed-by: Person'"), checkpoint_gate.TRAILER_FIX)
 
     def test_a_markdown_only_checkpoint_and_other_subjects_pass(self) -> None:
         self.stage("notes.md")
@@ -204,6 +294,45 @@ class MergeCommitAgreementTests(MergeInProgressFixture):
         _ = self.git("add", "test_merge.py")
         message = "checkpoint(unit): merge incoming\n\nChange-Review: none — tests only\n"
         assert_commit_answers_match(self, message, bases=("HEAD", "MERGE_HEAD"), expected_status=1)
+
+    def test_pending_merge_refuses_covers_and_plain_commit_accepts_the_same_lines(self) -> None:
+        message = "checkpoint(unit): merge incoming\n\n" + SEE + "\n" + change_review.COVERS + ": bad-hash"
+        command = "git commit -m " + shlex.quote(message)
+        self.assertEqual(gate.refusal(command, self.repo),
+                         change_review.merge_review_problem(message, is_merge=True))
+        _ = self.git("commit", "-qm", "Merge incoming")
+        self.assertEqual(gate.refusal(command, self.repo), "")
+        self.assertEqual(gate.refusal("git commit --amend -m " + shlex.quote(message), self.repo),
+                         change_review.merge_review_problem(message, is_merge=True))
+
+    def test_pending_merge_reads_both_trailer_forms(self) -> None:
+        for trailer in (SEE, change_review.COVERS + ": bad-hash", "Reviewed-by=Person", "Change-Review=Visible | Try | See"):
+            for option in ("--trailer ", "--trailer="):
+                with self.subTest(trailer=trailer, option=option):
+                    command = "git commit -m 'Merge incoming' " + option + shlex.quote(trailer)
+                    self.assertEqual(gate.refusal(command, self.repo), checkpoint_gate.TRAILER_FIX)
+        _ = self.git("commit", "-qm", "Merge incoming")
+        for option in ("--trailer ", "--trailer="):
+            self.assertEqual(gate.refusal("git commit -m 'checkpoint(unit): grid' "
+                                         + option + shlex.quote(SEE), self.repo), checkpoint_gate.TRAILER_FIX)
+            self.assertEqual(gate.refusal("git commit --amend -m 'fix: merge' "
+                                         + option + "'Reviewed-by: Person'", self.repo), checkpoint_gate.TRAILER_FIX)
+
+    def test_linked_worktree_uses_its_pending_merge_file(self) -> None:
+        linked = self.root / "linked"
+        _ = self.git("worktree", "add", "--detach", str(linked), "HEAD")
+        _ = self.git("-C", str(linked), "merge", "--no-ff", "--no-commit", "incoming")
+        self.assertTrue((linked / ".git").is_file())
+        message = change_review.COVERS + ": malformed"
+        self.assertEqual(gate.refusal("git commit -m " + shlex.quote(message), linked),
+                         change_review.merge_review_problem(message, is_merge=True))
+
+    def test_merge_continue_reads_the_saved_message(self) -> None:
+        _ = (self.repo / ".git/MERGE_MSG").write_text(SEE + "\n")
+        self.assertEqual(gate.refusal("git merge --continue", self.repo),
+                         change_review.merge_review_problem(SEE, is_merge=True))
+        for option in ("--abort", "--quit"):
+            self.assertEqual(gate.refusal("git merge " + option, self.repo), "")
 
 
 class HookTest(unittest.TestCase):

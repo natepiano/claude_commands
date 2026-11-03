@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Read live key=value configuration and recover the newest valid committed value."""
+"""Read live configuration, complete missing default values, and recover invalid values from Git."""
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 import math
 import os
@@ -11,7 +13,43 @@ import re
 import socket
 import subprocess
 import sys
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
+
+
+if TYPE_CHECKING:
+    from decimal import Decimal
+
+
+_warning_sink: ContextVar[Callable[[str], None] | None] = ContextVar("configuration_warning_sink", default=None)
+
+
+def _print_warning(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
+def _warning(message: str) -> None:
+    sink = _warning_sink.get()
+    if sink is None:
+        _print_warning(message)
+    else:
+        sink(message)
+
+
+@contextmanager
+def diagnostics(*, report: bool = True) -> Generator[list[str]]:
+    """Collect reader warnings for a reply, with optional local output."""
+    messages: list[str] = []
+
+    def collect(message: str) -> None:
+        messages.append(message)
+        if report:
+            _print_warning(message)
+
+    token = _warning_sink.set(collect)
+    try:
+        yield messages
+    finally:
+        _warning_sink.reset(token)
 
 
 class Unusable(ValueError):
@@ -44,21 +82,123 @@ class UnavailableValue:
     reason: str
 
 
-def value_origin(file: str | Path, key: str, convert: Callable[[str], Result]
+class _MissingKey(ValueError):
+    """The file has no effective entry for the requested key."""
+
+
+@dataclass(frozen=True)
+class _UnreadableFile:
+    reason: str
+    missing: bool
+
+
+@dataclass(frozen=True)
+class ConfigRead:
+    """Keep one live file read for the settings used in one pass."""
+
+    file: str | Path
+    source: Path
+    settings: dict[str, Setting] | _UnreadableFile
+    repository_allowed: bool
+
+    def _resolve(self, key: str, convert: Callable[[str], Result], *, warn: bool
                  ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
-    """Expose live validation without granting recovered values the same guarantee."""
+        bad = "<missing>"
+        repository_allowed = False
+        try:
+            if isinstance(self.settings, _UnreadableFile):
+                repository_allowed = self.settings.missing
+                raise ValueError(self.settings.reason)
+            setting = _setting(self.settings, key)
+            bad = setting.value
+            return UsableLiveValue(_converted(setting, convert))
+        except (OSError, UnicodeError, ValueError, ArithmeticError) as error:
+            repository_allowed = repository_allowed or isinstance(error, _MissingKey)
+            reason = f"{self.source}: {key}={bad!r}: {error}"
+        if repository_allowed and self.repository_allowed and isinstance(self.file, str):
+            repository = _repository_path(self.file)
+            if repository != self.source:
+                try:
+                    setting = _setting(_parse(repository.read_text(encoding="utf-8")), key)
+                    return RecoveredValue(_converted(setting, convert), reason)
+                except (OSError, UnicodeError, ValueError, ArithmeticError):
+                    pass
+        for committed in _committed_files(self.source):
+            try:
+                value = _converted(_setting(_parse(committed), key), convert)
+            except (ValueError, ArithmeticError):
+                continue
+            if warn:
+                _warning(f"warning: {reason}")
+            return RecoveredValue(value, reason)
+        if warn:
+            _warning(f"warning: {reason}")
+        return UnavailableValue(reason)
+
+    def origin(self, key: str, convert: Callable[[str], Result]
+               ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
+        """Distinguish live values from recovered values without a warning."""
+        return self._resolve(key, convert, warn=False)
+
+    def _value(self, key: str, convert: Callable[[str], Result]) -> Result:
+        result = self._resolve(key, convert, warn=True)
+        if isinstance(result, UnavailableValue):
+            raise Unusable(f"{result.reason}; no usable committed value")
+        return result.value
+
+    def text(self, key: str) -> str:
+        return self._value(key, str)
+
+    def number(self, key: str) -> float:
+        return self._value(key, _number)
+
+    def whole(self, key: str) -> int:
+        return self._value(key, _whole)
+
+    def words(self, key: str) -> tuple[str, ...]:
+        return self._value(key, lambda value: tuple(value.split()))
+
+    def values(self) -> dict[str, str]:
+        """Return the map, including empty entries that have no limits."""
+        keys = self.settings
+        if isinstance(keys, _UnreadableFile):
+            fault = keys
+            keys = self._recover_file(fault)
+        result: dict[str, str] = {}
+        for key in keys:
+            setting = _setting(keys, key)
+            if not setting.value and not setting.limit.startswith(("# whole:", "# range:", "# one of:")):
+                result[key] = setting.value
+                continue
+            try:
+                _limits(setting)
+                result[key] = setting.value
+            except ValueError:
+                result[key] = self.text(key)
+        return result
+
+    def _recover_file(self, fault: _UnreadableFile) -> dict[str, Setting]:
+        if fault.missing and self.repository_allowed and isinstance(self.file, str):
+            try:
+                return _parse(_repository_path(self.file).read_text(encoding="utf-8"))
+            except (OSError, UnicodeError):
+                pass
+        for contents in _committed_files(self.source):
+            _warning(f"warning: {self.source}: keys: {fault.reason}")
+            return _parse(contents)
+        _warning(f"warning: {self.source}: keys: {fault.reason}")
+        raise Unusable(f"{self.source}: keys: {fault.reason}; no usable committed file")
+
+
+def read(file: str | Path) -> ConfigRead:
+    """Read and parse the live file once; resolve faults when a setting is used."""
     source = path(file)
     try:
-        setting = _setting(_parse(source.read_text(encoding="utf-8")), key)
-        return UsableLiveValue(_converted(setting, convert))
-    except (OSError, UnicodeError, ValueError, ArithmeticError) as error:
-        reason = f"{source}: {key}: {error}"
-    for committed in _committed_files(source):
-        try:
-            return RecoveredValue(_converted(_setting(_parse(committed), key), convert), reason)
-        except (ValueError, ArithmeticError):
-            continue
-    return UnavailableValue(reason)
+        settings = _parse(source.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError) as error:
+        return ConfigRead(file, source, _UnreadableFile(str(error), isinstance(error, FileNotFoundError)),
+                          "CONF_DIR" not in os.environ)
+    return ConfigRead(file, source, settings, "CONF_DIR" not in os.environ)
 
 
 def directory() -> Path:
@@ -72,6 +212,11 @@ def path(file: str | Path) -> Path:
     if not file or Path(file).name != file or file.endswith(".conf"):
         raise Unusable(f"{file}: file: expected a configuration stem")
     return directory() / f"{file}.conf"
+
+
+def _repository_path(stem: str) -> Path:
+    """Return the repository configuration file for a validated stem."""
+    return Path(__file__).resolve().parents[2] / "config" / f"{stem}.conf"
 
 
 def _parse(source: str) -> dict[str, Setting]:
@@ -92,7 +237,7 @@ def _setting(settings: dict[str, Setting], key: str) -> Setting:
     for candidate in (f"{key}.{host}", key):
         if candidate in settings:
             return settings[candidate]
-    raise ValueError("key is missing")
+    raise _MissingKey("key is missing")
 
 
 def _limits(setting: Setting) -> None:
@@ -108,18 +253,27 @@ def _limits(setting: Setting) -> None:
         bounds = limit.removeprefix(form).strip().split("..")
         if len(bounds) != 2:
             raise ValueError(f"invalid limit {limit}")
-        convert = _whole if form == "# whole:" else _number
+        convert = _whole if form == "# whole:" else decimal
         value = convert(setting.value)
         low, high = (bound.strip() for bound in bounds)
         if (low and value < convert(low)) or (high and value > convert(high)):
             raise ValueError(f"outside range {low}..{high}")
 
 
-def _number(value: str) -> float:
-    result = float(value)
-    if not math.isfinite(result):
+def decimal(value: str) -> Decimal:
+    from decimal import Decimal, InvalidOperation
+
+    try:
+        result = Decimal(value)
+    except InvalidOperation as error:
+        raise ValueError("expected a finite number") from error
+    if not result.is_finite() or not math.isfinite(float(result)):
         raise ValueError("expected a finite number")
     return result
+
+
+def _number(value: str) -> float:
+    return float(decimal(value))
 
 
 def _whole(value: str) -> int:
@@ -158,66 +312,6 @@ def _converted(setting: Setting, convert: Callable[[str], Result]) -> Result:
         raise ValueError("expected a # range: limit")
     result = convert(setting.value)
     _limits(setting)
-    return result
-
-
-def _read(file: str | Path, key: str, convert: Callable[[str], Result]) -> Result:
-    source = path(file)
-    bad = "<missing>"
-    try:
-        setting = _setting(_parse(source.read_text(encoding="utf-8")), key)
-        bad = setting.value
-        return _converted(setting, convert)
-    except (OSError, UnicodeError, ValueError) as error:
-        reason = str(error)
-    print(f"warning: {source}: {key}={bad!r}: {reason}", file=sys.stderr)
-    for committed in _committed_files(source):
-        try:
-            return _converted(_setting(_parse(committed), key), convert)
-        except ValueError:
-            continue
-    raise Unusable(f"{source}: {key}={bad!r}: {reason}; no usable committed value")
-
-
-def text(file: str | Path, key: str) -> str:
-    return _read(file, key, str)
-
-
-def number(file: str | Path, key: str) -> float:
-    return _read(file, key, _number)
-
-
-def whole(file: str | Path, key: str) -> int:
-    return _read(file, key, _whole)
-
-
-def words(file: str | Path, key: str) -> tuple[str, ...]:
-    return _read(file, key, lambda value: tuple(value.split()))
-
-
-def values(file: str | Path) -> dict[str, str]:
-    """Read a variable-key map; explicit empty entries without limits remain optional."""
-    source = path(file)
-    try:
-        contents = source.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as error:
-        print(f"warning: {source}: keys: {error}", file=sys.stderr)
-        for contents in _committed_files(source):
-            break
-        else:
-            raise Unusable(f"{source}: keys: {error}; no usable committed file") from error
-    keys = _parse(contents)
-    result: dict[str, str] = {}
-    for key in keys:
-        setting = _setting(keys, key)
-        if not setting.value and not setting.limit.startswith(("# whole:", "# range:", "# one of:")):
-            result[key] = setting.value
-            continue
-        try:
-            _limits(setting)
-            result[key] = setting.value
-        except ValueError:
-            result[key] = text(file, key)
     return result
 
 
@@ -265,7 +359,7 @@ def main(arguments: list[str] | None = None) -> int:
         print("usage: conf.py get FILE KEY", file=sys.stderr)
         return 2
     try:
-        print(text(args[1], args[2]))
+        print(read(args[1]).text(args[2]))
     except Unusable as error:
         print(str(error), file=sys.stderr)
         return 2

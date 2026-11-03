@@ -4,7 +4,7 @@
 
 ## What it is
 
-One roster lists every session of interest on natedev and the Mac: Claude showrunners, unit directors, workers and freestanding sessions; Codex workers with their unit director and showrunner; and the user's own Codex windows across account daemons. `scripts/message/roster.py` only lists. The existing senders take their recipients from it: `send.py` reaches any one listed session by address or unique name, on either machine, and `broadcast.py` reaches groups (showrunners, unit directors, workers, a unit's workers, agents, top-level sessions, everyone) on both machines. Each kind of session lists its own kind natively where it can and uses the roster for the rest; the instruction texts say which tool to use. Every message to the user passes one gate, `scripts/notify/pushover.py`, which refuses a message that neither states the user's action (`--action`) nor says none is needed (`--no-action`). A headless reviewer then checks each push for clarity before it is posted (`docs/as-built/message-clarity.md`). Shutdown tests run under a guard that fails a test, instead of sending, when it reaches a real send.
+One roster lists every session of interest on natedev and the Mac: Claude showrunners, unit directors, workers and freestanding sessions; Codex workers with their unit director and showrunner; and the user's own Codex windows across account daemons. `scripts/message/roster.py` only lists. `send.py` selects identity from staff and checks transport through the roster. It reaches a staff member on either machine, and `broadcast.py` reaches groups (showrunners, unit directors, workers, a unit's workers, agents, top-level sessions, everyone) on both machines. Each kind of session lists its own kind natively where it can and uses the roster for the rest; the instruction texts say which tool to use. Every message to the user passes one gate, `scripts/notify/pushover.py`, which refuses a message that neither states the user's action (`--action`) nor says none is needed (`--no-action`). A headless reviewer then checks each push for clarity before it is posted (`docs/as-built/message-clarity.md`). Shutdown tests run under a guard that fails a test, instead of sending, when it reaches a real send.
 
 ### Data flow
 
@@ -87,7 +87,7 @@ Codex rows:
 
 - `UnitLabels(session, showrunner="—", unit="—")` is frozen, and each field is whitespace-collapsed. Showrunner is the production slug and unit is the unit id without its `-unit` suffix, read through `_production_of` and `_unit_of`, the same helpers `shown_name` uses through `_production(entry)` and `_unit(entry)`; `_short_unit` is the one place that strips `-unit`. A production with no running showrunner still names its slug. These are the short names herdr shows (production `builds`, unit `report-unit` gives `builds`, `report`), never a session name. `—` marks a missing part.
 - `unit_labels(entries) -> dict[str, UnitLabels]` keys a full roster's entries by Claude session id and Codex thread id. `/build:queue` uses it (`docs/as-built/build-memory-admission.md`, "Queue API").
-- `unit_labels_for(session_ids, environment) -> dict[str, UnitLabels]` is the fast path for known Claude session ids. It reads the session records, the showrunner registry through `showrunners.registered_showrunners(known_sessions=...)`, and unit marks through `session_staff.session_staff_and_directors(records, environment)`, which reads only each record's `/proc/<pid>/environ` (`HERDR_PROC` replaces `/proc`). It never reads the process table, Codex meshes or accounts. A session whose `CLAUDE_CODE_SESSION_ID` names another known session resolves under that director and takes its production and unit. Unknown ids are left out, and any error returns `{}`. `/build:status` uses it (`docs/as-built/build-targets.md`).
+- `unit_labels_for(session_ids, environment) -> dict[str, UnitLabels]` is the fast path for known Claude session ids. It reads the session records, the showrunner registry through `showrunners.registered_showrunners(known_sessions=...)`, and session labels through `session_staff.session_staff_and_directors(records, environment)`, which reads only each record's `/proc/<pid>/environ` (`HERDR_PROC` replaces `/proc`). It never reads the process table, Codex meshes or accounts. A session whose `CLAUDE_CODE_SESSION_ID` names another known session resolves under that director and takes its production and unit. Unknown ids are left out, and any error returns `{}`. `/build:status` uses it (`docs/as-built/build-targets.md`).
 - Both paths group marks through `session_staff.group_marked_units`, the one slug-rename and duplicate-mark rule; a test pins that both paths give the same labels.
 - Sessions with a given name such as `organon` still join their staff unit through cwd equal to its present local `worktree.path`. `pane_launch.RecordedLabels` and the host-unavailable fallback in `unit_labels.production_places` use `StaffLabels.environment`, the same identity → timer target → exact folder → normalized name order as the status line. A folder is never inferred from the session name or a production Units table.
 - `UnitLabels.folder_name() -> str` names the copies folder `/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`: showrunner `hana`, unit `lfo` gives `hana-lfo`. A unit name equal to the showrunner name, or one that starts with the showrunner name and `-`, is the folder name alone (`cargo-liner-style` + `cargo-liner-style-types` gives `cargo-liner-style-types`). The prefix rule needs the hyphen: `hana` + `hanami` gives `hana-hanami`. A `—` part is left out with its hyphen (`builds`, `lfo`); with both parts `—` the session name is the folder name. A caller looks up labels with `unit_labels_for([<session id from build_hold.owning_session()>], environment)`, so a Codex worker resolves to its unit director. No caller uses `folder_name` yet.
@@ -103,7 +103,7 @@ Codex rows:
 - **`--snapshot`** (hidden from `--help`) prints `RosterSnapshot`: tagged JSON that decodes back into the same variants, used only between machines.
 - **Problems** go to stderr as `could not read: <source>: <detail>`; the other machine's are prefixed with its host; an unreachable machine, timeout or undecodable snapshot is `<host>: not reached: <why>`. A decodable snapshot is used whatever the remote exit status. Exit 0 clean, 1 with any problem.
 
-Durable-role warnings print once on stderr with `warning:`. JSON and snapshots carry an optional `warnings` list; older snapshots without it have no warnings. Warnings alone leave exit status 0. `send.py` prints them once and continues local, peer and relay name resolution; they do not trigger the incomplete-roster refusal. `top_level.py` and `broadcast.py` display the same diagnostics while retaining readable recipients.
+Durable-role warnings print once on stderr with `warning:`. JSON and snapshots carry an optional `warnings` list; older snapshots without it have no warnings. Warnings alone leave exit status 0. `send.py` prints them once and continues transport resolution; they do not trigger the incomplete-roster refusal. `top_level.py` and `broadcast.py` display the same diagnostics while retaining readable recipients.
 
 ### `send.py`: one recipient
 
@@ -112,35 +112,32 @@ send.py --to NAME|uds:<path>|session:<id>|worker:<run>/<worker>|codex:<thread>
         [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
         [--here | --machine HOST] [--codex --session-dir DIR] [--timeout SECONDS]
         (--text TEXT | --file PATH | stdin)
-send.py --to user --summary TITLE [--need note|decision|blocked] (--action TEXT | --no-action) ...
+send.py --to user --text-id ID --value KEY=VALUE ...
 send.py ack KEY | reopen KEY | pending [NAME] | retire --to ADDRESS --from SENDER --key KEY
 send.py drain-sockets
 ```
 
 The argparse boundary builds `RecipientSelection = RosterLookup(to) | MeshWorker(session_dir, worker)` and `RecipientResolutionScope = LocalOnly | LocalThenPeer | NamedMachine(host)`: `--here` is `LocalOnly`, `--machine HOST` is `NamedMachine`, neither is `LocalThenPeer`; the two together are a usage error. `Options.action: MessageUserAction = UserAction | NoUserRecipient`.
 
-Routes (`resolve_recipient(to: str, scope: RecipientResolutionScope, observed: roster.Roster) -> DeliveryRoute`). `observed` holds the roster already read for this send:
+`send.py` reads one `staff.snapshot()` for each session send. `resolve_staff_recipient` selects each staff recipient.
+A typed name first matches a staff path or short name. Unit names accept both `resources` and `resources-unit`.
+One staff row selects its `current_session`. Several staff rows produce a named ambiguity error and no delivery.
+The repeat-notice owner follows staff parents to the showrunner. It uses the default owner for a non-staff sender.
 
-| `--to` | Route |
-|---|---|
-| `user` | `pushover.py` here; under `--machine`, `send.py --here --to user ...` there |
-| `uds:<path>` | Claude delivery on this machine, even with `--machine`; a missing relay socket or a delivery connect returning `ENOENT` or `ECONNREFUSED` resolves its saved sender name to a live session, else `FAILED` (exit 3); postmaster first when registered and available, else relay |
-| any form, `--machine HOST` | `ssh HOST send.py --here ...` with no local roster read |
-| `session:<id>` | Claude delivery; resolved to the live session's `uds:` socket first; postmaster first when available, else relay; no live session → `QUEUED` |
-| `worker:<run>/<worker>` | that row's `codex_mesh.py send --session-dir <run dir> --to <worker>` |
-| `codex:<thread>` | the loaded roster row carries its account daemon; `codex_daemon.queue(daemon, thread_id, text, timeout)` calls `thread/queue/add` on that socket. An unloaded thread fails (exit 3), naming the homes checked; multiple owners are ambiguous (exit 2), listing their accounts |
-| bare name | roster rows whose names are equal after `str.casefold()`; one `Messageable` sends by its address |
-| `--codex --session-dir DIR` | `MeshWorker`: `codex_mesh.py send` directly, no roster read |
+A non-staff name uses a unique live roster session. Lookup checks this machine before the peer.
+A name without a staff row or live session prints `send.py: no staff row or live session for 'x'`.
+That refusal exits 2. It creates no relay or queue.
 
-Resolution for `session:`, `worker:`, `codex:` and bare names reads this machine's roster once (problems print as `send.py: roster: <problem>`). Address forms match `Messageable` addresses exactly; names match any row without regard to letter case, with no preference for an exact-case match. `send.py` imports `roster` only on that path, so acknowledgements (`ack`, `reopen`, `pending`, `retire`), `uds:` sockets and `--machine` sends start without it.
+Explicit `uds:`, `session:`, `codex:`, and `worker:` addresses also select a matching staff row's `current_session`.
+Worker lookup uses the native ID from the local or peer roster. The roster and registry supply transport for the current session.
+A staff member's old live socket cannot override its current session.
+Explicit non-staff addresses keep their transport, peer lookup, and queue behavior.
+`uds:` stays on this machine. `--machine HOST` forwards the selected address.
+`--codex --session-dir DIR --to SLOT` selects a run-scoped worker slot without staff lookup.
 
-`post-tool-use-sendmessage-miss.py` runs after SendMessage. Only a failed "No agent named … is reachable" result for a name reads the roster. The hook and send.py share `matching_recipients(to, scope, observed)`: casefold matches here first, then on the peer after a proven local miss. The hook adds context with each matching session's kind, account, machine and address, plus the send.py command to run with the sandbox off. Multiple matches require one listed address; a clean miss or roster error is stated. The hook never sends or blocks; successes, socket addresses and other failures do not read the roster.
+The SendMessage-miss hook uses the same resolver and snapshot. It reports the matching transport and a send command.
+The hook never sends a message. Successes, socket misses, and unrelated failures do not read the roster.
 
-- A match here sends here; the other machine is not asked.
-- Several matching rows: exit 2, `<name> matches <N> sessions:` with each address (or its `cannot take messages` reason) and role; Codex daemon rows also name their account and home.
-- One `CannotReceiveMessages` row: exit 2 with `cannot_receive_message_text`.
-- No match under `LocalThenPeer`: the other machine's roster is read. One `Messageable` row there sends through `ssh` with its address; ambiguity and `cannot take messages` apply to its rows too; a miss while it reports problems is `FAILED` with those problems. A bare name absent from a local roster that had problems asks no one: exit 2, `absence of <name> here is not proven; use an address or --machine`.
-- A clean miss: `session:` queues here (exit 1), `codex:` fails with `no live Codex daemon has thread <id> loaded; checked <homes>`, `worker:` exits 2 with `no roster session has address <address>`, a bare name goes to the Claude relay by name.
 
 Every ssh send runs `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/send.py" --here ...` with the text on stdin. `remote()` reads the outcome word from the last stdout line there, prefixing the detail `on <host>: `; a run that prints no outcome line (usage errors, `cannot take messages`, ambiguity, `no roster session has address`, which go to stderr) returns `FAILED: ssh <host>: <reason>`. Action flags are forwarded only for `--to user`.
 
@@ -154,7 +151,7 @@ Outcomes print as one line and log with the full text to `$XDG_STATE_HOME/messag
 | `REFUSED: <why>` | 2 | `pushover.py` refused before sending; nothing kept |
 | `HELD: <why>` | 4 | a user push not sent: it failed review (revise and resend), or another sender's claim on a legacy hold is live |
 | `REPLACED: <why>` | 0 | a newer version replaced this user push; nothing was sent |
-| `FAILED: <why>` | 3 | not delivered, not kept: an unresolved dead socket, a Codex recipient, the user, or ssh; for the user it ends with a `fallback text:` line |
+| `FAILED: <why>` | 3 | not delivered, not kept: an unresolved dead socket, a Codex recipient, the user, or ssh |
 
 The `--to user` outcomes in full, including `SENT: … rewritten:` and `sent despite failed review:`, are in `docs/as-built/message-clarity.md`.
 
@@ -164,9 +161,17 @@ Delivery mechanics: for a Claude recipient found in the live registry, `send.py`
 
 The fallback is a headless `command claude -p` relay (sonnet, auto mode, tools `SendMessage` plus `ListAgents` for a name, hooks, MCP and slash commands off, `CLAUDE_*` variables removed, named by `relay_identity.relay_session_name(--from)` as `relay/<sender>`); delivery is read from the `SendMessage` tool result in the stream, which stays in `STATE/relay/<to>.jsonl`. `--timeout` defaults to 40 s for every transport. Where `~/.config/claude/oauth-token.gpg` exists (the Mac, whose keychain ssh cannot open) the relay decrypts it, and queues with `gpg-agent is cold on <machine>: run github-warmup there` when it cannot. Undelivered Claude messages go to `STATE/queue/`, latest per `--key`, under the recipient's session id; `pending` prints and clears them. `--key` with `--repeat-minutes` skips a repeat within the window; `ack` skips every later send with the key until `reopen`.
 
-The relay name has the form `relay/<sender>`. A name alone does not identify a relay: a real session can use the same form. The message body always carries `Shown sender: <display name>`, even when the display name equals `--from`. The conversation-pause hook reads the original sender with `relay_identity.message_sender_name` for scheduled messages and its return question. The native SendMessage miss hook first looks up the exact target. Only after a clean miss, and only for a locally verified live relay with that name, does it use the same function to find the real sender's session. This name is attribution, not proof of origin.
+The relay name has the form `relay/<sender>`. A name alone does not identify a relay: a real session can use the same form. The message body always carries `Shown sender: <display name>`, even when the display name equals `--from`. The conversation-pause hook reads the original sender with `relay_identity.message_sender_name` for scheduled messages and its return question. The native SendMessage miss hook resolves the exact target through staff. A non-staff name can use a live roster row. Verified relay recovery retains its saved sender lookup. This name is display text. `send.py` records the runtime sender ID separately.
+The generated `Authority: morty (speaks for the user)` mark requires the configured native ID.
+Caller lines that start with `Authority:` or `Sender native id:` get a `> ` prefix in delivered text.
+Rendering converts line separators to LF before it quotes caller labels, including sender and forwarded display text.
+Only the generated metadata block directly after the preview grants authority. Quoted labels elsewhere grant none.
+Forwarded stamps require `SSH_CONNECTION` as a context check against accidental use.
+A session can inherit this variable. The check does not prove that `remote()` supplied the stamp.
+Code under the same account can set that environment. The mark is not authentication.
+See [message-clarity.md](message-clarity.md#sender-identity) for the stamp and queue rules.
 
-Before execing Claude, the relay's launcher uses `relay_identity.publish_relay_identity` to publish `STATE/relay_senders/<pid>.identity` and then the plain sender file `STATE/relay_senders/<pid>`, through the shared atomic-file writer. The identity file binds that sender to the process start and, on Linux, the boot ID. The shared `process_identity.process_start` reads the platform process identity; `sessions.process_start` exports the same reader for existing callers. Exec preserves both the process start and the PID used in Claude's `cc-socks/<pid>.sock` address. `live_relay_identity` is the shared check for session exclusion and miss recovery. Missing, unreadable, legacy or mismatched lifetime metadata cannot prove a live relay. The plain sender file remains available through `read_relay_sender` after the process exits, for dead-socket replies. A reply to a missing socket, or a delivery connect returning `ENOENT` or `ECONNREFUSED`, looks up that sender with `sessions.addressed(name, sessions.live_sessions())`. Send and drain use the same resolver; no extra connect probes a live socket. No record or no live named recipient produces a failed result and a stderr line naming the socket and sender. The queue boundary rejects raw sockets without a live session; sends carry the session ID found at their queue decision so a later session exit cannot create a raw socket queue.
+Before execing Claude, the relay's launcher uses `relay_identity.publish_relay_identity` to publish `STATE/relay_senders/<pid>.identity` and then the plain sender file `STATE/relay_senders/<pid>`, through the shared atomic-file writer. The identity file binds that sender to the process start and, on Linux, the boot ID. The shared `process_identity.process_start` reads the platform process identity; `sessions.process_start` exports the same reader for existing callers. Exec preserves both the process start and the PID used in Claude's `cc-socks/<pid>.sock` address. `live_relay_identity` is the shared check for session exclusion and miss recovery. Missing, unreadable, legacy or mismatched lifetime metadata cannot prove a live relay. The plain sender file remains available through `read_relay_sender` after the process exits, for dead-socket replies. A reply to a missing socket, or a delivery connect returning `ENOENT` or `ECONNREFUSED`, checks that sender through the supplied staff snapshot. A staff sender uses its current session. A non-staff sender uses the registry. Send and drain use the same resolver; no extra connect probes a live socket. No record or no live named recipient produces a failed result and a stderr line naming the socket and sender. The queue boundary rejects raw sockets without a live session; sends carry the session ID found at their queue decision so a later session exit cannot create a raw socket queue.
 
 `send.py drain-sockets` recovers raw `uds__*.sock.jsonl` queue files under a separate `.drain-sockets.lock`, so its relays do not block normal sends. It delivers each message in a recent file (newest entry under 24 hours old) to the live session, marked `Stuck message from <original time>:`. A saved relay sender takes precedence over queued recipient metadata. Each stable recovery ID gets a flushed and fsynced attempt in `STATE/socket-recovery-attempts.jsonl` before relay, then a durable result in `STATE/log.jsonl` before the queue checkpoint. The message log keeps one row per result; attempts do not count as messages. A rerun skips confirmed sends and retries known failures without a second queued copy. An attempt with no result is archived without resending, reports `UNCONFIRMED: stuck reply from <time> to <name> may have arrived; archived, not resent`, and exits 3 once. Its archive checkpoint preserves other unsent entries, and a retry reuses an identical archive instead of copying it. Unresolved or unreadable files stay in place with a report naming the file (exit 3); the drain continues with other files. Files at least 24 hours old move intact to `STATE/socket-queue-archive/`; one line reports the count and oldest and newest message times. Archive names never replace an existing file. `UNCONFIRMED` and `SENT` lines are printed and flushed before removing the queue entry; a rerun may repeat the report without sending again. The old-file summary (`archiving <n> socket queue files: …`) is printed and flushed before any of its files move, so an interrupted move cannot hide the count; a rerun names only the files still to move. `pending` keeps its existing print-and-clear behavior.
 
@@ -333,14 +338,39 @@ Reads the `ThisMachine` roster and runs no ssh. It prints `<name>\tuds:<socket p
 - `refused_at(action, priority) -> ActionAllowed | ActionRefused` refuses `NoActionRequired` above priority 0.
 - `first_line(action, session)`: `Action: <text>` or `No action needed.`, with an optional `Session: <name>` line above it (`SessionLine | NoSessionLine`); `FIX` is the recovery text and `REFUSED_BEFORE_SENDING` the stderr marker.
 
-`scripts/notify/pushover.py [--priority 0|1|2] [--source NAME] (--action TEXT | --no-action) TITLE MESSAGE`, or `--text-id ID --value k=v…` for a catalog text, is the one path to the user's phone, called by `send.py --to user` and directly. Refusals come before the keys file is read, in order: `ActionRefused` from parsing, `ActionUnstated` (`no action stated`), action text over `ACTION_TEXT_MAX` (1015), `refused_at`. A refusal sends nothing, logs `refused before sending: <reason>`, prints `pushover: refused before sending: <reason>. <FIX>` and exits 2. After the refusal checks, `review.review()` checks the push unless the user's `review_off` switch is set. A send opens with `first_line(action, session)`; it ends with a `Sent by: <sender>` line and a last `Template: <text id>` line (`Template: none (free text)` with no `--text-id`). Over `MESSAGE_MAX` (1024) the body is cut, never the action line or those two lines; an empty sender is refused. Priority 2 repeats every 300 s until acknowledged, for at most 3 h. Every `~/.local/state/notify/pushover.jsonl` line names `--source`, else the parent command line (80 chars). Exit 0 sent; 1 Pushover refused or unreachable; 2 refused before sending, usage, or keys missing; 4 another sender's hold claim is live; 5 replaced; 6 not sent (failed review or withheld). The review and these outcomes are in `docs/as-built/message-clarity.md`.
+`scripts/notify/pushover.py --text-id ID --value k=v…` is the direct phone boundary.
+It refuses a missing template before review, credentials, claims, or posting.
+`send.py --to user` uses this boundary and requires the same template.
+Legacy pushes already kept during silence still release.
+Agent-written values receive live review.
+Each push ends with `Sent by: <sender> · Template: <id>`.
+Priority 2 repeats until acknowledgment or expiry.
+The review and delivery outcomes are in `docs/as-built/message-clarity.md`.
 
 Senders:
 
-- `send.py --to user` requires `--action` or `--no-action` and `--summary`; `--need note|decision|blocked` maps to priority 0, 1, 2, and `decision` / `blocked` require `--action`. The action flags on any other recipient are a usage error (`--action and --no-action go with --to user`). A `pushover.py` exit 2 with the `refused before sending:` marker becomes `REFUSED`; any other failure is `FAILED: the user was not reached: ...`. With `CLAUDE_PROBE_SESSION=1` in its environment (`PROBE_ENV`, `scripts/lib/probe_session.py`; set by `accounts.py exec --probe`), `--to user` prints `not sent: probe sessions never push to the phone` and exits 0 before review, logging or delivery.
-- `escalate.py hold(key, summary, text, action: UserAction, minutes=15, need="decision")` raises `ValueError` for `NoActionRequired` with a `need` other than `note`; a stored hold without an action (`LegacyHeld`) is never delivered, lists as `waiting for a hold that states its action`, and the next `hold()` for its key replaces it.
+- `send.py --to user` requires `--text-id`; the template supplies its title and action.
+  Decisions and blocked pushes require an action.
+  Other recipients reject action flags.
+  A channel refusal becomes `REFUSED`; other delivery errors become `FAILED`.
+  Probe sessions send no phone pushes.
+
+| Need | Phone priority |
+| --- | --- |
+| note | 0 |
+| decision | 0 by default; 1 only when `0 < due - now <= decision_high_priority_window_seconds` |
+| blocked | 2 |
+
+`--due` requires ISO 8601 with an explicit offset and a user decision.
+`config/send.conf` sets `decision_high_priority_window_seconds=1800`.
+The sender reads this value at use.
+An overdue decision stays at priority 0 and records a diagnostic.
+`--priority 1` cannot bypass this rule.
+Release recalculates the priority of a kept decision.
+
+- `escalate.hold(key, push: RenderedPush, minutes=15)` keeps the registered template id and its values. Legacy free-text holds stay unchanged. They are not delivered or replaced. The owner must revise them with a registered template.
 - `restart_support.send_message(recipient, ...)` raises `ValueError` for `user`; `restart_support.alert_user(push: RenderedPush, *, machine="")` is the shutdown path to the user; the catalog render supplies title, body and action; it takes no scope, and callers skip the call when the session record's `alerts` is `"none"`.
-- `/alert_user` sends with `--need decision|blocked --action`; on the Mac it adds `--machine natedev`, since the Pushover keys exist only there. On `FAILED` it falls back to PushNotification with the exact `fallback text:` line `send.py` printed; the PreToolUse gate `scripts/hooks/pre-tool-use-push-gate.py` allows nothing else. `REFUSED` and `HELD` never fall back.
+- `/alert_user` uses a registered template. Mac callers add `--machine natedev`. Only a reviewed blocked push with a registered template can use the exact rendered emergency fallback after delivery fails.
 
 ### Shutdown test guard (`scripts/shutdown/test_support.py`)
 
@@ -393,7 +423,7 @@ Senders:
 
 - `--action` / `--no-action` go only with `--to user`; every other recipient carries `NoUserRecipient`; `broadcast.py` passes no action flags; `remote()` forwards them only for `user`.
 
-- No message reaches the user without `--action` or `--no-action`. `REFUSED:` (exit 2) means fix the flags and resend, never a PushNotification fallback.
+- No message reaches the user without `--action` or `--no-action`. `REFUSED:` (exit 2) means fix the flags and resend, never another phone path.
 
 - Under `LocalThenPeer` a local match is sent here and the other machine is not asked. Every ssh send and every per-row broadcast send passes `--here`. `--here` keeps `roster.py`, `send.py` and `broadcast.py` to this machine.
 
@@ -536,3 +566,21 @@ Unit marks come from `unit_lookup.every_marked_unit()`. A marked live Claude
 identifies its director; a socketless registry record joins by its pid's herdr
 place. Worktree ownership is a fallback when marks cannot be read, never for
 a worker ledger entry. Interactive herdr Codex panes are included.
+
+Automatic silence ends only after a user prompt passes source classification.
+Generated prose carries a script envelope and writes no source record.
+The classifier checks the envelope before it reads source records.
+Only slash commands use source records.
+Slash-command classification is a heuristic.
+A user can type the same slash command in the same pane while a script command waits.
+The two submissions can then exchange classifications.
+The same classification controls the WaitingForUser end and conversation-pause answers.
+A classification error can leave WaitingForUser open or bypass a conversation-pause answer.
+Peer prompts, script prompts, harness notices, and unknown prompts preserve silence.
+The return notice names the activity session.
+`~/.local/state/notify/auto-silence-events.jsonl` records each transition and ignored activity under the silence lock.
+An append failure preserves silence and held pushes.
+Raw agent calls to herdr `send-text` remain outside this source-marking boundary.
+
+Every new phone push requires a registered template before review or delivery.
+Message the user with `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id ID --value KEY=VALUE`. Use `decision.choices` for choices, `alert.blocked` for emergencies, and `nate.adhoc` for notes without an action. Each template supplies its need and action. Emergency pushes also need `--clears-when "<check>"`. A decision uses normal priority unless its explicit-offset `--due` falls inside the configured window. Use a specific registered template when one fits. Run `review.py show ID` for its values. For `decision.choices`, pass `choices` as a JSON list of objects with `label` and `effect`. Also supply `sender`, `title`, `session`, `machine`, `situation`, `recommended_choice`, and `recommendation_reason`.

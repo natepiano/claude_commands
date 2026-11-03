@@ -303,7 +303,7 @@ class SweepTests(SweepCase):
         without_window = cast(Callable[[list[str], list[str], int, str, bool], int], sweep.sweep)
         workspace_without_window = cast(Callable[[str | None, str, bool], int], sweep.sweep_workspace)
         before = {path: path.read_bytes() for path in target.root.rglob("*") if path.is_file()}
-        with mock.patch("sweep.conf.number", side_effect=AssertionError("No implicit configuration read expected")):
+        with mock.patch("sweep.conf.ConfigRead.number", side_effect=AssertionError("No implicit configuration read expected")):
             with self.assertRaisesRegex(TypeError, "recent_minutes"):
                 _ = without_window(roots, trees, 0, "test", False)
             with self.assertRaisesRegex(TypeError, "recent_minutes"):
@@ -2703,7 +2703,7 @@ raise SystemExit(int(os.environ[variable]))
               redirect_stdout(io.StringIO())):
             self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
                                                    phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB, PAGE_PATHS)))
-        self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list], [40, 220])
+        self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list], [170, 345])
         self.assertEqual(run.call_count, 2)
 
     def test_phone_disk_alert_keeps_action_and_build_shortfall_without_directory_dump(self) -> None:
@@ -3724,6 +3724,21 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
             "for": "timed builds", "release_eta": "unknown",
         }))
 
+    def test_state_override_moves_the_floor_lock_and_deletion_records_together(self) -> None:
+        base = self.base()
+        for name in ("first state", "second state"):
+            state = base / name
+            with mock.patch.dict(os.environ, {sweep.tmp_sweep.STATE_ENV: str(state)}), \
+                 mock.patch.object(sweep, "recover_pending_trims"), \
+                 mock.patch.object(sweep, "free_bytes", return_value=0), \
+                 mock.patch.object(sweep, "try_lock", return_value=None) as acquire, \
+                 mock.patch.object(sweep, "alert_floor_lock"), redirect_stdout(io.StringIO()):
+                self.assertEqual(sweep.hold_floor(GIB, False, roots=()), 0)
+                acquire.assert_called_once_with(str(state / "floor.lock"))
+                self.assertEqual(sweep.floor_record_path(), state / "floor.json")
+                self.assertEqual(sweep.target_deletes_path(), state / sweep.tmp_sweep.TARGET_DELETES_NAME)
+                self.assertTrue(state.is_dir())
+
     def test_own_deletes_do_not_hold_a_target_but_a_later_build_write_does(self) -> None:
         base = self.base()
         now = time.time()
@@ -4103,6 +4118,33 @@ class BudgetTests(unittest.TestCase):
         _ = path.write_text(CONFIG)
         return str(path)
 
+    def test_sweep_recovers_missing_live_recent_minutes_from_the_repository(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        live = root / "live"
+        live.mkdir()
+        _ = (live / "lint.conf").write_text("# range: 0..\nsweep_budget_gib=1\n")
+        repository = root / "repository.conf"
+        _ = repository.write_text("# range: 0..\nrecent_minutes=60\n")
+        environment = {key: value for key, value in os.environ.items() if key != "CONF_DIR"}
+        with (mock.patch.dict(os.environ, environment, clear=True),
+              mock.patch.object(conf, "directory", return_value=live),
+              mock.patch.object(conf, "_repository_path", return_value=repository),
+              mock.patch.object(sweep, "sweep_workspace", return_value=0) as workspace,
+              redirect_stderr(io.StringIO())):
+            self.assertEqual(sweep.main([]), 0)
+        self.assertEqual(workspace.call_args.args[3], 60.0)
+
+    def test_one_sweep_shares_settings_with_its_workspace_budget(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = write_config_fixture(root / "lint.conf", "recent_minutes=60\nsweep_budget_gib=1\n")
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(root), sweep.BUDGET_ENV: ""}),
+              mock.patch.object(conf, "read", wraps=conf.read) as reads,
+              mock.patch.object(sweep, "cargo_roots", return_value=[]),
+              mock.patch.object(sweep, "hold_floor", return_value=0),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(sweep.main([]), 0)
+        reads.assert_called_once_with("lint")
+
     def test_sweep_imports_in_a_fresh_interpreter(self) -> None:
         base = Path(self.enterContext(tempfile.TemporaryDirectory()))
         environment = {**os.environ, "BUILD_HOLD_DIR": str(base / "holders"),
@@ -4115,13 +4157,13 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_config_reads_as_lint_config_sh_does(self) -> None:
-        values = conf.values(Path(self.config()))
+        values = conf.read(Path(self.config())).values()
         self.assertEqual(values["sweep"], "on")
         self.assertEqual(values["sweep_budget_gib"], "24")
         self.assertEqual(values["sweep_budget_gib.hana"], "96")
         self.assertEqual(values["sweep_budget_gib.unset"], "")
         with self.assertRaises(conf.Unusable):
-            _ = conf.values(Path("/nonexistent/lint.conf"))
+            _ = conf.read(Path("/nonexistent/lint.conf")).values()
 
     def test_repo_key_then_default_key_then_built_in(self) -> None:
         config = self.config()

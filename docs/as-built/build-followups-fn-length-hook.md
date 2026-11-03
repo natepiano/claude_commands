@@ -67,8 +67,22 @@ Files: `scripts/hooks/showrunner_footer.py`, `scripts/production/footer_counts.p
 
 - **Production.** `read_production(instance_dir) -> Production | None` takes the doc from the last token of the instance's `CHECK`, requires `Status: PRODUCTION — running`, takes the zone from the user's zone setting (`scripts/lib/user_zone.py`; the doc's `- **User zone:**` line is not read), and builds `schedule` from state: `ScheduledDailies(next_due)` when `ENABLED=1`, else `NoDailiesSchedule.PAUSED_OR_UNSCHEDULED`. Anything unreadable gives `None` (the production is skipped).
 - **Open questions.** `open_questions(productions) -> int | None` counts the items now due in every production's needs-user file: an item with no `after`, or whose `after` is at or before now in the production's zone. It is `None` when a file cannot be read.
-- **Counts line.** `scripts/production/footer_counts.py` reads each count at render time and stores none. `changes` counts the production's own rows still to review (`change_review.scope_rows` on `scope_list(doc)`). `proposals` counts `proposals_table.waiting_entries(doc)`, the same own-production rows as `/next proposal`: open proposal issues waiting for approval and proposed lines in the ledger the Improvement queue field names. Accepted and deferred plan-backlog lines do not count. Shared issue folders are filtered by the production's slug and units (`proposals_folder.owners` and `proposer`); showrunners above and below count their own. `sources()` includes the Improvement queue ledger so the status line cache refreshes when it changes. A source that cannot be read counts 0. `counts_line` writes `For you: 1 question, 2 changes, 130 efficiency, 1 proposal`, zero counts left out, None when all are zero. Every kind is available through `/next`. The status line adds the open questions of the production's own list (`showrunner_footer.counts_line`, questions from `open_questions`). The dailies report's own footer (`dailies_render.py --footer`) shows the line too; no reply carries it.
-- **Old state.** Switch files left in `~/.local/state/showrunner/footers-off/` are not read; `tidy_wrapped.py` deletes a production's file at wrap. Pause, review-pause and shutdown records written while footers existed still load, and their footer keys are ignored.
+- **Counts line.** `scripts/production/footer_counts.py` reads each count at render time and stores none. `changes` uses the staff routing function in `scripts/production/change_routing.py`, which also supplies the change page tabs.
+The router reads the fixed staff id in each row's Producer cell.
+It follows the unit's staff parents to its showrunner.
+An empty Producer cell belongs to the list's showrunner.
+An unknown id or a broken parent chain counts under `unrouted`.
+The status line shows that count as a separate item.
+This global count includes the same lists as the page across independent production roots.
+The page, footer, and `/next` use the same typed waiting rule.
+The status count watches staff, lists, and delivery records.
+The merge writer and `change_review add` store Producer ids.
+`change_review backfill-producer [--list <path>] [--write]` fills historical rows after a backup.
+After the lists are filled, remove `producer_backfill.py`, including its adapter, and `test_producer_backfill.py`.
+Remove the `backfill-producer` CLI case and argparse choice from `change_review.py`.
+
+`proposals` counts `proposals_table.waiting_entries(doc)`, the same own-production rows as `/next proposal`: open proposal issues waiting for approval and proposed lines in the ledger the Improvement queue field names. Accepted and deferred plan-backlog lines do not count. Shared issue folders are filtered by the production's slug and units (`proposals_folder.owners` and `proposer`); showrunners above and below count their own. `sources()` includes the Improvement queue ledger so the status line cache refreshes when it changes. A source that cannot be read counts 0. `counts_line` writes `For you: 1 question, 2 changes, 130 efficiency, 1 proposal`, zero counts left out, None when all are zero. Every kind is available through `/next`. The status line adds the open questions of the production's own list (`showrunner_footer.counts_line`, questions from `open_questions`). The dailies report's own footer (`dailies_render.py --footer`) shows the line too; no reply carries it.
+- **Old state.** Switch files left in `~/.local/state/showrunner/footers-off/` are not read; `tidy_wrapped.py` deletes a production's file at wrap. Pause and review-pause records still load. Their footer keys have no effect. Shutdown restart keeps only staff row IDs.
 
 ### Tool-output read guard
 

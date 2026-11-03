@@ -90,13 +90,14 @@ from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atom
 from scripts.agents import worker_lifecycle
 
 NO_LOCK_DEADLINE = worker_lifecycle.NO_LOCK_DEADLINE
-from scripts.lib import nix_env, process_group, unit_runs
+from scripts.lib import build_folders, nix_env, process_group, unit_runs
 from scripts.lib.probe_session import PROBE_ENV
 from scripts.production import worker_admission, staff
 from scripts.production.worker_admission import WorkerStartAllowed
 from scripts.astra.design_roles import PhaseBoundDesigner, ReadOnlyReviewer, ThreadAccessPolicy
 from scripts.message import sessions, process_table
 from scripts.message import repeat_guard
+from scripts.message import send_budget
 from scripts.whoami import account
 from scripts.usage import agents_log
 from scripts.whoami.agent_accounts import (
@@ -1927,11 +1928,17 @@ def _signal_process(pid: object, signum: int, *, group: bool = False) -> None:
 
 def _pid_alive(pid: int) -> bool:
     """A recorded pid is live only if the OS can represent and find it."""
+    if pid <= 0:
+        return False
     try:
         _signal_process(pid, 0)
     except OSError as exc:
         return exc.errno == errno.EPERM
-    return True
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()
+    except (OSError, UnicodeError):
+        return True
+    return state[:1] != ["Z"]
 
 
 def _free_port() -> int:
@@ -2624,6 +2631,9 @@ def _retire_record(session_dir: str, record: dict[str, object]) -> None:
     servers: list[object] = cast("list[object]", stored) if isinstance(stored, list) else []
     servers.append(record)
     _write_account_move_json(retired_path, {"servers": servers})
+    pid = record.get("pid")
+    if worker_lifecycle.is_process_pid(pid):
+        _collect_exited_child(pid)
     _session_path(session_dir, SERVER_FILE).unlink(missing_ok=True)
 
 
@@ -2645,6 +2655,8 @@ def _record_started_server(session_dir: str, served: ServerRecord) -> None:
         if isinstance(previous_pid, int) and _pid_alive(previous_pid):
             _retire_record(session_dir, previous)
         else:
+            if worker_lifecycle.is_process_pid(previous_pid):
+                _ = _reap(previous_pid)
             path.unlink(missing_ok=True)
     _write_account_move_json(path, served)
 
@@ -3070,9 +3082,9 @@ def _server_environment(session_dir: str, workers_home: Path) -> dict[str, str]:
 def _set_run(environment: dict[str, str], run: str) -> None:
     """Name the run, and point TMPDIR into its folder so test temp folders end with the run."""
     environment["UNIT_RUN_DIR"] = run
-    temp = Path(run) / "tmp"
     try:
-        temp.mkdir(parents=True, exist_ok=True)
+        temp = build_folders.create_build_folder(build_folders.StableOwnerFolder(
+            unit_runs.RUN_TEMP_NAME, build_folders.ExplicitBuildParent(Path(run))))
     except OSError:
         return
     environment["TMPDIR"] = str(temp)
@@ -3506,11 +3518,13 @@ ThreadState = ThreadIdle | ThreadLive | ThreadActiveWithoutTurn | ThreadStateUnk
 @dataclass(frozen=True)
 class RelaunchAllowed:
     """Cleanup found no confirmed live turn that it could not interrupt."""
+    interrupt_requested: bool = False
 
 
 @dataclass(frozen=True)
 class RelaunchBlockedByLiveTurn:
     """The old thread still has a turn this launcher could not stop."""
+    interrupt_requested: bool = False
 
 
 UnwatchedTurnCleanupResult = RelaunchAllowed | RelaunchBlockedByLiveTurn
@@ -4407,11 +4421,16 @@ def _attach_and_run(
                                 old_port, old_thread, Path(_as_str(_attr(args, "log_file")))
                             )
                             if isinstance(cleanup, RelaunchBlockedByLiveTurn):
+                                if _pid_alive(_as_int(old_entry.get("launcher_pid"))):
+                                    print(
+                                        f"codex_mesh: {name}: thread {old_thread} still has a live turn that could not be interrupted; relaunch once it ends",
+                                        file=sys.stderr,
+                                    )
+                                    return WorkerLaunchRefused()
                                 print(
-                                    f"codex_mesh: {name}: thread {old_thread} still has a live turn that could not be interrupted; relaunch once it ends",
+                                    f"codex_mesh: {name}: thread {old_thread} has a stale turn with no live launcher; interrupt not confirmed; continuing relaunch",
                                     file=sys.stderr,
                                 )
-                                return WorkerLaunchRefused()
                         old_thread = ""
                     elif old_entry.get("status") == WAITING_CAPACITY:
                         # A dead waiting launcher cannot resume this thread.
@@ -4426,17 +4445,33 @@ def _attach_and_run(
                     except (ConnectionError, OSError, SystemExit) as exc:
                         live = ThreadStateUnknown(str(exc) or exc.__class__.__name__)
                     if isinstance(live, ThreadStateUnknown):
+                        if _pid_alive(_as_int(old_entry.get("launcher_pid"))):
+                            print(
+                                f"codex_mesh: {name}: thread {old_thread}: thread state unknown ({live.reason}); "
+                                + f"recorded launcher is alive; use codex_mesh.py end --to {name} before relaunching",
+                                file=sys.stderr,
+                            )
+                            return WorkerLaunchRefused()
+                        cleanup = _end_unwatched_turn(old_port, old_thread, log_path)
+                        detail = ("interrupt requested" if cleanup.interrupt_requested
+                                  else "cleanup attempted; interrupt not confirmed")
                         print(
-                            f"codex_mesh: {name}: thread {old_thread}'s state could not be read ({live.reason}); use codex_mesh.py end --to {name} before relaunching",
+                            f"codex_mesh: {name}: thread {old_thread}: thread state unknown ({live.reason}); "
+                            + f"{detail}; continuing relaunch",
                             file=sys.stderr,
                         )
-                        return WorkerLaunchRefused()
-                    if not isinstance(live, ThreadIdle):
-                        print(
-                            f"codex_mesh: {name}: thread {old_thread} has a live turn; use codex_mesh.py end --to {name} before relaunching",
-                            file=sys.stderr,
-                        )
-                        return WorkerLaunchRefused()
+                    elif not isinstance(live, ThreadIdle):
+                        if _pid_alive(_as_int(old_entry.get("launcher_pid"))):
+                            print(
+                                f"codex_mesh: {name}: thread {old_thread} has a live turn; use codex_mesh.py end --to {name} before relaunching",
+                                file=sys.stderr,
+                            )
+                            return WorkerLaunchRefused()
+                        cleanup = _end_unwatched_turn(old_port, old_thread, log_path)
+                        detail = ("interrupt requested" if cleanup.interrupt_requested
+                                  else "cleanup attempted; interrupt not confirmed")
+                        print(f"codex_mesh: {name}: thread {old_thread} has a stale turn with no live launcher; "
+                              + f"{detail}; continuing relaunch", file=sys.stderr)
             client = Client(port, name)
             _ = _bind_serving_server(client, session_dir, started_here=started_here)
             published = _create_published_worker(client, session_dir, staff_admission, "thread/start",
@@ -6099,8 +6134,8 @@ def _turn_service_tier(client: Client, args: argparse.Namespace) -> str:
         record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name)) if session_dir else {}
         task = _as_str(record.get("task"))
         resolved = subprocess.run(
-            ["bash", "-c", 'AGENTS_CONFIG_TIER_ONLY=1; source "$1"; agents_turn_service_tier "$2"',
-             "codex-mesh-tier", str(Path(__file__).with_name("agents_config.sh")), task or "delegate"],
+            ["bash", "-c", 'MODELS_CONFIG_TIER_ONLY=1; source "$1"; agents_turn_service_tier "$2"',
+             "codex-mesh-tier", str(Path(__file__).with_name("models_config.sh")), task or "delegate"],
             capture_output=True, text=True, timeout=5,
         )
         if resolved.returncode:
@@ -6137,7 +6172,7 @@ if [[ -n "$3" || -n "$4" ]]; then
  _agents_validate_pair "$2" "$AGENT_FAMILY" "$pair" || exit 2
 fi
 printf '%s\\n' "$AGENT_MODEL" "$AGENT_EFFORT"
-''', "mesh-turn", str(Path(__file__).with_name("agents_config.sh")), task, model, effort,
+''', "mesh-turn", str(Path(__file__).with_name("models_config.sh")), task, model, effort,
     ], capture_output=True, text=True, timeout=30)
     if resolved.returncode:
         raise SystemExit(resolved.stderr.strip() or "cannot resolve turn model and effort")
@@ -6210,6 +6245,7 @@ def _end_unwatched_turn(
     port: int, thread_id: str, log_path: Path
 ) -> UnwatchedTurnCleanupResult:
     """Best effort cleanup when this launcher cannot watch another turn."""
+    interrupt_requested = False
     try:
         with worker_lifecycle.operation_deadline(timeout=THREAD_RELEASE_TIMEOUT_SECS) as deadline:
             client = Client(port, f"cleanup-{os.getpid()}", operation_deadline=deadline)
@@ -6219,12 +6255,13 @@ def _end_unwatched_turn(
                 turn_id = _interruptible_turn_id(client, thread_id, live)
                 if isinstance(turn_id, ThreadLive):
                     reply = _interrupt_turn(client, thread_id, turn_id.turn_id)
+                    interrupt_requested = True
                     if "error" in reply:
                         reason = _as_str(_as_dict(reply["error"]).get("message")) or "turn/interrupt failed"
                         remaining = _read_live_turn(client, thread_id)
                         if isinstance(remaining, (ThreadLive, ThreadActiveWithoutTurn)):
                             _log_uninterrupted_thread(log_path, thread_id, reason)
-                            return RelaunchBlockedByLiveTurn()
+                            return RelaunchBlockedByLiveTurn(interrupt_requested=True)
                         if isinstance(remaining, ThreadStateUnknown):
                             _log_uninterrupted_thread(log_path, thread_id, reason)
                 elif isinstance(turn_id, (ThreadStateUnknown, ThreadActiveWithoutTurn)):
@@ -6235,8 +6272,12 @@ def _end_unwatched_turn(
             finally:
                 client.close()
     except (ConnectionError, OSError, SystemExit) as exc:
-        _log_uninterrupted_thread(log_path, thread_id, str(exc))
-    return RelaunchAllowed()
+        try:
+            _log_uninterrupted_thread(log_path, thread_id, str(exc))
+        except OSError as log_error:
+            print(f"codex_mesh: thread {thread_id}: cleanup failed ({exc}); cleanup log failed ({log_error})",
+                  file=sys.stderr)
+    return RelaunchAllowed(interrupt_requested=interrupt_requested)
 
 
 def command_send(args: argparse.Namespace) -> int:
@@ -6923,7 +6964,7 @@ def _open_admitted_worker(session_dir: str, role: str, admitted: WorkerStartAllo
         with worker_lifecycle.lock_worker(session_dir, name):
             command = ['bash', '-c',
                        'source "$1"; agents_resolve "direct.$2" || exit; printf "%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "${AGENT_SERVICE_TIER:-default}"', 'workers',
-                       str(Path(__file__).with_name("agents_config.sh")), role]
+                       str(Path(__file__).with_name("models_config.sh")), role]
             resolved = subprocess.run(command, capture_output=True, text=True, check=False, timeout=30)
             fields = resolved.stdout.strip().split()
             if resolved.returncode or len(fields) != 4:
@@ -7177,11 +7218,19 @@ def _reap_validated_servers(session_dir: str, deadline: float) -> None:
     print(f"stopped app-server {', '.join(str(pid) for pid in stopped)}" if stopped else "no app-server running")
 
 
+def _collect_exited_child(pid: int) -> None:
+    """Collect an exited child without waiting for a live process."""
+    with contextlib.suppress(ChildProcessError):
+        _ = os.waitpid(pid, os.WNOHANG)
+
+
 @worker_lifecycle.operation_deadline(timeout=2 * REAP_WAIT_SECS)
 def _reap(pid: int, *, deadline: float = NO_LOCK_DEADLINE) -> bool:
     """Stop one app-server; success requires confirmed exit within the budget."""
     deadline = worker_lifecycle.effective_deadline(deadline)
     if not _pid_alive(pid):
+        if worker_lifecycle.is_process_pid(pid):
+            _collect_exited_child(pid)
         return False
     if time.monotonic() >= deadline:
         return False
@@ -7199,7 +7248,10 @@ def _reap(pid: int, *, deadline: float = NO_LOCK_DEADLINE) -> bool:
                 return True
         except OSError:
             pass  # A server started by another launcher is not our child.
-        return not _pid_alive(pid)
+        if _pid_alive(pid):
+            return False
+        _collect_exited_child(pid)
+        return True
 
     term_until = min(deadline, time.monotonic() + REAP_WAIT_SECS)
     while not exited() and time.monotonic() < term_until:
@@ -8558,7 +8610,6 @@ def command_sweep(args: argparse.Namespace) -> int:
 
 # Delivers the sign-in change notice to the session holding a run.
 SEND_SCRIPT = Path(__file__).resolve().parent.parent / "message" / "send.py"
-NOTICE_TIMEOUT_SECS = 120
 
 
 def _marker_sessions(roots: tuple[Path, ...], folder: Path) -> list[str]:
@@ -8626,7 +8677,7 @@ def _notify_holder(session_id: str, line: str, kind: CodexNoticeKind) -> None:
         sent = subprocess.run(
             [sys.executable, str(SEND_SCRIPT), "--to", f"session:{session_id}", "--from", "codex-workers" if workers_changed else "codex-sign-in",
              "--summary", "Codex workers account changed" if workers_changed else "Codex sign-in changed", "--text", line],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=NOTICE_TIMEOUT_SECS, check=False,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=send_budget.seconds(), check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"codex_mesh: could not tell session {session_id}: {exc}", file=sys.stderr)

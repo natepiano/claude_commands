@@ -20,12 +20,13 @@ from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.signal_test_support import SignalPidGuard, install_signal_pid_guard
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
 
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 
 from scripts.whoami.note_file import note_name
+from scripts.accounts.home_test_support import scratch_accounts_config
 
 import argparse
 import ast
@@ -69,15 +70,26 @@ from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.lib import atomic_file, nix_env, unit_runs
 from scripts.message import process_table, sessions, unit_labels, roster as message_roster
 from scripts.production import showrunners
+from scripts.herdr import herdr
 from scripts.usage import agents_log
 from scripts.accounts import accounts, moves, refusals, role_map
 from scripts.astra import astra_work, design_roles
 from scripts.whoami import account, agent_accounts
 
 
+MESH_PROCESS_ROOT = Path("/proc")
 REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
 # Intentional contention probes bypass fixture observers and bookkeeping.
 KERNEL_FLOCK = fcntl.flock
+
+
+def write_server_record(session_dir: Path, port: int, workers_home: Path, dev_shell_worktree: str = "") -> None:
+    """Seed a complete server record for the fixture's checkout."""
+    _ = (session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
+        "port": port, "pid": os.getpid(), "codex_home": str(workers_home),
+        "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
+        "dev_shell_worktree": dev_shell_worktree,
+    }), encoding="utf-8")
 
 
 def worker_state_lock_path(path: Path) -> Path:
@@ -227,7 +239,7 @@ def refuse_real_home(path: Path, source: str) -> None:
 
 
 def assert_fixture_environment() -> None:
-    for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "AGENTS_CONFIG_FILE"):
+    for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "MODELS_CONFIG_FILE"):
         value = os.environ.get(name)
         if not value:
             raise AssertionError(f"{name} is unset; codex_mesh fixture requires setUpModule")
@@ -375,7 +387,7 @@ class FixtureModelDefaults:
         self.environment: dict[str, str] = self.resolver_environment()
         self.files: dict[Path, tuple[int, bytes]] = {
             Path(os.environ[key]): (Path(os.environ[key]).stat().st_mtime_ns, Path(os.environ[key]).read_bytes())
-            for key in ("AGENTS_CONFIG_FILE", "CODEX_CONFIG_FILE", "CODEX_PACER_TIER_FILE",
+            for key in ("MODELS_CONFIG_FILE", "CODEX_CONFIG_FILE", "CODEX_PACER_TIER_FILE",
                         "CODEX_CATALOG_SYNC_STATE_FILE")
         }
         self.run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run
@@ -384,7 +396,7 @@ class FixtureModelDefaults:
     @staticmethod
     def resolver_environment() -> dict[str, str]:
         return {key: value for key, value in os.environ.items()
-                if (key.startswith(("AGENTS_", "CODEX_")) or key in ("BASH_ENV", "ENV", "PATH", "SHELLOPTS", "BASHOPTS"))
+                if (key.startswith(("AGENTS_", "MODELS_", "CODEX_")) or key in ("BASH_ENV", "ENV", "PATH", "SHELLOPTS", "BASHOPTS"))
                 and key not in ("CODEX_HOME",)}
 
     def unchanged(self) -> bool:
@@ -483,21 +495,22 @@ def setUpModule() -> None:
         path = Path(home.name) / directory
         path.mkdir()
         unittest.addModuleCleanup(set_environment(variable, str(path)))
-        discovery_path = patch.object(showrunners, attribute, path)
-        _ = discovery_path.start()
-        unittest.addModuleCleanup(discovery_path.stop)
+        if attribute != "SESSIONS_DIR":
+            discovery_path = patch.object(showrunners, attribute, path)
+            _ = discovery_path.start()
+            unittest.addModuleCleanup(discovery_path.stop)
     restore_notes = set_environment("AGENT_NOTES_DIR", home.name)
-    unittest.addModuleCleanup(set_environment("AGENTS_CONFIG_PUBLISH", "0"))
+    unittest.addModuleCleanup(set_environment("MODELS_CONFIG_PUBLISH", "0"))
     # Tier tests never read the caller's registry, config, or pacer choice.
     tier_files = {
-        "AGENTS_CONFIG_FILE": str(Path(home.name) / "agents.conf"),
+        "MODELS_CONFIG_FILE": str(Path(home.name) / "models.conf"),
         "CODEX_CATALOG_SYNC_STATE_FILE": str(Path(home.name) / "catalog-sync"),
         "CODEX_CONFIG_FILE": str(Path(home.name) / "codex.toml"),
         "CODEX_PACER_TIER_FILE": str(Path(home.name) / "pacer-tier"),
     }
     for path in tier_files.values():
         _ = Path(path).write_text("", encoding="utf-8")
-    _ = write_registry(Path(tier_files["AGENTS_CONFIG_FILE"]))
+    _ = write_registry(Path(tier_files["MODELS_CONFIG_FILE"]))
     for key, value in tier_files.items():
         unittest.addModuleCleanup(set_environment(key, value))
     # The complete shared fixture costs seconds to validate in Bash. Reuse
@@ -812,8 +825,8 @@ def _as_test_dict(value: object) -> dict[str, object]:
 class FixtureModelDefaultsTests(unittest.TestCase):
     def test_only_unchanged_baseline_results_are_reused(self) -> None:
         with tempfile.TemporaryDirectory() as root:
-            registry = write_registry(Path(root) / "agents.conf")
-            with patch.dict(os.environ, {"AGENTS_CONFIG_FILE": str(registry)}):
+            registry = write_registry(Path(root) / "models.conf")
+            with patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)}):
                 resolve = MagicMock(return_value=("gpt-test", "high"))
                 defaults = FixtureModelDefaults(resolve)
                 args = argparse.Namespace(role="impl", task="", model="gpt-test", effort="high")
@@ -831,7 +844,7 @@ class FixtureModelDefaultsTests(unittest.TestCase):
         defaults = FixtureModelDefaults(resolve)
         args = argparse.Namespace(role="review", task="", model="gpt-test", effort="high")
         self.assertEqual(defaults(args), ("gpt-test", "high"))
-        with patch.dict(os.environ, {"AGENTS_CONFIG_FILE": "/tmp/custom-mesh-registry"}):
+        with patch.dict(os.environ, {"MODELS_CONFIG_FILE": "/tmp/custom-mesh-registry"}):
             self.assertEqual(defaults(args), ("gpt-test", "high"))
             self.assertEqual(defaults(args), ("gpt-test", "high"))
         with patch.object(subprocess, "run"):
@@ -914,6 +927,7 @@ class MeshCommandFixture(unittest.TestCase):
         self.loop_budget = FixtureLoopBudget(self.id())
         self.temporary = tempfile.TemporaryDirectory(dir="/tmp", prefix="codex-mesh-test-")
         self.addCleanup(self.temporary.cleanup)
+        self.addCleanup(self.assert_no_mesh_process_leaks)
         self.home = Path(self.temporary.name).resolve() / "home"
         self.home.mkdir()
         self.patches = contextlib.ExitStack()
@@ -970,10 +984,10 @@ class MeshCommandFixture(unittest.TestCase):
         self.start_args_timeout = TEST_HANG_GUARD_SECS
         select_fixture_workers(self.home, notes=self.home)
         self.server = StubAppServer(self.respond)
-        _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(
-            json.dumps({"port": self.server.port, "pid": os.getpid(), "codex_home": str(agent_accounts.workers_home()), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS}),
-            encoding="utf-8",
-        )
+        _ = self.start_stub_server(str(self.session_dir), agent_accounts.workers_home())
+        _ = self.patches.enter_context(patch.object(codex_mesh, "_start_server", side_effect=self.start_stub_server))
+        _ = self.patches.enter_context(patch.object(codex_mesh, "_start_watcher",
+            return_value=codex_mesh.ExistingServerWatcher()))
         read_frame = codex_mesh.Client.next_frame
 
         def bounded_read(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
@@ -994,9 +1008,66 @@ class MeshCommandFixture(unittest.TestCase):
 
     @override
     def tearDown(self) -> None:
-        self.patches.close()
         self.server.close()
-        self.temporary.cleanup()
+
+    def start_stub_server(self, session_dir: str, workers_home: Path,
+                          *_extra: object) -> int:
+        shell = next((value for value in _extra if isinstance(value, codex_mesh.WorktreeDevShell)),
+                     codex_mesh.InheritedServerEnvironment())
+        write_server_record(Path(session_dir), self.server.port, workers_home,
+                            str(shell.worktree) if isinstance(shell, codex_mesh.WorktreeDevShell) else "")
+        return self.server.port
+
+    def assert_no_mesh_process_leaks(self, proc: Path = MESH_PROCESS_ROOT) -> None:
+        root = str(Path(self.temporary.name).resolve())
+        leaks: list[str] = []
+        candidates: list[list[str]] = []
+        if sys.platform == "darwin":
+            observed = subprocess.run(["ps", "-axo", "pid=,args="], capture_output=True,
+                                      text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+            candidates = [line.strip().split(None, 1) for line in observed.stdout.splitlines()]
+        else:
+            for process in proc.iterdir():
+                if not process.name.isdigit():
+                    continue
+                try:
+                    command = os.fsdecode((process / "cmdline").read_bytes()).replace("\0", " ")
+                except OSError:
+                    continue
+                candidates.append([process.name, command])
+        for fields in candidates:
+            if len(fields) != 2:
+                continue
+            pid, command = fields
+            if not (("codex" in command and "app-server" in command) or "idle-stop" in command):
+                continue
+            evidence = command
+            if sys.platform == "darwin":
+                observed = subprocess.run(["lsof", "-a", "-p", pid, "-d", "cwd", "-Fn"],
+                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                evidence += "\n" + observed.stdout
+                try:
+                    environment = herdr.darwin_process_environment(int(pid))
+                except herdr.HerdrFailure as error:
+                    try:
+                        os.kill(int(pid), 0)
+                    except ProcessLookupError:
+                        continue
+                    except OSError:
+                        pass
+                    self.fail(f"Cannot check fixture mesh process {pid}: {error}")
+                codex_home = environment.get("CODEX_HOME", "")
+                if codex_home and Path(codex_home).expanduser().resolve().is_relative_to(Path(root)):
+                    evidence += "\n" + root
+            else:
+                try:
+                    evidence += "\n" + os.fsdecode((proc / pid / "environ").read_bytes())
+                    evidence += "\n" + str((proc / pid / "cwd").resolve())
+                except (OSError, ValueError):
+                    pass
+            if root in evidence:
+                leaks.append(f"{pid} {command}")
+        self.assertEqual(leaks, [], "The fixture leaves live mesh processes: " + "; ".join(leaks))
 
     def clock(self) -> float:
         _ = self.loop_budget.check()
@@ -1737,9 +1808,7 @@ class MeshCommandFixture(unittest.TestCase):
         _ = (selected / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
         _ = (notes / "codex2.md").write_text(f"---\nlogin: {login}\n---\n")
         self.assertEqual(accounts.main(["set-role", "workers", "codex2"]), 0)
-        _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
-            "port": self.server.port, "pid": os.getpid(), "codex_home": str(selected), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
-        }))
+        write_server_record(self.session_dir, self.server.port, selected)
         if stub_ensure:
             _ = self.patches.enter_context(patch.object(codex_mesh, "ensure_server", return_value=(self.server.port, True)))
         return agent_accounts.KnownCodexAccount(selected, login, "codex2")
@@ -3195,8 +3264,8 @@ class FixtureHomeSafetyTests(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp")))
         real = root / "real"
         real.mkdir()
-        for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "AGENTS_CONFIG_FILE"):
-            environment = {key: str(root / "safe") for key in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "AGENTS_CONFIG_FILE")}
+        for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "MODELS_CONFIG_FILE"):
+            environment = {key: str(root / "safe") for key in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "MODELS_CONFIG_FILE")}
             environment[name] = str(real / "nested")
             with (self.subTest(variable=name), patch(f"{__name__}.REAL_HOME", real),
                   patch.dict(os.environ, environment),
@@ -3324,6 +3393,82 @@ class QueueGraceSettingsTests(unittest.TestCase):
 @final
 class MeshCommandTests(MeshCommandFixture):
     """Launcher and recovery behavior against the shared bounded fake server."""
+
+    def test_fixture_guard_rejects_live_servers_and_watchers_in_its_temporary_folder(self) -> None:
+        proc = self.session_dir / "proc"
+        process = proc / "998099"
+        process.mkdir(parents=True)
+        _ = (process / "environ").write_bytes(os.fsencode(f"CODEX_HOME={self.home}/.codex\0"))
+        (process / "cwd").symlink_to(self.session_dir)
+        for command in ("codex app-server", "sh -c idle-stop"):
+            with self.subTest(command=command):
+                _ = (process / "cmdline").write_bytes(os.fsencode(command.replace(" ", "\0")))
+                with patch.object(sys, "platform", "linux"), patch.object(subprocess, "run") as external:
+                    with self.assertRaisesRegex(AssertionError, "fixture leaves live mesh processes"):
+                        self.assert_no_mesh_process_leaks(proc)
+                    external.assert_not_called()
+        _ = (process / "cmdline").write_bytes(b"unrelated\0command")
+        with patch.object(sys, "platform", "linux"):
+            self.assert_no_mesh_process_leaks(proc)
+
+    def test_darwin_fixture_guard_finds_servers_and_watchers_by_their_working_folder(self) -> None:
+        for command in ("codex app-server --listen ws://127.0.0.1:4001", "sh -c idle-stop"):
+            with self.subTest(command=command):
+                observed = subprocess.CompletedProcess(["ps"], 0, f"998099 {command}\n", "")
+                folder = subprocess.CompletedProcess(["lsof"], 0, f"p998099\nn{self.session_dir}\n", "")
+                with patch.object(sys, "platform", "darwin"), patch.object(
+                        subprocess, "run", side_effect=[observed, folder]) as inspect_process, patch.object(
+                            herdr, "darwin_process_environment", return_value={}):
+                    with self.assertRaisesRegex(AssertionError, "fixture leaves live mesh processes"):
+                        self.assert_no_mesh_process_leaks()
+                    self.assertEqual(inspect_process.call_args_list[1].args[0],
+                        ["lsof", "-a", "-p", "998099", "-d", "cwd", "-Fn"])
+
+    def test_darwin_fixture_guard_finds_a_server_home_with_a_checkout_working_folder(self) -> None:
+        command = "codex app-server --listen ws://127.0.0.1:4001"
+        observed = subprocess.CompletedProcess(["ps"], 0, f"998099 {command}\n", "")
+        folder = subprocess.CompletedProcess(["lsof"], 0, "p998099\nn/checkout\n", "")
+        for home, leaked in ((self.home / ".codex", True), (Path("/unrelated/account"), False)):
+            with (self.subTest(home=home), patch.object(sys, "platform", "darwin"),
+                  patch.object(subprocess, "run", side_effect=[observed, folder]),
+                  patch.object(herdr, "darwin_process_environment", return_value={"CODEX_HOME": str(home)})):
+                if leaked:
+                    with self.assertRaisesRegex(AssertionError, "fixture leaves live mesh processes"):
+                        self.assert_no_mesh_process_leaks()
+                else:
+                    self.assert_no_mesh_process_leaks()
+
+    def test_darwin_fixture_guard_finds_a_watcher_by_its_run_argument_outside_the_fixture_cwd(self) -> None:
+        command = f"sh -c idle-stop /checkout/codex_mesh.py 998098 4001 {self.session_dir}"
+        observed = subprocess.CompletedProcess(["ps"], 0, f"998099 {command}\n", "")
+        folder = subprocess.CompletedProcess(["lsof"], 0, "p998099\nn/checkout\n", "")
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(subprocess, "run", side_effect=[observed, folder]),
+              patch.object(herdr, "darwin_process_environment", return_value={})):
+            with self.assertRaisesRegex(AssertionError, "fixture leaves live mesh processes"):
+                self.assert_no_mesh_process_leaks()
+
+    def test_darwin_fixture_guard_distinguishes_an_exited_process_from_unreadable_evidence(self) -> None:
+        observed = subprocess.CompletedProcess(["ps"], 0, "998099 codex app-server\n", "")
+        folder = subprocess.CompletedProcess(["lsof"], 0, "p998099\nn/checkout\n", "")
+        for exited in (True, False):
+            with (self.subTest(exited=exited), patch.object(sys, "platform", "darwin"),
+                  patch.object(subprocess, "run", side_effect=[observed, folder]),
+                  patch.object(herdr, "darwin_process_environment", side_effect=herdr.HerdrFailure("environment unreadable")),
+                  patch.object(os, "kill", side_effect=ProcessLookupError if exited else None)):
+                if exited:
+                    self.assert_no_mesh_process_leaks()
+                else:
+                    with self.assertRaisesRegex(AssertionError, "Cannot check fixture mesh process 998099"):
+                        self.assert_no_mesh_process_leaks()
+
+    def test_complete_stub_seed_reuses_its_checkout_server(self) -> None:
+        shell = codex_mesh.WorktreeDevShell(self.session_dir, "fixture-revision")
+        _ = self.start_stub_server(str(self.session_dir), agent_accounts.workers_home(), shell)
+        with (patch.object(codex_mesh, "_server_dev_shell", return_value=shell),
+              patch.object(codex_mesh, "_start_server", wraps=self.start_stub_server) as start):
+            self.assertEqual(self.run_start(), (0, ""))
+        start.assert_not_called()
 
     def test_child_inherits_zero_queue_grace_without_waiting_for_a_frame(self) -> None:
         script = """
@@ -4952,11 +5097,11 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         })
 
     def tier_environment(self, registry: dict[str, dict[str, str]], config: str = "") -> dict[str, str]:
-        registry_file = self.session_dir / "agents.conf"
+        registry_file = self.session_dir / "models.conf"
         config_file = self.session_dir / "codex.toml"
         _ = write_registry(registry_file, registry)
         _ = config_file.write_text(config, encoding="utf-8")
-        return {"AGENTS_CONFIG_FILE": str(registry_file), "CODEX_CONFIG_FILE": str(config_file),
+        return {"MODELS_CONFIG_FILE": str(registry_file), "CODEX_CONFIG_FILE": str(config_file),
                 "CODEX_PACER_TIER_FILE": str(self.session_dir / "pacer-tier")}
 
     def test_finished_run_wake_uses_the_recorded_task_and_not_the_launch_tier(self) -> None:
@@ -4981,7 +5126,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                             self.assertEqual(codex_mesh.command_send(argparse.Namespace(
                                 session_dir=str(self.session_dir), to="worker",
                                 message="Run finished: fixture build passed", message_file="")), 0)
-                        _ = write_registry(Path(environment["AGENTS_CONFIG_FILE"]),
+                        _ = write_registry(Path(environment["MODELS_CONFIG_FILE"]),
                             {"delegate.options": {"codex_service_tier": "flex"},
                              f"{function}.options": {f"codex_service_tier.{row}": "default"}})
                     return frame
@@ -5479,7 +5624,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         with patch.dict(os.environ, self.prepare_turn_display_worker()):
             first, _output, errors = self.run_mesh(self.follow_cli())
             self.assertEqual((first, errors), (0, ""))
-            registry_path = Path(os.environ["AGENTS_CONFIG_FILE"])
+            registry_path = Path(os.environ["MODELS_CONFIG_FILE"])
             _ = write_registry(registry_path, {"direct.codex": {"review": "gpt-current:low"}}, update=True)
             second, _output, errors = self.run_mesh(self.follow_cli())
         self.assertEqual((second, errors), (0, ""))
@@ -7193,15 +7338,11 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         _ = (source / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{source_claims}.signature"}}))
         _ = (home / "codex9.md").write_text(f"---\nlogin: {source_login}\n---\n")
         self.assertEqual(accounts.main(["set-role", "workers", "codex9"]), 0)
-        _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
-            "port": self.server.port, "pid": os.getpid(), "codex_home": str(home / ".codex"), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
-        }))
+        write_server_record(self.session_dir, self.server.port, home / ".codex")
         new = StubAppServer(self.respond)
         _ = self.patches.callback(new.close)
         def start(session_dir: str, *_args: object) -> int:
-            _ = (Path(session_dir) / codex_mesh.SERVER_FILE).write_text(json.dumps({
-                "port": new.port, "pid": os.getpid(), "codex_home": str(agent_accounts.workers_home()), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
-            }))
+            write_server_record(Path(session_dir), new.port, agent_accounts.workers_home())
             return new.port
         _ = self.patches.enter_context(patch.object(codex_mesh, "_start_server", side_effect=start))
         _ = self.patches.enter_context(patch.object(codex_mesh, "_start_watcher"))
@@ -7938,9 +8079,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         rejected.respond = refuse_submission
         def start(session_dir: str, home: Path) -> int:
             server = rejected if home == target else recovered
-            _ = (Path(session_dir) / codex_mesh.SERVER_FILE).write_text(json.dumps({
-                "port": server.port, "pid": os.getpid(), "codex_home": str(home), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
-            }))
+            write_server_record(Path(session_dir), server.port, home)
             return server.port
         def move_on_refusal(_name: str, serving: codex_mesh.CodexServingState, _detail: str, *,
                             session_dir: str, thread_id: str,
@@ -8064,9 +8203,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         _ = (numbered.parent / "codex2.md").write_text(f"---\nlogin: {login}\n---\n")
         source, destination = (numbered, default) if default_destination else (default, numbered)
         source_label, destination_label = ("codex1", "default") if default_destination else ("default", "codex1")
-        _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
-            "port": self.server.port, "pid": os.getpid(), "codex_home": str(source), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
-        }))
+        write_server_record(self.session_dir, self.server.port, source)
         evidence = accounts.roles_history_file()
         evidence.parent.mkdir(parents=True, exist_ok=True)
         _ = evidence.write_text(json.dumps({"at": "2026-10-01T00:00:00Z", "role": "workers",
@@ -9341,7 +9478,8 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
 
     def test_relaunch_refuses_a_live_thread_without_starting_another(self) -> None:
         _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
-            "worker": {"thread_id": THREAD_ID, "turn_id": "peer-turn", "status": "running"}
+            "worker": {"thread_id": THREAD_ID, "turn_id": "peer-turn", "status": "running",
+                     "launcher_pid": os.getpid()}
         }), encoding="utf-8")
         self.live_turn = "peer-turn"
         code, errors = self.run_start()
@@ -9350,6 +9488,89 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         self.assertIn("end", errors)
         self.assertEqual(self.methods("thread/start"), [])
         self.assertEqual(self.methods("turn/steer"), [])
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(self.methods("thread/resume"), [])
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(errors, f"codex_mesh: worker: thread {THREAD_ID} has a live turn; "
+                         + "use codex_mesh.py end --to worker before relaunching\n")
+
+    def test_relaunch_interrupts_orphaned_turn_after_launcher_dies(self) -> None:
+        """The 13:01 restart leaves a turn without a launcher."""
+        old_thread = "old-orphaned-thread"
+        self.write_pool_roster({"worker": {
+            "thread_id": old_thread, "turn_id": "orphaned-turn", "status": "running",
+            "launcher_pid": 1_000_000_000,
+        }})
+        self.live_turn = "orphaned-turn"
+
+        code, errors = self.run_start()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(errors.splitlines(), [
+            f"codex_mesh: worker: thread {old_thread} has a stale turn with no live launcher; "
+            + "interrupt requested; continuing relaunch",
+        ])
+        interrupts = self.methods("turn/interrupt")
+        self.assertEqual([request["params"] for request in interrupts], [
+            {"threadId": old_thread, "turnId": "orphaned-turn"},
+        ])
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        started = self.methods("thread/start")
+        self.assertEqual(self.methods("thread/resume"), [])
+        self.assertLess(self.server.requests.index(interrupts[0]), self.server.requests.index(started[0]))
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(len(self.methods("turn/start")), 1)
+
+    def test_failed_worker_continues_after_orphan_interrupt_is_refused(self) -> None:
+        old_thread = "old-orphaned-thread"
+        self.write_pool_roster({"worker": {
+            "thread_id": old_thread, "turn_id": "orphaned-turn", "status": "failed",
+            "launcher_pid": 1_000_000_000,
+        }})
+        self.interrupt_error = "interrupt refused"
+        respond = self.server.respond
+
+        def old_thread_is_active(request: dict[str, object]) -> list[dict[str, object]] | None:
+            params = _as_test_dict(request.get("params"))
+            if request.get("method") == "thread/turns/list" and params.get("threadId") == old_thread:
+                return [_reply(request, {
+                    "data": [{"id": "orphaned-turn", "status": "inProgress"}], "nextCursor": None,
+                })]
+            if request.get("method") == "thread/read" and params.get("threadId") == old_thread:
+                return [_reply(request, {"thread": {
+                    "id": old_thread, "status": {"type": "active"},
+                    "turns": [{"id": "orphaned-turn", "status": "inProgress"}],
+                }})]
+            return respond(request)
+
+        self.server.respond = old_thread_is_active
+
+        code, errors = self.run_start()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(errors.splitlines(), [
+            f"codex_mesh: worker: thread {old_thread} has a stale turn with no live launcher; "
+            + "interrupt not confirmed; continuing relaunch",
+        ])
+        self.assertEqual(len(self.methods("turn/interrupt")), 1)
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertEqual(self.methods("thread/resume"), [])
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+
+    def test_relaunch_reports_orphaned_turn_without_a_recorded_launcher(self) -> None:
+        old_thread = "old-orphaned-thread"
+        self.write_pool_roster({"worker": {
+            "thread_id": old_thread, "turn_id": "orphaned-turn", "status": "running",
+        }})
+        self.live_turn = "orphaned-turn"
+
+        code, errors = self.run_start()
+
+        self.assertEqual(code, 0)
+        self.assertIn(f"worker: thread {old_thread} has a stale turn", errors)
+        self.assertEqual(len(errors.splitlines()), 1)
+        self.assertEqual(len(self.methods("turn/interrupt")), 1)
+        self.assertEqual(len(self.methods("thread/start")), 1)
         self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
 
     def test_relaunch_refuses_a_waiting_worker_with_a_live_launcher(self) -> None:
@@ -9468,7 +9689,8 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         old_thread = "old-failed-thread"
         old_turn = "old-live-turn"
         _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
-            "worker": {"thread_id": old_thread, "turn_id": old_turn, "status": "failed"}
+            "worker": {"thread_id": old_thread, "turn_id": old_turn, "status": "failed",
+                     "launcher_pid": os.getpid()}
         }), encoding="utf-8")
         self.live_turn = old_turn
         self.interrupt_error = "interrupt refused"
@@ -9507,7 +9729,8 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
     def test_failed_worker_refuses_relaunch_when_active_turn_has_no_id(self) -> None:
         old_thread = "old-failed-thread"
         _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
-            "worker": {"thread_id": old_thread, "turn_id": "", "status": "failed"}
+            "worker": {"thread_id": old_thread, "turn_id": "", "status": "failed",
+                     "launcher_pid": os.getpid()}
         }), encoding="utf-8")
         self.live_turn = "old-live-turn"
         self.hide_live_turn_id = True
@@ -9564,22 +9787,51 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         self.assertIn("replaced", (self.session_dir / "worker.log").read_text(encoding="utf-8"))
 
     def test_relaunch_refuses_when_thread_read_errors(self) -> None:
-        """An unreadable active thread is never assumed idle."""
+        """A live launcher retains an unreadable thread."""
+        old_thread = "old-unreadable-thread"
         _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
-            "worker": {"thread_id": THREAD_ID, "turn_id": "", "status": "running"}
+            "worker": {"thread_id": old_thread, "turn_id": "", "status": "running",
+                     "launcher_pid": os.getpid()}
         }), encoding="utf-8")
+        respond = self.server.respond
+
+        def old_thread_failure(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/start":
+                self.read_failure = ""
+            return respond(request)
+
+        self.server.respond = old_thread_failure
         self.read_failure = "error"
-        code, errors = self.run_start()
+        before = (self.session_dir / codex_mesh.ROSTER_FILE).read_bytes()
+        with patch.object(codex_mesh, "_end_unwatched_turn") as cleanup:
+            code, errors = self.run_start()
+        cleanup.assert_not_called()
+        self.assertEqual((self.session_dir / codex_mesh.ROSTER_FILE).read_bytes(), before)
         self.assertEqual(code, 2)
-        self.assertIn("could not be read", errors)
+        self.assertIn("recorded launcher is alive; use codex_mesh.py end --to worker before relaunching", errors)
+        self.assertIn("thread state unknown", errors)
         self.assertIn("read refused", errors)
+        self.assertEqual(len(errors.splitlines()), 1)
         self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(self.methods("thread/resume"), [])
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(self.worker_record()["thread_id"], old_thread)
 
     def test_relaunch_refuses_when_thread_read_times_out(self) -> None:
-        """A timed out read cannot authorize a relaunch."""
+        """A live launcher retains a thread after a read timeout."""
+        old_thread = "old-unreadable-thread"
         _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
-            "worker": {"thread_id": THREAD_ID, "turn_id": "", "status": "running"}
+            "worker": {"thread_id": old_thread, "turn_id": "", "status": "running",
+                     "launcher_pid": os.getpid()}
         }), encoding="utf-8")
+        respond = self.server.respond
+
+        def old_thread_failure(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/start":
+                self.read_failure = ""
+            return respond(request)
+
+        self.server.respond = old_thread_failure
         self.read_failure = "timeout"
         self.lifecycle_clock.freeze()
         original_call = codex_mesh.Client.call
@@ -9596,7 +9848,87 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         def timed_read(client: codex_mesh.Client, method: str,
                        params: dict[str, object], timeout: float = codex_mesh.CALL_TIMEOUT_SECS) -> codex_mesh.RpcMessage:
             nonlocal expiring_read
-            expiring_read = method == "thread/read"
+            expiring_read = method == "thread/read" and params.get("threadId") == old_thread
+            try:
+                return original_call(client, method, params, timeout=timeout)
+            finally:
+                expiring_read = False
+
+        before = (self.session_dir / codex_mesh.ROSTER_FILE).read_bytes()
+        with (patch.object(codex_mesh, "_end_unwatched_turn") as cleanup,
+              patch.object(codex_mesh.Client, "call", timed_read),
+              patch.object(codex_mesh.Client, "_read_until", expire_read)):
+            code, errors = self.run_start()
+        cleanup.assert_not_called()
+        self.assertEqual((self.session_dir / codex_mesh.ROSTER_FILE).read_bytes(), before)
+        self.assertEqual(code, 2)
+        self.assertIn("recorded launcher is alive; use codex_mesh.py end --to worker before relaunching", errors)
+        self.assertIn("timed out", errors)
+        self.assertEqual(len(errors.splitlines()), 1)
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(self.methods("thread/resume"), [])
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(self.worker_record()["thread_id"], old_thread)
+
+    def test_relaunch_continues_when_dead_launchers_thread_read_errors(self) -> None:
+        """An unreadable thread does not block a relaunch."""
+        old_thread = "old-unreadable-thread"
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "worker": {"thread_id": old_thread, "turn_id": "", "status": "running",
+                     "launcher_pid": 1_000_000_000}
+        }), encoding="utf-8")
+        respond = self.server.respond
+
+        def old_thread_failure(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/start":
+                self.read_failure = ""
+            return respond(request)
+
+        self.server.respond = old_thread_failure
+        self.read_failure = "error"
+        code, errors = self.run_start()
+        self.assertEqual(code, 0)
+        self.assertIn("thread state unknown", errors)
+        self.assertIn("read refused", errors)
+        self.assertEqual(len(errors.splitlines()), 1)
+        self.assertIn("cleanup attempted; interrupt not confirmed", errors)
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertEqual(self.methods("thread/resume"), [])
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+
+    def test_relaunch_continues_when_dead_launchers_thread_read_times_out(self) -> None:
+        """A read timeout does not block a relaunch."""
+        old_thread = "old-unreadable-thread"
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "worker": {"thread_id": old_thread, "turn_id": "", "status": "running",
+                     "launcher_pid": 1_000_000_000}
+        }), encoding="utf-8")
+        respond = self.server.respond
+
+        def old_thread_failure(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/start":
+                self.read_failure = ""
+            return respond(request)
+
+        self.server.respond = old_thread_failure
+        self.read_failure = "timeout"
+        self.lifecycle_clock.freeze()
+        original_call = codex_mesh.Client.call
+        original_read = codex_mesh.Client._read_until  # pyright: ignore[reportPrivateUsage]
+        expiring_read = False
+
+        def expire_read(client: codex_mesh.Client, deadline: codex_mesh.TransportDeadline,
+                        wake: codex_mesh.FollowEvents | codex_mesh.SocketOnlyWait = codex_mesh.SOCKET_ONLY_WAIT) -> codex_mesh.RpcMessage | None:
+            if expiring_read:
+                self.lifecycle_clock.advance(max(0.0, deadline.expires - self.lifecycle_clock.monotonic()) + 1)
+                return None
+            return original_read(client, deadline, wake)
+
+        def timed_read(client: codex_mesh.Client, method: str,
+                       params: dict[str, object], timeout: float = codex_mesh.CALL_TIMEOUT_SECS) -> codex_mesh.RpcMessage:
+            nonlocal expiring_read
+            expiring_read = method == "thread/read" and params.get("threadId") == old_thread
             try:
                 return original_call(client, method, params, timeout=timeout)
             finally:
@@ -9605,9 +9937,95 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         with (patch.object(codex_mesh.Client, "call", timed_read),
               patch.object(codex_mesh.Client, "_read_until", expire_read)):
             code, errors = self.run_start()
-        self.assertEqual(code, 2)
+        self.assertEqual(code, 0)
         self.assertIn("timed out", errors)
-        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(len(errors.splitlines()), 1)
+        self.assertIn("cleanup attempted; interrupt not confirmed", errors)
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertEqual(self.methods("thread/resume"), [])
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+
+    def test_relaunch_interrupts_when_unknown_thread_becomes_readable_during_cleanup(self) -> None:
+        old_thread = "old-unreadable-thread"
+        self.write_pool_roster({"worker": {
+            "thread_id": old_thread, "status": "running", "launcher_pid": 1_000_000_000,
+        }})
+        respond = self.server.respond
+        old_reads = 0
+
+        def recover_read(request: dict[str, object]) -> list[dict[str, object]] | None:
+            nonlocal old_reads
+            params = _as_test_dict(request.get("params"))
+            if request.get("method") == "thread/read" and params.get("threadId") == old_thread:
+                old_reads += 1
+                if old_reads == 1:
+                    return [{"id": request.get("id"), "error": {"message": "read refused"}}]
+                self.live_turn = "orphaned-turn"
+            return respond(request)
+
+        self.server.respond = recover_read
+        code, errors = self.run_start()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(errors.splitlines()), 1)
+        self.assertIn(f"worker: thread {old_thread}: thread state unknown (read refused)", errors)
+        self.assertIn("interrupt requested; continuing relaunch", errors)
+        self.assertNotIn("interrupt not confirmed", errors)
+        self.assertEqual(len(self.methods("turn/interrupt")), 1)
+        self.assertEqual(len(self.methods("thread/start")), 1)
+
+    def test_relaunch_continues_after_cleanup_connection_and_log_write_failures(self) -> None:
+        old_thread = "old-unreadable-thread"
+        self.write_pool_roster({"worker": {
+            "thread_id": old_thread, "status": "running", "launcher_pid": 1_000_000_000,
+        }})
+        respond = self.server.respond
+
+        def unreadable_old_thread(request: dict[str, object]) -> list[dict[str, object]] | None:
+            params = _as_test_dict(request.get("params"))
+            if request.get("method") == "thread/read" and params.get("threadId") == old_thread:
+                return [{"id": request.get("id"), "error": {"message": "read refused"}}]
+            return respond(request)
+
+        self.server.respond = unreadable_old_thread
+        with (patch.object(codex_mesh, "_drop_queued_messages", side_effect=ConnectionError("cleanup connection failed")),
+              patch.object(codex_mesh, "_log_uninterrupted_thread", side_effect=OSError("log write refused"))):
+            code, errors = self.run_start()
+
+        self.assertEqual(code, 0)
+        self.assertIn(f"thread {old_thread}: cleanup failed (cleanup connection failed)", errors)
+        self.assertIn("cleanup log failed (log write refused)", errors)
+        self.assertIn("cleanup attempted; interrupt not confirmed; continuing relaunch", errors)
+        self.assertNotIn("interrupt requested", errors)
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(len(self.methods("thread/start")), 1)
+
+    def test_relaunch_reports_no_interrupt_when_active_thread_becomes_idle_during_cleanup(self) -> None:
+        old_thread = "old-orphaned-thread"
+        self.write_pool_roster({"worker": {
+            "thread_id": old_thread, "status": "running", "launcher_pid": 1_000_000_000,
+        }})
+        respond = self.server.respond
+        old_reads = 0
+
+        def turn_ends(request: dict[str, object]) -> list[dict[str, object]] | None:
+            nonlocal old_reads
+            params = _as_test_dict(request.get("params"))
+            if request.get("method") == "thread/read" and params.get("threadId") == old_thread:
+                old_reads += 1
+                self.live_turn = "orphaned-turn" if old_reads == 1 else ""
+            return respond(request)
+
+        self.server.respond = turn_ends
+        code, errors = self.run_start()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(errors.splitlines()), 1)
+        self.assertIn("cleanup attempted; interrupt not confirmed; continuing relaunch", errors)
+        self.assertNotIn("interrupt requested", errors)
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(len(self.methods("thread/start")), 1)
 
     def test_stop_pause_interrupts_live_work_preserves_queued_messages_and_threads(self) -> None:
         entries: dict[str, object] = {
@@ -12299,9 +12717,9 @@ class FollowEventRegressionTests(MeshCommandFixture):
             if item.get("type") == "agentMessage" and not created.is_set():
                 self.assertFalse(stream.runs.last_observed.live)
                 self.assertGreater(stream.runs.next_check, self.lifecycle_clock.monotonic())
-                _ = run.write_text(json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
+                atomic_file.write_text_atomic(run, json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
                 pending = self.session_dir / "worker.pending.json"
-                _ = pending.write_text(pending.read_text() + "\n")
+                atomic_file.write_text_atomic(pending, pending.read_text() + "\n")
                 if resident:
                     record = self.worker_record()
                     record["status"] = "done"
@@ -12336,7 +12754,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
                     held = codex_mesh.hold_message(str(self.session_dir), "worker", "detached run result",
                                                    without_launcher=False)
                     self.assertIsInstance(held, codex_mesh.HeldForLauncher)
-                _ = run.write_text('{"worker":"worker","status":"finished"}')
+                atomic_file.write_text_atomic(run, '{"worker":"worker","status":"finished"}')
                 if resident:
                     _ = (self.session_dir / "worker.end").write_text("end")
             code, errors = LauncherHangGuard(self.id()).result(future)
@@ -12355,7 +12773,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
         self.outcomes = ["completed", "listed_before_notices"]
         run = self.session_dir / codex_mesh.DETACHED_RUNS_DIR / "last.json"
         run.parent.mkdir()
-        _ = run.write_text(json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
+        atomic_file.write_text_atomic(run, json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
         held_on_run = threading.Event()
         polled_result_turn = threading.Event()
         steps: list[codex_mesh.StreamStep | codex_mesh.FailedWithThread] = []
@@ -12393,7 +12811,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
                                                without_launcher=False)
                 # Match mesh_runs.command_supervise: hold the result while the
                 # run still owns the inbox, then publish its finished record.
-                _ = run.write_text(json.dumps({"worker": "worker", "status": "finished", "pid": os.getpid()}))
+                atomic_file.write_text_atomic(run, json.dumps({"worker": "worker", "status": "finished", "pid": os.getpid()}))
                 self.assertIsInstance(held, codex_mesh.HeldForLauncher)
                 LauncherHangGuard("the held result opened no turn").event(self.server.held_turn_ready)
                 LauncherHangGuard("no lifecycle check ran on the result turn").event(polled_result_turn)
@@ -13439,12 +13857,12 @@ class WorkerAdoptionTests(MeshCommandFixture):
         }})
 
     def configure_allocation(self) -> None:
-        registry = self.session_dir / "workers-agents.conf"
+        registry = self.session_dir / "workers-models.conf"
         _ = write_registry(registry, {'codex.agents': {'gpt-fixture-sol': 'high,xhigh,max'}, 'assignments': {'direct': 'codex'}, 'direct.codex': {'impl': 'gpt-fixture-sol:xhigh'}, 'direct.options': {'codex_service_tier.impl': 'fast'}})
         checkpoint = self.session_dir / "catalog-current"
         checkpoint.touch()
         self.patches.enter_context(patch.dict(os.environ, {
-            "AGENTS_CONFIG_FILE": str(registry),
+            "MODELS_CONFIG_FILE": str(registry),
             "CODEX_CATALOG_SYNC_STATE_FILE": str(checkpoint),
         }))
 
@@ -13567,7 +13985,7 @@ class WorkerAdoptionTests(MeshCommandFixture):
 
     def test_new_review_thread_has_its_configured_shown_name_before_any_turn(self) -> None:
         self.configure_allocation()
-        registry = self.session_dir / "workers-agents.conf"
+        registry = self.session_dir / "workers-models.conf"
         _ = write_registry(registry, {"direct.codex": {"review": "gpt-fixture-sol:xhigh"}}, update=True)
         state = self.session_dir / plan_history.STATE_FILENAME
         _ = state.write_text(json.dumps({"working_dir": str(self.session_dir),
@@ -16956,7 +17374,7 @@ class WorkersHomeTests(unittest.TestCase):
         return home
 
     def record(self, home: Path, port: int = 4001) -> None:
-        _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({"port": port, "pid": os.getpid(), "codex_home": str(home), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS}))
+        write_server_record(self.session_dir, port, home)
 
     def writer_process_is_live(self, pid: int) -> bool:
         return pid == os.getpid()
@@ -17131,7 +17549,7 @@ class WorkersHomeTests(unittest.TestCase):
         other_run = self.session_dir.parent / "other-run"
         other_run.mkdir()
         self.record(selected)
-        _ = (other_run / codex_mesh.SERVER_FILE).write_text(json.dumps({"port": 4002, "pid": os.getpid(), "codex_home": str(self.home / ".codex"), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS}))
+        write_server_record(other_run, 4002, self.home / ".codex")
         with patch.dict(os.environ, {"CODEX_HOME": str(selected)}), patch.object(codex_mesh, "_sign_in_changed_at", return_value=2000), patch.object(codex_mesh, "_server_started_at", return_value=1000), patch.object(codex_mesh, "_stop_unused", return_value=False), patch.object(codex_mesh, "_start_watcher"), patch.object(codex_mesh, "_notify_holder"), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(codex_mesh.command_signin_changed(argparse.Namespace(root=str(self.session_dir.parent))), 0)
         self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
@@ -17144,7 +17562,7 @@ class WorkersHomeTests(unittest.TestCase):
         other_run = root / "other-run"
         other_run.mkdir()
         self.record(self.home / ".codex")
-        _ = (other_run / codex_mesh.SERVER_FILE).write_text(json.dumps({"port": 4002, "pid": os.getpid(), "codex_home": str(self.home / ".codex"), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS}))
+        write_server_record(other_run, 4002, self.home / ".codex")
         _ = (root / "active" / "director-one").write_text(str(self.session_dir) + "\n")
         _ = (root / "active" / "director-two").write_text(str(other_run) + "\n")
         with patch.object(codex_mesh, "SWEEP_ROOTS", (root,)), patch.object(codex_mesh, "_stop_unused", return_value=False), patch.object(codex_mesh, "_start_watcher"), patch.object(codex_mesh, "_notify_holder") as notify:
@@ -17404,10 +17822,12 @@ class DevShellServerTests(unittest.TestCase):
         self.workers_home = root / "workers"
         self.workers_home.mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HOME": str(Path.home()), "AGENT_NOTES_DIR": os.environ["AGENT_NOTES_DIR"],
             "PATH": "/caller/bin", "CODEX_HOME": "/caller/home",
             "UNIT_RUN_DIR": "/caller/run", "TMPDIR": str(root),
             "NIX_LDFLAGS": "caller linker flags",
         }, clear=True)))
+        _ = self.enterContext(scratch_accounts_config())
         _ = self.enterContext(patch.object(codex_mesh, "RUN_ROOTS", (self.session_dir.parent,)))
         _ = self.enterContext(patch.object(codex_mesh, "_design_context", return_value={}))
         _ = self.enterContext(patch.object(codex_mesh, "_holds_old_sign_in", return_value=False))
@@ -17898,6 +18318,38 @@ class ServerRecordTests(unittest.TestCase):
         process = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)])
         self.spawned.append(process)
         return process.pid
+
+    def test_pid_alive_rejects_a_zombie_stat(self) -> None:
+        with (patch.object(codex_mesh, "_signal_process"),
+              patch.object(Path, "read_text", return_value="4242 (app-server (child)) Z 1 2 3")):
+            self.assertFalse(codex_mesh._pid_alive(4242))  # pyright: ignore[reportPrivateUsage]
+
+    def test_pid_alive_rejects_nonpositive_pids_without_an_os_probe(self) -> None:
+        with patch.object(codex_mesh, "_signal_process") as probe:
+            for pid in (0, -1, -4242):
+                with self.subTest(pid=pid):
+                    self.assertFalse(codex_mesh._pid_alive(pid))  # pyright: ignore[reportPrivateUsage]
+            probe.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "linux", "The zombie check uses Linux process evidence.")
+    def test_retired_child_app_server_is_reaped(self) -> None:
+        for retirement in ("retire", "replace", "stop"):
+            with self.subTest(retirement=retirement):
+                pid = self.sleeper()
+                self.write_server(4321, pid)
+                os.kill(pid, signal.SIGTERM)
+                # Observe the exit without reaping the child before retirement.
+                _ = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+                if retirement == "retire":
+                    self.assertTrue(codex_mesh._retire_server(  # pyright: ignore[reportPrivateUsage]
+                        str(self.session_dir), 4321))
+                elif retirement == "replace":
+                    codex_mesh._record_started_server(  # pyright: ignore[reportPrivateUsage]
+                        str(self.session_dir), {"pid": os.getpid(), "port": 9876})
+                else:
+                    _ = codex_mesh._reap(pid)  # pyright: ignore[reportPrivateUsage]
+                with self.assertRaises(ChildProcessError):
+                    _ = os.waitpid(pid, os.WNOHANG)
 
     def test_loaded_threads_reads_current_and_retired_pages_under_one_deadline(self) -> None:
         current = self.session_dir / codex_mesh.SERVER_FILE

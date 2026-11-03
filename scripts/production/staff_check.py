@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from contextlib import redirect_stderr
 from dataclasses import dataclass
-import io
 import os
 from pathlib import Path
 import shlex
@@ -215,10 +213,22 @@ def wrong_rows(record: staff.StaffSnapshot, evidence: CheckEvidence) -> list[str
         if live[row.id] and (isinstance(row.worktree, staff.RemovedWorktree) or isinstance(row.doc, staff.WrappedDoc)):
             row_wrong(row, "live session is attached to a retired row")
     local_machine = remote.local_machine()
-    metadata_errors = io.StringIO()
-    with redirect_stderr(metadata_errors):
-        metadata = unit_lookup.unit_metadata(record, evidence.sources)
-    runners = evidence.sources.showrunner_members(record)
+    metadata = unit_lookup.unit_metadata(record, evidence.sources)
+    for problem in metadata.problems:
+        wrong(problem.unit_id, problem.name, problem.reason)
+    timer_documents: dict[staff.StaffId, set[Path]] = defaultdict(set)
+    for source in evidence.sources.productions.values():
+        owner = record.by_doc(local_machine, source.timer.doc)
+        if owner is None:
+            owner = record.by_member_reference(source.timer.target.removeprefix("session:"))
+        if owner is not None and owner.kind == "showrunner":
+            timer_documents[owner.id].add(source.timer.doc)
+        try:
+            _ = production_units.unit_table(source.document.splitlines())
+        except production_units.Refusal as error:
+            if owner is not None:
+                row_wrong(owner, f"uncertain: document unit table could not be read: {error}")
+            continue
     for row in record.rows:
         if row.kind == "unit":
             location = row.worktree
@@ -234,12 +244,7 @@ def wrong_rows(record: staff.StaffSnapshot, evidence: CheckEvidence) -> list[str
                 row_wrong(row, f"worktree does not exist: {location.path}")
             elif not production_units.worktree_is_linked(str(location.path)):
                 row_wrong(row, f"not a linked git worktree: {location.path}")
-            cells = metadata.get(row.id)
-            declared = production_units.cell_value(cells.get("Worktree", "")) if cells is not None else ""
-            if not declared or declared in ("—", "-"):
-                row_wrong(row, "uncertain: no document worktree bound to this unit")
-            elif Path(declared).expanduser() != location.path:
-                row_wrong(row, f"worktree belongs elsewhere: document names {declared}, staff names {location.path}")
+
         elif row.kind == "showrunner":
             doc = row.doc
             if isinstance(doc, staff.DocUnfilled):
@@ -252,7 +257,7 @@ def wrong_rows(record: staff.StaffSnapshot, evidence: CheckEvidence) -> list[str
                 row_wrong(row, f"production doc does not exist: {doc.path}")
             if isinstance(doc, staff.WrappedDoc):
                 continue
-            bound = [evidence.sources.productions[slug].timer.doc for slug, runner in runners.items() if runner.id == row.id]
+            bound = sorted(timer_documents[row.id])
             if not bound:
                 row_wrong(row, "uncertain: no timer document bound to this showrunner")
             elif len(bound) != 1 or bound[0] != doc.path:

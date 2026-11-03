@@ -100,6 +100,53 @@ class TidyWrappedTests(unittest.TestCase):
         self.assertEqual((unrelated.read_bytes(), unrelated.stat().st_mtime_ns), unrelated_before)
         self.assertFalse(reminders.exists())
 
+    def test_wrap_refuses_ambiguous_document_ownership_without_changing_any_file(self) -> None:
+        import tidy_wrapped
+
+        checkout = self.root / "main"
+        checkout.mkdir()
+
+        def git(*arguments: str) -> None:
+            result = subprocess.run(["git", *arguments], cwd=checkout, capture_output=True,
+                                    text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+        git("init", "-b", "main")
+        git("config", "user.name", "Cleanup Test")
+        git("config", "user.email", "cleanup@example.invalid")
+        folder = self.root / "questions"
+        relative = Path("docs/plans/done-production.md")
+        document = self.write(checkout / relative, production("wrapped") + f"\n- **Proposals:** `{folder}`\n")
+        git("add", ".")
+        git("commit", "-m", "Add a wrapped production")
+        other = self.root / "other-owner"
+        caller = self.root / "caller"
+        git("worktree", "add", "-b", "other-owner", str(other))
+        git("worktree", "add", "-b", "caller", str(caller))
+        first = fixture_member("showrunner", name="first-owner", doc=staff.WrappedDoc("natedev", document))
+        second = fixture_member("showrunner", name="second-owner", doc=staff.WrappedDoc("natedev", other / relative))
+        fields = {"since": "2000-01-01T08:00", "text": "Choose the layout",
+                  "question": "Keep this layout?", "asked_by": str(first.id)}
+        question = self.write(folder / "question-layout.md",
+                              "---\nrecord_type: question\nstatus: open\n"
+                              + f"production_id: {first.id}\nasked_by: {first.id}\n"
+                              + f"registration: {json.dumps(fields)}\n---\n# Choose the layout\n")
+        state = self.state_files("done")
+        paths = [*state, question, document, other / relative, caller / relative, self.root / "staff.json"]
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+        environment = {**os.environ, **source_environment(self.root / "sources"),
+                       "HOME": str(self.root), "SHOWRUNNER_STATE_DIR": str(self.state),
+                       "NOTIFIER_STATE_DIR": str(self.notifier)}
+        with (mock.patch.dict(os.environ, environment), isolated_source_readers(),
+              mock.patch.object(tidy_wrapped, "STATE_DIR", self.state),
+              mock.patch.object(tidy_wrapped, "NOTIFIER_STATE_DIR", self.notifier)):
+            result = invoke_cli(tidy_wrapped, lambda: tidy_wrapped.main([str(caller / relative)]),
+                                [str(caller / relative)], environment, self.root)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(str(first.id), result.stderr)
+        self.assertIn(str(second.id), result.stderr)
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
+
     def test_a_running_production_keeps_every_file(self) -> None:
         own = self.state_files("live")
         result = self.run_tidy(self.doc("live", "running"))

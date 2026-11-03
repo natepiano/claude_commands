@@ -344,7 +344,7 @@ class AffectedModulesTests(unittest.TestCase):
 
     def test_named_configuration_selects_its_callers_without_a_full_suite(self) -> None:
         self.write("config/limits.conf", "amount=1\n")
-        self.write("scripts/component/reader.py", 'import conf\nVALUE = conf.whole("limits", "amount")\n')
+        self.write("scripts/component/reader.py", 'import conf\nVALUE = conf.read("limits").whole("amount")\n')
         self.add_test("checks/test_limits.py", "import reader\n")
         self.certify()
         self.write("config/limits.conf", "amount=2\n")
@@ -355,7 +355,7 @@ class AffectedModulesTests(unittest.TestCase):
     def test_every_shared_input_trigger_requests_full_validation(self) -> None:
         paths = ["scripts/lib/new.py", "scripts/other/conftest.py", "settings.json",
                  "scripts/production/merge_gate.py", "scripts/production/affected_modules.py",
-                 "scripts/agents/agents_config.sh"]
+                 "scripts/agents/models_config.sh"]
         for path in paths:
             with self.subTest(path=path):
                 self.write(path, "# changed\n")

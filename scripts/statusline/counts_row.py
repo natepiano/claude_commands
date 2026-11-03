@@ -53,9 +53,11 @@ def row(instance: Path) -> tuple[str, str, list[Path]]:
 
     identities = QuestionStaff.read()
     sources.extend(footer_counts.sources(production.doc, identities=identities))
+    sources.extend(footer_counts.routing_sources(identities.record))
     sources.append(showrunner_footer.outstanding_path(production.slug))
     questions = showrunner_footer.open_questions([production], identities=identities)
-    line = showrunner_footer.counts_line([production], questions or 0) or ""
+    line = footer_counts.counts_line(footer_counts.read_counts(
+        production.doc, questions=questions or 0, record=identities.record)) or ""
     due = showrunner_footer.deferred_until([production.slug], production.zone, identities=identities)
     return line, "" if due is None else str(int(due.timestamp())), sources
 

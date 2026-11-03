@@ -19,8 +19,8 @@ from typing import ClassVar, cast, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib.test_agents_registry import ExactRows, registry_text, write_registry
-from scripts.whoami.note_file import note_name
+from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry
+from scripts.whoami.account_test_support import create_claude_account
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -85,18 +85,6 @@ def setUpModule() -> None:
     _ = unittest.enterModuleContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
 
 
-def stored_room(login: str, left: float, days: float) -> None:
-    """Store a fresh weekly reading for a Claude fixture account."""
-    from scripts.whoami import usage_store
-    saved = usage_store.load()
-    saved[usage_store.key("Claude", login)] = usage_store.StoredUsage(weekly=usage_store.StoredWindow(
-        left=left, at=datetime.now(timezone.utc).isoformat(),
-        resets=(datetime.now(timezone.utc) + timedelta(days=days)).isoformat()))
-    file = usage_store.store_file()
-    file.parent.mkdir(parents=True, exist_ok=True)
-    _ = file.write_text(json.dumps(saved))
-
-
 class QuotaReminderFixture(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -121,7 +109,7 @@ class QuotaReminderFixture(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(note_file, "AGENTS_DIR", self.root))
         _ = self.enterContext(mock.patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl"))
         config = self.root / "showrunners.json"
-        registry = self.root / "agents.conf"
+        registry = self.root / "models.conf"
         for name, value in (("CONFIG", config), ("STATE", self.root / "state.json"), ("relay", self.relay),
                             ("tell_user", self.tell_user), ("REGISTRY", registry)):
             patcher = mock.patch.object(quota_alert, name, value)
@@ -130,7 +118,7 @@ class QuotaReminderFixture(unittest.TestCase):
         recipients_patch = mock.patch.object(quota_alert, "recipients", configured_recipients)
         _ = recipients_patch.start()
         self.addCleanup(recipients_patch.stop)
-        # A fresh sync stamp and no Codex config keep agents_config.sh from syncing the catalog into the fixture.
+        # A fresh sync stamp and no Codex config keep models_config.sh from syncing the catalog into the fixture.
         synced = self.root / "catalog synced"
         for key, value in (("CODEX_CATALOG_SYNC_STATE_FILE", synced), ("CODEX_CONFIG_FILE", self.root / "absent"),
                            ("CODEX_MODELS_CACHE_FILE", self.root / "absent")):
@@ -155,7 +143,7 @@ class QuotaReminderFixture(unittest.TestCase):
         _ = (self.root / "showrunners.json").write_text(json.dumps({
             "threshold_percent": 1, "repeat_minutes": 30, "stall_minutes": 5,
             "faults_to": "natedev", "always": ["natedev"]}))
-        _ = write_registry((self.root / "agents.conf"), base_text=REGISTRY)
+        _ = write_registry((self.root / "models.conf"), base_text=REGISTRY)
         (self.root / "catalog synced").touch()
 
     @staticmethod
@@ -278,21 +266,13 @@ class QuotaReminderFixture(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(account, "account_of",
             return_value=account.Account("claude", identity.login, identity.label)))
 
-    def stored_room(self, login: str, left: float, days: float) -> None:
-        stored_room(login, left, days)
-
     def configure_claude_roles(self) -> None:
         _ = (self.root / ".claude").mkdir(exist_ok=True)
         _ = (self.root / ".claude.json").write_text(
             json.dumps({"oauthAccount": {"emailAddress": "showrunner@example.invalid"}}), encoding="utf-8",
         )
-        _ = (self.root / "claude2.md").write_text("---\nlogin: showrunner@example.invalid\n---\n")
         for label, login in (("claude1", "spare@example.invalid"), ("claude2", "showrunner@example.invalid"), ("claude3", "unit@example.invalid")):
-            self.assertEqual(accounts.setup(label), [])
-            _ = (self.root / note_name(label)).write_text(f"---\nlogin: {login}\n---\n")
-            _ = (accounts.account_dir(label) / ".claude.json").write_text(
-                json.dumps({"oauthAccount": {"emailAddress": login}}), encoding="utf-8",
-            )
+            create_claude_account(label, login)
         self.set_claude_activity("claude3")
 
     def assignments(self) -> dict[str, str]:
@@ -373,7 +353,7 @@ class CodexZeroEpisodeFixture(unittest.TestCase):
         config = self.root / "showrunners.json"
         _ = config.write_text(json.dumps({"threshold_percent": 1, "repeat_minutes": 30,
             "stall_minutes": 5, "faults_to": "director", "always": ["director"]}))
-        registry = self.root / "agents.conf"
+        registry = self.root / "models.conf"
         _ = write_registry(registry, base_text=REGISTRY)
         _ = self.enterContext(mock.patch.object(quota_alert, "CONFIG", config))
         _ = self.enterContext(mock.patch.object(quota_alert, "REGISTRY", registry))
