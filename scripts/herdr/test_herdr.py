@@ -40,6 +40,30 @@ from scripts.message.sessions_test_support import copy_session_modules
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, isolated_staff_file, unit_membership
 
 GIT_BINARY = shutil.which("git") or "git"
+NATIVE_PROCESS_START = "Tue Nov  3 08:00:00 2026"
+
+
+@contextmanager
+def native_process_commands(pid: int) -> Generator[None]:
+    """Supply private process facts for both platform readers."""
+    program = herdr.run_program
+
+    def process_start(observed_pid: int) -> str:
+        if observed_pid != pid:
+            raise AssertionError(f"unexpected process: {observed_pid}")
+        return NATIVE_PROCESS_START
+
+    def run(argv: list[str], timeout: float = herdr.PROGRAM_TIMEOUT_SECONDS, *,
+            environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        if argv[1:] == ["-o", "lstart=,tty=", "-p", str(pid)]:
+            return subprocess.CompletedProcess(argv, 0, NATIVE_PROCESS_START + " ??\n", "")
+        if argv[1:] == ["-a", "-p", str(pid), "-Fn"]:
+            return subprocess.CompletedProcess(argv, 1, "", "")
+        return program(argv, timeout, environment=environment)
+
+    with (patch.object(herdr, "run_program", side_effect=run),
+          patch.object(sessions, "process_start", side_effect=process_start)):
+        yield
 
 
 @contextmanager
@@ -50,11 +74,6 @@ def codex_launch_evidence(root: Path, argv: list[str]) -> Generator[dict[str, ob
     proc = root / "codex-launch-proc"
     (proc / str(pid) / "fd").mkdir(parents=True, exist_ok=True)
 
-    def process_start(observed_pid: int) -> str:
-        if observed_pid != pid:
-            raise AssertionError(f"unexpected process: {observed_pid}")
-        return "codex-launch-start"
-
     def environment(observed_pid: int) -> dict[str, str]:
         if observed_pid != pid:
             raise AssertionError(f"unexpected process: {observed_pid}")
@@ -63,7 +82,7 @@ def codex_launch_evidence(root: Path, argv: list[str]) -> Generator[dict[str, ob
     with (patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(root / "codex-launches"),
                                  "HERDR_PROC": str(proc)}),
           isolated_staff_file(root / "codex-staff.json", {}),
-          patch.object(sessions, "process_start", side_effect=process_start),
+          native_process_commands(pid),
           patch.object(herdr, "process_environment", side_effect=environment)):
         yield {"process_info": {"foreground_processes": [
             {"pid": pid, "argv": argv, "cwd": str(root)}]}}
@@ -163,13 +182,15 @@ class NativePaneSessionTests(StaffTestCase):
         identity = fixture_runtime_id("herdr-native-Claude")
         registry = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json"
         observation: dict[str, object] = {"pid": os.getpid(), "sessionId": identity,
-            "procStart": sessions.process_start(os.getpid()), "name": "same-name",
+            "procStart": NATIVE_PROCESS_START, "name": "same-name",
             "messagingSocketPath": str(self.root / "private.sock"), "updatedAt": 1}
         self.write_json(registry, observation)
         payload = {"result": {"process_info": {"foreground_processes": [
             {"pid": os.getpid(), "argv": ["claude", "-n", "same-name"]}]}}}
         result = subprocess.CompletedProcess[str]([], 0, json.dumps(payload), "")
         with (patch.object(herdr, "run_program", return_value=result),
+              native_process_commands(os.getpid()),
+              patch.object(herdr, "process_environment", return_value={}),
               patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": ""})):
             self.assertEqual(herdr.Herdr("agents").native_session("w1:p1", "claude", 1), identity)
             observation["procStart"] = "reused-process-id"
@@ -1347,12 +1368,9 @@ class LaunchDestinationTests(unittest.TestCase):
         identity = herdr.AgentProcessIdentity(456, 789)
         for case in ("live", "exited", "reused", "shell", "exited_before_signal"):
             with (self.subTest(case=case),
-                  patch.object(os, "pidfd_open", create=True),
-                  patch.object(signal, "pidfd_send_signal", create=True),
                   patch.object(os, "kill") as signalled,
+                  patch.object(herdr, "os", SimpleNamespace(kill=signalled)),
                   patch.object(herdr, "_startup_processes") as checked):
-                delattr(os, "pidfd_open")
-                delattr(signal, "pidfd_send_signal")
                 checked.return_value = (
                     herdr.PaneAtShell() if case == "exited" else
                     herdr.AgentProcessPresent((herdr.AgentProcessIdentity(456, 999),)) if case == "reused" else
