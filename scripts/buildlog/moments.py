@@ -22,6 +22,9 @@ type MetricKey = Literal[
     "failed", "reruns", "queue_hidden", "pass_reruns", "pass_hours", "fail_reruns", "fail_hours",
     "clippy", "clone_rebuilds", "clone_hours", "clone_repeats", "failed_pct", "reruns_pct",
     "queue_hidden_pct", "clone_repeats_pct", "nextest_per_phase", "clippy_per_phase",
+    "run_hours_hana_per_phase", "wait_hours_hana_per_phase", "failed_per_phase",
+    "reruns_per_phase", "clone_rebuilds_per_phase", "clone_hours_per_phase",
+    "fail_reruns_per_phase", "wait_hours_per_run_hour",
 ]
 type ComparisonSide = Literal["before", "after"]
 
@@ -109,7 +112,7 @@ MOMENTS: tuple[Moment, ...] = (
                     BaselineFigure("clone_rebuilds", 805, basis="total"),
                     BaselineFigure("clone_hours", 231, basis="total"),
                 ), ("sdlc: clone rebuilds 805 runs, 231 of 327 hana nextest hours; 134 phases.",
-                    "Fail then fail differs (ours about 80 h, sdlc 50–55 h); load ratios differ because sdlc's 134 phases include the Mac."), "week")),
+                    "Fail then fail differs (ours about 80 h, sdlc 50–55 h); per-phase rows differ because sdlc's 134 phases include the Mac."), "week")),
     MemoryMoment(datetime(2026, 10, 31, 13, 33, tzinfo=UTC), "Build budget 21 → 24 GiB (e791376e)"),
     BuildMoment(datetime(2026, 10, 31, 20, 36, tzinfo=UTC), "Queue test-phase charge (2a819dfd)", "all"),
 )
@@ -229,32 +232,52 @@ class RateUnavailable:
 
 
 @dataclass(frozen=True)
+class PerDay:
+    """Divide the row's total by the window days."""
+
+
+@dataclass(frozen=True)
+class Ratio:
+    numerator: MetricKey
+    denominator: MetricKey | Literal["phases"]
+
+
+@dataclass(frozen=True)
 class RateRow:
     key: MetricKey
     label: str
     scope: Literal["all", "hana"]
-    unit: Literal["hours", "runs", "percent", "per_phase"]
+    unit: Literal["hours", "runs", "percent", "runs_per_phase", "hours_per_phase", "per_run_hour"]
+    formula: PerDay | Ratio = PerDay()
 
 
 RATE_ROWS: tuple[RateRow, ...] = (
+    RateRow("nextest_per_phase", "Hana nextest / phase", "hana", "runs_per_phase", Ratio("nextest", "phases")),
+    RateRow("clippy_per_phase", "Hana clippy / phase", "hana", "runs_per_phase", Ratio("clippy", "phases")),
+    RateRow("run_hours_hana_per_phase", "Hana run hours / phase", "hana", "hours_per_phase", Ratio("run_hours_hana", "phases")),
+    RateRow("wait_hours_hana_per_phase", "Hana wait hours / phase", "hana", "hours_per_phase", Ratio("wait_hours_hana", "phases")),
+    RateRow("failed_per_phase", "Hana nextest failed / phase", "hana", "runs_per_phase", Ratio("failed", "phases")),
+    RateRow("reruns_per_phase", "Hana nextest reruns / phase", "hana", "runs_per_phase", Ratio("reruns", "phases")),
+    RateRow("clone_rebuilds_per_phase", "Hana clone rebuilds / phase", "hana", "runs_per_phase", Ratio("clone_rebuilds", "phases")),
+    RateRow("clone_hours_per_phase", "Hana clone rebuild hours / phase", "hana", "hours_per_phase", Ratio("clone_hours", "phases")),
+    RateRow("fail_reruns_per_phase", "Hana same-worker fail then fail / phase", "hana", "runs_per_phase", Ratio("fail_reruns", "phases")),
+    RateRow("wait_hours_per_run_hour", "Hana wait hours / run hour", "hana", "per_run_hour", Ratio("wait_hours_hana", "run_hours_hana")),
     RateRow("run_hours_all", "Run hours, all", "all", "hours"),
     RateRow("run_hours_hana", "Run hours, hana", "hana", "hours"),
     RateRow("wait_hours_all", "Wait hours, all", "all", "hours"),
     RateRow("wait_hours_hana", "Wait hours, hana", "hana", "hours"),
     RateRow("nextest", "Hana nextest steps", "hana", "runs"),
-    RateRow("failed_pct", "Hana nextest failed", "hana", "percent"),
-    RateRow("reruns_pct", "Hana nextest reruns", "hana", "percent"),
-    RateRow("queue_hidden_pct", "Hana queue-hidden repeats", "hana", "percent"),
+    RateRow("failed_pct", "Hana nextest failed", "hana", "percent", Ratio("failed", "nextest")),
+    RateRow("reruns_pct", "Hana nextest reruns", "hana", "percent", Ratio("reruns", "nextest")),
+    RateRow("queue_hidden_pct", "Hana queue-hidden repeats", "hana", "percent", Ratio("queue_hidden", "nextest")),
     RateRow("pass_reruns", "Same-worker after a pass, runs", "hana", "runs"),
     RateRow("pass_hours", "Same-worker after a pass, hours", "hana", "hours"),
     RateRow("fail_reruns", "Same-worker fail then fail, runs", "hana", "runs"),
     RateRow("fail_hours", "Same-worker fail then fail, hours", "hana", "hours"),
     RateRow("clippy", "Hana clippy steps", "hana", "runs"),
-    RateRow("nextest_per_phase", "Hana nextest / phase", "hana", "per_phase"),
-    RateRow("clippy_per_phase", "Hana clippy / phase", "hana", "per_phase"),
     RateRow("clone_rebuilds", "Hana clone rebuilds", "hana", "runs"),
     RateRow("clone_hours", "Hana clone rebuild hours", "hana", "hours"),
-    RateRow("clone_repeats_pct", "Hana clone repeats", "hana", "percent"),
+    RateRow("clone_repeats_pct", "Hana clone repeats", "hana", "percent", Ratio("clone_repeats", "clone_rebuilds")),
 )
 
 
@@ -364,20 +387,16 @@ def window_rates(connection: sqlite3.Connection, start: datetime, end: datetime,
     totals = window_totals(connection, start, end)
     phase_count = len({phase.phase_instance_id for phase in phases
                        if start.timestamp() <= phase.timestamp_epoch < end.timestamp() and hana_name(phase.working_dir)})
-    rates: dict[MetricKey, float | RateUnavailable] = {
-        row.key: totals[row.key] / days for row in RATE_ROWS if row.unit in ("hours", "runs")}
-    percentages: tuple[tuple[MetricKey, MetricKey, MetricKey], ...] = (
-        ("failed_pct", "failed", "nextest"), ("reruns_pct", "reruns", "nextest"),
-        ("queue_hidden_pct", "queue_hidden", "nextest"), ("clone_repeats_pct", "clone_repeats", "clone_rebuilds"),
-    )
-    for key, numerator, denominator in percentages:
-        rates[key] = (100 * totals[numerator] / totals[denominator] if totals[denominator]
-                      else RateUnavailable(f"no {denominator}"))
-    phase_ratios: tuple[tuple[MetricKey, MetricKey], ...] = (
-        ("nextest", "nextest_per_phase"), ("clippy", "clippy_per_phase"))
-    for kind, key in phase_ratios:
-        rates[key] = (totals[kind] / phase_count if phase_count
-                                      else RateUnavailable("no natedev hana phases"))
+    rates: dict[MetricKey, float | RateUnavailable] = {}
+    for row in RATE_ROWS:
+        if isinstance(row.formula, PerDay):
+            rates[row.key] = totals[row.key] / days
+            continue
+        numerator, denominator = row.formula.numerator, row.formula.denominator
+        divisor = phase_count if denominator == "phases" else totals[denominator]
+        reason = "no natedev hana phases" if denominator == "phases" else f"no {denominator}"
+        scale = 100 if row.unit == "percent" else 1
+        rates[row.key] = (scale * totals[numerator] / divisor if divisor else RateUnavailable(reason))
     return WindowRates(days, totals, rates, phase_count)
 
 

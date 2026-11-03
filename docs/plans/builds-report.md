@@ -154,3 +154,21 @@ Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's n
 - Source: the user's change review C682 (2026-11-02). The table is hard to read in the CLI; agents use it for analysis.
 
 **Files:** `commands/build/report.md`.
+
+### Phase 5 — The build report compares moments per phase, not per day  · status: done
+**Depends on:** Phase 1
+
+2026-11-03 (the user, through the builds showrunner): the machines ran much lighter after Build rules 1. A time comparison per day does not show whether matters improved. The report needs a comparison per a unit of work.
+
+#### As-built
+
+- The unit of work is the finished natedev hana phase (`WindowRates.phase_count`).
+- Each build moment's rate table leads with rows per phase: nextest, clippy, run hours, wait hours, failed nextest, nextest reruns, clone rebuilds, clone rebuild hours and fail-then-fail runs.
+- One row shows hana wait hours per hana run hour. It is unavailable when run hours are zero.
+- The per-day rows follow. Each cell suffix states its unit (`/phase`, `h /phase`, `/day`, `h /day`, `%`, `h wait / h run`). The header is `| Rate | Before | After | Change |`.
+- Under the table: `Hana phases finished: before N, after M.` and a note. The note says per-day rows follow load, per-phase counts do not, and per-phase hours still fall on a quieter machine.
+- `RateRow.formula` is `PerDay | Ratio`. One loop over `RATE_ROWS` computes every rate. Units `runs_per_phase` and `hours_per_phase` replace `per_phase`.
+- Both moment tables and the Moment 1 baseline table use `table()`, `rate_change()` and `rate_window_days()`. The baseline line reads `Hana phases finished in the baseline: N.`
+- Not added: rates per landed commit. A move of the note to one place per report is not made; the note stays under each table.
+
+**Files:** `scripts/buildlog/moments.py`, `scripts/buildlog/report.py`, `scripts/buildlog/test_moments.py`.
