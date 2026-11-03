@@ -47,6 +47,7 @@ from scripts.accounts import moves, worker_names
 from scripts.whoami import account
 from scripts.whoami import agent_accounts
 from scripts.whoami import usage_store
+from scripts.whoami.account_test_support import create_claude_account, stored_room
 import quota_alert
 from scripts.whoami import run_out
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -821,23 +822,14 @@ class AccountsTests(unittest.TestCase):
             (self.main_dir / name).mkdir(exist_ok=True)
         if not (self.home / ".claude.json").exists():
             _ = (self.home / ".claude.json").write_text("{}")
-        self.assertEqual(accounts.setup(label), [])
-        config = accounts.account_dir(label) / ".claude.json"
-        _ = config.write_text(json.dumps({"oauthAccount": {"emailAddress": login}}), encoding="utf-8")
+        create_claude_account(label, login)
         if default:
             _ = (self.home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": login}}), encoding="utf-8")
-        self.write_note(label, login)
         if note_label:
             self.write_note(note_label, login)
 
     def seed_room(self, login: str, days: float = 2) -> None:
-        now = datetime.now(timezone.utc)
-        file = usage_store.store_file()
-        saved = usage_store.load()
-        saved[usage_store.key("Claude", login)] = usage_store.StoredUsage(weekly=usage_store.StoredWindow(
-            left=80, at=now.isoformat(), resets=(now + timedelta(days=days)).isoformat()))
-        file.parent.mkdir(parents=True, exist_ok=True)
-        _ = file.write_text(json.dumps(saved))
+        stored_room(login, 80, datetime.now(timezone.utc) + timedelta(days=days))
 
     def write_readings(self, readings: list[accounts.QuotaReading]) -> None:
         log = accounts.readings_file()
@@ -7243,15 +7235,12 @@ class PickerTests(unittest.TestCase):
         _ = self.enterContext(patch.object(agent_accounts, "prepare_codex_home", return_value=agent_accounts.CodexHomePrepared()))
 
     def claude(self, label: str, login: str) -> None:
-        if label == "default":
-            config = self.home / ".claude.json"
-            note = "claude2"
-        else:
-            self.assertEqual(accounts.setup(label), [])
-            config = accounts.account_dir(label) / ".claude.json"
-            note = label
+        if label != "default":
+            create_claude_account(label, login)
+            return
+        config = self.home / ".claude.json"
         _ = config.write_text(json.dumps({"oauthAccount": {"emailAddress": login}}))
-        _ = (self.home / "notes" / note_name(note)).write_text(f"---\nlogin: {login}\n---\n")
+        _ = (self.home / "notes" / note_name("claude2")).write_text(f"---\nlogin: {login}\n---\n")
 
     def codex(self, label: str, login: str) -> None:
         home = self.home / (".codex" if label == "default" else "." + label.replace(" ", ""))
@@ -7276,11 +7265,10 @@ class PickerTests(unittest.TestCase):
                 resets=(self.now + timedelta(hours=3)).isoformat(), at=at)
         if tool == "Codex":
             usage["credits"] = usage_store.StoredCredits(balance=credits, at=at)
-        saved = usage_store.load()
-        saved[usage_store.key(tool, login)] = usage
-        file = usage_store.store_file()
-        file.parent.mkdir(parents=True, exist_ok=True)
-        _ = file.write_text(json.dumps(saved))
+        with usage_store.read_lock():
+            saved = usage_store.load()
+            saved[usage_store.key(tool, login)] = usage
+            usage_store.write(saved)
 
     def selection(self, *, tool: Literal["claude", "codex"] = "claude",
                   exclude: frozenset[str] = NO_PICK_EXCLUSIONS,
@@ -7862,6 +7850,18 @@ class PickerTests(unittest.TestCase):
         self.reading("Claude", "third@example.invalid", 0, 2)
         self.assert_picked("claude2", keep=accounts.KeepAccount("claude2"))
         self.assert_picked("claude1")
+
+    def test_claude_launch_with_room_prepares_the_selected_account_and_preserves_refusals(self) -> None:
+        selected = accounts.claude_account_with_room(self.now)
+        self.assertEqual(selected.label, "claude3")
+        self.assertEqual(selected.dir, accounts.account_dir("claude3"))
+        with patch.object(accounts, "prepared_account", return_value=accounts.AccountRefused("fixture account denied")):
+            with self.assertRaisesRegex(accounts.AccountsError, "fixture account denied"):
+                _ = accounts.claude_account_with_room(self.now)
+        for login in ("main@example.invalid", "first@example.invalid", "third@example.invalid"):
+            self.reading("Claude", login, 0, 2)
+        with self.assertRaisesRegex(accounts.AccountsError, "no claude account has room"):
+            _ = accounts.claude_account_with_room(self.now)
 
     def test_picker_prefers_soonest_weekly_reset_over_most_room(self) -> None:
         self.assert_picked("claude3")
