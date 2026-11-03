@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lib.py_floor_test_support import cache_file_name
 
 from scripts.lint.memory_test_support import config_environment
@@ -235,6 +236,7 @@ esac
         return example
 
     def verify(self, *args: str) -> subprocess.CompletedProcess[str]:
+        _ = caller_admission(self, self.root, self.environment)
         self.environment["TEST_METADATA"] = json.dumps(workspace_metadata(self.root))
         return subprocess.run(
             ["bash", str(VERIFY), *args],
@@ -328,6 +330,7 @@ class SeededExampleWorkspaceFixture(ExampleWorkspaceFixture):
         self.calls = self.root / "cargo-calls"
         self.metadata_calls = self.root / "metadata-calls"
         self.environment = self.fixture_environment.copy()
+        _ = caller_admission(self, self.root, self.environment)
 
     @override
     def tearDown(self) -> None:

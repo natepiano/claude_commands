@@ -1,7 +1,7 @@
 """One private admission server, fake clock and fault boundary for service tests."""
 from __future__ import annotations
 
-from scripts.lint.test_memory_admit import write_memory_config
+from scripts.build_queue.queue_fixture import write_memory_config
 
 from collections import Counter
 from collections.abc import Callable, Generator
@@ -13,22 +13,26 @@ import select
 import signal
 import socket
 import subprocess
-import tempfile
+import threading
+import time
 import unittest
 import uuid
 from unittest import mock
-from typing import cast
+from typing import cast, override
 
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import fake_memory_readings, gate_isolation_environment
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_service as service
 from scripts.build_queue.queue_fixture import write_process
+from scripts.lib.test_hang_guard import LauncherHangGuard
+from scripts.lib import build_folders
+from scripts.lib.socket_test_support import short_socket_directory
 
 NOW = datetime(2026, 10, 31, 12, tzinfo=UTC).timestamp()
 GIB = gate.GIB
-DEFAULT_WIDTH = wire.RequestedTestWidth(8)
-DEFAULT_CALL = wire.CallRecord("call-1")
+DEFAULT_WIDTH = gate.RequestedTestWidth(8)
+DEFAULT_CALL = gate.CallRecord("call-1")
 
 
 class FakeClock:
@@ -106,6 +110,40 @@ class ScopeEvents:
 class ObservedAdmissionServer(service.AdmissionServer):
     """Expose loop instrumentation only at the shared test fixture boundary."""
 
+    @staticmethod
+    def reply_filter(reply: wire.Reply) -> wire.Reply:
+        return reply
+
+    @staticmethod
+    def line_filter(line: str) -> str:
+        return line
+
+    @override
+    def _send(self, connection: service.Connection, reply: wire.Reply) -> None:
+        queued = len(connection.sending)
+        super()._send(connection, self.reply_filter(reply))
+        connection.sending = connection.sending[:queued] + self.line_filter(
+            connection.sending[queued:].decode()).encode()
+
+    @override
+    def handle_request(self, request: wire.Request,
+                       connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
+        if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)) and isinstance(self.proc, TestProcesses):
+            self.proc.register(request.owner)
+        return super().handle_request(request, connection)
+
+    def resolve_estimates(self, count: int = 1) -> None:
+        """Use worker completion as the barrier before the loop accepts its results."""
+        completed = [self.estimate_results.get(timeout=5) for _ in range(count)]
+        for result in completed:
+            self.estimate_results.put(result)
+        self._accept_estimates()
+
+    @contextmanager
+    def silent_replies(self) -> Generator[None]:
+        with mock.patch.object(self, "_send", return_value=None):
+            yield
+
     @property
     def pending_replies(self) -> dict[str, list[wire.Reply]]:
         return self._pending_replies
@@ -123,9 +161,9 @@ class ObservedAdmissionServer(service.AdmissionServer):
         before_delivery: list[wire.Wait | service.NoWaitReply] = []
         deliver = self._deliver
 
-        def observe(episode: str, reply: wire.Reply) -> None:
-            before_delivery.append(self.waiters[episode].last_reply)
-            deliver(episode, reply)
+        def observe(waiting: service.WaitingAdmission, reply: wire.Reply) -> None:
+            before_delivery.append(waiting.last_reply)
+            deliver(waiting, reply)
 
         with mock.patch.object(self, "_deliver", side_effect=observe):
             yield before_delivery
@@ -135,9 +173,10 @@ class TestProcesses:
     """Real pidfds with private resident-memory files."""
     def __init__(self, path: Path) -> None:
         self.path: Path = path
-        path.mkdir()
+        path.mkdir(parents=True, exist_ok=True)
         self.children: list[subprocess.Popen[bytes]] = []
         self.starts: dict[int, str] = {}
+        self.fixture_owners: dict[int, str] = {}
 
     def spawn(self, used: int = GIB) -> wire.Owner:
         child = subprocess.Popen(["sleep", "300"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -146,18 +185,28 @@ class TestProcesses:
         if start is None:
             raise RuntimeError("child has no process start time")
         self.starts[child.pid] = start
-        write_process(self.path, child.pid, used)
+        self.register(wire.Owner(child.pid, start), used)
         return wire.Owner(child.pid, start)
 
-    def processes(self) -> dict[int, gate.ProcessIdentity]:
-        return {pid: gate.ProcessIdentity(1, start) for pid, start in self.starts.items()
-                if self.owner_start(pid) == start}
+    def register(self, owner: wire.Owner, used: int = 0) -> None:
+        """Supply private memory for an owner that a caller process created."""
+        self.starts[owner.pid] = owner.start_time
+        if not (self.path / str(owner.pid) / "stat").exists():
+            write_process(self.path, owner.pid, used)
+            stat = self.path / str(owner.pid) / "stat"
+            fields = stat.read_text().rsplit(") ", 1)[1].split()
+            fields[19] = owner.start_time
+            _ = stat.write_text(f"{owner.pid} (fixture) {' '.join(fields)}\n")
 
-    def owner_start(self, pid: int) -> str | None:
-        return gate.process_start_time(pid)
+    def processes(self) -> dict[int, gate.ProcessIdentity]:
+        return gate.process_table(self.path)
+
+    def owner_start(self, pid: int) -> service.LiveOwnerIdentity | service.OwnerProcessGone:
+        start = self.fixture_owners[pid] if pid in self.fixture_owners else gate.process_start_time(pid)
+        return service.OwnerProcessGone() if start is None else service.LiveOwnerIdentity(start)
 
     def pidfd(self, pid: int) -> int:
-        return os.pidfd_open(pid)
+        return os.pidfd_open(os.getpid() if pid in self.fixture_owners else pid)
 
     def lifetime(self, row: gate.Reservation, owner_live: bool) -> gate.PopulatedStepScope | gate.LiveOwnerProcess | gate.EndedStep:
         return gate.reservation_lifetime(row, owner_live)
@@ -178,11 +227,15 @@ class PrivateReadings:
     """Count each real gate reader, against only the fixture's fake files."""
     def __init__(self, root: Path) -> None:
         self.root: Path = root
+        self.host_path: Path = root / "meminfo"
         self.counts: Counter[str] = Counter()
 
-    def host(self) -> gate.HostMemory:
+    def host(self) -> gate.HostMemory | gate.ReadingUnavailable:
         self.counts["host"] += 1
-        return gate.read_meminfo(self.root / "meminfo")
+        try:
+            return gate.read_meminfo(self.host_path)
+        except Exception as error:
+            return gate.ReadingUnavailable(str(error))
 
     def pressure(self, host: gate.HostMemory, policy: gate.AdmissionPolicy) -> gate.Pressure:
         self.counts["pressure"] += 1
@@ -204,6 +257,7 @@ class SocketPeer:
     def __init__(self, fixture: AdmissionFixture, request: wire.Request | str) -> None:
         self.fixture: AdmissionFixture = fixture
         self.socket: socket.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.socket.settimeout(3)
         self.socket.connect(str(fixture.socket_path))
         self.socket.sendall((request if isinstance(request, str) else wire.encode_request(request)).encode())
         self.socket.setblocking(False)
@@ -212,7 +266,10 @@ class SocketPeer:
     def replies(self) -> list[wire.Reply]:
         for _ in range(4):
             self.fixture.server.run_once(0)
+        deadline = time.monotonic() + 3
         while select.select([self.socket], [], [], 0)[0]:
+            if time.monotonic() >= deadline:
+                raise AssertionError("the private socket did not finish sending within 3 seconds")
             chunk = self.socket.recv(65536)
             if not chunk:
                 break
@@ -227,30 +284,41 @@ class SocketPeer:
 
 class AdmissionFixture(ExitStack):
     """Every server test uses this temporary state, socket, clock and owner set."""
-    def __init__(self) -> None:
+    def __init__(self, *, root: Path | None = None, log_dir: Path | None = None) -> None:
         super().__init__()
         if not hasattr(os, "pidfd_open") or not Path("/sys/fs/cgroup/cgroup.controllers").exists():
             raise unittest.SkipTest("admission service needs Linux pidfd and cgroup v2")
-        self.root: Path = Path(self.enter_context(tempfile.TemporaryDirectory(prefix="admit-test-")))
+        self.root: Path = root if root is not None else self.enter_context(
+            build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
+                prefix=build_folders.FOLDER_PREFIXES["admit-test"])))
         # AF_UNIX addresses have a small byte limit; TMPDIR may be a deep merge checkout.
         self.socket_dir: Path = Path(self.enter_context(
-            tempfile.TemporaryDirectory(prefix="admit-sock-", dir="/tmp")))
-        self.state_dir: Path = self.root / "state"
-        self.state_dir.mkdir()
+            short_socket_directory(build_folders.FOLDER_PREFIXES["admit-sock"])))
+        self.state_dir: Path = (log_dir if log_dir is not None else self.root / "log") / "admission"
+        self.state_dir.mkdir(parents=True, exist_ok=True)
         self.socket_path: Path = self.socket_dir / "admission.sock"
         self.clock: FakeClock = FakeClock()
         self.fault: Faults = Faults()
         self.proc: TestProcesses = TestProcesses(self.root / "proc")
         _ = self.callback(self.proc.close)
-        environment = {**gate_isolation_environment(self.root), **fake_memory_readings(
-            self.root, available_kib=60 * GIB // 1024, total_kib=60 * GIB // 1024),
-            "ADMISSION_SOCKET": str(self.socket_path), "BUILDLOG_DIR": str(self.root / "log"),
-            "BUILDLOG_PROC": str(self.proc.path), "LINT_CONFIG_FILE": str(self.root / "lint.conf"), "CONF_DIR": str(Path(self.root / "lint.conf").parent),
+        memory = ({"BUILDLOG_MEMINFO": str(self.root / "meminfo"),
+                   "BUILDLOG_MEMORY_PRESSURE": str(self.root / "pressure")}
+                  if (self.root / "meminfo").exists() else fake_memory_readings(
+                      self.root, available_kib=60 * GIB // 1024, total_kib=60 * GIB // 1024))
+        environment = {**gate_isolation_environment(self.root), **memory,
+            "BUILDLOG_BUILDS_CGROUP": str(self.root / "builds.slice"),
+            "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(self.root / "live-memory-reads.jsonl"),
+            "LINT_CONFIG_READER": str(Path(__file__).resolve().parents[1] / "lint/lint_config.sh"),
+            "ADMISSION_SOCKET": str(self.socket_path), "BUILDLOG_DIR": str(self.state_dir.parent),
+            "BUILDLOG_PROC": str(self.proc.path), "LINT_CONFIG_FILE": str(self.root / "lint.conf"),
             "BUILDLOG_BUILD_BUDGET_GIB": "21", "NOTIFY_SOCKET": "", "LISTEN_FDS": "",
-            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC"}
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC",
+            "HOME": str(self.root)}
         self.enter_context(mock.patch.dict(os.environ, environment))
-        write_memory_config(self.root / "lint.conf")
+        if not (self.root / "lint.conf").exists():
+            write_memory_config(self.root / "lint.conf")
         self.readings: PrivateReadings = PrivateReadings(self.root)
+        self.loop_access: threading.RLock = threading.RLock()
         try:
             self.server: ObservedAdmissionServer = self.new_server()
         except BaseException:
@@ -268,6 +336,53 @@ class AdmissionFixture(ExitStack):
     def restart(self) -> None:
         self.server.close()
         self.server = self.new_server()
+
+    @contextmanager
+    def serving(self) -> Generator[AdmissionFixture]:
+        """Run the private loop while a caller uses the socket or starts a child."""
+        stopped = threading.Event()
+        failures: list[BaseException] = []
+
+        real_monotonic = time.monotonic
+
+        def serve() -> None:
+            previous = real_monotonic()
+            try:
+                while not stopped.is_set():
+                    current = real_monotonic()
+                    self.clock.advance(current - previous)
+                    previous = current
+                    with self.loop_turn():
+                        self.server.run_once(0.01)
+            except BaseException as error:
+                failures.append(error)
+                stopped.set()
+
+        worker = threading.Thread(target=serve, name="private-admission-loop")
+        worker.start()
+        try:
+            yield self
+        finally:
+            stopped.set()
+            worker.join(timeout=3)
+            if worker.is_alive():
+                raise AssertionError("the private admission loop did not stop")
+            if failures:
+                raise failures[0]
+
+    def run_pass(self) -> gate.PassResult:
+        """Keep a test pass separate from the private loop's current event."""
+        with self.loop_turn():
+            return self.server.run_pass()
+
+    @contextmanager
+    def loop_turn(self) -> Generator[None]:
+        if not self.loop_access.acquire(timeout=3):
+            raise AssertionError("the private admission loop did not yield within 3 seconds")
+        try:
+            yield
+        finally:
+            self.loop_access.release()
 
     def configure(self, **seconds: float) -> None:
         write_memory_config(self.root / "lint.conf", **{name: str(value) for name, value in seconds.items()})
@@ -299,13 +414,38 @@ class AdmissionFixture(ExitStack):
             os.kill(pid, signal.SIGKILL)
             _ = os.waitpid(pid, 0)
 
+    def fixture_owner(self, pid: int, start: str) -> wire.Owner:
+        """Keep a caller's private process record alive without using a host PID."""
+        owner = wire.Owner(pid, start)
+        self.proc.fixture_owners[pid] = start
+        self.proc.register(owner)
+        return owner
+
+    def end_fixture_owner(self, pid: int) -> None:
+        with self.loop_turn():
+            del self.proc.fixture_owners[pid]
+            events = ScopeEvents(self.server.epoll)
+            events.events = [(descriptor, select.EPOLLIN)
+                for descriptor, watch in self.server.watchers.items()
+                if isinstance(watch, service.OwnerWatch) and watch.owner.pid == pid]
+            with mock.patch.object(self.server, "epoll", events):
+                self.server.run_once(0)
+
+    def build_history_generation(self) -> gate.BuildHistoryGeneration:
+        reply, = self.server.handle_request(wire.BuildHistoryRequest())
+        assert isinstance(reply, wire.BuildHistoryReply)
+        return gate.BuildHistoryGeneration(reply.generation)
+
     def request(self, *, need: int = 8 * GIB, owner: wire.Owner | None = None,
                 episode: str = "", since: float | None = None, age: float = 0,
-                width: wire.TestWidth = DEFAULT_WIDTH,
-                call: wire.Call = DEFAULT_CALL, step: str = "nextest") -> wire.AdmitRequest:
+                width: gate.TestWidth = DEFAULT_WIDTH,
+                call: gate.Call = DEFAULT_CALL, step: str = "nextest") -> wire.AdmitRequest:
         owner = owner or self.proc.spawn()
+        generation: gate.BuildHistoryGeneration | gate.NoBuildHistoryGeneration = gate.NoBuildHistoryGeneration()
+        if step == "build":
+            generation = self.build_history_generation()
         profile = gate.StepProfile("fixture", step, "tree", gate.ExpectedPeak(need, "measured", 5),
-                                   estimated_at=self.clock.now() - age)
+            estimated_at=self.clock.now() - age, build_history_generation=generation)
         return wire.AdmitRequest(episode or f"episode-{owner.pid}", owner, ("cargo", step),
             str(self.root), self.clock.now() if since is None else since, "",
             wire.Identity(f"session-{owner.pid}", "fixture", step, str(self.root)), call, width,
@@ -468,3 +608,48 @@ class ScriptedTransport:
 
 def reply_bytes(reply: wire.Reply) -> bytes:
     return wire.encode_reply(reply).encode()
+
+
+def wait_reply(reason: gate.WaitReason, position: int = 1, head: str = "head",
+               text: str = "free memory") -> wire.Wait:
+    """Build a held reply with the same decision fields as a real pass."""
+    peak = gate.ExpectedPeak(8 * GIB, "fallback", 0)
+    decision = gate.decide(0, 60 * GIB, peak.bytes, [], limits=gate.AdmissionLimits(21 * GIB, 3 * GIB))
+    snapshot = gate.AdmissionWaitSnapshot(decision, peak, (), 0, "repo", "nextest",
+                                         gate.DEFAULT_ADMISSION_POLICY, ())
+    return wire.Wait(reason, position, head, text, snapshot)
+
+
+def admitted_reply(reservation: str = "stem", need: int = GIB, source: str = "new-source",
+                   max_path: str = "stem.max", wave_path: str = "stem.wave") -> wire.Admitted:
+    """Supply the grant context used by sampler and client protocol tests."""
+    return wire.Admitted(reservation, need, source, max_path, wave_path,
+                         {"reservation_id": reservation, "need": need})
+
+
+_caller_services: dict[str, AdmissionFixture] = {}
+
+
+def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str, str]) -> AdmissionFixture:
+    """Use the one server for existing caller fixtures and their child processes."""
+    existing = _caller_services.get(environment.get("ADMISSION_SOCKET", ""))
+    if existing is not None and existing.root == root and not existing.server.closed:
+        return existing
+    _ = test.enterContext(LauncherHangGuard(test.id()).protect())
+    fixture = test.enterContext(AdmissionFixture(root=root, log_dir=Path(environment["BUILDLOG_DIR"])))
+    _caller_services[str(fixture.socket_path)] = fixture
+    test.addCleanup(_caller_services.pop, str(fixture.socket_path))
+    fixture.enter_context(mock.patch.dict(os.environ, {
+        "BUILDLOG_BUILD_BUDGET_GIB": environment.get("BUILDLOG_BUILD_BUDGET_GIB", "21"),
+    }))
+    fixture.clock.epoch = time.time()
+    launcher = Path.home() / ".claude/scripts/lib/py"
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    if not launcher.exists():
+        launcher.symlink_to(Path(__file__).resolve().parents[1] / "lib/py")
+    _ = environment.setdefault("LINT_CONFIG_READER", os.environ["LINT_CONFIG_READER"])
+    for key in ("ADMISSION_SOCKET", "LINT_CONFIG_FILE", "BUILDLOG_PROC", "BUILDLOG_MEMINFO",
+                "BUILDLOG_MEMORY_PRESSURE", "BUILDLOG_BUILDS_CGROUP", "BUILDLOG_LIVE_MEMORY_TRIPWIRE"):
+        environment[key] = os.environ[key]
+    _ = fixture.enter_context(fixture.serving())
+    return fixture

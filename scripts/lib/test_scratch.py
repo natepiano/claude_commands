@@ -15,20 +15,14 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Event, current_thread
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
-if TYPE_CHECKING:
-    from . import scratch
-    from ..lint import sweep
-    from ..style import style_sync
-else:
-    import scratch
-    from scripts.lint import sweep
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "style"))
-    import style_sync
+from scripts.lib import copy_record, scratch
+from scripts.lint import sweep
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "style"))
+from scripts.style import style_sync
 
-from scripts.lib import copy_record
 from scripts.message import sessions
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id

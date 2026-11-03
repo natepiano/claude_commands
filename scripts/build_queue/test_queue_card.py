@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import replace
 import unittest
 
-from scripts.build_queue import head_facts, queue_card
+from scripts.build_queue import head_facts, queue_card, queue_view
 from scripts.build_queue.queue_fixture import GOLDEN, NOW, QueueFixtureTests, queue_read_fixture
 from scripts.build_queue.queue_lines import plain, terminal_width
 from scripts.lint import memory_admit as gate
@@ -45,7 +45,8 @@ class QueueCardTests(QueueFixtureTests):
         model = self.fixture.model()
         for position in (1, 4):
             with self.subTest(position=position):
-                self.assertEqual(plain(queue_card.render_card(model, [position], 100)) + "\n",
+                page = [*queue_view.render_view(model, 100), (), *queue_card.render_card(model, [position], 100)]
+                self.assertEqual(plain(page) + "\n",
                                  (GOLDEN / f"card_{position}.txt").read_text())
 
     def test_first_card_answers_next_and_shares_all_head_checks(self) -> None:

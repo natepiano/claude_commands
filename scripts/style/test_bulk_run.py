@@ -8,6 +8,7 @@ import tempfile
 import sqlite3
 import socket
 import subprocess
+import sys
 import unittest
 from io import StringIO
 from unittest import mock
@@ -17,6 +18,8 @@ from contextlib import closing, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from typing import TypedDict, cast, final, override
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import bulk_run as run
 import bulk_rename as bulk

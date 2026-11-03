@@ -18,7 +18,7 @@ class VerifyMacMemoryExcludedTests(VerifyMacMemoryRetryFixture):
         self.environment["TEST_FREE_NOW_FREE"] = "1"
         process = self.start_verify("test", "sample", "--no-cache")
         self.addCleanup(self.stop_verify, process)
-        self.wait_for_path(self.runner_state / "sleep-events", (process,))
+        self.wait_for_memory_wait(process)
         self.release_memory(meminfo)
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
