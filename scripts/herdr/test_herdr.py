@@ -4743,7 +4743,7 @@ class SavedLayoutTests(unittest.TestCase):
     def test_retained_removed_units_and_wrapped_parents_do_not_classify_tabs_as_current_staff(self) -> None:
         retired = unit_membership("current", "retired-unit")
         old_child = unit_membership("wrapped", "child-unit")
-        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"))
+        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"), expected=retired.worktree)
         assert old_child.parent is not None
         _ = staff.set_doc(old_child.parent, staff.WrappedDoc("natedev", self.root / "archive.md"))
         processes = [herdr.HerdrProcess(1, herdr.HerdrPlace("fixture", "w1:p1"),

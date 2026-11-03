@@ -68,7 +68,7 @@
 
 **Ruled out:** selecting a restore row by its saved name; writing a staff row from the title hook.
 
-### Phase 4m — Port audit: every unit's port is in its `.unit.toml`  · status: todo
+### Phase 4m — Port audit: every unit's port is in its `.unit.toml`  · status: done
 
 **Depends on:** herdr-unit's 4h shrink, which writes this Work Order.
 

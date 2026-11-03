@@ -44,6 +44,7 @@ def setUpModule() -> None:
     configure_test_zone()
 
 
+from scripts.production import production_units as shared_production_units
 from scripts.production import staff, unit_config
 
 class NativeClaudeUnitTests(StaffTestCase):
@@ -218,6 +219,36 @@ class AddUnitLaunchTests(AddUnitTestCase):
         _ = self.successful("alpha", "--permanent")
         self.assertEqual(unit_config.read(self.root / "project-alpha"), unit_config.UnitConfig(
             unit_config.PermanentPlan(), unit_config.NoAppPort(), ()))
+
+    def test_admission_uses_the_shared_port_parser_and_units_lookup(self) -> None:
+        raw_port = "15733 (after it clashed with startup on 15731, 2026-10-02)"
+        self.commit_prepared_row(self.unit_row(port=raw_port))
+        with (patch.object(shared_production_units, "lookup_unit", wraps=shared_production_units.lookup_unit) as lookup,
+              patch.object(unit_config, "parse_port_cell", wraps=unit_config.parse_port_cell) as parser):
+            _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        value = unit_config.read(self.root / "project-alpha", cleanup=False)
+        assert isinstance(value, unit_config.UnitConfig)
+        self.assertEqual(value.port, unit_config.AppPort(15733))
+        self.assertGreater(lookup.call_count, 0)
+        parser.assert_any_call(raw_port)
+
+    def test_new_unit_does_not_take_a_port_from_another_productions_row(self) -> None:
+        other = self.root / "other-production.md"
+        _ = other.write_text("## Units\n\n| Unit | Port |\n| --- | --- |\n| alpha-unit | 15733 (note) |\n")
+        _ = fixture_member("showrunner", name="other", doc=staff.LiveDoc("natedev", other))
+        _ = self.successful("alpha", "--standby")
+        value = unit_config.read(self.root / "project-alpha", cleanup=False)
+        assert isinstance(value, unit_config.UnitConfig)
+        self.assertEqual(value.port, unit_config.NoAppPort())
+
+    def test_new_unit_keeps_its_supplied_port_beside_another_productions_row(self) -> None:
+        other = self.root / "other-production.md"
+        _ = other.write_text("## Units\n\n| Unit | Port |\n| --- | --- |\n| alpha-unit | 15733 (note) |\n")
+        _ = fixture_member("showrunner", name="other", doc=staff.LiveDoc("natedev", other))
+        _ = self.successful("alpha", "--standby", "--port", "8123")
+        value = unit_config.read(self.root / "project-alpha", cleanup=False)
+        assert isinstance(value, unit_config.UnitConfig)
+        self.assertEqual(value.port, unit_config.AppPort(8123))
 
     def test_brief_launch_writes_its_existing_relative_stub_plan_in_the_unit_config(self) -> None:
         _ = self.successful("alpha", "--brief", "Build the missing reader.")

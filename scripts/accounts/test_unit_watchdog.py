@@ -143,7 +143,7 @@ class UnitWatchdogTests(unittest.TestCase):
             tree = self.home / name
             _ = recorded_unit("fixture", name, tree, self.doc, plan="docs/plan.md")
             if name in self.retired:
-                _ = staff.set_worktree(member.id, staff.RemovedWorktree(local_machine(), tree))
+                _ = staff.set_worktree(member.id, staff.RemovedWorktree(local_machine(), tree), expected=member.worktree)
             tree.mkdir(exist_ok=True)
             _ = run_git([GIT, "init", "-b", "fixture", str(tree)], check=True, capture_output=True)
             events: list[dict[str, object]] = [{"event_type": "run_started", "working_dir": str(tree), "run_started_at": 1}]
