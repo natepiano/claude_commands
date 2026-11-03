@@ -1,7 +1,7 @@
 """Audit drift without repairing the fixture or suppressing uncertain evidence."""
 from __future__ import annotations
 
-from scripts.production.staff_test_support import fixture_member
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 
 from contextlib import redirect_stdout
 from dataclasses import dataclass, replace
@@ -17,10 +17,12 @@ import unittest
 from scripts.lib import unit_runs
 from scripts.production import staff, staff_check, staff_sources, unit_lookup, showrunners
 from scripts.production.staff_test_support import StaffTestCase
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import process_table, roster
 from scripts.message.relay_test_support import write_relay_record
 import herdr
 import sessions
+from scripts.shutdown import remote
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,34 @@ class StaffCheckFixture:
     evidence: staff_check.CheckEvidence
 
 
+class DocumentOwnerTests(unittest.TestCase):
+    def test_exchanged_timer_targets_keep_their_recorded_document_owners(self) -> None:
+        first_id = staff.StaffId(fixture_runtime_id("check-first-document-owner"))
+        second_id = staff.StaffId(fixture_runtime_id("check-second-document-owner"))
+        first_doc = Path("/fixture/first.md")
+        second_doc = Path("/fixture/second.md")
+        first = staff.StaffRow(first_id, "showrunner", "first", None, current_session=first_id,
+                               doc=staff.LiveDoc("natedev", first_doc))
+        second = staff.StaffRow(second_id, "showrunner", "second", None, current_session=second_id,
+                                doc=staff.LiveDoc("natedev", second_doc))
+        record = staff.StaffSnapshot((first, second))
+        document = "\n".join(("## Units", "| Unit | Worktree | Branch | Plan |",
+                              "| --- | --- | --- | --- |"))
+        sources = unit_lookup.MemberSources({
+            "first": showrunners.ShowrunnerSource(
+                showrunners.Timer("first", "session:" + second.id, first_doc, "UTC"), document),
+            "second": showrunners.ShowrunnerSource(
+                showrunners.Timer("second", "session:" + first.id, second_doc, "UTC"), document),
+        }, ())
+        evidence = staff_check.CheckEvidence(sources, (), staff_sources.WorkerEvidence((), {}, ()))
+        with (mock.patch.object(remote, "local_machine", return_value="natedev"),
+              mock.patch.object(Path, "is_file", return_value=True),
+              mock.patch.object(staff, "snapshot", side_effect=AssertionError("unexpected staff read"))):
+            problems = staff_check.wrong_rows(record, evidence)
+        self.assertEqual(problems, [])
+        self.assertEqual(record.rows, (first, second))
+
+
 class StaffCheckTests(StaffTestCase):
     @override
     def setUp(self) -> None:
@@ -44,10 +74,11 @@ class StaffCheckTests(StaffTestCase):
     @cached_property
     def fixture(self) -> StaffCheckFixture:
         runner, unit, worker = self.tree()
-        doc = self.production("sdlc", "models-unit")
-        folder = self.worktree("models-unit")
+        doc = self.fill_production("sdlc", "models-unit")
+        folder = self.source_root / "worktrees/models-unit"
+        write_text_atomic(folder / ".unit.toml", 'plan = "standby"\nresponsibilities = []\n')
         runner = staff.set_doc(runner.id, staff.LiveDoc("natedev", doc))
-        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", folder))
+        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", folder), expected=unit.worktree)
         live = (
             staff_check.LiveStaffSession(101, "claude:" + runner.id, runner.id),
             staff_check.LiveStaffSession(102, "claude:" + unit.id, unit.id, str(folder)),
@@ -58,6 +89,25 @@ class StaffCheckTests(StaffTestCase):
         evidence = staff_check.CheckEvidence(
             unit_lookup.member_sources(), live, staff_sources.WorkerEvidence((observation,), {}, ()))
         return StaffCheckFixture(runner, unit, worker, doc, folder, live, evidence)
+
+    def test_branch_and_configuration_failures_are_visible_without_diagnostic_capture(self) -> None:
+        folder = self.fixture.folder
+        pointer = (folder / ".git").read_text()
+        before = self.staff_file.read_bytes()
+        for failure in ("branch", "configuration"):
+            with self.subTest(failure=failure):
+                if failure == "branch":
+                    (folder / ".git").unlink()
+                else:
+                    write_text_atomic(folder / ".git", pointer)
+                    (folder / ".unit.toml").unlink()
+                code, output = self.check()
+                self.assertEqual(code, 1, output)
+                self.assertIn(f"{self.fixture.unit.id} {self.fixture.unit.name}:", output)
+                self.assertIn(str(folder), output)
+                if failure == "configuration":
+                    self.assertIn(".unit.toml", output)
+                self.assertEqual(self.staff_file.read_bytes(), before)
 
     def check(self, evidence: staff_check.CheckEvidence | None = None) -> tuple[int, str]:
         output = io.StringIO()
@@ -439,7 +489,7 @@ class StaffCheckTests(StaffTestCase):
     def test_worktree_that_disagrees_with_its_bound_document_is_listed(self) -> None:
         elsewhere = self.root / "other-checkout"
         elsewhere.mkdir()
-        _ = staff.set_worktree(self.fixture.unit.id, staff.PresentWorktree("natedev", elsewhere))
+        _ = staff.set_worktree(self.fixture.unit.id, staff.PresentWorktree("natedev", elsewhere), expected=self.fixture.unit.worktree)
         _ = self.assert_wrong(self.fixture.unit, "worktree belongs elsewhere: document names")
 
     def test_resumed_session_in_an_external_folder_keeps_its_valid_ownership(self) -> None:
@@ -449,13 +499,13 @@ class StaffCheckTests(StaffTestCase):
         self.assertEqual(self.check(evidence), (0, "checked 3 rows; 0 wrong\n"))
 
     def test_removed_worktree_is_valid_for_an_offline_retained_unit(self) -> None:
-        _ = staff.set_worktree(self.fixture.unit.id, staff.RemovedWorktree("natedev", self.fixture.folder))
+        _ = staff.set_worktree(self.fixture.unit.id, staff.RemovedWorktree("natedev", self.fixture.folder), expected=self.fixture.unit.worktree)
         shutil.rmtree(self.fixture.folder)
         evidence = replace(self.fixture.evidence, sessions=self.fixture.live[:1], workers=staff_sources.WorkerEvidence((), {}, ()))
         self.assertEqual(self.check(evidence), (0, "checked 3 rows; 0 wrong\n"))
 
     def test_live_session_on_a_removed_worktree_is_listed(self) -> None:
-        _ = staff.set_worktree(self.fixture.unit.id, staff.RemovedWorktree("natedev", self.fixture.folder))
+        _ = staff.set_worktree(self.fixture.unit.id, staff.RemovedWorktree("natedev", self.fixture.folder), expected=self.fixture.unit.worktree)
         _ = self.assert_wrong(self.fixture.unit, "live session is attached to a retired row")
 
     def test_missing_showrunner_document_is_listed(self) -> None:
@@ -469,7 +519,7 @@ class StaffCheckTests(StaffTestCase):
         _ = self.assert_wrong(self.fixture.runner, "production doc belongs elsewhere: timer names")
 
     def test_remote_worktree_is_reported_as_uncertain_instead_of_inferred(self) -> None:
-        _ = staff.set_worktree(self.fixture.unit.id, staff.PresentWorktree("mac", self.fixture.folder))
+        _ = staff.set_worktree(self.fixture.unit.id, staff.PresentWorktree("mac", self.fixture.folder), expected=self.fixture.unit.worktree)
         _ = self.assert_wrong(self.fixture.unit, "uncertain: worktree is on mac")
 
     def test_unfilled_worktree_is_listed(self) -> None:
@@ -479,7 +529,7 @@ class StaffCheckTests(StaffTestCase):
     def test_an_unbound_row_cannot_borrow_another_units_marked_session_or_document(self) -> None:
         stale = fixture_member("unit", name="former-name", parent=self.fixture.runner.id)
         folder = self.worktree("former-name-unit")
-        stale = staff.set_worktree(stale.id, staff.PresentWorktree("natedev", folder))
+        stale = staff.set_worktree(stale.id, staff.PresentWorktree("natedev", folder), expected=stale.worktree)
         output = self.assert_wrong(stale, "uncertain: no document worktree bound to this unit")
         self.assertNotIn(f"{self.fixture.unit.id} {self.fixture.unit.name}:", output)
 

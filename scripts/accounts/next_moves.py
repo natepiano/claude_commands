@@ -18,6 +18,8 @@ from typing import Literal, Protocol, cast
 from uuid import uuid4
 
 from scripts.accounts import role_map
+from scripts.lib import conf
+from scripts.issue_score.selection import UseConfiguredValue
 
 
 class NextMoveError(ValueError):
@@ -142,11 +144,14 @@ def account_pace(label: str, now: datetime) -> PaceEstimate | NoUsablePace:
     return PaceEstimate(rate * 3600)
 
 
-def resolve_hold(mode: HoldMode, label: str, now: datetime) -> ResolvedHold:
+def resolve_hold(mode: HoldMode, label: str, now: datetime, *,
+                 account_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> ResolvedHold:
     if isinstance(mode, FixedHold):
         return ResolvedHold(mode.minutes, mode)
+    if isinstance(account_config, UseConfiguredValue):
+        account_config = conf.read("accounts")
     pace = account_pace(label, now)
-    minutes = math.ceil(30 / pace.points_per_hour) if isinstance(pace, PaceEstimate) else 40
+    minutes = math.ceil(account_config.whole("half_point_pace_minutes") / pace.points_per_hour) if isinstance(pace, PaceEstimate) else account_config.whole("hold_default_minutes")
     return ResolvedHold(minutes, pace)
 
 

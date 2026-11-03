@@ -5,12 +5,13 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from scripts.issue_score.test_config import ConfiguredTestCase
 from scripts.issue_score import experiment, questions, vault
 
 ADOPTED_WORDINGS = Path(__file__).with_name("fixtures") / "adopted_wordings_v3.json"
 
 
-class QuestionTests(unittest.TestCase):
+class QuestionTests(ConfiguredTestCase):
     def test_adopted_area_definitions_fill_both_orders_without_changing_the_option_domain(self) -> None:
         areas = ["rendering", "tooling"]
         definitions = {"rendering": "Drawing scenes and managing render passes.",
@@ -43,8 +44,8 @@ class QuestionTests(unittest.TestCase):
     def test_every_jev_proposed_field_has_a_supported_threshold_policy(self) -> None:
         for field in questions.JEV_FIELDS:
             with self.subTest(field=field):
-                self.assertIn(field, questions.THRESHOLDS)
-                self.assertIsInstance(questions.THRESHOLDS[field], (questions.Supported, questions.MinimumGap))
+                self.assertIn(field, questions.thresholds())
+                self.assertIsInstance(questions.thresholds()[field], (questions.Supported, questions.MinimumGap))
 
     def test_effort_example_stems_resolve_only_the_exact_open_example_files(self) -> None:
         examples = {

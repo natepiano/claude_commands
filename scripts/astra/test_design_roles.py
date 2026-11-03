@@ -105,11 +105,12 @@ class DurableRolesTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        from scripts.production.staff_test_support import StaffTestCase, production_membership
+        from scripts.production.staff_test_support import StaffTestCase, production_membership, recorded_showrunner
         membership = StaffTestCase()
         membership.setUp()
         self.addCleanup(membership.doCleanups)
-        _ = membership.production("demo", "design-unit")
+        document = membership.production("demo", "design-unit")
+        _ = recorded_showrunner("demo", document)
         production_membership("demo", "design-unit")
         self.repository = self.root / "checkout"
         self.repository.mkdir()

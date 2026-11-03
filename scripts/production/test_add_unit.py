@@ -44,9 +44,37 @@ def setUpModule() -> None:
     configure_test_zone()
 
 
+from scripts.production import production_units as shared_production_units
 from scripts.production import staff, unit_config
 
 class NativeClaudeUnitTests(StaffTestCase):
+    def test_resume_uses_the_renamed_native_owner_for_arguments_and_tab(self) -> None:
+        document = self.production("demo")
+        _ = document.write_text(document.read_text() + "\n- **Merge branch:** `main`\n"
+                                + f"- **Showrunner checkout:** `{self.root}`\n- **Log:** `demo-log.md`\n")
+        runner = fixture_member("showrunner", name="demo", doc=staff.LiveDoc("natedev", document))
+        owner = fixture_member("unit", name="saved-name", parent=runner.id)
+        current = staff.native_id(fixture_runtime_id("renamed-unit-current"))
+        _ = staff.update_current_session(owner.current_session, current)
+        _ = staff.rename(owner.id, "row-name")
+        _ = fixture_member("unit", name="saved-name", parent=runner.id, runtime_id=fixture_runtime_id("decoy-unit"))
+        request = add_unit.UnitLaunch(
+            production=production_units.read_production(document), branch="kept", worktree=self.root,
+            plan=add_unit.PlanGiven(Path("plan.md")), port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(),
+            session=add_unit.ResumedSession(current, self.root), launch_kind=add_unit.NewWorkLaunch(), timeout=5,
+            identity=add_unit.UnitIdentity("saved-name-unit", "saved-name"))
+        from scripts.accounts.accounts import NamedAccount
+
+        with (patch.object(herdr, "start_server"), patch.object(herdr, "launch_agent", return_value=
+              herdr.AgentLaunched("w1:p1", herdr.PromptSubmitted(LAUNCHED_AT))) as launch):
+            _ = add_unit.launch_session(request, add_unit.DirectorAgent("fixture", add_unit.DefaultEffort()),
+                "resume", NamedAccount("claude1", self.root))
+        arguments = cast(list[str], launch.call_args.kwargs["agent_arguments"])
+        self.assertEqual(arguments[arguments.index("-n") + 1], "row-name")
+        self.assertEqual(arguments[arguments.index("--remote-control") + 1], "row-name")
+        self.assertEqual(launch.call_args.args[2], "row-name")
+        self.assertNotIn("STAFF_ID", cast(dict[str, str], launch.call_args.args[4]))
+
     def test_fresh_unit_uses_the_observed_claude_id_before_its_opening_prompt(self) -> None:
         document = self.production("demo")
         _ = document.write_text(document.read_text() + "\n- **Merge branch:** `main`\n"
@@ -192,6 +220,36 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(unit_config.read(self.root / "project-alpha"), unit_config.UnitConfig(
             unit_config.PermanentPlan(), unit_config.NoAppPort(), ()))
 
+    def test_admission_uses_the_shared_port_parser_and_units_lookup(self) -> None:
+        raw_port = "15733 (after it clashed with startup on 15731, 2026-10-02)"
+        self.commit_prepared_row(self.unit_row(port=raw_port))
+        with (patch.object(shared_production_units, "lookup_unit", wraps=shared_production_units.lookup_unit) as lookup,
+              patch.object(unit_config, "parse_port_cell", wraps=unit_config.parse_port_cell) as parser):
+            _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        value = unit_config.read(self.root / "project-alpha", cleanup=False)
+        assert isinstance(value, unit_config.UnitConfig)
+        self.assertEqual(value.port, unit_config.AppPort(15733))
+        self.assertGreater(lookup.call_count, 0)
+        parser.assert_any_call(raw_port)
+
+    def test_new_unit_does_not_take_a_port_from_another_productions_row(self) -> None:
+        other = self.root / "other-production.md"
+        _ = other.write_text("## Units\n\n| Unit | Port |\n| --- | --- |\n| alpha-unit | 15733 (note) |\n")
+        _ = fixture_member("showrunner", name="other", doc=staff.LiveDoc("natedev", other))
+        _ = self.successful("alpha", "--standby")
+        value = unit_config.read(self.root / "project-alpha", cleanup=False)
+        assert isinstance(value, unit_config.UnitConfig)
+        self.assertEqual(value.port, unit_config.NoAppPort())
+
+    def test_new_unit_keeps_its_supplied_port_beside_another_productions_row(self) -> None:
+        other = self.root / "other-production.md"
+        _ = other.write_text("## Units\n\n| Unit | Port |\n| --- | --- |\n| alpha-unit | 15733 (note) |\n")
+        _ = fixture_member("showrunner", name="other", doc=staff.LiveDoc("natedev", other))
+        _ = self.successful("alpha", "--standby", "--port", "8123")
+        value = unit_config.read(self.root / "project-alpha", cleanup=False)
+        assert isinstance(value, unit_config.UnitConfig)
+        self.assertEqual(value.port, unit_config.AppPort(8123))
+
     def test_brief_launch_writes_its_existing_relative_stub_plan_in_the_unit_config(self) -> None:
         _ = self.successful("alpha", "--brief", "Build the missing reader.")
         config = unit_config.read(self.root / "project-alpha")
@@ -203,7 +261,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
 
     def test_existing_unit_name_under_another_production_requires_an_explicit_move(self) -> None:
         old_doc = self.staff.production("old", "alpha-unit", workspace="original")
-        original = fixture_member("showrunner", name="original")
+        original = fixture_member("showrunner", name="original", doc=staff.LiveDoc("natedev", old_doc))
         old = fixture_member("unit", name="alpha", parent=original.id)
         before = self.staff.staff_file.read_bytes()
         document = old_doc.read_bytes()
@@ -726,7 +784,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         _ = self.git("add", "docs/hana/tool-based-ui-production.md")
         _ = self.git("commit", "-m", "production under another merge branch")
         (self.staff.source_root / "notifier/showrunner-build-followups/conf").unlink()
-        self.staff.register_production("tool-based-ui", self.doc)
+        _ = self.staff.record_production("tool-based-ui", self.doc)
         _ = self.successful("lfo", "--brief", "Add the LFO tool")
         worktree = self.root / "project-lfo"
         self.assertIn(self.unit_row("lfo", branch="tool-based-ui-lfo", worktree=worktree,
@@ -1124,7 +1182,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         _ = self.git("add", "docs/plans/build-followups-production.md")
         _ = self.git("commit", "-m", "move checkout")
         _ = self.git("push", "origin", "build-followups")
-        self.staff.register_production("build-followups", self.doc)
+        _ = self.staff.record_production("build-followups", self.doc)
         _ = self.successful("mul_add", "--plan", "docs/plans/given.md")
         self.assertIn(self.unit_row("mul_add", branch="build-followups-mul-add",
                                     worktree=self.root / "project-mul-add"), self.doc.read_text())

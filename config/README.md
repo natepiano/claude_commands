@@ -2,18 +2,28 @@
 
 ## Live values
 
-Python callers read key=value settings through `scripts/lib/conf.py`; bash callers
-can source `scripts/lib/conf.sh` and call `conf_value <file> <key>`. The file name
-is its stem. Reads use `~/.claude/config` on every call; `CONF_DIR` selects a test
-fixture folder and installed scripts refuse it. The first key wins, with a
-`key.<short-host>` value taking precedence over `key`. A `# range: A..B` or
-`# one of: a, b, c` comment directly above the key sets its limits. On a missing
-or invalid value, the reader warns and uses the newest valid committed value
-under that revision's limits; with no usable history it raises `conf.Unusable`.
+Python callers use `scripts/lib/conf.py`. Each `conf.read(file)` reads and parses
+one file once. Its `ConfigRead` supplies `text`, `number`, `whole`, `words` and
+`values` for one pass. A new `conf.read` sees the next file change.
+Do not retain a `ConfigRead` between passes.
+
+Bash callers source `scripts/lib/conf.sh` and call `conf_value <file> <key>`.
+The file name is its stem. Reads use `~/.claude/config`.
+`CONF_DIR` selects a test folder. Installed scripts refuse that override.
+The first key wins. A `key.<short-host>` value takes precedence over `key`.
+A comment directly above a key sets its limits: `# whole: A..B`,
+`# range: A..B` or `# one of: a, b, c`.
+
+The reader resolves a missing or invalid key when the caller uses it.
+An absent default file or key can use the repository value when `CONF_DIR` is unset.
+Otherwise, the reader warns and uses the newest valid committed value under that revision's limits.
+With no usable value, it raises `conf.Unusable`.
+`ConfigRead.origin(key, convert)` distinguishes a usable live value, a recovered value and an unavailable value without a warning.
+
 Only the user approves a value change. A session asks the user and runs `/tune`
-on the user's go, with the user's words; `/tune` publishes the one config file
-and pulls the Mac without a test or release cycle. Moving an unchanged value
-from code to config needs no approval and does not use `/tune`.
+on approval, with the user's words. `/tune` publishes the config file and pulls
+the Mac without a test or release cycle. Moving an unchanged value from code
+to config needs no approval and does not use `/tune`.
 
 ## bake_textures_example.json
 
@@ -94,7 +104,7 @@ the Mac. An empty `ci_repo` disables CI calls. `CONF_DIR` selects the fixture fo
 
 This file defines the disabled AWS SSH target. `offload=off` prevents work.
 The active target list remains `targets=mac,natedev` in `build_targets.conf`.
-Phase 9 requires the user's deployment steps before target activation.
+The user completes deployment before target activation.
 
 `host=aws-build` names the Tailscale SSH host. `instance_id` and `region` remain empty before deployment.
 `credentials_profile=build-scaler` names the user's AWS CLI profile. This file contains no credential.
@@ -106,7 +116,7 @@ The spending reserve is $3. The maximum drain time is 60 minutes.
 Each repository budget stays within the 32 GiB build budget.
 The fixed and hourly costs are estimates from the design's queue replay.
 
-The spending guard requires usable live spending settings through `conf.value_origin`.
+The spending guard requires usable live spending settings through `ConfigRead.origin`.
 A missing or malformed live limit refuses spending, even when committed history supplies a usable value.
 `daily_limit_usd` and `monthly_limit_usd` include `limit_reserve_usd` when the guard compares costs.
 Equality refuses deployment, starts and new admission. `limit_action=drain` rejects new work.
@@ -120,6 +130,30 @@ Gaps past this age incur running costs at the fallback price.
 Stale latest evidence refuses admission.
 `cost_explorer_interval_seconds=86400` schedules reconciliation reads.
 `cost_explorer_read_usd=0.01` reserves each scheduled read's cost.
+
+The controller reads the previous UTC day's actual charges when the daily read is due.
+Cost Explorer receives date-only UTC bounds. The ledger reconciles the reply against those same bounds.
+Accounting days can overlap these UTC periods.
+`cost_explorer_tag_key=BuildTarget` and `cost_explorer_tag_value=aws-build` select the AWS resource charges.
+The resource deployment must apply this tag to every charged resource.
+Reports and target status read local evidence. They make no AWS call and create no coordination file.
+The controller saves each successful reply in `charges/<day>.json` before reconciliation.
+A retry reads the saved reply and does not repeat the successful query.
+The ledger adds only the reconciliation difference through its existing accounting rule.
+The report shows the actual charge and query cost separately.
+The scheduled query cost already belongs to the estimate. Reconciliation does not add it again.
+`go-live.json` records the first permitted running observation for the wait comparison.
+
+`### AWS` reports uptime, steps, estimated queue wait saved, cost, and cost per saved hour.
+Missing comparisons remain unavailable. Run time differences can remain negative.
+The daily wait comparison remains unmatched for load.
+Each active peer report shows its last successful exchange and latest failure.
+The report gives `buildlog sync` and `buildlog sync resume` actions when needed.
+Target status separates confirmed results from slots retained for cleanup.
+Slot counts apply to each repository. They do not describe one global capacity.
+
+Positive numeric settings use the readable lower bound `# range: 0.001..`.
+Zero-permitted settings retain `# range: 0..`. Whole-number settings retain their existing limits.
 
 `fixed_usd_per_month` includes retained storage, root storage, IPv4 and provisioned gp3 performance.
 The corresponding component keys state each monthly estimate.
@@ -145,6 +179,25 @@ Each pending event stores its retry deadline and delivery owner.
 A separate delivery lock prevents concurrent sends.
 A later guard retries an unconfirmed delivery after its deadline with the same message key.
 Confirmed delivery prevents further attempts.
+
+`aws_target.py tick`, `start`, and `stop` serialize lifecycle actions under `controller.lock`.
+`controller.json` retains instance evidence, action intent, capacity retry time, and the drain deadline.
+`instance_type=m7a.4xlarge` selects the Spot price history.
+`tick_interval_s=30` sets the planned timer interval. This phase enables no timer.
+`aws_timeout_s=30` bounds each AWS command. `snapshot_max_age_s=60` bounds queue evidence.
+The controller reads only the saved admission snapshot and excludes rows that left for a local execution slot.
+`permission_ttl_s=90` bounds remote spending permission.
+The controller transfers admission evidence through Tailscale SSH, separately from buildlog synchronization.
+`remote_state_directory` stores the admission envelope, boot binding, idle evidence, and interruption record on the target.
+The envelope identifies its version, target, purpose, instance generation, decision time, and expiry.
+The runner requires a current allowed decision before shell evaluation and execution.
+A new boot invalidates the previous permission until the controller publishes current evidence.
+`interruption_poll_s=5` sets the IMDSv2 interruption interval. `imds_timeout_s=2` bounds each metadata request.
+The remote agent records interruption before it signals active process groups.
+The runner reports `aws_interrupted=<generation>` after interruption. The sender retains this evidence and the original queue time.
+`idle_stop_minutes` controls the remote idle stop. `drain_max_minutes` bounds a controlled drain without resetting its deadline.
+Confirmed stopping, stopped, or terminated evidence releases only unchanged claims captured for that target and generation.
+A retained `.linux-run.json` marker includes boot identity. Recovery preserves new processes that reuse an earlier PID.
 
 The SSH, retry, storage, slot, hold and claim settings apply when each command reads this file.
 Block and claim settings use the same units as `mac_test.conf`.

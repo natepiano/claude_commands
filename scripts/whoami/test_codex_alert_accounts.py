@@ -1264,7 +1264,7 @@ class CodexAccountAlertTests(unittest.TestCase):
             self.assertIsInstance(fallback, quota_alert.AccountCodexQuotaFallback)
             assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
             self.assertEqual(fallback.owner, a)
-        self.assertIsNone(quota_alert.edit_registry("agents_set_assignment", "module_review", "codex"))
+        self.assertIsNone(quota_alert.edit_registry("agents_set_assignment", "design_roles", "codex"))
         self.now += timedelta(days=3)
         funded = self.readings(a, self.report(a, 0, "19", five_left=0))
         _ = quota_alert.alert([self.note(1, "active", 0, "19")],
@@ -1273,7 +1273,7 @@ class CodexAccountAlertTests(unittest.TestCase):
             self.assertIsInstance(state["fallback"], quota_alert.NoCodexQuotaFallback)
         registry = registry_view()
         self.assertIn("direct=codex", registry)
-        self.assertIn("module_review=codex", registry)
+        self.assertIn("design_roles=codex", registry)
 
     def test_missing_and_old_fallback_records_decode_named_states_and_recover(self) -> None:
         with quota_alert.state_file() as state:
@@ -1399,7 +1399,7 @@ class CodexAccountAlertTests(unittest.TestCase):
             fallback = state["fallback"]
             self.assertIsInstance(fallback, quota_alert.AccountCodexQuotaFallback)
             assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
-            self.assertEqual(fallback.moved, ("direct", "module_review"))
+            self.assertEqual(fallback.moved, ("direct", "design_roles"))
             self.assertEqual(state.get("unseen"), unseen)
 
     def test_unknown_refusal_logs_without_telling_any_session(self) -> None:

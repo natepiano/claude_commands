@@ -20,7 +20,7 @@ USAGE = ("usage: session_pane.py <read|type|keys|where> <unit <slug> <unit>|sess
 
 
 class NoSuchTarget(Exception):
-    """No live session or marked unit identifies the requested pane."""
+    """No live session or unit with session labels identifies the requested pane."""
 
 
 def read_place(place: Place, lines: int = 60, *, joined: bool = False, ansi: bool = False,

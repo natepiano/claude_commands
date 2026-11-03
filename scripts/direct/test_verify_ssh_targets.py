@@ -43,6 +43,9 @@ class SshRunnerEvent(TypedDict):
     result_type: str
     clock: str
     holder: str
+    remote_output: str
+    remote_status: int
+    interruption_generation: str
 
 
 class MacWaitRegistration(TypedDict):
@@ -56,9 +59,10 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shlex
 import sys
 import time
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 from unittest import mock
 
 source = Path(os.environ["TEST_SOURCE_REPO"])
@@ -81,6 +85,8 @@ initial = mac_test.read_claims(mac_test.state_paths(request.target))
 before = {claim.path: claim.record for claim in initial}
 reserved = bool(args.claim_owner_pid and any(claim.record["pid"] == args.claim_owner_pid for claim in initial))
 same_path = False
+remote_output = ""
+remote_status = 0
 
 def complete(arguments, attempt):
     global same_path
@@ -110,6 +116,8 @@ def capture(arguments, deadline=offload.NO_COMMAND_TIME_LIMIT):
         actions.append("reachability")
         return offload.CommandOutput(0, "", "")
     actions.append("probe")
+    if mode == "probe-interrupted":
+        return offload.CommandOutput(75, "aws_interrupted=fixture-generation\n", "")
     if mode == "probe-leftovers":
         return offload.CommandOutput(255, "", "host unavailable")
     if mode == "disk":
@@ -133,15 +141,51 @@ def copy_source(*arguments):
     return offload.CopiedTree(offload.KnownTreeKey("sent-tree"))
 
 def stream(arguments):
+    global remote_output, remote_status
     actions.append("run")
     if mode in ("run-refusal", "after-probe"):
         wire, status = "linux_startup=unresolved\n", 75
         (root / (request.target + ".marker")).touch()
+    elif mode in ("interrupted", "other-generation"):
+        generation = "fixture-generation" if mode == "interrupted" else "old-generation"
+        wire, status = "aws_interrupted=" + generation + "\n", 255
+    elif mode == "runner-sigterm":
+        import linux_runner
+        from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
+
+        now = int(time.time())
+        permission_directory = seed_runner_permission(Path.home(), config.source, now, "fixture-boot")
+        values = offload.runner_values(offload.read_config(config.source), request.target)
+        command = shlex.split(arguments[-1])
+        mirror = Path.home() / command[command.index("--mirror") + 1]
+        mirror.mkdir(parents=True, exist_ok=True)
+        exports = root / "shell-exports"
+        shell = linux_runner.ShellEnvironment("fixture-shell", exports, root)
+
+        def interrupted_child(argv, **options):
+            assert argv[:2] == ["bash", "-c"], argv
+            step, = mirror.glob(".linux-step-*")
+            (step / "started").touch()
+            interrupt_runner(permission_directory, now)
+            return subprocess.CompletedProcess(argv, 143)
+
+        output = io.StringIO()
+        with mock.patch.object(linux_runner, "boot_identity", return_value="fixture-boot"), \
+             mock.patch.object(linux_runner, "slot_run", return_value=nullcontext()), \
+             mock.patch.object(linux_runner, "prepare_shell", return_value=shell), \
+             mock.patch.object(linux_runner, "trim_build_folder", return_value=0), \
+             mock.patch.object(subprocess, "run", side_effect=interrupted_child), \
+             redirect_stdout(output):
+            status = linux_runner.run(mirror, values, request.package, request.verb,
+                                      request.nextest_words, request.call_id, "sent-tree")
+        wire = output.getvalue()
     elif mode == "lost":
         wire, status = "connection lost\n", 255
     else:
         status = 42 if mode == "failed" else 4 if mode == "no-tests" else 0
         wire = "mac_exit=" + str(status) + "\nmac_cleanup=0\n"
+
+    remote_output, remote_status = wire, status
 
     class Remote:
         stdout = io.StringIO(wire)
@@ -174,6 +218,8 @@ event = dict(target=request.target, owner=args.claim_owner_pid, slot=controller.
              reserved=reserved, same_path=same_path, queued_at=os.environ.get("BUILDLOG_MEM_WAIT_SINCE", ""),
              memory_reservation=os.environ.get("BUILDLOG_MEM_RESERVATION", ""), actions=actions, mode=mode,
              result_type=type(result).__name__,
+             remote_output=remote_output, remote_status=remote_status,
+             interruption_generation=result.generation if isinstance(result, offload.InterruptedTargetRun) else "",
              holder=type(result.holder).__name__ if isinstance(result, offload.BusyMacDecline) else "",
              clock=Path(os.environ["TEST_ROUTING_CLOCK"]).read_text() if os.environ.get("TEST_ROUTING_CLOCK") else "")
 with (root / "ssh-events.jsonl").open("a") as output:
@@ -572,6 +618,94 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
         self.assertEqual(attempt["repo_identity"], "https://example.com/team/hana")
         self.assertEqual(self.routing_record()["target"], "natedev")
         self.assertEqual(first.read_text().strip(), "100.25")
+
+    def test_probe_interruption_preserves_the_attempt_and_original_queue_timestamp(self) -> None:
+        self.configure("aws,natedev")
+        state = self.home / ".local/state/build-targets/aws"
+        _ = (state / "controller.json").write_text(json.dumps({"generation": "fixture-generation"}))
+        first = self.root / "first-wait"
+        _ = first.write_text("100.25\n")
+        result = self.verify("test", "sample", "--no-cache", extra={
+            "TEST_SSH_MODES": '{"aws":"probe-interrupted"}', "BUILDLOG_MEM_WAIT_SINCE": "100.25",
+            "BUILDLOG_MEM_WAIT_FIRST_FILE": str(first)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        event, = self.ssh_events()
+        self.assertEqual(event["result_type"], "InterruptedTargetRun")
+        attempt, = self.attempts()
+        self.assertEqual((attempt["target"], attempt["outcome"], attempt["queued_at"]), ("aws", "lost", 100.25))
+        self.assertEqual(first.read_text().strip(), "100.25")
+        self.assertEqual(len(self.local_runs()), 1)
+
+    def test_interruption_preserves_queue_age_and_records_local_state_before_compilation(self) -> None:
+        self.configure("aws,natedev")
+        state = self.home / ".local/state/build-targets/aws"
+        _ = (state / "controller.json").write_text(json.dumps({"generation": "fixture-generation"}))
+        first = self.root / "first-wait"
+        _ = first.write_text("100.25\n")
+        cargo = self.bin_directory / "cargo"
+        original = self.bin_directory / "cargo-original"
+        _ = cargo.rename(original)
+        self.write_executable(cargo, r'''
+import json
+import os
+from pathlib import Path
+import sys
+
+sys.path.insert(0, os.environ["TEST_SOURCE_REPO"])
+if sys.argv[1:3] == ["nextest", "run"]:
+    from scripts.direct import step_record
+    record = json.loads(step_record.record_path(os.environ["BUILDLOG_CALL_ID"]).read_text())
+    path = Path(os.environ["TEST_RUNNER_STATE"]) / "local-step.json"
+    path.write_text(json.dumps(record))
+os.execv(str(Path(__file__).with_name("cargo-original")), [str(Path(__file__).with_name("cargo-original")), *sys.argv[1:]])
+''')
+        result = self.verify("test", "sample", "--no-cache", extra={
+            "TEST_SSH_MODES": '{"aws":"interrupted"}', "BUILDLOG_MEM_WAIT_SINCE": "100.25",
+            "BUILDLOG_MEM_WAIT_FIRST_FILE": str(first)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        event, = self.ssh_events()
+        self.assertEqual(event["result_type"], "InterruptedTargetRun")
+        attempt, = self.attempts()
+        self.assertEqual((attempt["target"], attempt["slot"], attempt["outcome"], attempt["queued_at"]),
+                         ("aws", 1, "lost", 100.25))
+        local = cast(dict[str, object], json.loads((self.runner_state / "local-step.json").read_text()))
+        self.assertEqual(local["state"], "on_natedev")
+        self.assertEqual(local["selected_target"], "natedev")
+        self.assertEqual(first.read_text().strip(), "100.25")
+        self.assertEqual(len(self.local_runs()), 1)
+
+    def test_interruption_from_another_generation_remains_an_unconfirmed_loss(self) -> None:
+        self.configure("aws,natedev")
+        state = self.home / ".local/state/build-targets/aws"
+        _ = (state / "controller.json").write_text(json.dumps({"generation": "fixture-generation"}))
+        result = self.verify("check", "sample", "--no-cache", extra={
+            "TEST_SSH_MODES": '{"aws":"other-generation"}'})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        event, = self.ssh_events()
+        self.assertEqual(event["result_type"], "LostMacRun")
+        attempt, = self.attempts()
+        self.assertEqual(attempt["outcome"], "lost")
+
+    def test_sigterm_runner_output_preserves_the_sender_interruption_result(self) -> None:
+        self.configure("aws,natedev")
+        state = self.home / ".local/state/build-targets/aws"
+        _ = (state / "controller.json").write_text(json.dumps({"generation": "fixture-generation"}))
+
+        result = self.verify("test", "sample", "--no-cache", extra={
+            "TEST_SSH_MODES": '{"aws":"runner-sigterm"}', "BUILDLOG_MEM_WAIT_SINCE": "100.25",
+        })
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        event, = self.ssh_events()
+        self.assertEqual(event["result_type"], "InterruptedTargetRun", json.dumps(event))
+        self.assertEqual(event["interruption_generation"], "fixture-generation")
+        self.assertEqual(event["remote_status"], 143)
+        lines = event["remote_output"].splitlines()
+        self.assertEqual([line for line in lines if line.startswith("aws_interrupted=")],
+                         ["aws_interrupted=fixture-generation"])
+        attempt, = self.attempts()
+        self.assertEqual((attempt["target"], attempt["outcome"], attempt["queued_at"]), ("aws", "lost", 100.25))
+        self.assertEqual(len(self.local_runs()), 1)
 
     def test_local_only_request_never_reserves_or_runs_linux_work(self) -> None:
         self.configure("aws,natedev")

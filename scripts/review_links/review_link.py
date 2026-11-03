@@ -13,11 +13,13 @@ import secrets
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from string import Template, ascii_lowercase, digits
 from typing import cast
 from urllib.parse import quote
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import atomic_file
 
 PORT = 8765
 
@@ -25,11 +27,14 @@ PORT = 8765
 def private_name(name: str) -> bool:
     """Identify publisher metadata and unfinished writes in any letter case."""
     folded = name.casefold()
-    return folded in (".index.json", ".index.lock") or folded.startswith(".review-link-")
+    return (folded in (".index.json", ".index.lock") or folded.startswith(".review-link-")
+            or atomic_file.temporary_target(folded) is not None)
 
 
 def review_root() -> Path:
-    return Path(os.environ.get("REVIEW_LINKS_ROOT") or Path.home() / ".local/share/review-links").expanduser()
+    from scripts.production import change_routing
+
+    return change_routing.review_root()
 
 
 def link_host() -> str:
@@ -107,21 +112,6 @@ def read_snapshot_index(root: Path) -> dict[str, str]:
             and not (root / identifier).is_symlink() and (root / identifier).is_dir()}
 
 
-def replace_file(path: Path, content: bytes) -> None:
-    """Publish complete bytes with one rename on the destination filesystem."""
-    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".review-link-", delete=False) as stream:
-        temporary = Path(stream.name)
-        try:
-            _ = stream.write(content)
-        except OSError:
-            temporary.unlink(missing_ok=True)
-            raise
-    try:
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 def snapshot(files: list[Path], name: str = "review", *, new: bool = False) -> list[str]:
     """Refresh a source set's short URLs; new requests a separate snapshot."""
     _ = name
@@ -169,13 +159,13 @@ def snapshot(files: list[Path], name: str = "review", *, new: bool = False) -> l
                 raise FileExistsError("could not allocate a snapshot id after 10 tries")
         try:
             for output, content in contents.items():
-                replace_file(folder / output, content)
+                atomic_file.write_bytes_atomic(folder / output, content, mode=0o600)
             for obsolete in folder.iterdir():
                 if obsolete.name not in contents and (obsolete.is_file() or obsolete.is_symlink()):
                     obsolete.unlink()
             os.utime(folder, None)
             index[source_set] = folder.name
-            replace_file(root / ".index.json", json.dumps(index, sort_keys=True).encode("utf-8"))
+            atomic_file.write_bytes_atomic(root / ".index.json", json.dumps(index, sort_keys=True).encode("utf-8"), mode=0o600)
         except OSError:
             if not reuse:
                 shutil.rmtree(folder)

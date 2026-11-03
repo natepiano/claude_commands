@@ -5,8 +5,10 @@ import fcntl
 import json
 import os
 import shlex
+import shutil
 import socket
 import subprocess
+from subprocess import run as run_fixture_git
 import sys
 import tempfile
 import unittest
@@ -14,6 +16,7 @@ from collections.abc import Generator
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from io import IOBase
 from datetime import UTC, datetime
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast, override
 from unittest import mock
@@ -24,6 +27,7 @@ from scripts.production import staff
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.shutdown import pane_record
 
+FIXTURE_GIT: str = shutil.which("git") or "git"
 CHECKOUT = Path(__file__).resolve().parents[2]
 STAFF_SCRIPT = Path(__file__).with_name("staff.py")
 SOURCES_SCRIPT = Path(__file__).with_name("staff_sources.py")
@@ -126,6 +130,32 @@ def showrunner_relationship(name: str, parent: str = "") -> staff.StaffRow:
         return staff.move(child.id, parent_id) if child.parent != parent_id else child
 
 
+def recorded_showrunner(name: str, doc: Path, parent: str = "") -> staff.StaffRow:
+    """Record the document that identifies one private production owner."""
+    row = showrunner_relationship(name, parent)
+    return staff.set_doc(row.id, staff.LiveDoc("natedev", doc))
+
+
+def recorded_unit(showrunner: str, unit: str, worktree: Path, doc: Path, *,
+                  plan: str = "standby") -> staff.StaffRow:
+    """Record private unit locations and configuration through the shared fixture writers."""
+    _ = recorded_showrunner(showrunner, doc)
+    row = unit_membership(showrunner, unit)
+    row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", worktree), expected=row.worktree)
+    worktree.mkdir(parents=True, exist_ok=True)
+    if not (worktree / ".git").exists():
+        _ = run_fixture_git([FIXTURE_GIT, "init", "-b", "fixture", str(worktree)],
+                            check=True, capture_output=True)
+    head = run_fixture_git([FIXTURE_GIT, "-C", str(worktree), "rev-parse", "--verify", "HEAD"],
+                           check=False, capture_output=True)
+    if head.returncode:
+        _ = run_fixture_git([FIXTURE_GIT, "-C", str(worktree), "-c", "user.name=Fixture",
+                             "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "fixture"],
+                            check=True, capture_output=True)
+    write_text_atomic(worktree / ".unit.toml", f"plan = {json.dumps(plan)}\nresponsibilities = []\n")
+    return row
+
+
 def showrunner_launch(row: staff.StaffRow, session_id: str, environment: dict[str, str]) -> None:
     """Pin timer identities when several fixture timers share one production doc."""
     launch = pane_record.launch(f"fixture:{session_id}", session_id, str(CHECKOUT), {}, ["claude", "-n", row.name])
@@ -173,11 +203,15 @@ from scripts.production.staff_test_support import isolated_source_readers, obser
 observe_operation_lock()
 # Import platform-dependent Python support before selecting fake Mac transport.
 from scripts.production import staff_sources
+from scripts.shutdown import remote
+from unittest import mock
 sys.platform = os.environ.get('STAFF_TEST_PLATFORM', 'linux')
 script = sys.argv.pop(1)
 sys.argv[0] = script
 # Retire/check verbs discover processes too, even without --live.
-with isolated_source_readers():
+with isolated_source_readers(), mock.patch.object(
+    remote, 'local_machine', return_value='mac' if sys.platform == 'darwin' else 'natedev',
+):
     runpy.run_path(script, run_name='__main__')
 """
 
@@ -276,6 +310,18 @@ with isolated_source_readers():
 """
 
 
+@dataclass(frozen=True)
+class RowProductionFixture:
+    """The row locations differ from the timer name and the Units table."""
+
+    runner: staff.StaffRow
+    unit: staff.StaffRow
+    worker: staff.StaffRow
+    doc: Path
+    worktree: Path
+    slug: str
+
+
 class StaffTestCase(unittest.TestCase):
     root: Path = Path()
     staff_file: Path = Path()
@@ -334,6 +380,9 @@ class StaffTestCase(unittest.TestCase):
             _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, environment)))
             _ = contexts.enter_context(mock.patch(
                 "scripts.shutdown.remote.other_machine", return_value="mac" if machine == "natedev" else "natedev",
+            ))
+            _ = contexts.enter_context(mock.patch(
+                "scripts.shutdown.remote.local_machine", return_value=machine,
             ))
             _ = contexts.enter_context(isolated_source_readers())
             if machine == "mac":
@@ -404,6 +453,11 @@ class StaffTestCase(unittest.TestCase):
         identity = fixture_runtime_id("showrunner::" + name)
         write_text_atomic(timer, f"TARGET=session:{identity}\nCHECK=zsh /fixture/production_check.sh {shlex.quote(str(doc))}\n")
 
+    def record_production(self, slug: str, doc: Path) -> staff.StaffRow:
+        """Register the timer and record its private owner document."""
+        self.register_production(slug, doc)
+        return recorded_showrunner(fixture_showrunner_name(slug, doc), doc)
+
     def units_doc(self, doc: Path, units: tuple[str, ...], *, workspace: str, retired: tuple[str, ...] = ()) -> None:
         rows = [f"| `{unit}` | `{self.source_root / 'worktrees' / unit}` | {'retired' if unit in retired else 'active'} |" for unit in units]
         write_text_atomic(doc, "\n".join([
@@ -453,6 +507,41 @@ class StaffTestCase(unittest.TestCase):
         self.write_json(registry, {"always": []})
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {"SHOWRUNNERS_CONFIG": str(registry)})))
         return doc
+
+    def row_production(self) -> RowProductionFixture:
+        """Create private git evidence and conflicting legacy metadata."""
+        slug = "timer-alias"
+        repository = self.source_root / "repositories" / slug
+        repository.mkdir(parents=True)
+        _ = self.fixture_git(repository, "init", "-b", "merge-from-git")
+        _ = self.fixture_git(repository, "config", "user.email", "fixture@example.invalid")
+        _ = self.fixture_git(repository, "config", "user.name", "Fixture")
+        _ = self.fixture_git(repository, "commit", "--allow-empty", "-m", "fixture")
+        folder = self.source_root / "worktrees" / "folder-is-not-the-unit-name"
+        folder.parent.mkdir(parents=True)
+        _ = self.fixture_git(repository, "worktree", "add", "-b", "branch-from-git", str(folder))
+        write_text_atomic(folder / ".unit.toml", 'plan = "docs/plans/from-config.md"\n'
+                          + 'port = 4317\nresponsibilities = ["shared-fixture"]\n')
+        doc = repository / "docs" / "row-production.md"
+        doc.parent.mkdir()
+        write_text_atomic(doc, "\n".join((
+            "# Production", "- **Showrunner session:** `row-owner`", "",
+            "## Units", "| Unit | Worktree | Branch | Plan | Port |",
+            "| --- | --- | --- | --- | --- |",
+            "| member-unit | /wrong/table-folder | wrong-table-branch | wrong-plan.md | 9999 |", "",
+        )))
+        runner = fixture_member("showrunner", name="row-owner", doc=staff.LiveDoc("natedev", doc))
+        unit = fixture_member("unit", name="member", parent=runner.id,
+                              worktree=staff.PresentWorktree("natedev", folder))
+        worker = fixture_worker("reader", unit.id)
+        runner = staff.update_current_session(runner.current_session, staff.native_id(fixture_runtime_id("row-owner-current")))
+        unit = staff.update_current_session(unit.current_session, staff.native_id(fixture_runtime_id("row-member-current")))
+        worker = staff.update_current_session(worker.current_session, staff.native_id(fixture_runtime_id("row-worker-current")))
+        timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{slug}" / "conf"
+        timer.parent.mkdir(parents=True)
+        write_text_atomic(timer, f"TARGET=session:{runner.id}\n"
+                          + f"CHECK=zsh /fixture/production_check.sh {shlex.quote(str(doc))}\n")
+        return RowProductionFixture(runner, unit, worker, doc, folder, slug)
 
     def retired_fill_production(self, slug: str, *units: str, wrapped: bool = False) -> Path:
         """Keep the live fill's repository, but replace its units with complete retired evidence."""

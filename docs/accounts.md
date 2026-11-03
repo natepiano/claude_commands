@@ -220,7 +220,16 @@ For `codexN` or `workers`, normal launches pass arguments to `codex` and set `CO
 
 When the first argument is `update`, the launcher uses the shared `~/.codex` install without account checks. The local update uses the terminal and receives the remaining arguments. It then updates the other machine through SSH with a 600-second limit. Each machine gets one version or failure summary line. An unreachable machine shows `unreachable; run codex update there`. The command returns zero only when both updates and version reads succeed.
 
-Configuration decides the account every launch starts on: new, standby and resumed units and nightly reviews use the units account; new and resumed showrunners use the showrunners account. Set a group with `accounts.py move units|showrunners claudeN`. An unconfigured group refuses with that command; an `--account` or `--config-dir` override must name its configured account. New unit launches use herdr panes carrying the selected account variables; legacy tmux options remain available for observation and model recovery, and never choose a resume account. Every selected account runs in its own numbered folder, with the shared memory directory set to `~/.claude`. The launch removes any inherited OAuth token. Commands accept account numbers and the launch groups; `default` refuses.
+Configured groups select accounts for new unit and showrunner launches.
+Nightly reviews use the units account.
+Set a group with `accounts.py move units|showrunners claudeN`.
+An unconfigured group refuses with that command.
+Explicit launch overrides must name the configured account.
+New launches retain the selected account and model in herdr pane launch records.
+Shared resume uses the requested target, or the conversation's retained launch account.
+Each selected account uses its resolved account folder and the shared memory directory at `~/.claude`.
+The launch removes an inherited OAuth token.
+Commands accept numbered accounts and launch groups; `default` refuses.
 
 A missing directory refuses without starting Claude, for example:
 
@@ -348,7 +357,12 @@ A role mapped to an account missing on this machine refuses with `accounts: <rol
 
 `exec unit`, `env unit` and `role unit` use the units account; `role showrunner` and new showrunner launches use the showrunners account. The legacy `unit` configuration key is ignored; `set-role unit` and `swap unit` refuse. Codex workers retain their own role.
 
-New units and showrunners save `@claude_config_dir` and `@claude_model` on tmux. A resume uses its group's configured account, and accepts `--account` or `--config-dir` only when it names that account. Promoting a unit uses the configured showrunners account; recovery as a unit uses the configured units account.
+New units and showrunners retain account and model information in their herdr pane launch records.
+Group launch resolution accepts `--account` or `--config-dir` only when it agrees with the selected account.
+Promoting a unit uses the configured showrunners account.
+The watchdog resumes the conversation on its pane launch account.
+A record-driven unit recovery can use its source account when the selected destination cannot launch.
+The recovery records the fallback reason.
 
 ## Adding an account
 
@@ -524,3 +538,22 @@ an unrelated numbered account remains usable.
 ### brp registration at login
 
 The `claude-brp-mcp` login job registers brp only at local scope in existing `~/rust/hana`, `~/rust/nateroids` and `~/rust/bevy_brp` checkouts, for the shared Claude home and each numbered home. It removes user-scope brp registrations so other projects do not inherit the server. The setup check verifies those same local registrations. A correct registration is left untouched.
+
+## Account configuration
+
+`config/accounts.conf` defines the account limits, timeouts, sizes, ages, and hold durations.
+The scripts read each value when they use it through `scripts/lib/conf.py`.
+Install the file in `~/.claude/config`, or select a folder with `CONF_DIR`.
+A configuration change needs no build.
+An explicit `CONF_DIR` is authoritative and has no repository fallback.
+Without `CONF_DIR`, a missing file or key uses the repository's `config/accounts.conf` before Git recovery.
+An invalid present value retains the validated Git recovery path.
+The file also defines the default notes folder and the home NixOS repository.
+A leading `~` uses `HOME`; `AGENT_NOTES_DIR` still overrides the notes folder.
+Account creation and account checks use the same notes-folder helper.
+Each process reads the configured notes folder once.
+Start a new process after a notes-folder change.
+Missing-note instructions name that folder.
+The refusal pass reads the usage age once and passes it through account selection.
+
+See the [account design](as-built/accounts.md) for types, invariants, shared settings, and machine-local settings.

@@ -13,7 +13,7 @@ import subprocess
 import sys
 import unittest
 from collections.abc import Callable
-from contextlib import redirect_stderr
+from contextlib import chdir, redirect_stderr
 from dataclasses import FrozenInstanceError, replace
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
@@ -150,7 +150,169 @@ class NativeRuntimeIdentityTests(StaffTestCase):
         self.assertEqual(staff.by_id(worker.id), worker)
 
 
+class DocumentLookupTests(StaffTestCase):
+    def git(self, checkout: Path, *arguments: str) -> None:
+        result = subprocess.run(["git", *arguments], cwd=checkout, capture_output=True,
+                                text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def checkouts(self) -> tuple[Path, Path, Path]:
+        main = self.root / "main"
+        main.mkdir()
+        self.git(main, "init", "-b", "main")
+        self.git(main, "config", "user.name", "Document Test")
+        self.git(main, "config", "user.email", "document@example.invalid")
+        document = main / "docs/plans/example-production.md"
+        document.parent.mkdir(parents=True)
+        _ = document.write_text("# Example production\n")
+        self.git(main, "add", ".")
+        self.git(main, "commit", "-m", "Add production document")
+        owner = self.root / "owner-checkout"
+        unit = self.root / "unit-checkout"
+        self.git(main, "worktree", "add", "-b", "owner", str(owner))
+        self.git(main, "worktree", "add", "-b", "unit", str(unit))
+        return main, owner, unit
+
+    def test_document_lookup_joins_checkouts_without_an_external_command(self) -> None:
+        main, owner, unit = self.checkouts()
+        relative = Path("docs/plans/example-production.md")
+        runner = fixture_member("showrunner", name="example", doc=staff.LiveDoc("natedev", owner / relative))
+        git_file = unit / ".git"
+        git_directory = Path(git_file.read_text().removeprefix("gitdir: ").strip())
+        _ = git_file.write_text(f"gitdir: {os.path.relpath(git_directory, unit)}\n")
+        separate = self.root / "separate-repository"
+        separate.mkdir()
+        self.git(separate, "init", "-b", "main")
+        (separate / relative).parent.mkdir(parents=True)
+        _ = (separate / relative).write_text((main / relative).read_text())
+        record = staff.snapshot()
+        before = self.staff_file.read_bytes()
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("No external command expected")):
+            self.assertEqual(record.by_doc("natedev", main / relative), runner)
+            self.assertEqual(record.by_doc("natedev", unit / relative), runner)
+            with chdir(unit):
+                self.assertEqual(record.by_doc("natedev", relative), runner)
+            self.assertIsNone(record.by_doc("mac", unit / relative))
+            self.assertIsNone(record.by_doc("natedev", unit / "docs/other-production.md"))
+            self.assertIsNone(record.by_doc("natedev", separate / relative))
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_document_outside_git_matches_only_its_exact_path(self) -> None:
+        document = self.root / "outside/example-production.md"
+        document.parent.mkdir()
+        _ = document.write_text("# Example production\n")
+        copy = self.root / "another/example-production.md"
+        copy.parent.mkdir()
+        _ = copy.write_text(document.read_text())
+        runner = fixture_member("showrunner", name="example", doc=staff.LiveDoc("natedev", document))
+        record = staff.snapshot()
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("No external command expected")):
+            self.assertEqual(record.by_doc("natedev", document), runner)
+            self.assertIsNone(record.by_doc("natedev", copy))
+
+    def test_document_lookup_refuses_unreadable_git_metadata_after_no_exact_match(self) -> None:
+        document = self.root / "owner/example-production.md"
+        document.parent.mkdir()
+        _ = document.write_text("# Example production\n")
+        _ = fixture_member("showrunner", name="example", doc=staff.LiveDoc("natedev", document))
+        record = staff.snapshot()
+        before = self.staff_file.read_bytes()
+        for name, metadata, unreadable in (("missing-gitdir", b"gitdir: missing-folder\n", "missing-folder"),
+                                           ("invalid-encoding", b"gitdir: \xff\n", ".git")):
+            with self.subTest(metadata=name):
+                checkout = self.root / name
+                checkout.mkdir()
+                _ = (checkout / ".git").write_bytes(metadata)
+                copy = checkout / "example-production.md"
+                _ = copy.write_text(document.read_text())
+                with (mock.patch.object(subprocess, "run", side_effect=AssertionError("No external command expected")),
+                      self.assertRaises(staff.StaffRefused) as refusal):
+                    _ = record.by_doc("natedev", copy)
+                self.assertIn(str(copy), str(refusal.exception))
+                self.assertIn(str(checkout / unreadable), str(refusal.exception))
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_document_lookup_skips_an_unreadable_candidate_checkout(self) -> None:
+        stale = self.root / "stale-checkout"
+        stale.mkdir()
+        _ = (stale / ".git").write_text("gitdir: missing-folder\n")
+        relative = Path("docs/plans/example-production.md")
+        _ = fixture_member("showrunner", name="stale", doc=staff.LiveDoc("natedev", stale / relative))
+        _, owner, unit = self.checkouts()
+        runner = fixture_member("showrunner", name="example", doc=staff.LiveDoc("natedev", owner / relative))
+        record = staff.snapshot()
+        before = self.staff_file.read_bytes()
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("No external command expected")):
+            self.assertEqual(record.by_doc("natedev", unit / relative), runner)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_exact_document_match_does_not_require_readable_git_metadata(self) -> None:
+        checkout = self.root / "unreadable-checkout"
+        checkout.mkdir()
+        _ = (checkout / ".git").write_text("gitdir: missing-folder\n")
+        document = checkout / "example-production.md"
+        _ = document.write_text("# Example production\n")
+        runner = fixture_member("showrunner", name="example", doc=staff.LiveDoc("natedev", document))
+        record = staff.snapshot()
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("No external command expected")):
+            self.assertEqual(record.by_doc("natedev", document), runner)
+
+    def test_document_lookup_refuses_multiple_repository_matches(self) -> None:
+        main, owner, unit = self.checkouts()
+        relative = Path("docs/plans/example-production.md")
+        _ = fixture_member("showrunner", name="first", doc=staff.LiveDoc("natedev", main / relative))
+        _ = fixture_member("showrunner", name="second", doc=staff.LiveDoc("natedev", owner / relative))
+        record = staff.snapshot()
+        before = self.staff_file.read_bytes()
+        with self.assertRaises(staff.StaffRefused):
+            _ = record.by_doc("natedev", unit / relative)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_exact_document_match_wins_over_a_repository_match(self) -> None:
+        main, owner, unit = self.checkouts()
+        relative = Path("docs/plans/example-production.md")
+        _ = fixture_member("showrunner", name="first", doc=staff.LiveDoc("natedev", main / relative))
+        exact = fixture_member("showrunner", name="second", doc=staff.LiveDoc("natedev", owner / relative))
+        record = staff.snapshot()
+        self.assertEqual(record.by_doc("natedev", owner / relative), exact)
+        self.assertIsNone(record.by_doc("natedev", unit / "docs/other-production.md"))
+
+
 class StaffTests(StaffTestCase):
+    def test_worktree_guard_changes_only_the_recorded_expected_location(self) -> None:
+        _, unit, _ = self.tree()
+        initial = staff.PresentWorktree("natedev", self.root / "initial")
+        settled = staff.RemovedWorktree("natedev", initial.path)
+        filled = staff.set_worktree(unit.id, initial, expected=unit.worktree)
+        changed = staff.set_worktree(unit.id, settled, expected=filled.worktree)
+        self.assertEqual(changed.worktree, settled)
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        self.assertEqual(staff.set_worktree(unit.id, settled, expected=initial), changed)
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+        for expected in (initial, staff.WorktreeUnfilled(),
+                         staff.RemovedWorktree("mac", initial.path),
+                         staff.RemovedWorktree("natedev", self.root / "different")):
+            with self.subTest(expected=expected), self.assertRaises(staff.StaffRefused):
+                _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.root / "third"), expected=expected)
+            self.assertEqual(staff.by_id(unit.id), changed)
+            self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_remote_worktree_guard_transports_the_full_expected_location(self) -> None:
+        runner, _, _ = self.tree()
+        initial = staff.PresentWorktree("natedev", self.root / "initial")
+        unit = fixture_member("unit", name="remote-guard", parent=runner.id, worktree=initial)
+        settled = staff.PresentWorktree("mac", self.root / "settled")
+        with self.machine("mac"):
+            changed = staff.set_worktree(unit.id, settled, expected=initial)
+            self.assertEqual(changed.worktree, settled)
+            self.assert_refused(lambda: staff.set_worktree(unit.id,
+                staff.RemovedWorktree("mac", settled.path), expected=initial))
+        self.assertEqual(staff.by_id(unit.id), changed)
+        command = self.ssh_commands()[0]
+        for flag, value in (("--expected-state", "present"), ("--expected-machine", "natedev"),
+                            ("--expected-path", str(initial.path))):
+            self.assertEqual(command[command.index(flag) + 1], value)
+
     def test_restored_unit_survives_its_previous_pending_retirement(self) -> None:
         parent = fixture_member("showrunner", name="sdlc")
         location = staff.PresentWorktree("natedev", self.root / "models")
@@ -264,7 +426,7 @@ class StaffTests(StaffTestCase):
         self.assert_refused(lambda: fixture_member("unit", name="duplicate", parent=runner.id, worktree=location))
         self.assert_refused(lambda: fixture_member("unit", name="models", parent=runner.id,
                                                worktree=staff.PresentWorktree("natedev", self.root / "other")))
-        removed = staff.set_worktree(filled.id, staff.RemovedWorktree(location.machine, location.path))
+        removed = staff.set_worktree(filled.id, staff.RemovedWorktree(location.machine, location.path), expected=filled.worktree)
         self.assert_refused(lambda: fixture_member("unit", name="models", parent=runner.id, worktree=location))
         self.assertEqual(staff.by_id(removed.id), removed)
 
@@ -358,7 +520,7 @@ class StaffTests(StaffTestCase):
         runner, unit, _ = self.tree()
         other = fixture_member("unit", name="unfilled", parent=runner.id)
         location = staff.PresentWorktree("natedev", self.root / "filled")
-        _ = staff.set_worktree(unit.id, location)
+        _ = staff.set_worktree(unit.id, location, expected=unit.worktree)
         worker = fixture_worker("test", other.id)
         record = staff.snapshot()
         filled = record.by_id(unit.id)
@@ -389,19 +551,20 @@ class StaffTests(StaffTestCase):
         runner, unit, worker = self.tree()
         other = fixture_member("unit", name="other", parent=runner.id)
         path, doc = self.root / "worktree", self.root / "production.md"
-        _ = self.assert_rerun("set-worktree", unit.id, "--machine", "natedev", "--path", str(path), "--state", "present")
+        _ = self.assert_rerun("set-worktree", unit.id, "--machine", "natedev", "--path", str(path), "--state", "present",
+                              "--expected-state", "unfilled")
         _ = self.assert_rerun("set-doc", runner.id, "--machine", "natedev", "--path", str(doc), "--state", "live")
         before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
-        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path))
+        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path), expected=unit.worktree)
         _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", doc))
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
-        self.assert_refused(lambda: staff.set_worktree(other.id, staff.PresentWorktree("natedev", path)))
+        self.assert_refused(lambda: staff.set_worktree(other.id, staff.PresentWorktree("natedev", path), expected=other.worktree))
         for wrong in (runner, worker):
-            self.assert_refused(lambda: staff.set_worktree(wrong.id, staff.PresentWorktree("natedev", path)))
+            self.assert_refused(lambda: staff.set_worktree(wrong.id, staff.PresentWorktree("natedev", path), expected=wrong.worktree))
         for wrong in (unit, worker):
             self.assert_refused(lambda: staff.set_doc(wrong.id, staff.LiveDoc("natedev", doc)))
-        _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", path))
-        claimed = staff.set_worktree(other.id, staff.PresentWorktree("natedev", path))
+        _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", path), expected=staff.PresentWorktree("natedev", path))
+        claimed = staff.set_worktree(other.id, staff.PresentWorktree("natedev", path), expected=other.worktree)
         self.assertEqual(staff.snapshot().by_worktree("natedev", path), claimed)
         wrapped = staff.set_doc(runner.id, staff.WrappedDoc("natedev", doc))
         self.assertEqual(staff.StaffRow.from_json(wrapped.to_json()), wrapped)
@@ -409,7 +572,7 @@ class StaffTests(StaffTestCase):
     def test_snapshot_finds_present_worktrees_by_machine_and_containing_path(self) -> None:
         runner, unit, _ = self.tree()
         path = self.root / "checkout"
-        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path))
+        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path), expected=unit.worktree)
         _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", path / "production.md"))
         record = staff.snapshot()
         self.assertEqual(record.by_worktree("natedev", path), record.by_id(unit.id))
@@ -419,7 +582,7 @@ class StaffTests(StaffTestCase):
         self.assertEqual(record.by_doc("natedev", path / "production.md"), record.by_id(runner.id))
         self.assertIsNone(record.by_doc("mac", path / "production.md"))
         self.assertIsNone(record.by_doc("natedev", path / "other.md"))
-        _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", path))
+        _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", path), expected=staff.PresentWorktree("natedev", path))
         self.assertIsNone(staff.snapshot().by_worktree("natedev", path))
 
     def test_remote_setters_use_one_owner_write_and_preserve_the_other_field(self) -> None:
@@ -427,7 +590,7 @@ class StaffTests(StaffTestCase):
         path = self.root / "mac" / "worktree"
         with self.machine("mac"):
             self.assertNotIn("STAFF_FILE", os.environ)
-            changed = staff.set_worktree(unit.id, staff.PresentWorktree("mac", path))
+            changed = staff.set_worktree(unit.id, staff.PresentWorktree("mac", path), expected=unit.worktree)
             self.assertEqual(changed.worktree, staff.PresentWorktree("mac", path))
             changed_doc = staff.set_doc(runner.id, staff.LiveDoc("mac", path / "production.md"))
         commands = self.ssh_commands()
@@ -737,7 +900,7 @@ class StaffTests(StaffTestCase):
         self.assertIsNone(staff.by_path("sdlc/missing/impl1"))
         self.assert_refused(lambda: staff.retire(unit.id))
         location = staff.PresentWorktree("natedev", self.root / "models")
-        _ = staff.set_worktree(unit.id, location)
+        _ = staff.set_worktree(unit.id, location, expected=unit.worktree)
         staff.defer_retire((unit.id,))
         self.assertEqual(staff.retire_pending(), (unit.id,))
         self.assertEqual(staff.retire(worker.id), worker)
@@ -944,23 +1107,23 @@ class StaffTests(StaffTestCase):
     def test_get_finds_a_member_by_its_worktree_root(self) -> None:
         _, unit, _ = self.tree()
         path = self.root / "checkout"
-        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path))
+        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path), expected=unit.worktree)
         found = self.cli("get", str(path), "--json")
         self.assertEqual(json.loads(found.stdout), unit.to_json())
 
     def test_get_finds_the_longest_worktree_for_an_inside_folder(self) -> None:
         runner, unit, _ = self.tree()
         path = self.root / "checkout"
-        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path))
+        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path), expected=unit.worktree)
         nested = fixture_member("unit", name="nested", parent=runner.id)
-        nested = staff.set_worktree(nested.id, staff.PresentWorktree("natedev", path / "nested"))
+        nested = staff.set_worktree(nested.id, staff.PresentWorktree("natedev", path / "nested"), expected=nested.worktree)
         found = self.cli("get", str(path / "nested/src"), "--json")
         self.assertEqual(json.loads(found.stdout), nested.to_json())
 
     def test_get_reports_an_unknown_worktree_path_as_not_found(self) -> None:
         _, unit, _ = self.tree()
         path = self.root / "checkout"
-        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path))
+        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path), expected=unit.worktree)
         missing = self.cli("get", str(self.root / "checkout-other"), code=1)
         self.assertIn("staff member not found", missing.stderr)
         self.assertEqual(missing.stdout, "")
@@ -1273,7 +1436,7 @@ class StaffTests(StaffTestCase):
     def test_pending_retirement_waits_for_workers_then_retires_units_before_showrunners(self) -> None:
         runner, unit, worker = self.tree()
         runner = staff.set_doc(runner.id, staff.LiveDoc("natedev", self.root / "sdlc.md"))
-        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.root / "models"))
+        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.root / "models"), expected=unit.worktree)
         child = fixture_member("showrunner", name="child", parent=runner.id)
         staff.defer_retire((runner.id, unit.id))
         original = self.staff_file.read_bytes()
@@ -1295,7 +1458,7 @@ class StaffTests(StaffTestCase):
     def test_pending_retirement_round_trips_over_mac_transport(self) -> None:
         runner, unit, worker = self.tree()
         runner = staff.set_doc(runner.id, staff.LiveDoc("natedev", self.root / "sdlc.md"))
-        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.root / "models"))
+        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.root / "models"), expected=unit.worktree)
         with self.machine("mac"):
             staff.defer_retire((runner.id, unit.id))
             self.assertEqual(staff.snapshot().pending_retire, tuple(sorted((runner.id, unit.id))))
