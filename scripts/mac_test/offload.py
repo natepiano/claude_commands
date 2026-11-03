@@ -2002,12 +2002,7 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
         "unresolved_count": evidence.unresolved_count if isinstance(evidence.unresolved_count, int) else None,
         "evidence_at": evidence.evidence_at or time.time(),
     }
-    if isinstance(result, InterruptedTargetRun):
-        class InterruptedAttempt(record.SshAttempt):
-            interruption_generation: str
-        record.ssh_attempt(InterruptedAttempt(**attempt, interruption_generation=result.generation))
-    else:
-        record.ssh_attempt(attempt)
+    record.ssh_attempt(attempt)
 
 
 def main() -> int:

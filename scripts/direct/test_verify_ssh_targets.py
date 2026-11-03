@@ -592,7 +592,6 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
         self.assertEqual(event["result_type"], "InterruptedTargetRun")
         attempt, = self.attempts()
         self.assertEqual((attempt["target"], attempt["outcome"], attempt["queued_at"]), ("aws", "lost", 100.25))
-        self.assertEqual(attempt["interruption_generation"], "fixture-generation")
         self.assertEqual(first.read_text().strip(), "100.25")
         self.assertEqual(len(self.local_runs()), 1)
 
@@ -628,7 +627,6 @@ os.execv(str(Path(__file__).with_name("cargo-original")), [str(Path(__file__).wi
         attempt, = self.attempts()
         self.assertEqual((attempt["target"], attempt["slot"], attempt["outcome"], attempt["queued_at"]),
                          ("aws", 1, "lost", 100.25))
-        self.assertEqual(attempt["interruption_generation"], "fixture-generation")
         local = cast(dict[str, object], json.loads((self.runner_state / "local-step.json").read_text()))
         self.assertEqual(local["state"], "on_natedev")
         self.assertEqual(local["selected_target"], "natedev")
@@ -646,7 +644,6 @@ os.execv(str(Path(__file__).with_name("cargo-original")), [str(Path(__file__).wi
         self.assertEqual(event["result_type"], "LostMacRun")
         attempt, = self.attempts()
         self.assertEqual(attempt["outcome"], "lost")
-        self.assertNotIn("interruption_generation", attempt)
 
     def test_local_only_request_never_reserves_or_runs_linux_work(self) -> None:
         self.configure("aws,natedev")

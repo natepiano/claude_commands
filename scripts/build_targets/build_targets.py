@@ -232,6 +232,8 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
             return ExcludedTarget(target, "busy")
         if isinstance(probe, offload.UnavailableProbe):
             return ExcludedTarget(target, "unreachable")
+        if isinstance(probe, offload.InterruptedTargetStatus):
+            return ExcludedTarget(target, "busy")
         if probe.free_gib < config.free_floor_gib:
             return ExcludedTarget(target, "disk")
     except (OSError, UnicodeError, ValueError) as error:
