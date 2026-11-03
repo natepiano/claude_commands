@@ -35,7 +35,7 @@ Python's tempfile), which test runs leave behind, and a lint/invoke.sh log
 file (INVOKE_TEMP_NAME). A direct/verify.sh run folder (VERIFY_TEMP_NAME) is an entry
 too: it stays while the run whose pid it names runs, and goes at once after. In /tmp alone (the
 wide root) every other empty folder this user owns, also one that holds only folders, is an entry
-too, whatever its name, and goes after WIDE_IDLE_SECONDS instead. A folder a system tool owns (SYSTEM_TEMP_NAMES,
+too, whatever its name, and uses the configured folder removal age instead. A folder a system tool owns (SYSTEM_TEMP_NAMES,
 SYSTEM_TEMP_PREFIXES; an empty EMPTY_PREFIXES one aside), another root and a
 folder that holds one stay. A folder in /tmp that holds something is
 folder_audit.py's, which checks it for unsaved git work first. Roots are real paths on both machines. An entry is deleted when
@@ -98,6 +98,7 @@ from typing import TYPE_CHECKING, TypedDict, cast
 from urllib.parse import unquote, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import conf  # noqa: E402
 import scratch  # noqa: E402
 from scripts.lib import copy_record  # noqa: E402
 from user_zone import user_zone  # noqa: E402
@@ -112,10 +113,6 @@ else:
 GIB = 1 << 30
 HOUR_SECONDS = 3600
 IDLE_SECONDS = 4 * HOUR_SECONDS
-# An empty folder this user owns in /tmp goes after this long, whatever its name: test leftovers
-# have names of their own (1,103 month-old ones went by hand on 2026-10-26, and the user had to
-# approve the rm). A folder there that holds something is folder_audit.py's, which checks git first.
-WIDE_IDLE_SECONDS = 7 * 24 * HOUR_SECONDS
 # A scratch folder whose task is open goes after this long anyway: an ender can fail.
 TASK_IDLE_SECONDS = 7 * 24 * HOUR_SECONDS
 # Inside a running session's folders only an entry this large can go (showrunner, 2026-10-25).
@@ -271,7 +268,7 @@ class Roots:
             return False
 
     def is_wide(self, root: str, entry: os.DirEntry[str]) -> bool:
-        """Whether entry goes only after WIDE_IDLE_SECONDS: an empty folder in a wide root that is
+        """Whether entry uses the configured folder removal age: an empty folder in a wide root that is
         no tempfile folder."""
         name = entry.name
         return root in self.wide and not any(pattern.fullmatch(name) for pattern in (TEMPFILE_NAME, INVOKE_TEMP_NAME, VERIFY_TEMP_NAME))
@@ -297,11 +294,11 @@ class Roots:
                 return Limit(float("inf"), TASK_OPEN)
             record = scratch.task_of(Path(entry.path))
             landed = isinstance(record, copy_record.Registered) and record.task.startswith("landed:")
-            return Limit(now - WIDE_IDLE_SECONDS if landed else float("inf"), TASK_OPEN)
+            return Limit(now - wide_idle_seconds() if landed else float("inf"), TASK_OPEN)
         # systemd-tmpfiles-clean sets each folder's times back after it reads it, which moves the
         # folder's ctime, so in a temp folder only a folder's mtime counts.
         if self.is_wide(root, entry):
-            return Limit(now - WIDE_IDLE_SECONDS, RECENT_WIDE, folder_ctime=False)
+            return Limit(now - wide_idle_seconds(), RECENT_WIDE, folder_ctime=False)
         return Limit(now - IDLE_SECONDS, RECENT, folder_ctime=root not in self.temp)
 
     def judged_empty(self, root: str, entry: os.DirEntry[str]) -> bool:
@@ -1089,7 +1086,7 @@ def cleanup_end_reason(entry: RemovableEntry, roots: Roots, now: float, proc: st
 
 
 def timed_entries(roots: Roots, now: float, proc: str) -> Iterator[KeptEntry | RemovableEntry]:
-    """Keep unrecorded top-level work for seven days after all other checks pass."""
+    """Keep unrecorded work until the configured folder removal age after the other checks pass."""
     for entry in judge_entries(roots, now, proc):
         if isinstance(entry, KeptEntry) or entry.root not in roots.plain + roots.runs:
             yield entry
@@ -1105,7 +1102,7 @@ def timed_entries(roots: Roots, now: float, proc: str) -> Iterator[KeptEntry | R
         if ended is CleanupKeepReason.UNREADABLE:
             yield KeptEntry(entry.path, ended.value)
             continue
-        change = last_change(entry.path, Limit(now - WIDE_IDLE_SECONDS, NO_END_RECENT))
+        change = last_change(entry.path, Limit(now - wide_idle_seconds(), NO_END_RECENT))
         if isinstance(change, str):
             yield KeptEntry(entry.path, change)
             continue
@@ -1201,6 +1198,11 @@ def apply_cleanup_plan(plan: Path, roots: Roots, now: float, proc: str) -> int:
         print(f"tmp sweep: could not delete {failure['path']}: {failure['error']}", file=sys.stderr)
     append_log(state_dir() / LOG_NAME, record(result, False, now), now)
     return 1 if result.failed else 0
+
+
+def wide_idle_seconds() -> int:
+    """Read the shared removal age for ordinary folders."""
+    return conf.whole("lint", "folder_remove_after_seconds")
 
 
 def state_dir() -> Path:

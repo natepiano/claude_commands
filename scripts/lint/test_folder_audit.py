@@ -27,7 +27,8 @@ else:
 import folder_audit
 import scratch
 import tmp_sweep
-from scripts.lib import copy_record
+from scripts.lib import conf, copy_record
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 DAY = 86_400
 
@@ -102,10 +103,9 @@ class FolderAuditTests(unittest.TestCase):
                                                                 "SCRATCH_ROOT": str(self.root / "scratch"),
                                                                 "SCRATCH_VISIBLE_ROOT": str(self.root / "repro"),
                                                                 "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
-                                                                "HANAS_CONFIG": str(self.root / "hanas.conf"),
-                                                                "MAC_TEST_CONFIG": str(self.root / "mac_test.conf")}))
-        _ = (self.root / "hanas.conf").write_text("clone_max_hours=2.5\n")
-        _ = (self.root / "mac_test.conf").write_text("free_floor_gib=8\n")
+                                                                **config_environment(self.root / "config")}))
+        _ = write_config_fixture(self.root / "config/hanas.conf", "clone_max_hours=2.5\n")
+        _ = write_config_fixture(self.root / "config/mac_test.conf", "free_floor_gib=8\n")
 
     def clone_folder(self, name: str, hours: float, *, dirty: bool = False) -> Path:
         source = self.root / "clone-source"
@@ -142,9 +142,38 @@ class FolderAuditTests(unittest.TestCase):
         self.assertFalse(old.exists())
         self.assertTrue(young.exists())
         self.assertTrue(ordinary.exists())
-        _ = (self.root / "hanas.conf").write_text("clone_max_hours=1\n")
+        _ = write_config_fixture(self.root / "config/hanas.conf", "clone_max_hours=1\n")
         self.assertEqual(self.judge_clones([young])[young], folder_audit.REMOVED)
         self.assertFalse(young.exists())
+
+    def test_judge_reads_scan_limits_once_for_multiple_due_folders(self) -> None:
+        paths = [folder(self.temp / name, 10) for name in ("first", "second")]
+        found = [(path, changed(path)) for path in paths]
+        (self.root / "proc").mkdir()
+        with unittest.mock.patch("folder_audit.conf.whole", wraps=conf.whole) as whole:
+            outcomes = folder_audit.judge(found, time.time(), False, proc=str(self.root / "proc"),
+                                          sockets=str(self.root / "unix"), mac=False)
+        self.assertEqual(outcomes, {path: folder_audit.WOULD_REMOVE for path in paths})
+        for key in ("folder_idle_depth", "folder_idle_entry_limit"):
+            self.assertEqual(whole.call_args_list.count(unittest.mock.call("lint", key)), 1, key)
+
+    def test_ordinary_folder_removal_age_reads_the_private_config_at_use(self) -> None:
+        ordinary = folder(self.temp / "ordinary", 3 / 24)
+        config = self.root / "config/lint.conf"
+        _ = write_config_fixture(config, "folder_remove_after_seconds=21600\n")
+        self.assertEqual(self.judge_clones([ordinary])[ordinary], "idle less than 0.25 days")
+        self.assertTrue(ordinary.exists())
+        _ = write_config_fixture(config, "folder_remove_after_seconds=7200\n")
+        self.assertEqual(self.judge_clones([ordinary])[ordinary], folder_audit.REMOVED)
+        self.assertFalse(ordinary.exists())
+
+    def test_state_folder_reads_the_private_config_when_the_environment_has_no_override(self) -> None:
+        configured = self.root / "configured-state"
+        _ = write_config_fixture(self.root / "config/lint.conf", f"folder_state_dir={configured}\n")
+        with unittest.mock.patch.dict(os.environ):
+            del os.environ["FOLDER_SWEEP_STATE_DIR"]
+            self.assertEqual(folder_audit.state_dir(), configured)
+        self.assertEqual(folder_audit.state_dir(), self.root / "state")
 
     def test_below_the_mac_floor_removes_the_oldest_idle_clone_until_space_recovers(self) -> None:
         younger = self.clone_folder("younger", 0.25)
@@ -172,7 +201,7 @@ class FolderAuditTests(unittest.TestCase):
         self.assertTrue(clone.exists())
         _ = self.judge_clones([clone], mac=True, free_space=9 * 1024**3)
         self.assertTrue(clone.exists())
-        _ = (self.root / "mac_test.conf").write_text("free_floor_gib=10\n")
+        _ = write_config_fixture(self.root / "config/mac_test.conf", "free_floor_gib=10\n")
         outcomes = self.judge_clones([clone], mac=True, free_space=9 * 1024**3)
         self.assertEqual(outcomes[clone], folder_audit.REMOVED)
         self.assertFalse(clone.exists())
@@ -217,6 +246,24 @@ class FolderAuditTests(unittest.TestCase):
         self.assertEqual(outcomes[listening], folder_audit.LIVE_SOCKET)
         for path in (used, held, listening, busy):
             self.assertTrue((path / "checkout" / "target" / "build").exists(), path)
+
+    def test_config_failure_keeps_an_active_hold_and_its_clone(self) -> None:
+        clone = self.clone_folder("config-held", 3)
+        _ = scratch.hold(clone, "gate:keep-config-held", "keep the clone")
+        record = scratch.holds_file()
+        before = record.read_bytes()
+        config = self.root / "config/scratch.conf"
+        _ = write_config_fixture(config, "holds_file=\n")
+        with unittest.mock.patch.dict(os.environ):
+            _ = os.environ.pop(scratch.HOLDS_ENV, None)
+            for attempt in range(2):
+                with self.subTest(attempt=attempt), self.assertRaises(conf.Unusable):
+                    _ = self.judge_clones([clone], mac=True, free_space=0)
+                self.assertEqual(record.read_bytes(), before)
+                self.assertTrue((clone / "checkout/target/build").exists())
+            _ = write_config_fixture(config, f"holds_file={record}\n")
+            self.assertEqual(self.judge_clones([clone], mac=True, free_space=0)[clone], folder_audit.HELD)
+            self.assertEqual(record.read_bytes(), before)
 
     def test_a_held_clone_lock_keeps_normal_and_linked_checkouts_clean(self) -> None:
         clone = self.clone_folder("clean-lock", 3)
@@ -409,6 +456,7 @@ class FolderAuditTests(unittest.TestCase):
         self.assertIsNone(folder_audit.expected_rust_names(self.root / "missing.txt"))
 
     def test_only_unexpected_idle_folders_are_loose(self) -> None:
+        _ = write_config_fixture(self.root / "config/lint.conf", "folder_remove_after_seconds=518400\n")
         _ = folder(self.rust / "hana")
         _ = folder(self.rust / "repro")
         stray = folder(self.rust / "hana_p34d_alone")
@@ -423,7 +471,7 @@ class FolderAuditTests(unittest.TestCase):
         in_scratch = folder(self.rust / "scratch" / "berth-phase1")
         loose = folder_audit.audit(self.rust, [self.temp], frozenset({"hana"}), time.time(), files=[])
         self.assertEqual([entry.path for entry in loose], [stray, in_scratch, loose_temp])
-        self.assertEqual({(entry.maker, entry.outcome) for entry in loose}, {("", folder_audit.LISTED)})
+        self.assertEqual({(entry.maker, entry.outcome) for entry in loose}, {("", "idle less than 6 days")})
         unread = folder_audit.audit(self.rust, [], None, time.time(), files=[])
         self.assertEqual([entry.path for entry in unread], [in_scratch])
 
@@ -453,6 +501,7 @@ class FolderAuditTests(unittest.TestCase):
         self.assertLess(changed(target), time.time() - 5 * DAY)
 
     def test_an_idle_loose_folder_goes_once_armed_unless_a_guard_keeps_it(self) -> None:
+        _ = write_config_fixture(self.root / "config/lint.conf", "folder_remove_after_seconds=518400\n")
         plain = folder(self.rust / "plain", 8)
         fresh = folder(self.rust / "fresh", 3)
         dirty = folder(self.rust / "dirty", 0)
@@ -483,7 +532,7 @@ class FolderAuditTests(unittest.TestCase):
 
         dry = run(False)
         self.assertEqual(dry["plain"], folder_audit.WOULD_REMOVE)
-        self.assertEqual(dry["fresh"], folder_audit.LISTED)
+        self.assertEqual(dry["fresh"], "idle less than 6 days")
         self.assertEqual(dry["dirty"], tmp_sweep.UNSAVED_WORK)
         self.assertEqual(dry["held"], folder_audit.HELD)
         self.assertEqual(dry["used"], "pid 12 works in it")

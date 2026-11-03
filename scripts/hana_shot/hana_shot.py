@@ -11,6 +11,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from difflib import get_close_matches
 from enum import StrEnum
+from functools import cache
 import http.client
 import importlib.util
 import json
@@ -28,41 +29,32 @@ import sys
 import tempfile
 import time
 import tomllib
-from types import FrameType
+from types import FrameType, ModuleType
 from typing import TYPE_CHECKING, IO, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast, override
+
+def _load_library(name: str) -> ModuleType:
+    """Load a shared library without changing the command's import path."""
+    path = Path(__file__).resolve().parents[1] / "lib" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"_hana_shot_{name}", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load library at {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 if TYPE_CHECKING:
-    from scripts.lib import process_group
+    from scripts.lib import conf, process_group
 else:
-    process_group_path = Path(__file__).resolve().parents[1] / "lib" / "process_group.py"
-    process_group_spec = importlib.util.spec_from_file_location("_hana_shot_process_group", process_group_path)
-    if process_group_spec is None or process_group_spec.loader is None:
-        raise ImportError(f"cannot load process group helper at {process_group_path}")
-    process_group = importlib.util.module_from_spec(process_group_spec)
-    process_group_spec.loader.exec_module(process_group)
+    if __package__:
+        from scripts.lib import conf
+    else:
+        conf = _load_library("conf")
+    process_group = _load_library("process_group")
 
-REFUSED_PORT = 15702
-HOST = "127.0.0.1"
-CALL_TIMEOUT = 10.0
-# Above extras' 25 s capture deadline. The environment override exists for the tests only.
-CAPTURE_TIMEOUT = float(os.environ.get("HANA_SHOT_CAPTURE_TIMEOUT", "30"))
-# A full Mac window over a slow link.
-COPY_TIMEOUT = 60.0
-SETTLE_LIMIT = 5.0
-UNCHANGED_FRAMES = 3
-RESEND_LIMIT = 2.0
-SETUP_LIMIT = 5.0
-READY_LIMIT = 180.0
-WARM_FRAME_MS = 50.0
-WARM_LIMIT = 30.0
-BLACK_MAXIMUM = 0.02
-MAX_MARGIN = 0.45
-SHOT_DIRECTORY_LIMIT = 1_073_741_824
-MAX_AGE_SECONDS = 604_800
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # Wakes the remote display and holds it until the run closes this shell's stdin; -t ends it if that never comes.
-REMOTE_KEEP_AWAKE = "caffeinate -u -t 3600 & echo awake; cat > /dev/null; kill $!"
 
 ORBIT_CAM = "hana_lagrange::orbit_cam::OrbitCam"
 EDITOR_CAMERA = "hana::camera::editor_camera::EditorCamera"
@@ -594,7 +586,7 @@ class Shot:
     target: str | None
     mode: str
     orientation: DefaultAngles | ExplicitAngles | TargetFace | ResolvedTargetFace = DefaultAngles()
-    margin: float = 0.1
+    margin: float = field(default_factory=lambda: conf.number("hana_shot", "default_margin"))
     focus: Vec3 | None = None
     radius: float | None = None
     crop: str = "none"
@@ -630,7 +622,18 @@ class Result:
     settle_frames: int
 
 
-POOL = ThreadPoolExecutor(max_workers=6)
+@cache
+def worker_pool() -> ThreadPoolExecutor:
+    """Create the worker pool when capture work first needs it."""
+    return ThreadPoolExecutor(max_workers=conf.whole("hana_shot", "workers"))
+
+
+@dataclass(frozen=True)
+class ConfiguredCallTimeout:
+    """Use the configured BRP call timeout."""
+
+
+CONFIGURED_CALL_TIMEOUT = ConfiguredCallTimeout()
 
 
 # ---------------------------------------------------------------------------
@@ -678,13 +681,18 @@ class Brp:
 
     def __init__(self, port: int) -> None:
         self.port: int = port
+        self.host: str = conf.text("hana_shot", "host")
+        self.call_timeout: float = conf.number("hana_shot", "call_timeout_seconds")
         self.target_evidence: TargetEvidence = TargetEvidence()
 
-    def call(self, method: str, params: object = None, timeout: float = CALL_TIMEOUT) -> object:
+    def call(self, method: str, params: object = None,
+             timeout: float | ConfiguredCallTimeout = CONFIGURED_CALL_TIMEOUT) -> object:
+        if isinstance(timeout, ConfiguredCallTimeout):
+            timeout = self.call_timeout
         body: dict[str, object] = {"jsonrpc": "2.0", "id": 1, "method": method}
         if params is not None:
             body["params"] = params
-        connection = http.client.HTTPConnection(HOST, self.port, timeout=timeout)
+        connection = http.client.HTTPConnection(self.host, self.port, timeout=timeout)
         try:
             connection.request("POST", "/", json.dumps(body), {"content-type": "application/json"})
             raw = connection.getresponse().read()
@@ -738,8 +746,9 @@ def frame_number(diagnostics: Diagnostics) -> int:
 
 
 def check_port(port: int) -> None:
-    if port == REFUSED_PORT:
-        raise Refused(f"port {REFUSED_PORT} is the user's own Hana; launch a test instance on another port")
+    refused_port = conf.whole("hana_shot", "refused_port")
+    if port == refused_port:
+        raise Refused(f"port {refused_port} is the user's own Hana; launch a test instance on another port")
     if not 1024 <= port <= 65535:
         raise Refused(f"--port must be 1024 to 65535, got {port}")
 
@@ -798,12 +807,12 @@ class Session:
         self.window_level: WindowLevelPending | WindowLeftAlone | WindowRaised = WindowLevelPending()
 
     def start(self) -> CameraState:
-        system = None if self.remote is None else POOL.submit(remote_system, self.remote)
-        camera_rows = POOL.submit(
+        system = None if self.remote is None else worker_pool().submit(remote_system, self.remote)
+        camera_rows = worker_pool().submit(
             self.brp.query,
             {"data": {"components": [ORBIT_CAM, GLOBAL_TRANSFORM, CAMERA]}, "filter": {"with": [EDITOR_CAMERA]}},
         )
-        diagnostics = POOL.submit(self.brp.diagnostics)
+        diagnostics = worker_pool().submit(self.brp.diagnostics)
         rows = camera_rows.result()
         if len(rows) != 1:
             raise Failure(f"expected one editor camera, found {len(rows)}")
@@ -836,7 +845,7 @@ class Session:
         try:
             if self.remote is None:
                 keep_awake_process.terminate()
-            _ = keep_awake_process.communicate(timeout=CALL_TIMEOUT)
+            _ = keep_awake_process.communicate(timeout=conf.number("hana_shot", "call_timeout_seconds"))
         except subprocess.TimeoutExpired:
             keep_awake_process.kill()
             _ = keep_awake_process.wait()
@@ -846,20 +855,23 @@ class Session:
         return camera_state(self.brp.components(self.camera, [ORBIT_CAM, GLOBAL_TRANSFORM, CAMERA]))
 
     def sample(self) -> Sample:
-        diagnostics = POOL.submit(self.brp.diagnostics)
+        diagnostics = worker_pool().submit(self.brp.diagnostics)
         state = self.read_camera()
         return Sample(state, frame_number(diagnostics.result()))
 
     def frame_seconds(self) -> float:
-        return max(0.005, (self.frame_ms or 16.0) / 1000)
+        return max(conf.number("hana_shot", "minimum_frame_seconds"),
+                   (self.frame_ms or conf.number("hana_shot", "default_frame_ms")) / 1000)
 
-    def settle(self, before: CameraState, extra_frames: int, limit: float = SETTLE_LIMIT) -> Settled:
+    def settle(self, before: CameraState, extra_frames: int) -> Settled:
         """Wait until the camera has moved and held still for a frame, or never moved.
 
         A BRP call can land in the frame that answered the previous call, so frames are
         counted from the frame counter, never from the number of calls.
         """
+        limit = conf.number("hana_shot", "settle_seconds")
         deadline = time.monotonic() + limit
+        unchanged_frames = conf.whole("hana_shot", "unchanged_frames")
         first: int | None = None
         moved_at: int | None = None
         previous: Sample | None = None
@@ -877,7 +889,7 @@ class Session:
             )
             if moved_at is not None and held and current.frame >= moved_at + 1 + extra_frames:
                 return Settled(current.state, True, current.frame - first)
-            if moved_at is None and current.frame >= first + UNCHANGED_FRAMES + extra_frames:
+            if moved_at is None and current.frame >= first + unchanged_frames + extra_frames:
                 return Settled(current.state, False, current.frame - first)
             if time.monotonic() > deadline:
                 raise Failure(
@@ -940,7 +952,8 @@ def move(session: Session, shot: Shot, target: Target | None, before: CameraStat
             return settled
         # An unchanged camera means the fit was rejected, or the camera already held this
         # fit. A fit with another margin tells the two apart.
-        probe = shot.margin + 0.05 if shot.margin + 0.05 <= MAX_MARGIN else shot.margin - 0.05
+        margin_probe = conf.number("hana_shot", "margin_probe")
+        probe = shot.margin + margin_probe if shot.margin + margin_probe <= conf.number("hana_shot", "max_margin") else shot.margin - margin_probe
         session.fit(target.entity, shot, probe)
         probed = session.settle(settled.state, 0)
         if not probed.moved:
@@ -1095,7 +1108,7 @@ def closest_target_hint(evidence: TargetEvidence, text: str) -> str:
     selector = parse_selector(text)
     if selector.kind in ("name", "tool"):
         candidates = {candidate.lower(): candidate for candidate in evidence.selector_candidates}
-        closest = get_close_matches(selector.value.lower(), sorted(candidates), n=5)
+        closest = get_close_matches(selector.value.lower(), sorted(candidates), n=conf.whole("hana_shot", "selector_suggestions"))
         if closest:
             return "; closest: " + ", ".join(f"{selector.kind}:{candidates[name]}" for name in closest)
     return ""
@@ -1127,12 +1140,13 @@ def run_setup(session: Session, shot: Shot) -> list[Target]:
     """Run the view's Hana command, then wait for its target and a still camera."""
     assert shot.setup is not None and shot.target is not None
     session.brp.invoke(shot.setup)
-    deadline = time.monotonic() + SETUP_LIMIT
+    setup_seconds = conf.number("hana_shot", "setup_seconds")
+    deadline = time.monotonic() + setup_seconds
     targets: list[Target] = []
     while not targets:
         if time.monotonic() > deadline:
             raise Failure(
-                f"setup {shot.setup} ran but {shot.target} did not appear within {SETUP_LIMIT:.0f} s"
+                f"setup {shot.setup} ran but {shot.target} did not appear within {setup_seconds:.0f} s"
                 + closest_target_hint(session.brp.target_evidence, shot.target)
                 + next_step("run `hana_shot.py targets` to list the selectors that resolve now")
             )
@@ -1148,8 +1162,8 @@ def run_setup(session: Session, shot: Shot) -> list[Target]:
 
 
 def start_bounds(session: Session) -> tuple[Future[list[QueryRow]], Future[list[QueryRow]]]:
-    parents = POOL.submit(session.brp.query, {"data": {"components": [CHILD_OF]}})
-    boxes = POOL.submit(session.brp.query, {
+    parents = worker_pool().submit(session.brp.query, {"data": {"components": [CHILD_OF]}})
+    boxes = worker_pool().submit(session.brp.query, {
         "data": {
             "components": [AABB, GLOBAL_TRANSFORM],
             "option": [VIEW_VISIBILITY, INHERITED_VISIBILITY],
@@ -1319,10 +1333,11 @@ def hierarchy_rect(bounds: Bounds, root: int, state: CameraState, padding: int, 
 
 def capture(session: Session, params: dict[str, object]) -> ShotReply:
     """Take one screenshot, resending only when extras refuses because one is in flight."""
-    deadline = time.monotonic() + RESEND_LIMIT
+    deadline = time.monotonic() + conf.number("hana_shot", "resend_seconds")
+    capture_timeout = conf.number("hana_shot", "capture_timeout_seconds")
     while True:
         try:
-            return cast(ShotReply, session.brp.call("brp_extras/screenshot", params, timeout=CAPTURE_TIMEOUT))
+            return cast(ShotReply, session.brp.call("brp_extras/screenshot", params, timeout=capture_timeout))
         except BrpCallError as exc:
             if "already in progress" not in exc.message or time.monotonic() > deadline:
                 raise
@@ -1362,20 +1377,20 @@ def fetch(remote: RemoteFile, staging: Path) -> None:
     try:
         copied = subprocess.run(
             ["scp", "-q", source, str(staging)],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False, timeout=COPY_TIMEOUT,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False, timeout=conf.number("hana_shot", "copy_timeout_seconds"),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise Failure(f"could not copy {source}: {exc}") from exc
     if copied.returncode != 0 or not is_png(staging):
         detail = copied.stderr.strip() or f"scp exited {copied.returncode}"
         raise Failure(f"no PNG came back from {source} ({detail}); the shot is left there")
-    _ = POOL.submit(remove_remote, remote)
+    _ = worker_pool().submit(remove_remote, remote)
 
 
 def remove_remote(remote: RemoteFile) -> None:
     _ = subprocess.run(
         ["ssh", remote.host, "rm", "-f", remote.path],
-        stdin=subprocess.DEVNULL, capture_output=True, check=False, timeout=COPY_TIMEOUT,
+        stdin=subprocess.DEVNULL, capture_output=True, check=False, timeout=conf.number("hana_shot", "copy_timeout_seconds"),
     )
 
 
@@ -1384,7 +1399,7 @@ def remote_system(host: str) -> str:
     try:
         answer = subprocess.run(
             ["ssh", host, "uname", "-s"],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False, timeout=CALL_TIMEOUT,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False, timeout=conf.number("hana_shot", "call_timeout_seconds"),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise Failure(f"could not ask {host} for its system over ssh: {exc}") from exc
@@ -1398,11 +1413,11 @@ def remote_system(host: str) -> str:
 def keep_awake(host: str) -> subprocess.Popen[bytes]:
     """Hold the remote display awake until Session.close; returns once caffeinate runs."""
     process = subprocess.Popen(
-        ["ssh", host, REMOTE_KEEP_AWAKE], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        ["ssh", host, f"caffeinate -u -t {conf.whole('hana_shot', 'remote_awake_seconds')} & echo awake; cat > /dev/null; kill $!"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
-    started = POOL.submit(cast(IO[bytes], process.stdout).readline)
+    started = worker_pool().submit(cast(IO[bytes], process.stdout).readline)
     try:
-        awake = started.result(timeout=CALL_TIMEOUT).strip() == b"awake"
+        awake = started.result(timeout=conf.number("hana_shot", "call_timeout_seconds")).strip() == b"awake"
     except TimeoutError:
         awake = False
     if not awake:
@@ -1453,7 +1468,7 @@ def take(session: Session, shot: Shot, final: Path) -> Result:
         ensure_window(session, shot.window)
     if session.macos:
         keep_visible(session)
-    target_future = POOL.submit(resolve_one, session, shot)
+    target_future = worker_pool().submit(resolve_one, session, shot)
     before = session.read_camera()
     target = target_future.result()
     shot = resolve_face(session, shot, target)
@@ -1542,14 +1557,14 @@ def ensure_window(session: Session, size: str) -> None:
     if session.read_camera().size == (width, height):
         return
     entity = rows[0]["entity"]
-    first = POOL.submit(session.brp.mutate, entity, WINDOW, ".resolution.physical_width", width)
+    first = worker_pool().submit(session.brp.mutate, entity, WINDOW, ".resolution.physical_width", width)
     session.brp.mutate(entity, WINDOW, ".resolution.physical_height", height)
     first.result()
-    deadline = time.monotonic() + SETTLE_LIMIT
+    deadline = time.monotonic() + conf.number("hana_shot", "settle_seconds")
     while session.read_camera().size != (width, height):
         if time.monotonic() > deadline:
             raise Failure(f"the window did not reach {width}x{height} physical pixels; the window manager may refuse resizes")
-    session.wait_frames(2)
+    session.wait_frames(conf.whole("hana_shot", "window_frames"))
 
 
 def keep_visible(session: Session) -> None:
@@ -1575,9 +1590,9 @@ def keep_visible(session: Session) -> None:
             caffeinate = shutil.which("caffeinate")
             if caffeinate is not None:
                 session.keep_awake = subprocess.Popen(
-                    [caffeinate, "-u", "-t", "30"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    [caffeinate, "-u", "-t", str(conf.whole("hana_shot", "local_awake_seconds"))], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
-        session.wait_frames(2)
+        session.wait_frames(conf.whole("hana_shot", "window_frames"))
         session.window_level = prepared_window
     except BaseException:
         with EXIT_SIGNAL_LATCH.defer_during_cleanup():
@@ -1596,20 +1611,22 @@ def cache_directory() -> Path:
 
 def prune_shots(directory: Path) -> None:
     now = time.time()
+    max_age = conf.whole("hana_shot", "max_age_seconds")
+    max_bytes = conf.whole("hana_shot", "shot_directory_bytes")
     kept: list[tuple[float, int, Path]] = []
     for path in directory.glob("*.png"):
         try:
             details = path.stat()
         except OSError:
             continue
-        if now - details.st_mtime > MAX_AGE_SECONDS:
+        if now - details.st_mtime > max_age:
             path.unlink(missing_ok=True)
         else:
             kept.append((details.st_mtime, details.st_size, path))
     kept.sort()
     total = sum(size for _, size, _ in kept)
     for _, size, path in kept:
-        if total < SHOT_DIRECTORY_LIMIT:
+        if total < max_bytes:
             break
         path.unlink(missing_ok=True)
         total -= size
@@ -1649,7 +1666,7 @@ def git_sha(directory: Path) -> str:
     try:
         result = subprocess.run(
             ["git", "-C", str(directory), "rev-parse", "--short=9", "HEAD"],
-            capture_output=True, text=True, check=False, timeout=5,
+            capture_output=True, text=True, check=False, timeout=conf.number("hana_shot", "git_timeout_seconds"),
         )
     except (OSError, subprocess.TimeoutExpired):
         return "unknown"
@@ -1659,7 +1676,7 @@ def git_sha(directory: Path) -> str:
 def git_toplevel() -> Path | None:
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=False, timeout=5,
+            ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=False, timeout=conf.number("hana_shot", "git_timeout_seconds"),
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -1898,7 +1915,7 @@ def shot_from_view(name: str, view: ViewValue) -> Shot:
         target=view.get("target"),
         mode=view.get("mode", "fit"),
         orientation=request_orientation(view.get("face"), view.get("yaw"), view.get("pitch")),
-        margin=number(view.get("margin"), 0.1),
+        margin=number(view.get("margin"), conf.number("hana_shot", "default_margin")),
         focus=None if focus_values is None else (float(focus_values[0]), float(focus_values[1]), float(focus_values[2])),
         radius=view.get("radius"),
         crop=view.get("crop", "none"),
@@ -1929,9 +1946,10 @@ def validate_shot(shot: Shot) -> None:
         raise Refused(f"{where}: pose needs {' and '.join(missing)}; example: --mode pose --focus 0,0,0 --radius 6")
     if shot.crop == "entity" and shot.target is None:
         raise Refused(f"{where}: crop entity needs a target")
-    if not 0.0 <= shot.margin <= MAX_MARGIN:
+    max_margin = conf.number("hana_shot", "max_margin")
+    if not 0.0 <= shot.margin <= max_margin:
         raise Refused(
-            f"{where}: --margin must be 0 to {MAX_MARGIN}; "
+            f"{where}: --margin must be 0 to {max_margin}; "
             + "fraction of the viewport kept clear on each side (0.1 = 10%)"
         )
     if shot.padding < 0 or shot.settle < 0:
@@ -2030,7 +2048,7 @@ def _read_launch_state(state_path: Path) -> LaunchRecord:
 
 def port_answers(port: int) -> bool:
     try:
-        with socket.create_connection((HOST, port), timeout=0.5):
+        with socket.create_connection((conf.text("hana_shot", "host"), port), timeout=conf.number("hana_shot", "port_probe_seconds")):
             return True
     except OSError:
         return False
@@ -2044,8 +2062,8 @@ def panic_lines(log: Path) -> list[str]:
     found: list[str] = []
     for index, line in enumerate(lines):
         if "panic" in line.lower():
-            found.extend(lines[index:index + 3])
-    return found[:40]
+            found.extend(lines[index:index + conf.whole("hana_shot", "panic_context_lines")])
+    return found[:conf.whole("hana_shot", "panic_max_lines")]
 
 
 def uncommitted_build_paths(root: Path, executable: Path) -> list[str]:
@@ -2053,7 +2071,7 @@ def uncommitted_build_paths(root: Path, executable: Path) -> list[str]:
     try:
         result = subprocess.run(
             ["git", "-C", str(root), "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", "crates/", "Cargo.toml", "Cargo.lock"],
-            stdin=subprocess.DEVNULL, capture_output=True, timeout=3, check=False,
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=conf.number("hana_shot", "git_status_seconds"), check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         return []
@@ -2093,8 +2111,9 @@ def uncommitted_build_paths(root: Path, executable: Path) -> list[str]:
 
 
 def build_paths_label(paths: list[str]) -> str:
-    label = ", ".join(paths[:10])
-    return label + (f", and {len(paths) - 10} more" if len(paths) > 10 else "")
+    limit = conf.whole("hana_shot", "dirty_path_limit")
+    label = ", ".join(paths[:limit])
+    return label + (f", and {len(paths) - limit} more" if len(paths) > limit else "")
 
 
 def launch(port: int, worktree: str | None, binary: str | None, purpose: str = "", owner: str = "") -> tuple[LaunchState, subprocess.Popen[bytes]]:
@@ -2181,7 +2200,10 @@ def launch(port: int, worktree: str | None, binary: str | None, purpose: str = "
 
 
 def wait_ready(brp: Brp, process: subprocess.Popen[bytes], log: Path) -> None:
-    deadline = time.monotonic() + READY_LIMIT
+    ready_seconds = conf.number("hana_shot", "ready_seconds")
+    poll_seconds = conf.number("hana_shot", "poll_seconds")
+    warm_frame_ms = conf.number("hana_shot", "warm_frame_ms")
+    deadline = time.monotonic() + ready_seconds
     while True:
         if process.poll() is not None:
             lines = panic_lines(log)
@@ -2190,17 +2212,17 @@ def wait_ready(brp: Brp, process: subprocess.Popen[bytes], log: Path) -> None:
         if READY_LOG_LINE in log.read_text(errors="replace"):
             break
         if time.monotonic() > deadline:
-            raise Failure(f"Hana did not log '{READY_LOG_LINE}' within {READY_LIMIT:.0f} s")
-        time.sleep(0.1)
-    warm_deadline = time.monotonic() + WARM_LIMIT
+            raise Failure(f"Hana did not log '{READY_LOG_LINE}' within {ready_seconds:.0f} s")
+        time.sleep(poll_seconds)
+    warm_deadline = time.monotonic() + conf.number("hana_shot", "warm_seconds")
     while time.monotonic() < warm_deadline:
         try:
             frame_ms = brp.diagnostics()["frame_time_ms"]["current"]
         except Failure:
             frame_ms = None
-        if frame_ms is not None and frame_ms < WARM_FRAME_MS:
+        if frame_ms is not None and frame_ms < warm_frame_ms:
             return
-        time.sleep(0.1)
+        time.sleep(poll_seconds)
 
 
 def process_alive(pid: int) -> bool:
@@ -2223,6 +2245,9 @@ def same_binary(pid: int, binary: str) -> bool:
 def shutdown(port: int, process: subprocess.Popen[bytes] | None = None) -> None:
     """Stop a launched Hana, show any panic lines from its log, and remove its scratch."""
     check_port(port)
+    shutdown_seconds = conf.number("hana_shot", "shutdown_seconds")
+    poll_seconds = conf.number("hana_shot", "poll_seconds")
+    signal_grace_seconds = conf.number("hana_shot", "signal_grace_seconds")
     state_path = launch_state_path(port)
     record = _read_launch_state(state_path)
     launch_record = record
@@ -2240,21 +2265,21 @@ def shutdown(port: int, process: subprocess.Popen[bytes] | None = None) -> None:
                 break
     shutdown_answered = False
     try:
-        _ = Brp(port).call("brp_extras/shutdown", timeout=5)
+        _ = Brp(port).call("brp_extras/shutdown", timeout=conf.number("hana_shot", "shutdown_call_seconds"))
         shutdown_answered = True
     except Failure:
         pass
     if isinstance(launch_record, WholeLaunchRecord):
         state = launch_record.state
         pid = state["pid"]
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + shutdown_seconds
         while time.monotonic() < deadline:
             if process is not None:
                 if process.poll() is not None:
                     break
             elif not process_alive(pid):
                 break
-            time.sleep(0.1)
+            time.sleep(poll_seconds)
         else:
             if same_binary(pid, state["binary"]):
                 for signal_number in (signal.SIGTERM, signal.SIGKILL):
@@ -2262,7 +2287,7 @@ def shutdown(port: int, process: subprocess.Popen[bytes] | None = None) -> None:
                         process_group.send_process_group(pid, signal_number)
                     except ProcessLookupError:
                         break
-                    time.sleep(2)
+                    time.sleep(signal_grace_seconds)
         lines = panic_lines(Path(state["log"]))
         if lines:
             print(f"hana_shot: Hana on port {port} logged a panic:", file=sys.stderr)
@@ -2270,14 +2295,14 @@ def shutdown(port: int, process: subprocess.Popen[bytes] | None = None) -> None:
                 print(f"  {line}", file=sys.stderr)
         shutil.rmtree(state["scratch"], ignore_errors=True)
     else:
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + shutdown_seconds
         while port_answers(port):
             if time.monotonic() >= deadline:
                 raise Failure(
-                    f"Hana on port {port} still answers after 20 s without a whole launch record"
+                    f"Hana on port {port} still answers after {shutdown_seconds:g} s without a whole launch record"
                     + next_step(f"run shutdown again on port {port} after the launch finishes starting"),
                 )
-            time.sleep(0.1)
+            time.sleep(poll_seconds)
     state_path.unlink(missing_ok=True)
     for temporary_path in state_path.parent.glob(f".{state_path.name}.*.tmp"):
         temporary_path.unlink(missing_ok=True)
@@ -2370,7 +2395,7 @@ def shot_from_arguments(args: Arguments) -> Shot:
         target=target,
         mode=mode,
         orientation=request_orientation(args.face, args.yaw, args.pitch),
-        margin=args.margin if args.margin is not None else 0.1,
+        margin=args.margin if args.margin is not None else conf.number("hana_shot", "default_margin"),
         focus=parse_focus(args.focus) if args.focus else None,
         radius=args.radius,
         crop=args.crop or "none",
@@ -2661,7 +2686,8 @@ def from_current(session: Session, args: Arguments, mode: str) -> ViewValue:
         settled = session.settle(before, 0)
         return settled.state.pose.radius, settled.state
 
-    low, high = 0.0, MAX_MARGIN
+    max_margin = conf.number("hana_shot", "max_margin")
+    low, high = 0.0, max_margin
     low_radius, current = radius_at(low, state)
     high_radius, current = radius_at(high, current)
     if pose.radius <= low_radius:
@@ -2669,7 +2695,7 @@ def from_current(session: Session, args: Arguments, mode: str) -> ViewValue:
     elif pose.radius >= high_radius:
         margin = high
     else:
-        for _ in range(12):
+        for _ in range(conf.whole("hana_shot", "fit_iterations")):
             middle = (low + high) / 2
             radius, current = radius_at(middle, current)
             if radius < pose.radius:
@@ -2679,8 +2705,8 @@ def from_current(session: Session, args: Arguments, mode: str) -> ViewValue:
         margin = (low + high) / 2
     _ = radius_at(margin, current)
     view["margin"] = round(margin, 4)
-    if margin in (0.0, MAX_MARGIN):
-        print(f"hana_shot: the current distance is outside what margins 0 to {MAX_MARGIN} reach; stored {margin}", file=sys.stderr)
+    if margin in (0.0, max_margin):
+        print(f"hana_shot: the current distance is outside what margins 0 to {max_margin} reach; stored {margin}", file=sys.stderr)
     return view
 
 
@@ -2729,7 +2755,7 @@ def views_check(args: Arguments, path: Path, invocation: InProgressCaptureInvoca
                 failures.append(f"FAIL {name}: {exc}")
                 print(failures[-1], file=sys.stderr)
                 continue
-            if peak < BLACK_MAXIMUM:
+            if peak < conf.number("hana_shot", "black_maximum"):
                 error = f"the shot is black (brightest {peak:.3f}) at {result.path}"
                 invocation.attempts.append(failed_attempt(shot, result.path, FailureReason.BLACK_CAPTURE, started_ns, error))
                 invocation.failures.append(CaptureFailure(FailureReason.BLACK_CAPTURE, f"{name}: {error}"))
@@ -2776,7 +2802,7 @@ def add_shot_flags(parser: argparse.ArgumentParser) -> None:
     _ = parser.add_argument("--face", choices=FACES, help="target-local side to face in fit or pose; replaces --yaw/--pitch")
     _ = parser.add_argument("--yaw", type=float)
     _ = parser.add_argument("--pitch", type=float)
-    _ = parser.add_argument("--margin", type=float, help="0 to 0.45; fraction of the viewport reserved on each side of a fit (0.1 = 10%%)")
+    _ = parser.add_argument("--margin", type=float, help=f"0 to {conf.number('hana_shot', 'max_margin')}; fraction of the viewport reserved on each side of a fit (0.1 = 10%%)")
     _ = parser.add_argument("--focus", help="x,y,z (pose mode)")
     _ = parser.add_argument("--radius", type=float)
     _ = parser.add_argument("--crop", choices=CROPS)

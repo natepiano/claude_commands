@@ -28,7 +28,8 @@ else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "style"))
     import style_sync
 
-from scripts.lib import copy_record
+from scripts.lib import conf, copy_record
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.message import sessions
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id
@@ -37,6 +38,11 @@ MAKER_ID = fixture_runtime_id("scratch-Claude-session")
 
 RUN = "run:2a858b68-0f9a-4af2-b3cf-a776e6b180cb"
 ROW = "row:cargo-liner-C54"
+
+
+def setUpModule() -> None:
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, config_environment(root))))
 
 
 class ScratchTests(unittest.TestCase):
@@ -758,16 +764,52 @@ class ScratchTests(unittest.TestCase):
         self.assertIsInstance(record, copy_record.Registered)
         assert isinstance(record, copy_record.Registered)
         task = record.task
-        deadline = scratch.task_end(task, 1_000_000.0 + scratch.DEFAULT_LIFE_SECONDS)
+        deadline = scratch.task_end(task, 1_000_000.0 + conf.whole("scratch", "default_life_seconds"))
         self.assertIsInstance(deadline, scratch.Ended)
         assert isinstance(deadline, scratch.Ended)
-        self.assertEqual(deadline.at, 1_000_000.0 + scratch.DEFAULT_LIFE_SECONDS - 40)
+        self.assertEqual(deadline.at, 1_000_000.0 + conf.whole("scratch", "default_life_seconds") - 40)
         self.assertFalse(scratch.ended(task, 1_000_000.0))
-        self.assertTrue(scratch.ended(task, 1_000_000.0 + scratch.DEFAULT_LIFE_SECONDS))
+        self.assertTrue(scratch.ended(task, 1_000_000.0 + conf.whole("scratch", "default_life_seconds")))
         self.assertFalse(scratch.ended(RUN, 9e12))
         self.assertTrue(scratch.parsed_until("2026-10-28 09:30").startswith("until:2026-10-28T"))
         with self.assertRaises(scratch.ScratchError):
             _ = scratch.parsed_until("tomorrow")
+
+    def test_default_task_lifetime_reads_the_private_config_at_use(self) -> None:
+        with mock.patch.dict(os.environ, config_environment(self.base / "config")):
+            for lifetime in (3600, 7200):
+                with self.subTest(lifetime=lifetime):
+                    _ = write_config_fixture(conf.path("scratch"), f"default_life_seconds={lifetime}\n")
+                    path = scratch.new(now=1_000_020.0)
+                    record = scratch.task_of(path)
+                    self.assertIsInstance(record, copy_record.Registered)
+                    assert isinstance(record, copy_record.Registered)
+                    self.assertFalse(scratch.ended(record.task, 1_000_020.0 + lifetime - 1))
+                    self.assertTrue(scratch.ended(record.task, 1_000_020.0 + lifetime))
+
+    def test_repository_scan_reads_each_setting_once_across_recursive_folders(self) -> None:
+        root = self.base / "repos"
+        repositories = [root / name / "nested" for name in ("first", "second")]
+        for repo in repositories:
+            (repo / ".git").mkdir(parents=True)
+        with (
+            mock.patch.dict(os.environ, config_environment(self.base / "config")),
+            mock.patch("scratch.conf.whole", wraps=conf.whole) as whole,
+            mock.patch("scratch.conf.words", wraps=conf.words) as words,
+        ):
+            self.assertEqual(scratch.repos(root), repositories)
+        self.assertEqual(whole.call_args_list, [mock.call("scratch", "repo_depth")])
+        self.assertEqual(words.call_args_list, [mock.call("scratch", "repo_skip")])
+
+    def test_repository_scan_depth_reads_the_private_config_at_use(self) -> None:
+        root = self.base / "repos"
+        nested = root / "first/second"
+        (nested / ".git").mkdir(parents=True)
+        with mock.patch.dict(os.environ, config_environment(self.base / "config")):
+            _ = write_config_fixture(conf.path("scratch"), "repo_depth=1\n")
+            self.assertEqual(scratch.repos(root), [])
+            _ = write_config_fixture(conf.path("scratch"), "repo_depth=2\n")
+            self.assertEqual(scratch.repos(root), [nested])
 
     def test_a_held_folder_goes_with_its_task_unless_a_repo_in_it_has_unsaved_work(self) -> None:
         saved, unsaved = self.base / "saved", self.base / "unsaved" / "repo"

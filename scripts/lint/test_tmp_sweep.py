@@ -34,6 +34,7 @@ else:
     import sessions
 
 from scripts.lib import copy_record
+from scripts.lint.memory_test_support import config_environment
 
 DAY = 86_400
 LIVE_SESSION = "11111111-2222-3333-4444-555555555555"
@@ -96,6 +97,7 @@ class TmpSweepCase(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "NOTIFIER_SESSIONS_DIR": str(registry), "SHUTDOWN_STATE_DIR": str(base / "shutdown"),
             "BUILDLOG_DIR": str(base / "buildlog"),
+            **config_environment(base / "config"),
         })))
         self.now = time.time() + 2 * DAY
         _ = self.enterContext(mock.patch.object(tmp_sweep, "state_dir", return_value=self.state))

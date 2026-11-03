@@ -61,12 +61,28 @@ needed: the process carries its own labels.
 
 `config/hanas.conf` holds the exempt ports, labelled lifetime, unlabelled
 lifetime and stop grace. Each invocation reads those values through
-`config_values`. A Hana is a test when it has either test label, uses a port
-outside the exempt set, or carries `CLAUDECODE`, `SSH_CONNECTION` or
-`SHOWRUNNER_UNIT_ID`. A Hana on an exempt port with none of these markers is
+`scripts/lib/conf.py`. `CONF_DIR` selects the configuration folder.
+A Hana is a test when it has either test label.
+A non-exempt port also identifies a test.
+The environment markers `CLAUDECODE`, `SSH_CONNECTION`, and `SHOWRUNNER_UNIT_ID` also identify tests. A Hana on an exempt port with none of these markers is
 a user Hana, and neither stop nor sweep signals it. A test with neither label
 uses the shorter unlabelled limit.
 
 Tests inject process files, environment reads, SSH output and signals. They
 never signal a real process or SSH to the Mac. Installation of the `hanas`
 wrapper and the scheduled sweep belongs to the director after checkpoint.
+
+Capture limits come from `config/hana_shot.conf` through the same reader.
+The `window_frames` key sets the frame count after a window change.
+They include BRP deadlines, capture deadlines, camera waits, output limits, process waits, and worker count.
+The reader uses `CONF_DIR` for private test settings.
+`scratch.conf` controls the clone folder lifetime, visible root, hold file, and repository scan.
+The folder audit reads its other limits from `lint.conf` through the same reader.
+All moved values retain their previous defaults.
+
+`mac_run.sh` and `smoke_launch.sh` read their launch settings from `production.conf`.
+Smoke launches share `hana_shot.conf` `host` and `refused_port` with Hana commands.
+Mac runs share `mac_test.conf` `connect_timeout_s` and round it up for SSH.
+SFTP receives the configured bundle path unchanged. SSH receives shell quoting for the same path.
+These settings include ports, paths, wait times, and the Mac demo list.
+The Mac script calls `conf.py`. The smoke script uses the shared `conf.sh` reader.

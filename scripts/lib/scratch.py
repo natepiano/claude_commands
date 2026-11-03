@@ -23,9 +23,10 @@ A task, and what ends it:
   * `row:<showrunner>-C<n>`: change_review.py verdict;
   * `until:<YYYY-MM-DDTHHMMZ>`: the hourly tmp sweep, once the time passes. `--until` takes
     `YYYY-MM-DD` or `YYYY-MM-DD HH:MM` in the user's zone. With no task, a folder gets
-    `until:` DEFAULT_LIFE_SECONDS (24 h) from now.
+    `until:` for scratch.conf default_life_seconds from now.
 
-A folder lives in ROOT as `<task>-<word>-<6 chars>`; `--visible` (rows only) puts it in VISIBLE_ROOT
+A folder lives in ROOT as `<task>-<word>-<suffix>`; scratch.conf suffix_length sets the suffix length.
+`--visible` (rows only) puts it in VISIBLE_ROOT
 as `<showrunner>-C<n>-<word>`, where cargo-port lists it. Each holds copy_record.RECORD with its task, maker and
 times. The hourly tmp sweep (scripts/lint/tmp_sweep.py) keeps a folder in ROOT while its task is
 open, and removes it when its until: time passes, or after 7 idle days whatever its task, since an
@@ -70,24 +71,17 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import copy_record  # noqa: E402
+from scripts.lib import conf, copy_record  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 VISIBLE_ROOT_ENV = "SCRATCH_VISIBLE_ROOT"
-DEFAULT_VISIBLE_ROOT = "~/rust/repro"
 # A started removal keeps the record outside the folder until the folder is gone.
 REMOVAL_RECORD_PREFIX = ".scratch-removing-"
 REMOVAL_RECORD_SUFFIX = ".json"
 HOLDS_ENV = "SCRATCH_HOLDS"
-DEFAULT_HOLDS = "~/.local/state/scratch/holds.json"
 UNTIL_FORMAT = "%Y-%m-%dT%H%MZ"
-DEFAULT_LIFE_SECONDS = 24 * 3600
-# A repo deeper than this inside a removed folder is not looked for; build output is never a repo.
-REPO_DEPTH = 3
-SKIPPED_FOLDERS = frozenset({"target", "node_modules", ".git"})
 ROW_NAME = re.compile(r"[A-Za-z0-9_-]+-C[0-9]+")
 WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
-SUFFIX_LENGTH = 6
 SUFFIX_CHARACTERS = string.ascii_lowercase + string.digits
 BUSY = ".claude-busy"
 RECORD_LOCKS: ContextVar[frozenset[tuple[int, int]]] = ContextVar("scratch_record_locks", default=frozenset())
@@ -269,7 +263,8 @@ def directory_record_lock(path: Path, *, wait: bool) -> Generator[bool]:
     if copy_record.copy_folder(path) != path.resolve():
         yield True
         return
-    for attempt in range(3):
+    attempts = conf.whole("scratch", "record_lock_attempts")
+    for attempt in range(attempts):
         try:
             descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         except FileNotFoundError as error:
@@ -294,7 +289,7 @@ def directory_record_lock(path: Path, *, wait: bool) -> Generator[bool]:
             except FileNotFoundError as error:
                 raise ScratchError(f"{path}: copy was removed before its record lock was acquired") from error
             if (locked.st_dev, locked.st_ino) != (present.st_dev, present.st_ino):
-                if attempt == 2:
+                if attempt == attempts - 1:
                     raise ScratchError(f"{path}: copy kept changing while its record lock was acquired; retry")
                 continue
             if reentered:
@@ -439,7 +434,7 @@ class Hold(TypedDict):
 
 
 def visible_root() -> Path:
-    return Path(os.environ.get(VISIBLE_ROOT_ENV) or DEFAULT_VISIBLE_ROOT).expanduser()
+    return Path(os.environ.get(VISIBLE_ROOT_ENV) or conf.text("scratch", "visible_root")).expanduser()
 
 
 def until_task(moment: float) -> str:
@@ -548,7 +543,7 @@ def target(task: str, word: str, visible: bool) -> Path:
         if os.path.lexists(path):
             raise ScratchError(f"{path} exists")
         return path
-    suffix = "".join(secrets.choice(SUFFIX_CHARACTERS) for _ in range(SUFFIX_LENGTH))
+    suffix = "".join(secrets.choice(SUFFIX_CHARACTERS) for _ in range(conf.whole("scratch", "suffix_length")))
     slug = f"{match['kind']}-{match['name'].replace('/', '-')}"
     return copy_record.root() / "-".join(part for part in (slug, word, suffix) if part)
 
@@ -564,7 +559,7 @@ def maker() -> str:
 
 
 def task_or_default(task: str, now: float) -> str:
-    return task or until_task(now + DEFAULT_LIFE_SECONDS)
+    return task or until_task(now + conf.whole("scratch", "default_life_seconds"))
 
 
 def write_record(path: Path, task: str, now: float) -> None:
@@ -893,13 +888,14 @@ def clear_finished_copy_removals(base: Path) -> None:
 
 
 def holds_file() -> Path:
-    return Path(os.environ.get(HOLDS_ENV) or DEFAULT_HOLDS).expanduser()
+    return Path(os.environ.get(HOLDS_ENV) or conf.text("scratch", "holds_file")).expanduser()
 
 
 def holds() -> dict[str, Hold]:
     """Every hold on this machine, by the held folder's real path."""
+    path = holds_file()
     try:
-        raw = cast(object, json.loads(holds_file().read_text(encoding="utf-8")))
+        raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
     except (OSError, UnicodeError, ValueError):
         return {}
     if not isinstance(raw, dict):
@@ -950,8 +946,12 @@ def _git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True, text=True, check=False)
 
 
-def repos(path: Path, depth: int = REPO_DEPTH) -> list[Path]:
-    """Each git repo or worktree at or under `path`, down to `depth` folders; links not followed."""
+def repos(path: Path) -> list[Path]:
+    """Find repositories to the configured depth. Exclude configured folder names and symbolic links."""
+    return _repos(path, conf.whole("scratch", "repo_depth"), conf.words("scratch", "repo_skip"))
+
+
+def _repos(path: Path, depth: int, skipped: tuple[str, ...]) -> list[Path]:
     if os.path.lexists(path / ".git"):
         return [path]
     if depth == 0:
@@ -962,8 +962,8 @@ def repos(path: Path, depth: int = REPO_DEPTH) -> list[Path]:
     except OSError:
         return []
     for entry in entries:
-        if entry.name not in SKIPPED_FOLDERS and entry.is_dir() and not entry.is_symlink():
-            found.extend(repos(entry, depth - 1))
+        if entry.name not in skipped and entry.is_dir() and not entry.is_symlink():
+            found.extend(_repos(entry, depth - 1, skipped))
     return found
 
 

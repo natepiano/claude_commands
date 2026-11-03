@@ -14,7 +14,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import TypedDict, cast, final, override
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -189,10 +189,10 @@ class MacRunTests(unittest.TestCase):
         self.bin_directory.mkdir()
         self.repository = self.root / "repo"
         self.repository.mkdir()
-        self.config_path = self.root / "mac_test.conf"
+        self.config_path = self.root / "config/mac_test.conf"
         self.temp_directory = self.root / "tmp"
         self.temp_directory.mkdir()
-        _ = write_config_fixture(self.config_path, "ci_repo=\n")
+        _ = write_config_fixture(self.config_path, "ci_repo=\nconnect_timeout_s=6\n")
         stub = self.bin_directory / "command-stub"
         self.write_executable(stub, COMMAND_STUB)
         for name in ("ssh", "scp", "git", "systemd-run", "gh", "rsync"):
@@ -209,7 +209,7 @@ class MacRunTests(unittest.TestCase):
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "PYTHONPATH": str(startup),
             "MAC_TEST_STATE_DIR": str(self.state_directory),
-            "MAC_TEST_CONFIG": str(self.config_path), "CONF_DIR": str(Path(self.config_path).parent),
+            **config_environment(self.config_path.parent),
             "MAC_RUN_STUB_STATE": str(self.stub_state),
             "MAC_RUN_SHA": SHA,
             "MAC_RUN_CHECKOUT": str(self.home / "scratch" / "gate-mac-run-private" / "checkout"),
@@ -433,6 +433,22 @@ class MacRunTests(unittest.TestCase):
         self.assertEqual(list(self.temp_directory.iterdir()), [])
         self.assertIn(f"HEAD={SHA}", result.stdout)
         self.assert_claim_released()
+
+    def test_bundle_with_a_space_has_the_same_sftp_and_ssh_filename(self) -> None:
+        remote_bundle = "/tmp/Hana test.bundle"
+        _ = write_config_fixture(self.root / "config/production.conf", f"mac_run_bundle={remote_bundle}\n")
+        result = self.mac_run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        events = self.events()
+        copy = next(event for event in events if event["command"] == "scp")
+        destination = copy["args"][-1].split(":", 1)[1]
+        command = next(event["args"][-1] for event in events
+                       if event["command"] == "ssh" and " fetch -q " in event["args"][-1])
+        arguments = shlex.split(command)
+        fetched = arguments[arguments.index("fetch") + 2]
+        self.assertEqual(destination, remote_bundle)
+        self.assertEqual(fetched, remote_bundle)
+        self.assertEqual(destination, fetched)
 
     def test_bundle_uses_fixture_temp_directory(self) -> None:
         result = self.mac_run()

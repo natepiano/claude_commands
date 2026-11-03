@@ -13,12 +13,12 @@ the backstop for the rest: folders that can hold work. A folder is loose when it
     a session scratchpad (/tmp/claude-<uid>), a run folder root, a scratch root, a folder that holds
     only folders, a verify.sh run folder or a tempfile folder, which the sweep judges.
 
-Only folders this user owns and idle for MIN_AGE_SECONDS are named. The initial scan includes
+The audit names only owned folders idle for lint.conf folder_min_age_seconds. The initial scan includes
 folder mtimes and each git repo's HEAD, index and HEAD log, so a commit counts. The shared tmp-sweep
 change-time scan also checks mtime and ctime throughout the tree, so copying files with preserved
-mtimes starts a new idle period. Removal requires WIDE_IDLE_SECONDS (7 days) without a change.
+mtimes starts a new idle period. Removal uses lint.conf folder_remove_after_seconds.
 
-A loose clone uses clone_max_hours from hanas.conf; other folders use REMOVE_AFTER_SECONDS.
+A loose clone uses clone_max_hours from hanas.conf. Other folders use folder_remove_after_seconds from lint.conf.
 On the Mac, free_floor_gib from mac_test.conf can select younger idle clones too, oldest first.
 Under that floor, unsaved clones lose only target. These rules share all of the following keeps:
 
@@ -46,7 +46,6 @@ import argparse
 import fcntl
 import hashlib
 import json
-import math
 import os
 import re
 import stat
@@ -55,7 +54,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import cast
@@ -71,21 +70,13 @@ from scripts.lib import copy_record  # noqa: E402
 
 RUST_ROOTS_FILE = Path(__file__).resolve().parents[2] / "config" / "rust_roots.txt"
 RUST_SCRATCH_NAME = "scratch"
-MIN_AGE_SECONDS = 24 * 3600
-REMOVE_AFTER_SECONDS = tmp_sweep.WIDE_IDLE_SECONDS
 KEPT_NAMES = SYSTEM_TEMP_NAMES | {"unit", "delegate", "scratch", "repro", "session", "copies"}
 KEPT_PREFIXES = SYSTEM_TEMP_PREFIXES
-IDLE_DEPTH = 3
-# A folder with more entries than this inside IDLE_DEPTH is not read to the end, and stays.
-IDLE_ENTRY_LIMIT = 50_000
-SKIPPED_FOLDERS = frozenset({"target", "node_modules", ".git"})
 GIT_TIME_FILES = ("HEAD", "index", os.path.join("logs", "HEAD"))
 UNIX_SOCKETS = "/proc/net/unix"
 STATE_ENV = "FOLDER_SWEEP_STATE_DIR"
-DEFAULT_STATE_DIR = os.path.join("~", ".local", "state", "folder-sweep")
 ARMED_NAME = "armed"
 REMOVED_LOG = "removed.jsonl"
-RG_FILES_PER_CALL = 500
 # A session counts as a maker only where one of its own commands names the folder. ripgrep returns
 # each whole JSON "command" string that names a loose folder (the path, then a boundary or the
 # string's end), and every folder in it is read from there. A listing in a tool result names every
@@ -93,11 +84,8 @@ RG_FILES_PER_CALL = 500
 COMMAND_START = r'"command":"(?:[^"\\]|\\.)*?'
 COMMAND_REST = r'(?:(?:[^A-Za-z0-9_.\-"\\]|\\.)(?:[^"\\]|\\.)*)?"'
 TRANSCRIPT_TIME = re.compile(rb'"timestamp":"([^"]+)"')
-START_LINES = 20
-START_BYTES = 1 << 20
 SEND = Path(__file__).resolve().parents[1] / "message" / "send.py"
 
-LISTED = "idle less than 7 days"
 REMOVED = "removed"
 WOULD_REMOVE = "would remove"
 HELD = "a hold keeps it"
@@ -107,6 +95,12 @@ TARGET_REMOVED = "removed target; kept unsaved source"
 WOULD_REMOVE_TARGET = "would remove target; keep unsaved source"
 
 
+def listed() -> str:
+    """Describe the configured age required for ordinary folder removal."""
+    days = conf.whole("lint", "folder_remove_after_seconds") / 86400
+    return f"idle less than {days:g} days"
+
+
 @dataclass(frozen=True)
 class ClonePolicy:
     max_idle_seconds: float
@@ -114,22 +108,9 @@ class ClonePolicy:
 
 
 def clone_policy() -> ClonePolicy:
-    """Read clone age and the Mac floor at use, without a second set of defaults."""
-    config = Path(__file__).resolve().parents[2] / "config"
-
-    def number(file: str, override: str, key: str) -> float:
-        path = os.environ.get(override) or str(config / file)
-        values = conf.values(Path(path))
-        try:
-            value = float(values[key])
-        except (KeyError, ValueError) as error:
-            raise ValueError(f"{path}: {key} needs a finite non-negative number") from error
-        if not math.isfinite(value) or value < 0:
-            raise ValueError(f"{path}: {key} needs a finite non-negative number")
-        return value
-
-    return ClonePolicy(number("hanas.conf", "HANAS_CONFIG", "clone_max_hours") * 3600,
-                       number("mac_test.conf", "MAC_TEST_CONFIG", "free_floor_gib") * 1024**3)
+    """Read clone age and the Mac floor through the shared reader."""
+    return ClonePolicy(conf.number("hanas", "clone_max_hours") * 3600,
+                       conf.number("mac_test", "free_floor_gib") * 1024**3)
 
 
 def is_clone(path: Path) -> bool:
@@ -182,7 +163,7 @@ class Loose:
     path: Path
     changed: float
     maker: str
-    outcome: str = LISTED
+    outcome: str = field(default_factory=listed)
 
 
 def expected_rust_names(path: Path = RUST_ROOTS_FILE) -> frozenset[str] | None:
@@ -203,8 +184,10 @@ def kept_in_temp(entry: Path) -> bool:
 
 def candidates(rust: Path, temps: list[Path], expected: frozenset[str] | None) -> list[Path]:
     """Every loose folder this user owns, before the age rule."""
+    visible_root = scratch.visible_root()
+
     def kept_in_rust(entry: Path) -> bool:
-        return expected is None or entry.name in expected or entry.name in KEPT_NAMES
+        return expected is None or entry == visible_root or entry.name in expected or entry.name in KEPT_NAMES
 
     roots: list[tuple[Path, Callable[[Path], bool]]] = [
         (rust, kept_in_rust), (rust / RUST_SCRATCH_NAME, lambda _entry: False),
@@ -226,15 +209,27 @@ def candidates(rust: Path, temps: list[Path], expected: frozenset[str] | None) -
     return found
 
 
-def _walk(path: Path, depth: int) -> Iterator[os.DirEntry[str]]:
-    """Every entry under path down to depth folders, SKIPPED_FOLDERS passed over; links not followed."""
-    frontier = [(str(path), depth)]
+@dataclass(frozen=True)
+class FolderScanLimits:
+    depth: int
+    entry_limit: int
+    skipped: tuple[str, ...]
+
+
+def folder_scan_limits() -> FolderScanLimits:
+    return FolderScanLimits(conf.whole("lint", "folder_idle_depth"),
+                            conf.whole("lint", "folder_idle_entry_limit"), conf.words("scratch", "repo_skip"))
+
+
+def _walk(path: Path, limits: FolderScanLimits) -> Iterator[os.DirEntry[str]]:
+    """Read entries to the configured depth. Exclude configured folder names and symbolic links."""
+    frontier = [(str(path), limits.depth)]
     while frontier:
         folder, left = frontier.pop()
         for entry in tmp_sweep.listing(folder):
             yield entry
             try:
-                if left and entry.name not in SKIPPED_FOLDERS and entry.is_dir(follow_symlinks=False):
+                if left and entry.name not in limits.skipped and entry.is_dir(follow_symlinks=False):
                     frontier.append((entry.path, left - 1))
             except OSError:
                 continue
@@ -242,9 +237,13 @@ def _walk(path: Path, depth: int) -> Iterator[os.DirEntry[str]]:
 
 def last_change(path: Path) -> float | str:
     """The newest mtime in path (see the module text), or TOO_LARGE."""
+    return _last_change(path, folder_scan_limits())
+
+
+def _last_change(path: Path, limits: FolderScanLimits) -> float | str:
     newest = _mtime(path)
-    for count, entry in enumerate(_walk(path, IDLE_DEPTH)):
-        if count >= IDLE_ENTRY_LIMIT:
+    for count, entry in enumerate(_walk(path, limits)):
+        if count >= limits.entry_limit:
             return TOO_LARGE
         try:
             newest = max(newest, entry.stat(follow_symlinks=False).st_mtime)
@@ -254,7 +253,7 @@ def last_change(path: Path) -> float | str:
         git = scratch.git_directory(repo)
         if isinstance(git, scratch.GitDirectory):
             newest = max([newest, *(_mtime(git.path / name) for name in GIT_TIME_FILES)])
-    return newest
+    return float(newest)
 
 
 def bound_sockets(table: str = UNIX_SOCKETS) -> frozenset[str] | None:
@@ -268,7 +267,11 @@ def bound_sockets(table: str = UNIX_SOCKETS) -> frozenset[str] | None:
 
 def live_socket(path: Path, bound: frozenset[str] | None) -> bool:
     """Whether a socket in path is live; every socket counts as live when `bound` is None."""
-    for entry in _walk(path, IDLE_DEPTH):
+    return _live_socket(path, bound, folder_scan_limits())
+
+
+def _live_socket(path: Path, bound: frozenset[str] | None, limits: FolderScanLimits) -> bool:
+    for entry in _walk(path, limits):
         try:
             if stat.S_ISSOCK(entry.stat(follow_symlinks=False).st_mode):
                 if bound is None or entry.path in bound or os.path.realpath(entry.path) in bound:
@@ -309,7 +312,7 @@ def worktree_sources(path: Path) -> list[Path]:
 
 
 def state_dir() -> Path:
-    return Path(os.path.expanduser(os.environ.get(STATE_ENV, DEFAULT_STATE_DIR)))
+    return Path(os.path.expanduser(os.environ.get(STATE_ENV) or conf.text("lint", "folder_state_dir")))
 
 
 def armed() -> bool:
@@ -407,10 +410,13 @@ def judge(found: list[tuple[Path, float]], now: float, removing: bool, proc: str
     space = free_bytes if free_space is None else free_space
     clones = {path for path, _ in found if is_clone(path)}
     pending = {path for path, _ in found if isinstance(scratch.pending_removal(path), copy_record.Registered)}
+    remove_after = conf.whole("lint", "folder_remove_after_seconds")
+    limits = folder_scan_limits()
     due = [path for path, changed in found
-           if now - changed >= (policy.max_idle_seconds if path in clones else REMOVE_AFTER_SECONDS)
+           if now - changed >= (policy.max_idle_seconds if path in clones else remove_after)
            or on_mac and path in clones or path in pending]
-    outcomes = {path: LISTED for path, _ in found}
+    listed_outcome = listed()
+    outcomes = {path: listed_outcome for path, _ in found}
     if not due:
         return outcomes
     holds = scratch.holds()
@@ -436,7 +442,7 @@ def judge(found: list[tuple[Path, float]], now: float, removing: bool, proc: str
         if str(path) in used_entries:
             outcomes[path] = used_entries[str(path)]
             continue
-        if live_socket(path, bound):
+        if _live_socket(path, bound, limits):
             outcomes[path] = LIVE_SOCKET
             continue
         with scratch.removal_lock(path) if removing else scratch.judgment_lock(path) as idle:
@@ -475,8 +481,11 @@ def makers(paths: list[Path], files: list[Path]) -> dict[Path, str]:
     in_command = re.compile(f"(?:{alternatives})(?![A-Za-z0-9_.-])")
     earliest: dict[str, tuple[float, str]] = {}
     started: dict[str, float] = {}
-    for start in range(0, len(files), RG_FILES_PER_CALL):
-        chunk = [str(file) for file in files[start:start + RG_FILES_PER_CALL]]
+    files_per_call = conf.whole("lint", "folder_rg_files_per_call")
+    start_lines = conf.whole("lint", "folder_start_lines")
+    start_bytes = conf.whole("lint", "folder_start_bytes")
+    for start in range(0, len(files), files_per_call):
+        chunk = [str(file) for file in files[start:start + files_per_call]]
         result = subprocess.run(["rg", "--only-matching", "--with-filename", "--null", "--no-line-number",
                                  "--no-messages", "--no-config", "--file", "-", "--", *chunk],
                                 input=pattern, capture_output=True, check=False)
@@ -484,18 +493,18 @@ def makers(paths: list[Path], files: list[Path]) -> dict[Path, str]:
             file, _, command = line.partition("\0")
             for name in {found.group(0) for found in in_command.finditer(command)}:
                 if file not in started:
-                    started[file] = _started(Path(file))
+                    started[file] = _started(Path(file), start_lines, start_bytes)
                 if started[file] < earliest.get(name, (float("inf"), ""))[0]:
                     earliest[name] = (started[file], Path(file).stem)
     return {path: earliest[str(path)][1] for path in paths if str(path) in earliest}
 
 
-def _started(path: Path) -> float:
+def _started(path: Path, start_lines: int, start_bytes: int) -> float:
     """The first timestamp in a transcript's opening lines, else its file time."""
     try:
         with path.open("rb") as handle:
-            for _ in range(START_LINES):
-                found = TRANSCRIPT_TIME.search(handle.readline(START_BYTES))
+            for _ in range(start_lines):
+                found = TRANSCRIPT_TIME.search(handle.readline(start_bytes))
                 if found:
                     return datetime.fromisoformat(found.group(1).decode().replace("Z", "+00:00")).timestamp()
     except (OSError, ValueError):
@@ -517,18 +526,21 @@ def audit(rust: Path, temps: list[Path], expected: frozenset[str] | None, now: f
     if removing:
         resume_pending_prunes()
     changes: dict[Path, float | str] = {}
+    limits = folder_scan_limits()
+    listed_outcome = listed()
+    minimum_folder_age = conf.whole("lint", "folder_min_age_seconds")
     discovered = candidates(rust, temps, expected) + test_clones([copy_record.root()] if clone_roots is None else clone_roots)
     # macOS reports /private/tmp in lsof even when discovery started through /tmp.
     # Resolve once at discovery, before age, hold, process, socket and lock checks.
     for entry in dict.fromkeys(entry.resolve() for entry in discovered):
-        when = last_change(entry)
+        when = _last_change(entry, limits)
         if isinstance(when, float):
-            minimum_age = 0 if is_clone(entry) else MIN_AGE_SECONDS
-            change = tmp_sweep.last_change(str(entry), tmp_sweep.Limit(now - minimum_age, LISTED))
+            minimum_age = 0 if is_clone(entry) else minimum_folder_age
+            change = tmp_sweep.last_change(str(entry), tmp_sweep.Limit(now - minimum_age, listed_outcome))
             when = change if isinstance(change, str) else max(when, change[0])
         changes[entry] = when
     found = [(entry, when) for entry, when in changes.items()
-             if isinstance(when, float) and when and (is_clone(entry) or now - when >= MIN_AGE_SECONDS)]
+             if isinstance(when, float) and when and (is_clone(entry) or now - when >= minimum_folder_age)]
     outcomes = judge(found, now, removing, proc, sockets, mac=mac, free_space=free_space)
     too_large = [entry for entry, when in changes.items() if when == TOO_LARGE]
     named_paths = [entry for entry, _ in found] + too_large
@@ -541,7 +553,7 @@ def audit(rust: Path, temps: list[Path], expected: frozenset[str] | None, now: f
 def message(folders: list[Loose]) -> str:
     shown = "; ".join(f"{folder.path} ({folder.outcome})" for folder in folders)
     return (f"folder audit: loose folder(s) you made: {shown}. The audit uses hanas.conf clone_max_hours "
-            + "for clones and 7 idle days for other folders. The Mac floor can remove idle clones sooner, "
+            + f"for clones and {conf.whole('lint', 'folder_remove_after_seconds') / 86400:g} idle days for other folders. The Mac floor can remove idle clones sooner, "
             + "or just their targets when source is unsaved. Holds and live processes keep them. Move each you need into a "
             + "task's scratch (`~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py adopt <path> --task "
             + "<task>`) or hold it (`scratch.py hold <path> --reason <why>`). Make new scratch only with "

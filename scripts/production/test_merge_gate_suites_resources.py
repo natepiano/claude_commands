@@ -49,7 +49,7 @@ if __name__ == "__main__":
     Path(sys.argv[2]).write_text(str(spin_cpu(float(sys.argv[1]))))
 '''
 from scripts.lint import memory_admit
-from scripts.lib import copy_record
+from scripts.lib import copy_record, scratch
 
 
 @final

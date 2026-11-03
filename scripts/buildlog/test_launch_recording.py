@@ -28,8 +28,10 @@ from test_index import Record, encode, point_root_at, step
 from test_launches import CLI, result_line
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
+    from ..lint.memory_test_support import config_environment
 else:
     from scripts.lib import test_hang_guard
+    from scripts.lint.memory_test_support import config_environment
 
 if TYPE_CHECKING:
     from ..hana_shot import hana_shot
@@ -72,6 +74,7 @@ class LaunchRecordingTests(unittest.TestCase):
         )
         point_root_at(self, self.root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **config_environment(base / "config"),
             "XDG_CACHE_HOME": str(self.cache),
             "BUILDLOG_LAUNCH_STATES": str(self.cache / "hana-shot" / "launches"),
             "BUILDLOG_TRANSCRIPTS": str(base / "transcripts"),

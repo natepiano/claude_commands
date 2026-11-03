@@ -132,6 +132,15 @@ Each command shows its script's output unchanged; each script answers in about a
 
 ### Build output retained by the sweep
 
+`sweep.py` reads its resource limits through `scripts/lib/conf.py`.
+`lint.conf` holds the `sweep_*` keys for discovery, indexing, alerts, and history.
+`CONF_DIR` selects the configuration folder for private tests.
+The moved values retain their previous defaults. `config/README.md` lists each key.
+`hold_floor(floor, dry_run)` reads `sweep_floor_roots` when the pass starts.
+Floor records and `floor.lock` use `tmp_sweep.state_dir()`.
+Disk measurements and build history use `scripts/buildlog/store.py::root()`.
+The first `sweep_message_path_widths` entry supplies the default alert path width.
+
 `scripts/lint/sweep.py` keeps the configured free-space floor (300 GiB on natedev).
 When free space is below the floor, it takes only the shortfall. Orphaned
 copies go first from any idle target. Then whole takes and build-unit batches

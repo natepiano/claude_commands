@@ -1278,3 +1278,23 @@ The Phase 26 checkpoint did not name two narrowed assertions; this phase's check
 **Gotchas:** `/tmp` and `/private/tmp` must reach guards as the same canonical path; Git locks belong inside resolved metadata to keep clean checkouts clean. Successful SSH status or a sent signal alone cannot confirm checkout exit.
 
 **Ruled out:** Raw TERM as exit proof; root locks that dirty Git; standing-clone exemptions; bypassing live-use checks for pending removal; unrelated per-row environment failures blocking cleanup.
+
+### Phase 45 — Hanas and the folder audit read their settings through the one config reader  · status: done
+
+**Approved:** the user via morty and the builds showrunner, 2026-11-02 ~21:00 EST: "Resume resources-unit's configuration work to replace hard-coded settings. Preserve existing values unless nate approves a value change."
+
+#### Work Order
+
+**Goal:** Every setting in this unit's files comes from config through `scripts/lib/conf.py`. No value changes.
+
+**Spec:**
+
+1. `scripts/hanas/hanas.py` `read_config` reads `config/hanas.conf` through `conf.py` (`conf.number`/`conf.whole`/`conf.words`, or `conf.read(file)` if devtools Phase 4r is on main first). The `scripts.lint.config_values` call and the `HANAS_CONFIG` path override go; `CONF_DIR` selects another config folder.
+2. `scripts/lint/folder_audit.py` `ClonePolicy` reads `hanas.conf` `clone_max_hours` and `mac_test.conf` `free_floor_gib` through `conf.py`. The `HANAS_CONFIG`/`MAC_TEST_CONFIG` overrides go. `REMOVE_AFTER_SECONDS`, `DEFAULT_STATE_DIR` and any other tunable in the file move to config with their current values. `rust_roots.txt` stays a list file.
+3. Any other hard-coded tunable in a file this unit owns (scripts/hanas, scripts/lint/folder_audit.py, scripts/lint/sweep.py, scripts/lib/scratch.py, Test Hana and clone code from Phases 43-44) moves to its config file with the same value. scripts/lint/memory_admit.py is queue-unit's: do not edit it. List each moved setting (file, name, value, new key).
+4. A new key goes in the file's `.conf` with its current value and a one-line comment, and in `config/README.md` where that file lists its keys.
+5. Tests set `CONF_DIR` to a temporary folder with the needed `.conf` files, not `HANAS_CONFIG` or `MAC_TEST_CONFIG`. No test writes a fixed value that config owns; it reads it or sets it in its own temporary config.
+
+**Acceptance:** `scripts/hanas` tests, `scripts/lint/test_folder_audit.py`, `test_sweep.py`, `scripts/lib/test_scratch.py`, `test_conf.py` and basedpyright on changed Python files pass; `git grep -n 'HANAS_CONFIG\|MAC_TEST_CONFIG\|config_values' -- scripts/hanas scripts/lint/folder_audit.py` is empty; every value in the moved-settings list equals its old value.
+
+**Workers:** `1 writer + 1 tester` — `sweep-impl` writes the source, conf and docs; `sweep-test` writes the tests.

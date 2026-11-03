@@ -15,8 +15,9 @@ require_checkout(Path(__file__))
 
 
 def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
-    """Write a complete private config, replacing named values without losing limits."""
-    source = Path(__file__).resolve().parents[2] / "config" / (f"{template}.conf" if template else path.name)
+    """Update a private config. Keep existing values and limits outside the overrides."""
+    source = path if path.exists() else (
+        Path(__file__).resolve().parents[2] / "config" / (f"{template}.conf" if template else path.name))
     lines = source.read_text().splitlines() if source.exists() else []
     for raw in overrides.splitlines():
         key, separator, value = raw.partition("=")

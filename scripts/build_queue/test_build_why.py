@@ -676,8 +676,9 @@ class BuildWhyTests(unittest.TestCase):
             row = cast(dict[str, object], json.loads(path.read_text()))
             row["token_left_at"] = NOW - 10
             _ = path.write_text(json.dumps(row))
-        inputs = gate.gather_queue_inputs(self.directory, gate.process_table(self.proc), NOW)
-        gate.write_queue_snapshot(self.directory, inputs)
+        inputs = gate.gather_queue_inputs(self.directory, gate.process_table(self.proc), NOW,
+                                          policy=gate.DEFAULT_ADMISSION_POLICY)
+        gate.write_queue_snapshot(self.directory, inputs, policy=gate.DEFAULT_ADMISSION_POLICY)
         with mock.patch.object(gate, "locked_queue_read", side_effect=AssertionError("fresh snapshot took lock")):
             reading = gate.queue_read()
             if isinstance(reading, gate.QueueBusy):

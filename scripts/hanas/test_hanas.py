@@ -19,6 +19,7 @@ import unittest
 from unittest import mock
 
 from scripts.hanas import hanas
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 RUN_FIXTURE_SHELL = subprocess.run
@@ -76,19 +77,25 @@ class HanasTests(unittest.TestCase):
         self.remote_shell = "bash"
         self.mac_environment_failure = False
         _ = (self.root / "remote-identity").write_text(MAC_STARTED)
-        self.config = self.root / "hanas.conf"
-        _ = self.config.write_text(
+        self.config = self.root / "config/hanas.conf"
+        _ = write_config_fixture(self.config,
             "exempt_ports=31000,31001\ntest_max_hours=2.5\n"
             + "unlabelled_max_minutes=7\nstop_grace_seconds=0.125\n"
         )
-        self.mac_config = self.root / "mac_test.conf"
-        _ = self.mac_config.write_text("host=private-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n")
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "MAC_TEST_CONFIG": str(self.mac_config),
-            "HANAS_CONFIG": str(self.config),
-        })))
+        self.mac_config = self.config.parent / "mac_test.conf"
+        _ = write_config_fixture(self.mac_config, "host=private-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(self.config.parent))))
         _ = self.enterContext(mock.patch.object(os, "kill", side_effect=AssertionError("real process signal")))
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=AssertionError("real ssh")))
+
+    def test_config_folder_selects_limits_and_exempt_ports_at_use(self) -> None:
+        other = self.root / "other-config"
+        _ = write_config_fixture(other / "hanas.conf", "exempt_ports=32000\ntest_max_hours=3.75\n")
+        with mock.patch.dict(os.environ, config_environment(other)):
+            config = hanas.read_config()
+        self.assertEqual(config.exempt_ports, frozenset({32000}))
+        self.assertEqual(config.test_max_seconds, 3.75 * 3600)
+        self.assertEqual(hanas.read_config().exempt_ports, frozenset({31000, 31001}))
 
     def process(self, pid: int, environment: dict[str, str], *, age: float = 600.0, executable: str = "target/debug/hana") -> Path:
         directory = self.proc / str(pid)
@@ -240,7 +247,7 @@ class HanasTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].environment, {"BRP_EXTRAS_PORT": "31000"})
         self.assertEqual(rows[0].purpose, "")
-        self.assertFalse(hanas.is_test_hana(rows[0], hanas.read_config(self.config)))
+        self.assertFalse(hanas.is_test_hana(rows[0], hanas.read_config()))
         self.assertEqual(len(reads), 3)
         self.assertTrue(all(argv[-1] == "201" for argv in reads))
 
@@ -320,7 +327,7 @@ class HanasTests(unittest.TestCase):
     def test_each_configured_exempt_port_requires_labels_or_agent_environment(self) -> None:
         _ = self.process(101, {"BRP_EXTRAS_PORT": "31002"})
         base = self.local_rows()[0]
-        config = hanas.read_config(self.config)
+        config = hanas.read_config()
         for port in (31000, 31001):
             user = replace(base, port=port, environment={"BRP_EXTRAS_PORT": str(port)})
             with self.subTest(port=port, case="user"):
@@ -363,7 +370,7 @@ class HanasTests(unittest.TestCase):
         for pid, contents in original_stats.items():
             _ = (self.proc / str(pid) / "stat").write_text(contents)
         # A config edit takes effect in this process, without a build or reload.
-        _ = self.config.write_text(
+        _ = write_config_fixture(self.config,
             "exempt_ports=31000,31001\ntest_max_hours=10\n"
             + "unlabelled_max_minutes=15\nstop_grace_seconds=0.25\n"
         )
@@ -413,7 +420,7 @@ class HanasTests(unittest.TestCase):
 
         output = io.StringIO()
         with redirect_stdout(output):
-            hanas.stop_process(row, hanas.read_config(self.config), signal_call=exits_after_term,
+            hanas.stop_process(row, hanas.read_config(), signal_call=exits_after_term,
                                sleep_call=self.sleeps.append, ssh_runner=self.ssh, identity_reader=self.identity)
         self.assertEqual(self.signals, [(101, signal.SIGTERM)])
         self.assertEqual(output.getvalue(), "natedev:101: stopped\n")
@@ -477,7 +484,7 @@ class HanasTests(unittest.TestCase):
                 self.sleeps.clear()
                 output = io.StringIO()
                 with redirect_stdout(output):
-                    hanas.stop_process(row, hanas.read_config(self.config),
+                    hanas.stop_process(row, hanas.read_config(),
                                        signal_call=self.send_signal, identity_reader=self.identity,
                                        sleep_call=reuse_during_grace, ssh_runner=self.ssh)
                 self.assertEqual(self.signals, [] if before_term else [(101, signal.SIGTERM)])
@@ -492,7 +499,7 @@ class HanasTests(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0, "", "")
 
         with redirect_stdout(output), self.assertRaisesRegex(ValueError, "stop could not be confirmed"):
-            hanas.stop_process(row, hanas.read_config(self.config), ssh_runner=masked_status)
+            hanas.stop_process(row, hanas.read_config(), ssh_runner=masked_status)
         self.assertEqual(output.getvalue(), "")
 
     def test_reused_remote_pid_is_not_signalled_before_term_or_after_grace(self) -> None:

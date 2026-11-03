@@ -55,7 +55,7 @@ The disk floor. Each budget fits the disk; together they do not (hana 96 GiB
 in each of 9 worktrees, 24 in 7 other repos, CI 160 x 2), and natedev's disk
 filled on 2026-10-03. When lint.conf sets sweep_free_floor_gib.<host> or
 sweep_free_floor_gib, the shortfall below that free-space floor sets how much
-build output goes. A target is a directory under FLOOR_ROOTS holding
+build output goes. A target is a directory under the configured sweep_floor_roots holding
 .rustc_info.json, or Cargo's cache tag beside a build tree: a folder cargo
 creates carries the tag from its first moment, and .rustc_info.json may come
 only when the first build ends, or never. Cargo's registry carries the same
@@ -84,7 +84,7 @@ Each such pass first runs tmp_sweep.py once an hour, which deletes agent
 scratch under /tmp/claude and /tmp/claude-<uid>/<project>/ that no process
 uses and where nothing changed in 4 hours, before the floor takes any build
 cache. Gate copies and scratch builds there had stayed until the disk filled.
-CI's targets are outside FLOOR_ROOTS, and its accounts cannot read lint.conf.
+CI's targets are outside the configured sweep_floor_roots, and its accounts cannot read lint.conf.
 By 15:23 PDT on 2026-10-06 that timer had taken 801 GiB, from units last
 used a median 3.0 h earlier. In a 60 GiB shortfall simulation, target-first order spared the
 active hana targets that the prior global unit order reached.
@@ -206,7 +206,6 @@ GIT_DIR = ".git"
 GITDIR_PREFIX = "gitdir:"
 COMMONDIR_FILE = "commondir"
 ALTERNATES_FILE = os.path.join("objects", "info", "alternates")
-DEFAULT_DOC_INDEX_MIB = 250.0
 DOC_INDEX_ENV = "LINT_SWEEP_DOC_INDEX_MIB"
 DOC_DIR = "doc"
 DOC_LOCK_NAME = ".lock"
@@ -218,7 +217,6 @@ PROC_DIR = "/proc"
 PROC_LOCKS = "/proc/locks"
 # The kernel writes /proc/locks one page per read and drops its lock between pages; a lock freed earlier in the
 # list moves the next page past one line. Each extra read gives a skipped line another chance to show.
-PROC_LOCKS_READS = 3
 # The kernel adds this to an exe, cwd or maps path whose file was removed.
 DELETED_SUFFIX = " (deleted)"
 # cargo runs a subcommand as `cargo-nextest nextest …`; a wrapper may rename argv[0].
@@ -232,9 +230,7 @@ INCREMENTAL_DIR = "incremental"
 COPY_DIRS = {"deps": "", "examples": "examples"}
 DEP_INFO_SUFFIX = ".d"
 # A dep-info file's first line starts with the output it describes.
-DEP_INFO_HEAD = 4096
 # target/debug, target/<triple>/debug, target/<custom>/<triple>/debug.
-MAX_TREE_DEPTH = 3
 FLOOR_KEY = "sweep_free_floor_gib"
 RECENT_KEY = "recent_minutes"
 FLOOR_LOCK_ALERT_KEY = "floor_lock_alert_minutes"
@@ -244,29 +240,15 @@ USE_STAMP = scratch.USE_STAMP
 # 421 GiB of idle targets under ~/.cache/trace-targets, where hana_catalyst agents point
 # CARGO_TARGET_DIR, had stayed unseen. ~/.cache/sccache holds no .rustc_info.json and no cargo
 # cache tag, so is_cargo_target never takes it.
-FLOOR_ROOTS = ("~/rust", "~/.local/state", "~/.cache", "/tmp")
-FLOOR_LOCK = os.path.join("~", ".local", "state", "lint-sweep", "floor.lock")
 # Claude Code keeps each session's scratch (scratchpad/, tasks/) in <root>/<project>/<session id>/,
 # where <project> is the session's working directory with every / as -.
-FLOOR_STATE_ENV = "LINT_SWEEP_STATE_DIR"
-BUILDLOG_DIR_ENV = "BUILDLOG_DIR"
-CI_TARGETS = ("/var/lib/hana-ci/hana-linux-1", "/var/lib/hana-ci/hana-linux-2")
-GROWTH_WINDOW_SECONDS = 30 * 60
-SNAPSHOT_MAX_AGE_SECONDS = 15 * 60
-ALERT_INTERVAL_SECONDS = 60 * 60
 # A phone push stays under this many characters (test_push_texts pins it for every catalog example).
-PUSH_TEXT_LIMIT = 500
 # The page names at most this many paths.
-PAGE_PATHS = 4
 NO_PAGE_PATHS = "No path is known: the disk measurement names no folder."
 # Three trace-driven sweeps on 2026-10-04 followed about 30 GiB of unexplained
 # loss each; their smallest removal was 35.2 GiB, versus 29.2 GiB at most otherwise.
-UNEXPLAINED_FALL_BYTES = 10 * GIB
-LARGE_REMOVAL_BYTES = 32 * GIB
 # A nightly worktree's target is 5 below its root, a scratch crate's under
 # /tmp/claude-<uid>/<project>/<session>/scratchpad/ up to 7.
-FLOOR_SEARCH_DEPTH = 8
-FLOOR_SKIP = frozenset({".git", "node_modules"})
 # cargo writes this at a target directory's root: early in a build into a
 # folder that already exists; into a folder it creates, when the first build
 # ends or never (31 finished scratch targets had none on 2026-10-08). It
@@ -528,9 +510,13 @@ def cargo_roots() -> list[str]:
 
 def build_trees(root: str) -> list[str]:
     """Directories under root that hold a .fingerprint/ dir."""
+    return _build_trees(root, conf.whole("lint", "sweep_max_tree_depth"))
+
+
+def _build_trees(root: str, depth: int) -> list[str]:
     trees: list[str] = []
     frontier = [root]
-    for _ in range(MAX_TREE_DEPTH + 1):
+    for _ in range(depth + 1):
         next_frontier: list[str] = []
         for directory in frontier:
             if directory != root and is_cargo_target(directory):
@@ -626,7 +612,7 @@ def file_key(path: str) -> str:
 def held_cargo_lock_files() -> set[str]:
     """Observe Linux flocks without taking cargo locks during candidate choice."""
     held: set[str] = set()
-    for _ in range(PROC_LOCKS_READS):
+    for _ in range(conf.whole("lint", "sweep_proc_locks_reads")):
         try:
             with open(PROC_LOCKS, encoding="ascii", errors="replace") as handle:
                 for line in handle:
@@ -809,7 +795,7 @@ def process_use(target: str, owners: TargetOwnerIndex, proc: str = PROC_DIR) -> 
 def lock_holder(lock: str, locks: str = PROC_LOCKS) -> int | None:
     """The pid that holds flock() on lock, read from /proc/locks; None without /proc or holder.
 
-    A read under load can skip a line (PROC_LOCKS_READS), so no holder is the answer only after every read agrees.
+    A read under load can skip a line (sweep_proc_locks_reads), so no holder is the answer only after every read agrees.
     """
     try:
         stat = os.stat(lock)
@@ -817,7 +803,7 @@ def lock_holder(lock: str, locks: str = PROC_LOCKS) -> int | None:
         return None
     # "1: FLOCK  ADVISORY  WRITE <pid> <major>:<minor>:<inode> 0 EOF"; a waiter's line has "->".
     device = f"{os.major(stat.st_dev):02x}:{os.minor(stat.st_dev):02x}:{stat.st_ino}"
-    for _ in range(PROC_LOCKS_READS):
+    for _ in range(conf.whole("lint", "sweep_proc_locks_reads")):
         try:
             with open(locks, encoding="ascii", errors="replace") as handle:
                 lines = handle.read().splitlines()
@@ -1188,9 +1174,13 @@ def copied_up(directory: str) -> list[os.DirEntry[str]]:
 
 def dep_info_output(path: str, directory: str) -> str | None:
     """Name of the copy in directory that a dep-info file says it describes."""
+    return _dep_info_output(path, directory, conf.whole("lint", "sweep_dep_info_head_bytes"))
+
+
+def _dep_info_output(path: str, directory: str, head_bytes: int) -> str | None:
     try:
         with open(path, "rb") as handle:
-            head = handle.read(DEP_INFO_HEAD)
+            head = handle.read(head_bytes)
     except OSError:
         return None
     target, separator, _ = head.partition(b":")
@@ -1230,6 +1220,7 @@ def claim_copies(
     candidates: dict[str, list[tuple[os.DirEntry[str], Group]]],
     roots: dict[str, Group],
     orphans: Group,
+    head_bytes: int,
 ) -> None:
     """Give each copy in directory, with its dep-info, to the unit it came from,
     or to orphans when that unit is gone; leave a file that matches neither."""
@@ -1252,7 +1243,7 @@ def claim_copies(
             group is None
             and stat.st_nlink == 1
             and stem in dep_infos
-            and dep_info_output(dep_infos[stem].path, directory) is not None
+            and _dep_info_output(dep_infos[stem].path, directory, head_bytes) is not None
         ):
             group = orphans
         if group is None:
@@ -1265,7 +1256,7 @@ def claim_copies(
             continue
         group = owners.get(stem)
         if group is None:
-            name = dep_info_output(entry.path, directory)
+            name = _dep_info_output(entry.path, directory, head_bytes)
             if name is None or os.path.lexists(os.path.join(directory, name)):
                 continue
             group = orphans
@@ -1275,6 +1266,7 @@ def claim_copies(
 def group_roots(trees: list[str], scan: Scan) -> dict[str, Group]:
     """Map each removable entry's path to its group, with last-use times filled in."""
     roots: dict[str, Group] = {}
+    head_bytes = conf.whole("lint", "sweep_dep_info_head_bytes")
     for tree in trees:
         directories = {source: os.path.normpath(os.path.join(tree, copied)) for source, copied in COPY_DIRS.items()}
         copies = {source: copied_up(directory) for source, directory in directories.items()}
@@ -1316,7 +1308,7 @@ def group_roots(trees: list[str], scan: Scan) -> dict[str, Group]:
                 group.last_used = group.compiled = max(mtimes, default=0.0)
         orphans = Group(kind="orphan", build_tree=tree)
         for source, directory in directories.items():
-            claim_copies(directory, copies[source], candidates[source], roots, orphans)
+            claim_copies(directory, copies[source], candidates[source], roots, orphans, head_bytes)
         if orphans.entries:
             scan.orphans.append(orphans)
         for entry in listing(os.path.join(tree, INCREMENTAL_DIR)):
@@ -1629,6 +1621,7 @@ def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], s
 def recover_pending_trims(locked_targets: Sequence[str] = ()) -> None:
     """Publish unfinished takes even when the rerun has no output or shortfall left."""
     directory = floor_record_path().parent / "trims"
+    tree_depth = conf.whole("lint", "sweep_max_tree_depth")
     for path in sorted(directory.glob("*.json")):
         with path.with_suffix(".lock").open("a") as guard:
             try:
@@ -1640,7 +1633,7 @@ def recover_pending_trims(locked_targets: Sequence[str] = ()) -> None:
                 if isinstance(take, DamagedTrimIntentSetAside):
                     continue
                 locks = (TargetLocksAcquired([]) if take.target in locked_targets
-                         else lock_trees(build_trees(take.target)))
+                         else lock_trees(_build_trees(take.target, tree_depth)))
                 if isinstance(locks, TargetLockBusy):
                     continue
                 try:
@@ -1906,7 +1899,7 @@ def scan_floor_roots(roots: list[str], trees: dict[str, list[str]]) -> Scan:
         return scan_target(roots[0])
     discovered = roots.discovered if isinstance(roots, DiscoveredTargetRoots) else tuple(trees)
     combined = Scan(discovered_targets=discovered)
-    with ThreadPoolExecutor(max_workers=4) as workers:
+    with ThreadPoolExecutor(max_workers=conf.whole("lint", "sweep_scan_workers")) as workers:
         for scan in workers.map(scan_target, roots):
             # Count a shared inode once, keeping its full link count across targets.
             combined.blocks.update(scan.blocks)
@@ -1997,6 +1990,9 @@ def target_dirs(roots: Sequence[str]) -> list[str]:
     """Every cargo target directory under roots."""
     found: set[str] = set()
     owned_trees: set[str] = set()
+    search_depth = conf.whole("lint", "sweep_floor_search_depth")
+    tree_depth = conf.whole("lint", "sweep_max_tree_depth")
+    skipped = conf.words("lint", "sweep_floor_skip")
     for root in roots:
         frontier = [(os.path.expanduser(root), 0)]
         while frontier:
@@ -2008,10 +2004,10 @@ def target_dirs(roots: Sequence[str]) -> list[str]:
                 # A target can contain another target in residue, but Cargo's
                 # own build trees belong to this root and need no root search.
                 depth = 0
-                owned_trees.update(build_trees(directory))
+                owned_trees.update(_build_trees(directory, tree_depth))
                 if directory in owned_trees:
                     continue
-            if depth < FLOOR_SEARCH_DEPTH:
+            if depth < search_depth:
                 # Style keeps one cache under the common git directory. Do not walk git objects.
                 retained = os.path.join(directory, GIT_DIR, scratch.STYLE_TARGET_NAME)
                 if (os.path.isdir(os.path.join(directory, GIT_DIR))
@@ -2021,7 +2017,7 @@ def target_dirs(roots: Sequence[str]) -> list[str]:
                 frontier.extend(
                     (entry.path, depth + 1)
                     for entry in listing(directory)
-                    if entry.name not in FLOOR_SKIP and entry.path not in owned_trees
+                    if entry.name not in skipped and entry.path not in owned_trees
                     and entry.is_dir(follow_symlinks=False)
                 )
     return sorted(found)
@@ -2185,8 +2181,7 @@ def floor_bytes(values: dict[str, str], host: str) -> tuple[int | None, str | No
 
 
 def floor_record_path() -> Path:
-    state = os.environ.get(FLOOR_STATE_ENV) or "~/.local/state/lint-sweep"
-    return Path(os.path.expanduser(state)) / "floor.json"
+    return tmp_sweep.state_dir() / "floor.json"
 
 
 def _finite_number(value: object) -> TypeGuard[int | float]:
@@ -2305,8 +2300,7 @@ def write_floor_record(path: Path, record: FloorRecord) -> None:
 
 
 def read_disk_measurement() -> DiskMeasurement:
-    directory = os.environ.get(BUILDLOG_DIR_ENV) or "~/.local/state/buildlog"
-    path = Path(os.path.expanduser(directory)) / "disk.json"
+    path = store.root() / store.DISK_NAME
     try:
         raw = cast(object, json.loads(path.read_text()))
     except FileNotFoundError:
@@ -2391,22 +2385,23 @@ def alert_path(path: str, limit: int) -> str:
 
 
 def disk_measurement_lines(measurement: DiskMeasurement, free_fall: int, cache_growth: int,
-                           now: float, explain_fall: bool = True, path_limit: int = 256,
+                           now: float, explain_fall: bool, path_limit: int,
                            previous: NoFloorRecord | FloorRecord = NO_FLOOR_RECORD) -> list[str]:
     if isinstance(measurement, UnavailableDiskMeasurement):
         return [f"buildlog-disk measurement unavailable ({measurement.reason})."]
+    measurement_paths = conf.whole("lint", "sweep_measurement_paths")
     age = now - measurement.measured_at.timestamp()
     measured_before_fall = (explain_fall and isinstance(previous, FloorRecord)
                             and measurement.measured_at.timestamp() <= previous.measured_at)
-    stale = f"; stale by {int(age // 60)} minutes" if age > SNAPSHOT_MAX_AGE_SECONDS else ""
+    stale = f"; stale by {int(age // 60)} minutes" if age > conf.number("lint", "sweep_snapshot_max_age_seconds") else ""
     if isinstance(measurement.comparison, NoEarlierDiskMeasurement):
         lines = [f"buildlog-disk measured {pacific_time(measurement.measured_at)}{stale}."]
         lines.append("No earlier buildlog-disk measurement to compare; largest directories outside build caches:")
-        ranked = sorted(measurement.directories, key=lambda item: item.bytes, reverse=True)[:3]
+        ranked = sorted(measurement.directories, key=lambda item: item.bytes, reverse=True)[:measurement_paths]
     else:
         lines = [f"buildlog-disk measured {pacific_time(measurement.comparison.measured_at)} to {pacific_time(measurement.measured_at)}{stale}."]
         lines.append("Directories outside build caches that grew most:")
-        ranked = sorted((item for item in measurement.directories if item.growth_bytes > 0), key=lambda item: item.growth_bytes, reverse=True)[:3]
+        ranked = sorted((item for item in measurement.directories if item.growth_bytes > 0), key=lambda item: item.growth_bytes, reverse=True)[:measurement_paths]
         lines.append(f"Measured folders {movement(measurement.outside_cache_growth_bytes, 'grew', 'shrank')} outside build caches.")
         if explain_fall and not measured_before_fall:
             unaccounted = max(0, free_fall - cache_growth)
@@ -2431,27 +2426,36 @@ def disk_measurement_lines(measurement: DiskMeasurement, free_fall: int, cache_g
     return lines
 
 
+def fit_alert_text(render: Callable[[int], str]) -> str:
+    """Try configured path widths and keep the final complete message."""
+    widths = tuple(map(int, conf.words("lint", "sweep_message_path_widths")))
+    limit = conf.whole("lint", "sweep_message_limit")
+    for index, width in enumerate(widths):
+        message = render(width)
+        if len(message) <= limit or index == len(widths) - 1:
+            return message
+    raise conf.Unusable("lint: sweep_message_path_widths needs at least one path width")
+
+
 def floor_alert_text(now: float, removed: int, previous: NoFloorRecord | FloorRecord,
                      free_fall: int, cache_growth: int, reasons: list[str],
                      measurement: DiskMeasurement) -> str:
     comparison = (f"Since the previous sweep at {pacific_time(previous.measured_at)}, free space "
                   + f"{movement(-free_fall, 'rose', 'fell')} while build caches {movement(cache_growth, 'grew', 'shrank')}."
                   if isinstance(previous, FloorRecord) else "No earlier floor sweep to compare.")
-    for path_limit in (256, 128, 96, 72, 56, 40, 24, 16):
-        message = "\n".join([
+    def render(path_limit: int) -> str:
+        return "\n".join([
             f"Disk floor sweep at {pacific_time(now)} removed {gib(removed)} of build caches.",
             comparison,
             f"Alert threshold: {'; '.join(reasons)}.",
             *disk_measurement_lines(measurement, free_fall, cache_growth, now,
                                     isinstance(previous, FloorRecord), path_limit, previous),
         ])
-        if len(message) <= 1024:
-            return message
-    return message
+    return fit_alert_text(render)
 
 
-def holder_text(holder: FloorHolder, path_limit: int = 256) -> str:
-    """One busy target: its path and size, and what holds it."""
+def holder_text(holder: FloorHolder, path_limit: int) -> str:
+    """Describe one busy target, its size, and its process."""
     who = f"pid {holder.pid}" if holder.pid is not None else "a process"
     return f"{alert_path(holder.path, path_limit)} ({gib(holder.bytes)}): {who} {holder.how}"
 
@@ -2475,8 +2479,8 @@ def floor_out_of_reach_text(now: float, removed: int, free: int, floor: int,
         closing = ["No session above could be told, so the user also gets a page with these paths."]
     else:
         closing = ["No target is in use, so the user also gets a page with the largest paths below."]
-    for path_limit in (256, 128, 96, 72, 56, 40, 24, 16):
-        message = "\n".join([
+    def render(path_limit: int) -> str:
+        return "\n".join([
             f"Build cache cleanup removed {gib(removed)}, but natedev still has only {gib(free)} free. Builds need {gib(floor)} free. No idle build cache is left to remove.",
             *(["These target dirs are in use; the sweep removes their output when that use ends:"] if holders else []),
             *(holder_line(holder, path_limit) for holder in holders),
@@ -2485,16 +2489,15 @@ def floor_out_of_reach_text(now: float, removed: int, free: int, floor: int,
             *closing,
             *disk_measurement_lines(measurement, 0, 0, now, False, path_limit),
         ])
-        if len(message) <= 1024:
-            return message
-    return message
+    return fit_alert_text(render)
 
 
 def holder_message_text(holder: FloorHolder, free: int, floor: int) -> str:
     """The message to the session whose process holds a target the floor needs."""
+    path_limit = int(conf.words("lint", "sweep_message_path_widths")[0])
     return "\n".join([
         f"natedev has {gib(free)} free, and builds need {gib(floor)} free. The disk floor sweep removed all idle build output.",
-        f"{holder_text(holder)}. This process is in your session, so the sweep cannot remove that output.",
+        f"{holder_text(holder, path_limit)}. This process is in your session, so the sweep cannot remove that output.",
         "When the process ends, the next sweep removes the output. If the process is stale, stop it.",
     ])
 
@@ -2533,9 +2536,9 @@ def disk_floor_push(removed: int, free: int, floor: int, paths: Sequence[str]) -
         return render("sweep.disk_floor", removed=gib(removed), free=gib(free), floor=gib(floor),
                       shortfall=gib(max(0, floor - free)), paths=listed)
 
-    for count in range(min(len(paths), PAGE_PATHS), 0, -1):
+    for count in range(min(len(paths), conf.whole("lint", "sweep_page_paths")), 0, -1):
         push = page("\n\n".join(paths[:count]))
-        if len(push.message) < PUSH_TEXT_LIMIT:
+        if len(push.message) < conf.whole("lint", "sweep_push_text_limit"):
             return push
     return page(paths[0] if paths else NO_PAGE_PATHS)
 
@@ -2543,14 +2546,14 @@ def disk_floor_push(removed: int, free: int, floor: int, paths: Sequence[str]) -
 def session_send_argv(to: str) -> list[str]:
     """send.py's argv for a disk floor message to the session named to; the text goes on stdin."""
     return [sys.executable, str(Path(__file__).resolve().parents[1] / "message/send.py"),
-            "--to", to, "--from", "disk_floor", "--timeout", "30"]
+            "--to", to, "--from", "disk_floor", "--timeout", f"{conf.number("lint", "sweep_sender_timeout_seconds"):g}"]
 
 
 def send_holder_message(session: str, message: str) -> bool:
     """Tell a session that its process holds a target the floor needs; True when send.py delivered
     the message or queued it (exit 1)."""
     try:
-        result = subprocess.run(session_send_argv(session), input=message, text=True, capture_output=True, timeout=40)
+        result = subprocess.run(session_send_argv(session), input=message, text=True, capture_output=True, timeout=conf.number("lint", "sweep_send_timeout_seconds"))
     except (OSError, subprocess.TimeoutExpired) as error:
         print(f"lint sweep: message to {session} failed: {error}", file=sys.stderr)
         return False
@@ -2584,7 +2587,7 @@ def send_floor_alert(message: str, channels: FloorAlertChannels, *,
     delivered = False
     for channel, command in commands:
         try:
-            timeout = review.user_send_seconds() + 15 if channel == "phone" else 40
+            timeout = review.user_send_seconds() + conf.number("lint", "sweep_phone_send_grace_seconds") if channel == "phone" else conf.number("lint", "sweep_send_timeout_seconds")
             result = subprocess.run(command, input=message if channel == "message" else None, text=True, capture_output=True, timeout=timeout)
             if result.returncode == 0 or (channel == "message" and result.returncode == 1):
                 delivered = True
@@ -2621,6 +2624,9 @@ def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]]
     records = sessions.live_sessions()
     own_deletes = read_target_deletes(target_deletes_path(), time.time())
     protected: dict[str, BuildHoldTarget] = {}
+    lookback = conf.number("lint", "sweep_holder_lookback_seconds")
+    delete_grace = conf.number("lint", "sweep_delete_stamp_grace_seconds")
+    tree_depth = conf.whole("lint", "sweep_max_tree_depth")
     for holder in state.holders:
         folders: list[Path] = []
         for record in records:
@@ -2634,8 +2640,8 @@ def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]]
                 folders.append(folder)
         if not folders:
             print(f"lint sweep: {holder.name} holds natedev builds; its working folder was not found")
-        # Allow three minutes for clock differences and filesystem timestamp granularity.
-        changed_since = holder.since.timestamp() - 3 * 60
+        # Allow the configured interval for clock and filesystem differences.
+        changed_since = holder.since.timestamp() - lookback
         for root in targets:
             if root in protected:
                 continue
@@ -2643,7 +2649,7 @@ def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]]
                 protected[root] = BuildHoldTarget(holder.name)
                 continue
             if root not in known_trees:
-                known_trees[root] = build_trees(root)
+                known_trees[root] = _build_trees(root, tree_depth)
             own_delete = own_deletes.get(str(Path(root).resolve()), float("-inf"))
             paths = [os.path.join(root, USE_STAMP)]
             for tree in known_trees[root]:
@@ -2653,8 +2659,8 @@ def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]]
                     changed = os.stat(path).st_mtime
                 except OSError:
                     continue
-                # A delete changes its parent directory's mtime; allow two seconds for coarse timestamps.
-                if changed >= changed_since and changed > own_delete + 2:
+                # A delete changes its parent folder's mtime; allow the configured timestamp tolerance.
+                if changed >= changed_since and changed > own_delete + delete_grace:
                     protected[root] = BuildHoldTarget(holder.name)
                     break
     return protected
@@ -2691,13 +2697,10 @@ def floor_scan_targets(scan: Scan, idle: Sequence[str], target_uses: dict[str, f
     return rows
 
 
-def hold_floor(
-    floor: int,
-    dry_run: bool,
-    roots: Sequence[str] = FLOOR_ROOTS,
-    lock: str = FLOOR_LOCK,
-) -> int:
+def hold_floor(floor: int, dry_run: bool) -> int:
     """Below the floor, take the shortfall from the least used idle targets."""
+    roots = conf.words("lint", "sweep_floor_roots")
+    lock = tmp_sweep.state_dir() / "floor.lock"
     if not dry_run:
         recover_pending_trims()
     home = os.path.expanduser("~")
@@ -2706,7 +2709,7 @@ def hold_floor(
         return 0
     guard = None
     if not dry_run:
-        lock_path = os.path.expanduser(lock)
+        lock_path = str(lock)
         os.makedirs(os.path.dirname(lock_path), exist_ok=True)
         guard = try_lock(lock_path)
         if guard is None:
@@ -2716,7 +2719,7 @@ def hold_floor(
     try:
         planned_at = time.time()
         if guard is not None:
-            record_floor_lock(os.path.expanduser(lock), guard, planned_at)
+            record_floor_lock(str(lock), guard, planned_at)
         record_path = floor_record_path()
         idle: list[str] = []
         tree_targets: dict[str, str] = {}
@@ -2727,6 +2730,7 @@ def hold_floor(
         hold_targets = build_hold_targets(targets, known_trees)
         uses = process_uses(owners)
         locked_files = held_cargo_lock_files()
+        tree_depth = conf.whole("lint", "sweep_max_tree_depth")
         for root in targets:
             if root not in known_trees and (root in hold_targets or root in uses):
                 known_trees[root] = []
@@ -2745,7 +2749,7 @@ def hold_floor(
                 print(f"lint sweep: pid {uses[root].pid} {uses[root].how}; {root} left alone")
                 busy[root] = uses[root]
                 continue
-            root_trees = known_trees[root] if root in known_trees else build_trees(root)
+            root_trees = known_trees[root] if root in known_trees else _build_trees(root, tree_depth)
             known_trees[root] = root_trees
             blocked = next((path for path in target_lock_paths(root_trees)
                             if file_key(path) in locked_files), "")
@@ -2767,7 +2771,7 @@ def hold_floor(
                           else directory_blocks(path))
                       for path, use in busy.items()}
         held_bytes = sum(busy_bytes.values())
-        ci_bytes = sum(directory_blocks(path) for path in CI_TARGETS)
+        ci_bytes = sum(directory_blocks(path) for path in conf.words("lint", "sweep_ci_targets"))
         unchanged_caches = held_bytes + ci_bytes
         before_caches = total + unchanged_caches
         # The growth check compares this pair with the previous record. The scan takes minutes, so
@@ -2822,7 +2826,8 @@ def hold_floor(
             with locked_floor_record(record_path) as previous:
                 history = previous.alert_history if isinstance(previous, FloorRecord) else NoDeliveredAlert()
                 push_history = previous.push_history if isinstance(previous, FloorRecord) else NoDeliveredAlert()
-                push_due = isinstance(push_history, NoDeliveredAlert) or now - push_history.at >= ALERT_INTERVAL_SECONDS
+                alert_interval = conf.number("lint", "sweep_alert_interval_seconds")
+                push_due = isinstance(push_history, NoDeliveredAlert) or now - push_history.at >= alert_interval
                 # (user, 2026-10-05) Only an exhausted sweep still under the floor reaches the phone; other alerts reach natedev alone.
                 # (2026-10-21) It never asks the user to free space by hand. Each session whose process
                 # holds a busy target is told; the user gets a page, with exact paths, only when no
@@ -2844,21 +2849,23 @@ def hold_floor(
                         delivered = send_floor_alert(message, FloorAlertChannels.NATEDEV_AND_PHONE, phone=page)
                     if delivered or told:
                         push_history = DeliveredAlert(time.time())
-                elif removed > 0 and (isinstance(history, NoDeliveredAlert) or now - history.at >= ALERT_INTERVAL_SECONDS):
+                elif removed > 0 and (isinstance(history, NoDeliveredAlert) or now - history.at >= alert_interval):
                     free_fall = previous.free_bytes - scanned_free if isinstance(previous, FloorRecord) else 0
                     cache_growth = before_caches - previous.build_cache_bytes if isinstance(previous, FloorRecord) else 0
-                    recent = isinstance(previous, FloorRecord) and 0 <= now - previous.measured_at <= GROWTH_WINDOW_SECONDS
+                    recent = isinstance(previous, FloorRecord) and 0 <= now - previous.measured_at <= conf.number("lint", "sweep_growth_window_seconds")
                     same_held_roots = (isinstance(previous, FloorRecord)
                                        and isinstance(previous.held_roots, KnownHeldRoots)
                                        and previous.held_roots.roots == frozenset(hold_targets))
-                    growth_fired = recent and same_held_roots and free_fall - cache_growth > UNEXPLAINED_FALL_BYTES
-                    removal_fired = removed > LARGE_REMOVAL_BYTES
+                    unexplained_fall = conf.whole("lint", "sweep_unexplained_fall_bytes")
+                    large_removal = conf.whole("lint", "sweep_large_removal_bytes")
+                    growth_fired = recent and same_held_roots and free_fall - cache_growth > unexplained_fall
+                    removal_fired = removed > large_removal
                     if growth_fired or removal_fired:
                         reasons: list[str] = []
                         if growth_fired:
-                            reasons.append("free space fell more than 10 GiB beyond build-cache growth")
+                            reasons.append(f"free space fell more than {unexplained_fall / GIB:g} GiB beyond build-cache growth")
                         if removal_fired:
-                            reasons.append("removed more than 32 GiB in one sweep")
+                            reasons.append(f"removed more than {large_removal / GIB:g} GiB in one sweep")
                         message = floor_alert_text(now, removed, previous, free_fall, cache_growth,
                                                    reasons, read_disk_measurement())
                         if send_floor_alert(message, FloorAlertChannels.NATEDEV):
@@ -2985,7 +2992,7 @@ def budget_bytes(environ: dict[str, str], config: str, repo: str | None) -> tupl
 def doc_index_bytes() -> int | None:
     raw = os.environ.get(DOC_INDEX_ENV, "")
     if not raw:
-        return int(DEFAULT_DOC_INDEX_MIB * MIB)
+        return int(conf.number("lint", "sweep_doc_index_mib") * MIB)
     return size_bytes(raw, MIB)
 
 
@@ -3114,7 +3121,7 @@ def read_sweep_journal(since: float) -> list[SweepRemoval]:
     result = subprocess.run(
         ["journalctl", "--since", f"@{since:.6f}", "--output=json", "--no-pager",
          "--grep=lint sweep:|tmp sweep: deleted"],
-        capture_output=True, text=True, check=True, timeout=120,
+        capture_output=True, text=True, check=True, timeout=conf.number("lint", "sweep_history_timeout_seconds"),
     )
     return parse_sweep_journal(result.stdout.splitlines())
 
@@ -3192,6 +3199,11 @@ def clone_kind(folder: str) -> str:
 
 def rebuild_causes(steps: Sequence[RebuildStep], events: Sequence[SweepRemoval],
                    since: float, until: float) -> list[ColdRebuild]:
+    return _rebuild_causes(steps, events, since, until, conf.whole("lint", "sweep_cold_crates"))
+
+
+def _rebuild_causes(steps: Sequence[RebuildStep], events: Sequence[SweepRemoval],
+                    since: float, until: float, cold_crates: int) -> list[ColdRebuild]:
     by_folder: dict[str, list[SweepRemoval]] = {}
     for event in events:
         # Floor and budget lines name a target; tmp sweep lines name the removed folder.
@@ -3201,7 +3213,7 @@ def rebuild_causes(steps: Sequence[RebuildStep], events: Sequence[SweepRemoval],
     cold: list[ColdRebuild] = []
     for step in sorted(steps, key=lambda item: item.started_at):
         prior = previous.get(step.workspace)
-        if since <= step.started_at < until and step.crates_compiled >= 50:
+        if since <= step.started_at < until and step.crates_compiled >= cold_crates:
             cause: RebuildCause = "none"
             if prior is not None:
                 candidates = [event for folder in {Path(step.folder), *Path(step.folder).parents,
@@ -3223,9 +3235,10 @@ def rebuilds_main(argv: list[str]) -> int:
         print("usage: sweep.py rebuilds --days N (N must be a positive integer)", file=sys.stderr)
         return 2
     days = int(argv[1])
+    cold_crates = conf.whole("lint", "sweep_cold_crates")
     until = time.time()
     since = until - days * DAY_SECONDS
-    root = Path(os.environ.get(BUILDLOG_DIR_ENV) or "~/.local/state/buildlog").expanduser()
+    root = store.root()
     try:
         evidence = read_rebuild_evidence(root)
         steps = evidence.steps
@@ -3234,11 +3247,11 @@ def rebuilds_main(argv: list[str]) -> int:
         journal_since = since
         for step in steps:
             prior = previous.get(step.workspace)
-            if since <= step.started_at < until and step.crates_compiled >= 50 and prior is not None:
+            if since <= step.started_at < until and step.crates_compiled >= cold_crates and prior is not None:
                 journal_since = min(journal_since, prior.ended_at)
             previous[step.workspace] = step
         events = merge_sweep_removals(read_sweep_journal(journal_since), evidence.trims, read_sweep_removals())
-        cold = rebuild_causes(steps, events, since, until)
+        cold = _rebuild_causes(steps, events, since, until, cold_crates)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"lint sweep: cannot read rebuild evidence: {error}", file=sys.stderr)
         return 2
@@ -3246,7 +3259,7 @@ def rebuilds_main(argv: list[str]) -> int:
     for rebuild in cold:
         key = (clone_kind(rebuild.step.workspace), rebuild.cause)
         totals[key] = totals.get(key, 0.0) + rebuild.step.compile_seconds / 3600
-    print(f"Cold rebuild compile-hours over {days} days ({len(cold)} steps with crates_compiled >= 50)")
+    print(f"Cold rebuild compile-hours over {days} days ({len(cold)} steps with crates_compiled >= {cold_crates})")
     print("Clone kind | " + " | ".join(REBUILD_CAUSES) + " | total")
     print("--- | " + " | ".join("---:" for _ in range(5)))
     for kind in CLONE_KINDS:
@@ -3330,7 +3343,8 @@ def sweep_workspace(target_dir: str | None, config: str, dry_run: bool,
         root, use = next(iter(uses.items()))
         print(f"lint sweep: pid {use.pid} {use.how}; {root} skipped")
         return 0
-    trees = [tree for root in roots for tree in build_trees(root)]
+    tree_depth = conf.whole("lint", "sweep_max_tree_depth")
+    trees = [tree for root in roots for tree in _build_trees(root, tree_depth)]
     locks = lock_trees(trees)
     if isinstance(locks, TargetLockBusy):
         print(f"lint sweep: a cargo build holds {locks.path}; skipped")

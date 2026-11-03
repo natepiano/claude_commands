@@ -10,6 +10,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 from pathlib import Path
 import signal
 import struct
@@ -26,7 +27,9 @@ import zlib
 
 from scripts.buildlog import store
 from scripts.hana_shot import hana_shot
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 LAUNCH_RECORDING_PURPOSE = "launch recovery"
@@ -331,7 +334,9 @@ class BuildLogIsolatedTest(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "capture_timeout_seconds=1\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **config_environment(self.scratch / "config"),
             "BUILDLOG_DIR": str(self.scratch / "buildlog"),
         })))
 
@@ -364,7 +369,6 @@ class HanaShotTest(BuildLogIsolatedTest):
         environment = {
             **os.environ,
             "XDG_CACHE_HOME": str(self.scratch / "cache"),
-            "HANA_SHOT_CAPTURE_TIMEOUT": "1",
             # RemoteTests puts its fake scp and ssh here.
             "PATH": f"{self.scratch / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}",
         }
@@ -1244,6 +1248,18 @@ class LaunchRecordRecoveryTests(HanaShotTest):
 
 
 class PortGuardTests(HanaShotTest):
+    def test_standalone_command_runs_without_pythonpath_from_another_folder(self) -> None:
+        environment = self.script_environment()
+        _ = environment.pop("PYTHONPATH", None)
+        result = subprocess.run(
+            [sys.executable, "-B", "-E", str(SCRIPT.resolve()), "targets", "--port", str(self.port)],
+            cwd=self.scratch, env=environment, capture_output=True, text=True,
+            timeout=TEST_HANG_GUARD_SECS, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"camera  entity:{CAMERA_ENTITY}", result.stdout)
+        self.assertTrue(self.fake.calls)
+
     def test_launch_command_without_purpose_names_the_required_flag(self) -> None:
         result = self.run_script("launch", "--port", "15797")
         self.assertEqual(result.returncode, 2, result.stderr)
@@ -1252,6 +1268,7 @@ class PortGuardTests(HanaShotTest):
         self.assertEqual(self.fake.calls, [])
 
     def test_user_port_is_refused_by_every_command(self) -> None:
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "refused_port=15702\n")
         for argv in (
             ["shot", "--port", "15702", "--mode", "home"],
             ["pose", "get", "--port", "15702"],
@@ -1458,15 +1475,8 @@ class FailureGuidanceTests(HanaShotTest):
         return error
 
     def test_settle_timeout_names_retry_then_pose_recovery(self) -> None:
-        settle = hana_shot.Session.settle
-
-        def settle_with_short_limit(
-            session: hana_shot.Session, before: hana_shot.CameraState, extra_frames: int,
-        ) -> hana_shot.Settled:
-            return settle(session, before, extra_frames, limit=0.01)
-
-        with mock.patch.object(hana_shot.Session, "settle", settle_with_short_limit):
-            result = self.in_process_shot("--target", "name:Log", "--mode", "fit", "--settle", "1000000")
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "capture_timeout_seconds=1\nsettle_seconds=0.01\n")
+        result = self.in_process_shot("--target", "name:Log", "--mode", "fit", "--settle", "1000000")
 
         self.assertNotEqual(result.returncode, 0, result.stderr)
         error = self.assert_recorded_error(result)
@@ -1486,9 +1496,9 @@ class FailureGuidanceTests(HanaShotTest):
         ]
         for selector, expected in (("name:Panle", "Panel"), ("tool:Grayscal", "Grayscale")):
             with self.subTest(selector=selector):
-                with mock.patch.object(hana_shot, "SETUP_LIMIT", 0.01):
-                    result = self.in_process_shot("--target", selector, "--mode", "hana-frame",
-                                                  "--setup", "scene::spawn")
+                _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "capture_timeout_seconds=1\nsetup_seconds=0.01\n")
+                result = self.in_process_shot("--target", selector, "--mode", "hana-frame",
+                                              "--setup", "scene::spawn")
 
                 self.assertEqual(result.returncode, 1, result.stderr)
                 line = self.timing_lines()[-1]
@@ -1681,6 +1691,59 @@ class ViewsTests(HanaShotTest):
 
 
 class ShotTests(HanaShotTest):
+    def test_both_window_operations_use_the_configured_frame_count(self) -> None:
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "window_frames=7\n")
+        session = hana_shot.Session(hana_shot.Brp(self.port))
+        _ = session.start()
+        with mock.patch.object(session, "wait_frames") as frames, mock.patch.object(shutil, "which", return_value=None):
+            hana_shot.ensure_window(session, "640x480")
+            hana_shot.keep_visible(session)
+        self.assertEqual(frames.call_args_list, [mock.call(7), mock.call(7)])
+        self.assertEqual(self.fake.window_physical_size, (640, 480))
+
+    def test_brp_reads_host_and_timeout_once_per_instance(self) -> None:
+        with (
+            mock.patch("scripts.hana_shot.hana_shot.conf.text", wraps=conf.text) as text,
+            mock.patch("scripts.hana_shot.hana_shot.conf.number", wraps=conf.number) as number,
+        ):
+            brp = hana_shot.Brp(self.port)
+            first = brp.diagnostics()
+            second = brp.diagnostics()
+        self.assertGreater(hana_shot.frame_number(second), hana_shot.frame_number(first))
+        self.assertEqual(text.call_args_list, [mock.call("hana_shot", "host")])
+        self.assertEqual(number.call_args_list, [mock.call("hana_shot", "call_timeout_seconds")])
+
+    def test_readiness_and_shutdown_read_poll_settings_once_per_call(self) -> None:
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "poll_seconds=0.001\nwarm_frame_ms=20\n")
+        log = self.scratch / "startup.log"
+        _ = log.write_text("")
+        process = cast(subprocess.Popen[bytes], mock.Mock())
+        process.poll = mock.Mock(return_value=None)
+        brp = hana_shot.Brp(self.port)
+        diagnostics = [{"frame_time_ms": {"current": value}} for value in (30.0, 25.0, 5.0)]
+        def tick(_seconds: float) -> None:
+            _ = log.write_text(hana_shot.READY_LOG_LINE)
+        with (
+            mock.patch.object(time, "sleep", side_effect=tick),
+            mock.patch.object(brp, "diagnostics", side_effect=diagnostics) as readings,
+            mock.patch("scripts.hana_shot.hana_shot.conf.number", wraps=conf.number) as number,
+        ):
+            hana_shot.wait_ready(brp, process, log)
+        self.assertEqual(readings.call_count, 3)
+        for key in ("poll_seconds", "warm_frame_ms", "ready_seconds", "warm_seconds"):
+            self.assertEqual(number.call_args_list.count(mock.call("hana_shot", key)), 1, key)
+        with (
+            mock.patch.dict(os.environ, self.script_environment()),
+            mock.patch.object(hana_shot.Brp, "call", return_value=None),
+            mock.patch.object(hana_shot, "port_answers", side_effect=[True, True, False]) as answers,
+            mock.patch.object(time, "sleep"),
+            mock.patch("scripts.hana_shot.hana_shot.conf.number", wraps=conf.number) as number,
+            redirect_stderr(io.StringIO()),
+        ):
+            hana_shot.shutdown(self.port)
+        self.assertEqual(answers.call_count, 3)
+        self.assertEqual(number.call_args_list.count(mock.call("hana_shot", "poll_seconds")), 1)
+
     def test_home_shot_writes_the_png_and_one_timing_line(self) -> None:
         result = self.shot("--mode", "home")
         self.assertEqual(result.returncode, 0, result.stderr)

@@ -12,7 +12,7 @@ from scripts.lint import memory_admit as gate
 
 class QueueCardTests(QueueFixtureTests):
     def test_follower_names_the_eligible_heads_place_after_a_token_waiter(self) -> None:
-        inputs = self.fixture.inputs()
+        inputs = self.fixture.inputs(policy=gate.DEFAULT_ADMISSION_POLICY)
         (token_path, token), (head_path, head), (follower_path, follower) = inputs.ordered[:3]
         inputs = replace(inputs,
             host=gate.HostMemory(14 * gate.GIB, 60 * gate.GIB), pressure=gate.NoPressureHold(),
@@ -22,7 +22,8 @@ class QueueCardTests(QueueFixtureTests):
                 (head_path, {**head, "need": 21 * gate.GIB, "priority_since": NOW - 60}),
                 (follower_path, {**follower, "need": 10 * gate.GIB}),
             ])
-        reading = gate.queue_read_from(inputs, gate.AdmissionLimits(21 * gate.GIB, 3 * gate.GIB))
+        reading = gate.queue_read_from(inputs, gate.AdmissionLimits(21 * gate.GIB, 3 * gate.GIB),
+                                       policy=gate.DEFAULT_ADMISSION_POLICY)
         self.assertEqual([step.pid for step in reading.view.waiting], [token["pid"], head["pid"], follower["pid"]])
         self.assertIsInstance(reading.view.waiting[2].reason, gate.BehindHead)
         self.assertEqual(queue_view.reason_phrase(reading.view.waiting[2].reason, reading.view.waiting), "#2's turn")

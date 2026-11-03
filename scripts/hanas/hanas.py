@@ -7,7 +7,6 @@ import argparse
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-import math
 import os
 from pathlib import Path
 import re
@@ -25,7 +24,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts" / "mac_test"))
 sys.path.insert(0, str(ROOT / "scripts" / "lint"))
 
-from scripts.lint.config_values import config_values
+from scripts.lib import conf
 
 
 @dataclass(frozen=True)
@@ -63,27 +62,18 @@ class HanaProcess:
     environment_status: EnvironmentKnown | EnvironmentUnknown = ENVIRONMENT_KNOWN
 
 
-def read_config(path: Path | None = None) -> HanasConfig:
-    settings = path if path is not None else Path(os.environ.get("HANAS_CONFIG", str(ROOT / "config" / "hanas.conf"))).expanduser()
-    values = config_values(str(settings))
-
-    def number(key: str) -> float:
-        try:
-            value = float(values[key])
-        except (KeyError, ValueError) as error:
-            raise ValueError(f"{settings}: {key} needs a finite non-negative number") from error
-        if not math.isfinite(value) or value < 0:
-            raise ValueError(f"{settings}: {key} needs a finite non-negative number")
-        return value
-
+def read_config() -> HanasConfig:
+    settings = conf.path("hanas")
+    values = conf.values("hanas")
     try:
         ports = frozenset(int(item.strip()) for item in values["exempt_ports"].split(",") if item.strip())
     except (KeyError, ValueError) as error:
         raise ValueError(f"{settings}: exempt_ports needs comma-separated ports") from error
     if any(not 0 < port <= 65535 for port in ports):
         raise ValueError(f"{settings}: exempt_ports contains an invalid port")
-    return HanasConfig(ports, number("test_max_hours") * 3600,
-                       number("unlabelled_max_minutes") * 60, number("stop_grace_seconds"))
+    return HanasConfig(ports, conf.number("hanas", "test_max_hours") * 3600,
+                       conf.number("hanas", "unlabelled_max_minutes") * 60,
+                       conf.number("hanas", "stop_grace_seconds"))
 
 
 @dataclass(frozen=True)

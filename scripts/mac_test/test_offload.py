@@ -226,6 +226,7 @@ class OffloadSettingsTests(unittest.TestCase):
             result = offload.check_leftovers(config.connection, "kept-host", HANA)
         self.assertEqual(run.call_args.kwargs["timeout"], 0.125)
         self.assertEqual(result, offload.LeftoverCheckFailed("SSH leftover check timed out after 0.125 s"))
+        self.settings.unlink()
         _ = write_config_fixture(self.settings, template="mac_test")
         commit_config_fixture(self.settings)
         for value in ("bad", "0", "-1", "nan", "inf"):
