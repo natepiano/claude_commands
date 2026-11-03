@@ -1721,38 +1721,24 @@ Test failed close and interrupted retirement, then rerun without another launch.
 
 ### Phase 6b — The herdr suite passes on the Mac  · status: done
 
-**Owner:** herdr-unit (natedev assignment, 2026-11-03).
+#### As-built
 
-**Depends on:** Phase 6a. Land before Phase 4b.
-
-#### Work Order
-
-**Goal:** the herdr test suite (`scripts/herdr`) passes on the Mac with no failures or errors. Today ten tests fail there, and they also failed before Phase 6a.
-
-**Spec:**
-1. For each red test below, find the commit that made it red on the Mac. Bisect on a Mac copy of the tree.
-2. Fix each defect where it lives: in the source when the code is wrong on darwin, in the test when the test assumes Linux (for example a `/proc` path, a home folder, or `/tmp` against `/private/tmp`).
-3. Keep Linux behavior the same. A test that cannot pass on darwin gets a darwin path, not a skip.
-4. The red tests:
-   - `test_herdr.LaunchDestinationTests.test_cleanup_without_process_handles_signals_only_a_fresh_agent_identity` (cases `live`, `exited`, `reused`, `shell`, `exited_before_signal`): ERROR.
-   - `test_herdr.NativePaneSessionTests.test_native_pane_identity_uses_its_exact_claude_pid_registry_without_an_exported_id`: ERROR.
-   - `test_herdr.PromptSubmissionTests.test_promptless_codex_restart_needs_no_transcript_or_submit`: ERROR.
-   - `test_herdr.HerdrTests.test_moved_terminal_clears_its_conversation_when_the_agent_with_old_pane_marks_exits`: FAIL.
-   - `test_herdr.HerdrTests.test_session_of_keeps_the_terminal_but_clears_the_conversation_after_claude_exits`: FAIL.
-   - `test_herdr_sessions.HerdrSessionsTests.test_staff_marks_are_visible_without_a_claude_record`: FAIL.
-5. Record each red's cause commit and fix in the checkpoint notice.
+- The herdr suite (`scripts/herdr`) passes on the Mac and on natedev: 381 tests, 0 failures, 0 errors. The source is unchanged; each of the ten Mac reds was a test or fixture that assumed Linux.
+- `native_process_commands(pid)` in `test_herdr.py` is the one fixture for darwin process facts. It answers `ps -o lstart=,tty= -p <pid>` and `lsof -a -p <pid> -Fn` and patches `sessions.process_start` for that one pid. Any other pid raises `AssertionError`.
+- The fresh-identity cleanup test replaces `herdr.os` with a namespace that has only `kill`, so the test takes the signal path without pidfd on every host.
+- `fake_herdr.py` reads the fixture process tree from `HERDR_PROC` on every host, so it sees a fixture agent exit on darwin too.
+- The staff-marks test in `test_herdr_sessions.py` patches `process_start` for its Codex fixture.
 
 **Files:**
-- `scripts/herdr/herdr.py`, `scripts/herdr/herdr_sessions.py` — source repairs.
-- `scripts/herdr/test_herdr.py`, `scripts/herdr/test_herdr_sessions.py`, `scripts/herdr/fake_herdr.py` — test and fixture repairs.
+- `scripts/herdr/test_herdr.py` — `native_process_commands`, the darwin-safe cleanup test.
+- `scripts/herdr/test_herdr_sessions.py` — the staff-marks fixture start time.
+- `scripts/herdr/fake_herdr.py` — the fixture process tree on every host.
 
-A cause in a file outside these paths is fixed there through berth, and the notice names that file as also touched.
+**Binds later work:** a change to the darwin process identity read changes `native_process_commands` in the same place and keeps its one-pid guard.
 
-**Workers:** `1 writer + 1 tester` — `impl`: source repairs; `test`: test and fixture repairs.
+**Gotchas:** run the Mac suite from `scripts/herdr` on a copy of `scripts` and `config`, with `PYTHONPATH` at the copy root and `HERDR_BIN=/nonexistent/herdr`. Judge a Mac run only by its `Ran`/`OK`/`FAILED` lines; a relayed exit code can read 0 for a failed run.
 
-**State:** none.
-
-**Acceptance gate:** the herdr suite on natedev and on the Mac with 0 failures and 0 errors (run on the Mac with `HERDR_BIN=/nonexistent/herdr` and the `scripts` and `config` folders copied); the shutdown suite on natedev; basedpyright 0/0/0 on each changed file and its caller modules.
+**Ruled out:** a regression test for the fixture's own pid guard — it would test a mock it configures.
 
 ### Phase 6c — The startup reader keeps one deadline and a strong Mac process generation  · status: todo
 
@@ -1770,6 +1756,13 @@ A cause in a file outside these paths is fixed there through berth, and the noti
 3. When the microsecond read fails, the identity is weak. `_terminate_startup_agents` (`herdr.py:4204`) sends no signal to a weak identity and keeps the pane.
 4. Linux behavior stays the same.
 
+**Constraints from prior phases (6b):**
+- The herdr suite passes on the Mac at 6b (381 tests, 0 failures, 0 errors). Keep it at 0 failures and 0 errors.
+- `native_process_commands(pid)` in `test_herdr.py` is the one fixture that gives darwin process facts. It answers `ps -o lstart=,tty= -p <pid>` and `lsof -a -p <pid> -Fn`, and patches `sessions.process_start`, for one pid only. Any other pid raises `AssertionError`.
+- When the darwin identity moves to `proc_pidinfo`, change that helper in the same place. Keep the one-pid guard.
+- `fake_herdr.py` reads `HERDR_PROC` on every host.
+- Run the Mac suite from `scripts/herdr` on a copy of the tree. Use `rsync` of `scripts` and `config` to `mac:/tmp/<folder>/`, then `cd /tmp/<folder>/scripts/herdr`. Set `PYTHONPATH=/tmp/<folder>` and `HERDR_BIN=/nonexistent/herdr`, then run `python3 -m unittest discover`. Judge the run only by its `Ran`/`OK`/`FAILED` lines.
+
 **Files:**
 - `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py`
 
@@ -1777,7 +1770,7 @@ A cause in a file outside these paths is fixed there through berth, and the noti
 
 **State:** `AgentProcessIdentity` on darwin holds microsecond start time, not `ps lstart` seconds.
 
-**Acceptance gate:** a test where a darwin pid is reused in the same second with a different microsecond start: the pane stays and no signal is sent; a test where the microsecond read fails: no signal; a test that the whole startup observation stays within the launch deadline when each `ps` call is slow; the herdr suite on natedev and on the Mac; the shutdown suite on natedev; basedpyright 0/0/0 on both files and their caller modules.
+**Acceptance gate:** a test where a darwin pid is reused in the same second with a different microsecond start: the pane stays and no signal is sent; a test where the microsecond read fails: no signal; a test that the whole startup observation stays within the launch deadline when each `ps` call is slow; the herdr suite on natedev and on the Mac, each with 0 failures and 0 errors; the shutdown suite on natedev; basedpyright 0/0/0 on both files and their caller modules.
 
 ### Phase 7 — worker_panes.py: start-or-resume, close, observe  · status: todo
 
