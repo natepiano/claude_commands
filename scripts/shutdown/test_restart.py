@@ -44,7 +44,6 @@ from user_action import ActionRequired
 from push_texts import RenderedPush
 from session_types import GitCheckout
 import restart
-import launch_permission as restore_permission
 from scripts.shutdown import stop_resume
 import relaunch
 import herdr
@@ -296,7 +295,7 @@ def peer_json(*, outcome: str = "done", lines: Sequence[str] = (), missing: Sequ
         "no_remote_control": missing, "refused": refused})
 
 
-HEAL_FOLDER_TRUST = restart._heal_folder_trust  # pyright: ignore[reportPrivateUsage]
+HEAL_FOLDER_TRUST = restart._copy_claude_trust  # pyright: ignore[reportPrivateUsage]
 
 
 def setUpModule() -> None:
@@ -463,7 +462,7 @@ class RestartTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(herdr, "shared_session", return_value="writing"))
         _ = self.enterContext(patch.object(restart, "_folder_exists", return_value=True))
         # Fixture folders are not trusted; herdr_restart_fixture puts the real trust step back.
-        _ = self.enterContext(patch.object(restart, "_heal_folder_trust"))
+        _ = self.enterContext(patch.object(restart, "_copy_claude_trust"))
         # Synthetic saved PIDs do not identify processes on the test machine.
         _ = self.enterContext(patch.object(sessions, "process_start", return_value="unrelated-process-start"))
         _ = self.enterContext(patch.object(sessions, "remote_control", return_value="active"))
@@ -618,18 +617,7 @@ class RestartTests(ShutdownTestCase):
                 target_result = (OSError("target held") if failure == "exception" else
                     restart.SessionLaunched(herdr.PromptNotSubmitted("add_unit failed")) if failure == "outcome" else
                     restart.SessionLaunched(SUBMITTED_PROMPT))
-                with (patch.object(restart, "_retire"),
-                      patch.object(restart, "_live_session_ids", return_value=frozenset()),
-                      patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
-                      patch.object(restore_permission, "launch_permission", return_value=restore_permission.AllowedByShutdownState()),
-                      patch.object(restart, "_launch_session", side_effect=[target_result, restart.SessionLaunched(SUBMITTED_PROMPT)]) as launch,
-                      patch.object(restart, "wait_for_confirmation", return_value=restart.RegistryConfirmation((live,))),
-                      patch.object(sessions, "live_sessions", return_value=[live]),
-                      patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude2")),
-                      patch.object(restart_support, "_unit_showrunner", return_value="fixture-showrunner"),
-                      patch.object(restart_support, "send_message", return_value=restart_support.MessageSent(kind="sent")) as notice,
-                      patch.object(restart_support, "alert_user", return_value=True) as phone,
-                      redirect_stdout(io.StringIO()) as output):
+                with (patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()), patch.object(restart, "_launch_session", side_effect=[target_result, restart.SessionLaunched(SUBMITTED_PROMPT)]) as launch, patch.object(restart, "wait_for_confirmation", return_value=restart.RegistryConfirmation((live,))), patch.object(sessions, "live_sessions", return_value=[live]), patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude2")), patch.object(restart_support, "_unit_showrunner", return_value="fixture-showrunner"), patch.object(restart_support, "send_message", return_value=restart_support.MessageSent(kind="sent")) as notice, patch.object(restart_support, "alert_user", return_value=True) as phone, redirect_stdout(io.StringIO()) as output):
                     current = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
                     if failure == "confirmation":
                         restart.confirm_entry(current, RESTARTED, False, observed_at=time.time())
@@ -652,12 +640,7 @@ class RestartTests(ShutdownTestCase):
                 saved = entry(unit("both-failed-" + alerts))
                 saved.update(target="claude3", source_label=LABEL, alerts=alerts)
                 self.create([saved])
-                with (patch.object(restart, "_retire"),
-                      patch.object(restart, "_live_session_ids", return_value=frozenset()),
-                      patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
-                      patch.object(restore_permission, "launch_permission", return_value=restore_permission.AllowedByShutdownState()),
-                      patch.object(restart, "_launch_session", side_effect=[OSError("target held"), OSError("source failed")]) as launch,
-                      patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone):
+                with (patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()), patch.object(restart, "_launch_session", side_effect=[OSError("target held"), OSError("source failed")]) as launch, patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone):
                     _ = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
                 self.assertEqual(launch.call_count, 2)
                 current = shutdown_record.find_session(LOGIN, saved["session"]["session_id"])
@@ -679,14 +662,7 @@ class RestartTests(ShutdownTestCase):
         saved = entry(owner)
         saved.update(target="claude3", source_label=LABEL, alerts="none")
         self.create([saved])
-        with (patch.object(restart, "_retire"),
-              patch.object(restart, "_live_session_ids", return_value=frozenset()),
-              patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
-              patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
-              patch.object(restore_permission, "launch_permission", return_value=restore_permission.AllowedByShutdownState()),
-              patch.object(restart, "_launch_session", side_effect=OSError("both refuse")) as launch,
-              patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone,
-              redirect_stdout(io.StringIO())):
+        with (patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()), patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()), patch.object(restart, "_launch_session", side_effect=OSError("both refuse")) as launch, patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone, redirect_stdout(io.StringIO())):
             for _ in range(3):
                 current = shutdown_record.find_session(LOGIN, owner["session_id"])
                 assert current is not None
@@ -717,14 +693,8 @@ class RestartTests(ShutdownTestCase):
         saved = entry(unit("failed-push-retry"))
         saved.update(target="claude3", source_label=LABEL, alerts="none")
         self.create([saved])
-        with (patch.object(restart, "_retire"),
-              patch.object(restart, "_live_session_ids", return_value=frozenset()),
-              patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
-              patch.object(restore_permission, "launch_permission", return_value=restore_permission.AllowedByShutdownState()),
-              patch.object(restart, "_launch_session", side_effect=OSError("both refuse")) as launch,
-              patch.object(quota_alert, "tell_user", side_effect=[
-                  quota_alert.PushFailed("fixture delivery failed"), quota_alert.PushSent()]) as phone,
-              redirect_stdout(io.StringIO())):
+        with (patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()), patch.object(restart, "_launch_session", side_effect=OSError("both refuse")) as launch, patch.object(quota_alert, "tell_user", side_effect=[
+                  quota_alert.PushFailed("fixture delivery failed"), quota_alert.PushSent()]) as phone, redirect_stdout(io.StringIO())):
             for attempt in range(3):
                 current = shutdown_record.find_session(LOGIN, saved["session"]["session_id"])
                 assert current is not None
@@ -750,9 +720,7 @@ class RestartTests(ShutdownTestCase):
         self.configure_groups(units="claude3")
         child = subprocess.CompletedProcess(["fake add_unit"], 0,
             "restart-prompt-outcome: " + herdr.encode_prompt_outcome(SUBMITTED_PROMPT) + "\n", "")
-        with (patch.object(restart, "_run", return_value=child) as launch,
-              patch.object(restart, "_herdr_launch", side_effect=AssertionError("unit bypassed add_unit")),
-              patch.object(restore_permission, "launch_permission", return_value=restore_permission.AllowedByShutdownState())):
+        with (patch.object(restart, "_run", return_value=child) as launch, patch.object(restart, "_herdr_launch", side_effect=AssertionError("unit bypassed add_unit"))):
             _ = restart._launch_session(saved, "fallback note", self.desktop_state, dry_run=False, source_fallback=True)  # pyright: ignore[reportPrivateUsage]
         argv = cast(list[str], launch.call_args.args[0])
         self.assertTrue(any(part.endswith("/add_unit.py") for part in argv))
@@ -1098,15 +1066,7 @@ class RestartTests(ShutdownTestCase):
             "restart-prompt-outcome: " + herdr.encode_prompt_outcome(outcome) + "\n", "")
         source_child = subprocess.CompletedProcess(["fake add_unit"], 0,
             "restart-prompt-outcome: " + herdr.encode_prompt_outcome(SUBMITTED_PROMPT) + "\n", "")
-        with (patch.object(restart, "_run", side_effect=[child, source_child]) as command,
-              patch.object(restart, "_retire"),
-              patch.object(restart, "_live_session_ids", return_value=frozenset()),
-              patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
-              patch.object(restore_permission, "launch_permission", return_value=restore_permission.AllowedByShutdownState()),
-              patch.object(restart, "wait_for_confirmation", return_value=restart.RegistryConfirmation((live,))),
-              patch.object(sessions, "live_sessions", return_value=[live]),
-              patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude2")),
-              patch.object(restart_support, "alert_user", return_value=True) as phone, redirect_stdout(io.StringIO()) as output):
+        with (patch.object(restart, "_run", side_effect=[child, source_child]) as command, patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()), patch.object(restart, "wait_for_confirmation", return_value=restart.RegistryConfirmation((live,))), patch.object(sessions, "live_sessions", return_value=[live]), patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude2")), patch.object(restart_support, "alert_user", return_value=True) as phone, redirect_stdout(io.StringIO()) as output):
             current = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
         launches = [call for call in command.call_args_list
                     if any(part.endswith("/add_unit.py") for part in cast(list[str], call.args[0]))]
@@ -2127,7 +2087,7 @@ class RestartTests(ShutdownTestCase):
                     else fixture_runtime_id("fresh-restart-backend"))
 
         _ = self.enterContext(patch.object(herdr.Herdr, "native_session", observed_native))
-        _ = self.enterContext(patch.object(restart, "_heal_folder_trust", HEAL_FOLDER_TRUST))
+        _ = self.enterContext(patch.object(restart, "_copy_claude_trust", HEAL_FOLDER_TRUST))
         cwd = self.root / "trusted folder"
         cwd.mkdir()
         config = self.root / ".claude3"
@@ -3119,45 +3079,8 @@ class RestartTests(ShutdownTestCase):
         self.assertFalse(log.exists())
         self.assertEqual(conversation_pause.read_scheduled_prompts("resume-id"), ())
 
-    def test_herdr_restart_refuses_an_untrusted_folder_before_server_start(self) -> None:
-        owner, _, log = self.herdr_restart_fixture()
-        config_dir = Path(owner.get("config_dir", ""))
-        _ = (config_dir / ".claude.json").write_text('{"projects": {}}')
-        self.assertIsInstance(herdr.claude_trust(Path(owner["cwd"]), config_dir / ".claude.json"), herdr.Untrusted)
-        with self.assertRaisesRegex(OSError, "has not trusted this folder") as refused:
-            _ = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
-        command = f"cd {shlex.quote(owner['cwd'])} && {named_prefix(str(config_dir))}claude"
-        self.assertIn(f"Run: {command}", str(refused.exception))
-        self.assertFalse(log.exists())
 
-    def test_herdr_restart_refuses_an_unreadable_trust_file_with_its_account_command(self) -> None:
-        owner, _, log = self.herdr_restart_fixture()
-        config_dir = Path(owner.get("config_dir", ""))
-        _ = (config_dir / ".claude.json").write_text('{"private": "do not disclose"')
-        self.assertIsInstance(herdr.claude_trust(Path(owner["cwd"]), config_dir / ".claude.json"), herdr.UnreadableTrustFile)
-        with self.assertRaisesRegex(OSError, "cannot read .* to check Claude trust") as refused:
-            _ = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
-        command = f"cd {shlex.quote(owner['cwd'])} && {named_prefix(str(config_dir))}claude"
-        self.assertIn(f"Run: {command}", str(refused.exception))
-        self.assertNotIn("do not disclose", str(refused.exception))
-        self.assertFalse(log.exists())
-
-    def test_herdr_legacy_home_restart_checks_its_resolved_numbered_trust_file(self) -> None:
-        owner, _, log = self.herdr_restart_fixture()
-        owner["config_dir"] = str(self.root / ".claude")
-        # No account trusts the folder, so there is no trust to copy.
-        _ = (self.root / ".claude3/.claude.json").write_text("{\"projects\": {}}")
-        for content, trust_type in (("{\"projects\": {}}", herdr.Untrusted), ("{", herdr.UnreadableTrustFile)):
-            with self.subTest(trust_type=trust_type):
-                _ = (self.root / ".claude2/.claude.json").write_text(content)
-                self.assertIsInstance(herdr.claude_trust(Path(owner["cwd"]), self.root / ".claude2/.claude.json"), trust_type)
-                with self.assertRaises(OSError) as refused:
-                    _ = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
-                command = f"cd {shlex.quote(owner['cwd'])} && {named_prefix(str(self.root / '.claude2'))}claude"
-                self.assertIn(f"Run: {command}", str(refused.exception))
-                self.assertFalse(log.exists())
-
-    def test_herdr_restart_copies_folder_trust_from_another_account_on_the_machine(self) -> None:
+    def test_herdr_restart_copies_trust_from_another_account_on_the_machine(self) -> None:
         owner, _, _ = self.herdr_restart_fixture()
         target = self.root / ".claude2"
         _ = (target / ".claude.json").write_text('{"projects": {}}')
@@ -3173,25 +3096,6 @@ class RestartTests(ShutdownTestCase):
                 trust = herdr.claude_trust(Path(owner["cwd"]), target / ".claude.json")
                 self.assertIsInstance(trust, herdr.Untrusted if dry_run else herdr.Trusted)
 
-    def test_a_folder_no_account_trusts_refuses_in_the_dry_run_and_saves_the_trust_command(self) -> None:
-        owner, _, log = self.herdr_restart_fixture()
-        config_dir = Path(owner.get("config_dir", ""))
-        _ = (config_dir / ".claude.json").write_text(json.dumps({
-            "projects": {}, "oauthAccount": {"emailAddress": "third@example.invalid"},
-        }))
-        command = f"cd {shlex.quote(owner['cwd'])} && {named_prefix(str(config_dir))}claude"
-        saved = entry(owner)
-        self.create([saved])
-        preview = io.StringIO()
-        with redirect_stdout(preview), patch.object(restart, "_retire"), \
-             patch.object(restart, "_live_session_ids", return_value=frozenset()):
-            _ = restart.relaunch_session(saved, dry_run=True, desktop_state=self.desktop_state)
-            current = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
-        self.assertIn(f"kept name restart failed: {owner['cwd']}: Claude has not trusted this folder. Run: {command}", preview.getvalue())
-        progress = current["progress"]
-        assert progress["kind"] == "restart failed"
-        self.assertEqual(progress.get("trust_command"), command)
-        self.assertFalse(log.exists())
 
     def test_a_checkout_move_that_fails_launches_in_whichever_folder_holds_the_checkout(self) -> None:
         old, new = self.root / "demo-old-trunk", self.root / "demo-new-trunk"
@@ -3247,17 +3151,6 @@ class RestartTests(ShutdownTestCase):
                     self.assertEqual(shutdown_record.session_records(LOGIN)[0]["progress"]["kind"], "restart failed")
                     self.assertIsNotNone(shutdown_record.account_hold(LOGIN))
 
-    def test_herdr_restart_does_not_accept_trust_from_an_ancestor_folder(self) -> None:
-        owner, _, log = self.herdr_restart_fixture()
-        config_dir = Path(owner.get("config_dir", ""))
-        _ = (config_dir / ".claude.json").write_text(json.dumps({
-            "projects": {str(self.root): {"hasTrustDialogAccepted": True}},
-        }))
-        with self.assertRaisesRegex(OSError, "has not trusted this folder") as refused:
-            _ = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
-        command = f"cd {shlex.quote(owner['cwd'])} && {named_prefix(str(config_dir))}claude"
-        self.assertIn(f"Run: {command}", str(refused.exception))
-        self.assertFalse(log.exists())
 
     def test_herdr_unit_restart_and_move_keep_account_names_and_checkpoint_through_add_unit(self) -> None:
         template, _, log = self.herdr_restart_fixture()
@@ -4594,16 +4487,7 @@ class RestartTests(ShutdownTestCase):
             self.assertEqual(source_fallback, bool(launched))
             launched.append(copy.deepcopy(current))
             return restart.SessionLaunched(SUBMITTED_PROMPT)
-        with (patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
-              patch.object(restart, "_process_liveness", return_value=restart.SessionNotLive()),
-              patch.object(stop_resume, "stop") as stop,
-              patch.object(restore_permission, "launch_permission", return_value=restore_permission.AllowedByShutdownState()),
-              patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone,
-              patch.object(restart, "_retire"),
-              patch.object(restart, "_live_session_ids", return_value=frozenset()),
-              patch.object(restart, "_launch_session", side_effect=launch),
-              patch.object(restart, "wait_for_confirmation", return_value=restart.RegistryConfirmation()),
-              redirect_stdout(io.StringIO())):
+        with (patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()), patch.object(restart, "_process_liveness", return_value=restart.SessionNotLive()), patch.object(stop_resume, "stop") as stop, patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone, patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "_launch_session", side_effect=launch), patch.object(restart, "wait_for_confirmation", return_value=restart.RegistryConfirmation()), redirect_stdout(io.StringIO())):
             _ = restart.up(LOGIN)
         stop.assert_not_called()
         self.assertEqual(len(launched), 2)

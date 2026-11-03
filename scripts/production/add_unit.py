@@ -554,7 +554,6 @@ def _is_excluded_standing_plan(production: Production, plan: Path) -> bool:
 
 
 def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> ReadyToLaunch:
-    from scripts.accounts.accounts import trust_command
     from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, repository_trust_key
 
     handoff: NoSessionHandoff | RunningSessionHandoff = NoSessionHandoff()
@@ -631,11 +630,9 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
     check_folder = (repository_trust_key(production.checkout)
                     if isinstance(request.session, NewSession) and not folder.exists() else folder)
     trust = claude_trust(check_folder, account_file)
-    if isinstance(trust, UnreadableTrustFile):
-        raise Refusal(f"{request.unit}: {trust}")
-    if isinstance(trust, Untrusted):
-        label = account.label
-        raise Refusal(f"{request.unit}: Claude is not trusted in {folder} on {label}. Run: {trust_command(check_folder, account)}")
+    if isinstance(trust, (Untrusted, UnreadableTrustFile)):
+        reason = str(trust) if isinstance(trust, UnreadableTrustFile) else f"Claude has not trusted {check_folder}"
+        print(f"{request.unit}: trust anomaly: {reason}", file=sys.stderr)
     if restoring or isinstance(launch.launch_kind, ResumeInStartFolderLaunch):
         # These conversations keep their existing plan; worktree admission is checked separately.
         if isinstance(existing, ExistingUnitRow) and existing.plan != launch.plan_cell:
@@ -1302,7 +1299,6 @@ def set_autocompact(request: RequestedUnitLaunch, session_id: str, value: str, c
     print(f"{request.unit}: {setting} {verb} to session {session_id} at its next restart")
 
 
-
 def configuration_for(request: UnitLaunch) -> unit_config.UnitConfig:
     """Read a resume's file unchanged, or check the requested publication by key."""
     existing = unit_config.read(request.worktree, cleanup=False)
@@ -1520,14 +1516,10 @@ def _main(argv: list[str]) -> int:
             )
         resume_model = model_for_resume(request, cast(str, args.model))
         resume_autocompact = autocompact_for_resume(request, cast(str, args.autocompact))
-        # Read the shutdown launch barrier only when a unit is launched.
-        import launch_permission
 
         handoff: NoSessionHandoff | StoppedSessionHandoff = NoSessionHandoff()
         if isinstance(request.session, ResumedSession) and isinstance(request.session.handoff, AttachRunningSession):
-            # Release the launch barrier before stopping the source process.
-            with launch_permission.launch_barrier():
-                attach_ready = preflight(request, unit_account)
+            attach_ready = preflight(request, unit_account)
             source = attach_ready.handoff
             if cast(bool, args.check):
                 return 0
@@ -1538,62 +1530,58 @@ def _main(argv: list[str]) -> int:
             request = replace(request, session=request.session._replace(handoff=ResumeStoppedSession()))
 
         outcome = herdr.PromptNotSubmitted("restore reused a session without submit proof")
-        from scripts.whoami.account import named_claude_account
-        with launch_permission.admitted_launch(named_claude_account(unit_account.label).login,
-                request.session.session_id if isinstance(request.session, ResumedSession) else "",
-                request.unit_id, lambda: None):
-            ready = preflight(request, unit_account)
-            request = ready.launch
-            if cast(bool, args.check):
-                return 0
-            pending = _pending_launch(request)
-            if isinstance(pending, DeadPendingOpening):
-                pending.record.unlink()
-            marked_unit = launched_unit(request)
-            stopped_tab: MarkedUnitFound | NoMarkedUnit = NoMarkedUnit()
-            if (
-                isinstance(request.session, ResumedSession)
-                and isinstance(marked_unit, MarkedUnitFound)
-            ):
-                unit = marked_unit.unit
-                if isinstance(unit.claude, unit_lookup.ClaudeUnknown):
-                    raise Refusal(
-                        f"cannot tell whether Claude runs in session {unit.place.session}: "
-                        + unit.claude.reason
-                    )
-                if isinstance(unit.claude, unit_lookup.ClaudeNotRunning):
-                    stopped_tab = marked_unit
-                    marked_unit = NoMarkedUnit()
-            if isinstance(handoff, StoppedSessionHandoff) and isinstance(marked_unit, MarkedUnitFound):
-                raise Refusal(f"cannot attach {handoff.session_id}: unit tab already runs")
-            if isinstance(marked_unit, MarkedUnitFound):
-                retry = shlex.join(["add_unit.py", *argv])
-                if isinstance(ready.row, NoUnitRow):
-                    raise Refusal(f"unit {request.identity.unit} already runs in session {marked_unit.unit.place.session} "
-                                  + f"but has no Units row; end that session, then run {retry}")
-                if isinstance(ready.plan_transition, BriefToPlanTransition):
-                    raise Refusal(f"unit {request.identity.unit} runs its brief in session {marked_unit.unit.place.session}; "
-                                  + f"end that session, then run {retry}")
-            _ = publish_unit(ready)
-            if isinstance(stopped_tab, MarkedUnitFound):
-                place = stopped_tab.unit.place
-                try:
-                    herdr.close_agent(place.session, place.pane)
-                except herdr.HerdrFailure as error:
-                    raise Refusal(f"cannot end session {place.session}: {error}") from error
-            if cast(str, args.autocompact) and isinstance(request.session, ResumedSession):
-                autocompact.record(request.session.session_id, cast(str, args.autocompact))
-            if isinstance(marked_unit, NoMarkedUnit):
-                prompt = prompt_for(request)
-                outcome = launch_session(request, ready.director, prompt, unit_account, target=unit_account.label
-                               if isinstance(request.session, ResumedSession) else "", model=resume_model,
-                               autocompact_window=resume_autocompact)
-            elif opening_record(request.production, request.unit_id).exists():
-                recovered = finish_opening(request, marked_unit)
-                if not isinstance(recovered, NoPendingOpening):
-                    outcome = recovered
-                if isinstance(recovered, herdr.PromptNotSubmitted):
-                    raise Refusal(f"{request.identity.unit}: opening prompt not submitted: {recovered.reason}")
+        ready = preflight(request, unit_account)
+        request = ready.launch
+        if cast(bool, args.check):
+            return 0
+        pending = _pending_launch(request)
+        if isinstance(pending, DeadPendingOpening):
+            pending.record.unlink()
+        marked_unit = launched_unit(request)
+        stopped_tab: MarkedUnitFound | NoMarkedUnit = NoMarkedUnit()
+        if (
+            isinstance(request.session, ResumedSession)
+            and isinstance(marked_unit, MarkedUnitFound)
+        ):
+            unit = marked_unit.unit
+            if isinstance(unit.claude, unit_lookup.ClaudeUnknown):
+                raise Refusal(
+                    f"cannot tell whether Claude runs in session {unit.place.session}: "
+                    + unit.claude.reason
+                )
+            if isinstance(unit.claude, unit_lookup.ClaudeNotRunning):
+                stopped_tab = marked_unit
+                marked_unit = NoMarkedUnit()
+        if isinstance(handoff, StoppedSessionHandoff) and isinstance(marked_unit, MarkedUnitFound):
+            raise Refusal(f"cannot attach {handoff.session_id}: unit tab already runs")
+        if isinstance(marked_unit, MarkedUnitFound):
+            retry = shlex.join(["add_unit.py", *argv])
+            if isinstance(ready.row, NoUnitRow):
+                raise Refusal(f"unit {request.identity.unit} already runs in session {marked_unit.unit.place.session} "
+                              + f"but has no Units row; end that session, then run {retry}")
+            if isinstance(ready.plan_transition, BriefToPlanTransition):
+                raise Refusal(f"unit {request.identity.unit} runs its brief in session {marked_unit.unit.place.session}; "
+                              + f"end that session, then run {retry}")
+        _ = publish_unit(ready)
+        if isinstance(stopped_tab, MarkedUnitFound):
+            place = stopped_tab.unit.place
+            try:
+                herdr.close_agent(place.session, place.pane)
+            except herdr.HerdrFailure as error:
+                raise Refusal(f"cannot end session {place.session}: {error}") from error
+        if cast(str, args.autocompact) and isinstance(request.session, ResumedSession):
+            autocompact.record(request.session.session_id, cast(str, args.autocompact))
+        if isinstance(marked_unit, NoMarkedUnit):
+            prompt = prompt_for(request)
+            outcome = launch_session(request, ready.director, prompt, unit_account, target=unit_account.label
+                           if isinstance(request.session, ResumedSession) else "", model=resume_model,
+                           autocompact_window=resume_autocompact)
+        elif opening_record(request.production, request.unit_id).exists():
+            recovered = finish_opening(request, marked_unit)
+            if not isinstance(recovered, NoPendingOpening):
+                outcome = recovered
+            if isinstance(recovered, herdr.PromptNotSubmitted):
+                raise Refusal(f"{request.identity.unit}: opening prompt not submitted: {recovered.reason}")
         if isinstance(request.launch_kind, UnitRestoreLaunch):
             print("restart-prompt-outcome: " + herdr.encode_prompt_outcome(outcome))
             if isinstance(outcome, herdr.PromptNotSubmitted):

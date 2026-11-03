@@ -8,6 +8,8 @@ Step tables, Rebuilds, Memory pressure and Summary count natedev's steps; the Ma
 Mac copies counts Mac copies of still-compiling natedev tests and estimates the time the winners saved.
 The Power profile section compares passing natedev steps before and after each profile change in the last 7 days.
 The CPU and disk pressure section shows sampled CPU and IO stall shares, CPU idle and iowait per host.
+`~/.claude/scripts/buildlog/buildlog usage-hours [YYYY-MM-DD]` shows hourly averages for build memory, process memory and file cache. It includes build and CI CPU, disk traffic, lowest free disk and free pool tokens.
+For questions about memory, CPU or disk by hour, run this command. Answer from its table in a few lines.
 
 Empty, or only a date → run `~/.claude/scripts/buildlog/buildlog report [YYYY-MM-DD]` (default today; its times are in the user's zone) and show its markdown unchanged. Add at most one line after it, only for something the tables do not show.
 Then run `python3 ~/.claude/scripts/production/review_regime.py watch` and show its line under the report, unless it starts `acknowledged`. On exit 3, load `/message_style` if this session has not yet, then also run `python3 ~/.claude/scripts/message/send.py --to user --need decision --action "Acknowledge the review watch in this session." --summary "Review watch waits on your acknowledgment" --text "<the line>"`; on the Mac, add `--machine natedev`. User, 2026-10-04: every build report shows the 12-phase review watch until the user acknowledges it; drop this paragraph once it reads `acknowledged`.

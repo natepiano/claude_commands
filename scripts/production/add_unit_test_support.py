@@ -748,23 +748,6 @@ class AddUnitTestCase(ShutdownTestCase):
                 return git_run(command, cwd=cwd, capture_output=True, text=True, check=False)
             if "show-options" in command:
                 return subprocess.CompletedProcess(command, 0, "", "")
-            if "launch-blocked" in command:
-                live = (
-                    Path(self.env["SHUTDOWN_STATE_DIR"])
-                    / "owner@example.com"
-                    / "record.json"
-                ).exists()
-                return subprocess.CompletedProcess(
-                    command,
-                    0 if live else 1,
-                    (
-                        "claude2 is held by a shutdown "
-                        + "(since 2026-10-09 14:49 PDT)\n"
-                        if live
-                        else ""
-                    ),
-                    "",
-                )
             commands.append(command)
             return subprocess.CompletedProcess(command, 0, "", "")
 

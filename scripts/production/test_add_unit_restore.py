@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import fcntl
 import io
 import json
 import os
-import subprocess
 import sys
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import cast, final
 from unittest.mock import patch
@@ -23,7 +21,6 @@ from scripts.production import unit_config
 import production_units
 import autocompact
 import conversation_pause
-import launch_permission
 import unit_lookup
 import sessions
 from herdr import HerdrPlace
@@ -33,8 +30,7 @@ from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.herdr.fake_herdr import CommandResponse
 
 
-from add_unit_test_support import AddUnitTestCase, ObservedUnitLaunch, configure_test_zone, SHARED, SUBMITTED_PROMPT
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from add_unit_test_support import AddUnitTestCase, configure_test_zone, SHARED, SUBMITTED_PROMPT
 from scripts.lib.script_envelope import SCRIPT_ENVELOPE_START, SCRIPT_ENVELOPE_END, script_prompt
 
 
@@ -486,119 +482,6 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertEqual(commands, [])
         self.assertEqual((launches, writes), (1, 1))
         self.assertEqual(self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766"), ())
-
-    def test_launch_claim_releases_global_barrier_before_spawn(self) -> None:
-        note = self.root / "restart-note"
-        _ = note.write_text("Resume this unit.", encoding="utf-8")
-        request = add_unit.UnitLaunch(
-            production=production_units.read_production(self.doc),
-            identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
-            branch="build-followups-alpha",
-            worktree=self.root / "project-alpha",
-            plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
-            port=add_unit.OmittedCell(),
-            owns=add_unit.OmittedCell(),
-            session=add_unit.ResumedSession(
-                "62ccbd64-f22e-5647-b20e-7899aa39d766", self.root / "prior-session"
-            ),
-            launch_kind=add_unit.UnitRestoreLaunch(
-                "62ccbd64-f22e-5647-b20e-7899aa39d766", note, "recorded-name", "recorded-herdr"
-            ),
-            timeout=1.0,
-        )
-        _ = self.prepare_restored_worktree("alpha", request.worktree)
-        ready = add_unit.ReadyToLaunch(
-            request,
-            add_unit.NoUnitRow(),
-            add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
-        )
-        old = self.shutdown_record("down")
-        owner = cast(list[dict[str, object]], old["entries"])[0]
-        session_shutdown: dict[str, object] = {
-            "login": old["login"],
-            "label": old["label"],
-            "machine": old["machine"],
-            "requested_at": old["requested_at"],
-            "requested_by": old["requested_by"],
-            "request_id": "launch-barrier-request",
-            "hold": "account",
-            "then": "stop",
-            "force": old["force"],
-            "alerts": "user",
-            "workers": [],
-            **owner,
-        }
-        creator: subprocess.Popen[str] | None = None
-
-        def start_shutdown(_request: add_unit.UnitLaunch) -> None:
-            nonlocal creator
-            creator = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-c",
-                    "import os, shutdown_record; assert shutdown_record.create_session(shutdown_record.parse_session_records(os.environ['TEST_RECORD'])[0])",
-                ],
-                cwd=Path(__file__).parents[1] / "shutdown",
-                env={
-                    **self.env,
-                    "TEST_RECORD": json.dumps([session_shutdown]),
-                },
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-
-        def launch(_request: add_unit.UnitLaunch, _prompt: str) -> herdr.PromptSubmitted:
-            self.assertIsNotNone(creator)
-            if creator is None:
-                self.fail("shutdown creator did not start")
-            creator_stdout, creator_stderr = creator.communicate(timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(creator.returncode, 0, (creator_stdout, creator_stderr))
-            self.assertEqual(len(launch_permission.pending_launches()), 1)
-            lock_path = Path(self.env["SHUTDOWN_STATE_DIR"]) / "launch.lock"
-            with lock_path.open("a+", encoding="utf-8") as contender:
-                fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                fcntl.flock(contender.fileno(), fcntl.LOCK_UN)
-
-            return SUBMITTED_PROMPT
-
-        def finish_shutdown() -> None:
-            self.assertIsNotNone(creator)
-            if creator is None:
-                self.fail("shutdown creator did not start")
-            stdout, stderr = creator.communicate(timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(creator.returncode, 0, (stdout, stderr))
-
-        error = io.StringIO()
-        with (
-            patch.object(add_unit, "launch_request", return_value=request),
-            patch.object(add_unit, "preflight", return_value=ready),
-            patch.object(
-                add_unit,
-                "launched_unit",
-                return_value=add_unit.NoMarkedUnit(),
-            ),
-            patch.object(herdr, "live_sessions", return_value=[]),
-            patch.object(add_unit, "write_stub", side_effect=start_shutdown),
-            patch.object(add_unit, "append_row"),
-            patch.object(add_unit, "commit_unit"),
-            patch.object(add_unit, "ensure_worktree"),
-            patch.object(add_unit, "launch_session", side_effect=ObservedUnitLaunch(self, launch)),
-            patch.object(add_unit, "wait_for_remote_control") as wait,
-            patch.object(add_unit, "record"),
-            patch.dict(os.environ, self.env),
-            redirect_stderr(error),
-        ):
-            result = add_unit.main(
-                ["--production", "unused", "alpha", "--plan", "unused",
-                 "--config-dir", str(Path(self.env["HOME"]) / ".claude2")]
-            )
-            finish_shutdown()
-
-        self.assertEqual(result, 0, error.getvalue())
-        wait.assert_not_called()
-        account = Path(self.env["SHUTDOWN_STATE_DIR"]) / "owner@example.com"
-        self.assertTrue((account / "sessions" / "62ccbd64-f22e-5647-b20e-7899aa39d766.json").is_file())
 
     def test_restore_prose_does_not_write_a_scheduled_prompt_record(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(

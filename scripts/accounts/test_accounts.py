@@ -87,7 +87,6 @@ def setUpModule() -> None:
     _ = unittest.enterModuleContext(patch.object(role_map, "is_role_map_host", return_value=True))
 
 
-
 def accounts_reader_calls(source: str) -> dict[str, set[str]]:
     """Collect each method called on the accounts configuration."""
     readers: dict[str, set[str]] = {}
@@ -947,22 +946,14 @@ class AccountsTests(unittest.TestCase):
         _ = path.write_text(json.dumps({"units": label}))
 
     def test_exec_claude_uses_default_home_and_removes_inherited_account_settings(self) -> None:
-        from scripts.shutdown import launch_permission
 
         arguments = ["--resume", "conversation id", "--", "quoted argument"]
         for tty, probe in ((False, False), (True, False), (False, True)):
-            with (self.subTest(tty=tty, probe=probe),
-                  patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "inherited"),
+            with (self.subTest(tty=tty, probe=probe), patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "inherited"),
                       "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(self.root / "inherited-memory"),
                       "CLAUDE_CODE_OAUTH_TOKEN": "fixture-token", "KEEP": "yes",
                       "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
-                      "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")}),
-                  patch.object(accounts, "prepared_account") as prepare,
-                  patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()),
-                  patch.object(subprocess, "run", side_effect=AssertionError("unexpected subprocess")),
-                  patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected subprocess")),
-                  patch.object(sys.stdin, "isatty", return_value=tty),
-                  patch.object(os, "execvpe") as launch):
+                      "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")}), patch.object(accounts, "prepared_account") as prepare, patch.object(subprocess, "run", side_effect=AssertionError("unexpected subprocess")), patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected subprocess")), patch.object(sys.stdin, "isatty", return_value=tty), patch.object(os, "execvpe") as launch):
                 self.assertEqual(self.run_cli("exec", *(["--probe"] if probe else []),
                                               "claude", *arguments), (0, "", ""))
                 prepare.assert_not_called()
@@ -1840,7 +1831,6 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(accounts.account_identity(accounts.account_dir("claude3")), agent_accounts.NumberedAccount("claude2", self.home / ".claude3", "main@example.invalid"))
 
 
-
     def prepare_swap(self, *, shared_default_login: bool = False) -> accounts.SwapInventory:
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory(
@@ -1882,28 +1872,6 @@ class AccountsTests(unittest.TestCase):
         with patch.object(subprocess, "run", side_effect=shutdown):
             result = self.run_cli("swap", "unit", label, *(["--dry-run"] if dry_run else []))
         return result, commands
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
     def test_burn_keeps_historical_account_identity_after_logout_or_another_login(self) -> None:
@@ -6504,8 +6472,6 @@ finally:
         self.assertFalse(hasattr(accounts, "HOME"))
 
 
-
-
     def test_unknown_role_is_refused_by_every_role_command(self) -> None:
         for arguments in (
             ("role", "unknown"),
@@ -6521,12 +6487,6 @@ finally:
                     stderr,
                     "accounts: unknown is not a role; only unit, showrunner and workers are supported\n",
                 )
-
-
-
-
-
-
 
 
     def workers_fixture(self) -> tuple[Path, Path]:

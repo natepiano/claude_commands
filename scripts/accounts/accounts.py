@@ -3397,7 +3397,7 @@ class SessionMoveRefused:
     reason: str
 
 
-SessionMoveOutcome = stop_results.ClaudeUp | stop_results.MoveHandedOff | stop_results.ResumePending | stop_results.RunningOnAnotherAccount | SessionMoveRefused
+SessionMoveOutcome = stop_results.ClaudeUp | stop_results.MoveHandedOff | stop_results.ResumePending | SessionMoveRefused
 
 
 class SessionBatchMove(Protocol):
@@ -3432,8 +3432,7 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, account_config
     batch = cast(SessionBatchMove, import_module("scripts.shutdown.stop_resume").move_sessions)
     results = batch(eligible, checked.destination.label, why=why)
     for identity, result in zip(eligible, results):
-        if isinstance(result, (stop_results.ClaudeUp, stop_results.MoveHandedOff, stop_results.ResumePending,
-                               stop_results.RunningOnAnotherAccount)):
+        if isinstance(result, (stop_results.ClaudeUp, stop_results.MoveHandedOff, stop_results.ResumePending)):
             outcomes[identity] = result
         else:
             reason = ("session has no tab on this machine" if isinstance(result, stop_results.SessionNotFound)
@@ -3445,9 +3444,6 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, account_config
 def move_result_line(result: SessionMoveOutcome) -> str:
     if isinstance(result, SessionMoveRefused):
         return f"{result.session_id}: not moved: {result.reason}"
-    if isinstance(result, stop_results.RunningOnAnotherAccount):
-        return f"{result.session_id}: not moved: {stop_results.resume_failure_reason(result)}"
-
     if isinstance(result, stop_results.ResumePending):
         return f"{result.session_id}: stopped, resume pending: {next(iter(result.reason.splitlines()), 'unknown error')}"
     if isinstance(result, stop_results.MoveHandedOff):
@@ -3562,12 +3558,11 @@ def _move_output(results: tuple[SessionMoveOutcome, ...],
     stderr = ""
     for result in results:
         line = move_result_line(result) + ("; " + "; ".join(notices) if notices else "") + "\n"
-        if isinstance(result, (SessionMoveRefused, stop_results.ResumePending, stop_results.RunningOnAnotherAccount)):
+        if isinstance(result, (SessionMoveRefused, stop_results.ResumePending)):
             stderr += line
         else:
             stdout += line
-    return stdout, stderr, int(any(isinstance(item, (SessionMoveRefused, stop_results.ResumePending,
-                                                   stop_results.RunningOnAnotherAccount)) for item in results))
+    return stdout, stderr, int(any(isinstance(item, (SessionMoveRefused, stop_results.ResumePending)) for item in results))
 
 
 @role_map.role_map_command
