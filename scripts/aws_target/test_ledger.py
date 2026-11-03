@@ -1,13 +1,16 @@
 """Cost evidence must survive retries and refuse unsafe spending."""
 from __future__ import annotations
 
+from collections.abc import Sequence
 from contextlib import redirect_stderr
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 import fcntl
 import io
 import json
 from pathlib import Path
 import subprocess
+from threading import Event
 from typing import cast, override
 from unittest import mock
 import unittest
@@ -69,16 +72,15 @@ class LedgerTests(CostFixture):
         self.assertEqual(after, before)
         self.assertEqual(sum(r.end - r.start for r in after.intervals if r.kind == "instance"), 3600)
 
-    def test_unknown_transition_refuses_every_spending_entry(self) -> None:
+    def test_unknown_observation_rejection_keeps_evidence_and_allows_later_charging(self) -> None:
         self.running(self.start)
-        self.observe(self.start + 1800, "unknown")
+        before = self.book.path.read_bytes()
+        with self.assertRaises(ledger.ObservationRejected):
+            self.observe(self.start + 1800, "unknown")
+        self.assertEqual(self.book.path.read_bytes(), before)
         self.observe(self.start + 3600, "stopped")
-        for purpose in ("deployment", "start", "admission"):
-            with self.subTest(purpose=purpose):
-                result = self.guard(self.start + 3600, purpose)
-                self.assertIsInstance(result, ledger.SpendingUnavailable)
-                if isinstance(result, ledger.SpendingUnavailable):
-                    self.assertIn("transition", result.reason)
+        self.assertEqual(self.estimate(self.start + 3600).monthly.usd, Decimal("1"))
+        self.assertIsInstance(self.guard(self.start + 3600), ledger.SpendingAllowed)
         self.assertEqual(self.notices, [])
 
     def test_first_resource_requires_a_priced_inventory(self) -> None:
@@ -345,6 +347,7 @@ class LedgerTests(CostFixture):
         self.assertIsInstance(self.book.guard(self.settings, "admission", now, refused), ledger.SpendingRefused)
         self.assertEqual(self.saved_events()[0]["delivery"], "pending")
         self.book = ledger.CostLedger(self.state)
+        now += config.read_settings(self.settings).notification_retry_s
         self.assertIsInstance(self.guard(now), ledger.SpendingRefused)
         self.assertEqual([event.event_id for event in attempts], [event.event_id for event in self.notices])
         self.assertEqual(self.saved_events()[0]["delivery"], "delivered")
@@ -356,6 +359,7 @@ class LedgerTests(CostFixture):
         with mock.patch.object(self, "notice", side_effect=RuntimeError("fixture delivery failure")):
             self.assertIsInstance(self.guard(now), ledger.SpendingRefused)
         self.assertEqual(self.saved_events()[0]["delivery"], "pending")
+        now += config.read_settings(self.settings).notification_retry_s
         self.assertIsInstance(self.guard(now), ledger.SpendingRefused)
         self.assertEqual(len(self.notices), 1)
 
@@ -365,6 +369,7 @@ class LedgerTests(CostFixture):
             with self.assertRaises(KeyboardInterrupt):
                 _ = self.guard(now)
         self.book = ledger.CostLedger(self.state)
+        now += config.read_settings(self.settings).notification_retry_s
         self.assertIsInstance(self.guard(now), ledger.SpendingRefused)
         self.assertEqual(len(self.notices), 1)
 
@@ -379,6 +384,7 @@ class LedgerTests(CostFixture):
         self.assertEqual(self.notices, [])
         self.assertEqual(self.saved_events()[0]["delivery"], "pending")
         self.book = ledger.CostLedger(self.state)
+        now += config.read_settings(self.settings).notification_retry_s
         self.assertIsInstance(self.guard(now), ledger.SpendingRefused)
         self.assertEqual(len(self.notices), 1)
 
@@ -395,6 +401,189 @@ class LedgerTests(CostFixture):
         self.assertIsInstance(self.book.guard(self.settings, "admission", now, unlocked_notice), ledger.SpendingRefused)
         self.assertEqual(len(self.notices), 1)
         self.assertEqual(self.saved_events()[0]["delivery"], "delivered")
+
+    def test_concurrent_guards_deliver_a_pending_notice_once(self) -> None:
+        now = self.reach_limit()
+        entered, release = Event(), Event()
+        competing_notices: list[ledger.LimitEvent] = []
+
+        def blocked_notice(event: ledger.LimitEvent) -> bool:
+            self.notices.append(event)
+            entered.set()
+            if not release.wait(timeout=5):
+                raise AssertionError("The test did not release the notifier")
+            return True
+
+        def competing_notice(event: ledger.LimitEvent) -> bool:
+            competing_notices.append(event)
+            return True
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            first = executor.submit(self.book.guard, self.settings, "admission", now, blocked_notice)
+            try:
+                self.assertTrue(entered.wait(timeout=5), "The first guard did not enter the notifier")
+                other = ledger.CostLedger(self.state)
+                after_deadline = now + config.read_settings(self.settings).notification_retry_s + 1
+                self.assertIsInstance(other.guard(self.settings, "start", after_deadline, competing_notice), ledger.SpendingRefused)
+                self.assertEqual(competing_notices, [])
+                self.assertEqual(self.saved_events()[0]["delivery"], "pending")
+            finally:
+                release.set()
+            self.assertIsInstance(first.result(timeout=5), ledger.SpendingRefused)
+        self.assertEqual(len(self.notices), 1)
+        self.assertEqual(self.saved_events()[0]["delivery"], "delivered")
+
+    def test_failed_notice_waits_for_its_saved_retry_deadline_across_restart(self) -> None:
+        now = self.reach_limit()
+        attempts: list[ledger.LimitEvent] = []
+
+        def failed_notice(event: ledger.LimitEvent) -> bool:
+            attempts.append(event)
+            return False
+
+        self.assertIsInstance(self.book.guard(self.settings, "admission", now, failed_notice), ledger.SpendingRefused)
+        event_id = self.saved_events()[0]["event_id"]
+        self.book = ledger.CostLedger(self.state)
+        self.replace("notification_retry_s", "120")
+        for at in (now, now + 59):
+            self.assertIsInstance(self.book.guard(self.settings, "start", at, failed_notice), ledger.SpendingRefused)
+        self.assertEqual(len(attempts), 1)
+        self.assertIsInstance(self.book.guard(self.settings, "admission", now + 60, failed_notice), ledger.SpendingRefused)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual([event.event_id for event in attempts], [event_id, event_id])
+        self.book = ledger.CostLedger(self.state)
+        self.assertIsInstance(self.guard(now + 179), ledger.SpendingRefused)
+        self.assertEqual(self.notices, [])
+        self.assertIsInstance(self.guard(now + 180), ledger.SpendingRefused)
+        self.assertEqual([event.event_id for event in self.notices], [event_id])
+        self.assertEqual(self.saved_events()[0]["delivery"], "delivered")
+
+    def test_failed_delivery_state_write_does_not_allow_an_immediate_second_notice(self) -> None:
+        now = self.reach_limit()
+
+        def fail_delivery_commit(path: Path, text: str) -> None:
+            document = cast(dict[str, object], json.loads(text))
+            events = cast(list[dict[str, object]], document["events"])
+            if any(event["delivery"] == "delivered" for event in events):
+                raise OSError("The ledger disk is full")
+            write_text_atomic(path, text)
+
+        with mock.patch.object(ledger, "write_text_atomic", side_effect=fail_delivery_commit):
+            self.assertIsInstance(self.guard(now), ledger.SpendingRefused)
+        saved = self.saved_events()[0]
+        self.book = ledger.CostLedger(self.state)
+        with mock.patch.object(ledger, "write_text_atomic", side_effect=OSError("The ledger disk is full")):
+            self.assertIsInstance(self.guard(now + 1), ledger.SpendingUnavailable)
+        self.assertEqual(self.saved_events()[0], saved)
+        self.assertIsInstance(self.guard(now + 59), ledger.SpendingRefused)
+        self.assertEqual(len(self.notices), 1)
+
+    def test_message_key_prevents_duplicate_delivery_after_a_failed_confirmation_and_restart(self) -> None:
+        now = self.reach_limit()
+        retry_s = config.read_settings(self.settings).notification_retry_s
+        clock = [now]
+        received: list[str] = []
+        attempts: list[str] = []
+        replies: list[str] = []
+        sent: dict[tuple[str, str, str], int] = {}
+
+        def message(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if arguments[0] == "git":
+                return git_only(arguments, **options)
+            self.assertEqual(Path(arguments[1]).name, "send.py")
+            self.assertIn("--key", arguments)
+            key = arguments[arguments.index("--key") + 1]
+            self.assertTrue(key)
+            recipient = arguments[arguments.index("--to") + 1]
+            sender = arguments[arguments.index("--from") + 1]
+            identity = recipient, sender, key
+            repeat_minutes = (Decimal(arguments[arguments.index("--repeat-minutes") + 1])
+                              if "--repeat-minutes" in arguments else Decimal(0))
+            attempts.append(key)
+            if identity in sent and Decimal(clock[0] - sent[identity]) < repeat_minutes * 60:
+                reply = "SKIPPED: inside the repeat window\n"
+            else:
+                received.append(key)
+                sent[identity] = clock[0]
+                reply = "SENT: fixture recipient\n"
+            replies.append(reply)
+            return subprocess.CompletedProcess(list(arguments), 0, reply, "")
+
+        def fail_confirmation(path: Path, text: str) -> None:
+            document = cast(dict[str, object], json.loads(text))
+            events = cast(list[dict[str, object]], document["events"])
+            if any(event["delivery"] == "delivered" for event in events):
+                raise OSError("The confirmation write failed")
+            write_text_atomic(path, text)
+
+        with mock.patch.object(subprocess, "run", side_effect=message):
+            with mock.patch.object(ledger, "write_text_atomic", side_effect=fail_confirmation):
+                self.assertIsInstance(self.book.guard(self.settings, "admission", now,
+                                                     clock=lambda: float(clock[0])), ledger.SpendingRefused)
+            event_id = self.saved_events()[0]["event_id"]
+            self.assertEqual(self.saved_events()[0]["delivery"], "pending")
+            self.book = ledger.CostLedger(self.state)
+            clock[0] += retry_s + 1
+            self.assertIsInstance(self.book.guard(self.settings, "start", clock[0],
+                                                 clock=lambda: float(clock[0])), ledger.SpendingRefused)
+            self.assertEqual(self.saved_events()[0]["event_id"], event_id)
+            self.assertEqual(self.saved_events()[0]["delivery"], "delivered")
+            self.assertIsInstance(self.book.guard(self.settings, "admission", clock[0] + retry_s,
+                                                 clock=lambda: float(clock[0] + retry_s)),
+                                  ledger.SpendingRefused)
+        self.assertEqual(len(received), 1)
+        self.assertEqual(attempts, [f"aws-limit:{event_id}", f"aws-limit:{event_id}"])
+        self.assertEqual(replies, ["SENT: fixture recipient\n", "SKIPPED: inside the repeat window\n"])
+
+    def test_each_pending_notice_sets_its_retry_deadline_from_its_own_attempt(self) -> None:
+        self.replace("monthly_limit_usd", "20")
+        now = self.reach_limit()
+        retry_s = config.read_settings(self.settings).notification_retry_s
+        clock = [now]
+        attempts: list[tuple[str, int, int]] = []
+
+        def slow_first_notice(event: ledger.LimitEvent) -> bool:
+            attempts.append((event.event_id, clock[0], event.retry_after))
+            if len(attempts) == 1:
+                clock[0] += retry_s + 1
+                return True
+            return False
+
+        def current_time() -> float:
+            return float(clock[0])
+
+        self.assertIsInstance(ledger.spending_guard(
+            self.settings, self.state, clock=current_time, notify=slow_first_notice), ledger.SpendingRefused)
+        self.assertEqual(len(attempts), 2)
+        first, second = attempts
+        self.assertNotEqual(first[0], second[0])
+        self.assertIsInstance(ledger.spending_guard(
+            self.settings, self.state, clock=current_time, notify=slow_first_notice), ledger.SpendingRefused)
+        self.assertEqual([attempt[0] for attempt in attempts].count(second[0]), 1)
+        self.assertEqual(first[2], first[1] + retry_s)
+        self.assertEqual(second[2], second[1] + retry_s)
+        saved = next(event for event in self.saved_events() if event["event_id"] == second[0])
+        self.assertEqual(saved["delivery"], "pending")
+        self.assertEqual(saved["retry_after"], second[1] + retry_s)
+
+    def test_legacy_unknown_observations_do_not_block_later_confirmed_charging(self) -> None:
+        self.running(self.start)
+        document = cast(dict[str, object], json.loads(self.book.path.read_text()))
+        observations = cast(list[dict[str, object]], document["observations"])
+        observations.append({"at": self.start + 1800, "state": "unknown", "source": "legacy evidence"})
+        _ = self.book.path.write_text(json.dumps(document))
+        self.book = ledger.CostLedger(self.state)
+        self.observe(self.start + 3600, "stopped")
+        self.observe(self.start + 7200, "running")
+        self.observe(self.start + 10800, "stopped")
+        result = self.guard(self.start + 10800)
+        self.assertIsInstance(result, ledger.SpendingAllowed)
+        self.assertIsInstance(result.evidence.costs, ledger.CostEstimate)
+        if isinstance(result.evidence.costs, ledger.CostEstimate):
+            self.assertGreaterEqual(result.evidence.costs.monthly.usd, Decimal("1"))
+            charged = [row for row in result.evidence.costs.intervals
+                       if row.kind == "instance" and row.start >= self.start + 7200]
+            self.assertEqual(sum(row.usd for row in charged), Decimal("1"))
 
     def test_guard_reconciles_only_the_overlapping_charge_seconds(self) -> None:
         self.replace("daily_limit_usd", "3.50")
