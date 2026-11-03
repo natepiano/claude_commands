@@ -190,9 +190,8 @@ class UnitWatchdogTests(unittest.TestCase):
         self.notices.append(text)
         return "told fixture"
 
-    def resume(self, identity: str, *, why: str, to: str, restore_missing: bool) -> stop_resume.ClaudeUp | stop_resume.ResumeFailed:
+    def resume(self, identity: str, *, why: str, to: str) -> stop_resume.ClaudeUp | stop_resume.ResumeFailed:
         self.assertEqual(why, "unit watchdog recovery")
-        self.assertTrue(restore_missing)
         self.commands.append(["resume", identity, "--to", to, "--only", identity])
         if to in self.refused:
             return stop_resume.ResumeFailed(identity, "fixture refused")
@@ -635,7 +634,7 @@ class UnitWatchdogTests(unittest.TestCase):
             failure, launches = self.recover_queued(source)
         self.assertEqual(failure, "")
         self.assertEqual(len(launches), 1)
-        resume.assert_called_once_with("alpha", why="unit watchdog recovery", to="claude4", restore_missing=True)
+        resume.assert_called_once_with("alpha", why="unit watchdog recovery", to="claude4")
 
 
     def test_several_units_read_run_records_once_per_pass(self) -> None:
