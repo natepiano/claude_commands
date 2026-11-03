@@ -18,6 +18,8 @@ import unittest
 from unittest import mock
 from pathlib import Path
 from typing import final
+from scripts.production.cli_fixture import production_paths
+from scripts.shutdown import pane_record
 from zoneinfo import ZoneInfo
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -630,7 +632,8 @@ with lock.open("a") as held:
         base = self.git("rev-parse", "HEAD^1")
         _ = self.git("push", "--force", "origin", f"{base}:refs/heads/main")
         _ = self.git("push", "--force", "origin", f"{base}:refs/heads/production")
-        with mock.patch.dict(os.environ, {"PATH": self.env["PATH"]}):  # Merge tests names a stub on the test PATH
+        with (mock.patch.dict(os.environ, self.env), production_paths(self.env),
+              mock.patch.object(pane_record, "RECORD_DIR", self.root / "panes")):
             request = request_from(argparse.Namespace(
                 production=str(self.doc), unit="alpha-unit", phase="2", hash=sha,
                 also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS, parallel=PARALLEL,

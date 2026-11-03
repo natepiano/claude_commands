@@ -23,6 +23,7 @@ import rules
 import style_ledger
 
 from style_plan_test_support import StylePlanFixture
+from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner
 
 
 @final
@@ -86,6 +87,7 @@ class StylePlanTests(StylePlanFixture):
         _ = plan.write_text(self.plan_header().replace("names-unit", family + "-unit"))
         _ = self.doc.write_text(self.doc.read_text() +
                                 f"| {family}-unit | docs/style-production/units/{family}-unit.md | {worktree} | demo-style-{family} |\n")
+        _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc), family + "-unit", worktree)
         return self.rule(family + "-borrow", f"tier: C\nfamily: {family}\ninput_scope: file\n")
 
     def assert_projected_follow_count_matches_borrow(self) -> None:

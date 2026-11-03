@@ -66,6 +66,7 @@ from rename_state import RenameRefused, read_json, write_json, write_text  # noq
 from unit_move import PathMove, git  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 from scripts.production import staff, staff_sources
+from scripts.shutdown import remote
 from scripts.lib import git_exclude, conf
 from scripts.astra import design_roles
 
@@ -230,7 +231,11 @@ def _build(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
     if production_units.plan_cell_is_retired(row.get("Plan", "")):
         raise RenameRefused(f"{old} is retired; its row is history")
     old_branch = production_units.cell_value(row.get("Branch", ""))
-    worktree = Path(production_units.cell_value(row.get("Worktree", ""))).expanduser()
+    selected = staff_sources.member(staff_sources.UnitMember(production.slug, old), staff.snapshot())
+    if isinstance(selected, staff_sources.NoSuchMember):
+        raise staff.StaffUnreadable(f"{production.slug}/{old}: no matching staff member")
+    location = unit_lookup.local_worktree(selected)
+    worktree = location.path
     old_stem, new_stem = unit_names.stem(old), unit_names.stem(new)
     if new_stem == old_branch:
         new_branch = old_branch
@@ -252,7 +257,7 @@ def _build(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
     return UnitRename(slug, old, new, str(production.doc), str(production.checkout), production.merge_branch,
                       old_branch, new_branch, str(worktree), str(new_worktree),
                       git(worktree, "rev-parse", "HEAD"), str(scratch), old_session=old_session,
-                      id_matches=id_matches)
+                      id_matches=id_matches, staff_id=selected.row.id)
 
 
 def _staff_id(slug: str, unit: str) -> staff.StaffId:
@@ -475,7 +480,7 @@ def _doc_text(rename: UnitRename, text: str) -> str:
         row = dict(zip(headings, cells, strict=False))
         if section == "## Units" and production_units.cell_value(row.get("Unit", "")) == rename.old:
             values = {"Unit": rename.new, "Worktree": rename.new_worktree, "Branch": rename.new_branch}
-            values = {column: f"`{value}`" if "`" in row[column] else value for column, value in values.items()}
+            values = {column: f"`{value}`" if "`" in row[column] else value for column, value in values.items() if column in row}
         elif section in EDITED_COLUMNS and not (section == "## Gates" and
                                                 row.get("Clears when", "").lower().startswith("cleared")):
             values = {column: _token(rename.old, rename.new, row[column])
@@ -1131,11 +1136,16 @@ def _doc_failures(rename: UnitRename) -> list[str]:
     doc = Path(rename.doc)
     text = doc.read_text(encoding="utf-8")
     rows = [row for row in _rows(doc) if production_units.cell_value(row.get("Unit", "")) in (rename.old, rename.new)]
-    cells = [{column: production_units.cell_value(row.get(column, "")) for column in ("Unit", "Worktree", "Branch")}
+    cells = [{column: production_units.cell_value(row.get(column, "")) for column in ("Unit", "Branch")}
              for row in rows]
     failures: list[str] = []
-    if cells != [{"Unit": rename.new, "Worktree": rename.new_worktree, "Branch": rename.new_branch}]:
-        failures.append(f"{doc}: the Units row does not name {rename.new}, {rename.new_worktree} and {rename.new_branch}")
+    if cells != [{"Unit": rename.new, "Branch": rename.new_branch}]:
+        failures.append(f"{doc}: the Units row does not name {rename.new} and {rename.new_branch}")
+    row = staff.snapshot().by_id(rename.staff_id) if isinstance(rename.staff_id, str) else None
+    if row is None or isinstance(row.worktree, staff.WorktreeUnfilled):
+        failures.append(f"{rename.new}: staff worktree is unavailable")
+    elif row.worktree.machine != remote.local_machine() or row.worktree.path != Path(rename.new_worktree):
+        failures.append(f"{rename.new}: staff worktree differs from {rename.new_worktree}")
     # apply's own edit would change nothing: no Hub files or open Gates unit cell names the old id.
     if _doc_text(rename, text) != text:
         failures.append(f"{doc}: a Hub files or open Gates unit cell still names {rename.old}")
@@ -1465,7 +1475,8 @@ def apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
                 _preflight(rename)
         with staff.operation():
             if fresh:
-                rename.staff_id = _staff_id(rename.slug, rename.old)
+                if isinstance(rename.staff_id, UnboundStaffMember):
+                    rename.staff_id = _staff_id(rename.slug, rename.old)
                 bind_stop_target(rename)
                 # The request is saved before anything changes, so every later refusal resumes.
                 _save(path, rename)

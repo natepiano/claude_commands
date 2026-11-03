@@ -30,6 +30,7 @@ from remote import other_machine, run_remote
 from scripts.production import staff_sources
 from scripts.production import showrunners
 from scripts.message import send_result
+from scripts.message import send_budget
 import sessions
 import inventory as stop_work
 from user_zone import user_zone
@@ -184,12 +185,8 @@ def run_notifier(verb: str, instance: str) -> None:
 def _deliver_message(
     command: list[str], recipient: str, text: str
 ) -> MessageSendOutcome:
-    timeout = 60.0
-    if recipient == "user":
-        timeout = review.user_send_seconds() + 15
-        if "--machine" in command:
-            # send.py gives SSH its user wait plus 10 s termination and 30 s transport time.
-            timeout += 40
+    timeout = (send_budget.user_seconds(review.user_send_seconds()) if recipient == "user"
+               else send_budget.seconds())
     try:
         result = subprocess.run(
             command,

@@ -33,6 +33,7 @@ import process_group
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.process_failure import failure_detail
 from scripts.message import send_result
+from scripts.message import send_budget
 from scripts.whoami import note_file
 
 from scripts.lib import models_registry  # noqa: E402
@@ -255,9 +256,8 @@ AGENTS = Path(__file__).resolve().parent.parent / "agents" / "models_config.sh"
 REGISTRY = models_registry.registry_path()
 # The session whose user is shown a switch on their next prompt.
 OWNER = "natedev"
-# One relay took 9 s when measured. The snapshot timer gives agent_notes.py 60 s in
-# all, and the relays run in parallel, so one timeout bounds the whole alert:
-# send.py stops a relay at --timeout and kills it KILL_GRACE seconds later.
+# These values keep the existing 30-second relay delivery limit.
+# The outer budget uses the configured cleanup grace through send_budget.
 RELAY_TIMEOUT = 40
 KILL_GRACE = 10
 # The whole switch took 2 s of wall time when measured idle and 8 s at load average 87; each entry
@@ -1501,7 +1501,7 @@ def relay(recipient: str, text: str, key: str | None) -> str | None:
     command = [sys.executable, str(SEND), "--to", recipient, "--from", "quota_alert",
                "--timeout", str(RELAY_TIMEOUT - KILL_GRACE), *(["--key", key] if key else [])]
     try:
-        done = subprocess.run(command, input=text, capture_output=True, text=True, timeout=RELAY_TIMEOUT + 5,
+        done = subprocess.run(command, input=text, capture_output=True, text=True, timeout=send_budget.seconds(RELAY_TIMEOUT - KILL_GRACE),
                               check=False)
     except (subprocess.TimeoutExpired, OSError) as error:
         return str(error)
@@ -1540,7 +1540,7 @@ def tell_user(push: RenderedPush) -> PushDelivery:
     command[1] = str(SEND)
     try:
         done = subprocess.run(command, capture_output=True, text=True,
-                              timeout=user_send_timeout + KILL_GRACE + 5,
+                              timeout=send_budget.user_seconds(user_send_timeout),
                               check=False)
     except (subprocess.TimeoutExpired, OSError) as error:
         return PushFailed(str(error))

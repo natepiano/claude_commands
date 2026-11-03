@@ -1079,16 +1079,17 @@ class CodexAccountAlertTests(unittest.TestCase):
         self.save_room(old, 0)
         self.save_room(target, 1)
         readings = self.readings(old, self.report(old, 0), self.report(target, 1))
-        with patch.object(accounts, "_codex_live", return_value=Report("Codex", problem="target unavailable")):
+        with patch.object(accounts, "_write_role", side_effect=OSError("fixture workers role write failed")) as write:
             _ = quota_alert.blocked([self.note(1, "active", 0)], old, self.now,
                 codex_readings=readings, window=refusals.KnownWindow("weekly"))
+        write.assert_called_once()
         self.assertEqual(agent_accounts.workers_home(), old.home)
         entries = moves.read_moves()
         self.assertEqual([entry["kind"] for entry in entries], ["requested", "failed"])
         self.assertEqual(entries[0]["move_id"], entries[1]["move_id"])
         failed = entries[1]
         assert failed["kind"] == "failed"
-        self.assertIn("target unavailable", failed["reason"])
+        self.assertIn("fixture workers role write failed", failed["reason"])
         self.assertIn("direct=claude", registry_view())
 
     def test_no_room_fallback_restores_on_another_account_when_it_regains_room(self) -> None:

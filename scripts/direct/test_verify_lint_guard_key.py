@@ -15,8 +15,8 @@ from typing import cast, override
 
 from scripts.direct import verify_lint_scope_test_support as support
 from scripts.direct import assertion_guard_test_support as guard_support
-from scripts.production.staff_test_support import isolated_staff_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production.staff_test_support import isolated_staff_file
 
 
 class VerifyLintGuardKeyTests(support.VerifyLintScopeFixture):

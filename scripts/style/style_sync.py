@@ -30,6 +30,7 @@ import process_group
 from add_style import NoStyleProduction, standing_style_production
 from production_units import Refusal
 from scripts.message import send_result
+from scripts.message import send_budget
 from scripts.production import showrunners
 import style_ledger
 from process_failure import failure_detail
@@ -37,10 +38,7 @@ import scratch
 
 PYTHON = SCRIPTS / "lib/py"
 SEND = SCRIPTS / "message/send.py"
-# send.py delivers for up to --timeout, then may spend its KILL_GRACE (10 s) stopping a relay, then logs.
-# Its own run is the bound: stopping it sooner reports a send it delivered as failed.
 SEND_SECONDS = 10
-SEND_RUN_SECONDS = SEND_SECONDS + 10 + 15
 ROSTER = SCRIPTS / "message/roster.py"
 SHOWRUNNERS = SCRIPTS / "production/showrunners.py"
 VERIFY = SCRIPTS / "direct/verify.sh"
@@ -89,7 +87,7 @@ def notify(repo_dir: Path, branch: str, tip: str) -> None:
             "--text", f"From {caller}: branch point {branch} moved to {tip[:7]}; sync.",
             "--key", f"style-sync:{standing.slug}",
             "--timeout", str(SEND_SECONDS),
-        ], capture_output=True, text=True, check=False, timeout=SEND_RUN_SECONDS)
+        ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
         outcome = send_result.send_outcome(sent.returncode, sent.stdout)
         if isinstance(outcome, send_result.ConfirmedSendOutcome):
             match outcome.header.outcome:
@@ -423,7 +421,7 @@ def handoff_notice(slug: str, parent: str, checkpoint: str) -> HandoffDelivery:
         str(PYTHON), str(SEND), "--to", address, "--from", slug,
         "--text", f"From the showrunner of {slug}: hand-off {checkpoint}",
         "--timeout", str(SEND_SECONDS),
-    ], capture_output=True, text=True, check=False, timeout=SEND_RUN_SECONDS)
+    ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
     outcome = send_result.send_outcome(result.returncode, result.stdout)
     if isinstance(outcome, send_result.ConfirmedSendOutcome):
         if outcome.header.outcome in {"queued", "kept"}:
@@ -501,7 +499,7 @@ def wake_waiters(repo: Path, ticket_id: str) -> None:
                     str(PYTHON), str(SEND), "--to", addresses[0], "--from", standing.slug,
                     "--text", f"From the showrunner of {standing.slug}: ticket {ticket_id} merged; refill.",
                     "--timeout", str(SEND_SECONDS),
-                ], capture_output=True, text=True, check=False, timeout=SEND_RUN_SECONDS)
+                ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
                 if result.returncode:
                     raise Refusal(f"send.py: {failure_detail(result)}")
             except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
