@@ -35,7 +35,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
 from scripts.lib.process_failure import failure_detail
-from scripts.production.showrunners import load_settings, registered_showrunners, require_complete
+from scripts.production.showrunners import load_settings
+from scripts.production import staff
 if TYPE_CHECKING:
     from ..whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
                                         codex_account, workers_home)
@@ -438,7 +439,7 @@ def _cancel_outgoing_codex_holds(home: Path, login: str) -> None:
             relays = held.relays if isinstance(held, HeldMessage) else ()
             if not relays:
                 try:
-                    names = [*load_settings()["always"], *(runner["session"] for runner in require_complete(registered_showrunners()))]
+                    names = [*load_settings()["always"], *(f"session:{row.current_session}" for row in staff.active(staff.snapshot(), "showrunner"))]
                 except (OSError, ValueError):
                     continue
                 label = held.owner.label if isinstance(held, HeldMessage) and isinstance(held.owner, KnownCodexAccount) else "Codex"

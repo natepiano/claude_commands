@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import TextIO, cast, override
 from unittest.mock import patch
 
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file, fixture_member, recorded_showrunner, recorded_unit
 from scripts.direct import phase_reservation, phase_table, plan_history, progress_history, recorder_state
 # These regressions check the private verifier's semantic result before wait closure.
 from scripts.direct.progress_history import _supplier_message  # pyright: ignore[reportPrivateUsage]
@@ -81,6 +83,8 @@ class ProgressHistoryTests(unittest.TestCase):
         # Socket fixtures need a short path even when the run's TMPDIR is long.
         self.temporary = tempfile.TemporaryDirectory(dir="/tmp")
         self.root = Path(self.temporary.name)
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = (self.root / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
         self.history_dir = self.root / "history"
         self.working_dir = self.root / "bevy_hana_rubric"
         self.working_dir.mkdir()
@@ -120,6 +124,9 @@ class ProgressHistoryTests(unittest.TestCase):
                          + "ux check minutes 0, ux repair minutes 0")
 
     def test_production_resolver_accepts_both_plan_header_forms(self) -> None:
+        document = self.root / "example-production.md"
+        _ = document.write_text("# Production\n")
+        _ = recorded_unit("Example", "unit-a", self.working_dir, document, plan="unit-plan.md")
         plan = self.working_dir / "unit-plan.md"
         for header in ("**Production: Example**", "**Production:** Example"):
             for field in ("project_plan_doc", "plan_doc"):
@@ -373,6 +380,11 @@ print('two homes isolated; recorder lock retained; caller restored')
             + "production doc `docs/example-production.md`\n",
             encoding="utf-8",
         )
+        document = self.working_dir / "docs" / "example-production.md"
+        if not document.exists():
+            _ = document.write_text("# Production — Example\n")
+        _ = recorded_unit("Example", "unit-a", self.working_dir, document,
+                          plan=str(plan_path.relative_to(self.working_dir)))
 
     def start_run(self, name: str, started_at: int) -> Path:
         session_dir = self.root / name
@@ -2795,7 +2807,8 @@ with patch.object(fcntl, "flock", admission):
         self.assertNotIn("wait_without_id_n", second)
         self.assertNotIn("wait_without_id_n", third)
 
-    def phase_source_fixture(self, name: str) -> tuple[Path, Path, Path]:
+    def phase_source_fixture(self, name: str, *, production: str = "Hana",
+                             unit: str = "widgets", recorded: bool = True) -> tuple[Path, Path, Path]:
         session = self.start_run(name, 1000)
         worktree = self.root / "widget-enhancements"
         worktree.mkdir()
@@ -2805,6 +2818,13 @@ with patch.object(fcntl, "flock", admission):
         _ = (worktree / ".git").write_text("gitdir: ../hana/.git/worktrees/widget-enhancements\n")
         plan = worktree / "tool-based-ui-widget.md"
         _ = plan.write_text("> **Production:** Hana — unit `widgets`; production doc `hana.md`\n")
+        document = self.root / "hana-production.md"
+        _ = document.write_text("# Production\n")
+        if recorded:
+            owner = recorded_showrunner(production, document)
+            _ = fixture_member("unit", name=unit, parent=owner.id,
+                               worktree=staff.PresentWorktree("natedev", worktree))
+        _ = (worktree / ".unit.toml").write_text(f'plan = "{plan.name}"\nresponsibilities = []\n')
         state_path = session / "progress_history_state.json"
         state = cast(dict[str, object], json.loads(state_path.read_text()))
         state.update(working_dir=str(worktree), worktree=worktree.name,
@@ -2878,13 +2898,13 @@ with patch.object(fcntl, "flock", admission):
             self.assertEqual(phase["plan_doc"], {"state": "Recorded", "value": plan.name})
             self.assertEqual(phase["production"], {"state": "Recorded", "value": "Hana"})
             self.assertEqual(phase["repository"], {"state": "Recorded", "value": "hana"})
-        self.assertEqual(reads.count(plan), 1)
+        self.assertEqual(reads.count(plan), 0)
         self.assertEqual(reads.count(worktree / ".git"), 1)
         self.assertEqual(sum(path.name == "commondir" for path in reads), 1)
 
     def test_old_phase_with_removed_worktree_reports_metadata_not_recorded(self) -> None:
         name = "phase-source-gone"
-        session, worktree, plan = self.phase_source_fixture(name)
+        session, worktree, plan = self.phase_source_fixture(name, recorded=False)
         _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
                              "--phase-title", "Phase source", at=1010)
         events = self.read_events(name)
@@ -2912,7 +2932,8 @@ with patch.object(fcntl, "flock", admission):
 
     def test_production_doc_paths_report_the_heading_name_instead_of_the_path(self) -> None:
         name = "phase-production-doc-path"
-        session, worktree, plan = self.phase_source_fixture(name)
+        session, worktree, plan = self.phase_source_fixture(name, production="tool-based-ui",
+                                                               unit="geometry-material-unit")
         production_doc = worktree / "docs" / "hana" / "tool-based-ui-production.md"
         production_doc.parent.mkdir(parents=True)
         _ = production_doc.write_text("# Production — tool-based-ui\n", encoding="utf-8")
@@ -2960,10 +2981,14 @@ with patch.object(fcntl, "flock", admission):
 
     def test_unreadable_or_unnamed_production_docs_report_missing_metadata_with_a_reason(self) -> None:
         name = "phase-production-doc-unavailable"
-        session, worktree, plan = self.phase_source_fixture(name)
+        session, worktree, plan = self.phase_source_fixture(name, recorded=False)
         production_doc = worktree / "production.md"
         _ = plan.write_text("> **Production:** production.md — unit geometry-material-unit, branch widgets\n",
                             encoding="utf-8")
+        state_path = session / "progress_history_state.json"
+        state = cast(dict[str, object], json.loads(state_path.read_text()))
+        state.update(production=str(production_doc), unit="geometry-material-unit")
+        _ = state_path.write_text(json.dumps(state))
         cases = (("missing", "production document cannot be read:"),
                  ("invalid UTF-8", "production document cannot be read:"),
                  ("no heading", "production doc lacks its name"),
@@ -2989,7 +3014,8 @@ with patch.object(fcntl, "flock", admission):
 
     def test_plain_production_names_do_not_require_a_production_doc(self) -> None:
         name = "phase-production-plain-name"
-        session, worktree, plan = self.phase_source_fixture(name)
+        session, worktree, plan = self.phase_source_fixture(name, production="tool-based-ui",
+                                                               unit="geometry-material-unit")
         _ = plan.write_text("> **Production:** tool-based-ui — unit geometry-material-unit, branch widgets\n",
                             encoding="utf-8")
         self.assertFalse((worktree / "tool-based-ui").exists())
@@ -3010,20 +3036,17 @@ with patch.object(fcntl, "flock", admission):
             ("> **Production: build-followups** (enh-showrunner-unit)", "build-followups", ""),
             (f"> **Production: natedev** — unit `herdr-unit`; worktree {worktree}", "natedev", "herdr-unit"),
         )
-        for index, (header, production, unit) in enumerate(headers):
+        for index, (header, _production, _unit) in enumerate(headers):
             with self.subTest(header=header):
                 _ = plan.write_text(header + "\n", encoding="utf-8")
                 _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", str(index + 1),
                                      "--phase-title", "Production without unit", at=1010 + index)
                 started = [event for event in self.read_events(name) if event["event_type"] == "phase_started"][-1]
-                self.assertEqual(started["production"], {"state": "Recorded", "value": production})
-                if unit:
-                    self.assertEqual(started["unit"], {"state": "Recorded", "value": unit})
-                else:
-                    self.assertEqual(started["unit"], {"state": "NotRecorded", "reason": "phase plan header names no unit"})
+                self.assertEqual(started["production"], {"state": "Recorded", "value": "Hana"})
+                self.assertEqual(started["unit"], {"state": "Recorded", "value": "widgets"})
                 report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
                 phase = cast(list[dict[str, object]], report["phases"])[-1]
-                self.assertEqual(phase["production"], {"state": "Recorded", "value": production})
+                self.assertEqual(phase["production"], {"state": "Recorded", "value": "Hana"})
 
     def test_old_phases_read_production_from_headers_without_a_quoted_unit(self) -> None:
         name = "phase-bare-production-old"
@@ -3044,17 +3067,17 @@ with patch.object(fcntl, "flock", admission):
             ("> **Production: build-followups** (enh-showrunner-unit)", "build-followups"),
             (f"> **Production: natedev** — unit herdr-unit, worktree {worktree}", "natedev"),
         )
-        for header, production in headers:
+        for header, _production in headers:
             with self.subTest(header=header):
                 _ = plan.write_text(header + "\n", encoding="utf-8")
                 report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
                 phase, = cast(list[dict[str, object]], report["phases"])
-                self.assertEqual(phase["production"], {"state": "Recorded", "value": production})
+                self.assertEqual(phase["production"], {"state": "Recorded", "value": "Hana"})
                 self.assertEqual(phase["state"], "HistoryNotRecorded")
 
     def test_phase_production_and_unit_each_keep_their_run_state_override(self) -> None:
         name = "phase-partial-source"
-        session, worktree, plan = self.phase_source_fixture(name)
+        session, worktree, plan = self.phase_source_fixture(name, production="natedev", unit="herdr-unit")
         state_path = session / "progress_history_state.json"
         for index, (field, value, header, production, unit) in enumerate((
             ("unit", "assigned-unit", "> **Production:** natedev", "natedev", "assigned-unit"),
@@ -3078,7 +3101,7 @@ with patch.object(fcntl, "flock", admission):
 
     def test_waits_returns_json_when_a_legacy_plan_is_invalid_utf8_or_unreadable(self) -> None:
         name = "phase-unreadable-plan"
-        session, worktree, plan = self.phase_source_fixture(name)
+        session, worktree, plan = self.phase_source_fixture(name, recorded=False)
         _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
                              "--phase-title", "Unreadable legacy plan", at=1010)
         events = self.read_events(name)
@@ -6997,14 +7020,14 @@ with patch.object(fcntl, "flock", admission):
         _ = fake_showrunner.write_timer(
             notifier_dir,
             "example",
-            "example-showrunner-id",
+            recorded_showrunner("Example", production_doc).current_session,
             "UTC",
             production_doc,
         )
         held = fake_showrunner.write_session(
             sessions_dir,
             "example-showrunner",
-            "example-showrunner-id",
+            recorded_showrunner("Example", production_doc).current_session,
         )
         self.addCleanup(held.close)
         vault_root = self.root / "vault" / "showrunners"
@@ -7090,14 +7113,14 @@ with patch.object(fcntl, "flock", admission):
         _ = fake_showrunner.write_timer(
             notifier_dir,
             "example",
-            "eta-example-showrunner-id",
+            recorded_showrunner("Example", production_doc).current_session,
             "UTC",
             production_doc,
         )
         held = fake_showrunner.write_session(
             sessions_dir,
             "example-showrunner",
-            "eta-example-showrunner-id",
+            recorded_showrunner("Example", production_doc).current_session,
         )
         self.addCleanup(held.close)
         vault_root = self.root / "vault" / "showrunners"

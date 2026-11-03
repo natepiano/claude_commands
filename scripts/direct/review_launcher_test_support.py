@@ -251,8 +251,17 @@ class ReviewLauncherFixture(LauncherFixture):
         no model tokens. The real heartbeat watcher uses a short interval.
         """
         direct_dir, agents, lib = prepare_launcher_runtime(self.root)
-        _ = shutil.copy2(DIRECT_DIR.parent / "production/showrunners.py",
-                         self.root / "scripts/production/showrunners.py")
+        for name in ("showrunners.py", "session_staff.py", "staff.py", "session_labels.py",
+                     "unit_config.py", "unit_names.py", "unit_table.py"):
+            _ = shutil.copy2(DIRECT_DIR.parent / "production" / name,
+                             self.root / "scripts/production" / name)
+        for directory, names in (("herdr", ("place.py", "pane_launch.py")),
+                                 ("shutdown", ("remote.py",))):
+            destination = self.root / "scripts" / directory
+            destination.mkdir()
+            for name in names:
+                _ = shutil.copy2(DIRECT_DIR.parent / directory / name, destination / name)
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib/git_exclude.py", lib / "git_exclude.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/probe_session.py", lib / "probe_session.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/process_failure.py", lib / "process_failure.py")
         for name in ("conf.py", "conf.sh"):
