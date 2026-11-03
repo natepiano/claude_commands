@@ -1740,7 +1740,7 @@ Test failed close and interrupted retirement, then rerun without another launch.
 
 **Ruled out:** a regression test for the fixture's own pid guard — it would test a mock it configures.
 
-### Phase 6c — The startup reader keeps one deadline and a strong Mac process generation  · status: todo
+### Phase 6c — The startup reader keeps one deadline and a strong Mac process generation  · status: done
 
 **Owner:** herdr-unit (follow-up of Phase 6a, 2026-11-03).
 
