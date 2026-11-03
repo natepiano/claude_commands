@@ -1207,39 +1207,20 @@ Tests: `scripts/lint/test_memory_admit.py`: a large dev build with 1 to 9 earlie
 ### Phase 42 — Bump and token-wait edges: one bad intent, the pane's session, unit names, card text and type shapes  · status: done
 **Depends on:** Phase 41
 
-**Approved:** item 7 of the production rules (Phase 26 cold review, 2026-10-31). Builds showrunner 2026-10-31: card text as recommended.
+#### As-built
 
-#### Work Order
-
-**Goal:** Fix the smaller defects the Phase 26 cold review found.
-
-**Spec:**
-
-1. **One bad token-wait intent stops nothing else.** `check()` finishes each `*.token-wait` intent in its own guard (`memory_admit.py:2796`): an error is logged with the intent's path and the intent stays for the next poll; the other intents and the admission go on.
-2. **The pane's bump names the session itself.** `mods/unit-board/hooks/register.tsx:420` passes the session id from `$.session.id()` to the process explicitly (as `--you` does at :309), not by inheriting `CLAUDE_CODE_SESSION_ID`. Its test asserts the id reaches the process.
-3. **A unit name is checked.** `priority set <unit>` refuses a unit that is not in the roster's unit labels (one line naming the unit; the old priority stays), and the unit goes to argparse as `--unit=<unit>`, so a word that starts with `-` is a unit, not a flag.
-4. **Card text** (builds showrunner 2026-10-31, as recommended): the card names a unit-priority step as `N of <unit> (queue priority)`, not `moved up`, and shows no legacy per-row bump rows as its reason; the priority line shows once per card and renders the stored `why`, not a fixed "(the user's bump)".
-5. **Corrupt priority file.** `priority_clear` on an unreadable `queue_priority.json` removes it and says so; it does not print "cleared" and leave it.
-6. **Type design.** `Waiter.priority_rank` leaves the durable row type: the resolved order is its own type (for example `RankedWaiter` with `PriorityUnit | NormalOrder`). `QueuePriority.transition` becomes `SettledPriority | PendingPriorityTransition`. `resolve_queue_order` and `token_wait` take named types, not bare `None`. `priority_set` reports "no waiting step" as a named case, not `place = 0`. `BehindHead.head_since` gets a name that is not `head_since`.
-
-Tests: `scripts/lint/test_memory_admit.py`: one intent whose finish raises does not stop `check` for the others; an unknown unit is refused and the old priority stays; `--unit=-x` is a unit; a corrupt priority file is removed on clear. `mods/unit-board/tests/queue.test.ts`: the session id reaches the process. `scripts/build_queue/test_queue_card.py`, `test_head_facts.py` and the goldens: the item 4 text.
-
-The Phase 26 checkpoint did not name two narrowed assertions; this phase's checkpoint carries their lines: `Assertion-Change: scripts/lint/test_memory_admit.py::test_cleanup_added_floor_expires_the_old_estimate_without_losing_queue_place — bump_order and holds_younger left the waiter row in Phase 26` and the same for `test_estimate_expiry_after_lock_keeps_queue_and_recovery_for_next_poll`.
-
-**Constraints from prior phases:** Phase 41 keeps token-wait rows in the resolved order and keeps their original `since` and `priority_since`, but `waiter_state` returns `TokenWaitingWaiter` until the token returns. `first_queued_waiter` selects the first `QueuedWaiter`; token waiters are neither head candidates nor room holders. `QueueExplanation.head` is `HeadExplanation | TokenWaitersOnly | NoWaiter`. All readers use that head, which need not be row 1; an all-token queue has no eligible head. Priority transitions save `month_row_end` before publication. `finish_priority_transition` passes it as `start` to `record.queue_priority`, which uses `append_row_once`. A retry keeps the same transition id and offset; old intents without the offset use 0. Keep this path bounded and retry-safe. Item 6 changes the type boundary, not these rules or the stored clocks. Preserve `test_priority_cleanup_uses_the_saved_log_end_and_records_a_stopped_set_once`, `test_token_waiter_keeps_order_without_holding_the_strict_head_or_memory`, and the eligible-head and all-token reader tests. The existing `1 writer + 1 tester` split has a real test lane; the source writer owns the shared admission types and queue renderers.
-
-**Acceptance:** the tests; `test_memory_admit.py`, the `scripts/build_queue` suites, `claude plugin test mods/unit-board` and `basedpyright` on the changed Python files pass from the worktree.
+- One bad token-wait intent stops nothing else: each intent finishes in its own guard; an error is logged with its path and the intent stays for the next poll.
+- The unit-board pane's bump passes the session id from `$.session.id()` to the process; it does not inherit `CLAUDE_CODE_SESSION_ID`.
+- `priority set <unit>` refuses a unit that is not in the roster, and keeps the old priority. The unit goes to argparse as `--unit=<unit>`.
+- The card names a unit-priority step `N of <unit> (queue priority)`, shows the priority line once, and renders the stored `why`.
+- `priority_clear` removes an unreadable `queue_priority.json` and says so.
+- Types: the resolved order is `RankedWaiter` with `PriorityUnit | NormalOrder`; a transition is `SettledPriority | PendingPriorityTransition`; these live in `scripts/build_queue/admission_service.py` and `scripts/lint/memory_admit.py`. "No waiting step" is `NoWaitingStep` in `scripts/build_queue/build_queue.py`.
 
 **Files:**
-- `scripts/lint/memory_admit.py` — items 1, 3, 5, 6.
-- `mods/unit-board/hooks/register.tsx` — item 2.
-- `scripts/build_queue/queue_card.py`, `scripts/build_queue/head_facts.py`, `scripts/build_queue/build_queue.py`, `scripts/build_queue/golden/card_*.txt` — items 3, 4.
-- `docs/as-built/build-memory-admission.md`, `commands/build/queue.md`, `commands/showrunner/bump.md` — where they state the changed rules.
-- `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_queue_card.py`, `scripts/build_queue/test_head_facts.py`, `scripts/build_queue/test_build_queue.py`, `mods/unit-board/tests/queue.test.ts` — tests.
-
-**Workers:** `1 writer + 1 tester`
-- `impl` — the source, doc and command files.
-- `test` — the test files and goldens.
+- `scripts/lint/memory_admit.py`, `scripts/build_queue/admission_service.py` — intent guard, unit check, types
+- `mods/unit-board/hooks/register.tsx` — bump session id
+- `scripts/build_queue/queue_card.py`, `head_facts.py`, `build_queue.py`, `golden/card_*.txt` — card text, priority clear
+- `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_queue_card.py`, `test_head_facts.py`, `test_build_queue.py`, `mods/unit-board/tests/queue.test.ts` — tests
 
 ### Phase 43 — Every agent Hana carries its owner and purpose, and `hanas` lists, stops and sweeps test Hanas on both machines  · status: done
 
