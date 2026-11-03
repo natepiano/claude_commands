@@ -45,39 +45,28 @@
 
 **Depends on:** herdr-unit's 4h checkpoint merged into `sdlc`. Must land before devtools-unit starts 3t and before herdr-unit's 4e. After herdr-unit's 3a lands, it also touches `scripts/shutdown/restart.py`.
 
-#### Work Order
+#### As-built
 
-**Goal:** every launch and every restore of a member takes its name from its row, and a hand `/rename` in a unit director's pane leaves the row and the tab as they are and prints the rename_unit command.
-
-**Spec:**
-
-1. **Launch and restore names.** `add_unit.py`, `add_showrunner.py` and `resume_unit.py` use the row's name for `-n` and tab titles. A restore takes one snapshot, selects each row by its native resume id, and reads the current name. No launch or restart record sets or preserves `STAFF_ID`. On an unreadable snapshot, reuse each saved display name and print one problem line; on a missing row, name that entry and use its saved name. Never select a row by a saved name.
-2. **A hand `/rename`.** `herdr_tab_title.py` resolves the session by its native runtime id. For a unit, keep its tab and pane on the row name and print `/showrunner:rename_unit` on a mismatch; write no staff row. The session record may keep the typed name until its next launch. Showrunner titles change only through the production rename command. Worker labels stay their short names. A session with no row keeps the existing ad hoc title behavior. Row kind, not inherited marks, separates these cases.
-3. **One runtime join.** Read Claude identity from the exact process registry or hook input and Codex identity from the thread runtime. Use the Phase 3h resolver once per snapshot. A hook that runs while a clear handoff is incomplete lists that missing-row state and changes no staff record. Keep the shutdown unit's resume identity and account evidence; do not add an identity environment variable.
+- `add_unit.py`, `add_showrunner.py` and `resume_unit.py` take the staff row's name for `-n`, the tab title and the pane title.
+- `scripts/shutdown/launch_names.py` holds `LaunchNames`: one staff snapshot per restore or restart, rows selected by native resume id, one owner ssh read on the Mac. An unreadable snapshot reuses each saved display name and prints one problem line. A missing row names the entry and keeps its saved name. No row is selected by a saved name.
+- `pane_restore.py`, `restart.py` and `stop_resume.py` title a resumed pane and its tab from that snapshot inside `herdr.restore_staff(...)`. An empty name never clears a title. An existing pane is retitled when its tab title is stale, also when its pane label already matches.
+- `pane_record.without_legacy_identity` is public; no launch or restart record sets or keeps `STAFF_ID`.
+- `herdr.py` drops `STAFF_ID`, `CLAUDE_CODE_SESSION_ID` and `CODEX_THREAD_ID` from every agent environment. `copy_claude_trust` writes through `write_text_atomic(new_file_mode=0o600)`; `atomic_file.write_text_atomic` takes an optional `new_file_mode`.
+- `herdr_tab_title.py` resolves a session by its native runtime id. A unit keeps its row name on the tab and pane, and a mismatch prints the `/showrunner:rename_unit` command. Showrunners and workers keep their row titles; a session with no row keeps the ad hoc title. The hook writes no staff row and never stops the turn. It prints the missing-row line only when an incomplete clear is proved.
 
 **Files:**
-- `scripts/production/add_showrunner.py`, `scripts/production/add_unit.py`, `scripts/production/resume_unit.py` — the row's name for `-n` and the tab title; native identity lookup.
-- `scripts/hooks/herdr_tab_title.py`, `scripts/hooks/test_herdr_tab_title.py` — a hand `/rename` of a unit keeps the row's name and prints the command.
-- `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py` — environment isolation prevents inherited identities.
-- `scripts/shutdown/pane_record.py`, `scripts/shutdown/pane_restore.py`, `scripts/shutdown/test_pane_record.py`, `scripts/shutdown/test_pane_restore.py` — native resume id and restore name; the shutdown unit's files.
-- `scripts/production/test_add_showrunner.py`, `scripts/production/test_add_unit.py`, `scripts/production/test_resume_unit.py` — launch-name and native-id tests.
-- `scripts/production/staff.py`, `scripts/production/staff_sources.py`, `scripts/production/staff_test_support.py`, `scripts/lib/atomic_file.py` — read only.
-- `scripts/shutdown/restart.py`, `scripts/shutdown/stop_resume.py`, `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_stop_resume.py` — the launch-name audit (Phase 3h review).
+- `scripts/production/add_unit.py`, `add_showrunner.py`, `resume_unit.py` — row names at launch and resume.
+- `scripts/shutdown/launch_names.py` — `LaunchNames` and its read states.
+- `scripts/shutdown/pane_record.py`, `pane_restore.py`, `restart.py`, `stop_resume.py` — restore names and titles from one snapshot.
+- `scripts/herdr/herdr.py`, `scripts/lib/atomic_file.py` — identity-free agent environment; mode for a new atomic file.
+- `scripts/hooks/herdr_tab_title.py` — the hand `/rename` rule.
+- Tests: `test_add_unit.py`, `test_add_unit_restore.py`, `test_add_showrunner.py`, `test_resume_unit.py`, `test_herdr.py`, `test_atomic_file.py`, `test_herdr_tab_title.py`, `test_pane_record.py`, `test_pane_restore.py`, `test_restart.py`, `test_stop_resume.py`, `test_unit_watchdog.py`.
 
-**Workers:** `2 writers` — split by launch path and hook.
-- `impl` — launch names and runtime joins: `add_unit.py`, `add_showrunner.py`, `resume_unit.py`, `herdr.py`, `pane_record.py`, `pane_restore.py` and their tests.
-- `test` (opens as impl) — the hook (`herdr_tab_title.py`, `test_herdr_tab_title.py`).
+**Binds later work:** a launched agent gets no identity variable; its identity comes from the native runtime join. Launch titles go in the `NewTab` destination of `herdr.launch_prepared_agent`.
 
-**State:** names shown by launches, hooks and restores. No new identity state.
+**Gotchas:** `pane_record` must not import `session_staff` (import cycle); `LaunchNames` lives in its own module for that reason. A test that patches `Herdr.retitle` must expect the pane id and the row name.
 
-**Constraints from prior phases:** Phase 3h owns native identity and the shared runtime join; Phase 3r owns current rows and configuration. Shutdown owns restart and pane records. Use one snapshot, including one owner ssh read on the Mac. Use `staff_test_support.py` and the shared atomic writer. This phase does not repeat identity backfill.
-- Phase 3h review (2026-11-01): native admission and most restore identity shipped in 3h; do not repeat them. Keep `pane_record.resume_launch`'s fixed-reference to current-session conversion. Test a renamed row whose current session differs from its id.
-
-**Assertion-Change:** `test_add_unit_restore.AddUnitRestoreTests.test_restore_keeps_claude_name_and_sanitizes_herdr_agent_name` expects the row name `alpha`, not the saved session name, in the tab rename, pane rename, `--remote-control` and `-n` (unit director ruling, 2026-11-02: Spec item 1).
-
-**Assertion-Change:** `test_resume_unit.ResumeUnitTests.assert_resumed`, `test_retired_as_built_without_a_header_is_passed_to_the_resume_launch` and `test_folder_note_resumes_in_the_start_folder_and_restores_the_unit_worktree` expect the row name `alpha`, not `alpha-unit`, as the resume launch name (unit director ruling, 2026-11-02: Spec item 1).
-
-**Acceptance gate:** basedpyright 0/0 on changed files and callers. Launch tests prove row names and no `STAFF_ID`. Hook tests cover unit mismatch, showrunner, worker, missing row and delayed clear; no hook writes staff. Restore tests use a renamed native-id row, several Mac entries with one ssh read, remote failure and a missing row. The pane writer uses `atomic_file`; no own `os.replace` stays. A real throwaway unit rename and restart keeps its tab, pane and terminal and takes its new row name; a finished rerun changes nothing. A real hand `/rename` prints the unit rename command and keeps the row name. Full gate green.
+**Ruled out:** selecting a restore row by its saved name; writing a staff row from the title hook.
 
 ### Phase 4m — Port audit: every unit's port is in its `.unit.toml`  · status: todo
 
@@ -85,6 +74,38 @@
 
 #### Work Order
 
-herdr-unit writes it in its 4h shrink. Copy it here at phase start.
+Copied from herdr-worker-panes.md Phase 4m at phase start (2026-11-02).
+
+**Goal:** before 4c deletes the Units table, every live and retired unit has its port in its `.unit.toml`, from a recorded source, never from a likely value.
+
+**Spec:**
+1. List each staff unit row with its configuration port and the Port cell from its bound production document.
+2. Read active configuration from the worktree and retired configuration from its parked file; use `cleanup=False` for every audit read.
+3. Read remote configuration on its recorded machine; record the source path and bound-document evidence.
+4. Report `AppPort`, valid `NoAppPort`, `ConfigMissing`, or `unavailable: <cause>`; never treat missing configuration as `NoAppPort`.
+5. List a missing or different port for sdlc; the audit writes nothing and guesses no value.
+6. Add one guarded port repair in `unit_config`, taking the recorded old value and sdlc's settled value.
+7. Require the recorded old value before publication; accept an already settled value as `unchanged`, and refuse any third value.
+8. Use this repair for active and parked configuration; preserve retirement facts, responsibilities, and repository formatting.
+9. Publish through the shared atomic writer; a rerun after interruption finishes once.
+10. After repair, a rerun of the audit prints no gap and exits 0.
+
+**Files:**
+- `scripts/production/audit_unit_ports.py` — new: the read-only audit command.
+- `scripts/production/unit_config.py` — the guarded port repair.
+- `scripts/production/test_audit_unit_ports.py`, `scripts/production/test_unit_config.py` — tests and fixtures.
+- `scripts/production/staff.py`, `scripts/production/production_doc.py`, `scripts/shutdown/remote.py` — read only.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — the audit command and guarded repair; hub: `scripts/production/unit_config.py`.
+- `test` — their tests and fixtures.
+
+**Acceptance gate:** the audit prints no gap on natedev and the Mac; a rerun changes nothing and exits 0; full gate green.
+
+**Acceptance gate (port evidence):** test valid `NoAppPort`, missing configuration, bound-document evidence, parked files, and unavailable remote reads.
+Interrupt the guarded repair before and after publication; reruns preserve retirement facts and responsibilities.
+Test unchanged reruns and refusal when the recorded old value differs.
+
+**Note (sdlc, 2026-11-02, user rule):** readers read the staff page `~/.local/state/staff/staff.json` directly, not `staff.py show --json --live`. A change to the staff.json format bumps its version and tells cargo-liner.
 
 **Note for the Work Order (sdlc, 2026-11-02, from herdr's architect review):** `unit_config.write_parked` refuses a changed port. This phase adds one guarded port repair in `unit_config` that takes the old value and the settled value, with interrupt and rerun tests. Phase 4 lands first.
