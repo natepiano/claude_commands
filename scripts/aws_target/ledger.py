@@ -5,7 +5,7 @@ from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Generator, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from datetime import datetime, time as day_time, timedelta
+from datetime import date, datetime, time as day_time, timedelta
 from decimal import Decimal
 from enum import Enum
 import fcntl
@@ -19,8 +19,9 @@ from typing import Literal, cast
 from zoneinfo import ZoneInfo
 
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib import conf
 from scripts.aws_target.config import (
-    LimitSettingEvidence, SpendingConfigurationUnavailable, SpendingSettings, money, read_settings,
+    LimitSettingEvidence, MeasurementUnavailable, SpendingConfigurationUnavailable, SpendingSettings, money, offload_enabled, read_settings,
 )
 
 InstanceState = Literal["pending", "running", "stopping", "stopped", "terminated", "unknown"]
@@ -33,6 +34,32 @@ class InstanceObservation:
     at: int
     state: InstanceState
     source: str
+
+
+@dataclass(frozen=True)
+class ComputeUnconfirmed:
+    """The resource request has no confirmed result."""
+
+
+@dataclass(frozen=True)
+class ComputeInstanceConfirmed:
+    at: int
+    instance_id: str
+
+
+@dataclass(frozen=True)
+class ComputeResourcesAbsent:
+    at: int
+
+
+@dataclass(frozen=True)
+class ComputeRequest:
+    at: int
+    stack: str
+    region: str
+    spot_max_usd_per_hour: Decimal
+    request_id: str = field(default_factory=lambda: uuid4().hex)
+    resolution: ComputeUnconfirmed | ComputeInstanceConfirmed | ComputeResourcesAbsent = ComputeUnconfirmed()
 
 
 @dataclass(frozen=True)
@@ -56,12 +83,35 @@ class ResourceInventory:
 
 
 @dataclass(frozen=True)
+class EstablishedDayCost:
+    day: str
+    usd: Decimal
+
+
+@dataclass(frozen=True)
 class CostReconciliation:
     at: int
     period_start: int
     period_end: int
     usd: Decimal
     source: str
+    query_usd: Decimal = Decimal(0)
+    established_days: tuple[EstablishedDayCost, ...] = field(default=(), compare=False)
+
+
+@dataclass(frozen=True)
+class ChargeRead:
+    day: str
+    at: int
+    period_start: int
+    period_end: int
+    actual_usd: Decimal
+    estimated_usd: Decimal
+    query_usd: Decimal
+
+    @property
+    def difference_usd(self) -> Decimal:
+        return self.actual_usd - self.estimated_usd
 
 
 @dataclass(frozen=True)
@@ -71,6 +121,7 @@ class ChargedInterval:
     usd: Decimal
     source: str
     kind: ChargeKind
+    confirmed_uptime_s: int = 0
 
 
 @dataclass(frozen=True)
@@ -93,6 +144,7 @@ class CostEstimate:
     intervals: tuple[ChargedInterval, ...]
     inventory_at: int
     observation_at: int
+    established_reconciliations: tuple[CostReconciliation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -182,6 +234,8 @@ class LedgerEvidence:
     events: list[LimitEvent] = field(default_factory=list)
     price_refresh_at: int = 0
     decision: dict[str, object] = field(default_factory=dict)
+    charge_refresh_at: int = 0
+    compute_requests: list[ComputeRequest] = field(default_factory=list)
 
 
 class ObservationRejected(ValueError):
@@ -192,57 +246,81 @@ class LedgerUnavailable(ValueError):
     """Evidence cannot establish a safe spending decision."""
 
 
-def _mapping(value: object) -> dict[str, object]:
+def mapping(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
         raise LedgerUnavailable("expected an evidence record")
     return cast(dict[str, object], value)
 
 
-def _text(row: dict[str, object], key: str) -> str:
-    value = row[key]
+def text(row: dict[str, object], key: str) -> str:
+    value = row.get(key)
     if not isinstance(value, str) or not value:
         raise LedgerUnavailable(f"{key}: expected nonempty text")
     return value
 
 
-def _instant(row: dict[str, object], key: str) -> int:
-    value = row[key]
+def instant(row: dict[str, object], key: str) -> int:
+    value = row.get(key)
     if type(value) is not int or value < 0:
         raise LedgerUnavailable(f"{key}: expected nonnegative integer seconds")
     return value
 
 
-def _rows(row: dict[str, object], key: str) -> tuple[dict[str, object], ...]:
-    value = row[key]
+def rows(row: dict[str, object], key: str) -> tuple[dict[str, object], ...]:
+    value = row.get(key)
     if not isinstance(value, list):
         raise LedgerUnavailable(f"{key}: expected evidence records")
-    return tuple(_mapping(item) for item in cast(list[object], value))
+    return tuple(mapping(item) for item in cast(list[object], value))
 
 
 def _decode(row: dict[str, object]) -> LedgerEvidence:
     if row.get("version") != 1:
         raise LedgerUnavailable("unsupported ledger version")
     observations: list[InstanceObservation] = []
-    for record in _rows(row, "observations"):
-        state = _text(record, "state")
+    for record in rows(row, "observations"):
+        state = text(record, "state")
         if state not in ("pending", "running", "stopping", "stopped", "terminated", "unknown"):
             raise LedgerUnavailable("unknown instance state")
-        observations.append(InstanceObservation(_instant(record, "at"), state, _text(record, "source")))
+        observations.append(InstanceObservation(instant(record, "at"), state, text(record, "source")))
     evidence = LedgerEvidence(
         observations,
-        [PriceSample(_instant(r, "at"), money(_text(r, "usd_per_hour")), _text(r, "source")) for r in _rows(row, "prices")],
-        [ResourceInventory(_instant(r, "at"), tuple(PricedResource(_text(p, "name"), money(_text(p, "usd_per_month")))
-                                                 for p in _rows(r, "resources")), _text(r, "source"))
-         for r in _rows(row, "inventories")],
-        [CostReconciliation(_instant(r, "at"), _instant(r, "period_start"), _instant(r, "period_end"),
-                            money(_text(r, "usd")), _text(r, "source")) for r in _rows(row, "reconciliations")],
-        [LimitEvent(_text(r, "event_id"), _instant(r, "at"), _text(r, "period"), money(_text(r, "estimate_usd")),
-                    money(_text(r, "limit_usd")), _text(r, "recipient"), _instant(r, "timeout_s"),
+        [PriceSample(instant(r, "at"), money(text(r, "usd_per_hour")), text(r, "source")) for r in rows(row, "prices")],
+        [ResourceInventory(instant(r, "at"), tuple(PricedResource(text(p, "name"), money(text(p, "usd_per_month")))
+                                                 for p in rows(r, "resources")), text(r, "source"))
+         for r in rows(row, "inventories")],
+        [CostReconciliation(instant(r, "at"), instant(r, "period_start"), instant(r, "period_end"),
+                            money(text(r, "usd")), text(r, "source"), money(str(r.get("query_usd", "0"))),
+                            tuple(EstablishedDayCost(date.fromisoformat(text(d, "day")).isoformat(), money(text(d, "usd")))
+                                  for d in rows(r, "established_days")) if "established_days" in r else ())
+         for r in rows(row, "reconciliations")],
+        [LimitEvent(text(r, "event_id"), instant(r, "at"), text(r, "period"), money(text(r, "estimate_usd")),
+                    money(text(r, "limit_usd")), text(r, "recipient"), instant(r, "timeout_s"),
                     DeliveryState(r.get("delivery", "pending")),
-                    _instant(r, "retry_after") if "retry_after" in r else 0,
-                    DeliveryOwner(_text(r, "owner")) if r.get("owner") else DeliveryUnowned())
-         for r in _rows(row, "events")],
-        _instant(row, "price_refresh_at"), _mapping(row["decision"]))
+                    instant(r, "retry_after") if "retry_after" in r else 0,
+                    DeliveryOwner(text(r, "owner")) if r.get("owner") else DeliveryUnowned())
+         for r in rows(row, "events")],
+        instant(row, "price_refresh_at"), mapping(row["decision"]),
+        instant(row, "charge_refresh_at") if "charge_refresh_at" in row else 0)
+    for record in rows(row, 'compute_requests') if 'compute_requests' in row else ():
+        resolution = mapping(record.get('resolution'))
+        outcome = text(resolution, 'outcome')
+        if outcome == 'unconfirmed':
+            resolved = ComputeUnconfirmed()
+        elif outcome == 'instance':
+            resolved = ComputeInstanceConfirmed(instant(resolution, 'at'), text(resolution, 'instance_id'))
+        elif outcome == 'absent':
+            resolved = ComputeResourcesAbsent(instant(resolution, 'at'))
+        else:
+            raise LedgerUnavailable('unknown compute request outcome')
+        request = ComputeRequest(instant(record, 'at'), text(record, 'stack'), text(record, 'region'),
+                                 money(text(record, 'spot_max_usd_per_hour')), text(record, 'request_id'), resolved)
+        if not isinstance(resolved, ComputeUnconfirmed) and resolved.at < request.at:
+            raise LedgerUnavailable('compute reconciliation precedes its request')
+        evidence.compute_requests.append(request)
+    if len({r.request_id for r in evidence.compute_requests}) != len(evidence.compute_requests):
+        raise LedgerUnavailable('duplicate compute request identity')
+    if sum(isinstance(r.resolution, ComputeUnconfirmed) for r in evidence.compute_requests) > 1:
+        raise LedgerUnavailable('multiple unconfirmed compute requests')
     for inventory in evidence.inventories:
         names = [resource.name for resource in inventory.resources]
         if not names or len(set(names)) != len(names):
@@ -274,19 +352,37 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
                          "resources": [{"name": p.name, "usd_per_month": str(p.usd_per_month)} for p in r.resources]}
                         for r in state.inventories],
         "reconciliations": [{"at": r.at, "period_start": r.period_start, "period_end": r.period_end,
-                             "usd": str(r.usd), "source": r.source} for r in state.reconciliations],
+                             "usd": str(r.usd), "source": r.source, "query_usd": str(r.query_usd),
+                             "established_days": [{"day": d.day, "usd": str(d.usd)} for d in r.established_days]}
+                            for r in state.reconciliations],
         "events": [{"event_id": r.event_id, "at": r.at, "period": r.period, "estimate_usd": str(r.estimate_usd),
                     "limit_usd": str(r.limit_usd), "recipient": r.recipient, "timeout_s": r.timeout_s,
                     "delivery": r.delivery.value, "retry_after": r.retry_after,
                     "owner": r.owner.token if isinstance(r.owner, DeliveryOwner) else ""} for r in state.events],
         "price_refresh_at": state.price_refresh_at, "decision": state.decision,
+        "charge_refresh_at": state.charge_refresh_at,
+        "compute_requests": [
+            {'at': r.at, 'stack': r.stack, 'region': r.region, 'spot_max_usd_per_hour': str(r.spot_max_usd_per_hour),
+             'request_id': r.request_id,
+             'resolution': {'outcome': 'unconfirmed'} if isinstance(r.resolution, ComputeUnconfirmed) else
+             {'outcome': 'instance', 'at': r.resolution.at, 'instance_id': r.resolution.instance_id}
+             if isinstance(r.resolution, ComputeInstanceConfirmed) else {'outcome': 'absent', 'at': r.resolution.at}}
+            for r in state.compute_requests],
     }
+
+
+def period_bounds(day: date, zone: ZoneInfo) -> tuple[int, int]:
+    first = datetime.combine(day, day_time(), zone)
+    return int(first.timestamp()), int((first + timedelta(days=1)).timestamp())
+
+
+def charge_period_day(now: int) -> date:
+    return datetime.fromtimestamp(now, ZoneInfo('UTC')).date() - timedelta(days=1)
 
 
 def _days(start: int, end: int, zone: ZoneInfo) -> Iterator[tuple[int, int]]:
     while start < end:
-        date = datetime.fromtimestamp(start, zone).date() + timedelta(days=1)
-        boundary = int(datetime.combine(date, day_time(), zone).timestamp())
+        _, boundary = period_bounds(datetime.fromtimestamp(start, zone).date(), zone)
         stop = min(end, boundary)
         yield start, stop
         start = stop
@@ -307,31 +403,35 @@ def _overlap(charge: ChargedInterval, start: int, end: int) -> Decimal:
 
 
 def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
-             current_window: bool = False) -> CostEstimate:
+             current_window: bool = False, require_fresh: bool = True,
+             window: date | None = None, pricing_end: int | None = None) -> CostEstimate:
     if type(now) is not int or now < 0:
         raise LedgerUnavailable("decision time must use nonnegative integer seconds")
+    pricing_end = now if pricing_end is None else pricing_end
     if not state.inventories:
         raise LedgerUnavailable("a priced resource inventory is required before spending")
     inventories = sorted(state.inventories, key=lambda item: item.at)
     observations = sorted((r for r in state.observations if r.state != "unknown"), key=lambda item: item.at)
     prices = sorted(state.prices, key=lambda item: item.at)
-    if any(r.at > now for r in (*inventories, *observations, *prices, *state.reconciliations)):
+    if any(r.at > pricing_end for r in (*inventories, *observations, *prices)) or (require_fresh and any(
+            r.at > now for r in state.reconciliations)):
         raise LedgerUnavailable("cost evidence is from the future")
-    if observations and now - observations[-1].at > settings.observation_max_age_seconds:
+    if require_fresh and observations and now - observations[-1].at > settings.observation_max_age_seconds:
         raise LedgerUnavailable("instance state evidence is stale")
     local = datetime.fromtimestamp(now, settings.accounting_zone)
     month_start = int(local.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp())
-    window_start = month_start if current_window else 0
+    window_start = period_bounds(window, settings.accounting_zone)[0] if window is not None else month_start if current_window else 0
+    requested_start = window_start
     # Include the complete periods needed by overlapping reconciliations.
     for reading in sorted(state.reconciliations, key=lambda r: r.period_end, reverse=True):
-        if reading.period_end > window_start:
+        if reading.period_end > window_start and reading.period_start < now:
             window_start = min(window_start, reading.period_start)
-    relevant_readings = [r for r in state.reconciliations if r.period_end > window_start]
+    relevant_readings = [r for r in state.reconciliations if r.period_end > window_start and r.period_start < now]
     intervals: list[ChargedInterval] = []
     inventory_index = max(0, bisect_right(inventories, window_start, key=lambda r: r.at) - 1)
     for index in range(inventory_index, len(inventories)):
         inventory = inventories[index]
-        end = inventories[index + 1].at if index + 1 < len(inventories) else now
+        end = inventories[index + 1].at if index + 1 < len(inventories) else pricing_end
         monthly = max(settings.fixed_usd_per_month, sum((p.usd_per_month for p in inventory.resources), Decimal(0)))
         for start, stop in _days(max(inventory.at, window_start), end, settings.accounting_zone):
             intervals.append(ChargedInterval(start, stop, monthly * Decimal(stop - start)
@@ -345,7 +445,7 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
     observation_index = max(0, bisect_right(observations, window_start, key=lambda r: r.at) - 1)
     for index in range(observation_index, len(observations)):
         observation = observations[index]
-        end = observations[index + 1].at if index + 1 < len(observations) else now
+        end = observations[index + 1].at if index + 1 < len(observations) else pricing_end
         if end <= window_start:
             continue
         confirmed_end = min(end, observation.at + settings.observation_max_age_seconds)
@@ -368,26 +468,93 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
             else:
                 price, source = settings.fallback_usd_per_hour, "configured fallback_usd_per_hour"
             for left, right in _days(start, stop, settings.accounting_zone):
-                intervals.append(ChargedInterval(left, right, price * Decimal(right - left) / Decimal(3600), source, "instance"))
+                intervals.append(ChargedInterval(left, right, price * Decimal(right - left) / Decimal(3600),
+                                                 source, "instance", right - left))
     if observations and inventories[0].at < observations[0].at:
         fallback(inventories[0].at, observations[0].at)
+    for request in state.compute_requests:
+        if request.at > pricing_end:
+            raise LedgerUnavailable('compute request evidence is from the future')
+        start = max(request.at, window_start)
+        end = pricing_end if isinstance(request.resolution, ComputeUnconfirmed) else min(pricing_end, request.resolution.at)
+        if start >= end:
+            continue
+        rate = max(settings.fallback_usd_per_hour, request.spot_max_usd_per_hour)
+        for left, right in _days(start, end, settings.accounting_zone):
+            intervals.append(ChargedInterval(left, right, rate * Decimal(right - left)
+                                             / Decimal(3600), 'unconfirmed compute request', 'instance'))
     interval = settings.cost_explorer_interval_seconds
-    first_read = inventories[0].at + max(0, (window_start - inventories[0].at + interval - 1) // interval) * interval
-    for at in range(first_read, now, interval):
+    origin = state.charge_refresh_at + interval if state.charge_refresh_at else inventories[0].at
+    first_read = origin + max(0, (window_start - origin + interval - 1) // interval) * interval
+    for at in range(first_read, pricing_end, interval):
         intervals.append(ChargedInterval(at, at, settings.cost_explorer_read_usd, "scheduled Cost Explorer read", "explorer"))
+    if state.charge_refresh_at:
+        for reading in relevant_readings:
+            intervals.append(ChargedInterval(reading.period_start, reading.period_start, reading.query_usd,
+                                             "confirmed Cost Explorer read", "explorer"))
+    established_reconciliations: list[CostReconciliation] = []
     for reading in relevant_readings:
         if reading.period_end <= reading.period_start:
             raise LedgerUnavailable("invalid Cost Explorer period")
-        estimated = sum((_overlap(r, reading.period_start, reading.period_end) for r in intervals), Decimal(0))
+        estimated = period_cost((r for r in intervals if r.kind != "explorer"), reading.period_start, reading.period_end)
         extra = max(Decimal(0), reading.usd - estimated)
+        established_days: list[EstablishedDayCost] = []
+        previous = {d.day: d.usd for d in reading.established_days}
         for start, end in _days(reading.period_start, reading.period_end, settings.accounting_zone):
-            intervals.append(ChargedInterval(start, end, extra * Decimal(end - start)
-                                             / Decimal(reading.period_end - reading.period_start), reading.source, "reconciliation"))
+            day = datetime.fromtimestamp(start, settings.accounting_zone).date().isoformat()
+            base = period_cost((r for r in intervals if r.kind != "explorer"), start, end)
+            computed = base + extra * Decimal(end - start) / Decimal(reading.period_end - reading.period_start)
+            established = max(computed, previous.get(day, Decimal(0)))
+            established_days.append(EstablishedDayCost(day, established))
+            intervals.append(ChargedInterval(start, end, established - base, reading.source, "reconciliation"))
+        established_reconciliations.append(replace(reading, established_days=tuple(established_days)))
+    if window is not None or pricing_end > now:
+        intervals = [replace(r, start=max(r.start, requested_start), end=min(r.end, now),
+                             usd=_overlap(r, requested_start, now),
+                             confirmed_uptime_s=max(0, min(now, r.end) - max(requested_start, r.start))
+                             if r.confirmed_uptime_s else 0) for r in intervals
+                     if (r.end > requested_start or r.start == r.end >= requested_start) and r.start < now]
     day, month = local.date().isoformat(), local.strftime("%Y-%m")
     daily = sum((r.usd for r in intervals if datetime.fromtimestamp(r.start, settings.accounting_zone).date().isoformat() == day), Decimal(0))
     monthly_total = sum((r.usd for r in intervals if datetime.fromtimestamp(r.start, settings.accounting_zone).strftime("%Y-%m") == month), Decimal(0))
     return CostEstimate(now, DailyTotal(day, daily), MonthlyTotal(month, monthly_total), tuple(intervals),
-                        inventories[-1].at, observations[-1].at if observations else 0)
+                        inventories[-1].at, observations[-1].at if observations else 0, tuple(established_reconciliations))
+
+
+def costs_from_evidence(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
+                        current_window: bool = True, window: date | None = None) -> CostEstimate:
+    """Calculate report costs without publishing a decision or requiring fresh admission evidence."""
+    reconciliations = [r for r in state.reconciliations if r.period_start < now]
+    # Price complete reconciliation periods before restricting costs to the report window.
+    pricing_end = max(now, max((r.period_end for r in reconciliations), default=now))
+    snapshot = LedgerEvidence(
+        [r for r in state.observations if r.at <= pricing_end], [r for r in state.prices if r.at <= pricing_end],
+        [r for r in state.inventories if r.at <= pricing_end], reconciliations,
+        charge_refresh_at=state.charge_refresh_at,
+        compute_requests=[r for r in state.compute_requests if r.at <= pricing_end])
+    return _charges(snapshot, settings, now, current_window=current_window, require_fresh=False,
+                    window=window, pricing_end=pricing_end)
+
+
+def period_cost(intervals: Sequence[ChargedInterval] | Iterator[ChargedInterval], start: int, end: int) -> Decimal:
+    """Return the sum of charges inside the requested period."""
+    return sum((_overlap(charge, start, end) for charge in intervals), Decimal(0))
+
+
+def read_charge(path: Path) -> ChargeRead:
+    row = mapping(cast(object, json.loads(path.read_text())))
+    reading = ChargeRead(text(row, 'day'), instant(row, 'at'), instant(row, 'period_start'),
+                         instant(row, 'period_end'), money(text(row, 'actual_usd')),
+                         money(text(row, 'estimated_usd')), money(text(row, 'query_usd')))
+    if reading.period_end <= reading.period_start or reading.period_end > reading.at:
+        raise LedgerUnavailable('invalid charge reconciliation')
+    return reading
+
+
+def charge_record(reading: ChargeRead) -> dict[str, object]:
+    return {'day': reading.day, 'at': reading.at, 'period_start': reading.period_start,
+            'period_end': reading.period_end, 'actual_usd': str(reading.actual_usd),
+            'estimated_usd': str(reading.estimated_usd), 'query_usd': str(reading.query_usd)}
 
 
 def _reserved_fixed_costs(state: LedgerEvidence, settings: SpendingSettings, costs: CostEstimate) -> tuple[Decimal, Decimal]:
@@ -395,8 +562,7 @@ def _reserved_fixed_costs(state: LedgerEvidence, settings: SpendingSettings, cos
     local = datetime.fromtimestamp(costs.at, settings.accounting_zone)
     inventory = max(state.inventories, key=lambda item: item.at)
     monthly = max(settings.fixed_usd_per_month, sum((p.usd_per_month for p in inventory.resources), Decimal(0)))
-    day_end = int(datetime.combine(local.date() + timedelta(days=1), day_time(), settings.accounting_zone).timestamp())
-    day_start = int(datetime.combine(local.date(), day_time(), settings.accounting_zone).timestamp())
+    day_start, day_end = period_bounds(local.date(), settings.accounting_zone)
     denominator = Decimal(_month_seconds(costs.at, settings.accounting_zone))
     daily_accrued = sum((r.usd for r in costs.intervals if r.kind == "fixed"
                          and datetime.fromtimestamp(r.start, settings.accounting_zone).date() == local.date()), Decimal(0))
@@ -419,7 +585,7 @@ def send_limit_event(event: LimitEvent) -> bool:
     return result.returncode == 0 and result.stdout.startswith(("SENT:", "SKIPPED:"))
 
 
-def _decision_record(decision: SpendingDecision) -> dict[str, object]:
+def decision_record(decision: SpendingDecision) -> dict[str, object]:
     evidence = decision.evidence
     record: dict[str, object] = {
         "at": decision.at, "purpose": evidence.purpose,
@@ -453,13 +619,24 @@ class CostLedger:
         self.directory: Path = directory
         self.path: Path = directory / "cost-ledger.json"
 
+    def _read(self) -> LedgerEvidence:
+        """Read atomically published evidence without creating files or acquiring locks."""
+        try:
+            return _decode(mapping(cast(object, json.loads(self.path.read_text()))))
+        except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
+            raise LedgerUnavailable(f"ledger evidence is unavailable: {error}") from error
+
+    def read_snapshot(self) -> LedgerEvidence:
+        """Read the published evidence without creating coordination files."""
+        return self._read()
+
     @contextmanager
     def _locked(self) -> Generator[LedgerEvidence]:
         self.directory.mkdir(parents=True, exist_ok=True)
         with (self.directory / "cost-ledger.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             try:
-                state = _decode(_mapping(cast(object, json.loads(self.path.read_text())))) if self.path.exists() else LedgerEvidence()
+                state = self._read() if self.path.exists() else LedgerEvidence()
                 yield state
             except (KeyError, TypeError, ArithmeticError, UnicodeError) as error:
                 raise LedgerUnavailable(f"ledger evidence is invalid: {error}") from error
@@ -471,14 +648,37 @@ class CostLedger:
         _ = _decode(document)
         write_text_atomic(self.path, json.dumps(document, sort_keys=True) + "\n")
 
-    def observe(self, observation: InstanceObservation) -> None:
+    def observe(self, observation: InstanceObservation, *, confirms_transition: bool = False) -> None:
         if observation.state == "unknown":
             raise ObservationRejected("unknown does not confirm an instance lifecycle state")
         with self._locked() as state:
-            if any(r.at == observation.at and r.state not in (observation.state, "unknown") for r in state.observations):
-                raise LedgerUnavailable("conflicting instance observations")
+            conflicts = [r for r in state.observations if r.at == observation.at and r.state not in (observation.state, "unknown")]
+            if conflicts:
+                if not confirms_transition:
+                    raise LedgerUnavailable("conflicting instance observations")
+                state.observations = [r for r in state.observations if r not in conflicts]
             if observation not in state.observations:
                 state.observations.append(observation)
+            self._save(state)
+
+    def pending_compute_requests(self) -> tuple[ComputeRequest, ...]:
+        if not self.path.exists():
+            return ()
+        return tuple(r for r in self.read_snapshot().compute_requests if isinstance(r.resolution, ComputeUnconfirmed))
+
+    def record_compute_request(self, request: ComputeRequest) -> None:
+        with self._locked() as state:
+            if any(isinstance(r.resolution, ComputeUnconfirmed) for r in state.compute_requests):
+                raise LedgerUnavailable('reconcile the outstanding compute request before another deployment')
+            state.compute_requests.append(request)
+            self._save(state)
+
+    def resolve_compute_request(self, request: ComputeRequest,
+                                resolution: ComputeInstanceConfirmed | ComputeResourcesAbsent) -> None:
+        with self._locked() as state:
+            if request not in state.compute_requests or not isinstance(request.resolution, ComputeUnconfirmed):
+                raise LedgerUnavailable('the compute request is no longer outstanding')
+            state.compute_requests[state.compute_requests.index(request)] = replace(request, resolution=resolution)
             self._save(state)
 
     def record_price(self, sample: PriceSample) -> None:
@@ -503,8 +703,9 @@ class CostLedger:
         if reading.period_end <= reading.period_start:
             raise LedgerUnavailable("invalid Cost Explorer period")
         with self._locked() as state:
-            if reading not in state.reconciliations:
-                state.reconciliations.append(reading)
+            if reading in state.reconciliations:
+                return
+            state.reconciliations.append(reading)
             self._save(state)
 
     def refresh_prices(self, settings_path: Path, now: int,
@@ -521,9 +722,77 @@ class CostLedger:
             self._save(state)
         return True
 
+    def _reconcile_charge(self, state: LedgerEvidence, reading: ChargeRead) -> None:
+        key = (reading.period_start, reading.period_end, 'Cost Explorer')
+        established: dict[str, Decimal] = {}
+        for saved in state.reconciliations:
+            if (saved.period_start, saved.period_end, saved.source) == key:
+                for day in saved.established_days:
+                    established[day.day] = max(established.get(day.day, Decimal(0)), day.usd)
+        reconciliation = CostReconciliation(reading.at, reading.period_start, reading.period_end,
+                                             reading.actual_usd, 'Cost Explorer', reading.query_usd,
+                                             tuple(EstablishedDayCost(day, usd) for day, usd in sorted(established.items())))
+        if reconciliation in state.reconciliations and state.charge_refresh_at >= reading.at:
+            return
+        state.reconciliations = [r for r in state.reconciliations
+                                 if (r.period_start, r.period_end, r.source) != key]
+        state.reconciliations.append(reconciliation)
+        state.charge_refresh_at = max(state.charge_refresh_at, reading.at)
+        self._save(state)
+
+    def refresh_charges(self, settings_path: Path, now: int,
+                        fetch: Callable[[int, int], Decimal]) -> ChargeRead | MeasurementUnavailable:
+        """Recover the newest saved reply before another scheduled query."""
+        configuration = conf.read(settings_path)
+        if not offload_enabled(configuration):
+            return MeasurementUnavailable('disabled')
+        settings = read_settings(configuration)
+        day = charge_period_day(now)
+        start, end = period_bounds(day, ZoneInfo('UTC'))
+        with self._locked() as state:
+            newest = max((self.directory / 'charges').glob('*.json'), default=None)
+            if newest is not None:
+                previous = read_charge(newest)
+                self._reconcile_charge(state, previous)
+                if (previous.period_start, previous.period_end) == (start, end):
+                    return previous
+            if state.charge_refresh_at and now < state.charge_refresh_at + settings.cost_explorer_interval_seconds:
+                return MeasurementUnavailable('charge read is not due')
+            costs = costs_from_evidence(state, settings, end,
+                                        window=datetime.fromtimestamp(start, settings.accounting_zone).date())
+            estimated = period_cost(costs.intervals, start, end)
+            actual = fetch(start, end)
+            if not actual.is_finite() or actual < 0:
+                raise ValueError('Cost Explorer reply must contain finite nonnegative USD')
+            reading = ChargeRead(day.isoformat(), now, start, end, actual, estimated, settings.cost_explorer_read_usd)
+            path = self.directory / 'charges' / f'{day.isoformat()}.json'
+            write_text_atomic(path, json.dumps(charge_record(reading), sort_keys=True) + '\n')
+            self._reconcile_charge(state, reading)
+            return reading
+
+    def _save_estimate(self, state: LedgerEvidence, costs: CostEstimate) -> None:
+        established = {r: r for r in costs.established_reconciliations}
+        state.reconciliations = [established.get(r, r) for r in state.reconciliations]
+        self._save(state)
+
     def estimate(self, settings: SpendingSettings, now: int) -> CostEstimate:
         with self._locked() as state:
-            return _charges(state, settings, now)
+            costs = _charges(state, settings, now)
+            self._save_estimate(state, costs)
+            return costs
+
+    def decision_is_current(self, decision: SpendingDecision) -> bool:
+        """Confirm that durable evidence contains this exact decision."""
+        try:
+            with self._locked() as state:
+                return state.decision == decision_record(decision)
+        except (OSError, ValueError):
+            return False
+
+    def permission_for_decision(self, decision: SpendingDecision) -> AdmissionPermission:
+        if not self.decision_is_current(decision):
+            return PermissionUnavailable(decision.at, 'current decision has no durable publication')
+        return decode_permission(decision_record(decision))
 
     def _decide(self, state: LedgerEvidence, settings_path: Path,
                 purpose: SpendingPurpose, now: int) -> SpendingDecision:
@@ -604,8 +873,11 @@ class CostLedger:
             with self._locked() as state:
                 decision = self._decide(state, settings_path, purpose, now)
                 evidence = decision.evidence
-                state.decision = _decision_record(decision)
-                self._save(state)
+                state.decision = decision_record(decision)
+                if isinstance(evidence.costs, CostEstimate):
+                    self._save_estimate(state, evidence.costs)
+                else:
+                    self._save(state)
         except (OSError, ValueError, ArithmeticError) as error:
             return SpendingUnavailable(now, str(error), evidence)
         try:
@@ -619,3 +891,71 @@ def spending_guard(settings_path: Path, directory: Path, purpose: SpendingPurpos
                    clock: Callable[[], float] = time.time,
                    notify: Callable[[LimitEvent], bool] = send_limit_event) -> SpendingDecision:
     return CostLedger(directory).guard(settings_path, purpose, int(clock()), notify, clock=clock)
+
+
+@dataclass(frozen=True)
+class PermissionAllowed:
+    at: int
+    evidence: dict[str, object]
+
+
+@dataclass(frozen=True)
+class PermissionRefused:
+    at: int
+    reason: str
+    evidence: dict[str, object]
+
+
+@dataclass(frozen=True)
+class PermissionUnavailable:
+    at: int
+    reason: str
+    evidence: dict[str, object] = field(default_factory=dict)
+
+
+AdmissionPermission = PermissionAllowed | PermissionRefused | PermissionUnavailable
+
+
+def permission_status(permission: AdmissionPermission) -> str:
+    if isinstance(permission, PermissionAllowed):
+        return 'allowed'
+    if isinstance(permission, PermissionRefused):
+        return 'refused'
+    return 'unavailable'
+
+
+def permission_record(permission: AdmissionPermission) -> dict[str, object]:
+    """Encode a permission with the ledger's decision fields."""
+    if permission.evidence:
+        return permission.evidence
+    if isinstance(permission, PermissionAllowed):
+        return {}
+    return {'at': permission.at, 'purpose': 'admission',
+            'status': permission_status(permission),
+            'reason': permission.reason}
+
+
+def decode_permission(value: object) -> AdmissionPermission:
+    """Decode the ledger decision without inferring permission from absent costs."""
+    try:
+        row = mapping(value)
+        at = instant(row, 'at')
+        if row.get('purpose') != 'admission':
+            raise LedgerUnavailable('decision purpose is not admission')
+        status = row.get('status')
+        if status == 'unavailable':
+            return PermissionUnavailable(at, text(row, 'reason'), row)
+        if status == 'refused':
+            return PermissionRefused(at, text(row, 'reason'), row)
+        if status != 'allowed':
+            raise LedgerUnavailable('unknown permission state')
+        limits = rows(row, 'limits')
+        if {r.get('key') for r in limits if r.get('origin') == 'live'} != {'daily_limit_usd', 'monthly_limit_usd'}:
+            raise LedgerUnavailable('live spending limits are missing')
+        _ = instant(row, 'inventory_at')
+        _ = instant(row, 'observation_at')
+        for key in ('daily_usd', 'monthly_usd', 'daily_limit_usd', 'monthly_limit_usd', 'reserve_usd'):
+            _ = money(text(row, key))
+        return PermissionAllowed(at, row)
+    except (KeyError, TypeError, ValueError, ArithmeticError) as error:
+        return PermissionUnavailable(0, f'invalid decision evidence: {error}')

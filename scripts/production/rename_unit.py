@@ -24,14 +24,13 @@ import argparse
 import dataclasses
 import os
 import re
-import shlex
 import subprocess
 import sys
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, ExitStack
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Protocol, cast
@@ -66,24 +65,20 @@ from rename_state import RenameRefused, read_json, write_json, write_text  # noq
 from unit_move import PathMove, git  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 from scripts.production import staff, staff_sources
+from scripts.shutdown import remote
 from scripts.lib import git_exclude, conf
 from scripts.astra import design_roles
 
 if TYPE_CHECKING:
     from scripts.style import style_ledger
-    from scripts.shutdown import shutdown_record
-    from scripts.shutdown.shutdown_record import SessionShutdown
 else:
     import style_ledger
-    import shutdown_record
-    from shutdown_record import SessionShutdown
 
 RESERVED = frozenset({add_unit.NIGHTLY_REVIEW_UNIT})
 # Columns a unit rename edits outside the Units row; a File or Gate cell is never touched.
 EDITED_COLUMNS = {"## Hub files": ("Owner unit", "Other units that touch it"), "## Gates": ("Waiting", "Waits on")}
 PROGRESS = ("merged", "doc_commit", "unit_tip", "account", "session_id", "kept", "old_session")
 SHUTDOWN = Path(os.environ.get("RENAME_UNIT_SHUTDOWN") or Path(__file__).resolve().parent.parent / "shutdown/shutdown.py")
-STOPPED = frozenset({"stopped", "already gone", "process identity lost"})
 LIVE_WAIT_SECONDS = float(os.environ.get("RENAME_UNIT_LIVE_WAIT") or 180)
 # A run supervisor passes SIGTERM to its command and exits when that ends: a lint seen
 # 2026-10-20 took longer than retire_unit's 10 s.
@@ -230,7 +225,11 @@ def _build(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
     if production_units.plan_cell_is_retired(row.get("Plan", "")):
         raise RenameRefused(f"{old} is retired; its row is history")
     old_branch = production_units.cell_value(row.get("Branch", ""))
-    worktree = Path(production_units.cell_value(row.get("Worktree", ""))).expanduser()
+    selected = staff_sources.member(staff_sources.UnitMember(production.slug, old), staff.snapshot())
+    if isinstance(selected, staff_sources.NoSuchMember):
+        raise staff.StaffUnreadable(f"{production.slug}/{old}: no matching staff member")
+    location = unit_lookup.local_worktree(selected)
+    worktree = location.path
     old_stem, new_stem = unit_names.stem(old), unit_names.stem(new)
     if new_stem == old_branch:
         new_branch = old_branch
@@ -252,7 +251,7 @@ def _build(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
     return UnitRename(slug, old, new, str(production.doc), str(production.checkout), production.merge_branch,
                       old_branch, new_branch, str(worktree), str(new_worktree),
                       git(worktree, "rev-parse", "HEAD"), str(scratch), old_session=old_session,
-                      id_matches=id_matches)
+                      id_matches=id_matches, staff_id=selected.row.id)
 
 
 def _staff_id(slug: str, unit: str) -> staff.StaffId:
@@ -270,10 +269,10 @@ def _unit_of_session(slug: str, name: str, units: list[str]) -> str:
         raise RenameRefused(f"{name}: cannot tell which unit's session it names: {error}") from error
     found = {unit for unit, place in marked.items()
              if isinstance(place.claude, unit_lookup.LiveClaude) and place.claude.name == name}
-    for item in shutdown_records(slug, tuple(units)):
-        host = item["session"]["host"]
-        if host["kind"] == "unit" and item["session"]["name"] == name:
-            found.add(host["unit"])
+    for unit in units:
+        member = staff_sources.member(staff_sources.UnitMember(slug, unit), staff.snapshot())
+        if isinstance(member, staff_sources.MemberFound) and member.row.name == name:
+            found.add(unit)
     if len(found) > 1:
         raise RenameRefused(f"{name} names the sessions of {' and '.join(sorted(found))}; give the unit id")
     return next(iter(found), "")
@@ -287,8 +286,8 @@ def _session_name(slug: str, unit: str) -> str:
         raise RenameRefused(f"{unit}: cannot tell whether Claude is running: {error}") from error
     if found is not None and isinstance(found.claude, unit_lookup.LiveClaude):
         return found.claude.name
-    names = [item["session"]["name"] for item in shutdown_records(slug, (unit,))]
-    return names[0] if names else ""
+    member = staff_sources.member(staff_sources.UnitMember(slug, unit), staff.snapshot())
+    return "" if isinstance(member, staff_sources.NoSuchMember) else member.row.name
 
 
 def _check_stopped(rename: UnitRename, *, relaunch: bool = False) -> None:
@@ -475,7 +474,7 @@ def _doc_text(rename: UnitRename, text: str) -> str:
         row = dict(zip(headings, cells, strict=False))
         if section == "## Units" and production_units.cell_value(row.get("Unit", "")) == rename.old:
             values = {"Unit": rename.new, "Worktree": rename.new_worktree, "Branch": rename.new_branch}
-            values = {column: f"`{value}`" if "`" in row[column] else value for column, value in values.items()}
+            values = {column: f"`{value}`" if "`" in row[column] else value for column, value in values.items() if column in row}
         elif section in EDITED_COLUMNS and not (section == "## Gates" and
                                                 row.get("Clears when", "").lower().startswith("cleared")):
             values = {column: _token(rename.old, rename.new, row[column])
@@ -558,14 +557,18 @@ def _merge(rename: UnitRename, _save: Callable[[], None]) -> None:
     rename.merged = unit_move.merge_into(worktree, f"origin/{rename.merge_branch}", message)
 
 
+def _relocate_staff_row(row: staff.StaffRow, worktree: Path) -> None:
+    if isinstance(row.worktree, staff.WorktreeUnfilled) or row.worktree.path == worktree:
+        return
+    _ = staff.set_worktree(row.id, dataclasses.replace(row.worktree, path=worktree), expected=row.worktree)
+
+
 def relocate_staff_worktree(member_id: staff.StaffId, worktree: Path) -> None:
     """Change a recorded worktree path without changing its lifecycle state."""
     row = staff.by_id(member_id)
     if row is None or row.kind != "unit":
         raise RenameRefused(f"{member_id}: no matching unit staff row")
-    if isinstance(row.worktree, staff.WorktreeUnfilled):
-        return
-    _ = staff.set_worktree(member_id, dataclasses.replace(row.worktree, path=worktree))
+    _relocate_staff_row(row, worktree)
 
 
 def _move_git(rename: UnitRename, _save: Callable[[], None]) -> None:
@@ -584,7 +587,12 @@ def _move_git(rename: UnitRename, _save: Callable[[], None]) -> None:
         _ = git(Path(rename.new_worktree), "switch", rename.new_branch)
     worktree = Path(rename.new_worktree)
     git_exclude.ensure_excluded(worktree, "/.unit.toml")
-    relocate_staff_worktree(rename.staff_id, worktree)
+    row = staff.by_id(rename.staff_id)
+    if row is None or row.kind != "unit":
+        raise RenameRefused(f"{rename.staff_id}: no matching unit staff row")
+    if not isinstance(row.worktree, staff.WorktreeUnfilled) and row.worktree.path not in (source, worktree):
+        raise RenameRefused(f"{row.id}: staff worktree differs from the journal source and destination")
+    _relocate_staff_row(row, worktree)
 
 
 def _move_claude(rename: UnitRename, _save: Callable[[], None]) -> None:
@@ -711,28 +719,6 @@ def run_shutdown(*arguments: str) -> None:
         raise RenameRefused(f"shutdown {arguments[0]}: {(result.stderr or result.stdout).strip()}")
 
 
-def _unit_records(rename: StopTarget) -> list[SessionShutdown]:
-    """The journaled director remains the same when its staff name or parent moves."""
-    return shutdown_records(rename.slug, (rename.old, rename.new), session_id=rename.session_id)
-
-
-def shutdown_records(slug: str, units: tuple[str, ...], *, session_id: str = "") -> list[SessionShutdown]:
-    try:
-        saved = shutdown_record.all_session_records()
-    except (shutdown_record.InvalidRecord, OSError) as error:
-        raise RenameRefused(f"shutdown records unreadable: {error}") from error
-    found: list[SessionShutdown] = []
-    for item in saved:
-        host = item["session"]["host"]
-        if host["kind"] != "unit" or host["unit"] not in units:
-            continue
-        recorded_id = item["session"]["session_id"]
-        if (recorded_id == session_id if session_id else
-                staff_sources.unit_parent(host["unit"], recorded_id).slug == slug):
-            found.append(item)
-    return found
-
-
 def _bind_live_pane(rename: StopTarget, marked: unit_lookup.MarkedUnit) -> None:
     """Pin the terminal at the director's exact place before stopping its agent."""
     try:
@@ -753,22 +739,14 @@ def _bind_live_pane(rename: StopTarget, marked: unit_lookup.MarkedUnit) -> None:
 
 def bind_stop_target(rename: StopTarget) -> None:
     """Journal the director before changing the staff name or parent used to find it."""
-    records = _unit_records(rename)
-    if len(records) > 1:
-        raise RenameRefused(f"{rename.old} has {len(records)} shutdown records; settle them first")
     marked = unit_lookup.marked_unit(rename.slug, rename.old)
-    if (records and marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude)
-            and records[0]["session"]["session_id"] != marked.claude.session_id):
-        raise RenameRefused(f"{rename.old}: director does not match its shutdown record")
     conversation = unit_move.unit_conversation(marked, session_id=rename.session_id)
     if isinstance(conversation, unit_move.UnitConversation):
         rename.account, rename.session_id = conversation.account, conversation.session_id
-    elif records:
-        rename.account, rename.session_id = records[0]["label"], records[0]["session"]["session_id"]
-    elif marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude):
-        raise RenameRefused(f"{rename.old}: session {marked.claude.session_id} has no pane launch account")
-    elif rename.session_id and not rename.account:
-        raise RenameRefused(f"{rename.old}: session {rename.session_id} has no pane launch account or shutdown record")
+    else:
+        member = staff_sources.member(staff_sources.UnitMember(rename.slug, rename.old), staff.snapshot())
+        if not isinstance(member, staff_sources.NoSuchMember):
+            rename.session_id = str(member.row.current_session)
     if marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude):
         _bind_live_pane(rename, marked)
 
@@ -837,32 +815,15 @@ def stop_unit(rename: StopTarget, save: Callable[[], None]) -> None:
     recovering_pane = bool(rename.pane_id) and (found is None or not isinstance(found.claude, unit_lookup.LiveClaude))
     pane = None if recovering_pane else unit_move.unit_pane(found, rename.slug)
     from scripts.shutdown import stop_resume
-    records = _unit_records(rename)
-    if len(records) > 1:
-        raise RenameRefused(f"{rename.old} has {len(records)} shutdown records; settle them first")
     identity = found.claude.session_id if found is not None and isinstance(found.claude, unit_lookup.LiveClaude) else rename.session_id
     if found is not None and isinstance(found.claude, unit_lookup.ClaudeUnknown):
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {found.claude.reason}")
-    if not identity and len(records) == 1:
-        identity = records[0]["session"]["session_id"]
     if identity and found is not None and isinstance(found.claude, unit_lookup.LiveClaude):
         result = stop_resume.stop(identity)
         if not isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning)):
             reason = result.reason if isinstance(result, stop_resume.StopFailed) else "no local session tab"
             raise RenameRefused(f"{rename.old}: stop refused: {reason}")
         rename.session_id = identity
-        if records:
-            for saved in records:
-                _ = shutdown_record.update_session(saved["login"], identity,
-                    lambda current: current.update(progress=shutdown_record.SessionStopped(
-                        kind="stopped", at=datetime.now(UTC).isoformat(timespec="seconds"))))
-    # Only the deleted conductor wrote stop issues; name the one command that settles its record.
-    for saved in records:
-        if saved["stop_issues"]:
-            settle = shlex.join(["python3", "scripts/shutdown/shutdown.py", "forget",
-                                 saved["session"]["session_id"], "--account", saved["label"]])
-            raise RenameRefused(f"{rename.old}: an old stop record has unresolved cleanup issues; settle it: "
-                                + f"cd ~/.claude && {settle}")
     _stop_runs(rename)
     if rename.pane_id and (recovering_pane or pane is not None):
         pane = _stopped_pane(rename)
@@ -928,12 +889,6 @@ def _stop_runs(rename: StopTarget) -> None:
         raise RenameRefused("; ".join(left))
 
 
-
-
-def _moved(path: str, old: str, new: str) -> str:
-    return new + path[len(old):] if path == old or path.startswith(old + "/") else path
-
-
 def renamed_note(rename: UnitRename) -> str:
     plans = ", ".join(str(path).replace(rename.checkout, rename.new_worktree, 1) for path in _plans(rename))
     return (f"While you were stopped the showrunner renamed you: you are now {rename.new}, in worktree "
@@ -949,78 +904,6 @@ def seat_note(rename: UnitRename) -> str:
     return (f"While you were paused the showrunner renamed your unit: your worktree is now {rename.new_worktree} "
             + f"on branch {rename.new_branch}. {rename.old_worktree} no longer exists; wherever your instructions "
             + f"name it, use {rename.new_worktree}.")
-
-
-def repoint_shutdown_worktree(saved: SessionShutdown, old: str, new: str,
-                              host_names: dict[str, str], note: str) -> None:
-    """Move restore paths and worker launchers without changing the unit's identity."""
-    session = saved["session"]
-    host = session["host"]
-    if host["kind"] != "unit":
-        raise RenameRefused("shutdown record is not a unit's")
-    if saved["progress"]["kind"] not in STOPPED:
-        raise RenameRefused(f"shutdown record reads {saved['progress']['kind']}; settle it first")
-    host["session_name"] = host_names.get(host["session_name"], host["session_name"])
-    if host["plan"]["kind"] == "plan":
-        host["plan"]["path"] = _moved(host["plan"]["path"], old, new)
-    session["cwd"] = _moved(session["cwd"], old, new)
-    for worker in saved["workers"]:
-        worker["cwd"] = _moved(worker["cwd"], old, new)
-    if old == new:
-        return
-    for worker in saved.get("codex_seats", []):
-        worker["launcher_command"] = [_moved(argument, old, new) for argument in worker["launcher_command"]]
-        prompt = Path(worker["run_dir"]) / f"{worker['seat']}.resume-prompt.md"
-        text = prompt.read_text(encoding="utf-8") if prompt.exists() else ""
-        if note not in text:
-            _ = prompt.write_text(f"{text}{note}\n", encoding="utf-8")
-
-
-def _host_names(rename: UnitRename) -> dict[str, str]:
-    """Each herdr session name made from the old stem or the old session name, to its new form."""
-    import herdr
-
-    new_stem = unit_names.stem(rename.new)
-    olds = [unit_names.stem(rename.old), *([rename.old_session] if rename.old_session else [])]
-    return {herdr.generated_session_name(old_form): herdr.generated_session_name(new_form)
-            for old in olds for old_form, new_form in (
-                (old, new_stem), (unit_names.branch(rename.slug, old), unit_names.branch(rename.slug, new_stem)))}
-
-
-def _restart_record(rename: UnitRename, save: Callable[[], None]) -> None:
-    """Point the stopped unit's shutdown record at its new names; restart reads the plan from the Units row.
-
-    The Claude session takes the new stem whatever it was called before, and a herdr session name
-    made from the old stem or the old session name takes the same form of the new stem (user,
-    2026-10-19: builder-report kept its name when build-report-unit became builds-unit).
-    """
-    if not rename.session_id:
-        return
-    records = _unit_records(rename)
-    if not records:
-        return
-    new_stem = unit_names.stem(rename.new)
-
-    def change(saved: SessionShutdown) -> None:
-        session = saved["session"]
-        host = session["host"]
-        if not rename.old_session:
-            rename.old_session = session["name"]
-        host_names = _host_names(rename)
-        if host["kind"] != "unit" or host["unit"] not in (rename.old, rename.new):
-            raise RenameRefused(f"shutdown record {rename.session_id} is not {rename.old}'s")
-        if saved["progress"]["kind"] not in STOPPED:
-            raise RenameRefused(f"{rename.old}'s shutdown record reads {saved['progress']['kind']}; settle it first")
-        host["unit"] = rename.new
-        repoint_shutdown_worktree(saved, rename.old_worktree, rename.new_worktree, host_names, seat_note(rename))
-        session["name"] = new_stem
-        saved["renamed"] = renamed_note(rename)
-
-    try:
-        _ = shutdown_record.update_session(records[0]["login"], rename.session_id, change)
-    except (shutdown_record.NoLiveRecord, shutdown_record.InvalidRecord, OSError) as error:
-        raise RenameRefused(f"{rename.old}'s shutdown record: {error}") from error
-    save()
 
 
 def _old_tab_titles(rename: UnitRename) -> frozenset[str]:
@@ -1041,28 +924,14 @@ def _rename_saved_layout(rename: UnitRename) -> None:
 def _relaunch(rename: UnitRename, _save: Callable[[], None]) -> None:
     _rename_saved_layout(rename)
     if rename.session_id:
-        # Restart also resumes its own partial worker/timer restores on a retry.
-        if _unit_records(rename):
-            run_shutdown("restart", "--only", rename.session_id)
-        else:
-            rows = production_units.unit_table(Path(rename.doc).read_text(encoding="utf-8").splitlines())
-            row = next((row for row in rows if production_units.cell_value(row["Unit"]) == rename.new), None)
-            if row is None or not (plan := production_units.cell_value(row.get("Plan", ""))):
-                raise RenameRefused(f"{rename.new}: no Plan in {rename.doc}")
-            result = subprocess.run([sys.executable, str(Path(add_unit.__file__)),
-                "--production", rename.doc, rename.new, *production_units.plan_arguments(plan),
-                "--resume", rename.session_id, "--cwd", rename.new_worktree,
-                *(["--account", rename.account] if rename.account else [])],
-                pass_fds=staff.operation_fds(),
-                capture_output=True, text=True, check=False)
-            if result.returncode:
-                raise RenameRefused((result.stderr or result.stdout).strip())
-    # Keep the source launch until a relaunch succeeds, then remove its old names.
-    # A stopped unit with no conversation also leaves no restorable old pane.
+        run_shutdown("restart", "--only", rename.session_id)
+        _await_live(rename)
+    record = staff.initial_snapshot()
+    if not isinstance(rename.staff_id, UnboundStaffMember):
+        for worker in record.find(kind="worker", parent=rename.staff_id):
+            run_shutdown("restart", "--only", str(worker.id))
     if rename.old != rename.new:
         _ = pane_record.forget_unit(rename.old)
-    if rename.session_id:
-        _await_live(rename)
 
 
 def _await_live(rename: UnitRename) -> None:
@@ -1070,7 +939,7 @@ def _await_live(rename: UnitRename) -> None:
     Past LIVE_WAIT_SECONDS verify reports it as not running."""
     deadline = time.monotonic() + LIVE_WAIT_SECONDS
     while True:
-        found = unit_lookup.marked_units(rename.slug).get(rename.new)
+        found = unit_lookup.marked_unit(rename.slug, rename.new)
         if (found is not None and isinstance(found.claude, unit_lookup.LiveClaude)) or time.monotonic() >= deadline:
             return
         time.sleep(POLL_SECONDS)
@@ -1122,11 +991,16 @@ def _doc_failures(rename: UnitRename) -> list[str]:
     doc = Path(rename.doc)
     text = doc.read_text(encoding="utf-8")
     rows = [row for row in _rows(doc) if production_units.cell_value(row.get("Unit", "")) in (rename.old, rename.new)]
-    cells = [{column: production_units.cell_value(row.get(column, "")) for column in ("Unit", "Worktree", "Branch")}
+    cells = [{column: production_units.cell_value(row.get(column, "")) for column in ("Unit", "Branch")}
              for row in rows]
     failures: list[str] = []
-    if cells != [{"Unit": rename.new, "Worktree": rename.new_worktree, "Branch": rename.new_branch}]:
-        failures.append(f"{doc}: the Units row does not name {rename.new}, {rename.new_worktree} and {rename.new_branch}")
+    if cells != [{"Unit": rename.new, "Branch": rename.new_branch}]:
+        failures.append(f"{doc}: the Units row does not name {rename.new} and {rename.new_branch}")
+    row = staff.snapshot().by_id(rename.staff_id) if isinstance(rename.staff_id, str) else None
+    if row is None or isinstance(row.worktree, staff.WorktreeUnfilled):
+        failures.append(f"{rename.new}: staff worktree is unavailable")
+    elif row.worktree.machine != remote.local_machine() or row.worktree.path != Path(rename.new_worktree):
+        failures.append(f"{rename.new}: staff worktree differs from {rename.new_worktree}")
     # apply's own edit would change nothing: no Hub files or open Gates unit cell names the old id.
     if _doc_text(rename, text) != text:
         failures.append(f"{doc}: a Hub files or open Gates unit cell still names {rename.old}")
@@ -1164,12 +1038,7 @@ def _session_failures(rename: UnitRename) -> list[str]:
     if not rename.session_id:
         return []
     failures: list[str] = []
-    records = _unit_records(rename)
-    saved = records[0] if records else None
-    if saved is not None and saved["session"]["host"]["kind"] == "unit" and saved["session"]["host"]["unit"] != rename.new:
-        failures.append(f"shutdown record {rename.session_id} does not name {rename.new}")
-    marked = unit_lookup.marked_units(rename.slug)
-    found = marked.get(rename.new)
+    found = unit_lookup.marked_unit(rename.slug, rename.new)
     if found is None or not isinstance(found.claude, unit_lookup.LiveClaude):
         failures.append(f"{rename.new} is not running; relaunch it with shutdown.py restart --here --only {rename.session_id}")
     # When the id already matched, the mark is the new id too; only the session name changed.
@@ -1243,7 +1112,7 @@ def verify_failures(rename: UnitRename) -> list[str]:
                 *unit_rename_sweep.sweep(tuple(old for old, new in (
                     (rename.old, rename.new), (rename.old_branch, rename.new_branch),
                     (rename.old_worktree, rename.new_worktree)) if old != new), _sweep_roots(rename))]
-    except (shutdown_record.InvalidRecord, production_units.Refusal, style_ledger.LedgerError) as error:
+    except (production_units.Refusal, style_ledger.LedgerError) as error:
         raise RenameRefused(f"verify could not read a place: {error}") from error
 
 
@@ -1272,7 +1141,7 @@ class Step(NamedTuple):
 
 
 def _describe_stop(r: UnitRename) -> str:
-    return (f"pause {r.old} and its Codex workers through the shutdown path; its record carries the relaunch; "
+    return (f"stop {r.old} and pause its Codex workers; staff supplies the relaunch; "
             + "then stop its runs' app-servers and keep detached commands")
 
 
@@ -1310,17 +1179,8 @@ def _describe_retire(r: UnitRename) -> str:
             if r.old_branch != r.new_branch else f"keep branch {r.old_branch}")
 
 
-def _describe_record(r: UnitRename) -> str:
-    session = (f"Claude session {r.old_session} -> {unit_names.stem(r.new)}" if r.old_session
-               else "no Claude session to name")
-    if r.id_matches:
-        return f"shutdown record: {session}"
-    return (f"shutdown record: unit {r.old} -> {r.new}, {session}, and the paths under its worktree, "
-            + "each paused Codex worker's included, whose resume prompt names the new worktree")
-
-
 def _describe_relaunch(r: UnitRename) -> str:
-    return f"relaunch {r.new} from its shutdown record in {r.new_worktree}"
+    return f"relaunch {r.new} from its staff row in {r.new_worktree}"
 
 
 def _describe_verify(r: UnitRename) -> str:
@@ -1336,14 +1196,13 @@ STEPS = (
     Step(_merge_rename, _describe_merge_rename),
     Step(_move_state, _describe_state, source_writes=True),
     Step(_retire, _describe_retire),
-    Step(_restart_record, _describe_record, merge_lock=MergeLockScope.NONE, source_writes=True),
     Step(_relaunch, _describe_relaunch, merge_lock=MergeLockScope.NONE, source_writes=True),
     Step(_verify, _describe_verify, stopped=False, merge_lock=MergeLockScope.NONE),
 )
 
 
 # The steps a name-only rename runs; the rest name the id, which already is the new one.
-NAME_STEPS: tuple[Callable[[UnitRename, Callable[[], None]], None], ...] = (stop_unit, _restart_record, _relaunch, _verify)
+NAME_STEPS: tuple[Callable[[UnitRename, Callable[[], None]], None], ...] = (stop_unit, _relaunch, _verify)
 
 
 def step_number(run: Callable[[UnitRename, Callable[[], None]], None]) -> int:
@@ -1394,7 +1253,7 @@ def _save(path: Path, rename: UnitRename) -> None:
     for name in LOCATION_FIELDS:
         del saved[name]
     write_json(path, {**saved, "done": rename.step == len(STEPS),
-                      "claimed": rename.step < step_number(_restart_record)})
+                      "claimed": rename.step < step_number(_relaunch)})
 
 
 def _resumed(path: Path, old: str, new: str) -> UnitRename | None:
@@ -1438,10 +1297,19 @@ def plan(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
 def _rename_staff(rename: UnitRename) -> None:
     if isinstance(rename.staff_id, UnboundStaffMember):
         raise staff.StaffRefused(f"{rename.slug}/{rename.old}: no journaled staff identity")
-    _ = staff.rename(rename.staff_id, unit_names.name(rename.new))
+    row = staff.by_id(rename.staff_id)
+    if row is not None and row.name != unit_names.name(rename.new):
+        _ = staff.rename(rename.staff_id, unit_names.name(rename.new))
 
 
 def apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
+    prepared = plan(slug, old, new, scratch)
+    identity = prepared.staff_id if not isinstance(prepared.staff_id, UnboundStaffMember) else _staff_id(prepared.slug, prepared.old)
+    with staff.row_operation(str(identity)):
+        return _apply(slug, old, new, scratch)
+
+
+def _apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
     slug = showrunners.canonical_slug(slug)
     path = rename_state.unit_journal(slug)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1456,7 +1324,8 @@ def apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
                 _preflight(rename)
         with staff.operation():
             if fresh:
-                rename.staff_id = _staff_id(rename.slug, rename.old)
+                if isinstance(rename.staff_id, UnboundStaffMember):
+                    rename.staff_id = _staff_id(rename.slug, rename.old)
                 bind_stop_target(rename)
                 # The request is saved before anything changes, so every later refusal resumes.
                 _save(path, rename)

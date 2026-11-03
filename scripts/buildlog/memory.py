@@ -87,13 +87,14 @@ class EarlyoomKill:
 
     @property
     def outside_build_gate(self) -> bool:
-        if self.oom_score_adj == conf.whole("lint", "build_oom_score_adj") or not isinstance(self.cmdline, str):
+        if self.oom_score_adj == conf.read("lint").whole("build_oom_score_adj") or not isinstance(self.cmdline, str):
             return False
         return "/target/" in cmdline_program(self.cmdline)
 
     @property
     def is_build(self) -> bool:
-        return self.oom_score_adj == conf.whole("lint", "build_oom_score_adj") or self.outside_build_gate
+        return (self.oom_score_adj == conf.read("lint").whole("build_oom_score_adj")
+                or isinstance(self.cmdline, str) and "/target/" in cmdline_program(self.cmdline))
 
 
 def service_state(value: int | None) -> ServiceState:
@@ -179,9 +180,17 @@ def samples_line(rows: list[tuple[str, str, ServiceState]]) -> str:
     return f"sccache outside its service: {len(outside)} min — {', '.join(parts)}"
 
 
-def instrument_lines(connection: sqlite3.Connection, predicate: str, params: tuple[str, ...]) -> list[str]:
-    steps = predicate.format(column="started_at")
-    samples = predicate.format(column="at")
+@dataclass(frozen=True)
+class InstrumentPredicates:
+    samples: str
+    steps: str
+    calls: str
+
+
+def instrument_lines(connection: sqlite3.Connection, predicates: InstrumentPredicates, params: tuple[str, ...]) -> list[str]:
+    steps = predicates.steps.format(column="started_at")
+    samples = predicates.samples.format(column="at")
+    calls = predicates.calls.format(column="started_at")
     sampled = cast(list[tuple[str, str, int | None]], connection.execute(
         f"SELECT host, at, sccache_in_service FROM samples WHERE {samples} ORDER BY host, at", params
     ).fetchall())
@@ -197,7 +206,7 @@ def instrument_lines(connection: sqlite3.Connection, predicate: str, params: tup
         "SELECT count(*) FILTER (WHERE mem_kills > 0 AND coalesce(mem_kill_stopped, 0) = 0 AND outcome = 'ran' AND status = 0), "
         + "count(*) FILTER (WHERE mem_kills > 0 AND coalesce(mem_kill_stopped, 0) = 0 AND (outcome IS NOT 'ran' OR status IS NOT 0)), "
         + "count(*) FILTER (WHERE mem_kill_stopped = 1) "
-        + f"FROM calls WHERE {steps}", params
+        + f"FROM calls WHERE {calls}", params
     ).fetchone())
     unsliced_parts = [
         label for count, label in (
@@ -350,7 +359,8 @@ def window_report(connection: sqlite3.Connection, start: datetime, end: datetime
         lines.append(f"memory waits: {waits[0]} steps, total {duration(waits[1])}, longest {duration(waits[2])}, {waits[3]} reached the 15-min limit")
     else:
         lines.append("memory waits: none")
-    lines.extend(instrument_lines(connection, "host = ? AND {column} >= ? AND {column} < ?", (store.host_name(), *bounds)))
+    predicate = "host = ? AND {column} >= ? AND {column} < ?"
+    lines.extend(instrument_lines(connection, InstrumentPredicates(predicate, predicate, predicate), (store.host_name(), *bounds)))
     zram: ZramPresent | ZramAbsent = last["zram"] if last["kind"] == "memory_snapshot" else {"state": "absent"}
     if zram["state"] == "present":
         ratio = zram["data_bytes"] / zram["compressed_bytes"] if zram["compressed_bytes"] else 0.0

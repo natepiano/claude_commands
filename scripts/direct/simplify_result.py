@@ -1,170 +1,143 @@
 #!/usr/bin/env python3
-"""Validate, save, reuse, and report a simplify review result."""
+"""Prepare, validate, and report a simplify review."""
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
-import os
+from dataclasses import dataclass
 from pathlib import Path
 import re
-import subprocess
+from string import Template
+import shlex
 import sys
 from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.agents.claude_result import claude_result
+from scripts.lib import conf
+from scripts.issue_score.selection import UseConfiguredValue
 from scripts.lib.atomic_file import write_text_atomic
 
 
-def json_object(text: str) -> dict[str, object]:
-    """Read a JSON object without accepting another JSON value."""
-    value = cast(object, json.loads(text))
-    return cast(dict[str, object], value) if isinstance(value, dict) else {}
+@dataclass(frozen=True)
+class ReviewFiles:
+    """Use the artifact paths that the launcher owns."""
+
+    findings: Path
+    status: Path
+    log: Path
+    summary: Path
 
 
-def failure_reason(reason: str, report: str, log: str, exit_code: int, fallback: str = "") -> str:
-    """Keep a stated reason before using the review evidence."""
+def log_errors(log: str) -> str:
+    """Read plain launch errors from the review log."""
+    return "\n".join(line.removeprefix("ERROR:").strip() for line in log.splitlines() if line.startswith("ERROR:"))
+
+
+def failure_reason(reason: str, report: str, log: Path, exit_code: int) -> str:
+    """Read log evidence only after a stated or extracted reason."""
     if reason:
         return reason
     if report.startswith("ERROR:"):
         return report.removeprefix("ERROR:").strip()
-    errors = [line.removeprefix("ERROR:").strip() for line in log.splitlines() if line.startswith("ERROR:")]
-    return "\n".join(errors) or fallback or f"the simplify review did not finish successfully (exit {exit_code})"
+    if log.exists():
+        detail = log_errors(log.read_text(errors="replace"))
+        if detail:
+            return detail
+    return f"the simplify review did not finish successfully (exit {exit_code})"
 
 
-def send_failure_once(session: Path, phase: str, reason: str) -> None:
-    """Let send.py apply its repeat window for the recipient and failure key."""
-    from scripts.lib import conf
-    from scripts.lib.process_failure import failure_detail
+def well_formed(report: str) -> bool:
+    """Accept Pass or item 1 after a heading or preamble."""
+    return any(line.strip() == "Pass" or re.match(r"^1[.)]\s", line.strip()) is not None
+               for line in report.strip().splitlines())
 
-    try:
-        state = json_object((session / "progress_history_state.json").read_text())
-        unit = state.get("unit") or session.name
-        target = conf.text("direct", "SIMPLIFY_FAILURE_TARGET")
-        repeat = conf.whole("direct", "SIMPLIFY_FAILURE_REPEAT_MINUTES")
-        digest = Path(os.environ.get("UNIT_REVIEW_CACHE_FILE", "")).stem
-        key = hashlib.sha256(json.dumps([digest, reason]).encode()).hexdigest()
-        sender = os.environ.get("SIMPLIFY_FAILURE_SENDER") or str(Path(__file__).resolve().parents[1] / "message/send.py")
-        prefix = "PROOF, no action: " if os.environ.get("UNIT_REVIEW_PROOF") == "1" else ""
-        message = f"{prefix}URGENT: simplify review failed. Unit: {unit}. Phase: {phase}. Reason: {reason}"
-        delivered = subprocess.run([
-            sys.executable, sender, "--to", target, "--from", "simplify review",
-            "--summary", prefix + "URGENT: simplify review failed", "--key", f"simplify-{key}",
-            "--repeat-minutes", str(repeat), "--text", message,
-        ], capture_output=True, text=True, check=False)
-        if delivered.returncode != 0:
-            print("simplify: unable to send failure message: " + failure_detail(delivered), file=sys.stderr)
-    except (OSError, ValueError) as error:
-        print(f"simplify: unable to send failure message: {error}", file=sys.stderr)
+
+def prepare(diff: Path, cwd: Path, source: Path, prompt: Path, files: ReviewFiles, *,
+            settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Path:
+    """Clear old evidence, check the diff, and write the prompt."""
+    if isinstance(settings, UseConfiguredValue):
+        settings = conf.read("direct")
+    _ = files.findings.write_text("")
+    _ = files.summary.write_text("")
+    diff = (cwd / diff.expanduser()).resolve()
+    with diff.open("rb") as stream:
+        _ = stream.read(1)
+    standing = Template((conf.directory() / "review/simplify.md").read_text()).substitute(
+        agents=",".join(settings.words("SIMPLIFY_AGENTS")))
+    if source.resolve() == prompt.resolve():
+        prompt = prompt.with_name(f"{prompt.stem}.generated{prompt.suffix}")
+    user_words = source.read_text()
+    write_text_atomic(prompt, f"/simplify {shlex.quote(str(diff))}\n\n" + standing + "\n\n" + user_words + "\n")
+    return prompt
 
 
 def validate(report: str, log: str, agent_count: int) -> str:
     """Return the reason when the report or agent completion is invalid."""
-    if not report.strip():
-        return failure_reason("", report, log, 1, "Claude returned an empty simplify report")
     if report.startswith("ERROR:"):
-        return failure_reason("", report, log, 1)
-    stats: dict[str, object] = {}
-    for line in log.splitlines():
-        try:
-            event = json_object(line)
-        except ValueError:
-            continue
-        if event.get("type") == "result" and isinstance(event.get("subagent_stats"), dict):
-            stats = cast(dict[str, object], event["subagent_stats"])
-    if stats and (stats.get("completed") != agent_count or stats.get("failed") != 0):
+        return report.removeprefix("ERROR:").strip()
+    result = claude_result(log)
+    if result.reason:
+        return result.reason
+    if not report.strip():
+        return log_errors(log) or "Claude returned an empty simplify report"
+    if result.stats and (result.stats.get("completed") != agent_count or result.stats.get("failed") != 0):
         return f"the {agent_count} simplify agents did not all complete successfully"
-    stripped = report.strip()
-    if stripped.splitlines()[:1] == ["Pass"] or re.match(r"^1[.)]\s", stripped):
-        return ""
-    return "the simplify report must start with Pass or item 1"
+    return "" if well_formed(report) else "the simplify report must start with Pass or item 1"
 
 
-def publish_summary(findings: Path, report: str, action: str) -> None:
-    """Copy the summary and print the caller's result line."""
-    summary = os.environ.get("UNIT_REVIEW_SUMMARY_FILE", "")
-    if summary:
-        _ = Path(summary).write_text(report)
-    print(f"simplify: {action}; summary {findings}")
-
-
-def reuse(directory: Path) -> bool:
-    """Restore a saved successful review."""
-    saved = os.environ.get("UNIT_REVIEW_CACHE_FILE", "")
-    if not saved:
-        return False
-    cache = Path(saved)
-    try:
-        record = json_object(cache.read_text())
-    except (OSError, ValueError):
-        record = {}
-    report = record.get("summary")
-    if record.get("status") != "reviewed" or not isinstance(report, str):
-        cache.unlink(missing_ok=True)
-        return False
-    findings = directory / "review_findings_1_simplify.txt"
-    _ = findings.write_text(report)
-    _ = (directory / "review_status_simplify").write_text("reviewed\n")
-    publish_summary(findings, report, "reused")
-    return True
-
-
-def finish(directory: Path, session: Path, phase: str, reason: str, exit_code: int) -> None:
-    """Save a finished review or report its failure through the shared sender."""
-    status = directory / "review_status_simplify"
-    findings = directory / "review_findings_1_simplify.txt"
-    report = findings.read_text() if findings.exists() else ""
-    previous = status.read_text().strip() if status.exists() else "error"
+def finish(files: ReviewFiles, reason: str, exit_code: int) -> str:
+    """Copy a finished review and return its final state to the launcher."""
+    report = files.findings.read_text() if files.findings.exists() else ""
+    previous = files.status.read_text().splitlines()[0] if files.status.exists() else "error"
     action = "reviewed" if exit_code == 0 and previous == "reviewed" else "error"
-    saved = os.environ.get("UNIT_REVIEW_CACHE_FILE", "")
-    if action == "reviewed" and saved:
-        try:
-            write_text_atomic(Path(saved), json.dumps({"status": action, "summary": report}) + "\n")
-        except OSError as error:
-            reason = f"unable to publish the review cache: {error}"
-            action = "error"
-    _ = status.write_text(action + "\n")
     if action == "error":
-        log_path = directory / "review_agent_1_simplify.log"
-        log = log_path.read_text(errors="replace") if log_path.exists() else ""
-        reason = failure_reason(reason, report, log, exit_code)
+        reason = failure_reason(reason, report, files.log, exit_code)
+        report = f"ERROR: {reason}\n"
+        _ = files.findings.write_text(report)
         print(f"simplify: error: {reason}", file=sys.stderr)
-        send_failure_once(session, phase, reason)
-    publish_summary(findings, report, action)
+    _ = files.summary.write_text(report)
+    return action
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("reuse", "finish"):
+    for name in ("prepare", "finish", "check"):
         command = commands.add_parser(name)
-        _ = command.add_argument("--phase-dir", type=Path, required=True)
+        _ = command.add_argument("--findings-file", type=Path, required=True)
+        _ = command.add_argument("--status-file", type=Path, required=True)
+        _ = command.add_argument("--log-file", type=Path, required=True)
+        _ = command.add_argument("--summary-file", type=Path, required=True)
+        if name == "prepare":
+            _ = command.add_argument("--diff", type=Path, required=True)
+            _ = command.add_argument("--cwd", type=Path, required=True)
+            _ = command.add_argument("--source", type=Path, required=True)
+            _ = command.add_argument("--prompt-file", type=Path, required=True)
         if name == "finish":
-            _ = command.add_argument("--session-dir", type=Path, required=True)
-            _ = command.add_argument("--phase", required=True)
             _ = command.add_argument("--reason", default="")
             _ = command.add_argument("--exit-code", type=int, required=True)
-    check = commands.add_parser("check")
-    _ = check.add_argument("--report-file", type=Path, required=True)
-    _ = check.add_argument("--log-file", type=Path, required=True)
     args = parser.parse_args()
     command_name = cast(str, args.command)
-    if command_name == "reuse":
-        return 0 if reuse(cast(Path, args.phase_dir)) else 1
+    files = ReviewFiles(cast(Path, args.findings_file), cast(Path, args.status_file), cast(Path, args.log_file),
+                        cast(Path, args.summary_file))
     if command_name == "finish":
-        finish(cast(Path, args.phase_dir), cast(Path, args.session_dir), cast(str, args.phase),
-               cast(str, args.reason), cast(int, args.exit_code))
+        print(finish(files, cast(str, args.reason), cast(int, args.exit_code)))
         return 0
-    from scripts.lib import conf
-
-    report_path = cast(Path, args.report_file)
-    log_path = cast(Path, args.log_file)
-    report = report_path.read_text() if report_path.exists() else ""
-    log = log_path.read_text(errors="replace") if log_path.exists() else ""
-    reason = validate(report, log, conf.whole("direct", "SIMPLIFY_AGENT_COUNT"))
+    settings = conf.read("direct")
+    if command_name == "prepare":
+        try:
+            print(prepare(cast(Path, args.diff), cast(Path, args.cwd), cast(Path, args.source),
+                          cast(Path, args.prompt_file), files, settings=settings))
+            return 0
+        except (OSError, KeyError, ValueError) as error:
+            print(f"unable to prepare the simplify review: {error}", file=sys.stderr)
+            return 1
+    report = files.findings.read_text() if files.findings.exists() else ""
+    log = files.log.read_text(errors="replace") if files.log.exists() else ""
+    reason = validate(report, log, len(settings.words("SIMPLIFY_AGENTS")))
     if reason:
-        if not report.strip() or report.strip().splitlines()[:1] == ["Pass"] or re.match(r"^1[.)]\s", report.strip()):
-            _ = report_path.write_text(f"ERROR: {reason}")
+        if not report.strip() or well_formed(report):
+            _ = files.findings.write_text(f"ERROR: {reason}")
         print(reason)
         return 1
     return 0

@@ -186,6 +186,21 @@ class FindingsLedgerFixture(unittest.TestCase):
     def status(self) -> dict[str, object]:
         return cast(dict[str, object], json.loads(self.run_command("status")))
 
+    def finding_rows(self) -> list[dict[str, object]]:
+        return cast(list[dict[str, object]], self.status()["findings"])
+
+    def ledger(self) -> str:
+        return (self.session_dir / "findings_state.json").read_text(encoding="utf-8")
+
+    def open_simplify(self, title: str, *, held: bool = False) -> str:
+        options = ("--held-for-decision",) if held else ()
+        return self.run_command(
+            "open", "--severity", "minor", "--title", title,
+            "--caught-by", "worker", "--lens", "simplify",
+            "--file", "scripts/direct/assign.py",
+            "--detail", "The change removes a retry that callers use.", *options,
+        )
+
     def events(self) -> list[dict[str, object]]:
         if not self.history_file.exists():
             return []

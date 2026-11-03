@@ -18,6 +18,10 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.message import send_budget
+from scripts.lib.script_envelope import SCRIPT_ENVELOPE_START
+
 if TYPE_CHECKING:
     from ..lib import script_prompts, unit_runs
     from ..message.relay_identity import message_sender_name
@@ -369,6 +373,9 @@ def prompt_source(
     text = prompt.lstrip()
     if not text:
         return PromptSource.NOTICE
+    if text.startswith(SCRIPT_ENVELOPE_START):
+        return PromptSource.SCHEDULED
+    recorded_script = typed_by_script(text)
     if CROSS_SESSION_TAG.match(text) is not None:
         opening_tag = text.partition(">")[0]
         match = FROM_NAME.search(opening_tag)
@@ -381,7 +388,7 @@ def prompt_source(
             or HARNESS_NOTICE.match(text) is not None
             or text.startswith(USAGE_RESET)):
         return PromptSource.NOTICE
-    if _is_recorded_scheduled_prompt(text, scheduled_prompts()) or typed_by_script(text):
+    if _is_recorded_scheduled_prompt(text, scheduled_prompts()) or recorded_script:
         return PromptSource.SCHEDULED
     return PromptSource.TYPED
 
@@ -877,7 +884,7 @@ def _send_question(delivery: QuestionDelivery) -> bool:
         result = subprocess.run(
             [*send_command(), "--to", f"uds:{delivery.socket}", "--from", WATCHER,
              "--key", f"conversation-pause-{delivery.session_id}", "--text", QUESTION],
-            capture_output=True, text=True, check=False, timeout=90,
+            capture_output=True, text=True, check=False, timeout=send_budget.seconds(),
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         print(f"conversation-pause: send for {delivery.session_id}: {error}", file=sys.stderr)

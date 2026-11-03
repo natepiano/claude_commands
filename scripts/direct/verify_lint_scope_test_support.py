@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from scripts.build_queue.admission_test_support import caller_admission
+from scripts.lib.py_floor_test_support import cache_file_name
+
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 import json
@@ -96,6 +99,11 @@ if arguments[:1] == ["clippy"]:
     if "TEST_CLIPPY_EXPECT_SOURCE" in os.environ:
         if source.read_text(encoding="utf-8") != os.environ["TEST_CLIPPY_EXPECT_SOURCE"]:
             raise SystemExit(101)
+    if "TEST_CLIPPY_STATUSES" in os.environ:
+        judgments = [json.loads(line)["args"] for line in
+                     Path(os.environ["TEST_CARGO_EVENTS"]).read_text(encoding="utf-8").splitlines()]
+        judgment_count = sum(args[:1] == ["clippy"] and "--fix" not in args for args in judgments)
+        raise SystemExit(json.loads(os.environ["TEST_CLIPPY_STATUSES"])[judgment_count - 1])
     raise SystemExit(int(os.environ.get("TEST_CLIPPY_STATUS", "0")))
 if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
     events = [json.loads(line)["args"] for line in
@@ -185,6 +193,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
         if "fixture_seed" not in type(self).__dict__ or not self.fixture_seed.is_dir():
             self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
             self.build_fixture()
+            _ = caller_admission(self, self.root, self.environment)
             return
         self.root = self.fixture_root
         _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
@@ -193,6 +202,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
         self.events = self.root / "cargo-events.jsonl"
         self.taplo_events = self.root / "taplo-events.jsonl"
         self.environment = self.fixture_environment.copy()
+        _ = caller_admission(self, self.root, self.environment)
 
     def build_fixture(self) -> None:
         home = self.root / "home"
@@ -217,7 +227,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
             self.write_shell(bin_directory / name, "exit 99\n")
         for directory in ("tmp", "state", "cache", "runtime", "target", "cargo-home", ".git", "cgroup"):
             (self.root / directory).mkdir()
-        interpreter_cache = self.root / "cache" / "claude" / "python3-3.11"
+        interpreter_cache = self.root / "cache" / "claude" / cache_file_name()
         interpreter_cache.parent.mkdir()
         _ = interpreter_cache.write_text(sys.executable + "\n", encoding="utf-8")
         pressure = self.root / "memory-pressure"
@@ -434,7 +444,7 @@ raise SystemExit(128 + signal if signal else result.returncode)
 
     def assert_fix_and_judgment_calls(self, *, fix_passes: int = 1) -> None:
         scope = ["--workspace", "--all-targets", "--all-features", "--keep-going"]
-        self.assertEqual(self.calls("clippy"), [
+        self.assertEqual(self.calls("clippy"), [[*scope, "--", "-D", "warnings"]] + [
             ["--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs",
              *scope, "--", "-D", "warnings"],
         ] * fix_passes + [[*scope, "--", "-D", "warnings"]])

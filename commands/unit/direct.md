@@ -25,7 +25,7 @@ review, gate and report. Every prompt sent to a worker carries them inline per
 <HeldAstraRoles>
 For LongLivedWorkers and LaunchImplementation, the director briefs and accepts;
 Astra authors the assigned design. Use one `design_roles.py` designer and at most one
-reviewer per design, with models resolved from `design_roles` in `agents.conf`. Open
+reviewer per design, with models resolved from `design_roles` in `models.conf`. Open
 once; resume the same instance across rounds, phases and runs. `design_roles.py` saves
 each headed prompt and reply; do not also use `astra_work.py brief` for that role.
 For a designer outside `design_roles.py`, include `config/design_roles/designer.md` in its brief
@@ -307,6 +307,10 @@ started with `mesh_runs.py start`, detaches and pushes its own result to the
 worker, per <WritePromptContract/> item 3. A live run keeps the worker's
 launcher attached, so the dispatch finishes only when the worker is done.
 Records are in `${SESSION_DIR}/mesh_runs/`, each log beside its record.
+`start` checks for a live twin before it applies `config/mesh_runs.conf` `LIVE_RUN_LIMIT` to that worker.
+At the limit, exit 4 starts nothing and names the live runs on stderr.
+Wait for a run's result as the next message, or put more files in one run.
+Exit 3 means the caller is not a mesh worker; only that exit permits attached execution.
 A message from a worker's run saying no
 launcher is attached carries the result to you: dispatch that worker
 (`implement.sh --to <full worker name>`) when it should act on it.
@@ -573,7 +577,7 @@ launcher's own `landed` and `abandon` reach that phase's ledger.
 | `exposure --proposal <P1\|P2> --basis "<text>" [--decision "<text>"]` | record trial exposure before the decision (the user, 2026-10-28) |
 | `abandon --reason <r> [--edits-landed]` | a dispatched repair died; reopen its batch |
 | `verdict --id F001 --state <accepted\|still_open\|reopened> [--evidence <e>]` | record closure evidence |
-| `decision --id F001 --answer <approved\|declined> --user-words "<answer>"` | Record the user's answer to a held item. This command applies no change. |
+| `decision --id F001 --answer <approved\|declined> --user-words "<answer>" [--withdraw "<reason>"]` | Record the user's answer. Use `--withdraw` to replace a decided ruling and preserve its history. This command applies no change. |
 
 `findings.py` owns batching and gating: the first round gates blockers and
 minors, later rounds gate blockers, nits never gate. It rejects a partial batch,
@@ -1301,8 +1305,9 @@ reporting anything about the round.
    Record each simplify item; discard none.
    Open behavior-preserving items within the phase as `minor --lens simplify`.
    Add `--held-for-decision` for each behavior change or change outside the phase.
+   Open a change that removes a copy as `minor --lens simplify`, not held, also outside the phase.
    Include the proposed change, files, and reason in its detail.
-   Only the user can decide a held simplify item.
+   A held item goes to the user only when it touches money, safety, product behavior the user sees, or an act that cannot be undone. Settle every other held item under DecisionEconomy and state the call in one line (user, 2026-11-02).
    Record the user's answer with `decision --user-words`.
    Explain each refuted finding from another lens.
    Report reviewer disagreements under <DelegationResultFormat/>.
@@ -1383,6 +1388,12 @@ Before a build goes to the user's machine (an install, a binary path given to
 the user, a deploy), run in that repository:
 
 `python3 ~/.claude/scripts/direct/assertion_guard.py --base main`
+
+Use `Assertion-Change: <path>::<test> — <why>` for one test.
+Use `Assertion-Change: <path>::<test-name-prefix>* — <mechanism> deleted` for deleted tests with the same prefix in that path.
+The prefix rules only `test removed` findings.
+It does not rule assertions in tests that remain.
+A prefix that matches no removed test blocks.
 
 Exit 1 (a removed, weaker or turned-off assertion or test with no
 `Assertion-Change:` ruling) or exit 2 (it could not run) stops the hand-off:

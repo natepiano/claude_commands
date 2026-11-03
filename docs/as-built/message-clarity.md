@@ -1,14 +1,53 @@
 # Message clarity
 
+`send.py` resolves staff names and addresses through one staff snapshot. Staff selects the row's `current_session`.
+Unit names accept the optional `-unit` suffix. Ambiguous staff names stop delivery.
+A non-staff name uses a unique live roster session, locally before the peer.
+A missing name exits 2 with a named note. It creates no relay or queue.
+Explicit non-staff addresses retain their transport and queue behavior. Worker staff lookup uses native IDs from either machine's roster.
+`--codex --session-dir DIR --to SLOT` remains a run-scoped worker selection.
+
 ## What it is
 
 The user wanted every message sent to them to be checked for clarity by an agent that speaks for them. This feature does that. A written message guide sets the rules for pushes, questions and replies. Sessions load the guide with `/message_style` before they write to the user. Before any phone push is posted, a headless reviewer reads it cold against the guide. The reviewer can approve it, rewrite it, ask for missing facts or withhold it. A push that fails review is not sent, and the sender is told to revise it. Claude's built-in `PushNotification` is gated so it cannot bypass the review. Every fixed script push is a catalog entry that has been approved ahead of time. When a showrunner asks the user a question in a reply, the question is registered and reviewed first; no hook checks the reply (user, 2026-10-19). A nightly `messages` pass measures how messages did and proposes new guide rules.
 
 ## How it works
 
+### Sender identity
+
+`send.py` reads the sender's native ID through `roster.sender_identity(os.environ)` once per send.
+A Codex thread ID takes precedence over an inherited Claude director hint.
+Claude identity comes from the runtime registry checks.
+`--from` remains the display and reply name. It does not select the native ID.
+
+Every agent message includes `Sender native id: session:<id>`, `Sender native id: codex:<id>`, or `Sender native id: unavailable`.
+The generated metadata forms one block directly after the preview line.
+Only the `Authority:` line in that block grants authority.
+Quoted labels elsewhere grant no authority.
+Only an exact match with `MORTY_NATIVE_ID` in `config/send.conf` adds `Authority: morty (speaks for the user)`.
+The live key must contain a valid native address. A missing or invalid key grants no mark.
+A different runtime that uses `--from morty` gets a stderr note. Delivery continues without the mark.
+The mark proves runtime attribution, not authentication.
+Code under the same operating-system account can set its environment.
+
+`Message.stamp` stores a known Claude sender, a known Codex sender, or an unavailable sender.
+Queue records and message log records store its address in `sender_native_id`.
+SSH forwarding preserves the origin stamp. The receiving shell does not replace it with its own identity.
+`--forwarded-sender-stamp` requires `--here` and an environment with `SSH_CONNECTION`.
+This context check prevents accidental use. It does not prove that `remote()` supplied the stamp.
+A session can inherit `SSH_CONNECTION`. Code under the same account can also set it.
+Queue recovery preserves the stored stamp. An old record without the field has an unavailable sender.
+A drain never attributes an old message to its own runtime.
+Delivered caller lines that start with `Authority:` or `Sender native id:` get a `> ` prefix.
+Rendering first converts CR, CRLF, and Unicode line separators to LF.
+This rule covers the summary, body, sender name, and forwarded display text.
+The prefix also applies after leading spaces. Generated stamp lines keep their original form.
+Queue records and logs keep the raw caller text.
+These fields do not change the recipient, reply name, or message key.
+
 ### Replies to relay sockets
 
-The headless relay uses the session name `relay/<sender>`. Session lookups identify a relay only when its saved sender and process start identity match the live process; on Linux the boot ID must also match. A real session with the same name form, or a reused PID, stays visible. Its message body names the real sender in `Shown sender:`. The name rule and its readers are described in [session-roster.md](session-roster.md). Before the headless relay starts Claude, it atomically publishes the process lifetime and sender in `message/relay_senders/<pid>.identity`, then the plain sender name in `message/relay_senders/<pid>`. The plain sender remains available after the process exits for reply recovery. It then execs Claude with that same PID, which owns `cc-socks/<pid>.sock`. A reply to a missing socket, or one whose delivery connect returns `ENOENT` or `ECONNREFUSED`, resolves the saved name through the live session registry. Send and drain share this rule; a live socket takes only its delivery connect. Without a saved name or a live session, `send.py` reports `FAILED` (exit 3), names the address and sender on stderr, and keeps no raw socket queue. A queued message uses the session ID found at the queue decision, even if that session then exits.
+The headless relay uses the session name `relay/<sender>`. Session lookups identify a relay only when its saved sender and process start identity match the live process; on Linux the boot ID must also match. A real session with the same name form, or a reused PID, stays visible. Its message body names the real sender in `Shown sender:`. The name rule and its readers are described in [session-roster.md](session-roster.md). Before the headless relay starts Claude, it atomically publishes the process lifetime and sender in `message/relay_senders/<pid>.identity`, then the plain sender name in `message/relay_senders/<pid>`. The plain sender remains available after the process exits for reply recovery. It then execs Claude with that same PID, which owns `cc-socks/<pid>.sock`. A reply to a missing socket, or one whose delivery connect returns `ENOENT` or `ECONNREFUSED`, checks the saved name through staff. A staff sender uses its current session. A non-staff sender uses the live registry. Send and drain share this rule; a live socket takes only its delivery connect. Without a saved name or a live session, `send.py` reports `FAILED` (exit 3), names the address and sender on stderr, and keeps no raw socket queue. A queued message uses the session ID found at the queue decision, even if that session then exits.
 
 `send.py drain-sockets` recovers old raw `uds__*.sock.jsonl` queues. It delivers each message in a file whose newest entry is under 24 hours old to the named live session, marked `Stuck message from <original time>:`. Recovery uses the relay record, then queued recipient metadata (`to_name`, `to-name`, `recipient_name`, or a named `to`). Each stable recovery ID gets a flushed and fsynced attempt in `message/socket-recovery-attempts.jsonl` before delivery, followed by its durable result in `message/log.jsonl`. The message log keeps one row per result; attempts do not count as messages. A rerun skips confirmed sends. An attempt without a result is archived without resending: `UNCONFIRMED: stuck reply from <time> to <name> may have arrived; archived, not resent` (exit 3); a later run has nothing to repeat. Known failed sends remain for retry, without another queued copy. Unresolved or unreadable files stay in place and are reported by path (exit 3); other files still run. Older files move intact to `message/socket-queue-archive/`; one line gives the file count and oldest and newest message times. Archive names never overwrite another item, and a retry reuses an identical uncertain entry's archive. `UNCONFIRMED` and `SENT` lines are printed and flushed before removing the queue entry; a rerun may repeat the report, without sending again. The old-file summary (`archiving <n> socket queue files: …`) is printed and flushed before any of its files move, so an interrupted move cannot hide the count; a rerun names only the files still to move.
 
@@ -34,16 +73,17 @@ The headless relay uses the session name `relay/<sender>`. Session lookups ident
   - The title is under 45 characters, names what is at stake and has no fixed prefix.
   - The first 150 characters make sense on their own.
   - The header plus body is under 500 characters.
+  - The two approved decision templates can use up to 1024 characters.
 - `ask-once-then-count` limits only the end-of-reply reminder, never an answer the user asked for.
 
 ### Push data flow
 
 ```
-session ──send.py --to user──┐
+session ──send.py --to user --text-id ID──┐
 script ──push_texts.user_send_argv → send.py --to user --text-id ID --value k=v──┤
 nixos ──pushover.py --text-id ID --value k=v──┤
                                               ▼
-pushover.py send(): parse → action checks (refuse = exit 2) → legacy hold lookup (free text and agent-written ids)
+pushover.py send(): parse → template admission → action checks (refuse = exit 2) → legacy hold lookup (free text and agent-written ids)
   → approved registered text, except agent-written ids: no review | review_off: no review | else review.review(draft)
   → agent-written nate.adhoc is checked like free text: apply rewrites; failed review means exit 6
   → print "pushover: reviewed JSON: {…}"
@@ -52,8 +92,12 @@ pushover.py send(): parse → action checks (refuse = exit 2) → legacy hold lo
 send.py user(): map exit code → SENT / HELD / REPLACED / REFUSED / FAILED
   → on FAILED or failed-review HELD under a Claude session: write failed/<session_id>.json
                                               ▼
-PushNotification (built-in) ── PreToolUse gate ── allowed only with that marker's exact fallback line
 ```
+
+The fallback gate requires a reviewed blocked push whose delivery failed.
+Its marker contains a registered template id and the full rendered text.
+The text contains the title, action, body, and sender/template footer.
+The gate permits only an exact match. A missing template id or failed gate check denies the fallback.
 
 ### The reviewer: `scripts/notify/review.py`
 
@@ -71,7 +115,7 @@ PushNotification (built-in) ── PreToolUse gate ── allowed only with that
 - Each review runs `claude -p` once, through `_review()`:
   - **Binary:** `reviewer_binary()` takes the first executable from `shutil.which("claude")`, `~/.local/bin/claude`, `/etc/profiles/per-user/$USER/bin/claude` or `/run/current-system/sw/bin/claude`. If none is found, the result is `Unreviewed("no claude binary: <paths tried>")`. The `review.jsonl` line records the resolved path or the paths tried.
   - **Account:** `reviewer_environment()` removes the caller's `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` and `CLAUDE_CONFIG_DIR`, then applies `accounts.prepared_account(accounts.role_account("unit").label)`.
-  - **Model:** `agents_resolve_print message_review.reviewer` sets the model, with a 2 s cap on that lookup. When it resolves nothing, the reviewer uses opus at medium effort. `config/agents.conf` has no `message_review` entry today, so the fallback is what runs.
+  - **Model:** `agents_resolve_print message_review.reviewer` sets the model, with a 2 s cap on that lookup. When it resolves nothing, the reviewer uses opus at medium effort. `config/models.conf` has no `message_review` entry today, so the fallback is what runs.
   - **System prompt:** the guide filtered by tag, followed by an instruction. Pushes use `push,all` and `reviewer_prompt.md`. Replies use `reply,all` and an inline prompt. Questions use `question,all` and an inline prompt.
   - **Zone:** the draft prompt of each review (push, reply and question) starts with `zone_line()`: `User zone: AST (America/Curacao). Today: 2026-10-25.`, from `scripts/lib/user_zone.py`. Each system prompt says times are in that zone. The reviewer never assumes a zone (2026-10-25: a reviewer refused AST times as not EDT).
   - **Flags:** `--json-schema SCHEMA --output-format json --tools "" --no-session-persistence --setting-sources ""`.
@@ -126,7 +170,7 @@ PushNotification (built-in) ── PreToolUse gate ── allowed only with that
 - An emergency push (priority 2) repeats every 300 s for 3 h until the user taps Acknowledge. Deleting it on the phone does not stop it. With `--key`, the post carries `tags=push_tag(KEY)` (`key-` and the first 16 hex digits of the key's SHA-256: the same key gives the same tag). Below priority 2, or with no key, there is no tag. Priority 2 is never kept during silence, and `post_kept()` passes the kept key, so a tag is never lost.
 - `pushover.py cancel [--source NAME] KEY` posts `token` to `receipts/cancel_by_tag/<tag>.json`, which stops every emergency push with the key's tag. It logs to `pushover.jsonl` with title `cancel emergency push` and outcome `cancel: cancelled N`, `cancel: nothing to cancel`, `cancel: refused: …`, `cancel: unreachable: …` or `cancel: keys missing`. It prints `pushover: cancelled N` or `pushover: nothing to cancel` and exits 0; it exits 1 when Pushover refused it or could not be reached, and 2 on usage or keys missing. No receipt is stored. (2026-10-23: a stall-watch prompt push kept repeating after the user answered the prompt.)
 - While the user's silence is on (`silence.py`), `deliver()` keeps a push below priority 2 in `silence-kept.jsonl` and silence end posts it. `deliver(…, key=, text_id=)` puts `--key` and `--text-id` in the `KeptPush`, so a released push gets the same footer. A kept push with the same non-empty key from the same source replaces the older kept one (`silence.keep_here()`), so silence end sends only the newest. On the Mac the key goes in the push JSON to natedev's `silence.py keep`. A held push sent after its hold expires has no key (`""`), and an old kept line with no key reads as `""`. An old kept line with no text id reads as `""` and is sent as free text. `silence.py drop --source S --key K` (`silence.drop()`) removes the kept pushes with that source and non-empty key and prints how many; on the Mac it asks natedev over ssh, and gives 0 when natedev cannot answer. `send.py retire --to user` runs it, so each kept push goes out once, and the alert of a closed rca.py case is gone before silence ends. When auto silence ends (`auto_silence.come_back()`), `silence.auto_off` goes first and the kept pushes follow: title `{sender}: you are back`, body `{held}`, one of `No pushes were held while you were away.`, `The push held while you were away comes next.` or `The N pushes held while you were away come next.`
-- With `--text-id`, the push is rendered from the catalog. The template sets the sender, the action and the Session line. The priority comes from the template's `need` (`note`→0, `decision`→1, `blocked`→2), unless `--priority 2` is given.
+- With `--text-id`, the push is rendered from the catalog. The template sets the sender, the action and the Session line. The priority comes from the template's `need` (`note`→0, `decision`→0, `blocked`→2), unless `--priority 2` is given.
 - Refused before sending (exit 2, logged as `refused before sending: <reason>`):
   - no action stated
   - both `--action` and `--no-action`
@@ -169,14 +213,12 @@ PushNotification (built-in) ── PreToolUse gate ── allowed only with that
 | `HELD: not sent: this push asks the user to type a go. Send it with the session.needs_go template: <call>` | 4 | `send()`, before the claim and pushover (no marker) |
 | `REPLACED: a newer version replaced this push; nothing was sent` | 0 | pushover 5 (no marker) |
 | `REFUSED: <why>` | 2 | pushover 2 with `refused before sending:` (no marker) |
-| `FAILED: the user was not reached: <why> fallback text:` + one line, or `… <UNREVIEWED_FALLBACK>` | 3 | Any other failure: exit 1, keys missing, timeout |
+| `FAILED: the user was not reached: <why>` | 3 | A channel error, missing keys, or a timeout; report the failure. |
 | `not sent: probe sessions never push to the phone` | 0 | A session started with `accounts.py exec --probe` |
 
-- `FailedPush(title, action, body, hold, reviewed, need, held)`:
-  - `fallback_allowed` is true when `(reviewed and not held) or need == "blocked"`.
-  - `text` is the fallback line: `<title> — <header>` with whitespace collapsed (the `Session:` line included when present), at most 200 characters, cut at a word boundary with `…`.
-  - `reviewed` is true only when the text came from a `pushover: reviewed JSON:` line.
-- `user_failure()` writes the fallback marker `~/.local/state/notify/failed/<session_id>.json` under `failed/.lock`. It does this only when `$CLAUDE_PID` resolves a `sessionId` from `~/.claude/sessions/<pid>.json`, and never on a refusal. The marker holds `time`, `title`, `action`, `body`, `message`, `fallback`, `reviewed`, `need`, `held`, and optionally `held_source`, `held_identity` and `held_machine` (empty means local).
+A failed phone send permits no other phone path.
+Legacy failure records remain readable by the existing tools.
+
 - An auto-mode refusal goes only through `--text-id auto_mode.refused`. A push without it whose title or text has `auto mode` (or `auto-mode`) and `refused`, `denied` or `stopped` is held, before the claim, so a resend with the template is not skipped by `--repeat-minutes`. The three rca.py pushes (`RCA_TEXTS`: `permission.rca_started`, `permission.rca_fixed` and `permission.rca_fixed_rewritten`) are not held: their titles say the session stopped, and a cause can say that auto mode refused a command.
 - Paid credit use goes only through `--text-id quota.paid_credits`. A free-text or agent-written push (`nate.adhoc`) whose title, text or action has `paid credits` or `use_credits` is held the same way (`wrong_template()`). Other registered `quota.*` pushes that name paid credits are not held.
 - `--text-id quota.paid_credits`: the caller gives `account`, `machine`, `credits`, `refill` and `next_reset`. `paid_credits_values()` fills `sender` from the session's own record; with no record (a script such as `quota_alert.py` on its timer, or the far side of `--machine`), it uses `--value sender`, then `--from`, and refuses a run with none.
@@ -218,30 +260,28 @@ Sends no longer create holds: in production code, nothing calls `review.hold()`.
 - `retire_claim()` cancels a claimed revision that was rejected and writes `<id>.held`.
 - `due()` prunes delivered records older than 3600 s. It then posts holds older than `HOLD_SECONDS` (300 s), and stale claims, one at a time through `post_claim`, logging `expired send failed: …` on failure. Only `hold()` scheduled it, as notifier job `notify-review`, every minute.
 
-### The PushNotification gate: `scripts/hooks/pre-tool-use-push-gate.py`
+### Registered phone admission
 
-The gate is a PreToolUse hook. Its `settings.json` entry has matcher `PushNotification` and `"timeout": 120`. Built-in PushNotification takes only `message`: one line, no title.
+Every new phone push requires `--text-id` before review, credentials, claims, or posting.
+Use `decision.choices`, `alert.blocked`, or `nate.adhoc` when no specific template fits.
+Decisions use structured choices. Agent-written values receive live review.
+Both send.py and pushover.py enforce admission.
+A legacy free-text push already kept during silence still releases.
+Escalate keeps legacy free-text holds unchanged and requests a template revision from their owner.
+New escalate holds retain their registered template and values.
 
-1. With no marker for the `session_id`, an age outside 0–600 s, or a `message` that does not match the marker's `fallback` (whitespace-normalised), the gate denies with `DENIAL`, which points to `send.py --to user`. The marker is left in place.
-2. On a match, valid authorization stays in place until delivery or its existing expiry: a PreToolUse allow does not prove the push ran. A stopped or failed built-in push can retry the same reviewed fallback within the original ten-minute window; allowing it does not renew that window.
-3. If `held` is true and `need` is not `blocked`, it deletes the marker under `failed/.lock` and denies with `HELD_FALLBACK`.
-4. If `reviewed` is false and `need` is not `blocked`, it deletes the marker under `failed/.lock` and denies with `UNREVIEWED_FALLBACK`. A marker without `reviewed` counts as reviewed.
-5. If `held_source` and `held_identity` are present, it releases the hold, locally or over ssh with `review.py release`. While the answer is `posting`, it asks again each second until `posting_wait_seconds()` has passed. `delivered` deletes the unchanged marker under `failed/.lock` and denies with `ALREADY_SENT`; a replacement marker is preserved. Every other answer, and a timeout, allows the push and retains authorization for retry.
-6. Otherwise it allows the push. Any exception, including failing to import `review`, also allows the push and prints `push gate: <type>: <error>` to stderr.
-
-`post-tool-use-push-delivered.py` runs through the PostToolUse dispatcher only for `PushNotification`. After a successful push (`tool_response.success` is true and `is_error` is not true), it consumes the matching fallback marker under the same `failed/.lock`. The gate and delivery hook share the marker path and whitespace rule. A delivered fallback therefore uses its approval once; stopping before delivery still permits a retry. A missing or unreadable marker, a failed push, or a different message leaves approval unchanged. Any hook error prints a short stderr line and exits successfully. No settings change is needed.
 
 ### Script push texts
 
 - `scripts/notify/push_texts.py`:
-  - `PushText(id, sender, need, title, action: ActionTemplate | NoActionNeeded, body, examples: tuple[PushExample, ...], purpose, session: SessionTemplate | NoSessionLine, header: bool = True, agent_written: bool = False)` and `PushExample(name, values)`. `purpose` is one line (72 characters at most) that says when the push goes out. It is not part of the fingerprint, so a change to it moves no approval. With `header=False` the phone shows only the title and the body, with no `No action needed.` line. `catalog()` refuses `header=False` on an entry that has an action or a session. `nate.adhoc` uses it, and `fingerprint` includes it only when it is False. `nate.adhoc`, `alert.blocked` and `alert.decision` have `agent_written=True`; this field is excluded from the fingerprint. `agent_written(text_id: str) -> bool` returns False for unknown ids.
+  - `PushText(id, sender, need, title, action: ActionTemplate | NoActionNeeded, body, examples: tuple[PushExample, ...], purpose, session: SessionTemplate | NoSessionLine, header: bool = True, agent_written: bool = False)` and `PushExample(name, values)`. `purpose` is one line (72 characters at most) that says when the push goes out. It is not part of the fingerprint, so a change to it moves no approval. With `header=False` the phone shows only the title and the body, with no `No action needed.` line. `catalog()` refuses `header=False` on an entry that has an action or a session. `nate.adhoc` uses it, and `fingerprint` includes it only when it is False. `nate.adhoc`, `alert.blocked`, `alert.decision`, `decision.choices`, and `review_watch.acknowledge` have `agent_written=True`; this field is excluded from the fingerprint. `agent_written(text_id: str) -> bool` returns False for unknown ids.
   - `render(id, **values)` and `render_entry(entry, values) -> RenderedPush`. An unknown id, a missing value or an extra value raises `ValueError`.
   - `user_send_argv(rendered, *, sender, machine, priority, timeout)` builds the `send.py --to user --from … --need … --text-id … --value …` argv. User-send wrappers take a rendered push, never a string.
   - `fingerprint(entry)` is the sha256 over the templates and every example's values and filled text.
   - `listing(entries)` gives one line per entry, sorted by id: the id in one column, then its purpose. `shown(entry)` gives the entry's purpose, its template with the `{placeholders}` (Title, Session, Action, body, as the phone lays them out) and its first example filled through `render_entry`. `review.py list` and `review.py show <id>` print them with no network and no reviewer; an unknown id prints `No template named <id>.` and the list, and exits 1. `/nate`, `/nate help` and `/nate usage` print the `adhoc`, `silence` and `show` lines and then `review.py list`; `/nate show <id>` prints `review.py show <id>` (user request, 2026-10-21).
   - `REVIEWED_FILE` and `catalog()`, which loads `push_catalog.ENTRIES` and checks for unique ids and named examples.
 - `scripts/notify/push_catalog.py` holds every fixed phone text, from scripts and from nixos, each with realistic examples. A comment says where the examples come from. Entry ids include `shutdown.*`, `quota.*`, `rust.*`, `sweep.disk_floor`, `codex.reset_ready` and `nixos.{disk_low,gpu_stopped,ups_battery,ups_shutdown}`.
-- `nixos.gpu_stopped`: sender `gpu`, need `decision` (Pushover priority 1 through `send.py`), values `xid`, `meaning`, and `time` as `HH:MM <zone>` in the user's zone; wording lives in `push_catalog.py`. `scripts/notify/gpu_xid.py` owns the code-to-meaning table and CLI: `gpu_xid.py <code>` prints the meaning and exits 0; an unknown code exits 2.
+- `nixos.gpu_stopped`: sender `gpu`, need `decision` (priority 0 without an in-window `--due`), values `xid`, `meaning`, and `time` as `HH:MM <zone>` in the user's zone; wording lives in `push_catalog.py`. `scripts/notify/gpu_xid.py` owns the code-to-meaning table and CLI: `gpu_xid.py <code>` prints the meaning and exits 0; an unknown code exits 2.
 - `auto_mode.refused` (user approved 2026-10-21, need `decision`): title `{sender}: auto mode stopped {session}`, `Session: {session}`, Action `On {machine}, in the {session} pane, approve the prompt or add an allow rule`, then `Auto mode refused {action} in the {session} session.{waits_line}`, each refused command on its own line, `Approve: the work goes on now, and auto mode can stop it on {this} {noun} again.` and `Allow rule: the work goes on now, and auto mode lets {this} {noun} run from then on.{rule_line}`.
 - `session.needs_go` (user approved 2026-10-21, need `decision`): title `{sender}: {session} waits for your go`, `Session: {session}`, Action `On {machine}, in the {session} pane, type: {go}`, then `{why}.` and `Your go {does}.`
 - `quota.paid_credits` (user approved 2026-10-21, need `decision`): title `{sender}: {account} now uses paid credits`, Action `To stop it, set use_credits: off in ~/rust/hanadocs/agents/{account}.md on {machine}`, then the credits and refill line, `Leave on (recommended):` and `Turn off:`. `quota_alert.py` sends this id, or `quota.paid_credits_queued` while a workers move is queued. The old paid-credits ids are no longer sent.
@@ -257,7 +297,7 @@ The gate is a PreToolUse hook. Its `settings.json` entry has matcher `PushNotifi
   - the title is under 45 characters and the header plus body is under 500 (the Session line counts);
   - no rendered push contains `@`.
 
-  It also fails any literal phone send under `scripts/` outside `push_texts.py`, `pushover.py`, `send.py` and `escalate.py`. A literal phone send is `--to user`, `--to=user`, a `pushover.py` path, or `broadcast.send("user", …)`, and the test tracks list mutations and aliases.
+  It also fails any literal phone send under `scripts/`, `commands/`, and `codex/` outside `push_texts.py`, `pushover.py`, `send.py`. A literal phone send is `--to user`, `--to=user`, a `pushover.py` path, or `broadcast.send("user", …)`, and the test tracks list mutations and aliases.
 - A status note that asks nothing goes to a log or to the requesting session, not the phone. For example, `quota_alert.py` logs `quota status <name>: …`.
 
 ### Repeated machine messages
@@ -380,13 +420,12 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
 ## Invariants
 
 - **No test or live check reaches the phone.** Tests fake the reviewer `runner` and `post`. Live checks use `review.py check`, `replay`, `texts` or `sample`, and none of these posts. Probe sessions never push.
-- **A push is never lost to the reviewer.** A missing binary, timeout, error, quota or unreadable JSON gives `Unreviewed`, and the push goes out as written, logged `unreviewed: <why>`. Any gate error allows the fallback.
+- **A push is never lost to the reviewer.** A missing binary, timeout, error, quota or unreadable JSON gives `Unreviewed`, and the push goes out as written, logged `unreviewed: <why>`. A failed phone send permits no other phone path.
 - **The reviewer never adds a fact.** It may cut, reorder and reword. When facts are missing it asks, and a session push that needs facts is not sent.
 - **No skip flag.** Only the user's `review_off` switch turns review off.
 - **Form is kept.** An action push stays an action push and a no-action push stays one. The Session line stays above `Action:`. Priority never changes. Pushover limits are a title ≤ 250 and a message ≤ 1024, header and footer included.
 - **A push that fails review is not sent** (exit 6, `HELD`). Only registered ids that are not agent-written and emergency (priority 2) pushes still send, logged with the failed rules. A failing registered text requests a template fix only when it is not agent-written. `nate.adhoc` is checked like free text.
-- **The fallback is reviewed text only.** The gate allows PushNotification only with the exact `fallback text:` from a recent failed send. A send that was never reviewed or failed review gets no fallback unless `need` is `blocked`. A withheld push never reads as an allowed fallback, and the marker's `held` field stays separate from `reviewed`.
-- **A fallback never lets a claimed hold post too.** The gate releases the hold before allowing the push, and `post_claim` checks cancellation and the delivered record under the lock just before it posts.
+- **Use registered phone paths only.** A failed send permits no other phone path.
 - **Every script phone push is a catalog entry** sent through `push_texts.user_send_argv` or `--text-id`. A literal phone send under `scripts/` fails `test_push_texts`. Question review is not a push and needs no catalog entry.
 - **The approval file is read only through `review.text_approvals()`.** User-spec approvals carry `objections`. Approving an id keeps records for exactly its current examples. The reviewer's rewrites of the user's own text are never applied; agent-written `nate.adhoc` values take the reviewer's rewrite.
 - **Every reader of the `Action:` line** (review.py parse, record and check; send.py; pushover.py) keeps a `Session:` line above it, and the length rule counts that line.
@@ -394,7 +433,7 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
 - **Outer waits come from `review.py` helpers** (`user_send_seconds()` and the others), never from literals. Each reviewer call can take up to `review_timeout_seconds()`, and wherever a rewrite is checked again, the budget allows two reviews.
 - **A terminal non-delivery** (`SKIPPED`, `REPLACED`) exits 0. Callers treat a nonzero exit as worth a retry or an alarm.
 - **Changes to `questions()` keep calling `record_question_history`** with `question` and `reviewed`, so the nightly count matches the reply. Question detection elsewhere reuses `reply_questions`. Recipient context applies only to the Stop hook, through `user_reply_questions`. `reply_questions` and `sample` stay unchanged.
-- **Do not commit `settings.json` or `config/agents.conf` from a unit worktree;** the showrunner applies the exact lines a change proposes.
+- **Do not commit `settings.json` or `config/models.conf` from a unit worktree;** the showrunner applies the exact lines a change proposes.
 
 ## Calibration and gotchas
 
@@ -423,7 +462,6 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
 - The title is under 45 characters and the header plus body is under 500, counted by code. In code the title rule's stem is `push-title-under-45`, which has no rule file; the guide's title rule is `title-names-the-stake`.
 - The first 150 characters make sense on their own.
 - At most 3 questions.
-- The fallback line is at most 200 characters.
 - The full holdout example sits near the 500 limit with the Session line counted.
 
 **Nightly numbers:**
@@ -439,7 +477,6 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
 
 **Holds and the gate:**
 - A sender killed mid-post can cause one repeat post after the stale-claim time, because the remote accept and the local release cannot happen together atomically.
-- Any gate error allows the fallback, so a rare duplicate is still possible.
 - A stale or mismatched marker denies the push and is left in place. A matching marker is consumed before the held and unreviewed checks.
 - `--answerable` and the hold files are legacy. Sends no longer create holds, but an existing hold still blocks a second sender (exit 4) and is delivered once by `due`.
 
@@ -458,13 +495,12 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
 
 ## Why
 
-- **PushNotification only as a gated fallback:** the built-in push skips review, so it is allowed only for a failed send and only with that send's reviewed text.
+- **Use registered phone paths only.** A failed send permits no other phone path.
 - **A headless `claude -p` with no tools, settings or session:** it reads every message cold, the way the user does, and cannot act. It runs on the unit account with the caller's credentials removed, so it never acts as the sending session.
 - **Reviewer faults send the push as written:** an outage must never silence an alert to the user.
 - **A failed session push is not sent; registry and emergency pushes are:** a live session can revise and resend. A timer or script has no session to revise in time, and holding its push loses it. So the push goes out and a template fix is requested. The hold code stays only so existing holds finish.
 - **Code counts lengths:** the model reported false length failures on short bodies.
-- **The time limit lives in `config/notify.conf`:** a fixed 20 s constant was too short and could not be configured, and `config/agents.conf` is pinned.
-- **The gate releases the hold before allowing the fallback:** denying the fallback outright while a claim is live could leave the user with no push at all.
+- **The time limit lives in `config/notify.conf`:** a fixed 20 s constant was too short and could not be configured, and `config/models.conf` is pinned.
 - **User-specified texts are approved with recorded objections:** the user's own four lines win over the reviewer's rewrite.
 - **No source tracking for example values:** the logs hold no real sends for those senders, so the catalog says where its examples come from instead.
 - **No recipient filter in the nightly count:** one day's measurement found 29 of 578 showrunner replies with an unregistered ask. Only one (3.4%) was addressed to a peer only, well under the one-in-four bar, so peer asks are too small a share to matter.
@@ -473,11 +509,14 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
 
 
 Registered alerts and delivery footer (2026-11-01):
-- Every posted push ends in `Sent by: <sender> · Template: <id>` on one line. Free text keeps `none (free text)`. The audit reads both this and historical two-line footers.
+- Every posted push ends in `Sent by: <sender> · Template: <id>` on one line. Legacy kept free text keeps `none (free text)`. The audit reads both this and historical two-line footers.
 - `mac.locked`, `github.keys_cold`, `build_hold.blocking` and `nixos.ups_power_back` carry the approved fixed wording. GitHub cold keys need no body. UPS battery and shutdown alerts also use their existing ids.
 - `nixos.ups_replace_battery` asks the user to replace the worn UPS battery after REPLBATT.
 - `nixos.ups_no_contact` asks the user to check the UPS USB cable after NOCOMM.
 - `/alert_user` selects a fixed template first, else `alert.blocked` or `alert.decision`. These two use agent-written title, action and body: short and to the point, with live review like `nate.adhoc`.
-- For agent-written and free-text pushes, the push review receives every fixed template's id and purpose. When one fits, it withholds the draft under `use-registered-template:<id>`, including emergency drafts; it names the required id instead of rewriting around it. Fixed registered live reviews and catalog example reviews do not get this instruction; fixed registered texts still send as rendered and report review failures.
+- For agent-written pushes and legacy free-text records, the push review receives every fixed template's id and purpose. When one fits, it withholds the draft under `use-registered-template:<id>`, including emergency drafts; it names the required id instead of rewriting around it. Fixed registered live reviews and catalog example reviews do not get this instruction; fixed registered texts still send as rendered and report review failures.
 - `send.py` gives `github.keys_cold` a shared `github.keys_cold:<machine>` key in its existing locked claim store. Every sender uses it. Under the claim lock, the warm-check record is saved before the key, so a sender crash before delivery cannot strand a claim without its check; a failed send releases the claim. A delivered event suppresses later sessions until the existing `github-warm-status` clear check retires it. The check survives phone expiry so a continuing cold spell cannot start a second event. Run the template on the machine with cold keys, forwarding delivery with `--machine natedev` on the Mac. No extra ledger or time window.
-- Free text is still accepted pending the nixos rebuild; this phase adds no missing-id refusal.
+- New phone pushes require a registered template at both admission boundaries.
+
+A decision uses priority 1 only before an explicit deadline within the configured decision window.
+The channel recalculates this priority when it releases a kept push.

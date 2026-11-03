@@ -37,6 +37,9 @@ NOTICE_FIXTURE = r'''import sys,os,json,signal,io
 from pathlib import Path
 from unittest.mock import patch
 import send,repeat_guard as g,roster
+from scripts.message import send_result
+from scripts.production import staff
+staff.snapshot=lambda: staff.StaffSnapshot(())
 role,mode,root,sink=sys.argv[1:]
 if role=='supervise':
     limits=g.configuration()
@@ -74,7 +77,7 @@ else:
         options=send.parse(command[2:])._replace(shown_sender=send.ShownSender(g.NOTICE_SENDER))
         with patch.object(roster,'roster',return_value=roster.Roster([],[])), patch.object(send,'resolve_recipient',return_value=send.CodexSessionRecipient('codex:owner','owner','owner',send.codex_daemon.CodexDaemon(Path(root),Path(root)/'unused.sock'))), patch.object(send,'codex_session',accept), patch.object(send,'user',accept), patch.object(send,'wrong_template',return_value=None):
             result=send.send(options)
-        return send.EXIT[result.outcome],result.outcome.upper()+': '+result.detail,''
+        return send_result.EXIT[result.outcome],result.outcome.upper()+': '+result.detail,''
     sys.stdin=io.StringIO(json.dumps(request))
     with patch.object(send,'repeat_notice_owner',owner), patch.object(send,'run',transport):
         send.main(['repeat-notice-attempt'])
@@ -581,6 +584,12 @@ print(json.dumps(asdict(g._stored_check(Path(sys.argv[1]), g.Attempt('watchdog',
         notice = saved.notices
         keys: list[str] = []
         for code, output, expected in ((1, "QUEUED: durable owner", "queued"),
+                                        (0, "KEPT: until silence ends", "queued"),
+                                        (0, "REPLACED: newer notice", "unknown"),
+                                        (2, "REFUSED: action required", "failed"),
+                                        (4, "HELD: review", "failed"),
+                                        (0, "checking recipient\nSENT: fake sink", "delivered"),
+                                        (1, "checking recipient\nQUEUED: durable owner", "queued"),
                                         (3, "FAILED: unavailable", "failed"),
                                         (None, "", "unknown"), (-9, "", "unknown"), (0, "SKIPPED: previous claim", "unknown"),
                                         (0, "", "unknown"), (0, "SENT: fake sink", "delivered")):
@@ -591,6 +600,14 @@ print(json.dumps(asdict(g._stored_check(Path(sys.argv[1]), g.Attempt('watchdog',
         self.assertEqual(len(set(keys)), 1)
         self.assertIn(notice[0].id, keys[0])
         self.assertEqual(arguments[arguments.index("--repeat-minutes") + 1], "0")
+
+    def test_notice_payload_does_not_turn_a_failure_into_a_queued_notice(self) -> None:
+        self.prime_outbox()
+        saved = guard.decode(next(self.root.glob("*.json")).read_text())
+        for code in (1, 3):
+            with (self.subTest(code=code), patch.object(send, "repeat_notice_owner", return_value="owner"),
+                  patch.object(send, "run", return_value=(code, "FAILED: unavailable\nQUEUED: quoted result", ""))):
+                self.assertEqual(send.deliver_repeat_notice(saved, saved.notices[0], self.limits), "failed")
 
     def test_an_active_episode_crosses_both_window_boundaries_without_another_alert(self) -> None:
         _ = self.apply("unrelated", at=0)

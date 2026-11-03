@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from scripts.production import staff, showrunners, unit_names
-from scripts.production.unit_table import Refusal, cell_value, unit_table
+from scripts.production.unit_table import unit_spellings
 
 
 def showrunner_owner(record: staff.StaffSnapshot, slug: str, document: str) -> staff.StaffRow | None:
@@ -33,19 +33,21 @@ class StaffLabels:
         """Join session labels against the report's single staff snapshot."""
         sources = showrunners.read_sources(unreadable=showrunners.UnreadableTimerPolicy.SKIP)
         productions = {source.timer.slug: source for source in sources}
-        parents = {slug: row for slug, source in productions.items()
-                   if (row := showrunner_owner(record, slug, source.document)) is not None}
+        parents: dict[str, staff.StaffRow] = {}
+        for row in record.find(kind="showrunner"):
+            timer = showrunners.timer_for(row, record, sources=sources)
+            if isinstance(timer, showrunners.Timer):
+                parents[timer.slug] = row
         return cls(record, productions, parents)
 
-    def environment(self, environment: Mapping[str, str], session_id: str, name: str = "", cwd: str = "") -> dict[str, str]:
+    def environment(self, environment: Mapping[str, str], session_id: str) -> dict[str, str]:
         """Join the current native runtime identity without inferring a member."""
-        del name, cwd
         result = {key: value for key, value in environment.items() if key != "STAFF_ID"}
         row = self.record.by_current_session(session_id) if session_id else None
         if row is None:
             return result
         result["CLAUDE_CODE_SESSION_ID"] = row.current_session
-        if row.kind == "showrunner":
+        if row.kind in ("showrunner", "agent"):
             _ = result.pop("SHOWRUNNER_UNIT", None)
             _ = result.pop("SHOWRUNNER_UNIT_ID", None)
         elif row.kind == "unit":
@@ -55,24 +57,13 @@ class StaffLabels:
             slugs = [slug for slug, owner in self.showrunners.items() if owner.id == parent.id]
             slug = slugs[0] if len(slugs) == 1 else parent.name
             result["SHOWRUNNER_UNIT"] = slug
-            identifiers: set[str] = set()
             source = self.productions.get(slug)
-            if source is not None:
-                try:
-                    identifiers = {cell_value(cells["Unit"]) for cells in unit_table(source.document.splitlines())
-                                   if "Unit" in cells and unit_names.name(cell_value(cells["Unit"])) == row.name}
-                except (Refusal, unit_names.BadName):
-                    pass
+            spellings = unit_spellings(source.document.splitlines()) if source is not None else {}
             retained_id = result.get("SHOWRUNNER_UNIT_ID", "")
             try:
                 retained_owner = unit_names.name(retained_id) if retained_id else ""
             except unit_names.BadName:
                 retained_owner = ""
-            # A missing production table cannot rename an existing unit id.
-            if len(identifiers) == 1:
-                result["SHOWRUNNER_UNIT_ID"] = next(iter(identifiers))
-            elif retained_owner == row.name:
-                result["SHOWRUNNER_UNIT_ID"] = retained_id
-            else:
-                result["SHOWRUNNER_UNIT_ID"] = unit_names.unit_id(row.name)
+            result["SHOWRUNNER_UNIT_ID"] = spellings.get(
+                row.name, retained_id if retained_owner == row.name else unit_names.unit_id(row.name))
         return result

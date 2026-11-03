@@ -247,10 +247,13 @@ class ProductionRenamePhaseNoteTests(unittest.TestCase):
         self.assertEqual(json.loads(note_fields(note)["production_file"]), NEW_LINK)
         held = fake_showrunner.write_session(fixture.root / "state/sessions", "runner-now", "test-showrunner")
         self.addCleanup(held.close)
+        worktree = fixture.worktrees / "alpha-unit"
+        plan = worktree / "docs/plans/alpha-unit.md"
+        fixture.write(plan, fixture.plan_path("alpha-unit").read_text())
         session = fixture.root / "phase-session"
         fixture.write(session / "progress_history_state.json", json.dumps({
-            "working_dir": str(fixture.checkout),
-            "project_plan_doc": str(fixture.plan_path("alpha-unit")),
+            "working_dir": str(worktree),
+            "project_plan_doc": str(plan),
             "status": "active", "phase": None,
         }))
         result = subprocess.run(

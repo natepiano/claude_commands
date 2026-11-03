@@ -66,39 +66,34 @@ function readableFixture(): StoredAccountsStatus {
 // These literal rows specify the columns, role order, totals, and narrow facts.
 const TABLE_DRAWN_LINES: Record<number, readonly string[]> = {
   "140": [
-    "   account  left  role                         busy  shell  idle  total     resets    credits  enabled",
-    "●  aLpha     60%  showrunners, unit directors  1, 2   1, 0  0, 1   2, 3      14:00  unlimited  yes",
-    "●  beta      20%  workers                         7            5     12  Sat 14:00     13,446",
-    "●  Charlie    8%  workers                         0      0     1      1  Sun 14:00",
-    "●  Delta     25%  spare                                                     23 Oct",
-    "●  Echo        —  showrunners, unit directors  0, 0   0, 0  0, 0   0, 0",
-    "●  Foxtrot   90%  spare                                                  Thu 14:00             yes",
-    "●  Gamma     74%  workers                         1      1     2      4     24 Oct",
-    "   total                                         11      2     9     22",
+    "   account  left  role            busy  shell  idle  total     resets    credits  enabled",
+    "●  aLpha     60%  showrunners        1      1     0      2      14:00  unlimited  yes",
+    "                  unit directors     2      0     1      3",
+    "●  beta      20%  workers            7            5     12  Sat 14:00     13,446",
+    "●  Charlie    8%  workers            0      0     1      1  Sun 14:00",
+    "●  Delta     25%  spare                                        23 Oct",
+    "●  Echo        —  showrunners        0      0     0      0",
+    "                  unit directors     0      0     0      0",
+    "●  Foxtrot   90%  spare                                     Thu 14:00             yes",
+    "●  Gamma     74%  workers            1      1     2      4     24 Oct",
+    "   total                            11      2     9     22",
     "",
     "Problems",
     "• Stored weekly reading is unavailable for the spare account; keep its previous assignment until another reading arrives.",
     "• The role cache has an old showrunner assignment that needs refreshing before the next production starts."
   ],
   "100": [
-    "   account  left  role                         busy  shell  idle  total",
-    "     resets    credits  enabled",
-    "●  aLpha     60%  showrunners, unit directors  1, 2   1, 0  0, 1   2, 3",
-    "      14:00  unlimited  yes",
-    "●  beta      20%  workers                         7            5     12",
-    "  Sat 14:00     13,446",
-    "●  Charlie    8%  workers                         0      0     1      1",
-    "  Sun 14:00",
-    "●  Delta     25%  spare",
-    "     23 Oct",
-    "●  Echo        —  showrunners, unit directors  0, 0   0, 0  0, 0   0, 0",
-    "",
-    "●  Foxtrot   90%  spare",
-    "  Thu 14:00             yes",
-    "●  Gamma     74%  workers                         1      1     2      4",
-    "     24 Oct",
-    "   total                                         11      2     9     22",
-    "",
+    "   account  left  role            busy  shell  idle  total     resets    credits  enabled",
+    "●  aLpha     60%  showrunners        1      1     0      2      14:00  unlimited  yes",
+    "                  unit directors     2      0     1      3",
+    "●  beta      20%  workers            7            5     12  Sat 14:00     13,446",
+    "●  Charlie    8%  workers            0      0     1      1  Sun 14:00",
+    "●  Delta     25%  spare                                        23 Oct",
+    "●  Echo        —  showrunners        0      0     0      0",
+    "                  unit directors     0      0     0      0",
+    "●  Foxtrot   90%  spare                                     Thu 14:00             yes",
+    "●  Gamma     74%  workers            1      1     2      4     24 Oct",
+    "   total                            11      2     9     22",
     "",
     "Problems",
     "• Stored weekly reading is unavailable for the spare account; keep its previous assignment until",
@@ -107,28 +102,26 @@ const TABLE_DRAWN_LINES: Record<number, readonly string[]> = {
     "  starts."
   ],
   "60": [
-    "● aLpha",
-    "  60% left · role showrunners, unit directors · busy 1, 2",
-    "  shell 1, 0 · idle 0, 1 · total 2, 3 · resets 14:00",
-    "  credits unlimited · enabled",
-    "● beta",
-    "  20% left · role workers · busy 7 · idle 5 · total 12",
-    "  resets Sat 14:00 · credits 13,446",
-    "● Charlie",
-    "  8% left · role workers · busy 0 · shell 0 · idle 1",
-    "  total 1 · resets Sun 14:00",
-    "● Delta",
-    "  25% left · role spare · resets 23 Oct",
-    "● Echo",
-    "  — left · role showrunners, unit directors · busy 0, 0",
-    "  shell 0, 0 · idle 0, 0 · total 0, 0",
-    "● Foxtrot",
-    "  90% left · role spare · resets Thu 14:00 · enabled",
-    "● Gamma",
-    "  74% left · role workers · busy 1 · shell 1 · idle 2",
-    "  total 4 · resets 24 Oct",
-    "total",
-    "  busy 11 · shell 2 · idle 9 · total 22",
+    "   account  left  role            busy  shell  idle  total",
+    "     resets    credits  enabled",
+    "●  aLpha     60%  showrunners        1      1     0      2",
+    "      14:00  unlimited  yes",
+    "                  unit directors     2      0     1      3",
+    "●  beta      20%  workers            7            5     12",
+    "  Sat 14:00     13,446",
+    "●  Charlie    8%  workers            0      0     1      1",
+    "  Sun 14:00",
+    "●  Delta     25%  spare",
+    "     23 Oct",
+    "●  Echo        —  showrunners        0      0     0      0",
+    "",
+    "                  unit directors     0      0     0      0",
+    "●  Foxtrot   90%  spare",
+    "  Thu 14:00             yes",
+    "●  Gamma     74%  workers            1      1     2      4",
+    "     24 Oct",
+    "   total                            11      2     9     22",
+    "",
     "",
     "Problems",
     "• Stored weekly reading is unavailable for the spare",
@@ -139,13 +132,12 @@ const TABLE_DRAWN_LINES: Record<number, readonly string[]> = {
   ],
   "30": [
     "● aLpha",
-    "  60% left",
-    "  role showrunners, unit",
-    "  directors",
-    "  busy 1, 2 · shell 1, 0",
-    "  idle 0, 1 · total 2, 3",
-    "  resets 14:00",
+    "  60% left · role showrunners",
+    "  busy 1 · shell 1 · idle 0",
+    "  total 2 · resets 14:00",
     "  credits unlimited · enabled",
+    "  role unit directors · busy 2",
+    "  shell 0 · idle 1 · total 3",
     "● beta",
     "  20% left · role workers",
     "  busy 7 · idle 5 · total 12",
@@ -159,11 +151,11 @@ const TABLE_DRAWN_LINES: Record<number, readonly string[]> = {
     "  25% left · role spare",
     "  resets 23 Oct",
     "● Echo",
-    "  — left",
-    "  role showrunners, unit",
-    "  directors",
-    "  busy 0, 0 · shell 0, 0",
-    "  idle 0, 0 · total 0, 0",
+    "  — left · role showrunners",
+    "  busy 0 · shell 0 · idle 0",
+    "  total 0",
+    "  role unit directors · busy 0",
+    "  shell 0 · idle 0 · total 0",
     "● Foxtrot",
     "  90% left · role spare",
     "  resets Thu 14:00 · enabled",
@@ -319,6 +311,29 @@ function hasSensitivePath(paths: readonly string[]) {
 }
 describe('accounts table', () => {
   for (const columns of [140, 60, 30]) {
+    test(`${columns} cells: the next role has only its own role and counts`, async ($, on) => {
+      const fake = accountsHost(on);
+      const data = statusFixture();
+      data.accounts = [data.accounts[0]!];
+      data.problems = [];
+      const before = JSON.stringify(data);
+      fake.replace(data);
+      await $.command.run(command());
+      const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane',
+        surface: 'terminal', props: { ...props, bodyColumns: columns } });
+      const tree = await ui.drawn();
+      const rows = accountLines(tree, 'Low');
+      const next = rows.findIndex(line => /^(?:role )?showrunners\b/.test(line.trim()));
+      expect(next).toBeGreaterThan(0);
+      const continuation = normalized(rows.slice(next)).replace(/ · /g, ' ');
+      expect(continuation).toBe(columns === 30
+        ? 'role showrunners busy 1 shell 0 idle 1 total 2' : 'showrunners 1 0 1 2');
+      expect(rows.filter(line => line.startsWith('● '))).toHaveLength(1);
+      expect(JSON.stringify(data)).toBe(before);
+    });
+  }
+
+  for (const columns of [140, 50, 30]) {
     test(`${columns} cells: counts sum both machines and retain separate machine data`, async ($, on) => {
       const fake = accountsHost(on);
       const data = statusFixture();
@@ -340,7 +355,14 @@ describe('accounts table', () => {
         surface: 'terminal', props: { ...props, bodyColumns: columns } });
       const tree = await ui.drawn();
       const row = normalized(accountLines(tree, 'Low'));
-      for (const values of ['3, 1', '2, 1', '1, 3', '6, 5']) expect(row).toContain(values);
+      if (columns === 140) {
+        expect(row).toContain('unit directors 3 2 1 6');
+        expect(row).toContain('showrunners 1 1 3 5');
+      } else {
+        const facts = row.replace(/ · /g, ' ');
+        expect(facts).toContain('role unit directors busy 3 shell 2 idle 1 total 6');
+        expect(facts).toContain('role showrunners busy 1 shell 1 idle 3 total 5');
+      }
       expect(accountDisplay(data.accounts[1]!).roleCounts).toEqual([
         { kind: 'available', value: { busy: 3, shell: null, idle: 2, total: 5 } },
       ]);
@@ -395,7 +417,7 @@ describe('accounts table', () => {
         }
         for (const heading of ['account', 'left', 'role', 'busy', 'shell', 'idle', 'total', 'resets', 'credits', 'enabled']) {
           const headings = spans.filter(span => span.bold && span.text.trim() === heading);
-          expect(headings.length).toBe((columns <= 60 ? 0 : 1) + (heading === 'total' ? 1 : 0));
+          expect(headings.length).toBe((columns < 60 ? 0 : 1) + (heading === 'total' ? 1 : 0));
           expect(headings.every(span => span.bold && span.color === 'default')).toBe(true);
         }
         for (const node of elements(tree)) {
@@ -418,7 +440,7 @@ describe('accounts table', () => {
     const fake = accountsHost(on, [], { USER_ZONE: 'America/New_York' });
     fake.replace(readableFixture());
     await $.command.run(command());
-    for (const columns of [140, 100]) {
+    for (const columns of [140, 80]) {
       const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane', surface: 'terminal',
         props: { ...props, bodyColumns: columns } });
       const lines = rowLines(await ui.drawn());
@@ -426,26 +448,26 @@ describe('accounts table', () => {
       expect(header.indexOf('account')).toBe(3);
       expect(header.indexOf('role')).toBe(18);
       expect(header.indexOf('left')).toBe(12);
-      expect(header.indexOf('busy')).toBe(47);
-      expect(header.indexOf('shell')).toBe(53);
-      expect(header.indexOf('idle')).toBe(60);
-      expect(header.indexOf('total')).toBe(66);
+      expect(header.indexOf('busy')).toBe(34);
+      expect(header.indexOf('shell')).toBe(40);
+      expect(header.indexOf('idle')).toBe(47);
+      expect(header.indexOf('total')).toBe(53);
       const firstRows = lines.filter(line => line.startsWith('● '));
       for (const [i, row] of firstRows.entries()) {
         expect(row.indexOf(LABELS[i]!)).toBe(3);
-        expect(row.slice(18, 45).trim()).toBe(i === 0 || i === 4 ? 'showrunners, unit directors'
+        expect(row.slice(18, 32).trim()).toBe(i === 0 || i === 4 ? 'showrunners'
           : i === 3 || i === 5 ? 'spare' : 'workers');
         expect(row.slice(12, 16).trim()).toBe(['60%', '20%', '8%', '25%', '—', '90%', '74%'][i]);
         expect(row[15]).toBe(i === 4 ? '—' : '%');
-        expect(row.slice(47, 51).trim()).toBe(['1, 2', '7', '0', '', '0, 0', '', '1'][i]);
-        expect(row.slice(53, 58).trim()).toBe(['1, 0', '', '0', '', '0, 0', '', '1'][i]);
-        expect(row.slice(60, 64).trim()).toBe(['0, 1', '5', '1', '', '0, 0', '', '2'][i]);
-        expect(row.slice(66, 71).trim()).toBe(['2, 3', '12', '1', '', '0, 0', '', '4'][i]);
+        expect(row.slice(34, 38).trim()).toBe(['1', '7', '0', '', '0', '', '1'][i]);
+        expect(row.slice(40, 45).trim()).toBe(['1', '', '0', '', '0', '', '1'][i]);
+        expect(row.slice(47, 51).trim()).toBe(['0', '5', '1', '', '0', '', '2'][i]);
+        expect(row.slice(53, 58).trim()).toBe(['2', '12', '1', '', '0', '', '4'][i]);
       }
-      const detail = columns === 140 ? firstRows : LABELS.map((_, i) => lines[3 + i * 2]!);
-      const resetStart = columns === 140 ? 73 : 2;
-      const creditStart = columns === 140 ? 84 : 13;
-      const enabledStart = columns === 140 ? 95 : 24;
+      const detail = columns === 140 ? firstRows : firstRows.map(row => lines[lines.indexOf(row) + 1]!);
+      const resetStart = columns === 140 ? 60 : 2;
+      const creditStart = columns === 140 ? 71 : 13;
+      const enabledStart = columns === 140 ? 82 : 24;
       for (const [i, row] of detail.entries()) {
         expect(row.slice(resetStart, resetStart + 9).trim()).toBe(['14:00', 'Sat 14:00', 'Sun 14:00', '23 Oct', '', 'Thu 14:00', '24 Oct'][i]);
         expect(row.slice(creditStart, creditStart + 9).trim()).toBe(i === 0 ? 'unlimited' : i === 1 ? '13,446' : '');
@@ -455,7 +477,7 @@ describe('accounts table', () => {
     }
   });
 
-  for (const columns of [140, 100, 60]) {
+  for (const columns of [140, 80, 50]) {
     test(`all columns remain at ${columns} cells when no balance exists`, async ($, on) => {
       const fake = accountsHost(on, [], { USER_ZONE: 'America/New_York' });
       const data = readableFixture();
@@ -467,14 +489,14 @@ describe('accounts table', () => {
         props: { ...props, bodyColumns: columns } });
       const lines = rowLines(await ui.drawn());
       // Empty balances retain every column and the credit setting.
-      if (columns === 60) {
-        expect(normalized(accountLines(await ui.drawn(), 'aLpha'))).toBe(
-          '● aLpha 60% left · role showrunners, unit directors · busy 1, 2 shell 1, 0 · idle 0, 1 · total 2, 3 · resets 14:00 enabled');
+      if (columns === 50) {
+        expect(normalized(accountLines(await ui.drawn(), 'aLpha')).replace(/ · /g, ' ')).toBe(
+          '● aLpha 60% left role showrunners busy 1 shell 1 idle 0 total 2 resets 14:00 enabled role unit directors busy 2 shell 0 idle 1 total 3');
       } else {
         expect(lines.slice(0, lines.findIndex(line => line.startsWith('● '))).join(' ').trim().split(/\s+/))
           .toEqual(['account', 'left', 'role', 'busy', 'shell', 'idle', 'total', 'resets', 'credits', 'enabled']);
       }
-      if (columns === 60) expect(lines.join(' ')).not.toContain('credits');
+      if (columns === 50) expect(lines.join(' ')).not.toContain('credits');
       else expect(lines.join(' ')).toContain('credits');
       expect(lines.join(' ')).not.toContain('in use');
       expect(lines.filter(line => line.startsWith('● '))).toHaveLength(7);
@@ -511,7 +533,7 @@ describe('accounts table', () => {
     expect(textInColor(tree, 'inactive')).not.toContain('●');
     const ordinary = textInColor(tree, 'default');
     for (const fact of ['60%', '25%', '90%', '74%', '—',
-      'showrunners, unit directors', 'workers', 'spare', 'unlimited', '13,446', '14:00', '24 Oct']) {
+      'showrunners', 'unit directors', 'workers', 'spare', 'unlimited', '13,446', '14:00', '24 Oct']) {
       expect(ordinary).toContain(fact);
     }
   });
@@ -621,8 +643,8 @@ describe('accounts table', () => {
     });
   }
 
-  for (const columns of [140, 60, 30]) {
-    test(`${columns} cells: worker roles join activity counts and keep unknown shell blank in the total`, async ($, on) => {
+  for (const columns of [140, 50, 30]) {
+    test(`${columns} cells: worker roles have separate activity counts and keep unknown shell blank in the total`, async ($, on) => {
       const fake = accountsHost(on);
       fake.replace({ accounts: [{ ...statusFixture().accounts[1]!, roles: ['workers', 'reviewers'],
         role_counts: [{ busy: 2, shell: null, idle: 3, total: 5 },
@@ -632,8 +654,14 @@ describe('accounts table', () => {
         surface: 'terminal', props: { ...props, bodyColumns: columns } });
       const lines = rowLines(await ui.drawn());
       const row = normalized(accountLines(await ui.drawn(), 'Watch'));
-      expect(row).toContain('workers, reviewers');
-      for (const counts of ['2, 1', '3, 4', '5, 5']) expect(row).toContain(counts);
+      if (columns === 140) {
+        expect(row).toContain('workers 2 3 5');
+        expect(row).toContain('reviewers 1 4 5');
+      } else {
+        const facts = row.replace(/ · /g, ' ');
+        expect(facts).toContain('role workers busy 2 idle 3 total 5');
+        expect(facts).toContain('role reviewers busy 1 idle 4 total 5');
+      }
       expect(lines.join(' ')).not.toContain('in use');
       if (columns === 140) {
         const shell = lines[0]!.indexOf('shell');
@@ -668,7 +696,7 @@ describe('accounts pane', () => {
     fake.replace(data);
     await $.command.run(command());
     const ui = await mount($);
-    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('3, 2');
+    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('unit directors 1 1 1 3');
     fake.clear();
     const changed = statusFixture();
     changed.session_inputs = [path];
@@ -677,7 +705,7 @@ describe('accounts pane', () => {
     fake.change(path);
     await fake.clock.advance(10_000);
     expect(fake.accountRuns()).toEqual([ARGV]);
-    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('4, 2');
+    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('unit directors 1 1 2 4');
     expect(fake.boardRuns()).toEqual([]);
     fake.clear();
     await fake.clock.advance(10_000);
@@ -695,7 +723,7 @@ describe('accounts pane', () => {
     fake.replace(data);
     await $.command.run(command());
     const ui = await mount($);
-    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('3, 2');
+    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('unit directors 1 1 1 3');
     const unchanged = [...fake.mtimes.entries()];
     const afterExit = structuredClone(data);
     afterExit.accounts[0]!.role_counts = [{ busy: 1, shell: 0, idle: 1, total: 2 }, { busy: 1, shell: 0, idle: 1, total: 2 }];
@@ -705,7 +733,7 @@ describe('accounts pane', () => {
     expect([...fake.mtimes.entries()]).toEqual(unchanged);
     expect(fake.accountRuns()).toEqual([ARGV]);
     expect(fake.boardRuns()).toEqual([]);
-    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('2, 2');
+    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('unit directors 1 0 1 2');
     expect(fake.escaped).toEqual([]);
     expect(fake.forbidden).toEqual([]);
   });
@@ -719,7 +747,7 @@ describe('accounts pane', () => {
     fake.replace(data);
     await $.command.run(command());
     const ui = await mount($);
-    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('3, 2');
+    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('unit directors 1 1 1 3');
     const unchanged = [...fake.mtimes.entries()];
     fake.clear();
     fake.failNext();
@@ -734,7 +762,7 @@ describe('accounts pane', () => {
     expect([...fake.mtimes.entries()]).toEqual(unchanged);
     expect(fake.accountRuns()).toEqual([ARGV]);
     expect(fake.accountStateKind()).toBe('accounts');
-    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('2, 2');
+    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('unit directors 1 0 1 2');
     expect(fake.boardRuns()).toEqual([]);
     expect(fake.escaped).toEqual([]);
     expect(fake.forbidden).toEqual([]);
@@ -757,7 +785,8 @@ describe('accounts pane', () => {
       }
       for (const heading of OLD_HEADINGS) expect(text.includes(heading)).toBe(false);
       expect(text.includes('@')).toBe(false);
-      expect(text.includes('unit directors, showrunners')).toBe(true);
+      expect(text.includes('unit directors, showrunners')).toBe(false);
+      expect(text.includes('unit directors')).toBe(true);
       expect(hasSensitivePath(fake.fs)).toBe(false);
       expect(fake.escaped.length).toBe(0);
       expect(fake.forbidden).toEqual([]);

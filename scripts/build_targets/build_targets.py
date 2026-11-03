@@ -9,6 +9,7 @@ from contextlib import ExitStack, redirect_stdout
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 import importlib
 import io
 import json
@@ -26,6 +27,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from targets import (
     ANY_ELIGIBLE_TARGET,
+    AwsStatusRow,
+    read_aws_status as read_aws_status,
     ConfigError,
     EligibleTarget,
     ExcludedTarget,
@@ -58,10 +61,10 @@ import override_guard
 from user_zone import user_zone
 if TYPE_CHECKING:
     from ..message import roster
-    from ..aws_target import ledger as cost_ledger
+    from ..aws_target import config as aws_config, ledger as cost_ledger, measurement
 else:
     from scripts.message import roster
-    from scripts.aws_target import ledger as cost_ledger
+    from scripts.aws_target import config as aws_config, ledger as cost_ledger, measurement
 
 
 
@@ -122,6 +125,8 @@ def running_job_text(job: RunningJob,
 def format_state(name: str, state: TargetState,
                  labels: Mapping[RunningJob | Held, roster.UnitLabels] = _NO_UNIT_LABELS) -> str:
     name = display_field(name)
+    if isinstance(state, AwsStatusRow):
+        return format_aws_status(state)
     if isinstance(state, Free):
         return f"{name}: free"
     if isinstance(state, Running):
@@ -141,11 +146,44 @@ def format_state(name: str, state: TargetState,
 
 
 def probe_target(target: SshTarget) -> TargetState:
+    if is_aws_target(target):
+        return target_state(target)
     config = offload.read_config(target.settings)
     result = offload.probe_reachability(offload.ProcessController(), config)
     if isinstance(result, offload.UnreachableHost):
         return Unreachable(result.reason)
     return target_state(target)
+
+
+
+def format_aws_status(row: AwsStatusRow) -> str:
+    def at(value: float) -> str:
+        return local_time(datetime.fromtimestamp(value, timezone.utc)) if value else 'unavailable'
+    monthly = f'${row.monthly_usd:.2f}' if isinstance(row.monthly_usd, Decimal) else 'unavailable'
+    cap = f'${row.monthly_limit_usd:.2f}' if isinstance(row.monthly_limit_usd, Decimal) else 'unavailable'
+    state = f'starting since {at(row.starting_at)}' if row.state == 'starting' else row.state
+    lines = [f'{row.target}: {state}; evidence {at(row.evidence_at)}; month {monthly} / {cap}',
+             f'  spending {row.spending}; decision {at(row.decision_at)}; {display_field(row.reason)}']
+    for slots in row.slots:
+        lines.append(f'  {slots.repository}: {slots.occupied}/{slots.capacity} slots; '
+                     + f'{slots.active} active, {slots.retained} retained pending cleanup')
+    for result in row.results:
+        count = str(result.unresolved_count) if isinstance(result.unresolved_count, int) else 'unavailable'
+        lines.append(f'  result {result.repo_identity} slot {result.slot}: {result.outcome}; '
+                     + f'completion {result.completion}; cleanup {result.cleanup}; unresolved {count}; evidence {at(result.evidence_at)}')
+    for notice in row.notices:
+        text = f'  notice {notice.period}: {notice.delivery.value}'
+        if notice.delivery == cost_ledger.DeliveryState.PENDING:
+            text += f'; retry after {at(notice.retry_after)}'
+        lines.append(text)
+    if any(slots.retained for slots in row.slots):
+        recovery = {
+            measurement.ControllerRecovery.CONTROLLER_TICK: 'controller evidence is unavailable',
+            measurement.ControllerRecovery.CONFIRM_STOP: 'controller tick confirms stop or remote cleanup',
+            measurement.ControllerRecovery.STATE_EVIDENCE_RELEASE: 'state-evidence release',
+        }[row.recovery]
+        lines.append(f'  recovery: {recovery}; run aws_target.py tick')
+    return '\n'.join(lines)
 
 
 def command_status(probe: bool = False) -> int:
@@ -232,6 +270,8 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
             return ExcludedTarget(target, "busy")
         if isinstance(probe, offload.UnavailableProbe):
             return ExcludedTarget(target, "unreachable")
+        if isinstance(probe, offload.InterruptedTargetStatus):
+            return ExcludedTarget(target, "busy")
         if probe.free_gib < config.free_floor_gib:
             return ExcludedTarget(target, "disk")
     except (OSError, UnicodeError, ValueError) as error:
@@ -268,7 +308,7 @@ def aws_spending_exclusion(target: SshTarget) -> str:
     """Check AWS spending before reading the execution settings."""
     if not is_aws_target(target):
         return ""
-    if conf.text(target.settings, "offload") != "on":
+    if not aws_config.offload_enabled(conf.read(target.settings)):
         return "off"
     decision = cost_ledger.spending_guard(target.settings, mac_test.state_paths(target.name).directory)
     if isinstance(decision, cost_ledger.SpendingAllowed):

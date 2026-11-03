@@ -14,9 +14,11 @@ from typing import TYPE_CHECKING, cast, override
 from unittest.mock import patch
 
 import escalate
+import push_texts
 import send
 import sessions
-from scripts.production import showrunners
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file
 if TYPE_CHECKING:
     from ..whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
 else:
@@ -34,6 +36,33 @@ if os.environ.get("REFUSED"):
 """
 
 
+def registered_push(summary: str, text: str, action: ActionRequired | NoActionRequired,
+                    need: str = "decision") -> push_texts.RenderedPush:
+    if isinstance(action, NoActionRequired):
+        return push_texts.render("nate.adhoc", sender="escalate", title=summary, description=text)
+    return push_texts.render("alert.blocked" if need == "blocked" else "alert.decision",
+                            sender="escalate", title=summary, body=text, action=action.text)
+
+
+def registered_arguments(arguments: tuple[str, ...]) -> tuple[str, ...]:
+    if not arguments or arguments[0] != "hold" or "--summary" not in arguments:
+        return arguments
+    def value(flag: str, default: str = "") -> str:
+        return arguments[arguments.index(flag) + 1] if flag in arguments else default
+    if "--action" not in arguments and "--no-action" not in arguments:
+        return arguments
+    action = NoActionRequired() if "--no-action" in arguments else ActionRequired(value("--action"))
+    if isinstance(action, NoActionRequired) and value("--need", "decision") != "note":
+        return arguments
+    if isinstance(action, ActionRequired) and action.text == "none":
+        return arguments
+    if value("--need", "decision") not in ("note", "decision", "blocked"):
+        return arguments
+    rendered = registered_push(value("--summary"), value("--text"), action, value("--need", "decision"))
+    return ("hold", arguments[1], "--minutes", value("--minutes", "15"), "--text-id", rendered.id,
+            *(item for key, value in rendered.values.items() for item in ("--value", f"{key}={value}")))
+
+
 class EscalateTests(unittest.TestCase):
     root: Path = Path()
     environment: dict[str, str] = {}
@@ -48,9 +77,11 @@ class EscalateTests(unittest.TestCase):
             **os.environ, "ESCALATE_STATE_DIR": str(self.root / "state"), "LOG": str(self.root / "log"),
             "ESCALATE_SEND": str(self.root / "send.py"), "ESCALATE_NOTIFIER": str(self.root / "notifier.sh"),
         }
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        _ = (self.root / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
 
     def run_script(self, *arguments: str, **environment: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), *arguments], env={**self.environment, **environment},
+        return subprocess.run([sys.executable, str(SCRIPT), *registered_arguments(arguments)], env={**self.environment, **environment},
                               capture_output=True, text=True, check=False)
 
     def hold(self, minutes: str = "0") -> subprocess.CompletedProcess[str]:
@@ -79,8 +110,7 @@ class EscalateTests(unittest.TestCase):
         self.assertEqual(self.run_script("due").stdout, "disk: sent to the user\n")
         self.assertEqual(self.run_script("due").stdout, "")
         self.assertEqual(self.log().count(
-            "send --to user --from escalate --key escalate-disk --summary Disk --need decision --action free disk space "
-            + "--text Disk is full.\n"), 1)
+            "send --to user --from escalate --need decision --text-id alert.decision --key escalate-disk "), 1)
         self.assertEqual(self.run_script("list").stdout, "disk - sent - Disk\n")
 
     def test_closing_a_sent_blocked_push_stops_its_repeats_and_other_closes_do_not(self) -> None:
@@ -141,7 +171,7 @@ class EscalateTests(unittest.TestCase):
                         self.assertIn("closed script hold five_hour.removed", escalate.due(10**12)[0].line)
                         self.assertEqual(escalate.due(10**12), [])
                     elif route == "hold":
-                        self.assertTrue(escalate.hold("usage", escalate.SessionPush("Choose build", "Retry?", ActionRequired("Choose retry."))))
+                        self.assertTrue(escalate.hold("usage", registered_push("Choose build", "Retry?", ActionRequired("Choose retry."))))
                     elif route == "reconcile":
                         escalate.reconcile_codex_holds(self.root, "new@example.invalid")
                     else:
@@ -157,14 +187,18 @@ class EscalateTests(unittest.TestCase):
         self.assertTrue(all(entry["text_id"] == "five_hour.removed" for entry in entries))
         self.assertNotIn("send ", self.log())
 
-    def test_session_hold_written_before_registry_metadata_still_sends_and_closes(self) -> None:
+    def test_session_hold_without_registry_metadata_stays_unchanged_and_never_delivers(self) -> None:
         path = self.root / "state/held/session.json"
         path.parent.mkdir(parents=True)
         _ = path.write_text(json.dumps({"summary": "Build choice", "text": "Choose retry.", "need": "decision",
-            "held_at": 1.0, "minutes": 0, "outcome": "waiting", "action": {"kind": "required", "text": "Choose retry."}}))
-        self.assertEqual(self.run_script("due").stdout, "session: sent to the user\n")
-        self.assertEqual(self.run_script("due").stdout, "")
-        self.assertIn("--summary Build choice --need decision --action Choose retry. --text Choose retry.", self.log())
+            "held_at": 1.0, "minutes": 0, "outcome": "waiting", "origin_session": "owner-session",
+            "action": {"kind": "required", "text": "Choose retry."}}))
+        before = path.read_bytes()
+        done = self.run_script("due")
+        self.assertEqual(done.stdout, "")
+        self.assertIn("owner-session: legacy hold needs a template revision", done.stderr)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertNotIn("send ", self.log())
         self.assertEqual(self.run_script("close", "session").stdout, "session: closed\n")
 
     def test_review_held_push_is_terminal_and_returns_to_the_relayed_session(self) -> None:
@@ -175,7 +209,7 @@ class EscalateTests(unittest.TestCase):
                   subprocess.CompletedProcess([], 4, "HELD: not sent, failed review: reader-starts-cold\n", ""),
                   subprocess.CompletedProcess([], 0, "SENT: to session\n", "")]) as run):
             relay = escalate.HeldRelay(recipient="session:writer", key="original-question")
-            _ = escalate.hold("question", escalate.SessionPush("Build choice", "Choose a build", ActionRequired("Choose retry"), "decision"), minutes=0, relays=(relay,))
+            _ = escalate.hold("question", registered_push("Build choice", "Choose a build", ActionRequired("Choose retry"), "decision"), minutes=0, relays=(relay,))
             settled = escalate.due(10**12)
             self.assertEqual(escalate.due(10**12), [])
         self.assertEqual(run.call_count, 2)
@@ -197,8 +231,8 @@ class EscalateTests(unittest.TestCase):
               patch.object(subprocess, "run", side_effect=[
                   subprocess.CompletedProcess([], 4, "HELD: failed review\n", ""),
                   subprocess.CompletedProcess([], 0, "SENT\n", "")]) as run):
-            self.assertEqual(escalate.main(["hold", "question", "--summary", "Choose build", "--text", "Choose retry",
-                                           "--action", "Choose retry", "--minutes", "0"]), 0)
+            self.assertEqual(escalate.main(list(registered_arguments(("hold", "question", "--summary", "Choose build", "--text", "Choose retry",
+                                           "--action", "Choose retry", "--minutes", "0")))), 0)
             _ = escalate.due(10**12)
             self.assertEqual(escalate.due(10**12), [])
         self.assertEqual(run.call_count, 2)
@@ -215,7 +249,7 @@ class EscalateTests(unittest.TestCase):
                   subprocess.CompletedProcess([], 3, "FAILED: relay unavailable\n", ""),
                   subprocess.CompletedProcess([], 0, "SENT: to session\n", "")]) as run):
             relay = escalate.HeldRelay(recipient="session:writer", key="original-question")
-            _ = escalate.hold("question", escalate.SessionPush("Build choice", "Choose a build",
+            _ = escalate.hold("question", registered_push("Build choice", "Choose a build",
                               ActionRequired("Choose retry")), minutes=0, relays=(relay,))
             settled = escalate.due(10**12)
             self.assertTrue(settled[-1].failed)
@@ -251,9 +285,9 @@ class EscalateTests(unittest.TestCase):
                                "--no-action", "--need", "note", "--minutes", "0")
         self.assertEqual(held.returncode, 0)
         self.assertEqual(self.run_script("due").stdout, "news: sent to the user\n")
-        self.assertIn("--need note --no-action --text Finished.", self.log())
+        self.assertIn("--text-id nate.adhoc", self.log())
 
-    def test_legacy_hold_is_not_delivered_and_the_next_hold_replaces_it(self) -> None:
+    def test_legacy_hold_is_not_delivered_or_replaced(self) -> None:
         path = self.root / "state" / "held" / "disk.json"
         path.parent.mkdir(parents=True)
         legacy = {"summary": "Old disk", "text": "Old text", "need": "decision", "held_at": 0.0,
@@ -264,10 +298,10 @@ class EscalateTests(unittest.TestCase):
         self.assertEqual(self.run_script("list").stdout,
                          "disk - waiting for a hold that states its action\n")
 
-        self.assertIn("disk: held", self.hold().stdout)
-        record = cast(dict[str, object], cast(object, json.loads(path.read_text(encoding="utf-8"))))
-        self.assertEqual(record["action"], {"kind": "required", "text": "free disk space"})
-        self.assertEqual(self.run_script("due").stdout, "disk: sent to the user\n")
+        before = path.read_bytes()
+        self.assertEqual(self.hold().stdout, "disk: already held\n")
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.run_script("due").stdout, "")
 
     def test_current_hold_is_not_replaced(self) -> None:
         _ = self.hold("15")
@@ -277,6 +311,35 @@ class EscalateTests(unittest.TestCase):
                                  "--action", "do something else", "--minutes", "15")
         self.assertEqual(second.stdout, "disk: already held\n")
         self.assertEqual(path.read_text(encoding="utf-8"), before)
+
+    def test_account_reconciliation_preserves_a_legacy_free_text_hold(self) -> None:
+        path = self.root / "state/held/five-hour-codex.json"
+        path.parent.mkdir(parents=True)
+        _ = path.write_text(json.dumps({"summary": "Old Codex", "text": "Choose an account.", "need": "decision",
+            "held_at": 1.0, "minutes": 0, "outcome": "waiting",
+            "action": {"kind": "required", "text": "Choose an account."}}))
+        before = path.read_bytes()
+        with patch.object(escalate, "STATE", self.root / "state"):
+            escalate.reconcile_codex_holds(self.root / ".codex2", "second@example.invalid")
+        self.assertEqual(path.read_bytes(), before)
+        self.assertNotIn("send ", self.log())
+
+    def test_registered_hold_keeps_its_template_and_structured_values(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
+        values = entry.examples[0].values
+        arguments = ["hold", "choice", "--text-id", entry.id, "--minutes", "0",
+                     *(item for key, value in values.items() for item in ("--value", f"{key}={value}"))]
+        done = self.run_script(*arguments)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        held = escalate.read(self.root / "state" / "held" / "choice.json")
+        self.assertIsInstance(held, escalate.RegisteredHold)
+        assert isinstance(held, escalate.RegisteredHold)
+        self.assertEqual(held.text_id, entry.id)
+        self.assertEqual(dict(held.values), values)
+        delivered = self.run_script("due")
+        self.assertEqual((delivered.returncode, delivered.stdout), (0, "choice: sent to the user\n"))
+        self.assertIn("--text-id decision.choices", self.log())
+        self.assertIn("--value choices=" + values["choices"], self.log())
 
     def test_written_action_reads_back_as_the_domain_type(self) -> None:
         _ = self.hold("15")
@@ -289,7 +352,7 @@ class EscalateTests(unittest.TestCase):
         for action in ([], ["--action", "none"], ["--no-action"]):
             done = self.run_script("hold", "disk", "--summary", "a", "--text", "b", *action)
             self.assertEqual(done.returncode, 2)
-            self.assertIn("Say what the user does", done.stderr)
+            self.assertIn("--text-id", done.stderr)
 
     def select_codex(self, number: int) -> KnownCodexAccount:
         home = self.root / f".codex{number}"
@@ -307,18 +370,18 @@ class EscalateTests(unittest.TestCase):
 
     def test_due_after_swap_cancels_outgoing_account_without_waiting_for_updater(self) -> None:
         with (patch.dict(os.environ, {"HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root)}),
-              patch.object(escalate, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery()),
+              patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
               patch.object(escalate, "load_settings", return_value={"always": []}),
               patch.object(escalate, "STATE", self.root / "owned holds"),
               patch.object(escalate, "schedule"), patch.object(escalate, "deliver", return_value="") as deliver):
             a = self.select_codex(1)
-            _ = escalate.hold("a-window", escalate.SessionPush("codex1", "A low", NoActionRequired(), "note"), minutes=0, owner=a)
+            _ = escalate.hold("a-window", registered_push("codex1", "A low", NoActionRequired(), "note"), minutes=0, owner=a)
             b = self.select_codex(2)
-            _ = escalate.hold("b-window", escalate.SessionPush("codex2", "B low", NoActionRequired(), "note"), minutes=0, owner=b)
-            _ = escalate.hold("other-tool", escalate.SessionPush("Claude", "Claude low", NoActionRequired(), "note"), minutes=0)
+            _ = escalate.hold("b-window", registered_push("codex2", "B low", NoActionRequired(), "note"), minutes=0, owner=b)
+            _ = escalate.hold("other-tool", registered_push("Claude", "Claude low", NoActionRequired(), "note"), minutes=0)
             _ = escalate.due(10**12)
             held = [cast(escalate.HeldMessage, call.args[0]) for call in deliver.call_args_list]
-            self.assertEqual({entry.summary for entry in held}, {"codex2", "Claude"})
+            self.assertEqual({entry.summary for entry in held}, {"escalate codex2", "escalate Claude"})
             self.assertIsInstance(escalate.read(escalate.held_path("a-window")), escalate.NoHeld)
 
     def test_due_with_unknown_selected_login_preserves_owned_hold_without_delivery(self) -> None:
@@ -326,7 +389,7 @@ class EscalateTests(unittest.TestCase):
               patch.object(escalate, "STATE", self.root / "owned holds"),
               patch.object(escalate, "schedule"), patch.object(escalate, "deliver", return_value="") as deliver):
             a = self.select_codex(1)
-            _ = escalate.hold("a-window", escalate.SessionPush("codex1", "A low", NoActionRequired(), "note"), minutes=0, owner=a)
+            _ = escalate.hold("a-window", registered_push("codex1", "A low", NoActionRequired(), "note"), minutes=0, owner=a)
             _ = (a.home / "auth.json").write_text("unreadable")
             before = escalate.held_path("a-window").read_text()
             _ = escalate.due(10**12)
@@ -338,8 +401,8 @@ class EscalateTests(unittest.TestCase):
               patch.object(escalate, "STATE", self.root / "owned holds"),
               patch.object(escalate, "schedule"), patch.object(escalate, "deliver", return_value="") as deliver):
             a = self.select_codex(1)
-            _ = escalate.hold("a-window", escalate.SessionPush("codex1", "A low", NoActionRequired(), "note"), minutes=0, owner=a)
-            _ = escalate.hold("five-hour-codex", escalate.SessionPush("legacy Codex", "old low", NoActionRequired(), "note"), minutes=0)
+            _ = escalate.hold("a-window", registered_push("codex1", "A low", NoActionRequired(), "note"), minutes=0, owner=a)
+            _ = escalate.hold("five-hour-codex", registered_push("legacy Codex", "old low", NoActionRequired(), "note"), minutes=0)
             _ = (self.root / "codex1.md").unlink()
             before = {path.name: path.read_text() for path in (escalate.STATE / "held").glob("*.json")}
             _ = escalate.due(10**12)
@@ -351,13 +414,11 @@ class EscalateTests(unittest.TestCase):
               patch.object(escalate, "STATE", self.root / "owned holds"),
               patch.object(escalate, "schedule")):
             a = self.select_codex(1)
-            _ = escalate.hold("a-window", escalate.SessionPush("codex1", "A low", NoActionRequired(), "note"), owner=a)
+            _ = escalate.hold("a-window", registered_push("codex1", "A low", NoActionRequired(), "note"), owner=a)
             b = self.select_codex(2)
             path = escalate.held_path("a-window")
             saved = path.read_bytes()
-            partial = showrunners.ShowrunnerDiscovery([], (
-                showrunners.ShowrunnerLookupFailure("missing", "fixture lookup failed"),))
-            with (patch.object(escalate, "registered_showrunners", return_value=partial),
+            with (patch.object(staff, "snapshot", side_effect=OSError("fixture lookup failed")),
                   patch.object(escalate, "load_settings", return_value={"always": ["offline"]}),
                   patch.object(escalate, "deliver", return_value="") as deliver,
                   patch.object(subprocess, "run") as send):
@@ -375,16 +436,14 @@ class EscalateTests(unittest.TestCase):
               patch.object(escalate, "load_settings", return_value={"always": ["offline"]}),
               patch.object(escalate, "deliver", return_value="") as deliver):
             selected = self.select_codex(1)
-            _ = escalate.hold("five-hour-codex", escalate.SessionPush(
+            _ = escalate.hold("five-hour-codex", registered_push(
                 "Old Codex", "Old account needs attention", ActionRequired("Select an account.")), minutes=0)
-            _ = escalate.hold("other-tool", escalate.SessionPush(
+            _ = escalate.hold("other-tool", registered_push(
                 "Other tool", "A distinct question", ActionRequired("Answer the question.")), minutes=0)
             path = escalate.held_path("five-hour-codex")
             saved = path.read_bytes()
             self.assertIsInstance(cast(escalate.HeldMessage, escalate.read(path)).owner, escalate.UnownedHold)
-            partial = showrunners.ShowrunnerDiscovery([], (
-                showrunners.ShowrunnerLookupFailure("missing", "fixture lookup failed"),))
-            with (patch.object(escalate, "registered_showrunners", return_value=partial),
+            with (patch.object(staff, "snapshot", side_effect=OSError("fixture lookup failed")),
                   patch.object(subprocess, "run") as retire):
                 for attempt in range(3):
                     escalate.reconcile_codex_holds(selected.home, selected.login)
@@ -392,7 +451,7 @@ class EscalateTests(unittest.TestCase):
                     self.assertEqual(path.read_bytes(), saved)
                 retire.assert_not_called()
             self.assertEqual([call.args[1] for call in deliver.call_args_list], ["other-tool"])
-            with (patch.object(escalate, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery()),
+            with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
                   patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as retire):
                 _ = escalate.due(10**12 + 4)
             self.assertFalse(path.exists())
@@ -409,10 +468,10 @@ class EscalateTests(unittest.TestCase):
               patch.object(escalate, "schedule"), patch.object(escalate, "deliver", return_value="") as deliver):
             a = self.select_codex(1)
             for key in ("5-hour codex1", "5-hour Codex", "5-hour Claude"):
-                send.enqueue(send.Message("offline", "quota_alert", "", "low window", key), "offline", datetime.now(timezone.utc))
+                send.enqueue(send.Message("offline", "quota_alert", "", "low window", key, stamp=send.UnavailableSender()), "offline", datetime.now(timezone.utc))
             relay = escalate.HeldRelay(recipient="offline", key="5-hour codex1")
-            _ = escalate.hold("a-window", escalate.SessionPush("codex1", "A low", NoActionRequired(), "note"), owner=a, relays=(relay,))
-            _ = escalate.hold("five-hour-codex", escalate.SessionPush("legacy", "old low", NoActionRequired(), "note"))
+            _ = escalate.hold("a-window", registered_push("codex1", "A low", NoActionRequired(), "note"), owner=a, relays=(relay,))
+            _ = escalate.hold("five-hour-codex", registered_push("legacy", "old low", NoActionRequired(), "note"))
             _ = self.select_codex(2)
             def retire(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
                 self.assertIn("retire", command)
@@ -420,7 +479,7 @@ class EscalateTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, "", "")
             with (patch.object(subprocess, "run", side_effect=retire),
                   patch.object(escalate, "load_settings", return_value={"always": ["offline"]}),
-                  patch.object(escalate, "registered_showrunners", return_value=[])):
+                  patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(()))):
                 _ = escalate.due(10**12)
             deliver.assert_not_called()
             self.assertEqual([item["key"] for item in send.read_queue(send.queue_path("offline"))], ["5-hour Claude"])

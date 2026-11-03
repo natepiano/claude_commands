@@ -19,12 +19,50 @@ import fake_showrunner
 import fake_unit_host
 from fake_unit_host import HostedUnit
 from scripts.production import staff
-from scripts.production.staff_test_support import isolated_staff_file, unit_membership, showrunner_relationship
+from scripts.production.staff_test_support import StaffTestCase, isolated_staff_file, unit_membership, showrunner_relationship
 import production_units
 
 SCRIPT = Path(__file__).with_name("live_units.py")
 OLD_HEADER = ("| Unit | Plan | Worktree | Branch | Session | Port | Owns |", "| --- | --- | --- | --- | --- | --- | --- |")
 HEADER = ("| Unit | Plan | Worktree | Branch | Port | Owns |", "| --- | --- | --- | --- | --- | --- |")
+
+
+class RowDocumentLiveUnitsTests(StaffTestCase):
+    def test_incomplete_facts_keep_the_live_unit_and_one_named_problem(self) -> None:
+        import io
+        from contextlib import redirect_stderr
+        from scripts.production import live_units, unit_lookup
+
+        fixture = self.row_production()
+        every = unit_lookup.MarkedProductions({}, {}, {fixture.slug: ("member-unit",)})
+        unavailable = fixture.worktree.with_name("unavailable-member")
+        for failure in ("branch", "configuration"):
+            with self.subTest(failure=failure):
+                if failure == "branch":
+                    _ = fixture.worktree.rename(unavailable)
+                else:
+                    _ = unavailable.rename(fixture.worktree)
+                    (fixture.worktree / ".unit.toml").unlink()
+                errors = io.StringIO()
+                with (redirect_stderr(errors),
+                      mock.patch("unit_lookup.every_marked_unit", return_value=every)):
+                    units = live_units.production_units(fixture.doc)
+                self.assertEqual([item.unit for item in units], ["member-unit"])
+                self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                self.assertIn(fixture.unit.name, errors.getvalue())
+                self.assertIn(str(fixture.worktree), errors.getvalue())
+                if failure == "configuration":
+                    self.assertIn(".unit.toml", errors.getvalue())
+
+    def test_units_in_uses_the_document_join_when_the_filename_and_timer_slug_differ(self) -> None:
+        from scripts.production import live_units, session_staff
+
+        fixture = self.row_production()
+        every = session_staff.MarkedProductions({}, {}, {fixture.slug: ("member-unit",)})
+        before = self.staff_file.read_bytes()
+        selected = live_units.units_in(fixture.doc, every)
+        self.assertEqual([unit.unit for unit in selected], ["member-unit"])
+        self.assertEqual(self.staff_file.read_bytes(), before)
 
 
 def marked(label: str, pane: str, unit: str, slug: str = "show") -> HostedUnit:
@@ -45,7 +83,7 @@ class LiveUnitsTests(unittest.TestCase):
         before = self.run_script()
         self.assertEqual(before.returncode, 0, before.stderr)
         retired = unit_membership("show", "retired-unit")
-        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"))
+        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"), expected=retired.worktree)
         after = self.run_script()
         self.assertEqual(after.returncode, 0, after.stderr)
         self.assertEqual(after.stdout, before.stdout)

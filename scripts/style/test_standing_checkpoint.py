@@ -21,6 +21,7 @@ from style_child_test_support import style_cli_command
 import mechanical_classes
 import style_ledger
 import style_rules
+from scripts.production.staff_test_support import fixture_unit_location, isolated_staff_file, recorded_showrunner
 
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -64,6 +65,7 @@ class StandingCheckpointTests(unittest.TestCase):
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
             fake_fmt.STATE: str(self.root / "fmt"),
         }
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.env))
         fake_fmt.install(self.bin, self.root / "fmt")
         board = self.bin / "cargo-berth"
         _ = board.write_text(
@@ -93,6 +95,9 @@ class StandingCheckpointTests(unittest.TestCase):
             _ = exclude.write("/docs/product-production.md\n")
         self.write(parent, self.production("main", self.repo))
         self.write(self.doc, self.production("style/main", self.style) + f"\n- **Parent production:** {parent}\n- **Branch point:** main\n")
+        _ = recorded_showrunner("sample", parent)
+        owner = recorded_showrunner("sample-style", self.doc)
+        _ = fixture_unit_location(owner, "names-unit", self.unit)
         self.plan = self.unit / "docs/style-production/units/names-unit.md"
         self.template = self.style / "docs/style-production/units/names-unit.md"
         header = "\n".join([

@@ -35,7 +35,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
-# repo needs >= 3.11.
+# repo needs >= 3.12.
 PY="${SCRIPT_DIR}/../lib/py"
 AGENTS_DIR="${SCRIPT_DIR}/../agents"
 QUESTION_FILE="${SESSION_DIR}/question.md"
@@ -51,7 +51,7 @@ if [[ ! -f "${QUESTION_FILE}" ]]; then
   exit 2
 fi
 
-source "${AGENTS_DIR}/agents_config.sh"
+source "${AGENTS_DIR}/models_config.sh"
 if ! agents_resolve "${TASK}" 2>"${LOG_FILE}"; then
   echo "error" > "${STATUS_FILE}"
   cat "${LOG_FILE}" >&2

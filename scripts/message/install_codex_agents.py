@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Install the repository's messaging instructions in Codex AGENTS.md.
 
-commands/message.md carries the same words as codex/AGENTS-messaging.md.
+codex/AGENTS-messaging.md supplies the generated messaging block and its registered phone paths.
 After editing either, run this installer once here and once with --machine mac.
 """
 

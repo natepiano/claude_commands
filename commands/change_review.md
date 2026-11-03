@@ -93,23 +93,49 @@ When the user asks to review changes, open the prepared page:
 2. Give the link to the user.
 
 The page contains every waiting change, with staff-based showrunner tabs.
+Each row stores its producer's fixed staff id in the Producer cell.
+The reader follows that id to the unit's current staff showrunner.
+An empty cell belongs to the list's showrunner.
+A showrunner id belongs to that showrunner.
+Names come from the staff record at use.
+Renamed and retired units keep their ids.
+The `unrouted` tab shows an unknown id or a broken staff parent chain.
+Verdicts save without sending a message.
+This tab offers no question control, and the server refuses question submissions without saving.
+Its count covers all page lists, including independent production roots.
 Tabs with waiting changes precede empty tabs in alphabetical order and keep their positions until the next page load.
 The selected tab draws its full outline inside its edges, including the first and last tabs.
 Answers save in the background.
 Each successful save opens the next waiting change in the same tab.
 Navigation during a save prevents this automatic change.
 Next skips a change without saving an answer.
-A failed save keeps the answer, failure text, resend control, and waiting count.
-Validate yourself advances the page when the request saves.
-On a page load, only a sent validation message removes the row from the count and Next order.
-Pending and failed validation messages keep the row waiting, with a note and a resend control.
-This state survives a reload and a server restart.
+A failed HTTP save keeps the typed answer, error text, answer form, and waiting count.
+A saved verdict shows **Saved: <answer>**.
+Validate yourself removes the row from every waiting count and Next order when the request saves.
 A direct link shows **The showrunner will validate this** without answer buttons.
-The showrunner still receives the validation message and retains the row in its own `/next` queue.
-Send feedback removes the row from the page count only when its verdict saves.
 Ask a question uses the one-line feedback field.
-Only a sent question message removes the row from the count until the showrunner answers.
-Pending and failed question messages keep the row waiting after a page load, with a note and a resend control.
+It removes the row from every waiting count until the showrunner answers.
+A direct link shows **The showrunner will answer this** without answer buttons.
+Send feedback saves the text unchanged; text that starts with `works` or `fine` can land the change.
+The server manages delivery; the page shows no delivery notes, links, or resend controls.
+The server reads `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf` when delivery starts.
+The initial values are 3 tries and a 5 second pause.
+Each round sends to all remaining recipients before one pause; later rounds retry only failed recipients.
+A `QUEUED:` result counts as kept and needs no retry.
+After all tries fail, the server alerts the tab's showrunner once to pass the saved answer on by hand.
+The server resolves every staff recipient ID to its current session for each send.
+At startup, the server scans the review lists and resumes pending records with the same retry budget.
+It ignores legacy page context and reads the current owner and production document through the same function as the browser.
+Recovery skips records that a live request owns.
+It ignores legacy failed records and preserves validation ownership and open questions.
+The router alerts `unrouted_alert_recipient` once for each unrouted row and reason.
+It alerts only for a list in the real change-review folder; a list elsewhere never alerts.
+This config key starts at `natedev`.
+`unrouted_alert_retry_seconds` starts at 60 seconds and accepts 5 through 3600 seconds.
+Both keys are in `config/review_links.conf` and are read when used.
+Failed alerts remain pending until the configured pause ends.
+A nonblocking lock prevents two renders from sending one alert at once.
+The router records acceptance only after the sender accepts or queues the alert.
 Do not ask for a batch size or take page answers in chat.
 
 The diagnostic command `show <production>` still prints the current row and count.
@@ -148,10 +174,12 @@ there leaves the row open. Then:
 Pass the ID as `/next` shows it, such as `C434` or `sdlc/C9`.
 It moves the row to `## Reviewed` with the verdict, today's date and its Merged cell, and prints
 `C<n> landed` or `C<n> returns to its unit (merged …)`. Either way it removes
-the row's scratch folders and prints `removed <path>` for each. Send a returning row,
-its change and the user's words to the unit that made it: the merge commit it
-names gives the checkpoint, and so the unit. A change outside a unit goes back
-to the session that added it. The fix comes back as a new row.
+the row's scratch folders and prints `removed <path>` for each.
+The Producer cell stays with the row in Reviewed.
+Send a returning row and the user's words to its Producer staff id.
+Read its current session from the staff record at send time.
+An empty Producer cell belongs to the list's showrunner.
+The fix returns as a new row.
 
 Rerunning the same verdict prints `already has this verdict`, the first run's
 line and the scratch removal lines. A different verdict for a Reviewed row is
@@ -190,3 +218,32 @@ The command refuses an old or unknown ID, a different answer, or a row without a
 A change for the user to check is never put in `open_for_user` and never
 counted among the open questions. It goes on this list, and the user asks for
 "change review" when they want it.
+
+### Producer ids
+
+The merge writer matches each checkpoint branch to a Units row.
+It reads that row's Worktree path and stores the unit's fixed staff id in Producer.
+An unregistered unit leaves the cell empty and prints one named note.
+For `add`, `--repo` selects the directory; the default is `.`.
+A unit worktree stores its id.
+A showrunner directory or an unowned directory leaves the cell empty.
+The page, status line, and `/next` use one staff routing rule.
+The owner's staff showrunner supplies the production document, even when the list's document reference is missing.
+
+1. Run `change_review.py backfill-producer [--list <path>]` to inspect older rows.
+2. Run the command with `--write` to fill mapped Producer cells.
+3. Read each named report for an unmapped row.
+
+The command searches To review and Reviewed.
+It uses the checkpoint's Change-Review text when a merge contains several units.
+If no included checkpoint names the change, the command checks the merge commit's own checkpoint subject.
+It matches old Branch, Plan, and Unit names through retained Worktree paths.
+When that lookup fails, the command removes `build-followups-` from the checkpoint name.
+Exactly one staff unit with the remaining name supplies the id. Retired units count.
+Zero or several matches leave Producer empty. A valid Worktree result wins.
+It copies each changed list to `<name>.backup-<timestamp>` before the locked write.
+An unmapped row stays empty.
+A repeated run changes nothing.
+After the lists are filled, remove `scripts/production/producer_backfill.py`, including its adapter.
+Remove the `backfill-producer` CLI case and argparse choice from `change_review.py`.
+Remove `scripts/production/test_producer_backfill.py`.

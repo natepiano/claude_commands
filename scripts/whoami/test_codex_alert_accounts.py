@@ -17,7 +17,7 @@ from typing import Literal, cast, override
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib.test_agents_registry import registry_text, write_registry
+from scripts.lib.test_models_registry import registry_text, write_registry
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -26,7 +26,7 @@ import quota_alert
 from scripts.whoami import agent_accounts
 from scripts.whoami.agent_accounts import CodexHomeSource, Quota, Report
 from scripts.accounts import accounts, moves, next_moves, refusals, role_map
-from scripts.lib import agents_registry
+from scripts.lib import models_registry
 from scripts.production import showrunners
 from scripts.whoami import usage_store
 from push_texts import RenderedPush, catalog, render_entry
@@ -38,7 +38,7 @@ CURRENT_READING_AGE = timedelta()
 
 def registry_view() -> str:
     """Read the shared registry containing the alert's edits."""
-    return agents_registry.registry_text(quota_alert.REGISTRY)
+    return models_registry.registry_text(quota_alert.REGISTRY)
 
 
 def reset_registry(text: str) -> None:
@@ -74,7 +74,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         config = self.root / "showrunners.json"
         _ = config.write_text(json.dumps({"threshold_percent": 1, "repeat_minutes": 30,
             "stall_minutes": 5, "faults_to": "director", "always": ["director"]}))
-        registry = self.root / "agents.conf"
+        registry = self.root / "models.conf"
         _ = write_registry(registry, base_text=REGISTRY)
         _ = self.enterContext(patch.object(quota_alert, "CONFIG", config))
         _ = self.enterContext(patch.object(quota_alert, "STATE", self.root / "alerts.json"))
@@ -1079,16 +1079,17 @@ class CodexAccountAlertTests(unittest.TestCase):
         self.save_room(old, 0)
         self.save_room(target, 1)
         readings = self.readings(old, self.report(old, 0), self.report(target, 1))
-        with patch.object(accounts, "_codex_live", return_value=Report("Codex", problem="target unavailable")):
+        with patch.object(accounts, "_write_role", side_effect=OSError("fixture workers role write failed")) as write:
             _ = quota_alert.blocked([self.note(1, "active", 0)], old, self.now,
                 codex_readings=readings, window=refusals.KnownWindow("weekly"))
+        write.assert_called_once()
         self.assertEqual(agent_accounts.workers_home(), old.home)
         entries = moves.read_moves()
         self.assertEqual([entry["kind"] for entry in entries], ["requested", "failed"])
         self.assertEqual(entries[0]["move_id"], entries[1]["move_id"])
         failed = entries[1]
         assert failed["kind"] == "failed"
-        self.assertIn("target unavailable", failed["reason"])
+        self.assertIn("fixture workers role write failed", failed["reason"])
         self.assertIn("direct=claude", registry_view())
 
     def test_no_room_fallback_restores_on_another_account_when_it_regains_room(self) -> None:
@@ -1264,7 +1265,7 @@ class CodexAccountAlertTests(unittest.TestCase):
             self.assertIsInstance(fallback, quota_alert.AccountCodexQuotaFallback)
             assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
             self.assertEqual(fallback.owner, a)
-        self.assertIsNone(quota_alert.edit_registry("agents_set_assignment", "module_review", "codex"))
+        self.assertIsNone(quota_alert.edit_registry("agents_set_assignment", "design_roles", "codex"))
         self.now += timedelta(days=3)
         funded = self.readings(a, self.report(a, 0, "19", five_left=0))
         _ = quota_alert.alert([self.note(1, "active", 0, "19")],
@@ -1273,7 +1274,7 @@ class CodexAccountAlertTests(unittest.TestCase):
             self.assertIsInstance(state["fallback"], quota_alert.NoCodexQuotaFallback)
         registry = registry_view()
         self.assertIn("direct=codex", registry)
-        self.assertIn("module_review=codex", registry)
+        self.assertIn("design_roles=codex", registry)
 
     def test_missing_and_old_fallback_records_decode_named_states_and_recover(self) -> None:
         with quota_alert.state_file() as state:
@@ -1399,7 +1400,7 @@ class CodexAccountAlertTests(unittest.TestCase):
             fallback = state["fallback"]
             self.assertIsInstance(fallback, quota_alert.AccountCodexQuotaFallback)
             assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
-            self.assertEqual(fallback.moved, ("direct", "module_review"))
+            self.assertEqual(fallback.moved, ("direct", "design_roles"))
             self.assertEqual(state.get("unseen"), unseen)
 
     def test_unknown_refusal_logs_without_telling_any_session(self) -> None:

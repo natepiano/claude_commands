@@ -82,6 +82,7 @@ class RemoteJobClaim(ClaimOwnerRecord):
 
     remote_host: str
     cleanup_pending: NotRequired[bool]
+    instance_generation: NotRequired[str]
 
 
 RunRecord = ProcessBoundClaim | RemoteJobClaim
@@ -483,16 +484,17 @@ def config_path(target: str = "") -> Path:
 
 def read_config(target: str = "") -> MacTestConfig:
     settings = config_path(target)
-    values = conf.values(settings)
+    config = conf.read(settings)
+    values = config.values()
     if "ci_repo" not in values:
-        ci_repo = conf.text(settings, "ci_repo")
+        ci_repo = config.text("ci_repo")
     else:
         ci_repo = values["ci_repo"]
     if target:
         configured = offload.configured_ssh_target(target)
         if configured.platform == "linux" and ci_repo:
             raise StateReadError(f"{settings}: ci_repo must be empty for a Linux target")
-    ci_fields = {key: conf.text(settings, key) if ci_repo else values.get(key, "")
+    ci_fields = {key: config.text(key) if ci_repo else values.get(key, "")
                  for key in ("ci_variable", "ci_workflow", "ci_job")}
 
     return MacTestConfig(
@@ -500,14 +502,14 @@ def read_config(target: str = "") -> MacTestConfig:
         ci_variable=ci_fields["ci_variable"],
         ci_workflow=ci_fields["ci_workflow"],
         ci_job=ci_fields["ci_job"],
-        gh_timeout_s=conf.number(settings, "gh_timeout_s"),
-        block_hours=conf.number(settings, "block_hours"),
-        block_max_hours=conf.number(settings, "block_max_hours"),
-        block_warn_minutes=conf.number(settings, "block_warn_minutes"),
-        host=conf.text(settings, "host"),
-        connect_timeout_s=conf.number(settings, "connect_timeout_s"),
-        claim_idle_minutes=conf.number(settings, "claim_idle_minutes"),
-        claim_poll_seconds=conf.number(settings, "claim_poll_seconds"),
+        gh_timeout_s=config.number("gh_timeout_s"),
+        block_hours=config.number("block_hours"),
+        block_max_hours=config.number("block_max_hours"),
+        block_warn_minutes=config.number("block_warn_minutes"),
+        host=config.text("host"),
+        connect_timeout_s=config.number("connect_timeout_s"),
+        claim_idle_minutes=config.number("claim_idle_minutes"),
+        claim_poll_seconds=config.number("claim_poll_seconds"),
     )
 
 
@@ -602,6 +604,11 @@ def read_run(path: Path) -> RunState:
     if not isinstance(host, str) or not host.strip():
         raise StateReadError(f"{path} has an invalid remote_host")
     remote: RemoteJobClaim = {**record, "remote_host": host}
+    if 'instance_generation' in values:
+        generation = required_string(values, 'instance_generation', path)
+        if not generation:
+            raise StateReadError(f'{path} has an invalid instance_generation')
+        remote['instance_generation'] = generation
     if "cleanup_pending" in values:
         if values["cleanup_pending"] is not True:
             raise StateReadError(f"{path} has an invalid cleanup_pending")
@@ -936,7 +943,7 @@ def scopes_overlap(first: ClaimScope, second: ClaimScope) -> bool:
 def slot_capacity(paths: StatePaths, scope: ClaimScope) -> int:
     if target_config.uses_legacy_mac_layout(paths.platform) or isinstance(scope, WholeMacScope):
         return 1
-    values = conf.values(config_path(paths.target))
+    values = conf.read(config_path(paths.target)).values()
     value = values.get(f"slots.{scope.name}", values.get("slots", ""))
     if not value and not scope.key:
         return 1  # Preserve the legacy claim protocol for records without an origin.
@@ -2009,6 +2016,14 @@ def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobCl
     return ClaimFinished(13)
 
 
+def bind_instance_generation(paths: StatePaths, claim: RemoteJobClaim) -> None:
+    """Bind new AWS work without changing retained claim evidence."""
+    if target_config.is_aws_target(offload.configured_ssh_target(paths.target)):
+        generation = offload.expected_instance_generation(paths.target)
+        if generation:
+            claim['instance_generation'] = generation
+
+
 def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                *, reserve_wait: bool = False) -> ClaimAttempt:
     """One claim attempt under state.lock: take over, refuse, or write the claim."""
@@ -2079,6 +2094,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         claimed["copy"] = True
     if isinstance(args.remote, str):
         remote_claim: RemoteJobClaim = {**claimed, "remote_host": args.remote}
+        bind_instance_generation(paths, remote_claim)
         claimed = remote_claim
     if isinstance(owner, build_hold.OwningSession):
         claimed["holder_session"] = owner.session_id
@@ -2135,6 +2151,7 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope) -
         record = {**claim.record}
     else:
         record = {**claim.record, "remote_host": args.remote}
+        bind_instance_generation(paths, record)
     record["pid"] = args.pid
     record["proc_start"] = start
     write_json(claim.path, record)
@@ -2676,6 +2693,69 @@ def dispatch_command(args: CliArguments, paths: StatePaths) -> int:
     if args.command == "watch-claim":
         return command_watch_claim(paths, config)
     return command_status(paths, config)
+
+
+
+
+RELEASE_STATES = ('stopping', 'stopped', 'terminated')
+
+
+@dataclass(frozen=True)
+class StoppedInstanceEvidence:
+    target: str
+    generation: str
+    state: str
+    observed_at: float
+    claims: tuple[HeldClaim, ...]
+    remote_host: str
+
+
+def release_host(paths: StatePaths, generation: str, state: str) -> str:
+    configured = offload.configured_ssh_target(paths.target)
+    if not target_config.is_aws_target(configured) or state not in RELEASE_STATES or not generation:
+        raise StateReadError('instance evidence cannot release these claims')
+    return offload.read_connection_settings(configured.settings).host
+
+
+def claim_matches_instance(claim: HeldClaim, host: str, generation: str) -> bool:
+    return (claim.record.get('remote_host') == host
+            and claim.record.get('instance_generation') == generation)
+
+
+def capture_release_evidence(paths: StatePaths, generation: str, state: str,
+                             observed_at: float) -> StoppedInstanceEvidence:
+    """Capture claims bound to the observed instance and host."""
+    with locked(paths.lock):
+        host = release_host(paths, generation, state)
+        claims = tuple(claim for claim in read_claims(paths)
+                       if claim_matches_instance(claim, host, generation)
+                       and datetime.fromisoformat(claim.record['since']).timestamp() <= observed_at)
+    return StoppedInstanceEvidence(paths.target, generation, state, observed_at, claims, host)
+
+
+def release_stopped_claims(paths: StatePaths, evidence: StoppedInstanceEvidence) -> int:
+    """Release only unchanged claims bound to the confirmed stopped instance."""
+    if evidence.target != paths.target:
+        raise StateReadError('instance evidence does not match the target')
+    released = 0
+    with locked(paths.lock):
+        host = release_host(paths, evidence.generation, evidence.state)
+        if host != evidence.remote_host:
+            raise StateReadError('instance host evidence does not match the target')
+        current = {claim.path: claim for claim in read_claims(paths)}
+        for claim in evidence.claims:
+            if claim.path not in current or current[claim.path].record != claim.record:
+                continue
+            if not claim_matches_instance(claim, host, evidence.generation):
+                continue
+            proof: dict[str, object] = {'target': evidence.target, 'generation': evidence.generation,
+                     'remote_host': host, 'state': evidence.state, 'observed_at': evidence.observed_at,
+                     'path': str(claim.path), 'claim': dict(claim.record)}
+            (paths.directory / 'release-evidence').mkdir(parents=True, exist_ok=True)
+            write_json(paths.directory / 'release-evidence' / claim.path.name, proof)
+            claim.path.unlink(missing_ok=True)
+            released += 1
+    return released
 
 
 if __name__ == "__main__":

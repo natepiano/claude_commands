@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from scripts.lib.names import JobKey
 
 from scripts.agents import worker_lifecycle
-from scripts.production import worker_admission
+from scripts.production import unit_names, worker_admission
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 
 ROSTER = "mesh_roster.json"
@@ -1307,15 +1307,9 @@ def resolve_live_unit_director(
     run: Path, record: staff.StaffSnapshot, sources: unit_lookup.MemberSources,
     running: Sequence[SessionRecord], dependencies: Callable[[Path], None],
 ) -> LiveUnitDirector | NoLiveUnitDirector:
-    """Resolve the current director once, including restarts on another account.
-
-    Shutdown history carries the unit's stable host/name when a run's director file
-    still names the former session. Run markers and folders are not proof that the
-    director died.
-    """
+    """Resolve the current director from the live staff membership."""
     from scripts.lib import unit_runs
     from scripts.production import unit_lookup
-    from scripts.shutdown.launch_permission import shutdown_state_root
 
     director = unit_runs.director(run, dependencies=dependencies)
     for session in running:
@@ -1324,40 +1318,6 @@ def resolve_live_unit_director(
     dependencies(run / STATE)
     context = worker_lifecycle.read_json_object(run / STATE)
     production, unit = context.get("production"), context.get("unit")
-    names: set[str] = set()
-    for path in shutdown_state_root().glob("*/history/*.json"):
-        dependencies(path)
-        try:
-            saved = worker_lifecycle.read_json_object(path)
-        except (OSError, ValueError, WorkerUnavailable):
-            continue
-        previous = _object(saved.get("session"))
-        host = _object(previous.get("host"))
-        if host.get("kind") not in ("unit", "legacy tmux unit"):
-            continue
-        runs = previous.get("run_dirs")
-        same_run = isinstance(runs, list) and any(
-            isinstance(value, str) and Path(value).resolve() == run.resolve()
-            for value in cast(list[object], runs))
-        same_unit = False
-        if production and unit and host.get("unit") == unit:
-            try:
-                same_unit = unit_lookup.unit_parent(
-                    str(unit), str(previous.get("session_id", "")), record=record, sources=sources).slug == production
-            except OSError:
-                pass
-        if not (same_run or same_unit or (director and previous.get("session_id") == director)):
-            continue
-        for name in (previous.get("name"), host.get("session_name")):
-            if isinstance(name, str) and name:
-                names.add(name)
-        # A restart may resume the original session id rather than create one.
-        for session in running:
-            if session["sessionId"] == previous.get("session_id"):
-                return LiveUnitDirector(session["sessionId"], session["pid"])
-    for session in running:
-        if names.intersection((session["name"], *session["formerNames"])):
-            return LiveUnitDirector(session["sessionId"], session["pid"])
     if isinstance(production, str) and isinstance(unit, str) and production and unit:
         try:
             marked = unit_lookup.marked_unit(production, unit, record=record, sources=sources, running=running)
@@ -1755,17 +1715,10 @@ def _former_worktrees(current: UnitWorktree, former: tuple[str, ...]) -> tuple[P
         f"-{current.production}-", f"-{name}-", 1)) for name in former if name != current.production)
 
 
-def _plan_unit(state: dict[str, object], old: Path, current: UnitWorktree) -> tuple[str, str]:
-    plan = _text(state.get("project_plan_doc")) or _text(state.get("plan_doc"))
-    if not plan:
-        return "", ""
-    path = Path(plan).expanduser()
-    if path.is_absolute():
-        path = Path(_moved_path(str(path), old, current.path))
-    else:
-        path = current.path / path
+def _run_unit(state: dict[str, object]) -> tuple[str, str]:
     from scripts.direct.progress_history import ProductionUnitIdentity, resolve_production_unit
-    identity = resolve_production_unit({"plan_doc": str(path), "working_dir": str(current.path)})
+    # A candidate folder is not evidence of the run's ownership.
+    identity = resolve_production_unit(state)
     return (identity.production, identity.unit) if isinstance(identity, ProductionUnitIdentity) else ("", "")
 
 
@@ -1798,9 +1751,13 @@ def find_moved_unit_runs(units: tuple[UnitWorktree, ...], former: tuple[str, ...
                 if production == "adhoc":
                     production, unit = "", ""
                 if not production or not unit:
-                    production, unit = _plan_unit(state, old, current)
+                    production, unit = _run_unit(state)
                 if production and unit:
-                    accepted = unit == current.unit and production in (*former, current.production)
+                    try:
+                        accepted = (unit_names.name(unit) == unit_names.name(current.unit)
+                                    and production in (*former, current.production))
+                    except unit_names.BadName:
+                        accepted = False
                 else:
                     accepted = old in known_old
                 if accepted:

@@ -18,8 +18,7 @@
 #   1. the filter drivers, in .git/config (and no retired one)
 #   2. the launchd watcher, which keeps `git status` quiet after each write
 #      and snapshots settings.json's local-only keys for the smudge to restore
-#   3. a restore, snapshot, and index refresh right now, for anything that
-#      happened while the above was missing
+#   3. a restore and a guarded clean that saves local values before the index refresh
 
 set -uo pipefail
 
@@ -146,11 +145,13 @@ PLIST
 ensure_watcher
 
 # ── 3. catch up on anything that changed while the above was missing ──
-# Restore before snapshot: a checkout that ran with no smudge left a bare blob
-# in settings.json, and snapshotting that first would only confirm the loss.
-settings_local_keys_restore "$REPO_ROOT"
-settings_local_keys_snapshot "$REPO_ROOT"
-git_filters_refresh_all "$REPO_ROOT"
+# Restore missing local values before the guarded clean saves them.
+settings_local_keys_restore
+if ! git_filters_refresh_all "$REPO_ROOT"; then
+    echo "ensure_git_filters: clean failed; index refresh stopped." >&2
+    exit 1
+fi
+settings_local_keys_notices deliver
 
 if ((${#installed[@]} > 0)); then
     echo "ensure_git_filters: installed ${installed[*]} in $REPO_ROOT"

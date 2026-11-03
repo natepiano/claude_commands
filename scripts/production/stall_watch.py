@@ -41,7 +41,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.process_group import send_process_group
 
-from scripts.production import showrunners, staff, unit_names
+from scripts.production import showrunners, staff, unit_names, session_staff
 import unit_lookup
 from session_pane import HerdrFailure, agent_status, read_place
 
@@ -59,7 +59,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, Iterator
 
 STATE_DIR = Path(os.environ.get("STALL_WATCH_STATE_DIR") or Path.home() / ".local/state/stall-watch")
-SESSIONS_DIR = Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
 PROJECTS_DIR = Path(os.environ.get("STALL_WATCH_PROJECTS_DIR") or Path.home() / ".claude/projects")
 SESSIONS = Path(os.environ.get("STALL_WATCH_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
 SEND = Path(os.environ.get("STALL_WATCH_SEND") or Path(__file__).resolve().parent.parent / "message/send.py")
@@ -1247,7 +1246,9 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
             slug = configured["slug"]
             marked = unit_lookup.marked_units(slug, record=record)
             for name, unit in marked.items():
-                row = unit_lookup.unit_row(name, record, staff_id=unit.staff_id)
+                reference = (session_staff.StoredReference(unit.staff_id) if unit.staff_id
+                             else session_staff.BY_NAME)
+                row = unit_lookup.unit_row(name, record, reference=reference)
                 if row.parent not in members_by_parent:
                     members_by_parent[row.parent] = tuple(alias
                         for member in record.find(kind="unit", parent=row.parent)

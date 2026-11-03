@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
-export AGENTS_CONFIG_PUBLISH=0
+export MODELS_CONFIG_PUBLISH=0
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "$SCRIPT_DIR/../lib/test_agents_registry.sh"
+source "$SCRIPT_DIR/../lib/test_models_registry.sh"
 TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agent-exec.XXXXXX")"
 trap 'rm -rf "$TEST_DIR"' EXIT
 
@@ -44,7 +44,7 @@ accounts.set_role("workers", "codex1")
 PYTHON
 export CLAUDE_CONFIG_DIR="$HOME/.claude2"
 
-export AGENTS_CONFIG_FILE="$TEST_DIR/agents.conf"
+export MODELS_CONFIG_FILE="$TEST_DIR/models.conf"
 export CODEX_CONFIG_FILE="$TEST_DIR/codex.toml"
 export CODEX_MODELS_CACHE_FILE="$TEST_DIR/models.json"
 export CODEX_CATALOG_SYNC_STATE_FILE="$TEST_DIR/last_success"
@@ -52,7 +52,7 @@ export CODEX_CATALOG_SYNC_STATE_FILE="$TEST_DIR/last_success"
 unset AGENT_EXEC_DRY_RUN AGENT_EXEC_EXTRA_ARGS || true
 touch "$CODEX_CATALOG_SYNC_STATE_FILE"
 
-write_test_registry "$AGENTS_CONFIG_FILE" \
+write_test_registry "$MODELS_CONFIG_FILE" \
     assignments/codex_case=codex \
     assignments/direct.simplify=claude \
     direct.claude/simplify=opus:max \
@@ -112,12 +112,12 @@ assert_equal "codex readonly command is wrong" \
 
 claude_write="$(run_dry claude_case.task write)"
 assert_equal "claude write command is wrong" \
-    "cd $WORKING_DIR && $claude_command --print --dangerously-skip-permissions --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
+    "cd $WORKING_DIR && env CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 $claude_command --print --dangerously-skip-permissions --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$claude_write"
 
 claude_readonly="$(run_dry claude_case.task readonly)"
 assert_equal "claude readonly command is wrong" \
-    "cd $WORKING_DIR && $claude_command --print --permission-mode plan --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
+    "cd $WORKING_DIR && env CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 $claude_command --print --permission-mode plan --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$claude_readonly"
 
 simplify_readonly="$(run_dry direct.simplify readonly)"
@@ -161,7 +161,7 @@ assert_equal "codex command did not carry the function's service tier" \
 
 tier_claude_command="$(run_dry tier_case.claude_task readonly)"
 assert_equal "claude command carried a codex service tier" \
-    "cd $WORKING_DIR && $claude_command --print --permission-mode plan --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
+    "cd $WORKING_DIR && env CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 $claude_command --print --permission-mode plan --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$tier_claude_command"
 
 extra_command="$(AGENT_EXEC_EXTRA_ARGS='--add-dir /tmp/extra' run_dry codex_case.task write)"
@@ -202,12 +202,9 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]).resolve()))
-from scripts.accounts import accounts, role_map
-import json
-notes = Path.home().parent / "notes"
-_ = (notes / "claude4.md").write_text("---\nlogin: route@example.invalid\n---\n")
-assert accounts.setup("claude4") == []
-_ = (accounts.account_dir("claude4") / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "route@example.invalid"}}))
+from scripts.accounts import role_map
+from scripts.whoami.account_test_support import create_claude_account
+create_claude_account("claude4", "route@example.invalid")
 role_map.write_role_map(role_map.WorkersClaudeRouteChange(
     role_map.NamedWorkersClaudeAccount("claude4", datetime.now(timezone.utc) + timedelta(days=2)), "queued workers route", datetime.now(timezone.utc).isoformat()))
 PYTHON
@@ -215,12 +212,18 @@ cat > "$TEST_DIR/bin/claude" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$CLAUDE_CONFIG_DIR" > "$TEST_CLAUDE_HOME_FILE"
 cat > "$TEST_CLAUDE_PROMPT_FILE"
-printf '%s\n' '{"type":"result","result":"done"}'
+if [[ -n "${TEST_CLAUDE_RESULT:-}" ]]; then
+    printf '%s\n' "$TEST_CLAUDE_RESULT"
+else
+    printf '%s\n' '{"type":"result","result":"done"}'
+fi
+printf '%s\n' "$CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" > "$TEST_CLAUDE_BACKGROUND_FILE"
 exit "${TEST_CLAUDE_EXIT_CODE:-0}"
 EOF
 chmod +x "$TEST_DIR/bin/claude"
 export TEST_CLAUDE_HOME_FILE="$TEST_DIR/claude-home"
 export TEST_CLAUDE_PROMPT_FILE="$TEST_DIR/claude-prompt"
+export TEST_CLAUDE_BACKGROUND_FILE="$TEST_DIR/background-disabled"
 bash "$SCRIPT_DIR/agent_exec.sh" claude_case.task write "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
 assert_equal "workers ignored the named Claude account" "$HOME/.claude4" "$(cat "$TEST_CLAUDE_HOME_FILE")"
 assert_equal "Claude worker lost its prompt" "test prompt" "$(cat "$TEST_CLAUDE_PROMPT_FILE")"
@@ -238,12 +241,34 @@ test_extraction_failure_preserves_the_task_exit_policy() {
     done <<'CASES'
 claude_case.task 0 0
 claude_case.task 7 7
-direct.simplify 0 1
-direct.simplify 7 1
+direct.simplify 0 0
+direct.simplify 7 7
 CASES
 }
 
 test_extraction_failure_preserves_the_task_exit_policy
+
+test_every_claude_print_launch_keeps_agents_and_reports_errors() {
+    local task event expected actual
+    for task in claude_case.task direct.simplify; do
+        while IFS=$'\t' read -r event expected; do
+            actual=0
+            TEST_CLAUDE_RESULT="$event" bash "$SCRIPT_DIR/agent_exec.sh" \
+                "$task" readonly "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE" \
+                2> "$TEST_DIR/print-error.stderr" || actual=$?
+            assert_equal "$task accepted a Claude error" 1 "$actual"
+            assert_equal "$task did not retain foreground agents" 1 "$(cat "$TEST_CLAUDE_BACKGROUND_FILE")"
+            assert_equal "$task lost the execution reason" "$expected" "$(cat "$OUTPUT_FILE")"
+            [[ "$(cat "$TEST_DIR/print-error.stderr")" != *"$expected"* ]] \
+                || fail "$task printed the output error on stderr"
+        done <<'CASES'
+{"type":"result","is_error":true,"result":"weekly limit"}	ERROR: weekly limit
+{"type":"result","errors":["credentials expired"],"result":"Pass"}	ERROR: credentials expired
+CASES
+    done
+}
+
+test_every_claude_print_launch_keeps_agents_and_reports_errors
 
 # The worker's registry-selected Claude path uses the same account.
 export STAFF_FILE="$TEST_DIR/staff.json"
@@ -301,10 +326,10 @@ assert_equal "friend took the workers account" "$HOME/.claude2" "$(cat "$TEST_CL
 assert_equal "friend did not launch" "abcdef12" "$(cat "$TEST_DIR/friend-id")"
 
 # CLI assignments also come from the registry.
-write_test_registry "$AGENTS_CONFIG_FILE" --update cli.claude/commit_prep=opus:max
-cp "$AGENTS_CONFIG_FILE" "$TEST_DIR/cli.conf"
+write_test_registry "$MODELS_CONFIG_FILE" --update cli.claude/commit_prep=opus:max
+cp "$MODELS_CONFIG_FILE" "$TEST_DIR/cli.conf"
 write_test_registry "$TEST_DIR/cli.conf" --update assignments/cli.commit_prep=claude
-AGENTS_CONFIG_FILE="$TEST_DIR/cli.conf" bash "$SCRIPT_DIR/../cli_agent/cli_agent.sh" commit_prep < /dev/null > "$TEST_DIR/cli-output"
+MODELS_CONFIG_FILE="$TEST_DIR/cli.conf" bash "$SCRIPT_DIR/../cli_agent/cli_agent.sh" commit_prep < /dev/null > "$TEST_DIR/cli-output"
 assert_equal "CLI worker ignored the named Claude account" "$HOME/.claude4" "$(cat "$TEST_CLAUDE_HOME_FILE")"
 python3 - "$SCRIPT_DIR/../.." <<'PYTHON'
 import sys

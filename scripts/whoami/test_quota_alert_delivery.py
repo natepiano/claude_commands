@@ -14,7 +14,7 @@ from typing import cast
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 from scripts.whoami import quota_alert_test_support as support
 import quota_alert
 import review
@@ -83,7 +83,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
             self.assertIsInstance(REAL_TELL_USER(render("quota.claude_next_move", account="claude2", remaining="0%")), quota_alert.PushSent)
             command = cast(list[str], run.call_args.args[0])
             self.assertEqual(float(command[command.index("--timeout") + 1]), review.user_send_seconds())
-            self.assertEqual(run.call_args.kwargs["timeout"], review.user_send_seconds() + 15)
+            self.assertEqual(run.call_args.kwargs["timeout"], review.user_send_seconds() + 140)
             self.assertNotIn("input", run.call_args.kwargs)
         self.assertEqual(quota_alert.RELAY_TIMEOUT, 40)
 
@@ -162,6 +162,42 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
             for notice in notices.values():
                 assert notice["kind"] == "known"
                 self.assertEqual(notice["label"], "codex1")
+
+
+class RelayOutcomeTests(unittest.TestCase):
+    def test_user_delivery_requires_a_confirmed_success_outcome(self) -> None:
+        push = render("quota.claude_next_move", account="claude2", remaining="0%")
+        cases = ((0, "SENT: fixture", True), (0, "SKIPPED: repeated", True),
+                 (0, "KEPT: silence", True), (0, "REPLACED: revision", True),
+                 (1, "QUEUED: offline", False), (3, "FAILED: unavailable", False),
+                 (2, "REFUSED: invalid", False), (4, "HELD: decision", False), (5, "PENDING: active", False),
+                 (0, "", False), (0, "QUEUED: inconsistent", False),
+                 (1, "SENT: inconsistent", False), (0, "FAILED: inconsistent", False))
+        for code, text, accepted in cases:
+            with self.subTest(code=code, text=text), mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, text, "")):
+                result = REAL_TELL_USER(push)
+                self.assertIsInstance(result, quota_alert.PushSent if accepted else quota_alert.PushFailed)
+                if isinstance(result, quota_alert.PushFailed):
+                    self.assertNotEqual(result.why, "")
+
+    def test_confirmed_relay_outcomes_preserve_success_and_queue_policies(self) -> None:
+        for code, header, expected in ((0, "SENT", None), (0, "SKIPPED", None),
+                                      (0, "KEPT", None), (0, "REPLACED", None),
+                                      (1, "QUEUED", "QUEUED: fixture detail"),
+                                      (3, "FAILED", "stdout: FAILED: fixture detail"),
+                                      (2, "REFUSED", "stdout: REFUSED: fixture detail"),
+                                      (4, "HELD", "stdout: HELD: fixture detail"),
+                                      (5, "PENDING", "stdout: PENDING: fixture detail")):
+            with self.subTest(header=header), mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, header + ": fixture detail", "")):
+                self.assertEqual(quota_alert.relay("fixture", "message", "fixture-key"), expected)
+
+    def test_inconsistent_and_missing_relay_results_report_failure(self) -> None:
+        for code, output in ((0, "QUEUED: offline"), (0, "FAILED: unavailable"), (1, "SENT: fixture"),
+                             (0, ""), (1, ""), (-15, "SENT: fixture")):
+            with self.subTest(code=code, output=output), mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, output, "")):
+                failure = quota_alert.relay("fixture", "message", "fixture-key")
+                self.assertIsNotNone(failure)
+                self.assertNotEqual(failure, "")
 
 
 if __name__ == "__main__":

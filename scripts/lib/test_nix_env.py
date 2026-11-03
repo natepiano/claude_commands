@@ -409,3 +409,27 @@ class RegisteredCopyTests(GitNixFixture):
         _ = self.envrc(outside)
         _ = (outside / copy_record.RECORD).write_bytes((checkout / copy_record.RECORD).read_bytes())
         self.assert_explicit_approval_required(outside)
+
+
+class NixConfigTests(NixFixture):
+    def test_direnv_commands_read_the_timeout_setting_at_use(self) -> None:
+        _ = self.envrc(self.work)
+        settings = Path(self.env["CONF_DIR"]) / "nix_env.conf"
+        original = settings.read_text()
+        with patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("direnv", 600)) as run:
+            self.assertEqual(nix_env.ensure(self.work), nix_env.Refused(f"nix_env: {self.work}: direnv timed out after 600 s"))
+            self.assertEqual(run.call_args.kwargs["timeout"], 600)
+            _ = settings.write_text(original.replace("command_timeout_seconds=600", "command_timeout_seconds=2"))
+            self.assertEqual(nix_env.ensure(self.work), nix_env.Refused(f"nix_env: {self.work}: direnv timed out after 2 s"))
+            self.assertEqual(run.call_args.kwargs["timeout"], 2)
+
+    def test_config_keeps_the_existing_values(self) -> None:
+        from scripts.lib import conf
+
+        settings = conf.read(Path(__file__).resolve().parents[2] / "config/nix_env.conf")
+        for key, expected in {'trusted_home_folders': 'rust worktrees', 'trusted_home_prefix': '.claude', 'heal_state_directory': '~/.local/state/nix-heal', 'session_directory_glob': '.claude*/sessions'}.items():
+            with self.subTest(key=key):
+                self.assertEqual(settings.text(key), expected)
+        for key, expected in {'command_timeout_seconds': 600.0, 'restart_interval_seconds': 3600.0, 'relaunch_launch_seconds': 90.0, 'relaunch_confirmation_seconds': 30.0, 'alert_timeout_seconds': 30.0}.items():
+            with self.subTest(key=key):
+                self.assertEqual(settings.number(key), expected)

@@ -444,11 +444,11 @@ def _repair_round(state: dict[str, object], session_dir: Path) -> int:
     return len(phase_rounds(events)) + 1
 
 
-def _astra_due(entry: dict[str, object], repair_round: int) -> bool:
+def _astra_due(entry: dict[str, object], repair_round: int, settings_read: conf.ConfigRead) -> bool:
     if _string(entry.get("state")) != STATE_OPEN:
         return False
     attempts = _integer(entry.get("fix_attempts"))
-    triggered = repair_round >= conf.whole("direct", "ROUTING_FROM_ROUND") or attempts >= conf.whole("direct", "ASTRA_AFTER_FAILED_FIXES")
+    triggered = repair_round >= settings_read.whole("ROUTING_FROM_ROUND") or attempts >= settings_read.whole("ASTRA_AFTER_FAILED_FIXES")
     return triggered and not any(
         _integer(record.get("fix_attempts"), -1) == attempts
         for record in _object_list(entry.get("astra_reviews"))
@@ -589,13 +589,13 @@ def _review_cancellations(passes: list[PhasePass]) -> int:
     return max(per_slot.values(), default=0)
 
 
-def _repair_budget(state: dict[str, object]) -> int:
+def _repair_budget(state: dict[str, object], settings_read: conf.ConfigRead) -> int:
     """How many fix rounds this phase's original finding count justifies."""
     rounds = _rounds(state)
     if not rounds:
         return 0
     initial = _integer(rounds[0].get("gating_open_before"), 0)
-    return max(conf.whole("direct", "MIN_REPAIR_BUDGET"), math.ceil(initial * conf.number("direct", "REPAIR_ROUNDS_PER_FINDING")))
+    return max(settings_read.whole("MIN_REPAIR_BUDGET"), math.ceil(initial * settings_read.number("REPAIR_ROUNDS_PER_FINDING")))
 
 
 def _gating_severities(state: dict[str, object]) -> tuple[str, ...]:
@@ -622,7 +622,7 @@ def _summarize(entry: dict[str, object]) -> dict[str, object]:
     detail = _string(entry.get("detail"))
     if detail:
         summary["detail"] = detail
-    for key in ("route", "astra_reviews", "decision"):
+    for key in ("route", "astra_reviews", "decision", "decision_history"):
         if key in entry:
             summary[key] = entry[key]
     return summary
@@ -670,6 +670,7 @@ def _advisory_reason(
     state: dict[str, object],
     gating_open: int,
     passes: list[PhasePass],
+    settings_read: conf.ConfigRead,
 ) -> str:
     """The convergence pattern worth reporting this round, or "" for none.
 
@@ -686,31 +687,31 @@ def _advisory_reason(
         entry = _finding(state, finding_id)
         if _string(entry.get("state")) != STATE_OPEN:
             continue
-        if _integer(entry.get("reopen_count")) >= conf.whole("direct", "MAX_REOPENS"):
+        if _integer(entry.get("reopen_count")) >= settings_read.whole("MAX_REOPENS"):
             return f"{finding_id} reopened {_integer(entry.get('reopen_count'))} times after being accepted"
     for finding_id in sorted(_findings(state)):
         entry = _finding(state, finding_id)
         if _string(entry.get("state")) != STATE_OPEN:
             continue
-        if _integer(entry.get("fix_attempts")) >= conf.whole("direct", "MAX_FIX_ATTEMPTS"):
+        if _integer(entry.get("fix_attempts")) >= settings_read.whole("MAX_FIX_ATTEMPTS"):
             attempts = _integer(entry.get("fix_attempts"))
             return f"{finding_id} failed to close after {attempts} repair attempts"
     kind, run = _consecutive_same_kind(passes)
-    if run >= conf.whole("direct", "MAX_CONSECUTIVE_SAME_KIND_PASSES"):
+    if run >= settings_read.whole("MAX_CONSECUTIVE_SAME_KIND_PASSES"):
         return f"{run} consecutive {kind} passes ran without the phase advancing"
     cancellations = _review_cancellations(passes)
-    if cancellations > conf.whole("direct", "MAX_REVIEW_CANCELLATIONS"):
+    if cancellations > settings_read.whole("MAX_REVIEW_CANCELLATIONS"):
         return f"the blind review was canceled {cancellations} times, so it is never completing"
     # Stall and budget read live rounds: an abandoned round repaired nothing, so
     # counting it would stop the phase for a repair that never ran.
     rounds = _live_rounds(state)
-    if len(rounds) >= conf.whole("direct", "STALLED_ROUNDS"):
+    if len(rounds) >= settings_read.whole("STALLED_ROUNDS"):
         previous = _integer(rounds[-1].get("gating_open_before"), -1)
         earlier = _integer(rounds[-2].get("gating_open_before"), -1)
         if previous >= 0 and earlier >= 0 and gating_open >= previous >= earlier:
             trend = f"({earlier} -> {previous} -> {gating_open})"
-            return f"the gating open count has not decreased for {conf.whole("direct", "STALLED_ROUNDS")} rounds {trend}"
-    budget = _repair_budget(state)
+            return f"the gating open count has not decreased for {settings_read.whole("STALLED_ROUNDS")} rounds {trend}"
+    budget = _repair_budget(state, settings_read)
     if budget and len(rounds) >= budget:
         initial = _integer(rounds[0].get("gating_open_before"), 0)
         return (
@@ -719,8 +720,8 @@ def _advisory_reason(
         )
     # The backstop counts every dispatch, abandoned ones included: a loop that
     # keeps launching repairs that keep dying is exactly the runaway it guards.
-    if len(_rounds(state)) >= conf.whole("direct", "RUNAWAY_ROUNDS"):
-        return f"the runaway backstop of {conf.whole("direct", "RUNAWAY_ROUNDS")} fix rounds was reached"
+    if len(_rounds(state)) >= settings_read.whole("RUNAWAY_ROUNDS"):
+        return f"the runaway backstop of {settings_read.whole("RUNAWAY_ROUNDS")} fix rounds was reached"
     return ""
 
 
@@ -784,7 +785,10 @@ def _verdict(args: argparse.Namespace) -> None:
     entry = _finding(state, finding_id)
     outcome = _arg_string(args, "state")
     current = _string(entry.get("state"))
-    if current in (STATE_HELD, STATE_DECIDED):
+    answer = _string((_object_dict(entry.get("decision")) or {}).get("answer"))
+    if current == STATE_DECIDED and answer == "declined":
+        raise SystemExit(f"{finding_id} is closed by the declined decision; no closure verdict can change it")
+    if current == STATE_HELD or (current == STATE_DECIDED and answer != "approved"):
         raise SystemExit(f"{finding_id} requires the user's decision; no closure verdict can change it")
     # A verdict judges a repair that exists. While one is in flight nothing has
     # confirmed any edit landed, so there is nothing a reviewer could have read.
@@ -835,7 +839,7 @@ def _verdict(args: argparse.Namespace) -> None:
     print(f"{finding_id} {_string(entry.get('state'))}")
 
 
-def _gate_payload(state: dict[str, object], session_dir: Path) -> dict[str, object]:
+def _gate_payload(state: dict[str, object], session_dir: Path, settings_read: conf.ConfigRead) -> dict[str, object]:
     gating = _gating_severities(state)
     batch = _open_entries(state, gating)
     counts = _open_counts(state)
@@ -847,7 +851,7 @@ def _gate_payload(state: dict[str, object], session_dir: Path) -> dict[str, obje
         "round": len(_rounds(state)) + 1,
         "repair_round": repair_round,
         "astra_review_due": [_string(entry.get("id")) for entry in batch
-                             if _astra_due(entry, repair_round)],
+                             if _astra_due(entry, repair_round, settings_read)],
         "gating_severities": list(gating),
         "open_counts": counts,
         "batch": [_summarize(entry) for entry in batch],
@@ -855,7 +859,7 @@ def _gate_payload(state: dict[str, object], session_dir: Path) -> dict[str, obje
             _summarize(entry)
             for entry in _open_entries(state, tuple(s for s in SEVERITIES if s not in gating))
         ],
-        "repair_budget": _repair_budget(state),
+        "repair_budget": _repair_budget(state, settings_read),
         "passes_run": len(passes),
         "consecutive_same_kind": {"kind": kind, "count": run} if run else None,
         "review_cancellations": _review_cancellations(passes),
@@ -868,11 +872,12 @@ def _gate_payload(state: dict[str, object], session_dir: Path) -> dict[str, obje
     # one finding still gets its fifth; the difference is that the gate says so
     # out loud instead of refusing.
     payload["verdict"] = "dispatch"
-    payload["advisory"] = _advisory_reason(state, gating_open, passes) or None
+    payload["advisory"] = _advisory_reason(state, gating_open, passes, settings_read) or None
     return payload
 
 
 def _gate(args: argparse.Namespace) -> None:
+    settings_read = _command_settings(args)
     session_dir = _session_dir(args)
     now = _now_epoch()
     state = _read_state(session_dir, now, _arg_string(args, "phase"))
@@ -891,7 +896,7 @@ def _gate(args: argparse.Namespace) -> None:
             + ", ".join(pending)
             + " before gating the next round"
         )
-    payload = _gate_payload(state, session_dir)
+    payload = _gate_payload(state, session_dir, settings_read)
     _write_state(session_dir, state)
     _append_event(
         session_dir,
@@ -908,7 +913,7 @@ def _gate(args: argparse.Namespace) -> None:
             "open_counts": payload.get("open_counts"),
         },
     )
-    if _integer(payload.get("repair_round")) >= conf.whole("direct", "ROUTING_FROM_ROUND") and any(
+    if _integer(payload.get("repair_round")) >= settings_read.whole("ROUTING_FROM_ROUND") and any(
         _integer(entry.get("fix_attempts")) >= 1
         for entry in _open_entries(state, _gating_severities(state))
     ):
@@ -941,6 +946,7 @@ def _required_text(args: argparse.Namespace, name: str) -> str:
 
 
 def _route(args: argparse.Namespace) -> None:
+    settings_read = _command_settings(args)
     session_dir = _session_dir(args)
     now = _now_epoch()
     state = _read_state(session_dir, now, _arg_string(args, "phase"))
@@ -949,7 +955,7 @@ def _route(args: argparse.Namespace) -> None:
     if _string(entry.get("state")) != STATE_OPEN:
         raise SystemExit(f"{finding_id} is {entry.get('state')}; only open findings can be routed")
     repair_round = _repair_round(state, session_dir)
-    if _string(entry.get("severity")) in _gating_severities(state) and _astra_due(entry, repair_round):
+    if _string(entry.get("severity")) in _gating_severities(state) and _astra_due(entry, repair_round, settings_read):
         raise SystemExit(f"Astra review due for {finding_id}; record it with findings.py astra before routing")
     records = _object_list(entry.get("astra_reviews"))
     route: dict[str, object] = {
@@ -1025,10 +1031,11 @@ def _close_route(args: argparse.Namespace) -> None:
 
 
 def _dispatch(args: argparse.Namespace) -> None:
+    settings_read = _command_settings(args)
     session_dir = _session_dir(args)
     now = _now_epoch()
     state = _read_state(session_dir, now, _arg_string(args, "phase"))
-    payload = _gate_payload(state, session_dir)
+    payload = _gate_payload(state, session_dir, settings_read)
     verdict = _string(payload.get("verdict"))
     if verdict != "dispatch":
         raise SystemExit(f"gate says {verdict}; there is nothing to dispatch")
@@ -1057,11 +1064,11 @@ def _dispatch(args: argparse.Namespace) -> None:
         raise SystemExit('--accepted-checks "none:" requires a reason')
     repair_round = _integer(payload.get("repair_round"))
     due = sorted(finding_id for finding_id in covered & expected
-                 if _astra_due(_finding(state, finding_id), repair_round))
+                 if _astra_due(_finding(state, finding_id), repair_round, settings_read))
     if due:
         raise SystemExit("Astra review due for " + ", ".join(due) + "; record it with findings.py astra")
     kept = _kept_evidence(args, covered)
-    if repair_round >= conf.whole("direct", "ROUTING_FROM_ROUND"):
+    if repair_round >= settings_read.whole("ROUTING_FROM_ROUND"):
         missing_kept = sorted(covered - set(kept))
         if missing_kept:
             raise SystemExit(
@@ -1216,26 +1223,58 @@ def _abandon(args: argparse.Namespace) -> None:
     )
 
 
+def _record_decision_event(session_dir: Path, state: dict[str, object], entry: dict[str, object]) -> None:
+    """Record the saved decision once, including its withdrawn ruling."""
+    decision = _object_dict(entry.get("decision")) or {}
+    event: dict[str, object] = {
+        "event_type": "finding_decision", "finding_id": entry["id"],
+        "timestamp": _iso_time(_number(decision.get("timestamp_epoch"))), **decision,
+        "phase_instance_id": _string(state.get("phase_instance_id")),
+    }
+    history = _object_list(entry.get("decision_history"))
+    if history:
+        event["withdrew"] = history[-1]
+    history_file = _history_file(session_dir)
+    if history_file is not None and history_file.exists():
+        for line in history_file.read_text(encoding="utf-8").splitlines():
+            recorded = _json_object(line)
+            if recorded is not None and all(recorded.get(key) == value for key, value in event.items()):
+                return
+    _append_event(session_dir, state, event)
+
+
 def _decision(args: argparse.Namespace) -> None:
     """Record the user's answer without applying the proposed change."""
     session_dir = _session_dir(args)
     now = _now_epoch()
     state = _read_state(session_dir, now, _arg_string(args, "phase"), closed_phase_ok=True)
     entry = _finding(state, _arg_string(args, "id"))
-    if _string(entry.get("state")) != STATE_HELD:
-        raise SystemExit("Only a finding held for a decision can receive an answer")
+    current = _string(entry.get("state"))
+    withdrawing = hasattr(args, "withdraw")
+    if current not in (STATE_HELD, STATE_DECIDED):
+        raise SystemExit("Only a held or decided finding can receive an answer")
+    if current == STATE_HELD and withdrawing:
+        raise SystemExit("--withdraw requires a decided finding; this finding has no ruling to withdraw")
+    previous = _object_dict(entry.get("decision")) or {}
+    answer = _arg_string(args, "answer")
+    words = _arg_string(args, "user_words").strip()
+    repeated = (current == STATE_DECIDED and previous.get("answer") == answer
+                and previous.get("user_words") == words)
+    if current == STATE_DECIDED and not withdrawing and not repeated:
+        raise SystemExit("This finding is decided; use --withdraw to replace its current ruling")
     decision: dict[str, object] = {
-        "answer": _arg_string(args, "answer"),
+        "answer": answer,
         "user_words": _required_text(args, "user_words"),
         "timestamp_epoch": now,
     }
-    entry["state"] = STATE_DECIDED
-    entry["decision"] = decision
-    _write_state(session_dir, state)
-    _append_event(session_dir, state, {
-        "event_type": "finding_decision", "finding_id": entry["id"],
-        "timestamp": _iso_time(now), **decision,
-    })
+    if not repeated:
+        if current == STATE_DECIDED:
+            withdrew = {**previous, "withdrawn_epoch": now, "withdraw_reason": _required_text(args, "withdraw")}
+            entry["decision_history"] = [*_object_list(entry.get("decision_history")), withdrew]
+        entry["state"] = STATE_DECIDED
+        entry["decision"] = decision
+        _write_state(session_dir, state)
+    _record_decision_event(session_dir, state, entry)
     print(f"{entry['id']} decided: {decision['answer']}")
 
 
@@ -1307,12 +1346,14 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = opened.add_argument("--held-for-decision", action="store_true")
     opened.set_defaults(handler=_open)
 
-    decision = subparsers.add_parser("decision", help="record the user's answer to a held finding")
+    decision = subparsers.add_parser("decision", help="record the user's answer to a held or decided finding")
     _ = decision.add_argument("--session-dir", required=True)
     _ = decision.add_argument("--phase", default="", help=PHASE_HELP)
     _ = decision.add_argument("--id", required=True)
     _ = decision.add_argument("--answer", choices=("approved", "declined"), required=True)
     _ = decision.add_argument("--user-words", required=True)
+    _ = decision.add_argument("--withdraw", default=argparse.SUPPRESS,
+                              help="explain why the current ruling no longer stands")
     decision.set_defaults(handler=_decision)
 
     verdict = subparsers.add_parser("verdict", help="record a closure review's outcome")
@@ -1398,21 +1439,29 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def require_configuration() -> None:
+def _command_settings(args: argparse.Namespace) -> conf.ConfigRead:
+    """Use the file read that main made for this command."""
+    value = cast(object, getattr(args, "config_read"))
+    if not isinstance(value, conf.ConfigRead):
+        raise TypeError("command configuration must be a ConfigRead")
+    return value
+
+
+def require_configuration(settings_read: conf.ConfigRead) -> None:
     problems: list[str] = []
     for key in ("MAX_FIX_ATTEMPTS", "MAX_REOPENS", "STALLED_ROUNDS", "RUNAWAY_ROUNDS",
                 "ROUTING_FROM_ROUND", "ASTRA_AFTER_FAILED_FIXES", "MIN_REPAIR_BUDGET",
                 "MAX_CONSECUTIVE_SAME_KIND_PASSES", "MAX_REVIEW_CANCELLATIONS", "REPAIR_ROUNDS_PER_FINDING"):
         try:
             if key == "REPAIR_ROUNDS_PER_FINDING":
-                _ = conf.number("direct", key)
+                _ = settings_read.number(key)
             else:
-                _ = conf.whole("direct", key)
+                _ = settings_read.whole(key)
         except conf.Unusable as error:
             message = str(error)
             if "key is missing" in message:
                 message = f"{key} is not set: {message}"
-            elif "expected a whole number" in message or "could not convert string to float" in message:
+            elif "expected a whole number" in message or "expected a finite number" in message:
                 raw = conf.effective_line("direct", key)[1]
                 message = f"{key}={raw} is not a whole number: {message}"
             elif not conf.path("direct").is_file():
@@ -1424,7 +1473,9 @@ def require_configuration() -> None:
 
 def main() -> None:
     args = _build_parser().parse_args()
-    require_configuration()
+    settings_read = conf.read("direct")
+    require_configuration(settings_read)
+    args.config_read = settings_read
     handler_value: object = getattr(args, "handler")  # pyright: ignore[reportAny]
     if not callable(handler_value):
         raise SystemExit("No command handler selected")

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from scripts.lib import test_hang_guard
 
-from scripts.lib.test_agents_registry import registry_text, write_registry
+from scripts.lib.test_models_registry import registry_text, write_registry
 
 from functools import cached_property
 import json
@@ -245,7 +245,7 @@ class OpenPass(TypedDict):
 ProgressState = TypedDict("ProgressState", {"pass": dict[str, OpenPass]})
 
 
-AGENTS_REGISTRY = launcher_registry(("impl", "test", "fix"))
+MODELS_REGISTRY = launcher_registry(("impl", "test", "fix"))
 
 
 class ImplementLauncherFixture(LauncherFixture):
@@ -279,7 +279,7 @@ class ImplementLauncherFixture(LauncherFixture):
                 "# whole: 1..", "MIN_REPAIR_BUDGET=2", "# whole: 1..", "MAX_CONSECUTIVE_SAME_KIND_PASSES=6",
                 "# whole: 0..", "MAX_REVIEW_CANCELLATIONS=1", "# whole: 1..", "ROUTING_FROM_ROUND=4",
                 "# whole: 1..", "ASTRA_AFTER_FAILED_FIXES=2", "",
-            ), AGENTS_REGISTRY,
+            ), MODELS_REGISTRY,
         )
         _ = write_config_fixture(self.config_file, self.config_file.read_text(encoding="utf-8"))
         _ = config_environment(self.root)
@@ -518,7 +518,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         return (session_dir / f"observed_{command}.txt").read_text(encoding="utf-8")
 
     def claude_worker(self, session_dir: Path) -> Path:
-        registry = self.root / ".claude" / "config" / "agents.conf"
+        registry = self.root / ".claude" / "config" / "models.conf"
         _ = write_registry(registry, base_text=CLAUDE_REGISTRY)
         sessions = self.root / "sessions"
         sessions.mkdir()
@@ -590,7 +590,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
     def claude_launch(
         self, session_dir: Path, registry_row: str, *, inherited_effort: str = "", kind: str = "impl"
     ) -> subprocess.CompletedProcess[str]:
-        registry = self.root / ".claude" / "config" / "agents.conf"
+        registry = self.root / ".claude" / "config" / "models.conf"
         _ = write_registry(registry, {"direct.claude": {"impl": registry_row}}, base_text=CLAUDE_REGISTRY)
         stub = self.root / "claude"
         _ = stub.write_text(STUB_CLAUDE, encoding="utf-8")

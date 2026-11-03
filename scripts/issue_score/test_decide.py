@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest import mock
+
+from scripts.lib import conf
 from dataclasses import replace
 from pathlib import Path
 from typing import Literal, cast
@@ -29,6 +32,27 @@ def choice_answer(probabilities: dict[str, float]) -> client.ChoiceAnswer:
 
 
 class DecideTests(ConfiguredTestCase):
+    def test_threshold_selection_reads_one_configuration_for_all_candidates(self) -> None:
+        self.change_configuration(self.configuration(), **{"error_target.category": ".1"})
+        points = [decide.RiskPoint(.4, .9, .2), decide.RiskPoint(.6, .5, .05)]
+        with (mock.patch.object(conf, "read", wraps=conf.read) as read,
+              mock.patch.object(questions, "thresholds", wraps=questions.thresholds) as thresholds,
+              mock.patch.object(questions, "error_targets", wraps=questions.error_targets) as targets):
+            result = decide.select_threshold("category", points)
+        self.assertEqual(result, decide.Supported(.6))
+        read.assert_called_once_with("issue_score")
+        self.assertEqual(thresholds.call_count, 1)
+        self.assertEqual(targets.call_count, 1)
+
+    def test_threshold_selection_uses_the_callers_read_after_the_live_target_changes(self) -> None:
+        path = self.configuration(**{"error_target.category": ".1"})
+        scoring_config = conf.read("issue_score")
+        self.change_configuration(path, **{"error_target.category": ".3"})
+        with mock.patch.object(conf, "read", side_effect=AssertionError("selection read the file again")):
+            result = decide.select_threshold("category", [decide.RiskPoint(.6, .5, .2)],
+                                             scoring_config=scoring_config)
+        self.assertIsInstance(result, decide.Unsupported)
+
     def test_config_edits_change_certainty_evidence_and_split_decisions_without_a_reload(self) -> None:
         path = self.configuration()
         choice = choice_answer({"rendering": .7, "tooling": .3})

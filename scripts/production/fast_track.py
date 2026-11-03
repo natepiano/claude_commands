@@ -29,7 +29,7 @@ import process_group
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from scripts.lib import conf
+from scripts.lib import build_folders, conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 
@@ -110,13 +110,13 @@ class FastTrackArguments(argparse.Namespace):
     paths: list[str] = field(default_factory=list)
 
 
-def limits() -> FastTrackLimits:
+def limits(settings_read: conf.ConfigRead) -> FastTrackLimits:
     return FastTrackLimits(
-        max_changed_lines=conf.whole("fast_track", "max_changed_lines"),
-        max_files=conf.whole("fast_track", "max_files"),
-        check_time_limit_seconds=conf.number("fast_track", "check_time_limit_seconds"),
-        max_push_attempts=conf.whole("fast_track", "max_push_attempts"),
-        refused_paths=conf.words("fast_track", "refused_paths"),
+        max_changed_lines=settings_read.whole("max_changed_lines"),
+        max_files=settings_read.whole("max_files"),
+        check_time_limit_seconds=settings_read.number("check_time_limit_seconds"),
+        max_push_attempts=settings_read.whole("max_push_attempts"),
+        refused_paths=settings_read.words("refused_paths"),
     )
 
 
@@ -134,9 +134,9 @@ def git(repo: Path, *arguments: str, environment: dict[str, str] | None = None) 
     return result.stdout
 
 
-def fetch_main(repo: Path) -> None:
-    attempts = conf.whole("fast_track", "fetch_lock_attempts")
-    wait_seconds = conf.number("fast_track", "fetch_lock_wait_seconds")
+def fetch_main(repo: Path, settings_read: conf.ConfigRead) -> None:
+    attempts = settings_read.whole("fetch_lock_attempts")
+    wait_seconds = settings_read.number("fetch_lock_wait_seconds")
     for attempt in range(attempts):
         result = run_git(repo, "fetch", "origin", "main")
         if result.returncode == 0:
@@ -167,8 +167,8 @@ def selected_paths(repo: Path, names: list[str], config: FastTrackLimits) -> lis
 
 def patch_for(repo: Path, paths: list[str]) -> bytes:
     """Use a private index to include new files without changing the director's index."""
-    with tempfile.TemporaryDirectory(prefix="fast-track-index-") as temporary:
-        environment = {**os.environ, "GIT_INDEX_FILE": str(Path(temporary) / "index"),
+    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track-index"])) as temporary:
+        environment = {**os.environ, "GIT_INDEX_FILE": str(temporary / "index"),
                        "GIT_LITERAL_PATHSPECS": "1"}
         _ = git(repo, "read-tree", "HEAD", environment=environment)
         # A missing untracked path after a successful restore is an empty patch.
@@ -352,8 +352,8 @@ def save_records(rows: list[PushRecord]) -> None:
     write_text_atomic(state_file(), "".join(json.dumps(row) + "\n" for row in rows))
 
 
-def pending(repo: Path, unit: str) -> None:
-    _ = reconcile(repo, unit)
+def pending(repo: Path, unit: str, settings_read: conf.ConfigRead) -> None:
+    _ = reconcile(repo, unit, settings_read=settings_read)
     with record_lock():
         rows = records()
     for row in rows:
@@ -419,9 +419,9 @@ def fast_check(repo: Path, paths: list[str], config: FastTrackLimits) -> None:
     environment = {key: value for key, value in os.environ.items()
                    if key not in ("PYTHONUNBUFFERED", "REFUSAL_WATCH_INVENTORY", "STAFF_OPERATION_FD")}
     environment["HERDR_BIN"] = "/nonexistent/herdr"
-    with tempfile.TemporaryDirectory(prefix="fast-track-check-") as temporary:
+    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track-check"])) as temporary:
         for number, module in enumerate(sorted(modules)):
-            root = Path(temporary) / str(number)
+            root = temporary / str(number)
             root.mkdir()
             isolated = merge_gate.test_module_environment(root, environment)
             check_command([sys.executable, "-m", "unittest", "discover", "-s", str(module.parent),
@@ -456,8 +456,8 @@ def select_patch(repo: Path, paths: list[str]) -> Generator[SelectedPatch]:
         patch = patch_for(repo, paths)
         if git(repo, "rev-parse", "HEAD").strip() != head:
             raise Refused("HEAD changed while selecting the patch; retry the command")
-        with tempfile.TemporaryDirectory(prefix="fast-track-restore-index-") as temporary:
-            environment = {**os.environ, "GIT_INDEX_FILE": str(Path(temporary) / "index")}
+        with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track-restore-index"])) as temporary:
+            environment = {**os.environ, "GIT_INDEX_FILE": str(temporary / "index")}
             _ = git(repo, "read-tree", head, environment=environment)
             if patch:
                 result = subprocess.run(["git", "-C", str(repo), "apply", "--cached"], input=patch,
@@ -594,7 +594,7 @@ def close_restore(repo: Path, unit: str, identity: str) -> None:
 
 
 def reconcile(repo: Path, unit: str, *, finish: bool = False, paths: tuple[str, ...] = (),
-              published_commit: str = "") -> str:
+              published_commit: str = "", settings_read: conf.ConfigRead) -> str:
     """Publish review rows first; only command recovery restores and promotes."""
     with record_lock():
         selected = [(path, attempt) for path, attempt in attempts()
@@ -603,7 +603,7 @@ def reconcile(repo: Path, unit: str, *, finish: bool = False, paths: tuple[str, 
                     and (not published_commit or attempt["restore"]["record"]["commit"] == published_commit)]
     if not selected:
         return ""
-    fetch_main(repo)
+    fetch_main(repo, settings_read)
     recovered = ""
     # Old attempts finish before new attempts; the snapshots remain immutable.
     selected.sort(key=lambda entry: entry[1]["restore"]["record"]["time"])
@@ -678,8 +678,8 @@ def promote(production: Path, repo: Path, commit: str, unit: str) -> None:
         if isinstance(promotion, production_doc.PromoteTo) and not promotion.checkouts and isinstance(promotion.mac, production_doc.MacCheckout):
             # The director stays on its branch. A Mac-only destination still needs
             # a local main ref at the published commit for the existing pull helper.
-            with tempfile.TemporaryDirectory(prefix="fast-track-promote-") as temporary:
-                source = Path(temporary) / "checkout"
+            with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track-promote"])) as temporary:
+                source = temporary / "checkout"
                 _ = git(repo, "clone", "--shared", "--no-checkout", str(repo), str(source))
                 _ = git(source, "update-ref", "refs/heads/main", commit)
                 merge_checkpoint.promote_targets(promotion, "main", commit, source=source, label=f"fast-track {unit}")
@@ -690,23 +690,23 @@ def promote(production: Path, repo: Path, commit: str, unit: str) -> None:
 
 
 def push_patch(repo: Path, production: Path, unit: str, why: str, paths: list[str],
-               selection: SelectedPatch, config: FastTrackLimits) -> str:
+               selection: SelectedPatch, config: FastTrackLimits, settings_read: conf.ConfigRead) -> str:
     from scripts.production import merge_checkpoint
 
     patch = selection.patch
     digest = hashlib.sha256(patch).hexdigest()
-    with tempfile.TemporaryDirectory(prefix="fast-track-") as temporary:
-        copy = Path(temporary) / "checkout"
-        fetch_main(repo)
+    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track"])) as temporary:
+        copy = temporary / "checkout"
+        fetch_main(repo, settings_read)
         _ = git(repo, "clone", "--shared", "--no-checkout", str(repo), str(copy))
         _ = git(copy, "remote", "set-url", "origin", git(repo, "remote", "get-url", "origin").strip())
         for key in ("user.name", "user.email"):
             value = git(repo, "config", "--get", key).strip()
             _ = git(copy, "config", key, value)
-        patch_file = Path(temporary) / "fix.patch"
+        patch_file = temporary / "fix.patch"
         _ = patch_file.write_bytes(patch)
         for _attempt in range(config.max_push_attempts):
-            _ = reconcile(repo, unit)
+            _ = reconcile(repo, unit, settings_read=settings_read)
             _ = git(copy, "fetch", "origin", "main")
             base = git(copy, "rev-parse", "origin/main").strip()
             _ = git(copy, "checkout", "--detach", "--force", base)
@@ -732,16 +732,16 @@ def push_patch(repo: Path, production: Path, unit: str, why: str, paths: list[st
                 # A writer outside the shared lock can move origin during push.
                 _ = git(copy, "fetch", "origin", "main")
                 if not is_on_main(copy, commit):
-                    _ = reconcile(repo, unit)
+                    _ = reconcile(repo, unit, settings_read=settings_read)
                     if git(copy, "rev-parse", "origin/main").strip() != base:
                         continue
                     raise Refused(failure_detail(result))
             try:
-                _ = reconcile(repo, unit, finish=True, paths=tuple(paths), published_commit=commit)
+                _ = reconcile(repo, unit, finish=True, paths=tuple(paths), published_commit=commit, settings_read=settings_read)
             except (Refused, OSError, ValueError, KeyError) as error:
                 raise PublishedFailure(str(error)) from error
             return commit
-    _ = reconcile(repo, unit)
+    _ = reconcile(repo, unit, settings_read=settings_read)
     raise Refused("max_push_attempts exceeded; use the normal path")
 
 
@@ -762,7 +762,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         repo = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").strip()).resolve()
         if args.pending:
-            pending(repo, args.unit)
+            pending(repo, args.unit, conf.read("fast_track"))
             return 0
         if args.mark_reviewed:
             mark_reviewed(args.unit, args.commit, args.review_pass)
@@ -773,9 +773,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.production == Path() or not args.paths or not args.why.strip() or any(c in args.why for c in "\r\n"):
             raise Refused("--production, a one-line --why, and file paths are required")
         _ = args.production.read_text()
-        config = limits()
+        settings_read = conf.read("fast_track")
+        config = limits(settings_read)
         paths = selected_paths(repo, args.paths, config)
-        recovered = reconcile(repo, args.unit, finish=True, paths=tuple(paths))
+        recovered = reconcile(repo, args.unit, finish=True, paths=tuple(paths), settings_read=settings_read)
         with select_patch(repo, paths) as selection:
             patch = selection.patch
             if recovered and not patch:
@@ -785,7 +786,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise Refused("no change")
             paths = [path for path, _, _ in patch_counts(repo, patch)]
             check_size(repo, paths, patch, config)
-            commit = push_patch(repo, args.production, args.unit, args.why.strip(), paths, selection, config)
+            commit = push_patch(repo, args.production, args.unit, args.why.strip(), paths, selection, config, settings_read)
         print(f"fast-track {args.unit} pushed main at {commit[:12]}")
         return 0
     except (Refused, PublishedFailure, OSError, ValueError, KeyError) as error:

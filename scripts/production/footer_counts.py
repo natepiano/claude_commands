@@ -1,19 +1,14 @@
-"""The counts line: how much waits on the user, read at render time and never stored.
-
-The status line and the dailies report's own footer show it; no reply carries it (user,
-2026-10-18). Each count is the production's own: the showrunners above and below it count their
-own (user, 2026-10-27). Changes are the production's open rows from its current and earlier
-lists (change_review.scope_rows), proposals the issues and plan-backlog lines that /next proposal
-lists for review (proposals_table.waiting_entries), and efficiency the proposed or deferred
-lines in its Efficiency ledger. Accepted plan-backlog lines are work in progress and do not count.
-"""
+"""Count the user's waiting items through the same staff routing as the change page."""
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 import change_review
+from scripts.lib import conf
+from scripts.production import change_routing, staff
 import proposals_folder
 import proposals_table
 from production_units import Refusal, production_field
@@ -31,17 +26,31 @@ class FooterCounts(NamedTuple):
     proposals: int = 0
     questions: int = 0
     efficiency: int = 0
+    unrouted: int = 0
 
 
 def total(each: list[FooterCounts]) -> FooterCounts:
     return FooterCounts(*(sum(column) for column in zip(FooterCounts(), *each)))
 
 
-def changes(doc: Path) -> int:
+def change_counts(doc: Path, record: staff.StaffSnapshot) -> tuple[int, int]:
+    """Count the production tab and the unrouted tab in one routed pass."""
     try:
-        return len(change_review.scope_rows(change_review.scope_list(doc), doc))
+        scope = change_review.review_scope(doc, False, record)
+        routed = change_review.routed_review_entries(change_review.scope_list(doc), doc, record=record)
+        return (sum(owner.tab in scope for _, owner, _ in routed),
+                sum(isinstance(owner, change_routing.UnroutedChange) for _, owner, _ in routed))
     except (change_review.ChangeReviewError, OSError):
-        return 0
+        return 0, 0
+
+
+def changes(doc: Path) -> int:
+    return change_counts(doc, staff.snapshot())[0]
+
+
+def unrouted_changes(doc: Path) -> int:
+    """Count the same global unrouted tab as the change page."""
+    return change_counts(doc, staff.snapshot())[1]
 
 
 def proposals(doc: Path) -> int:
@@ -78,12 +87,22 @@ def efficiency(doc: Path) -> int:
     return sum(open_efficiency(line) for line in lines)
 
 
-def read_counts(doc: Path, *, questions: int = 0) -> FooterCounts:
+def read_counts(doc: Path, *, questions: int = 0, record: staff.StaffSnapshot | None = None) -> FooterCounts:
     """Each count for one production doc; a source that cannot be read counts nothing."""
     try:
-        return FooterCounts(changes(doc), proposals(doc), questions, efficiency(doc))
+        change_count, unrouted_count = change_counts(doc, record if record is not None else staff.snapshot())
+        return FooterCounts(change_count, proposals(doc), questions, efficiency(doc), unrouted_count)
     except OSError:
         return FooterCounts(questions=questions)
+
+
+def routing_sources(record: staff.StaffSnapshot | None = None) -> list[Path]:
+    """Watch staff, all review lists, and delivery records for tab count changes."""
+    root = change_routing.review_root()
+    record = record if record is not None else staff.snapshot()
+    lists = change_review.lists_directory()
+    return [conf.path("change_review"), lists, *lists.glob(change_review.PREFIX + "*.md"),
+            *(Path(path) for path in record.inputs), root, *root.glob(".review-link-delivery-*")]
 
 
 def sources(doc: Path, *, identities: QuestionStaff | None = None) -> list[Path]:
@@ -119,6 +138,9 @@ def sources(doc: Path, *, identities: QuestionStaff | None = None) -> list[Path]
                 found.append(questions.path)
             found.extend(record.path for record in question_records_for_document(doc, identities)
                          if record.status == "open")
+    except staff.StaffRefused as error:
+        print(f"questions: refused — {error}", file=sys.stderr)
+        raise SystemExit(2) from error
     except OSError:
         pass
     return found
@@ -138,5 +160,6 @@ def counts_line(counts: FooterCounts) -> str | None:
         (counts.questions, plural(counts.questions, "question")),
         (counts.changes, plural(counts.changes, "change")),
         (counts.efficiency, f"{counts.efficiency} efficiency"),
-        (counts.proposals, plural(counts.proposals, "proposal"))) if count]
+        (counts.proposals, plural(counts.proposals, "proposal")),
+        (counts.unrouted, f"{counts.unrouted} unrouted")) if count]
     return COUNTS_HEAD + ", ".join(parts) if parts else None

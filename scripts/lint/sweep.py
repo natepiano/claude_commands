@@ -178,6 +178,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeGuard, TypedDict, cast, overload, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.message import send_budget
 import conf
 from process_failure import failure_detail
 from user_zone import user_zone  # noqa: E402
@@ -190,7 +192,8 @@ if TYPE_CHECKING:
     from ..notify import review
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import tmp_sweep
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lint import tmp_sweep
     import scratch
     from atomic_file import write_text_atomic
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
@@ -245,10 +248,9 @@ USE_STAMP = scratch.USE_STAMP
 # CARGO_TARGET_DIR, had stayed unseen. ~/.cache/sccache holds no .rustc_info.json and no cargo
 # cache tag, so is_cargo_target never takes it.
 FLOOR_ROOTS = ("~/rust", "~/.local/state", "~/.cache", "/tmp")
-FLOOR_LOCK = os.path.join("~", ".local", "state", "lint-sweep", "floor.lock")
 # Claude Code keeps each session's scratch (scratchpad/, tasks/) in <root>/<project>/<session id>/,
 # where <project> is the session's working directory with every / as -.
-FLOOR_STATE_ENV = "LINT_SWEEP_STATE_DIR"
+FLOOR_STATE_ENV = tmp_sweep.STATE_ENV
 BUILDLOG_DIR_ENV = "BUILDLOG_DIR"
 CI_TARGETS = ("/var/lib/hana-ci/hana-linux-1", "/var/lib/hana-ci/hana-linux-2")
 GROWTH_WINDOW_SECONDS = 30 * 60
@@ -868,7 +870,7 @@ def alert_floor_lock(path: str, free: int, floor: int) -> None:
         holder = floor_lock_holder(path)
         if not isinstance(holder, KnownFloorLockHolder):
             return
-        seconds = int(conf.number("lint", FLOOR_LOCK_ALERT_KEY) * 60)
+        seconds = int(conf.read("lint").number(FLOOR_LOCK_ALERT_KEY) * 60)
         now = time.time()
         if now - holder.started_at < seconds:
             return
@@ -2185,8 +2187,7 @@ def floor_bytes(values: dict[str, str], host: str) -> tuple[int | None, str | No
 
 
 def floor_record_path() -> Path:
-    state = os.environ.get(FLOOR_STATE_ENV) or "~/.local/state/lint-sweep"
-    return Path(os.path.expanduser(state)) / "floor.json"
+    return tmp_sweep.state_dir() / "floor.json"
 
 
 def _finite_number(value: object) -> TypeGuard[int | float]:
@@ -2194,7 +2195,7 @@ def _finite_number(value: object) -> TypeGuard[int | float]:
 
 
 def target_deletes_path() -> Path:
-    return floor_record_path().with_name("target-deletes.json")
+    return tmp_sweep.state_dir() / tmp_sweep.TARGET_DELETES_NAME
 
 
 def read_target_deletes(path: Path, now: float) -> dict[str, float]:
@@ -2550,7 +2551,7 @@ def send_holder_message(session: str, message: str) -> bool:
     """Tell a session that its process holds a target the floor needs; True when send.py delivered
     the message or queued it (exit 1)."""
     try:
-        result = subprocess.run(session_send_argv(session), input=message, text=True, capture_output=True, timeout=40)
+        result = subprocess.run(session_send_argv(session), input=message, text=True, capture_output=True, timeout=send_budget.seconds(30))
     except (OSError, subprocess.TimeoutExpired) as error:
         print(f"lint sweep: message to {session} failed: {error}", file=sys.stderr)
         return False
@@ -2584,7 +2585,7 @@ def send_floor_alert(message: str, channels: FloorAlertChannels, *,
     delivered = False
     for channel, command in commands:
         try:
-            timeout = review.user_send_seconds() + 15 if channel == "phone" else 40
+            timeout = send_budget.user_seconds(review.user_send_seconds()) if channel == "phone" else send_budget.seconds(30)
             result = subprocess.run(command, input=message if channel == "message" else None, text=True, capture_output=True, timeout=timeout)
             if result.returncode == 0 or (channel == "message" and result.returncode == 1):
                 delivered = True
@@ -2695,9 +2696,10 @@ def hold_floor(
     floor: int,
     dry_run: bool,
     roots: Sequence[str] = FLOOR_ROOTS,
-    lock: str = FLOOR_LOCK,
+    lock: str = "",
 ) -> int:
     """Below the floor, take the shortfall from the least used idle targets."""
+    lock = lock or str(tmp_sweep.state_dir() / "floor.lock")
     if not dry_run:
         recover_pending_trims()
     home = os.path.expanduser("~")
@@ -2969,17 +2971,19 @@ def local_origin_git_dir(common: str) -> str | None:
     return None
 
 
-def budget_bytes(environ: dict[str, str], config: str, repo: str | None) -> tuple[int | None, str]:
+def budget_bytes(environ: dict[str, str], config: str | conf.ConfigRead, repo: str | None) -> tuple[int | None, str]:
     """The sweep budget, None when its value is malformed, and where it came from."""
     raw = environ.get(BUDGET_ENV, "")
     if raw:
         return size_bytes(raw, GIB), f"{BUDGET_ENV} in the environment"
-    values = conf.values(Path(config))
+    settings_read = config if isinstance(config, conf.ConfigRead) else conf.read(Path(config))
+    config = str(settings_read.source)
+    values = settings_read.values()
     keys = [f"{BUDGET_KEY}.{repo}", BUDGET_KEY] if repo else [BUDGET_KEY]
     for key in keys:
         if values.get(key):
             return size_bytes(values[key], GIB), f"{key} in {config}"
-    return int(conf.number(Path(config), BUDGET_KEY) * GIB), f"{BUDGET_KEY} in {config}"
+    return int(settings_read.number(BUDGET_KEY) * GIB), f"{BUDGET_KEY} in {config}"
 
 
 def doc_index_bytes() -> int | None:
@@ -3283,8 +3287,9 @@ def main(argv: list[str]) -> int:
             return 2
     config = str(conf.path("lint"))
     try:
-        values = conf.values(Path(config))
-        recent_seconds = int(conf.number("lint", RECENT_KEY) * 60)
+        settings_read = conf.read("lint")
+        values = settings_read.values()
+        recent_seconds = int(settings_read.number(RECENT_KEY) * 60)
         floor, floor_key = floor_bytes(values, socket.gethostname())
     except conf.Unusable as error:
         print(f"lint sweep: {error}", file=sys.stderr)
@@ -3293,7 +3298,7 @@ def main(argv: list[str]) -> int:
     if floor is None and floor_key is not None:
         print(f"lint sweep: {floor_key} in {config} must be a non-negative number of GiB", file=sys.stderr)
         return 2
-    status = 0 if floor_only else sweep_workspace(target_dir, config, dry_run, recent_minutes)
+    status = 0 if floor_only else sweep_workspace(target_dir, settings_read, dry_run, recent_minutes)
     if floor_only:
         status = tmp_sweep.run_if_due(dry_run) or status
     if floor is not None:
@@ -3301,7 +3306,7 @@ def main(argv: list[str]) -> int:
     return status
 
 
-def sweep_workspace(target_dir: str | None, config: str, dry_run: bool,
+def sweep_workspace(target_dir: str | None, config: str | conf.ConfigRead, dry_run: bool,
                     recent_minutes: float) -> int:
     """Sweep target_dir, or the working directory's workspace, to its budget."""
     budget, source = budget_bytes(dict(os.environ), config, repo_name(os.getcwd()))

@@ -19,6 +19,7 @@ from unittest import mock
 sys.path[:0] = [str(Path(__file__).resolve().parents[1] / name)
                 for name in ("production", "message", "herdr")]
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.message.sessions_test_support import copy_session_modules
 from scripts.production import staff
 from scripts.production.staff_test_support import (
@@ -95,7 +96,7 @@ class UnitStatusFixture(unittest.TestCase):
         hooks = root / "scripts/hooks"
         hooks.mkdir()
         _ = (hooks / "direct_run.py").write_text("raise SystemExit(1)\n", encoding="utf-8")
-        for name in ("production_units.py", "unit_table.py", "live_units.py", "showrunners.py", "unit_lookup.py", "session_staff.py", "session_labels.py", "unit_names.py", "staff.py", "session_pane.py"):
+        for name in ("production_units.py", "unit_table.py", "live_units.py", "showrunners.py", "unit_lookup.py", "session_staff.py", "session_labels.py", "unit_names.py", "staff.py", "session_pane.py", "unit_config.py"):
             _ = shutil.copy2(SCRIPT.with_name(name), script.with_name(name))
         (root / "scripts/herdr").mkdir()
         for name in ("herdr.py", "place.py", "pane_launch.py"):
@@ -103,7 +104,7 @@ class UnitStatusFixture(unittest.TestCase):
         (root / "scripts/shutdown").mkdir()
         for name in ("pane_record.py", "remote.py"):
             _ = shutil.copy2(SCRIPT.parents[1] / "shutdown" / name, root / "scripts/shutdown" / name)
-        for name in ("atomic_file.py", "user_zone.py", "probe_session.py", "unit_runs.py", "nix_env.py", "process_failure.py"):
+        for name in ("atomic_file.py", "git_exclude.py", "user_zone.py", "probe_session.py", "unit_runs.py", "nix_env.py", "process_failure.py", "script_envelope.py"):
             _ = shutil.copy2(SCRIPT.parents[1] / "lib" / name, root / "scripts/lib" / name)
         for name in ("active", "sessions"):
             (root / name).mkdir()
@@ -168,7 +169,18 @@ class UnitStatusFixture(unittest.TestCase):
             for unit in units:
                 worktree = root / "worktrees" / unit
                 worktree.mkdir(parents=True)
-                _ = (worktree / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
+                for arguments in (
+                    ["init", "--quiet", "-b", unit],
+                    ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                     "-c", "commit.gpgsign=false", "commit", "--quiet", "--allow-empty", "-m", "fixture"],
+                ):
+                    _ = subprocess.run(["git", "-C", str(worktree), *arguments], check=True,
+                                       capture_output=True, text=True, env=environment,
+                                       timeout=TEST_HANG_GUARD_SECS)
+                if unit not in retired_units:
+                    member = unit_membership("example", unit)
+                    _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", worktree), expected=member.worktree)
+                    write_text_atomic(worktree / ".unit.toml", 'plan = "docs/plan.md"\nresponsibilities = []\n')
                 plan = "(retired by the user)" if unit in retired_units else "docs/plan.md"
                 rows.append(f"| {unit} | {plan} | {worktree} | {unit} | — | — |")
                 if unit in missing_units:
@@ -197,6 +209,8 @@ class UnitStatusFixture(unittest.TestCase):
             _ = production_doc.write_text("\n".join((
                 "# Production", "## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
                 "| --- | --- | --- | --- | --- | --- |", *rows)), encoding="utf-8")
+            owner = showrunner_relationship("example")
+            _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", production_doc))
             zsh = shutil.which("zsh")
             if zsh is None:
                 raise RuntimeError("zsh is required for unit status tests")

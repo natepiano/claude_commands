@@ -36,8 +36,9 @@ Three results follow:
 ### Machine
 
 - **Type: m7a.4xlarge** to start (Phase 0 result below; m7a.8xlarge was the first proposal). 16 vCPU (on 7a types each vCPU is a physical core), 64 GiB: about half of natedev's build throughput, enough for the large hana steps (hana nextest peaks at 11.6 GiB). m7a.8xlarge (32 vCPU, 128 GiB) is the next size. x86_64 only: an arm64 machine would be a third platform, and its results would not stand for natedev's.
-- **Market: Spot**, a persistent request with interruption behavior `stop`. The machine will run most hours, so the price gap matters more than the interruptions (estimates below). A capacity miss at start is recorded and retried after `capacity_backoff_s`; the steps stay in natedev's queue as today. If misses are frequent in the report, the instance is replaced with an on-demand one (one stack parameter; the data volume keeps the caches).
-- **Region:** us-east-1 or us-east-2 (the user's zone is America/New_York; both have the same list price). Day one runs `aws ec2 get-spot-placement-scores` for the type (free) and picks the better region. The region is a config value.
+- **Market: Spot**, a persistent request with interruption behavior `stop`. The machine will run most hours, so the price gap matters more than the interruptions (estimates below). A capacity miss at start is recorded and retried after `capacity_backoff_s`; the steps stay in natedev's queue as today. If misses are frequent in the report, the instance is replaced with an on-demand one. That needs a template change: the launch template has Spot market options only. The data volume keeps the caches.
+  The account created 2026-11-03 is a project account. Its Paid Plan policy denied Spot launches. The user chose Spot and activated advanced features on 2026-11-03, which removed that policy.
+- **Region:** us-east-2. The account's `RegionFloor` policy allows us-east-1, us-east-2 and us-west-2, and it denies most actions in us-east-1. The region is a config value.
 - **Storage:** a separate 500 GiB gp3 data volume for `/home` (mirrors, build folders, sccache, rustup, cargo), 6,000 IOPS and 500 MB/s, encrypted, `DeleteOnTermination=false` and retained by the stack. The root volume holds only NixOS and the nix store. A stopped or replaced instance keeps every warm build folder. Size: hana slots at the Mac's 56 GiB budget, cargo-liner slots at 24 GiB, plus the nix store and sccache.
 - **OS: NixOS**, a host `aws-build` in the nixos repo, from the official NixOS AMI. hana's flake already has a headless shell, `.#ci`, with llvmpipe, lavapipe and `xvfb-run`. hana's CI runs in it on a NixOS machine without a GPU. So the box runs the same tests CI runs, window tests included, and its results match natedev's.
 
@@ -61,7 +62,7 @@ The spending limit is the user's number; it is the one question in this design.
 ### Access and keys
 
 - **natedev to the box: Tailscale SSH.** natedev reaches the Mac the same way today (`ssh -G mac` shows `identityagent none`; the host is `mac.tail21e383.ts.net`). Tailscale checks the tailnet identity, so no ssh key and no gpg-agent take part. A cold gpg-agent after a reboot does not stop the box's work.
-- **The box joins the tailnet once.** The user runs `sudo tailscale up --ssh --advertise-tags=tag:build-aws` in an SSM Session Manager window and logs in through the printed URL. No auth key exists to store. The tailnet policy lets natedev's user ssh into `tag:build-aws` and gives the tag no connections out, so the box cannot open a connection to natedev or the Mac.
+- **The box joins the tailnet once.** The user runs `sudo tailscale up --ssh --advertise-tags=tag:build-aws` in an SSM Session Manager window and logs in through the printed URL. No auth key exists to store. The tailnet policy lets natedev's user and the Mac's user ssh into `tag:build-aws` and gives the tag no connections out, so the box cannot open a connection to natedev or the Mac.
 - **The box holds no GitHub credential.** Source trees arrive by rsync from natedev, as on the Mac. `~/.claude` scripts and config arrive the same way: natedev copies the tracked files when the box reports a different commit in its probe answer. crates.io, rustup and cache.nixos.org are public. hana has no git dependencies (it vendors `clay-layout`). If a workspace gets a git dependency later, natedev fetches it and the tree carries it.
 - **natedev's AWS key.** A dedicated IAM user whose policy allows only `StartInstances` and `StopInstances` on the one instance ARN, the read-only `Describe*` calls for instances, Spot requests and Spot prices, and `ce:GetCostAndUsage`. The user writes its key at their own terminal to `~/.config/aws-build/credentials` (mode 0600, profile `build-scaler`). It is a file, not a gpg-agent secret, for the same reboot reason. A leaked key can only start or stop that instance, and layer 3 caps the cost.
 - **Break-glass login:** SSM Session Manager (instance profile with `AmazonSSMManagedInstanceCore`). No inbound TCP port is open. The security group allows inbound UDP 41641 so Tailscale connects directly and not through a relay.
@@ -90,6 +91,7 @@ The spending limit is the user's number; it is the one question in this design.
 ### Measurement
 
 - **Dollars.** The ledger (above) per day, and once a day one Cost Explorer read of the real charge ($0.01 a call), so the estimate is checked against the bill.
+- **Uptime.** Hours up count pending, running and stopping time, as the cost rule does (Phase 9 F045).
 - **Work.** Box steps carry `host=aws-build` and reach natedev through `buildlog sync`, as Mac steps do. Calls carry `target=aws`.
 - **Wait saved (estimate).** For a step that left natedev's queue after waiting t seconds: the median of (wait − t) over that day's natedev steps of the same kind and repository that waited longer than t. This is the rule `### Mac copies` uses. Add the difference between natedev's median run time and the box's run time for that command; it can be negative.
 - **Report.** `/build:status` gets an `aws:` row: `stopped`, `starting since HH:MM`, `running <n> of <m> slots`, `draining — Spot interruption at HH:MM`, or `start refused — month limit reached`, each with the month's dollars against the cap. `/build:report` gets an `### AWS` section and one lead line: `AWS: up <h>, <n> steps, about <h> of queue wait saved for $<d> ($<d> per saved hour, estimated).` It also shows natedev's daily summed queue wait before and after go-live, labelled as not matched for load.
@@ -116,11 +118,40 @@ Go-live is the end of Phase 3, with test, check and doc: about 1,000 of last wee
 2. Run the runbook: `aws cloudformation deploy` of the template, with the region from the placement score and the $400 cap.
 3. In SSM Session Manager on the box: `sudo tailscale up --ssh --advertise-tags=tag:build-aws`, then add the tag rule to the tailnet policy.
 4. Create the scaler user's access key and write it with `aws configure --profile build-scaler` on natedev.
-5. Rebuild natedev and the box from the nixos branch.
+5. Rebuild the box from the nixos branch. natedev was rebuilt on `/etc/nixos` 10353a9 (2026-11-03), which holds the patch.
 
 ## Spending cap (user, 2026-11-01)
 
-`monthly_limit_usd=400` and `daily_limit_usd=20` (the monthly cap / 20). The AWS Budget uses the same $400. Phase 0 expects about $250 a month on Spot for test, check and doc, so the cap leaves room for Phase 4's lint (about $274).
+`monthly_limit_usd=400`: the user's words were "$400/month cap is fine to start". `daily_limit_usd=20` is derived (the monthly cap / 20); the user approved it on 2026-11-03 ("approve all 4"). The AWS Budget uses the same $400. Phase 0 expects about $250 a month on Spot for test, check and doc, so the cap leaves room for Phase 4's lint (about $274).
+
+## Review answers (user, 2026-11-02)
+
+Finding ids restart in each phase, so each answer names its phase.
+
+### Phase 8
+
+- **F038, "a".** The Linux runner prints the `aws_interrupted=` marker once. The second print in `execute_slot` goes; the sender still reports the interrupted run, and the exit status is the child's. This is plan Phase 10.
+- **F039, "d".** The build log entry does not store `interruption_generation`. Every outcome writes a plain SSH attempt record; the generation stays in the remote record for routing.
+- **F040, "a - i want only one way of doing things".** `conf.py` reads a config file once, and every caller (`scripts/aws_target/config.py` included) uses that one reader. devtools-unit makes this change.
+
+### Phase 9 (AWS cost and status reporting)
+
+- **F034, "b": declined.** Status keeps reading the build log files for attempt results, not the build log index. Reading only the `YYYY-MM.jsonl` files gives the speed.
+- **F035, "yes we should honor the cost limits": approved.** The cap, the accounting zone and both Cost Explorer tag keys are read only through the strict settings reader. An invalid cap is refused and the guard stops; status shows the cap as unavailable. A missing tag key stops AWS work.
+- **F036 and F040, copy removals: approved** under "you never have to ask me to remove duplication". One local-step rule serves the SQL and Python paths for old rows with no target. The report prints the Mac sync state once (`peer_sync_lines` replaces `mac_note`).
+- **F039, "a": approved.** The build report shows every AWS target, not only the target named `aws`.
+- **F041, "a": approved.** The status reader is separate from the report reader. Status does not read the charge files or `go-live.json`.
+- **F042, "a": approved.** Each tick reads only the newest charge file. A saved reply that is not reconciled still reconciles first.
+- **"settle": approved** (the showrunner's recommendations):
+  - F037: the memory section counts steps and calls by the target rule; machine samples keep the host rule.
+  - F038: the wait-saved estimate uses the report's local day.
+  - F043: a day's cost prices only that day, not the whole ledger history.
+  - F044: `CostLedger.refresh_charges` owns the charge schedule, its lock and the reconcile-once check.
+  - F045: uptime counts pending, running and stopping time, with the cost rule's cap on a stale observation.
+  - F046: the controller record stores the recovery case; status builds the recovery words.
+  - F047: the controller state file has no `charge_error`.
+  - F048: the charge difference is computed (actual minus estimate), not stored in `charges/<day>.json`.
+- **F049, "settle": declined.** No index on `ssh_attempts` for now; the table is small.
 
 ## Phase 0 result — queue replay (2026-10-31)
 

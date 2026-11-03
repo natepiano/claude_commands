@@ -9,6 +9,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO, TextIO, cast
 
+TEMPORARY_NAME = re.compile(r"\.(?P<target>.+)\.(?P<pid>\d+)\.[^.]+\.tmp", re.DOTALL)
+
+
+def temporary_target(name: str) -> str | None:
+    """Return the destination name of an atomic temporary file."""
+    match = TEMPORARY_NAME.fullmatch(name)
+    return match.group("target") if match is not None else None
+
 
 def sync_folder(folder: Path) -> None:
     """Persist the folder's directory entries, including a completed replacement."""
@@ -21,13 +29,12 @@ def sync_folder(folder: Path) -> None:
 
 def remove_dead_temporary_files(path: Path) -> None:
     """Remove sibling temporary files whose writing process has ended."""
-    name = re.compile(rf"\.{re.escape(path.name)}\.(\d+)\.[^.]+\.tmp")
     for sibling in path.parent.iterdir():
-        match = name.fullmatch(sibling.name)
-        if match is None:
+        match = TEMPORARY_NAME.fullmatch(sibling.name)
+        if match is None or match.group("target") != path.name:
             continue
         try:
-            os.kill(int(match.group(1)), 0)
+            os.kill(int(match.group("pid")), 0)
         except ProcessLookupError:
             sibling.unlink(missing_ok=True)
         except PermissionError:
@@ -77,23 +84,28 @@ def prepared_replacement(path: Path, content: str | bytes, *, mode: int) -> Gene
         yield temporary
 
 
-def write_text_atomic(path: Path, text: str) -> None:
-    """Publish whole text; distinguish refusal from visible, unconfirmed replacement."""
-    _write_atomic(path, text)
+def write_text_atomic(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
+    """Publish complete text; preserve existing permissions or use the supplied mode for a new file."""
+    _write_atomic(path, text, new_file_mode=new_file_mode)
 
 
-def write_bytes_atomic(path: Path, data: bytes) -> None:
+def write_bytes_atomic(path: Path, data: bytes, *, mode: int | None = None) -> None:
     """Publish exact bytes with the same durability guarantees as text publication."""
-    _write_atomic(path, data)
+    _write_atomic(path, data, mode=mode)
 
 
-def _write_atomic(path: Path, content: str | bytes) -> None:
+def _write_atomic(path: Path, content: str | bytes, *, mode: int | None = None,
+                  new_file_mode: int | None = None) -> None:
     """Own the single replacement boundary for text and binary evidence."""
     replaced = False
     try:
-        with _flushed_temporary_file(path, content) as temporary:
-            if path.exists():
+        with _flushed_temporary_file(path, content, mode=mode if mode is not None else 0o600) as temporary:
+            if mode is not None:
+                temporary.chmod(mode)
+            elif path.exists():
                 temporary.chmod(path.stat().st_mode)
+            elif new_file_mode is not None:
+                temporary.chmod(new_file_mode)
             else:
                 mask = os.umask(0)
                 _ = os.umask(mask)

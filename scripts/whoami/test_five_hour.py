@@ -22,9 +22,11 @@ from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
 import five_hour
 from scripts.whoami.agent_accounts import CodexHomeSource, CodexRateLimits, Quota, Report
 from scripts.accounts import accounts, role_map
+from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner
 
 import escalate  # five_hour puts scripts/message on the path
 import quota_alert
+import push_texts
 import send
 import sessions
 from quota_alert import Config, Showrunner
@@ -376,7 +378,10 @@ class AccountHoldTests(unittest.TestCase):
         _ = self.enterContext(patch.object(five_hour, "STATE", self.root / "notices"))
         _ = self.enterContext(patch.object(escalate, "schedule"))
         _ = self.enterContext(patch.object(escalate, "load_settings", return_value=CONFIG))
-        _ = self.enterContext(patch.object(escalate, "registered_showrunners", return_value=SHOWRUNNERS))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        document = self.root / "show-production.md"
+        _ = document.write_text("# Show production\n", encoding="utf-8")
+        _ = recorded_showrunner("hana", document)
         _ = self.enterContext(patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")))
         _ = self.enterContext(patch.object(five_hour, "load_config", return_value=CONFIG))
         _ = self.enterContext(patch.object(quota_alert, "registered_showrunners", return_value=SHOWRUNNERS))
@@ -403,7 +408,7 @@ class AccountHoldTests(unittest.TestCase):
     def test_swap_cancels_outgoing_and_legacy_holds_without_recovery_and_keeps_other_tools(self) -> None:
         a = self.readings(1)
         _ = five_hour.watch([a.checked_homes[0].report], now=self.now, codex_readings=a)
-        _ = escalate.hold("five-hour-codex", escalate.SessionPush("Old Codex", "old", NoActionRequired(), "note"))
+        _ = escalate.hold("five-hour-codex", push_texts.render("nate.adhoc", sender="quota", title="Old Codex", description="old"))
         _ = escalate.hold("five-hour-claude", escalate.SessionPush("Claude", "other", NoActionRequired(), "note"))
         self.sent.clear()
         b = self.readings(2, None)
@@ -424,7 +429,7 @@ class AccountHoldTests(unittest.TestCase):
             a = self.readings(1)
             _ = five_hour.watch([a.checked_homes[0].report], now=self.now, codex_readings=a)
             # This queued relay predates log-only Codex notices; new watches never enqueue it.
-            send.enqueue(send.Message("hana", "quota_alert", "", "old Codex warning", "5-hour codex1"),
+            send.enqueue(send.Message("hana", "quota_alert", "", "old Codex warning", "5-hour codex1", stamp=send.UnavailableSender()),
                          "offline", self.now)
             self.assertTrue(send.read_queue(send.queue_path("hana")))
             chosen = self.readings(2, None)

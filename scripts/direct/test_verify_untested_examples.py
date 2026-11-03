@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import unittest
+from typing import override
+from scripts.build_queue.admission_test_support import caller_admission
 
 # Existing suites import these fixture names from this module.
 from scripts.direct.verify_examples_test_support import (
@@ -14,6 +16,11 @@ from scripts.direct.verify_examples_test_support import (
 
 
 class UntestedExampleTests(SeededExampleWorkspaceFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = caller_admission(self, self.root, self.environment)
+
     def test_clean_package_passes_gate(self) -> None:
         _ = self.package()
         _ = self.example(source="fn main() {}\n")

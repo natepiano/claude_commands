@@ -19,7 +19,7 @@ port_lint.py writes its own call records through write_call() here.
       From invoke.sh's run(), before every step: print the tree key
       (treekey.py) of the worktree the step would be recorded under, or
       nothing.
-  record.py test-phase-context RESERVATION ARGV...
+  record.py test-phase-context SAMPLING_CONTEXT ARGV...
       Before release, print the reservation's repository and filter metadata
       with the actual post-share argv's test width. The sampler adds its window.
   record.py call OUTCOME STATUS CACHED WAIT WALL BUILD SAVED ELAPSED VERB [ARG...]
@@ -89,6 +89,12 @@ else:
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 import memory_admit
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if TYPE_CHECKING:
+    from ..aws_target.config import MeasurementUnavailable
+else:
+    from scripts.aws_target.config import MeasurementUnavailable
 import conf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
@@ -111,7 +117,7 @@ def sync_config() -> dict[str, str]:
     """Read peer settings when a sync or report needs them."""
     path = Path(os.environ.get("BUILD_TARGETS_CONFIG", str(Path(__file__).resolve().parents[2]
                                                          / "config/build_targets.conf"))).expanduser()
-    return conf.values(path)
+    return conf.read(path).values()
 
 
 def target_hosts(target: str) -> tuple[str, ...]:
@@ -135,6 +141,33 @@ def configured_targets() -> tuple[str, ...]:
 def local_targets() -> tuple[str, ...]:
     return tuple(target.name for target in read_targets() if isinstance(target, LocalTarget))
 
+
+@dataclass(frozen=True)
+class LocalStepIdentity:
+    targets: tuple[str, ...]
+    hosts: tuple[str, ...]
+
+
+def local_step_identity(targets: tuple[str, ...] = ()) -> LocalStepIdentity:
+    configured = targets or local_targets()
+    hosts = tuple(dict.fromkeys(alias for name in configured for alias in target_hosts(name)))
+    return LocalStepIdentity(configured, hosts)
+
+
+NONLOCAL_STEP_CALLERS = ('verify-linux',)
+
+
+def is_local_step(target: object, host: object, caller: object, *,
+                  targets: tuple[str, ...] = (), hosts: tuple[str, ...] = ()) -> bool:
+    """Use explicit target identity before legacy host identity."""
+    if caller in NONLOCAL_STEP_CALLERS:
+        return False
+    identity = LocalStepIdentity(targets, hosts) if targets and hosts else local_step_identity(targets)
+    configured = targets or identity.targets
+    if target:
+        return target in configured
+    aliases = hosts or identity.hosts
+    return host in aliases
 
 def synchronized_hosts() -> tuple[str, ...]:
     values = sync_config()
@@ -300,7 +333,7 @@ def write_launch_line(record_data: Mapping[str, object]) -> bool:
     return True
 
 
-def pending_launches_root() -> Path:
+def pending_launch_root() -> Path:
     return store.root() / "pending-launches"
 
 
@@ -323,7 +356,7 @@ def _save_pending_record(path: Path, fields: Mapping[str, object], *, replace_ex
 
 
 def _pending_launch_path(row: LaunchStep) -> Path:
-    return pending_launches_root() / _launch_row_path(row).with_suffix(".json").name
+    return pending_launch_root() / _launch_row_path(row).with_suffix(".json").name
 
 
 def _save_pending_launch(row: LaunchStep) -> Path:
@@ -568,12 +601,16 @@ def pending_steps_root() -> Path:
     return store.root() / "pending-steps"
 
 
-def test_phase_context(reservation: Path, argv: list[str]) -> dict[str, object]:
+def test_phase_context(sampling_context: str, argv: list[str]) -> dict[str, object]:
     """Copy admission's selection, using the argv that actually runs for its width."""
-    loaded = cast(object, json.loads(reservation.read_text()))
+    loaded = cast(object, json.loads(sampling_context))
     if not isinstance(loaded, dict):
-        raise ValueError("test-phase reservation is not an object")
+        raise ValueError("test-phase sampling context is not an object")
     fields = cast(dict[str, object], loaded)
+    call = fields.get("call_id")
+    if isinstance(call, dict):
+        recorded_call = memory_admit.parse_snapshot_value(cast(dict[str, object], call), memory_admit.Call)
+        fields["call_id"] = recorded_call.call_id if isinstance(recorded_call, memory_admit.CallRecord) else None
     # Admission's parser returns the first width. Supplying nextest's environment
     # default last preserves an explicit flag, including a nonnumeric one.
     width_argv = argv
@@ -1025,6 +1062,40 @@ def ssh_attempt(attempt: SshAttempt) -> None:
     })
 
 
+@dataclass(frozen=True)
+class AttemptResult:
+    repo_identity: str
+    slot: int
+    outcome: str
+    completion: str
+    cleanup: str
+    unresolved_count: int | MeasurementUnavailable
+    evidence_at: float
+
+
+def read_attempt_results(target: str) -> tuple[AttemptResult, ...]:
+    """Read the latest repository slot results from host month files."""
+    latest: dict[tuple[str, int], AttemptResult] = {}
+    for path in sorted(store.root().glob('*/[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl')):
+        with path.open('rb') as handle:
+            fcntl.flock(handle, fcntl.LOCK_SH)
+            for row in store.whole_rows(handle, 0):
+                if row.get('kind') != 'ssh_attempt' or row.get('target') != target:
+                    continue
+                count = row.get('unresolved_count')
+                at = float(str(row.get('evidence_at')))
+                slot = int(str(row.get('slot')))
+                if not math.isfinite(at) or at < 0 or slot < 0:
+                    raise ValueError('invalid attempt evidence')
+                result = AttemptResult(str(row.get('repo_identity', 'unknown')), slot,
+                                       str(row.get('outcome', 'unavailable')), str(row.get('completion', 'missing')),
+                                       str(row.get('cleanup', 'unconfirmed')),
+                                       count if type(count) is int and count >= 0 else MeasurementUnavailable('process count is unavailable'), at)
+                key = result.repo_identity, result.slot
+                if key not in latest or latest[key].evidence_at <= at:
+                    latest[key] = result
+    return tuple(latest[key] for key in sorted(latest))
+
 def hold_event(args: list[str]) -> None:
     event, target, key, holder, reason, at = args[:6]
     if event not in ("began", "ended") or len(args) not in (6, 7):
@@ -1218,7 +1289,7 @@ def main(argv: list[str]) -> int:
             if found:
                 print(found)
         elif command == "test-phase-context":
-            print(json.dumps(test_phase_context(Path(rest[0]), rest[1:]), separators=(",", ":")))
+            print(json.dumps(test_phase_context(rest[0], rest[1:]), separators=(",", ":")))
         elif command == "hold-event":
             hold_event(rest)
         elif command == "hold-build":

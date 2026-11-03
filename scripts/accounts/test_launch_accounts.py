@@ -17,14 +17,13 @@ from unittest.mock import patch
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, nix_env_fake as fixtures
 from scripts.lib.code_kind import is_test_code
-from scripts.shutdown import launch_permission
 
 
 ROOT = Path(__file__).resolve().parents[1]
 # These are account decisions with a separate, explicit contract.
 EXCEPTIONS = {
     ("accounts/accounts.py", "exec_account"): "the user explicitly names the account",
-    ("shutdown/restart.py", "_resume_parts"): "ungrouped resumes retain their recorded directory; groups use the resolver",
+    ("shutdown/restart.py", "session_launch"): "a resume retains the account that holds its transcript",
     ("message/send.py", "relay"): "the relay retains the caller account or uses the showrunners resolver",
     ("notify/review.py", "reviewer_environment"): "the headless reviewer uses the units account through role_account",
 }
@@ -200,8 +199,6 @@ class ExecLaunchShellTests(unittest.TestCase):
             "KEEP": "base", "UNSET_BY_SHELL": "old", "AGENT_NOTES_DIR": str(self.home / "notes"),
             "SHUTDOWN_STATE_DIR": str(self.home / "shutdown"),
             "NOTIFIER_SESSIONS_DIR": str(self.home / "sessions")}, clear=True)))
-        _ = self.enterContext(patch.object(launch_permission, "launch_permission",
-            return_value=launch_permission.AllowedByShutdownState()))
         _ = self.enterContext(patch.object(Path, "cwd", return_value=self.folder))
         _ = self.enterContext(patch.object(sys.stdin, "isatty", return_value=False))
         prepared = accounts.PreparedAccount({"CLAUDE_CONFIG_DIR": str(self.home / ".claude4")},
@@ -290,19 +287,6 @@ class ExecLaunchShellTests(unittest.TestCase):
                 self.assertEqual(environment["UNSET_BY_SHELL"], "old")
                 self.assertNotIn("IN_NIX_SHELL", environment)
                 self.assertFalse((self.folder / ".envrc").exists())
-
-    def test_refused_envrc_exits_one_without_starting_an_agent_or_supervisor(self) -> None:
-        envrc = self.folder.parent / ".envrc"
-        _ = envrc.write_text("use flake\n")
-        for label in ("claude", "claude4", "units", "showrunners", "codex2", "workers"):
-            for reason in (f"nix_env: run direnv allow {envrc}", "nix_env: IN_NIX_SHELL is not set",
-                           "nix_env: direnv timed out"):
-                with (self.subTest(label=label, reason=reason), patch.object(sys.stdin, "isatty", return_value=True),
-                      patch.object(self.loader, "ensure", return_value=fixtures.FakeShellRefusal(reason)),
-                      patch.object(accounts, "resolve_program") as resolve, patch.object(os, "execvpe") as launch):
-                    self.assertEqual(self.run_exec(label), (1, "", reason + "\n"))
-                    resolve.assert_not_called()
-                    launch.assert_not_called()
 
     def test_missing_helper_fails_only_exec_with_a_clear_error(self) -> None:
         with (patch.object(accounts, "import_module", side_effect=ImportError("fixture helper missing")), patch.object(os, "execvpe") as launch,
@@ -439,7 +423,7 @@ subprocess.run(["claude", "--resume", "session"], env={"CLAUDE_CONFIG_DIR": str(
 
     def test_recorded_resume_exception_does_not_allow_selecting_a_groups_launch_account(self) -> None:
         source = '''\
-def _resume_parts(session: Session, prompt: str):
+def session_launch(identity: str):
     selected = accounts.role_account("unit")
     return selected
 '''
