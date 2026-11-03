@@ -23,13 +23,13 @@ class RegistryOverrideTests(unittest.TestCase):
     def test_plain_row_overrides_keep_other_default_assignments(self) -> None:
         text = fixture.registry_text({'assignments': {'direct': 'claude'}})
         self.assertIn('direct=claude\n', text)
-        self.assertIn('team_review=codex\n', text)
+        self.assertIn('design_roles=codex\n', text)
 
     def test_exact_assignment_rows_keep_the_complete_catalog_and_role_defaults(self) -> None:
         text = fixture.registry_text({'assignments': fixture.ExactRows({
-            'direct': 'codex', 'module_review': 'codex', 'removed': None})})
+            'direct': 'codex', 'cli': 'codex', 'removed': None})})
         self.assertEqual(text.partition('[assignments]\n')[2].partition('\n\n')[0],
-                         'direct=codex\nmodule_review=codex')
+                         'direct=codex\ncli=codex')
         self.assertIn('[direct.codex]\nimpl=gpt-test:high\n', text)
         self.assertIn('[codex.agents]\n', text)
         self.assertIn('[claude.agents]\n', text)
