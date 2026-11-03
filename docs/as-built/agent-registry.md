@@ -117,7 +117,12 @@ agent_exec.sh <task> <write|readonly> <working_dir> <prompt_file> <output_file> 
 Wrong arg count or a bad mode returns 2. A missing prompt file writes `Prompt not found: <path>` to the log file and returns 1. Otherwise it sources `agents_config.sh`, calls `agents_resolve <task>`, reads the prompt into a variable, and dispatches on family (internal entry point `agents_exec_main`):
 
 - **codex** — `codex exec <agents_codex_args> [extra] --ephemeral (--full-auto | --sandbox read-only) -C <working_dir> -o <output_file> "$PROMPT" > <log_file> 2>&1`.
-- **claude** — `claude --print (--dangerously-skip-permissions | --permission-mode plan) --settings '{"sandbox":{"enabled":false}}' --verbose --output-format stream-json <agents_claude_args> [extra] -- "$PROMPT"`, executed in a subshell as `( cd "$working_dir" && … > "$log_file" 2>&1 )` because the claude CLI has no `-C`. The streamed JSON log is what `heartbeat_watch.sh` narrates; afterwards `agents_claude_extract_result` (an inline `python3` heredoc) pulls the final `result` event's text into `<output_file>`, preserving the caller contract "output = final answer, log = full log". Claude's own exit code is returned.
+- **claude** — Each print launch sets `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` and sends the prompt through stdin.
+  The launcher uses plan permissions for readonly tasks and skips permissions for write tasks.
+  It retains the stream-json events in the log.
+  `scripts/agents/claude_result.py` writes the final answer to the output file.
+  An `is_error` result or an `errors` array writes `ERROR: <reason>` and returns exit 1.
+  Otherwise, the launcher returns Claude's exit code.
 
 `AGENT_EXEC_EXTRA_ARGS` is appended to the family CLI's arg list. `AGENT_EXEC_DRY_RUN=1` prints the fully assembled command — every argv token `printf '%q'`-quoted by `agents_exec_print_argv`, with the redirection suffix, and a `cd <working_dir> && ` prefix on the claude branch — then exits 0 without executing. `agent_exec` exports nothing; consumers that need provenance re-resolve themselves.
 
@@ -510,3 +515,8 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - **An owed resume after a completed turn starts at once.** The completed turn shows the model is serving, so a wait would only delay the worker's own work; only a capacity refusal earns one.
 
 Accepted Codex turns record `turn_model` and `turn_effort` in the roster for display only. Board worker rows and progress worker notes read these fields. Durable identity model fields remain compatibility data and do not choose a dispatch model; worker reuse is by role and availability. Every turn resolves its current shared role default or an explicit dispatch override.
+
+
+The simplify launch lock owner alone writes its report, status, and summary.
+The `review_status_simplify` file contains one atomic status line: `preparing`, `reviewing`, `reviewed`, or `error`.
+A rejected launch writes its reason to stderr and preserves the shared files.

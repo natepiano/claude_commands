@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import re
 
+from scripts.production import unit_names
+
 
 class Refusal(Exception):
     """An invalid request that must leave the production unchanged."""
@@ -45,3 +47,20 @@ def unit_table(lines: list[str]) -> list[dict[str, str]]:
     headings = unit_headings(lines)
     _, rows = unit_rows(lines)
     return [dict(zip(headings, row_cells(row), strict=False)) for row in rows]
+
+
+def unit_spellings(lines: list[str]) -> dict[str, str]:
+    """Return unique table spellings for display without selecting staff members."""
+    try:
+        rows = unit_table(lines)
+    except Refusal:
+        return {}
+    spellings: dict[str, set[str]] = {}
+    for cells in rows:
+        displayed = cell_value(cells.get("Unit", ""))
+        try:
+            name = unit_names.name(displayed)
+        except unit_names.BadName:
+            continue
+        spellings.setdefault(name, set()).add(displayed)
+    return {name: next(iter(values)) for name, values in spellings.items() if len(values) == 1}

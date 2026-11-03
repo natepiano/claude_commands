@@ -24,7 +24,7 @@ from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_showrunner, fake_unit_host, showrunners, staff
 from scripts.production.production_units import read_production
 from scripts.production.staff_test_support import (
-    isolated_staff_file, production_membership, showrunner_relationship, unit_membership,
+    isolated_staff_file, production_membership, showrunner_relationship, unit_membership, recorded_unit,
 )
 
 
@@ -203,12 +203,15 @@ class PhaseTableTests(unittest.TestCase):
             encoding="utf-8",
         )
         production_membership("show", *(row[0] for row in rows if not row[1].startswith("retired")))
+        for unit, plan, worktree in rows:
+            if not plan.startswith("retired"):
+                _ = recorded_unit("show", unit, worktree, path, plan=plan)
         return path
 
     def make_live_worktree(self, name: str) -> Path:
         worktree = self.root / name
         worktree.mkdir()
-        _ = (worktree / ".git").write_text("gitdir: test\n", encoding="utf-8")
+        _ = subprocess.run(["git", "init", "-b", "branch", str(worktree)], check=True, capture_output=True)
         return worktree
 
     def write_run_for_plan(

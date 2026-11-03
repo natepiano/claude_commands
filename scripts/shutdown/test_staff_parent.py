@@ -1,7 +1,7 @@
 """Unit restarts read the current staff edge, never saved parent fields."""
 from __future__ import annotations
 
-from scripts.production.staff_test_support import fixture_member
+from scripts.production.staff_test_support import fixture_member, recorded_showrunner
 
 import io
 import json
@@ -25,7 +25,7 @@ from test_restart import entry, unit, STOPPED
 class StaffParentTests(StaffTestCase):
     def saved_unit(self) -> shutdown_record.SessionShutdown:
         old = self.production("demo", "owner-unit")
-        parent = fixture_member("showrunner", name="demo")
+        parent = recorded_showrunner("demo", old)
         member = fixture_member("unit", name="owner", parent=parent.id,
                                 runtime_id="12c4a16a-68ac-49b0-88fe-000000000102")
         self.pane("w1:p1", session_id=member.id, environment={
@@ -38,7 +38,7 @@ class StaffParentTests(StaffTestCase):
     def test_restart_uses_current_staff_parent_after_transfer(self) -> None:
         saved = self.saved_unit()
         destination = self.production("other", "owner-unit")
-        parent = fixture_member("showrunner", name="other")
+        parent = recorded_showrunner("other", destination)
         member = staff.snapshot().by_path("demo/owner")
         assert member is not None
         _ = staff.move(member.id, parent.id)

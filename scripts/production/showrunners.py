@@ -36,6 +36,7 @@ from user_zone import user_zone_name  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 from sessions import SessionRecord, messaging_socket_exists  # noqa: E402
 from scripts.production import staff  # noqa: E402
+from scripts.shutdown import remote  # noqa: E402
 
 RULES = "Read the Nested showrunners rules in ~/.claude/commands/showrunner/produce.md."
 
@@ -104,6 +105,28 @@ class Timer(NamedTuple):
     target: str
     doc: Path
     zone: str
+
+
+@dataclass(frozen=True)
+class NoTimer:
+    reason: str
+
+
+def timer_for(row: staff.StaffRow, snapshot: staff.StaffSnapshot, *,
+              sources: Iterable[ShowrunnerSource] | None = None) -> Timer | NoTimer:
+    """Join a timer by its document and the recorded document owner."""
+    doc = row.doc
+    if not isinstance(doc, (staff.LiveDoc, staff.WrappedDoc)):
+        return NoTimer(f"{row.name}: production document is not recorded")
+    owner = snapshot.by_doc(doc.machine, doc.path)
+    if owner is None or owner.id != row.id or doc.machine != remote.local_machine():
+        return NoTimer(f"{row.name}: no local timer for the recorded document")
+    sources = sources if sources is not None else read_sources(unreadable=UnreadableTimerPolicy.RAISE)
+    matches = [source.timer for source in sources
+               if source.timer.doc == doc.path]
+    if len(matches) > 1:
+        raise staff.StaffUnreadable(f"{row.name}: several timers name {doc.path}")
+    return matches[0] if matches else NoTimer(f"{row.name}: no timer names {doc.path}")
 
 
 @dataclass(frozen=True)
