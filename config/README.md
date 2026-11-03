@@ -262,6 +262,16 @@ The AWS mapping permits `aws-build` records without activating the AWS target.
 Each exchange reads these settings again.
 Vault transfers use the same configured SSH connection timeout.
 
+`vault.lock_retries` sets the extra fast-forward tries after a busy vault index lock.
+The default is 5; the allowed whole numbers are 0 through 10.
+`vault.lock_retry_delay_s` sets the seconds between these tries.
+The default is 3; the allowed range is 0 through 5.
+Each vault transfer reads both settings again.
+The default retry delays add at most 15 seconds.
+The maximum retry delays add 50 seconds: ten retries at five seconds each.
+An exhausted retry returns the `vault_locked` cause.
+The outage state saves the error text in `vault_pull.json` as `outage.detail`.
+
 Each peer retains its own status in `sync-peers/<encoded-peer>.json`.
 `sync.json` retains the Mac status for existing readers.
 A failed peer does not prevent another peer's exchange.
