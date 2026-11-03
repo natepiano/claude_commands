@@ -426,7 +426,7 @@ Delivery failures, restarts, and failed ledger writes preserve the event and dup
 
 **Binds later work:** An interrupted slot prints one `aws_interrupted=` line after `mac_exit` and `mac_cleanup`, and exits with the child status.
 
-### Phase 11 — Prepare guarded deployment and the NixOS branch  · status: todo
+### Phase 11 — Prepare guarded deployment and the NixOS branch  · status: done
 **Depends on:** Phase 10
 
 #### Work Order

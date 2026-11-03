@@ -36,6 +36,32 @@ class InstanceObservation:
 
 
 @dataclass(frozen=True)
+class ComputeUnconfirmed:
+    """The resource request has no confirmed result."""
+
+
+@dataclass(frozen=True)
+class ComputeInstanceConfirmed:
+    at: int
+    instance_id: str
+
+
+@dataclass(frozen=True)
+class ComputeResourcesAbsent:
+    at: int
+
+
+@dataclass(frozen=True)
+class ComputeRequest:
+    at: int
+    stack: str
+    region: str
+    spot_max_usd_per_hour: Decimal
+    request_id: str = field(default_factory=lambda: uuid4().hex)
+    resolution: ComputeUnconfirmed | ComputeInstanceConfirmed | ComputeResourcesAbsent = ComputeUnconfirmed()
+
+
+@dataclass(frozen=True)
 class PriceSample:
     at: int
     usd_per_hour: Decimal
@@ -200,6 +226,7 @@ class LedgerEvidence:
     price_refresh_at: int = 0
     decision: dict[str, object] = field(default_factory=dict)
     charge_refresh_at: int = 0
+    compute_requests: list[ComputeRequest] = field(default_factory=list)
 
 
 class ObservationRejected(ValueError):
@@ -210,59 +237,79 @@ class LedgerUnavailable(ValueError):
     """Evidence cannot establish a safe spending decision."""
 
 
-def _mapping(value: object) -> dict[str, object]:
+def mapping(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
         raise LedgerUnavailable("expected an evidence record")
     return cast(dict[str, object], value)
 
 
-def _text(row: dict[str, object], key: str) -> str:
-    value = row[key]
+def text(row: dict[str, object], key: str) -> str:
+    value = row.get(key)
     if not isinstance(value, str) or not value:
         raise LedgerUnavailable(f"{key}: expected nonempty text")
     return value
 
 
 def instant(row: dict[str, object], key: str) -> int:
-    value = row[key]
+    value = row.get(key)
     if type(value) is not int or value < 0:
         raise LedgerUnavailable(f"{key}: expected nonnegative integer seconds")
     return value
 
 
-def _rows(row: dict[str, object], key: str) -> tuple[dict[str, object], ...]:
-    value = row[key]
+def rows(row: dict[str, object], key: str) -> tuple[dict[str, object], ...]:
+    value = row.get(key)
     if not isinstance(value, list):
         raise LedgerUnavailable(f"{key}: expected evidence records")
-    return tuple(_mapping(item) for item in cast(list[object], value))
+    return tuple(mapping(item) for item in cast(list[object], value))
 
 
 def _decode(row: dict[str, object]) -> LedgerEvidence:
     if row.get("version") != 1:
         raise LedgerUnavailable("unsupported ledger version")
     observations: list[InstanceObservation] = []
-    for record in _rows(row, "observations"):
-        state = _text(record, "state")
+    for record in rows(row, "observations"):
+        state = text(record, "state")
         if state not in ("pending", "running", "stopping", "stopped", "terminated", "unknown"):
             raise LedgerUnavailable("unknown instance state")
-        observations.append(InstanceObservation(instant(record, "at"), state, _text(record, "source")))
+        observations.append(InstanceObservation(instant(record, "at"), state, text(record, "source")))
     evidence = LedgerEvidence(
         observations,
-        [PriceSample(instant(r, "at"), money(_text(r, "usd_per_hour")), _text(r, "source")) for r in _rows(row, "prices")],
-        [ResourceInventory(instant(r, "at"), tuple(PricedResource(_text(p, "name"), money(_text(p, "usd_per_month")))
-                                                 for p in _rows(r, "resources")), _text(r, "source"))
-         for r in _rows(row, "inventories")],
+        [PriceSample(instant(r, "at"), money(text(r, "usd_per_hour")), text(r, "source")) for r in rows(row, "prices")],
+        [ResourceInventory(instant(r, "at"), tuple(PricedResource(text(p, "name"), money(text(p, "usd_per_month")))
+                                                 for p in rows(r, "resources")), text(r, "source"))
+         for r in rows(row, "inventories")],
         [CostReconciliation(instant(r, "at"), instant(r, "period_start"), instant(r, "period_end"),
-                            money(_text(r, "usd")), _text(r, "source"), money(str(r.get("query_usd", "0"))))
-         for r in _rows(row, "reconciliations")],
-        [LimitEvent(_text(r, "event_id"), instant(r, "at"), _text(r, "period"), money(_text(r, "estimate_usd")),
-                    money(_text(r, "limit_usd")), _text(r, "recipient"), instant(r, "timeout_s"),
+                            money(text(r, "usd")), text(r, "source"), money(str(r.get("query_usd", "0"))))
+         for r in rows(row, "reconciliations")],
+        [LimitEvent(text(r, "event_id"), instant(r, "at"), text(r, "period"), money(text(r, "estimate_usd")),
+                    money(text(r, "limit_usd")), text(r, "recipient"), instant(r, "timeout_s"),
                     DeliveryState(r.get("delivery", "pending")),
                     instant(r, "retry_after") if "retry_after" in r else 0,
-                    DeliveryOwner(_text(r, "owner")) if r.get("owner") else DeliveryUnowned())
-         for r in _rows(row, "events")],
-        instant(row, "price_refresh_at"), _mapping(row["decision"]),
+                    DeliveryOwner(text(r, "owner")) if r.get("owner") else DeliveryUnowned())
+         for r in rows(row, "events")],
+        instant(row, "price_refresh_at"), mapping(row["decision"]),
         instant(row, "charge_refresh_at") if "charge_refresh_at" in row else 0)
+    for record in rows(row, 'compute_requests') if 'compute_requests' in row else ():
+        resolution = mapping(record.get('resolution'))
+        outcome = text(resolution, 'outcome')
+        if outcome == 'unconfirmed':
+            resolved = ComputeUnconfirmed()
+        elif outcome == 'instance':
+            resolved = ComputeInstanceConfirmed(instant(resolution, 'at'), text(resolution, 'instance_id'))
+        elif outcome == 'absent':
+            resolved = ComputeResourcesAbsent(instant(resolution, 'at'))
+        else:
+            raise LedgerUnavailable('unknown compute request outcome')
+        request = ComputeRequest(instant(record, 'at'), text(record, 'stack'), text(record, 'region'),
+                                 money(text(record, 'spot_max_usd_per_hour')), text(record, 'request_id'), resolved)
+        if not isinstance(resolved, ComputeUnconfirmed) and resolved.at < request.at:
+            raise LedgerUnavailable('compute reconciliation precedes its request')
+        evidence.compute_requests.append(request)
+    if len({r.request_id for r in evidence.compute_requests}) != len(evidence.compute_requests):
+        raise LedgerUnavailable('duplicate compute request identity')
+    if sum(isinstance(r.resolution, ComputeUnconfirmed) for r in evidence.compute_requests) > 1:
+        raise LedgerUnavailable('multiple unconfirmed compute requests')
     for inventory in evidence.inventories:
         names = [resource.name for resource in inventory.resources]
         if not names or len(set(names)) != len(names):
@@ -302,6 +349,13 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
                     "owner": r.owner.token if isinstance(r.owner, DeliveryOwner) else ""} for r in state.events],
         "price_refresh_at": state.price_refresh_at, "decision": state.decision,
         "charge_refresh_at": state.charge_refresh_at,
+        "compute_requests": [
+            {'at': r.at, 'stack': r.stack, 'region': r.region, 'spot_max_usd_per_hour': str(r.spot_max_usd_per_hour),
+             'request_id': r.request_id,
+             'resolution': {'outcome': 'unconfirmed'} if isinstance(r.resolution, ComputeUnconfirmed) else
+             {'outcome': 'instance', 'at': r.resolution.at, 'instance_id': r.resolution.instance_id}
+             if isinstance(r.resolution, ComputeInstanceConfirmed) else {'outcome': 'absent', 'at': r.resolution.at}}
+            for r in state.compute_requests],
     }
 
 
@@ -406,6 +460,17 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
                                                  source, "instance", right - left))
     if observations and inventories[0].at < observations[0].at:
         fallback(inventories[0].at, observations[0].at)
+    for request in state.compute_requests:
+        if request.at > pricing_end:
+            raise LedgerUnavailable('compute request evidence is from the future')
+        start = max(request.at, window_start)
+        end = pricing_end if isinstance(request.resolution, ComputeUnconfirmed) else min(pricing_end, request.resolution.at)
+        if start >= end:
+            continue
+        rate = max(settings.fallback_usd_per_hour, request.spot_max_usd_per_hour)
+        for left, right in _days(start, end, settings.accounting_zone):
+            intervals.append(ChargedInterval(left, right, rate * Decimal(right - left)
+                                             / Decimal(3600), 'unconfirmed compute request', 'instance'))
     interval = settings.cost_explorer_interval_seconds
     origin = state.charge_refresh_at + interval if state.charge_refresh_at else inventories[0].at
     first_read = origin + max(0, (window_start - origin + interval - 1) // interval) * interval
@@ -445,7 +510,8 @@ def costs_from_evidence(state: LedgerEvidence, settings: SpendingSettings, now: 
     snapshot = LedgerEvidence(
         [r for r in state.observations if r.at <= pricing_end], [r for r in state.prices if r.at <= pricing_end],
         [r for r in state.inventories if r.at <= pricing_end], reconciliations,
-        charge_refresh_at=state.charge_refresh_at)
+        charge_refresh_at=state.charge_refresh_at,
+        compute_requests=[r for r in state.compute_requests if r.at <= pricing_end])
     return _charges(snapshot, settings, now, current_window=current_window, require_fresh=False,
                     window=window, pricing_end=pricing_end)
 
@@ -456,10 +522,10 @@ def period_cost(intervals: Sequence[ChargedInterval] | Iterator[ChargedInterval]
 
 
 def read_charge(path: Path) -> ChargeRead:
-    row = _mapping(cast(object, json.loads(path.read_text())))
-    reading = ChargeRead(_text(row, 'day'), instant(row, 'at'), instant(row, 'period_start'),
-                         instant(row, 'period_end'), money(_text(row, 'actual_usd')),
-                         money(_text(row, 'estimated_usd')), money(_text(row, 'query_usd')))
+    row = mapping(cast(object, json.loads(path.read_text())))
+    reading = ChargeRead(text(row, 'day'), instant(row, 'at'), instant(row, 'period_start'),
+                         instant(row, 'period_end'), money(text(row, 'actual_usd')),
+                         money(text(row, 'estimated_usd')), money(text(row, 'query_usd')))
     if reading.period_end <= reading.period_start or reading.period_end > reading.at:
         raise LedgerUnavailable('invalid charge reconciliation')
     return reading
@@ -499,7 +565,7 @@ def send_limit_event(event: LimitEvent) -> bool:
     return result.returncode == 0 and result.stdout.startswith(("SENT:", "SKIPPED:"))
 
 
-def _decision_record(decision: SpendingDecision) -> dict[str, object]:
+def decision_record(decision: SpendingDecision) -> dict[str, object]:
     evidence = decision.evidence
     record: dict[str, object] = {
         "at": decision.at, "purpose": evidence.purpose,
@@ -536,7 +602,7 @@ class CostLedger:
     def _read(self) -> LedgerEvidence:
         """Read atomically published evidence without creating files or acquiring locks."""
         try:
-            return _decode(_mapping(cast(object, json.loads(self.path.read_text()))))
+            return _decode(mapping(cast(object, json.loads(self.path.read_text()))))
         except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
             raise LedgerUnavailable(f"ledger evidence is unavailable: {error}") from error
 
@@ -562,14 +628,37 @@ class CostLedger:
         _ = _decode(document)
         write_text_atomic(self.path, json.dumps(document, sort_keys=True) + "\n")
 
-    def observe(self, observation: InstanceObservation) -> None:
+    def observe(self, observation: InstanceObservation, *, confirms_transition: bool = False) -> None:
         if observation.state == "unknown":
             raise ObservationRejected("unknown does not confirm an instance lifecycle state")
         with self._locked() as state:
-            if any(r.at == observation.at and r.state not in (observation.state, "unknown") for r in state.observations):
-                raise LedgerUnavailable("conflicting instance observations")
+            conflicts = [r for r in state.observations if r.at == observation.at and r.state not in (observation.state, "unknown")]
+            if conflicts:
+                if not confirms_transition:
+                    raise LedgerUnavailable("conflicting instance observations")
+                state.observations = [r for r in state.observations if r not in conflicts]
             if observation not in state.observations:
                 state.observations.append(observation)
+            self._save(state)
+
+    def pending_compute_requests(self) -> tuple[ComputeRequest, ...]:
+        if not self.path.exists():
+            return ()
+        return tuple(r for r in self.read_snapshot().compute_requests if isinstance(r.resolution, ComputeUnconfirmed))
+
+    def record_compute_request(self, request: ComputeRequest) -> None:
+        with self._locked() as state:
+            if any(isinstance(r.resolution, ComputeUnconfirmed) for r in state.compute_requests):
+                raise LedgerUnavailable('reconcile the outstanding compute request before another deployment')
+            state.compute_requests.append(request)
+            self._save(state)
+
+    def resolve_compute_request(self, request: ComputeRequest,
+                                resolution: ComputeInstanceConfirmed | ComputeResourcesAbsent) -> None:
+        with self._locked() as state:
+            if request not in state.compute_requests or not isinstance(request.resolution, ComputeUnconfirmed):
+                raise LedgerUnavailable('the compute request is no longer outstanding')
+            state.compute_requests[state.compute_requests.index(request)] = replace(request, resolution=resolution)
             self._save(state)
 
     def record_price(self, sample: PriceSample) -> None:
@@ -658,14 +747,18 @@ class CostLedger:
         with self._locked() as state:
             return _charges(state, settings, now)
 
-    def permission_for_decision(self, decision: SpendingDecision) -> AdmissionPermission:
+    def decision_is_current(self, decision: SpendingDecision) -> bool:
+        """Confirm that durable evidence contains this exact decision."""
         try:
             with self._locked() as state:
-                if state.decision != _decision_record(decision):
-                    return PermissionUnavailable(decision.at, 'current decision has no durable publication')
-                return decode_permission(state.decision)
-        except (OSError, ValueError) as error:
-            return PermissionUnavailable(decision.at, str(error))
+                return state.decision == decision_record(decision)
+        except (OSError, ValueError):
+            return False
+
+    def permission_for_decision(self, decision: SpendingDecision) -> AdmissionPermission:
+        if not self.decision_is_current(decision):
+            return PermissionUnavailable(decision.at, 'current decision has no durable publication')
+        return decode_permission(decision_record(decision))
 
     def _decide(self, state: LedgerEvidence, settings_path: Path,
                 purpose: SpendingPurpose, now: int) -> SpendingDecision:
@@ -746,7 +839,7 @@ class CostLedger:
             with self._locked() as state:
                 decision = self._decide(state, settings_path, purpose, now)
                 evidence = decision.evidence
-                state.decision = _decision_record(decision)
+                state.decision = decision_record(decision)
                 self._save(state)
         except (OSError, ValueError, ArithmeticError) as error:
             return SpendingUnavailable(now, str(error), evidence)
@@ -808,24 +901,24 @@ def permission_record(permission: AdmissionPermission) -> dict[str, object]:
 def decode_permission(value: object) -> AdmissionPermission:
     """Decode the ledger decision without inferring permission from absent costs."""
     try:
-        row = _mapping(value)
+        row = mapping(value)
         at = instant(row, 'at')
         if row.get('purpose') != 'admission':
             raise LedgerUnavailable('decision purpose is not admission')
         status = row.get('status')
         if status == 'unavailable':
-            return PermissionUnavailable(at, _text(row, 'reason'), row)
+            return PermissionUnavailable(at, text(row, 'reason'), row)
         if status == 'refused':
-            return PermissionRefused(at, _text(row, 'reason'), row)
+            return PermissionRefused(at, text(row, 'reason'), row)
         if status != 'allowed':
             raise LedgerUnavailable('unknown permission state')
-        limits = _rows(row, 'limits')
+        limits = rows(row, 'limits')
         if {r.get('key') for r in limits if r.get('origin') == 'live'} != {'daily_limit_usd', 'monthly_limit_usd'}:
             raise LedgerUnavailable('live spending limits are missing')
         _ = instant(row, 'inventory_at')
         _ = instant(row, 'observation_at')
         for key in ('daily_usd', 'monthly_usd', 'daily_limit_usd', 'monthly_limit_usd', 'reserve_usd'):
-            _ = money(_text(row, key))
+            _ = money(text(row, key))
         return PermissionAllowed(at, row)
     except (KeyError, TypeError, ValueError, ArithmeticError) as error:
         return PermissionUnavailable(0, f'invalid decision evidence: {error}')
