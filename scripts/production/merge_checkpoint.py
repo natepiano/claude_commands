@@ -460,8 +460,9 @@ def change_review_commits(request: MergeRequest) -> list[change_review.Commit]:
         raise Stop("change review", "failed", str(error), "the showrunner will inspect the failed command") from error
     if refused := change_review.missing(commits):
         raise Stop("change review", "held", "; ".join(refused),
-                   f"commit a checkpoint whose {change_review.TRAILER} lines describe the change and that names each "
-                   + f"listed commit in a `{change_review.TRAILER}-Covers: <hash>` line, push it, and send its hash")
+                   "commit a checkpoint (a plain commit, not a merge: the gate does not read merge commits) "
+                   + f"whose {change_review.TRAILER} lines describe the change and that names each "
+                   + f"listed commit in a `{change_review.COVERS}: <hash>` line, push it, and send its hash")
     report("change review", "ok", f"{len(commits)} unit commit(s) carry their {change_review.TRAILER} lines")
     return commits
 

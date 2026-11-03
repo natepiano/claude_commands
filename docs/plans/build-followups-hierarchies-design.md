@@ -601,7 +601,7 @@ Known record limits live at their sources: the older run files above lack comple
 
 ### Proposal: finish the chosen outcome before optional adjacent changes share its gate
 
-**Proposed, not started. Owner:** Hana's existing `hana` showrunner, with `widget-unit` as the first trial unit. The showrunner selects the next already-prioritized user-visible widget outcome with a concrete working example and its required ergonomics, look and correctness. Its director keeps that outcome and its required fixes together through the existing unit gate, trunk integration and an available working demo. A newly found change enters that checkpoint only if the chosen outcome needs it to pass acceptance or the user directs its inclusion in that checkpoint. Other changes keep their own later checkpoint and test result. Shared-file dependencies must be resolved before separating them; this is not permission to bypass a failing test or submit incomplete work.
+**Approved by the user 2026-11-01 (via sdlc), not started. Owner:** Hana's existing `hana` showrunner, with `widget-unit` as the first trial unit. The showrunner selects the next already-prioritized user-visible widget outcome with a concrete working example and its required ergonomics, look and correctness. Its director keeps that outcome and its required fixes together through the existing unit gate, trunk integration and an available working demo. A newly found change enters that checkpoint only if the chosen outcome needs it to pass acceptance or the user directs its inclusion in that checkpoint. Other changes keep their own later checkpoint and test result. Shared-file dependencies must be resolved before separating them; this is not permission to bypass a failing test or submit incomplete work.
 
 **What shrinks:** defer the unstarted palette-footer conversion in P, “Palette footer is one rich line,” which promises the same visible edges, gaps and colours. It is marked todo in the plan and has no matching checkpoint in the local Git history searched for this trace. Treating this representation change as optional for the trial is a proposed priority choice, not a claim that the user dropped it. Further discretionary adjacent polish and newly proposed features also start later in the selected unit until that outcome reaches trunk and a working demo. User orders and necessary regression fixes keep priority. Other units continue independent work. No further reporting or push-audit work is planned. The wait-holder trial above continues separately. There is no new allocator, required cost gate or fixed Hana share.
 
@@ -609,7 +609,14 @@ Known record limits live at their sources: the older run files above lack comple
 
 **Keep or roll back:** after that window, keep the trial only if a selected outcome reaches its agreed working example and the record supports shorter completion without omitted acceptance, new regressions or hidden deferred dependencies. Report the full selected set, not just successes. If separating adjacent work itself blocks a required fix, recombine it immediately. If the week shows only fewer repair labels, later optional work, or incomplete timing, make no speed claim and end the trial unless the user explicitly extends it. Restore the prior admission order; keep the records and fixes.
 
-**Question for the unit director to route through the showrunner:** May Hana try this outcome-first checkpoint rule for the measurement window above, with optional adjacent work deferred and the stated rollback rule?
+**Decision (user, 2026-11-01, via sdlc):** approved. The user noted that this data can be out of date, that the order is for the `hana` showrunner to adjust, and that no urgent demo sets a date. widget-unit stays on hold until the user restarts it through `hana`.
+
+**Agreed order (`hana` showrunner, 2026-11-01).** Phase numbers are those of `/home/natepiano/rust/widget-enhancements/docs/hana_diegetic/rich-text-plan.md` on that date:
+
+1. P34, "Every tooltip opens beside its target, closes on press, and shows on the Power switch in both states", goes to trunk and a working demo first. Its saved work, not yet reviewed, is `a155025b97` and local branch `wip/widget/p34` at `7758e77d01`.
+2. P36, "A rear control that looks live takes the pointer", comes next.
+3. P8 "Palette footer is one rich line", P9 "Typography and Parley wrapping", P10 "Palettes and Screen chrome use spans" and P11 "Info and status panels use spans" wait, unless P34 needs them.
+4. The other todo phases keep plan order. Multiword matching (plan line 610) is still marked todo, but checkpoint `65a0d49153` reached trunk through `680dbde040` and waits for review as C190. Do not schedule it again.
 
 ## Questions for the user
 

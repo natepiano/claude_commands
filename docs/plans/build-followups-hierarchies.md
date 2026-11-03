@@ -497,3 +497,50 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - `scripts/production/test_review_regime.py` — a second add keeps the first row byte for byte and exits 0 (was `test_the_same_unit_plan_and_phase_is_refused`).
 - `scripts/production/test_merge_checkpoint_history.py` — a merge, then a repair merge of the same phase with the real `review_regime.py` and a test `HOME`: `record: ok` with the kept line, one ledger row, two log lines; a rerun prints "checkpoint already recorded".
 - `scripts/production/test_merge_checkpoint.py` — a failing add after a first merge stops record and keeps the first log line; a retry records the repair once.
+
+### Phase 17 — The held-merge message says the covering commit cannot be a merge commit  · status: done
+
+#### Work Order
+
+**Goal:** When the merge gate holds a unit's checkpoint for a missing Change-Review line, its message says that the commit carrying the `Change-Review-Covers` line must be a plain commit, not a merge commit.
+
+**Spec:**
+- Source (sdlc showrunner, 2026-10-31, from natedev): the hold message tells the unit to name each listed commit in a `Change-Review-Covers: <hash>` line. `change_review.unit_commits` (`scripts/production/change_review.py:255`) reads with `git log --no-merges`, so a Covers line on a merge commit is never read. This cost verify-unit one failed merge.
+- `merge_checkpoint.change_review_commits` (`scripts/production/merge_checkpoint.py:461-464`): the `Stop("change review", "held", …)` next-step text becomes: `commit a checkpoint (a plain commit, not a merge: the gate does not read merge commits) whose Change-Review lines describe the change and that names each listed commit in a `Change-Review-Covers: <hash>` line, push it, and send its hash`. Build the trailer name from `change_review.TRAILER` as today. Keep the stage name, status and refused list as they are.
+- `scripts/production/change_review.py` module docstring (line 24, "A pushed checkpoint that missed its line is covered by a later one carrying the lines and `Change-Review-Covers: <hash>`"): add that the later one must be a plain commit, because merge commits are not read.
+- Do not change `unit_commits`, `missing` or what the gate reads. Only the text changes.
+
+**Files:**
+- `scripts/production/merge_checkpoint.py` — the held next-step text
+- `scripts/production/change_review.py` — the module docstring sentence
+- `scripts/production/test_merge_checkpoint_validation.py` — the existing held-before-merge test checks the plain-commit rule (review F001: no second gate run)
+- `docs/as-built/showrunner-automation.md` — the Covers sentence names a plain commit (review F004)
+
+**Workers:** 1 writer; the change is two strings and one test, so nothing splits.
+- `impl` — all three files
+
+**State:** none
+
+**Constraints from prior phases:** Phase 6d's `lands()` in `change_review.py` decides a verdict by its first word; leave it as is.
+
+Assertion-Change: scripts/production/test_merge_checkpoint_validation.py test_a_checkpoint_without_a_change_review_line_is_held_before_merge — `assertNotEqual(result.process.returncode, 0)` becomes `assertEqual(result.process.returncode, 1)` (stricter), and its `"Change-Review-Covers"` literal becomes `change_review.COVERS` (same value).
+
+**Acceptance gate:** `python3 -m unittest scripts.production.test_merge_checkpoint` and `python3 -m unittest scripts.production.test_change_review` pass from the worktree root; `basedpyright scripts/production/merge_checkpoint.py scripts/production/change_review.py scripts/production/test_merge_checkpoint.py` ends `0 errors, 0 warnings, 0 notes`.
+
+### Phase 18 — The change-review hook and the merge gate read one rule for merge commits  · status: todo
+
+#### Work Order
+
+**Goal:** A unit cannot put a Change-Review or Covers line on a merge commit. The hook refuses it at commit time, by the same rule the merge gate reads, so no line is accepted that the gate ignores.
+
+**Spec:**
+- Source: Phase 17 simplify review (F005, F006, F008), settled by the sdlc showrunner on 2026-11-03. sdlc: "Each phase now deletes more lines than it adds" (user: "everything is too complex").
+- One rule in `scripts/production/change_review.py` says that a merge commit carries no Change-Review or Covers lines. The hook (`scripts/hooks/pre-tool-use-change-review-gate.py`, `refusal`) and the merge gates read that one rule. Add no second check.
+- The hook knows a merge commit: a `git merge` command, or a `git commit` while `MERGE_HEAD` exists. Its refusal says: put the lines on a plain commit after the merge.
+- `change_review` owns the gate's next-step text (Phase 17's held message). `merge_checkpoint.py` and `scripts/production/merge_gate.py:1443` both import it; `merge_gate`'s refusal then names the next step.
+- Read-only check (F006): list the checkpoint merge commits on HEAD that carry a visible Change-Review line (31 found in review, for example `0d18aaa4c`, `d34684ce7`) and say for each one whether a plain commit also carries its lines. Send that list to sdlc before any row is added; the list is the user's. Add no row in this phase.
+- The phase deletes more lines than it adds.
+
+**Files:** `scripts/production/change_review.py`, `scripts/hooks/pre-tool-use-change-review-gate.py`, `scripts/production/merge_checkpoint.py`, `scripts/production/merge_gate.py`, and their tests. The exact list is set at phase start.
+
+**State:** none (the check is read-only).

@@ -20,9 +20,10 @@ the session (a terminal, a showrunner session, a unit session or any Claude sess
 `Change-Review: Panels keep their shields | In a natedev terminal, run `hana` | Each panel shows its
 shield`. A line with another number of parts, or an empty part, is refused. `Change-Review: none —
 <why nothing visible changes>` names a change the user cannot see. A checkpoint that changes only
-Markdown needs none. A pushed checkpoint that
-missed its line is covered by a later one carrying the lines and `Change-Review-Covers: <hash>`. The merge gate refuses a
-unit's checkpoint without one, then adds one row per visible line under the list's "## To review":
+Markdown needs none. A later checkpoint covers a pushed checkpoint that missed its line. It carries
+the lines and `Change-Review-Covers: <hash>`. The later checkpoint must be a plain commit because
+the merge gate does not read merge commits. The merge gate refuses a unit's checkpoint without its
+line, then adds one row per visible line under the list's "## To review":
 the next C number, the push date and the merged hash, the How to check cell `<how to try it> You
 see: <what you see>`, and "not yet" when the table has an "On the Mac build" column. `add` writes one
 row for a change no checkpoint line carries; `edit` rewrites one row still to review in place and keeps
@@ -89,6 +90,7 @@ from production_units import Refusal, cell_value, production_field, unit_table  
 from proposals_folder import owner_docs, scope_docs, slug_of  # noqa: E402
 
 TRAILER = "Change-Review"
+COVERS = f"{TRAILER}-Covers"
 LIST_HEADER = "- **Change review:**"
 SECTION = "## To review"
 REVIEWED = "## Reviewed"
@@ -105,7 +107,7 @@ CHECKED_FROM = 1792036800
 LANDED = "2026-10-15"
 _NONE = re.compile(r"^none\s*[—–-]+\s*(?P<why>\S.*)$")
 _LINE = re.compile(rf"^{TRAILER}:\s*(?P<value>.*)$", re.MULTILINE)
-_COVERS = re.compile(rf"^{TRAILER}-Covers:\s*(?P<sha>[0-9a-f]{{7,40}})\s*$", re.MULTILINE)
+_COVERS = re.compile(rf"^{COVERS}:\s*(?P<sha>[0-9a-f]{{7,40}})\s*$", re.MULTILINE)
 _NUMBER = re.compile(r"^\| C(\d+) \|", re.MULTILINE)
 _ROW = re.compile(r"^[A-Z]\d+$")
 _LANDS = re.compile(r"^\s*(?:(?:okay|ok)\s+)?(?:c\d+\s+)?(?:works|fine)\b", re.IGNORECASE)
