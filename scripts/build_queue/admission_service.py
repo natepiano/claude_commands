@@ -20,6 +20,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.build_queue import admission_protocol as wire
+from scripts.build_queue import queue_snapshot
 from scripts.build_queue.queue_view import reason_phrase
 from scripts.lint import memory_admit as gate
 from scripts.lint.build_shape import build_shape, recorded_build_shape
@@ -865,6 +866,13 @@ class AdmissionServer:
             self.next_pass = min(self.next_pass, self.override_reconnect_until.at)
         if starts:
             self.next_pass = self.clock.monotonic()
+        try:
+            ordered, priority = self._queue_order()
+            queue_snapshot.write_queue_snapshot(self.state_dir,
+                replace(inputs, ordered=ordered, recovery=self.recovery, override=self.override, priority=priority), policy)
+        except OSError:
+            # An old snapshot expires without changing the admission result.
+            pass
         return result
 
     def _effects(self, recovery: gate.RecoverySpacing, override: gate.OverrideKept | gate.OverrideEnded,

@@ -43,7 +43,8 @@ Design Phase 0 is done at `bc636f47`. Its queue replay selected `m7a.4xlarge` Sp
   - `scripts/direct/verify_mac_offload_test_support.py` — existing fake verify environment.
   - `scripts/lint/invoke.sh` — Linux memory admission and command execution.
   - `scripts/lint/memory_gate.sh` — `buildlog_wait_for_memory`, `LINT_QUEUE_LEAVE_HOOK` and status 75.
-  - `scripts/lint/memory_admit.py` — `remote_identity`, `git_identity`, `read_queue_snapshot`, `QueueInputs` and snapshot serialization.
+  - `scripts/lint/memory_admit.py` — `remote_identity`, `git_identity`, `QueueInputs` and snapshot serialization.
+  - `scripts/build_queue/queue_snapshot.py` — `read_queue_snapshot` and the shared snapshot type.
   - `scripts/lint/memory_test_support.py` — `fake_memory_readings` and `gate_isolation_environment`.
   - `scripts/lib/atomic_file.py` — `write_text_atomic` and `create_text_atomic`.
   - `scripts/lib/conf.py` — the sole configuration reader; validates live values and recovers usable committed values.

@@ -81,7 +81,12 @@ At the first start without `state.json`, the service imports the old admission f
 It imports live reservations, saved intents, waiter places, token handoffs, priority, head override, and recovery spacing.
 It writes state before it deletes imported files. Later starts import nothing.
 The old `.waiting`, `.reservation`, `.token-wait`, and `queue_priority.json` forms have no live writer.
-There is no admission lock or `queue.json` cache.
+There is no admission lock.
+After each pass, the service publishes `admission/queue.json` atomically through `scripts/build_queue/queue_snapshot.py`.
+The snapshot contains the pass readings, its policy, and the remaining waiters.
+The AWS controller reads this snapshot without a live queue request.
+It refuses a start when the snapshot is missing, stale, or incomplete.
+Queue views continue to use the service.
 
 ### Estimates and charges
 

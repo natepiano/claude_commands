@@ -26,11 +26,70 @@ from scripts.lib.user_zone import user_zone
 from scripts.message.roster import UnitLabels
 from scripts.lint.build_shape import build_shape
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service
-from scripts.build_queue import queue_view
+from scripts.build_queue import queue_snapshot, queue_view
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, only_admitted
 
 
 class ServiceTests(unittest.TestCase):
+    def test_each_pass_publishes_captured_readings_and_remaining_waiters(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            request = fixture.request()
+            _ = fixture.server.handle_request(request)
+            snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+            self.assertIsInstance(snapshot, queue_snapshot.QueueSnapshot)
+            assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+            inputs = fixture.server.last_inputs
+            assert isinstance(inputs, gate.QueueInputs)
+            self.assertEqual(snapshot.inputs.host, inputs.host)
+            self.assertEqual(snapshot.inputs.pressure, inputs.pressure)
+            self.assertEqual(snapshot.inputs.running, inputs.running)
+            self.assertEqual(snapshot.inputs.reservations, inputs.reservations)
+            self.assertEqual([row for _, row in snapshot.inputs.ordered],
+                             [waiting.row for waiting in fixture.server.waiters.values()])
+            self.assertEqual(snapshot.written_at, fixture.clock.now())
+            self.assertEqual(snapshot.policy, fixture.server.last_policy)
+            fixture.clock.advance(1)
+            fixture.free(60 * GIB)
+            counts = fixture.readings.counts.copy()
+            _ = fixture.server.run_pass()
+            snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+            assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+            self.assertEqual(snapshot.written_at, fixture.clock.now())
+            self.assertEqual(snapshot.inputs.ordered, [])
+            self.assertIn(request.episode, fixture.server.reservations)
+            self.assertEqual(fixture.readings.counts["host"] - counts["host"], 1)
+            self.assertEqual(fixture.readings.counts["pressure"] - counts["pressure"], 1)
+            self.assertEqual(fixture.readings.counts["compilers"] - counts["compilers"], 1)
+
+    def test_snapshot_replacement_failure_keeps_the_last_complete_snapshot(self) -> None:
+        with AdmissionFixture() as fixture:
+            _ = fixture.server.run_pass()
+            previous = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+            inputs = fixture.server.last_inputs
+            assert isinstance(inputs, gate.QueueInputs)
+            with mock.patch.object(os, "replace", side_effect=OSError("snapshot unavailable")):
+                with self.assertRaises(OSError):
+                    queue_snapshot.write_queue_snapshot(fixture.state_dir, replace(inputs, now=inputs.now + 1),
+                                                        fixture.server.last_policy)
+            self.assertEqual(queue_snapshot.read_queue_snapshot(fixture.state_dir), previous)
+            self.assertFalse((fixture.state_dir / "queue.json.tmp").exists())
+            with mock.patch.object(queue_snapshot, "write_queue_snapshot", side_effect=OSError("snapshot unavailable")):
+                _ = fixture.server.run_pass()
+            self.assertEqual(queue_snapshot.read_queue_snapshot(fixture.state_dir), previous)
+
+    def test_snapshot_accepts_unowned_memory_without_a_reservation(self) -> None:
+        with AdmissionFixture() as fixture:
+            unowned = fixture.root / "builds.slice/unowned.scope"
+            unowned.mkdir(parents=True)
+            _ = (unowned / "memory.current").write_text(str(GIB))
+            _ = (unowned / "cgroup.procs").write_text("")
+            _ = fixture.server.run_pass()
+            snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+            assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+            self.assertEqual(snapshot.inputs, fixture.server.last_inputs)
+            self.assertTrue(any(isinstance(step.measured, gate.UnownedSliceMemory) for step in snapshot.inputs.running))
+
     def test_unreadable_owner_refuses_without_waiter_or_reservation(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request()
