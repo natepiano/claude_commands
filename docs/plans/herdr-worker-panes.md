@@ -1700,7 +1700,7 @@ Phases 7 and 10-12 consume this operation instead of adding close logic.
 Each test preserves the director and sibling panes and leaves one retained replacement launch.
 Test failed close and interrupted retirement, then rerun without another launch.
 
-### Phase 6a — A darwin reader behind `startup_processes`  · status: todo
+### Phase 6a — A darwin reader behind `startup_processes`  · status: done
 
 **Owner:** pane track rule: herdr-unit or models-unit, whichever is free first (sdlc, 2026-11-02).
 

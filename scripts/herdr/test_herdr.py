@@ -282,6 +282,8 @@ REAL_SUBMIT_OPENING_PROMPT = herdr.Herdr.submit_opening_prompt
 REAL_LOAD_FACTOR = herdr.load_factor
 PROCESS_SESSIONS = herdr._process_sessions  # pyright: ignore[reportPrivateUsage]
 REQUIRE_SHARED = herdr._require_shared  # pyright: ignore[reportPrivateUsage]
+STARTUP_PROCESSES = herdr._startup_processes  # pyright: ignore[reportPrivateUsage]
+STARTUP_PROCESS_READER = herdr._startup_process_reader  # pyright: ignore[reportPrivateUsage]
 
 
 @final
@@ -1706,6 +1708,195 @@ class HerdrTests(unittest.TestCase):
             commands.append(f"{pid} {command}")
         self.configure(["-U", str(os.getuid()), "-o", "pid=,ppid=,uid=,comm="], "\n".join(executables))
         self.configure(["-U", str(os.getuid()), "-o", "pid=,command="], "\n".join(commands))
+
+    def darwin_startup_table(self, text: str, *, started: str = "Tue Nov  3 08:00:00 2026") -> None:
+        """Supply process facts without an environment or a proc tree."""
+        self.darwin_process_table(text)
+        states: list[str] = []
+        for line in text.splitlines():
+            pid, parent, _uid, _command = line.split(maxsplit=3)
+            states.append(f"{pid} {parent} S {started}")
+        self.configure(["-axo", "pid=,ppid=,state=,lstart="], "\n".join(states))
+        self.configure(["-o", "tpgid=", "-p", "10"], "10\n")
+
+    def darwin_startup_pane(self, arguments: list[str]) -> None:
+        """Use the existing Mac command fake and reject unexpected process reads."""
+        self.darwin()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PROC": str(self.root / "missing-proc")})))
+        self.responses["default"] = {"stdout": "", "code": 1, "stderr": "unexpected process query"}
+        self.configure_herdr(["pane", "process-info", "--pane", "pane-1"], self.startup_observation(arguments))
+
+    def test_darwin_startup_at_shell_needs_no_proc_or_environment(self) -> None:
+        self.darwin_startup_pane(["zsh"])
+        self.darwin_startup_table(f"10 1 {os.getuid()} /bin/zsh\n")
+        self.assertEqual(self.herdr.startup_processes("pane-1", "claude", 1),
+                         herdr.PaneStartupObservation(herdr.PaneShell(10), herdr.PaneAtShell()))
+        self.assertEqual(STARTUP_PROCESSES(herdr.PaneShell(10), "claude", set()), herdr.PaneAtShell())
+        self.assertFalse(any("eww" in command for command in self.commands()))
+
+    def test_darwin_startup_reports_foreground_work(self) -> None:
+        self.darwin_startup_pane(["/usr/bin/vim", "plan.md"])
+        self.darwin_startup_table(f"10 1 {os.getuid()} /bin/zsh\n11 10 {os.getuid()} /usr/bin/vim plan.md\n")
+        self.configure(["-o", "tpgid=", "-p", "10"], "11\n")
+        self.assertEqual(self.herdr.startup_processes("pane-1", "claude", 1).activity,
+                         herdr.PaneRunning(("/usr/bin/vim",)))
+        self.assertEqual(STARTUP_PROCESSES(herdr.PaneShell(10), "claude", set()),
+                         herdr.PaneRunning(("/usr/bin/vim",)))
+
+    def test_darwin_startup_identifies_native_and_node_agents_under_the_shell(self) -> None:
+        self.darwin_startup_pane(["zsh"])
+        for kind, arguments in (("claude", ["/opt/bin/claude", "--resume", "thread"]),
+                                ("codex", ["/opt/bin/codex", "resume", "thread"]),
+                                ("claude", ["/opt/bin/node", "/opt/lib/@anthropic-ai/claude-code/cli.js"]),
+                                ("codex", ["/opt/bin/node", "/opt/lib/@openai/codex/bin/codex.js"])):
+            with self.subTest(kind=kind, arguments=arguments):
+                self.configure_herdr(["pane", "process-info", "--pane", "pane-1"], self.startup_observation(arguments))
+                self.darwin_startup_table(f"10 1 {os.getuid()} /bin/zsh\n11 10 {os.getuid()} {shlex.join(arguments)}\n")
+                observation = self.herdr.startup_processes("pane-1", kind, 1)
+                self.assertIsInstance(observation.activity, herdr.AgentProcessPresent)
+                assert isinstance(observation.activity, herdr.AgentProcessPresent)
+                self.assertEqual(len(observation.activity.identities), 1)
+                identity = observation.activity.identities[0]
+                self.assertEqual(identity.pid, 11)
+                self.assertIsInstance(identity.start_ticks, int)
+                self.assertGreater(identity.start_ticks, 0)
+                tracked: set[herdr.AgentProcessIdentity] = set()
+                self.assertEqual(STARTUP_PROCESSES(observation.shell, kind, tracked), observation.activity)
+                self.assertEqual(tracked, {identity})
+        self.assertFalse(any("eww" in command for command in self.commands()))
+
+    def test_darwin_startup_retains_exec_and_parent_changes_but_drops_reused_pids(self) -> None:
+        self.darwin_startup_pane(["zsh"])
+        shell = f"10 1 {os.getuid()} /bin/zsh\n"
+        self.darwin_startup_table(shell + f"11 10 {os.getuid()} /opt/bin/claude\n")
+        tracked: set[herdr.AgentProcessIdentity] = set()
+        first = STARTUP_PROCESSES(herdr.PaneShell(10), "claude", tracked)
+        self.assertIsInstance(first, herdr.AgentProcessPresent)
+        assert isinstance(first, herdr.AgentProcessPresent)
+        self.assertEqual({identity.pid for identity in first.identities}, {11})
+        self.darwin_startup_table(shell + f"11 1 {os.getuid()} /opt/bin/runtime\n")
+        self.assertEqual(STARTUP_PROCESSES(herdr.PaneShell(10), "claude", tracked), first)
+        self.darwin_startup_table(shell + f"11 1 {os.getuid()} /opt/bin/runtime\n",
+                                  started="Tue Nov  3 08:00:01 2026")
+        self.assertEqual(STARTUP_PROCESSES(herdr.PaneShell(10), "claude", tracked), herdr.PaneAtShell())
+        self.assertEqual(tracked, set())
+
+    def test_darwin_startup_discards_a_process_that_exits_during_the_walk(self) -> None:
+        self.darwin_startup_pane(["zsh"])
+        shell = f"10 1 {os.getuid()} /bin/zsh\n"
+        self.darwin_startup_table(shell + "11 10 0 /usr/bin/sudo\n")
+        self.darwin_process_table(shell)
+        self.configure(["-o", "command=", "-p", "11"], code=1)
+        with patch.object(os, "kill", side_effect=ProcessLookupError):
+            self.assertEqual(STARTUP_PROCESSES(herdr.PaneShell(10), "claude", set()), herdr.PaneAtShell())
+        self.assertIn(["-o", "command=", "-p", "11"], self.commands())
+
+    def test_darwin_startup_keeps_a_child_from_the_same_process_snapshot(self) -> None:
+        self.darwin_startup_pane(["zsh"])
+        self.darwin_startup_table(f"10 1 {os.getuid()} /bin/zsh\n11 10 {os.getuid()} /opt/bin/claude\n")
+        # Earlier process tables cannot describe a child that starts later.
+        self.configure(["-axo", "pid=,state=,lstart="], "10 S Tue Nov  3 08:00:00 2026\n")
+        self.configure(["-axo", "pid=,ppid="], "10 1\n11 10\n")
+        tracked: set[herdr.AgentProcessIdentity] = set()
+        activity = STARTUP_PROCESSES(herdr.PaneShell(10), "claude", tracked)
+        self.assertIsInstance(activity, herdr.AgentProcessPresent)
+        assert isinstance(activity, herdr.AgentProcessPresent)
+        self.assertEqual({identity.pid for identity in activity.identities}, {11})
+        self.assertEqual(self.commands().count(["-axo", "pid=,ppid=,state=,lstart="]), 1)
+        self.assertNotIn(["-axo", "pid=,ppid="], self.commands())
+
+    def test_darwin_startup_reports_another_users_foreground_command(self) -> None:
+        self.darwin_startup_pane(["zsh"])
+        shell = f"10 1 {os.getuid()} /bin/zsh\n"
+        self.darwin_startup_table(shell + "11 10 0 /usr/bin/sudo /usr/bin/vim plan.md\n")
+        self.darwin_process_table(shell)
+        self.configure(["-o", "command=", "-p", "11"], "/usr/bin/sudo /usr/bin/vim plan.md\n")
+        self.configure(["-o", "tpgid=", "-p", "10"], "11\n")
+        self.assertEqual(STARTUP_PROCESSES(herdr.PaneShell(10), "claude", set()),
+                         herdr.PaneRunning(("/usr/bin/sudo",)))
+        self.assertIn(["-o", "command=", "-p", "11"], self.commands())
+
+    def test_darwin_startup_keeps_agent_presence_when_its_pid_is_gone_or_missing(self) -> None:
+        self.darwin_startup_pane(["claude"])
+        self.darwin_startup_table(f"10 1 {os.getuid()} /bin/zsh\n")
+        self.assertEqual(self.herdr.startup_processes("pane-1", "claude", 1).activity,
+                         herdr.AgentProcessPresent(()))
+        reply = self.startup_observation(["claude"]).replace('"pid": 11, ', "")
+        self.configure_herdr(["pane", "process-info", "--pane", "pane-1"], reply)
+        self.assertEqual(self.herdr.startup_processes("pane-1", "claude", 1).activity,
+                         herdr.AgentProcessPresent(()))
+
+    def test_darwin_startup_passes_the_callers_timeout_to_each_process_read(self) -> None:
+        self.darwin_startup_pane(["claude"])
+        shell = f"10 1 {os.getuid()} /bin/zsh\n"
+        self.darwin_startup_table(shell + f"11 10 {os.getuid()} /opt/bin/claude\n12 10 0 /usr/bin/sudo\n")
+        self.darwin_process_table(shell + f"11 10 {os.getuid()} /opt/bin/claude\n")
+        self.configure(["-o", "command=", "-p", "12"], "/usr/bin/sudo /usr/bin/vim plan.md\n")
+        run_program = herdr.run_program
+        timeouts: list[float] = []
+
+        def read(argv: list[str], timeout: float = 10.0, *,
+                 environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            if argv[1:3] != ["--session", "fixture"]:
+                timeouts.append(timeout)
+            return run_program(argv, timeout=timeout, environment=environment)
+
+        with patch.object(herdr, "run_program", read):
+            activity = self.herdr.startup_processes("pane-1", "claude", 0.75).activity
+            self.assertIsInstance(activity, herdr.AgentProcessPresent)
+            reader = STARTUP_PROCESS_READER(0.75)
+            self.assertEqual(reader.arguments(11), ["/opt/bin/claude"])
+            self.assertEqual(reader.arguments(12), ["/usr/bin/sudo", "/usr/bin/vim", "plan.md"])
+            self.assertEqual(reader.foreground(10), 10)
+        self.assertEqual(timeouts, [0.75] * 6)
+
+    def test_darwin_startup_reads_no_process_snapshot_without_an_agent_pid(self) -> None:
+        self.darwin_startup_pane(["zsh"])
+        self.assertEqual(self.herdr.startup_processes("pane-1", "claude", 1).activity, herdr.PaneAtShell())
+        reply = self.startup_observation(["claude"]).replace('"pid": 11, ', "")
+        self.configure_herdr(["pane", "process-info", "--pane", "pane-1"], reply)
+        self.assertEqual(self.herdr.startup_processes("pane-1", "claude", 1).activity,
+                         herdr.AgentProcessPresent(()))
+        self.assertEqual(self.commands(), [["--session", "fixture", "pane", "process-info", "--pane", "pane-1"]] * 2)
+
+    def test_linux_startup_keeps_children_read_before_a_missing_thread_list_but_not_after(self) -> None:
+        self.startup_process(10, ["zsh"])
+        self.startup_process(11, ["claude"])
+        tasks = self.proc / "10" / "task"
+        first = tasks / "1"
+        _ = (tasks / "10").rename(first)
+        second = tasks / "2"
+        second.mkdir()
+        (first / "children").unlink()
+        iterdir = Path.iterdir
+
+        def threads(path: Path) -> Generator[Path]:
+            if path == tasks:
+                yield from order
+            else:
+                yield from iterdir(path)
+
+        for child_thread in (first, second):
+            child_list = child_thread / "children"
+            _ = child_list.write_text("11")
+            expected = (herdr.AgentProcessPresent((herdr.AgentProcessIdentity(11, 1100),))
+                        if child_thread == first else herdr.PaneProcessesUnreadable())
+            for order in ([first, second], [second, first]):
+                with self.subTest(child_thread=child_thread.name, threads=order), patch.object(Path, "iterdir", threads):
+                    self.assertEqual(STARTUP_PROCESSES(herdr.PaneShell(10), "claude", set()), expected)
+            child_list.unlink()
+
+    def test_darwin_startup_reports_failed_ps_as_unreadable(self) -> None:
+        self.darwin_startup_pane(["/usr/bin/vim", "plan.md"])
+        for query in (["-axo", "pid=,ppid=,state=,lstart="],
+                      ["-U", str(os.getuid()), "-o", "pid=,ppid=,uid=,comm="],
+                      ["-U", str(os.getuid()), "-o", "pid=,command="],
+                      ["-o", "tpgid=", "-p", "10"]):
+            with self.subTest(query=query):
+                self.darwin_startup_table(f"10 1 {os.getuid()} /bin/zsh\n11 10 {os.getuid()} /usr/bin/vim plan.md\n")
+                self.configure(query, code=1, stderr="process table denied")
+                self.assertEqual(STARTUP_PROCESSES(herdr.PaneShell(10), "claude", set()),
+                                 herdr.PaneProcessesUnreadable())
 
     def run_fake(self, argv: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
         """Replay the command fake in process while Popen models the server child."""
