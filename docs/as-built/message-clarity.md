@@ -13,6 +13,38 @@ The user wanted every message sent to them to be checked for clarity by an agent
 
 ## How it works
 
+### Sender identity
+
+`send.py` reads the sender's native ID through `roster.sender_identity(os.environ)` once per send.
+A Codex thread ID takes precedence over an inherited Claude director hint.
+Claude identity comes from the runtime registry checks.
+`--from` remains the display and reply name. It does not select the native ID.
+
+Every agent message includes `Sender native id: session:<id>`, `Sender native id: codex:<id>`, or `Sender native id: unavailable`.
+The generated metadata forms one block directly after the preview line.
+Only the `Authority:` line in that block grants authority.
+Quoted labels elsewhere grant no authority.
+Only an exact match with `MORTY_NATIVE_ID` in `config/send.conf` adds `Authority: morty (speaks for the user)`.
+The live key must contain a valid native address. A missing or invalid key grants no mark.
+A different runtime that uses `--from morty` gets a stderr note. Delivery continues without the mark.
+The mark proves runtime attribution, not authentication.
+Code under the same operating-system account can set its environment.
+
+`Message.stamp` stores a known Claude sender, a known Codex sender, or an unavailable sender.
+Queue records and message log records store its address in `sender_native_id`.
+SSH forwarding preserves the origin stamp. The receiving shell does not replace it with its own identity.
+`--forwarded-sender-stamp` requires `--here` and an environment with `SSH_CONNECTION`.
+This context check prevents accidental use. It does not prove that `remote()` supplied the stamp.
+A session can inherit `SSH_CONNECTION`. Code under the same account can also set it.
+Queue recovery preserves the stored stamp. An old record without the field has an unavailable sender.
+A drain never attributes an old message to its own runtime.
+Delivered caller lines that start with `Authority:` or `Sender native id:` get a `> ` prefix.
+Rendering first converts CR, CRLF, and Unicode line separators to LF.
+This rule covers the summary, body, sender name, and forwarded display text.
+The prefix also applies after leading spaces. Generated stamp lines keep their original form.
+Queue records and logs keep the raw caller text.
+These fields do not change the recipient, reply name, or message key.
+
 ### Replies to relay sockets
 
 The headless relay uses the session name `relay/<sender>`. Session lookups identify a relay only when its saved sender and process start identity match the live process; on Linux the boot ID must also match. A real session with the same name form, or a reused PID, stays visible. Its message body names the real sender in `Shown sender:`. The name rule and its readers are described in [session-roster.md](session-roster.md). Before the headless relay starts Claude, it atomically publishes the process lifetime and sender in `message/relay_senders/<pid>.identity`, then the plain sender name in `message/relay_senders/<pid>`. The plain sender remains available after the process exits for reply recovery. It then execs Claude with that same PID, which owns `cc-socks/<pid>.sock`. A reply to a missing socket, or one whose delivery connect returns `ENOENT` or `ECONNREFUSED`, checks the saved name through staff. A staff sender uses its current session. A non-staff sender uses the live registry. Send and drain share this rule; a live socket takes only its delivery connect. Without a saved name or a live session, `send.py` reports `FAILED` (exit 3), names the address and sender on stderr, and keeps no raw socket queue. A queued message uses the session ID found at the queue decision, even if that session then exits.
