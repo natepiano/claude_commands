@@ -1,0 +1,288 @@
+diff --git a/configuration.nix b/configuration.nix
+index c75eac6..a45978e 100644
+--- a/configuration.nix
++++ b/configuration.nix
+@@ -67,6 +67,7 @@
+     ./modules/linux/herdr.nix
+     ./modules/linux/config-overview.nix
+     ./modules/linux/buildlog.nix
++    ./modules/linux/aws-build.nix
+     ./modules/linux/usage-collect.nix
+     ./modules/linux/disk-floor.nix
+     ./modules/linux/home.nix
+diff --git a/flake.nix b/flake.nix
+index c9795df..f49d57f 100644
+--- a/flake.nix
++++ b/flake.nix
+@@ -75,6 +75,15 @@
+         modules = [ ./configuration.nix ];
+       };
+ 
++      nixosConfigurations.aws-build = nixpkgs.lib.nixosSystem {
++        system = "x86_64-linux";
++        specialArgs = {
++          inherit inputs;
++          username = "natepiano";
++        };
++        modules = [ ./hosts/aws-build.nix ];
++      };
++
+       # The Mac. The platform comes from nixpkgs.hostPlatform in darwin.nix;
+       # the account there is natemccoy, so every shared module writes its
+       # home-manager block for that user instead.
+diff --git a/hosts/aws-bootstrap.sh.in b/hosts/aws-bootstrap.sh.in
+new file mode 100644
+index 0000000..75e61fe
+--- /dev/null
++++ b/hosts/aws-bootstrap.sh.in
+@@ -0,0 +1,46 @@
++#!/usr/bin/env bash
++# The user deploys the rendered public file through CloudFormation.
++set -euo pipefail
++
++case "${AWS_BUILD_DATA_VOLUME_ID-}" in
++  vol-[0-9a-f]*) ;;
++  *) echo 'The bootstrap has no data volume identity.' >&2; exit 1 ;;
++esac
++install -d -m 0755 /var/lib/aws-build
++if test -f /var/lib/aws-build/data-volume-id; then
++  test "$(cat /var/lib/aws-build/data-volume-id)" = "$AWS_BUILD_DATA_VOLUME_ID"
++fi
++printf '%s\n' "$AWS_BUILD_DATA_VOLUME_ID" > /var/lib/aws-build/data-volume-id
++if test -f /var/lib/aws-build/bootstrap-complete; then
++  exit 0
++fi
++
++# Bound the first boot before package installation or configuration evaluation.
++if test "$(systemctl show --property=LoadState --value aws-build-first-boot-stop.timer)" = not-found; then
++  systemd-run --unit=aws-build-first-boot-stop --on-active=@IDLE_STOP_SECONDS@s \
++    /run/current-system/sw/bin/systemctl poweroff
++fi
++
++cat > /var/lib/aws-build/bootstrap.nix <<'NIX'
++{ pkgs, ... }:
++let
++  source = pkgs.fetchzip {
++    url = @SCRIPTS_SOURCE_URL_JSON@;
++    hash = @SCRIPTS_SOURCE_SHA256_JSON@;
++  };
++in
++{
++  imports = [ ((@INPUT@) {
++    bootstrap = true;
++    installation = {
++      inherit source;
++      scriptCommit = @SCRIPTS_SOURCE_COMMIT_JSON@;
++      remoteSettings = @REMOTE_SETTINGS_JSON@;
++      existingVolume = @EXISTING_DATA_VOLUME_JSON@;
++      volumeWaitSeconds = @DATA_VOLUME_WAIT_SECONDS@;
++    };
++  }) ];
++}
++NIX
++nixos-rebuild switch -I nixos-config=/var/lib/aws-build/bootstrap.nix
++touch /var/lib/aws-build/bootstrap-complete
+diff --git a/hosts/aws-build-base.nix b/hosts/aws-build-base.nix
+new file mode 100644
+index 0000000..0ea6bb1
+--- /dev/null
++++ b/hosts/aws-build-base.nix
+@@ -0,0 +1,144 @@
++# Share the volume checks and lifecycle service across both installation stages.
++{ bootstrap ? false, installation ? {}, username ? "natepiano" }:
++{ lib, pkgs, modulesPath, ... }:
++let
++  home = "/home/${username}";
++  scripts = "${home}/.claude";
++  existingVolume = if bootstrap then installation.existingVolume else "";
++  inherit (installation) source scriptCommit remoteSettings;
++in
++{
++  imports = [
++    "${modulesPath}/virtualisation/amazon-image.nix"
++    ../modules/linux/tailscale.nix
++  ];
++  networking.hostName = "aws-build";
++  nixpkgs.hostPlatform = "x86_64-linux";
++  system.stateVersion = "26.05";
++  time.timeZone = "UTC";
++  services.openssh.enable = lib.mkForce false;
++  services.amazon-ssm-agent.enable = true;
++  networking.firewall.allowedTCPPorts = lib.mkForce [];
++  nix.settings.experimental-features = [ "nix-command" "flakes" ];
++  environment.systemPackages = with pkgs; [
++    python313 git rsync bash coreutils
++  ];
++  environment.etc."aws-build/remote.conf".source = "/var/lib/aws-build/remote.conf";
++  users.users.${username} = {
++    isNormalUser = true;
++    inherit home;
++    createHome = false;
++    extraGroups = [ "wheel" ];
++  };
++  fileSystems."/home" = {
++    device = "/dev/disk/by-label/aws-home";
++    fsType = "ext4";
++    options = [ "nofail" ];
++  };
++  systemd.services.aws-build-volume = {
++    requiredBy = [ "home.mount" ];
++    before = [ "home.mount" ];
++    path = with pkgs; [ coreutils util-linux e2fsprogs ];
++    serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
++    script = ''
++      set -euo pipefail
++      expected=$(cat /var/lib/aws-build/data-volume-id)
++      serial_id=$(printf '%s' "$expected" | tr -d '-')
++      volume_path="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$serial_id"
++      ${pkgs.systemd}/bin/udevadm wait ${lib.optionalString bootstrap "--timeout=${toString installation.volumeWaitSeconds}"} "$volume_path"
++      device=$(readlink -f "$volume_path")
++      test -b "$device"
++      serial=$(lsblk -dn -o SERIAL "$device" | tr -d '[:space:]-')
++      test "$serial" = "$serial_id"
++      test -z "$(lsblk -nr -o MOUNTPOINTS "$device" | tr -d '[:space:]')"
++      if ${if bootstrap then "false" else "true"}; then
++        test "$(blkid -s TYPE -o value "$device")" = ext4
++        test "$(blkid -s LABEL -o value "$device")" = aws-home
++      elif test -n ${lib.escapeShellArg existingVolume}; then
++        test "$expected" = ${lib.escapeShellArg existingVolume}
++        test "$(blkid -s TYPE -o value "$device")" = ext4
++        test "$(blkid -s LABEL -o value "$device")" = aws-home
++      elif test "$(blkid -s TYPE -o value "$device" || true)" = ext4 &&
++           test "$(blkid -s LABEL -o value "$device")" = aws-home; then
++        # A repeated bootstrap preserves the existing filesystem.
++        :
++      else
++        test -z "$(wipefs --no-act --noheadings --output TYPE "$device")"
++        test "$(lsblk -nr -o TYPE "$device" | wc -l)" -eq 1
++        mkfs.ext4 -L aws-home "$device"
++      fi
++    '';
++  };
++  systemd.services.aws-build-home = {
++    before = [ "aws-build-remote.service" ];
++    after = [ "home.mount" ];
++    requires = [ "home.mount" ];
++    unitConfig.RequiresMountsFor = "/home";
++    serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
++    script = ''
++      ${pkgs.util-linux}/bin/mountpoint -q /home
++      ${pkgs.coreutils}/bin/install -d -m 0700 -o ${username} -g users ${home}
++      ${pkgs.coreutils}/bin/install -d -m 0755 /var/lib/aws-build
++      if test -f /var/lib/aws-build/remote.conf; then
++        ${pkgs.coreutils}/bin/chmod 0644 /var/lib/aws-build/remote.conf
++      fi
++    '';
++  };
++  systemd.services.aws-build-install = lib.mkIf bootstrap {
++    wants = [ "network-online.target" ];
++    unitConfig.RequiresMountsFor = "/home";
++    requires = [ "home.mount" ];
++    after = [ "home.mount" "network-online.target" ];
++    before = [ "aws-build-remote.service" ];
++    path = with pkgs; [ python313 coreutils ];
++    serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
++    script = ''
++      set -euo pipefail
++      ${pkgs.util-linux}/bin/mountpoint -q /home
++      install -d -m 0700 -o ${username} -g users ${home} ${scripts}
++      cp -r --no-preserve=ownership ${source}/scripts ${scripts}/
++      install -d -m 0700 -o ${username} -g users ${scripts}/config
++      cp -r --no-preserve=ownership ${source}/config/. ${scripts}/config/
++      printf '%s\n' ${lib.escapeShellArg scriptCommit} > ${scripts}/.build-target-script-commit
++      ${pkgs.python313}/bin/python3 - <<'PY'
++from pathlib import Path
++import sys
++sys.path.insert(0, "${source}")
++from scripts.aws_target.remote import write_bootstrap_settings
++write_bootstrap_settings(Path('/etc/aws-build/bootstrap.conf'), Path('/var/lib/aws-build/remote.conf'))
++PY
++      chmod -R u+w ${scripts}
++      chown -R ${username}:users ${scripts}
++    '';
++  };
++  environment.etc."aws-build/bootstrap.conf" = lib.mkIf bootstrap { text = remoteSettings; };
++  systemd.services.aws-build-remote = {
++    wantedBy = [ "multi-user.target" ];
++    wants = [ "network-online.target" ];
++    requires = [ "aws-build-home.service" ] ++ lib.optional bootstrap "aws-build-install.service";
++    after = [ "network-online.target" "aws-build-home.service" ] ++ lib.optional bootstrap "aws-build-install.service";
++    path = with pkgs; [ python313 bash git rsync coreutils openssh systemd ];
++    environment = { HOME = home; CONF_DIR = "${scripts}/config"; };
++    unitConfig = {
++      ConditionPathExists = "${scripts}/scripts/aws_target/remote.py";
++      RequiresMountsFor = "/home";
++    };
++    serviceConfig = {
++      User = username;
++      WorkingDirectory = scripts;
++      ExecStart = "${pkgs.python313}/bin/python3 ${scripts}/scripts/aws_target/remote.py serve --settings /etc/aws-build/remote.conf";
++      UMask = "0077";
++    };
++  };
++  security.polkit.enable = true;
++  security.polkit.extraConfig = ''
++    polkit.addRule(function(action, subject) {
++      if (subject.user == "${username}" &&
++          (action.id == "org.freedesktop.login1.power-off" ||
++           action.id == "org.freedesktop.login1.power-off-multiple-sessions" ||
++           action.id == "org.freedesktop.login1.power-off-ignore-inhibit")) {
++        return polkit.Result.YES;
++      }
++    });
++  '';
++}
+diff --git a/hosts/aws-build.nix b/hosts/aws-build.nix
+new file mode 100644
+index 0000000..60fdddd
+--- /dev/null
++++ b/hosts/aws-build.nix
+@@ -0,0 +1,22 @@
++# Add the pinned development tools to the shared AWS host.
++{ pkgs, inputs, username, ... }:
++let
++  toolchain = pkgs.rust-bin.nightly.latest.default;
++  rustPlatform = pkgs.makeRustPlatform { cargo = toolchain; rustc = toolchain; };
++  mend = rustPlatform.buildRustPackage {
++    pname = "cargo-mend";
++    version = "0-unstable-${inputs.cargo-liner.shortRev}";
++    src = inputs.cargo-liner;
++    cargoLock.lockFile = "${inputs.cargo-liner}/Cargo.lock";
++    cargoBuildFlags = [ "-p" "cargo-mend" ];
++    doCheck = false;
++  };
++in
++{
++  imports = [ (import ./aws-build-base.nix { inherit username; }) ];
++  nixpkgs.overlays = [ inputs.lanzaboote.inputs.rust-overlay.overlays.default ];
++  nix.registry.nixpkgs.flake = inputs.nixpkgs;
++  nix.nixPath = [ "nixpkgs=${inputs.nixpkgs}" ];
++  environment.systemPackages = [ toolchain mend pkgs.cargo-nextest ]
++    ++ (with pkgs; [ nix util-linux procps gcc pkg-config cacert ]);
++}
+diff --git a/modules/linux/aws-build.nix b/modules/linux/aws-build.nix
+new file mode 100644
+index 0000000..4408641
+--- /dev/null
++++ b/modules/linux/aws-build.nix
+@@ -0,0 +1,20 @@
++# The user enables this service after the activation checks.
++{ lib, pkgs, ... }:
++{
++  # Keep the Install section without creating an automatic boot dependency.
++  systemd.user.units."aws-target.service".wantedBy = lib.mkForce [];
++  systemd.user.services.aws-target = {
++    description = "Run guarded AWS ticks with the live configured interval";
++    wantedBy = [ "default.target" ];
++    path = with pkgs; [ python313 bash git rsync coreutils openssh systemd awscli2 ];
++    environment.AWS_SHARED_CREDENTIALS_FILE = "%h/.config/aws-build/credentials";
++    unitConfig.ConditionPathExists = "%h/.claude/scripts/aws_target/aws_target.py";
++    serviceConfig = {
++      WorkingDirectory = "%h/.claude";
++      ExecStart = "${pkgs.python313}/bin/python3 %h/.claude/scripts/aws_target/aws_target.py serve --settings %h/.claude/config/aws_target.conf --directory %h/.local/state/build-targets/aws";
++      Restart = "on-failure";
++      RestartSec = "1s";
++      UMask = "0077";
++    };
++  };
++}
