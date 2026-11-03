@@ -199,15 +199,31 @@ The build report is too long for the user and is not used for analysis. Retire i
 
 The result goes to the showrunner. No repository code changes.
 
+Completion gate: add one row to `docs/plans/builds-report-rounds.md` with the hana commit, the settings of each side, the measured times, the limits and the conclusion. Mark it as a controlled A/B result, not a phase-time measurement over ten hana phases.
+
 ### Phase 7 — The build improvement loop ranks costs and records each round  · status: done
 **Depends on:** none (runs beside Phase 6)
 
-- Add `buildlog costs [--days N]`: one short ranked list of build hours lost per day by cause and machine (natedev, Mac, CI; AWS when it exists). Causes include memory wait, cold rebuilds, reruns on a tree that passed, failed runs, an idle Mac while steps wait, and cancelled CI. Each line also shows the cost per finished phase.
-- Add phase time to the same command: median and p90 wall time of finished phases, from progress history, for the window.
-- Add the round record `docs/plans/builds-report-rounds.md`: cost, prediction, owner, status, measured result, kept or undone.
-- Retire `/build:report` (`commands/build/report.md`) and move each caller to `buildlog costs` or the CLI. Keep `buildlog report`, the index and every collector.
+#### As-built
+
+- `buildlog costs [--days N]` (`scripts/buildlog/costs.py`) prints one ranked list of build hours lost by machine and cause, as h/day and h/finished phase. Causes: memory wait, cold rebuilds (50+ crates), failed runs, reruns after a pass, cancelled CI, and Mac idle while natedev waits. It runs in 0.45–0.70 s.
+- The machine comes from `steps.target`, else from `record.target_hosts()`. No host list is copied.
+- Mac idle = candidate waits minus Mac execution and complete Mac holds. Holds with no recorded end make the row an upper bound, with its unknown part beside it (`MacIdleEstimate`, `RankedCost.unknown_seconds`).
+- Phase time reads only `phase_finished` events (wall time = finish minus `phase_started_at`). It prints the median and p90 for hana phases and for all phases.
+- `moments.py` holds the shared `window_bounds`, `nextest_outcome`, `previous_nextest` and `nearest_rank`. `number_option.py` parses `--days` and `--hours`. `holds.py` and `mac_outcome.py` import coordination and recorder modules only where a reader needs them.
+- `docs/plans/builds-report-rounds.md` holds the round record, with four round-1 rows.
+- `/build:report` (`commands/build/report.md`) is retired. `buildlog report`, the index and every collector remain.
+
+**Files:** `scripts/buildlog/costs.py`, `scripts/buildlog/number_option.py`, `scripts/buildlog/cli.py`, `scripts/buildlog/moments.py`, `scripts/buildlog/report.py`, `scripts/buildlog/holds.py`, `scripts/buildlog/mac_report.py`, `scripts/buildlog/mac_outcome.py`, `scripts/buildlog/test_costs.py`, `scripts/buildlog/test_moments.py`, `scripts/buildlog/test_report.py`, `docs/plans/builds-report-rounds.md`.
 
 ### Phase 8 — Build history as charts  · status: todo
 **Depends on:** Phase 7
 
 The user, 2026-11-03: tables do not work for them. Lower priority. Design a chart view of the build history (costs and phase time over time, each build change marked). Design first; the build waits for the user's go.
+
+Constraints from Phase 7 (the design must answer each one):
+
+1. Buckets: `costs.collect_costs()` pairs reruns and Mac execution only inside one window. One call per bucket loses reruns across a bucket edge and earlier Mac runs that overlap later waits. Pair in one continuous pass, then split into buckets. Name the interval edges and add test fixtures that cross an edge.
+2. Uncertainty: keep the Mac idle upper bound and its unknown part (`MacIdleEstimate`), missing phase times and unavailable per-phase costs visible in each chart. Never show them as zero. Test each state.
+3. Readers: reuse `moments.progress_events()` and the costs readers. Read history once per chart set, read-only. Set a measured speed limit for the full series.
+4. Do not restore `/build:report`.
