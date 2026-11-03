@@ -160,6 +160,8 @@ A failed first query shows `Build queue could not be read.`
 `/build:queue bump <position|session|folder>` uses the card's selector resolver to select a waiting step.
 It sets priority for that step's unit. An unmatched selector exits 3 without a priority change.
 The service refuses `priority_set` when no waiting step or current reservation belongs to the unit.
+The queue commands `bump`, `clear`, and `admit-head` work from any session or a plain shell.
+`queue_command_actor()` selects `CLAUDE_CODE_SESSION_ID`, then `CODEX_THREAD_ID`, then `"user"`.
 The pane passes its session id to mutating commands. Read-only commands keep their existing environment.
 
 Mutation requests have replay ids. The service persists each terminal reply before delivery.

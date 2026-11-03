@@ -23,6 +23,5 @@ A failed first query shows `Build queue could not be read.`
 It sets priority for that step's unit with the reason `the user's bump`. `clear` clears priority.
 An unmatched selector exits 3 with `build queue: no waiting step matches <selector>`.
 `admit-head <why>` permits the current head to exceed the budget when free memory permits its start.
-These commands require a showrunner session. Priority preserves order among steps with the same rank.
-The permission refusal says: `build queue: type /build:queue bump <position|session|folder> in a showrunner pane`.
+These commands work from any session or a plain shell. Priority preserves order among steps with the same rank.
 Use `/build:status` for holds and target state.

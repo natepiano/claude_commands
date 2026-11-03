@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 import io
 import os
@@ -13,7 +13,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.lint import memory_admit as gate
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 if TYPE_CHECKING:
     from scripts.lib import conf
 else:
@@ -38,6 +38,27 @@ class ClientTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(client, "CLOCK", fixture.clock))
         _ = self.enterContext(mock.patch("scripts.build_queue.admission_client.socket.socket", side_effect=transport.socket))
         return transport
+
+    def test_priority_commands_from_any_session_send_the_actor(self) -> None:
+        for claude, codex, actor in (("ordinary-session", "codex-session", "ordinary-session"),
+                                      ("", "codex-session", "codex-session"), ("", "", "user")):
+            for argv in (("priority-set", "unit"), ("priority-clear",), ("admit-head", "urgent")):
+                with self.subTest(actor=actor, argv=argv), \
+                     mock.patch.dict(os.environ), \
+                     mock.patch.object(client, "_mutation", return_value=wire.Ok()) as mutation, \
+                     redirect_stdout(io.StringIO()):
+                    for key in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
+                        _ = os.environ.pop(key, None)
+                    if claude:
+                        os.environ["CLAUDE_CODE_SESSION_ID"] = claude
+                    if codex:
+                        os.environ["CODEX_THREAD_ID"] = codex
+                    self.assertEqual(client.main(list(argv)), 0)
+                    mutation.assert_called_once()
+                    request = cast(wire.PrioritySetRequest | wire.PriorityClearRequest | wire.AdmitHeadRequest,
+                                   mutation.call_args.args[0])
+                    self.assertIsInstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest, wire.AdmitHeadRequest))
+                    self.assertEqual(request.actor, actor)
 
     def test_unusable_config_exits_with_checker_failure_and_names_the_key(self) -> None:
         with AdmissionFixture() as fixture:

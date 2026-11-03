@@ -1724,7 +1724,6 @@ class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
             "CLAUDE_CODE_SESSION_ID": "showrunner-id", "CODEX_THREAD_ID": "",
         }))
         _ = self.enterContext(patch.object(time, "time", side_effect=lambda: self.clock))
-        _ = self.enterContext(patch.object(gate, "showrunner_is_registered", return_value=True))
         _ = self.enterContext(patch.object(gate, "priority_labels", return_value=self.labels))
         _ = self.meminfo.write_text(f"MemAvailable: {60 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
         self.readings.update({300: gate.MeasuredMemory(0), 400: gate.MeasuredMemory(0)})

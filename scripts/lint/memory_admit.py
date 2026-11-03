@@ -632,10 +632,6 @@ class NoQueuePriority:
 NO_QUEUE_PRIORITY = NoQueuePriority()
 
 
-class PriorityRefused(ValueError):
-    pass
-
-
 def queue_priority_path(directory: Path) -> Path:
     return directory / "queue_priority.json"
 
@@ -762,29 +758,9 @@ class NoHeadAdmissionOverride:
 NO_HEAD_ADMISSION_OVERRIDE = NoHeadAdmissionOverride()
 
 
-class AdmitHeadRefused(ValueError):
-    """The requested head override cannot be set."""
-
-
-class ShowrunnerRegistry(Protocol):
-    def production_of(self, session_id: str) -> Path | None: ...
-
-
-def showrunner_is_registered(session_id: str) -> bool:
-    # This path runs only for a privileged command, never on a check poll.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
-    showrunners = cast(ShowrunnerRegistry, cast(object, importlib.import_module("scripts.production.showrunners")))
-    return showrunners.production_of(session_id) is not None
-
-
-def require_showrunner() -> str:
-    """Return the registered Claude showrunner id or refuse the caller."""
-    if os.environ.get("CODEX_THREAD_ID"):
-        raise AdmitHeadRefused("only a registered showrunner session may run this command")
-    session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-    if not session or not showrunner_is_registered(session):
-        raise AdmitHeadRefused("only a registered showrunner session may run this command")
-    return session
+def queue_command_actor() -> str:
+    """Identify the user command without a session-role check."""
+    return os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or "user"
 
 
 def head_override_path(directory: Path) -> Path:

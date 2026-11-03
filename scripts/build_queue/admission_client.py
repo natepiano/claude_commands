@@ -756,9 +756,9 @@ def main(argv: list[str] | None = None) -> int:
                   mine(args.session_id) if args.command == "mine" else release(args.reservation, args.value, _saved_cleanup_timing())
                   if args.command == "release" else width(args.reservation, args.value)
                   if args.command == "width" else token_wait(args.reservation, _saved_cleanup_timing()) if args.command == "token-wait" else
-                  priority_set(args.unit, args.why, gate.require_showrunner()) if args.command == "priority-set" else
-                  priority_clear(gate.require_showrunner()) if args.command == "priority-clear" else
-                  admit_head(args.why, gate.require_showrunner()))
+                  priority_set(args.unit, args.why, gate.queue_command_actor()) if args.command == "priority-set" else
+                  priority_clear(gate.queue_command_actor()) if args.command == "priority-clear" else
+                  admit_head(args.why, gate.queue_command_actor()))
         if isinstance(result, wire.Refused):
             return 2
         print(wire.encode_record(result))
@@ -772,9 +772,6 @@ def main(argv: list[str] | None = None) -> int:
     except wire.AdmissionUnavailable as error:
         print(f"admission service unavailable: {error.reason}", file=sys.stderr)
         return 2
-    except (gate.AdmitHeadRefused, gate.PriorityRefused) as error:
-        print(str(error), file=sys.stderr)
-        return 3
     except (CheckerFailure, ValueError, OSError) as error:
         if args.command == "launch" and str(error) == LAUNCH_WAIT_LIMIT_REASON:
             output.deadline_reached = True

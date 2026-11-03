@@ -86,7 +86,7 @@ def main() -> int:
             print("build queue: use /build:queue bump <position|session|folder>")
             return 3
         try:
-            actor = memory_admit.require_showrunner()
+            actor = memory_admit.queue_command_actor()
             if sys.argv[1] == "bump" and len(sys.argv) == 3:
                 return bump(sys.argv[2], actor)
             elif sys.argv[1] == "clear" and len(sys.argv) == 2:
@@ -102,12 +102,6 @@ def main() -> int:
             if command == "clear":
                 print("queue priority cleared")
             return 0
-        except (memory_admit.AdmitHeadRefused, memory_admit.PriorityRefused) as error:
-            if command == "bump":
-                print(f"build queue: type /build:queue bump {sys.argv[2]} in a showrunner pane")
-            else:
-                print(f"build queue: {error}", file=sys.stderr)
-            return 3
         except admission_protocol.AdmissionUnavailable as error:
             print(f"build queue: admission service unavailable: {error.reason}", file=sys.stderr)
             return 2

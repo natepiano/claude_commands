@@ -190,30 +190,32 @@ class QueueTests(unittest.TestCase):
 
 
 
-    def test_bump_refuses_other_sessions_without_moving_or_logging(self) -> None:
-        first = self.fixture.waiter(100, "head-id", "head")
-        second = self.fixture.waiter(200, "worker-id", "worker")
-        self.labels_read.return_value = dict([self.entry("head-id", "shared"), self.entry("worker-id", "shared")])
-        before = (first.read_bytes(), second.read_bytes())
-        for selector in ("2", "worker-id", "worker", "/tmp/tree-200", "tree-200", "shared", "unknown"):
-            with self.subTest(selector=selector):
-                with mock.patch.object(memory_admit, "queue_read", side_effect=AssertionError("bump read the queue")), \
-                     mock.patch.object(unit_labels, "unit_labels_for", side_effect=AssertionError("bump read labels")):
-                    status, output, errors = self.bump_output(selector)
-                self.assertEqual(status, 3)
-                self.assertEqual(output, f"build queue: type /build:queue bump {selector} in a showrunner pane\n")
-                self.assertEqual(errors, "")
-                self.assertEqual((first.read_bytes(), second.read_bytes()), before)
-            self.assertEqual([step.pid for step in memory_admit.queue_view().waiting], [100, 200])
-            self.assertEqual(list((self.root / "buildlog").glob("*/*.jsonl")), [])
+    def test_bump_from_any_session_records_the_actor(self) -> None:
+        _ = self.fixture.waiter(100, "head-id", "head")
+        _ = self.fixture.waiter(200, "worker-id", "worker")
+        admission = self.private_mutation_service()
+        labels = {"worker-id": UnitLabels("worker", unit="berth")}
+        self.labels_read.return_value = labels
+        for claude, codex, actor in (("ordinary-session", "codex-session", "ordinary-session"),
+                                      ("", "codex-session", "codex-session"), ("", "", "user")):
+            with self.subTest(actor=actor), \
+                 mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": claude, "CODEX_THREAD_ID": codex}), \
+                 mock.patch.object(memory_admit, "priority_labels", return_value=labels):
+                self.assertEqual(self.bump_output("2" if actor == "ordinary-session" else "1")[0], 0)
+                priority = admission.server.priority
+                self.assertNotIsInstance(priority, memory_admit.NoQueuePriority)
+                if not isinstance(priority, memory_admit.NoQueuePriority):
+                    self.assertEqual(priority["set_by"], actor)
+                events = [cast(dict[str, object], json.loads(line)) for path in (self.root / "buildlog").glob("*/*.jsonl")
+                          for line in path.read_text().splitlines() if '"queue_priority"' in line]
+                self.assertEqual(events[-1]["set_by"], actor)
 
     def test_bump_sets_the_units_priority_and_reports_its_resolved_place(self) -> None:
         first = self.fixture.waiter(100, "head-id", "head")
         second = self.fixture.waiter(200, "worker-id", "worker")
         before = (first.read_bytes(), second.read_bytes())
         admission = self.private_mutation_service()
-        with mock.patch.object(memory_admit, "require_showrunner", return_value="showrunner"), \
-             mock.patch.object(memory_admit, "priority_labels", return_value={"worker-id": UnitLabels("worker", unit="berth")}):
+        with mock.patch.object(memory_admit, "priority_labels", return_value={"worker-id": UnitLabels("worker", unit="berth")}):
             self.labels_read.return_value = {"worker-id": UnitLabels("worker", unit="berth")}
             status, output, errors = self.bump_output("2")
             self.assertEqual([step.pid for step in memory_admit.queue_view().waiting], [200, 100])
@@ -226,8 +228,7 @@ class QueueTests(unittest.TestCase):
 
     def test_unmatched_bump_selector_refuses_without_writing_priority(self) -> None:
         admission = self.private_mutation_service()
-        with mock.patch.object(memory_admit, "require_showrunner", return_value="showrunner"), \
-             mock.patch.object(admission_client, "priority_set", side_effect=AssertionError("unmatched priority write")):
+        with mock.patch.object(admission_client, "priority_set", side_effect=AssertionError("unmatched priority write")):
             status, output, errors = self.bump_output("berth")
         self.assertEqual((status, output, errors), (3, "build queue: no waiting step matches berth\n", ""))
         self.assertIsInstance(admission.server.priority, memory_admit.NoQueuePriority)
@@ -245,34 +246,35 @@ class QueueTests(unittest.TestCase):
         self.labels_read.return_value = {"worker-id": UnitLabels("worker", unit="actual-unit")}
         for selector in ("2", "worker-id", "worker", "/tmp/tree-200", "tree-200"):
             with self.subTest(selector=selector), \
-                 mock.patch.object(memory_admit, "require_showrunner", return_value="director"), \
+                 mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "actor-id"}), \
                  mock.patch.object(admission_client, "priority_set", return_value=wire.Ok()) as mutation:
                 self.assertEqual(self.bump_output(selector),
                     (0, "queue priority set for actual-unit (step #2): first step now #2\n", ""))
-                mutation.assert_called_once_with("actual-unit", "the user's bump", "director")
+                mutation.assert_called_once_with("actual-unit", "the user's bump", "actor-id")
 
     def test_bump_row_without_a_unit_refuses_without_writing_priority(self) -> None:
         _ = self.fixture.waiter(100, "head-id", "head")
         self.labels_read.return_value = {}
-        with mock.patch.object(memory_admit, "require_showrunner", return_value="director"), \
-             mock.patch.object(admission_client, "priority_set", side_effect=AssertionError("unitless priority write")):
+        with mock.patch.object(admission_client, "priority_set", side_effect=AssertionError("unitless priority write")):
             self.assertEqual(self.bump_output("1"), (3, "build queue: waiting step #1 has no unit\n", ""))
 
-    def test_admit_head_and_clear_refuse_other_roles_without_any_mutation(self) -> None:
+    def test_admit_head_and_clear_from_any_session_send_the_actor(self) -> None:
         for arguments in (("admit-head", "urgent"), ("clear",)):
-            for codex in ("", "worker-thread"):
-                with self.subTest(arguments=arguments, codex=codex), \
-                     mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "inherited", "CODEX_THREAD_ID": codex}), \
-                     mock.patch.object(memory_admit, "showrunner_is_registered", return_value=bool(codex)), \
-                     mock.patch.object(admission_client, "admit_head", side_effect=AssertionError("unauthorized head")), \
-                     mock.patch.object(admission_client, "priority_clear", side_effect=AssertionError("unauthorized clear")):
-                    output, errors = io.StringIO(), io.StringIO()
-                    with mock.patch("sys.argv", ["build_queue.py", *arguments]), \
-                         redirect_stdout(output), redirect_stderr(errors):
-                        status = build_queue.main()
-                    self.assertEqual(status, 3)
-                    self.assertIn("showrunner", output.getvalue() + errors.getvalue())
-                    self.assertNotIn("Traceback", output.getvalue() + errors.getvalue())
+            for claude, codex, actor in (("ordinary-session", "codex-session", "ordinary-session"),
+                                          ("", "codex-session", "codex-session"), ("", "", "user")):
+                with self.subTest(arguments=arguments, actor=actor), \
+                     mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": claude, "CODEX_THREAD_ID": codex}), \
+                     mock.patch.object(admission_client, "admit_head", return_value=wire.Ok()) as head, \
+                     mock.patch.object(admission_client, "priority_clear", return_value=wire.Ok()) as clear, \
+                     mock.patch("sys.argv", ["build_queue.py", *arguments]), \
+                     redirect_stdout(io.StringIO()):
+                    self.assertEqual(build_queue.main(), 0)
+                    if arguments[0] == "clear":
+                        clear.assert_called_once_with(actor)
+                        head.assert_not_called()
+                    else:
+                        head.assert_called_once_with("urgent", actor)
+                        clear.assert_not_called()
 
     def private_mutation_service(self) -> AdmissionFixture:
         files = {path: path.read_bytes() for path in self.fixture.directory.glob("*.waiting")}
@@ -294,8 +296,7 @@ class QueueTests(unittest.TestCase):
 
     def bump_output(self, *units: str) -> tuple[int, str, str]:
         output, errors = io.StringIO(), io.StringIO()
-        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "actor-id"}), \
-             mock.patch("sys.argv", ["build_queue.py", "bump", *units]), \
+        with mock.patch("sys.argv", ["build_queue.py", "bump", *units]), \
              redirect_stdout(output), redirect_stderr(errors):
             status = build_queue.main()
         return status, output.getvalue(), errors.getvalue()
@@ -1082,20 +1083,6 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(status, 0, errors)
         self.assertTrue(text.startswith("Build queue · 10:46\n\n"))
         self.assertNotIn("starts", text)
-
-    def test_bump_permission_refusal_stays_short_with_many_waiters(self) -> None:
-        for pid in range(100, 132):
-            _ = self.fixture.waiter(pid, f"session-{pid}", f"worker-{pid}")
-        status, text, errors = self.bump_output("berth")
-        self.assertEqual(status, 3)
-        self.assertEqual(errors, "")
-        self.assertEqual(len(text.splitlines()), 1)
-        self.assertLess(len(text.encode()), 120)
-        self.assertEqual(text.strip(), "build queue: type /build:queue bump berth in a showrunner pane")
-        self.assertNotIn("worker-", text)
-        docs = (Path(__file__).resolve().parents[2] / "commands/build/queue.md").read_text()
-        self.assertIn(text.strip().replace("berth", "<position|session|folder>"), docs)
-        self.assertIn("/build:queue bump <position|session|folder>", docs)
 
     def test_explicit_columns_override_environment_for_text_and_json(self) -> None:
         reading = queue_read_fixture(memory_admit.QueueView((), (), 20 * GIB, 0, GIB, NOW), policy=admission_policy_fixture())

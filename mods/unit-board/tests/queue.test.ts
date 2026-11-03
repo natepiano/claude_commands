@@ -631,7 +631,7 @@ describe('build queue pane', () => {
     expect(fake.escaped).toEqual([]);
   });
 
-  for (const refusal of ["build queue: type /build:queue bump berth in a showrunner pane"]) {
+  for (const refusal of ["build queue: no waiting step matches berth"]) {
     test(`bump reports its refusal: ${refusal}`, async ($, on) => {
       const fake = queueHost(on);
       fake.refuseBump(refusal);
