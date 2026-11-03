@@ -8,10 +8,17 @@ import random
 from typing import cast
 from uuid import uuid4
 
+from scripts.lib import conf
+from .selection import UseConfiguredValue
+
 from . import evaluate, questions, vault
-from .records import BlindAssignment, BlindFiles, BlindItem, BlindKey, BlindScore, BlindSheet, PreferenceTally, STATE_DIR
+from .records import BlindAssignment, BlindFiles, BlindItem, BlindKey, BlindScore, BlindSheet, PreferenceTally, state_dir as configured_state_dir
 
 Disagreement = tuple[vault.Issue, str | int, str | int]
+
+
+def sample_count() -> int:
+    return conf.whole("issue_score", "blind_sample_count")
 
 
 def _spread_choices(candidates: dict[str, list[Disagreement]], count: int) -> list[tuple[str, vault.Issue, str | int, str | int]]:
@@ -48,13 +55,16 @@ def _spread_choices(candidates: dict[str, list[Disagreement]], count: int) -> li
 
 def _safe_directory(state_dir: Path, issues_dir: Path) -> Path:
     directory = state_dir.expanduser().resolve()
-    if directory.is_relative_to(vault.VAULT_ROOT.resolve()) or directory.is_relative_to(issues_dir.resolve()):
+    if directory.is_relative_to(vault.vault_root().resolve()) or directory.is_relative_to(issues_dir.resolve()):
         raise ValueError("Blind files must be outside the issue vault")
     return directory
 
 
-def blind(run_id: str, count: int = 20, *, seed: int = 0,
-          issues_dir: Path = vault.ISSUES_DIR, state_dir: Path = STATE_DIR) -> BlindFiles:
+def blind(run_id: str, count: int | UseConfiguredValue = UseConfiguredValue.CURRENT, *, seed: int = 0,
+          issues_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT, state_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT) -> BlindFiles:
+    issues_dir = vault.issue_directory() if isinstance(issues_dir, UseConfiguredValue) else issues_dir
+    state_dir = configured_state_dir() if isinstance(state_dir, UseConfiguredValue) else state_dir
+    count = sample_count() if isinstance(count, UseConfiguredValue) else count
     if count <= 0:
         raise ValueError("--count must be positive")
     name = run_id.removesuffix(".jsonl")
@@ -130,7 +140,7 @@ def _entries(value: object) -> list[dict[str, object]]:
 
 def blind_score(sheet: Path) -> BlindScore:
     sheet = sheet.expanduser().resolve()
-    if sheet.is_relative_to(vault.VAULT_ROOT.resolve()):
+    if sheet.is_relative_to(vault.vault_root().resolve()):
         raise ValueError("Blind files must be outside the issue vault")
     submitted = _object(cast(object, json.loads(sheet.read_text(encoding="utf-8"))))
     key = _object(cast(object, json.loads((sheet.parent / "keys" / sheet.name).read_text(encoding="utf-8"))))

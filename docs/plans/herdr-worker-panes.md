@@ -1114,6 +1114,45 @@ It supports reruns and is deleted in Phase 18.
 Test a `/clear` during migration: resolve current ownership again, report unavailable evidence, and preserve fixed store keys.
 Make no unproved write and create no second row.
 
+### Phase 4p — A zombie app-server is not live  · status: done
+
+**Owner:** herdr-unit (sdlc, 2026-11-02; the user asked to resume two items this defect blocks).
+
+#### Work Order
+
+**Goal:** `codex_mesh.py` counts a zombie app-server as dead, and the launcher reaps each app-server it retires.
+
+**Spec:**
+1. `_pid_alive` returns False when `/proc/<pid>/stat` shows state `Z`. The EPERM rule stays.
+2. The launcher reaps each child app-server it retires; a pid that is not its child is ignored.
+
+**Files:** `scripts/agents/codex_mesh.py`, `scripts/agents/test_codex_mesh.py`.
+
+**Workers:** `1 writer`. Code only: Phase 45 and every worker thread keep running.
+
+**Acceptance gate:** one test for each item; `test_codex_mesh.py` passes; basedpyright 0/0 on both files. natedev merges the hash with `gm.sh`.
+
+### Phase 4q — A relaunch refuses only a provably live turn  · status: done
+
+**Owner:** herdr-unit (sdlc, 2026-11-02). A herdr restart at 13:01 stopped a models-unit reviewer; its relaunch was refused on a stale live turn with no launcher running, and the unit lost 7.5 hours.
+
+#### Work Order
+
+**Goal:** a worker relaunch refuses only on proof that the old turn is still driven by a live launcher. Otherwise it reports the stale turn and continues (user rule: report anomalies, never block).
+
+**Spec:**
+1. In `codex_mesh.py` relaunch (about :4428-4448), a thread read that shows a turn in progress is a live turn only when the turn's recorded launcher process is alive (`_pid_alive`, which now treats a zombie as dead).
+2. With a dead launcher, interrupt the orphaned turn once, print one report line that names the worker and thread, and continue the relaunch on the same thread.
+3. An app-server that cannot be reached holds no live turn: report it and continue, never refuse.
+4. A live launcher still refuses, with today's text.
+
+**Files:**
+- `scripts/agents/codex_mesh.py`, `scripts/agents/test_codex_mesh.py`
+
+**Workers:** `1 writer`. Code only.
+
+**Acceptance gate:** one test each for items 1-4, including the 13:01 case (dead launcher, thread read shows a turn in progress); `test_codex_mesh.py` passes; basedpyright 0/0. natedev merges the hash with `gm.sh`.
+
 ### Phase 4 — Member names come from the staff row  · status: todo
 
 **Owner:** models-unit (sdlc split, 2026-11-02 08:23).

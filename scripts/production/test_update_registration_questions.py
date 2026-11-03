@@ -10,12 +10,43 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
+from scripts.production import staff
 from scripts.production.update_registration_test_support import RegistrationFixture, QuestionRegistration, registration, review
 
 from scripts.production.update_registration_test_support import setUpModule as setUpModule
 
 
 class RegistrationTests(RegistrationFixture):
+    def test_unit_files_and_lists_questions_from_linked_and_main_checkouts(self) -> None:
+        main = self.checkout
+        relative = self.doc.relative_to(main)
+        owner_id = self.fixture_staff_id()
+        asker_id = self.fixture_staff_id("alpha-unit")
+        owner = self.root / "owner-checkout"
+        unit = self.root / "unit-checkout"
+        _ = self.git("worktree", "add", "-b", "owner-copy", str(owner))
+        _ = self.git("worktree", "add", "-b", "unit-copy", str(unit))
+        _ = staff.set_doc(owner_id, staff.LiveDoc("natedev", owner / relative))
+        staff_file = self.state / "staff/staff.json"
+        before = staff_file.read_bytes()
+        for checkout, title in ((unit, "Unit checkout question"), (main, "Main checkout question")):
+            with self.subTest(checkout=checkout):
+                self.checkout: Path = checkout
+                self.doc: Path = relative
+                with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?")):
+                    filed = self.run_command("ask", "--text", title, "--question", "Keep this layout?",
+                                             "--unit", str(asker_id))
+                self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
+                listed = self.run_command("questions-table")
+                self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
+                self.assertIn(title, listed.stdout)
+        records = list((self.root / "issues").glob("question-*.md"))
+        self.assertEqual(len(records), 2)
+        for record in records:
+            self.assertIn(f"asked_by: {asker_id}", record.read_text().splitlines())
+            self.assertIn(f"production_id: {owner_id}", record.read_text().splitlines())
+        self.assertEqual(staff_file.read_bytes(), before)
+
     def test_question_without_a_proposals_line_can_be_filed_listed_and_answered(self) -> None:
         _ = self.doc.write_text("\n".join(line for line in self.doc.read_text().splitlines()
                                          if not line.startswith("- **Proposals:**")) + "\n")

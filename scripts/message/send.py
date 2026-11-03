@@ -38,6 +38,9 @@ A name without a staff row or live session is refused without a relay or queue.
 Explicit non-staff addresses keep their transport and queue behavior.
 Worker addresses use native IDs from the local or peer roster for staff lookup.
 `--codex` with `--session-dir` selects a run-scoped slot without staff lookup.
+Each message records its runtime sender ID separately from `--from`.
+Only the configured Morty ID adds `Authority: morty (speaks for the user)`.
+Queues and SSH forwarding retain the original sender ID.
 `--here` checks only this machine. `--machine` runs this script on HOST over ssh.
 
 `--to user` reaches the user wherever they are; `--summary` is the title. `--need`
@@ -133,6 +136,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import process_group
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff, unit_names
+from scripts.lib import conf
 import sessions  # noqa: E402
 from relay_identity import SavedRelaySender, read_relay_sender, relay_session_name
 import postmaster  # noqa: E402
@@ -282,7 +286,8 @@ LogEntry = TypedDict("LogEntry", {"time": str, "machine": str, "from": str, "to"
                                   "summary": str, "text": str, "outcome": Outcome, "detail": str,
                                   "via": NotRequired[Literal["postmaster", "relay", "queue"]],
                                   "postmaster": NotRequired[Literal["delivered", "unresolved"] | postmaster.PostmasterMiss],
-                                  "seconds": NotRequired[float], "human": NotRequired[bool], "receiver": NotRequired[str]})
+                                  "seconds": NotRequired[float], "human": NotRequired[bool], "receiver": NotRequired[str],
+                                  "sender_native_id": NotRequired[str]})
 
 
 class SocketRecoveryAttempt(TypedDict):
@@ -301,6 +306,7 @@ KeyedMessage = TypedDict(
         "text": str,
         "reason": str,
         "shown_sender": NotRequired[str],
+        "sender_native_id": NotRequired[str],
         "socket_recovery": NotRequired[str],
     },
 )
@@ -315,6 +321,7 @@ UnkeyedMessage = TypedDict(
         "text": str,
         "reason": str,
         "shown_sender": NotRequired[str],
+        "sender_native_id": NotRequired[str],
         "socket_recovery": NotRequired[str],
     },
 )
@@ -333,6 +340,34 @@ KeyStates = dict[str, KeyState]
 
 
 @dataclass(frozen=True)
+class ClaudeSender:
+    session_id: str
+
+
+@dataclass(frozen=True)
+class CodexSender:
+    thread_id: str
+
+
+@dataclass(frozen=True)
+class UnavailableSender:
+    """The message has no recorded runtime identity."""
+
+
+SenderStamp = ClaudeSender | CodexSender | UnavailableSender
+
+
+@dataclass(frozen=True)
+class RuntimeSender:
+    """Read the sender identity from this process."""
+
+
+@dataclass(frozen=True)
+class ForwardedSender:
+    stamp: SenderStamp
+
+
+@dataclass(frozen=True)
 class Message:
     """Routing identity and body with sending-machine display text, or the raw sender for legacy callers."""
     to: str
@@ -342,6 +377,7 @@ class Message:
     key: str | None
     shown_sender: str = ""
     human: bool = False
+    stamp: SenderStamp = UnavailableSender()
 
     def __post_init__(self) -> None:
         if not self.shown_sender:
@@ -614,6 +650,7 @@ class Options(NamedTuple):
     human: bool = False
     no_accounting: bool = False
     report_recipient: bool = False
+    sender_origin: RuntimeSender | ForwardedSender = RuntimeSender()
 
     @property
     def to(self) -> str:
@@ -717,6 +754,11 @@ def _queued_message(value: object) -> QueuedMessage | None:
     key = values.get("key")
     if "shown_sender" in values and not isinstance(values["shown_sender"], str):
         return None
+    if "sender_native_id" in values:
+        try:
+            _ = read_sender_stamp(values["sender_native_id"])
+        except ValueError:
+            return None
     if key is None:
         return cast(UnkeyedMessage, cast(object, values))
     if isinstance(key, str):
@@ -745,6 +787,7 @@ def enqueue(message: Message, reason: str, at: datetime) -> None:
             text=message.text,
             reason=reason,
             shown_sender=message.shown_sender,
+            sender_native_id=sender_native_id(message.stamp),
             **{"from": message.sender},
         )
     else:
@@ -756,6 +799,7 @@ def enqueue(message: Message, reason: str, at: datetime) -> None:
             text=message.text,
             reason=reason,
             shown_sender=message.shown_sender,
+            sender_native_id=sender_native_id(message.stamp),
             **{"from": message.sender},
         )
     with locked():
@@ -984,6 +1028,7 @@ def log(message: Message, result: Result, at: datetime, route: Route = NO_CLAUDE
     entry: LogEntry = {"time": at.isoformat(), "machine": machine(), "from": message.sender, "to": result.receiver or message.to,
                        "key": message.key, "summary": message.text.strip().splitlines()[0] if message.text.strip()
                        else "", "text": message.text, "outcome": result.outcome, "detail": result.detail}
+    entry["sender_native_id"] = sender_native_id(message.stamp)
     entry["human"] = message.human
     if isinstance(route, ClaudeRoute):
         entry["via"] = route.via
@@ -1258,7 +1303,8 @@ def recover_socket_queues(records: list[sessions.SessionRecord], at: datetime) -
                 continue
             message = Message(recipient.address, entry["from"], entry["summary"],
                               f"Stuck message from {entry['time']}:\n" + entry["text"], identity,
-                              entry.get("shown_sender", entry["from"]))
+                              entry.get("shown_sender", entry["from"]),
+                              stamp=read_sender_stamp(entry.get("sender_native_id", "unavailable")))
             if not saved:
                 _rewrite_queue(path, remaining)
                 saved = True
@@ -1306,9 +1352,11 @@ def pending(to: str | None) -> str:
         entries = sorted((entry for path in paths for entry in read_queue(path)), key=lambda entry: entry["time"])
         for path in paths:
             path.unlink(missing_ok=True)
-    return "\n\n".join(f"Queued message {index} of {len(entries)}, from {entry['from']} at {entry['time']}:"
-                       + shown_sender_line(entry["from"], entry.get("shown_sender", entry["from"])) + "\n"
-                       + entry["text"].rstrip() for index, entry in enumerate(entries, 1))
+    return "\n\n".join(stamped_text(
+        f"Queued message {index} of {len(entries)}, from {entry['from']} at {entry['time']}:"
+        + shown_sender_line(entry["from"], entry.get("shown_sender", entry["from"])),
+        "\n" + entry["text"].rstrip(), read_sender_stamp(entry.get("sender_native_id", "unavailable")))
+        for index, entry in enumerate(entries, 1))
 
 
 # ---------------------------------------------------------------------------
@@ -1572,7 +1620,7 @@ def relay_prompt(message: Message) -> str:
     lines = [
         "You are a relay that delivers one message. Make exactly one SendMessage call:",
         f"- to: {json.dumps(message.to)}",
-        f"- summary: {json.dumps(message.summary)}",
+        f"- summary: {json.dumps(quote_sender_lines(message.summary))}",
         "- message: the text between the BEGIN and END lines below, copied exactly. Keep every character, space, "
         + "line break, backtick and placeholder as written. Add nothing, drop nothing, reword nothing. Leave out "
         + "the BEGIN and END lines.",
@@ -1705,6 +1753,8 @@ def relay_plan(message: Message) -> RelayPlan:
             message.text,
             message.key,
             message.shown_sender,
+            message.human,
+            message.stamp,
         )
     )
 
@@ -1892,6 +1942,7 @@ def remote(message: Message, host: str, options: Options) -> Result:
     """Forward delivery and queue ownership; this invocation owns its accounting."""
     forwarded = ["--no-accounting", "--report-recipient", "--here", "--to", message.to, "--from", message.sender, "--summary", message.summary,
                  "--timeout", f"{options.timeout:g}"]
+    forwarded += ["--forwarded-sender-stamp", sender_native_id(message.stamp)]
     if message.to != USER:
         forwarded += ["--forwarded-shown-sender", message.shown_sender]
     if options.human:
@@ -2134,6 +2185,7 @@ def parse(argv: list[str]) -> Options:
     _ = parser.add_argument("--no-accounting", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--report-recipient", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--forwarded-shown-sender", help=argparse.SUPPRESS)
+    _ = parser.add_argument("--forwarded-sender-stamp", help=argparse.SUPPRESS)
     _ = parser.add_argument("--summary", help="SendMessage's short label, default the first line; the title to `user`")
     _ = parser.add_argument("--priority", choices=("0", "1", "2"), help=argparse.SUPPRESS)
     _ = parser.add_argument("--need", choices=list(CHANNEL_PRIORITY), default="note",
@@ -2235,12 +2287,23 @@ def parse(argv: list[str]) -> Options:
     forwarded_sender = optional_str(attr(args, "forwarded_shown_sender"))
     if forwarded_sender is not None and (attr(args, "here") is not True or not forwarded_sender):
         parser.error("--forwarded-shown-sender needs --here and nonempty sending-machine display text")
+    forwarded_stamp = optional_str(attr(args, "forwarded_sender_stamp"))
+    origin: RuntimeSender | ForwardedSender = RuntimeSender()
+    if forwarded_stamp is not None:
+        if attr(args, "here") is not True:
+            parser.error("--forwarded-sender-stamp needs --here")
+        if "SSH_CONNECTION" not in os.environ:
+            parser.error("--forwarded-sender-stamp needs an SSH receive environment (SSH_CONNECTION)")
+        try:
+            origin = ForwardedSender(read_sender_stamp(forwarded_stamp))
+        except ValueError as error:
+            parser.error(str(error))
     scope: RecipientResolutionScope = (
         NamedMachine(host) if host is not None else
         LocalOnly() if attr(args, "here") is True else LocalThenPeer()
     )
     get = {name: attr(args, name) for name in Options._fields
-           if name not in {"action", "selection", "scope", "values", "commands", "shown_sender"}}
+           if name not in {"action", "selection", "scope", "values", "commands", "shown_sender", "sender_origin"}}
     options = Options(selection=selection, sender=optional_str(get["sender"]), summary=optional_str(get["summary"]),
                       key=optional_str(get["key"]), repeat_minutes=optional_float(get["repeat_minutes"]),
                       scope=scope, timeout=optional_float(get["timeout"]) or TIMEOUT,
@@ -2250,7 +2313,8 @@ def parse(argv: list[str]) -> Options:
                       self_clearing=get["self_clearing"] is True,
                       human=get["human"] is True, no_accounting=get["no_accounting"] is True,
                       report_recipient=get["report_recipient"] is True,
-                      shown_sender=ShownSender(forwarded_sender) if forwarded_sender is not None else SenderNotResolved())
+                      shown_sender=ShownSender(forwarded_sender) if forwarded_sender is not None else SenderNotResolved(),
+                      sender_origin=origin)
     if options.to == USER and (options.summary is None or isinstance(options.selection, MeshWorker)):
         parser.error("--to user needs --summary, its title, and takes no --codex")
     if options.to != USER and options.need != "note":
@@ -2313,21 +2377,90 @@ def sender_shown_name(sender: str, observed: roster.Roster) -> str:
     return sender
 
 
+def sender_stamp() -> SenderStamp:
+    """Read the native sender identity independently of the display name."""
+    import roster
+
+    identity = roster.sender_identity(os.environ)
+    if isinstance(identity, roster.ClaudeSession):
+        return ClaudeSender(identity.session_id)
+    if isinstance(identity, roster.CodexThread):
+        return CodexSender(identity.thread_id)
+    return UnavailableSender()
+
+
+def sender_native_id(stamp: SenderStamp) -> str:
+    if isinstance(stamp, ClaudeSender):
+        return f"session:{stamp.session_id}"
+    if isinstance(stamp, CodexSender):
+        return f"codex:{stamp.thread_id}"
+    return "unavailable"
+
+
+def read_sender_stamp(value: object) -> SenderStamp:
+    """Decode recorded provenance without reading the current runtime."""
+    if value == "unavailable":
+        return UnavailableSender()
+    if isinstance(value, str):
+        kind, separator, identity = value.partition(":")
+        if separator and re.fullmatch(r"[\w-]+", identity):
+            if kind == "session":
+                return ClaudeSender(identity)
+            if kind == "codex":
+                return CodexSender(identity)
+    raise ValueError("invalid sender native id")
+
+
+def morty_stamp(stamp: SenderStamp) -> bool:
+    if isinstance(stamp, UnavailableSender):
+        return False
+    # A recovered configuration value cannot grant authority after a missing live key.
+    if not isinstance(conf.value_origin("send", "MORTY_NATIVE_ID", str), conf.UsableLiveValue):
+        return False
+    try:
+        expected = conf.text("send", "MORTY_NATIVE_ID")
+        kind, _, identity = expected.partition(":")
+        if kind not in ("session", "codex"):
+            return False
+        _ = staff.native_id(identity)
+    except (conf.Unusable, staff.StaffRefused):
+        return False
+    return expected == sender_native_id(stamp)
+
+
+def sender_stamp_lines(stamp: SenderStamp) -> str:
+    text = f"\nSender native id: {sender_native_id(stamp)}"
+    if morty_stamp(stamp):
+        text += "\nAuthority: morty (speaks for the user)"
+    return text
+
+
 def shown_sender_line(sender: str, display: str) -> str:
     return f"\nShown sender: {display}" if display != sender else ""
 
 
+def quote_sender_lines(text: str) -> str:
+    """Separate caller text from generated sender metadata."""
+    normalized = re.sub(r"\r\n|[\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]", "\n", text)
+    return re.sub(r"(?m)^([^\S\n]*(?:Authority:|Sender native id:))", r"> \1", normalized)
+
+
+def stamped_text(first: str, rest: str, stamp: SenderStamp) -> str:
+    preview, separator, remainder = quote_sender_lines(first).partition("\n")
+    return preview + sender_stamp_lines(stamp) + separator + remainder + quote_sender_lines(rest)
+
+
 def agent_text(message: Message, *, via_relay: bool = False) -> str:
-    """Keep the body preview intact and add the sending machine's display text."""
-    first, separator, rest = message.text.partition("\n")
+    """Format caller text and add the sending machine's display and native stamp."""
+    first, separator, rest = quote_sender_lines(message.text).partition("\n")
     sender = relay_session_name(message.sender) if via_relay else message.sender
-    return first + shown_sender_line(sender, message.shown_sender) + separator + rest
+    return stamped_text(first + shown_sender_line(sender, message.shown_sender), separator + rest, message.stamp)
 
 
 def delivered_text(message: Message, entry_id: str) -> str:
-    shown = shown_sender_line(message.sender, message.shown_sender)
-    return (f"Message from {message.sender} via postmaster: {message.summary} [{entry_id[:8]}]"
-            + f"{shown}\n\n{message.text}")
+    return stamped_text(
+        f"Message from {message.sender} via postmaster: {quote_sender_lines(message.summary)} [{entry_id[:8]}]"
+        + shown_sender_line(message.sender, message.shown_sender), "\n\n" + message.text, message.stamp)
 
 
 def send(options: Options) -> Result:
@@ -2371,7 +2504,10 @@ def send(options: Options) -> Result:
     key = user_emergency_key(sender, summary) if emergency and options.key is None else options.key
     display = (options.shown_sender.text if isinstance(options.shown_sender, ShownSender)
                else sender_shown_name(sender, observed) if options.to != USER else sender)
-    message = Message(destination, sender, summary, text, key, display, options.human)
+    stamp = (options.sender_origin.stamp if isinstance(options.sender_origin, ForwardedSender) else sender_stamp())
+    if sender.casefold() == "morty" and not morty_stamp(stamp):
+        print("send.py: sender 'morty' does not match MORTY_NATIVE_ID", file=sys.stderr)
+    message = Message(destination, sender, summary, text, key, display, options.human, stamp)
     started = now()
     # An emergency push repeats on the phone until the user acknowledges it, it is retired, or it
     # expires: with no --repeat-minutes, a send with its key inside that lifetime is skipped.
@@ -2420,6 +2556,7 @@ def send(options: Options) -> Result:
             message.key,
             message.shown_sender,
             message.human,
+            message.stamp,
         )
         result = codex(transport, route.session_dir, options.timeout)
     elif isinstance(route, CodexSessionRecipient):
