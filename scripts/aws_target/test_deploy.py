@@ -11,19 +11,22 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
-from typing import cast, override
+from typing import ClassVar, cast, override
 from unittest import mock
 from urllib.request import Request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mac_test'))
 
-from scripts.aws_target import aws_target, config as aws_config, deploy, ledger, remote
+from scripts.aws_target import aws_target, config as aws_config, deploy, ledger, measurement, remote
 from scripts.aws_target.config import read_control_settings
 from scripts.aws_target.ledger_test_support import CostFixture
+from scripts.aws_target.measurement_test_support import DAY, narrow
 from scripts.buildlog import sync
 from scripts.lib import conf
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 FAKE_AWS = r'''import datetime, json, os, pathlib, sys
@@ -97,12 +100,13 @@ class DeploymentTests(CostFixture):
     now: int = 0
     bundle: Path = Path()
     credentials: Path = Path()
+    patch_sections: ClassVar[dict[str, str]] = {}
 
     @override
     def setUp(self) -> None:
         super().setUp()
         _ = self.settings.write_text((deploy.TEMPLATE.parents[3] / 'config/aws_target.conf').read_text())
-        self.now = int(datetime(2026, 1, 15, 23, 59, tzinfo=UTC).timestamp())
+        self.now = int(datetime.fromisoformat(DAY + "T23:59:00+00:00").timestamp())
         self.bundle = self.root / 'bundle'
         self.bundle.mkdir()
         bootstrap = self.bundle / 'bootstrap.sh'
@@ -153,9 +157,7 @@ class DeploymentTests(CostFixture):
         self.credentials.chmod(0o600)
         bin_path = self.root / 'bin'
         bin_path.mkdir()
-        fake = bin_path / 'aws'
-        _ = fake.write_text(f'#!{sys.executable}\n' + FAKE_AWS)
-        fake.chmod(0o700)
+        self.fake_commands(f'#!{sys.executable}\n' + FAKE_AWS, 'aws')
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             'PATH': f'{bin_path}{os.pathsep}{os.environ["PATH"]}', 'DEPLOY_FIXTURE': str(self.root),
             'AWS_SHARED_CREDENTIALS_FILE': str(self.credentials),
@@ -657,18 +659,7 @@ class DeploymentTests(CostFixture):
                                      patch, re.MULTILINE))
         self.assertEqual(len(file_modes), 1)
         self.assertEqual(int(file_modes[0].group(1), 8) & 0o004, 0o004)
-        section = patch.split('diff --git a/hosts/aws-bootstrap.sh.in b/hosts/aws-bootstrap.sh.in\n', 1)[1]
-        section = section.split('\ndiff --git ', 1)[0]
-        base = patch.split('diff --git a/hosts/aws-build-base.nix b/hosts/aws-build-base.nix\n', 1)[1]
-        base = base.split('\ndiff --git ', 1)[0]
-        hosts = self.root / 'nixos/hosts'
-        _ = (hosts / 'aws-build-base.nix').write_text('\n'.join(
-            line[1:] for line in base.splitlines() if line.startswith('+') and not line.startswith('+++')) + '\n')
-        source = '\n'.join(line[1:] for line in section.splitlines()
-                           if line.startswith('+') and not line.startswith('+++')) + '\n'
-        template = hosts / 'reviewed-bootstrap.sh.in'
-        _ = template.write_text(source)
-        self.replace('bootstrap_template_path', str(template))
+        self.install_reviewed_template()
         for volume in ('', 'vol-0123456789abcdef0'):
             with self.subTest(volume=volume):
                 self.replace('existing_data_volume_id', volume)
@@ -872,9 +863,320 @@ class DeploymentTests(CostFixture):
         _ = self.settings.write_text(source)
         self.assertIn('# range: 10..20\nidle_stop_minutes=15', deploy.remote_configuration(self.settings))
 
+    def fake_commands(self, source: str, *names: str) -> None:
+        for name in names:
+            path = self.root / 'bin' / name
+            _ = path.write_text(source)
+            path.chmod(0o700)
+
+    def run_bash(self, path: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(['bash', str(path)], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+
+    def patch_source(self, path: str) -> str:
+        if not self.patch_sections:
+            patch = (deploy.TEMPLATE.parent / 'nixos.patch').read_text()
+            for section in patch.split('diff --git ')[1:]:
+                name = section.splitlines()[0].split(' b/', 1)[1]
+                self.patch_sections[name] = '\n'.join(line[1:] for line in section.splitlines()
+                                                     if line.startswith('+') and not line.startswith('+++')) + '\n'
+        return self.patch_sections[path]
+
+    def install_reviewed_template(self) -> None:
+        hosts = self.root / 'nixos/hosts'
+        template = hosts / 'reviewed-bootstrap.sh.in'
+        _ = template.write_text(self.patch_source('hosts/aws-bootstrap.sh.in'))
+        _ = (hosts / 'aws-build-base.nix').write_text(self.patch_source('hosts/aws-build-base.nix'))
+        self.replace('bootstrap_template_path', str(template))
+
+    def reviewed_bundle(self) -> str:
+        self.install_reviewed_template()
+        with mock.patch.object(sys, 'argv', ['deploy.py', 'bootstrap', '--settings', str(self.settings),
+                                           '--output', str(self.bundle)]):
+            self.assertEqual(deploy.main(), 0)
+        return (self.bundle / 'bootstrap.sh').read_text()
+
+    def test_bootstrap_retry_keeps_the_existing_watchdog_deadline(self) -> None:
+        rendered = self.reviewed_bundle()
+        watchdog = rendered.split('# Bound the first boot', 1)[1].split('\ncat > ', 1)[0]
+        watchdog = watchdog[watchdog.index('\n') + 1:]
+        script = self.root / 'watchdog.sh'
+        _ = script.write_text('set -euo pipefail\n' + watchdog)
+        fake = r'''import json, os, pathlib, sys
+root = pathlib.Path(os.environ['DEPLOY_FIXTURE'])
+state = root / 'watchdog-deadline.json'
+if pathlib.Path(sys.argv[0]).name == 'systemctl':
+    assert sys.argv[1:] == ['show', '--property=LoadState', '--value', 'aws-build-first-boot-stop.timer']
+    print('loaded' if state.exists() else 'not-found')
+else:
+    with (root / 'watchdog-calls.jsonl').open('a') as output:
+        output.write(json.dumps(sys.argv[1:]) + '\n')
+    seconds = next(arg.split('=')[1].removesuffix('s') for arg in sys.argv[1:] if arg.startswith('--on-active='))
+    state.write_text(json.dumps(int((root / 'clock').read_text()) + int(seconds)))
+'''
+        self.fake_commands(f'#!{sys.executable}\n' + fake, 'systemctl', 'systemd-run')
+        first = self.run_bash(script)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        deadline = (self.root / 'watchdog-deadline.json').read_bytes()
+        self.assertEqual(json.loads(deadline), self.now + int(read_control_settings(self.settings).idle_stop_minutes * 60))
+        self.set_clock(self.now + 60)
+        second = self.run_bash(script)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual((self.root / 'watchdog-deadline.json').read_bytes(), deadline)
+        self.assertEqual(len((self.root / 'watchdog-calls.jsonl').read_text().splitlines()), 1)
+
+    def test_controller_service_restarts_after_a_failed_interval_read(self) -> None:
+        module = self.patch_source('modules/linux/aws-build.nix')
+        unit = module.split('systemd.user.services.aws-target = {', 1)[1]
+        service = unit.split('serviceConfig = {', 1)[1].split('};', 1)[0]
+        self.assertRegex(service, r'Restart\s*=\s*"on-failure"\s*;')
+        delay = re.search(r'RestartSec\s*=\s*"([0-9]+(?:\.[0-9]+)?)s"\s*;', service)
+        if delay is None:
+            self.fail('the controller needs a restart delay')
+        self.assertGreater(Decimal(delay.group(1)), 0)
+
+    def install_volume_fakes(self) -> None:
+        state = self.root / 'volume-state'
+        state.mkdir()
+        _ = (state / 'data-volume-id').write_text('vol-0123456789abcdef0\n')
+        (self.root / 'device').touch()
+        fake = r'''#!/bin/sh
+set -eu
+root=$DEPLOY_FIXTURE
+case ${0##*/} in
+  udevadm) test "$1" = wait ;;
+  readlink)
+    test "$1" = -f
+    test "$2" = /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol0123456789abcdef0
+    printf '%s/device\n' "$root" ;;
+  lsblk)
+    case "$3" in
+      SERIAL) printf '%s\n' "$(cat "$root/serial")" ;;
+      TYPE) printf 'disk\n' ;;
+      *) test "$3" = MOUNTPOINTS ;;
+    esac ;;
+  blkid)
+    test "$1" = -s
+    test "$3" = -o
+    test "$4" = value
+    test "$5" = "$root/device"
+    if test -f "$root/TYPE" || test -f "$root/LABEL"; then
+      if test -f "$root/$2"; then cat "$root/$2"; else printf '\n'; fi
+    else
+      printf '\n'
+      exit 2
+    fi ;;
+  wipefs)
+    if test -f "$root/TYPE"; then cat "$root/TYPE"; else printf '\n'; fi ;;
+  mkfs.ext4)
+    test "$#" -eq 3
+    test "$1" = -L
+    test "$2" = aws-home
+    test "$3" = "$root/device"
+    printf 'format\n' >> "$root/formats"
+    printf 'ext4\n' > "$root/TYPE"
+    printf 'aws-home\n' > "$root/LABEL" ;;
+  *) exit 1 ;;
+esac
+'''
+        self.fake_commands(fake, 'udevadm', 'readlink', 'lsblk', 'blkid', 'wipefs', 'mkfs.ext4')
+
+    def volume_script(self, *, bootstrap: bool, existing: str = '') -> Path:
+        base = self.patch_source('hosts/aws-build-base.nix')
+        host = self.patch_source('hosts/aws-build.nix')
+        self.assertRegex(host, r'imports\s*=\s*\[\s*\(import\s+\./aws-build-base\.nix\b')
+        self.assertIn('existingVolume = if bootstrap then installation.existingVolume else "";', base)
+        if bootstrap:
+            self.replace('existing_data_volume_id', existing)
+            source = self.reviewed_bundle()
+            installation = source.split('    installation = {', 1)[1].split('    };', 1)[0]
+            volume = re.search(r'existingVolume = ("[^"\n]*");', installation)
+            delay = re.search(r'volumeWaitSeconds = ([0-9]+);', installation)
+            if volume is None or delay is None:
+                self.fail('the rendered installation needs volume settings')
+            existing = cast(str, json.loads(volume.group(1)))
+            wait = '--timeout=' + delay.group(1)
+        else:
+            source, existing, wait = base, '', ''
+        volume_script = source.split('systemd.services.aws-build-volume = {', 1)[1]
+        script = volume_script.split("script = ''\n", 1)[1].split("\n    '';", 1)[0]
+        bindings = {
+            '${pkgs.systemd}/bin/udevadm': 'udevadm',
+            '${lib.optionalString bootstrap "--timeout=${toString installation.volumeWaitSeconds}"}': wait,
+            '${if bootstrap then "false" else "true"}': 'false' if bootstrap else 'true',
+            '${lib.escapeShellArg existingVolume}': shlex.quote(existing),
+            '/var/lib/aws-build': str(self.root / 'volume-state'),
+            'test -b "$device"': 'test -f "$device"',
+        }
+        self.assertEqual(script.count('test -b "$device"'), 1)
+        for name, value in bindings.items():
+            script = script.replace(name, value)
+        self.assertNotIn('${', script)
+        path = self.root / ('bootstrap-volume.sh' if bootstrap else 'host-volume.sh')
+        _ = path.write_text(script)
+        return path
+
+    def test_both_volume_modes_refuse_wrong_serials_and_preserve_existing_filesystems(self) -> None:
+        self.install_volume_fakes()
+        for bootstrap in (True, False):
+            script = self.volume_script(bootstrap=bootstrap, existing='vol-0123456789abcdef0')
+            for serial, expected_status in (('vol-wrong', 1), ('vol0123456789abcdef0', 0)):
+                with self.subTest(bootstrap=bootstrap, serial=serial):
+                    _ = (self.root / 'serial').write_text(serial)
+                    original = {'TYPE': b'ext4\n', 'LABEL': b'aws-home\n', 'evidence': b'keep'}
+                    for key, value in original.items():
+                        _ = (self.root / key).write_bytes(value)
+                    result = self.run_bash(script)
+                    self.assertEqual(result.returncode, expected_status, result.stderr)
+                    self.assertEqual({key: (self.root / key).read_bytes() for key in original}, original)
+                    self.assertFalse((self.root / 'formats').exists())
+
+    def test_bootstrap_formats_matching_blank_media_once_and_full_host_refuses_it(self) -> None:
+        self.install_volume_fakes()
+        _ = (self.root / 'serial').write_text('vol0123456789abcdef0')
+        full = self.volume_script(bootstrap=False)
+        refused = self.run_bash(full)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertFalse((self.root / 'formats').exists())
+        bootstrap = self.volume_script(bootstrap=True)
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                result = self.run_bash(bootstrap)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((self.root / 'formats').read_text(), 'format\n')
+        kept = self.run_bash(full)
+        self.assertEqual(kept.returncode, 0, kept.stderr)
+        self.assertEqual((self.root / 'formats').read_text(), 'format\n')
+
+    def test_earlier_day_request_costs_do_not_reduce_the_next_days_reconciled_guard_totals(self) -> None:
+        self.text_setting('accounting_zone', 'America/New_York')
+        self.costs({'fixed_usd_per_month': '0', 'cost_explorer_read_usd': '0',
+                    'observation_max_age_seconds': '259200', 'limit_reserve_usd': '0', 'daily_limit_usd': '18'})
+        start = int(datetime(2026, 2, 1, tzinfo=UTC).timestamp())
+        end = start + 86400
+        self.set_clock(end + 3600)
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(start, (ledger.PricedResource('volume', Decimal(0)),), 'fixture'))
+        book.observe(ledger.InstanceObservation(start, 'stopped', 'confirmed stopped'))
+        book.reconcile(ledger.CostReconciliation(self.now, start, end, Decimal(24), 'UTC bill'))
+        before = book.guard(self.settings, 'deployment', self.now, lambda _event: True)
+        before_costs = narrow(self, before.evidence.costs, ledger.CostEstimate)
+        self.assertEqual(before_costs.daily.usd, Decimal(19))
+        self.assertEqual(before_costs.monthly.usd, Decimal(19))
+        self.assertIsInstance(before, ledger.SpendingRefused)
+        request = ledger.ComputeRequest(start, 'replacement', 'us-east-1', Decimal(2))
+        book.record_compute_request(request)
+        book.resolve_compute_request(request, ledger.ComputeResourcesAbsent(start + 5 * 3600))
+        after = book.guard(self.settings, 'deployment', self.now, lambda _event: True)
+        after_costs = narrow(self, after.evidence.costs, ledger.CostEstimate)
+        self.assertGreaterEqual(after_costs.daily.usd, before_costs.daily.usd)
+        self.assertGreaterEqual(after_costs.monthly.usd, before_costs.monthly.usd)
+        self.assertIsInstance(after, ledger.SpendingRefused)
+        self.assertEqual(sum(row.confirmed_uptime_s for row in after_costs.intervals), 0)
+
+    def test_lower_price_keeps_each_established_day_and_the_guard_refusal(self) -> None:
+        self.text_setting('accounting_zone', 'America/New_York')
+        self.costs({'fixed_usd_per_month': '0', 'cost_explorer_read_usd': '0',
+                    'observation_max_age_seconds': '259200', 'price_max_age_seconds': '259200',
+                    'fallback_usd_per_hour': '1', 'limit_reserve_usd': '0', 'daily_limit_usd': '20'})
+        start = int(datetime(2026, 2, 1, tzinfo=UTC).timestamp())
+        end = start + 86400
+        self.set_clock(end)
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(start, (ledger.PricedResource('volume', Decimal(0)),), 'fixture'))
+        book.observe(ledger.InstanceObservation(start, 'running', 'confirmed running'))
+        book.observe(ledger.InstanceObservation(end, 'stopped', 'confirmed stopped'))
+        book.record_price(ledger.PriceSample(start, Decimal('0.1'), 'earlier day price'))
+        book.record_price(ledger.PriceSample(start + 5 * 3600, Decimal(1), 'later day price'))
+        book.reconcile(ledger.CostReconciliation(self.now, start, end, Decimal(24), 'Cost Explorer'))
+        before = book.guard(self.settings, 'deployment', self.now, lambda _event: True)
+        self.assertIsInstance(before, ledger.SpendingRefused)
+        before_costs = narrow(self, before.evidence.costs, ledger.CostEstimate)
+        book.record_price(ledger.PriceSample(start + 6 * 3600, Decimal('0.1'), 'lower later price'))
+        reopened = ledger.CostLedger(self.state)
+        after = reopened.guard(self.settings, 'deployment', self.now, lambda _event: True)
+        after_costs = narrow(self, after.evidence.costs, ledger.CostEstimate)
+        self.assertGreaterEqual(after_costs.daily.usd, before_costs.daily.usd)
+        self.assertGreaterEqual(after_costs.monthly.usd, before_costs.monthly.usd)
+        self.assertIsInstance(after, ledger.SpendingRefused)
+        saved = reopened.path.read_bytes()
+        snapshot = reopened.read_snapshot()
+        readonly = ledger.costs_from_evidence(snapshot, aws_config.read_settings(self.settings), self.now)
+        self.assertEqual(reopened.path.read_bytes(), saved)
+        self.assertEqual(snapshot, reopened.read_snapshot())
+        self.assertEqual(readonly.daily, after_costs.daily)
+
+        self.replace('offload', 'on')
+        charges = self.state / 'charges'
+        charges.mkdir()
+        reading = ledger.ChargeRead('2026-02-01', self.now + 1, start, end, Decimal(24), Decimal(0), Decimal(0))
+        _ = (charges / '2026-02-01.json').write_text(json.dumps(ledger.charge_record(reading)))
+        recovered = reopened.refresh_charges(self.settings, self.now + 1,
+                                             lambda _start, _end: self.fail('recover the saved reply first'))
+        self.assertEqual(recovered, reading)
+        resolved = reopened.guard(self.settings, 'deployment', self.now + 1, lambda _event: True)
+        resolved_costs = narrow(self, resolved.evidence.costs, ledger.CostEstimate)
+        self.assertGreaterEqual(resolved_costs.daily.usd, before_costs.daily.usd)
+        self.assertGreaterEqual(resolved_costs.monthly.usd, before_costs.monthly.usd)
+        self.assertIsInstance(resolved, ledger.SpendingRefused)
+
+    def test_matching_bill_adds_no_reconciliation_charge(self) -> None:
+        self.costs({'fixed_usd_per_month': '0', 'cost_explorer_read_usd': '0',
+                    'observation_max_age_seconds': '259200', 'price_max_age_seconds': '259200'})
+        start = self.now - 86400
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(start, (ledger.PricedResource('volume', Decimal(0)),), 'fixture'))
+        book.observe(ledger.InstanceObservation(start, 'running', 'confirmed running'))
+        book.record_price(ledger.PriceSample(start, Decimal(1), 'confirmed price'))
+        book.reconcile(ledger.CostReconciliation(self.now, start, self.now, Decimal(24), 'UTC bill'))
+        costs = book.estimate(aws_config.read_settings(self.settings), self.now)
+        self.assertEqual(ledger.period_cost(costs.intervals, start, self.now), Decimal(24))
+        self.assertEqual(sum(r.usd for r in costs.intervals if r.kind == 'reconciliation'), Decimal(0))
+
+    def test_readonly_measurements_leave_reconciled_day_totals_unestablished(self) -> None:
+        self.costs({'fixed_usd_per_month': '0', 'cost_explorer_read_usd': '0'})
+        start = self.now - 3600
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(start, (ledger.PricedResource('volume', Decimal(0)),), 'fixture'))
+        book.observe(ledger.InstanceObservation(start, 'stopped', 'confirmed stopped'))
+        book.observe(ledger.InstanceObservation(self.now, 'stopped', 'fresh confirmed stopped'))
+        book.reconcile(ledger.CostReconciliation(self.now, start, self.now, Decimal(2), 'UTC bill'))
+        saved = book.path.read_bytes()
+        snapshot = book.read_snapshot()
+        costs = ledger.costs_from_evidence(snapshot, aws_config.read_settings(self.settings), self.now)
+        self.assertEqual(costs.daily.usd, Decimal(2))
+        self.assertEqual(snapshot.reconciliations[0].established_days, ())
+        self.assertEqual(book.path.read_bytes(), saved)
+        _ = book.estimate(aws_config.read_settings(self.settings), self.now)
+        reopened = ledger.CostLedger(self.state).read_snapshot()
+        self.assertEqual(reopened.reconciliations[0].established_days,
+                         (ledger.EstablishedDayCost(DAY, Decimal(2)),))
+
+    def test_estimate_preserves_distinct_replies_for_the_same_period(self) -> None:
+        self.costs({'fixed_usd_per_month': '0', 'cost_explorer_read_usd': '0'})
+        start = self.now - 60
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(start, (ledger.PricedResource('volume', Decimal(0)),), 'fixture'))
+        book.observe(ledger.InstanceObservation(start, 'stopped', 'confirmed stopped'))
+        readings = (ledger.CostReconciliation(self.now, start, self.now, Decimal(2), 'UTC bill'),
+                    ledger.CostReconciliation(self.now, start, self.now, Decimal(1), 'UTC bill'))
+        for reading in readings:
+            book.reconcile(reading)
+        costs = book.estimate(aws_config.read_settings(self.settings), self.now)
+        self.assertEqual(costs.daily.usd, Decimal(2))
+        self.assertEqual(tuple(ledger.CostLedger(self.state).read_snapshot().reconciliations), readings)
+
+    def test_money_and_measurement_use_the_configuration_finite_number_rule(self) -> None:
+        for value in ('1e400', 'nan', 'inf'):
+            for parser in (aws_config.money, measurement.number):
+                with self.subTest(value=value, parser=parser.__name__):
+                    with self.assertRaises(ValueError):
+                        _ = parser(value)
+
     def test_spending_caps_refuse_values_above_the_configured_maximum(self) -> None:
-        for key, value, normal in (('monthly_limit_usd', '400.01', '400'), ('daily_limit_usd', '20.01', '20')):
-            with self.subTest(key=key):
+        for key, value, normal in (('monthly_limit_usd', '400.01', '400'), ('daily_limit_usd', '20.01', '20'),
+                                   ('monthly_limit_usd', '400.0000000000000001', '400'),
+                                   ('daily_limit_usd', '20.0000000000000001', '20')):
+            with self.subTest(key=key, value=value):
                 self.replace(key, value)
                 with self.assertRaises(ValueError):
                     _ = aws_config.read_settings(self.settings)

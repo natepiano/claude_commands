@@ -452,7 +452,7 @@ Delivery failures, restarts, and failed ledger writes preserve the event and dup
 
 **Ruled out:** replacing known instance charges with the fallback rate during an unconfirmed request — it under-counts; charging an unconfirmed request at a historical Spot price — it is not an upper bound.
 
-### Phase 12 — Exact spending caps, the midnight total and the NixOS regression tests  · status: todo
+### Phase 12 — Exact spending caps, the midnight total and the NixOS regression tests  · status: done
 **Depends on:** Phase 11
 
 #### Work Order
