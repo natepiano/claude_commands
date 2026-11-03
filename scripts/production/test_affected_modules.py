@@ -355,7 +355,7 @@ class AffectedModulesTests(unittest.TestCase):
     def test_every_shared_input_trigger_requests_full_validation(self) -> None:
         paths = ["scripts/lib/new.py", "scripts/other/conftest.py", "settings.json",
                  "scripts/production/merge_gate.py", "scripts/production/affected_modules.py",
-                 "scripts/agents/agents_config.sh"]
+                 "scripts/agents/models_config.sh"]
         for path in paths:
             with self.subTest(path=path):
                 self.write(path, "# changed\n")

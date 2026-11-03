@@ -89,7 +89,7 @@ The verbs:
 
 A held design role (a roster entry with `held_design_id`, `docs/as-built/long-lived-workers.md#lasting-roles`) changes only through `scripts/astra/design_roles.py`: `start`, `prime` over it, `fork` from it, `reopen`, `set-instructions`, raw `stop` and `stop --pause` refuse it, `follow` takes only its `authorized_prompt` (or an account-move continuation), and `send` queues the text in the role store.
 
-`follow` and `start` both send `model` on every `turn/start`. Every submission resolves the current `agents.conf` default for its role, unless the dispatch supplied an explicit model or effort override. This also applies to follow-ups, owed continuations, overflow recovery, capacity retries and account moves, on the same thread with its context kept. Saved model and effort values are display history only.
+`follow` and `start` both send `model` on every `turn/start`. Every submission resolves the current `models.conf` default for its role, unless the dispatch supplied an explicit model or effort override. This also applies to follow-ups, owed continuations, overflow recovery, capacity retries and account moves, on the same thread with its context kept. Saved model and effort values are display history only.
 
 **Roster fields (`mesh_roster.json`).** Each entry has:
 
@@ -348,7 +348,7 @@ Other public functions: `queue_message`, `pending_messages`, `held_document`, `e
 
 **Authorization.** `_authorize` requires placement host = local host, a live holder from `resolve_holder` (unit holder: `unit_lookup.every_marked_unit` with a `LiveClaude`; showrunner holder: `production_tree.showrunner_sessions` and `sessions.running_sessions`), and `CLAUDE_CODE_SESSION_ID` equal to that session. A missing or ambiguous holder blocks dispatch but does not change the holder.
 
-**Models.** `resolve_model(role)` sources `scripts/agents/agents_config.sh` and runs `agents_resolve "design_roles.<role>"`; the family must be `codex`. `config/agents.conf` has `[assignments] design_roles=codex` and `[design_roles.codex] designer=astra:xhigh`, `reviewer=astra:xhigh` (the `astra` word resolves to `gpt-6-astra`). A missing or invalid row refuses; there is no fallback model.
+**Models.** `resolve_model(role)` sources `scripts/agents/models_config.sh` and runs `agents_resolve "design_roles.<role>"`; the family must be `codex`. `config/models.conf` has `[assignments] design_roles=codex` and `[design_roles.codex] designer=astra:xhigh`, `reviewer=astra:xhigh` (the `astra` word resolves to `gpt-6-astra`). A missing or invalid row refuses; there is no fallback model.
 
 **Prompts.** A designer prompt is `config/design_roles/designer.md` + `Use apply_patch for all repository edits. Edit only the bound output paths.` A reviewer prompt is `astra_review.review_prompt(document, "")`. `_prompt` writes the `astra_work.header_line` first (`PhaseWork` from the binding, else `StandaloneWork`), then the instructions, the holder's text and each pending message as `Pending message <id> from <source>: <text>`.
 

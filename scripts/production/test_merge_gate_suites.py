@@ -103,7 +103,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
         for row in rows:
             self.assertTrue(Path(row["buildlog"]).is_relative_to(row["tmpdir"]))
             self.assertFalse(Path(row["tmpdir"]).exists())
-        self.assertEqual(set(caller_log.iterdir()), {caller_log / "keep", caller_log / "admission"})
+        self.assertEqual(set(caller_log.iterdir()), {caller_log / "keep"})
         self.assertEqual((caller_log / "keep").read_text(), "caller log")
         self.assertEqual(list((caller_log / "admission").glob("*.reservation")), [])
         self.assertEqual(list((caller_log / "admission").glob("*.waiting")), [])

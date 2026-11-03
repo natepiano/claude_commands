@@ -19,19 +19,17 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
         lock = board / "locks" / "cargo.d"
         meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
         _ = meminfo.write_text("MemAvailable: 0 kB\n")
-        peer_meminfo = self.root / "peer-meminfo"
-        _ = peer_meminfo.write_text("MemAvailable: 50331648 kB\n")
         environment = {**self.environment, "UNIT_RUN_DIR": str(board),
                        "UNIT_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1"}
         phase_16_errors = self.root / "phase-16.err"
         phase_16 = self.start_memory_waiter(environment, phase_16_errors)
+        resume_waiter = self.defer_memory_waiter_for_peer()
         phase_15: subprocess.Popen[bytes] | None = None
         try:
             self.assertFalse(lock.exists(), "the memory wait kept the token")
             phase_15 = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"],
                                         cwd=self.root,
-                                        env={**environment, "BUILDLOG_MEMINFO": str(peer_meminfo),
-                                             "TEST_BLOCK": "1"},
+                                        env={**environment, "TEST_BLOCK": "1"},
                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                         start_new_session=True)
             self.started_groups.add(phase_15.pid)
@@ -43,7 +41,7 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
             self.assertEqual(launcher_release.returncode, 1, launcher_release.stdout)
             self.assertIn(f"held by live pid {phase_15.pid}", launcher_release.stderr)
 
-            _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
+            resume_waiter()
             self.wait_for_output(phase_16_errors, "memory free after", phase_16)
             self.assertIsNone(phase_16.poll(), phase_16_errors.read_text())
             self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 1)

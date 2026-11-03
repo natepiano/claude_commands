@@ -187,7 +187,7 @@ class OpenPass(TypedDict):
 ProgressState = TypedDict("ProgressState", {"pass": dict[str, OpenPass]})
 
 
-AGENTS_REGISTRY = launcher_registry(("impl",), mesh=True)
+MODELS_REGISTRY = launcher_registry(("impl",), mesh=True)
 
 
 class ReviewLauncherFixture(LauncherFixture):
@@ -217,7 +217,7 @@ class ReviewLauncherFixture(LauncherFixture):
                 "UNIT_COMPACT_ABOVE_TOKENS=100000",
                 "ROUTING_FROM_ROUND=4", "ASTRA_AFTER_FAILED_FIXES=2",
                 "",
-            ), AGENTS_REGISTRY,
+            ), MODELS_REGISTRY,
         )
         _ = write_config_fixture(self.config_file, self.config_file.read_text(encoding="utf-8"))
         _ = config_environment(self.root)

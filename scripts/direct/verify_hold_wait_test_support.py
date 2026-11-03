@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.build_queue.admission_test_support import caller_admission
+
 import json
 import os
 import select
@@ -190,6 +192,7 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         self.runner_state: Path = self.root / "runner-state"
         self.cargo_events_path: Path = self.root / "cargo-events.jsonl"
         self.environment: dict[str, str] = self.fixture_environment.copy()
+        _ = caller_admission(self, self.root, self.environment)
 
     @override
     def stop_verify(self, process: subprocess.Popen[str]) -> None:
