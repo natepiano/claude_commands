@@ -98,7 +98,8 @@ class SettingsFilterTests(unittest.TestCase):
             source = KEYS.parents[2] / "config" / f"{name}.conf"
             _ = shutil.copy2(source, self.root / "config" / source.name)
         _ = shutil.copy2(KEYS.with_name("local_key_notices.py"), self.root / "scripts/settings/local_key_notices.py")
-        _ = shutil.copy2(KEYS.parents[1] / "message/send_result.py", self.root / "scripts/message/send_result.py")
+        for name in ("send_result.py", "send_budget.py"):
+            _ = shutil.copy2(KEYS.parents[1] / "message" / name, self.root / "scripts/message" / name)
         _ = (self.root / "scripts/message/send.py").write_text('''import json, sys, runpy
 from pathlib import Path
 if __name__ != "__main__":

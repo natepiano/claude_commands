@@ -14,6 +14,7 @@ import fcntl
 import json
 import os
 import socket
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -115,6 +116,9 @@ class RefusalWatchTests(unittest.TestCase):
             "SHUTDOWN_STATE_DIR": str(self.home / "shutdown"),
             "NOTIFIER_SESSIONS_DIR": str(self.home / "sessions"), "USER_ZONE": "America/New_York",
         }, clear=True)))
+        for name in ("send", "postmaster", "codex_daemon"):
+            _ = shutil.copy2(Path(__file__).resolve().parents[2] / "config" / f"{name}.conf",
+                             Path(os.environ["CONF_DIR"]) / f"{name}.conf")
         (self.home / "notes").mkdir()
         _ = self.enterContext(patch.object(socket, "gethostname", return_value="natedev"))
         _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))

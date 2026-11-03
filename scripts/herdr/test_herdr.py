@@ -2383,7 +2383,7 @@ class HerdrTests(unittest.TestCase):
         message = isolated.parent / "message"
         copy_session_modules(message)
         library = isolated.parent / "lib"
-        library.mkdir()
+        library.mkdir(exist_ok=True)
         _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/nix_env.py", library / "nix_env.py")
         _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/process_failure.py", library / "process_failure.py")
         _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/probe_session.py", library / "probe_session.py")
