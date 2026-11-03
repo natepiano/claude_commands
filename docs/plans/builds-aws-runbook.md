@@ -263,24 +263,21 @@ Permit that user to enter the box's `natepiano` account through Tailscale SSH.
 Test the permitted and denied directions in the policy console.
 Do not store a Tailscale auth key on either branch.
 
+natedev is already rebuilt. On 2026-11-03 it switched to `/etc/nixos` 10353a9, which holds the patch commit 78746da.
+`aws-target.service` is installed on natedev and stays disabled until go-live.
+
 1. Give the natedev showrunner the prepared `aws-build` branch and the director's commit.
-2. Have the showrunner inspect the patch and both Nix evaluation results.
-3. Rebuild natedev and the box yourself from the reviewed branch.
-4. Keep the controller service inactive during both activations.
+2. Have the showrunner inspect the patch and the box's Nix evaluation result.
+3. Rebuild the box yourself from the reviewed branch.
+4. Keep the controller service inactive during the box activation.
 5. Confirm SSM, Tailscale SSH, `/home`, and the remote lifecycle service after activation.
-
-Use the reviewed checkout for the user-run natedev activation:
-
-```sh
-sudo nixos-rebuild switch --flake /home/natepiano/worktrees/nixos-aws-build#natedev
-```
 
 Install the reviewed public NixOS branch on the box before its user-run activation.
 Use the `aws-build` output for that activation.
 Do not copy credentials, private host keys, or a live machine's configuration directory.
-The showrunner must supply the committed branch identity before either activation.
+The showrunner must supply the committed branch identity before the activation.
 
-Agents must not activate either system or modify the live NixOS checkout.
+Agents must not activate a system or modify the live NixOS checkout.
 The prepared AWS host installs Python 3.13, Nix, Git, rsync, Rust, nextest, and mend.
 Its pinned Rust overlay and cargo-liner source supply the Rust tools.
 A successful Nix evaluation proves neither package builds nor runtime tool parity.
