@@ -400,6 +400,8 @@ Measurement notes:
 4. The report's by-change window follows selected episode bounds, not the full seven-day invocation window. It gives n=14 `/hana_shot` episodes and n=4 by-hand episodes on each split, all from natedev. It labels these groups too small to judge. Do not treat those medians as proof of a Phase 13 effect.
 5. Phase 14 has no direct invocation measurement for standalone launch or shutdown. Phase 15 changes attribution and cache handling; neither supplies a new speed-gain entry here.
 
+**Not built (showrunner, 2026-11-03):** the refused-resize recovery step. It saves about 4.4 minutes a week from n=1, and 2-4 hours of work take 28-55 weeks to repay. The next re-rank is a week after this one's scan: 2026-11-10 08:09 EST. Propose it again only if its saving repays the work in about 8 weeks or less, or the failure repeats.
+
 ### Phase 7 — We know what fills a long `/hana_shot` episode, and its fix comes back priced · status: done
 
 #### As-built
