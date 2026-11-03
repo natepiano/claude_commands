@@ -403,9 +403,9 @@ run() {
             if [[ "$CMD" != test && "$STEP_RUNS_ON" != natedev_only ]] && buildlog_step_compiles "$@"; then
                 export LINT_QUEUE_LEAVE_HOOK="$(ssh_retry_hook)"
             fi
-            # Judgment diagnostics use this existing step-group tee so waits
-            # remain live and the parent keeps its signal/cancellation path.
-            if run_once "$@" 2>&1 | tee "$step_log" ${CLIPPY_LOG:+"$CLIPPY_LOG"}; then
+            # Keep diagnostic logs in the step group. The parent keeps the
+            # step PID and stops the step when it receives a signal.
+            if run_once "$@" 2>&1 | tee "$step_log" ${CLIPPY_LOG:+"$CLIPPY_LOG"} ${MEND_LOG:+"$MEND_LOG"}; then
                 exit 0
             else
                 exit "${PIPESTATUS[0]}"
@@ -2570,7 +2570,8 @@ export BUILDLOG_CHECK_FAILED_FILE="$HOLD_WAIT_DIR/check-failed"
 trap 'hold_status=$?; interrupt_hold_wait; finish_hold_wait; release_wait_claim; remove_step_record; final_pass_finish "$hold_status"; exit "$hold_status"' EXIT
 hold_interrupted() {
     local signal_name=$1 code=$2
-    trap - INT TERM HUP
+    # Ignore repeated signals while cleanup closes the hold record.
+    trap '' INT TERM HUP
     if [[ -n "$HOLD_WAITER_PID" ]]; then
         # A background Bash sleep inherits ignored INT. End that waiter with
         # TERM for every caller signal; keep the caller's status in the record.
@@ -3399,7 +3400,10 @@ verify_cleanup() {
 # status the trap receives; a lint failure record keeps it.
 trap 'EXIT_STATUS=$?; [[ ${EXIT_STATUS} -eq 0 ]] && verify_cleanup completed || verify_cleanup error; final_pass_finish "$EXIT_STATUS"; exit "${EXIT_STATUS}"' EXIT
 verify_interrupted() {
-    trap - EXIT INT TERM HUP
+    trap - EXIT
+    # The supervisor can forward a signal that this group already received.
+    # Ignore later signals until cleanup removes this call's records.
+    trap '' INT TERM HUP
     EXIT_STATUS=$((128 + $1))
     interrupt_hold_wait
     if [[ -n "$RUN_STEP_PID" ]]; then
@@ -3543,12 +3547,12 @@ case "$CMD" in
         if lint_config_enabled mend; then
             [[ "$PKG" != --workspace ]] || echo 'style-lint: mend start'
             MEND_LOG="$(mktemp)"
-            # pipefail is set, so a failing mend fails the pipeline; the log
-            # only decides which message names the failure.
-            if invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}" 2>&1 | tee "$MEND_LOG"; then
+            # run() records diagnostics through its step tee. Keep this call
+            # in the parent so the signal handler can stop the active step.
+            if invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}"; then
                 :
             else
-                mend_status=${PIPESTATUS[0]}
+                mend_status=$?
                 if (( mend_status == 137 || mend_status == 125 )); then
                     rm -f "$MEND_LOG"
                     exit "$mend_status"
@@ -3562,6 +3566,7 @@ case "$CMD" in
                 exit 1
             fi
             rm -f "$MEND_LOG"
+            MEND_LOG=""
             [[ "$PKG" != --workspace ]] || echo 'style-lint: mend passed'
         else
             lint_config_skip_notice mend "cargo mend --all-targets --workspace --fix"

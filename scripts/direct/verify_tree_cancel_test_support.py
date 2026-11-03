@@ -9,9 +9,11 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import cast, override
 
+from scripts.agents.mesh_runs import RunRecord
 from scripts.direct.test_tree_watch import write_workspace
 from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
 from scripts.direct.verify_token_wait_test_support import VERIFY
@@ -29,6 +31,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import signal
 from pathlib import Path
 
@@ -82,6 +85,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 root = Path(os.environ["TEST_CONTROL"])
@@ -177,8 +181,28 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         _ = path.write_text("#!/bin/sh\n" + code)
         path.chmod(0o755)
 
-    def start_verify(self, command: str, **extra: str) -> subprocess.Popen[str]:
-        process = subprocess.Popen(["bash", str(VERIFY), command, "sample"],
+    def start_verify(self, command: str, *, supervised: bool = False, **extra: str) -> subprocess.Popen[str]:
+        arguments = ["bash", str(VERIFY), command, "sample"]
+        if supervised:
+            record_path = self.control / "lint-run.json"
+            record: RunRecord = {
+                "run_id": "lint-run", "status": "running", "session_dir": str(self.board),
+                "worker": "test", "thread_id": "fixture", "label": "lint cancellation",
+                "command": arguments, "cwd": str(self.workspace),
+                "log": str(self.control / "lint-run.log"), "started_at": time.time(),
+                "pid": 0, "director_dir": str(self.board), "done_message_file": "",
+            }
+            _ = record_path.write_text(json.dumps(record))
+            # Use the real supervisor. Keep result delivery inside this fixture.
+            supervisor = """
+import sys
+from unittest.mock import patch
+from scripts.agents import mesh_runs
+with patch.object(mesh_runs, "deliver", return_value="private fixture"):
+    raise SystemExit(mesh_runs.main(["supervise", sys.argv[1]]))
+"""
+            arguments = [sys.executable, "-c", supervisor, str(record_path)]
+        process = subprocess.Popen(arguments,
                                    cwd=self.workspace, env={**self.environment, **extra},
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                    start_new_session=True)
