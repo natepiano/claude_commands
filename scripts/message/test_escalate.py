@@ -409,7 +409,7 @@ class EscalateTests(unittest.TestCase):
               patch.object(escalate, "schedule"), patch.object(escalate, "deliver", return_value="") as deliver):
             a = self.select_codex(1)
             for key in ("5-hour codex1", "5-hour Codex", "5-hour Claude"):
-                send.enqueue(send.Message("offline", "quota_alert", "", "low window", key), "offline", datetime.now(timezone.utc))
+                send.enqueue(send.Message("offline", "quota_alert", "", "low window", key, stamp=send.UnavailableSender()), "offline", datetime.now(timezone.utc))
             relay = escalate.HeldRelay(recipient="offline", key="5-hour codex1")
             _ = escalate.hold("a-window", escalate.SessionPush("codex1", "A low", NoActionRequired(), "note"), owner=a, relays=(relay,))
             _ = escalate.hold("five-hour-codex", escalate.SessionPush("legacy", "old low", NoActionRequired(), "note"))

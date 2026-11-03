@@ -26,6 +26,7 @@ from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 
 from scripts.whoami.note_file import note_name
+from scripts.accounts.home_test_support import scratch_accounts_config
 
 import argparse
 import ast
@@ -12299,9 +12300,9 @@ class FollowEventRegressionTests(MeshCommandFixture):
             if item.get("type") == "agentMessage" and not created.is_set():
                 self.assertFalse(stream.runs.last_observed.live)
                 self.assertGreater(stream.runs.next_check, self.lifecycle_clock.monotonic())
-                _ = run.write_text(json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
+                atomic_file.write_text_atomic(run, json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
                 pending = self.session_dir / "worker.pending.json"
-                _ = pending.write_text(pending.read_text() + "\n")
+                atomic_file.write_text_atomic(pending, pending.read_text() + "\n")
                 if resident:
                     record = self.worker_record()
                     record["status"] = "done"
@@ -12336,7 +12337,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
                     held = codex_mesh.hold_message(str(self.session_dir), "worker", "detached run result",
                                                    without_launcher=False)
                     self.assertIsInstance(held, codex_mesh.HeldForLauncher)
-                _ = run.write_text('{"worker":"worker","status":"finished"}')
+                atomic_file.write_text_atomic(run, '{"worker":"worker","status":"finished"}')
                 if resident:
                     _ = (self.session_dir / "worker.end").write_text("end")
             code, errors = LauncherHangGuard(self.id()).result(future)
@@ -17404,10 +17405,12 @@ class DevShellServerTests(unittest.TestCase):
         self.workers_home = root / "workers"
         self.workers_home.mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HOME": str(Path.home()), "AGENT_NOTES_DIR": os.environ["AGENT_NOTES_DIR"],
             "PATH": "/caller/bin", "CODEX_HOME": "/caller/home",
             "UNIT_RUN_DIR": "/caller/run", "TMPDIR": str(root),
             "NIX_LDFLAGS": "caller linker flags",
         }, clear=True)))
+        _ = self.enterContext(scratch_accounts_config())
         _ = self.enterContext(patch.object(codex_mesh, "RUN_ROOTS", (self.session_dir.parent,)))
         _ = self.enterContext(patch.object(codex_mesh, "_design_context", return_value={}))
         _ = self.enterContext(patch.object(codex_mesh, "_holds_old_sign_in", return_value=False))
@@ -17898,6 +17901,31 @@ class ServerRecordTests(unittest.TestCase):
         process = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)])
         self.spawned.append(process)
         return process.pid
+
+    def test_pid_alive_rejects_a_zombie_stat(self) -> None:
+        with (patch.object(codex_mesh, "_signal_process"),
+              patch.object(Path, "read_text", return_value="4242 (app-server (child)) Z 1 2 3")):
+            self.assertFalse(codex_mesh._pid_alive(4242))  # pyright: ignore[reportPrivateUsage]
+
+    @unittest.skipUnless(sys.platform == "linux", "The zombie check uses Linux process evidence.")
+    def test_retired_child_app_server_is_reaped(self) -> None:
+        for retirement in ("retire", "replace", "stop"):
+            with self.subTest(retirement=retirement):
+                pid = self.sleeper()
+                self.write_server(4321, pid)
+                os.kill(pid, signal.SIGTERM)
+                # Observe the exit without reaping the child before retirement.
+                _ = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+                if retirement == "retire":
+                    self.assertTrue(codex_mesh._retire_server(  # pyright: ignore[reportPrivateUsage]
+                        str(self.session_dir), 4321))
+                elif retirement == "replace":
+                    codex_mesh._record_started_server(  # pyright: ignore[reportPrivateUsage]
+                        str(self.session_dir), {"pid": os.getpid(), "port": 9876})
+                else:
+                    _ = codex_mesh._reap(pid)  # pyright: ignore[reportPrivateUsage]
+                with self.assertRaises(ChildProcessError):
+                    _ = os.waitpid(pid, os.WNOHANG)
 
     def test_loaded_threads_reads_current_and_retired_pages_under_one_deadline(self) -> None:
         current = self.session_dir / codex_mesh.SERVER_FILE

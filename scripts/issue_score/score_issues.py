@@ -26,15 +26,43 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.issue_score import client, decide, questions, vault
+from scripts.issue_score.selection import UseConfiguredValue
 from scripts.issue_score import experiment as wording
 from scripts.issue_score.blind import blind, blind_score
 from scripts.issue_score.evaluate import Split, compare, in_split, load_run
 from scripts.issue_score.records import (AgentProposal, AgentProposals, AwaitingAgentProposals, FailedIssue,
                                         ReadyForBandRouting, Reassessment, RequestPayload, ReviewRow,
-                                        ScoredIssue, ScoreRun, STATE_DIR)
+                                        ScoredIssue, ScoreRun, state_dir as configured_state_dir)
 from scripts.prioritize import renumber
+from scripts.lib import conf
 
-WORKERS = 8
+
+def workers() -> int:
+    return conf.whole("issue_score", "workers")
+
+
+@dataclass(frozen=True)
+class ScoringStorage:
+    state_dir: Path
+    ledger_path: Path
+
+
+def _scoring_storage(selection: Path | UseConfiguredValue, issues_dir: Path) -> ScoringStorage:
+    """Keep explicit directories isolated and reject all writes inside the vault."""
+    if isinstance(selection, UseConfiguredValue):
+        state_dir = configured_state_dir()
+        ledger_path = client.spend_ledger()
+    else:
+        state_dir = selection
+        ledger_path = selection / "spend.jsonl"
+    storage = ScoringStorage(state_dir.expanduser().resolve(), ledger_path.expanduser().resolve())
+    forbidden = (vault.vault_root().resolve(), issues_dir.resolve())
+    if any(storage.state_dir.is_relative_to(root) for root in forbidden):
+        raise ValueError("Result files must be outside the issue vault")
+    if any(storage.ledger_path.is_relative_to(root) for root in forbidden):
+        raise ValueError("Spend ledger must be outside the issue vault")
+    return storage
+
 
 @dataclass(frozen=True)
 class GoalCandidate:
@@ -66,7 +94,7 @@ class CommandArguments(argparse.Namespace):
     repeat: str = ""
     baseline: str = ""
     variants: str = ""
-    count: int = 20
+    count: int | UseConfiguredValue = UseConfiguredValue.CURRENT
     seed: int = 0
     sheet: str = ""
     project: str = ""
@@ -74,17 +102,20 @@ class CommandArguments(argparse.Namespace):
     body_file: str = ""
 
 
-def content_hash(issue: vault.Issue, areas: Sequence[str], definitions: Mapping[str, str]) -> str:
+def content_hash(issue: vault.Issue, areas: Sequence[str], definitions: Mapping[str, str], *,
+                 request_state: questions.IssueState | UseConfiguredValue = UseConfiguredValue.CURRENT) -> str:
     """Hash content plus area context, excluding all current field labels."""
+    request_state = vault.build_state(issue) if isinstance(request_state, UseConfiguredValue) else request_state
     text = json.dumps({"title": issue.title, "project": issue.project,
-                       "body": issue.body, "areas": areas,
+                       "body": issue.body, "request_state": request_state, "areas": areas,
                        "style_inputs": asdict(issue.style_inputs),
                        "area_definitions": {area: definitions[area] for area in areas if area in definitions}},
                       sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def load_cache(state_dir: Path, model: str = questions.MODEL) -> dict[tuple[str, str], ScoredIssue]:
+def load_cache(state_dir: Path, model: str | UseConfiguredValue = UseConfiguredValue.CURRENT) -> dict[tuple[str, str], ScoredIssue]:
+    model = questions.model() if isinstance(model, UseConfiguredValue) else model
     cache: dict[tuple[str, str], ScoredIssue] = {}
     for path in sorted((state_dir / "runs").glob("*.jsonl")):
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -112,15 +143,16 @@ def _decided_fields(main: client.Response, area: client.Response) -> dict[str, o
     return {name: asdict(decision) for name, decision in decisions.items()}
 
 
-def _score_issue(issue: vault.Issue, areas: list[str], model: str, state_dir: Path,
+def _score_issue(issue: vault.Issue, areas: list[str], model: str, ledger_path: Path,
                  budget_exhausted: Event, definitions: Mapping[str, str]) -> ScoredIssue:
-    return _issue_judgments(issue, areas, model, state_dir, budget_exhausted, {}, "", definitions)["production"]
+    return _issue_judgments(issue, areas, model, ledger_path, budget_exhausted, {}, "", definitions)["production"]
 
 
-def _issue_judgments(issue: vault.Issue, areas: list[str], model: str, state_dir: Path,
+def _issue_judgments(issue: vault.Issue, areas: list[str], model: str, ledger_path: Path,
                      budget_exhausted: Event, variants: wording.VariantSets, experiment_id: str,
                      definitions: Mapping[str, str]) -> dict[str, ScoredIssue]:
     state = vault.build_state(issue)
+    digest = content_hash(issue, areas, definitions, request_state=state)
     area_state: questions.AreaState = {"issue": state["issue"], "areas": list(areas)}
     main_payload: RequestPayload = {"model": model, "state": state, "questions": wording.build_questions(questions.main_questions(), variants)}
     area_payload: RequestPayload = {"model": model, "state": area_state, "questions": wording.build_questions(questions.area_questions(areas, definitions), variants)}
@@ -130,7 +162,7 @@ def _issue_judgments(issue: vault.Issue, areas: list[str], model: str, state_dir
             raise client.BudgetExceeded("TypeSafe run stopped because its budget was exhausted")
         try:
             return client.system_one(payload["state"], payload["questions"], model,
-                                     ledger_path=state_dir / "spend.jsonl")
+                                     ledger_path=ledger_path)
         except client.BudgetExceeded:
             budget_exhausted.set()
             raise
@@ -144,7 +176,7 @@ def _issue_judgments(issue: vault.Issue, areas: list[str], model: str, state_dir
         selected_main = wording.project_response(main, variant, variants)
         selected_area = wording.project_response(area, variant, variants)
         record: ScoredIssue = {
-            "issue_path": str(issue.path), "content_hash": content_hash(issue, areas, definitions),
+            "issue_path": str(issue.path), "content_hash": digest,
             "question_set_version": questions.QUESTION_SET_VERSION, "model": main["model"],
             "payloads": {"main": main_payload, "area": area_payload},
             "answers": {"main": selected_main, "area": selected_area},
@@ -162,15 +194,17 @@ def _issue_judgments(issue: vault.Issue, areas: list[str], model: str, state_dir
 
 
 def experiment(variants: wording.VariantSets, only: str = "*", limit: int = 0, *,
-               issues_dir: Path = vault.ISSUES_DIR, state_dir: Path = STATE_DIR,
-               model: str = questions.MODEL,
-               area_definitions_path: Path = vault.AREA_DEFINITIONS_PATH) -> dict[str, ScoreRun]:
+               issues_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT, state_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT,
+               model: str | UseConfiguredValue = UseConfiguredValue.CURRENT,
+               area_definitions_path: Path | UseConfiguredValue = UseConfiguredValue.CURRENT) -> dict[str, ScoreRun]:
     """Ask production and variants together, freshly, on tuning issues only."""
+    issues_dir = vault.issue_directory() if isinstance(issues_dir, UseConfiguredValue) else issues_dir
+    storage = _scoring_storage(state_dir, issues_dir)
+    state_dir, ledger_path = storage.state_dir, storage.ledger_path
+    model = questions.model() if isinstance(model, UseConfiguredValue) else model
+    area_definitions_path = vault.area_definitions_path() if isinstance(area_definitions_path, UseConfiguredValue) else area_definitions_path
     if limit < 0 or not variants:
         raise ValueError("Experiments require variants and a nonnegative limit")
-    state_dir = state_dir.expanduser().resolve()
-    if state_dir.is_relative_to(vault.VAULT_ROOT.resolve()) or state_dir.is_relative_to(issues_dir.resolve()):
-        raise ValueError("Result files must be outside the issue vault")
     issues = vault.load_open_issues(issues_dir)
     areas = vault.area_vocabulary(issues)
     definitions = vault.load_area_definitions(area_definitions_path)
@@ -193,12 +227,13 @@ def experiment(variants: wording.VariantSets, only: str = "*", limit: int = 0, *
     # Open all run files before requests so even an empty experiment has artifacts.
     with ExitStack() as stack:
         outputs = {variant: stack.enter_context(path.open("x", encoding="utf-8")) for variant, path in paths.items()}
-        with ThreadPoolExecutor(max_workers=WORKERS) as executor:
-            for start in range(0, len(selected), WORKERS):
+        batch_size = workers()
+        with ThreadPoolExecutor(max_workers=batch_size) as executor:
+            for start in range(0, len(selected), batch_size):
                 if budget_exhausted.is_set():
                     break
-                pending = {executor.submit(_issue_judgments, issue, areas, model, state_dir,
-                                           budget_exhausted, variants, identifier, definitions): issue for issue in selected[start:start + WORKERS]}
+                pending = {executor.submit(_issue_judgments, issue, areas, model, ledger_path,
+                                           budget_exhausted, variants, identifier, definitions): issue for issue in selected[start:start + batch_size]}
                 for future in as_completed(pending):
                     try:
                         results = future.result()
@@ -214,16 +249,19 @@ def experiment(variants: wording.VariantSets, only: str = "*", limit: int = 0, *
     return {variant: ScoreRun(path, failures[variant]) for variant, path in paths.items()}
 
 
-def score(only: str = "*", limit: int = 0, *, issues_dir: Path = vault.ISSUES_DIR,
-          state_dir: Path = STATE_DIR, model: str = questions.MODEL,
+def score(only: str = "*", limit: int = 0, *, issues_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT,
+          state_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT, model: str | UseConfiguredValue = UseConfiguredValue.CURRENT,
           split: Split = "all", fresh: bool = False,
-          area_definitions_path: Path = vault.AREA_DEFINITIONS_PATH,
-          rules_dirs: tuple[Path, ...] = vault.STYLE_RULES_DIRS) -> ScoreRun:
+          area_definitions_path: Path | UseConfiguredValue = UseConfiguredValue.CURRENT,
+          rules_dirs: tuple[Path, ...] | UseConfiguredValue = UseConfiguredValue.CURRENT) -> ScoreRun:
+    issues_dir = vault.issue_directory() if isinstance(issues_dir, UseConfiguredValue) else issues_dir
+    storage = _scoring_storage(state_dir, issues_dir)
+    state_dir, ledger_path = storage.state_dir, storage.ledger_path
+    model = questions.model() if isinstance(model, UseConfiguredValue) else model
+    area_definitions_path = vault.area_definitions_path() if isinstance(area_definitions_path, UseConfiguredValue) else area_definitions_path
+    rules_dirs = vault.style_rules_dirs() if isinstance(rules_dirs, UseConfiguredValue) else rules_dirs
     if limit < 0:
         raise ValueError("--limit must be nonnegative")
-    state_dir = state_dir.expanduser().resolve()
-    if state_dir.is_relative_to(vault.VAULT_ROOT.resolve()) or state_dir.is_relative_to(issues_dir.resolve()):
-        raise ValueError("Result files must be outside the issue vault")
     issues = vault.load_scoring_issues(issues_dir, rules_dirs=rules_dirs)
     areas = vault.area_vocabulary(vault.load_open_issues(issues_dir))
     definitions = vault.load_area_definitions(area_definitions_path)
@@ -245,15 +283,16 @@ def score(only: str = "*", limit: int = 0, *, issues_dir: Path = vault.ISSUES_DI
             record = cache[key].copy()
             record["decided_fields"] = _decided_fields(record["answers"]["main"], record["answers"]["area"])
             return record
-        return _score_issue(issue, areas, model, state_dir, budget_exhausted, definitions)
+        return _score_issue(issue, areas, model, ledger_path, budget_exhausted, definitions)
 
     with result_path.open("x", encoding="utf-8") as output:
-        with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+        batch_size = workers()
+        with ThreadPoolExecutor(max_workers=batch_size) as executor:
             # Submit bounded batches rather than queuing the entire vault.
-            for start in range(0, len(selected), WORKERS):
+            for start in range(0, len(selected), batch_size):
                 if budget_exhausted.is_set():
                     break
-                pending = {executor.submit(result, issue): issue for issue in selected[start:start + WORKERS]}
+                pending = {executor.submit(result, issue): issue for issue in selected[start:start + batch_size]}
                 for future in as_completed(pending):
                     record: ScoredIssue | FailedIssue
                     try:
@@ -353,22 +392,25 @@ def _proposal_lines(main: Mapping[str, client.Answer], decisions: Mapping[str, d
     return ranking + ("\nAlternatives: " + " · ".join(alternatives) if alternatives else "")
 
 
-def propose(project: str, title: str, body: str = "", *, issues_dir: Path = vault.ISSUES_DIR,
-            state_dir: Path = STATE_DIR, model: str = questions.MODEL,
-            area_definitions_path: Path = vault.AREA_DEFINITIONS_PATH,
-            project_bases_dir: Path = vault.PROJECT_BASES_DIR) -> str:
+def propose(project: str, title: str, body: str = "", *, issues_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT,
+            state_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT, model: str | UseConfiguredValue = UseConfiguredValue.CURRENT,
+            area_definitions_path: Path | UseConfiguredValue = UseConfiguredValue.CURRENT,
+            project_bases_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT) -> str:
     """Render a single-valued ranking and separate unsure alternatives without writing them."""
+    issues_dir = vault.issue_directory() if isinstance(issues_dir, UseConfiguredValue) else issues_dir
+    storage = _scoring_storage(state_dir, issues_dir)
+    ledger_path = storage.ledger_path
+    model = questions.model() if isinstance(model, UseConfiguredValue) else model
+    area_definitions_path = vault.area_definitions_path() if isinstance(area_definitions_path, UseConfiguredValue) else area_definitions_path
+    project_bases_dir = vault.project_bases_dir() if isinstance(project_bases_dir, UseConfiguredValue) else project_bases_dir
     project_names = vault.load_project_names(project_bases_dir)
     if project not in project_names:
         raise ValueError(f"Unknown project shorthand: {project}")
     issue = vault.Issue(Path("__new_issue__.md"), title, project_names[project], body, {})
     _ = vault.build_state(issue)
-    state_dir = state_dir.expanduser().resolve()
-    if state_dir.is_relative_to(vault.VAULT_ROOT.resolve()) or state_dir.is_relative_to(issues_dir.resolve()):
-        raise ValueError("Result files must be outside the issue vault")
     areas = vault.area_vocabulary(vault.load_open_issues(issues_dir))
     definitions = vault.load_area_definitions(area_definitions_path)
-    record = _score_issue(issue, areas, model, state_dir, Event(), definitions)
+    record = _score_issue(issue, areas, model, ledger_path, Event(), definitions)
     main = record["answers"]["main"]["answers"]
     decisions = decide.decide_answers(main, record["answers"]["area"]["answers"])
     return _proposal_lines(main, decisions)
@@ -465,16 +507,21 @@ def _provisional_score(values: Mapping[str, str], goals_path: Path, goals: dict[
     return float(renumber.calculate_score(goals[goal_label], {field: values[field].count("⭐") for field in vault.RATING_FIELDS}))
 
 
-def reassess(run_id: str, *, issues_dir: Path = vault.ISSUES_DIR, state_dir: Path = STATE_DIR,
-             area_definitions_path: Path = vault.AREA_DEFINITIONS_PATH,
-             rules_dirs: tuple[Path, ...] = vault.STYLE_RULES_DIRS,
-             goals_path: Path = vault.VAULT_ROOT / "prioritization goals.md") -> Path:
+def reassess(run_id: str, *, issues_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT, state_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT,
+             area_definitions_path: Path | UseConfiguredValue = UseConfiguredValue.CURRENT,
+             rules_dirs: tuple[Path, ...] | UseConfiguredValue = UseConfiguredValue.CURRENT,
+             goals_path: Path | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Path:
     """Rebuild saved judgments under today's policy; write review artifacts only."""
+    issues_dir = vault.issue_directory() if isinstance(issues_dir, UseConfiguredValue) else issues_dir
+    state_dir = configured_state_dir() if isinstance(state_dir, UseConfiguredValue) else state_dir
+    area_definitions_path = vault.area_definitions_path() if isinstance(area_definitions_path, UseConfiguredValue) else area_definitions_path
+    rules_dirs = vault.style_rules_dirs() if isinstance(rules_dirs, UseConfiguredValue) else rules_dirs
+    goals_path = vault.vault_root() / "prioritization goals.md" if isinstance(goals_path, UseConfiguredValue) else goals_path
     name = run_id.removesuffix(".jsonl")
     if not name or Path(name).name != name or name in (".", ".."):
         raise ValueError("run-id must be a run filename without a directory")
     state_dir = state_dir.expanduser().resolve()
-    if state_dir.is_relative_to(vault.VAULT_ROOT.resolve()) or state_dir.is_relative_to(issues_dir.resolve()):
+    if state_dir.is_relative_to(vault.vault_root().resolve()) or state_dir.is_relative_to(issues_dir.resolve()):
         raise ValueError("Review files must be outside the issue vault")
     reports = state_dir / "reports"
     agent_path = reports / (name + "-agent-proposals.json")
@@ -518,7 +565,7 @@ def reassess(run_id: str, *, issues_dir: Path = vault.ISSUES_DIR, state_dir: Pat
             continue
         main = record["answers"]["main"]["answers"]
         decisions = decide.decide_answers(main, record["answers"]["area"]["answers"])
-        current = {field: issue.labels.get(field, "") for field in questions.THRESHOLDS}
+        current = {field: issue.labels.get(field, "") for field in questions.thresholds()}
         proposed = {field: _proposal_value(field, decision.value) for field, decision in decisions.items()}
         taken = [field for field, decision in decisions.items()
                  if field in questions.JEV_FIELDS and decide.is_sure(field, decision)]
@@ -599,7 +646,7 @@ def reassess(run_id: str, *, issues_dir: Path = vault.ISSUES_DIR, state_dir: Pat
     high = [row for row in rows if row["routing"]["status"] == "ready" and row["routing"]["band"] == "Score >= 20"]
     lines += ["## Score >= 20 — field results", "", f"Issues: {len(high)}. Evaluate this group separately from the whole backlog.", "",
               "| Field | Taken | Routed to user | Changed from current |", "| --- | --- | --- | --- |"]
-    for field in questions.THRESHOLDS:
+    for field in questions.thresholds():
         taken_count = sum(field in row["taken"] for row in high)
         changed = sum(row["current"][field] != row["proposed"][field] for row in high)
         lines.append(f"| {field} | {taken_count} | {len(high) - taken_count} | {changed} |")
@@ -638,7 +685,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = experiment_command.add_argument("--limit", type=int, default=0)
     blind_command = commands.add_parser("blind", help="Write a held-out A/B preference sheet")
     _ = blind_command.add_argument("run_id")
-    _ = blind_command.add_argument("--count", type=int, default=20)
+    _ = blind_command.add_argument("--count", type=int, default=UseConfiguredValue.CURRENT)
     _ = blind_command.add_argument("--seed", type=int, default=0)
     blind_score_command = commands.add_parser("blind-score", help="Tally a completed A/B preference sheet")
     _ = blind_score_command.add_argument("sheet")
