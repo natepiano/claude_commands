@@ -820,7 +820,7 @@ class RecordRerunTests(unittest.TestCase):
         replace = os.replace
 
         def refuse_pending_save(old: str | os.PathLike[str], new: str | os.PathLike[str]) -> None:
-            if Path(new).parent == record.pending_launches_root():
+            if Path(new).parent == record.pending_launch_root():
                 raise OSError("fixture pending save was refused")
             replace(old, new)
 
@@ -828,7 +828,7 @@ class RecordRerunTests(unittest.TestCase):
             self.assertFalse(record.launch(source, fixture.worktree))
         self.assertEqual(source.read_bytes(), original_source)
         self.assertEqual(self.fixture.records(), [])
-        self.assertEqual(list(record.pending_launches_root().glob("*.json")), [])
+        self.assertEqual(list(record.pending_launch_root().glob("*.json")), [])
         errors = self.fixture.root / store.ERRORS_NAME
         self.assertIn("fixture pending save was refused", errors.read_text())
         first_line = self.assert_health_line(0, 1)
@@ -845,7 +845,7 @@ class RecordRerunTests(unittest.TestCase):
         else:
             fixture = self.launch_fixture()
             source = fixture.saved_launch(15803, "2026-10-02T12:00:00+00:00")
-            pending = record.pending_launches_root()
+            pending = record.pending_launch_root()
             publisher = record
             method = "write_launch_line"
             action = lambda: record.launch(source, fixture.worktree)

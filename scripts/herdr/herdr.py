@@ -2302,7 +2302,6 @@ def _repository_key(directory: Path, flag: str) -> Path:
     return path.parent if flag == "--git-common-dir" else path
 
 
-
 def live_sessions() -> list[SessionEntry]:
     response = decode_object(Herdr("default").run("session", "list", "--json"), "herdr session list")
     payload = json_object(response["result"], "herdr session result") if "result" in response else response
@@ -4187,7 +4186,7 @@ def agent_base_environment(environment: dict[str, str], unset_environment: froze
     for key in tuple(base_env):
         # scripts/lib/unit_env.sh and unit_runs.environ map every PLAN_DELEGATE_ alias to UNIT_.
         if (key.startswith(("HERDR_", "CODEX_", "UNIT_", "PLAN_DELEGATE_", "SHOWRUNNER_", "CLAUDE_", "STAFF_", "NIX_HEAL_"))
-                or key in {"ANTHROPIC_API_KEY", "SHELL", "TMUX", "TMUX_PANE", "SHUTDOWN_PARENT_LAUNCH_CLAIM"}):
+                or key in {"ANTHROPIC_API_KEY", "SHELL", "TMUX", "TMUX_PANE"}):
             del base_env[key]
     base_env.update(environment)
     for identity in ("STAFF_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
@@ -4267,8 +4266,6 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
             script = (f"cd -- {shlex.quote(str(prepared.directory))} && "
                       f"unset {shlex.join(sorted(key for key in removals if not key.startswith('HERDR_')))} && export {exports}")
             client.run_in_pane(pane, ["eval", script])
-        from scripts.shutdown.launch_permission import claim_launch_pane
-        claim_launch_pane(name, pane)
         start_requested = True
         outcome = start_agent(name, pane, kind, agent_arguments, opening, timeout_ms, agent=agent)
     except (HerdrFailure, OSError, subprocess.SubprocessError):

@@ -419,8 +419,8 @@ def resume_pending(directory: Path, limits: HealLimits, session: HealSession, pe
         alert(directory, limits, session, history, str(error))
         return
     if not isinstance(result, stop_resume.ClaudeUp):
-        reason = (stop_resume.resume_failure_reason(result)
-                  if isinstance(result, (stop_resume.ResumeFailed, stop_resume.RunningOnAnotherAccount))
+        reason = (result.reason
+                  if isinstance(result, stop_resume.ResumeFailed)
                   else "no local session tab")
         log(directory, session, history, "refused", reason)
         alert(directory, limits, session, history, reason)

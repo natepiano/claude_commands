@@ -16,7 +16,6 @@ from scripts.production.fake_unit_host import PaneShellFixture, stopped_record
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import unit_move
 import herdr
-import launch_permission
 import rename_unit
 import retire_unit
 import shutdown_record
@@ -110,13 +109,6 @@ class UnitOperationPaneTests(unittest.TestCase):
                 rename_unit.check_stoppable(self.target())
         self.assertEqual(self.pane.close_calls(), [])
 
-    def test_unrelated_admitted_launch_does_not_block_the_clean_stop(self) -> None:
-        claim = unit_move.unit_pane(self.pane.found, 'demo')
-        with launch_permission.admitted_launch('other@example.com', 'other-conversation', 'beta-unit', lambda: None):
-            launch_permission.claim_launch_pane('other', self.pane.place.pane)
-            unit_move.close_unit_pane(claim)
-        self.assertEqual(self.pane.close_calls(), [['--session', 'agents', 'pane', 'close', 'w1:p1']])
-        self.assertFalse((self.root / 'proc' / str(self.pane.shell)).exists())
 
     def test_no_unit_pane_needs_no_close(self) -> None:
         self.assertIsNone(unit_move.unit_pane(None, 'demo'))
@@ -136,10 +128,7 @@ class UnitOperationPaneTests(unittest.TestCase):
         self.pane.found = unit_lookup.MarkedUnit('alpha-unit',
             unit_lookup.LiveClaude('alpha', 'new-session', 'socket', self.pane.director), self.pane.place)
         self.saved['progress'] = {'kind': 'waiting'}
-        with (launch_permission.admitted_launch('owner@example.com', self.pane.native_id, 'alpha-unit', lambda: None),
-              mock.patch.object(shutdown_record, 'update_session', side_effect=AssertionError('no record proof')),
-              mock.patch.object(herdr, 'process_action', side_effect=AssertionError('no process proof'))):
-            launch_permission.claim_launch_pane(self.pane.place.session, self.pane.place.pane)
+        with (mock.patch.object(shutdown_record, 'update_session', side_effect=AssertionError('no record proof')), mock.patch.object(herdr, 'process_action', side_effect=AssertionError('no process proof'))):
             unit_move.close_unit_pane(pane)
         self.assertEqual(self.pane.close_calls(), [['--session', 'agents', 'pane', 'close', 'w1:p1']])
 

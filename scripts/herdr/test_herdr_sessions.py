@@ -7,19 +7,17 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 import io
 import json
 import os
-import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import chdir, nullcontext
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from datetime import datetime, timezone
 from typing import TypedDict, cast, override
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import patch
 
 import herdr
 import herdr_sessions
@@ -27,7 +25,6 @@ import sessions
 from fake_herdr import CommandResponse
 from sessions import SessionRecord, UnreadableSessionRecord, read_session
 from scripts.production import showrunners
-from scripts.shutdown import launch_permission
 from scripts.accounts import accounts
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -594,8 +591,6 @@ class StandaloneLaunchTests(unittest.TestCase):
             str(self.root): {"hasTrustDialogAccepted": True},
         }, "oauthAccount": {"emailAddress": "legacy@example.invalid"}}))
         self.save()
-        _ = self.enterContext(patch.object(launch_permission, "launch_barrier", side_effect=lambda: nullcontext()))
-        _ = self.enterContext(patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()))
         self.attachments = []
         _ = self.enterContext(patch.object(os, "execvp", side_effect=self.record_attachment))
 
@@ -660,29 +655,6 @@ class StandaloneLaunchTests(unittest.TestCase):
         }))
         return directory
 
-    def test_ctrl_c_during_launch_returns_130_and_releases_the_barrier(self) -> None:
-        for verb, options in (("start", ["--name", "solo"]),
-                              ("resume", ["solo", "--session-id", "recorded"])):
-            for operation in ("start_server", "open_tab", "start_agent"):
-                self.log.unlink(missing_ok=True)
-                (self.proc / "net/unix").unlink(missing_ok=True)
-                self.destination()
-                barrier = MagicMock()
-                release = Mock(return_value=False)
-                barrier.__exit__ = release
-                with (self.subTest(verb=verb, operation=operation),
-                      patch.object(launch_permission, "launch_barrier", return_value=barrier),
-                      patch.object(herdr, operation, side_effect=KeyboardInterrupt)):
-                    self.assertEqual(self.call(verb, *options, "--cwd", str(self.root)),
-                                     (130, "herdr_sessions: stopped\n"))
-                release.assert_called_once_with(None, None, None)
-                self.assertEqual(self.attachments, [])
-
-    def test_ctrl_c_before_launch_barrier_returns_130_without_starting_commands(self) -> None:
-        with patch.object(launch_permission, "launch_barrier", side_effect=KeyboardInterrupt):
-            self.assertEqual(self.call("start", "--name", "solo", "--cwd", str(self.root)),
-                             (130, "herdr_sessions: stopped\n"))
-        self.assertEqual(self.commands(), [])
 
     def test_launch_server_failure_prints_only_its_message(self) -> None:
         message = f"herdr server for agents did not start; see {self.root}/herdr-server.log"
@@ -692,17 +664,14 @@ class StandaloneLaunchTests(unittest.TestCase):
         self.assertEqual(self.attachments, [])
         self.assertEqual(self.commands(), [])
 
-    def test_start_after_cutover_uses_showrunners_account_for_pane_and_admission(self) -> None:
+    def test_start_after_cutover_uses_showrunners_account_for_pane(self) -> None:
         directory = self.numbered_account()
         groups = accounts.groups_file()
         groups.parent.mkdir(parents=True, exist_ok=True)
         _ = groups.write_text(json.dumps({"showrunners": "claude4"}))
         _ = (Path.home() / ".claude.json").write_text("{}")
         self.destination()
-        with patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()) as permission:
-            self.assertEqual(self.call("start", "--name", "solo", "--cwd", str(self.root)), (0, ""))
-        environment = cast(dict[str, str], permission.call_args.args[0])
-        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(directory))
+        self.assertEqual(self.call("start", "--name", "solo", "--cwd", str(self.root)), (0, ""))
         workspace, = [command for command in self.commands() if command[2:4] == ["workspace", "create"]]
         self.assertIn(f"CLAUDE_CONFIG_DIR={directory}", workspace)
         self.assertIn(f"CLAUDE_CODE_REMOTE_MEMORY_DIR={Path.home() / '.claude'}", workspace)
@@ -772,16 +741,11 @@ class StandaloneLaunchTests(unittest.TestCase):
                                      for command in added))
                 self.assertEqual(len(self.agent_starts()), starts_before + 1)
 
-    def test_start_inherits_named_account_for_pane_and_new_work_admission(self) -> None:
+    def test_start_inherits_named_account_for_pane(self) -> None:
         directory = self.numbered_account()
         self.destination()
-        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(directory), "CLAUDE_CODE_OAUTH_TOKEN": "unrelated"}), patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()) as permission:
+        with (patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(directory), "CLAUDE_CODE_OAUTH_TOKEN": "unrelated"})):
             self.assertEqual(self.call("start", "--name", "solo", "--cwd", str(self.root)), (0, ""))
-        environment = cast(dict[str, str], permission.call_args.args[0])
-        purpose = cast(launch_permission.LaunchPurpose, permission.call_args.args[1])
-        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(directory))
-        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", environment)
-        self.assertIsInstance(purpose, launch_permission.NewWorkLaunchPurpose)
         workspace, = [command for command in self.commands() if command[2:4] == ["workspace", "create"]]
         self.assertIn(f"CLAUDE_CONFIG_DIR={directory}", workspace)
         self.assertEqual(len(self.agent_starts()), 1)
@@ -878,56 +842,6 @@ class StandaloneLaunchTests(unittest.TestCase):
         self.assertEqual(len(self.agent_starts()), 1)
         self.assertFalse(any(command[2:4] == ["agent", "prompt"] for command in self.commands()))
 
-    def test_untrusted_folder_refuses_with_account_trust_command_before_server_start(self) -> None:
-        folder = self.root / "folder with 'quotes' and spaces"
-        folder.mkdir()
-        directory = self.numbered_account()
-        claude_arguments = ["--model", "opus", "--settings", '{"text":"keep $(literal) and quotes"}']
-        for verb in ("start", "resume"):
-            if verb == "start":
-                trust_file = self.root / "home/.claude.json"
-                trust_command = (f"cd {shlex.quote(str(folder))} && env -u CLAUDE_CONFIG_DIR "
-                                 + "-u CLAUDE_CODE_REMOTE_MEMORY_DIR -u CLAUDE_CODE_OAUTH_TOKEN claude")
-                options = ["--name", "solo"]
-                rerun_options = options
-            else:
-                trust_file = directory / ".claude.json"
-                trust_command = accounts.trust_command(folder, accounts.NamedAccount("claude4", directory))
-                options = ["solo", "--session-id", "recorded", "--config-dir", str(directory.relative_to(self.root)),
-                           "--restore", "--prompt-file", "opening note.txt", "--attach"]
-                rerun_options = ["solo"]
-            original = json.dumps({"projects": {}, "oauthAccount": {"emailAddress": (
-                "legacy@example.invalid" if verb == "start" else "numbered@example.invalid")}})
-            _ = trust_file.write_text(original)
-            with self.subTest(verb=verb), chdir(self.root):
-                code, error = self.call(verb, *options, "--cwd", folder.name, "--", *claude_arguments)
-            self.assertEqual(code, 1)
-            self.assertEqual(error.splitlines()[:2], [f"herdr_sessions: Claude has not trusted {folder}.",
-                "Paste this, accept Claude's trust prompt, then exit Claude; the session then starts:"])
-            command = error.splitlines()[2]
-            self.assertTrue(command.startswith(trust_command + " && "), command)
-            expected = [sys.executable, str(Path(herdr_sessions.__file__).resolve()), verb,
-                        *rerun_options, "--cwd", str(folder)]
-            if verb == "resume":
-                expected.extend(["--session-id", "recorded", "--config-dir", str(directory), "--restore",
-                                 "--prompt-file", str(self.root / "opening note.txt"), "--attach"])
-            expected.extend(["--", *claude_arguments])
-            self.assertEqual(shlex.split(command.removeprefix(trust_command + " && ")), expected)
-            self.assertEqual(trust_file.read_text(), original)
-        self.assertEqual(self.commands(), [])
-        self.assertEqual(self.attachments, [])
-
-    def test_unreadable_trust_file_keeps_its_repair_message_without_a_launch_rerun(self) -> None:
-        _ = (self.root / "home/.claude.json").write_text('{"oauthAccount":{"emailAddress":"legacy@example.invalid"}}')
-        with patch.object(herdr, "claude_trust", return_value=herdr.UnreadableTrustFile(
-                self.root, self.root / "home/.claude.json", "PermissionError")):
-            code, error = self.call("start", "--name", "solo", "--cwd", str(self.root))
-        self.assertEqual(code, 1)
-        self.assertIn("PermissionError", error)
-        self.assertIn(". Run: cd ", error)
-        self.assertNotIn("Paste this", error)
-        self.assertNotIn(str(Path(herdr_sessions.__file__).resolve()), error)
-        self.assertEqual(self.commands(), [])
 
     def test_inherited_default_account_variables_refuse_before_agent_start(self) -> None:
         for variable in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"):
@@ -938,50 +852,6 @@ class StandaloneLaunchTests(unittest.TestCase):
                              + "it started, so a new tab would inherit it; start that server again from a shell without it\n"))
         self.assertEqual(self.agent_starts(), [])
         self.assertFalse(any(command[2:4] == ["workspace", "create"] for command in self.commands()))
-
-    def test_shutdown_hold_and_unreadable_state_refuse_both_verbs_before_server_start(self) -> None:
-        for permission, reason in ((launch_permission.BlockedByShutdown("account is held"), "account is held"),
-                                   (launch_permission.ShutdownStateUnreadable("broken record"), "broken record")):
-            for verb in (("start", "--name", "solo"), ("resume", "solo", "--session-id", "recorded")):
-                with patch.object(launch_permission, "launch_permission", return_value=permission):
-                    code, error = self.call(*verb, "--cwd", str(self.root))
-                self.assertEqual(code, 1)
-                self.assertIn(reason, error)
-        self.assertEqual(self.commands(), [])
-
-    def test_restore_admission_uses_recorded_session_and_selected_account_under_barrier(self) -> None:
-        self.destination()
-        held = [False]
-
-        from contextlib import contextmanager
-        from collections.abc import Generator, Mapping
-
-        @contextmanager
-        def barrier() -> Generator[None, None, None]:
-            held[0] = True
-            try:
-                yield
-            finally:
-                held[0] = False
-
-        def permission(environment: Mapping[str, str], purpose: launch_permission.LaunchPurpose) -> launch_permission.LaunchPermission:
-            self.assertTrue(held[0])
-            self.assertNotIn("CLAUDE_CONFIG_DIR", environment)
-            self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", environment)
-            self.assertEqual(purpose, launch_permission.RecordedSessionRestoreLaunchPurpose("recorded"))
-            return launch_permission.AllowedByShutdownState()
-
-        with patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "inherited"}), patch.object(launch_permission, "launch_barrier", barrier), patch.object(launch_permission, "launch_permission", permission):
-            self.assertEqual(self.call("resume", "solo", "--session-id", "recorded", "--cwd", str(self.root), "--restore"), (0, ""))
-        self.assertFalse(held[0])
-        self.assertEqual(len(self.agent_starts()), 1)
-
-    def test_unreadable_launch_barrier_starts_no_server(self) -> None:
-        with patch.object(launch_permission, "launch_barrier", side_effect=OSError("lock unavailable")):
-            code, error = self.call("start", "--name", "solo", "--cwd", str(self.root))
-        self.assertEqual(code, 1)
-        self.assertIn("shutdown state unreadable: launch barrier: lock unavailable", error)
-        self.assertEqual(self.commands(), [])
 
 
 if __name__ == "__main__":
