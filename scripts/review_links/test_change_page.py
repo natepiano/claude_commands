@@ -155,7 +155,6 @@ class ChangePageTests(unittest.TestCase):
             "FEATURE_LOG_VAULT": str(self.temporary / "vault"),
             "XDG_STATE_HOME": str(self.temporary / "state"),
             "STAFF_FILE": str(self.temporary / "staff.json"),
-            "XDG_CACHE_HOME": str(self.temporary / "cache"),
         }))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.temporary / "notifier"))
         _ = self.enterContext(patch.object(change_review, "LISTS", self.temporary))
@@ -191,13 +190,11 @@ class ChangePageTests(unittest.TestCase):
                                    worktree=staff.PresentWorktree("natedev", Path("/unused/feature")))
         _ = change_review.append_rows(self.review_list, [item, item, change_review.Visible(
             "Internal comments clarified", "Read the diff", "The old and new comments agree with the tests")],
-            date(2026, 11, 1), merged, self.production)
+            date(2026, 11, 1), merged, self.production, producers=[self.unit.id] * 3)
         for row, kind in (("C1", "See in action"), ("C2", "See in action"), ("C3", "Read only")):
             _ = change_review.set_row_kind(self.review_list, row, kind, self.production)
         self.page_path = urlsplit(change_page.publish(self.production, self.review_list, ["C1", "C3"])).path
         self.page = change_page.page_at(self.root, self.page_path)
-        router = change_routing.StaffRouting(staff.snapshot(), {"page-owner": self.production}, change_review)
-        _ = router.graph(self.repo / ".git")
         self.messages = []
         self.raw_messages = []
         self.delivery_done = threading.Event()
@@ -569,15 +566,9 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.messages, [])
 
     def test_an_unrouted_row_with_a_missing_alert_setting_still_renders(self) -> None:
-        runner = fixture_member("showrunner", name="other-runner")
-        _ = fixture_member("unit", name="other-unit", parent=runner.id)
-        _ = self.git("checkout", "-b", "routing-conflict")
-        _ = self.git("commit", "--allow-empty", "-m", "checkpoint(builder-unit): first owner")
-        _ = self.git("commit", "--allow-empty", "-m", "checkpoint(other-unit): second owner")
-        _ = self.git("checkout", "main")
-        _ = self.git("merge", "--no-ff", "routing-conflict", "-m", "Merge conflicting owners")
+        _ = self.enterContext(patch.object(change_routing, "LISTS", self.temporary))
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Conflict", "Read", "Proof")],
-                                      date(2026, 11, 2), self.git("rev-parse", "HEAD"), self.production)
+                                      date(2026, 11, 2), "abcdef12", self.production, producers=[staff.StaffId("missing-producer")])
         config = self.temporary / "config/review_links.conf"
         _ = config.write_text(config.read_text().replace("unrouted_alert_retry_seconds=60", ""))
         path = urlsplit(change_page.publish_browser()).path
@@ -745,7 +736,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn(f"Production: {doc}", self.messages[0][2])
 
     def test_a_row_without_a_staff_unit_uses_its_list_showrunner_and_production(self) -> None:
-        row = change_page.answer_row(self.page, "C1") | {"Merged": "", "Production": "another-production"}
+        row = change_page.answer_row(self.page, "C1") | {"Producer": "", "Merged": "", "Production": "another-production"}
         routing = change_page.list_routing({self.review_list: change_review.review_snapshot(self.review_list)})
         assignment = routing.owner_and_production(self.review_list, row)
         runner = staff.snapshot().by_path("page-owner")
@@ -993,46 +984,10 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(forms.counts["sdlc"], 3)
         self.assertEqual(set(forms.save_urls), {"page-owner/C1", "page-owner/C2", "page-owner/C3"})
 
-    def test_a_page_reads_all_commit_parents_once_per_repository(self) -> None:
-        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.production))
-        _ = staff.move(self.unit.id, runner.id)
-        other_repo = self.temporary / "other-repo"
-        _ = subprocess.run(["git", "clone", "--quiet", str(self.repo), str(other_repo)], check=True)
-        other_doc = self.temporary / "other-production.md"
-        other_list = self.temporary / "change-review - other.md"
-        _ = other_doc.write_text(self.production.read_text().replace(str(self.repo), str(other_repo))
-                                .replace(str(self.review_list), str(other_list)))
-        _ = change_review.append_rows(other_list, [change_review.Visible("Other change", "Read", "Proof")],
-                                      date(2026, 11, 2), self.git("rev-parse", "HEAD"), other_doc)
-        router = change_routing.StaffRouting(staff.snapshot(), {}, change_review)
-        for repo in (self.repo, other_repo):
-            router.history_path(repo / ".git").unlink(missing_ok=True)
-        path = urlsplit(change_browser.publish()).path
-        with patch.object(subprocess, "run", wraps=subprocess.run) as commands:
-            reply = self.request(path, {})
-        self.assertEqual(reply.status, 200, reply.body)
-        invocations = [cast(list[str], call.args[0]) for call in commands.call_args_list]
-        parent_reads = [command for command in invocations if "rev-list" in command and "--parents" in command]
-        self.assertCountEqual([command[2] for command in parent_reads],
-                              [str(self.repo / ".git"), str(other_repo / ".git")])
-        self.assertTrue(all("--stdin" in command and "--no-walk" in command for command in parent_reads))
-        forms = BrowserForms()
-        forms.feed(reply.body)
-        self.assertEqual(set(forms.rows), {"page-owner/C1", "page-owner/C2", "page-owner/C3", "other/C1"})
-        self.assertEqual(set(forms.tabs.values()), {"sdlc"})
-
     def test_an_unrouted_row_refuses_a_question_without_saving_and_still_accepts_a_verdict(self) -> None:
-        runner = fixture_member("showrunner", name="other-runner")
-        _ = fixture_member("unit", name="other-unit", parent=runner.id)
         assert self.unit.parent is not None
-        _ = fixture_member("unit", name="aws-unit", parent=self.unit.parent)
-        _ = self.git("checkout", "-b", "aws-unit")
-        _ = self.git("commit", "--allow-empty", "-m", "checkpoint(aws-unit): unknown owner")
-        _ = self.git("commit", "--allow-empty", "-m", "checkpoint(other-unit): other owner")
-        _ = self.git("checkout", "main")
-        _ = self.git("merge", "--no-ff", "aws-unit", "-m", "Merge unknown unit")
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Unknown", "Read", "Proof")],
-                                      date(2026, 11, 2), self.git("rev-parse", "HEAD"), self.production)
+                                      date(2026, 11, 2), "abcdef12", self.production, producers=[staff.StaffId("missing-producer")])
         path, forms, body = self.browser()
         del body
         self.assertEqual(forms.tabs["page-owner/C4"], "unrouted")
@@ -1078,14 +1033,14 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.messages, [])
         self.assertEqual(self.review_list.read_bytes(), before)
 
-    def test_unknown_staff_keeps_a_change_under_its_source_list(self) -> None:
+    def test_a_producer_keeps_its_list_showrunner_without_a_new_staff_parent(self) -> None:
         path, forms, body = self.browser()
         del path, body
         self.assertEqual(forms.tabs["page-owner/C1"], "page-owner")
 
     def test_a_showrunner_own_change_stays_under_its_source_list(self) -> None:
         merged = self.git("rev-parse", "HEAD")
-        _ = self.review_list.write_text(self.review_list.read_text().replace(merged, ""))
+        _ = self.review_list.write_text(self.review_list.read_text().replace(merged, "").replace(self.unit.id, ""))
         path, forms, body = self.browser()
         del path, body
         self.assertEqual(forms.tabs["page-owner/C1"], "page-owner")
@@ -1094,12 +1049,8 @@ class ChangePageTests(unittest.TestCase):
         foreign = self.temporary / "sdlc-production.md"
         _ = foreign.write_text(self.production.read_text())
         _ = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", foreign))
-        _ = self.git("checkout", "-b", "aws-unit")
-        _ = self.git("commit", "--allow-empty", "-m", "checkpoint(aws-unit): unknown unit")
-        _ = self.git("checkout", "main")
-        _ = self.git("merge", "--no-ff", "aws-unit", "-m", "Merge aws-unit phase 1 into builds")
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Unknown unit", "Read", "Proof")],
-                                      date(2026, 11, 2), self.git("rev-parse", "HEAD"), foreign)
+                                      date(2026, 11, 2), "abcdef12", foreign)
         path, forms, body = self.browser()
         del path, body
         self.assertEqual(forms.tabs["page-owner/C4"], "page-owner")
@@ -1120,6 +1071,9 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual([recipient for recipient, _, _ in self.messages], ["page-owner"])
 
     def test_a_list_without_a_production_document_shows_its_changes_without_answer_controls(self) -> None:
+        runner = staff.snapshot().by_path("page-owner")
+        assert runner is not None
+        _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", self.temporary / "missing.md"))
         text = self.review_list.read_text().replace(str(self.production), str(self.temporary / "missing.md"))
         _ = self.review_list.write_text(text)
         path, forms, body = self.browser()
@@ -1137,10 +1091,10 @@ class ChangePageTests(unittest.TestCase):
         _ = staff.move(self.unit.id, runner.id)
         earlier = self.temporary / "change-review - earlier.md"
         _ = change_review.append_rows(earlier, [change_review.Visible("First", "Read", "Proof")],
-                                      date(2026, 11, 2), self.git("rev-parse", "HEAD"), self.production,
-                                      urgency.cell(urgency.read(), "C2"))
+                                      date(2026, 11, 2), "abcdef12", self.production,
+                                      urgency.cell(urgency.read(), "C2"), producers=[self.unit.id])
         _ = change_review.append_rows(earlier, [change_review.Visible("Second", "Read", "Proof")],
-                                      date(2026, 11, 2), self.git("rev-parse", "HEAD"), self.production)
+                                      date(2026, 11, 2), "abcdef12", self.production, producers=[self.unit.id])
         path, forms, body = self.browser()
         del body
         keys = list(forms.rows)
@@ -1158,22 +1112,15 @@ class ChangePageTests(unittest.TestCase):
         row = next(row for row in change_review.review_rows(earlier) if row["#"] == "C2")
         self.assertEqual(row["Verdict"], "not works: Needs a correction")
 
-    def test_a_merge_with_two_units_uses_each_change_trailer_for_its_staff_tab(self) -> None:
+    def test_rows_from_two_units_use_their_producer_ids_for_their_staff_tabs(self) -> None:
         first = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.production))
         second = fixture_member("showrunner", name="other", doc=staff.LiveDoc("natedev", self.production))
         _ = staff.move(self.unit.id, first.id)
-        _ = fixture_member("unit", name="second-unit", parent=second.id)
-        _ = self.git("checkout", "-b", "mixed")
-        _ = self.git("commit", "--allow-empty", "-m",
-                     "checkpoint(builder-unit): first change\n\nChange-Review: First mixed change | Read | First proof")
-        _ = self.git("commit", "--allow-empty", "-m",
-                     "checkpoint(second-unit): second change\n\nChange-Review: Second mixed change | Read | Second proof")
-        _ = self.git("checkout", "main")
-        _ = self.git("merge", "--no-ff", "mixed", "-m", "merge both units")
+        second_unit = fixture_member("unit", name="second-unit", parent=second.id)
         _ = change_review.append_rows(self.review_list,
                                       [change_review.Visible("First mixed change", "Read", "First proof"),
                                        change_review.Visible("Second mixed change", "Read", "Second proof")],
-                                      date(2026, 11, 2), self.git("rev-parse", "HEAD"), self.production)
+                                      date(2026, 11, 2), "abcdef12", self.production, producers=[self.unit.id, second_unit.id])
         path, forms, body = self.browser()
         del path, body
         self.assertEqual(forms.tabs["page-owner/C4"], "sdlc")
@@ -1749,6 +1696,8 @@ class ChangePageTests(unittest.TestCase):
 
     def test_validate_yourself_moves_the_qualified_row_from_an_earlier_list(self) -> None:
         earlier = self.temporary / "change-review - demo.md"
+        demo = fixture_member("showrunner", name="demo")
+        _ = staff.set_doc(demo.id, staff.LiveDoc("natedev", self.production))
         _ = change_review.append_rows(earlier, [change_review.Visible("Earlier change", "Run it", "Proof")],
                                       date(2026, 11, 1), "", self.production)
         _ = change_review.set_row_kind(earlier, "C1", "Read only", self.production)
@@ -1784,7 +1733,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.review_list.read_bytes(), before)
         self.assertEqual(self.messages, [])
 
-    def test_not_works_and_free_text_take_the_existing_checkpoint_unit_route(self) -> None:
+    def test_not_works_and_free_text_follow_the_stored_producer_route(self) -> None:
         for row, outcome, feedback, verdict in (("C1", "not works", "", "not works"),
                                                ("C2", "feedback", "works but café | <still tiny>",
                                                 "works but café | <still tiny>")):
@@ -1994,9 +1943,9 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.proposal("C1")["status"], "landed")
         self.assertIn("Saved: works", self.request(path, {}).body)
 
-    def test_a_checkpoint_hash_routes_feedback_to_its_unit(self) -> None:
+    def test_a_producer_id_routes_feedback_to_its_unit(self) -> None:
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Direct checkpoint", "Run", "Proof")],
-                                      date(2026, 11, 1), self.git("rev-parse", "feature"), self.production)
+                                      date(2026, 11, 1), "abcdef12", self.production, producers=[self.unit.id])
         _ = change_review.set_row_kind(self.review_list, "C4", "See in action", self.production)
         path = urlsplit(change_page.publish(self.production, self.review_list, ["C4"])).path
         page = change_page.page_at(self.root, path)
@@ -2023,10 +1972,9 @@ class ChangePageTests(unittest.TestCase):
         owner = staff.snapshot().by_path("page-owner")
         if owner is None:
             self.fail("the list showrunner must have a staff record")
-        _ = fixture_member("unit", name="sibling-production-unit", parent=owner.id)
-        _ = self.git("commit", "--allow-empty", "-m", "checkpoint(sibling-production-unit): sibling change")
+        sibling_unit = fixture_member("unit", name="sibling-production-unit", parent=owner.id)
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Sibling change", "Run", "Proof")],
-                                      date(2026, 11, 1), self.git("rev-parse", "HEAD"), sibling)
+                                      date(2026, 11, 1), "abcdef12", sibling, producers=[sibling_unit.id])
         _ = change_review.set_row_kind(self.review_list, "C4", "Read only", child)
         path = urlsplit(change_page.publish(child, self.review_list, ["C4"])).path
         page = change_page.page_at(self.root, path)

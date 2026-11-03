@@ -14,12 +14,26 @@ from typing import cast, final
 from contextlib import redirect_stdout
 from unittest import mock
 from scripts.lib import scratch
-from scripts.production import change_review, merge_gate
+from scripts.production import change_review, merge_gate, staff
+from scripts.production.test_change_review import ProducerFixture
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
 
 
 @final
 class MergeGateCheckpointTests(MergeGateFixture):
+    def review_producer(self, doc: Path) -> staff.StaffId:
+        """Give the checkpoint unit a private staff record and a Units row."""
+        self.write(doc, doc.read_text() + "\n## Units\n\n"
+                   + "| Unit | Branch | Worktree |\n| --- | --- | --- |\n"
+                   + f"| fixture | unit-phase | {self.unit} |\n")
+        path = Path(self.environment["HOME"]) / ".local/state/staff/staff.json"
+        with isolated_staff_file(path, self.environment):
+            runner = fixture_member("showrunner", name="fixture-showrunner", doc=staff.LiveDoc("natedev", doc))
+            unit = fixture_member("unit", name="fixture-unit", parent=runner.id,
+                                  worktree=staff.PresentWorktree("natedev", self.unit))
+        return unit.id
+
     def test_checkout_holds_a_shared_copy_lock_through_suites_and_releases_it_on_error(self) -> None:
         copies = self.root / "copies"
         checkout = copies / "show-maker" / "21-gate"
@@ -264,6 +278,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
     def test_a_green_merge_adds_one_row_per_visible_change_to_the_named_list(self) -> None:
         review, doc = self.review_list()
+        producer = self.review_producer(doc)
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
                                             + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away\n"
                                             + "Change-Review: none — the gate script")
@@ -274,7 +289,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         merged = self.git(self.checkout, "rev-parse", "--short=8", "HEAD")
         written = review.read_text(encoding="utf-8").splitlines()[-1]
-        rows = {f"| C8 | The grid fades gently | {day} · {merged} | not yet | Run `hana` in a natedev terminal. You see: The grid lines fade out farther away | production |" for day in days}
+        rows = {f"| C8 | The grid fades gently | {day} · {merged} | not yet | Run `hana` in a natedev terminal. You see: The grid lines fade out farther away | production | {producer} |" for day in days}
         self.assertIn(written, rows)
         self.assertIn(f"Change review: {written}", result.stdout)
         self.assertNotIn("drift", result.stderr)
@@ -282,6 +297,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
     def test_without_production_the_calling_showrunners_list_takes_the_rows(self) -> None:
         review, doc = self.review_list()
+        producer = self.review_producer(doc)
         timer = Path(self.environment["NOTIFIER_STATE_DIR"]) / "showrunner-fixture"
         timer.mkdir(parents=True)
         self.write(timer / "conf", "TARGET=session:fixture-showrunner\n"
@@ -294,6 +310,34 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertIn(f"Change review: 2 row(s) added to {review}: C8–C9", result.stdout)
         self.assertEqual([line.split(" | ")[1] for line in review.read_text(encoding="utf-8").splitlines()[-2:]],
                          ["The grid fades gently", "The sky dims"])
+        self.assertEqual([row[change_review.PRODUCER] for row in change_review.pending(review)
+                          if row["#"] in {"C8", "C9"}], [producer, producer])
+
+    def test_an_unreadable_staff_record_refuses_before_the_merge_and_a_rerun_writes_the_rows(self) -> None:
+        review, doc = self.review_list()
+        producer = self.review_producer(doc)
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
+                                            + "Change-Review: The grid fades gently | Run hana | The grid fades")
+        path = Path(self.environment["STAFF_FILE"])
+        record = path.read_bytes()
+        before = review.read_bytes()
+        path.unlink()
+        refused = self.run_gate("--production", str(doc), checkpoint=checkpoint)
+        self.assert_refused_before_gate(refused)
+        self.assertIn("cannot read staff record", refused.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        self.assertEqual(review.read_bytes(), before)
+        _ = path.write_bytes(record)
+        retried = self.run_gate("--production", str(doc), checkpoint=checkpoint)
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        merged = self.git(self.checkout, "rev-parse", "HEAD")
+        self.assertEqual(self.git(self.origin, "rev-parse", "integration"), merged)
+        self.assertEqual(self.git(self.checkout, "rev-list", "--count", f"{self.base}..HEAD", "--merges"), "1")
+        self.assertEqual(self.git(self.checkout, "rev-list", "--parents", "-n", "1", "HEAD").split(),
+                         [merged, self.base, checkpoint])
+        self.assertEqual([row[change_review.PRODUCER] for row in change_review.pending(review)
+                          if row["#"] == "C8"], [producer])
 
     def test_a_gate_that_finds_no_production_is_refused_before_the_merge(self) -> None:
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
@@ -311,6 +355,18 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Change review: the production doc has no Change review line; no rows written",
                       result.stdout)
+
+    def test_a_production_without_a_list_does_not_read_the_staff_record(self) -> None:
+        doc = self.root / "production.md"
+        self.write(doc, "# p\n")
+        _ = self.review_producer(doc)
+        Path(self.environment["STAFF_FILE"]).unlink()
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
+                                            + "Change-Review: The grid fades gently | Run hana | The grid fades")
+        result = self.run_gate("--production", str(doc), checkpoint=checkpoint)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"),
+                         self.git(self.origin, "rev-parse", "integration"))
 
     @gate_suites(*FIXTURE_FOLDERS)
     def test_green_gate_pushes_no_ff_merge_with_subject_body_and_all_modules(self) -> None:
@@ -408,3 +464,27 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
 if __name__ == "__main__":
     _ = unittest.main()
+
+
+class MergeGateProducerTests(ProducerFixture):
+    def test_record_changes_writes_the_checkpoint_units_staff_id(self) -> None:
+        merged = self.merge()
+        commits = change_review.merge_commits(self.repo, merged)
+        with mock.patch.object(change_review, "drift", return_value=[]):
+            merge_gate.record_changes(self.repo, self.listing, self.doc,
+                                      change_review.publication_changes(commits, self.doc), "main")
+        self.assertEqual(change_review.pending(self.listing)[0]["Producer"], self.unit.id)
+        self.assertEqual(change_review.pending(self.listing)[0]["Production"], "top")
+
+    def test_record_changes_keeps_an_unknown_producer_empty_and_prints_one_named_note(self) -> None:
+        merged = self.merge()
+        commits = change_review.merge_commits(self.repo, merged)
+        output = io.StringIO()
+        with (mock.patch.object(change_review, "drift", return_value=[]),
+              mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())), redirect_stdout(output)):
+            merge_gate.record_changes(self.repo, self.listing, self.doc,
+                                      change_review.publication_changes(commits, self.doc), "main")
+        self.assertEqual(change_review.pending(self.listing)[0]["Producer"], "")
+        notes = [line for line in output.getvalue().splitlines() if line.startswith("change review: no staff row")]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("new-unit", notes[0])

@@ -77,8 +77,6 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
     snapshots = {path: change_review.review_snapshot(path)
                  for path in sorted(change_review.LISTS.glob(change_review.PREFIX + "*.md"))}
     routing = change_page.list_routing(snapshots)
-    routing.prepare((path.stem.removeprefix(change_review.PREFIX), snapshot.pending)
-                    for path, snapshot in snapshots.items())
     grouped: dict[str, list[WaitingChange]] = {path.stem.removeprefix(change_review.PREFIX): [] for path in snapshots}
     grouped.update({runner.name: [] for runner in routing.runners.values()})
     defaults: dict[str, Path] = {}

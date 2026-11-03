@@ -27,6 +27,10 @@ else:
     from memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
 import offload
+if TYPE_CHECKING:
+    from ..build_targets import target_config
+else:
+    import target_config
 import conf
 from offload_test_support import OffloadCommandFixture, FILTER, HANA, HANA_COMMAND_PATTERN
 
@@ -71,6 +75,16 @@ class OffloadSettingsTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         _ = self.enterContext(mock.patch("subprocess.run", side_effect=AssertionError("No external command expected")))
         _ = self.enterContext(mock.patch("subprocess.Popen", side_effect=AssertionError("No external command expected")))
+
+    def test_ssh_target_state_path_needs_no_registry(self) -> None:
+        with mock.patch.object(target_config, "read_targets", side_effect=AssertionError("No registry read expected")):
+            self.assertEqual(offload.ssh_target_state_directory("aws"), self.root / ".local/state/build-targets/aws")
+            self.assertEqual(offload.ssh_target_state_directory("mac"), self.root / "state")
+
+    def test_ssh_target_state_path_refuses_invalid_names(self) -> None:
+        for target in (".", "..", "../aws", "/tmp/aws", "aws/other"):
+            with self.subTest(target=target), self.assertRaises(target_config.ConfigError):
+                _ = offload.ssh_target_state_directory(target)
 
     def test_explicit_settings_path_controls_every_offload_field(self) -> None:
         settings = self.root / "other-mac.conf"

@@ -90,25 +90,24 @@ The page never uses a review list as a production document.
 
 Tabs show each showrunner and its waiting count.
 `scripts/production/change_routing.py` owns the routing rule for the page, the status line, and `/next`.
-The router searches every staff repository for the merge checkpoint.
-The Production cell and list hints do not restrict this search.
-A unit checkpoint identifies a staff row, including a qualified path such as `builds/resources-unit`.
-The router follows its staff parent ids to its showrunner.
-A change without a unit checkpoint belongs to its list's showrunner.
-The router ignores unknown producer aliases when a known staff unit exists.
-For an unknown producer, the router first reads the saved unit rename journal.
-A renamed unit follows the journal's fixed staff ID or current unit name.
-A retired unit, plan alias, or production name without a staff unit belongs to its list's showrunner.
-Several known units under one showrunner belong to that showrunner; only the showrunner receives their messages.
-Units under different showrunners remain in `unrouted`.
-A known unit without a showrunner also remains in `unrouted`.
-The page shows the conflict note under the change.
-The router prints the conflict and change ID to stderr.
+Each row stores one fixed staff id in the `Producer` cell.
+The cell stores no name.
+The router reads the name and parent ids from the staff record at use.
+A unit producer belongs to its current staff showrunner.
+A showrunner producer belongs to that showrunner.
+An empty Producer cell belongs to the list's showrunner.
+A rename or a removed worktree does not change the producer id.
+An unknown id or a broken parent chain belongs to `unrouted`.
+The page shows its note under the change.
+The router prints the note and change id to stderr.
 A verdict on an unrouted row saves without sending a message or recording a delivery failure.
 An unrouted row offers no question control.
 The server refuses its question submissions without saving.
 The Production cell supplies no tab or message recipient.
-The router alerts the configured showrunner about each new unrouted row and reason.
+The router alerts the configured showrunner about each new unrouted row and reason only within the real change-review folder.
+The list's resolved parent must equal `change_routing.LISTS.resolve()`.
+`CHANGE_REVIEW_DIR` sets this folder when the module loads; the default is `~/rust/hanadocs/change-review`.
+Lists outside this folder print the routing note without sending an alert or writing an alert record.
 `unrouted_alert_recipient` starts at `natedev` in `config/review_links.conf`.
 `unrouted_alert_retry_seconds` starts at 60 and accepts 5 through 3600 seconds.
 The router reads both keys when it uses them.
@@ -121,15 +120,40 @@ A new reason permits one new alert.
 A crash between acceptance and the durable mark can repeat an alert.
 Routed rows and rows that need no user answer send no routing alert.
 
-The router caches commit history with a key from Git refs, HEAD, and packed-refs.
-The status count watches the same paths that form the graph cache key.
-New, changed, and deleted refs invalidate both caches.
-Concurrent graph writes use separate temporary files before atomic replacement.
-A failed write removes its temporary file.
-The router reads commit parents in one command for each repository that lacks a current cache.
-Production aliases share one document read per request.
-Rows from the same checkpoint share its selection within that request.
-The router reads full checkpoint messages when a merge contains several units.
+The status count watches the staff record, review lists, and delivery records.
+The owner's staff document supplies the production document when the file exists.
+The supplied production document for that showrunner is the fallback.
+A missing document reference in the source list does not block a row with an available owner document.
+An unrouted row retains verdict controls when its list's staff showrunner has an available document.
+Its owner remains unrouted and receives no message.
+
+`merge_checkpoint`, `merge_gate`, and `change_review.py append` store each checkpoint unit's Producer id.
+The gate reads the staff record before the merge, so a missing record refuses the run before the push.
+Each writer matches the branch to its Units row and finds the staff unit by the Worktree path.
+An exact Branch name wins over a Plan, Unit, or worktree alias.
+The staff lookup prefers present worktrees, then the latest row within each worktree state.
+An unregistered unit writes an empty cell and one named note.
+`change_review.py add --repo <directory>` stores the unit id of that worktree.
+A showrunner directory or an unowned directory stores an empty cell.
+A verdict retains the Producer cell in Reviewed.
+
+Use `change_review.py backfill-producer [--list <path>]` to report older rows with no Producer id.
+Add `--write` to fill mapped rows in To review and Reviewed.
+The command copies each changed list to `<name>.backup-<timestamp>` before the locked write.
+It finds historical checkpoints in the production repositories.
+For a merge with several units, an exact Change-Review text selects the checkpoint.
+If no included checkpoint names the change, the command checks the merge commit's own checkpoint subject.
+It maps the old Branch, Plan, or Unit name through the Units Worktree path to the retained staff id.
+When that lookup fails, the command removes `build-followups-` from the checkpoint name.
+Exactly one staff unit with the remaining name supplies the id. Retired units count.
+Zero or several matches leave Producer empty. A valid Worktree result wins.
+It reports each unmapped row by list, row id, and old name.
+A failed list prints its name and error; the command continues and returns 1 after all lists.
+A rerun retries an unfinished commit.
+A completed list keeps its bytes and commit.
+After the lists are filled, remove `scripts/production/producer_backfill.py`, including its adapter.
+Remove the `backfill-producer` CLI case and argparse choice from `change_review.py`.
+Remove `scripts/production/test_producer_backfill.py`.
 Delivery records store fixed staff ids.
 Each send reads `staff.snapshot()` and sends to `session:<current_session>` from the saved staff row.
 An account move changes the next recipient address without changing the stored staff id.
@@ -276,10 +300,8 @@ Older selected-row pages use the same staff route.
 The saved verdict selects recipients when a new message attempt begins.
 An exact `works` verdict goes only to the showrunner, including text from Send feedback.
 When one staff unit owns the change, every other verdict also goes to that unit.
-The router resolves qualified staff paths before matching unit names or worktree names.
-An exact change trailer selects among checkpoints.
-A single unit also covers a reworded row.
-A change without a unit checkpoint belongs to its list's staff showrunner.
+The Producer cell identifies that unit through its fixed staff id.
+An empty Producer cell belongs to the list's staff showrunner.
 Retries retain stored staff recipient ids.
 Older records without recipient ids compute the same recipients as a fresh verdict send.
 No agent polls for answers.

@@ -79,7 +79,7 @@ class LocalKeyNoticeTests(unittest.TestCase):
         for code, header, status in ((0, "SENT", "accepted"), (0, "SKIPPED", "accepted"),
                                      (1, "QUEUED", "accepted"), (0, "KEPT", "pending"),
                                      (0, "REPLACED", "pending"), (3, "FAILED", "pending"),
-                                     (2, "REFUSED", "pending"), (4, "HELD", "pending")):
+                                     (2, "REFUSED", "pending"), (4, "HELD", "pending"), (5, "PENDING", "pending")):
             with self.subTest(header=header):
                 notices.record(self.root, "fixture", [header])
                 with patch("subprocess.run", return_value=subprocess.CompletedProcess([], code, header + ": fixture", "")), redirect_stderr(io.StringIO()):
