@@ -18,6 +18,12 @@
 
 `verify.sh lint` runs its stages in this order: assertion guard, mend, fmt, taplo, clippy. The assertion guard reads one `git diff -U0` and the commit messages from the base, and reports removed, weaker, changed (a note that does not block), test removed and test turned off; it judges a multi-line assertion as one whole statement and ignores whitespace, so a reflow or a move is no finding. A finding blocks unless an `Assertion-Change: <path>::<test> — <why>` line in the run's work orders (`UNIT_SESSION_DIR`) or a commit message names it. It takes about 0.5 s on the 87,000-line cargo-liner-tile checkpoint e21d5b93. On that checkpoint it reports 73 blocking findings, four of them weaker, among them `draw.rs:2644`; `grep -e weaker -e blocking` on its output keeps only the weaker lines and the total. Mend rewrites the code first. Fmt formats what mend wrote. The clippy stage runs `cargo clippy --fix` and fmt, repeated while a pass changes the tree, at most three times. Then it updates the cache key and judges. Every clippy run in this path uses `--keep-going`. Workspace rustdoc runs separately through `verify.sh doc` after staging, immediately before the checkpoint commit; its exact-tree pass record is mandatory. See [Lint-step fix](build-followups-mul-add.md#lint-step-fix) for the pass rules.
 
+Use `Assertion-Change: <path>::<test-name-prefix>* — <mechanism> deleted` beside the per-test form.
+This form covers deleted tests with the same prefix in that path.
+The prefix rules only `test removed` findings.
+It does not rule assertions in tests that remain.
+A prefix that matches no removed test blocks.
+
 **Files and their roles**
 
 - `docs/direct/phase_checks.md` — the one definition of `<PhaseChecks/>`.
