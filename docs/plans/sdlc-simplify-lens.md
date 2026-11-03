@@ -85,7 +85,8 @@ The user's extra words come from two places:
 - Words for one unit: the showrunner relays them as now, `From the user (via the showrunner): ...`.
   The director passes them to its next simplify launch, and the saved prompt file records them.
 
-Rerun: the summary is keyed by phase, pass and diff hash. A second launch on the same diff exits 0 with no new run.
+Every simplify launch starts a fresh review, including a retry after failure.
+The phase launch lock protects the active report and status from a second launch.
 A failed or busy Claude run reports `error`. <DualReview/> step 6 names the missing lens and the phase goes on.
 
 No worktree writes: plan mode and the removed tools stop edits. review.sh already fails a review when a file changes.
@@ -121,13 +122,13 @@ The trial is the only measure so far. The review-trial line records minutes and 
 2b. `~/.claude/commands/showrunner/produce.md`: the showrunner files each held simplify item with `/showrunner:question`, and never settles one itself.
 3. `~/.claude/scripts/usage/agents_log.py`: add `simplify` to the `Lens` type, so `assign.py` and `findings.py` accept it.
 4. `~/.claude/scripts/direct/assign.py`: route lens `simplify` through `agent_exec.sh` with the removed tools.
-   Write the prompt file. Reuse an existing summary for the same diff hash and exit 0.
+   Write the prompt file before each fresh review.
 5. `~/.claude/config/agents.conf`: one row with the Claude model and effort for the simplify run.
 6. `~/.claude/config/direct.conf`: `SIMPLIFY_LENS=on|off`, read by `assign.py` at launch.
 7. `~/.claude/config/review/simplify.md` (new): the report-only output form and the user's standing words.
 8. `~/.claude/scripts/direct/progress_history.py` and `merge_checkpoint.py`: the review-trial line
    counts simplify findings and minutes on their own field, and `review_numbers` reads it.
-9. Tests beside `assign.py`: the argv in `AGENT_EXEC_DRY_RUN` mode, the rerun with no new run, the `off` switch.
+9. Tests beside `assign.py`: the argv in `AGENT_EXEC_DRY_RUN` mode, a fresh review on the same diff, the `off` switch.
 
 No change: `settings.json`, `checkpoint.md`, `session_pane.py`.
 `production_format.md` gets one line only if the checkpoint notice format lives there and not in `phase_end.md`.
@@ -158,10 +159,10 @@ The phase took items 14 and 22 although they reach `review.sh` and `test_agent_e
 
 The second live simplify run (2026-11-02, pass 1 through `review.sh`) raised 25 items. Item 1 was the same as closure finding F018, which the phase fixed. The phase took items 2-17 and item 24. Item 24 makes a failed usage-log write not stop the review; that write is new in this phase, and `prepare_session.sh` and `agent_bg.sh` already treat it this way. Seven items were held for the user's decision. The report text is in the phase's `review_findings_1_simplify.txt`.
 
-2. Item 18, `review.sh:521-533`, `assign.py:671-674`: publish the simplify cache only when the status reads `reviewed`, as a plain atomic copy of the summary. Effect: a failed run runs again on the same diff, and does not replay `error`. Status: approved by the user 2026-11-02; applied in phase simplify-empty.
-3. Item 19, `assign.py:663-708`, `review.sh:521-539`: give `review.sh` one `--cache <file>` option that owns the lock, the replay and the publish. Effect: changes how a group SIGKILL stops a run. Status: replaced 2026-11-02 by the showrunner's design: `assign.py` hands control to `review.sh` with exec, and `review.sh` owns the lock, the reuse and the save. Applied in phase simplify-empty.
+2. Item 18, `review.sh:521-533`, `assign.py:671-674`: a failed review runs again on the same diff. Status: approved by the user 2026-11-02. The user later approved a fresh run for every simplify review.
+3. Item 19, `assign.py:663-708`, `review.sh:521-539`: one process owns each simplify review. Status: replaced by the exec design in phase simplify-empty. `review.sh` owns the phase launch lock and result files.
 4. Item 20, `assign.py:684-700`: install `interrupt` for three signals and remove the restore loop and the `try/finally`. Effect: a forwarded SIGINT or SIGHUP no longer sends a second SIGTERM. Status: removed by the exec design in phase simplify-empty; no signal handlers remain.
-5. Item 21, `progress_history.py:6135-6223`: take simplify minutes from `pass_elapsed_seconds` on `pass_finished` events with `called_task` `direct.simplify`. Effect: one key and one clock; minute values change by a small amount. Status: approved by the user 2026-11-02; filed in `docs/plans/sdlc-phases-next.md` for a later phase.
+5. Item 21, `progress_history.py:6135-6223`: take simplify minutes from `pass_elapsed_seconds` on `pass_finished` events with `called_task` `direct.simplify`. Effect: one key and one clock; minute values change by a small amount. Status: settled by standing rule (one clock; two sources for one number is a copy; sdlc 2026-11-02); listed in `docs/plans/sdlc-phases-next.md` for the next fixes.
 6. Item 22, `findings.py:724-729`: let `--held-for-decision` take any lens and refuse `--severity blocker`. Effect: the held state is open to all lenses; four doc lines change. Status: declined by the user 2026-11-02: "i haven't needed it so far so we're only making the exception for simplify for the time being - we may make it auto in the future".
 7. Item 23, `review.sh:735`: do not give the simplify run the pending fast-track diffs. Effect: changes the documented rule that every broad review gets them (`docs/plans/sdlc-devtools-tests.md:303`). Status: declined by the user 2026-11-02: "i don't agree - simplify is now a standard review process".
 8. Item 25, `review_regime.py:85-125`: add `optional_float` beside `optional_int` and use it for the four minute fields. Effect: edits three lines from before this phase. Status: approved by the user 2026-11-02 ("you never have to ask me to remove duplication"); filed in `docs/plans/sdlc-phases-next.md` for a later phase.

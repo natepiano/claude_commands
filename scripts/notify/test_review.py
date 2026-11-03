@@ -1475,6 +1475,18 @@ class LocalReviewTests(unittest.TestCase):
             self.assertEqual(call.environment["CLAUDE_CONFIG_DIR"], str(self.root / ".claude2"))
             self.assertEqual(call.environment["MESSAGE_TEST_KEEP"], "kept")
 
+    def test_reviewer_refuses_an_account_with_the_wrong_login_before_launch(self) -> None:
+        _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "wrong@example.invalid"},
+        }))
+        runner = FakeReviewer(verdict(self.draft))
+        result = review.review(self.draft, False, runner=runner)
+        self.assertIsInstance(result, review.Unreviewed)
+        assert isinstance(result, review.Unreviewed)
+        self.assertTrue(result.why.startswith("review unavailable: accounts:"))
+        self.assertIn("holds a different login from claude2", result.why)
+        self.assertEqual(runner.calls, [])
+
     def test_named_unit_account_replaces_the_callers_directory(self) -> None:
         runner = FakeReviewer(verdict(self.draft))
         _ = (self.root / "notes/claude3.md").write_text("---\nlogin: unit@example.invalid\n---\n")

@@ -10,21 +10,18 @@ from datetime import datetime, timezone
 import sys
 sys.path.insert(0, str(Path(sys.argv[1]).resolve()))
 from scripts.accounts import accounts
-if sys.argv[2] == "quota":
-    selected = accounts.pick("claude", datetime.now(timezone.utc))
-    if isinstance(selected, accounts.NoAccountWithRoom):
-        print(accounts.no_room_line("claude", selected))
-        raise SystemExit(1)
-    prepared = accounts.prepared_account(selected.label, resume=False)
-    if isinstance(prepared, accounts.AccountRefused):
-        print(prepared.reason)
-        raise SystemExit(1)
-    print(f"simplify: Claude account {selected.label}", file=sys.stderr)
-else:
-    selected = accounts.account_for_unscoped_launch(os.environ, workers=sys.argv[2] == "workers")
+try:
+    if sys.argv[2] == "quota":
+        selected = accounts.claude_account_with_room(datetime.now(timezone.utc))
+        print(f"Claude account {selected.label}", file=sys.stderr)
+    else:
+        selected = accounts.account_for_unscoped_launch(os.environ, workers=sys.argv[2] == "workers")
+except accounts.AccountsError as error:
+    print(f"ERROR: {error}", file=sys.stderr)
+    raise SystemExit(1)
 print("" if isinstance(selected, accounts.LegacyHomeLaunch) else selected.dir)
 PYTHON
-)" || { [[ "${1:-}" != quota ]] || printf '%s\n' "$config_dir"; return 1; }
+)" || return 1
     if [[ -n "$config_dir" ]]; then
         export CLAUDE_CONFIG_DIR="$config_dir"
         export CLAUDE_CODE_REMOTE_MEMORY_DIR="$HOME/.claude"
@@ -32,5 +29,4 @@ PYTHON
         unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR
     fi
     unset CLAUDE_CODE_OAUTH_TOKEN
-    [[ "${1:-}" != quota ]] || printf '%s\n' "$config_dir"
 }

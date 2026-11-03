@@ -1,8 +1,8 @@
 # Simplify review
 
-Report only. Edit no file. Keep all four agents: reuse, simplification, efficiency, and altitude.
+Report only. Edit no file. Keep these agents: $agents.
 Run each Agent call in the foreground.
-Wait for all four agents to return their results before you return the final result.
+Wait for all listed agents to return their results before you return the final result.
 
 Return exactly one of these forms:
 
