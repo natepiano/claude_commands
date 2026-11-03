@@ -566,6 +566,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.messages, [])
 
     def test_an_unrouted_row_with_a_missing_alert_setting_still_renders(self) -> None:
+        _ = self.enterContext(patch.object(change_routing, "LISTS", self.temporary))
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Conflict", "Read", "Proof")],
                                       date(2026, 11, 2), "abcdef12", self.production, producers=[staff.StaffId("missing-producer")])
         config = self.temporary / "config/review_links.conf"

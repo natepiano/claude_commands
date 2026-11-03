@@ -83,7 +83,7 @@ class NativeRuntimeIdentityTests(StaffTestCase):
     def test_unit_lookup_keeps_exact_removed_worktrees_and_ignores_showrunners(self) -> None:
         runner, unit, _ = self.tree()
         location = self.root / "retired-unit"
-        unit = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", location))
+        unit = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", location), expected=unit.worktree)
         record = staff.snapshot()
         self.assertEqual(record.unit_by_worktree("natedev", location), unit)
         self.assertIsNone(record.unit_by_worktree("mac", location))

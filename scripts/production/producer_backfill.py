@@ -14,6 +14,9 @@ from production_units import Refusal
 from scripts.shutdown import remote
 
 
+OLD_CHECKPOINT_PREFIX = "build-followups-"
+
+
 @dataclass(frozen=True)
 class UnmappedProducer:
     name: str
@@ -87,7 +90,15 @@ class ProducerHistory:
         source = self.tree.branches.get(names[0])
         producer = (change_review.producer_for(source, self.record, self.machine)
                     if source is not None else change_review.UnknownProducer())
-        return UnmappedProducer(names[0]) if isinstance(producer, change_review.UnknownProducer) else producer
+        if not isinstance(producer, change_review.UnknownProducer):
+            return producer
+        name = names[0]
+        if name.startswith(OLD_CHECKPOINT_PREFIX):
+            unit_name = name.removeprefix(OLD_CHECKPOINT_PREFIX)
+            matches = [row.id for row in self.record.rows if row.kind == "unit" and row.name == unit_name]
+            if len(matches) == 1:
+                return matches[0]
+        return UnmappedProducer(name)
 
 
 @dataclass(frozen=True)
