@@ -12,7 +12,8 @@
 
 # extraKnownMarketplaces names folders on one machine (natedev's nate-local plugins).
 # theme is what /theme picks on each machine.
-SETTINGS_LOCAL_KEYS_JSON='["model","effortLevel","modelSettings","extraKnownMarketplaces","theme"]'
+# voice stores the voice setting for each machine.
+SETTINGS_LOCAL_KEYS_JSON='["model","effortLevel","modelSettings","extraKnownMarketplaces","theme","voice"]'
 SETTINGS_LOCAL_KEYS_SIDECAR="settings.local-keys.json"
 
 # Hook groups that belong to one machine, matched by a substring of any of

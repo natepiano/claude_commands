@@ -429,7 +429,7 @@ class StatusTests(IsolatedBuildTargetTest):
 
     def test_probe_uses_shared_settings_reader_without_building_config(self) -> None:
         target = targets.SshTarget("mac", "macos", self.settings)
-        config = offload.OffloadConfig(False, "reader-mac", 2.0, 3.0, 4.0, 5.0, "6", {})
+        config = offload.OffloadConfig(False, offload.SshConnectionSettings("reader-mac", 2.0, 10.0), 3.0, 4.0, 5.0, "6", {})
         calls: list[offload.OffloadConfig] = []
 
         def reachable(

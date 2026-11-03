@@ -1000,6 +1000,31 @@ class HoldEventRecord(TypedDict):
     until: str
 
 
+class SshAttempt(TypedDict):
+    call_id: str
+    target: str
+    repo_identity: str
+    queued_at: float
+    departed_at: float
+    slot: int
+    outcome: str
+    completion: str
+    cleanup: str
+    unresolved_count: int | None
+    evidence_at: float
+
+
+def ssh_attempt(attempt: SshAttempt) -> None:
+    """Keep an SSH attempt when later local work changes the final target."""
+    host = store.host_name()
+    at = time.time()
+    store.append_line(store.host_file(host, at), {
+        **attempt, "kind": "ssh_attempt", "v": RECORD_VERSION,
+        "id": f"{host}-{time.time_ns()}-{secrets.token_hex(4)}", "host": host,
+        "at": store.utc_iso(at),
+    })
+
+
 def hold_event(args: list[str]) -> None:
     event, target, key, holder, reason, at = args[:6]
     if event not in ("began", "ended") or len(args) not in (6, 7):

@@ -1096,7 +1096,7 @@ def _holds_live_agent(client: herdr.Herdr, destination: HerdrDestination) -> boo
     while True:
         held = any(isinstance(destination, RecordedHerdrPane) and row["pane_id"] == destination.pane_id
                    and row.get("agent")
-                   and row["agent_status"] not in {"exited", "stopped", "dead"} for row in client.agents())
+                   and row["agent_status"] not in {herdr.AgentStatus.EXITED, herdr.AgentStatus.STOPPED, herdr.AgentStatus.DEAD} for row in client.agents())
         remaining = deadline - time.monotonic()
         if not held or remaining <= 0:
             return held
@@ -1204,7 +1204,7 @@ def _herdr_launch(
         title = session["name"] if isinstance(parts.name, SavedSessionName) else parts.name
         labels = parts.names.labels if isinstance(parts.names, LaunchNames) else StaffLabelsRead.UNAVAILABLE
         with herdr.restore_staff(record, labels=labels):
-            launched = herdr.launch_prepared_agent(name, herdr_space(session, record), title, prepared_environment,
+            launched = herdr.launch_prepared_agent(name, herdr.NewTab(herdr_space(session, record), title), prepared_environment,
                 kind="claude", agent=title, agent_arguments=list(parts.claude_arguments),
                 opening=herdr.OpeningPrompt(parts.opening_prompt,
                     herdr.SessionTranscript(config_dir, expected_identity), publish_identity), timeout_ms=90_000)

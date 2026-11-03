@@ -3098,3 +3098,48 @@ User 2026-11-02: remove the `read` column; a reading that fails or is old shows 
 User 2026-11-02 "go", via natedev: the `codex` alias set a numbered `CODEX_HOME`, so `codex update` failed with "Could not detect the Codex installation method".
 
 **As-built:** `_exec_codex_account` in `scripts/accounts/accounts.py` sends a first argument of `update` to `_update_codex`, with no account check. It runs the local program with `CODEX_HOME=~/.codex`, attached to the terminal, then reads its version. Then it runs `CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex" update >&2 && … --version` on `remote.other_machine()` over ssh (600 s limit; stderr discarded, so stdout holds only the version). It prints one version or failure line per machine; ssh 255 or a timeout prints `unreachable; run codex update there`. Exit 0 only when both machines updated. Two repair rounds (F001: update text could print as the version; F002: invalid stderr bytes raised a traceback). Style review PASS.
+
+### Phase 101u — The accounts board counts sessions on both machines  · status: done · 06901023
+
+User 2026-11-02 (via the Mac session): "the accounts board should show the counts for all configured machines for both Mac and for Nate Dev. If Mac is unavailable, it should show that."
+
+**As-built:** each status pass in `scripts/accounts/accounts.py` publishes this machine's per-account busy, shell, idle and total counts to `~/.local/state/accounts/session_counts.json` (`_publish_session_counts`), keyed by the machine alias. `_start_session_counts_fetch` starts a detached fetch of the other machine's file under a nonblocking lock, through `role_map.ssh_role_map(..., machine=)`, into `peer_session_counts.json`; the board read never waits on ssh. `_machine_role_counts` sums both machines into each count column and keeps them apart in the JSON field `role_counts_by_machine`. A missing, damaged, failed or older-than-ten-minutes copy adds one problem line, `<machine> unavailable: counts are <this machine> only`, and the board shows local counts. Legacy `~/.codex` sessions count, and numbered Codex homes count under `codex_home_label()`. The unit-board hook and types read the new field. Three findings closed in two repair rounds (F001 machine alias; F002 legacy `~/.codex` counts; F003 numbered-home label).
+
+### Phase 101v — Status reads stay read-only and test runs start no ssh  · status: done · cc347b39
+
+natedev 2026-11-02 (urgent): main was red from 101u (069010236): `test_role_map` and `test_refusal_watch`, 4 failures and 1 error.
+
+**As-built:** `_count_role_sessions` counts in memory and writes no file; `_session_counts_document` (was `_publish_session_counts`) builds the document that `session-counts-read` prints, and `_session_counts_file` is gone. `_machine_role_counts` takes the status `UsageSource` and starts the detached fetch only for `RefreshStaleUsage`, so `status --stored` reads only `peer_session_counts.json` and opens no lock. `test_role_map.py`, `test_refusal_watch.py` and `test_cutover_home.py` stub `_start_session_counts_fetch` for the whole module. New test `test_stored_status_starts_no_counts_fetch_and_writes_nothing`. 3251 tests in the accounts modules and their importers pass. No code review ran (urgent red-main repair; the director read the diff).
+
+### Phase 101x — The Mac voice setting stays local  · status: done · 0dc14b47
+
+natedev 2026-11-02 (urgent): the user turned on voice on the Mac; its `settings.json` gained a top-level `voice` key, and promotion and claude-sync refused the tracked edit from about 16:00 EST.
+
+**As-built:** `voice` joins `SETTINGS_LOCAL_KEYS_JSON` in `scripts/settings/settings_local_keys.sh`, beside `theme`. The Mac fixture in `scripts/settings/test_settings_local_keys.py` has `voice: {enabled: true, mode: hold}`; the cleaned copy has no `voice` key and the sidecar merge puts the full object back. Tests were not run at the checkpoint (hana build hold); the merge gate runs them.
+
+### Phase 101w — Account tunables live in config  · status: todo
+
+natedev 2026-11-02: the hard-coded values proposal, phase 3 (user approved 2026-11-01). Move each tunable value in the accounts code to config through `scripts/lib/conf.py`, with the same value.
+
+#### Work Order
+**Goal:** every tunable value in `scripts/accounts/` (a limit, a timeout, an interval, a size, an age, a count, a threshold, a path root) is read at use from `config/accounts.conf` through `scripts/lib/conf.py`, with its value unchanged.
+**Spec:**
+1. Inventory each tunable literal in the non-test modules of `scripts/accounts/`. A fixed format, protocol name, file name inside a state folder, or test value is not a tunable; leave it.
+2. Add one key per tunable to the new `config/accounts.conf`, with a comment line that says what it controls. Use the unit in the key name (`_seconds`, `_minutes`, `_percent`, `_bytes`).
+3. Read each key at use with `conf.whole`, `conf.number` or `conf.text`; no module-level copy, no second reader, no fallback literal in code.
+4. Keep every value exactly as it is now. Never change a value: the user approves each value change.
+5. Tests use `CONF_DIR` with a scratch copy of `config/accounts.conf`; add one test that each key in the file is read by the code and each value parses.
+6. docs/accounts.md: one short section that names `config/accounts.conf` and says a change needs no build.
+**Files:**
+- `config/accounts.conf`
+- `scripts/accounts/accounts.py`
+- `scripts/accounts/role_map.py`
+- `scripts/accounts/refusal_watch.py`
+- `scripts/accounts/next_moves.py`
+- `scripts/accounts/moves.py`
+- `scripts/accounts/unit_watchdog.py`
+- `scripts/accounts/new_account.py`
+- `scripts/accounts/refusals.py`
+- `scripts/accounts/outage_alerts.py`
+- `scripts/accounts/test_accounts.py`
+- `docs/accounts.md`

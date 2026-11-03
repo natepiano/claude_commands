@@ -68,7 +68,6 @@ class RepositorySlotTests(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(self.root),
             "HOME": str(self.root), "BUILD_TARGETS_CONFIG": str(registry),
-            "MAC_TEST_CONFIG": str(self.root / "mac.conf"),
             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILD_HOLD_DIR": str(self.root / "holders"),
