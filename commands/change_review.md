@@ -93,6 +93,10 @@ When the user asks to review changes, open the prepared page:
 2. Give the link to the user.
 
 The page contains every waiting change, with staff-based showrunner tabs.
+The `unrouted` tab shows unit changes without a staff row.
+Verdicts save without sending a message.
+This tab offers no question control, and the server refuses question submissions without saving.
+Its count covers all page lists, including independent production roots.
 Tabs with waiting changes precede empty tabs in alphabetical order and keep their positions until the next page load.
 The selected tab draws its full outline inside its edges, including the first and last tabs.
 Answers save in the background.
@@ -105,10 +109,13 @@ On a page load, only a sent validation message removes the row from the count an
 Pending and failed validation messages keep the row waiting, with a note and a resend control.
 This state survives a reload and a server restart.
 A direct link shows **The showrunner will validate this** without answer buttons.
-The showrunner still receives the validation message and retains the row in its own `/next` queue.
+The showrunner receives the validation message.
+The showrunner's `/next` keeps a sent validation request pending and places it last.
 Send feedback removes the row from the page count only when its verdict saves.
 Ask a question uses the one-line feedback field.
 Only a sent question message removes the row from the count until the showrunner answers.
+Delivery without a recipient records a failure and releases the active attempt.
+A resend can recover after the staff record changes.
 Pending and failed question messages keep the row waiting after a page load, with a note and a resend control.
 Do not ask for a batch size or take page answers in chat.
 

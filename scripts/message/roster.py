@@ -1350,7 +1350,7 @@ def machine_name() -> str:
     return socket.gethostname().split(".", 1)[0]
 
 
-def _local_roster(environment: Mapping[str, str]) -> Roster:
+def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnapshot | None = None) -> Roster:
     home_state = account.home_account_state()
     problems: list[str] = []
     warnings: list[str] = []
@@ -1358,7 +1358,8 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
     records = _newest_sessions()
     details = _raw_session_details(records, problems)
     try:
-        membership = staff.initial_snapshot()
+        if membership is None:
+            membership = staff.initial_snapshot()
     except staff.StaffUnreadable as error:
         _problem(problems, "staff membership", error)
         membership = staff.StaffSnapshot(())
@@ -1455,14 +1456,15 @@ def peer_roster(environment: Mapping[str, str]) -> Roster:
 
 
 @role_map_command
-def roster(environment: Mapping[str, str], scope: RosterScope) -> Roster:
+def roster(environment: Mapping[str, str], scope: RosterScope, *,
+           membership: staff.StaffSnapshot | None = None) -> Roster:
     match scope:
         case ThisMachine():
-            return _local_roster(environment)
+            return _local_roster(environment, membership=membership)
         case AllMachines():
             with ThreadPoolExecutor(max_workers=2) as pool:
                 peer = pool.submit(peer_roster, environment)
-                local = _local_roster(environment)
+                local = _local_roster(environment, membership=membership)
                 other = peer.result()
             return Roster([*local.entries, *other.entries], [*local.problems, *other.problems],
                           [*local.warnings, *other.warnings])
