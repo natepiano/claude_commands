@@ -237,6 +237,9 @@ The command searches To review and Reviewed.
 It uses the checkpoint's Change-Review text when a merge contains several units.
 If no included checkpoint names the change, the command checks the merge commit's own checkpoint subject.
 It matches old Branch, Plan, and Unit names through retained Worktree paths.
+When that lookup fails, the command removes `build-followups-` from the checkpoint name.
+Exactly one staff unit with the remaining name supplies the id. Retired units count.
+Zero or several matches leave Producer empty. A valid Worktree result wins.
 It copies each changed list to `<name>.backup-<timestamp>` before the locked write.
 An unmapped row stays empty.
 A repeated run changes nothing.

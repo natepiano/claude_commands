@@ -74,7 +74,8 @@ class StaffRoutingTests(unittest.TestCase):
         row = {"#": "C1", "Producer": self.unit.id}
         before = self.router().owner(row, self.root / "change-review - top.md")
         _ = staff.rename(self.unit.id, "renamed-unit")
-        _ = staff.set_worktree(self.unit.id, staff.RemovedWorktree("natedev", self.root / "builder"))
+        _ = staff.set_worktree(self.unit.id, staff.RemovedWorktree("natedev", self.root / "builder"),
+                                   expected=self.unit.worktree)
         self.assertEqual(self.router().owner(row, self.root / "change-review - top.md"), before)
 
     def test_a_showrunner_producer_owns_its_change(self) -> None:

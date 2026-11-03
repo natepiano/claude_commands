@@ -141,6 +141,9 @@ It finds historical checkpoints in the production repositories.
 For a merge with several units, an exact Change-Review text selects the checkpoint.
 If no included checkpoint names the change, the command checks the merge commit's own checkpoint subject.
 It maps the old Branch, Plan, or Unit name through the Units Worktree path to the retained staff id.
+When that lookup fails, the command removes `build-followups-` from the checkpoint name.
+Exactly one staff unit with the remaining name supplies the id. Retired units count.
+Zero or several matches leave Producer empty. A valid Worktree result wins.
 It reports each unmapped row by list, row id, and old name.
 A failed list prints its name and error; the command continues and returns 1 after all lists.
 A rerun retries an unfinished commit.
