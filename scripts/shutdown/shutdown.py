@@ -615,7 +615,7 @@ def main(arguments: list[str] | None = None) -> int:
     _ = stop_command.add_argument("session")
     resume_command = commands.add_parser("resume", help="resume a local session in its own tab")
     _ = resume_command.add_argument("session")
-    _ = resume_command.add_argument("--why", required=True)
+    _ = resume_command.add_argument("--why", default="resumed by name")
     _ = resume_command.add_argument("--to", dest="resume_to")
     forget = commands.add_parser("forget", help="forget one stopped session's restore")
     _ = forget.add_argument("forget_name", metavar="NAME_OR_ID")
@@ -823,10 +823,10 @@ def _all_accounts(options: CommandLine) -> int:
 def _dispatch(options: CommandLine) -> int:
     if options.command in {"stop", "resume"}:
         result = (stop_resume.stop(options.session) if options.command == "stop"
-                  else stop_resume.resume(options.session, why=options.why, to=options.resume_to))
+                  else stop_resume.resume(options.session, why=options.why, to=options.resume_to, restore_missing=True, resume_ended=True))
         if isinstance(result, stop_resume.SessionNotFound):
             print(f"{result.name}: no tab on this machine")
-            return 2
+            return 1 if options.command == "resume" else 2
         if isinstance(result, (stop_resume.StopFailed, stop_resume.ResumeFailed)):
             print(f"{result.session_id}: {options.command} failed: {next(iter(result.reason.splitlines()), 'unknown error')}")
             return 1

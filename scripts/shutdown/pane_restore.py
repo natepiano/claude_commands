@@ -93,9 +93,14 @@ def _resume(session: str, client: herdr.Herdr, pane: herdr.TabSession,
     account = ({"CODEX_HOME": entry["config_dir"]} if kind == "codex"
                else named_account_environment(Path(entry["config_dir"])))
     environment = {**entry["environment"], **account}
+    from scripts.lib.resume_message import resume_message
+
+    arguments = pane_record.resume_arguments(entry)
+    if kind == "claude":
+        arguments.append(resume_message("the herdr server restarted"))
     title = entry["name"] or pane.label
     launched = herdr.launch_agent(session, pane.workspace, title, entry["cwd"], environment, kind,
-        pane_record.resume_arguments(entry), herdr.NoOpeningPrompt(), START_TIMEOUT_MS, agent=title)
+        arguments, herdr.NoOpeningPrompt(), START_TIMEOUT_MS, agent=title)
     if isinstance(launched, herdr.nix_env.Refused):
         raise herdr.HerdrFailure(launched.reason)
     path = pane_record.record_path(session)

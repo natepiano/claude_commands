@@ -18,7 +18,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 from threading import Event
 from time import monotonic
-from typing import cast
+from typing import TYPE_CHECKING, Never, cast
 from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -39,11 +39,14 @@ from scripts.lib.resume_message import (
 )
 from scripts.shutdown.stop_results import (
     Stopped as Stopped, NotRunning as NotRunning, StopFailed as StopFailed,
-    ClaudeUp as ClaudeUp, ResumePending as ResumePending, MoveHandedOff as MoveHandedOff, ResumeFailed as ResumeFailed,
+    ClaudeUp as ClaudeUp, ClaudeStartState, ResumePending as ResumePending, MoveHandedOff as MoveHandedOff, ResumeFailed as ResumeFailed,
     SessionNotFound as SessionNotFound, MoveResult as MoveResult, claude_up_line as claude_up_line,
 )
 import sessions
 from launch_permission import shutdown_state_root
+
+if TYPE_CHECKING:
+    from scripts.production.staff import StaffRow
 
 STOP_GRACE_SECONDS = 2.0
 KILL_GRACE_SECONDS = 5.0
@@ -181,18 +184,33 @@ def resume_arguments(entry: pane_record.PaneLaunch) -> list[str]:
     return pane_record.resume_arguments(LaunchNames.read().resume(entry))
 
 
-def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account: str, message: str) -> sessions.LiveSessionProcess:
-    """Run the account command in the session's own pane, with one resume message."""
+def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account: str) -> list[str]:
+    """Build the account command for both terminal paths."""
     client = herdr.Herdr(herdr.shared_session())
     pane = next((pane for pane in client.panes() if pane["pane_id"] == tab.pane_id), None)
     if pane is None:
         raise herdr.HerdrFailure(f"no pane {tab.pane_id!r}")
-    # A tab moved between workspaces keeps its shell's old marks; hooks must see this pane.
-    environment = {**entry["environment"], "HERDR_PANE_ID": tab.pane_id, "HERDR_WORKSPACE_ID": pane["workspace_id"]}
+    environment = {**entry["environment"], "HERDR_PANE_ID": tab.pane_id,
+                   "HERDR_WORKSPACE_ID": pane["workspace_id"], "RELAUNCH_PROMPT_DELIVERY": "pane"}
     _ = environment.pop("STAFF_ID", None)
-    command = ["env", "-u", "HERDR_TAB_ID", "-u", "STAFF_ID", *(f"{key}={value}" for key, value in environment.items()),
-               sys.executable, str(SCRIPTS / "accounts/accounts.py"), "exec", account,
-               *pane_record.resume_arguments(entry)]
+    return ["env", "-u", "HERDR_TAB_ID", "-u", "STAFF_ID", *(f"{key}={value}" for key, value in environment.items()),
+            "sh", "-c", 'cd -- "$1" && shift && exec "$@"', "resume", entry["cwd"],
+            sys.executable, str(SCRIPTS / "accounts/accounts.py"), "exec", account,
+            *pane_record.resume_arguments(entry)]
+
+
+def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
+                      account: str, message: str) -> Never:
+    """Replace the foreground command with the saved account launch."""
+    command = _pane_command(tab, entry, account)
+    os.chdir(entry["cwd"])
+    os.execvp(command[0], [*command, message])
+
+
+def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account: str, message: str) -> sessions.LiveSessionProcess:
+    """Run the account command in the session's own pane, with one resume message."""
+    client = herdr.Herdr(herdr.shared_session())
+    command = _pane_command(tab, entry, account)
     launched_at = datetime.now(timezone.utc)
     client.run_in_pane(tab.pane_id, command)
     deadline = monotonic() + START_SECONDS
@@ -239,24 +257,64 @@ def _running_on_account(identity: str, pane_id: str, target: str | None) -> Clau
     observed = herdr.Herdr(herdr.shared_session()).native_session(pane_id, "claude", START_SECONDS)
     if observed != identity:
         return ResumeFailed(identity, f"resumed registry identity differs: {observed}")
-    return ClaudeUp(identity, pane_id, label)
+    return ClaudeUp(identity, pane_id, label, start_state=ClaudeStartState.ALREADY_RUNNING)
 
 
-def resume(session: str, *, why: str, to: str | None = None, requester: str = "",
-           restore_missing: bool = False) -> ClaudeUp | ResumeFailed | SessionNotFound:
+def _member_machine(member: StaffRow) -> str:
+    """Return the member's recorded machine, or an empty string when unknown."""
+    from scripts.production import staff
+
+    location = member.worktree if isinstance(member.worktree, (staff.PresentWorktree, staff.RemovedWorktree)) else member.doc
+    if isinstance(location, (staff.PresentWorktree, staff.RemovedWorktree, staff.LiveDoc, staff.WrappedDoc)):
+        return location.machine
+    return ""
+
+
+def _nearby_resume_names(reference: str, names: LaunchNames) -> list[str]:
+    """Select close names from local units and showrunners."""
+    import remote
+
+    machine = remote.local_machine()
+    return sorted({row.name for row in names.tab_record.rows
+                   if row.kind in {"unit", "showrunner"} and _member_machine(row) == machine
+                   and reference.casefold() in row.name.casefold()})[:5]
+
+
+def resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "",
+           restore_missing: bool = False, resume_ended: bool = False) -> ClaudeUp | ResumeFailed | SessionNotFound:
     policy = sessions.retry_policy()
     names = LaunchNames.read()
+    record = names.tab_record
+    member = record.by_member_reference(session)
+    matches = [row for row in record.rows if row.name == session or row == member]
+    candidates = ", ".join(f"{row.name} ({row.id})" for row in matches[:5])
+    if len(matches) > 1:
+        return ResumeFailed(session, f"ambiguous name; candidates: {candidates}")
+    if matches:
+        import remote
+
+        member = matches[0]
+        machine = _member_machine(member)
+        if machine and machine != remote.local_machine():
+            return ResumeFailed(session, f"session is on {machine}")
+        session = member.current_session
     attempt = 0
     while True:
-        result = _resume_once(session, why=why, to=to, requester=requester, restore_missing=restore_missing, names=names)
+        result = _resume_once(session, why=why, to=to, requester=requester, restore_missing=restore_missing, resume_ended=resume_ended, names=names)
         attempt += 1
+        if isinstance(result, SessionNotFound) and not matches:
+            nearby = _nearby_resume_names(session, names)
+            suffix = "; candidates: " + ", ".join(nearby) if nearby else ""
+            return ResumeFailed(session, "unknown name" + suffix)
+        if isinstance(result, ResumeFailed) and result.reason == "Claude is still running on another account":
+            return result
         if not isinstance(result, ResumeFailed) or attempt >= policy.resume_attempts:
             return result
         time.sleep(policy.resume_delay_seconds)
 
 
 def _resume_once(session: str, *, why: str, to: str | None = None, requester: str = "",
-                 restore_missing: bool = False, names: LaunchNames) -> ClaudeUp | ResumeFailed | SessionNotFound:
+                 restore_missing: bool = False, resume_ended: bool = False, names: LaunchNames) -> ClaudeUp | ResumeFailed | SessionNotFound:
     began = monotonic()
     identity = session
     original: pane_launch.LaunchPublication | None = None
@@ -289,12 +347,12 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             tab.pane_id if isinstance(tab, herdr.TabSession) else "")
         running = _running_on_account(identity, pane_id, to)
         if isinstance(running, RunningOnAnotherAccount):
-            return ResumeFailed(identity, "Claude is still running")
+            return ResumeFailed(identity, "Claude is still running on another account")
         if not isinstance(running, sessions.SessionNotLive):
             return running
         if entry is None or entry["session_id"] != identity:
             return ResumeFailed(identity, "pane launch entry does not match the session")
-        if restore_missing and entry.get("ended", False):
+        if restore_missing and not resume_ended and entry.get("ended", False):
             return ResumeFailed(identity, "Claude was closed by hand")
         if not entry.get("flags_read", False):
             return ResumeFailed(identity, "pane launch flags are unknown")
@@ -339,6 +397,19 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         workers = ResumeWorkers(codex_seats([Path(run) for run in unit_runs.held(identity)]), entry["cwd"])
         message = resume_message(why, moved_from=source_label if to else None,
                                  moved_to=to, workers=workers)
+        if os.environ.get("HERDR_PANE_ID") == tab.pane_id:
+            if original is None:
+                raise ValueError("resume has no original publication")
+            with pane_record.locked(client.session):
+                entries = pane_record.read_strict(client.session)
+                if entries.get(tab.pane_id) != original.entry:
+                    raise ValueError("retained launch changed before the resume attempt")
+                pending = entry.copy()
+                pending["session_id"] = original.entry["session_id"]
+                entries[tab.pane_id] = pending
+                pane_record.save(client.session, entries)
+            attempt_pane = tab.pane_id
+            _exec_in_own_pane(tab, entry, label, message)
         live = sessions.session_liveness(identity)
         if isinstance(live, sessions.SessionLivenessUnknown):
             raise herdr.HerdrFailure(live.reason)
