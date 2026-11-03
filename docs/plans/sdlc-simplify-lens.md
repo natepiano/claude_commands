@@ -25,7 +25,7 @@
 User-approved 2026-11-02 via the sdlc showrunner. User requirements (these override the design below where they differ):
 
 1. Use the four-agent form. Keep the Agent tool. Remove Edit, Write and NotebookEdit, and use plan mode.
-2. Never drop a finding. A finding that changes behavior or reaches outside the phase is held for the user. The director lists it in the checkpoint notice. The showrunner files it as a user question and never settles it.
+2. Never drop a finding. A finding that changes behavior or reaches outside the phase is held. The director lists it in the checkpoint notice. It reaches the user only when it touches money, safety, product behavior the user sees, or an act that cannot be undone; the director settles every other held item.
 3. The live check proves that the four agents start and that no file changes.
 4. No settings.json change is planned. If the live check shows one is needed, ask the sdlc showrunner before changing it.
 5. An on/off key in config, read at use.
@@ -58,8 +58,9 @@ No code changes after review without a closure review and a gate.
 Items held for a decision (user, 2026-11-02, via Morty: "these changes may be desirable"):
 
 1. The director sends each held item to the showrunner. It goes in the phase's checkpoint notice, with its finding id, the files and the change it proposes.
-2. The showrunner files each item as a question for the user with `/showrunner:question`, led by the unit.
-   The showrunner does not settle these items itself. This is a stated exception to its usual design authority.
+2. A held item goes to the user only when it touches money, safety, product behavior the user sees, or an act that cannot be undone. The showrunner files only those as user questions with `/showrunner:question`, led by the unit.
+   The director settles every other held item under DecisionEconomy and states the call in one line
+   (user, 2026-11-02, via builds: "you're asking me a bunch of questions that seem obvious - and design oriented - which ones really need me?").
 3. The status line count and `/next question` show the item. The user approves or declines it.
 4. Approved: the showrunner sends it to the owning unit as a `next` item, or as a phase when it is large.
    Declined: the finding closes with the user's words. In both cases nothing is applied before the answer.
@@ -166,3 +167,38 @@ The second live simplify run (2026-11-02, pass 1 through `review.sh`) raised 25 
 6. Item 22, `findings.py:724-729`: let `--held-for-decision` take any lens and refuse `--severity blocker`. Effect: the held state is open to all lenses; four doc lines change. Status: declined by the user 2026-11-02: "i haven't needed it so far so we're only making the exception for simplify for the time being - we may make it auto in the future".
 7. Item 23, `review.sh:735`: do not give the simplify run the pending fast-track diffs. Effect: changes the documented rule that every broad review gets them (`docs/plans/sdlc-devtools-tests.md:303`). Status: declined by the user 2026-11-02: "i don't agree - simplify is now a standard review process".
 8. Item 25, `review_regime.py:85-125`: add `optional_float` beside `optional_int` and use it for the four minute fields. Effect: edits three lines from before this phase. Status: approved by the user 2026-11-02 ("you never have to ask me to remove duplication"); filed in `docs/plans/sdlc-phases-next.md` for a later phase.
+
+### Phase 2 — findings.py records the user's answer over a withdrawn ruling  · status: done
+
+#### Work Order
+
+**Goal:** `findings.py decision` records the user's own answer on a finding that already holds a withdrawn or non-user ruling, keeps both rulings in the history, and `verdict` can close a finding after its decision.
+
+**Spec:**
+1. Today `_decision` (`scripts/direct/findings.py:1219`) refuses any finding whose state is not `held_for_decision`. A finding that holds a showrunner ruling (state `decided`) cannot take the user's answer. Seen on simplify-empty F022, and on builds aws Phase 8 F038-F040.
+2. Add `--withdraw "<why the current ruling no longer stands>"` to `decision`. With it, a `decided` finding takes the new answer:
+   - move the current `decision` object into a `decision_history` list on the finding, adding `withdrawn_epoch` and `withdraw_reason`;
+   - store the new answer as `decision`;
+   - append one `finding_decision` event that carries `withdrew` (the old decision object).
+3. Without `--withdraw`, a `decided` finding still refuses, and the message names `--withdraw`. `--withdraw` on a `held_for_decision` finding is refused. Every other state refuses as now.
+4. Today `_verdict` (`findings.py:787-788`) refuses `decided` findings. Change it:
+   - `held_for_decision` still refuses;
+   - a `decided` finding with answer `approved` accepts `verdict` like an open finding (the repair was applied; this was simplify-follow F033);
+   - a `decided` finding with answer `declined` refuses `verdict` with a message that it is closed by the decision.
+5. `status` shows `decision_history` when present. The `gate` result and batches do not change.
+6. Update the `decision` row in `~/.claude/commands/unit/direct.md` <FindingsLedger/> (in this repo: `commands/unit/direct.md`) to name `--withdraw`.
+7. Tests in `scripts/direct/test_findings.py`: decision over a decided finding with and without `--withdraw`; the history keeps both; `--withdraw` on a held finding is refused; verdict after an approved decision is accepted; verdict after a declined decision is refused; verdict on a held finding is refused.
+
+**Files:**
+- `scripts/direct/findings.py` — `_decision`, `_verdict`, the `decision` parser, `status`
+- `scripts/direct/test_findings.py` — the tests in Spec item 7
+- `commands/unit/direct.md` — the `decision` row
+
+**Workers:** 1 writer; the change is one module and its tests.
+- `impl` — all three files
+
+**State:** the findings ledger state file and its event log (`decision_history`, `finding_decision` events).
+
+**Constraints from prior phases:** `decision` never applies the proposed change; it records words only. Only the user's own words go into `--user-words` (memory: record only the user's answer).
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/direct -p test_findings.py` and `test_findings_simplify.py` pass; `basedpyright scripts/direct/findings.py scripts/direct/test_findings.py` reports 0 errors, 0 warnings, 0 notes.
