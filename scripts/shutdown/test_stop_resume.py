@@ -20,12 +20,14 @@ from typing import cast, final, override
 from unittest.mock import Mock, call, patch
 
 from scripts.accounts import accounts
-from scripts.whoami import account
+from scripts.lib import conf
+from scripts.whoami import account, agent_accounts
 from scripts.shutdown import stop_resume
 from scripts.shutdown.launch_names import LaunchNames
 from scripts.production import showrunners, staff, staff_sources, stall_watch
 from scripts.shutdown.inventory import PausedSeat
 import herdr
+import inventory
 import pane_record
 import pane_launch
 import sessions
@@ -153,9 +155,58 @@ class StopResumeTests(unittest.TestCase):
 
     def test_resume_of_a_session_on_another_account_refuses(self) -> None:
         self.live.return_value = sessions.LiveSessionProcess(123)
-        self.assertEqual(stop_resume.resume("alpha", to="claude4"), stop_resume.ResumeFailed(
-            self.entry["session_id"], "Claude is still running on another account"))
+        self.assertEqual(stop_resume.resume("alpha", to="claude4"), stop_resume.RunningOnAnotherAccount(
+            self.entry["session_id"]))
         self.live.assert_called_once()
+        self.start.assert_not_called()
+        self.kill.assert_not_called()
+
+    def test_retry_returns_the_typed_account_refusal_after_one_attempt(self) -> None:
+        refused = stop_resume.RunningOnAnotherAccount(self.entry["session_id"])
+        policy = sessions.SessionRetryPolicy(1, 0, 3, 1)
+        with (patch.object(stop_resume, "_resume_once", return_value=refused) as attempt,
+              patch.object(sessions, "retry_policy", return_value=policy),
+              patch.object(time, "sleep") as delay):
+            self.assertIs(stop_resume.resume("alpha", to="claude4"), refused)
+        attempt.assert_called_once()
+        delay.assert_not_called()
+
+    def test_retry_does_not_use_failure_text_as_an_account_refusal(self) -> None:
+        failed = stop_resume.ResumeFailed(self.entry["session_id"], "Claude is still running on another account")
+        resumed = stop_resume.ClaudeUp(self.entry["session_id"], "w1:p2", "claude4")
+        policy = sessions.SessionRetryPolicy(1, 0, 3, 1)
+        with (patch.object(stop_resume, "_resume_once", side_effect=[failed, resumed]) as attempt,
+              patch.object(sessions, "retry_policy", return_value=policy),
+              patch.object(time, "sleep") as delay):
+            self.assertIs(stop_resume.resume("alpha", to="claude4"), resumed)
+        self.assertEqual(attempt.call_count, 2)
+        delay.assert_called_once_with(1)
+
+    def test_account_move_preserves_the_typed_account_refusal(self) -> None:
+        refused = stop_resume.RunningOnAnotherAccount(self.entry["session_id"])
+        settings = conf.ConfigRead("accounts", self.root / "accounts.conf", {}, False)
+        destination = agent_accounts.NumberedAccount("claude4", self.root / ".claude4", "fixture-owner")
+        with (patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning(self.entry["session_id"])),
+              patch.object(stop_resume, "resume", return_value=refused),
+              patch.object(accounts, "check_move_target", return_value=accounts.MoveTargetReady(destination)),
+              patch.object(inventory, "listing", return_value=[])):
+            self.assertIs(stop_resume.move("alpha", "claude4", why="fixture move"), refused)
+            outcomes = accounts.move_sessions((self.entry["session_id"],), "claude4",
+                                              why="fixture move", account_config=settings)
+            self.assertEqual(len(outcomes), 1)
+            self.assertIs(outcomes[0], refused)
+            moved = accounts.move("alpha", "claude4", account_config=settings)
+        self.assertEqual(moved, accounts.MoveStartFailed("alpha", "claude4", "",
+            f"{self.entry['session_id']}: not moved: Claude is still running on another account\n", 1))
+        self.assertEqual(accounts.move_result_line(refused),
+                         f"{self.entry['session_id']}: not moved: Claude is still running on another account")
+
+    def test_shutdown_prints_the_typed_account_refusal_and_exits_one(self) -> None:
+        self.live.return_value = sessions.LiveSessionProcess(123)
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(shutdown.main(["resume", "alpha", "--to", "claude4"]), 1)
+        self.assertEqual(output.getvalue().splitlines(), [
+            f"{self.entry['session_id']}: resume failed: Claude is still running on another account"])
         self.start.assert_not_called()
         self.kill.assert_not_called()
 

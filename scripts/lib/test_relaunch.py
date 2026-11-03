@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import TYPE_CHECKING, TypedDict, cast, override
+from typing import TypedDict, cast, override
 import unittest
 from unittest.mock import patch
 
@@ -168,25 +168,6 @@ class RelaunchTests(ShutdownTestCase):
                     expected = [*expected, resume_message("you were stopped and resumed")]
                 self.assertEqual(observed["argv"], expected)
                 self.assertEqual(observed["marks"], marks if identity == "2d058b83-b9da-46fd-9e87-877cd3f50a52" else {})
-
-    def test_server_restore_supplies_the_restart_cause(self) -> None:
-        from scripts.shutdown import pane_restore, pane_record
-        if TYPE_CHECKING:
-            from scripts.herdr import herdr
-        else:
-            import herdr
-
-        entry = pane_record.launch("w1:p2", "session", str(self.root), {}, ["claude"])
-        with patch.object(herdr, "herdr_binary", return_value="/nonexistent/herdr"):
-            client = herdr.Herdr("agents")
-        tab = herdr.TabSession("w1:p2", "fixture", "w1", "session")
-        with (patch.object(client, "pane_activity", return_value=herdr.PaneAtShell()),
-              patch.object(pane_restore, "named_account_environment", return_value={}),
-              patch.object(herdr, "launch_agent", side_effect=ValueError("captured")) as launch):
-            with self.assertRaisesRegex(ValueError, "captured"):
-                pane_restore._resume("agents", client, tab, entry)  # pyright: ignore[reportPrivateUsage]
-        arguments = cast(list[str], launch.call_args.args[6])
-        self.assertIn("the herdr server restarted", arguments[-1])
 
     def test_pane_delivery_does_not_add_a_second_prompt(self) -> None:
         from scripts.shutdown import pane_record

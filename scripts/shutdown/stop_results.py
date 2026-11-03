@@ -53,6 +53,11 @@ class ResumeFailed:
 
 
 @dataclass(frozen=True)
+class RunningOnAnotherAccount:
+    session_id: str
+
+
+@dataclass(frozen=True)
 class SessionNotFound:
     name: str
 
@@ -65,7 +70,14 @@ class ResumePending:
     reason: str
 
 
-MoveResult = ClaudeUp | MoveHandedOff | StopFailed | ResumeFailed | ResumePending | SessionNotFound
+ResumeResult = ClaudeUp | ResumeFailed | RunningOnAnotherAccount | SessionNotFound
+MoveResult = ResumeResult | MoveHandedOff | StopFailed | ResumePending
+
+
+def resume_failure_reason(result: ResumeFailed | RunningOnAnotherAccount) -> str:
+    if isinstance(result, RunningOnAnotherAccount):
+        return "Claude is still running on another account"
+    return result.reason
 
 
 def claude_up_line(result: ClaudeUp) -> str:

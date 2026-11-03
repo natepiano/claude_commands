@@ -10,7 +10,7 @@ import signal
 import sys
 import subprocess
 import time
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -41,6 +41,8 @@ from scripts.shutdown.stop_results import (
     Stopped as Stopped, NotRunning as NotRunning, StopFailed as StopFailed,
     ClaudeUp as ClaudeUp, ClaudeStartState, ResumePending as ResumePending, MoveHandedOff as MoveHandedOff, ResumeFailed as ResumeFailed,
     SessionNotFound as SessionNotFound, MoveResult as MoveResult, claude_up_line as claude_up_line,
+    RunningOnAnotherAccount as RunningOnAnotherAccount, ResumeResult as ResumeResult,
+    resume_failure_reason as resume_failure_reason,
 )
 import sessions
 from launch_permission import shutdown_state_root
@@ -233,11 +235,6 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
     return live
 
 
-@dataclass(frozen=True)
-class RunningOnAnotherAccount:
-    session_id: str
-
-
 def _running_on_account(identity: str, pane_id: str, target: str | None) -> ClaudeUp | ResumeFailed | sessions.SessionNotLive | RunningOnAnotherAccount:
     """A rerun leaves a proven live destination alone; unreadable attribution cannot authorize a stop."""
     live = sessions.session_liveness(identity)
@@ -281,7 +278,7 @@ def _nearby_resume_names(reference: str, names: LaunchNames) -> list[str]:
 
 
 def resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "",
-           restore_missing: bool = False, resume_ended: bool = False) -> ClaudeUp | ResumeFailed | SessionNotFound:
+           restore_missing: bool = False, resume_ended: bool = False) -> ResumeResult:
     policy = sessions.retry_policy()
     names = LaunchNames.read()
     record = names.tab_record
@@ -306,7 +303,7 @@ def resume(session: str, *, why: str = "resumed by name", to: str | None = None,
             nearby = _nearby_resume_names(session, names)
             suffix = "; candidates: " + ", ".join(nearby) if nearby else ""
             return ResumeFailed(session, "unknown name" + suffix)
-        if isinstance(result, ResumeFailed) and result.reason == "Claude is still running on another account":
+        if isinstance(result, RunningOnAnotherAccount):
             return result
         if not isinstance(result, ResumeFailed) or attempt >= policy.resume_attempts:
             return result
@@ -314,7 +311,7 @@ def resume(session: str, *, why: str = "resumed by name", to: str | None = None,
 
 
 def _resume_once(session: str, *, why: str, to: str | None = None, requester: str = "",
-                 restore_missing: bool = False, resume_ended: bool = False, names: LaunchNames) -> ClaudeUp | ResumeFailed | SessionNotFound:
+                 restore_missing: bool = False, resume_ended: bool = False, names: LaunchNames) -> ResumeResult:
     began = monotonic()
     identity = session
     original: pane_launch.LaunchPublication | None = None
@@ -346,8 +343,6 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         pane_id = entry["pane_id"] if isinstance(tab, SessionNotFound) and entry is not None else (
             tab.pane_id if isinstance(tab, herdr.TabSession) else "")
         running = _running_on_account(identity, pane_id, to)
-        if isinstance(running, RunningOnAnotherAccount):
-            return ResumeFailed(identity, "Claude is still running on another account")
         if not isinstance(running, sessions.SessionNotLive):
             return running
         if entry is None or entry["session_id"] != identity:
@@ -596,7 +591,7 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                 stopped.append(result)
             except Exception as error:
                 stopped.append(StopFailed(session, str(error)))
-        def resume_moved(identity: str) -> ClaudeUp | ResumeFailed | SessionNotFound:
+        def resume_moved(identity: str) -> ResumeResult:
             result = (resume(identity, why=why, to=target, requester=requester) if requester else
                       resume(identity, why=why, to=target))
             return replace(result, elapsed_seconds=monotonic() - began) if isinstance(result, ClaudeUp) else result
@@ -610,7 +605,7 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                 continue
             try:
                 resumed = resumes[index].result()
-                if isinstance(resumed, ClaudeUp):
+                if isinstance(resumed, (ClaudeUp, RunningOnAnotherAccount)):
                     outcomes.append(resumed)
                 else:
                     reason = "session has no tab after stop" if isinstance(resumed, SessionNotFound) else resumed.reason

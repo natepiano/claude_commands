@@ -10,6 +10,7 @@ Use a short name, a staff id, or a session id.
 The default reason is `resumed by name`.
 The command restores the saved account, environment, and folder.
 A closed tab uses the existing restore path.
+A herdr server restore resumes the saved conversation without a generated prompt.
 An empty target pane replaces the foreground process with the saved launch.
 A session already running on the target account prints an already-running line and returns status 0.
 A session running on another account refuses resume without stopping.

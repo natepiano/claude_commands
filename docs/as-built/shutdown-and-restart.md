@@ -44,7 +44,7 @@ The restore paths use these causes:
 2. An account move uses its supplied reason and the source and target accounts.
 3. A refusal-watch move uses the refusal-watch reason through the shared account move.
 4. A folder move uses `the session folder moved`.
-5. A herdr server restore uses `the herdr server restarted` through `pane_restore`.
+5. A herdr server restore resumes the saved conversation without a generated prompt.
 6. A relaunch with no known cause uses `you were stopped and resumed`.
 
 The relaunch supervisor preserves explicit prompts.
