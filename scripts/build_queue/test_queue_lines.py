@@ -17,9 +17,9 @@ from scripts.build_queue.queue_lines import (
     pad_left,
     pad_right,
     plain,
-    terminal_width,
     wrap,
 )
+from scripts.lib.terminal_cells import terminal_width
 
 
 def styled_letters(lines: Sequence[Line]) -> list[tuple[str, str, bool]]:
