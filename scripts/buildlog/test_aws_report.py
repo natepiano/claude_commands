@@ -33,6 +33,11 @@ class AwsReportTests(MeasurementFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        registry = self.root / "build_targets.conf"
+        _ = registry.write_text(
+            registry.read_text()
+            + "# whole: 0..10\nvault.lock_retries=5\n"
+            + "# range: 0..5\nvault.lock_retry_delay_s=3\n")
         self.state: Path = self.root / ".local/state/build-targets/aws"
         self.seed_cost()
         self.text_setting("host", "aws-build")
