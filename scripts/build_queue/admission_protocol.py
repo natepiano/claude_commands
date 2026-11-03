@@ -39,39 +39,6 @@ class Identity:
     folder: str
 
 
-@dataclass(frozen=True)
-class RequestedTestWidth:
-    threads: int
-
-    def __post_init__(self) -> None:
-        if self.threads <= 0:
-            raise ValueError("test width must be positive")
-
-
-@dataclass(frozen=True)
-class UnspecifiedTestWidth:
-    pass
-
-
-@dataclass(frozen=True)
-class NoTestWidth:
-    pass
-
-
-TestWidth = RequestedTestWidth | UnspecifiedTestWidth | NoTestWidth
-
-
-@dataclass(frozen=True)
-class CallRecord:
-    call_id: str
-
-
-@dataclass(frozen=True)
-class NoCallRecord:
-    pass
-
-
-Call = CallRecord | NoCallRecord
 Profile = gate.StepProfile | gate.ProgramProfile
 
 
@@ -84,10 +51,11 @@ class AdmitRequest:
     since: float
     sidecar: str
     identity: Identity
-    call: Call
-    test_width: TestWidth
+    call: gate.Call
+    test_width: gate.TestWidth
     profile: Profile
     fresh_test: bool
+    token_back_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -114,6 +82,11 @@ class WidthRequest:
 
 
 @dataclass(frozen=True)
+class BuildHistoryRequest:
+    pass
+
+
+@dataclass(frozen=True)
 class ViewRequest:
     pass
 
@@ -135,8 +108,28 @@ class AdmitHeadRequest:
     actor: str
 
 
+@dataclass(frozen=True)
+class PrioritySetRequest:
+    request_id: str
+    unit: str
+    why: str
+    actor: str
+
+
+@dataclass(frozen=True)
+class PriorityClearRequest:
+    request_id: str
+    actor: str
+
+
+@dataclass(frozen=True)
+class TokenWaitRequest:
+    request_id: str
+    reservation: str
+
+
 Request = (AdmitRequest | LaunchRequest | ReleaseRequest | WidthRequest | ViewRequest
-           | ExplainRequest | MineRequest | AdmitHeadRequest)
+           | BuildHistoryRequest | ExplainRequest | MineRequest | AdmitHeadRequest | PrioritySetRequest | PriorityClearRequest | TokenWaitRequest)
 
 
 @dataclass(frozen=True)
@@ -145,6 +138,7 @@ class Wait:
     position: int
     head: str
     text: str
+    snapshot: gate.AdmissionWaitSnapshot
 
 
 @dataclass(frozen=True)
@@ -154,6 +148,7 @@ class Admitted:
     source: str
     max_path: str
     wave_path: str
+    sampling_context: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -173,6 +168,11 @@ class Ok:
 
 
 @dataclass(frozen=True)
+class BuildHistoryReply:
+    generation: int
+
+
+@dataclass(frozen=True)
 class ViewReply:
     reading: gate.QueueRead
 
@@ -180,6 +180,7 @@ class ViewReply:
 @dataclass(frozen=True)
 class ExplainReply:
     explanation: gate.QueueExplanation
+    fallbacks: tuple[gate.ConfigFallback, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -187,21 +188,24 @@ class MineReply:
     reading: gate.QueueRead
 
 
-Reply = Wait | Admitted | LaunchAdmitted | Refused | Ok | ViewReply | ExplainReply | MineReply
+Reply = Wait | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply | ViewReply | ExplainReply | MineReply
 
 _REQUESTS: dict[str, type] = {
     "admit": AdmitRequest, "launch": LaunchRequest, "release": ReleaseRequest,
     "width": WidthRequest, "view": ViewRequest, "explain": ExplainRequest,
-    "mine": MineRequest, "admit_head": AdmitHeadRequest,
+    "build_history": BuildHistoryRequest, "mine": MineRequest, "admit_head": AdmitHeadRequest,
+    "priority_set": PrioritySetRequest, "priority_clear": PriorityClearRequest, "token_wait": TokenWaitRequest,
 }
 _REPLIES: dict[str, type] = {
     "wait": Wait, "admitted": Admitted, "launch_admitted": LaunchAdmitted,
-    "refused": Refused, "ok": Ok, "view": ViewReply, "explain": ExplainReply, "mine": MineReply,
+    "build_history": BuildHistoryReply, "refused": Refused, "ok": Ok, "view": ViewReply, "explain": ExplainReply, "mine": MineReply,
 }
 T = TypeVar("T")
 
 
 def admission_socket_path() -> Path:
+    from scripts.build_hold.override_guard import refuse_overrides
+    refuse_overrides(Path(__file__), "build_queue/admission_protocol.py")
     return Path(os.environ.get("ADMISSION_SOCKET") or "/run/build-admission/build-admission.sock")
 
 

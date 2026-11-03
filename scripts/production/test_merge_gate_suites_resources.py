@@ -1,7 +1,7 @@
 """Merge gate suites contracts."""
 
 from __future__ import annotations
-from scripts.build_queue import queue_place
+from scripts.build_queue import queue_place, admission_protocol as wire
 
 import unittest
 import io
@@ -228,13 +228,14 @@ class MergeGateResourcesTests(GateSuitesFixture):
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
-        def observed(result: memory_admit.CheckResult) -> None:
+        def observed(result: memory_admit.AdmissionWaitSnapshot) -> None:
             nonlocal admitted
             admitted = result.decision.state == "admit"
             if result.decision.state == "hold":
                 assert_busy()
                 waited.add("memory")
-                busy.unlink()
+                replies = self.admission.server.handle_request(wire.ReleaseRequest("release-busy", busy.reservation, 0))
+                self.assertEqual(replies, [wire.Ok()])
 
         def free_slot(seconds: float) -> None:
             if admitted and "slot" not in waited:
