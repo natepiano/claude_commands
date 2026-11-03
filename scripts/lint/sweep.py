@@ -178,6 +178,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeGuard, TypedDict, cast, overload, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.message import send_budget
 import conf
 from process_failure import failure_detail
 from user_zone import user_zone  # noqa: E402
@@ -2550,7 +2552,7 @@ def send_holder_message(session: str, message: str) -> bool:
     """Tell a session that its process holds a target the floor needs; True when send.py delivered
     the message or queued it (exit 1)."""
     try:
-        result = subprocess.run(session_send_argv(session), input=message, text=True, capture_output=True, timeout=40)
+        result = subprocess.run(session_send_argv(session), input=message, text=True, capture_output=True, timeout=send_budget.seconds(30))
     except (OSError, subprocess.TimeoutExpired) as error:
         print(f"lint sweep: message to {session} failed: {error}", file=sys.stderr)
         return False
@@ -2584,7 +2586,7 @@ def send_floor_alert(message: str, channels: FloorAlertChannels, *,
     delivered = False
     for channel, command in commands:
         try:
-            timeout = review.user_send_seconds() + 15 if channel == "phone" else 40
+            timeout = send_budget.user_seconds(review.user_send_seconds()) if channel == "phone" else send_budget.seconds(30)
             result = subprocess.run(command, input=message if channel == "message" else None, text=True, capture_output=True, timeout=timeout)
             if result.returncode == 0 or (channel == "message" and result.returncode == 1):
                 delivered = True

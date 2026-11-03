@@ -517,7 +517,6 @@ class MergeGateFixture(unittest.TestCase):
         with contextlib.ExitStack() as scope:
             for name, value in {
                 "NOTIFIER_STATE_DIR": Path(self.environment["NOTIFIER_STATE_DIR"]),
-                "SESSIONS_DIR": home / ".claude/sessions",
                 "SHOWRUNNER_STATE_DIR": home / ".local/state/showrunner",
             }.items():
                 _ = scope.enter_context(mock.patch.object(showrunners, name, value))

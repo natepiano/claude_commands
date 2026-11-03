@@ -484,9 +484,10 @@ def setUpModule() -> None:
         path = Path(home.name) / directory
         path.mkdir()
         unittest.addModuleCleanup(set_environment(variable, str(path)))
-        discovery_path = patch.object(showrunners, attribute, path)
-        _ = discovery_path.start()
-        unittest.addModuleCleanup(discovery_path.stop)
+        if attribute != "SESSIONS_DIR":
+            discovery_path = patch.object(showrunners, attribute, path)
+            _ = discovery_path.start()
+            unittest.addModuleCleanup(discovery_path.stop)
     restore_notes = set_environment("AGENT_NOTES_DIR", home.name)
     unittest.addModuleCleanup(set_environment("AGENTS_CONFIG_PUBLISH", "0"))
     # Tier tests never read the caller's registry, config, or pacer choice.

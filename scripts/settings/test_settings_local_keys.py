@@ -94,14 +94,16 @@ class SettingsFilterTests(unittest.TestCase):
             _ = shutil.copy2(source, self.root / "scripts/settings" / source.name)
         for name in ("conf.sh", "conf.py", "atomic_file.py", "py"):
             _ = shutil.copy2(KEYS.parents[1] / "lib" / name, self.root / "scripts/lib" / name)
-        _ = shutil.copy2(KEYS.parents[2] / "config/settings.conf", self.root / "config/settings.conf")
+        for name in ("settings", "send", "postmaster", "codex_daemon"):
+            source = KEYS.parents[2] / "config" / f"{name}.conf"
+            _ = shutil.copy2(source, self.root / "config" / source.name)
         _ = shutil.copy2(KEYS.with_name("local_key_notices.py"), self.root / "scripts/settings/local_key_notices.py")
         _ = shutil.copy2(KEYS.parents[1] / "message/send_result.py", self.root / "scripts/message/send_result.py")
         _ = (self.root / "scripts/message/send.py").write_text('''import json, sys, runpy
 from pathlib import Path
 if __name__ != "__main__":
     protocol = runpy.run_path(REAL_SENDER)
-    TIMEOUT = protocol["TIMEOUT"]
+    delivery_timeout = protocol["delivery_timeout"]
 else:
     root = Path(__file__).resolve().parents[2]
     with (root / "sent.jsonl").open("a") as output:
@@ -230,6 +232,19 @@ else:
         self.assertEqual(len(sends), 2)
         self.assertEqual(sends[1][1], "fixture-destination")
         self.assertEqual(sends[1][-1], f"Settings key secondKey is local on {socket.gethostname().split(".")[0]}.")
+
+    def test_missing_budget_config_reports_an_error_and_keeps_the_notice_pending(self) -> None:
+        (self.root / "config/postmaster.conf").unlink()
+        self.write_settings({"shared": 1, "newSetting": True})
+        _ = self.refresh()
+        result = self.run_command(BASH, "-c", '''source scripts/settings/settings_local_keys.sh
+settings_local_keys_notices deliver
+''', check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("postmaster.conf", result.stderr)
+        self.assertIn("no usable committed value", result.stderr)
+        self.assertEqual(self.sends(), [])
+        self.assertIn('"pending"', self.history.read_text())
 
     def test_failed_notice_retries_after_key_deletion_and_queued_notice_is_accepted(self) -> None:
         (self.root / "fail-send").touch()

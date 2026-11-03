@@ -450,7 +450,6 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
         for module, fields in (
             (showrunners, {"CONFIG": Path(environment["SHOWRUNNERS_CONFIG"]),
                            "NOTIFIER_STATE_DIR": Path(environment["NOTIFIER_STATE_DIR"]),
-                           "SESSIONS_DIR": Path(environment["NOTIFIER_SESSIONS_DIR"]),
                            "SHOWRUNNER_STATE_DIR": Path(environment["SHOWRUNNER_STATE_DIR"])}),
             (tidy_wrapped, {"STATE_DIR": Path(environment["SHOWRUNNER_STATE_DIR"]),
                             "NOTIFIER_STATE_DIR": Path(environment["NOTIFIER_STATE_DIR"])}),

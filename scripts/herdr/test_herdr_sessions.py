@@ -77,7 +77,6 @@ class HerdrSessionsTests(unittest.TestCase):
         _ = self.enterContext(patch.object(herdr_sessions, "live_session", side_effect=self.record_is_live))
         _ = self.enterContext(patch.object(sessions, "running_session", side_effect=self.record_is_live))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.state))
-        _ = self.enterContext(patch.object(showrunners, "SESSIONS_DIR", self.records))
         _ = self.enterContext(patch.object(showrunners, "socket_for", return_value="fake-socket"))
         _ = self.enterContext(patch.object(showrunners, "_session_name", side_effect=self.registered_name))
         _ = self.enterContext(patch.object(showrunners, "user_zone_name", return_value="UTC"))

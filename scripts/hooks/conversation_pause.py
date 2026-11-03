@@ -18,6 +18,9 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.message import send_budget
+
 if TYPE_CHECKING:
     from ..lib import script_prompts, unit_runs
     from ..message.relay_identity import message_sender_name
@@ -877,7 +880,7 @@ def _send_question(delivery: QuestionDelivery) -> bool:
         result = subprocess.run(
             [*send_command(), "--to", f"uds:{delivery.socket}", "--from", WATCHER,
              "--key", f"conversation-pause-{delivery.session_id}", "--text", QUESTION],
-            capture_output=True, text=True, check=False, timeout=90,
+            capture_output=True, text=True, check=False, timeout=send_budget.seconds(),
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         print(f"conversation-pause: send for {delivery.session_id}: {error}", file=sys.stderr)

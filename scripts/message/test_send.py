@@ -11,6 +11,7 @@ import socket
 import sqlite3
 import subprocess
 import shlex
+import signal
 import shutil
 import sys
 import tempfile
@@ -100,7 +101,66 @@ INIT: dict[str, object] = {"type": "system", "subtype": "init", "permissionMode"
 
 REAL_OPEN_CASE = rca.open_case
 
+
+def write_send_config(path: Path, values: str) -> int:
+    """Keep timing settings when a test changes the sender authority setting."""
+    defaults = Path(send.__file__).resolve().parents[2] / "config"
+    for name in ("postmaster", "codex_daemon", "send_repeat_guard", "rca"):
+        _ = (path.parent / f"{name}.conf").write_text((defaults / f"{name}.conf").read_text())
+    timings = "\n".join(line for line in (defaults / "send.conf").read_text().splitlines()
+                        if not line.startswith("MORTY_NATIVE_ID="))
+    return path.write_text(timings + "\n" + values)
+
 class RelayAccountTests(unittest.TestCase):
+    def test_relay_reads_its_cleanup_budget_before_starting_the_process(self) -> None:
+        class TimedOutRelay:
+            returncode: int = 0
+
+            def __init__(self) -> None:
+                self.timeouts: list[float] = []
+                self.inputs: list[str | None] = []
+                self.signals: list[int] = []
+
+            def communicate(self, stdin: str | None = None, *, timeout: float) -> tuple[str, str]:
+                self.inputs.append(stdin)
+                self.timeouts.append(timeout)
+                if len(self.timeouts) == 1:
+                    raise subprocess.TimeoutExpired("relay", timeout)
+                return "", ""
+
+            def send_signal(self, sig: int) -> None:
+                self.signals.append(sig)
+
+        process = TimedOutRelay()
+        started = False
+
+        @contextmanager
+        def launch() -> Generator[TimedOutRelay]:
+            nonlocal started
+            started = True
+            yield process
+
+        def read_grace() -> float:
+            self.assertFalse(started)
+            return 0.5
+
+        with (mock.patch.object(subprocess, "Popen", return_value=launch()),
+              mock.patch.object(send, "kill_grace", new=read_grace),
+              mock.patch.dict(os.environ, {"SEND_REPEAT_NOTICE_JOB": "1"})):
+            self.assertEqual(send.run(["relay"], "body", 1), (None, "", ""))
+        self.assertEqual(process.timeouts, [1, 0.5])
+        self.assertEqual(process.inputs, ["body", None])
+        self.assertEqual(process.signals, [signal.SIGTERM])
+
+    def test_parser_default_timeout_changes_without_a_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory)
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
+                for seconds in (11, 17):
+                    _ = (config / "send.conf").write_text(f"# range: 0.001..\ndelivery_timeout={seconds}\n")
+                    self.assertEqual(send.parse(["--to", "user", "--summary", "Title", "--text", "Body", "--no-action"]).timeout,
+                                     seconds)
+
     def test_relay_publishes_its_sender_before_exec_and_keeps_the_socket_owners_pid(self) -> None:
         with short_socket_directory() as directory:
             root = Path(directory)
@@ -151,11 +211,12 @@ class RelayAccountTests(unittest.TestCase):
                 with (
                     self.subTest(status=status),
                     mock.patch.dict(os.environ, {"HOME": str(home)}, clear=True),
-                    scratch_accounts_config(),
+                    scratch_accounts_config() as config,
                     mock.patch.object(send, "claude_binary", return_value="claude"),
                     mock.patch.object(send, "STATE", home / "message-state"),
                     mock.patch.object(send, "run", return_value=(0, stream(INIT, call(delivered), answer(OK)), "")) as launch,
                 ):
+                    _ = write_send_config(config / "send.conf", "")
                     result = send.relay(send.Message("uds:/recipient", "sender-address", "Preview", original, None,
                                                     "sdlc · roles · worker test"), 10)
                 self.assertEqual(result.outcome, "sent")
@@ -177,10 +238,11 @@ class RelayAccountTests(unittest.TestCase):
                 "oauthAccount": {"emailAddress": "legacy@example.invalid"}}))
             with (mock.patch.dict(os.environ, {"HOME": str(home), "CLAUDE_CODE_SESSION_ID": "caller",
                                               "CLAUDE_CODE_REMOTE_MEMORY_DIR": "inherited-memory"}, clear=True),
-                  scratch_accounts_config(),
+                  scratch_accounts_config() as config,
                   mock.patch.object(send, "claude_binary", return_value="claude"),
                   mock.patch.object(send, "STATE", home / "message-state"),
                   mock.patch.object(send, "run", return_value=(0, "", "")) as launch):
+                _ = write_send_config(config / "send.conf", "")
                 _ = send.relay(send.Message("uds:/unused", "test", "hello", "body", None), 10)
             launch.assert_called_once()
             environment = cast(dict[str, str], launch.call_args.args[3])
@@ -390,7 +452,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             mock.patch.object(roster, "roster", return_value=self.recipient_roster([], []))
         )
         (self.root / "config").mkdir()
-        _ = (self.root / "config/send.conf").write_text(
+        _ = write_send_config(self.root / "config/send.conf",
             "MORTY_NATIVE_ID=codex:00000000-0000-4000-8000-000000000001\n")
         _ = self.enterContext(mock.patch.object(staff, "runtime_id", return_value=""))
 
@@ -445,7 +507,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         stamp = send.ClaudeSender("00000000-0000-4000-8000-000000000002")
         message = send.Message("recipient", "morty", "Decision", "Use the plan.", None, stamp=stamp)
         self.assertNotIn("Authority:", send.agent_text(message))
-        _ = (self.root / "config/send.conf").write_text(
+        _ = write_send_config(self.root / "config/send.conf",
             "MORTY_NATIVE_ID=session:00000000-0000-4000-8000-000000000002\n")
         self.assertIn("Authority: morty (speaks for the user)", send.agent_text(message))
 
@@ -466,7 +528,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
     def test_missing_or_invalid_morty_config_never_grants_authority(self) -> None:
         for config in ("", "MORTY_NATIVE_ID=codex:bad", "MORTY_NATIVE_ID=unavailable"):
             with self.subTest(config=config):
-                _ = (self.root / "config/send.conf").write_text(config)
+                _ = write_send_config(self.root / "config/send.conf", config)
                 with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "00000000-0000-4000-8000-000000000001"}):
                     self.assertEqual(self.send("--text", config or "Missing config").outcome, "sent")
                 self.assertNotIn("Authority:", send.agent_text(self.relayed[-1]))
@@ -618,7 +680,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 self.assertIn("\n> Authority: morty (speaks for the user)", replay)
                 self.assertNotIn(separator, replay)
                 with mock.patch.object(send, "run", return_value=(0, "SENT: worker", "")) as launch:
-                    self.assertEqual(send.codex(message, "/fixture/run", send.TIMEOUT).outcome, "sent")
+                    self.assertEqual(send.codex(message, "/fixture/run", send.delivery_timeout()).outcome, "sent")
                 command = cast(list[str], launch.call_args.args[0])
                 self.assertEqual(command[command.index("--message") + 1], forms[0])
                 self.assertEqual(command[command.index("--guard-text") + 1], body)
@@ -1018,7 +1080,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued()) as queue, \
                 mock.patch.object(roster, "roster", return_value=self.recipient_roster([self.daemon_row("remote-thread")], [])):
             self.assertEqual(send.send(received).outcome, "sent")
-        queue.assert_called_once_with(self.daemon_owner(), "remote-thread", "body\nSender native id: unavailable\nShown sender: sdlc · roles · worker test", timeout=send.TIMEOUT)
+        queue.assert_called_once_with(self.daemon_owner(), "remote-thread", "body\nSender native id: unavailable\nShown sender: sdlc · roles · worker test", timeout=send.delivery_timeout())
 
     def test_queued_sender_display_survives_roster_changes_and_legacy_records_use_raw_sender(self) -> None:
         queued_at = datetime(2026, 10, 20, tzinfo=timezone.utc)
@@ -1067,7 +1129,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(command[command.index("--to") + 1], "mesh-address")
         self.assertEqual(command[command.index("--session-dir") + 1], "/fixture/run")
         self.assertEqual(command[command.index("--message") + 1], expected)
-        queue.assert_called_once_with(self.daemon_owner(), "thread-address", expected, timeout=send.TIMEOUT)
+        queue.assert_called_once_with(self.daemon_owner(), "thread-address", expected, timeout=send.delivery_timeout())
         self.assertEqual([(row["from"], row["to"], row["text"]) for row in self.log()], [
             ("sender-address", "mesh-address", original), ("sender-address", "codex:thread-address", original),
         ])
@@ -1122,7 +1184,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                     self.assertEqual(send.send(received).outcome, "sent")
                 expected = ("Message from sender-address: Preview\nSender native id: unavailable\n\nbody" if display == "sender-address" else
                             "Message from sender-address: Preview\nSender native id: unavailable\nShown sender: sdlc · roles · worker test\n\nbody")
-                queue.assert_called_once_with(self.daemon_owner(), "remote-thread", expected, timeout=send.TIMEOUT)
+                queue.assert_called_once_with(self.daemon_owner(), "remote-thread", expected, timeout=send.delivery_timeout())
                 logged = self.log()[-1]
                 self.assertEqual((logged["from"], logged["to"], logged["key"], logged["text"]),
                                  ("sender-address", "codex:remote-thread", "reply-key", original))
@@ -1492,14 +1554,14 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                     with self.assertRaises(KeyboardInterrupt):
                         _ = send.send(options)
                 before = (self.root / "keys.json").read_bytes()
-                with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.TIMEOUT - 1)):
+                with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.delivery_timeout() - 1)):
                     self.assertEqual(send.send(options).outcome, "pending")
                 self.assertEqual((self.root / "keys.json").read_bytes(), before)
                 self.assertEqual(len(self.relayed), delivered)
-                with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.TIMEOUT + 1)):
+                with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.delivery_timeout() + 1)):
                     self.assertEqual(send.send(options).outcome, "sent")
-                self.assertEqual(self.claims(key), {"staff:recipient": (started + timedelta(seconds=send.TIMEOUT + 1)).isoformat()})
-                with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.TIMEOUT * 2 + 2)):
+                self.assertEqual(self.claims(key), {"staff:recipient": (started + timedelta(seconds=send.delivery_timeout() + 1)).isoformat()})
+                with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.delivery_timeout() * 2 + 2)):
                     self.assertEqual(send.send(options).outcome, "skipped")
                 self.assertEqual(len(self.relayed), delivered + 1)
         self.assertEqual(len(self.relayed), 2)
@@ -1547,11 +1609,11 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         _ = path.write_text(json.dumps({"notice": state}))
         before = path.read_bytes()
         options = local_options(["--to", "recipient", "--key", "notice", "--repeat-minutes", "30", "--text", "Notice"])
-        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.TIMEOUT - 1)):
+        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.delivery_timeout() - 1)):
             self.assertEqual(send.send(options).outcome, "pending")
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(self.relayed, [])
-        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.TIMEOUT + 1)):
+        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.delivery_timeout() + 1)):
             self.assertEqual(send.send(options).outcome, "sent")
         self.assertEqual(len(self.relayed), 1)
 
@@ -2140,7 +2202,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def clear_check(self, at: datetime | None = None, timeout: float = 0) -> tuple[int, list[str]]:
         with mock.patch.object(send, "now", return_value=at or send.now()):
-            return send.clear_check(timeout or send.CHECK_TIMEOUT_S)
+            return send.clear_check(timeout or send.check_timeout())
 
     def test_an_emergency_push_with_no_clear_step_is_refused(self) -> None:
         bare = [argument for argument in self.emergency("--key", "github-cold") if argument not in ("--clears-when", "true")]
@@ -3251,7 +3313,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
 
         self.assertEqual(code, 0)
         self.assertEqual(output.getvalue(), "SENT: queued on Codex session thread-one\n")
-        queue.assert_called_once_with(self.daemon_owner(), "thread-one", "hello\nSender native id: unavailable", timeout=send.TIMEOUT)
+        queue.assert_called_once_with(self.daemon_owner(), "thread-one", "hello\nSender native id: unavailable", timeout=send.delivery_timeout())
         read_roster.assert_called_once()
 
     def test_named_codex_session_uses_its_display_name_in_the_outcome(self) -> None:
@@ -3269,7 +3331,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             ]))
 
         self.assertEqual(result, send.Result("sent", "queued on Codex session Codex window"))
-        queue.assert_called_once_with(self.daemon_owner(), "thread-window", "hello\nSender native id: unavailable", timeout=send.TIMEOUT)
+        queue.assert_called_once_with(self.daemon_owner(), "thread-window", "hello\nSender native id: unavailable", timeout=send.delivery_timeout())
 
     def test_codex_queue_failure_and_timeout_are_failed_and_never_kept(self) -> None:
         failures = (
@@ -3354,6 +3416,30 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             result = self.send("--codex", "--session-dir", str(self.root), "--text", "hi")
         self.assertEqual(result.outcome, "failed")
         self.assertEqual(send.pending("bogus"), "")
+
+    def test_remote_delivery_and_retirement_follow_the_configured_transport_allowance(self) -> None:
+        directory = self.root / "remote-budget-config"
+        directory.mkdir()
+        config = directory / "send.conf"
+        _ = write_send_config(config, "MORTY_NATIVE_ID=codex:fixture\n")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(directory)}):
+            options = send.parse(["--to", "session:recipient", "--from", "Sender", "--text", "body"])
+            message = send.Message("session:recipient", "Sender", "Summary", "body", None)
+            record = send.Emergency(key="remote", sender="Sender", check="true", machine="fixture-peer",
+                                    sent=send.now().isoformat(), expires=send.now().isoformat())
+            budgets: list[tuple[float, float]] = []
+            for allowance in (30, 90):
+                source = Path(__file__).resolve().parents[2] / "config/send.conf"
+                _ = config.write_text(source.read_text().replace("remote_transport_seconds=30",
+                                                               f"remote_transport_seconds={allowance}"))
+                with mock.patch.object(send, "run", return_value=(0, "SENT: fixture\n", "")) as run:
+                    self.assertEqual(send.remote(message, "fixture-peer", options).outcome, "sent")
+                    delivery = cast(float, run.call_args.args[2])
+                    self.assertEqual(send.retire_record(record)[0], 0)
+                    retirement = cast(float, run.call_args.args[2])
+                budgets.append((delivery, retirement))
+            self.assertEqual(budgets[1][0] - budgets[0][0], 60)
+            self.assertEqual(budgets[1][1] - budgets[0][1], 60)
 
     def test_remote_reports_its_outcome_and_ssh_failure_is_failed(self) -> None:
         commands: list[list[str]] = []
@@ -3556,7 +3642,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                      "--action", "Choose retry.", "--text", "The build stopped."]
         with mock.patch.object(review, "review_timeout_seconds", return_value=90):
             for extra, expected in (([], 205), (["--timeout", "5"], 205),
-                                    (["--timeout", "250"], 250), (["--machine", "natedev"], 245)):
+                                    (["--timeout", "250"], 250), (["--machine", "natedev"], 285)):
                 with self.subTest(extra=extra), mock.patch.object(send, "run", return_value=(0, "SENT: to the user\n", "")) as run:
                     self.assertEqual(send.send(local_options([*arguments, *extra])).outcome, "sent")
                 self.assertEqual(run.call_args.args[2], expected)
@@ -3737,8 +3823,8 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 self.assertEqual(send.send(options).outcome, "sent")
             # The review reads the whole alert with its waits sentence, and holds it back at most 30 s.
             [(draft, limit)] = self.reviews
-            self.assertEqual(limit, send.WAITS_REVIEW_SECONDS)
-            self.assertEqual(send.WAITS_REVIEW_SECONDS, 30)
+            self.assertEqual(limit, send.waits_review_seconds())
+            self.assertEqual(send.waits_review_seconds(), 30)
             self.assertIn("Auto mode refused 2 shell commands in the modules session. The P542 build waits for them.\n", draft.body)
             pushed = cast(list[str], run.call_args.args[0])
             self.assertIn("waits_line= The P542 build waits for them." if kept else "waits_line=", pushed)
@@ -4714,7 +4800,7 @@ class AccountDaemonRoutingTests(unittest.TestCase):
         (self.homes[1] / "sessions").symlink_to(self.homes[0] / "sessions", target_is_directory=True)
         (self.root / "claude-sessions").mkdir()
         (self.root / "config").mkdir()
-        _ = (self.root / "config/send.conf").write_text(
+        _ = write_send_config(self.root / "config/send.conf",
             "MORTY_NATIVE_ID=codex:00000000-0000-4000-8000-000000000001\n")
         binaries = self.root / "bin"
         binaries.mkdir()

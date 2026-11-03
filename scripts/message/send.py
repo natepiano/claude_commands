@@ -68,7 +68,7 @@ An emergency push stops by itself when its cause is fixed. `--clears-when CMD` g
 command, run on this machine, that exits 0 when the cause is gone (`--clears-when github-warm-status`).
 A sent push with it is recorded in STATE/emergencies.json: key, sender, check, machine (the host
 that posted the push: this one, or --machine HOST), sent and expires (sent + pushover.EXPIRE_S).
-`clear-check` runs each record's check with no stdin and a CHECK_TIMEOUT_S limit. On exit 0 it
+`clear-check` runs each record's check with no stdin and a check_timeout() limit. On exit 0 it
 retires the push as `retire --to user` does (on the posting host over ssh when that is another
 host) and removes the record; it drops an expired record; it never pushes. It prints one line per
 record: `retired: KEY from SENDER: ...`, `kept: KEY from SENDER: ...`, `dropped: KEY from SENDER: ...`,
@@ -128,6 +128,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 
@@ -138,6 +139,7 @@ import process_group
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff, unit_names
 from scripts.lib import conf
+from scripts.message import send_budget
 from scripts.message.send_result import (
     Outcome as Outcome, EXIT as EXIT, OUTCOME_HEADERS as OUTCOME_HEADERS,
     OutcomeHeader as OutcomeHeader, NoOutcomeHeader as NoOutcomeHeader, parse_outcome as parse_outcome,
@@ -180,8 +182,6 @@ AUTO_MODE_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --
                   + ' [--value "rule=<the allow rule>"]')
 # The push shows a longer refused command cut to its first 89 characters and "…".
 REFUSED_COMMAND_LENGTH = 90
-# The cold-read review of an auto_mode.refused waits sentence holds the alert back at most this long.
-WAITS_REVIEW_SECONDS = 30
 PAID_CREDITS_TEXT = "quota.paid_credits"
 PAID_CREDITS_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id quota.paid_credits'
                      + ' --value account=<account> --value machine=<machine> --value credits=<paid credits left>'
@@ -226,9 +226,6 @@ RCA_TEXTS = frozenset({rca.STARTED_TEXT, rca.FIXED_TEXT, rca.REWRITTEN_TEXT})
 AUTO_MODE_HELD = ("not sent: this push reports an auto-mode refusal. Send it with the auto_mode.refused template: "
                   + AUTO_MODE_CALL)
 PERMISSION_MODE = "auto"
-# One relay took 9 s when measured; quota_alert.py's budget is built on this.
-TIMEOUT = 40
-KILL_GRACE = 10
 # Exec preserves this PID: Claude's cc-socks/<pid>.sock belongs to the recorded process.
 # Publish before Claude starts, so even an immediate reply can resolve its sender.
 RELAY_EXEC = f"""import os, sys
@@ -238,16 +235,36 @@ from relay_identity import publish_relay_identity
 publish_relay_identity(os.getpid(), sys.argv[2], Path(sys.argv[1]))
 os.execvpe(sys.argv[3], sys.argv[3:], os.environ)
 """
-# Above pushover.TIMEOUT_S, so Pushover's own timeout reports first.
-USER_CANCEL_TIMEOUT = 30
-# A --clears-when check that runs longer is stopped, and its push is kept.
-CHECK_TIMEOUT_S = 20
-# The far retire's cancel limit, the ssh connect timeout and its start-up.
-REMOTE_RETIRE_TIMEOUT = USER_CANCEL_TIMEOUT + 30
 EMERGENCIES = "emergencies.json"
 NO_CLEAR_STEP = ("an emergency push (--need blocked) repeats on the phone until it is cancelled, and this one has no"
                  + ' way to clear. Add --clears-when "<command that exits 0 when fixed>", such as'
                  + " --clears-when github-warm-status: send.py then cancels the push when that command exits 0")
+
+
+def waits_review_seconds() -> float:
+    """Push review budget in seconds."""
+    return conf.read("send").number("waits_review_seconds")
+
+
+def delivery_timeout() -> float:
+    """Default delivery budget in seconds."""
+    return conf.read("send").number("delivery_timeout")
+
+
+def kill_grace() -> float:
+    """Relay shutdown grace in seconds."""
+    return conf.read("send").number("kill_grace")
+
+
+def user_cancel_timeout() -> float:
+    """Emergency cancellation budget in seconds."""
+    return conf.read("send").number("user_cancel_timeout")
+
+
+def check_timeout() -> float:
+    """Emergency check budget in seconds."""
+    return conf.read("send").number("check_timeout")
+
 
 Need = Literal["note", "decision", "blocked"]
 CHANNEL_PRIORITY: dict[Need, str] = {"note": "0", "decision": "1", "blocked": "2"}
@@ -963,7 +980,7 @@ def retire(to: str, sender: str, key: str) -> int:
 def cancel_user_push(sender: str, key: str) -> tuple[int, str]:
     """Stop the user's emergency push sent with key, through the same channel user() sends on."""
     code, out, err = run([sys.executable, str(USER_CHANNEL), "cancel", "--source", sender, key], "",
-                         USER_CANCEL_TIMEOUT)
+                         user_cancel_timeout())
     if code == 0 and "pushover: nothing to cancel" in out:
         return 0, f"nothing to cancel: no emergency push for {key} is repeating"
     if code == 0:
@@ -1057,7 +1074,7 @@ def retire_record(record: Emergency) -> tuple[int, str]:
     forget_sent(record["key"], USER)
     forwarded = shlex.join(["retire", "--to", USER, "--from", record["sender"], "--key", record["key"]])
     command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", record["machine"], f"{REMOTE} {forwarded}"]
-    code, out, err = run(command, "", REMOTE_RETIRE_TIMEOUT)
+    code, out, err = run(command, "", user_cancel_timeout() + conf.read("send").number("remote_transport_seconds"))
     last = (out.strip().splitlines() or [""])[-1]
     if code == 0:
         return 0, f"on {record['machine']}: {last}"
@@ -1078,11 +1095,16 @@ def clear_check_turn() -> Generator[bool]:
         yield True
 
 
-def clear_check(timeout: float = CHECK_TIMEOUT_S) -> tuple[int, list[str]]:
+class ConfiguredCheckTimeout(Enum):
+    CURRENT = "current"
+
+
+def clear_check(timeout: float | ConfiguredCheckTimeout = ConfiguredCheckTimeout.CURRENT) -> tuple[int, list[str]]:
     """Retire each live emergency push whose check passes and drop the expired ones; never pushes.
 
     The lock is not held while checks and retires run: a retire takes it, and a send must not wait on a check.
     """
+    timeout = check_timeout() if isinstance(timeout, ConfiguredCheckTimeout) else timeout
     if not (STATE / EMERGENCIES).exists():
         return 0, []
     with clear_check_turn() as turn:
@@ -1168,7 +1190,7 @@ class RepeatPending:
 
 def pending_deliveries(state: KeyState) -> dict[str, PendingDelivery]:
     """Read legacy pending timestamps with the default delivery limit."""
-    return {recipient: PendingDelivery(started=mark, limit_seconds=TIMEOUT) if isinstance(mark, str) else mark
+    return {recipient: PendingDelivery(started=mark, limit_seconds=delivery_timeout()) if isinstance(mark, str) else mark
             for recipient, mark in state.get("pending", {}).items()}
 
 
@@ -1478,7 +1500,7 @@ def recover_socket_queues(records: list[sessions.SessionRecord], at: datetime) -
             started = now()
             append_record(STATE / "socket-recovery-attempts.jsonl",
                           SocketRecoveryAttempt(key=identity, time=started.isoformat()), durable=True)
-            result = relay_socket(message, TIMEOUT, records, metadata, membership=membership)
+            result = relay_socket(message, delivery_timeout(), records, metadata, membership=membership)
             log(message, result, started)
             if result.outcome != "sent":
                 lines.append(f"FAILED: socket queue {path}: {result.detail}; kept for retry")
@@ -1804,13 +1826,14 @@ def run(command: list[str], stdin: str, timeout: float, env: dict[str, str] | No
     A timeout stops the process group. Notice deliveries instead inherit their
     supervisor's group, whose whole-job deadline also stops descendants.
     """
+    grace = kill_grace()
     with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           text=True, env=env, cwd=cwd, start_new_session=os.environ.get("SEND_REPEAT_NOTICE_JOB") != "1") as process:
         try:
             out, err = process.communicate(stdin, timeout=timeout)
             return process.returncode, out, err
         except subprocess.TimeoutExpired:
-            for sig, wait in ((signal.SIGTERM, KILL_GRACE), (signal.SIGKILL, None)):
+            for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, None)):
                 try:
                     if os.environ.get("SEND_REPEAT_NOTICE_JOB") == "1":
                         process.send_signal(sig)
@@ -1819,7 +1842,7 @@ def run(command: list[str], stdin: str, timeout: float, env: dict[str, str] | No
                 except ProcessLookupError:
                     pass
                 try:
-                    out, err = process.communicate(timeout=KILL_GRACE if wait is None and os.environ.get("SEND_REPEAT_NOTICE_JOB") == "1" else wait)
+                    out, err = process.communicate(timeout=grace if wait is None and os.environ.get("SEND_REPEAT_NOTICE_JOB") == "1" else wait)
                     return None, out, err
                 except subprocess.TimeoutExpired:
                     continue
@@ -2129,7 +2152,7 @@ def deliver_template_fix(text_id: str, recipient: str, text: str) -> None:
     command = [sys.executable, str(Path(__file__).resolve()), "--to", recipient, "--from", "push template review",
                "--summary", "Fix push template " + text_id, "--text", text]
     try:
-        code, out, err = run(command, "", TIMEOUT + 40)
+        code, out, err = run(command, "", send_budget.seconds())
         if code != 0:
             log_template_fix_error(text_id, (err or out).strip() or ("timed out" if code is None else f"exit {code}"))
     except OSError as error:
@@ -2181,7 +2204,7 @@ def remote(message: Message, host: str, options: Options) -> Result:
         # This host's claim holds the emergency's lifetime window; the run on host must not apply it again.
         forwarded += ["--repeat-minutes", "0"]
     command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, f"{'CLAUDE_PID= ' if message.to == USER else ''}{REMOTE} {shlex.join(forwarded)}"]
-    code, out, err = run(command, message.text, options.timeout + KILL_GRACE + 30)
+    code, out, err = run(command, message.text, send_budget.remote_seconds(options.timeout))
     receiver, err = recipient_report(err)
     failure: FailureText = NO_FAILED_PUSH
     if message.to == USER and "send.py: failed push JSON: " in err:
@@ -2289,16 +2312,17 @@ def auto_mode_key(session: str, commands: tuple[str, ...]) -> str:
 
 
 def reviewed_waits(options: Options) -> Options:
-    """An auto_mode.refused alert keeps its waits sentence, a value the session writes, only when the
-    cold-read review passes the alert within WAITS_REVIEW_SECONDS. A timeout, a failure or no reviewer
-    sends the alert without it: a slow review never holds the alert back longer."""
+    """Review the waits sentence within the configured budget.
+
+    Keep the sentence only when the reviewer approves it. Send the alert without the sentence if the review fails.
+    """
     values = {key: item for key, _, item in (value.partition("=") for value in options.values)}
     if not values.get("waits_line") or review.switched_off():
         return options
     rendered = push_texts.render(AUTO_MODE_TEXT, **values)
     draft = review.Draft(rendered.sender, CHANNEL_PRIORITY[options.need], rendered.title, rendered.action,
                          rendered.body, False, rendered.session)
-    outcome = review.review(draft, False, limit=WAITS_REVIEW_SECONDS)
+    outcome = review.review(draft, False, limit=waits_review_seconds())
     if isinstance(outcome, review.Approved):
         return options
     why = outcome.why if isinstance(outcome, review.Unreviewed | review.Withheld) else ", ".join(outcome.failed_rules)
@@ -2417,7 +2441,7 @@ def parse(argv: list[str]) -> Options:
     _ = location.add_argument("--here", action="store_true", help="resolve and deliver only here")
     _ = parser.add_argument("--codex", action="store_true", help="the recipient is a codex_mesh.py thread")
     _ = parser.add_argument("--session-dir", help="the codex_mesh.py session directory")
-    _ = parser.add_argument("--timeout", type=float, default=TIMEOUT, help=f"delivery seconds (default {TIMEOUT})")
+    _ = parser.add_argument("--timeout", type=float, default=delivery_timeout(), help=f"delivery seconds (default {delivery_timeout():g})")
     body = parser.add_mutually_exclusive_group()
     _ = body.add_argument("--text")
     _ = body.add_argument("--file")
@@ -2517,7 +2541,7 @@ def parse(argv: list[str]) -> Options:
            if name not in {"action", "selection", "scope", "values", "commands", "shown_sender", "sender_origin"}}
     options = Options(selection=selection, sender=optional_str(get["sender"]), summary=optional_str(get["summary"]),
                       key=optional_str(get["key"]), repeat_minutes=optional_float(get["repeat_minutes"]),
-                      scope=scope, timeout=optional_float(get["timeout"]) or TIMEOUT,
+                      scope=scope, timeout=optional_float(get["timeout"]) or delivery_timeout(),
                       need=cast(Need, get["need"]), action=action, text=optional_str(get["text"]),
                       file=optional_str(get["file"]), answerable=get["answerable"] is True, text_id=text_id, values=tuple(raw_values),
                       commands=tuple(commands), clears_when=optional_str(get["clears_when"]) or "",
@@ -2919,7 +2943,7 @@ def main(argv: list[str]) -> int:
     match argv:
         case ["repeat-notices"]:
             repeat_guard.drain(Path(os.environ.get("SEND_REPEAT_STATE", str(STATE / "repeats"))), attempt_repeat_notice, now().timestamp(),
-                               cleanup_seconds=2 * KILL_GRACE)
+                               cleanup_seconds=2 * kill_grace())
         case ["repeat-notice-attempt"]:
             request = as_dict(loads(sys.stdin.read()))
             state = repeat_guard.decode(json.dumps(request["state"]))
