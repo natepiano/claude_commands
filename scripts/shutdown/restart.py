@@ -29,6 +29,7 @@ from typing import Literal, Never, Protocol, TypedDict, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.accounts import outage_alerts
+from scripts.lib.script_envelope import SCRIPT_ENVELOPE_START, script_prompt
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 for dependency in ("whoami", "message", "notify", "production", "hooks", "lib", "herdr"):
@@ -41,9 +42,8 @@ from scripts.whoami.account import (  # noqa: E402
     named_account_environment,
     named_claude_account,
     own_claude_account,
-    NAMED_ACCOUNT_VARIABLES,
 )
-from scripts.shutdown import folder_trust, stop_resume  # noqa: E402
+from scripts.shutdown import stop_resume  # noqa: E402
 import pane_record  # noqa: E402
 from scripts.shutdown.launch_names import LaunchNames, LaunchNamesNotRead, SavedLaunchNames
 from pane_launch import StaffLabelsRead  # noqa: E402
@@ -92,7 +92,7 @@ from shutdown_record import (  # noqa: E402
     update_session,
 )
 import shutdown_record as recovery_store  # noqa: E402
-import launch_permission as restore_permission  # noqa: E402
+from scripts.shutdown.stop_results import shutdown_state_root  # noqa: E402
 import remote  # noqa: E402
 from remote import other_machine, run_remote  # noqa: E402
 import sessions  # noqa: E402
@@ -145,7 +145,7 @@ SEND = SCRIPTS / "message" / "send.py"
 RESTART_LAUNCH_WORKERS = 256
 SESSION_WAIT_SECONDS = 90.0
 SESSION_POLL_SECONDS = 0.5
-CONDUCTOR_ONLY_VARIABLES = frozenset({"REFUSAL_WATCH_INVENTORY", "PYTHONUNBUFFERED", "SHUTDOWN_PARENT_LAUNCH_CLAIM", "STAFF_OPERATION_FD"})
+CONDUCTOR_ONLY_VARIABLES = frozenset({"REFUSAL_WATCH_INVENTORY", "PYTHONUNBUFFERED", "STAFF_OPERATION_FD"})
 # herdr lists a stopped agent as live for a few seconds after its process ends.
 AGENT_EXIT_SECONDS = 15.0
 REMOTE_CONTROL_WAIT_SECONDS = 10.0
@@ -518,11 +518,11 @@ def _run(argv: list[str], *, dry_run: bool, check: bool = True) -> subprocess.Co
         capture_output=True,
         text=True,
         check=check,
-        env={**{
+        env={
             name: value
             for name, value in os.environ.items()
             if not name.startswith("CLAUDE_") and name not in CONDUCTOR_ONLY_VARIABLES
-        }, **restore_permission.inherited_launch_claim()},
+        },
     )
 
 
@@ -623,7 +623,10 @@ def restart_note(
         note += " " + stop_resume.resume_message("", workers=stop_resume.ResumeWorkers(seats, record["session"]["cwd"]))
         note += " Saved workers: " + ", ".join(seat["seat"] + (" (paused mid-turn)" if seat["turn_live"] else "") for seat in seats) + "."
     # A unit renamed while it was stopped learns its new names before anything else it reads.
-    return f"{record['renamed']} {note}" if "renamed" in record else note
+    if "renamed" in record:
+        marker = SCRIPT_ENVELOPE_START
+        note = note.replace(marker, marker + " " + record["renamed"], 1)
+    return note
 
 
 def _stop_note(record: SessionShutdown, restarted_at: str) -> str:
@@ -788,7 +791,7 @@ def _resume_parts(session: Session, prompt: str, target: str = "", *, login: str
     argv = pane_record.resume_arguments(entry)
     if isinstance(conversation, StartFreshConversation):
         del argv[:2]
-    return ResumeParts(session["cwd"], environment, tuple(argv), prompt, account, conversation, entry["name"], names)
+    return ResumeParts(session["cwd"], environment, tuple(argv), script_prompt(prompt), account, conversation, entry["name"], names)
 
 
 def _resume_shell(parts: ResumeParts) -> str:
@@ -934,7 +937,7 @@ def _require_submitted_prompt(record: SessionShutdown, outcome: herdr.PromptSubm
 def _record_scheduled_restart_prompt(
     session_id: str, prompt: str, *, dry_run: bool
 ) -> None:
-    if dry_run:
+    if dry_run or not prompt.lstrip().startswith("/"):
         return
     try:
         recorded = conversation_pause.read_scheduled_prompts(session_id)
@@ -1103,26 +1106,19 @@ def _holds_live_agent(client: herdr.Herdr, destination: HerdrDestination) -> boo
         time.sleep(min(SESSION_POLL_SECONDS, remaining))
 
 
-class FolderNotTrusted(OSError):
-    """No account on this machine trusts the session's folder; `command` is the user's one-time fix."""
-
-    def __init__(self, reason: str, command: str) -> None:
-        super().__init__(f"{reason}. Run: {command}")
-        self.command: str = command
-
-
-def _heal_folder_trust(session: Session, folder: Path, config_dir: Path, *, dry_run: bool) -> None:
-    """Adapt the shared trust result to recorded restart's reporting and failure storage."""
+def _copy_claude_trust(session: Session, folder: Path, config_dir: Path, *, dry_run: bool) -> None:
+    """Copy existing trust and report anomalies without blocking the launch."""
     from scripts.accounts import accounts
 
     recorded = session.get("config_dir")
-    trust = folder_trust.heal(folder, config_dir, Path(recorded) if recorded else config_dir, dry_run=dry_run)
-    target = accounts.claude_config_label(config_dir)
+    trust = herdr.heal_claude_trust(folder, config_dir / ".claude.json",
+        accounts.trust_sources(config_dir, Path(recorded) if recorded else config_dir), dry_run=dry_run)
     if isinstance(trust, herdr.TrustCopied):
         copied = "would copy" if dry_run else "copied"
-        print(f"{session['name']}: {copied} folder trust for {folder} from {trust.source} to {target}")
-    elif isinstance(trust, (folder_trust.FolderNotTrusted, folder_trust.FolderTrustUnreadable)):
-        raise FolderNotTrusted(trust.reason, trust.command)
+        print(f"{session['name']}: {copied} folder trust for {folder} from {trust.source} to {accounts.claude_config_label(config_dir)}")
+    elif isinstance(trust, (herdr.Untrusted, herdr.UnreadableTrustFile)):
+        reason = str(trust) if isinstance(trust, herdr.UnreadableTrustFile) else f"Claude has not trusted {folder}"
+        print(f"{session['name']}: trust anomaly: {reason}", file=sys.stderr)
 
 
 def _prepare_resume_environment(session_id: str, cwd: str, environment: dict[str, str],
@@ -1153,7 +1149,7 @@ def _herdr_launch(
         environment = {**named_account_environment(parts.account.config_dir), **environment}
     name = destination.name
     config_dir = Path(environment["CLAUDE_CONFIG_DIR"])
-    _heal_folder_trust(session, Path(parts.cwd), config_dir, dry_run=dry_run)
+    _copy_claude_trust(session, Path(parts.cwd), config_dir, dry_run=dry_run)
     if isinstance(parts.names, SavedLaunchNames):
         record = staff.initial_snapshot()
     elif isinstance(parts.names.record, staff.StaffSnapshot):
@@ -1871,66 +1867,24 @@ def _restart_note_delivered(
     return False
 
 
-def _restore_launch_unchanged(saved: SessionShutdown, current: SessionShutdown) -> bool:
-    return (_same_relaunch_claim(saved, current) if saved["progress"]["kind"] == "restarting" else
-            saved["request_id"] == current["request_id"] and saved["progress"] == current["progress"])
-
-
-def _claimed_unit_launch(saved: SessionShutdown, note: str, state: DesktopLaunchState,
-                         *, source_fallback: bool = False) -> SessionLaunched | ManualRestartRequired:
-    def admit() -> None:
-        found = lookup_session(saved["login"], saved["session"]["session_id"])
-        if not isinstance(found, ShutdownFound) or not _restore_launch_unchanged(saved, found.record):
-            raise OSError("unit restart claim changed before launch")
-    with restore_permission.admitted_launch(saved["login"], saved["session"]["session_id"],
-            saved["session"]["name"], admit):
-        if source_fallback:
-            return _launch_session(saved, note, state, dry_run=False, source_fallback=True)
-        return _launch_session(saved, note, state, dry_run=False)
-
-
 def _launch_recovery_record(
     saved: SessionShutdown, note: str, desktop_state: DesktopLaunchState, *, dry_run: bool,
 ) -> SessionLaunched | ManualRestartRequired:
-    # Units perform the same admission in add_unit, in its own process/barrier.
     if dry_run:
         return _launch_session(saved, note, desktop_state, dry_run=True)
     if saved["session"]["kind"] == "unit":
-        return _claimed_unit_launch(saved, note, desktop_state)
+        return _launch_session(saved, note, desktop_state, dry_run=False)
     parts = _resume_parts(saved["session"], note, saved.get("target", ""), login=saved["login"],
                           at=saved["requested_at"], probe=saved.get("probe", False), names=desktop_state.launch_names())
     launch_record: SessionShutdown = saved
-    environment = {key: value for key, value in os.environ.items()
-                   if key not in {*NAMED_ACCOUNT_VARIABLES, "CLAUDE_CODE_OAUTH_TOKEN"}}
     if isinstance(parts.account, MoveResumeAccount):
         from scripts.accounts import accounts
 
         prepared = accounts.prepared_account(parts.account.target, resume=True)
         if isinstance(prepared, accounts.AccountRefused):
             raise OSError(prepared.reason)
-        environment.update(prepared.variables)
-        for key in prepared.remove:
-            _ = environment.pop(key, None)
-        # Pin the selected group account; a concurrent group change must refuse.
         launch_record = {**saved, "target": parts.account.target}
-    else:
-        environment.update(named_account_environment(parts.account.config_dir))
-        environment.update(parts.environment)
-    def admit() -> None:
-        found = lookup_session(saved["login"], saved["session"]["session_id"])
-        if not isinstance(found, ShutdownFound) or not _restore_launch_unchanged(saved, found.record):
-            raise OSError("recovery record is absent or its restart claim changed")
-        permission = restore_permission.launch_permission(environment,
-            restore_permission.RecordedSessionRestoreLaunchPurpose(saved["session"]["session_id"]))
-        if isinstance(permission, restore_permission.BlockedByShutdown):
-            raise restore_permission.LaunchAdmissionRefused(permission.reason)
-        if isinstance(permission, restore_permission.ShutdownStateUnreadable):
-            raise restore_permission.LaunchAdmissionRefused("shutdown state unreadable: " + permission.detail)
-
-    launch_login = named_claude_account(launch_record.get("target") or saved["login"]).login
-    with restore_permission.admitted_launch(launch_login, saved["session"]["session_id"],
-            saved["session"]["name"], admit):
-        return _launch_session(launch_record, note, desktop_state, dry_run=False)
+    return _launch_session(launch_record, note, desktop_state, dry_run=False)
 
 def _folder_exists(folder: str) -> bool:
     return Path(folder).is_dir()
@@ -2013,8 +1967,6 @@ class SourceFallbackSettled:
 def _try_source_fallback(saved: SessionShutdown, error: BaseException,
                          desktop_state: DesktopLaunchState) -> SourceFallbackUnavailable | SourceFallbackSettled:
     """Start the source once, only after the target is known not to be live."""
-    if isinstance(error, (restore_permission.LaunchRevoked, restore_permission.LaunchAdmissionRefused)):
-        return SourceFallbackUnavailable()
     target = saved.get("target", "")
     source = saved.get("source_label", saved["label"])
     if not target or target == source or not isinstance(_session_liveness(saved["session"]["session_id"]), SessionNotLive):
@@ -2029,22 +1981,7 @@ def _try_source_fallback(saved: SessionShutdown, error: BaseException,
         prepared = accounts.prepared_account(source, resume=True)
         if isinstance(prepared, accounts.AccountRefused):
             raise OSError(prepared.reason)
-        environment = {**os.environ, **prepared.variables}
-        for key in prepared.remove:
-            _ = environment.pop(key, None)
-        def admit() -> None:
-            found = lookup_session(saved["login"], saved["session"]["session_id"])
-            if not isinstance(found, ShutdownFound) or not _restore_launch_unchanged(saved, found.record):
-                raise OSError("restart claim changed before source fallback")
-            permission = restore_permission.launch_permission(environment,
-                restore_permission.RecordedSessionRestoreLaunchPurpose(saved["session"]["session_id"]))
-            if isinstance(permission, restore_permission.BlockedByShutdown):
-                raise restore_permission.LaunchAdmissionRefused(permission.reason)
-            if isinstance(permission, restore_permission.ShutdownStateUnreadable):
-                raise restore_permission.LaunchAdmissionRefused("shutdown state unreadable: " + permission.detail)
-        with restore_permission.admitted_launch(named_claude_account(source).login, saved["session"]["session_id"],
-                saved["session"]["name"], admit):
-            launch = _launch_session(saved, note, desktop_state, dry_run=False, source_fallback=True)
+        launch = _launch_session(saved, note, desktop_state, dry_run=False, source_fallback=True)
         if isinstance(launch, ManualRestartRequired):
             raise OSError("source needs a manual restart: " + launch.command)
         outcome = launch.prompt_outcome
@@ -2214,20 +2151,6 @@ def launch_entry(
             print(f"cannot restart {session['name']}: {error}")
         else:
             mark_restart_failed(record, str(error))
-        return EntrySettled()
-    except FolderNotTrusted as error:
-        # Nothing launched, and a retry refuses the same way until the user accepts trust once.
-        # No account on this machine trusts the folder, the source included, so no source fallback is tried.
-        if dry_run:
-            print(f"{session['name']} restart failed: {_error_reason(error)}")
-        else:
-            mark_restart_failed(record, _error_reason(error), trust_command=error.command)
-        return EntrySettled()
-    except (restore_permission.LaunchAdmissionRefused, restore_permission.LaunchRevoked) as error:
-        if dry_run:
-            print(f"cannot restart {session['name']}: {_error_reason(error)}")
-        else:
-            mark_restart_failed(record, _error_reason(error))
         return EntrySettled()
     except (accounts.AccountsError, OSError, subprocess.SubprocessError) as error:
         if dry_run:
@@ -2423,8 +2346,7 @@ def _claim_relaunch(record: SessionShutdown) -> tuple[SessionShutdown, bool]:
         current["progress"] = {"kind": "restarting", "at": at, "prior": copy.deepcopy(progress)}
         claimed = True
 
-    with restore_permission.launch_barrier():
-        return update_session(record["login"], record["session"]["session_id"], claim), claimed
+    return update_session(record["login"], record["session"]["session_id"], claim), claimed
 
 
 def _launch_entry_safely(
@@ -2800,7 +2722,7 @@ def _read_all_restore_sources() -> ReadableRestoreSources:
         records = all_session_records()
     except (OSError, ValueError):
         records = []
-        root = restore_permission.shutdown_state_root()
+        root = shutdown_state_root()
         for directory in sorted(root.iterdir()):
             if directory.name.startswith(".") or not directory.is_dir():
                 continue

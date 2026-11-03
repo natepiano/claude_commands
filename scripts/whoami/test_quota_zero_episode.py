@@ -14,7 +14,7 @@ from typing import cast
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 
 from scripts.whoami import quota_alert_test_support as support
 import quota_alert
@@ -124,7 +124,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         for failed_step in ("edit", "confirmation"):
             with (self.subTest(failed_step=failed_step),
                   mock.patch.object(quota_alert, "STATE", self.root / f"{failed_step}-alerts.json"),
-                  mock.patch.object(quota_alert, "REGISTRY", self.root / f"{failed_step}-agents.conf")):
+                  mock.patch.object(quota_alert, "REGISTRY", self.root / f"{failed_step}-models.conf")):
                 _ = write_registry(quota_alert.REGISTRY, base_text=REGISTRY)
                 owner = self.readings(self.now).selected_account
                 assert isinstance(owner, agent_accounts.KnownCodexAccount)

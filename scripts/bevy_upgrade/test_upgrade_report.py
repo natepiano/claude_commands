@@ -5,20 +5,12 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, final
+from typing import final, override
 from zoneinfo import ZoneInfo
 
 import pins
 import upgrade_record
 import upgrade_report
-
-if TYPE_CHECKING:
-    from typing import override
-else:
-    def override(method: object) -> object:
-        """The checker marker is an identity decorator on Python 3.11."""
-        return method
-
 
 NOW = datetime(2026, 10, 12, 19, 8, 41, tzinfo=timezone.utc)
 REVISION = "1234567890abcdef1234567890abcdef12345678"

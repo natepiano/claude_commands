@@ -24,7 +24,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 CONFIG = Path(os.environ.get("SHOWRUNNERS_CONFIG") or Path(__file__).resolve().parents[2] / "config/showrunners.json")
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
-SESSIONS_DIR = Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
 SESSIONS = Path(os.environ.get("SHOWRUNNERS_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
 SHOWRUNNER_STATE_DIR = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
 # Where Claude Code keeps each session scratchpad, as /tmp/claude-<uid>/<project>/<session id>/scratchpad.
@@ -35,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from user_zone import user_zone_name  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 from sessions import SessionRecord, messaging_socket_exists  # noqa: E402
+from scripts.lib.session_paths import sessions_directory as sessions_directory
 from scripts.production import staff  # noqa: E402
 from scripts.shutdown import remote  # noqa: E402
 
@@ -121,11 +121,16 @@ def timer_for(row: staff.StaffRow, snapshot: staff.StaffSnapshot, *,
     owner = snapshot.by_doc(doc.machine, doc.path)
     if owner is None or owner.id != row.id or doc.machine != remote.local_machine():
         return NoTimer(f"{row.name}: no local timer for the recorded document")
-    sources = sources if sources is not None else read_sources(unreadable=UnreadableTimerPolicy.RAISE)
+    failures: list[ShowrunnerLookupFailure] = []
+    sources = sources if sources is not None else read_sources(
+        unreadable=UnreadableTimerPolicy.SKIP, on_failure=failures.append)
     matches = [source.timer for source in sources
                if source.timer.doc == doc.path]
     if len(matches) > 1:
         raise staff.StaffUnreadable(f"{row.name}: several timers name {doc.path}")
+    if not matches and failures:
+        reasons = "; ".join(f"showrunner-{failure.production}: {failure.reason}" for failure in failures)
+        raise OSError(f"{row.name}: no readable timer names {doc.path}; {reasons}")
     return matches[0] if matches else NoTimer(f"{row.name}: no timer names {doc.path}")
 
 
@@ -235,7 +240,7 @@ def session_name(session_id: str) -> str:
 
 
 def _session_name(session_id: str) -> str:
-    for path in SESSIONS_DIR.glob("*.json"):
+    for path in sessions_directory().glob("*.json"):
         try:
             pid = int(path.stem)
             try:
@@ -290,9 +295,15 @@ class UnreadableTimerPolicy(Enum):
     STRICT = "strict"  # Audit every source, including incomplete timer declarations.
 
 
+def _report_source_failure(failure: ShowrunnerLookupFailure) -> None:
+    print(failure.diagnostic, file=sys.stderr)
+
+
 def read_sources(state_dir: Path | None = None, *,
                  unreadable: UnreadableTimerPolicy,
-                 dependencies: Callable[[Path], None] | None = None) -> list[ShowrunnerSource]:
+                 dependencies: Callable[[Path], None] | None = None,
+                 on_failure: Callable[[ShowrunnerLookupFailure], None] = _report_source_failure,
+                 ) -> list[ShowrunnerSource]:
     """Read each timer/doc once, applying the caller's policy to unreadable timers."""
     found: list[ShowrunnerSource] = []
     for instance in sorted((state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*")):
@@ -305,7 +316,7 @@ def read_sources(state_dir: Path | None = None, *,
                 raise ValueError(f"{instance / 'conf'}: {error}") from error
             if isinstance(error, OSError) and unreadable is UnreadableTimerPolicy.RAISE:
                 raise
-            print(f"showrunners: skipping {instance.name}: {error}", file=sys.stderr)
+            on_failure(ShowrunnerLookupFailure(instance.name.removeprefix("showrunner-"), str(error)))
     return found
 
 

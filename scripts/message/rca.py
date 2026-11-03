@@ -52,11 +52,14 @@ from concurrent.futures import ThreadPoolExecutor
 from time import monotonic, sleep
 from collections.abc import Generator
 from contextlib import contextmanager
+from enum import Enum
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import Literal, NamedTuple, NotRequired, TypedDict, cast
+
+from scripts.lib import conf
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
@@ -68,7 +71,7 @@ import sessions  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
 import silence  # noqa: E402
 from user_zone import user_zone  # noqa: E402
-from session_staff import PRODUCTION_MARK  # noqa: E402
+from scripts.production import staff  # noqa: E402
 
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "message" / "rca"
 SEND = Path(os.environ.get("RCA_SEND") or Path(__file__).resolve().parent / "send.py")
@@ -84,8 +87,6 @@ FIXED_TEXT = "permission.rca_fixed"
 # The reviewer's rewrite of a fixed text it refused twice: its title and body as the reviewer wrote them.
 REWRITTEN_TEXT = "permission.rca_fixed_rewritten"
 REMIND_AFTER = timedelta(minutes=30)
-# A user push waits for its review; a Claude recipient falls back to a relay.
-SEND_SECONDS = 300
 # The completed outcome of each owner message and reminder, after a line with its time and key.
 OWNER_LOG = "owner.log"
 # The first word of a command that changes a file: auto_mode.refused's "write …" and "edit …", and the
@@ -97,6 +98,11 @@ CHANNEL_PRIORITY = {"note": "0", "decision": "1", "blocked": "2"}
 
 Kind = Literal["prompt", "auto_mode"]
 Status = Literal["open", "started", "fixed"]
+
+
+def send_seconds() -> float:
+    """Owner delivery budget in seconds."""
+    return conf.read("rca").number("send_seconds")
 
 
 class Case(TypedDict):
@@ -211,17 +217,36 @@ def transcript_of(report: Report) -> str:
 
 
 def production_of(report: Report) -> str:
-    slug = report.production or os.environ.get(PRODUCTION_MARK, "")
-    return showrunners.canonical_slug(slug) if slug else ""
+    if report.production:
+        return report.production
+    record = staff.snapshot()
+    known = sessions.named(report.session, sessions.live_sessions())
+    identity = known["sessionId"] if known is not None else ""
+    row = record.by_current_session(identity)
+    while row is not None and row.kind != "showrunner":
+        row = record.by_id(row.parent) if row.parent is not None else None
+    if row is None:
+        return ""
+    timer = showrunners.timer_for(row, record)
+    return timer.slug if isinstance(timer, showrunners.Timer) else row.name
 
 
 def owner_address(production: str, *, deadline: float = math.inf) -> str:
     """Where the case's owner gets messages: the production's showrunner, else the natedev session."""
-    if not production:
+    if not production or monotonic() >= deadline:
         return NATEDEV
     try:
-        return showrunners.current_address(production, deadline=deadline) or NATEDEV
-    except ValueError:
+        record = staff.snapshot()
+        for row in staff.active(record, "showrunner"):
+            timer = showrunners.timer_for(row, record)
+            slug = timer.slug if isinstance(timer, showrunners.Timer) else row.name
+            if slug == production:
+                socket = showrunners.socket_for(f"session:{row.current_session}", deadline=deadline)
+                return f"uds:{socket}" if socket else NATEDEV
+        return NATEDEV
+    except TimeoutError:
+        raise
+    except (OSError, ValueError):
         return NATEDEV
 
 
@@ -275,8 +300,13 @@ def owner_message(case: Case, *, reminder: bool = False) -> str:
     return "\n".join(lines)
 
 
-def send(argv: list[str], *, seconds: float = SEND_SECONDS) -> tuple[bool, str]:
+class ConfiguredSendBudget(Enum):
+    CURRENT = "current"
+
+
+def send(argv: list[str], *, seconds: float | ConfiguredSendBudget = ConfiguredSendBudget.CURRENT) -> tuple[bool, str]:
     """Run send.py; whether it exited 0, and what it printed."""
+    seconds = send_seconds() if isinstance(seconds, ConfiguredSendBudget) else seconds
     if seconds <= 0:
         return False, "owner delivery budget exhausted; retained for the next pass"
     try:
@@ -297,7 +327,7 @@ def tell_owner(case: Case, *, reminder: bool = False, deadline: float = math.inf
         with open(STATE / OWNER_LOG, "a", encoding="utf-8") as log:
             _ = log.write(f"{now().isoformat()} {key}\n")
             log.flush()
-            sent, outcome = send(argv, seconds=min(SEND_SECONDS, max(0, deadline - monotonic())))
+            sent, outcome = send(argv, seconds=min(send_seconds(), max(0, deadline - monotonic())))
             _ = log.write(outcome + "\n")
         if sent:
             with locked(deadline=deadline):

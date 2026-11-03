@@ -126,13 +126,13 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         for name, path in {
             "NOTIFIER_STATE_DIR": self.root / "notifier",
-            "SESSIONS_DIR": self.root / "sessions",
             "SHOWRUNNER_STATE_DIR": self.root / "showrunner-state",
             "CONFIG": self.root / "showrunners.json",
         }.items():
             _ = self.enterContext(mock.patch.object(showrunners, name, path))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner-state"),
         })))
         _ = self.staff.production("parent", "demo-unit")

@@ -28,7 +28,17 @@ It never opens a session.
 
 ## Every account in one table
 
-`/showrunner:accounts` prints one table: a row for each numbered `~/.claudeN`, logged in or not; `~/.claude` is the shared config home and has no account row, then a row for each `~/.codexN`. The legacy `~/.codex` has a row only while it holds a login. Noted accounts whose home is absent or blocked by a file or broken link, and whose login no home holds, get `not set up` rows. In a terminal:
+`/showrunner:accounts` prints one table for the numbered Claude and Codex accounts.
+The table includes accounts without a login.
+`~/.claude` is the shared config home and has no account row.
+The legacy `~/.codex` has a row only while it holds a login.
+A noted account without a usable home has a `not set up` row when no home holds its login.
+Each role has a separate row.
+The first role row shows the account's values.
+Later rows show only the role.
+The text table keeps its existing columns and has no session counts.
+An account with one role or no role keeps its existing row.
+In a terminal:
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py status
@@ -38,7 +48,7 @@ It never opens a session.
 | --- | --- |
 | Folder | The account folder. |
 | Label | The account's label. A named Claude folder keeps its own label; a Codex home shows the label of its login's note. |
-| Role | `units` and/or `showrunners` for the selected Claude groups; `workers` for the Codex home in use, `spare` for the other Codex homes. |
+| Role | One role per row: `units`, `showrunners`, `workers`, or `spare`. |
 | Weekly left | Percent of the weekly window left. A dash when the account has no weekly window. |
 | Weekly resets | When the weekly window resets. |
 | On credits | Codex only: `yes` when a window is used up and the account's credits now pay for the work. |
@@ -54,8 +64,10 @@ Times are in the user's zone setting (`config/user_zone.conf`). The numbers are 
 The JSON has no login or folder fields. `--json` cannot be combined with `--detail`.
 
 The accounts board orders its columns as account, left, role, busy, shell, idle, total, resets, credits, enabled.
-Each count cell sums natedev and Mac counts, then joins its role values in role order.
-For example, `units, showrunners` can have busy counts `3, 2`.
+Each role has a separate row with its own counts from natedev and the Mac.
+The first role row includes all account values.
+Later rows show only the role and its counts.
+For example, `units` can have a busy count of `3`, followed by `showrunners` with `2`.
 Spare counts are blank.
 Claude session records supply `busy`, `shell`, or `idle`.
 Missing or unknown activity counts as idle.
@@ -458,7 +470,18 @@ accounts.py next hold units 1 half-point --expect 1 claude4
 
 The list has showrunners, units and workers sections in that order, numbered from 1 within each group: “units 1: at 1% → claude4, hold 30 min”. Position 1 runs next; an empty log prints “nothing set up”. `move GROUP N M` moves position N to M, `remove GROUP N` removes it, and `add … --at N` inserts at positions 1 through the group’s size plus 1 (omission appends). Edits preserve other groups’ order and internal entry identities; ids are never shown or accepted in these commands. The Mac forwards group positions to natedev, which resolves and edits them under the watch and log locks; install both machines together. A head change immediately clears the displaced head’s hold and notice keys, so the new head starts its own hold on a later pass; an unchanged head keeps its hold.
 
-For units, showrunners and workers, the agent-notes refusal part considers only the first entry per group; later entries wait until the head is recorded and removed, then become eligible on a later pass. Later Claude entries keep no hold until then. A due head that cannot run stays queued and tells showrunners once per changed reason (target already current, unreadable login, stale or missing reading, low target, unresolved refusal or refused preparation). A head targeting the current account blocks later entries too. The example holds units at 1% for 30 minutes, moves them to claude4, then holds again when claude4 reads low before moving them to claude2. Both groups may share an account; the Role cell then reads `units, showrunners`.
+For units, showrunners and workers, agent-notes considers only the first entry per group.
+Later entries wait until it records and removes the first entry.
+A later pass can then process the next entry.
+Later Claude entries keep no hold during that wait.
+A due first entry that cannot run stays queued.
+It tells showrunners once when the blocking reason changes.
+Blocking reasons include the current target, an unreadable login, missing or stale readings, low quota, unresolved refusals, and refused preparation.
+An entry that targets the current account also blocks later entries.
+The example holds units at 1% for 30 minutes, then moves them to claude4.
+It holds them again when claude4 reads low, then moves them to claude2.
+Both groups can use the same account.
+The table shows `units` and `showrunners` on separate rows for that account.
 
 `--hold-minutes N` is finite and nonnegative; omitted or zero moves immediately. `--hold half-point` instead estimates the time to use another 0.5 percentage point from the selected account’s weighted pace history, including usage by other groups sharing that account. One point per hour gives 30 minutes, rounded up to whole minutes; missing, zero or negative pace uses 40 minutes. The list shows, for example, “showrunners 1: at 1% → claude2, hold half a point (≈30 min)” or “hold half a point (40 min default: no pace history)”. The Mac prints natedev’s rendered list using natedev’s selection and readings; `next-read` remains machine JSON.
 

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+
 import os
 import json
 import shlex
 import subprocess
 import sys
 import unittest
-from unittest import mock
 from pathlib import Path
 from typing import cast, override
 
@@ -19,13 +20,13 @@ from scripts.production.staff_test_support import isolated_staff_file
 
 
 class VerifyLintGuardKeyTests(support.VerifyLintScopeFixture):
+    admission: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
     strong: str = ""
     weak: str = ""
 
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
         (self.root / "bin/git").unlink()
         (self.root / ".git").rmdir()
         self.environment.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
@@ -52,19 +53,7 @@ class VerifyLintGuardKeyTests(support.VerifyLintScopeFixture):
         _ = self.git("push", "-q", "origin", "HEAD:refs/heads/accepted")
         _ = self.git("branch", "--set-upstream-to=origin/accepted")
         _ = self.enable_cache()
-
-    def test_production_registration_keeps_the_default_staff_record_unchanged(self) -> None:
-        default = Path(self.environment["HOME"]) / ".local/state/staff/staff.json"
-        default.parent.mkdir(parents=True, exist_ok=True)
-        _ = default.write_text('{"private sentinel": true}\n')
-        before = default.read_bytes(), default.stat().st_mtime_ns
-        notifier = self.root / "registration-notifier"
-        notifier.mkdir()
-        with mock.patch.dict(os.environ, {"STAFF_FILE": ""}):
-            _ = guard_support.register_production(self.root, self.root, notifier, "builds", branch="feature")
-        self.assertEqual((default.read_bytes(), default.stat().st_mtime_ns), before)
-        self.assertTrue((self.root / "staff.json").is_file())
-        self.assertEqual(self.environment["STAFF_FILE"], str(self.root / "staff.json"))
+        self.admission = caller_admission(self, self.root, self.environment)
 
     def git(self, *arguments: str) -> str:
         result = subprocess.run(
@@ -374,10 +363,15 @@ run_once cargo nextest run -E "package(sample) & test(native_rate)"
         _ = self.git("push", "-q", "origin", previous_production + ":refs/heads/builds")
         _ = self.git("push", "-q", "origin", production + ":refs/heads/incoming")
         _ = self.git("branch", "--set-upstream-to=origin/strict")
-        notifier = self.root / "notifier"
-        notifier.mkdir()
-        _ = guard_support.register_production(self.root, self.root, notifier, "builds", branch="feature")
-        self.environment["NOTIFIER_STATE_DIR"] = str(notifier)
+        registry = guard_support.GitRepositoryFixture()
+        registry.root = self.root
+        registry.repo = self.root
+        registry.environment = self.environment
+        registry.notifier_dir = self.root / "notifier"
+        registry.notifier_dir.mkdir()
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        _ = registry.register_production("builds", branch="feature")
+        self.environment["NOTIFIER_STATE_DIR"] = str(registry.notifier_dir)
         self.cache_passing_lint()
 
         _ = self.git("--git-dir", str(self.root / "remote.git"),

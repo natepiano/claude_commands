@@ -20,6 +20,12 @@ Verbs:
              When the worker already has a live run of the same command in the same folder and the
              files did not change since it started (same tree key), start starts nothing: it
              names that run, whose result still arrives as the worker's next message.
+             Otherwise, config/mesh_runs.conf LIVE_RUN_LIMIT limits live runs for that worker.
+             Exit 4 refuses a new run at the limit and names the live runs on stderr.
+             Wait for a run's result as the next message, or put more files in one run.
+             Finished records and records without their supervisor do not hold a place.
+             One exclusive .start.lock protects the check, record creation, and supervisor publication.
+             Orphan reaping takes the same lock before it reads or finishes records.
   supervise  <record>
              Run the command, wait for it, deliver its result, then mark the record finished.
   reap       --session-dir D [--worker NAME]
@@ -40,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import json
 import os
 import secrets
@@ -59,11 +66,14 @@ from uuid import NAMESPACE_URL, uuid5
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import codex_mesh
 from scripts.buildlog import treekey
-from scripts.lib import unit_runs
+from scripts.lib import conf, unit_runs
 from scripts.message import repeat_guard
+from scripts.message import send_budget
 
 # Exit status of `start` when the caller is not a mesh worker: run the command attached.
 NOT_A_MESH_WORKER = 3
+# A worker at its live-run limit must keep its command pending, never run it attached.
+LIVE_RUN_LIMIT_REACHED = 4
 # Lines of the log the result message carries.
 RESULT_TAIL_LINES = 20
 # Characters the result message keeps of one log line, and of the whole tail: the message
@@ -84,7 +94,6 @@ ORPHAN_VERDICT = ("FAIL (no exit status): the run's supervisor process is gone, 
 # Where run folders and their active markers live; tests point this at a temporary folder.
 RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()
 SEND_SCRIPT = codex_mesh.SEND_SCRIPT
-SEND_TIMEOUT_SECS = 120
 FORWARDED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 # On natedev the command runs in a scope in builds.slice, beside the steps scripts/lint/invoke.sh
 # places there, so its compiles take the builds' memory limit and CPU weight, below the sessions.
@@ -245,6 +254,13 @@ def reap_orphans(session_dir: str, worker: str = "") -> list[str]:
     runs = _runs_dir(session_dir)
     if not runs.is_dir():
         return []
+    with (runs / ".start.lock").open("a") as admission:
+        fcntl.flock(admission, fcntl.LOCK_EX)
+        return _reap_orphans_locked(runs, worker)
+
+
+def _reap_orphans_locked(runs: Path, worker: str = "") -> list[str]:
+    """Reap orphan records while the caller holds the runs-folder admission lock."""
     now = time.time()
     records = [(path, raw) for path in sorted(runs.glob("*.json"))
                if (raw := codex_mesh._read_json_object(path)).get("run_id")]  # pyright: ignore[reportPrivateUsage]
@@ -294,6 +310,17 @@ def live_twin(runs: Path, worker: str, command: list[str], cwd: str, tree_key: s
     return None
 
 
+def live_runs(runs: Path, worker: str) -> list[RunRecord]:
+    """Return this worker's running records whose supervisors still own them."""
+    found: list[RunRecord] = []
+    for path in sorted(runs.glob("*.json")):
+        raw = codex_mesh._read_json_object(path)  # pyright: ignore[reportPrivateUsage]
+        if (raw.get("status") == "running" and raw.get("worker") == worker
+                and supervises(codex_mesh._as_int(raw.get("pid")), path)):  # pyright: ignore[reportPrivateUsage]
+            found.append(cast(RunRecord, cast(object, raw)))
+    return found
+
+
 def command_start(args: argparse.Namespace) -> int:
     command = [str(part) for part in cast(list[object], getattr(args, "command", []) or [])]
     if command and command[0] == "--":
@@ -319,32 +346,47 @@ def command_start(args: argparse.Namespace) -> int:
     director_dir = str(getattr(args, "director_dir", "") or "") or session_dir
     runs = _runs_dir(session_dir)
     runs.mkdir(parents=True, exist_ok=True)
-    _ = reap_orphans(session_dir)
     cwd = os.getcwd()
     tree_key = treekey.tree_key(cwd) or ""
-    if twin := live_twin(runs, name, command, cwd, tree_key):
-        started = time.strftime("%H:%M:%S", time.localtime(twin["started_at"]))
-        print(f"run {twin['run_id']} is already running for {name} on these files (started {started}, "
-              + f"log {twin['log']}); started nothing; its result arrives as your next message")
-        return 0
-    run_id = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}-{secrets.token_hex(2)}"
-    record_path = runs / f"{run_id}.json"
-    log_path = runs / f"{run_id}.log"
-    record: RunRecord = {
-        "run_id": run_id, "status": "running", "session_dir": session_dir, "worker": name,
-        "thread_id": thread_id, "label": label, "command": command, "cwd": cwd,
-        "log": str(log_path), "started_at": time.time(), "pid": 0,
-        "director_dir": director_dir, "done_message_file": done_file, "tree_key": tree_key,
-    }
-    _write_record(record_path, record)
-    with log_path.open("ab") as log:
-        supervisor = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "supervise", str(record_path)],
-            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-            start_new_session=True, cwd=cwd,
-        )
-    record["pid"] = supervisor.pid
-    _write_record(record_path, record)
+    with (runs / ".start.lock").open("a") as admission:
+        fcntl.flock(admission, fcntl.LOCK_EX)
+        _ = _reap_orphans_locked(runs)
+        if twin := live_twin(runs, name, command, cwd, tree_key):
+            started = time.strftime("%H:%M:%S", time.localtime(twin["started_at"]))
+            print(f"run {twin['run_id']} is already running for {name} on these files (started {started}, "
+                  + f"log {twin['log']}); started nothing; its result arrives as your next message")
+            return 0
+        try:
+            limit = conf.read("mesh_runs").whole("LIVE_RUN_LIMIT")
+        except conf.Unusable as error:
+            print(f"mesh_runs: {error}", file=sys.stderr)
+            return 2
+        active = live_runs(runs, name)
+        if len(active) >= limit:
+            details = "\n".join(f"  {run['run_id']}: {run['label']}" for run in active)
+            print(f"mesh_runs: live-run limit {limit} reached for {name}; started nothing.\n"
+                  + f"Live runs:\n{details}\n"
+                  + "Wait for a run's result; it arrives as your next message. "
+                  + "Or put more files in one run.", file=sys.stderr)
+            return LIVE_RUN_LIMIT_REACHED
+        run_id = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}-{secrets.token_hex(2)}"
+        record_path = runs / f"{run_id}.json"
+        log_path = runs / f"{run_id}.log"
+        record: RunRecord = {
+            "run_id": run_id, "status": "running", "session_dir": session_dir, "worker": name,
+            "thread_id": thread_id, "label": label, "command": command, "cwd": cwd,
+            "log": str(log_path), "started_at": time.time(), "pid": 0,
+            "director_dir": director_dir, "done_message_file": done_file, "tree_key": tree_key,
+        }
+        _write_record(record_path, record)
+        with log_path.open("ab") as log:
+            supervisor = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "supervise", str(record_path)],
+                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                start_new_session=True, cwd=cwd,
+            )
+        record["pid"] = supervisor.pid
+        _write_record(record_path, record)
     print(f"run {run_id} started detached for {name} (pid {supervisor.pid}, log {log_path}); "
           + "its result arrives as your next message")
     return 0
@@ -410,7 +452,7 @@ def send_to_director(session_id: str, summary: str, text: str) -> bool:
         sent = subprocess.run(
             [sys.executable, str(SEND_SCRIPT), "--to", f"session:{session_id}", "--from", "mesh-runs",
              "--summary", summary, "--text", text],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=SEND_TIMEOUT_SECS, check=False,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=send_budget.seconds(), check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"mesh_runs: could not tell session {session_id}: {exc}", file=sys.stderr)
@@ -529,7 +571,12 @@ def _run(command: list[str], cwd: str, environment: dict[str, str], log: Path) -
 
 def command_supervise(args: argparse.Namespace) -> int:
     record_path = Path(str(getattr(args, "record", "")))
-    record = _read_record(record_path)
+    with (record_path.parent / ".start.lock").open("a") as admission:
+        fcntl.flock(admission, fcntl.LOCK_EX)
+        record = _read_record(record_path)
+        if record["pid"] == 0:
+            record["pid"] = os.getpid()
+            _write_record(record_path, record)
     environment = dict(os.environ)
     environment.update({
         "UNIT_DETACHED_RUN": "1",

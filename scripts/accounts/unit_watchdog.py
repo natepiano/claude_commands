@@ -186,7 +186,7 @@ def _sources(report_failure: Callable[[str], None] = lambda _message: None) -> d
 
 
 class ResumeUnit(Protocol):
-    def __call__(self, session: str, *, why: str, to: str, restore_missing: bool) -> stop_results.ClaudeUp | stop_results.ResumeFailed | stop_results.SessionNotFound: ...
+    def __call__(self, session: str, *, why: str, to: str) -> stop_results.ResumeResult: ...
 
 
 def _restart(label: str, identity: str, source: str) -> str:
@@ -201,10 +201,12 @@ def _restart(label: str, identity: str, source: str) -> str:
         if isinstance(live, sessions.LiveSessionProcess):
             return ""  # Another recovery already brought this conversation back.
         resume = cast(ResumeUnit, import_module("scripts.shutdown.stop_resume").resume)
-        result = resume(identity, why="unit watchdog recovery", to=label, restore_missing=True)
+        result = resume(identity, why="unit watchdog recovery", to=label)
         if isinstance(result, stop_results.ClaudeUp):
             return ""
-        return result.reason if isinstance(result, stop_results.ResumeFailed) else f"{identity}: no pane launch"
+        return (result.reason
+                if isinstance(result, stop_results.ResumeFailed)
+                else f"{identity}: no pane launch")
     except (OSError, ValueError, herdr.HerdrFailure) as error:
         return str(error)
 

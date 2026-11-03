@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import unit_runs
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -426,7 +426,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             return real_run(command, capture_output=capture_output, text=text, check=check, timeout=timeout, env=env)
 
         with (mock.patch.object(subprocess, "run", run),
-              mock.patch.multiple(stall_watch, STATE_DIR=self.state, SESSIONS_DIR=self.sessions,
+              mock.patch.multiple(stall_watch, STATE_DIR=self.state,
                                   PROJECTS_DIR=self.projects, SESSIONS=self.sessions_script,
                                   SEND=self.bin / "send.py", PS="ps"),
               mock.patch.multiple(rca, STATE=self.root / "state/message/rca",
@@ -1756,9 +1756,9 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
 
     def write_context_usage(self, tokens: int, *, window: int = 300_000) -> None:
         """A local model registry, configured window and last billed context; no real settings."""
-        registry = self.root / "agents.conf"
+        registry = self.root / "models.conf"
         _ = write_registry(registry, {"claude.context": {"default": str(window)}}, replace_sections=("claude.context",))
-        self.environment.update(AGENTS_CONFIG_FILE=str(registry), CLAUDE_CODE_AUTO_COMPACT_WINDOW="400k")
+        self.environment.update(MODELS_CONFIG_FILE=str(registry), CLAUDE_CODE_AUTO_COMPACT_WINDOW="400k")
         transcript = self.projects / "project" / "204f532d-a97a-59e7-a6a7-caf86af3f5ee.jsonl"
         entries = [{"type": "assistant", "message": {"model": "claude-test-1", "usage": usage}}
                    for usage in ({"input_tokens": 400_000},

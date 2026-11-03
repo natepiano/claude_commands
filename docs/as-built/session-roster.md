@@ -342,7 +342,25 @@ Reads the `ThisMachine` roster and runs no ssh. It prints `<name>\tuds:<socket p
 
 Senders:
 
-- `send.py --to user` requires `--action` or `--no-action` and `--summary`; `--need note|decision|blocked` maps to priority 0, 1, 2, and `decision` / `blocked` require `--action`. The action flags on any other recipient are a usage error (`--action and --no-action go with --to user`). A `pushover.py` exit 2 with the `refused before sending:` marker becomes `REFUSED`; any other failure is `FAILED: the user was not reached: ...`. With `CLAUDE_PROBE_SESSION=1` in its environment (`PROBE_ENV`, `scripts/lib/probe_session.py`; set by `accounts.py exec --probe`), `--to user` prints `not sent: probe sessions never push to the phone` and exits 0 before review, logging or delivery.
+- `send.py --to user` requires `--action` or `--no-action` and `--summary`.
+  Decisions and blocked pushes require an action.
+  Other recipients reject action flags.
+  A channel refusal becomes `REFUSED`; other delivery errors become `FAILED`.
+  Probe sessions send no phone pushes.
+
+| Need | Phone priority |
+| --- | --- |
+| note | 0 |
+| decision | 0 by default; 1 only when `0 < due - now <= decision_high_priority_window_seconds` |
+| blocked | 2 |
+
+`--due` requires ISO 8601 with an explicit offset and a user decision.
+`config/send.conf` sets `decision_high_priority_window_seconds=1800`.
+The sender reads this value at use.
+An overdue decision stays at priority 0 and records a diagnostic.
+`--priority 1` cannot bypass this rule.
+Release recalculates the priority of a kept decision.
+
 - `escalate.py hold(key, summary, text, action: UserAction, minutes=15, need="decision")` raises `ValueError` for `NoActionRequired` with a `need` other than `note`; a stored hold without an action (`LegacyHeld`) is never delivered, lists as `waiting for a hold that states its action`, and the next `hold()` for its key replaces it.
 - `restart_support.send_message(recipient, ...)` raises `ValueError` for `user`; `restart_support.alert_user(push: RenderedPush, *, machine="")` is the shutdown path to the user; the catalog render supplies title, body and action; it takes no scope, and callers skip the call when the session record's `alerts` is `"none"`.
 - `/alert_user` sends with `--need decision|blocked --action`; on the Mac it adds `--machine natedev`, since the Pushover keys exist only there. On `FAILED` it falls back to PushNotification with the exact `fallback text:` line `send.py` printed; the PreToolUse gate `scripts/hooks/pre-tool-use-push-gate.py` allows nothing else. `REFUSED` and `HELD` never fall back.
@@ -541,3 +559,18 @@ Unit marks come from `unit_lookup.every_marked_unit()`. A marked live Claude
 identifies its director; a socketless registry record joins by its pid's herdr
 place. Worktree ownership is a fallback when marks cannot be read, never for
 a worker ledger entry. Interactive herdr Codex panes are included.
+
+Automatic silence ends only after a user prompt passes source classification.
+Generated prose carries a script envelope and writes no source record.
+The classifier checks the envelope before it reads source records.
+Only slash commands use source records.
+Slash-command classification is a heuristic.
+A user can type the same slash command in the same pane while a script command waits.
+The two submissions can then exchange classifications.
+The same classification controls the WaitingForUser end and conversation-pause answers.
+A classification error can leave WaitingForUser open or bypass a conversation-pause answer.
+Peer prompts, script prompts, harness notices, and unknown prompts preserve silence.
+The return notice names the activity session.
+`~/.local/state/notify/auto-silence-events.jsonl` records each transition and ignored activity under the silence lock.
+An append failure preserves silence and held pushes.
+Raw agent calls to herdr `send-text` remain outside this source-marking boundary.

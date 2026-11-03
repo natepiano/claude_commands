@@ -27,6 +27,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast
 
+RUN_TEMP_NAME = "tmp"
 RUN_ROOT = Path("/tmp/claude/unit")
 FORMER_RUN_ROOT = Path("/tmp/claude/delegate")
 # Notifier instances a unit run once had; conversation_pause names them "status reports".
@@ -72,6 +73,20 @@ def environ(name: str) -> str:
 def run_roots(override: str | Path | None = None) -> tuple[Path, ...]:
     """The folders that hold run folders, the new name first."""
     return (Path(override),) if override else (RUN_ROOT, FORMER_RUN_ROOT)
+
+
+def run_temp_path(run: Path) -> Path:
+    """Name the temporary folder that shares the run's lifetime."""
+    return run / RUN_TEMP_NAME
+
+
+def activate(run: Path, session_id: str) -> None:
+    """Write the current marker and remove the former marker."""
+    current, *former = active_dirs()
+    current.mkdir(parents=True, exist_ok=True)
+    _ = (current / session_id).write_text(f"{run}\n", encoding="utf-8")
+    for directory in former:
+        (directory / session_id).unlink(missing_ok=True)
 
 
 def history_root() -> Path:
@@ -330,6 +345,13 @@ def _held_main(argv: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) == 3 and argv[0] == "activate":
+        try:
+            activate(Path(argv[1]), argv[2])
+        except OSError as error:
+            print(f"unit_runs: marker not recorded: {error}", file=sys.stderr)
+            return 1
+        return 0
     if argv and argv[0] == "held":
         return _held_main(argv[1:])
     if len(argv) == 2 and argv[0] == "record-director":
@@ -345,7 +367,7 @@ def main(argv: list[str]) -> int:
     if argv == ["move-history"]:
         return move_history(time.time())
     if argv != ["removal-check"]:
-        print("usage: unit_runs.py removal-check | history-root | move-history | record-director <run folder> | held <session id>",
+        print("usage: unit_runs.py removal-check | history-root | move-history | record-director <run folder> | activate <run folder> <session id> | held <session id>",
               file=sys.stderr)
         return 2
     if TYPE_CHECKING:

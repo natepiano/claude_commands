@@ -103,7 +103,6 @@ class UnitRenameFixture(StaffTestCase):
             (tidy_wrapped, "STATE_DIR", self.state),
             (tidy_wrapped, "NOTIFIER_STATE_DIR", self.root / "state/notifier"),
             (stall_watch, "STATE_DIR", self.root / "state/stall-watch"),
-            (stall_watch, "SESSIONS_DIR", self.root / "state/sessions"),
             (stall_watch, "PROJECTS_DIR", self.home / ".claude/projects"),
         ):
             _ = self.enterContext(mock.patch.object(module, name, value))

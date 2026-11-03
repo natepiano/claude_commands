@@ -29,15 +29,15 @@ to config needs no approval and does not use `/tune`.
 
 Example configuration for the `/blender:bake_textures` command. Copy and modify this template to specify blend files, objects, texture maps, and export settings for texture baking.
 
-## agents.conf
+## models.conf
 
 Global agent registry with three layers: `[assignments]` maps each function to
 an agent family; `[<function>.<family>]` maps each subtask to an
 `agent[:effort]` row; and `[<family>.agents]` catalogs each valid agent and its
 allowed efforts. Omit `:effort` to use the agent CLI's default.
 
-`config/agents.conf` is the shared registry on both machines; there is no
-local override file. `/agent` and `/showrunner:effort` edit it atomically,
+`config/models.conf` is the shared registry on both machines; there is no
+local override file. `/default_models` and `/showrunner:effort` edit it atomically,
 then publish a `config(agents): …` commit containing only this path to origin.
 The writer fetches and fast-forwards before editing, and replays all pending
 local row changes on a newer remote tip if a push races another writer (three
@@ -45,13 +45,13 @@ tries). Repeating an interrupted edit finishes its publication, even when the
 requested value is already in the local file. A lost push acknowledgement
 reconciles the accepted commit without creating another one.
 Other staged and unstaged work is preserved. Tests set
-`AGENTS_CONFIG_PUBLISH=0`; temporary registries never publish.
+`MODELS_CONFIG_PUBLISH=0`; temporary registries never publish.
 
 The Codex catalog sync reads `~/.codex/config.toml` and
 `~/.codex/models_cache.json`. It adds models and efforts without removing
 anything another machine knows, and publishes only additions. Retired catalog
 models require an explicit edit to `[codex.agents]` in the shared registry;
-`/agent` does not delete catalog rows. The freshness check runs at login, every
+`/default_models` does not delete catalog rows. The freshness check runs at login, every
 five minutes, and when a source is newer than the last successful sync. The
 Claude catalog is hand-maintained; the sync warns when the Claude CLI
 advertises a model alias that `[claude.agents]` does not yet list.
@@ -110,7 +110,7 @@ The user completes deployment before target activation.
 `credentials_profile=build-scaler` names the user's AWS CLI profile. This file contains no credential.
 `kinds=test,check,doc` excludes lint. An empty `ci_repo` disables GitHub calls.
 
-`monthly_limit_usd=400` and `daily_limit_usd=20` contain the user's spending limits.
+`monthly_limit_usd=400` is the user's monthly spending limit (approved 2026-11-01). `daily_limit_usd=20` is derived (the monthly limit / 20) and waits for the user's approval at go-live.
 The AWS Budget must read `monthly_limit_usd`. Code must never raise either limit.
 The spending reserve is $3. The maximum drain time is 60 minutes.
 Each repository budget stays within the 32 GiB build budget.
@@ -155,6 +155,27 @@ Slot counts apply to each repository. They do not describe one global capacity.
 Positive numeric settings use the readable lower bound `# range: 0.001..`.
 Zero-permitted settings retain `# range: 0..`. Whole-number settings retain their existing limits.
 
+Deployment settings require the account inputs before preparation.
+`deployment_profile` names the administrator profile. `credentials_profile` names the scaler profile.
+`stack_name`, `availability_zone`, `vpc_id`, and `subnet_id` select the deployment location.
+`ami_id`, `ami_owner_id`, `nixos_release`, and `root_device_name` identify the official x86_64 NixOS image.
+`notification_email` receives the Budget notices. The `budget_notice_*_percent` keys set their thresholds.
+`budget_stop_percent` sets the stop threshold. The live spending guard remains the primary limit.
+`root_volume_gib` sizes the root volume.
+`data_volume_gib`, `data_volume_iops`, and `data_volume_throughput` fix the retained volume settings through their conf limits.
+`existing_data_volume_id` selects a retained volume. An empty value requests a new volume.
+`spot_max_usd_per_hour` limits the Spot request price.
+`deployment_price_usd_per_hour` and `deployment_price_at` record the current public price and its Unix timestamp.
+`preflight_max_age_s` limits preparation age. `deployment_timeout_s` bounds each deployment command.
+`scaler_user_name` names the IAM user.
+`bootstrap_template_path` selects the reviewed template in the separate NixOS checkout.
+`scripts_source_url`, `scripts_source_sha256`, and `scripts_source_commit` identify the public archive.
+The bootstrap command writes `bootstrap.sh` and `remote.conf` in the output directory.
+`prepare` reads that `bootstrap.sh` file.
+`aws_target.py serve` reads `tick_interval_s` between ticks. `controller_tick_timeout_s` bounds each tick process.
+`remote.py serve` reads `interruption_poll_s` between remote checks.
+The [runbook](../docs/plans/builds-aws-runbook.md) gives the deployment and activation steps.
+
 `fixed_usd_per_month` includes retained storage, root storage, IPv4 and provisioned gp3 performance.
 The corresponding component keys state each monthly estimate.
 The guard uses the greater of the total and the component sum.
@@ -183,7 +204,7 @@ Confirmed delivery prevents further attempts.
 `aws_target.py tick`, `start`, and `stop` serialize lifecycle actions under `controller.lock`.
 `controller.json` retains instance evidence, action intent, capacity retry time, and the drain deadline.
 `instance_type=m7a.4xlarge` selects the Spot price history.
-`tick_interval_s=30` sets the planned timer interval. This phase enables no timer.
+`tick_interval_s` sets the interval between controller ticks. The service remains disabled before activation.
 `aws_timeout_s=30` bounds each AWS command. `snapshot_max_age_s=60` bounds queue evidence.
 The controller reads only the saved admission snapshot and excludes rows that left for a local execution slot.
 `permission_ttl_s=90` bounds remote spending permission.
@@ -241,6 +262,16 @@ The AWS mapping permits `aws-build` records without activating the AWS target.
 Each exchange reads these settings again.
 Vault transfers use the same configured SSH connection timeout.
 
+`vault.lock_retries` sets the extra fast-forward tries after a busy vault index lock.
+The default is 5; the allowed whole numbers are 0 through 10.
+`vault.lock_retry_delay_s` sets the seconds between these tries.
+The default is 3; the allowed range is 0 through 5.
+Each vault transfer reads both settings again.
+The default retry delays add at most 15 seconds.
+The maximum retry delays add 50 seconds: ten retries at five seconds each.
+An exhausted retry returns the `vault_locked` cause.
+The outage state saves the error text in `vault_pull.json` as `outage.detail`.
+
 Each peer retains its own status in `sync-peers/<encoded-peer>.json`.
 `sync.json` retains the Mac status for existing readers.
 A failed peer does not prevent another peer's exchange.
@@ -249,6 +280,14 @@ Transfers exclude admission and pending state directories.
 Each configured peer supplies only its own host folders.
 The `BUILDLOG_PEER` override retains the legacy transfer of all other synchronized host folders.
 Rsync replaces complete files and preserves this host's append files.
+
+## test_times.conf
+
+`SLOW_TEST_S` sets the minimum test time retained in the build log.
+Failed tests, errors, and unexpected successes remain in the log at every duration.
+`TOP_RUNS` sets the number of recent gate runs used to rank each module by its median wall time.
+Callers read these settings through `scripts/lib/conf.py` at each use.
+`CONF_DIR` selects a fixture folder for tests.
 
 ## direct.conf
 

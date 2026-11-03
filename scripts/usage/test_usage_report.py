@@ -17,11 +17,11 @@ from typing import TypedDict, cast, final, override
 from zoneinfo import ZoneInfo
 
 from scripts.usage import collect, weights
+from scripts.production.staff_test_support import fixture_member, recorded_showrunner
 from scripts.usage.test_collect import FIXTURES as COLLECT_FIXTURES, MacStreamReport, REPOSITORY, SNAPSHOT_COMMIT_SCRIPT, SshBehavior
 from scripts.usage.test_outcomes import OutcomeFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
-from scripts.production.staff_test_support import fixture_member
 
 
 FIXTURES = Path(__file__).with_name("fixtures") / "report"
@@ -89,24 +89,16 @@ class ReportFixture(OutcomeFixture):
             shutil.rmtree(directory)
         _ = shutil.copytree(FIXTURES / "home", self.root, dirs_exist_ok=True)
         _ = shutil.copytree(FIXTURES / "production-docs", self.production_docs, dirs_exist_ok=True)
-        for document, members in (
-            (self.production_docs / "sample-production.md", (("Base", "/invented/build"),
-                                                            ("Deep", "/invented/build/component"))),
-            (self.production_docs / "other-production.md", (("Elsewhere", "/invented/elsewhere"),)),
-        ):
-            # The report fixtures use invented absolute paths in their usage records.
-            if not document.exists():
-                document = next(path for path in self.production_docs.glob("*.md")
-                                if members[0][0] in path.read_text())
-            owner = fixture_member("showrunner", name=document.stem,
-                                   doc=staff.LiveDoc("natedev", document))
-            lines = ["# Report fixture", "- **Showrunner checkout:** `/invented`", "## Units",
-                     "| Unit | Worktree | Plan |", "| --- | --- | --- |"]
-            for name, folder in members:
+        for filename, entries in (("fixture-production.md", (("Base", "/invented/build"),
+                                                            ("Deep", "/invented/build/component"),
+                                                            ("director", "/invented/director"),
+                                                            ("no-turn", "/invented/no-turn"),
+                                                            ("loose", "/invented/loose"))),
+                                  ("other-production.md", (("Elsewhere", "/invented/elsewhere"),))):
+            owner = recorded_showrunner(filename, self.production_docs / filename)
+            for name, tree in entries:
                 _ = fixture_member("unit", name=name, parent=owner.id,
-                                   worktree=staff.PresentWorktree("natedev", Path(folder)))
-                lines.append(f"| {name} | /stale/display | docs/plan.md |")
-            _ = document.write_text("\n".join(lines) + "\n")
+                                   worktree=staff.PresentWorktree("natedev", Path(tree)))
         _ = self.commit("checkpoint(report-plan): phase 7 — First", "2026-10-10T21:37:00Z")
         _ = self.commit("checkpoint(report-plan): phase 7 — Second", "2026-10-10T21:38:00Z")
         _ = self.commit("checkpoint(other-plan): phase 7 — Unmapped", "2026-10-11T07:01:00Z")
@@ -487,8 +479,8 @@ raise SystemExit(result)
         self.assert_report("unit", "weighted", "--by", "unit")
         document = self.production_docs / "fixture-production.md"
         _ = document.write_text(document.read_text(encoding="utf-8").replace("| Deep |", "| Renamed |"), encoding="utf-8")
-        row = next(row for row in staff.find(kind="unit") if row.name == "Deep")
-        _ = staff.rename(row.id, "Renamed")
+        deep = next(row for row in staff.snapshot().find(kind="unit") if row.name == "Deep")
+        _ = staff.rename(deep.id, "Renamed")
         self.assert_report("unit-renamed", "weighted", "--by", "unit")
 
     def test_unit_containment_does_not_match_a_neighbor_with_the_same_prefix(self) -> None:

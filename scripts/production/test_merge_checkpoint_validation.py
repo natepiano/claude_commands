@@ -98,11 +98,15 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.git("rev-parse", "HEAD"), result.before)
         self.assertEqual(self.events("checkpoint-test"), [])
     def test_a_checkpoint_without_a_change_review_line_is_held_before_merge(self) -> None:
+        import change_review
+
         sha = self.dated_checkpoint("checkpoint(alpha): grid fades")
         result = self.run_checkpoint(sha)
-        self.assertNotEqual(result.process.returncode, 0)
+        self.assertEqual(result.process.returncode, 1)
         self.assert_stopped_before_merge(result, "held", "checkpoint(alpha): grid fades: no Change-Review line")
-        self.assertIn("Change-Review-Covers", result.process.stdout)
+        self.assertIn(sha[:change_review.SHORT], result.process.stdout)
+        self.assertIn("a plain commit, not a merge: the gate does not read merge commits", result.process.stdout)
+        self.assertIn(change_review.COVERS, result.process.stdout)
     def test_a_merge_adds_a_row_per_visible_change_to_the_named_list(self) -> None:
         review = self.root / "change-review.md"
         _ = review.write_text("## To review\n\n| # | Change | Merged | On the Mac build | How to check |\n"

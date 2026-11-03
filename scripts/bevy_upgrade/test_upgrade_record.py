@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, final
+from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -23,14 +23,6 @@ if TYPE_CHECKING:
     from ..lib import test_hang_guard
 else:
     from scripts.lib import test_hang_guard
-
-if TYPE_CHECKING:
-    from typing import override
-else:
-    def override(method: object) -> object:
-        """The checker marker is an identity decorator on Python 3.11."""
-        return method
-
 
 NOW = datetime(2026, 10, 12, 19, 8, 41, tzinfo=timezone.utc)
 LATER = datetime(2026, 10, 13, 1, 2, 3, tzinfo=timezone.utc)

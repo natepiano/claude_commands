@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Send the user one Pushover alert: the one way any session reaches their phone.
 
-  pushover.py [--priority 0|1|2] [--source NAME] [--key KEY] (--action TEXT | --no-action) TITLE MESSAGE
+  pushover.py [--priority 0|1|2] [--due ISO8601] [--source NAME] [--key KEY] (--action TEXT | --no-action) TITLE MESSAGE
   pushover.py cancel [--source NAME] KEY     stop the emergency push sent with --key KEY
 
 Priority 0 is a normal notification, 1 high (sounds in Pushover's quiet hours),
 2 emergency: it repeats every RETRY_S seconds until the user taps Acknowledge,
-for at most EXPIRE_S. Deleting it on the phone does not stop it. Which events
-get which priority is each caller's policy. An emergency push with --key carries
-the Pushover tag push_tag(KEY); `cancel` stops every emergency push with that tag.
+for at most EXPIRE_S. Deleting it on the phone does not stop it.
+A decision uses priority 1 only before an explicit deadline within the configured decision window.
+Other decisions use priority 0. Release checks the deadline again.
+An emergency push with --key carries the Pushover tag push_tag(KEY).
+`cancel` stops every emergency push with that tag.
 It prints "pushover: cancelled N" or "pushover: nothing to cancel" and exits 0;
 it exits 1 when Pushover refused it or could not be reached, 2 on usage or keys missing.
 
@@ -44,11 +46,16 @@ import urllib.request
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 import review
 import push_texts
 import silence
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if TYPE_CHECKING:
+    from . import decision_priority
+else:
+    import decision_priority
 from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
                          ActionUnstated, UserAction, first_line, parse_user_action, refused_at,
                          NotificationSession, NO_SESSION_LINE, split_session, session_prefix)
@@ -180,6 +187,7 @@ def log(source: str, priority: str, title: str, message: str, outcome: str) -> N
 
 
 class Arguments(TypedDict):
+    need: str
     priority: str
     source: str | None
     key: str
@@ -191,11 +199,13 @@ class Arguments(TypedDict):
     text_id: str
     session: NotificationSession
     header: bool
+    due: str
 
 
 def parse(argv: list[str]) -> Arguments | None:
     """Parse options without exiting, so callers get send()'s usage status."""
     priority = "0"
+    due = ""
     source: str | None = None
     action: str | None = None
     no_action = False
@@ -214,13 +224,15 @@ def parse(argv: list[str]) -> Arguments | None:
             no_action = True
             index += 1
             continue
-        if option not in ("--priority", "--source", "--key", "--action", "--text-id", "--value") or index + 1 >= len(argv):
+        if option not in ("--priority", "--source", "--key", "--action", "--text-id", "--value", "--due") or index + 1 >= len(argv):
             return None
         value = argv[index + 1]
         if option == "--priority":
             if value not in PRIORITIES:
                 return None
             priority = value
+        elif option == "--due":
+            due = value
         elif option == "--source":
             if not value.strip():
                 return None
@@ -237,8 +249,13 @@ def parse(argv: list[str]) -> Arguments | None:
         else:
             action = value
         index += 2
+    try:
+        _ = decision_priority.read_due(due)
+    except ValueError:
+        return None
     session: NotificationSession = NO_SESSION_LINE
     header = True
+    need = "blocked" if priority == "2" else "decision" if priority == "1" or due else "note"
     positionals = argv[index:]
     if text_id:
         try:
@@ -248,7 +265,9 @@ def parse(argv: list[str]) -> Arguments | None:
         if positionals or action is not None or no_action:
             return None
         source = source or rendered.sender
-        priority = "2" if priority == "2" else {"note": "0", "decision": "1", "blocked": "2"}[rendered.need]
+        need = "blocked" if priority == "2" else rendered.need
+        if due and need != "decision":
+            return None
         action = rendered.action.text if isinstance(rendered.action, ActionRequired) else None
         no_action = action is None
         positionals = [rendered.title, rendered.body]
@@ -256,11 +275,17 @@ def parse(argv: list[str]) -> Arguments | None:
         header = rendered.header
     elif values:
         return None
+    try:
+        priority = decision_priority.priority(need, due)
+    except ValueError:
+        return None
     if len(positionals) != 2 or not positionals[0].strip() or (not text_id and not positionals[1].strip()):
         return None
     if not text_id:
         session, positionals[1] = split_session(positionals[1])
     return {
+        "need": need,
+        "due": due,
         "session": session,
         "priority": priority,
         "source": source,
@@ -314,14 +339,15 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
                       f"--action may hold at most {action_limit} characters")
     if len(first_line(action, arguments["session"])) + 1 > MESSAGE_MAX:
         return refuse(source, priority, title, message, "Session and action exceed the message limit")
-    match refused_at(action, int(priority)):
+    action_priority = {"blocked": 2, "decision": 1, "note": 0}[arguments["need"]]
+    match refused_at(action, action_priority):
         case ActionRefused(reason):
             return refuse(source, priority, title, message, reason)
         case ActionAllowed():
             pass
     draft = review.Draft(source, priority, title, action,
                          trimmed_body(action, arguments["message"], arguments["session"], header=arguments["header"]),
-                         arguments["answerable"], arguments["session"])
+                         arguments["answerable"], arguments["session"], arguments["due"])
     header, key = arguments["header"], arguments["key"]
     registered_text = bool(arguments["text_id"]) and not push_texts.agent_written(arguments["text_id"])
     claimed = False
@@ -429,10 +455,13 @@ def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
     During silence a non-empty `key` makes the kept push replace an older kept one from the same source.
     """
     source, priority, title = draft.source, draft.priority, draft.title
+    need = "blocked" if priority == "2" else "decision" if draft.due or priority == "1" else "note"
+    priority = decision_priority.priority(need, draft.due)
     message = posted_message(draft.action, draft.body, draft.session, header=header)
     if priority != "2":
         kept = silence.keep({"source": source, "priority": priority, "title": title,
-                             "message": message, "detail": detail, "key": key, "text_id": text_id},
+                             "message": message, "detail": detail, "key": key, "text_id": text_id,
+                             "due": draft.due, "need": need},
                             deliver=lambda push: post_kept(push, keys_file, post))
         if isinstance(kept, silence.Kept):
             log(source, priority, title, message, f"kept: silence {kept.until}" + (f", {detail}" if detail else ""))
@@ -448,7 +477,9 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
             "dropped: retired template message.repeat_flood")
         return 0
     detail = ", ".join(part for part in ("kept during silence", push["detail"]) if part)
-    return post_message(push["source"], push["priority"], push["title"], push["message"], keys_file, post, detail,
+    need = push.get("need") or {"0": "note", "1": "decision", "2": "blocked"}[push["priority"]]
+    priority = decision_priority.priority(need, push.get("due", ""))
+    return post_message(push["source"], priority, push["title"], push["message"], keys_file, post, detail,
                         push["key"], push["text_id"])
 
 

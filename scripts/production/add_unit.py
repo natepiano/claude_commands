@@ -540,7 +540,7 @@ def worktree_on_branch(request: UnitLaunch) -> bool:
 
 def director_agent(request: UnitLaunch) -> DirectorAgent:
     """Resolve the unit director in this script's checkout before any writes."""
-    resolver = Path(__file__).resolve().parents[1] / "agents" / "agents_config.sh"
+    resolver = Path(__file__).resolve().parents[1] / "agents" / "models_config.sh"
     result = subprocess.run(
         ["bash", "-c", 'source "$1" && agents_resolve production.director && printf "%s\\n%s\\n%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT"',
          "_", str(resolver)], cwd=request.production.checkout,

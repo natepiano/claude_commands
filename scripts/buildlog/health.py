@@ -77,7 +77,7 @@ def snapshot_path(host: str) -> Path:
 def calculate_snapshot() -> RecorderHealthSnapshot:
     machine = machine_for_host(store.host_name())
     pending = 0
-    for root in (record.pending_launches_root(), record.pending_steps_root()):
+    for root in (record.pending_launch_root(), record.pending_steps_root()):
         try:
             paths = list(root.iterdir())
         except FileNotFoundError:

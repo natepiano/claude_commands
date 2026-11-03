@@ -218,6 +218,30 @@ raise SystemExit(1)
 
 
 class RowTimerJoinTests(StaffTestCase):
+    def test_unreadable_timer_preserves_another_showrunners_document_match(self) -> None:
+        fixture = self.row_production()
+        bad_owner = fixture_member("showrunner", name="broken-owner")
+        bad_doc = self.root / "broken-production.md"
+        write_text_atomic(bad_doc, "# Broken production\n")
+        bad_owner = staff.set_doc(bad_owner.id, staff.LiveDoc("natedev", bad_doc))
+        bad_conf = Path(os.environ["NOTIFIER_STATE_DIR"]) / "showrunner-broken-alias" / "conf"
+        bad_conf.mkdir(parents=True)
+        record = staff.snapshot()
+        errors = io.StringIO()
+
+        with redirect_stderr(errors):
+            timer = showrunners.timer_for(fixture.runner, record)
+            with self.assertRaises(OSError) as raised:
+                _ = showrunners.timer_for(bad_owner, record)
+
+        self.assertIsInstance(timer, showrunners.Timer)
+        assert isinstance(timer, showrunners.Timer)
+        self.assertEqual((timer.slug, timer.doc), (fixture.slug, fixture.doc))
+        self.assertIn(bad_owner.name, str(raised.exception))
+        self.assertIn(str(bad_conf), str(raised.exception))
+        self.assertIn("Is a directory", str(raised.exception))
+        self.assertEqual(errors.getvalue(), "")
+
     def test_a_timer_target_cannot_replace_a_missing_document_join(self) -> None:
         from scripts.production import session_staff
 
@@ -352,7 +376,7 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
             with (self.subTest(command=command),
                   mock.patch.dict(os.environ, self.environment()),
                   mock.patch.multiple(showrunners, NOTIFIER_STATE_DIR=self.notifier,
-                                      SESSIONS_DIR=self.sessions, SESSIONS=self.sessions_script,
+                                      SESSIONS=self.sessions_script,
                                       SHOWRUNNER_STATE_DIR=self.state),
                   mock.patch.object(showrunners, "socket_for", side_effect=lookup),
                   redirect_stdout(output), redirect_stderr(errors)):
@@ -517,7 +541,6 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         self.assertEqual(self.successful("name", "old"), "new-name\n")
         with (mock.patch.dict(os.environ, self.environment()),
               mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
-              mock.patch.object(showrunners, "SESSIONS_DIR", self.sessions),
               mock.patch.object(showrunners, "SESSIONS", self.sessions_script)):
             self.assertEqual(showrunners.current_address("old"), address)
             self.assertEqual(showrunners.current_name("old"), "new-name")
@@ -526,7 +549,6 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         self.showrunner("new", formerly=("old",), name="new-name")
         with (mock.patch.dict(os.environ, self.environment()),
               mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
-              mock.patch.object(showrunners, "SESSIONS_DIR", self.sessions),
               mock.patch.object(showrunners, "SESSIONS", self.sessions_script)):
             self.assertEqual(showrunners.named("new-name")["slug"], "new")
             self.assertEqual(showrunners.named("old")["slug"], "new")
@@ -538,7 +560,6 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         self.showrunner("z-new", formerly=("old",))
         with (mock.patch.dict(os.environ, self.environment()),
               mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
-              mock.patch.object(showrunners, "SESSIONS_DIR", self.sessions),
               mock.patch.object(showrunners, "SESSIONS", self.sessions_script)):
             self.assertEqual(showrunners.named("old")["slug"], "z-new")
 

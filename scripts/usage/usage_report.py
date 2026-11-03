@@ -19,8 +19,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import staff, staff_sources, unit_lookup, session_staff, production_units
+from scripts.production import production_units, session_staff, staff, unit_lookup, unit_names
 from scripts.usage import collect, outcomes, weights
+from scripts.shutdown import remote
 from scripts.lib.user_zone import user_zone_name
 from scripts.usage.rollouts import parse_timestamp
 
@@ -283,29 +284,37 @@ class UnitWorktree:
     worktree: Path
 
 
-def document_units(path: Path, *,
-                   record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> tuple[UnitWorktree, ...]:
-    """Read branch worktrees and report unavailable unit facts."""
-    found: list[UnitWorktree] = []
+def document_units(path: Path, *, resolver: session_staff.RowResolver | None = None) -> tuple[UnitWorktree, ...]:
+    """Read a document owner's unit worktrees from one staff snapshot."""
     try:
-        record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
-        lines = path.read_text(encoding="utf-8").splitlines()
-        sources = unit_lookup.member_sources()
-        slug = unit_lookup.production_slug_for_document(path, record, sources)
-        rows = production_units.unit_table(lines)
-    except (OSError, UnicodeError, production_units.Refusal, staff.StaffRefused) as error:
-        print(f"usage: {path}: {error}", file=sys.stderr)
+        resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+        cells = production_units.unit_table(path.read_text(encoding="utf-8").splitlines())
+    except (staff.StaffUnreadable, OSError, UnicodeError, production_units.Refusal) as error:
+        print(f"usage_report: {path}: {error}", file=sys.stderr)
         return ()
-    for row in rows:
-        unit = outcomes.cell_value(row.get("Unit", ""))
-        try:
-            selected = sources.member(staff_sources.UnitMember(slug, unit), record)
-            location = unit_lookup.local_worktree(selected)
-            if isinstance(location, staff.RemovedWorktree):
-                continue
-            found.append(UnitWorktree(unit, unit_lookup.plan_worktree(row, selected)))
-        except (staff.StaffUnreadable, staff.StaffRefused) as error:
-            print(f"usage: {unit}: {error}", file=sys.stderr)
+    owner = resolver.record.by_doc(remote.local_machine(), path)
+    if owner is None:
+        print(f"usage_report: {path}: no staff owner binds the document", file=sys.stderr)
+        return ()
+    found: list[UnitWorktree] = []
+    for row in resolver.record.find(kind="unit", parent=owner.id):
+        tree = resolver.unit_worktree(row)
+        if isinstance(tree, staff.WorktreeUnfilled):
+            print(f"usage_report: {row.name}: the worktree is not recorded", file=sys.stderr)
+        else:
+            folder = tree.path
+            name = row.name
+            for unit_cells in cells:
+                if unit_names.name(outcomes.cell_value(unit_cells.get("Unit", ""))) != row.name:
+                    continue
+                name = outcomes.cell_value(unit_cells["Unit"])
+                if outcomes.cell_value(unit_cells.get("Plan", "")) and isinstance(tree, staff.PresentWorktree):
+                    try:
+                        folder = unit_lookup.plan_worktree(unit_cells, session_staff.MemberFound(row))
+                    except staff.StaffUnreadable as error:
+                        print(f"usage_report: {row.name}: {error}", file=sys.stderr)
+                break
+            found.append(UnitWorktree(name, folder))
     return tuple(found)
 
 
@@ -314,27 +323,29 @@ def longest_first(worktrees: Iterable[UnitWorktree]) -> tuple[UnitWorktree, ...]
     return tuple(sorted(worktrees, key=lambda row: len(row.worktree.parts), reverse=True))
 
 
-def unit_worktrees(production_docs: Path) -> tuple[UnitWorktree, ...]:
-    try:
-        record = staff.snapshot()
-    except staff.StaffUnreadable as error:
-        print(f"usage: {error}", file=sys.stderr)
-        return ()
+def unit_worktrees(production_docs: Path, *, resolver: session_staff.RowResolver | None = None) -> tuple[UnitWorktree, ...]:
+    resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
     return longest_first(row for document in sorted(production_docs.glob("*-production.md"))
-                         for row in document_units(document, record=record))
+                         for row in document_units(document, resolver=resolver))
 
 
-def register_report_functions(db: sqlite3.Connection, worktrees: tuple[UnitWorktree, ...]) -> None:
+def register_report_functions(db: sqlite3.Connection, worktrees: tuple[UnitWorktree, ...],
+                              *, resolver: session_staff.RowResolver | None = None) -> None:
+    resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
     @lru_cache(maxsize=8192)
     def report_unit(folder: str | None) -> str:
         # A SQL NULL is the boundary value for an agent whose folder was not reported.
         if folder is None:
             return "unknown"
         path = Path(folder)
+        member = resolver.member_by_folder(remote.local_machine(), path)
+        if isinstance(member, session_staff.MemberFound):
+            return member.row.name
+        # Retained worktrees keep the recorded attribution for history.
         for row in worktrees:
             if path.is_relative_to(row.worktree):
                 return row.unit
-        return path.name or "unknown"
+        return "unknown"
 
     db.create_function("report_unit", 1, report_unit, deterministic=True)
     weights.register(db)
@@ -954,7 +965,8 @@ def main(argv: Sequence[str] = ()) -> int:
         request = report_request(args)
         with closing(open_read_store(args.db)) as db:
             check_store_version(db)
-            register_report_functions(db, unit_worktrees(args.production_docs))
+            resolver = session_staff.RowResolver(staff.snapshot())
+            register_report_functions(db, unit_worktrees(args.production_docs, resolver=resolver), resolver=resolver)
             print(render_report(db, request), end="")
     except ReportRefused as error:
         print("usage_report: " + " ".join(str(error).splitlines()), file=sys.stderr)

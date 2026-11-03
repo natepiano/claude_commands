@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import broadcast
 import process_table
 from scripts.production import showrunners
+from scripts.message import send_budget
 from scripts.lib.process_failure import failure_detail
 from live_units import live_unit_names
 from sessions import SessionRecord, live_sessions
@@ -398,7 +399,7 @@ def announce_quiet(running: int | QuietCountObservation) -> None:
             _ = notice.write_text("claim\n", encoding="utf-8")
         try:
             done = subprocess.run(command, capture_output=True, text=True, check=False,
-                                  timeout=review.user_send_seconds() + 15)
+                                  timeout=send_budget.user_seconds(review.user_send_seconds()))
             _finish_quiet_notice(observation, sent=not done.returncode)
             if done.returncode:
                 print(f"codex wind-down: reset alert failed: {failure_detail(done)}", file=sys.stderr)

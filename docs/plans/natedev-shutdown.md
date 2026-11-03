@@ -51,7 +51,7 @@ The user's rule: "1 yes 2 yes 3 yes - plus a resume message". There is one way f
 
 ### Phase 8: the record store deleted
 
-- Deleted: `shutdown_record.py` (session records, account holds and their locks), the record-driven restart in `restart.py`, recovery snapshots, `records`, `holds`, `held-sessions`, `launch-blocked` and `forget`, and the launch barrier in `launch_permission.py` that only account holds fed.
+- Deleted: `shutdown_record.py` (session records, account holds and their locks), the record-driven restart in `restart.py`, recovery snapshots, `records`, `holds`, `held-sessions`, `launch-blocked` and `forget`.
 - `pane_restore.py` (boot restore) stays and uses the Phase 6 builder.
 
 ### Phase 9: the transfer journal and the long rename steps deleted

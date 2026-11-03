@@ -11,12 +11,26 @@ from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
 
+from scripts.lib import conf
 from scripts.production import delivery_state, staff, unrouted_alert
 from scripts.production.production_units import Refusal, production_field
 from scripts.production.proposals_folder import slug_of
 
 PREFIX = "change-review - "
 PRODUCER = "Producer"
+
+
+def configured_lists_directory() -> Path:
+    return Path(conf.read("change_review").text("lists_directory")).expanduser()
+
+
+def lists_directory() -> Path:
+    override = os.environ.get("CHANGE_REVIEW_DIR")
+    return Path(override) if override else configured_lists_directory()
+
+
+def _is_real_list(review_list: Path, configured_folder: Path) -> bool:
+    return review_list.resolve().parent == configured_folder
 
 
 @dataclass(frozen=True)
@@ -133,6 +147,14 @@ class StaffRouting:
                 self.production_by_name[name] = path
 
     @cached_property
+    def _configured_folder(self) -> Path:
+        return configured_lists_directory().resolve()
+
+    @cached_property
+    def _review_root(self) -> Path:
+        return review_root()
+
+    @cached_property
     def list_paths(self) -> dict[str, Path]:
         paths: dict[str, Path] = {}
         for doc in dict.fromkeys(self.documents.values()):
@@ -195,10 +217,13 @@ class StaffRouting:
     def unrouted(self, review_list: Path, row: dict[str, str], note: str, producer: str) -> UnroutedChange:
         list_owner = self.list_owner(review_list)
         print(f"staff: {note[0].lower() + note[1:]} (change {list_owner}/{row['#']})", file=sys.stderr)
-        if not row.get("Verdict") and waits_for_user(review_list, row, review_root()):
+        if not row.get("Verdict") and _is_real_list(review_list, self._configured_folder):
+            root = self._review_root
+            if not waits_for_user(review_list, row, root):
+                return UnroutedChange(note + "; no message goes out")
             member = self.record.by_id(staff.StaffId(producer))
             names = (member.name if member is not None else producer,)
-            unrouted_alert.notify(review_root(), list_owner, row, note, names)
+            unrouted_alert.notify(root, list_owner, row, note, names)
         return UnroutedChange(note + "; no message goes out")
 
 
@@ -213,7 +238,7 @@ def delivery_path(root: Path, review_list: Path, row: str) -> Path:
 
 
 def review_root() -> Path:
-    return Path(os.environ.get("REVIEW_LINKS_ROOT") or Path.home() / ".local/share/review-links").expanduser()
+    return Path(os.environ.get("REVIEW_LINKS_ROOT") or conf.read("change_review").text("review_links_directory")).expanduser()
 
 
 def waits_for_user(review_list: Path, row: dict[str, str], root: Path) -> bool:

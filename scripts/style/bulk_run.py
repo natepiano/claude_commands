@@ -14,7 +14,6 @@ import re
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
@@ -23,6 +22,9 @@ from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Protocol, cast, override
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import build_folders
 
 import bulk_constants as constants
 import bulk_rename as bulk
@@ -1039,8 +1041,8 @@ def require_test_tree(repo: Path, tree: str) -> None:
 
 
 def test_tree(repo: Path, commit: str, tree: str, runner: Runner, times: dict[str, float]) -> CommandResult:
-    with tempfile.TemporaryDirectory(prefix="bulk-rule-test-") as folder:
-        checkout = Path(folder) / "repo"
+    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["bulk-rule-test"])) as folder:
+        checkout = folder / "repo"
         _ = git(repo, "clone", "--shared", "--no-checkout", str(repo), str(checkout))
         _ = git(checkout, "checkout", "--detach", commit)
         require_test_tree(checkout, tree)

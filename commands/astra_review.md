@@ -33,6 +33,9 @@ changes no file.
      `python3 ~/.claude/scripts/agents/mesh_runs.py start --label "astra review" -- <the command>`
      and end your turn; the result is your next message. Exit 3 means you are
      not a mesh worker: run the command attached in one call instead.
+     A live twin takes priority over `config/mesh_runs.conf` `LIVE_RUN_LIMIT`.
+     Exit 4 refuses a new run at that limit and names the live runs.
+     Wait for a run's result, or put more files in one run. Never run attached after exit 4.
 3. When it finishes, read its output once.
    - Exit 0: present the review that follows the heading line, in full. Name
      where it was saved (the `Saved:` line). The review is advice: add your own

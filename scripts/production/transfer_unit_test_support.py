@@ -94,14 +94,12 @@ class UnitTransferFixture(StaffTestCase):
             (showrunners, "NOTIFIER_STATE_DIR", self.root / "state/notifier"),
             (showrunners, "SHOWRUNNER_STATE_DIR", self.root / "state/showrunner"),
             (showrunners, "CONFIG", self.root / "home/.claude/showrunners.json"),
-            (showrunners, "SESSIONS_DIR", self.root / "state/sessions"),
             (progress_history, "SESSION_ROOTS", (self.root / "sessions",)),
             (pane_record, "RECORD_DIR", self.root / "home/.local/state/herdr-panes"),
             (pane_record, "PROC", self.root / "proc"),
             (tidy_wrapped, "STATE_DIR", self.root / "state/showrunner"),
             (tidy_wrapped, "NOTIFIER_STATE_DIR", self.root / "state/notifier"),
             (stall_watch, "STATE_DIR", self.root / "state/stall-watch"),
-            (stall_watch, "SESSIONS_DIR", self.root / "state/sessions"),
             (stall_watch, "PROJECTS_DIR", self.root / "home/.claude/projects"),
         ):
             _ = self.enterContext(mock.patch.object(module, name, value))

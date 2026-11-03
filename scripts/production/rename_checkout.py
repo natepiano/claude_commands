@@ -239,6 +239,8 @@ def checkout(slug: str, destination: str = "") -> None:
     move(old, new)
     resumed = stop_resume.resume(session_id, why="showrunner checkout moved")
     if not isinstance(resumed, stop_resume.ClaudeUp):
-        reason = resumed.reason if isinstance(resumed, stop_resume.ResumeFailed) else "no local tab"
+        reason = (resumed.reason
+                  if isinstance(resumed, stop_resume.ResumeFailed)
+                  else "no local tab")
         raise RenameRefused(f"{slug}: resume failed: {reason}")
     print(f"{slug}: checkout moved to {new}; run rename.py checkout {slug} again to push the doc commit")

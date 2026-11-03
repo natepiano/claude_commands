@@ -2703,7 +2703,7 @@ raise SystemExit(int(os.environ[variable]))
               redirect_stdout(io.StringIO())):
             self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
                                                    phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB, PAGE_PATHS)))
-        self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list], [40, 220])
+        self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list], [170, 345])
         self.assertEqual(run.call_count, 2)
 
     def test_phone_disk_alert_keeps_action_and_build_shortfall_without_directory_dump(self) -> None:
@@ -3723,6 +3723,21 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
             "holder": "build-speed", "since": datetime.fromtimestamp(since, PACIFIC).isoformat(),
             "for": "timed builds", "release_eta": "unknown",
         }))
+
+    def test_state_override_moves_the_floor_lock_and_deletion_records_together(self) -> None:
+        base = self.base()
+        for name in ("first state", "second state"):
+            state = base / name
+            with mock.patch.dict(os.environ, {sweep.tmp_sweep.STATE_ENV: str(state)}), \
+                 mock.patch.object(sweep, "recover_pending_trims"), \
+                 mock.patch.object(sweep, "free_bytes", return_value=0), \
+                 mock.patch.object(sweep, "try_lock", return_value=None) as acquire, \
+                 mock.patch.object(sweep, "alert_floor_lock"), redirect_stdout(io.StringIO()):
+                self.assertEqual(sweep.hold_floor(GIB, False, roots=()), 0)
+                acquire.assert_called_once_with(str(state / "floor.lock"))
+                self.assertEqual(sweep.floor_record_path(), state / "floor.json")
+                self.assertEqual(sweep.target_deletes_path(), state / sweep.tmp_sweep.TARGET_DELETES_NAME)
+                self.assertTrue(state.is_dir())
 
     def test_own_deletes_do_not_hold_a_target_but_a_later_build_write_does(self) -> None:
         base = self.base()

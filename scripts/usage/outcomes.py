@@ -14,10 +14,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, Literal, cast
 
-from scripts.production import staff, staff_sources, unit_lookup, session_staff, production_units
+from scripts.production import production_units, session_staff, staff, unit_lookup, unit_names
 from scripts.accounts.worker_names import journal_entry
 from scripts.usage.rollouts import parse_timestamp
 from scripts.whoami import run_out
+from scripts.shutdown import remote
 
 
 @dataclass(frozen=True)
@@ -45,53 +46,69 @@ def cell_value(value: str) -> str:
     return quoted.group(1) if quoted else value.split(" — ", 1)[0].strip()
 
 
-def production_paths(path: Path, *,
-                     record: staff.StaffSnapshot | staff.StaffUnreadable | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> tuple[Path, ...]:
+def production_paths(path: Path, *, resolver: session_staff.RowResolver | None = None) -> tuple[Path, ...]:
+    """Read the worktrees held by the document owner's staff rows."""
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError):
         return ()
-    paths: list[Path] = []
-    for line in lines:
-        if line.startswith("- **Repository:** "):
-            value = cell_value(line.removeprefix("- **Repository:** "))
-            if value:
-                paths.append(Path(value).expanduser())
+    headers = tuple(Path(value).expanduser() for line in lines if line.startswith("- **Repository:** ")
+                    if (value := cell_value(line.removeprefix("- **Repository:** "))))
     try:
-        record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
-        if isinstance(record, staff.StaffUnreadable):
-            raise record
-        sources = unit_lookup.member_sources()
-        slug = unit_lookup.production_slug_for_document(path, record, sources)
-        rows = production_units.unit_table(lines)
-    except (OSError, staff.StaffRefused, production_units.Refusal) as error:
+        resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+        cells = {cell_value(row.get("Unit", "")): row for row in production_units.unit_table(lines)}
+    except (staff.StaffUnreadable, production_units.Refusal) as error:
         print(f"outcomes: {path}: {error}", file=sys.stderr)
-        return tuple(paths)
-    for row in rows:
-        try:
-            selected = sources.member(staff_sources.UnitMember(slug, cell_value(row.get("Unit", ""))), record)
-            location = unit_lookup.local_worktree(selected)
-            if isinstance(location, staff.RemovedWorktree):
+        return headers
+    owner = resolver.record.by_doc(remote.local_machine(), path)
+    if owner is None:
+        print(f"outcomes: {path}: no staff owner binds the document", file=sys.stderr)
+        return headers
+    paths: list[Path] = []
+    found_main = False
+    for row in resolver.record.find(kind="unit", parent=owner.id):
+        tree = resolver.unit_worktree(row)
+        if isinstance(tree, staff.WorktreeUnfilled):
+            print(f"outcomes: {row.name}: the worktree is not recorded", file=sys.stderr)
+            continue
+        if tree.machine != remote.local_machine():
+            continue
+        folder = tree.path
+        for unit_cells in cells.values():
+            if unit_names.name(cell_value(unit_cells.get("Unit", ""))) != row.name:
                 continue
-            paths.append(unit_lookup.plan_worktree(row, selected))
-        except (staff.StaffUnreadable, staff.StaffRefused) as error:
-            print(f"outcomes: {path}: {error}", file=sys.stderr)
+            if cell_value(unit_cells.get("Plan", "")):
+                try:
+                    folder = unit_lookup.plan_worktree(unit_cells, session_staff.MemberFound(row))
+                except staff.StaffUnreadable as error:
+                    print(f"outcomes: {row.name}: {error}", file=sys.stderr)
+            break
+        worktrees = git_text(folder, "worktree", "list", "--porcelain")
+        if worktrees:
+            first = worktrees.splitlines()[0]
+            if first.startswith("worktree "):
+                main = Path(first.removeprefix("worktree "))
+                if main not in paths:
+                    paths.append(main)
+                found_main = found_main or main != folder
+        if folder not in paths:
+            paths.append(folder)
+    if not found_main:
+        paths = [*(header for header in headers if header not in paths), *paths]
     return tuple(paths)
 
 
-def repositories(claude_repo: Path, production_docs: Path, *,
-                 record: staff.StaffSnapshot | staff.StaffUnreadable | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> tuple[Path, ...]:
-    if isinstance(record, session_staff.ReadCurrentStaff):
-        try:
-            record = staff.snapshot()
-        except staff.StaffUnreadable as error:
-            print(f"outcomes: {error}", file=sys.stderr)
-            record = error
+def repositories(claude_repo: Path, production_docs: Path, *, resolver: session_staff.RowResolver | None = None) -> tuple[Path, ...]:
+    try:
+        resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+    except staff.StaffUnreadable as error:
+        print(f"outcomes: {error}", file=sys.stderr)
+        resolver = session_staff.RowResolver(staff.StaffSnapshot(()))
     candidates = [claude_repo]
     candidates.extend(
         path
         for document in sorted(production_docs.glob("*-production.md"))
-        for path in production_paths(document, record=record)
+        for path in production_paths(document, resolver=resolver)
     )
     unique: dict[str, Path] = {}
     for candidate in candidates:
@@ -358,16 +375,17 @@ def collect_checkpoints(db: sqlite3.Connection, claude_repo: Path, production_do
             record = staff.snapshot()
         except staff.StaffUnreadable as error:
             print(f"outcomes: {error}", file=sys.stderr)
-            record = error
+            record = staff.StaffSnapshot(())
             state = PartialSourceRead()
+        resolver = session_staff.RowResolver(record)
         candidates = (claude_repo, *(path for document in sorted(production_docs.glob("*-production.md"))
-                                     for path in production_paths(document, record=record)))
+                                     for path in production_paths(document, resolver=resolver)))
         # Repository discovery omits failures; retain them in this source's state.
         # A worktree removed after its merge is no failure: its commits stay in the shared repository.
         for candidate in candidates:
             if candidate.exists() and git_text(candidate, "rev-parse", "--git-common-dir") is None:
                 state = PartialSourceRead()
-        repos = repositories(claude_repo, production_docs, record=record)
+        repos = repositories(claude_repo, production_docs, resolver=resolver)
         if not repos:
             state = PartialSourceRead()
         for repo in repos:

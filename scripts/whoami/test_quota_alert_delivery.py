@@ -14,7 +14,7 @@ from typing import cast
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 from scripts.whoami import quota_alert_test_support as support
 import quota_alert
 import review
@@ -83,7 +83,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
             self.assertIsInstance(REAL_TELL_USER(render("quota.claude_next_move", account="claude2", remaining="0%")), quota_alert.PushSent)
             command = cast(list[str], run.call_args.args[0])
             self.assertEqual(float(command[command.index("--timeout") + 1]), review.user_send_seconds())
-            self.assertEqual(run.call_args.kwargs["timeout"], review.user_send_seconds() + 15)
+            self.assertEqual(run.call_args.kwargs["timeout"], review.user_send_seconds() + 140)
             self.assertNotIn("input", run.call_args.kwargs)
         self.assertEqual(quota_alert.RELAY_TIMEOUT, 40)
 

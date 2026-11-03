@@ -62,6 +62,7 @@ class StaffRoutingTests(unittest.TestCase):
                          change_routing.ShowrunnerOwnChange(self.top.id, "top"))
 
     def test_an_unknown_producer_id_is_unrouted_and_alerts_with_the_row(self) -> None:
+        _ = self.enterContext(mock.patch.object(change_routing, "configured_lists_directory", return_value=self.root))
         identity = fixture_runtime_id("missing-producer")
         owner = self.router().owner({"#": "C777", "Producer": identity}, self.root / "change-review - top.md")
         self.assertIsInstance(owner, change_routing.UnroutedChange)
@@ -69,6 +70,48 @@ class StaffRoutingTests(unittest.TestCase):
         self.assertIn(identity, owner.note)
         self.assertEqual(owner.tab, "unrouted")
         self.assertEqual(cast(mock.Mock, self.alert).call_args.args[2]["#"], "C777")
+
+    def test_one_router_reads_the_configured_alert_folder_once(self) -> None:
+        router = self.router()
+        listing = self.root / "change-review - top.md"
+        with mock.patch.object(change_routing, "configured_lists_directory", return_value=self.root) as configured:
+            for number in range(3):
+                owner = router.owner({"#": f"C{number}", "Producer": "unknown"}, listing)
+                self.assertIsInstance(owner, change_routing.UnroutedChange)
+            configured.assert_called_once_with()
+        self.assertEqual(cast(mock.Mock, self.alert).call_count, 3)
+
+    def test_a_fixture_list_outside_the_real_folder_sends_no_alert_and_writes_no_record(self) -> None:
+        with mock.patch.object(unrouted_alert, "send_message") as send:
+            owner = self.router().owner({"#": "C9", "Producer": "unknown"},
+                                        self.root / "change-review - top.md")
+        self.assertIsInstance(owner, change_routing.UnroutedChange)
+        cast(mock.Mock, self.alert).assert_not_called()
+        send.assert_not_called()
+        self.assertFalse((self.root / "links/.review-link-unrouted").exists())
+        self.assertFalse((self.root / "links").exists())
+
+    def test_the_reader_environment_override_never_makes_a_fixture_list_real(self) -> None:
+        with (mock.patch.dict(os.environ, {"CHANGE_REVIEW_DIR": str(self.root)}),
+              mock.patch.object(unrouted_alert, "send_message") as send):
+            self.assertEqual(change_routing.lists_directory(), self.root)
+            owner = self.router().owner({"#": "C9", "Producer": "unknown"},
+                                        self.root / "change-review - top.md")
+        self.assertIsInstance(owner, change_routing.UnroutedChange)
+        cast(mock.Mock, self.alert).assert_not_called()
+        send.assert_not_called()
+        self.assertFalse((self.root / "links/.review-link-unrouted").exists())
+        self.assertFalse((self.root / "links").exists())
+
+    def test_patching_only_the_review_reader_folder_sends_no_alert(self) -> None:
+        with (mock.patch.object(change_review, "lists_directory", return_value=self.root),
+              mock.patch.object(unrouted_alert, "send_message") as send):
+            owner = self.router().owner({"#": "C9", "Producer": "unknown"},
+                                        self.root / "change-review - top.md")
+        self.assertIsInstance(owner, change_routing.UnroutedChange)
+        cast(mock.Mock, self.alert).assert_not_called()
+        send.assert_not_called()
+        self.assertFalse((self.root / "links/.review-link-unrouted").exists())
 
     def test_renamed_and_retired_units_keep_their_producer_route(self) -> None:
         row = {"#": "C1", "Producer": self.unit.id}
@@ -189,7 +232,7 @@ class StaffRoutingTests(unittest.TestCase):
         _ = change_review.append_rows(listing, [change_review.Visible(f"Change {i}", "Read", "Proof") for i in range(5)],
             date(2026, 11, 2), "", docs["top"],
             producers=[self.unit.id, change_review.UnknownProducer(), staff.StaffId(fixture_runtime_id("missing-producer")), retired.id, self.child.id])
-        with (mock.patch.object(change_review, "LISTS", self.root), mock.patch.object(cli_review, "LISTS", self.root),
+        with (mock.patch.object(change_review, "lists_directory", return_value=self.root), mock.patch.object(cli_review, "lists_directory", return_value=self.root),
               mock.patch.object(showrunners, "timer_docs", return_value=docs)):
             prepared = change_browser.prepare(change_page.ReviewBrowser("secret"), change_page.DeliveryStatus(self.root / "links"))
             counts = {tab: sum(item.waiting and item.tab == tab for item in prepared.changes) for tab in prepared.queues}
@@ -244,6 +287,8 @@ class StaffRoutingTests(unittest.TestCase):
             root = Path(directory)
             config = root / "config"
             config.mkdir()
+            settings = Path(__file__).resolve().parents[2] / "config/change_review.conf"
+            _ = (config / "change_review.conf").write_text(settings.read_text())
             source = Path(__file__).resolve().parents[2] / "config/review_links.conf"
             _ = (config / "review_links.conf").write_text(source.read_text().replace("delivery_pause_seconds=5", "delivery_pause_seconds=0"))
             environment = {"CONF_DIR": str(config), "STAFF_FILE": str(root / "staff.json"), "CHANGE_REVIEW_DIR": str(root),
@@ -262,7 +307,7 @@ class StaffRoutingTests(unittest.TestCase):
                 assert runner is not None and parent is not None
                 _ = staff.move(runner.id, parent.id)
                 import change_review as cli_review
-                with (mock.patch.object(change_review, "LISTS", root), mock.patch.object(cli_review, "LISTS", root),
+                with (mock.patch.object(change_review, "lists_directory", return_value=root), mock.patch.object(cli_review, "lists_directory", return_value=root),
                       mock.patch.object(showrunners, "timer_docs", return_value=docs)):
                     browser = change_page.ReviewBrowser("secret")
                     status = change_page.DeliveryStatus(root / "links")
@@ -308,3 +353,23 @@ class MergeWriterRoutingTests(ProducerFixture):
         assert isinstance(owner, change_routing.StaffRoutedChange)
         self.assertEqual(owner.unit_id, self.unit.id)
         self.assertEqual(change_page.verdict_recipients(owner, "not works"), (self.unit.id, owner.showrunner_id))
+
+
+class ChangeReviewConfigTests(unittest.TestCase):
+    def test_delivery_root_reads_the_folder_setting_at_use(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = root / "change_review.conf"
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(root), "REVIEW_LINKS_ROOT": ""}):
+                _ = settings.write_text(f"review_links_directory={root / 'first'}\n")
+                self.assertEqual(change_routing.review_root(), root / "first")
+                _ = settings.write_text(f"review_links_directory={root / 'second'}\n")
+                self.assertEqual(change_routing.review_root(), root / "second")
+
+    def test_config_keeps_the_existing_values(self) -> None:
+        from scripts.lib import conf
+
+        settings = conf.read(Path(__file__).resolve().parents[2] / "config/change_review.conf")
+        for key, expected in {'lists_directory': '~/rust/hanadocs/change-review', 'review_links_directory': '~/.local/share/review-links'}.items():
+            with self.subTest(key=key):
+                self.assertEqual(settings.text(key), expected)

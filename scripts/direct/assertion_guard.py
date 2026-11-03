@@ -1310,25 +1310,37 @@ class NoProductionBase:
 
 
 def production_merge_branch(repo: Path) -> ProductionMergeBranch | NoProductionBase:
-    """Match a Units worktree first, then its branch, across registered docs."""
+    """Read the merge branch from the folder owner's row."""
     original_path = sys.path[:]
     try:
         repository_root = Path(__file__).resolve().parents[2]
         sys.path.insert(0, str(repository_root))
         sys.path.insert(0, str(repository_root / "scripts" / "production"))
-        from scripts.production import production_units, staff, unit_lookup
+        from scripts.production import production_units, session_staff, staff, unit_lookup
+        from scripts.shutdown import remote
     except ImportError:
         return NoProductionBase()
     finally:
         sys.path[:] = original_path
     worktree = Path(git(repo, "rev-parse", "--show-toplevel").strip()).resolve()
+    try:
+        record = staff.snapshot()
+        resolver = session_staff.RowResolver(record)
+        member = resolver.member_by_folder(remote.local_machine(), worktree)
+        if isinstance(member, session_staff.MemberFound):
+            resolved_branch = resolver.merge_branch(member.row)
+            if isinstance(resolved_branch, session_staff.Branch):
+                return ProductionMergeBranch(resolved_branch.name)
+            print(f"assertion_guard: {member.row.name}: {resolved_branch.reason}", file=sys.stderr)
+    except (OSError, ValueError) as error:
+        print(f"assertion_guard: {worktree}: {error}", file=sys.stderr)
+        return NoProductionBase()
     branch = git(repo, "branch", "--show-current").strip()
     branch_match: ProductionMergeBranch | NoProductionBase = NoProductionBase()
     try:
         sources = unit_lookup.member_sources()
         if not sources.productions:
             return branch_match
-        record = staff.snapshot()
     except staff.StaffUnreadable as error:
         print(f"assertion_guard: {error}", file=sys.stderr)
         return branch_match

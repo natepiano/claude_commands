@@ -57,6 +57,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import process_group
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import build_folders
 from scripts.production import change_review  # noqa: E402
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
@@ -69,6 +70,7 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.lint import memory_admit  # noqa: E402
+from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E402
 from scripts.build_queue.queue_place import (  # noqa: E402
     QueuePlace, QueuePlaceRefused, defer_cleanup_signals, queue_place, suite_scope_prefix,
 )
@@ -335,7 +337,7 @@ def gate_reservation(repo: Path, cap_mib: int, temporary: Path, hold: BuildHoldW
     try:
         with queue_place("merge-gate", repo,
                          sizing=memory_admit.FixedCapSizing(cap),
-                         before_check=hold.wait_until_free) as place:
+                         before_check=AdmissionHoldCheck(hold.wait_until_free, hold.admits)) as place:
             yield place
     except QueuePlaceRefused as error:
         raise GateRefused(str(error)) from error
@@ -383,13 +385,21 @@ def interrupted(signum: int, _frame: object) -> None:
 
 
 @contextmanager
-def rollback_signals() -> Generator[None, None, None]:
-    previous = {sig: signal.signal(sig, interrupted) for sig in ROLLBACK_SIGNALS}
+def rollback_signals(*, defer: bool = False) -> Generator[None, None, None]:
+    pending: list[int] = []
+
+    def record(signum: int, _frame: object) -> None:
+        pending.append(signum)
+
+    signals = (*ROLLBACK_SIGNALS, signal.SIGINT) if defer else ROLLBACK_SIGNALS
+    previous = {sig: signal.signal(sig, record if defer else interrupted) for sig in signals}
     try:
         yield
     finally:
         for sig, handler in previous.items():
             _ = signal.signal(sig, handler)
+    if pending:
+        signal.raise_signal(pending[0])
 
 
 def fetch_branches(repo: Path, *branches: str) -> None:
@@ -573,16 +583,11 @@ def reap_gate_job(job: RunningGateJob, *, block: bool = False) -> None:
     """Collect the leader's status and CPU once, including children it waited for."""
     if job.process.returncode is not None:
         return
-    previous = signal.pthread_sigmask(signal.SIG_BLOCK, ROLLBACK_SIGNALS)
-    try:
+    with rollback_signals(defer=True):
         pid, status, usage = os.wait4(job.process.pid, 0 if block else os.WNOHANG)
         if pid:
             job.process.returncode = os.waitstatus_to_exitcode(status)
             job.cpu_seconds = usage.ru_utime + usage.ru_stime
-    finally:
-        # Deliver pending interrupts only after the reaped status and CPU are stored.
-        # The mask covers this thread only; the gate starts no other thread.
-        _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 def kill_job_group(job: RunningGateJob) -> None:
@@ -593,6 +598,24 @@ def kill_job_group(job: RunningGateJob) -> None:
     except ProcessLookupError:
         pass
     reap_gate_job(job, block=True)
+
+
+def stop_gate_job(job: RunningGateJob) -> None:
+    """Stop the group and reap its leader before capacity returns."""
+    config = memory_admit.read_memory_config()
+    try:
+        process_group.send_process_group(job.process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + config.program_stop_seconds
+    while job.process.returncode is None:
+        reap_gate_job(job)
+        remaining = deadline - time.monotonic()
+        if job.process.returncode is not None or remaining <= 0:
+            break
+        time.sleep(min(config.program_sample_seconds, remaining))
+    # Kill surviving group members even when the leader has exited.
+    kill_job_group(job)
 
 
 def one_minute_load() -> float:
@@ -925,10 +948,11 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     maximum_load = starting_load
     began = time.monotonic()
     python = os.environ.get("MERGE_GATE_PYTHON", sys.executable)
-    with (tempfile.TemporaryDirectory(prefix="merge-gate-", dir=tmpfs) as temporary,
-          gate_reservation(repo, memory_cap_mib, Path(temporary), hold) as reservation,
+    with (build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
+              build_folders.FOLDER_PREFIXES["merge-gate"], build_folders.ExplicitBuildParent(tmpfs))) as temporary,
+          gate_reservation(repo, memory_cap_mib, temporary, hold) as reservation,
           shared_cpu_pool() as cpu_pool):
-        environment = {**os.environ, "TMPDIR": temporary}
+        environment = {**os.environ, "TMPDIR": str(temporary)}
         types_python = typecheck_python() if type_dirs else ""
         if isinstance(types_python, Path):
             pending.appendleft(GateJobRequest("types", repo / "basedpyright", "basedpyright", GateJobKind.TYPE_CHECK))
@@ -969,7 +993,8 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                         break
                     request = pending.popleft()
                     suite, path = request.suite, request.path
-                    root = Path(tempfile.mkdtemp(prefix=f"{suite}-{path.stem}-", dir=temporary))
+                    root = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
+                        build_folders.FOLDER_PREFIXES["merge-gate-module"].format(owner=f"{suite}-{path.stem}"), build_folders.ExplicitBuildParent(temporary)))
                     log = root / "output.log"
                     job_environment = ({**environment, "TMPDIR": str(root)} if request.kind is GateJobKind.TYPE_CHECK
                                        else test_module_environment(root, environment))
@@ -979,7 +1004,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                              *type_dirs]
                             if request.kind is GateJobKind.TYPE_CHECK else
                             [*scope_prefix, python, "-m", "unittest", "discover", "-s", str(path.parent), "-p", path.name])
-                    with defer_cleanup_signals():
+                    with rollback_signals(defer=True):
                         if request.kind is GateJobKind.TYPE_CHECK:
                             job = start_gate_job(suite, path, argv, repo, job_environment, log, kind=request.kind)
                         else:
@@ -1051,9 +1076,9 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     time.sleep(0.05)
         finally:
             # Only terminate groups created by this runner. Reap them before tmpfs cleanup.
-            with defer_cleanup_signals():
+            with rollback_signals(defer=True):
                 for job in running:
-                    kill_job_group(job)
+                    stop_gate_job(job)
                     job.output.close()
                     if isinstance(job.cpu_slot, SharedCPUSlot):
                         job.cpu_slot.release()
@@ -1473,8 +1498,8 @@ def nightly(args: GateArguments) -> int:
     _ = nightly_git(repo, "fetch", "origin",
                     f"+refs/heads/{args.merge_branch}:refs/remotes/origin/{args.merge_branch}")
     commit = checked_git(repo, "rev-parse", f"refs/remotes/origin/{args.merge_branch}")
-    with tempfile.TemporaryDirectory(prefix="merge-gate-nightly-") as temporary:
-        clone = Path(temporary) / "checkout"
+    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["merge-gate-nightly"])) as temporary:
+        clone = temporary / "checkout"
         _ = nightly_git(repo, "clone", "--shared", "--no-checkout", "--", str(repo), str(clone))
         _ = nightly_git(clone, "checkout", "--detach", commit)
         tree = checked_git(clone, "rev-parse", "HEAD^{tree}")

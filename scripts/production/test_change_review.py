@@ -123,7 +123,6 @@ def producer_rows(root: Path, documents: dict[str, Path], lists: dict[Path, str]
         _ = path.write_text(text)
 
 
-
 class ProducerFixture(unittest.TestCase):
     root: Path = Path()
     repo: Path = Path()
@@ -280,7 +279,6 @@ class ProducerWriterTests(ProducerFixture):
                 self.assertEqual(change_review.pending(self.listing)[-1]["Producer"], expected)
 
 
-
 class ReviewKindTest(unittest.TestCase):
     def test_set_kind_is_recorded_once_and_survives_the_verdict_with_its_proof(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -373,7 +371,7 @@ class ListTest(unittest.TestCase):
         record = staff.StaffSnapshot(())
         scans = mock.Mock(wraps=links.glob)
         folder = mock.Mock(glob=scans)
-        with (mock.patch.object(change_review, "LISTS", root),
+        with (mock.patch.object(change_review, "lists_directory", return_value=root),
               mock.patch.object(change_routing, "review_root", return_value=folder)):
             routed = change_review.routed_review_entries(listings[0], doc, record=record)
         self.assertEqual(sorted((source.path.name, owner.tab, row["#"]) for source, owner, row in routed),
@@ -449,7 +447,7 @@ class AttachedListTest(unittest.TestCase):
             "| --- | --- | --- | --- | --- |\n" +
             "| C9 | Earlier child | Check earlier | 2026-10-02 | |\n" +
             "| C11 | Dependent child | Check dependent | 2026-10-03 | blocks, after C9 |\n")
-        _ = self.enterContext(mock.patch.object(change_review, "LISTS", self.root))
+        _ = self.enterContext(mock.patch.object(change_review, "lists_directory", return_value=self.root))
         _ = self.enterContext(mock.patch.object(showrunner_tree, "root_of", return_value="parent"))
 
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
@@ -934,7 +932,7 @@ class ActionTest(unittest.TestCase):
         _ = self.path.write_text(LIST.replace("C76", "C9"), encoding="utf-8")
         _ = earlier.write_text(LIST.replace("C76", "C9").replace("Panels keep shields", "Earlier change"),
                                encoding="utf-8")
-        _ = self.enterContext(mock.patch.object(change_review, "LISTS", self.path.parent))
+        _ = self.enterContext(mock.patch.object(change_review, "lists_directory", return_value=self.path.parent))
         _ = self.enterContext(mock.patch.object(change_review, "production_list", return_value=self.path))
         return earlier
 

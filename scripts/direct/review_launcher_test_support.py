@@ -187,7 +187,7 @@ class OpenPass(TypedDict):
 ProgressState = TypedDict("ProgressState", {"pass": dict[str, OpenPass]})
 
 
-AGENTS_REGISTRY = launcher_registry(("impl",), mesh=True)
+MODELS_REGISTRY = launcher_registry(("impl",), mesh=True)
 
 
 class ReviewLauncherFixture(LauncherFixture):
@@ -217,7 +217,7 @@ class ReviewLauncherFixture(LauncherFixture):
                 "UNIT_COMPACT_ABOVE_TOKENS=100000",
                 "ROUTING_FROM_ROUND=4", "ASTRA_AFTER_FAILED_FIXES=2",
                 "",
-            ), AGENTS_REGISTRY,
+            ), MODELS_REGISTRY,
         )
         _ = write_config_fixture(self.config_file, self.config_file.read_text(encoding="utf-8"))
         _ = config_environment(self.root)
@@ -251,11 +251,20 @@ class ReviewLauncherFixture(LauncherFixture):
         no model tokens. The real heartbeat watcher uses a short interval.
         """
         direct_dir, agents, lib = prepare_launcher_runtime(self.root)
-        _ = shutil.copy2(DIRECT_DIR.parent / "production/showrunners.py",
-                         self.root / "scripts/production/showrunners.py")
+        for name in ("showrunners.py", "session_staff.py", "staff.py", "session_labels.py",
+                     "unit_config.py", "unit_names.py", "unit_table.py"):
+            _ = shutil.copy2(DIRECT_DIR.parent / "production" / name,
+                             self.root / "scripts/production" / name)
+        for directory, names in (("herdr", ("place.py", "pane_launch.py")),
+                                 ("shutdown", ("remote.py",))):
+            destination = self.root / "scripts" / directory
+            destination.mkdir()
+            for name in names:
+                _ = shutil.copy2(DIRECT_DIR.parent / directory / name, destination / name)
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib/git_exclude.py", lib / "git_exclude.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/probe_session.py", lib / "probe_session.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/process_failure.py", lib / "process_failure.py")
-        for name in ("conf.py", "conf.sh"):
+        for name in ("conf.py", "conf.sh", "session_paths.py"):
             _ = shutil.copy2(DIRECT_DIR.parent / "lib" / name, lib / name)
         _ = shutil.copy2(DIRECT_DIR.parent / "production/fast_track.py",
                          self.root / "scripts/production/fast_track.py")

@@ -1,7 +1,7 @@
 """Shell launchers select the caller's Claude account or the mapped Codex workers home."""
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 
 import json
 import os
@@ -52,15 +52,15 @@ class CodexCliLauncherTests(NixFixture):
         selection = self.home / ".claude/config/accounts.json"
         selection.parent.mkdir(parents=True)
         _ = selection.write_text('{"workers": "codex1"}')
-        registry = write_registry(self.root / "agents.conf", {
+        registry = write_registry(self.root / "models.conf", {
             "assignments": {"cli": "codex"},
             "cli.codex": {"interactive": "gpt-test:high", "commit_prep": "gpt-test:high"},
             "cli.options": {"codex_service_tier": "default"},
             "codex.agents": {"gpt-test": "high"},
         })
         self.launched = self.root / "codex-start.json"
-        self.env.update(AGENT_NOTES_DIR=str(notes), AGENTS_CONFIG_FILE=str(registry),
-                        AGENTS_CONFIG_PUBLISH="0", CODEX_CATALOG_SYNC_STATE_FILE=str(registry),
+        self.env.update(AGENT_NOTES_DIR=str(notes), MODELS_CONFIG_FILE=str(registry),
+                        MODELS_CONFIG_PUBLISH="0", CODEX_CATALOG_SYNC_STATE_FILE=str(registry),
                         CODEX_CONFIG_FILE=str(self.root / "codex.toml"),
                         CODEX_MODELS_CACHE_FILE=str(self.root / "models.json"),
                         CODEX_START_LOG=str(self.launched))
@@ -123,7 +123,7 @@ class ClaudeLauncherTests(unittest.TestCase):
         groups = accounts.groups_file()
         groups.parent.mkdir(parents=True, exist_ok=True)
         _ = groups.write_text(json.dumps({"showrunners": "claude3"}))
-        registry = self.home / "agents.conf"
+        registry = self.home / "models.conf"
         _ = write_registry(registry, {'assignments': {'cli': 'claude', 'sample': 'claude'}, 'cli.claude': {'interactive': 'opus:high'}, 'sample.claude': {'task': 'opus:high'}, 'claude.agents': {'opus': 'low,medium,high,max'}})
         binary = self.home / "bin/claude"
         binary.parent.mkdir()
@@ -140,7 +140,7 @@ class ClaudeLauncherTests(unittest.TestCase):
                               + "print(json.dumps({'type': 'result', 'result': 'finished'}))\n")
         binary.chmod(0o755)
         self.environment = {key: value for key, value in os.environ.items() if not key.startswith("CLAUDE")}
-        self.environment.update(AGENTS_CONFIG_PUBLISH="0", HOME=str(self.home), AGENT_NOTES_DIR=str(notes), AGENTS_CONFIG_FILE=str(registry),
+        self.environment.update(MODELS_CONFIG_PUBLISH="0", HOME=str(self.home), AGENT_NOTES_DIR=str(notes), MODELS_CONFIG_FILE=str(registry),
                                 CODEX_CATALOG_SYNC_STATE_FILE=str(registry),
                                 XDG_CACHE_HOME=str(self.home / "cache"), XDG_STATE_HOME=str(self.home / "state"),
                                 PATH=str(binary.parent) + os.pathsep + os.environ["PATH"])

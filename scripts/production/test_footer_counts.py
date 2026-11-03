@@ -70,8 +70,6 @@ def issue(folder: Path, name: str, status: str, tags: str, proposed_by: str = "p
                                            encoding="utf-8")
 
 
-
-
 def production_doc(folder: Path, slug: str, proposals: Path, *units: str) -> Path:
     """A production doc that names the shared proposals folder and its units."""
     rows = "".join(f"| {unit} | `docs/plans/{unit}.md` |\n" for unit in units)
@@ -96,7 +94,7 @@ class FooterCountsTests(unittest.TestCase):
         _ = fixture_member("showrunner", name="fixture")
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"NEXT_STATE_DIR": str(self.root / "next")})))
-        _ = self.enterContext(mock.patch.object(change_review, "LISTS", self.root))
+        _ = self.enterContext(mock.patch.object(change_review, "lists_directory", return_value=self.root))
         _ = fixture_member("showrunner", name="production")
         # The doc's own line names the list; no live showrunner's list is looked up.
         _ = self.enterContext(mock.patch.object(change_review, "showrunner_of",
@@ -333,11 +331,26 @@ class FooterCountsTests(unittest.TestCase):
         self.assertEqual([footer_counts.changes(doc) for doc in (top, kid, grandkid)], [2, 1, 1])
         self.assertIn(listing, footer_counts.sources(kid))
 
+    def test_routing_sources_watch_the_live_configuration_file(self) -> None:
+        configuration = self.root / "settings"
+        configuration.mkdir()
+        source = configuration / "change_review.conf"
+        _ = source.write_text(f"lists_directory={self.root}\nreview_links_directory={self.root / 'links'}\n")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)}):
+            paths = footer_counts.routing_sources(staff.snapshot())
+        self.assertIn(source, paths)
+        self.assertIn(self.root, paths)
+        self.assertIn(self.root / "links", paths)
+
     def test_a_missing_alert_setting_keeps_footer_and_next_routing_available(self) -> None:
-        from scripts.production import unrouted_alert
+        from scripts.production import change_routing, unrouted_alert
+
+        _ = self.enterContext(mock.patch.object(change_routing, "configured_lists_directory", return_value=self.root))
 
         config = self.root / "config"
         config.mkdir()
+        source = Path(__file__).resolve().parents[2] / "config/change_review.conf"
+        _ = (config / "change_review.conf").write_text(source.read_text())
         _ = (config / "review_links.conf").write_text("unrouted_alert_recipient=top\n")
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))
         listing = self.root / "change-review - top.md"
@@ -376,7 +389,7 @@ class FooterCountsTests(unittest.TestCase):
         for name, doc in self.tree.items():
             _ = doc.write_text(f"# {name}\n- **Change review:** `{listing}`\n- **Showrunner checkout:** `{self.root}`\n")
             _ = fixture_member("showrunner", name=name, doc=staff.LiveDoc("natedev", doc))
-        with mock.patch.object(page_review, "LISTS", self.root):
+        with mock.patch.object(page_review, "lists_directory", return_value=self.root):
             forms = BrowserForms()
             forms.feed(change_browser.render(change_page.ReviewBrowser("secret"), change_page.DeliveryStatus(self.root)).decode())
         counts = [footer_counts.changes(doc) for doc in self.tree.values()]
@@ -392,7 +405,7 @@ class FooterCountsTests(unittest.TestCase):
         for listing in listings:
             _ = listing.write_text("## To review\n\n| # | Change |\n| --- | --- |\n| C1 | First |\n")
         producer_rows(self.root, self.tree, listings, selected_rows={})
-        with mock.patch.object(page_review, "LISTS", self.root):
+        with mock.patch.object(page_review, "lists_directory", return_value=self.root):
             browser = change_page.ReviewBrowser("token")
             prepared = change_browser.prepare(browser, change_page.DeliveryStatus(self.root / "links"))
         count = sum(item.waiting and item.tab == "unrouted" for item in prepared.changes)

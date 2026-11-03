@@ -335,7 +335,7 @@ class BoardJsonTests(unittest.TestCase):
                 module = sys.modules.get(name)
                 if module is not None:
                     for field, value in (
-                        ("NOTIFIER_STATE_DIR", self.notifier), ("SESSIONS_DIR", self.sessions),
+                        ("NOTIFIER_STATE_DIR", self.notifier),
                         ("SESSIONS", self.session_script), ("SHOWRUNNER_STATE_DIR", self.showrunner_state),
                     ):
                         _ = scope.enter_context(patch.object(module, field, value))
@@ -673,9 +673,14 @@ class BoardJsonTests(unittest.TestCase):
         root = self.production("root")
         child = self.production("child")
         self.attach(child.slug, root.slug)
-        partial = showrunners.ShowrunnerDiscovery([], (
-            showrunners.ShowrunnerLookupFailure(child.slug, "fixture lookup failed"),))
-        with patch.object(showrunners, "registered_showrunners", return_value=partial):
+        timer_for = showrunners.timer_for
+
+        def read_timer(row: staff.StaffRow, record: staff.StaffSnapshot) -> showrunners.Timer | showrunners.NoTimer:
+            if row.name == child.slug:
+                raise OSError("fixture lookup failed")
+            return timer_for(row, record)
+
+        with patch.object(showrunners, "timer_for", side_effect=read_timer):
             with self.assertRaisesRegex(OSError, "fixture lookup failed"):
                 _ = board_json.main(["--production", root.slug])
         self.assertFalse((self.output / "root.json").exists())
@@ -688,7 +693,10 @@ class BoardJsonTests(unittest.TestCase):
         self.attach(child.slug, root.slug)
         self.attach(grandchild.slug, child.slug)
         child_row = next(row for row in staff.find(kind="showrunner") if row.name == child.slug)
-        _ = fixture_member("showrunner", name="unregistered", parent=child_row.id)
+        document = self.root / "unregistered-production.md"
+        _ = document.write_text("# Production — unregistered\n")
+        _ = fixture_member("showrunner", name="unregistered", parent=child_row.id,
+                           doc=staff.LiveDoc("natedev", document))
         response, documents = self.generate("--production", root.slug)
 
         self.assertEqual([doc["production"] for doc in documents],

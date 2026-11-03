@@ -18,12 +18,12 @@ from unittest.mock import patch
 
 from scripts.usage import collect, outcomes, usage_report
 from scripts.whoami import worker_usage
-from scripts.production import staff
-from scripts.production.staff_test_support import isolated_staff_file, fixture_member
 from scripts.usage.test_collect import (
     CollectorFixture, FIXTURES as COLLECT_FIXTURES, MacRun, MacStreamReport, SshBehavior,
 )
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file, recorded_showrunner
 
 
 class DefaultSourcesTests(unittest.TestCase):
@@ -105,6 +105,8 @@ class OutcomeFixture(CollectorFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = (self.root / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
         _ = shutil.copytree(FIXTURES / "home", self.root, dirs_exist_ok=True)
         self.claude_root: Path = self.root / ".claude/projects"
         self.codex_root: Path = self.root / ".codex/sessions"
@@ -242,6 +244,38 @@ class ProductionPathsTests(unittest.TestCase):
                 outcomes.production_paths(document),
                 (Path("/repo/main"), branch_worktree),
             )
+
+    def test_staff_worktree_finds_the_repository_despite_a_stale_header(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        repository = root / "main"
+        worktree = root / "worktree"
+        for command in (
+            ["git", "init", "--quiet", str(repository)],
+            ["git", "-C", str(repository), "-c", "user.name=Fixture",
+             "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false",
+             "commit", "--quiet", "--allow-empty", "-m", "fixture"],
+            ["git", "-C", str(repository), "worktree", "add", "--quiet", "-b", "unit", str(worktree)],
+        ):
+            _ = subprocess.run(command, capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+        document = root / "sample-production.md"
+        _ = document.write_text(
+            "".join((
+                "# Production\n\n- **Repository:** `/wrong/header`\n\n",
+                "## Units\n\n| Unit | Worktree |\n| --- | --- |\n",
+                f"| a | `{worktree}` |\n",
+            )),
+            encoding="utf-8",
+        )
+        _ = self.enterContext(isolated_staff_file(Path(directory.name) / "staff.json", {}))
+        owner = recorded_showrunner("fixture-owner", document)
+        _ = fixture_member("unit", name="a", parent=owner.id,
+                           worktree=staff.PresentWorktree("natedev", worktree))
+        self.assertEqual(
+            outcomes.production_paths(document),
+            (repository, worktree),
+        )
 
 
 class OutcomeTests(OutcomeFixture):
@@ -557,6 +591,11 @@ class OutcomeTests(OutcomeFixture):
         _ = (self.production_docs / "fixture-production.md").write_text(
             f"- **Repository:** `{second_repo}`\n\n## Units\n\n| Worktree |\n| --- |\n| `{self.repository}` |\n",
             encoding="utf-8")
+        owner = recorded_showrunner("second-owner", self.production_docs / "fixture-production.md")
+        _ = fixture_member("unit", name="second", parent=owner.id,
+                           worktree=staff.PresentWorktree("natedev", second_repo))
+        _ = fixture_member("unit", name="first", parent=owner.id,
+                           worktree=staff.PresentWorktree("natedev", self.repository))
         _ = self.collect()
         self.assertEqual({cast(str, row["commit_id"]) for row in self.rows("SELECT * FROM checkpoints")}, {first, side, second})
         _ = self.collect()

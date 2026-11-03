@@ -27,7 +27,6 @@ import inventory
 import shutdown_record
 import sessions
 from scripts.production import showrunners
-import launch_permission
 from scripts.whoami import account
 from scripts.whoami import agent_accounts
 from scripts.accounts import accounts, refusals
@@ -50,7 +49,6 @@ class AccountMoveTests(ShutdownTestCase):
     def setUp(self) -> None:
         super().setUp()
         _ = self.enterContext(scratch_accounts_config())
-        _ = self.enterContext(patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         notes = self.root / "notes"
         notes.mkdir()
@@ -89,9 +87,7 @@ class AccountMoveTests(ShutdownTestCase):
             with self.subTest(subject=subject):
                 self.moves.calls.clear()
                 member = replace(self.current_listing()[0], kind="unit")
-                with (patch.object(launch_permission, "launch_permission",
-                                   side_effect=AssertionError("moves must not read shutdown holds")),
-                      patch.object(accounts, "live_group_members", return_value={"units": [member], "showrunners": []})):
+                with (patch.object(accounts, "live_group_members", return_value={"units": [member], "showrunners": []})):
                     result, output, error = self.cli(subject)
                 self.assertEqual(result, 0, error)
                 self.assertEqual(error, "")
@@ -100,9 +96,7 @@ class AccountMoveTests(ShutdownTestCase):
 
     def test_target_preview_uses_readiness_and_usage_without_querying_holds(self) -> None:
         before = self.disk_state()
-        with patch.object(launch_permission, "launch_permission",
-                          side_effect=AssertionError("preview must not read shutdown holds")):
-            result = accounts.check_move_target("claude3", datetime.now(timezone.utc), repair=False)
+        result = accounts.check_move_target("claude3", datetime.now(timezone.utc), repair=False)
         self.assertIsInstance(result, accounts.MoveTargetReady)
         self.assertEqual(self.disk_state(), before)
 
