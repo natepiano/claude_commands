@@ -245,7 +245,11 @@ def _encode(value: object, variants: dict[str, type]) -> str:
     name = next((name for name, schema in variants.items() if type(value) is schema), None)
     if name is None:
         raise ValueError("unknown admission message")
-    return encode_record({"v": VERSION, "type": name, "data": value}) + "\n"
+    data = gate.snapshot_value(value)
+    if isinstance(value, AdmitRequest) and isinstance(value.run, NoRun):
+        # Remove this main-service compatibility after the admission cut-over.
+        del cast(dict[str, object], data)["run"]
+    return encode_record({"v": VERSION, "type": name, "data": data}) + "\n"
 
 
 def _parse(line: str | bytes, variants: dict[str, type]) -> object:

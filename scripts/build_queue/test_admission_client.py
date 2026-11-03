@@ -33,6 +33,38 @@ class ClientTests(unittest.TestCase):
         _ = self.enterContext(mock.patch("scripts.build_queue.admission_client.socket.socket", side_effect=transport.socket))
         return transport
 
+    def test_live_main_gate_grant_is_admitted_and_released(self) -> None:
+        # Capture: gate_reservation used the live main service on 2026-11-03.
+        grant_line, release_line = (Path(__file__).with_name("fixtures") / "live_main_gate.jsonl").read_bytes().splitlines(keepends=True)
+        with AdmissionFixture() as fixture:
+            request = replace(fixture.request(), profile=gate.ProgramProfile(
+                "merge-gate", "repo", str(fixture.root), gate.FixedCapSizing(1 << 20)))
+            transport = self.use_transport(fixture, Exchange(grant_line), Exchange(release_line))
+            waits: list[wire.Wait] = []
+            result = client.admit(request, waits.append, lambda: request)
+            self.assertIsInstance(result, wire.Admitted)
+            assert isinstance(result, wire.Admitted)
+            self.assertEqual((result.need, result.source), (1 << 20, "cap"))
+            self.assertEqual(waits, [])
+            self.assertIsInstance(client.release(result.reservation, 0), wire.Ok)
+            self.assertEqual(transport.requests[0], request)
+            release = transport.requests[1]
+            assert isinstance(release, wire.ReleaseRequest)
+            self.assertEqual((release.reservation, release.status), (result.reservation, 0))
+
+    def test_live_main_queue_replies_pass_the_client_query_paths(self) -> None:
+        directory = Path(__file__).with_name("fixtures")
+        view_reply = (directory / "live_main_view.json").read_bytes()
+        explain_reply = (directory / "live_main_explain.json").read_bytes()
+        with AdmissionFixture() as fixture:
+            transport = self.use_transport(fixture, Exchange(view_reply), Exchange(explain_reply))
+            reading = client.view()
+            explanation = client.explain()
+            self.assertTrue(reading.view.running)
+            self.assertTrue(explanation.running)
+            self.assertGreater(explanation.totals.measured, 0)
+            self.assertEqual(transport.requests, [wire.ViewRequest(), wire.ExplainRequest()])
+
     def test_main_service_pressure_snapshot_waits_then_admits_without_inventing_condition(self) -> None:
         # Main aeb936809630c8a539613d4b0def9dce0db040c0 produced this reply through wire.encode_reply.
         main_reply = (Path(__file__).with_name("fixtures") / "main_pressure_wait.json").read_bytes()
