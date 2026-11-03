@@ -40,6 +40,14 @@ class ResumeClock(local):
 
 @final
 class StopResumeTests(unittest.TestCase):
+    def test_enveloped_resume_launch_paths_need_no_source_record(self) -> None:
+        from scripts.lib import script_prompts
+
+        with patch.object(script_prompts, "record", side_effect=AssertionError("recorded resume")):
+            result = stop_resume.resume("alpha")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.assertTrue(self.client.prompts[0][1].text.startswith('<system-reminder source="script">'))
+
     def test_resume_names_share_one_snapshot_and_default_reason(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
         row = staff.StaffRow(staff.StaffId("accounts-unit"), "unit", "accounts", None,
@@ -53,6 +61,7 @@ class StopResumeTests(unittest.TestCase):
             read.assert_called_once()
             self.assertIn("resumed by name", self.client.prompts[0][1].text)
             self.assertNotIn("the herdr server restarted", self.client.prompts[0][1].text)
+            self.assertTrue(self.client.prompts[0][1].text.startswith('<system-reminder source="script">'))
 
     def test_unknown_ambiguous_and_remote_names_refuse(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
@@ -90,6 +99,7 @@ class StopResumeTests(unittest.TestCase):
         arguments = cast(list[str], execute.call_args.args[1])
         self.assertEqual(arguments[arguments.index("exec") + 1], "claude3")
         self.assertIn("resumed by name", arguments[-1])
+        self.assertTrue(arguments[-1].startswith('<system-reminder source="script">'))
         self.assertIn("CLAUDE_CONFIG_DIR=" + self.entry["config_dir"], arguments)
         self.assertTrue(pane_record.read("agents")["w1:p2"].get("ended", False))
         self.start.assert_not_called()

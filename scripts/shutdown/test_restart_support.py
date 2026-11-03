@@ -500,14 +500,14 @@ class RestartSupportTests(ShutdownTestCase):
         config = self.root / "notify.conf"
         _ = config.write_text("REVIEW_TIMEOUT_SECONDS=90\n")
         with patch.object(review, "NOTIFY_CONFIG", config):
-            for machine, expected in (("", 220), ("natedev", 260)):
+            for machine, expected in (("", 345), ("natedev", 345)):
                 with (self.subTest(machine=machine),
                       patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT: fixture\n", "")) as sender):
                     _ = settle.alert_user(render("nixos.ups_battery", charge="30", minutes="5"), machine=machine)
                 self.assertEqual(sender.call_args.kwargs["timeout"], expected)
             with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT: fixture\n", "")) as sender:
                 self.assertEqual(settle.send_message("session:owner", "Shutdown", "Stop work"), {"kind": "sent"})
-            self.assertEqual(sender.call_args.kwargs["timeout"], 60)
+            self.assertEqual(sender.call_args.kwargs["timeout"], 180)
 
 
     def test_user_alert_timeout_reports_failed_delivery_without_interrupting_shutdown(self) -> None:
@@ -516,7 +516,7 @@ class RestartSupportTests(ShutdownTestCase):
               patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("fake send", 130)),
               redirect_stderr(io.StringIO()) as errors):
             _ = settle.alert_user(render("nixos.ups_battery", charge="30", minutes="5"))
-        self.assertIn("shutdown: user alert failed: send to user timed out after 130 seconds", errors.getvalue())
+        self.assertIn("shutdown: user alert failed: send to user timed out after 255 seconds", errors.getvalue())
 
 
     def test_ups_alert_ignores_account_hold_and_every_session_progress(self) -> None:
@@ -531,7 +531,7 @@ class RestartSupportTests(ShutdownTestCase):
                 _ = settle.alert_user(render("nixos.ups_battery", charge="30", minutes="5"))
             self.assertEqual(sender.call_args.kwargs["input"], "")
             self.assertIn("nixos.ups_battery", cast(list[str], sender.call_args.args[0]))
-            self.assertEqual(sender.call_args.kwargs["timeout"], 100)
+            self.assertEqual(sender.call_args.kwargs["timeout"], 225)
             self.assertIn("--to", cast(list[str], cast(object, sender.call_args.args[0])))
 
 

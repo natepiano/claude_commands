@@ -31,6 +31,7 @@ from scripts.herdr.fake_herdr import CommandResponse
 
 
 from add_unit_test_support import AddUnitTestCase, configure_test_zone, SHARED, SUBMITTED_PROMPT
+from scripts.lib.script_envelope import SCRIPT_ENVELOPE_START, SCRIPT_ENVELOPE_END, script_prompt
 
 
 def setUpModule() -> None:
@@ -208,7 +209,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
 
         self.assertIn("alpha-unit restore launched", result.stdout)
         self.assertEqual(len(self.servers_started()), 1)
-        self.assertEqual(len(self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766")), 1)
+        self.assertEqual(self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766"), ())
 
     def test_restart_from_a_record_before_the_slug_led_skips_another_productions_live_session(self) -> None:
         self.commit_prepared_row(self.unit_row("review"))
@@ -299,7 +300,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         )
 
         self.assertIn("alpha-unit restore launched", result.stdout)
-        self.assertEqual(len(self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766")), 1)
+        self.assertEqual(self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766"), ())
 
     def test_restore_without_a_units_row_is_refused_and_adds_nothing(self) -> None:
         self.write_shutdown_record(self.shutdown_record("restarting"))
@@ -408,7 +409,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
          "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
-        self.assertEqual(len(self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766")), 1)
+        self.assertEqual(self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766"), ())
         self.assertEqual(len(self.servers_started()), 1)
 
     def test_restart_restore_ignores_a_stale_record_for_another_session(self) -> None:
@@ -439,7 +440,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
          "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
-        self.assertEqual(len(self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766")), 1)
+        self.assertEqual(self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766"), ())
         self.assertEqual(len(self.servers_started()), 1)
 
     def test_restore_ignores_unreadable_stale_shutdown_state(self) -> None:
@@ -470,7 +471,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         )
 
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
-        self.assertEqual(len(self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766")), 1)
+        self.assertEqual(self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766"), ())
         self.assertEqual(len(self.servers_started()), 1)
 
     def test_stale_down_record_does_not_block_a_stopped_marked_restore(self) -> None:
@@ -480,10 +481,9 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertEqual(result, 0, error)
         self.assertEqual(commands, [])
         self.assertEqual((launches, writes), (1, 1))
-        self.assertEqual(len(self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766")), 1)
+        self.assertEqual(self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766"), ())
 
-
-    def test_restore_recording_failure_uses_one_stderr_line_and_does_not_launch(self) -> None:
+    def test_restore_prose_does_not_write_a_scheduled_prompt_record(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
             "62ccbd64-f22e-5647-b20e-7899aa39d766", self.root / "restart-note", "recorded-name", "recorded-herdr"
         )
@@ -492,17 +492,15 @@ class AddUnitRestoreTests(AddUnitTestCase):
             conversation_pause,
             "record_scheduled_prompts",
             side_effect=OSError("first line\nsecond line"),
-        ):
+        ) as record_prompt:
             result, error, _commands, launches, _writes = self.run_with_marked_unit(
                 launch_kind, unit_lookup.ClaudeNotRunning()
             )
 
-        self.assertEqual(result, 1)
-        self.assertEqual(
-            error,
-            "add_unit: restart prompt not recorded: first line\n",
-        )
-        self.assertEqual(launches, 0)
+        self.assertEqual(result, 0, error)
+        self.assertEqual(error, "")
+        self.assertEqual(launches, 1)
+        record_prompt.assert_not_called()
 
     def test_restore_keeps_marked_herdr_with_live_claude_and_reports_missing_submit_proof(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
@@ -754,16 +752,20 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertEqual(claude[claude.index("-n") + 1], "alpha")
         self.assertNotIn("claude", claude)
         self.assertIn("You are now alpha-unit in production build-followups", prompt)
-        self.assertTrue(prompt.endswith(restart_note), prompt)
+        opening_text = prompt.removeprefix(SCRIPT_ENVELOPE_START).removesuffix(SCRIPT_ENVELOPE_END).strip()
+        self.assertEqual(prompt, script_prompt(opening_text))
+        self.assertTrue(opening_text.endswith(restart_note), opening_text)
         self.assertNotIn("Run /unit:direct", prompt)
         recorded = self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766")
-        self.assertEqual(recorded, (existing_prompt, prompt))
+        self.assertEqual(recorded, (existing_prompt,))
         self.assertIs(conversation_pause.prompt_source(prompt, frozenset, lambda: recorded),
+                      conversation_pause.PromptSource.SCHEDULED)
+        self.assertIs(conversation_pause.prompt_source(prompt, frozenset, lambda: ()),
                       conversation_pause.PromptSource.SCHEDULED)
         start, = (row for row in self.herdr_calls() if row[2:4] == ["agent", "start"])
         self.assertEqual(start[4], "build-followups-restore----")
 
-    def test_restore_refuses_launch_when_prompt_cannot_be_recorded(self) -> None:
+    def test_restore_prose_launches_when_prompt_records_are_unavailable(self) -> None:
         self.commit_prepared_row(self.unit_row())
         prior = self.root / "prior-session"
         prior.mkdir()
@@ -782,10 +784,11 @@ class AddUnitRestoreTests(AddUnitTestCase):
             "--host-session", "recorded-herdr",
          "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
-        self.assertEqual(result.returncode, 1, (result.stdout, result.stderr))
-        self.assertEqual(len(result.stderr.splitlines()), 1)
-        self.assertIn("add_unit: restart prompt not recorded:", result.stderr)
-        self.assertEqual(self.servers_started(), [])
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(len(self.servers_started()), 1)
+        prompt = self.opening_prompt()
+        self.assertIs(conversation_pause.prompt_source(prompt, frozenset, lambda: ()),
+                      conversation_pause.PromptSource.SCHEDULED)
 
     def test_exact_table_row_is_adopted_without_suffix_in_another_production(self) -> None:
         row = self.unit_row("designers", branch="build-followups-designers",

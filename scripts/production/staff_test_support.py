@@ -252,7 +252,6 @@ def isolated_source_readers() -> Generator[None]:
             ("showrunners", {
                 "NOTIFIER_STATE_DIR": Path(os.environ["NOTIFIER_STATE_DIR"]),
                 "SHOWRUNNER_STATE_DIR": Path(os.environ["SHOWRUNNER_STATE_DIR"]),
-                "SESSIONS_DIR": Path(os.environ["NOTIFIER_SESSIONS_DIR"]),
             }),
             ("pane_record", {"RECORD_DIR": Path(os.environ["HERDR_PANE_RECORD_DIR"])}),
         ):
