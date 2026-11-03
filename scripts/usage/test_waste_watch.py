@@ -15,7 +15,8 @@ from typing import cast, final, override
 from unittest import mock
 
 from scripts.usage import collect, usage_report, waste_watch
-from scripts.production import showrunners
+from scripts.production import session_staff, showrunners, staff
+from scripts.production.staff_test_support import isolated_staff_file, recorded_unit, recorded_showrunner, fixture_member
 from scripts.usage.test_collect import FAILING_WATCH, CollectorFixture
 
 
@@ -46,6 +47,7 @@ class WasteWatchTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         state = self.root / "state"
         state.mkdir()
         self.db_path = state / "usage.db"
@@ -63,11 +65,13 @@ class WasteWatchTests(unittest.TestCase):
         _ = showrunner_doc.write_text(
             "# Watch\n\n## Units\n\n| Unit | Worktree |\n| --- | --- |\n"
             + f"| alpha | `{self.worktree}` |\n", encoding="utf-8")
+        _ = recorded_unit("watch-owner", "alpha", self.worktree, showrunner_doc)
         self.lookup = waste_watch.ShowrunnersFound((waste_watch.Showrunner(
             "watch", ADDRESS, usage_report.document_units(showrunner_doc)),))
         self.lookups = 0
 
-        def registered() -> waste_watch.ShowrunnerLookup:
+        def registered(*, resolver: session_staff.RowResolver | None = None) -> waste_watch.ShowrunnerLookup:
+            del resolver
             self.lookups += 1
             return self.lookup
 
@@ -113,7 +117,8 @@ class WasteWatchTests(unittest.TestCase):
         partial = showrunners.ShowrunnerDiscovery([], (
             showrunners.ShowrunnerLookupFailure("missing", "fixture lookup failed"),))
         # The fixture normally replaces this wrapper; exercise the real library entry here.
-        with mock.patch.object(showrunners, "registered_showrunners", return_value=partial):
+        with (mock.patch.object(showrunners, "registered_showrunners", return_value=partial),
+              mock.patch.object(staff, "snapshot", side_effect=OSError("fixture lookup failed"))):
             found = REAL_DISCOVERY()
         self.assertIsInstance(found, waste_watch.ShowrunnerLookupFailed)
         assert isinstance(found, waste_watch.ShowrunnerLookupFailed)
@@ -208,6 +213,11 @@ class WasteWatchTests(unittest.TestCase):
         self.assertEqual((self.sent(), self.alert_times()), ([], {}))
 
     def test_without_a_showrunner_the_alert_goes_to_stdout_and_counts_as_given(self) -> None:
+        doc = self.root / "loose-production.md"
+        _ = doc.write_text("# Loose production\n")
+        owner = recorded_showrunner("loose-owner", doc)
+        _ = fixture_member("unit", name="loose", parent=owner.id,
+                           worktree=staff.PresentWorktree("natedev", Path("/invented/loose")))
         self.request("loose", 0, 900_000, folder="/invented/loose")
         self.wait("loose", 1, 500_000, folder="/invented/loose")
         output = self.run_watch()

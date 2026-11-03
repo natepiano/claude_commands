@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import override
 from scripts.production import staff
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.production.staff_test_support import isolated_staff_file, unit_membership, showrunner_relationship
+from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, unit_membership
 
 SCRIPT = Path(__file__).with_name("prune_phase_notes.py")
 
@@ -60,13 +60,12 @@ class PrunePhaseNotesTests(unittest.TestCase):
             f"| `alpha-unit` | `docs/alpha.md` | `{alpha}` | `alpha` | — | — |", "",
         )), encoding="utf-8")
         self.timer(slug, doc)
-        owner = showrunner_relationship(slug)
-        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
         unit = unit_membership(slug, "alpha-unit")
         _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", alpha), expected=unit.worktree)
         return doc
 
     def timer(self, slug: str, doc: Path) -> None:
+        _ = recorded_showrunner(slug, doc)
         instance = self.notifier / f"showrunner-{slug}"
         instance.mkdir()
         _ = (instance / "conf").write_text(

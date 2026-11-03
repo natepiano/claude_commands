@@ -22,6 +22,7 @@ from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
 import five_hour
 from scripts.whoami.agent_accounts import CodexHomeSource, CodexRateLimits, Quota, Report
 from scripts.accounts import accounts, role_map
+from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner
 
 import escalate  # five_hour puts scripts/message on the path
 import quota_alert
@@ -376,7 +377,10 @@ class AccountHoldTests(unittest.TestCase):
         _ = self.enterContext(patch.object(five_hour, "STATE", self.root / "notices"))
         _ = self.enterContext(patch.object(escalate, "schedule"))
         _ = self.enterContext(patch.object(escalate, "load_settings", return_value=CONFIG))
-        _ = self.enterContext(patch.object(escalate, "registered_showrunners", return_value=SHOWRUNNERS))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        document = self.root / "show-production.md"
+        _ = document.write_text("# Show production\n", encoding="utf-8")
+        _ = recorded_showrunner("hana", document)
         _ = self.enterContext(patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")))
         _ = self.enterContext(patch.object(five_hour, "load_config", return_value=CONFIG))
         _ = self.enterContext(patch.object(quota_alert, "registered_showrunners", return_value=SHOWRUNNERS))
