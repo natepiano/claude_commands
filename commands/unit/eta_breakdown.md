@@ -1,5 +1,5 @@
 ---
-description: Break this unit's phase ETA into the steps left before it, each with what it does, how long it should take and when it should end, for the user to review.
+description: Show phase ETA steps and durations.
 ---
 
 # ETA breakdown

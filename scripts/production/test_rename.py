@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import fixture_member
+
 import json
 import os
 import shlex
@@ -20,6 +22,37 @@ from scripts.production.rename_test_support import CHECK_TIMER_HANDOFF, FAIL_GIT
 
 @final
 class ProductionRenameTests(support.ProductionRenameFixture):
+    def test_document_rename_updates_a_wrapped_location_without_reactivating_its_row(self) -> None:
+        row = self.production_row()
+        _ = staff.set_doc(row.id, staff.WrappedDoc("natedev", self.doc))
+        self.assert_success(self.run_rename("apply"))
+        retained = staff.by_id(row.id)
+        assert retained is not None
+        self.assertEqual((retained.id, retained.name, retained.parent, retained.doc),
+                         (row.id, NEW, row.parent, staff.WrappedDoc("natedev", self.new_doc)))
+        before = self.snapshot()
+        self.assert_success(self.run_rename("apply"))
+        self.assertEqual(self.snapshot(), before)
+
+    def test_retry_after_doc_move_updates_the_live_doc_on_the_same_staff_id(self) -> None:
+        row = self.production_row()
+        _ = staff.set_doc(row.id, staff.LiveDoc("natedev", self.doc))
+        with mock.patch.object(staff, "set_doc", side_effect=OSError("stopped after doc move")):
+            interrupted = self.run_rename("apply")
+        self.assertNotEqual(interrupted.returncode, 0, interrupted.stdout + interrupted.stderr)
+        self.assertFalse(self.doc.exists())
+        self.assertTrue(self.new_doc.is_file())
+        retained = staff.by_id(row.id)
+        assert retained is not None
+        self.assertEqual(retained.doc, staff.LiveDoc("natedev", self.doc))
+        self.assert_success(self.run_rename("apply"))
+        renamed = staff.by_id(row.id)
+        assert renamed is not None
+        self.assertEqual(renamed.doc, staff.LiveDoc("natedev", self.new_doc))
+        before = self.snapshot()
+        self.assert_success(self.run_rename("apply"))
+        self.assertEqual(self.snapshot(), before)
+
     def production_row(self) -> staff.StaffRow:
         return next(row for row in staff.find(kind="showrunner") if row.name == OLD)
 
@@ -38,12 +71,14 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         _ = self.git("add", str(self.doc))
         _ = self.git("commit", "-m", "Record workspace name")
         self.assert_success(self.run_rename("apply"))
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "showrunner", "new", None))
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(
+            row.id, "showrunner", "new", None, current_session=row.id,
+            doc=staff.LiveDoc("natedev", self.new_doc)))
         self.assertEqual(self.journal()["staff_id"], row.id)
         self.assertIn("- **Showrunner session:** `new`", self.new_doc.read_text())
 
     def test_taken_staff_name_refuses_before_sources_change(self) -> None:
-        _ = staff.ensure("showrunner", name=NEW)
+        _ = fixture_member("showrunner", name=NEW)
         before = self.snapshot()
         failed = self.run_rename("apply")
         self.assertEqual(failed.returncode, 2, failed.stderr)
@@ -52,9 +87,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
 
     def test_missing_staff_member_refuses_before_sources_change(self) -> None:
         row = self.production_row()
-        for unit in staff.snapshot().find(kind="unit", parent=row.id):
-            _ = staff.retire(unit.id)
-        _ = staff.retire(row.id)
+        self.forget_rows(row.id, *(unit.id for unit in staff.snapshot().find(kind="unit", parent=row.id)))
         before = self.snapshot()
         failed = self.run_rename("apply")
         self.assertEqual(failed.returncode, 2, failed.stderr)
@@ -87,6 +120,9 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         for path in (self.doc, self.new_doc):
             if path.exists():
                 self.write(path, path.read_text().replace(str(old), str(self.checkout)))
+        row = next(row for row in staff.find(kind="showrunner") if row.name in (OLD, NEW))
+        location = self.new_doc if self.new_doc.exists() else self.doc
+        _ = staff.set_doc(row.id, staff.LiveDoc("natedev", location))
         for conf in self.notifier.glob("showrunner-*/conf"):
             self.write(conf, conf.read_text().replace(str(old), str(self.checkout)))
         for unit in UNITS:
@@ -96,7 +132,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
 
     def assert_journal_has_no_current_locations(self) -> None:
         journal = self.journal()
-        for key in ("checkout", "old_doc", "new_doc", "timer", "state", "stall", "review_pool"):
+        for key in ("checkout", "old_doc", "new_doc", "timer", "state", "stall"):
             self.assertNotIn(key, journal)
         self.assertEqual(journal["plans"], [f"docs/plans/{unit}.md" for unit in UNITS])
         self.assertNotIn(str(self.root), json.dumps(journal))
@@ -129,7 +165,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         journal.update(checkout=str(self.checkout), old_doc=str(self.doc), new_doc=str(self.new_doc),
                        plans=[str(path) for path in plan.plans], timer=move_record(plan.timer),
                        state=[move_record(move) for move in plan.state],
-                       stall=[move_record(move) for move in plan.stall], review_pool=move_record(plan.review_pool))
+                       stall=[move_record(move) for move in plan.stall])
         self.write(self.state / "new/rename.json", json.dumps(journal))
         self.move_showrunner_checkout()
         self.assert_success(self.run_rename("apply"))
@@ -173,6 +209,8 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.new_doc = self.doc.with_name("new-production.md")
         _ = self.git("worktree", "repair")
         self.write(self.new_doc, self.new_doc.read_text().replace(str(old), str(self.checkout)))
+        row = next(row for row in staff.find(kind="showrunner") if row.name == NEW)
+        _ = staff.set_doc(row.id, staff.LiveDoc("natedev", self.new_doc))
         conf = self.notifier / "showrunner-new/conf"
         self.write(conf, conf.read_text().replace(str(old), str(self.checkout)))
         self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
@@ -261,12 +299,11 @@ class ProductionRenameTests(support.ProductionRenameFixture):
                      *(self.state / directory / f"{slug}.json"
                        for directory in ("review-paused", "outstanding") for slug in (OLD, NEW)),
                      self.state / "child/parent",
-                     *(self.stall_path(slug, unit) for unit in UNITS for slug in (OLD, NEW)),
-                     self.pool / "old", self.pool / "new"):
+                     *(self.stall_path(slug, unit) for unit in UNITS for slug in (OLD, NEW))):
             self.assertIn(str(path), result.stdout)
         self.assertIn(f"{self.state}/*/parent", result.stdout)
         steps = [int(line.split(".", 1)[0]) for line in result.stdout.splitlines()]
-        self.assertEqual(set(steps), set(range(1, 9)))
+        self.assertEqual(set(steps), set(range(1, 8)))
         self.assertEqual(steps, sorted(steps))
         self.assertIn("merge branch old -> new", result.stdout)
         self.assertIn("push origin new", result.stdout)
@@ -372,7 +409,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertTrue((self.notifier / "showrunner-old/conf").exists())
         self.assertFalse((self.notifier / "showrunner-new").exists())
         self.assert_success(self.run_rename("apply", source="ancient"))
-        self.assertEqual(self.completed_steps(), 9)
+        self.assertEqual(self.completed_steps(), 8)
         self.assertEqual(self.git("rev-parse", "new^"), base)
         self.assertEqual(self.git("status", "--porcelain"), "")
 
@@ -418,6 +455,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         moved_doc = directory / self.doc.name
         _ = self.git("mv", str(self.doc), str(moved_doc))
         self.doc = moved_doc
+        _ = staff.set_doc(self.production_row().id, staff.LiveDoc("natedev", moved_doc))
         self.new_doc = directory / "new-production.md"
         _ = self.git("commit", "-m", "Keep the production doc under a path with spaces")
         prefix = "CHECK=env 'NOTE=keep  spacing'  zsh /scripts/production_check.sh "
@@ -448,7 +486,6 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertTrue(self.new_doc.exists())
         self.assertTrue((self.notifier / "showrunner-new/conf").exists())
         self.assertFalse((self.notifier / "showrunner-old").exists())
-        self.assertTrue((self.pool / "old/pool.json").exists())
         for unit in UNITS:
             self.assertTrue(self.stall_path(OLD, unit).exists())
             self.assertRegex(self.plan_path(unit).read_text(),

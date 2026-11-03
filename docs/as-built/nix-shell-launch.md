@@ -24,7 +24,28 @@ under `~/rust`, `~/worktrees`, and `~/.claude*` are approved with
 when their `.git`, `commondir`, and `gitdir` back pointer prove registration by
 a repository under a trusted root, using file reads alone. This covers
 style-sync lint snapshots made with `git worktree add` under `/tmp/claude/session`;
-clones and forged links still require explicit approval. Files elsewhere require existing explicit approval;
+forged links still require explicit approval.
+
+Copies registered by `copies.py` under the configured scratch copies root
+(normally `/tmp/claude/copies/<pair>/<copy>`) also qualify when `.envrc` is a
+regular file, not a symlink, at the copy's top level. `registered_copy` uses
+`copy_record.copy_folder` to prove that location and `copy_record.read_record` to
+require a readable `copy_record.Registered` record. Its `source_path` must resolve
+to a directory under a trusted root. Git resolves `.envrc` at the record's
+`source_commit` and hashes the copy's file with `hash-object --no-filters`;
+approval requires equal blob hashes. Both git commands run in the trusted
+source repository with no `GIT_*` variables in their environment, so the copy supplies no git configuration or filters.
+Missing, malformed, unreadable or mismatching evidence requires explicit
+approval; an unregistered clone or a copied record outside the copies root
+does not qualify. `scripts/lib/copy_record.py` owns the copy locations and record
+reader using only the standard library, so importing it does not reach scratch
+or herdr. It is imported only when checking a copy, preserving the helper's
+cheap startup.
+
+This rule checks only `.envrc`. Files it loads, including `flake.nix`, are not
+checked and may differ from the source commit.
+
+Files elsewhere require existing explicit approval;
 a blocked-file refusal names the `direnv allow <path>` command. Each direnv
 command has a 600-second timeout. `direnv export json` runs in the requested
 directory with the supplied base environment. Strings replace variables;
@@ -50,16 +71,17 @@ resolver before calling `exec`.
 | Path | Integration |
 | --- | --- |
 | `herdr/herdr.py` | `launch_agent` checks `ensure(cwd, base_env)` before `open_tab`. It returns `AgentLaunched(pane, outcome)` or a typed `Refused`; refusal creates no pane and starts no agent. |
-| `production/add_unit.py` | New units, resumes, renames, transfers, watchdog recovery and account moves use `launch_agent`. |
+| `production/add_unit.py` | Unit launches use `launch_agent`. Account moves and watchdog recovery use the shared stop and resume path. |
 | `production/add_showrunner.py` | Child showrunners use `launch_agent`. |
-| `shutdown/restart.py` | Claude restarts and Codex snapshot restores prepare the saved cwd and account environment before `restore_server` can open a desktop window, then use `launch_prepared_agent`. A refusal leaves the snapshot available and opens no window or tab. |
+| `shutdown/restart.py` | Record-driven restarts prepare the saved cwd and account environment before `restore_server`, then use `launch_prepared_agent`. Refusal retains the record. |
+| `shutdown/stop_resume.py` | Shared resume runs the account exec command in the session's pane. The exec path prepares the launch shell. |
 | `shutdown/pane_restore.py` | Saved Claude panes use `launch_agent` before replacing their old tab. |
 | `herdr/herdr_sessions.py` | Standalone starts and resumes use `launch_agent`. |
 | `berth_fix/launch.sh` | Proves the worktree before opening a window; both window and current-terminal starts use `nix_env.py exec`. Worktree approval failure is fatal. |
 | `agents/agent_bg.sh` | Proves the cwd while making worker settings, passes the loaded env through settings for the long-lived background daemon, and starts the CLI through `exec`. |
 | `agents/agent_exec.sh` | Claude print runs use `exec` after changing to their requested directory. |
 | `agents/codex_mesh.py` | The shared Codex app-server calls `ensure(worktree, environment)` and starts Codex directly with the loaded env. Protected account, run, temporary-directory and held-role values come from the caller. `Refused` logs the helper's line, remembers the failed shell, and falls back to the caller env so other workers keep their shared server. The recorded pid is the server's pid. |
-| `accounts/accounts.py` | `exec` calls `launch_shell_environment(cwd)` for every Claude and Codex label. That guard dynamically loads `nix_env` and calls `ensure(cwd, os.environ)`, puts the caller's HOME back, and exits 1 with the helper's reason on `Refused`. |
+| `accounts/accounts.py` | Normal `exec` launches call `launch_shell_environment(cwd)`. It calls `ensure`, restores the caller's HOME, and refuses an unusable shell. `codex update` bypasses account launch. |
 | `cli_agent/cli_agent.sh` | Interactive and command Claude launches use `exec` in the caller's directory. |
 | `notify/review.py` | Loads the current directory's env before the Claude reviewer starts; refusal returns an unreviewed result. |
 | `make_a_worktree/direnv_allow.sh` | Thin, silent-on-success `ensure` call; failure retains the helper's stderr and exit status. `commands/make_a_worktree.md` requires stopping on failure. |

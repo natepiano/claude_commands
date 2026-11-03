@@ -28,6 +28,13 @@ else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "style"))
     import style_sync
 
+from scripts.lib import copy_record
+from scripts.message import sessions
+from scripts.production import staff
+from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id
+
+MAKER_ID = fixture_runtime_id("scratch-Claude-session")
+
 RUN = "run:2a858b68-0f9a-4af2-b3cf-a776e6b180cb"
 ROW = "row:cargo-liner-C54"
 
@@ -39,8 +46,23 @@ class ScratchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(mock.patch.dict(os.environ, {
-            scratch.ROOT_ENV: str(self.base / "scratch"), scratch.VISIBLE_ROOT_ENV: str(self.base / "repro"),
-            scratch.HOLDS_ENV: str(self.base / "holds.json"), "CLAUDE_CODE_SESSION_ID": "maker-session"}))
+            copy_record.ROOT_ENV: str(self.base / "scratch"), scratch.VISIBLE_ROOT_ENV: str(self.base / "repro"),
+            scratch.HOLDS_ENV: str(self.base / "holds.json"), copy_record.COPIES_ENV: str(self.base / "copies"),
+            "CODEX_THREAD_ID": MAKER_ID, "STAFF_FILE": str(self.base / "staff.json")}))
+        _ = staff.ensure("showrunner", name="maker", runtime_id=MAKER_ID)
+        def registered_plan(unit: str) -> Path:
+            return self.base / "registered-plans" / f"{unit}.md"
+
+        _ = self.enterContext(mock.patch.object(scratch, "registered_plan", side_effect=registered_plan))
+        _ = self.unit_plan("maker-unit", "### Phase 21 — Make a copy · status: todo\n")
+        _ = self.unit_plan("next-unit", "### Phase 22 — Use a copy · status: todo\n")
+        _ = self.unit_plan("builds-unit", "### Phase 7 — Check a build · status: todo\n")
+
+    def unit_plan(self, unit: str, text: str) -> Path:
+        plan = self.base / "registered-plans" / f"{unit}.md"
+        plan.parent.mkdir(exist_ok=True)
+        _ = plan.write_text(text)
+        return plan
 
     def git(self, repo: Path, *arguments: str) -> None:
         _ = subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", *arguments],
@@ -77,7 +99,7 @@ class ScratchTests(unittest.TestCase):
 
     def test_copy_record_with_a_legacy_shared_target_still_loads(self) -> None:
         path = self.copy()
-        record_path = path / scratch.RECORD
+        record_path = path / copy_record.RECORD
         fields = cast(dict[str, object], json.loads(record_path.read_text()))
         fields["target_mode"] = "shared"
         fields["shared_target"] = str(self.base / "old-build-folder")
@@ -85,20 +107,20 @@ class ScratchTests(unittest.TestCase):
 
         record = scratch.task_of(path)
 
-        self.assertIsInstance(record, scratch.Registered)
-        assert isinstance(record, scratch.Registered)
+        self.assertIsInstance(record, copy_record.Registered)
+        assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.task, "gate:copy")
         self.assertEqual(record.fields, fields)
         self.assertIsInstance(scratch.lifetime(path), scratch.Live)
         self.assertFalse((self.base / "old-build-folder").exists())
 
     def test_record_and_lifetime_results_distinguish_missing_bad_and_external_end(self) -> None:
-        self.assertIsInstance(scratch.task_of(self.base), scratch.NotRegistered)
-        _ = (self.base / scratch.RECORD).write_text("bad json")
+        self.assertIsInstance(scratch.task_of(self.base), copy_record.NotRegistered)
+        _ = (self.base / copy_record.RECORD).write_text("bad json")
         bad = scratch.task_of(self.base)
-        self.assertIsInstance(bad, scratch.UnreadableRecord)
-        assert isinstance(bad, scratch.UnreadableRecord)
-        self.assertIn(str(self.base / scratch.RECORD), bad.reason)
+        self.assertIsInstance(bad, copy_record.UnreadableRecord)
+        assert isinstance(bad, copy_record.UnreadableRecord)
+        self.assertIn(str(self.base / copy_record.RECORD), bad.reason)
         self.assertIsInstance(scratch.task_end("until:bad"), scratch.Unknown)
         self.assertIsInstance(scratch.task_end("gate:outside"), scratch.Live)
         self.assertIsInstance(scratch.task_end("until:2000-01-01T0000Z"), scratch.Ended)
@@ -109,7 +131,7 @@ class ScratchTests(unittest.TestCase):
         scratch.register_copy(path, task="gate:copy", owner_unit="maker-unit", source_path="/source",
                               source_commit="a" * 40, copy_commit="b" * 40, target_mode="seed",
                               seed_source="/seed", borrows_from="/source/.git", land_target="origin/builds")
-        fields = cast(dict[str, object], json.loads((path / scratch.RECORD).read_text()))
+        fields = cast(dict[str, object], json.loads((path / copy_record.RECORD).read_text()))
         self.assertEqual({key: fields[key] for key in ("source_path", "source_commit", "copy_commit", "target_mode",
                          "seed_source", "borrows_from", "owner_unit", "task", "land_target")},
                          {"source_path": "/source", "source_commit": "a" * 40, "copy_commit": "b" * 40,
@@ -119,13 +141,13 @@ class ScratchTests(unittest.TestCase):
         self.assertIsNone(scratch.repo_problem(path))
         _ = (path / "ordinary").write_text("keep me")
         self.assertEqual(scratch.repo_problem(path), "it has uncommitted changes")
-        before = (path / scratch.RECORD).read_bytes()
+        before = (path / copy_record.RECORD).read_bytes()
         with mock.patch.object(os, "replace", side_effect=OSError("injected record stop")):
             with self.assertRaises(OSError):
                 scratch.hand_over(path, "next-unit", "gate:next-unit")
-        self.assertEqual((path / scratch.RECORD).read_bytes(), before)
+        self.assertEqual((path / copy_record.RECORD).read_bytes(), before)
         scratch.hand_over(path, "next-unit", "gate:next-unit")
-        self.assertIsInstance(scratch.task_of(path), scratch.Registered)
+        self.assertIsInstance(scratch.task_of(path), copy_record.Registered)
 
     def test_phase_lifetime_reads_current_and_parked_phases_and_fails_closed(self) -> None:
         run = self.base / "run"
@@ -146,6 +168,84 @@ class ScratchTests(unittest.TestCase):
         self.assertIsInstance(scratch.lifetime(path), scratch.Ended)
         self.assertEqual(scratch.end("phase:maker-unit/21"), [path])
 
+    def test_an_existing_unknown_phase_task_can_update_and_end(self) -> None:
+        path = self.base / "scratch" / "legacy-phase"
+        path.mkdir(parents=True)
+        task = "phase:maker-unit/ci-icon"
+        scratch.write_record(path, task, 100.0)
+
+        scratch.renew(path, now=200.0)
+
+        record = scratch.task_of(path)
+        assert isinstance(record, copy_record.Registered)
+        self.assertEqual(record.task, task)
+        self.assertEqual(record.fields["renewed"], 200.0)
+        self.assertEqual(scratch.end(task), [path])
+        self.assertFalse(path.exists())
+
+    def test_unknown_phase_is_refused_before_creation_or_hand_over(self) -> None:
+        path = self.copy()
+        before = (path / copy_record.RECORD).read_bytes()
+        for operation in ("new", "adopt", "hand-over"):
+            with self.subTest(operation=operation):
+                loose = self.base / "loose"
+                loose.mkdir(exist_ok=True)
+                _ = (loose / "work").write_text("keep this work")
+                with self.assertRaises(scratch.ScratchError) as refusal:
+                    if operation == "new":
+                        _ = scratch.new("phase:maker-unit/ci-icon")
+                    elif operation == "adopt":
+                        _ = scratch.adopt(loose, "phase:maker-unit/ci-icon")
+                    else:
+                        scratch.hand_over(path, "maker-unit", "phase:maker-unit/ci-icon")
+                message = str(refusal.exception)
+                for form in ("ci-icon", "phase", "gate:<id>", "--until <when>"):
+                    self.assertIn(form, message)
+                self.assertEqual((path / copy_record.RECORD).read_bytes(), before)
+                self.assertEqual((loose / "work").read_text(), "keep this work")
+                self.assertFalse((self.base / "scratch").exists())
+
+    def test_real_phase_ids_come_from_the_registered_plan(self) -> None:
+        _ = self.unit_plan("maker-unit", (
+            "### Phase 21 — Finished work (abcdef12)\n\n"
+            "### Phase 21 Review\n\n"
+            "### Phase 22a — Split work · status: todo\n"))
+        caller_plan = self.base / "checkout" / "docs" / "plans" / "maker-unit.md"
+        caller_plan.parent.mkdir(parents=True)
+        _ = caller_plan.write_text("### Phase 99 — Caller-only phase · status: todo\n")
+        old_cwd = Path.cwd()
+        os.chdir(caller_plan.parents[2])
+        self.addCleanup(os.chdir, old_cwd)
+        for phase in ("21", "22a"):
+            with self.subTest(phase=phase):
+                task = f"phase:maker-unit/{phase}"
+                path = scratch.new(task)
+                self.assertTrue(path.is_dir())
+                record = scratch.task_of(path)
+                assert isinstance(record, copy_record.Registered)
+                self.assertEqual(record.task, task)
+                self.assertEqual(record.fields["phase_id"], phase)
+        with self.assertRaises(scratch.ScratchError):
+            _ = scratch.new("phase:maker-unit/99")
+
+    def test_phase_creation_without_a_readable_registered_plan_names_the_cause(self) -> None:
+        plan = self.unit_plan("maker-unit", "### Phase 21 — Work · status: todo\n")
+        for cause in ("unknown unit", "missing plan", "invalid encoding"):
+            with self.subTest(cause=cause):
+                unit = "unregistered-unit" if cause == "unknown unit" else "maker-unit"
+                if cause == "missing plan":
+                    plan.unlink()
+                elif cause == "invalid encoding":
+                    _ = plan.write_bytes(b"\xff")
+                with self.assertRaises(scratch.ScratchError) as refusal:
+                    _ = scratch.new(f"phase:{unit}/21")
+                message = str(refusal.exception)
+                self.assertIn(unit, message)
+                self.assertIn("plan", message.lower())
+                if cause != "unknown unit":
+                    self.assertIn(str(plan), message)
+                self.assertFalse((self.base / "scratch").exists())
+
     def test_hand_over_recovers_after_a_process_stops_before_record_replace(self) -> None:
         path = self.copy()
         program = ("import os,sys; from pathlib import Path; from scripts.lib import scratch; "
@@ -154,8 +254,8 @@ class ScratchTests(unittest.TestCase):
         self.assertEqual(stopped.returncode, 71, stopped.stderr)
         scratch.hand_over(path, "next-unit", "gate:next-unit")
         record = scratch.task_of(path)
-        self.assertIsInstance(record, scratch.Registered)
-        assert isinstance(record, scratch.Registered)
+        self.assertIsInstance(record, copy_record.Registered)
+        assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.task, "gate:next-unit")
         self.assertEqual(record.fields["owner_unit"], "next-unit")
         self.assertIsNone(scratch.repo_problem(path))
@@ -201,8 +301,8 @@ class ScratchTests(unittest.TestCase):
         before = alternate.read_text()
         scratch.hand_over(parent, "next-unit", "gate:next-unit")
         registered = scratch.task_of(parent)
-        self.assertIsInstance(registered, scratch.Registered)
-        assert isinstance(registered, scratch.Registered)
+        self.assertIsInstance(registered, copy_record.Registered)
+        assert isinstance(registered, copy_record.Registered)
         self.assertEqual(registered.task, "gate:next-unit")
         self.assertEqual(registered.fields["owner_unit"], "next-unit")
         self.assertEqual(alternate.read_text(), before)
@@ -238,7 +338,7 @@ class ScratchTests(unittest.TestCase):
         with scratch.copy_lock(path):
             self.assertEqual(scratch.end("gate:copy"), [])
         self.assertTrue(path.is_dir())
-        _ = (path / scratch.RECORD).write_text("bad record")
+        _ = (path / copy_record.RECORD).write_text("bad record")
         self.assertEqual(scratch.end("gate:copy"), [])
         self.assertTrue(path.is_dir())
 
@@ -270,9 +370,9 @@ class ScratchTests(unittest.TestCase):
         path = self.copy()
         alias = self.base / "tmp-link"
         alias.symlink_to(self.base / "copies", target_is_directory=True)
-        with mock.patch.dict(os.environ, {scratch.COPIES_ENV: str(alias)}):
+        with mock.patch.dict(os.environ, {copy_record.COPIES_ENV: str(alias)}):
             linked = alias / "show-maker" / "a"
-            self.assertEqual(scratch.copy_folder(linked), path)
+            self.assertEqual(copy_record.copy_folder(linked), path)
             scratch.register_copy(linked, task="gate:copy", owner_unit="maker-unit", source_path=str(self.base),
                                   source_commit="a", copy_commit="b", target_mode="none", seed_source="", borrows_from="")
             with scratch.copy_lock(linked), (path / scratch.BUSY).open("r") as probe:
@@ -285,9 +385,9 @@ class ScratchTests(unittest.TestCase):
             self.assertEqual(scratch.end("gate:copy"), [])
         scratch.hand_over(path, "next-unit", "gate:next")
         record = scratch.task_of(path)
-        assert isinstance(record, scratch.Registered)
+        assert isinstance(record, copy_record.Registered)
         self.assertNotIn("ended", record.fields)
-        scratch.atomic_record(path / scratch.RECORD, {**record.fields, "ended": 123, "ended_task": "gate:copy"})
+        scratch.atomic_record(path / copy_record.RECORD, {**record.fields, "ended": 123, "ended_task": "gate:copy"})
         self.assertIsInstance(scratch.lifetime(path), scratch.Live)
 
     def test_a_busy_tasks_end_evidence_survives_until_the_last_holder_exits(self) -> None:
@@ -297,7 +397,7 @@ class ScratchTests(unittest.TestCase):
             self.assertIsInstance(scratch.lifetime(path), scratch.Live)
         self.assertIsInstance(scratch.lifetime(path), scratch.Ended)
         record = scratch.task_of(path)
-        assert isinstance(record, scratch.Registered)
+        assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.fields["ended_task"], "gate:copy")
 
     def test_end_rechecks_task_after_a_hand_over_between_snapshot_and_lock(self) -> None:
@@ -322,8 +422,8 @@ class ScratchTests(unittest.TestCase):
         parent = self.copy("parent", task="until:2000-01-01T0000Z")
         child = self.copy("child")
         record = scratch.task_of(child)
-        assert isinstance(record, scratch.Registered)
-        scratch.atomic_record(child / scratch.RECORD, {**record.fields, "borrows_from": str(parent / ".git")})
+        assert isinstance(record, copy_record.Registered)
+        scratch.atomic_record(child / copy_record.RECORD, {**record.fields, "borrows_from": str(parent / ".git")})
         for held in (busy.parent, self.base / "copies", self.base):
             with self.subTest(held=held):
                 _ = scratch.hold(held, "gate:ancestor", "copy container")
@@ -345,7 +445,7 @@ class ScratchTests(unittest.TestCase):
         path = self.copy()
 
         def stopped_removal(folder: Path) -> None:
-            (folder / scratch.RECORD).unlink()
+            (folder / copy_record.RECORD).unlink()
             raise OSError("stopped after record unlink")
 
         with mock.patch.object(scratch, "remove", side_effect=stopped_removal):
@@ -374,8 +474,8 @@ class ScratchTests(unittest.TestCase):
         self.git(source, "update-ref", "refs/remotes/origin/work", "HEAD")
         path = self.copy(task="landed:maker-unit/work", land_target="origin/main")
         record = scratch.task_of(path)
-        assert isinstance(record, scratch.Registered)
-        scratch.atomic_record(path / scratch.RECORD, {**record.fields, "source_path": str(source)})
+        assert isinstance(record, copy_record.Registered)
+        scratch.atomic_record(path / copy_record.RECORD, {**record.fields, "source_path": str(source)})
         self.assertIsInstance(scratch.lifetime(path), scratch.Live)
         self.git(source, "update-ref", "refs/remotes/origin/main", "HEAD")
         self.assertIsInstance(scratch.lifetime(path), scratch.Ended)
@@ -391,17 +491,17 @@ class ScratchTests(unittest.TestCase):
             with self.subTest(task=task):
                 scratch.hand_over(path, "next-unit", task)
                 record = scratch.task_of(path)
-                assert isinstance(record, scratch.Registered)
+                assert isinstance(record, copy_record.Registered)
                 self.assertEqual(record.task, task)
                 self.assertEqual(record.fields["owner_unit"], "next-unit")
-        before = (path / scratch.RECORD).read_bytes()
+        before = (path / copy_record.RECORD).read_bytes()
         with self.assertRaises(scratch.ScratchError):
             scratch.hand_over(path, "next-unit", "row:invalid")
-        self.assertEqual((path / scratch.RECORD).read_bytes(), before)
+        self.assertEqual((path / copy_record.RECORD).read_bytes(), before)
 
     def test_lifetime_judgment_does_not_create_a_busy_mark(self) -> None:
         path = self.copy()
-        (path / scratch.RECORD).unlink()
+        (path / copy_record.RECORD).unlink()
         self.assertIsInstance(scratch.lifetime(path), scratch.Unknown)
         self.assertFalse((path / scratch.BUSY).exists())
 
@@ -442,7 +542,7 @@ class ScratchTests(unittest.TestCase):
                 caller = current_thread()
 
                 def paused_publish(destination: Path, fields: object) -> None:
-                    if destination == path / scratch.RECORD and current_thread() is not caller:
+                    if destination == path / copy_record.RECORD and current_thread() is not caller:
                         read.set()
                         if not resume.wait(10):
                             raise AssertionError("record writer did not resume")
@@ -476,7 +576,7 @@ class ScratchTests(unittest.TestCase):
                 if not transferred:
                     scratch.hand_over(path, "next-unit", "gate:next")
                 record = scratch.task_of(path)
-                assert isinstance(record, scratch.Registered)
+                assert isinstance(record, copy_record.Registered)
                 self.assertEqual(record.task, "gate:next")
                 self.assertEqual(record.fields["owner_unit"], "next-unit")
                 self.assertEqual(scratch.end("gate:old"), [])
@@ -509,7 +609,7 @@ class ScratchTests(unittest.TestCase):
             locked.append(identity)
 
         def paused_publish(destination: Path, fields: object) -> None:
-            if destination == path / scratch.RECORD and current_thread() is not caller:
+            if destination == path / copy_record.RECORD and current_thread() is not caller:
                 publishing.set()
                 if not resume.wait(10):
                     raise AssertionError("waiting record writer did not resume")
@@ -542,7 +642,7 @@ class ScratchTests(unittest.TestCase):
             scratch.hand_over(path, "next-unit", "gate:next")
         self.assertIn(replacement_identity, locked, "writer must lock the replacement directory")
         record = scratch.task_of(path)
-        assert isinstance(record, scratch.Registered)
+        assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.task, "gate:next")
         self.assertEqual(record.fields["owner_unit"], "next-unit")
         self.assertEqual(scratch.end("gate:old"), [])
@@ -587,14 +687,14 @@ class ScratchTests(unittest.TestCase):
         self.assertIsInstance(scratch.lifetime(path), scratch.Unknown)
         scratch.hand_over(path, "next-unit", "phase:next-unit/22", run_dir=str(new_run))
         record = scratch.task_of(path)
-        assert isinstance(record, scratch.Registered)
+        assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.fields["run_dir"], str(new_run))
         self.assertEqual(record.fields["phase_id"], "22")
         self.assertIsInstance(scratch.lifetime(path), scratch.Live)
         self.assertEqual(scratch.end("phase:maker-unit/21"), [])
         scratch.hand_over(path, "next-unit", "gate:next")
         record = scratch.task_of(path)
-        assert isinstance(record, scratch.Registered)
+        assert isinstance(record, copy_record.Registered)
         for field in ("run_dir", "phase_id", "land_target", "ended", "ended_task"):
             self.assertNotIn(field, record.fields)
 
@@ -609,8 +709,8 @@ class ScratchTests(unittest.TestCase):
     def test_no_task_lasts_a_day_and_until_ends_at_its_time(self) -> None:
         path = scratch.new(now=1_000_000.0)
         record = scratch.task_of(path)
-        self.assertIsInstance(record, scratch.Registered)
-        assert isinstance(record, scratch.Registered)
+        self.assertIsInstance(record, copy_record.Registered)
+        assert isinstance(record, copy_record.Registered)
         task = record.task
         deadline = scratch.task_end(task, 1_000_000.0 + scratch.DEFAULT_LIFE_SECONDS)
         self.assertIsInstance(deadline, scratch.Ended)
@@ -634,7 +734,7 @@ class ScratchTests(unittest.TestCase):
         task = "row:natedev-C9"
         for folder in (saved, unsaved.parent):
             _ = scratch.hold(folder, task, "change review C9")
-        self.assertEqual(scratch.holds()[str(saved)]["maker"], "maker-session")
+        self.assertEqual(scratch.holds()[str(saved)]["maker"], MAKER_ID)
         self.assertEqual(scratch.unsaved_work(unsaved.parent), f"{unsaved}: it has commits and no remote")
         self.assertEqual(scratch.end(task), [saved])
         self.assertFalse(saved.exists())
@@ -647,8 +747,8 @@ class ScratchTests(unittest.TestCase):
         path = scratch.new(RUN, "gate")
         self.assertEqual(path.parent, self.base / "scratch")
         self.assertRegex(path.name, r"^run-2a858b68-0f9a-4af2-b3cf-a776e6b180cb-gate-[a-z0-9]{6}$")
-        record = cast(dict[str, object], json.loads((path / scratch.RECORD).read_text()))
-        self.assertEqual((record["task"], record["maker"]), (RUN, "maker-session"))
+        record = cast(dict[str, object], json.loads((path / copy_record.RECORD).read_text()))
+        self.assertEqual((record["task"], record["maker"]), (RUN, MAKER_ID))
 
     def test_a_visible_repro_goes_where_cargo_port_lists_it(self) -> None:
         self.assertEqual(scratch.new(ROW, "demo", visible=True), self.base / "repro" / "cargo-liner-C54-demo")
@@ -678,7 +778,7 @@ class ScratchTests(unittest.TestCase):
         first, second = path / "a", path / "b"
         _ = first.write_text("first child")
         _ = second.write_text("second child")
-        record = (path / scratch.RECORD).read_bytes()
+        record = (path / copy_record.RECORD).read_bytes()
         other = scratch.new(RUN, "kept")
         real_unlink = os.unlink
         real_scandir = os.scandir
@@ -686,7 +786,7 @@ class ScratchTests(unittest.TestCase):
         @contextmanager
         def record_first(directory: int | str | os.PathLike[str]) -> Generator[Iterator[os.DirEntry[str]]]:
             with real_scandir(directory) as entries:
-                yield iter(sorted(entries, key=lambda entry: (entry.name != scratch.RECORD, entry.name)))
+                yield iter(sorted(entries, key=lambda entry: (entry.name != copy_record.RECORD, entry.name)))
 
         def stop_after_child(child: str | os.PathLike[str], *, dir_fd: int | None = None) -> None:
             real_unlink(child, dir_fd=dir_fd)
@@ -699,7 +799,7 @@ class ScratchTests(unittest.TestCase):
             _ = scratch.end(ROW)
         self.assertFalse(first.exists())
         self.assertTrue(second.is_file())
-        self.assertEqual((path / scratch.RECORD).read_bytes(), record)
+        self.assertEqual((path / copy_record.RECORD).read_bytes(), record)
         self.assertIn(path, [folder.path for folder in scratch.folders() if folder.task == ROW])
         self.assertEqual(scratch.end(ROW), [path])
         self.assertFalse(path.exists())
@@ -715,7 +815,7 @@ class ScratchTests(unittest.TestCase):
 
                 def stop_after_record(child: str | os.PathLike[str], *, dir_fd: int | None = None) -> None:
                     real_unlink(child, dir_fd=dir_fd)
-                    if boundary == "record removed" and Path(child).name == scratch.RECORD:
+                    if boundary == "record removed" and Path(child).name == copy_record.RECORD:
                         raise KeyboardInterrupt
 
                 def stop_at_folder(folder: Path) -> None:
@@ -729,7 +829,7 @@ class ScratchTests(unittest.TestCase):
                       mock.patch.object(Path, "rmdir", autospec=True, side_effect=stop_at_folder),
                       self.assertRaises(KeyboardInterrupt)):
                     _ = scratch.end(ROW)
-                self.assertFalse((path / scratch.RECORD).exists())
+                self.assertFalse((path / copy_record.RECORD).exists())
                 self.assertEqual(path.exists(), boundary != "after rmdir")
                 self.assertIn(path, [folder.path for folder in scratch.folders() if folder.task == ROW])
                 self.assertEqual(scratch.end(ROW), [path])
@@ -763,14 +863,14 @@ class ScratchTests(unittest.TestCase):
         self.assertFalse(loose.exists())
         self.assertTrue((path / "src").is_dir())
         record = scratch.task_of(path)
-        self.assertIsInstance(record, scratch.Registered)
-        assert isinstance(record, scratch.Registered)
+        self.assertIsInstance(record, copy_record.Registered)
+        assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.task, ROW)
 
     def test_renew_moves_the_records_time(self) -> None:
         path = scratch.new(RUN)
         scratch.renew(path, now=1_000.0)
-        self.assertEqual((path / scratch.RECORD).stat().st_mtime, 1_000.0)
+        self.assertEqual((path / copy_record.RECORD).stat().st_mtime, 1_000.0)
         with self.assertRaises(scratch.ScratchError):
             scratch.renew(self.base)
 
@@ -797,3 +897,47 @@ class ScratchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     _ = unittest.main()
+
+
+class NativeScratchMakerTests(StaffTestCase):
+    def test_scratch_owner_uses_the_exact_process_registry_when_claude_exports_no_session_id(self) -> None:
+        identity = fixture_runtime_id("scratch-exact-Claude-pid")
+        _ = staff.ensure("showrunner", name="maker", runtime_id=identity)
+        registry = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json"
+        self.write_json(registry, {"pid": os.getpid(), "procStart": sessions.process_start(os.getpid()),
+                                  "sessionId": identity, "name": "same-display-name",
+                                  "messagingSocketPath": str(self.root / "private.sock"), "updatedAt": 1})
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}):
+            self.assertEqual(scratch.maker(), identity)
+        self.write_json(registry, {"pid": os.getpid(), "procStart": "another-process-generation",
+                                  "sessionId": identity, "name": "same-display-name",
+                                  "messagingSocketPath": str(self.root / "private.sock"), "updatedAt": 1})
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}):
+            self.assertEqual(scratch.maker(), "")
+
+    def test_scratch_and_hold_keep_the_fixed_maker_after_a_session_handoff(self) -> None:
+        owner = staff.ensure("showrunner", name="maker", runtime_id=MAKER_ID)
+        current = staff.native_id(fixture_runtime_id("scratch-replacement-thread"))
+        _ = staff.update_current_session(owner.current_session, current)
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        held = self.root / "held"
+        held.mkdir()
+        with mock.patch.dict(os.environ, {
+            "CODEX_THREAD_ID": current, copy_record.ROOT_ENV: str(self.root / "scratch"),
+            scratch.HOLDS_ENV: str(self.root / "holds.json"),
+        }):
+            path = scratch.new(RUN, "handoff")
+            record = scratch.task_of(path)
+            self.assertIsInstance(record, copy_record.Registered)
+            assert isinstance(record, copy_record.Registered)
+            self.assertEqual(record.fields["maker"], owner.id)
+            _ = scratch.hold(held, "gate:maker-handoff", "retain the fixed owner")
+            self.assertEqual(scratch.holds()[str(held)]["maker"], owner.id)
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": owner.id}):
+            self.assertEqual(scratch.maker(), "")
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_unpublished_runtime_has_no_scratch_owner_and_creates_no_staff_store(self) -> None:
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": MAKER_ID}):
+            self.assertEqual(scratch.maker(), "")
+        self.assertFalse(self.staff_file.exists())

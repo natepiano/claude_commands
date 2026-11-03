@@ -4,7 +4,8 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from typing import final
-from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, HANG_GUARD_S as HANG_GUARD_S
+from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
@@ -29,7 +30,7 @@ exec "$TEST_REAL_PYTHON" "$TEST_WAIT_HELPER" "$TEST_PRESSURE_RELEASE"
             _ = ready.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
             _ = ready.replace(pressure)
             release.touch()
-            output, errors = process.communicate(timeout=HANG_GUARD_S)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(process.returncode, 0, output + errors)
             self.assertIn("memory pressure: full avg10 20.0", output + errors)
             self.assertEqual(len([event for event in self.cargo_events()

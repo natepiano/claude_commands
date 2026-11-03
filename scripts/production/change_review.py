@@ -8,6 +8,7 @@
     change_review.py edit [--production DOC] [--list L] --row ID --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
     change_review.py show [--production DOC] [--list L]
     change_review.py verdict [--production DOC] [--list L] --row ID --verdict "<the user's words>"
+    change_review.py set-kind [--production DOC] [--list L] --row ID --kind "See in action|Read only"
     change_review.py mark-important [--production DOC] [--list L] --row ID
     change_review.py list-path [--production DOC]
     change_review.py showrunner [--production DOC]
@@ -88,6 +89,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import issues  # noqa: E402
 from production_units import Refusal, cell_value, production_field, unit_table  # noqa: E402
 from proposals_folder import owner_docs, scope_docs, slug_of  # noqa: E402
+from scripts.production import change_routing, staff
 
 TRAILER = "Change-Review"
 COVERS = f"{TRAILER}-Covers"
@@ -98,6 +100,8 @@ CHECK = "How to check"
 URGENCY = "Urgency"
 # The production a row's change is from: its slug. A row from before the column is the root's.
 PRODUCTION = "Production"
+KIND = "Kind"
+REVIEW_KINDS = ("See in action", "Read only")
 NOT_YET = "not yet"
 FORM = "<what changed for you> | <how to try it: where and what to type> | <what you see>"
 SEPARATOR = " | "
@@ -188,6 +192,11 @@ def parse(value: str) -> Entry:
 
 def entries(message: str) -> list[Entry]:
     return [parse(found.group("value")) for found in _LINE.finditer(message)]
+
+
+def checkpoint_changes(message: str) -> tuple[str, ...]:
+    """The visible change names in a checkpoint message."""
+    return tuple(item.change for item in entries(message) if isinstance(item, Visible))
 
 
 def needs_trailer(subject: str, files: tuple[str, ...]) -> bool:
@@ -590,6 +599,7 @@ def append_rows(path: Path, changes: list[Visible], day: date, merged: str, prod
         when = f"{day.isoformat()} · {_cell(merged)}" if merged else day.isoformat()
         rows = [_row(path, columns, {"#": f"C{number + offset}", "Change": _cell(item.change), "Merged": when,
                                      "On the Mac build": NOT_YET, CHECK: _cell(item.how()), URGENCY: _cell(rank),
+                                     KIND: "",
                                      PRODUCTION: _cell(row_production(owners[offset] if owners else production))})
                 for offset, item in enumerate(changes)]
         _insert(lines, end, rows)
@@ -622,8 +632,7 @@ def _held(columns: list[str], rows: list[str], changes: list[Visible], merged: s
 def pending(path: Path) -> list[dict[str, str]]:
     """Each row still to review, as its cells by column name. Reads only."""
     lines = read(path).splitlines(keepends=True)
-    columns, first, end = _table(path, lines, SECTION)
-    return [dict(zip(columns, (_plain(cell) for cell in _cells(line)))) for line in lines[first:end]]
+    return _review_table(path, lines, SECTION)
 
 
 def scope_list(doc: Path) -> Path:
@@ -631,6 +640,13 @@ def scope_list(doc: Path) -> Path:
     from scripts.production import showrunners
     import showrunner_tree
 
+    if doc.is_file() and (value := _line_value(doc)):
+        return Path(value).expanduser()
+    if not doc.is_file():
+        for member in staff.snapshot().rows:
+            if (member.kind == "showrunner" and isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc))
+                    and member.doc.path == doc):
+                return list_file(member.name)
     slug = slug_of(doc)
     root = showrunner_tree.root_of(slug)
     try:
@@ -657,7 +673,8 @@ def scope_lists(path: Path, doc: Path, below: bool = False) -> tuple[ProductionR
     """The current list and each scoped production's own earlier list, once per path."""
     import showrunner_tree
 
-    lists = {path.absolute(): ProductionReviewList(path, showrunner_tree.root_of(slug_of(doc)))}
+    owner = _owner(path) if path.name.startswith(PREFIX) else showrunner_tree.root_of(slug_of(doc))
+    lists = {path.absolute(): ProductionReviewList(path, owner)}
     for production in scope_docs(doc, below):
         slug = slug_of(production)
         earlier = list_file(slug)
@@ -666,20 +683,68 @@ def scope_lists(path: Path, doc: Path, below: bool = False) -> tuple[ProductionR
     return tuple(lists.values())
 
 
-def scoped_review_entries(path: Path, doc: Path, below: bool = False) -> list[ScopedReviewEntry]:
-    """Read and rank each list independently; a bad list leaves the others in the queue."""
-    scope = {slug_of(each) for each in scope_docs(doc, below)}
-    entries: list[ScopedReviewEntry] = []
-    for review_list in scope_lists(path, doc, below):
+class ReviewHistoryReader:
+    """Supply the shared router with this module's Git readers."""
+
+    @staticmethod
+    def read_commit_parents(repo: Path, revisions: Iterable[str]) -> dict[str, tuple[str, ...]]:
+        return read_commit_parents(repo, revisions)
+
+    @staticmethod
+    def checkpoint_changes(message: str) -> tuple[str, ...]:
+        return checkpoint_changes(message)
+
+
+def routed_review_entries(path: Path, doc: Path, below: bool = False) -> list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]]:
+    """Read all source lists before the shared staff rule assigns their rows."""
+    return _routed_review_entries(path, doc, below, staff.snapshot())
+
+
+def _routed_review_entries(path: Path, doc: Path, below: bool, record: staff.StaffSnapshot) -> list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]]:
+    """Route all rows with one consistent staff snapshot."""
+    from scripts.production import showrunners
+
+    listed = {item.path.absolute(): item for item in scope_lists(path, doc, below)}
+    for source in LISTS.glob(PREFIX + "*.md"):
+        _ = listed.setdefault(source.absolute(), ProductionReviewList(source, _owner(source)))
+    documents = {**showrunners.timer_docs(), slug_of(doc): doc}
+    snapshots: dict[Path, ReviewListSnapshot] = {}
+    for source in listed:
         try:
-            rows = [row for row in pending(review_list.path)
-                    if (row.get(PRODUCTION) or review_list.default_production) in scope]
-            ranked = row_entries(rows)
+            snapshot = review_snapshot(source)
         except (ChangeReviewError, OSError, UnicodeError) as error:
-            print(f"change review: {review_list.path}: {error}", file=sys.stderr)
+            print(f"change review: {source}: {error}", file=sys.stderr)
             continue
-        entries.extend(ScopedReviewEntry(review_list, entry) for entry in ranked)
-    return entries
+        snapshots[source] = snapshot
+    documents = change_routing.production_documents(documents,
+        ((listed[source].default_production, snapshot.text) for source, snapshot in snapshots.items()))
+    routing = change_routing.StaffRouting(record, documents, ReviewHistoryReader())
+    routing.prepare((listed[source].default_production, snapshot.pending) for source, snapshot in snapshots.items())
+    return [(listed[source], routing.owner(row, listed[source].default_production), row)
+            for source, snapshot in snapshots.items()
+            for row in change_routing.waiting_rows(source, snapshot.pending)]
+
+
+def scoped_review_entries(path: Path, doc: Path, below: bool = False) -> list[ScopedReviewEntry]:
+    """Use the same staff tab as the change page."""
+    scope = {slug_of(each) for each in scope_docs(doc, below)}
+    record = staff.snapshot()
+    scope.update(member.name for member in record.rows
+                 if member.kind == "showrunner" and isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc))
+                 and slug_of(member.doc.path) in scope)
+    grouped: dict[Path, tuple[ProductionReviewList, list[dict[str, str]]]] = {}
+    for review_list, owner, row in _routed_review_entries(path, doc, below, record):
+        if owner.tab in scope:
+            if review_list.path not in grouped:
+                grouped[review_list.path] = (review_list, [])
+            grouped[review_list.path][1].append(row)
+    found: list[ScopedReviewEntry] = []
+    for review_list, rows in grouped.values():
+        try:
+            found.extend(ScopedReviewEntry(review_list, entry) for entry in row_entries(rows))
+        except ChangeReviewError as error:
+            print(f"change review: {review_list.path}: {error}", file=sys.stderr)
+    return found
 
 
 def scope_rows(path: Path, doc: Path, below: bool = False) -> list[dict[str, str]]:
@@ -720,7 +785,7 @@ class ChangeQueue:
 def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False) -> ChangeQueue:
     """The same change rows and pin for /next and change_review show."""
     if isinstance(scope, WholeReviewList):
-        return ChangeQueue(queue(path), row_entries(pending(path)))
+        return ChangeQueue(queue(path), row_entries(change_routing.waiting_rows(path, pending(path))))
     import showrunner_tree
 
     slug = slug_of(scope)
@@ -792,9 +857,25 @@ def visible_owners(commits: list[Commit], production: Path) -> list[Path]:
             for item in entries(commit.message) if isinstance(item, Visible)]
 
 
+def read_commit_parents(repo: Path, revisions: Iterable[str]) -> dict[str, tuple[str, ...]]:
+    """Read the parents of the requested commits in one Git command."""
+    requested = tuple(dict.fromkeys(revisions))
+    if not requested:
+        return {}
+    result = subprocess.run(["git", "-C", str(repo), "rev-list", "--no-walk", "--parents", "--stdin"],
+                            input="\n".join(requested) + "\n", capture_output=True, text=True, check=False)
+    if result.returncode:
+        raise ChangeReviewError(f"git rev-list --parents: {result.stderr.strip()}")
+    parents: dict[str, tuple[str, ...]] = {}
+    for line in result.stdout.splitlines():
+        sha, *ancestors = line.split()
+        parents[sha] = tuple(ancestors)
+    return parents
+
+
 def merge_commits(repo: Path, merge: str) -> list[Commit]:
     """The commits a merge brought in, without merges; none for a commit that is no merge."""
-    parents = _git(repo, "rev-list", "--parents", "-n", "1", merge).split()[1:]
+    parents = next(iter(read_commit_parents(repo, (merge,)).values()), ())
     if len(parents) < 2:
         return []
     records = _git(repo, "log", "--no-merges", "--format=%x1e%H%x1f%B", parents[1], f"^{parents[0]}", "--")
@@ -1057,14 +1138,73 @@ def record_verdict(path: Path, row: str, verdict: str, day: date,
                 return VerdictAlreadyRecorded(verdict, _plain(cells.get("Date", "")), row_merge(cells))
             return VerdictConflict(_plain(cells.get("Verdict", "")), _plain(cells.get("Date", "")))
         cells = dict(zip(columns, _cells(lines.pop(index))))
+        if not any(line.strip() == REVIEWED for line in lines):
+            reviewed_rows = list[str](("\n" + BODY[BODY.index(REVIEWED):]).splitlines(keepends=True))
+            _insert(lines, len(lines), reviewed_rows)
         _add_column(path, lines, REVIEWED, "Merged")
+        # Page rows retain their description and proof in the same record after
+        # answering. Older lists keep their existing Reviewed table shape.
+        if cells.get(KIND):
+            for column in (KIND, CHECK, PRODUCTION):
+                _add_column(path, lines, REVIEWED, column)
         reviewed, top, _ = _table(path, lines, REVIEWED)
-        _insert(lines, top, [_row(path, reviewed, {"#": row, "Change": cells.get("Change", ""),
+        _insert(lines, top, [_row(path, reviewed, {**dict.fromkeys(reviewed, ""), **cells, "#": row,
                                                    "Verdict": _cell(verdict), "Date": day.isoformat(),
                                                    "Merged": cells.get("Merged", "")})])
         return VerdictRecorded(row_merge(cells))
 
     return _edit(path, production, day, write, lambda _: f"verdict {row}")
+
+
+def review_rows(path: Path) -> list[dict[str, str]]:
+    """Read pending and saved page answers from the authoritative list."""
+    snapshot = review_snapshot(path)
+    return [*snapshot.pending, *snapshot.reviewed]
+
+
+def _review_table(path: Path, lines: list[str], section: str) -> list[dict[str, str]]:
+    """Decode one review table and refuse rows with missing or extra cells."""
+    columns, first, end = _table(path, lines, section)
+    result: list[dict[str, str]] = []
+    for line in lines[first:end]:
+        cells = _cells(line)
+        if len(cells) != len(columns):
+            raise ChangeReviewError(f"{path}: {cells[0]} has the wrong number of cells")
+        result.append(dict(zip(columns, map(_plain, cells))))
+    return result
+
+
+@dataclass(frozen=True)
+class ReviewListSnapshot:
+    """One list read, with its metadata and both review tables."""
+
+    text: str
+    pending: list[dict[str, str]]
+    reviewed: list[dict[str, str]]
+
+
+def review_snapshot(path: Path) -> ReviewListSnapshot:
+    text = read(path)
+    lines = text.splitlines(keepends=True)
+    pending = _review_table(path, lines, SECTION)
+    reviewed = _review_table(path, lines, REVIEWED) if any(line.strip() == REVIEWED for line in lines) else []
+    return ReviewListSnapshot(text, pending, reviewed)
+
+
+def set_row_kind(path: Path, row: str, kind: str, production: Path) -> str:
+    """Classify by whether the change alters something the user runs or sees."""
+    if kind not in REVIEW_KINDS:
+        raise ChangeReviewError("--kind must be 'See in action' or 'Read only'")
+
+    def write(lines: list[str]) -> str:
+        _add_column(path, lines, SECTION, KIND)
+        columns, index = _to_review(path, lines, row)
+        cells = dict(zip(columns, _cells(lines[index])))
+        written = _row(path, columns, {**cells, KIND: kind})
+        lines[index] = written + "\n"
+        return written
+
+    return _edit(path, production, today(), write, lambda _: f"kind {row}")
 
 
 def end_row_scratch(path: Path, row: str) -> list[str]:
@@ -1214,6 +1354,7 @@ class CommandLine(argparse.Namespace):
     see: str = ""
     row: str = ""
     verdict: str = ""
+    kind: str = ""
     production: str = ""
     urgency: str = ""
     due: str = ""
@@ -1298,6 +1439,9 @@ def _run(options: CommandLine) -> int:
             target = _row_option(options)
             now = datetime.now(user_zone()).replace(tzinfo=None)
             print(mark_row(target.path, target.row, now, production_doc(options.production)))
+        case "set-kind":
+            target = _row_option(options)
+            print(set_row_kind(target.path, target.row, options.kind, production_doc(options.production)))
         case "verdict":
             target = _row_option(options)
             verdict = _words("verdict", options.verdict)
@@ -1357,11 +1501,11 @@ def _run(options: CommandLine) -> int:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     _ = parser.add_argument("action", choices=("check", "append", "drift", "add", "edit", "show", "verdict",
-                                                   "mark-important", "list-path", "showrunner",
+                                                   "mark-important", "set-kind", "list-path", "showrunner",
                                                    "backfill-production"))
     _ = parser.add_argument("--repo", default=".")
     for name in ("checkpoint", "previous", "merge-branch", "list", "merged", "since", "change", "check", "see",
-                 "row", "verdict", "production", "urgency", "due", "after"):
+                 "row", "verdict", "production", "urgency", "due", "after", "kind"):
         _ = parser.add_argument(f"--{name}", default="")
     _ = parser.add_argument("--write", action="store_true")
     _ = parser.add_argument("--hold", action="append")

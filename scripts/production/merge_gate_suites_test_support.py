@@ -8,7 +8,8 @@ import select
 import sys
 from typing import override
 
-from scripts.production.merge_gate_test_support import MergeGateFixture, SUITE_MODULE, TEST_HANG_GUARD_SECS
+from scripts.production.merge_gate_test_support import MergeGateFixture, SUITE_MODULE
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 # Keep the shared fixture unchanged for its other subjects. These jobs still run
@@ -44,6 +45,7 @@ class GateSuitesFixture(MergeGateFixture):
     @override
     def bind_fixture(self, root: Path) -> None:
         super().bind_fixture(root)
+        self.environment["LINT_CONFIG_FILE"] = str(root / "lint.conf")
         self.environment["MERGE_GATE_PYTHON"] = sys.executable
 
     @override

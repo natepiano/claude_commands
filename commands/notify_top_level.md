@@ -1,6 +1,8 @@
 ---
-description: Send one message to every other top-level session, on this machine and on others over Remote Control; each showrunner passes it to its unit directors. Args - `[--here] <message>`; `--here` keeps it to this machine.
+description: Send a message to top-level sessions.
 ---
+
+Use `$ARGUMENTS` as `[--here] <message>`. With `--here`, send only on this machine.
 
 1. Recipients: `python3 ~/.claude/scripts/message/top_level.py`. Each output line is a session name, a tab, and its `uds:` address. Unit directors under a showrunner are left out, since their showrunner passes the message on; a unit director with no showrunner is included. Without `--here`, add every ListAgents peer on another machine by its ListAgents name.
 2. SendMessage to each local `uds:` address the message, then the line `Showrunners: pass this to your unit directors where it applies to them.` Report that session by its name. To a peer on another machine add `Reply "ack" to <you>.`; nothing reports that delivery back.

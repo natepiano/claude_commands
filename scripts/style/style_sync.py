@@ -25,9 +25,11 @@ from typing import Literal, cast
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "production"))
 sys.path.insert(0, str(SCRIPTS / "lib"))
+import process_group
 
 from add_style import NoStyleProduction, standing_style_production
 from production_units import Refusal
+from scripts.message import send_result
 from scripts.production import showrunners
 import style_ledger
 from process_failure import failure_detail
@@ -88,8 +90,14 @@ def notify(repo_dir: Path, branch: str, tip: str) -> None:
             "--key", f"style-sync:{standing.slug}",
             "--timeout", str(SEND_SECONDS),
         ], capture_output=True, text=True, check=False, timeout=SEND_RUN_SECONDS)
-        if sent.returncode:
-            raise Refusal(f"send.py: {failure_detail(sent)}")
+        outcome = send_result.send_outcome(sent.returncode, sent.stdout)
+        if isinstance(outcome, send_result.ConfirmedSendOutcome):
+            match outcome.header.outcome:
+                case "sent" | "skipped" | "kept" | "replaced":
+                    return
+                case "queued" | "failed" | "refused" | "held":
+                    pass
+        raise Refusal(f"send.py: {failure_detail(sent)}")
     except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
         detail = " ".join(str(error).splitlines()).removeprefix("style_sync: ")
         print("style_sync: notify: " + detail)
@@ -223,17 +231,17 @@ def lint_run_running(directory: Path, owner_record: OwnerRecord) -> bool:
     group = int(verifier_file.read_text())
     if group <= 0:
         raise ValueError(f"{VERIFIER_FILE} names no process group")
-    return probe(os.killpg, group)
+    return probe(process_group.send_process_group, group)
 
 
 def stop_lint_child(child: subprocess.Popen[str]) -> None:
     """Stop verify.sh and every process it started, so no cargo build writes into a removed checkout."""
     with suppress(ProcessLookupError):
-        os.killpg(child.pid, signal.SIGTERM)
+        process_group.send_process_group(child.pid, signal.SIGTERM)
     with suppress(subprocess.TimeoutExpired):
         _ = child.wait(CHILD_STOP_SECONDS)
     with suppress(ProcessLookupError):
-        os.killpg(child.pid, signal.SIGKILL)
+        process_group.send_process_group(child.pid, signal.SIGKILL)
     _ = child.wait()
 
 
@@ -408,11 +416,13 @@ def handoff_notice(slug: str, parent: str, checkpoint: str) -> HandoffDelivery:
         "--text", f"From the showrunner of {slug}: hand-off {checkpoint}",
         "--timeout", str(SEND_SECONDS),
     ], capture_output=True, text=True, check=False, timeout=SEND_RUN_SECONDS)
-    if result.returncode == 1 and result.stdout.startswith("QUEUED:"):
-        return "queued"
-    if result.returncode:
-        raise Refusal(f"send.py: {failure_detail(result)}")
-    return "sent"
+    outcome = send_result.send_outcome(result.returncode, result.stdout)
+    if isinstance(outcome, send_result.ConfirmedSendOutcome):
+        if outcome.header.outcome in {"queued", "kept"}:
+            return "queued"
+        if outcome.header.outcome in {"sent", "skipped", "replaced"}:
+            return "sent"
+    raise Refusal(f"send.py: {failure_detail(result)}")
 
 
 @dataclass(frozen=True)

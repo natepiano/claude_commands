@@ -68,15 +68,40 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from test_phase import (
+    NO_TEST_PHASE_RECORD as NO_TEST_PHASE_RECORD,
+    NoTestPhaseRecord as NoTestPhaseRecord,
+    ObservedTestPhase as ObservedTestPhase,
+    TestPhaseContext as TestPhaseContext,
+    TestPhaseRecord as TestPhaseRecord,
+    UnobservedTestPhase as UnobservedTestPhase,
+    UnreadableTestPhaseRecord as UnreadableTestPhaseRecord,
+)
 
 if __package__:
-    from . import store
+    from . import cgroup_capture, store
 else:
+    import cgroup_capture
     import store
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 import memory_admit
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if TYPE_CHECKING:
+    from ..aws_target.config import MeasurementUnavailable
+else:
+    from scripts.aws_target.config import MeasurementUnavailable
+import conf
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
+if TYPE_CHECKING:
+    from ..build_targets.target_config import LocalTarget, SshTarget, read_targets
+else:
+    from target_config import LocalTarget, SshTarget, read_targets
 
 if TYPE_CHECKING:
     import sample
@@ -87,8 +112,85 @@ GIT_TIMEOUT_S = 5
 RUSTC_TIMEOUT_S = 10
 LEDGER = Path.home() / ".local/state/verify/events.jsonl"
 LAUNCH_LOCK_NAME = "launches.lock"
-# Adding or renaming a host requires updating the folders carried by sync.
-SYNC_HOSTS = ("natedev", "Mac", "Nates-MacBook-Pro-2023")
+CPU_SIDECAR, IO_SIDECAR = ".cpu.stat", ".io.stat"
+def sync_config() -> dict[str, str]:
+    """Read peer settings when a sync or report needs them."""
+    path = Path(os.environ.get("BUILD_TARGETS_CONFIG", str(Path(__file__).resolve().parents[2]
+                                                         / "config/build_targets.conf"))).expanduser()
+    return conf.read(path).values()
+
+
+def target_hosts(target: str) -> tuple[str, ...]:
+    """Map a target to host names, including explicit legacy Mac aliases."""
+    values = sync_config()
+    configured = tuple(name.strip() for name in values.get(f"sync.hosts.{target}", "").split(",") if name.strip())
+    if any(name in (".", "..") or Path(name).name != name for name in configured):
+        raise ValueError("sync host names must be directory names")
+    return configured
+
+
+def mac_targets() -> tuple[str, ...]:
+    return tuple(target.name for target in read_targets()
+                 if isinstance(target, SshTarget) and target.platform == "macos")
+
+
+def configured_targets() -> tuple[str, ...]:
+    return tuple(target.name for target in read_targets())
+
+
+def local_targets() -> tuple[str, ...]:
+    return tuple(target.name for target in read_targets() if isinstance(target, LocalTarget))
+
+
+
+@dataclass(frozen=True)
+class LocalStepIdentity:
+    targets: tuple[str, ...]
+    hosts: tuple[str, ...]
+
+
+def local_step_identity(targets: tuple[str, ...] = ()) -> LocalStepIdentity:
+    configured = targets or local_targets()
+    hosts = tuple(dict.fromkeys(alias for name in configured for alias in target_hosts(name)))
+    return LocalStepIdentity(configured, hosts)
+
+
+NONLOCAL_STEP_CALLERS = ('verify-linux',)
+
+
+def is_local_step(target: object, host: object, caller: object, *,
+                  targets: tuple[str, ...] = (), hosts: tuple[str, ...] = ()) -> bool:
+    """Use explicit target identity before legacy host identity."""
+    if caller in NONLOCAL_STEP_CALLERS:
+        return False
+    identity = LocalStepIdentity(targets, hosts) if targets and hosts else local_step_identity(targets)
+    configured = targets or identity.targets
+    if target:
+        return target in configured
+    aliases = hosts or identity.hosts
+    return host in aliases
+
+def synchronized_hosts() -> tuple[str, ...]:
+    values = sync_config()
+    names: list[str] = []
+    for key, value in values.items():
+        if key.startswith("sync.hosts."):
+            names.extend(name.strip() for name in value.split(",") if name.strip())
+    if any(name in (".", "..") or Path(name).name != name for name in names):
+        raise ValueError("sync host names must be directory names")
+    return tuple(dict.fromkeys(names))
+
+
+def recorded_target(host: str) -> str:
+    explicit = os.environ.get("BUILDLOG_TARGET", "")
+    if explicit:
+        return explicit
+    values = sync_config()
+    names = [key.removeprefix("sync.hosts.") for key in values if key.startswith("sync.hosts.")]
+    for name in names:
+        if host in target_hosts(name):
+            return name
+    return ""
 
 
 class GitFacts(TypedDict):
@@ -138,47 +240,6 @@ class NoHeldLog:
 @dataclass(frozen=True)
 class NoPeakFile:
     pass
-
-
-@dataclass(frozen=True)
-class NoTestPhaseRecord:
-    pass
-
-
-NO_TEST_PHASE_RECORD = NoTestPhaseRecord()
-
-
-@dataclass(frozen=True)
-class UnobservedTestPhase:
-    pass
-
-
-@dataclass(frozen=True)
-class ObservedTestPhase:
-    peak_bytes: int
-    started_at: float
-
-
-class TestPhaseContext(TypedDict):
-    """Admission selection and actual width at the JSON persistence boundary."""
-
-    repo_identity: str | None
-    test_scope: Literal["full", "filtered"] | None
-    package: str | None
-    filters: list[str] | None
-    call_id: str | None
-    test_threads: int | None
-
-
-@dataclass(frozen=True)
-class TestPhaseRecord:
-    window: ObservedTestPhase | UnobservedTestPhase
-    context: TestPhaseContext
-
-
-@dataclass(frozen=True)
-class UnreadableTestPhaseRecord:
-    reason: str
 
 
 @dataclass(frozen=True)
@@ -708,7 +769,8 @@ def _resume_step_line(pending: PendingStep) -> bool:
 
 def _delete_step_sources(held: Path | NoHeldLog, peak: Path | NoPeakFile,
                          phase: Path | NoTestPhaseRecord = NO_TEST_PHASE_RECORD) -> None:
-    for path in (held, peak, phase):
+    sidecars = [Path(str(peak) + suffix) for suffix in (CPU_SIDECAR, IO_SIDECAR)] if isinstance(peak, Path) else []
+    for path in (held, peak, phase, *sidecars):
         if isinstance(path, Path):
             path.unlink(missing_ok=True)
             if path.parent.is_dir():
@@ -749,6 +811,24 @@ def finish_pending_step(path: Path) -> PublishedStep:
         pending = replace(pending, row={**pending.row, **test_phase_fields(phase)}, test_phase=phase)
         _ = _save_pending_step(pending, replace_existing=True)
     return _finish_step(path, pending, _resume_step_line)
+
+
+def scope_resources(peak: str) -> cgroup_capture.StepScopeCounters:
+    """Parse raw scope sidecars; only absence may lose a reading on retry.
+
+    CPU excludes compiles run by sccache.service. Any other read failure
+    propagates so step() keeps the sources instead of publishing unavailable.
+    """
+    def sidecar(suffix: str) -> str:
+        if not peak:
+            return ""
+        try:
+            return Path(peak + suffix).read_text()
+        except FileNotFoundError:
+            return ""
+
+    return {"cpu": cgroup_capture.parse_cpu(sidecar(CPU_SIDECAR)),
+            "io": cgroup_capture.parse_io(sidecar(IO_SIDECAR))}
 
 
 def step(args: list[str]) -> None:
@@ -793,7 +873,7 @@ def step(args: list[str]) -> None:
         tree = tree_facts(os.environ.get("BUILDLOG_TREE_START"), treekey.tree_key(directory))
         step_caller = caller(tty)
         sent_key = sent_tree_key()
-        if step_caller == "verify-mac" and tree["tree_changed"] is None and isinstance(sent_key, SentTreeKey):
+        if step_caller in ("verify-mac", "verify-linux") and tree["tree_changed"] is None and isinstance(sent_key, SentTreeKey):
             tree["tree_key"] = sent_key.value
         name = parse.step_name(argv)
         record_id = new_id(host, start)
@@ -815,6 +895,7 @@ def step(args: list[str]) -> None:
             "v": RECORD_VERSION,
             "id": record_id,
             "host": host,
+            "target": recorded_target(host),
             "started_at": started_at,
             "ended_at": ended_at,
             "duration_s": round(end - start, 3),
@@ -838,6 +919,7 @@ def step(args: list[str]) -> None:
             "tty": tty,
             "status": status,
             "rustc": None if name == "sweep" else rustc_version(argv, cwd),
+            "scope_resources": scope_resources(peak),
             "peak_mem_bytes": memory.peak_bytes if isinstance(memory.peak_bytes, int) else None,
             "mem_stall_some_s": memory.stall_some_s if isinstance(memory.stall_some_s, float) else None,
             "mem_stall_full_s": memory.stall_full_s if isinstance(memory.stall_full_s, float) else None,
@@ -952,10 +1034,73 @@ class HoldEventRecord(TypedDict):
     until: str
 
 
+class SshAttempt(TypedDict):
+    call_id: str
+    target: str
+    repo_identity: str
+    queued_at: float
+    departed_at: float
+    slot: int
+    outcome: str
+    completion: str
+    cleanup: str
+    unresolved_count: int | None
+    evidence_at: float
+
+
+def ssh_attempt(attempt: SshAttempt) -> None:
+    """Keep an SSH attempt when later local work changes the final target."""
+    host = store.host_name()
+    at = time.time()
+    store.append_line(store.host_file(host, at), {
+        **attempt, "kind": "ssh_attempt", "v": RECORD_VERSION,
+        "id": f"{host}-{time.time_ns()}-{secrets.token_hex(4)}", "host": host,
+        "at": store.utc_iso(at),
+    })
+
+
+
+@dataclass(frozen=True)
+class AttemptResult:
+    repo_identity: str
+    slot: int
+    outcome: str
+    completion: str
+    cleanup: str
+    unresolved_count: int | MeasurementUnavailable
+    evidence_at: float
+
+
+def read_attempt_results(target: str) -> tuple[AttemptResult, ...]:
+    """Read the latest repository slot results from host month files."""
+    latest: dict[tuple[str, int], AttemptResult] = {}
+    for path in sorted(store.root().glob('*/[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl')):
+        with path.open('rb') as handle:
+            fcntl.flock(handle, fcntl.LOCK_SH)
+            for row in store.whole_rows(handle, 0):
+                if row.get('kind') != 'ssh_attempt' or row.get('target') != target:
+                    continue
+                count = row.get('unresolved_count')
+                at = float(str(row.get('evidence_at')))
+                slot = int(str(row.get('slot')))
+                if not math.isfinite(at) or at < 0 or slot < 0:
+                    raise ValueError('invalid attempt evidence')
+                result = AttemptResult(str(row.get('repo_identity', 'unknown')), slot,
+                                       str(row.get('outcome', 'unavailable')), str(row.get('completion', 'missing')),
+                                       str(row.get('cleanup', 'unconfirmed')),
+                                       count if type(count) is int and count >= 0 else MeasurementUnavailable('process count is unavailable'), at)
+                key = result.repo_identity, result.slot
+                if key not in latest or latest[key].evidence_at <= at:
+                    latest[key] = result
+    return tuple(latest[key] for key in sorted(latest))
+
 def hold_event(args: list[str]) -> None:
     event, target, key, holder, reason, at = args[:6]
-    if event not in ("began", "ended") or target not in ("mac", "natedev") or len(args) not in (6, 7):
+    if event not in ("began", "ended") or len(args) not in (6, 7):
         raise ValueError("invalid hold-event arguments")
+    if target not in ("mac", "natedev"):
+        if not any(item.name == target and isinstance(item, SshTarget) for item in read_targets()):
+            raise ValueError(f"unknown SSH hold target: {target}")
     instant = datetime.fromisoformat(at)
     if instant.utcoffset() is None:
         raise ValueError("hold-event at needs an offset")
@@ -997,6 +1142,8 @@ class IdleFloorTarget(TypedDict):
     folder: str
     last_use: float
     bytes: int
+    takeable_bytes: NotRequired[int]
+    reason: NotRequired[str]
 
 
 def floor_scan(free_after_scan: int, floor: int, idle_targets: list[IdleFloorTarget], at: float) -> None:

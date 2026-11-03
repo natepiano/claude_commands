@@ -1540,7 +1540,7 @@ def read_units(problems: list[log_records.SourceProblem]) -> list[Unit]:
         doc = Path(runner["doc"])
         lines = read_source(str(doc), lambda: doc.read_text(encoding="utf-8").splitlines(), [], problems, event_source=log_records.SourceNotApplicable.STATE)
         repo = read_source(str(doc), lambda: production_units.production_field(lines, "Repository"), "repository not recorded", problems, event_source=log_records.SourceNotApplicable.STATE)
-        rows = read_source(str(doc), lambda: production_units.live_unit_table(lines, runner["slug"]), [], problems, event_source=log_records.SourceNotApplicable.STATE)
+        rows = read_source(str(doc), lambda: unit_lookup.live_unit_table(lines, runner["slug"]), [], problems, event_source=log_records.SourceNotApplicable.STATE)
         for row in rows:
             tree = production_units.cell_value(row.get("Worktree", ""))
             name = production_units.cell_value(row.get("Unit", ""))
@@ -1765,16 +1765,30 @@ def read_waiting(
     for candidate in candidates.ranked(lines):
         if candidate.state == "proposed":
             waiting.append(WaitingItem("efficiency items", log_records.moment(candidate.night[:10])))
-    folder = state / "showrunner/outstanding"
-    paths = read_source(str(folder), lambda: [path for path in folder.iterdir() if path.suffix == ".json"], [], problems, event_source=log_records.SourceNotApplicable.STATE)
-    for path in sorted(paths):
-        outstanding = read_source(str(path), lambda: dailies_render.read_outstanding(path), [], problems, event_source=log_records.SourceNotApplicable.STATE)
-        for item in outstanding:
-            if isinstance(item, dailies_render.OutstandingReminder):
-                continue
-            since = item.since
-            opened = since.replace(tzinfo=user_zone()) if since.tzinfo is None else since
-            waiting.append(WaitingItem("questions", opened))
+    from scripts.production.update_registration import QuestionStaff, OutstandingReminder, read_open_items
+
+    def read_questions() -> list[WaitingItem]:
+        identities = QuestionStaff.read()
+        documents = identities.documents()
+        folder = state / "showrunner/outstanding"
+        paths = {path.stem: path for path in folder.glob("*.json")}
+        questions: list[WaitingItem] = []
+        for slug in sorted(set(paths) | set(documents)):
+            reminder_path = paths.get(slug)
+            document = documents.get(slug)
+            source = str(document if document is not None else reminder_path)
+            outstanding = read_source(source, lambda: read_open_items(reminder_path, document=document, identities=identities),
+                                      [], problems, event_source=log_records.SourceNotApplicable.STATE)
+            for item in outstanding:
+                if isinstance(item, OutstandingReminder):
+                    continue
+                since = item.since
+                opened = since.replace(tzinfo=user_zone()) if since.tzinfo is None else since
+                questions.append(WaitingItem("questions", opened))
+        return questions
+
+    waiting.extend(read_source("showrunner questions", read_questions, [], problems,
+                               event_source=log_records.SourceNotApplicable.STATE))
     return waiting
 
 

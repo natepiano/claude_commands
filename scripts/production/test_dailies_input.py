@@ -3,32 +3,108 @@
 from __future__ import annotations
 
 import json
-import dailies_input
-import dailies_render
+import io
+from contextlib import redirect_stderr
 import os
+import sqlite3
 import subprocess
 import sys
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TextIO, cast
+from typing import TextIO, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+import dailies_input
+import dailies_render
 from production_units import read_production
 from dailies_render import LENGTHS
 from dailies_input import (BevyUpgradeUnavailable, Block, ClaudeNotRunning, Decision, FormWaiting,
                            Running, SessionGone, StillWaiting, TicksFailing, bevy_upgrade_watch)
 import unit_lookup
 from scripts.production import staff
-from scripts.production.staff_test_support import fixture_showrunner_name, unit_membership
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.herdr.herdr import HerdrPlace
+from scripts.shutdown.remote import local_machine
+from scripts.production.staff_test_support import StaffTestCase, fixture_showrunner_name, unit_membership, showrunner_relationship
 from unit_lookup import UnitState
 from dailies_input_test_support import (DailiesInputFixture, SCRIPT, RENDERER, WAITING, STAMP, AT,
                                         ALPHA, BETA, RACE_WATCH_STUB)
 from dailies_input_test_support import setUpModule as setUpModule
 
 
+class RowDailiesTests(StaffTestCase):
+    def test_incomplete_unit_facts_keep_the_dailies_row_and_one_named_problem(self) -> None:
+        fixture = self.row_production()
+        unavailable = fixture.worktree.with_name("unavailable-member")
+        for failure in ("branch", "configuration"):
+            with self.subTest(failure=failure):
+                if failure == "branch":
+                    _ = fixture.worktree.rename(unavailable)
+                else:
+                    _ = unavailable.rename(fixture.worktree)
+                    (fixture.worktree / ".unit.toml").unlink()
+                errors = io.StringIO()
+                with redirect_stderr(errors):
+                    units = dailies_input.units_from_doc(fixture.doc.read_text().splitlines(), fixture.slug,
+                                                        record=staff.snapshot())
+                self.assertEqual([item.name for item in units], ["member-unit"])
+                self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                self.assertIn(fixture.unit.name, errors.getvalue())
+                self.assertIn(str(fixture.worktree), errors.getvalue())
+                if failure == "configuration":
+                    self.assertIn(".unit.toml", errors.getvalue())
+
+    def test_both_live_unit_label_forms_join_the_same_row_and_session(self) -> None:
+        fixture = self.row_production()
+        unit = staff.rename(fixture.unit.id, "writer")
+        before = self.staff_file.read_bytes()
+        for label in ("writer", "writer-unit"):
+            with self.subTest(label=label):
+                live = unit_lookup.MarkedUnit(label, unit_lookup.LiveClaude(
+                    "live-writer", unit.current_session, "", os.getpid()), HerdrPlace("writer", "w1:p1"),
+                    staff_id=unit.id)
+                with mock.patch.object(unit_lookup, "marked_units", return_value={label: live}):
+                    units = dailies_input.units_from_doc(fixture.doc.read_text().splitlines(), fixture.slug,
+                                                        record=staff.snapshot())
+                self.assertEqual([(item.name, item.session) for item in units], [("writer-unit", "live-writer")])
+                self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_run_status_uses_the_row_worktree_when_the_table_names_another_folder(self) -> None:
+        fixture = self.row_production()
+        runs = unit_lookup.RunStates({str(fixture.worktree): unit_lookup.RunRecord(
+            self.root / "finished-run.jsonl", UnitState.RUN_FINISHED)})
+        with mock.patch.object(unit_lookup, "read_run_states", return_value=runs):
+            units = dailies_input.units_from_doc(fixture.doc.read_text().splitlines(), fixture.slug,
+                                                 record=staff.snapshot())
+        self.assertEqual([(unit.name, unit.run) for unit in units], [("member-unit", UnitState.RUN_FINISHED)])
+
+
 class DailiesInputTests(DailiesInputFixture):
+    @override
+    def timer(self, slug: str) -> None:
+        super().timer(slug)
+        doc = self.doc if slug == "example" else self.root / f"{slug}-production.md"
+        if doc != self.doc:
+            write_text_atomic(doc, self.doc.read_text().replace(
+                "- **Showrunner session:** test-showrunner", f"- **Showrunner session:** {slug}"))
+        row = showrunner_relationship(fixture_showrunner_name(slug, self.doc))
+        _ = staff.set_doc(row.id, staff.LiveDoc("natedev", doc))
+        conf = self.root / "notifier-state" / f"showrunner-{slug}" / "conf"
+        write_text_atomic(conf, f"TARGET=session:{row.id}\nCHECK=zsh /x/production_check.sh {doc}\n")
+
+    @override
+    def production_doc(self, *, beta: bool = False) -> None:
+        super().production_doc(beta=beta)
+        for label, name in ((ALPHA, "alpha"), (BETA, "beta")) if beta else ((ALPHA, "alpha"),):
+            row = unit_membership(fixture_showrunner_name("example", self.doc), label)
+            folder = self.root / name
+            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", folder), expected=row.worktree)
+            assert row.parent is not None
+            _ = staff.set_doc(row.parent, staff.LiveDoc("natedev", self.doc))
+            write_text_atomic(folder / ".unit.toml", f'plan = "docs/{name}.md"\nresponsibilities = []\n')
+
     def test_a_unit_whose_run_is_finished_needs_no_entry_and_is_left_out(self) -> None:
         self.production_doc(beta=True)
         self.status_lines(f"== {ALPHA}", "● Checking panel labels", f"== {BETA}", "● Standing by")
@@ -581,7 +657,9 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "23:40")
 
     def test_a_dailies_leaves_a_retired_units_note_for_the_timer_to_prune(self) -> None:
-        _ = staff.retire(unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).id)
+        _ = staff.set_worktree(
+            unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).id,
+            staff.RemovedWorktree(local_machine(), self.root / "alpha"), expected=unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).worktree)
         note = self.root / "vault/old-showrunner/alpha-unit.md"
         note.parent.mkdir(parents=True)
         _ = note.write_text(
@@ -665,7 +743,9 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual([unit["unit"] for unit in units], [ALPHA])
 
     def test_all_retired_units_report_no_live_units(self) -> None:
-        _ = staff.retire(unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).id)
+        _ = staff.set_worktree(
+            unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).id,
+            staff.RemovedWorktree(local_machine(), self.root / "alpha"), expected=unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).worktree)
         content = self.doc.read_text(encoding="utf-8")
         _ = self.doc.write_text(content.replace("`docs/alpha.md`", "retired after completion", 1),
                                 encoding="utf-8")
@@ -1641,7 +1721,8 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(parsed.waiting.count, 1)
         created = datetime.fromisoformat(cast(str, summary["oldest_waiting"]))
         local_created = created.astimezone(ZoneInfo("America/Los_Angeles"))
-        self.assertEqual(parsed.waiting.oldest_pending_since, local_created)
+        self.assertEqual(parsed.waiting.oldest_pending_since.astimezone(ZoneInfo("UTC")),
+                         local_created.astimezone(ZoneInfo("UTC")))
         _ = self.output.write_text(json.dumps({
             "length": "simple", "zone": "America/Los_Angeles", "units": [],
             "children": [{"name": "hana-style", "open": 0, "report": saved}],
@@ -1650,6 +1731,28 @@ class DailiesInputTests(DailiesInputFixture):
         rendered = self.run_renderer(render_at.strftime("%Y-%m-%dT%H:%M"))
         self.assertEqual(rendered.returncode, 0, rendered.stderr)
         self.assertIn(" · hand-off waiting 5h", rendered.stdout)
+
+    def assert_handoff_age_at(self, created_at: str) -> None:
+        ledger_cli = self.style_ledger_cli
+
+        def with_fixed_creation_time(*arguments: str) -> subprocess.CompletedProcess[str]:
+            result = ledger_cli(*arguments)
+            if arguments[:2] == ("handoff", "add"):
+                # The ledger runs in a child: fix its saved clock in the disposable database.
+                database, = Path(self.env["STYLE_LEDGER_STATE_DIR"]).rglob("ledger.sqlite")
+                with sqlite3.connect(database) as connection:
+                    _ = connection.execute("UPDATE handoffs SET created_at=?, updated_at=?",
+                                           (created_at, created_at))
+            return result
+
+        with mock.patch.object(self, "style_ledger_cli", side_effect=with_fixed_creation_time):
+            self.test_unsent_handoff_age_from_the_ledger_flags_the_saved_style_report()
+
+    def test_unsent_handoff_age_in_the_first_fold_of_the_repeated_hour(self) -> None:
+        self.assert_handoff_age_at("2026-11-01T08:01:42.340892+00:00")
+
+    def test_unsent_handoff_age_in_the_second_fold_of_the_repeated_hour(self) -> None:
+        self.assert_handoff_age_at("2026-11-01T09:01:42.340892+00:00")
 
     def test_failed_or_invalid_summary_saves_unavailable_and_the_report_still_succeeds(self) -> None:
         self.mark_style_production()

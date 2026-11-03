@@ -2,7 +2,7 @@
 
 Stop, resume and account move use `scripts/shutdown/stop_resume.py`.
 
-`stop(session)` ends only the selected local session's Claude process. It reads identity through `sessions.session_liveness`, keeps the pid and start time, checks that identity before each signal, sends TERM, and checks exit every 0.1 seconds and sends KILL after two seconds if the same process survives. It returns as soon as that process exits. It waits up to five seconds after KILL. It waits for that pid and start time to leave. Registry removal alone does not prove exit. A surviving process returns `StopFailed`. Workers keep their threads. No stopping record, ready mark, account hold or conductor is created.
+`stop(session)` ends only the selected local session's Claude process. It reads identity through `sessions.session_liveness`, keeps the pid and start time, checks that identity before each signal, sends TERM, and checks exit every 0.1 seconds and sends KILL after two seconds if the same process survives. After exit, `stall_watch.retire_session_prompt(session_id)` atomically publishes only `{session_id, at}` with no launch, pane or parent lookup. It takes no watcher lock and sends nothing; stall-watch finds saved prompts by their owning session id and retires their stored keys on its next pass, even after launch deletion. Any cancellation exception prints a separate warning and does not prevent intentional-stop bookkeeping or change the stop result. It waits up to five seconds after KILL. It waits for that pid and start time to leave. Registry removal alone does not prove exit. A surviving process returns `StopFailed`. Workers keep their threads. No stopping record, ready mark, account hold or conductor is created.
 
 `resume(session, why=..., to=...)` finds the session's own herdr tab and its launch entry, then runs the account exec command through `Herdr.run_in_pane`. The resume arguments and message have one builder each. The message says why the session stopped and resumed, tells it to continue its work, and explains how to resume existing workers. When herdr has a stale or empty conversation id, the saved launch entry supplies it unless another Claude runs in that pane. The command sets the destination pane's `HERDR_PANE_ID` and `HERDR_WORKSPACE_ID`. It unsets `HERDR_TAB_ID`, so a moved tab does not reuse its shell's old marks. No tab opens or closes. A live Claude refuses resume.
 
@@ -10,15 +10,25 @@ Stop, resume and account move use `scripts/shutdown/stop_resume.py`.
 
 The shared session registry reader skips a file that vanishes during the scan. It retries a transient unreadable file up to three times, 50 milliseconds apart. Other unreadable evidence remains visible.
 
-`move_sessions` uses the same stop and resume functions. All stops complete before any resumes. Each member resumes in its own pane on the target account; failures are independent. A selected caller hands off the same batch before any signal. Linux uses a user systemd service; macOS uses a detached process. An optional warning lasts at most fifteen seconds. The detached batch clears `CLAUDE_CODE_SESSION_ID` so it does not hand off again. Final results are one line per member under the shutdown state folder's `logs` directory.
+`move_sessions` uses the same stop and resume functions. All stops and prompt cancellation requests finish before any resumes. A retained request compares its wall-clock cutoff with the prompt's immutable observation-start time. An observation that spans stop/resume can be retired; the next watcher pass observes the resumed prompt afresh. A prompt first observed after the stop survives the older request, and failed retirement is retried by stall-watch. Each member resumes in its own pane on the target account; failures are independent. A selected caller hands off the same batch before any signal. Linux uses a user systemd service; macOS uses a detached process. An optional warning lasts at most fifteen seconds. The detached batch clears `CLAUDE_CODE_SESSION_ID` so it does not hand off again. Final results are one line per member under the shutdown state folder's `logs` directory.
 
 Retirement, checkout moves, running-session attach and nix-shell healing use this API. Retirement removes the unit’s pane launch entries after successful stop and cleanup. Retirement and unit rename close the unit's own pane after their ownership checks. A pane already gone counts as closed. Checkout moves stop before moving files and resume afterward. The checkout coordinator excludes only its own pid from cwd holders; other holders still refuse. Attach keeps its process and prompt-submission proofs. The conductor, bounded stop, pause messages and `down`, `now`, `ready`, `cancel`, `conduct` and `follow` commands are deleted.
 
-Watchdog recovery reads the unit's pane launch and live liveness. It keeps one notes pass of grace and resumes the same conversation on the launch account. The unit must not be retired, must have a worktree, and its run must not have finished. A unit with no run record is standing by and can recover. A queued recovery refuses a changed or ended launch. Shared resume creates a fresh tab when the pane is gone. Pending jobs prevent duplicate dispatch; unreadable live confirmation preserves their evidence. The watchdog reads no shutdown records, recovery snapshots or account holds. Its existing outage state and alert ledger retain delivery deduplication and retry. Record-driven restart still retries unconfirmed owner cleanup through `stop_resume.stop` before launching; a failed retry keeps the issue and a retry command.
+Watchdog recovery reads the unit's pane launch and live liveness. It keeps one notes pass of grace and resumes the same conversation on the launch account. The unit must not be retired, must have a worktree, and its run must not have finished. A unit with no run record is standing by and can recover. A queued recovery refuses a changed or ended launch. Shared resume creates a fresh tab when the pane is gone. Pending jobs prevent duplicate dispatch; unreadable live confirmation preserves their evidence. The watchdog excludes existing intentional stop records at or after the retained pane launch. It checks the record again before a queued recovery starts. An explicit later launch supersedes an older stop. It does not read account holds. Its outage state retains pending recovery jobs and first-seen times. The agent-notes job runs this check in its own process with the limits in `config/agent_notes.toml`. Shared resume supplies the restarted session’s prompt; the watchdog sends no messages to live sessions, showrunner notices or phone pushes. Record-driven restart still retries unconfirmed owner cleanup through `stop_resume.stop` before launching; a failed retry keeps the issue and a retry command.
 
-Record-driven restart, status, recovery snapshots, forget, account holds and launch barriers remain until Phase 8. `restart_support.py` owns their retained message, notifier and record-status helpers. Inventory owns fresh session attribution. Unit rename and production rename keep their Phase 9 journals; their stop boundary uses `stop_resume`.
+Record-driven restart, status, forget, account holds, and launch barriers remain available.
+Recovery snapshots and their restore and status readers are deleted.
+`restart_support.py` owns the retained record-driven message, notifier, and status helpers.
+Inventory owns fresh session attribution.
+Unit rename and production rename retain journals; their stop boundary uses `stop_resume`.
+The [account design](accounts.md) describes role selection, moves, and worker routing.
 
 ## Session hosting and manual recovery
+
+Pane launch writes store the supplied labels unchanged: an unmarked launch does not
+inherit a previous launch's staff identity. Restart, resume and the SessionStart
+hook recover a conversation's saved labels explicitly through `record_membership`
+before writing its launch.
 
 Herdr is the session host. Unit records retain `session_host: "herdr"`;
 standalone records carry the server and pane. A process inside a user-managed
@@ -29,15 +39,57 @@ A Mac `terminal` host restarts into a new herdr session, attached in the same
 window through its supervisor, else in a new Ghostty window. An
 unavailable desktop refuses with an unlock-and-restart instruction. A session
 with no conversation starts fresh under its recorded id and prints a plain
-explanation. `forget` retires stopped and failed shutdown-record entries as
-well as recovery snapshot entries.
+explanation. `forget` retires stopped and failed shutdown-record entries.
 
 Old host records normalize to explicit manual-recovery states. Their names
 never become herdr destinations. Unconfirmed cleanup stays in the record;
-status and restart print the cleanup and resume commands. An old Codex
-snapshot prints its recorded `CODEX_HOME` and `codex resume <id>` (or its
-picker), remains unacknowledged and makes restart partial with exit 1.
+status and restart print the cleanup and resume commands. Recovery snapshots no longer supply Claude or Codex restore candidates.
 
 The Remote Control fixer resolves the newly registered pid's herdr pane and
 checks identity and idle state before input. Tests use disposable state and
 fake host commands.
+
+`herdr-upkeep` runs `scripts/maintenance/herdr_upkeep.py`. It saves the running shared session’s layout and refreshes detection rules. `config/herdr_upkeep.toml` supplies its interval and process deadline at each invocation. A successful run saves its completion time; a not-due rerun changes nothing. The worker and its descendants are killed at the configured deadline, and a failed run stays due. Inventory no longer runs a desktop updater or reads the deleted `agent sessions.md`; production identity comes from `staff.json`. No reboot is part of the removal proof.
+
+A restart problem sends one phone push per kind of fix.
+Retryable failures share one count push with a retry command and its machine.
+Different retryable causes and long session names do not create more pushes.
+Trust failures share one count push per machine for plain restarts and failed moves.
+An all-account restart groups trust failures across accounts.
+If every folder has a configured trust key, the action runs `accounts.py trust`, then retries the restart.
+Otherwise, the action asks the natedev session to trust the stopped sessions’ folders from their shutdown records.
+The restart output keeps the trust command for each folder.
+Configured trust covers exact folder, repository-root, or main-checkout keys, not arbitrary descendants.
+Manual failures share one count push per machine. Its action requests a resume from the shutdown records.
+The same failed sessions, a subset, or a changed failure reason sends no second push.
+A confirmed recovery clears only outage claims older than its live observation.
+A later failure can send a new push.
+Failed push delivery releases the claims for a retry.
+
+## Outage alert ledger
+
+`scripts/accounts/outage_alerts.py` owns `~/.local/state/accounts/unit_outage_alerts.json`.
+A file lock and atomic replacement protect the ledger.
+Session ids identify outages independently of shutdown-record archival.
+An entry contains a token, owner pid, claim time, and `claimed` or `delivered` state.
+`AlertClaim`, `AlertInFlight`, and `AlertDelivered` distinguish permission to send from suppression.
+
+Each sender claims the sessions for one push immediately before that push.
+It includes only claimed sessions when the text lists sessions.
+It finishes delivery or releases those claims before reserving another push.
+The session's machine owns its ledger and sends its alerts.
+A remote caller prints peer results without claiming the peer's sessions locally.
+`--no-alert` suppresses delivery on the owning machine too.
+
+A successful push marks the matching token delivered.
+A failed push releases it for a later retry.
+An owner that exits leaves a stale claim that another sender can replace.
+A claim also expires after the configured lease, which defaults to fifteen minutes.
+That lease exceeds the normal send deadline.
+An older token cannot deliver or release its replacement.
+The record's `restore_alerted` mark remains separate from successful delivery in the ledger.
+
+`clear(session_id, observed_at)` removes only an entry claimed before the live observation.
+Callers pass the observation time, not the later archive time.
+A slow probe or batch archive therefore cannot remove an alert for a newer crash.
+The watchdog applies this rule when it sees a live unit, but sends no phone push itself.

@@ -1,5 +1,5 @@
 ---
-description: Multi-agent API review — ergonomics, performance, simplicity, duplication removal, module structure/naming, and judicious trait/generic use — across a crate or workspace member's public + internal API. Five review agents, an adversarial validation pass, then a worker-compatible phased implementation plan written to the docs directory.
+description: Review Rust APIs in the invoking session.
 ---
 
 **IMPORTANT**: Do NOT modify any source code. This command produces a review doc with an implementation plan — implementation happens via `/plan:to_phased_plan` + `/unit:direct` or a follow-up turn.
@@ -45,39 +45,26 @@ State one line: `Reviewing <target> API (crate: ${CRATE_NAME}). Review will be w
 ---
 
 <InventoryApi>
-**Goal:** one shared picture of the API surface so every agent reviews the same thing.
+**Goal:** Build one API inventory for all lenses.
 
 - Enumerate the surface in scope: `pub` items (types, traits, functions, methods, events, plugins) AND `pub(crate)`/module-internal items — internal APIs are in scope for duplication and simplicity. When `${FOCUS}` is set, enumerate only items within it; items elsewhere in the crate enter the inventory only as **callers or context** for the focused surface, marked as such.
 - Capture **usage evidence**: examples/, tests/, doc comments, and callers of the in-scope items. For workspace members, find external callers via `rg "use ${CRATE_NAME}(::|;|\s+as\s+)" --type rust` across the workspace (excluding `${CRATE_ROOT}`).
 - If `${IS_BEVY}`: list Events, Observers, Plugins, and which events are BRP-reachable (registered for reflection, `Serialize`/`Deserialize` or `Reflect`-constructible, triggerable via `world.trigger`).
 - Capture the **module tree** of the in-scope surface with per-file line counts (`wc -l`), noting sibling directories that implement the same trait or role.
 
-Capture as `${INVENTORY}` — item list plus file paths. Every agent prompt gets it verbatim.
+Store the item list and file paths as `${INVENTORY}`. Use it for every lens.
 </InventoryApi>
 
 ---
 
 <ReviewPass>
-**Goal:** five agents review the API along five lenses.
+**Goal:** Review the API through five lenses.
 
-Launch **5 external CLI agents in parallel** through `~/.claude/scripts/agents/agent_exec.sh` using the `api_review.reviewer` registry task and `readonly` mode. Readonly mode is the readonly review contract: codex uses `--sandbox read-only`; claude uses `--permission-mode plan`.
+The invoking session runs each lens itself, one after the other: A, B, C, D, then E.
 
-Create an absolute `${SESSION_DIR}` under `/tmp/claude/api_review/<uuid>/`, set `${WORKING_DIR}=${CRATE_ROOT}`, and create `${WAVE_DIR}=${SESSION_DIR}/reviewer`. Before backgrounding any reviewer:
+1. Create an absolute `${SESSION_DIR}` under `/tmp/claude/api_review/<uuid>/` for the findings.
 
-1. Warm the agent-catalog freshness gate once by running `bash ~/.claude/scripts/agents/agent_admin.sh api_review` with Bash `dangerouslyDisableSandbox: true`. This must not run sandboxed: a sandboxed catalog sync cannot update the registry or freshness state, and its warn-and-continue behavior can leave every parallel launch attempting the same stale sync.
-2. Capture provenance once for each task this command uses:
-   - `bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve_print api_review.reviewer' >> "${SESSION_DIR}/agent_provenance.txt"`
-   - `bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve_print api_review.adversary' >> "${SESSION_DIR}/agent_provenance.txt"`
-
-Write five absolute `${WAVE_DIR}/prompt_N.md` files and reserve `${WAVE_DIR}/findings_N.txt` and `${WAVE_DIR}/agent_N.log` for each reviewer. External CLI agents inherit no session context. Every prompt file must be self-contained and include:
-
-- The charter preamble below verbatim.
-- The review topic, intent, and posture/boundaries from `<ResolveTarget/>` and the shared context below.
-- `${CRATE_ROOT}`, `${FOCUS}` when set, and every other relevant file as explicit absolute paths.
-- `${INVENTORY}` verbatim and the reviewer's specific lens.
-- The full charter finding schema: Title / Where (paths + item names) / Severity (critical / important / minor) / Problem (concrete, with the current call site or doc passage) / Impact / Recommendation (with a before/after sketch where useful). Omit Class as specified below.
-
-Each prompt includes this preamble verbatim:
+Run this preamble once, before lens A.
 
 ```
 Before evaluating:
@@ -86,7 +73,7 @@ Before evaluating:
    If the output mentions a saved file path, Read that file. Apply the loaded rules — including forbidden-words.md — to every word of every finding you return.
 ```
 
-Then the per-agent body, with `${INVENTORY}` and this shared context:
+Apply this shared context to each lens:
 
 > The API serves three audiences: the author, AI agents, and other developers. Optimize for intuitive, low-ceremony use — a caller should be able to guess the right call from the names alone.
 >
@@ -94,17 +81,17 @@ Then the per-agent body, with `${INVENTORY}` and this shared context:
 >
 > The review subject is exactly the in-scope items in the inventory (when a focus is set, that subset — not the whole crate; state the focus here). Items marked as callers/context inform findings (they show real usage) but do not get findings of their own.
 
-Output format per finding: the charter's finding schema (omit Class — this command doesn't distinguish).
+Use the charter's finding schema for each finding. Omit Class.
 
-**Agent A — Ergonomics**
+**Lens A — Ergonomics**
 > Evaluate call-site ergonomics across `${INVENTORY}` — public and internal entry points alike. For each: how many steps/imports/type annotations does a typical use take? Judge naming (guessable? consistent verb/noun conventions?), defaults (`Default` impls, builder vs N-arg constructors), parameter types (accept `impl Into<T>`/`AsRef` where it removes caller ceremony), error types (can the caller do something with the error?), and discoverability (does the crate root re-export the things users need, or must callers know deep paths?). Ground truth is real call sites: examples/ and tests/ for public items, sibling-module callers for internal ones — flag anywhere the calling code is awkward.
 >
 > If `${IS_BEVY}`: the user prefers **observers** as the programming model. Flag APIs that force system-scheduling ceremony where an event + observer would be simpler. Flag work that agents or developers would want to trigger externally but that cannot be fired via a BRP `world.trigger` call (event not registered/reflectable, or the operation is only reachable through a system). Recommend the event-triggers-observer shape where it fits; don't force it onto genuinely per-frame logic.
 
-**Agent B — Simplicity and duplication**
+**Lens B — Simplicity and duplication**
 > Find surface to remove. Near-identical functions/methods/types (name the pairs and diff them), parallel entry points that do the same job (which one survives?), pass-through wrappers that add no behavior, config/options structs with fields nothing reads, items that are `pub` but have zero external callers per the inventory's usage evidence (narrow to `pub(crate)` or delete), and concepts a caller must learn that could be folded into an existing one. For each duplication finding, state the single surviving API and what migrates to it.
 
-**Agent C — Trait and generic opportunities (two-sided)**
+**Lens C — Trait and generic opportunities (two-sided)**
 > Evaluate where traits or generics would genuinely help — and where existing ones hurt. Rules:
 > - A trait is only justified with **more than one available implementer** (existing in the codebase, or a second one this review's plan concretely creates). One implementer = concrete type, no trait. Exception: a deliberate extension point for downstream crates, with that intent stated in the trait's doc comment.
 > - A generic is justified only when it removes real duplication or widens usability without adding caller-side type ceremony (turbofish, unresolvable inference).
@@ -112,49 +99,46 @@ Output format per finding: the charter's finding schema (omit Class — this com
 > - Side 2 — over-abstraction: existing traits with one implementer, generics with one instantiation, `where`-clause walls. Recommend concretizing.
 > Don't manufacture findings on either side — "the current balance is right" is a valid verdict.
 
-**Agent D — Module structure and naming**
+**Lens D — Module structure and naming**
 > Evaluate the module tree of the in-scope surface. Apply the loaded style rules — especially `name-submodules-after-anchor-types.md` and `when-to-split-a-module.md` — and:
 > - **Names match behavior.** A module name says what its contents *do* or names the anchor type they revolve around — never the *kind* of item inside. Flag names like `components`, `observers`, `systems`, `events`, `helpers`, `utils`, `types` and propose behavior/anchor-type names.
 > - **Parallel implementers, parallel structure.** Where multiple implementers of a trait (or same-role peers) each live in their own directory/`mod.rs`, their submodule layouts and names should match — the same concern gets the same filename in every implementer directory. Diff the sibling directories and flag divergences (same concern, different name; concern present in one, buried in another's `mod.rs`).
 > - **Cohesion.** Things that change together live together. Flag types/functions split across modules that every change touches in tandem, and unrelated items sharing a module.
 > - **Size.** A module over ~500 non-test lines is a split indicator (use `wc -l` plus `awk '/^#\[cfg\(test\)\]/{print NR; exit}'` to exclude inline tests). For each over-size module, propose the split along its natural seams — anchor types first — citing `when-to-split-a-module.md`.
 
-**Agent E — Performance**
+**Lens E — Performance**
 > Evaluate the runtime cost the API's shape imposes on callers. Flag: signatures that force allocation or clones at the boundary (owned `String`/`Vec` params where a borrow works, `.clone()` the caller can't avoid), dynamic dispatch (`Box<dyn Trait>`, `&dyn`) where static dispatch works, copies at module/crate boundaries, and work done per-call that could be amortized into construction/setup. If `${IS_BEVY}`: scrutinize anything on a per-frame path — allocation, lookup, or event churn each frame that setup-time registration would remove.
 >
 > Two-sided, per the charter's tie-breaks: also flag performance ceremony that isn't paying rent — lifetimes/generics that complicate every call site with no hot-path justification. When another lens's likely recommendation (e.g. `impl Into<T>` sugar) carries a cost on a hot path, say so explicitly with the cost named.
 
-After all prompt files exist, issue all five Bash tool calls in the same assistant turn, each with `run_in_background: true` and `dangerouslyDisableSandbox: true`:
+1. Write `${SESSION_DIR}/review_findings_<letter>.txt` after each lens, before the next lens.
+2. Write an explicit no-findings result when the lens finds no issue.
+3. Read all five files and collect their findings as `${FINDINGS}` before validation.
+4. Report any incomplete lens before synthesis.
 
-```bash
-bash ~/.claude/scripts/agents/agent_exec.sh api_review.reviewer readonly "${WORKING_DIR}" "${WAVE_DIR}/prompt_N.md" "${WAVE_DIR}/findings_N.txt" "${WAVE_DIR}/agent_N.log"
-```
-
-All working-directory, prompt, output, and log arguments must be absolute paths. Yield after starting the complete wave; task notifications signal completion. Do not poll. After all five notifications arrive, read every `${WAVE_DIR}/findings_N.txt` and collect the findings as `${FINDINGS}`. Synthesis and deduplication remain in this command session. Failure rule for both waves in this command: if a launch exits nonzero or its findings file is missing or empty, read that agent's `agent_N.log`, surface the error to the user, and decide whether to relaunch that one agent or proceed on the remaining findings — never silently treat a failed agent as an empty review.
-
-Accepted risk: running the style loader is proven under codex readonly mode, but untested under claude `--permission-mode plan` with `--print`.
+Never treat an incomplete review as a no-findings result.
 </ReviewPass>
 
 ---
 
 <ValidationPass>
-**Goal:** adversarially stress-test the findings before they become a plan. Merge and dedupe `${FINDINGS}` first, then create `${WAVE_DIR}=${SESSION_DIR}/adversary` and launch **2 external CLI agents in parallel** through `~/.claude/scripts/agents/agent_exec.sh` using the `api_review.adversary` registry task and `readonly` mode.
+**Goal:** Challenge the findings before they become a plan.
 
-Write `${WAVE_DIR}/prompt_1.md` and `prompt_2.md`, with matching `findings_N.txt` and `agent_N.log` paths. Each self-contained prompt repeats the charter + style-guide preamble verbatim; the review topic, intent, and posture/boundaries; all relevant explicit absolute file paths; `${INVENTORY}` and the merged `${FINDINGS}` verbatim; its adversarial lens; and the complete finding schema from `<ReviewPass/>`.
+Merge and dedupe `${FINDINGS}` first.
+The invoking session runs adversary lenses F, then G itself, one after the other.
+Use `${INVENTORY}`, the merged findings, and the finding format from `<ReviewPass/>`.
+Write `${SESSION_DIR}/adversary_findings_<letter>.txt` after each lens.
 
-**Agent F — Feasibility and blast radius**
+**Lens F — Feasibility and affected callers**
 > For each recommendation: count actual call sites that break (`rg` for the item across crate + workspace), name semver/behavior hazards, and check the before/after sketch actually compiles conceptually (ownership, lifetimes, object safety for proposed traits). Verify every proposed trait's implementer count — kill any that lands at one, unless it is a documented extension point for downstream implementers. Flag any recommendation that adds runtime cost (allocation, dispatch, copies) without the charter-required cost callout. For module moves/renames/splits, count broken `use` paths and flag visibility shifts (`pub(super)`/`pub(crate)` items that stop resolving). Rank surviving recommendations by benefit-to-churn.
 
-**Agent G — Over-engineering check**
+**Lens G — Over-engineering check**
 > Attack each recommendation as a skeptic: does it make the common call site simpler, or just different? Does it add a concept callers must learn? Would the author's own examples get shorter? Kill or demote anything that trades caller simplicity for internal elegance. "Reject" is a valid verdict per finding.
 
-Issue both Bash tool calls in the same assistant turn, each with `run_in_background: true` and `dangerouslyDisableSandbox: true`:
-
-```bash
-bash ~/.claude/scripts/agents/agent_exec.sh api_review.adversary readonly "${WORKING_DIR}" "${WAVE_DIR}/prompt_N.md" "${WAVE_DIR}/findings_N.txt" "${WAVE_DIR}/agent_N.log"
-```
-
-Yield after starting both; task notifications signal completion. Do not poll. After both notifications arrive, read both findings files and apply the verdicts: drop killed findings silently, adjust demoted ones. Conflicts between agents: caller-side simplicity wins. Synthesis stays in this command session.
+1. Read both findings files and apply their verdicts before writing the plan.
+2. Apply the review rule for no-findings results and incomplete lenses.
+3. Drop rejected findings silently and adjust demoted findings.
+4. Resolve conflicts in favor of caller simplicity.
 </ValidationPass>
 
 ---
@@ -175,7 +159,7 @@ Yield after starting both; task notifications signal completion. Do not poll. Af
 
 <surviving findings, ordered by severity. Each: title, where, observation with
 current call site, recommendation with before/after sketch. No dismissed
-alternatives, no agent attribution — this is the recommendation.>
+alternatives, no lens attribution — this is the recommendation.>
 
 ## Implementation plan
 

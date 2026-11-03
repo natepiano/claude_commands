@@ -22,9 +22,8 @@ import nightly_review
 from scripts.whoami import account
 from scripts.accounts import accounts
 from scripts.production import showrunners
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 # `messages` reads the message review from its own folder, as the timer does.
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 sys.path.insert(0, str(Path(nightly_review.__file__).resolve().parents[1] / "notify"))
 if TYPE_CHECKING:
@@ -254,6 +253,14 @@ class NightlyProductionTests(NightlyReviewTests):
 
     def runners(self, *docs: tuple[str, str]) -> list[showrunners.Showrunner]:
         return [showrunners.Showrunner(session="", socket="", slug=slug, zone="", doc=doc) for slug, doc in docs]
+
+    def test_unknown_production_cannot_make_the_nightly_owner_appear_unique(self) -> None:
+        healthy = self.runners(("one", self.doc("one", "permanent")))
+        partial = showrunners.ShowrunnerDiscovery(healthy, (
+            showrunners.ShowrunnerLookupFailure("missing", "fixture lookup failed"),))
+        with mock.patch.object(showrunners, "registered_showrunners", return_value=partial):
+            with self.assertRaisesRegex(OSError, "fixture lookup failed"):
+                _ = nightly_review.nightly_production()
 
     def test_the_production_with_the_permanent_row_is_found(self) -> None:
         listed = self.runners(("one", self.doc("one", "standby")), ("two", self.doc("two", "permanent")))

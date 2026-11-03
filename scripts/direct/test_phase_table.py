@@ -24,7 +24,7 @@ from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_showrunner, fake_unit_host, showrunners, staff
 from scripts.production.production_units import read_production
 from scripts.production.staff_test_support import (
-    isolated_staff_file, production_membership, showrunner_relationship, unit_membership,
+    isolated_staff_file, production_membership, showrunner_relationship, unit_membership, recorded_unit,
 )
 
 
@@ -203,12 +203,15 @@ class PhaseTableTests(unittest.TestCase):
             encoding="utf-8",
         )
         production_membership("show", *(row[0] for row in rows if not row[1].startswith("retired")))
+        for unit, plan, worktree in rows:
+            if not plan.startswith("retired"):
+                _ = recorded_unit("show", unit, worktree, path, plan=plan)
         return path
 
     def make_live_worktree(self, name: str) -> Path:
         worktree = self.root / name
         worktree.mkdir()
-        _ = (worktree / ".git").write_text("gitdir: test\n", encoding="utf-8")
+        _ = subprocess.run(["git", "init", "-b", "branch", str(worktree)], check=True, capture_output=True)
         return worktree
 
     def write_run_for_plan(
@@ -335,7 +338,7 @@ class PhaseTableTests(unittest.TestCase):
 
     def write_showrunner(self, name: str = "showrunner") -> None:
         self.showrunner_record_number += 1
-        session_id = f"showrunner-{self.showrunner_record_number}"
+        session_id = showrunner_relationship("show").id
         production = self.working_dir / "docs" / "show-production.md"
         _ = fake_showrunner.write_timer(
             self.notifier_dir,
@@ -353,11 +356,12 @@ class PhaseTableTests(unittest.TestCase):
 
     def write_stopped_showrunner(self) -> None:
         self.showrunner_record_number += 1
+        (self.sessions_dir / f"{os.getpid()}.json").unlink(missing_ok=True)
         production = self.working_dir / "docs" / "show-production.md"
         _ = fake_showrunner.write_timer(
             self.notifier_dir,
             "show",
-            f"stopped-showrunner-{self.showrunner_record_number}",
+            showrunner_relationship("show").id,
             "UTC",
             production,
         )
@@ -389,7 +393,7 @@ class PhaseTableTests(unittest.TestCase):
             self.write_showrunner()
 
     def mark_unit(self, live_name: str = "") -> None:
-        production_membership("show", "table-unit")
+        unit = unit_membership("show", "table-unit")
         fake_unit_host.write(self.environment(), [fake_unit_host.HostedUnit(
             "table-host", "w1:p1", {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "table-unit"})])
         if not live_name:
@@ -407,7 +411,7 @@ class PhaseTableTests(unittest.TestCase):
             json.dumps(
                 {
                     "pid": pid,
-                    "sessionId": f"live-{self.live_record_number}",
+                    "sessionId": unit.id,
                     "name": live_name,
                     "messagingSocketPath": str(socket_path),
                     "updatedAt": self.live_record_number,

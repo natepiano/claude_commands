@@ -1,5 +1,5 @@
 ---
-description: Judge whether direct-ready phased plans should run as a production — several /unit:direct units in parallel under one showrunner — and propose the units, hub-file owners and gates between units.
+description: Assess plans for parallel production.
 ---
 
 # Greenlight

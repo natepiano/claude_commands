@@ -267,7 +267,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         roles = accounts.claude_account_selection()
         with mock.patch.object(accounts, "claude_account_selection", side_effect=AssertionError("roles resolved twice")):
             lines = self.block([note], self.now, selection=roles)
-        self.assertIn("switched to claude for codex1: direct, module_review", lines)
+        self.assertIn("switched to claude for codex1: direct, design_roles", lines)
         self.assertEqual((len(self.sent), len(self.pushed)), (0, 0))
 
     def test_recovery_does_not_announce_a_different_healthy_claude_account(self) -> None:

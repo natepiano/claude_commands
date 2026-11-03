@@ -424,7 +424,7 @@ class AccountHoldTests(unittest.TestCase):
             a = self.readings(1)
             _ = five_hour.watch([a.checked_homes[0].report], now=self.now, codex_readings=a)
             # This queued relay predates log-only Codex notices; new watches never enqueue it.
-            send.enqueue(send.Message("hana", "quota_alert", "", "old Codex warning", "5-hour codex1"),
+            send.enqueue(send.Message("hana", "quota_alert", "", "old Codex warning", "5-hour codex1", stamp=send.UnavailableSender()),
                          "offline", self.now)
             self.assertTrue(send.read_queue(send.queue_path("hana")))
             chosen = self.readings(2, None)

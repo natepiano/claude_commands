@@ -1,5 +1,5 @@
 ---
-description: Show what this unit's /unit:direct run and its agents are doing right now.
+description: Report unit phase, ETA, and workers.
 argument-hint: "[tables]"
 ---
 

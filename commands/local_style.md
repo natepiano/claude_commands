@@ -1,5 +1,5 @@
 ---
-description: Create a local style guide doc for the current repo (or a workspace member)
+description: Create a local style guide.
 ---
 
 **Arguments**: `$ARGUMENTS` — `[<scope>] <filename>`

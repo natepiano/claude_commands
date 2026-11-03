@@ -99,6 +99,7 @@ from urllib.parse import unquote, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import scratch  # noqa: E402
+from scripts.lib import copy_record  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
     from ..lib import unit_runs
@@ -248,8 +249,8 @@ class Roots:
                         copy = scratch.removal_target(Path(entry.path))
                         if copy is not None:
                             removal = scratch.pending_removal(copy)
-                            if isinstance(removal, scratch.Registered) or (
-                                    isinstance(removal, scratch.NotRegistered) and not os.path.lexists(entry.path)):
+                            if isinstance(removal, copy_record.Registered) or (
+                                    isinstance(removal, copy_record.NotRegistered) and not os.path.lexists(entry.path)):
                                 continue
                         yield entry
             return
@@ -287,15 +288,15 @@ class Roots:
             return Limit(float("-inf"), VERIFY_RUNS) if running else Limit(float("inf"), RECENT)
         if root in self.scratch:
             record = scratch.task_of(Path(entry.path))
-            if isinstance(record, scratch.Registered) and scratch.ended(record.task, now):
+            if isinstance(record, copy_record.Registered) and scratch.ended(record.task, now):
                 return Limit(float("inf"), RECENT)
-            if isinstance(record, scratch.Registered):
+            if isinstance(record, copy_record.Registered):
                 return Limit(now - TASK_IDLE_SECONDS, TASK_OPEN)
         if root in self.copies:
-            if isinstance(scratch.pending_removal(Path(entry.path)), scratch.Registered):
+            if isinstance(scratch.pending_removal(Path(entry.path)), copy_record.Registered):
                 return Limit(float("inf"), TASK_OPEN)
             record = scratch.task_of(Path(entry.path))
-            landed = isinstance(record, scratch.Registered) and record.task.startswith("landed:")
+            landed = isinstance(record, copy_record.Registered) and record.task.startswith("landed:")
             return Limit(now - WIDE_IDLE_SECONDS if landed else float("inf"), TASK_OPEN)
         # systemd-tmpfiles-clean sets each folder's times back after it reads it, which moves the
         # folder's ctime, so in a temp folder only a folder's mtime counts.
@@ -343,7 +344,7 @@ def default_roots(tmp_root: str = TMP_ROOT, run_roots: Sequence[str] = RUN_ROOTS
     projects = tuple(entry.path for root in sessions_at for entry in listing(os.path.realpath(root))
                      if entry.name.startswith("-") and entry.is_dir(follow_symlinks=False))
     temp = temp_folders() if temp_roots is None else temp_roots
-    task_roots = (str(scratch.root()),) if scratch_roots is None else scratch_roots
+    task_roots = (str(copy_record.root()),) if scratch_roots is None else scratch_roots
     temp_real = tuple(os.path.realpath(root) for root in temp)
     wide = ("/tmp",) if wide_roots is None else wide_roots
     session_temp = (SESSION_TEMP_ROOT,) if session_temp_roots is None else session_temp_roots
@@ -762,7 +763,10 @@ def worker_use(guarded: dict[str, RunKeepReason]) -> WorkerUse:
                     record = cast(object, json.loads(text))
                     if not isinstance(record, dict):
                         continue
-                    cwd = cast(dict[str, object], record).get("cwd", "")
+                    fields = cast(dict[str, object], record)
+                    if fields.get("status") != "running":
+                        continue
+                    cwd = fields.get("cwd", "")
                     if not isinstance(cwd, str) or (cwd and not os.path.isabs(cwd)):
                         raise ValueError("worker working folder unreadable")
                     if cwd:
@@ -856,9 +860,9 @@ def owner_reason(entry: os.DirEntry[str], root: str, roots: Roots, live: frozens
         return ROOT
     if root in roots.scratch:
         record = scratch.task_of(Path(entry.path))
-        if isinstance(record, scratch.UnreadableRecord):
+        if isinstance(record, copy_record.UnreadableRecord):
             return record.reason
-        return ROW_WAITS if isinstance(record, scratch.Registered) and record.task.startswith("row:") else None
+        return ROW_WAITS if isinstance(record, copy_record.Registered) and record.task.startswith("row:") else None
     if root in roots.projects or root in roots.sessions:
         if live is None:
             return NO_SESSIONS
@@ -973,7 +977,7 @@ def judge_entries(roots: Roots, now: float, proc: str) -> Iterator[KeptEntry | R
             if root in inner and size < SESSION_ENTRY_MIN_BYTES:
                 yield KeptEntry(entry.path, SMALL_IN_LIVE_SESSION)
                 continue
-            pending = root in roots.copies and isinstance(scratch.pending_removal(Path(entry.path)), scratch.Registered)
+            pending = root in roots.copies and isinstance(scratch.pending_removal(Path(entry.path)), copy_record.Registered)
             git = GitWork.SAVED if pending else git_work(Path(entry.path))
             if git is not GitWork.SAVED:
                 yield KeptEntry(entry.path, git.value)
@@ -987,12 +991,12 @@ def remove_entry(entry: RemovableEntry, result: Sweep, dry_run: bool) -> bool:
         if not idle:
             result.keep(entry.path, "busy: .claude-busy is locked")
             return False
-        if scratch.copy_folder(Path(entry.path)) == Path(entry.path).resolve():
+        if copy_record.copy_folder(Path(entry.path)) == Path(entry.path).resolve():
             state = scratch.record_lifetime(Path(entry.path), time.time())
             if not isinstance(state, scratch.Ended):
                 result.keep(entry.path, state.why if isinstance(state, scratch.Live) else state.reason)
                 return False
-            pending = isinstance(scratch.pending_removal(Path(entry.path)), scratch.Registered)
+            pending = isinstance(scratch.pending_removal(Path(entry.path)), copy_record.Registered)
             git = GitWork.SAVED if pending else git_work(Path(entry.path))
             if git is not GitWork.SAVED:
                 result.keep(entry.path, git.value)
@@ -1004,7 +1008,7 @@ def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool) -> bo
     if not dry_run:
         try:
             path = Path(entry.path)
-            if scratch.copy_folder(path) == path.resolve():
+            if copy_record.copy_folder(path) == path.resolve():
                 scratch.remove_marked(path, lambda folder: delete_tree(str(folder)))
             else:
                 delete_tree(entry.path)
@@ -1070,7 +1074,7 @@ def cleanup_end_reason(entry: RemovableEntry, roots: Roots, now: float, proc: st
                     return CleanupEndReason.WORKERS_ENDED
         if entry.root in roots.scratch:
             record = scratch.task_of(Path(entry.path))
-            if isinstance(record, scratch.Registered) and scratch.ended(record.task, now):
+            if isinstance(record, copy_record.Registered) and scratch.ended(record.task, now):
                 return CleanupEndReason.TASK_ENDED
         if entry.root in roots.copies and isinstance(scratch.lifetime(Path(entry.path), now), scratch.Ended):
             return CleanupEndReason.TASK_ENDED

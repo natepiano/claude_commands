@@ -200,8 +200,6 @@ def patch_list(pass_: NotesPass) -> tuple[PassCallPatch, ...]:
         PassCallPatch(a, "swap", "prepares a Codex home and changes workers selection", []),
         PassCallPatch(d, "_write_state", "writes watchdog outage ownership"),
         PassCallPatch(d, "_start_recovery", "starts a detached unit restart"),
-        PassCallPatch(d, "_alert_failure", "claims an outage and sends its failure push"),
-        PassCallPatch(d, "_alert_without_record", "claims an outage without a launch and pushes it"),
         PassCallPatch(pass_.showrunners, "tell", "sends a watchdog outcome to a showrunner", "profile: message suppressed"),
         PassCallPatch(pass_.outage, "clear", "clears the outage alert ledger", False),
         PassCallPatch(import_module("scripts.whoami.agent_accounts"), "codex_live",

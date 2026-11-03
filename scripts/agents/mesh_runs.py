@@ -60,6 +60,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import codex_mesh
 from scripts.buildlog import treekey
 from scripts.lib import unit_runs
+from scripts.message import repeat_guard
 
 # Exit status of `start` when the caller is not a mesh worker: run the command attached.
 NOT_A_MESH_WORKER = 3
@@ -134,8 +135,6 @@ class NotMeshWorker:
 Caller = MeshCaller | NotMeshWorker
 
 
-def _pool_state() -> Path:
-    return Path(os.environ.get("REVIEW_POOL_STATE") or Path.home() / ".local/state/review-pool").expanduser()
 
 
 def _roster_folders() -> Iterator[Path]:
@@ -143,8 +142,6 @@ def _roster_folders() -> Iterator[Path]:
     for root in RUN_ROOTS:
         for path in sorted(root.glob(f"*/{codex_mesh.ROSTER_FILE}")):
             yield path.parent
-    for path in sorted(_pool_state().glob(f"*/mesh/*/{codex_mesh.ROSTER_FILE}")):
-        yield path.parent
     from scripts.astra import design_roles
     yield from design_roles.durable_meshes()
 
@@ -456,18 +453,26 @@ def deliver(record: RunRecord, exit_code: int | None) -> str:
     destination = design_roles.transfer_route(record["thread_id"])
     if destination:
         destination_roster = codex_mesh._read_json_object(Path(destination) / codex_mesh.ROSTER_FILE)  # pyright: ignore[reportPrivateUsage]
-        for value in destination_roster.values():
+        for candidate_name, value in destination_roster.items():
             candidate = codex_mesh._as_dict(value)  # pyright: ignore[reportPrivateUsage]
             if candidate.get("thread_id") == record["thread_id"]:
                 entry = candidate
+                session_dir, name = destination, candidate_name
                 break
     design_id, role = entry.get("held_design_id"), entry.get("held_role")
     if isinstance(design_id, str) and design_id and role in ("designer", "reviewer"):
+        receiver = repeat_guard.recipient_identity("", thread_id=record["thread_id"])
+        decision = repeat_guard.transport_check("mesh-runs", receiver, text)
+        if decision.held:
+            return f"held repeated run result: copy {decision.copies}"
         message_id = str(uuid5(NAMESPACE_URL, str(Path(session_dir).resolve()) + "/" + record["run_id"]))
         _ = design_roles.queue_message(design_id, role, "mesh_runs:" + record["run_id"],
                                 text, message_id=message_id)
+        repeat_guard.transport_result("mesh-runs", receiver, text, "queued")
         return f"queued for held role {name}; its holder controls the next assignment"
-    held = codex_mesh.hold_message(session_dir, name, text, without_launcher=False)
+    held = codex_mesh.hold_message(session_dir, name, text, without_launcher=False, sender="mesh-runs")
+    if isinstance(held, codex_mesh.RepeatHeld):
+        return f"held repeated run result: copy {held.copies}"
     if isinstance(held, codex_mesh.HeldForLauncher):
         return f"held for {name}'s attached launcher on thread {held.thread_id}"
     if isinstance(held, codex_mesh.HeldForNextDispatch):
@@ -484,7 +489,9 @@ def deliver(record: RunRecord, exit_code: int | None) -> str:
     if isinstance(held, codex_mesh.WorkerEnded):
         return f"nothing delivered: {held.reason} and no director was found"
     # No director to tell: hold the result so the worker's next dispatch still reads it.
-    kept = codex_mesh.hold_message(session_dir, name, text, without_launcher=True)
+    kept = codex_mesh.hold_message(session_dir, name, text, without_launcher=True, sender="mesh-runs")
+    if isinstance(kept, codex_mesh.RepeatHeld):
+        return f"held repeated run result: copy {kept.copies}"
     if isinstance(kept, codex_mesh.WorkerEnded):
         return f"nothing delivered: {kept.reason} and no director was found"
     return f"held for {name}'s next dispatch: no director was found"

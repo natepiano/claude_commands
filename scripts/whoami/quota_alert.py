@@ -27,9 +27,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import process_group
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.process_failure import failure_detail
-from scripts.message.send import OutcomeHeader, parse_outcome
+from scripts.message import send_result
 from scripts.whoami import note_file
 
 from scripts.lib import agents_registry  # noqa: E402
@@ -237,6 +240,7 @@ from scripts.production.showrunners import (
     ShowrunnerSettings as ShowrunnerSettings,
     load_settings_from as load_settings_from,
     registered_showrunners as registered_showrunners,
+    require_complete,
     socket_for as socket_for,
 )
 
@@ -604,7 +608,7 @@ def load_config() -> Config:
 def showrunners_now() -> list[Showrunner]:
     """Every showrunner with an update timer. None when the session records cannot say who runs."""
     try:
-        return registered_showrunners()
+        return require_complete(registered_showrunners())
     except OSError as error:
         print(f"quota-alert: showrunners unknown: {error}", file=sys.stderr)
         return []
@@ -813,7 +817,7 @@ def edit_registry(editor: str, *args: str) -> str | None:
         try:
             out, err = process.communicate(timeout=EDIT_TIMEOUT)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
+            process_group.send_process_group(process.pid, signal.SIGKILL)
             _ = process.communicate()
             return f"{editor} took longer than {EDIT_TIMEOUT} s and was stopped"
     if process.returncode == 0:
@@ -1510,12 +1514,16 @@ def relay(recipient: str, text: str, key: str | None) -> str | None:
                               check=False)
     except (subprocess.TimeoutExpired, OSError) as error:
         return str(error)
-    if done.returncode == 0:
-        return None
-    # send.py's QUEUED outcome keeps its own header: refusal_watch treats a queued copy as delivered.
-    outcome = parse_outcome(done.stdout)
-    if done.returncode == 1 and isinstance(outcome, OutcomeHeader) and outcome.outcome == "queued":
-        return " ".join(f"QUEUED: {outcome.detail}".split())
+    outcome = send_result.send_outcome(done.returncode, done.stdout)
+    if isinstance(outcome, send_result.ConfirmedSendOutcome):
+        match outcome.header.outcome:
+            case "sent" | "skipped" | "replaced" | "kept":
+                return None
+            case "queued":
+                # refusal_watch accepts a queued copy through this header.
+                return " ".join(f"QUEUED: {outcome.header.detail}".split())
+            case "failed" | "refused" | "held":
+                pass
     return " ".join(failure_detail(done).split())
 
 
@@ -1545,8 +1553,13 @@ def tell_user(push: RenderedPush) -> PushDelivery:
                               check=False)
     except (subprocess.TimeoutExpired, OSError) as error:
         return PushFailed(str(error))
-    if done.returncode == 0:
-        return PushSent()
+    outcome = send_result.send_outcome(done.returncode, done.stdout)
+    if isinstance(outcome, send_result.ConfirmedSendOutcome):
+        match outcome.header.outcome:
+            case "sent" | "skipped" | "kept" | "replaced":
+                return PushSent()
+            case "queued" | "failed" | "refused" | "held":
+                pass
     return PushFailed(" ".join(failure_detail(done).split()))
 
 

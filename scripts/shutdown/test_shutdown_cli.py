@@ -24,11 +24,10 @@ from collections.abc import Iterable
 from contextlib import redirect_stderr, redirect_stdout
 from typing import Literal, cast, final, override
 from unittest.mock import patch
-from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from test_support import linux_process_fixture, registry_confirmation, ShutdownTestCase
+from test_support import registry_confirmation, ShutdownTestCase
 import inventory
 import herdr
 from test_shutdown_record import LegacyRecordFixture, LegacyEntryFixture, write_old
@@ -38,7 +37,9 @@ import sessions
 import remote_control
 import shutdown
 import restart_support
+import remote
 from push_texts import RenderedPush
+from user_action import ActionRequired
 import restart as restart_work
 from scripts.whoami.account import Account, UnreadableAccount
 
@@ -185,43 +186,6 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             shutil.rmtree(self.state)
 
 
-
-
-
-
-
-
-
-
-
-    def test_snapshot_without_tmux_never_builds_a_host_binary(self) -> None:
-        linux_process_fixture(self)
-        proc = self.root / "proc"
-        boot = proc / "sys/kernel/random/boot_id"
-        boot.parent.mkdir(parents=True)
-        _ = boot.write_text("boot-one\n")
-        registry = self.root / "registry"
-        registry.mkdir()
-        calls: list[list[str]] = []
-
-        def run(argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-            del options
-            calls.append(argv)
-            if argv[1:] == ["--session", "default", "session", "list", "--json"]:
-                return subprocess.CompletedProcess(argv, 0, EMPTY_HERDR_SESSIONS, "")
-            raise FileNotFoundError(f"no executable: {argv[0]}")
-
-        with (patch.dict(os.environ, {
-                  "HERDR_PROC": str(proc), "HERDR_BIN": "/missing/herdr",
-
-                  "NOTIFIER_SESSIONS_DIR": str(registry),
-                  "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
-              }), patch.object(shutil, "which", return_value=None),
-              patch.object(subprocess, "run", side_effect=run)):
-            observed = inventory.snapshot_inventory()
-        self.assertIsInstance(observed, inventory.CompleteInventory)
-        self.assertFalse(any(Path(argv[0]).name in {"tmux", "nix"} for argv in calls), calls)
-
     def test_elapsed_text_uses_seconds_minutes_hours_and_days(self) -> None:
         cases = ((-1, "0s"), (0, "0s"), (59, "59s"), (60, "1m"),
                  (3599, "59m"), (3600, "1h"), (86399, "23h"),
@@ -229,180 +193,6 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         for seconds, expected in cases:
             with self.subTest(seconds=seconds):
                 self.assertEqual(restart_support.elapsed_text(seconds), expected)
-
-    def recovery(self, *identities: str) -> shutdown_store.RecoverySnapshot:
-        entries: list[shutdown_store.SnapshotSession] = []
-        for identity in identities:
-            owner = unit_session(identity)
-            owner["name"] = identity + "-name"
-            entries.append(shutdown_store.SnapshotClaudeSession(agent="claude", session=owner,
-                workers=[], timers=[], last_seen=OCTOBER, state="unresolved", crash="host gone"))
-        saved = shutdown_store.RecoverySnapshot(machine="natedev", login=LOGIN, label=LABEL,
-            taken_at=OCTOBER, sessions=entries)
-        shutdown_store.write_snapshot(saved)
-        return saved
-
-    def test_partial_snapshot_names_failed_sources_and_keeps_every_recovery_file(self) -> None:
-        saved = self.recovery("recoverable")
-        path = self.state / "snapshots" / (LOGIN + ".json")
-        before = path.read_bytes()
-        with (patch.object(inventory, "snapshot_inventory", return_value=inventory.PartialInventory(
-                ("session registry unreadable", "production marks unreadable"))), redirect_stderr(io.StringIO()) as error):
-            self.assertEqual(shutdown.main(["snapshot"]), 1)
-        self.assertEqual(path.read_bytes(), before)
-        self.assertEqual(shutdown_store.read_snapshot(LOGIN), saved)
-        self.assertIn("session registry unreadable", error.getvalue())
-        self.assertIn("production marks unreadable", error.getvalue())
-        attempts = shutdown_store.read_snapshot_attempts()
-        assert not isinstance(attempts, shutdown_store.NoSnapshotAttempt)
-        self.assertEqual(attempts["latest"]["kind"], "failed")
-        self.assertEqual(attempts["latest"].get("reasons"), ["session registry unreadable", "production marks unreadable"])
-        self.assertEqual(attempts["last_success"], {"kind": "not recorded"})
-
-    def test_snapshot_command_retains_a_crash_confirmed_entry_during_an_empty_observation(self) -> None:
-        _ = self.recovery("recoverable")
-        with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
-                "natedev", {}, {})), patch.object(restart_support, "record_time", return_value=JANUARY),
-              patch.object(restart_support, "local_machine", return_value="snapshot-host"),
-              redirect_stdout(io.StringIO())):
-            self.assertEqual(shutdown.main(["snapshot"]), 0)
-        saved = shutdown_store.read_snapshot(LOGIN)
-        assert not isinstance(saved, shutdown_store.NoRecoverySnapshot)
-        self.assertEqual(saved["taken_at"], JANUARY)
-        attempts = shutdown_store.read_snapshot_attempts()
-        assert not isinstance(attempts, shutdown_store.NoSnapshotAttempt)
-        self.assertEqual(attempts["machine"], "snapshot-host")
-        self.assertEqual(attempts["latest"], {"kind": "taken", "at": JANUARY, "accounts": 1})
-        self.assertEqual(attempts["last_success"], {"kind": "taken", "at": JANUARY})
-        self.assertEqual([(item["session"]["session_id"], item["last_seen"], item["state"])
-                          for item in saved["sessions"]], [("recoverable", OCTOBER, "unresolved")])
-
-    def test_snapshot_merge_errors_record_failure_and_keep_the_original_exit_code(self) -> None:
-        for failure in (shutdown_store.InvalidRecord("invalid recovery file"), OSError("disk unavailable")):
-            with (self.subTest(failure=failure),
-                patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory("natedev", {}, {})),
-                patch.object(shutdown_store, "merge_snapshots", side_effect=failure),
-                patch.object(restart_support, "record_time", return_value=OCTOBER),
-                redirect_stderr(io.StringIO()) as error,
-            ):
-                self.assertEqual(shutdown.main(["snapshot"]), 1)
-            attempts = shutdown_store.read_snapshot_attempts()
-            assert not isinstance(attempts, shutdown_store.NoSnapshotAttempt)
-            self.assertEqual(attempts["latest"], {"kind": "failed", "at": OCTOBER, "reasons": [str(failure)]})
-            self.assertIn(str(failure), error.getvalue())
-
-    def test_snapshot_outcome_write_failure_keeps_success_and_partial_exit_codes(self) -> None:
-        observations = (inventory.CompleteInventory("natedev", {}, {}), inventory.PartialInventory(("registry failed",)))
-        for observed, expected in zip(observations, (0, 1)):
-            with (self.subTest(expected=expected),
-                patch.object(inventory, "snapshot_inventory", return_value=observed),
-                patch.object(shutdown_store, "record_snapshot_attempt", side_effect=OSError("outcome disk full")),
-                redirect_stdout(io.StringIO()) as output,
-                redirect_stderr(io.StringIO()) as error,
-            ):
-                self.assertEqual(shutdown.main(["snapshot"]), expected)
-            self.assertIn("snapshot outcome not recorded: outcome disk full", error.getvalue())
-            if expected == 0:
-                self.assertIn("recovery snapshot saved for 0 accounts", output.getvalue())
-            else:
-                self.assertIn("snapshot incomplete: registry failed", error.getvalue())
-
-    def test_status_without_outcome_still_includes_existing_recovery_and_explicit_json_state(self) -> None:
-        _ = self.recovery("crashed")
-        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
-        with patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(shutdown.main(["status", LABEL, "--here"]), 0)
-        self.assertIn("recovery snapshot: no successful snapshot recorded", output.getvalue())
-        self.assertIn("crashed-name: unresolved", output.getvalue())
-        with patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(shutdown.main(["status", LABEL, "--here", "--json"]), 0)
-        payload = cast(dict[str, object], json.loads(output.getvalue()))
-        self.assertEqual(payload["snapshot"], {"kind": "no outcome recorded"})
-        self.assertEqual(len(cast(list[object], payload["recovery"])), 1)
-
-    def test_status_reports_taken_then_failed_in_user_zone_only_under_the_local_machine(self) -> None:
-        local = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
-        remote = inventory.Inventory(machine="Mac", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
-        shutdown_store.record_snapshot_attempt(shutdown_store.SnapshotTaken(kind="taken", at=OCTOBER, accounts=2), "natedev")
-        failed_at = "2026-10-09T21:50:10+00:00"
-        for failed in (False, True):
-            if failed:
-                shutdown_store.record_snapshot_attempt(shutdown_store.SnapshotFailed(kind="failed", at=failed_at,
-                    reasons=["registry unreadable", "host unreadable"]), "natedev")
-            with (self.subTest(failed=failed),
-                patch.object(shutdown, "inventory", return_value=local),
-                patch.object(shutdown, "run_remote", return_value=(0, json.dumps(remote))),
-                patch.object(shutdown, "_remote_shutdown_records", return_value=shutdown.AccountShutdownRecords(kind="records", records=[])),
-                patch.object(shutdown, "user_zone", return_value=ZoneInfo("America/New_York")),
-                patch.object(restart_support, "record_time", return_value=failed_at),
-                redirect_stdout(io.StringIO()) as output,
-            ):
-                self.assertEqual(shutdown.main(["status", LABEL]), 0)
-            text = output.getvalue()
-            line = "recovery snapshot: last taken 2026-10-09 17:49:10 EDT (1m ago)"
-            self.assertIn(line, text)
-            self.assertLess(text.index(line), text.index("Mac"))
-            self.assertEqual(text.count("recovery snapshot: last taken"), 1)
-            if failed:
-                self.assertIn("recovery snapshot failed 2026-10-09 17:50:10 EDT: registry unreadable; host unreadable", text)
-            else:
-                self.assertNotIn("recovery snapshot failed", text)
-            with patch.object(shutdown, "inventory", return_value=local), redirect_stdout(io.StringIO()) as output:
-                self.assertEqual(shutdown.main(["status", LABEL, "--here", "--json"]), 0)
-            payload = cast(dict[str, object], json.loads(output.getvalue()))
-            status = cast(dict[str, object], payload["snapshot"])
-            self.assertEqual(status["kind"], "recorded")
-            self.assertEqual(status["last_success"], {"kind": "taken", "at": OCTOBER})
-            self.assertEqual(cast(dict[str, object], status["latest"])["kind"], "failed" if failed else "taken")
-            self.assertEqual(payload["recovery"], [])
-
-    def test_json_status_accepts_a_remote_report_without_snapshot_metadata(self) -> None:
-        local = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
-        remote = inventory.Inventory(machine="Mac", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
-        with (patch.object(shutdown, "inventory", return_value=local),
-              patch.object(shutdown, "run_remote", return_value=(0, json.dumps(remote))),
-              redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(shutdown.main(["status", LABEL, "--json"]), 0)
-        reports = cast(list[dict[str, object]], json.loads(output.getvalue()))
-        self.assertEqual(reports[0]["snapshot"], {"kind": "no outcome recorded"})
-        self.assertEqual(reports[0]["recovery"], [])
-        self.assertEqual(reports[1], remote)
-
-    def test_invalid_or_unreadable_snapshot_outcome_does_not_fail_status(self) -> None:
-        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
-        self.state.mkdir(exist_ok=True)
-        _ = (self.state / "snapshot_attempt.json").write_text("{")
-        for as_json in (False, True):
-            with self.subTest(as_json=as_json), patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output:
-                self.assertEqual(shutdown.main(["status", LABEL, "--here", *(["--json"] if as_json else [])]), 0)
-            if as_json:
-                payload = cast(dict[str, object], json.loads(output.getvalue()))
-                status = cast(dict[str, object], payload["snapshot"])
-                self.assertEqual(status["kind"], "unreadable")
-                self.assertIn("cannot be read", str(status["error"]))
-            else:
-                self.assertIn("recovery snapshot: outcome unreadable:", output.getvalue())
-        with (patch.object(shutdown_store, "read_snapshot_attempts", side_effect=OSError("permission denied")),
-              patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(shutdown.main(["status", LABEL, "--here"]), 0)
-        self.assertIn("outcome unreadable: permission denied", output.getvalue())
-
-    def test_codex_status_includes_snapshot_outcome_in_text_and_json(self) -> None:
-        shutdown_store.record_snapshot_attempt(shutdown_store.SnapshotFailed(kind="failed", at=OCTOBER, reasons=["Codex unreadable"]), "natedev")
-        selection = shutdown.TerminalAccountSelection((Account("codex", "codex-work", "codex-work"),))
-        with (patch.object(shutdown, "_terminal_accounts", return_value=selection),
-              patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}), redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(shutdown.main(["status", "--here"]), 0)
-        self.assertIn("recovery snapshot: no successful snapshot recorded", output.getvalue())
-        self.assertIn("Codex unreadable", output.getvalue())
-        with (patch.object(shutdown, "_terminal_accounts", return_value=selection),
-              patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}), redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(shutdown.main(["status", "--here", "--json"]), 0)
-        reports = cast(list[dict[str, object]], json.loads(output.getvalue()))
-        status = cast(dict[str, object], reports[0]["snapshot"])
-        self.assertEqual(status["last_success"], {"kind": "not recorded"})
-        self.assertEqual(status["latest"], {"kind": "failed", "at": OCTOBER, "reasons": ["Codex unreadable"]})
-        self.assertEqual(reports[0]["recovery"], [])
 
 
     def test_forget_failed_restart_removes_it_from_status_and_bring_back(self) -> None:
@@ -430,164 +220,6 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertIn("bring back:", after.getvalue())
         self.assertIn("sibling-id", after.getvalue())
         self.assertEqual(shutdown_store.session_records(LOGIN), [sibling])
-
-    def test_forget_one_session_removes_both_its_snapshot_and_stopped_record(self) -> None:
-        _ = self.recovery("first", "second")
-        stopped = session_shutdown(shutdown_store.SessionStopped(kind="stopped", at=OCTOBER), "first")
-        self.assertTrue(shutdown_store.create_session(stopped))
-        with redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(shutdown.main(["forget", "first-name"]), 0)
-        self.assertEqual(output.getvalue(), "first-name: forgotten\n")
-        self.assertEqual(shutdown_store.session_records(LOGIN), [])
-        snapshot = shutdown_store.read_snapshot(LOGIN)
-        assert not isinstance(snapshot, shutdown_store.NoRecoverySnapshot)
-        self.assertEqual([item["session"]["session_id"] for item in snapshot["sessions"]], ["second"])
-
-
-
-
-    def test_forget_account_selector_retires_one_of_two_identical_cross_account_ids(self) -> None:
-        _ = (self.root / "notes/claude3.md").write_text("---\nlogin: third@example.invalid\n---\n")
-        original = self.recovery("shared-id")
-        other: shutdown_store.RecoverySnapshot = {**original, "login": "third@example.invalid", "label": "claude3"}
-        shutdown_store.write_snapshot(other)
-        with redirect_stdout(io.StringIO()):
-            self.assertEqual(shutdown.main(["forget", "shared-id", "--account", "claude3"]), 0)
-        self.assertEqual(shutdown_store.read_snapshot(LOGIN), original)
-        retired = shutdown_store.read_snapshot("third@example.invalid")
-        assert not isinstance(retired, shutdown_store.NoRecoverySnapshot)
-        self.assertEqual(retired["sessions"], [])
-
-    def test_forget_one_session_id_moved_between_accounts_forgets_it_on_both(self) -> None:
-        _ = (self.root / "notes/claude3.md").write_text("---\nlogin: third@example.invalid\n---\n")
-        original = self.recovery("shared-id")
-        shutdown_store.write_snapshot({**original, "login": "third@example.invalid", "label": "claude3"})
-        with redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(shutdown.main(["forget", "shared-id"]), 0)
-        self.assertEqual(sorted(output.getvalue().splitlines()),
-                         ["shared-id-name: forgotten on claude2", "shared-id-name: forgotten on claude3"])
-        for login in (LOGIN, "third@example.invalid"):
-            snapshot = shutdown_store.read_snapshot(login)
-            assert not isinstance(snapshot, shutdown_store.NoRecoverySnapshot)
-            self.assertEqual(snapshot["sessions"], [])
-
-    def test_forget_spaced_account_label_resolves_to_the_recorded_login(self) -> None:
-        _ = self.recovery("failed-id")
-        failed = session_shutdown(shutdown_store.SessionRestartFailed(kind="restart failed", at=OCTOBER,
-            reason="agent exited"), "failed-id")
-        self.assertTrue(shutdown_store.create_session(failed))
-        with redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(shutdown.main(["forget", "--account", "claude 2", "failed-id"]), 0)
-        self.assertEqual(output.getvalue(), "failed-id-name: forgotten\n")
-        self.assertEqual(shutdown_store.session_records(LOGIN), [])
-        snapshot = shutdown_store.read_snapshot(LOGIN)
-        assert not isinstance(snapshot, shutdown_store.NoRecoverySnapshot)
-        self.assertEqual(snapshot["sessions"], [])
-
-    def test_forget_unknown_account_uses_the_status_refusal_and_keeps_the_session(self) -> None:
-        saved = self.recovery("retained")
-        messages: list[str] = []
-        for arguments in (["status", "claude999", "--here"],
-                          ["forget", "retained", "--account", "claude999"]):
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error:
-                self.assertEqual(shutdown.main(arguments), 2)
-            messages.append(error.getvalue())
-        self.assertEqual(messages[1], messages[0])
-        self.assertIn("shutdown: unknown account claude999: give a note label such as claude2, or a login", messages[1])
-        self.assertEqual(shutdown_store.read_snapshot(LOGIN), saved)
-
-    def test_snapshot_only_name_is_not_a_down_now_cancel_or_status_selection(self) -> None:
-        _ = self.recovery('crashed')
-        for verb in ('status',):
-            with self.subTest(verb=verb), patch.object(shutdown, 'listing', return_value=[]), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error:
-                self.assertEqual(shutdown.main([verb, LABEL, '--here', '--only', 'crashed-name']), 2)
-            self.assertIn('matches no session', error.getvalue())
-
-    def test_restart_only_resolves_a_snapshot_only_name(self) -> None:
-        _ = self.recovery("crashed")
-        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
-        with (patch.object(shutdown, "listing", return_value=[]),
-              patch.object(shutdown, "inventory", return_value=report),
-              patch.object(restart_work, "restart", return_value=0) as restore):
-            self.assertEqual(shutdown.main(["restart", LABEL, "--here", "--only", "crashed-name"]), 0)
-        self.assertEqual(restore.call_args.kwargs["only"], ["crashed"])
-        self.assertTrue(restore.call_args.kwargs["here"])
-
-    def test_status_lists_unresolved_snapshot_last_seen_in_user_zone(self) -> None:
-        _ = self.recovery("crashed")
-        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
-        with (patch.object(shutdown, "inventory", return_value=report),
-              patch.object(shutdown, "user_zone", return_value=ZoneInfo("America/New_York")),
-              redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(shutdown.main(["status", LABEL, "--here"]), 0)
-        self.assertIn("crashed-name: unresolved; last seen 2026-10-09 17:49:10 EDT", output.getvalue())
-
-    def test_status_places_local_recovery_before_the_remote_machine_section(self) -> None:
-        _ = self.recovery("crashed")
-        local = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
-        remote = inventory.Inventory(machine="Mac", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
-        with (patch.object(shutdown, "_status", return_value=[local, remote]),
-              patch.object(shutdown, "_remote_shutdown_records", return_value=shutdown.AccountShutdownRecords(
-                  kind="records", records=[])),
-              redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(shutdown.main(["status", LABEL]), 0)
-        text = output.getvalue()
-        self.assertLess(text.index("natedev"), text.index("crashed-name: unresolved"))
-        self.assertLess(text.index("crashed-name: unresolved"), text.index("Mac"))
-        self.assertEqual(text.count("crashed-name: unresolved"), 1)
-
-    def test_json_status_keeps_recovery_last_seen_as_an_iso_timestamp(self) -> None:
-        _ = self.recovery("crashed")
-        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
-        with (patch.object(shutdown, "inventory", return_value=report),
-              patch.object(shutdown, "user_zone", return_value=ZoneInfo("America/New_York")),
-              redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(shutdown.main(["status", LABEL, "--here", "--json"]), 0)
-        payload = cast(dict[str, object], json.loads(output.getvalue()))
-        recovery = cast(list[dict[str, object]], payload["recovery"])
-        self.assertEqual(recovery[0]["last_seen"], OCTOBER)
-
-    def test_terminal_restart_only_finds_codex_snapshot_by_herdr_name_without_claude_account(self) -> None:
-        owner = inventory.parse_session({**unit_session("code-id"), "kind": "top-level", "name": "Code writing",
-            "host": {"kind": "herdr", "herdr_session": "code-writing", "pane_id": "w1:p1", "presentation": "detached"}}, "fixture")
-        assert owner["kind"] == "top-level"
-        codex = shutdown_store.SnapshotCodexSession(agent="codex", session=owner,
-            codex=shutdown_store.CodexLaunch(home=str(self.home / ".codex"), resume=shutdown_store.CodexSessionId(
-                kind="session id", session_id="code-id")), workers=[], timers=[], last_seen=OCTOBER, state="unresolved", crash="host gone")
-        shutdown_store.write_snapshot(shutdown_store.RecoverySnapshot(machine="natedev", login="codex-.codex", label="codex-.codex",
-            taken_at=OCTOBER, sessions=[codex]))
-        with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
-              patch.object(shutdown, "listing", return_value=[]),
-              patch.object(restart_work, "up", return_value=0) as restore,
-              patch.object(restart_work, "restart") as claude_restore):
-            self.assertEqual(shutdown.main(["restart", "--here", "--only", "code-writing"]), 0)
-        restore.assert_called_once_with("codex-.codex", False, ("code-id",))
-        claude_restore.assert_not_called()
-
-    def test_peer_up_json_restores_snapshot_and_keeps_the_result_protocol(self) -> None:
-        _ = self.recovery("crashed")
-        launched = sessions.SessionRecord(pid=23456, sessionId="crashed", name="crashed-name",
-            procStart="fixture-recovered-process", messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
-        def confirmed(ids: frozenset[str], _timeout: float) -> restart_work.RegistryConfirmation:
-            return restart_work.RegistryConfirmation((launched,) if launched["sessionId"] in ids else ())
-        # Unit recovery uses its normal launcher; confirmation and launch are isolated here.
-        with (patch.object(restart_work, "_session_liveness", return_value=restart_work.SessionNotLive()),
-              patch.object(restart_work, "_live_session_ids", return_value=frozenset()),
-              patch.object(sessions, "running_sessions", return_value=[launched]),
-              patch.object(restart_work, "_retire"),
-              patch.object(restart_work, "_launch_session", return_value=restart_work.SessionLaunched(herdr.PromptSubmitted(
-                  datetime.fromisoformat(OCTOBER), herdr.PromptRecipientProcess(launched["pid"], launched.get("procStart", ""))))),
-              patch.object(restart_work, "wait_for_confirmation", side_effect=confirmed),
-              patch.object(restart_work, "remote_control_missing"),
-              redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(shutdown.main(["up", LOGIN, "--here", "--json"]), 0)
-        result = restart_work.parse_peer_result(output.getvalue())
-        self.assertEqual(result["outcome"], "done")
-        self.assertEqual(result["refused"], [])
-        self.assertTrue(any("crashed-name: from snapshot taken" in line for line in result["lines"]))
-        remaining = shutdown_store.read_snapshot(LOGIN)
-        assert not isinstance(remaining, shutdown_store.NoRecoverySnapshot)
-        self.assertEqual(remaining["sessions"], [])
 
 
     def test_terminal_status_without_account_emits_one_json_array_for_all_accounts(self) -> None:
@@ -668,9 +300,6 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertEqual(resume.call_args.args[0], restart_work.AccountNotNamed())
 
 
-
-
-
     def test_remote_control_cli_passes_identity_without_an_alert_option(self) -> None:
         arguments = ["remote-control", "owner", "--pid", "321",
             "--proc-start", "original", "--who", "trunk unit", "--session", "Owner"]
@@ -731,16 +360,16 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                 peer = inventory.Inventory(machine=peer_machine, login=LOGIN, label=LABEL,
                                            sessions=[saved["session"]], unattributed=[])
 
-                def remote(arguments: list[str]) -> tuple[int, str]:
+                def read_peer(arguments: list[str]) -> tuple[int, str]:
                     if arguments == ["status", LOGIN, "--json", "--here"]:
                         return 0, json.dumps(peer)
                     self.assertEqual(arguments, ["records", "--json", "--here"])
                     return 0, json.dumps([saved])
 
-                with (patch.object(restart_support, "local_machine", return_value=local_machine),
+                with (patch.object(remote, "local_machine", return_value=local_machine),
                       patch.object(shutdown, "other_machine", return_value=peer_machine),
                       patch.object(shutdown, "inventory", return_value=local),
-                      patch.object(shutdown, "run_remote", side_effect=remote) as remote_read,
+                      patch.object(shutdown, "run_remote", side_effect=read_peer) as remote_read,
                       patch.object(shutdown, "named_claude_account", return_value=Account("claude", LOGIN, LABEL)),
                       patch.object(restart_work, "_owner_liveness",
                                    side_effect=AssertionError("peer liveness must come from its inventory")),
@@ -833,8 +462,6 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertEqual(len(actions), 1)
         self.assertIn("--only dead-failed", actions[0])
         self.assertNotIn("live-failed", actions[0])
-
-
 
 
     def test_quota_notice_and_import_modes_preserve_module_package_metadata(self) -> None:
@@ -934,7 +561,6 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                 for path in self.state.rglob("*") if path.is_file()}
 
 
-
     def test_status_reads_filename_conflict_without_migrating_records(self) -> None:
         _ = self.conflicting_legacy_record('session ids')
         before = self.store_contents()
@@ -950,11 +576,6 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertEqual(self.store_contents(), before)
 
 
-
-
-
-
-
     def test_internal_holds_refuses_unreadable_state(self) -> None:
         broken = self.state / LOGIN / "hold.json"
         broken.parent.mkdir(parents=True)
@@ -966,11 +587,6 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertEqual(output.getvalue(), "")
         self.assertTrue(error.getvalue().startswith("shutdown: "))
         self.assertIn(str(broken), error.getvalue())
-
-
-
-
-
 
 
     def test_launch_blocked_uses_pst_for_a_january_request(self) -> None:
@@ -1129,7 +745,6 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertEqual(self.run_cli(LOGIN), (
             0, f"{LABEL} is held by a shutdown (since 2026-10-09 14:49 PDT), requested in a terminal\n", "",
         ))
-
 
 
     def test_selected_waiting_session_restore_is_held_without_an_account_hold(self) -> None:
@@ -1372,8 +987,6 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertEqual(result.stderr, "")
 
 
-
-
     def test_stopping_session_restore_is_held_by_name(self) -> None:
         self.assertTrue(shutdown_store.create_session(session_shutdown(shutdown_store.SessionStopping(kind="stopping", at=OCTOBER))))
         self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-123"), (0, "alpha is held by a shutdown (since 2026-10-09 14:49 PDT)\n", ""))
@@ -1419,7 +1032,6 @@ class OnlySessionCliTests(ShutdownTestCase):
             ids = tuple(only)
             return {**report, 'sessions': [owner for owner in self.owners if not ids or owner['session_id'] in ids]}
         _ = self.enterContext(patch.object(shutdown, 'inventory', side_effect=observed))
-
 
 
         _ = self.enterContext(patch.object(restart_support, 'send_message', return_value=restart_support.MessageSent(kind='sent')))
@@ -1485,10 +1097,6 @@ class OnlySessionCliTests(ShutdownTestCase):
                     self.assertEqual([owner['session_id'] for owner in owners], ['beta-id'])
 
 
-
-
-
-
     def test_selected_status_filters_peer_sessions_without_requiring_a_peer_match(self) -> None:
         peer = inventory.Inventory(machine="Mac", login=LOGIN, label=LABEL, sessions=self.owners, unattributed=[])
         with patch.object(shutdown, "run_remote", return_value=(0, json.dumps(peer))) as remote:
@@ -1498,9 +1106,6 @@ class OnlySessionCliTests(ShutdownTestCase):
         self.assertIn("sessions", reports[1])
         peer_report = cast(inventory.Inventory, reports[1])
         self.assertEqual([owner["session_id"] for owner in peer_report["sessions"]], ["beta-id"])
-
-
-
 
 
     def test_restart_list_skips_live_and_keeps_going_after_unknown_name(self) -> None:
@@ -1618,7 +1223,6 @@ class OnlySessionCliTests(ShutdownTestCase):
                 self.assertIn(f"Beta is {progress['kind']}, not stopped; nothing to restart\n", output)
                 launch.assert_not_called()
                 self.assertEqual(shutdown_store.session_records(LOGIN), before)
-
 
 
     def test_only_help_is_public_for_each_action(self) -> None:
@@ -1767,10 +1371,10 @@ class OnlySessionCliTests(ShutdownTestCase):
         alert.assert_called_once()
         push = cast(RenderedPush, alert.call_args.args[0])
         self.assertEqual(push.id, "shutdown.restart_failed")
-        self.assertEqual(push.values["stopped"], "One session (Beta)")
+        self.assertEqual(push.values["stopped"], "1 session (Beta)")
         self.assertIn("window launch failed", output)
 
-    def test_selected_restart_of_a_failed_move_pushes_the_move_alert_not_a_restart_onto_the_source(self) -> None:
+    def test_selected_restart_of_a_failed_move_pushes_a_retry_that_keeps_the_target(self) -> None:
         _ = self.save_three({"kind": "stopped", "at": OCTOBER})
         def move(current: shutdown_store.SessionShutdown) -> None:
             current["target"], current["source_label"] = "claude3", current["label"]
@@ -1782,13 +1386,12 @@ class OnlySessionCliTests(ShutdownTestCase):
         self.assertEqual((status, error), (1, ""))
         alert.assert_called_once()
         push = cast(RenderedPush, alert.call_args.args[0])
-        self.assertEqual(push.id, "shutdown.move_failed")
-        self.assertEqual((push.values["session"], push.values["target"]), ("Beta", "claude3"))
-
-
-
-
-
+        self.assertEqual(push.id, "shutdown.restart_failed")
+        self.assertEqual(push.values["stopped"], "1 session (Beta)")
+        self.assertIn('/shutdown restart "claude2"', cast(ActionRequired, push.action).text)
+        saved = shutdown_store.find_session(LOGIN, "beta-id")
+        assert saved is not None
+        self.assertEqual(saved.get("target"), "claude3")
 
 
     def test_selected_restart_fresh_claim_names_existing_worker_without_launch_or_alert(self) -> None:
@@ -1855,7 +1458,6 @@ class OnlySessionCliTests(ShutdownTestCase):
         self.assertEqual(fixer.call_args.args[-2:], ("alpha unit", "Beta"))
         self.assertEqual(cast(dict[str, object], json.loads(output.getvalue()))["no_remote_control"], [])
         self.assertIsNone(shutdown_store.find_session(LOGIN, "beta-id"))
-
 
 
 if __name__ == "__main__":

@@ -28,8 +28,7 @@ else:
 import record as recorder
 import sample
 import store
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+from cgroup_test_support import CPU, IO_LINES, save_scope_counters, write_cgroup
 
 if TYPE_CHECKING:
     from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
@@ -38,6 +37,10 @@ else:
     from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
     from scripts.lint.memory_test_support import fake_memory_readings
 from test_index import point_root_at
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 SCRIPT = Path(__file__).with_name("record.py")
 TESTDATA = Path(__file__).with_name("testdata")
@@ -156,7 +159,7 @@ class RecordTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=60,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
     def step(
@@ -187,6 +190,21 @@ class RecordTests(unittest.TestCase):
                          (7 << 30, 10 << 30, 3 << 30))
         self.assertEqual(row["idle_targets"], targets)
         self.assertIsInstance(row["id"], str)
+
+    def test_floor_scan_preserves_takeable_bytes_and_reason_only_where_supplied(self) -> None:
+        targets: list[recorder.IdleFloorTarget] = [
+            {"folder": "/trees/whole/target", "last_use": START - 7200, "bytes": 65536},
+            {"folder": "/trees/linked/target", "last_use": START - 60, "bytes": 65536,
+             "takeable_bytes": 0, "reason": "links outside the target"},
+        ]
+        recorder.floor_scan(7 << 30, 10 << 30, targets, START)
+        row, = self.records()
+        self.assertEqual(row["idle_targets"], [
+            {"folder": "/trees/whole/target", "last_use": START - 7200, "bytes": 65536},
+            {"folder": "/trees/linked/target", "last_use": START - 60, "bytes": 65536,
+             "takeable_bytes": 0, "reason": "links outside the target"},
+        ])
+        self.assertEqual(row["shortfall"], 3 << 30)
 
     def test_queue_priority_events_keep_action_and_user_scope_in_the_build_log(self) -> None:
         at = float(START)
@@ -258,6 +276,32 @@ class RecordTests(unittest.TestCase):
         self.assertFalse(handoff.exists())
         self.assertFalse(peak.exists())
 
+    def test_scope_capture_records_cpu_and_optional_io_before_scope_disappears(self) -> None:
+        for with_io in (False, True):
+            with self.subTest(with_io=with_io):
+                scope = self.base / f"scope-{with_io}"
+                write_cgroup(scope, with_io=with_io)
+                peak = self.peak_file().rename(self.base / f"peak-{with_io}")
+                sidecar = Path(str(peak) + ".cgroup")
+                _ = sidecar.write_text(str(scope) + "\n")
+                captured = save_scope_counters(peak, scope)
+                self.assertEqual(captured.returncode, 0, captured.stderr)
+                sidecar.unlink()
+                shutil.rmtree(scope)
+                row = self.step(0, "0", "", str(peak), SWEEP)
+                resources = cast(Record, row["scope_resources"])
+                self.assertEqual(resources["cpu"], CPU)
+                io = cast(Record, resources["io"])
+                if with_io:
+                    self.assertEqual(io["state"], "measured")
+                    devices = cast(list[Record], io["devices"])
+                    self.assertEqual([device["raw"] for device in devices], list(IO_LINES))
+                else:
+                    self.assertEqual(io, {"state": "unavailable"})
+                self.assertFalse(Path(str(peak) + ".resources").exists())
+                self.assertFalse(Path(str(peak) + ".cpu.stat").exists())
+                self.assertFalse(Path(str(peak) + ".io.stat").exists())
+
     def test_step_records_cgroup_memory_stall_seconds(self) -> None:
         peak = self.base / "peak-pressure"
         _ = peak.write_text("\n".join([
@@ -312,13 +356,13 @@ class RecordTests(unittest.TestCase):
             )
             try:
                 assert process.stderr is not None
-                readable, _, _ = select.select([process.stderr], [], [], TEST_HANG_GUARD_SECS)
+                readable, _, _ = select.select([process.stderr], [], [], test_hang_guard.TEST_HANG_GUARD_SECS)
                 self.assertTrue(readable, "memory wait message did not arrive")
                 first_message = cast(str, process.stderr.readline())
                 self.assertIn("waiting for memory since ", first_message)
                 time.sleep(1.1)
                 _ = meminfo.write_text("MemAvailable: 12582912 kB\n")
-                output, remaining_errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                output, remaining_errors = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 errors = first_message + remaining_errors
             finally:
                 if process.poll() is None:
@@ -347,7 +391,7 @@ class RecordTests(unittest.TestCase):
         environment = self.environment(BUILDLOG_MEMINFO=str(meminfo), BUILDLOG_MEM_POLL_S="1", BUILDLOG_MEM_WAIT_LIMIT_S="1")
         result = subprocess.run(
             ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh")],
-            env=environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+            env=environment, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertRegex(result.stderr, r"waiting for memory since \d\d:\d\d P[DS]T: the machine has 10\.5 GiB free; a build starts at 12\.0")
@@ -377,7 +421,7 @@ class RecordTests(unittest.TestCase):
                 result = subprocess.run(
                     ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh")],
                     env=self.environment(BUILDLOG_MEMINFO=str(meminfo)),
-                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+                    capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
                 )
                 if name in ("at floor", "above floor"):
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -403,7 +447,7 @@ class RecordTests(unittest.TestCase):
             time.sleep(1.1)
             with meminfo.open("w") as writer:
                 _ = writer.write("MemAvailable: 12582912 kB\n")
-            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            output, errors = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         finally:
             if process.poll() is None:
                 process.kill()
@@ -443,7 +487,7 @@ class RecordTests(unittest.TestCase):
             env=self.environment(PATH=f"{self.base}:{os.environ['PATH']}", BUILDLOG_OFF="0", BUILDLOG_SCOPE="0",
                                  BUILDLOG_MEMINFO=str(meminfo), BUILDLOG_MEM_POLL_S="1",
                                  BUILDLOG_MEM_WAIT_LIMIT_S="0", BUILDLOG_SYNC="1"),
-            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+            capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(output_line, result.stdout)
@@ -472,7 +516,7 @@ class RecordTests(unittest.TestCase):
         )
         try:
             assert process.stderr is not None
-            readable, _, _ = select.select([process.stderr], [], [], TEST_HANG_GUARD_SECS)
+            readable, _, _ = select.select([process.stderr], [], [], test_hang_guard.TEST_HANG_GUARD_SECS)
             self.assertTrue(readable, "memory wait message did not arrive")
             first_message = cast(str, process.stderr.readline())
             self.assertIn("waiting for memory since ", first_message)
@@ -480,7 +524,7 @@ class RecordTests(unittest.TestCase):
             time.sleep(1.1)
             released_at = time.time()
             _ = meminfo.write_text("MemAvailable: 12582912 kB\n")
-            output, remaining_errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            output, remaining_errors = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
             errors = first_message + remaining_errors
         finally:
             if process.poll() is None:
@@ -628,6 +672,35 @@ class RecordTests(unittest.TestCase):
         self.assertEqual((row["caller"], row["call_id"], row["step"]), ("verify-mac", CALL_ID, "nextest"))
         self.assertEqual((row["tree_key"], row["tree_changed"]), (sent_key, None))
 
+    def test_verify_linux_step_without_git_keeps_the_sent_key_target_and_call(self) -> None:
+        mirror = self.base / "linux-mirror"
+        mirror.mkdir()
+        sent_key = "b" * 64
+
+        result = self.record(
+            "step", "1", str(START), str(START + 1), "0", "", "", *NEXTEST,
+            cwd=mirror,
+            extra={"BUILDLOG_CALLER": "verify-linux", "BUILDLOG_CALL_ID": CALL_ID,
+                   "BUILDLOG_TARGET": "aws", "BUILDLOG_SENT_TREE_KEY": sent_key},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = self.records()[-1]
+        self.assertEqual((row["caller"], row["target"], row["call_id"]), ("verify-linux", "aws", CALL_ID))
+        self.assertEqual((row["tree_key"], row["tree_changed"]), (sent_key, None))
+
+    def test_verify_linux_step_preserves_tree_verification_over_the_sent_key(self) -> None:
+        own_key = self.key(*NEXTEST)
+        sent_key = "b" * 64
+        for start_key, expected in ((own_key, (own_key, False)), ("0" * 64, (None, True))):
+            with self.subTest(start_key=start_key):
+                row = self.step(1, "0", "", "", NEXTEST, {
+                    "BUILDLOG_CALLER": "verify-linux", "BUILDLOG_TARGET": "aws",
+                    "BUILDLOG_TREE_START": start_key, "BUILDLOG_SENT_TREE_KEY": sent_key,
+                })
+
+                self.assertEqual((row["tree_key"], row["tree_changed"]), expected)
+
     def assert_unverified_mac_step_uses_sent_key(self) -> None:
         # The fallback must work where the preceding step's guard does not apply.
         mirror = self.base / "mirror-control"
@@ -759,6 +832,38 @@ class RecordTests(unittest.TestCase):
         call_record = self.records()[-1]
         self.assertEqual(call_record["token_wait_s"], 4)
         self.assertEqual(call_record["wait_s"], 9)
+
+    def test_ssh_attempts_keep_each_target_and_outcome_after_local_fallback(self) -> None:
+        for target, outcome, completion in (
+            ("aws", "failed", "confirmed"),
+            ("aws", "lost", "missing"),
+            ("spare", "declined", "missing"),
+            ("aws", "no_tests", "confirmed"),
+        ):
+            recorder.ssh_attempt({
+                "call_id": CALL_ID, "target": target,
+                "repo_identity": "github.com/example/hana",
+                "queued_at": START, "departed_at": START + 100, "slot": 2,
+                "outcome": outcome, "completion": completion,
+                "cleanup": "unconfirmed", "unresolved_count": 2,
+                "evidence_at": START + 150,
+            })
+        result = self.record(
+            "call", "ran", "0", "0", "100", "10", "", "0", "110", "test", "hana",
+            extra={"BUILDLOG_CALL_ID": CALL_ID, "BUILDLOG_TARGET": "natedev"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = self.records()
+        attempts = [row for row in rows if row["kind"] == "ssh_attempt"]
+        self.assertEqual([(row["target"], row["outcome"]) for row in attempts],
+                         [("aws", "failed"), ("aws", "lost"), ("spare", "declined"), ("aws", "no_tests")])
+        for row in attempts:
+            self.assertEqual((row["call_id"], row["queued_at"], row["departed_at"], row["slot"]),
+                             (CALL_ID, START, START + 100, 2))
+            self.assertEqual((row["cleanup"], row["unresolved_count"], row["evidence_at"]),
+                             ("unconfirmed", 2, START + 150))
+        final = next(row for row in rows if row["kind"] == "call")
+        self.assertEqual(final["target"], "natedev")
 
     def test_call_records_zero_token_wait_when_value_is_invalid(self) -> None:
         for value in ("", "abc"):

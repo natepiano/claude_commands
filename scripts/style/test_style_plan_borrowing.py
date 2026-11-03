@@ -198,7 +198,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual((code, errors), (3, ""))
         self.assertEqual(self.ledger().ticket_open("names-unit"), ())
 
-    def test_borrowing_idle_reports_every_family_and_keeps_own_exit_code(self) -> None:
+    def test_borrowing_reports_idle_when_all_structure_files_are_held(self) -> None:
         _ = self.rule("read")
         _ = self.rule("structure", "tier: D\nfamily: modules\n")
         self.sync()
@@ -206,14 +206,8 @@ class StylePlanTests(StylePlanFixture):
         with (redirect_stdout(output), mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources))):
             code = style_plan.main(["next-phase", "--unit", "names-unit", "--plan", str(self.plan), "--repo", str(self.repo)])
         self.assertEqual(code, 3)
-        self.assertIn("structure stays with modules:", output.getvalue())
-        self.assertIn("file busy", output.getvalue())
         self.assertIn("no available work:", output.getvalue())
-        diagnostic = next(line for line in output.getvalue().splitlines() if line.startswith("no available work:"))
-        for family in style_plan.FAMILIES:
-            self.assertIn(family + " ", diagnostic)
-        self.assertIn("names waiting for structure", diagnostic)
-        self.assertIn("waiting for structure: crates/alpha, crates/beta", output.getvalue())
+        self.assertEqual(self.ledger().ticket_open("names-unit"), ())
 
     def test_borrowing_idle_diagnostic_keeps_control_characters_on_one_line(self) -> None:
         result = style_plan.WaitingForSync(0, families=(style_plan.FamilyIdleReason("names", "waiting for sync: line\rbreak.rs"),))

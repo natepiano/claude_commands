@@ -9,6 +9,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TextIO, TypedDict, cast
 
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.agents import worker_lifecycle
+
 
 class WorkerLaunchRecord(TypedDict, total=False):
     name: str
@@ -132,7 +136,7 @@ def worker_claim_lock(run: Path) -> Generator[TextIO, None, None]:
     """Keep the old lock path so an earlier launcher can reopen the same inode."""
     path = _link_live_name(run / "impl_seat_claim.lock", run / "impl_worker_claim.lock")
     with path.open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_EX)
         migrate_worker_records(run)
         yield lock
 

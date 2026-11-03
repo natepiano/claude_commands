@@ -1,5 +1,5 @@
 ---
-description: Read the current feature log or its on-request digest
+description: Read the feature log or its digest.
 ---
 
 Use `~/.claude/scripts/lib/py

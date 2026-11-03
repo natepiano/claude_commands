@@ -2,13 +2,8 @@
 
 Code reviewers belong to the unit ledger. `assign.sh --role review` resumes
 `<worktree>-review`; concurrent work uses `<worktree>-review2`. Both are
-read-only and persist across phases and plans. The first dispatch adopts the
-unit's leased thread before ordinary allocation. A busy lease holds its slot
-until it can move. After the move, resume, queued messages, idle checks and
-restart use only the unit transport; the former pool state is an unread archive.
-`review.sh --pool code` and `--lease` are ignored for one release with one
-stderr line. `--pool ui` refuses; the fresh Claude helper in `<UXReview/>`
-remains the design check.
+read-only and persist across phases and plans. The fresh Claude helper in
+`<UXReview/>` remains the design check.
 
 ## What it is
 
@@ -21,17 +16,9 @@ worker ledger. Usage reports compare checkpointed phases through the usage store
 
 ## Unit code reviewers
 
-Code reviewers use the ordinary unit worker ledger. A reviewer already in the
-unit's destination slot wins, whether the unit opened it or adopted it from the
-pool. Ordinary resolution registers a roster-only reviewer in the ledger and
-keeps its thread. Otherwise the first own dispatch adopts the unit's most recently
-allocated leased code thread (`Reviewer.last_allocated`, with the reviewer name
-breaking ties) before opening any new reviewer. A saved transfer keeps its choice
-on recovery. Other idle leases return to the pool as `Unleased`; busy surplus
-leases are released on a later dispatch. Once no code leases remain for the unit,
-the ledger records `reviewers_adopted`, so later dispatches skip the pool. A busy chosen lease holds
-`review`, so concurrent work uses `review2`. A later dispatch
-adopts the first thread when its turn ends.
+Code reviewers use the ordinary unit worker ledger. Resolution reuses an idle
+reviewer and registers a roster-only reviewer in the ledger without changing its
+thread. A concurrent review uses `review2`.
 
 | Worker slot | Role | Access | Lifetime |
 | --- | --- | --- | --- |
@@ -55,46 +42,30 @@ A held design, or a run outside a production, takes its placement from the
 roster (`roster.mesh_title`). Each turn sets the title again, so it follows the
 current assignment.
 
-### Transfer the leased code reviewers
-
-Read the proposed transfer first. Name each destination run explicitly:
-
-```sh
-python3 scripts/direct/workers.py transfer-reviewers --production <slug> \
-  --session-dir <unit-run> --session-dir <another-unit-run>
-```
-
-The default prints `preview: would migrate` and writes nothing. It also lists
-surplus leases as `preview: would release`, busy reviewers as deferred, conflicts,
-and each skipped UI or unleased reviewer.
-Use `--apply` for an explicit move. Each applied result names the destination
-owner and the checked thread id. The command exits non-zero while any leased
-code reviewer is deferred or in conflict.
-
-The move keeps the thread id, account home, account-move marker, standing
-instructions and queued messages. It rejects an inbox with invalid queue fields
-and names its path. Both inboxes keep their bytes on that refusal. It fences
-the old transport, carries queued server input and releases the old writer,
-then registers the unit worker. The journal and inbox receipts let a rerun
-finish an interrupted move without copying messages twice. The unit receipt
-ends archive reads after the durable lease removal. The command prints the
-archive path; moved workers do not read it. This phase does not run a live apply.
-
 ## How it works
+
+### Account selection
+
+The [account design](accounts.md) owns the shared workers account selection and its authority on natedev.
+Both machines resolve that selection through `role_map.py`.
+The selected account is separate from a worker's thread and role.
+Account moves preserve those threads while the worker machinery changes the serving home.
+Claude assignment fallback does not replace the selected Codex account.
+The lifecycle and held-role rules below still apply during a move.
 
 ### Worker lifecycle in `scripts/agents/codex_mesh.py`
 
 Each run has one detached `codex app-server --listen ws://127.0.0.1:<port>`. Each worker is a named, non-ephemeral thread on it.
 
-**Server environment.** `_start_server` gives the server the caller's environment with `CODEX_HOME` set to the workers home. When `--session-dir` is a child of a unit run root (`RUN_ROOTS`, `/tmp/claude/unit` and `/tmp/claude/delegate`), it also sets `UNIT_RUN_DIR` to that folder and `TMPDIR` to its `tmp/` folder, replacing any values the caller carries. Worker processes inherit it: `verify.sh` takes the cargo token on that board, and the berth hook (`scripts/hooks/pre-tool-use-berth.py`) checks that run's open phases. The caller's copy cannot be used: implement.sh exports it only after its claim step, and the claim's `compact` call starts the server when none is running. On 2026-10-17, 11 of 13 live app-servers lacked it, all three started by that `compact` call among them. A retained legacy mesh directory (`mesh/<generation>/`), and any other mesh directory outside the run roots, keeps the caller's environment unchanged: one pool server serves the turns of many units, so no single run is right for it, and a reviewer edits nothing.
+**Server environment.** `_start_server` gives the server the caller's environment with `CODEX_HOME` set to the workers home. When `--session-dir` is a child of a unit run root (`RUN_ROOTS`, `/tmp/claude/unit` and `/tmp/claude/delegate`), it also sets `UNIT_RUN_DIR` to that folder and `TMPDIR` to its `tmp/` folder, replacing any values the caller carries. Worker processes inherit it: `verify.sh` takes the cargo token on that board, and the berth hook (`scripts/hooks/pre-tool-use-berth.py`) checks that run's open phases. The caller's copy cannot be used: implement.sh exports it only after its claim step, and the claim's `compact` call starts the server when none is running. On 2026-10-17, 11 of 13 live app-servers lacked it, all three started by that `compact` call among them. A mesh directory outside the run roots keeps the caller's environment unchanged.
 
 For unit runs, `start`, `prime`, an explicit `follow --cwd`, and resident turn transitions pass their known cwd to `ensure_server`. Direnv's nearest `.envrc` at or above that cwd selects the dev-shell folder, so turns in worktree subfolders share the same server. `direnv status --json` must identify that file as allowed (`state.foundRC.allowed == 0`) before the server starts through `direnv exec <dev-shell folder> env <managed assignments> codex …`. The approval check does not evaluate the shell. A missing or unapproved `.envrc` selects the ordinary launch. A missing direnv, failed or timed-out probe, or unreadable status is an unknown result: it keeps a healthy recorded server and its saved dev-shell preference. Without a healthy server, an unknown result starts an ordinary server.
 
-There is no wrapper on worker commands: the app-server passes the loaded dev-shell to all its children. The assignments after direnv restore `CODEX_HOME`, `UNIT_RUN_DIR`, `TMPDIR` and any managed held-role identity keys, so `.envrc` cannot replace them. [Direnv uses `syscall.Exec`](https://github.com/direnv/direnv/blob/v2.37.1/internal/cmd/cmd_exec.go), and `env` also executes its command in place: the recorded pid is the app-server's own pid. Plain launches retain the 30-second `SERVER_START_TIMEOUT_SECS` budget and sweep record-start window. Only dev-shell launches get `DEV_SHELL_START_TIMEOUT_SECS` (300 seconds) for cold direnv/Nix evaluation. While one starts, `mesh_server_start.json` names its pid, port, start time and dev-shell folder. The sweep discovers this temporary record under the run roots even without a recoverable log handle, and keeps that server through its dev-shell startup budget. The marker is removed after success or failure; expired markers do not extend the plain record-start window. If that launch cannot execute, exits, or times out, the failure and direnv's stderr go to `mesh_server.log`; the same start path retries with the caller's environment and records a plain server. `mesh_failed_dev_shell.json` remembers the failed folder, an input revision and a retry deadline 30 minutes after the failure was written. The revision covers `.envrc`, `flake.nix`, `flake.lock`, `shell.nix`, `default.nix` and `devenv.nix` in that folder, using each file’s nanosecond modification/change times and size, or its absence. The remembered-failure type owns both the input key and the deadline. Until the deadline, an unchanged revision makes a cwd caller reuse the healthy plain fallback and keeps restarts plain, instead of repeating the failed evaluation. Editing, creating or removing a tracked input, or reaching the deadline, permits a fresh attempt. Older failure records without the input key and deadline also permit a fresh attempt. A successful dev-shell start clears the failure record. The failure check runs under the server lock, so queued callers observe a failure saved by the preceding launch. Failed-start cleanup signals the whole process group, including evaluation children. No live worktree evaluation was measured for this change.
+There is no wrapper on worker commands: the app-server passes the loaded dev-shell to all its children. The assignments after direnv restore `CODEX_HOME`, `UNIT_RUN_DIR`, `TMPDIR` and any managed held-role identity keys, so `.envrc` cannot replace them. [Direnv uses `syscall.Exec`](https://github.com/direnv/direnv/blob/v2.37.1/internal/cmd/cmd_exec.go), and `env` also executes its command in place: the recorded pid is the app-server's own pid. Plain launches retain the 30-second `SERVER_START_TIMEOUT_SECS` budget and sweep record-start window. Only dev-shell launches get `DEV_SHELL_START_TIMEOUT_SECS` (300 seconds) for cold direnv/Nix evaluation. Every launch writes `mesh_server_start.json` with its pid, port, start time and complete serving configuration, including a dev-shell folder when one applies. The sweep discovers this temporary record under the run roots even without a recoverable log handle, and keeps that server through its dev-shell startup budget. The marker is removed after complete current-server publication or confirmed process exit; an unconfirmed live start retains it for reconciliation. Expired markers do not extend the plain record-start window. If that launch cannot execute, exits, or times out, the failure and direnv's stderr go to `mesh_server.log`; the same start path retries with the caller's environment and records a plain server. `mesh_failed_dev_shell.json` remembers the failed folder, an input revision and a retry deadline 30 minutes after the failure was written. The revision covers `.envrc`, `flake.nix`, `flake.lock`, `shell.nix`, `default.nix` and `devenv.nix` in that folder, using each file’s nanosecond modification/change times and size, or its absence. The remembered-failure type owns both the input key and the deadline. Until the deadline, an unchanged revision makes a cwd caller reuse the healthy plain fallback and keeps restarts plain, instead of repeating the failed evaluation. Editing, creating or removing a tracked input, or reaching the deadline, permits a fresh attempt. Older failure records without the input key and deadline also permit a fresh attempt. A successful dev-shell start clears the failure record. The failure check runs under the server lock, so queued callers observe a failure saved by the preceding launch. Failed-start cleanup signals the whole process group, including evaluation children. No live worktree evaluation was measured for this change.
 
 The server record stores `dev_shell_worktree` for a successful dev-shell launch. When a cwd caller receives a definite probe answer and the required dev-shell differs from the record (including a legacy record with no dev-shell), `ensure_server` retires the server and starts its replacement through the same path as an account or compaction-limit change. Existing turns retain the retired server until released. This also removes a previously loaded shell when its `.envrc` disappears or is no longer allowed. An unknown probe answer does not retire the server for a dev-shell mismatch. A caller without a cwd never retires a server for that reason.
 
-`mesh_dev_shell.json` in the session folder stores the last successfully served dev-shell folder as `worktree`, independently of the current server record. When `compact`, `serve`, `fork`, or another cwd-free caller must restart after idle-stop, it rechecks that folder's approval and uses the same dev-shell when still allowed. A definite answer selecting the ordinary environment clears this preference; an unknown answer preserves it for a later retry. A pre-existing server record can also supply the folder when the preference has not yet been written. Review pools and other shared mesh folders never load a worktree's dev-shell.
+`mesh_dev_shell.json` in the session folder stores the last successfully served dev-shell folder as `worktree`, independently of the current server record. When `compact`, `serve`, `fork`, or another cwd-free caller must restart after idle-stop, it rechecks that folder's approval and uses the same dev-shell when still allowed. A definite answer selecting the ordinary environment clears this preference; an unknown answer preserves it for a later retry. A pre-existing server record can also supply the folder when the preference has not yet been written. Shared mesh folders outside unit runs never load a worktree's dev-shell.
 
 The berth hook takes the session directory from `UNIT_RUN_DIR` when it names a folder that exists. When the variable is unset or its folder is gone, it reads the director's run marker (`unit_runs.marker`), so a stale variable never lets an edit through unchecked. The marker names one run, so a worker in a director's side run would otherwise check the main run's reservations.
 
@@ -104,7 +75,7 @@ The verbs:
 | --- | --- | --- |
 | `start` | `--session-dir --name [--role impl\|test\|fix\|review] [--lens] --cwd --prompt-file --summary-file [--reply-file] --log-file [--model --effort --service-tier] [--sandbox danger-full-access] [--resident]` | Opens a thread and blocks until its turn ends. `--role` is optional, and roleless threads such as ask-a-friend friends leave it out. A given role, with `--lens` when passed, is appended to `agents.jsonl` for the new thread. |
 | `follow` | `--session-dir --to --role (required) [--lens] [--claim-pid] --message-file --summary-file [--reply-file] --log-file [--model --effort --service-tier] [--cwd] [--read-only] [--image …]` | Runs one more turn on a finished thread. If the old server is gone, it resumes the thread on a new one. `--cwd`, `--read-only` and `--image` apply to that turn only and also apply to unit-owned reviewers; without them the request is the worker's usual one. |
-| `prime`, `fork`, `reset` | see `docs/as-built/review-pool.md` | Create a read-only reviewer template with standing instructions, fork a named reviewer from it, and remove every turn from an idle reviewer. Only the retained legacy allocator calls them. |
+| `prime`, `fork`, `reset` | `--session-dir`, worker name and command-specific arguments | Prime a thread with standing instructions, fork a named thread, or remove turns from an idle thread. Held roles restrict these operations as described below. |
 | `compact` | `--session-dir --to` | Exits 2 for a worker that is running or busy, a worker with no recorded context size, and a worker whose size is `not_measured_since_compaction` (`size not measured since its last compaction; compact refused`). Otherwise it reads the entry's `revision`, resumes the thread, waits up to 60 s (`COMPACT_IDLE_WAIT_SECS`) for a turn still live on it to end, exits 3 (`COMPACT_TURN_STILL_LIVE`) if one stays live, and calls `thread/compact/start`. It waits until the compaction turn has a `thread/compacted` notice or a `contextCompaction` item, a token-usage update and a `turn/completed`. It then writes the new size under `RosterUnchanged(thread_id, revision)`, so a turn that wrote the entry in between keeps its record. A refused write exits 4 (`COMPACT_ROSTER_CHANGED`), reports the current status, thread, turn and revision, and refuses the follow-up. Old followers detach once their launcher no longer owns the entry; broadcast compaction notices cannot change, settle or clean up a paused, finished or newly claimed worker. A size above 0 prints `compacted <worker>: <before> -> <after> tokens`; a compaction turn that reports 0 stores `not_measured_since_compaction` and prints `compacted <worker>: <before> tokens, size not measured until its next turn`. A compaction that has not finished in 300 s (`CompactionTimedOut`) is interrupted with `turn/interrupt` and the thread is read until idle, up to the same 60 s: idle is exit 1 with `…; interrupted the compaction turn, the worker is idle and not compacted`, so a follow-up can still be sent; a turn still live is exit 3. |
 
 | `can-follow` | `--session-dir --to --role [--lens] [--claim-pid]` | Refuses a worker that cannot take a follow-up. With `--claim-pid`, it claims the worker under the roster `flock`: it sets `status: starting`, `launcher_pid`, `previous_status`, the new `role`, and `previous_role` (the role the worker held before), and appends the role and lens to the role log `agents.jsonl` (`docs/as-built/usage-ledger.md`). |
@@ -129,7 +100,7 @@ A held design role (a roster entry with `held_design_id`, `docs/as-built/long-li
 - `revision`: raised by one on every write inside the roster lock; an entry without one reads as 0. `_update_roster_if_expected` writes only when the entry still matches what the writer expects (still on its thread, absent, ended on its thread, or at an unchanged revision), so a command still at work for an earlier thread, or a compaction that ends late, cannot replace a newer record (`docs/as-built/usage-ledger.md`, Worker roster guards).
 - A stream owns worker work only while its entry is `starting`, `running` or `waiting_capacity` with that launcher's PID. Ownership loss is sticky: an old subscriber cannot settle, clean up or close the inbox of a paused, finished, adopted or newly claimed worker. Terminal settlement checks launcher ownership under the roster lock. Readbacks, cleanup and summary delivery run outside that lock, with ownership rechecked before further work and inside the terminal write. `assign.py`, `implement.sh` and `review.sh` all refuse a follow-up after compaction exit 4 and advise same-thread `reopen` if idle.
 - During a claim only: `previous_role` and `previous_status`.
-- For a pooled reviewer, its template or a held design role: `instructions_file`, whose text is sent again as `developerInstructions` on every resume and fork.
+- For a thread with standing instructions, including a held design role: `instructions_file`, whose text is sent again as `developerInstructions` on every resume and fork.
 - `access_policy`, which decides the sandbox (`_worker_sandbox`, `_resume_params`): `{"kind": "ReadOnlyReviewer"}` (written by `prime` and `fork`, and for a held reviewer) gives `read-only`; `PhaseBoundDesigner` (a held designer) gives its `launch_sandbox`. An entry with no policy takes `--sandbox` or the default `danger-full-access`; an entry with `instructions_file` and no policy refuses with `recovery required`. Access never comes from the instructions text.
 
 The read-only roster reader `scripts/message/roster.py` (`docs/as-built/session-roster.md`) reads `thread_id`, `status`, `role`, `lens`, `launcher_pid` and `cwd`, and leaves `ended` workers out. A `review` worker with a `lens` field shows as `review (<lens>)`, but no launcher writes `lens` into the mesh roster. `codex_mesh.py --lens` records the lens in `agents.jsonl` only; it also appears in artifact names and in the progress and findings records.
@@ -165,9 +136,9 @@ first worker is busy. Both threads stay read-only.
 
 `review.sh` remains a compatibility launcher. With no recipient it resolves
 the unit's own reviewer. `--to` follows an explicit worker and `--slot` names
-an explicit extra worker. Both use read-only access. `--pool code` and `--lease`
-are ignored with one stderr line; `--pool ui` refuses and points to the fresh
-Claude helper in `<UXReview/>`. It never calls the old allocator.
+an explicit extra worker. Both use read-only access. Any other option, such as
+the retired `--pool` or `--lease`, exits 2 with `unknown review option` and the
+flag name.
 
 Every review attempt records `arm: own`. Records under
 `review_turns/<run>/<started>-<pid>-<sequence>.json` keep separate attempts from
@@ -337,6 +308,8 @@ across rounds, phases, runs, restarts and account moves.
 
 `scripts/astra/design_roles.py` keeps one designer and one reviewer slot per design.
 
+Phase-bound `open` and `adopt` use the resolved design checkout when `--checkout` is omitted. A saved phase binding always names its repository. Document lookup, run unbinding, holder moves, holder retirement and holder verification share one per-record reader: an unreadable record emits one stderr warning naming its path and reason, and the sweep continues. Rename and transfer operations share a `record_operation()` scope across their sweeps: each bad record warns once per operation, and a later retry can warn again. If its raw JSON identifies the target holder, run or document and a role is open, paused for a move or needs recovery, the operation refuses so that the live thread remains recoverable. Holder verification returns that refusal in its failure list.
+
 **Store.** Root `DESIGN_ROLES_STATE`, else `~/.local/state/astra/design-roles/`, on the holder's host. One directory per UUID `design_id`:
 
 | Path | Holds |
@@ -436,7 +409,7 @@ Other public functions: `queue_message`, `pending_messages`, `held_document`, `e
 - One designer and at most one reviewer per design, one holder per design, and the pair lives on the holder's host. No host transfer and no authority failover.
 - A lost or uncertain thread becomes `RoleNeedsRecovery`; nothing starts a replacement thread, forks a held thread or reopens an ended identity.
 - Held roles change only through `design_roles.py`. Every mesh route that can start, follow, pause, stop, reopen, fork or re-instruct a thread checks `held_design_id` and `_role_fence`. A new route must do the same.
-- Lock order is unit ledger, then design and pool locks, then worker lifecycle locks in sorted `(session, name)` order, then inbox, then roster. No operation acquires lifecycle while holding an inbox or roster flock. Adoption retains its nonblocking inbox attempts; it never waits on a busy inbox while holding a roster flock. Authority transitions and adoption publication retain the design and lifecycle fence; ordinary turn watching holds neither lifecycle nor roster.
+- Lock order is unit ledger, then design locks, then worker lifecycle locks in sorted `(session, name)` order, then inbox, then roster. No operation acquires lifecycle while holding an inbox or roster flock. Adoption retains its nonblocking inbox attempts; it never waits on a busy inbox while holding a roster flock. Authority transitions and adoption publication retain the design and lifecycle fence; ordinary turn watching holds neither lifecycle nor roster.
 - Park queued text before any server stop or release. Clear a pending message only after its turn is accepted; keep it and its ID on uncertainty.
 - Access comes from the roster `access_policy`, never from the instructions text. Reviews stay `ReadOnlyReviewer`.
 - The berth check covers `apply_patch` only. Designers edit by patch; shell or Python writes are outside the check. Do not copy reservation state into the role store.
@@ -469,7 +442,7 @@ Other public functions: `queue_message`, `pending_messages`, `held_document`, `e
 - **One natedev authority with explicit checkout mappings.** A URL spelling, a new worktree or an unreachable host must not make a second identity for the same document. Reservation before creation and retries with the same request ID mean an uncertain launch never frees the slot.
 - **Raw pause refused for held roles.** `stop --pause` truncates pending text and drops queued text, and raw `stop` deletes server records without move markers. Held roles release servers only through `_release_held_server`, which parks queues and proves idle first.
 - **Patch-only write check.** The berth hook sees `apply_patch` paths before the edit; other tools give no path list, and writers run with full sandbox access. So the guarantee covers patches, and the designer prompt tells designers to edit only by patch.
-- **Explicit access policy.** Access must not follow from prompt text. The mesh once inferred read-only access from `instructions_file`; a typed `ThreadAccessPolicy` on the roster entry now keeps access through start, follow, account recovery and adoption. `roster_access_policy` in `codex_mesh.py` is the one reader. An entry from before the policy existed gets its policy by what it is: with `instructions_file` and no `held_design_id` it is a reviewer template or fork (pool or `review.sh --slot`) and gets `ReadOnlyReviewer`; with `held_design_id` it is a damaged held role and refuses, naming `design_roles.py recover`; with neither it is a worker and keeps its launch sandbox. Each locked roster load stores the reviewer policy on every such entry in the file, so the first write after install migrates a whole pool; a read without the lock writes nothing.
+- **Explicit access policy.** Access must not follow from prompt text. The mesh once inferred read-only access from `instructions_file`; a typed `ThreadAccessPolicy` on the roster entry now keeps access through start, follow, account recovery and adoption. `roster_access_policy` in `codex_mesh.py` is the one reader. An entry from before the policy existed gets its policy by what it is: with `instructions_file` and no `held_design_id` it is a reviewer opened by `review.sh --slot` or `--to` and gets `ReadOnlyReviewer`; with `held_design_id` it is a damaged held role and refuses, naming `design_roles.py recover`; with neither it is a worker and keeps its launch sandbox. Each locked roster load stores the reviewer policy on every such entry in the file, so the first write after install migrates the whole file; a read without the lock writes nothing.
 - **Short cited rulings.** Revisions that answered every finding with more mechanism grew a design without a correctness gain. Holders resume the same writer with short rulings that cite files, and change the Work Order only when scope changes.
 
 
@@ -485,15 +458,54 @@ The operation boundary runs from the authoritative identity check through
 server effects to final roster publication. Settlement, pause, compact, claim,
 claim restoration, release-follow, start, submission, replacement-thread
 publication, account-move resume, reopen, end, reset, and bulk stop use it.
-Unit-worker adoption and rollback, reviewer transfer, and held-role recovery
-use the same lock module. Normal turn watching and capacity backoff release
+Unit-worker adoption and rollback and held-role recovery use the same lock
+module. Normal turn watching and capacity backoff release
 the lifecycle lock. Ledger telemetry refresh runs after releasing lifecycle
 and inbox locks, then reacquires ledger before lifecycle and roster.
 
-Known limit: bulk pause, bulk stop and held-server release lock the lifecycle of
-the workers present when they start, then act on every current roster entry. A
-worker added after that snapshot is changed without its lifecycle lock. A run-level
-membership lock is the planned fix (models-unit follow-up, F024 residual).
+The lock order is unit ledger, design, run membership, future staff lock,
+worker lifecycle, server, inbox, then roster. `membership.lock` in each session
+serializes admissions and shared-server maintenance; multiple runs are locked
+in sorted path order. `lock_membership`/`lock_memberships` and lifecycle/server
+locks share recursion diagnostics and support an absolute shutdown deadline.
+An admission holds membership from before server selection or thread creation
+through roster publication. It releases lifecycle, inbox and roster before
+membership, leaving the point for a future `staff.ensure_worker`/`staff.retire`
+call under membership alone. No staff calls are installed here.
+
+Bulk pause, stop, held-server release and server reaping own membership through
+cleanup. `_bulk_workers` acquires every lifecycle, then returns fresh validated
+records; role, transfer and ownership refusals precede mutation. Effects use
+only that work set. A changed set during acquisition is retried within the
+same deadline. `_server_lock` serializes server selection, retirement, reaping
+and conditional record removal; cleanup never removes a replacement record.
+Held-server refresh explicitly passes its membership lease and lifecycle
+ownership. A partially owned worker set refuses with recovery instructions.
+Account moves pass bulk ownership through interruption and release all these
+locks before waiting for continuations. Acquisition timeout reports incomplete
+shutdown, without claiming a turn or server has stopped.
+
+Shutdown establishes one monotonic deadline before director/ledger lookup,
+migration or adoption recovery reached during a timed shutdown. Standalone
+`recover_adoptions` establishes no finite scope. `worker_lifecycle.operation_deadline` carries
+that budget through callbacks and nested helpers; an omitted deadline inherits
+it, and an explicit limit can only shorten it. Nested scopes restore their
+parent on every exit. New threads and processes must receive the absolute
+deadline explicitly. `acquire_flock` is the sole acquisition primitive for
+shared, exclusive and immediate try-locks, including roster/server-record
+reads, ledger migration, design locks and inboxes. Ownership bookkeeping is
+thread-local and takes no auxiliary mutex. Read fallbacks propagate lock
+expiry as `OperationDeadlineExpired` to the incomplete-shutdown report.
+Ordinary socket timeouts retain their queue-preservation and recovery results.
+Legacy `Client(deadline=...)` and frame-read deadlines use wall time and are
+converted once to monotonic limits. `Client(operation_deadline=...)` accepts an
+absolute monotonic shutdown limit. One setup deadline covers connection and
+handshake, and one RPC deadline covers its send and every reply fragment;
+neither renews the operation budget. The operation wins equal deadlines, while
+a strictly earlier transport limit keeps its transport result even if handling
+runs late. A tighter active scope also applies to an existing client.
+Reaping reports success only after exit is confirmed within that same budget;
+a refused signal or surviving server retains its records.
 
 Settlement closes only its own inbox and checks ownership before cleanup and
 terminal publication. A replacement-thread failure normalizes both port and
@@ -513,3 +525,85 @@ revision and launcher under the roster flock. Compact does not recover a dead
 launcher; its refusal directs the caller to follow or reopen.
 When no server is live, follow refuses before claiming an abandoned worker;
 reopen can restart the server and recover only after proving that same thread idle.
+
+
+## Whole worker-state publication
+
+Worker rosters and pending inboxes use permanent sidecar locks:
+`mesh_roster.json.lock` and `<worker>.pending.json.lock`. Lock acquisition precedes
+opening the data path and the lock stays held through publication. A locked
+`WorkerStateFile` reopens the current pathname for each operation; it retains no
+data handle across a replacement. These lock files are never renamed separately
+or unlinked. The order remains unit ledger, design, membership, future staff,
+lifecycle, server, inbox, roster. Every flock uses `worker_lifecycle.acquire_flock`
+and inherits the active operation deadline, including assign lock users.
+
+All worker-state publications use `atomic_file.write_text_atomic`: a sibling file
+is flushed and synced, replaced, then its folder is synced. `AtomicPublicationFailed`
+means replacement did not occur and the old file remains whole.
+`AtomicDurabilityUnconfirmed` means complete new content is already visible but
+folder durability is unconfirmed. Neither failure permits a blind rollback or
+fresh allocation; recoverable transactions retain their journal and inspect the
+visible state on retry. Temporary cleanup belongs to that shared publisher.
+
+`WorkerStateUnreadable` names existing empty, invalid, wrongly shaped, or unreadable
+worker evidence. Operational readers refuse it; server cleanup retains the server
+and reports the doubt. Board narration omits unavailable enrichment. Missing files
+remain distinct: `resolve` checks ledger-owned names and exact thread identities
+before any new allocation, so a missing roster does not establish a new run.
+A missing inbox has no persisted messages. Before `1a8adf46`, the pending writer
+truncated the live file before writing JSON. Thus, a zero-byte inbox can indicate lost messages.
+An exclusive reader locks and rereads that file. It renames the file beside the original as
+`<worker>.pending.json.empty-legacy-<UTC timestamp>`. It logs one line with the file and reason.
+It then returns `{}`, which represents a valid empty queue. A shared reader also returns `{}`
+but leaves the file for an exclusive reader to quarantine. Readers also accept `{}` in a pending
+file as an empty queue. Non-empty records must pass all queue field checks.
+A newly cleared inbox contains `{"thread_id":"","messages":[],"accepting_messages":true}`.
+Queues for specific threads carry the same fields with their exact identity and close flag.
+
+`workers.py repair-roster --session-dir RUN` explicitly reconstructs missing rows
+from the current run's unit ledger. It preserves surviving rows, writes damaged
+content beside the roster as `mesh_roster.json.damaged`. Later distinct damage uses
+`mesh_roster.json.damaged.<sha256>`; retries reuse identical evidence and never
+overwrite an earlier incident. Ledger identity and policy, earlier exact-thread roster
+restrictions, and design authority supply local limits. Unfinished or quarantined
+transactions, live launchers, conflicting identities and unavailable/ambiguous live
+thread evidence refuse repair. Exact thread reads determine paused/idle versus
+running state; no launcher or context measurement is invented. A new revision fence
+exceeds all available earlier revisions rather than restarting at zero. Live probes
+run without the roster lock; final publication compares the complete original bytes.
+A rerun prints `roster already consistent: <path>` and changes no worker data.
+This verb is the only permitted replacement of unreadable roster evidence.
+
+Landing requires a point with **no live launcher or old writer** in the affected
+runs. All old entry points must be stopped and restarted before the first atomic
+replacement: an old process locks the data inode, which does not exclude a new
+sidecar-lock writer. Never run old and new writers together on a run. Real-run
+roster repair is an explicit director action after the checkpoint, not an automatic resolve.
+
+Atomic worker-state snapshots are strict but lock-free for previews and progress
+presentation: each read sees one complete publication and creates no lock file.
+Mutation still locks the stable sidecar before reading. Unreadable server
+metadata becomes unavailable evidence at the availability boundary; recovery
+refuses it without rewriting it. Cleanup keeps its strict uncertainty rule.
+
+Roster repair inspects ownership fields in all parseable rows, including rows
+whose telemetry is malformed. A live launcher, transfer fence, conflicting
+thread or adoption, or ambiguous ownership refuses repair without changing the
+evidence. Reconstruction keeps damaged-row restrictions separate from the proposed
+ledger/design reconstruction. Every field other than known execution/history
+fields must match that authority exactly, including access policies, held-role
+identity, legacy read-only evidence, sandbox limits and authorization fields.
+Unknown fields also refuse unless confirmed, so a newer restriction cannot be
+silently discarded by older repair code. Refusals name the worker, field and roster;
+no backup or replacement is published until authority checks pass.
+
+Server startup retains its start record after an unconfirmed durability outcome
+until a complete current-server record exists or process exit is confirmed.
+Before server selection or any new child, `ensure_server` reconciles that record
+under the server lock. A confirmed own process at the recorded endpoint that
+answers the existing WebSocket handshake is published as current and reused.
+A proven-dead process permits clearing the record and starting one replacement.
+Other states, including missing serving configuration in a legacy start record,
+refuse with the path and a request to confirm or stop the recorded process before
+retrying. The record stays intact; retry never overwrites an uncertain live start.

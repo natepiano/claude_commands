@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest import mock
+
+from scripts.lib import conf
 from dataclasses import replace
 from pathlib import Path
 from typing import Literal, cast
-from unittest import mock
 
+from scripts.issue_score.test_config import ConfiguredTestCase, patch_thresholds
 from scripts.issue_score import client, decide, questions
 
 FIXTURES = Path(__file__).with_name("fixtures")
@@ -28,21 +31,70 @@ def choice_answer(probabilities: dict[str, float]) -> client.ChoiceAnswer:
             "probabilities": probabilities}
 
 
-class DecideTests(unittest.TestCase):
+class DecideTests(ConfiguredTestCase):
+    def test_threshold_selection_reads_one_configuration_for_all_candidates(self) -> None:
+        self.change_configuration(self.configuration(), **{"error_target.category": ".1"})
+        points = [decide.RiskPoint(.4, .9, .2), decide.RiskPoint(.6, .5, .05)]
+        with (mock.patch.object(conf, "read", wraps=conf.read) as read,
+              mock.patch.object(questions, "thresholds", wraps=questions.thresholds) as thresholds,
+              mock.patch.object(questions, "error_targets", wraps=questions.error_targets) as targets):
+            result = decide.select_threshold("category", points)
+        self.assertEqual(result, decide.Supported(.6))
+        read.assert_called_once_with("issue_score")
+        self.assertEqual(thresholds.call_count, 1)
+        self.assertEqual(targets.call_count, 1)
+
+    def test_threshold_selection_uses_the_callers_read_after_the_live_target_changes(self) -> None:
+        path = self.configuration(**{"error_target.category": ".1"})
+        scoring_config = conf.read("issue_score")
+        self.change_configuration(path, **{"error_target.category": ".3"})
+        with mock.patch.object(conf, "read", side_effect=AssertionError("selection read the file again")):
+            result = decide.select_threshold("category", [decide.RiskPoint(.6, .5, .2)],
+                                             scoring_config=scoring_config)
+        self.assertIsInstance(result, decide.Unsupported)
+
+    def test_config_edits_change_certainty_evidence_and_split_decisions_without_a_reload(self) -> None:
+        path = self.configuration()
+        choice = choice_answer({"rendering": .7, "tooling": .3})
+        goal = decide.FieldDecision("ship_hana", .6, "unsure")
+        score = score_answer({"0": .3, "1": .0, "2": .7})
+        self.assertTrue(decide.is_sure("backlog_goal", goal))
+        self.assertEqual(decide.decide_choice(choice, choice, "area").certainty, "sure")
+        self.assertTrue(decide.decide_score(score, "backlog_impact").split)
+        evidence: dict[str, float] = dict.fromkeys(("deadline_named", "outside_cutoff", "current_harm", "blocks_planned_work"), .2)
+        evidence["deadline_named"] = .75
+        self.assertEqual(decide.decide_urgency(evidence, score_answer({"0": 1., "1": 0., "2": 0.})).value, 4)
+        self.change_configuration(path, **{"threshold.backlog_goal": ".8", "threshold.area": ".5",
+                                           "split_probability": ".4", "evidence_present": ".8"})
+        self.assertFalse(decide.is_sure("backlog_goal", goal))
+        self.assertEqual(decide.decide_choice(choice, choice, "area").certainty, "unsure")
+        self.assertFalse(decide.decide_score(score, "backlog_impact").split)
+        self.assertEqual(decide.decide_urgency(evidence, score_answer({"0": 1., "1": 0., "2": 0.})).value, 1)
+        main = cast(client.Response, json.loads((FIXTURES / "main_response.json").read_text()))
+        area = cast(client.Response, json.loads((FIXTURES / "area_response.json").read_text()))
+        area["answers"]["area_fits"] = {"type": "noul", "noul": .2}
+        self.assertEqual(decide.decide_answers(main["answers"], area["answers"])["area"].origin, "area_fallback")
+        self.change_configuration(path, evidence_absent=".1")
+        self.assertEqual(decide.decide_answers(main["answers"], area["answers"])["area"].origin, "choice")
+        points = [decide.RiskPoint(.6, .5, .15)]
+        self.assertIsInstance(decide.select_threshold("category", points), decide.Unsupported)
+        self.change_configuration(path, **{"error_target.category": ".2"})
+        self.assertEqual(decide.select_threshold("category", points), decide.Supported(.6))
+
     def test_configured_tuning_policy_controls_certainty_at_the_measured_boundaries(self) -> None:
         # Area uses a top-two gap; other supported fields use probability thresholds.
         expected = {"backlog_goal": .4, "category": .9,
                     "backlog_impact": .4, "backlog_alignment": .4}
         for field, threshold in expected.items():
             with self.subTest(field=field):
-                self.assertEqual(questions.THRESHOLDS[field], decide.Supported(threshold))
+                self.assertEqual(questions.thresholds()[field], decide.Supported(threshold))
                 below = decide.FieldDecision("fixture", threshold - .001, "unsure")
                 at = decide.FieldDecision("fixture", threshold, "unsure")
                 self.assertFalse(decide.is_sure(field, below))
                 self.assertTrue(decide.is_sure(field, at))
-        self.assertEqual(questions.THRESHOLDS["area"], decide.MinimumGap(.3))
+        self.assertEqual(questions.thresholds()["area"], decide.MinimumGap(.3))
         for field in ("backlog_urgency", "backlog_effort"):
-            self.assertIsInstance(questions.THRESHOLDS[field], decide.ReportOnly)
+            self.assertIsInstance(questions.thresholds()[field], decide.ReportOnly)
 
     def test_area_gap_uses_averaged_top_two_values_at_the_boundary_and_accepts_clear_winners(self) -> None:
         for first, second, expected in (
@@ -71,13 +123,13 @@ class DecideTests(unittest.TestCase):
         for gap in (0., .3, .4):
             for decision in (replace(clear, split=True), disagreement):
                 with self.subTest(gap=gap, decision=decision):
-                    self.assertFalse(decide.is_sure("area", decision, dict(questions.THRESHOLDS, area=decide.MinimumGap(gap))))
+                    self.assertFalse(decide.is_sure("area", decision, dict(questions.thresholds(), area=decide.MinimumGap(gap))))
 
     def test_unsupported_area_never_becomes_sure_even_for_certain_choices_or_fallback(self) -> None:
         main = cast(client.Response, json.loads((FIXTURES / "main_response.json").read_text()))
         area = cast(client.Response, json.loads((FIXTURES / "area_response.json").read_text()))
         origins: tuple[Literal["choice", "area_fallback"], ...] = ("choice", "area_fallback")
-        thresholds = dict(questions.THRESHOLDS, area=decide.Unsupported())
+        thresholds = dict(questions.thresholds(), area=decide.Unsupported())
         for confidence in (0., .4, .95, 1.):
             for origin in origins:
                 with self.subTest(confidence=confidence, origin=origin):
@@ -87,7 +139,7 @@ class DecideTests(unittest.TestCase):
             area["answers"]["area_fits"] = {"type": "noul", "noul": fits}
             for name in ("area", "area_reverse"):
                 area["answers"][name] = choice_answer({"rendering": 1., "tooling": 0.})
-            with mock.patch.dict(questions.THRESHOLDS, area=decide.Unsupported()):
+            with patch_thresholds(area=decide.Unsupported()):
                 result = decide.decide_answers(main["answers"], area["answers"])["area"]
             self.assertEqual(result.certainty, "unsure")
             self.assertEqual(result.confidence, 1.)
@@ -125,7 +177,7 @@ class DecideTests(unittest.TestCase):
         decision = decide.FieldDecision(4, 1., "unsure", threshold_dependencies={"backlog_goal": 1.})
         for policy in (decide.Unsupported(), decide.ReportOnly()):
             with self.subTest(goal_policy=policy):
-                thresholds = dict(questions.THRESHOLDS)
+                thresholds = dict(questions.thresholds())
                 thresholds["backlog_goal"] = policy
                 self.assertFalse(decide.is_sure("backlog_alignment", decision, thresholds))
 
@@ -154,7 +206,7 @@ class DecideTests(unittest.TestCase):
         disagreement = decide.decide_choice(choice_answer({"feature": .99, "refactor": .01}),
                                             choice_answer({"feature": .49, "refactor": .51}), "category")
         for threshold in (percent / 100 for percent in range(40, 100, 5)):
-            thresholds = dict(questions.THRESHOLDS)
+            thresholds = dict(questions.thresholds())
             for field, decision in (("backlog_impact", split), ("category", disagreement)):
                 thresholds[field] = decide.Supported(threshold)
                 with self.subTest(threshold=threshold, field=field):
@@ -167,7 +219,7 @@ class DecideTests(unittest.TestCase):
         main["answers"]["goal_reverse"] = choice_answer({"ship_hana": .65, "find_collaborators": .35})
         main["answers"]["alignment_ship_hana"] = score_answer({"0": 0., "1": 0., "2": .2, "3": .8, "4": 0.})
         decision = decide.decide_answers(main["answers"], area["answers"])["backlog_alignment"]
-        thresholds = dict(questions.THRESHOLDS)
+        thresholds = dict(questions.thresholds())
         thresholds.update(backlog_goal=decide.Supported(.6), backlog_alignment=decide.Supported(.75))
         self.assertTrue(decide.is_sure("backlog_alignment", decision, thresholds))
         thresholds["backlog_goal"] = decide.Supported(.7)
@@ -306,7 +358,7 @@ class DecideTests(unittest.TestCase):
         for policy, fits, certainty in ((decide.MinimumGap(.3), .29, "sure"),
                                        (decide.MinimumGap(.6), .2, "sure"),
                                        (decide.MinimumGap(.6), .2001, "unsure")):
-            with self.subTest(policy=policy, fits=fits), mock.patch.dict(questions.THRESHOLDS, area=policy):
+            with self.subTest(policy=policy, fits=fits), patch_thresholds(area=policy):
                 area["answers"]["area_fits"] = {"type": "noul", "noul": fits}
                 decision = decide.decide_answers(main["answers"], area["answers"])["area"]
                 self.assertEqual(decision.value, "unfiled")

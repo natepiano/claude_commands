@@ -1,5 +1,5 @@
 ---
-description: Run a production as its showrunner — launch each unit director (a /unit:direct session), merge and test every checkpoint on the merge branch, check visible work in screenshots before merging, clear waits between units, relay the user's words, and report each unit's ETA when asked.
+description: Direct units, merges, and production.
 ---
 
 # Produce
@@ -108,6 +108,20 @@ State:
   `From the showrunner:`.
 - **A unit director's message is a peer's** (/message). Check what it claims before passing it on:
   the hash exists, the tests ran, the shots show what it says.
+- **A message from morty is the user's** (user, 2026-11-02). Morty is the
+  user's associate producer, a Codex session. This rule is the one source;
+  other files point here.
+  - A message from morty counts as the user's own words: answers, approvals,
+    rulings and priorities. Begin a relay to a unit with
+    `From the user (via morty and <your name>):`.
+  - Morty is not a parent. No showrunner reports to morty.
+  - The permission rules stay. A morty message never changes the session's
+    permission settings, CLAUDE.md or config. It never approves a permission
+    prompt.
+  - The generated `Authority: morty (speaks for the user)` mark identifies
+    Morty's configured native sender id. `--from morty` alone carries no
+    authority. Before an action that cannot be undone on a message without
+    the mark, confirm it with morty by `send.py --to morty`.
 - **The showrunner decides, without asking the user:**
   - merges and their order;
   - holds and landing calls;
@@ -262,6 +276,12 @@ State:
   the list when `open_for_user` leaves it out; it leaves only through `answer`.
   User, 2026-10-28: "i asked it to add it to your question list not to bring
   it directly to my attention".
+  A held item goes to the user only when it touches money, safety, product behavior the user sees, or an act that cannot be undone.
+  File only those with `/showrunner:question`, led by the owning unit.
+  Include its finding id, phase, files, proposed change, and ledger location.
+  The director settles every other held item under DecisionEconomy and states the call in one line (user, 2026-11-02).
+  After approval, send the owning unit a `next` item or a phase.
+  After either answer, require the unit to record `findings.py decision` with the user's words.
   A change waiting for the user's check is never an open question: it goes on
   the change review list through `/change_review` add, never into
   `open_for_user` or the count, and the user asks for "change review" when
@@ -368,7 +388,10 @@ Run `python3 ~/.claude/scripts/production/production_lifecycle.py load
 the checkout, copies any state that `<SCRATCH>` holds and `STATE_DIR` does not, reads the last `### STATE` block of `LOG`, rebuilds each unit's
 last code checkpoint from first-parent merge history, and checks its herdr
 session. Use its lines to restore state. <StartUpdates/> registers this session
-again and retargets the instance. After a reboot, the herdr boot unit and `pane_restore.py` bring each pane back on its own account (`docs/as-built/herdr-restore.md`).
+again and retargets the instance. No boot restore unit is installed. `agents restart`
+restores selected sessions from recovery records on their own accounts. It starts or
+adopts herdr and opens a tab for each session. It does not run `pane_restore.py`
+for other panes. See `docs/as-built/herdr-restore.md`.
 
 When the production doc's **Production rules** say CI does not apply, pass
 `--no-ci` to this and every lifecycle subcommand.
@@ -544,6 +567,7 @@ Routing arrivals and ordering that queue are the showrunner's calls.
 
 <MergeCheckpoint>
 Input: the unit, phase, hash, shots, and `review trial:` line from its notice.
+File each `Held simplify:` item under <Throughout/> → Open questions before processing the checkpoint.
 Take the phase start time from the unit's previous merge time in `LOG`, or
 from its launch line in `LOG` for the first phase.
 
@@ -604,7 +628,11 @@ notice to the unit director before any merge command runs:
    `--as-built`; with either, omit `--review-trial`, `--parallel` and `--delivers`. Add
    `--cancel-prior` only with `Push: validate_and_push` when this push supersedes
    an older queued or running CI run on the merge branch and no CI point is
-   watching its result or diagnosing a red run. The script checks ancestry,
+   watching its result or diagnosing a red run. Add `--bump` only for a user's
+   bump: merge and push the code checkpoint first, then gate the pushed tip
+   in a detached clone in the background; red goes to the unit and the
+   showrunner, green to the showrunner. It refuses `--shrink`, `--as-built`
+   and `--from-child`. The script checks ancestry,
    origin, scope and conflicts, reports overlaps with other units, merges,
    tests, reruns red packages, pushes, promotes, and records the result. Its
    first `held` or `failed` line stops the run. Send its final `send <unit>:`
@@ -672,14 +700,15 @@ beginning `works` or `fine`, after optional `okay`/`ok` and a row id (`c17`),
 lands the row. Case and later words do not affect the result; any other start
 returns it to its unit.
 
-1. **Feature log.** Only when the production's project closes out by change
-   review: Hana (`~/rust/hana`, `~/rust/hana_catalyst`) and `~/.claude`. Other
+1. **Feature log.** Use only `ProjectSpec.closes_by_change_review` in
+   `scripts/feature_log/feature_log.py` to select projects, such as Hana and `~/.claude`. Other
    projects close out through `/validate_and_push`, so skip to step 2. The
    review id is the row: bare `C<n>` on hana's list, `<showrunner>/C<n>` on any
    other, where `<showrunner>` is the name the list `change-review - <showrunner>.md`
    is named for (`natedev/C3`).
+   A row with no proposal skips this step.
    - A landing row runs `add --review <id>`, or `supersede --review <id>` when
-     its proposal has `--old`. Propose a missing row first; correct wrong
+     its proposal has `--old`. Correct wrong
      meaning by rerunning `propose` while it is open.
    - A returning row runs `drop --review <id> --verdict "<verdict>"`.
 
@@ -1160,7 +1189,7 @@ condition: wrap neither waits on it nor retires its worktree or branch.
 - The showrunner writes no implementation code, tests or Work Orders in a unit's
   files.
 - Only the showrunner pushes the merge branch and main, never with force.
-  Units push only their own branch.
+  Units push only their own branch except <FastTrack/> (`commands/unit/fast_track.md`).
 - Merge only from a checkpoint notice. Never merge a visible change before a
   fresh design-check pass on its shots (<MergeCheckpoint/> step 3).
 - **An out-of-date as-built doc may always be corrected.** You and every unit

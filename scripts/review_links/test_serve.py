@@ -34,6 +34,8 @@ else:
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.review_links import serve
+from scripts.lib import atomic_file
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @dataclass(frozen=True)
@@ -64,7 +66,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.addCleanup(server.shutdown)
 
     def request(self, path: str) -> HttpReply:
-        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
         try:
             connection.request("GET", path)
             response = connection.getresponse()
@@ -109,7 +111,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 # handle_request serves one disposable connection without a background service.
                 thread = threading.Thread(target=server.handle_request)
                 thread.start()
-                connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                connection = HTTPConnection("127.0.0.1", server.server_port, timeout=TEST_HANG_GUARD_SECS)
                 try:
                     connection.request("GET", "/bbbbbb/draft.txt")
                     response = connection.getresponse()
@@ -117,7 +119,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertEqual(response.read(), b"still served")
                 finally:
                     connection.close()
-                    thread.join(5)
+                    thread.join(TEST_HANG_GUARD_SECS)
         self.assertTrue(expired.exists())
         self.assertIn("cannot delete snapshot", errors.getvalue())
         self.assertIn("aaaaaa", errors.getvalue())
@@ -164,7 +166,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                             self.assertEqual(reply.status, 200)
                             self.assertEqual(reply.body, b"still served")
                         finally:
-                            thread.join(5)
+                            thread.join(TEST_HANG_GUARD_SECS)
                 self.assertTrue(symlink.is_symlink())
                 self.assertTrue(target.is_dir())
                 if inaccessible == unreadable:
@@ -211,6 +213,24 @@ class ReviewLinksServerTests(unittest.TestCase):
                 reply = self.request(f"/{folder}/draft.html")
                 self.assertEqual(reply.status, 200)
                 self.assertEqual(reply.body, b"<title>Review snapshot</title>")
+
+    def test_an_atomic_index_temporary_is_not_served_before_publication(self) -> None:
+        private = b"private index source paths and page tokens"
+        publish = os.replace
+        requested: list[str] = []
+
+        def replace_file(source: Path, destination: Path) -> None:
+            requested.append(source.name)
+            self.assertEqual(source.read_bytes(), private)
+            reply = self.request("/" + source.name)
+            self.assertEqual(reply.status, 404)
+            self.assertNotIn(private, reply.body)
+            publish(source, destination)
+
+        with patch.object(os, "replace", side_effect=replace_file):
+            atomic_file.write_bytes_atomic(self.root / ".index.json", private, mode=0o600)
+        self.assertEqual(len(requested), 1)
+        self.assertEqual((self.root / ".index.json").read_bytes(), private)
 
     def test_index_and_unfinished_writes_are_not_served(self) -> None:
         for filename in (".index.json", ".review-link-unfinished"):
@@ -478,7 +498,7 @@ class ServerStartupTests(unittest.TestCase):
             result = subprocess.run(
                 [sys.executable, str(Path(__file__).with_name("serve.py")), "--port", "0"],
                 env={**os.environ, "PATH": str(root), "REVIEW_LINKS_ROOT": str(root / "snapshots")},
-                text=True, capture_output=True, check=False, timeout=5,
+                text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS,
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("tailscale", result.stderr.lower())

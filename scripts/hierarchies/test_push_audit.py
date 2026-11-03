@@ -19,6 +19,7 @@ from scripts.hierarchies import push_audit as audit
 from scripts.hierarchies import log_records
 from scripts.hierarchies.test_log_records import phone_overflow_lines, read_report_blocks, summary_lines
 from scripts.production import showrunners
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 JsonRecord = dict[str, object]
@@ -107,7 +108,7 @@ class PushAuditTest(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, str(AUDIT_SCRIPT), "report", "--full", "--since", since, "--until", until],
             cwd=AUDIT_SCRIPT.parents[2], env=environment, capture_output=True, text=True,
-            check=False, timeout=15,
+            check=False, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         return result.stdout
@@ -376,6 +377,17 @@ class PushAuditTest(unittest.TestCase):
         self.assertIn("ApprovedRegisteredText", detail_section(output))
         self.assertIn(REGISTERED_TEXT, output)
         self.assertIn("hana", output)
+
+    def test_both_footer_generations_keep_the_registered_identity_and_body_match(self) -> None:
+        for separator in ("\n", " · "):
+            with self.subTest(separator=separator):
+                push = self.push("Footer generations", text_id=REGISTERED_TEXT)
+                push["message"] = str(push["message"]).replace("\nTemplate:", separator + "Template:")
+                self.save(self.pushes, [push])
+                self.save(self.reviews, [self.failed_review("Footer generations")])
+                output = self.report()
+                self.assertIn("ApprovedRegisteredText", detail_section(output))
+                self.assertIn(REGISTERED_TEXT, output)
 
     def test_registered_text_id_can_come_from_review_or_delivered_footer(self) -> None:
         for review_id, footer_id in ((REGISTERED_TEXT, ""), ("", REGISTERED_TEXT)):

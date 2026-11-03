@@ -1,5 +1,5 @@
 ---
-description: Show or change what happens next when an account's weekly usage runs low.
+description: Set account moves for low weekly quota.
 ---
 
 Translate $ARGUMENTS into `python3 ~/.claude/scripts/accounts/accounts.py next`:

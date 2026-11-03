@@ -17,19 +17,71 @@ import merge_checkpoint
 from scripts.production import showrunners
 from scripts.production import production_doc
 from merge_checkpoint import check_parallel
+from production_units import Refusal
 
 # Importable once merge_checkpoint has put scripts/lib on the path.
 import scratch
 
-from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, REAL_MERGE_TESTS, REAL_OWNS, STUB, configure_test_environment
+from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, REAL_MERGE_TESTS, REAL_OWNS, STUB, TRIAL, configure_test_environment
 
 
 def setUpModule() -> None:
     configure_test_environment()
 
 
+class ReviewNumbersTests(unittest.TestCase):
+    def test_invalid_trial_shows_the_simplify_suffix_as_optional(self) -> None:
+        with self.assertRaises(Refusal) as refused:
+            _ = merge_checkpoint.review_numbers("review trial: invalid")
+        self.assertIn("ux repair minutes <R>[, simplify <N> findings, simplify minutes <S>]",
+                      str(refused.exception))
+        for suffix in (", simplify 1 findings", ", simplify minutes 2", ", simplify -1 findings, simplify minutes 2"):
+            with self.subTest(suffix=suffix), self.assertRaises(Refusal):
+                _ = merge_checkpoint.review_numbers(TRIAL + suffix)
+
+    def test_review_numbers_distinguishes_absent_simplify_from_recorded_zero(self) -> None:
+        for suffix, simplify in (
+            ("", merge_checkpoint.NoSimplifyReview()),
+            (", simplify 0 findings, simplify minutes 0", merge_checkpoint.SimplifyReviewMetrics("0", "0")),
+            (", simplify 3 findings, simplify minutes 2.5", merge_checkpoint.SimplifyReviewMetrics("3", "2.5")),
+        ):
+            with self.subTest(suffix=suffix):
+                self.assertEqual(merge_checkpoint.review_numbers(TRIAL + suffix),
+                                 merge_checkpoint.ReviewTrial("2", "3", "14", "4", "1", simplify))
+
+
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    def test_record_passes_separate_simplify_fields_when_the_trial_contains_them(self) -> None:
+        trial = TRIAL + ", simplify 0 findings, simplify minutes 2.5"
+        result = self.run_checkpoint(self.checkpoint(), trial=trial)
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        review = self.events("review_regime.py")
+        self.assertEqual(len(review), 1)
+        self.assertEqual(review[0][review[0].index("--simplify-findings") + 1], "0")
+        self.assertEqual(review[0][review[0].index("--simplify-minutes") + 1], "2.5")
+        self.assertNotIn("--note", review[0])
+
+    def test_failed_push_preserves_the_merge_branches_unpublished_tip(self) -> None:
+        self.write(self.checkout, "local-only.txt", "local commit must survive\n")
+        _ = self.git("add", "local-only.txt")
+        _ = self.git("commit", "-m", "local merge branch work not on origin")
+        before = self.git("rev-parse", "HEAD")
+        remote = self.git("rev-parse", "origin/production")
+        self.assertNotEqual(before, remote)
+        main = self.push_main_change("main-only.txt", "independent main work\n")
+        checkpoint = self.checkpoint()
+        hook = self.origin / "hooks/pre-receive"
+        _ = hook.write_text("#!/bin/sh\nexit 1\n")
+        hook.chmod(0o755)
+        result = self.run_checkpoint(checkpoint)
+        self.assertEqual(result.process.returncode, 1, result.process.stdout + result.process.stderr)
+        self.assertIn("push: failed", result.process.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD"), before)
+        self.assertEqual((self.checkout / "local-only.txt").read_text(), "local commit must survive\n")
+        self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), remote)
+        self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), main)
+
     def import_production_paths(self, *, review_rows: bool = True) -> Path:
         self.write(self.other, "outside/imported.txt", "other production\n")
         self.write(self.other, "outside/second.txt", "second imported path\n")
@@ -209,7 +261,9 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(accepted.process.returncode, 0, accepted.process.stderr + accepted.process.stdout)
         self.assertIn("scope: ok", accepted.process.stdout)
     def test_a_code_checkpoint_removes_its_phases_scratch_folders(self) -> None:
-        with mock.patch.dict(os.environ, self.env):
+        plan = self.root / "scratch-plan.md"
+        _ = plan.write_text("### Phase 2 — Checkpoint\n\n### Phase 3 — Later work\n")
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(scratch, "registered_plan", return_value=plan):
             done = [scratch.new("phase:alpha-unit/2", word) for word in ("gate", "copy")]
             later = scratch.new("phase:alpha-unit/3")
         result = self.run_checkpoint(self.checkpoint())
@@ -337,6 +391,9 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                             ("--review-minutes", "14"), ("--ux-check-minutes", "4"),
                             ("--ux-repair-minutes", "1")):
             self.assertEqual(review[0][review[0].index(flag) + 1], value)
+        self.assertNotIn("--simplify-findings", review[0])
+        self.assertNotIn("--simplify-minutes", review[0])
+        self.assertNotIn("--note", review[0])
 
     def test_a_failed_repair_review_add_keeps_the_first_log_until_a_retry_succeeds(self) -> None:
         first = self.run_checkpoint(self.checkpoint())
