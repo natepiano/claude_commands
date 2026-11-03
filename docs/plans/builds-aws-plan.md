@@ -411,48 +411,20 @@ Delivery failures, restarts, and failed ledger writes preserve the event and dup
 ### Phase 10 — Print the interruption marker once  · status: done
 **Depends on:** Phase 9
 
-#### Work Order
+#### As-built
 
-**Goal:** An interrupted AWS slot prints its interruption marker once and exits with the child status, and the sender result stays the same.
-
-**Spec:**
-
-1. In `scripts/mac_test/linux_runner.py`, delete the `if print_interruption(values): return 75` call in `execute_slot`.
-   The signal handler and the `finally` in `interruption_signals` both print the marker today; a simulated SIGTERM gives two `print_interruption` calls without the `execute_slot` call.
-   After the change, an interrupted slot prints `mac_exit` and `mac_cleanup` once, and its remote exit status is the child status, not 75.
-2. Add a regression test that runs an interrupted AWS slot through the real sender path.
-   Assert that the sender still reports `InterruptedTargetRun` with the same generation and attempt outcome as before.
-   Assert that the remote output holds exactly one `aws_interrupted=` line and the remote exit status is the child status.
-3. Give the run path one marker owner across signal handling and finalization. Preserve the probe contract and the child exit status.
-   Test SIGTERM through the runner and the real sender parser; assert one marker and the existing interruption outcome.
+- `linux_runner.py` prints `aws_interrupted=<generation>` once, in the `finally` of `interruption_signals`, after `mac_exit` and `mac_cleanup`. The SIGTERM handler only records the generation through `interruption_generation`, which returns `''` when no interruption is recorded.
+- The remote exit status of an interrupted slot is the child status, not 75. `interruptible_slot` is the one context for the run and probe paths, so the probe keeps its child status and generation evidence.
+- The sender still reports `InterruptedTargetRun` with the same generation and attempt outcome.
+- `runner_test_support.interrupt_runner` writes the interruption record and raises SIGTERM for the runner and sender tests; `seed_runner_permission` returns its permission folder.
 
 **Files:**
 
-- `scripts/mac_test/linux_runner.py` — remove the extra marker print in `execute_slot`.
-- `scripts/mac_test/test_linux_runner.py` — remote marker count and exit status.
-- `scripts/direct/test_verify_ssh_targets.py` — the sender's reported result for an interrupted AWS slot.
+- `scripts/mac_test/linux_runner.py` — single marker owner and `interruptible_slot`.
+- `scripts/aws_target/runner_test_support.py` — shared SIGTERM test helper.
+- `scripts/mac_test/test_linux_runner.py`, `scripts/direct/test_verify_ssh_targets.py` — one ordered marker check, child status and the sender result.
 
-**Workers:** 1 writer + 1 tester.
-
-- `impl` — `scripts/mac_test/linux_runner.py`.
-- `test` — the two test files; use the existing fixture generation and fake remote output.
-
-**State:** None. No record, schema or config changes.
-
-**Constraints from prior phases:** Phase 8 owns generation-bound interruption evidence; `offload.py` reads `aws_interrupted=` lines at lines 739 and 1246.
-The user chose this change on 2026-11-02 (Phase 8 simplify item 25, answer "a"). Keep it out of other phases.
-
-**Verification — impl:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/mac_test/linux_runner.py`
-
-**Verification — test:** `python3 -m unittest discover -s scripts/mac_test -p 'test_*.py'`
-
-**Verification — test:** `python3 -m unittest discover -s scripts/direct -p 'test_verify_ssh_targets.py'`
-
-**Verification — test types:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/mac_test/test_linux_runner.py scripts/direct/test_verify_ssh_targets.py`
-
-**Acceptance gate:** The commands pass. An interrupted AWS slot prints one marker, exits with the child status, and the sender reports the same `InterruptedTargetRun` result as before.
-
-**Also touches:** `scripts/mac_test/linux_runner.py`, `scripts/mac_test/test_linux_runner.py`, `scripts/direct/test_verify_ssh_targets.py` (owner verify-unit).
+**Binds later work:** An interrupted slot prints one `aws_interrupted=` line after `mac_exit` and `mac_cleanup`, and exits with the child status.
 
 ### Phase 11 — Prepare guarded deployment and the NixOS branch  · status: todo
 **Depends on:** Phase 10
@@ -568,6 +540,7 @@ Phase 6 permits spend only with usable live limits through `conf.py`; committed 
 Phase 8 checks AWS permission before shell evaluation and `shellHook` in both runner entry points.
 Phase 8 reconciles retained markers and claims using boot identity after restart.
 Phase 8 keeps interruption generation in remote evidence and sender results. Durable `ssh_attempts` records keep the `lost` outcome without `interruption_generation`.
+Phase 10: `linux_runner.py` prints `aws_interrupted=` once, in the `interruption_signals` finally after `mac_exit` and `mac_cleanup`; the remote exit status is the child status, never 75. `interruptible_slot` is the one context for the run and probe paths.
 `Controller._action` in `aws_target.py` returns at once while `offload=off`, manual stop included; registry activation alone enables exchange but no control or charge read.
 Phase 9: `config.offload_enabled` is the one owner of the offload switch. `CostLedger.refresh_charges` queries whole UTC days and each accounting day prices the overlap of each UTC reconciliation.
 Phase 9: `measurement.record_go_live` keeps the first permitted running observation in `go-live.json`; it is the report's go-live boundary.
