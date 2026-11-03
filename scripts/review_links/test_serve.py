@@ -34,6 +34,7 @@ else:
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.review_links import serve
+from scripts.lib import atomic_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -212,6 +213,24 @@ class ReviewLinksServerTests(unittest.TestCase):
                 reply = self.request(f"/{folder}/draft.html")
                 self.assertEqual(reply.status, 200)
                 self.assertEqual(reply.body, b"<title>Review snapshot</title>")
+
+    def test_an_atomic_index_temporary_is_not_served_before_publication(self) -> None:
+        private = b"private index source paths and page tokens"
+        publish = os.replace
+        requested: list[str] = []
+
+        def replace_file(source: Path, destination: Path) -> None:
+            requested.append(source.name)
+            self.assertEqual(source.read_bytes(), private)
+            reply = self.request("/" + source.name)
+            self.assertEqual(reply.status, 404)
+            self.assertNotIn(private, reply.body)
+            publish(source, destination)
+
+        with patch.object(os, "replace", side_effect=replace_file):
+            atomic_file.write_bytes_atomic(self.root / ".index.json", private, mode=0o600)
+        self.assertEqual(len(requested), 1)
+        self.assertEqual((self.root / ".index.json").read_bytes(), private)
 
     def test_index_and_unfinished_writes_are_not_served(self) -> None:
         for filename in (".index.json", ".review-link-unfinished"):

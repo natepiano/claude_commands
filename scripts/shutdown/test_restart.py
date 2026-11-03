@@ -375,6 +375,41 @@ class RestartTests(ShutdownTestCase):
             with self.subTest(kind=owner["kind"]):
                 self.assertEqual(restart.herdr_space(owner, record), owner["name"])
 
+    def test_restart_uses_one_snapshot_for_several_current_row_names(self) -> None:
+        from scripts.production.staff_test_support import fixture_member
+
+        saved: list[SessionShutdown] = []
+        expected: list[tuple[str, str]] = []
+        for name in ("first", "second"):
+            row = fixture_member("showrunner", name=name)
+            row = staff.update_current_session(row.current_session, staff.native_id(fixture_runtime_id(name + "-current")))
+            row = staff.rename(row.id, name + "-renamed")
+            owner = top_level(row.id, name=name, host=inventory.HerdrHost(
+                kind="herdr", herdr_session="writing", pane_id="w1:p1", presentation="detached"))
+            saved.append(entry(owner))
+            expected.append((row.current_session, row.name))
+        record = staff.snapshot()
+        with (patch.object(staff, "initial_snapshot", return_value=record) as read,
+              patch.object(restart, "_herdr_launch", return_value=restart.HerdrLaunch(
+                  herdr.ServerAdopted(), SUBMITTED_PROMPT)) as launch,
+              redirect_stdout(io.StringIO())):
+            for item in saved:
+                _ = restart._launch_session(item, "continue", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        read.assert_called_once_with()
+        parts = [cast(restart.ResumeParts, item.args[0]) for item in launch.call_args_list]
+        self.assertEqual([(part.conversation.session_id, part.name) for part in parts
+                          if isinstance(part.conversation, restart.ResumeConversation)], expected)
+        for part, (_, name) in zip(parts, expected, strict=True):
+            self.assertEqual(part.claude_arguments[part.claude_arguments.index("-n") + 1], name)
+            self.assertNotIn("STAFF_ID", part.environment)
+
+    def test_manual_command_rendering_does_not_report_a_missing_launch_name(self) -> None:
+        output = io.StringIO()
+        with redirect_stderr(output):
+            command = restart.legacy_resume_command(entry(top_level("missing-native-row", name="saved-name")))
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("-n saved-name", command)
+
     def test_restore_workspace_names_reads_one_snapshot_for_multiple_units(self) -> None:
         from scripts.production.staff_test_support import fixture_member
 
@@ -2127,6 +2162,53 @@ class RestartTests(ShutdownTestCase):
 
         _ = cast(object, self.enterContext(patch.object(herdr, "open_tab", open_tab)))
         return owner, responses, log
+
+    def test_restart_title_uses_the_resolved_entry_without_parsing_arguments(self) -> None:
+        from scripts.production.staff_test_support import fixture_member
+
+        owner, _, _ = self.herdr_restart_fixture()
+        row = fixture_member("showrunner", name="old-name", runtime_id=fixture_runtime_id("title-owner"))
+        row = staff.update_current_session(row.current_session, staff.native_id(fixture_runtime_id("title-current")))
+        row = staff.rename(row.id, "row-name")
+        owner["session_id"] = row.id
+        owner["name"] = "saved-name"
+        parts = restart._resume_parts(owner, "continue", names=self.desktop_state.launch_names())  # pyright: ignore[reportPrivateUsage]
+        parts = replace(parts, claude_arguments=("--resume", row.current_session))
+        with (patch.object(herdr, "restore_server", return_value=herdr.ServerAdopted()),
+              patch.object(herdr.Herdr, "agents", return_value=[]),
+              patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                  "destination:p1", SUBMITTED_PROMPT)) as launch,
+              patch.object(restart, "_present_restored_pane") as present,
+              redirect_stdout(io.StringIO())):
+            result = restart._herdr_launch(parts, restart.SharedHerdrTab("writing"), owner, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(result.prompt_outcome, SUBMITTED_PROMPT)
+        self.assertEqual(cast(herdr.NewTab, launch.call_args.args[1]).title, row.name)
+        self.assertEqual(launch.call_args.kwargs["agent"], row.name)
+        self.assertEqual(present.call_args.args[3], row.name)
+
+    def test_restart_keeps_saved_labels_and_reports_unreadable_sources_once(self) -> None:
+        from scripts.production import session_staff
+        from scripts.production.staff_test_support import fixture_member
+
+        identity = fixture_runtime_id("unreadable-label-owner")
+        row = fixture_member("showrunner", name="row-name", runtime_id=identity)
+        owner = top_level(identity, name="saved-name")
+        saved = pane_record.launch("old-pane", identity, owner["cwd"], {
+            "SHOWRUNNER_UNIT": "saved-production", "SHOWRUNNER_UNIT_ID": "saved-unit",
+        }, ["claude", "-n", "saved-name"])
+        pane_record.write("writing", saved)
+        output = io.StringIO()
+        with (patch.object(session_staff, "member_sources", side_effect=staff.StaffUnreadable("unreadable retained file")) as sources,
+              redirect_stderr(output)):
+            names = self.desktop_state.launch_names()
+            for _ in range(2):
+                parts = restart._resume_parts(owner, "continue", names=names)  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(parts.environment["SHOWRUNNER_UNIT"], "saved-production")
+                self.assertEqual(parts.environment["SHOWRUNNER_UNIT_ID"], "saved-unit")
+                self.assertEqual(parts.claude_arguments[parts.claude_arguments.index("-n") + 1], row.name)
+        sources.assert_called_once()
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertIn("session labels are unavailable", output.getvalue())
 
     def test_restart_keeps_session_name_in_saved_layout_pane_and_attach_hint(self) -> None:
         from scripts.herdr.test_herdr import TitledLayoutHerdr

@@ -5406,6 +5406,14 @@ with patch.object(fcntl, "flock", admission):
             at=at,
         )
 
+    def test_an_armed_review_recognizes_the_simplify_status_writer(self) -> None:
+        from scripts.lib.atomic_file import write_text_atomic
+
+        status = self.root / "review_status_simplify"
+        write_text_atomic(status, "reviewing\n")
+        working = cast(Callable[[dict[str, object]], bool], vars(progress_history)["_early_reviewer_working"])
+        self.assertTrue(working({"status_file": str(status), "started_at": 0}))
+
     def test_an_early_review_naming_its_phase_watches_that_phase_directory(self) -> None:
         """`review.sh --phase` writes its status there, so the marker must watch the same file."""
         self.write_agents_registry()

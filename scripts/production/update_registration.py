@@ -307,7 +307,7 @@ class QuestionStaff:
                 raise RegistrationFailure("ask", f"{unit} is not a unit of {production.slug}")
             return row
         selector = session_staff.UnitMember(production.slug, unit)
-        found = session_staff.unit_match(selector, self.record, parent=parent)
+        found = session_staff.unit_match(selector, self.record, parent=session_staff.RequiredParent(parent))
         if isinstance(found, session_staff.NoSuchMember):
             raise RegistrationFailure("ask", f"{unit} is not a unit of {production.slug}")
         return found.row
@@ -810,7 +810,8 @@ def question_folder(document: Path, identities: QuestionStaff) -> QuestionFolder
     owner = identities.record.by_doc(local_machine(), document)
     if owner is None or owner.kind != "showrunner":
         return QuestionOwnerUnavailable(document)
-    folder = issues_folder(document)
+    assert isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
+    folder = issues_folder(owner.doc.path)
     if folder is None:
         root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
         folder = root / owner.id / "questions"
@@ -1567,7 +1568,7 @@ def main() -> int:
         else:
             questions(production, cast(Path | None, args.state))
         return 0
-    except (RegistrationFailure, InputError, Refusal, OSError, ValueError, json.JSONDecodeError) as error:
+    except (staff.StaffRefused, RegistrationFailure, InputError, Refusal, OSError, ValueError, json.JSONDecodeError) as error:
         step = error.step if isinstance(error, RegistrationFailure) else action
         report(step, "failed", str(error).replace("\n", "; "))
         return 2

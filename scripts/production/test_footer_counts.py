@@ -323,6 +323,34 @@ class FooterCountsTests(unittest.TestCase):
         self.assertEqual([footer_counts.changes(doc) for doc in (top, kid, grandkid)], [2, 1, 1])
         self.assertIn(listing, footer_counts.sources(kid))
 
+    def test_a_missing_alert_setting_keeps_footer_and_next_routing_available(self) -> None:
+        from scripts.production import change_routing, unrouted_alert
+
+        config = self.root / "config"
+        config.mkdir()
+        _ = (config / "review_links.conf").write_text("unrouted_alert_recipient=top\n")
+        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))
+        listing = self.root / "change-review - top.md"
+        _ = listing.write_text(LIST)
+        doc = self.root / "top-production.md"
+        _ = doc.write_text(f"# Top\n- **Change review:** `{listing}`\n")
+        self.tree = {"top": doc}
+        top = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", doc))
+        other = fixture_member("showrunner", name="other")
+        one = fixture_member("unit", name="one", parent=top.id)
+        two = fixture_member("unit", name="two", parent=other.id)
+        candidates = {str(one.id), str(two.id)}
+        with (mock.patch.object(change_routing.StaffRouting, "selection",
+                                return_value=change_routing.CheckpointSelection(self.root, ())),
+              mock.patch.object(change_routing.StaffRouting, "candidate_units", return_value=candidates),
+              mock.patch.object(change_routing.StaffRouting, "read_messages"),
+              mock.patch.object(unrouted_alert, "send_message") as send, contextlib.redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(footer_counts.changes(doc), 0)
+            self.assertEqual(footer_counts.unrouted_changes(doc), 2)
+            self.assertEqual(change_review.scoped_review_entries(listing, doc), [])
+        send.assert_not_called()
+        self.assertIn("review-links unrouted alert:", errors.getvalue())
+
     def test_rows_without_checkpoints_count_for_the_list_showrunner_on_both_readers(self) -> None:
         from scripts.review_links import change_browser, change_page
         from scripts.production import change_review as page_review
@@ -345,7 +373,7 @@ class FooterCountsTests(unittest.TestCase):
         self.assertEqual(counts, [4, 0, 0])
         self.assertEqual(counts, [forms.counts[name] for name in self.tree])
 
-    def test_unknown_units_in_independent_roots_share_the_pages_global_unrouted_count(self) -> None:
+    def test_retired_units_in_independent_roots_return_to_their_own_showrunners(self) -> None:
         from scripts.review_links import change_browser, change_page
         from scripts.production import change_review as page_review
 
@@ -366,7 +394,7 @@ class FooterCountsTests(unittest.TestCase):
             browser = change_page.ReviewBrowser("token")
             prepared = change_browser.prepare(browser, change_page.DeliveryStatus(self.root / "links"))
         count = sum(item.waiting and item.tab == "unrouted" for item in prepared.changes)
-        self.assertEqual(count, 2)
+        self.assertEqual(count, 0)
         self.assertEqual([footer_counts.unrouted_changes(doc) for doc in self.tree.values()], [count, count])
 
     def test_a_new_git_ref_refreshes_the_cached_status_count_and_changes_its_tab(self) -> None:

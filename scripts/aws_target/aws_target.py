@@ -6,7 +6,8 @@ import argparse
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import UTC, datetime
+from decimal import Decimal
 import fcntl
 import json
 from pathlib import Path
@@ -18,8 +19,8 @@ from typing import Literal, Protocol, cast, final, get_args
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mac_test'))
-from scripts.aws_target import ledger, remote
-from scripts.aws_target.config import ControlSettings, money, read_control_settings
+from scripts.aws_target import ledger, measurement, remote
+from scripts.aws_target.config import ControlSettings, money, offload_enabled, read_control_settings, read_settings
 from scripts.build_targets.target_config import SshTarget, is_aws_target
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -64,9 +65,9 @@ class AwsCli:
         self.settings = settings
         self.execute = execute
 
-    def call(self, operation: str, *arguments: str) -> dict[str, object]:
+    def call(self, operation: str, *arguments: str, service: str = 'ec2') -> dict[str, object]:
         result = self.execute(['aws', '--profile', self.settings.credentials_profile, '--region', self.settings.region,
-                               'ec2', operation, *arguments, '--output', 'json'], capture_output=True, text=True,
+                               service, operation, *arguments, '--output', 'json'], capture_output=True, text=True,
                               timeout=self.settings.aws_timeout_s, check=False)
         if result.returncode:
             raise AwsUnavailable(result.stderr.strip() or f'{operation}: failed')
@@ -130,8 +131,8 @@ class Controller:
         self.target = target
         self.path = directory / 'controller.json'
 
-    def _publish(self, envelope: remote.AdmissionEnvelope, settings: ControlSettings) -> bool:
-        connection = offload.read_connection_settings(self.settings_path)
+    def _publish(self, envelope: remote.AdmissionEnvelope, settings: ControlSettings, configuration: conf.ConfigRead) -> bool:
+        connection = offload.connection_settings(configuration)
         command = shlex.join(['python3', '.claude/scripts/aws_target/remote.py', 'publish',
                               '--directory', settings.remote_state_directory])
         result = subprocess.run(['ssh', *offload.ssh_options(connection), connection.host, command], input=json.dumps(remote.envelope_record(envelope)),
@@ -142,17 +143,23 @@ class Controller:
         return mac_test.read_json_object(self.path) or {}
 
     def _save(self, state: dict[str, object], result: ControlResult) -> ControlResult:
+        _ = state.pop('charge_error', None)
+        if result.state == 'starting':
+            if state.get('state') != 'starting' or 'starting_at' not in state:
+                state['starting_at'] = result.at
+        else:
+            _ = state.pop('starting_at', None)
         state.update(asdict(result))
         write_text_atomic(self.path, json.dumps(state, sort_keys=True))
         return result
 
-    def _queued(self, settings: ControlSettings, now: int) -> int:
+    def _queued(self, settings: ControlSettings, now: int, configuration: conf.ConfigRead) -> int:
         snapshot = memory_admit.read_queue_snapshot(self.queue_directory)
         if (not isinstance(snapshot, memory_admit.QueueSnapshot)
                 or not 0 <= now - snapshot.written_at <= settings.snapshot_max_age_s
                 or isinstance(snapshot.inputs.host, memory_admit.ReadingUnavailable)):
             return 0
-        values = conf.values(self.settings_path)
+        values = configuration.values()
         return sum(1 for _, row in snapshot.inputs.ordered
                    if offload.linux_kind_permitted(values, str(row.get('step', ''))) and row.get('repo_identity')
                    and row.get('repository_name') and 'token_left_at' not in row
@@ -172,6 +179,28 @@ class Controller:
         captured = mac_test.capture_release_evidence(paths, evidence.generation, evidence.state, evidence.observed_at)
         if captured.claims:
             _ = mac_test.release_stopped_claims(paths, captured)
+
+    def refresh_charges(self, api: AwsCli, now: int) -> measurement.ChargeRead | measurement.MeasurementUnavailable:
+
+        def fetch(start: int, end: int) -> Decimal:
+            settings = read_settings(self.settings_path)
+            start_day = datetime.fromtimestamp(start, UTC).date().isoformat()
+            end_day = datetime.fromtimestamp(end, UTC).date().isoformat()
+            reply = api.call('get-cost-and-usage', '--time-period', f'Start={start_day},End={end_day}',
+                             '--granularity', 'DAILY', '--metrics', 'UnblendedCost', '--filter',
+                             json.dumps({'Tags': {'Key': settings.cost_explorer_tag_key, 'Values': [settings.cost_explorer_tag_value]}}), service='ce')
+            rows = reply.get('ResultsByTime')
+            items = cast(list[object], rows) if isinstance(rows, list) else []
+            if len(items) != 1 or not isinstance(items[0], dict):
+                raise ValueError('Cost Explorer daily reply is unavailable')
+            row = cast(dict[str, object], items[0])
+            total = cast(dict[str, object], row['Total'])
+            cost = cast(dict[str, object], total['UnblendedCost'])
+            if cost.get('Unit') != 'USD':
+                raise ValueError('Cost Explorer requires USD')
+            return money(str(cost['Amount']))
+
+        return measurement.read_charges(self.settings_path, self.directory, now, fetch)
 
     def _active(self) -> bool:
         paths = mac_test.state_paths(self.target)
@@ -206,12 +235,13 @@ class Controller:
 
     def _action(self, action: Literal['tick', 'start', 'stop']) -> ControlResult:
         now = int(self.clock())
-        if conf.text(self.settings_path, 'offload') != 'on':
+        configuration = conf.read(self.settings_path)
+        if not offload_enabled(configuration):
             return ControlResult('off', 'disabled', now)
         state: dict[str, object] = {}
         with control_lock(self.directory):
             try:
-                settings = read_control_settings(self.settings_path)
+                settings = read_control_settings(configuration)
                 configured = SshTarget(self.target, 'linux', self.settings_path)
                 if not is_aws_target(configured):
                     raise ValueError('target is not an AWS target')
@@ -236,6 +266,14 @@ class Controller:
                     self._prices(api, settings, now)
                 except (AwsUnavailable, OSError, ValueError, KeyError, TypeError) as error:
                     state['price_error'] = str(error)
+                try:
+                    period_day = measurement.charge_period_day(read_settings(self.settings_path), now).isoformat()
+                    if state.get('charge_period_day') != period_day:
+                        reading = self.refresh_charges(api, now)
+                        if isinstance(reading, measurement.ChargeRead):
+                            state['charge_period_day'] = reading.day
+                except (AwsUnavailable, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+                    print(f'aws_target: charge read unavailable: {error}', file=sys.stderr)
                 decision = ledger.spending_guard(self.settings_path, self.directory, 'admission',
                                                  clock=self.clock, notify=self.notify)
                 permission = ledger.CostLedger(self.directory).permission_for_decision(decision)
@@ -243,6 +281,8 @@ class Controller:
                     decision = ledger.SpendingUnavailable(decision.at, permission.reason, decision.evidence)
                 if isinstance(decision, ledger.SpendingAllowed):
                     state['permitted_generation'] = evidence.generation
+                    if evidence.state == 'running':
+                        measurement.record_go_live(self.directory, now)
                 if state.get('drain_generation') == evidence.generation:
                     permission = ledger.PermissionUnavailable(decision.at, 'controlled_drain')
                 envelope = remote.AdmissionEnvelope(1, self.target, 'admission', evidence.generation,
@@ -250,7 +290,7 @@ class Controller:
                 published = False
                 if evidence.state == 'running':
                     try:
-                        published = self.publish(envelope) if self.publish is not None else self._publish(envelope, settings)
+                        published = self.publish(envelope) if self.publish is not None else self._publish(envelope, settings, configuration)
                     except (OSError, ValueError, subprocess.SubprocessError) as error:
                         state['publication_error'] = {'at': int(self.clock()), 'reason': str(error)}
                 state['permission_published'] = published
@@ -273,7 +313,7 @@ class Controller:
                 if evidence.state != 'stopped':
                     return self._save(state, ControlResult('starting' if evidence.state == 'pending' else evidence.state,
                                                            '' if published else 'permission_unpublished', now, evidence.generation))
-                if action == 'tick' and self._queued(settings, now) < settings.start_min_waiting:
+                if action == 'tick' and self._queued(settings, now, configuration) < settings.start_min_waiting:
                     return self._save(state, ControlResult('stopped', 'no_eligible_work', now, evidence.generation))
                 backoff = state.get('capacity_retry_after', 0)
                 if type(backoff) is not int or backoff > now:
@@ -308,7 +348,7 @@ def main() -> int:
     _ = parser.add_argument('--queue-directory', type=Path)
     args = parser.parse_args(namespace=ControlArguments())
     directory = args.directory
-    if directory == Path() and conf.text(args.settings, 'offload') == 'on':
+    if directory == Path() and offload_enabled(conf.read(args.settings)):
         directory = offload.state_directory('aws')
     controller = Controller(args.settings, directory, args.queue_directory)
     result = {'tick': controller.tick, 'start': controller.start, 'stop': controller.stop}[args.command]()

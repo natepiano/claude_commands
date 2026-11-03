@@ -29,6 +29,7 @@ import production_units
 from scripts.production import showrunners
 import showrunner_tree
 from scripts.whoami import usage_store
+from scripts.whoami.account_test_support import stored_room
 import herdr as runtime
 from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
@@ -43,6 +44,25 @@ from scripts.message import sessions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 class NativeClaudeShowrunnerTests(StaffTestCase):
+    def test_resume_uses_the_row_name_after_rename_and_conversation_change(self) -> None:
+        document = self.production("demo")
+        _ = document.write_text(document.read_text() + "\n- **Merge branch:** `main`\n"
+                                + f"- **Showrunner checkout:** `{self.root}`\n- **Log:** `demo-log.md`\n")
+        owner = fixture_member("showrunner", name="demo", doc=staff.LiveDoc("natedev", document))
+        current = staff.native_id(fixture_runtime_id("renamed-showrunner-current"))
+        _ = staff.update_current_session(owner.current_session, current)
+        _ = staff.rename(owner.id, "row-name")
+        _ = fixture_member("showrunner", name="demo", runtime_id=fixture_runtime_id("decoy-showrunner"))
+        with (patch.object(runtime, "start_server"), patch.object(runtime, "launch_agent", return_value=
+              runtime.AgentLaunched("w1:p1", runtime.PromptSubmitted(datetime.now(timezone.utc)))) as launch):
+            _ = add_showrunner.launch(production_units.read_production(document), "fixture", "high", current,
+                                      self.root, accounts.NamedAccount("claude1", self.root))
+        arguments = cast(list[str], launch.call_args.kwargs["agent_arguments"])
+        self.assertEqual(arguments[arguments.index("-n") + 1], "row-name")
+        self.assertEqual(arguments[arguments.index("--remote-control") + 1], "row-name")
+        self.assertEqual(launch.call_args.args[2], "row-name")
+        self.assertNotIn("STAFF_ID", cast(dict[str, str], launch.call_args.args[4]))
+
     def test_fresh_showrunner_uses_the_observed_claude_id_before_its_opening_prompt(self) -> None:
         document = self.production("demo")
         _ = document.write_text(document.read_text() + "\n- **Merge branch:** `main`\n"
@@ -77,7 +97,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = fixture_member("showrunner", name="top")
+        _ = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", self.doc("top")))
 
     def test_launch_passes_the_ensured_showrunner_staff_id_to_the_pane(self) -> None:
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
@@ -468,11 +488,9 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             _ = (caller / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "unit@example.invalid"}}))
         self.env["CLAUDE_CONFIG_DIR"] = str(caller)
         now = datetime.now(timezone.utc)
-        saved = {"main@example.invalid": {"weekly": {"left": 99, "at": now.isoformat(),
-                  "resets": (now + timedelta(hours=1)).isoformat()}},
-                 "target@example.invalid": {"weekly": {"left": 0, "at": now.isoformat(),
-                  "resets": (now + timedelta(days=4)).isoformat()}}}
-        _ = (home / ".local/state/agent-notes/usage.json").write_text(json.dumps(saved))
+        with patch.dict(os.environ, self.env):
+            stored_room("main@example.invalid", 99, now + timedelta(hours=1))
+            stored_room("target@example.invalid", 0, now + timedelta(days=4))
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         before = path.read_bytes()
         result = self.run_command("kid")
@@ -548,12 +566,9 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             "projects": {str(self.root / "kid-checkout"): {"hasTrustDialogAccepted": True}}}))
         _ = (directory / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": "target@example.invalid"}, "projects": {}}))
-        file = home / ".local/state/agent-notes/usage.json"
-        saved = cast(dict[str, usage_store.StoredUsage], json.loads(file.read_text()))
         now = datetime.now(timezone.utc)
-        saved["target@example.invalid"] = {"weekly": {"left": 1, "at": now.isoformat(),
-            "resets": (now + timedelta(days=1)).isoformat()}}
-        _ = file.write_text(json.dumps(saved))
+        with patch.dict(os.environ, self.env):
+            stored_room("target@example.invalid", 1, now + timedelta(days=1))
         result = self.run_command("kid")
         self.refused(result, f"kid: Claude is not trusted in {self.root / 'kid-checkout'} on claude3. Run:")
         self.assertIn(f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))}", result.stderr)
@@ -754,7 +769,8 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         _ = edge.write_text("top\n", encoding="utf-8")
         top = fixture_member("showrunner", name="top")
         _ = fixture_member("showrunner", name="kid", parent=top.id,
-                           runtime_id="cfc4564d-fed3-5803-9a4c-e3119733bb53")
+                           runtime_id="cfc4564d-fed3-5803-9a4c-e3119733bb53",
+                           doc=staff.LiveDoc("natedev", self.doc("kid")))
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53")
         result = self.run_command("kid", "--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53", "--cwd", str(self.root), "--account", "claude2")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

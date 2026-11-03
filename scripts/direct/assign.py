@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import argparse
 import fcntl
-import hashlib
 import json
 import itertools
 import os
 import re
 import signal
-import shlex
 import socket
 import subprocess
 import sys
@@ -415,7 +413,7 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
         if record.get("held_design_id"):
             refuse(f"{dispatch.worker}: held roles resume through design_roles.py")
         try:
-            threshold = conf.whole("direct", "UNIT_COMPACT_ABOVE_TOKENS")
+            threshold = conf.read("direct").whole("UNIT_COMPACT_ABOVE_TOKENS")
         except conf.Unusable as error:
             refuse(str(error))
         context_tokens = record.get("context_tokens")
@@ -638,32 +636,15 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
 
 def execute_simplify(args: Arguments, run: Path, phase: str, cwd: Path, source_prompt: Path,
                      env: dict[str, str]) -> int:
-    directory = phase_reservation.phase_directory(run, phase)
-    directory.mkdir(parents=True, exist_ok=True)
-    if conf.text("direct", "SIMPLIFY_LENS") == "off":
+    if conf.read("direct").text("SIMPLIFY_LENS") == "off":
         print("simplify: off")
         return 0
     if args.pass_number != 1:
         print("simplify: skipped; broad review only")
         return 0
-    prompt = source_prompt
-    env["UNIT_REVIEW_CACHE_FILE"] = ""
-    _ = env.pop("UNIT_REVIEW_FAILURE_REASON", None)
-    try:
-        diff = (cwd / Path(args.diff).expanduser()).resolve()
-        digest = hashlib.sha256(diff.read_bytes()).hexdigest()
-        cache = directory / "simplify"
-        cache.mkdir(exist_ok=True)
-        prompt = cache / f"prompt-{os.getpid()}.md"
-        standing = (conf.directory() / "review/simplify.md").read_text()
-        _ = prompt.write_text(f"/simplify {shlex.quote(str(diff))}\n\n"
-                              + standing + "\n\n" + source_prompt.read_text() + "\n")
-        env["UNIT_REVIEW_CACHE_FILE"] = str(cache / f"{digest}.json")
-    except OSError as error:
-        env["UNIT_REVIEW_FAILURE_REASON"] = f"unable to prepare the simplify review: {error}"
-    env["UNIT_REVIEW_SUMMARY_FILE"] = str(Path(args.summary).resolve()) if args.summary else ""
-    command = ["bash", str(SCRIPTS / "review.sh"), "--phase", phase, str(run), str(cwd),
-               str(prompt), "simplify", "simplify review", "reviewing the completed phase diff", "1", "simplify"]
+    command = ["bash", str(SCRIPTS / "review.sh"), "--phase", phase, "--diff", args.diff,
+               "--summary", str(Path(args.summary).resolve()) if args.summary else "", str(run), str(cwd),
+               str(source_prompt), "simplify", "simplify review", "reviewing the completed phase diff", "1", "simplify"]
     os.execvpe(command[0], command, env)
 
 

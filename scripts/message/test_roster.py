@@ -431,7 +431,7 @@ class RosterTests(unittest.TestCase):
         wanted = ["17e44ec4-3e24-5ae1-b10d-5cf30de9455b", "acd50bad-5afa-5d3d-b155-3766b7d113e0"]
         labels = roster.unit_labels_for(wanted, self.environment)
         old = unit_membership("alpha", "retired-unit")
-        _ = staff.set_worktree(old.id, staff.RemovedWorktree("natedev", self.root / "retired"))
+        _ = staff.set_worktree(old.id, staff.RemovedWorktree("natedev", self.root / "retired"), expected=old.worktree)
         historical = showrunner_relationship("wrapped")
         _ = staff.set_doc(historical.id, staff.WrappedDoc("natedev", self.root / "wrapped-production.md"))
         self.assertEqual(self._entries(), before)
@@ -445,7 +445,9 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(reads.call_count, 1)
 
     def test_renamed_production_has_the_same_full_and_fast_labels(self) -> None:
-        showrunner_launch(showrunner_relationship("alpha"), "acd50bad-5afa-5d3d-b155-3766b7d113e0", self.environment)
+        owner = showrunner_relationship("alpha")
+        owner = staff.set_doc(owner.id, staff.LiveDoc("natedev", self.production_doc))
+        showrunner_launch(owner, "acd50bad-5afa-5d3d-b155-3766b7d113e0", self.environment)
         _ = (self.notifier / "showrunner-alpha").rename(self.notifier / "showrunner-builds")
         _ = self.production_doc.write_text(
             "## Production Context\n\n- **Formerly:** `alpha`\n\n" + self.production_doc.read_text(),
@@ -1412,6 +1414,14 @@ class RosterTests(unittest.TestCase):
         )
         self.assertNotIn("contract reviewer", entries)
 
+    def test_the_roster_recognizes_the_simplify_status_writer(self) -> None:
+        from scripts.lib.atomic_file import write_text_atomic
+
+        write_text_atomic(self.director_run / "review_status_adversary", "reviewing\n")
+        with mock.patch.object(os, "readlink", return_value="/review/cwd"):
+            entries = self._entries()
+        self.assertEqual(entries["adversary reviewer"].status, "running")
+
     def test_review_status_in_a_phase_directory_finds_its_reviewer(self) -> None:
         phase = self.director_run / "phases" / "4"
         phase.mkdir(parents=True)
@@ -1773,7 +1783,7 @@ class RosterTests(unittest.TestCase):
 
     def test_unreadable_herdr_fallback_places_director_but_never_ledger_worker_by_cwd(self) -> None:
         owner = unit_membership("alpha", "unit-one")
-        _ = staff.set_worktree(owner.id, staff.PresentWorktree(roster.remote.local_machine(), self.home / "projects/unit-one"))
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree(roster.remote.local_machine(), self.home / "projects/unit-one"), expected=owner.worktree)
         _ = self.production_doc.write_text("# Production without a Units table\n")
         worker_path = self.sessions / "worker.json"
         worker = cast(dict[str, object], json.loads(worker_path.read_text(encoding="utf-8")))
@@ -2212,7 +2222,7 @@ class CodexHolderLabelsTests(unittest.TestCase):
         assert unit.parent is not None
         self.runner_id = unit.parent
         # Both registry records are live processes, with real start identities.
-        # Only their declared unit marks and run metadata come from fixture files.
+        # Only their declared session labels and run metadata come from fixture files.
         for pid, sid, name in ((os.getppid(), self.director_id, "report-director"),
                                (os.getpid(), self.runner_id, "builds-runner")):
             start = sessions.process_start(pid)

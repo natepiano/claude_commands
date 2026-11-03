@@ -45,7 +45,7 @@ from scripts.whoami.note_file import NumberedAccountLabel, note_name, parse_acco
 import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.production.fake_unit_host import confirm_tab_close, native_claude
-from scripts.whoami import usage_store
+from scripts.whoami.account_test_support import stored_room
 from test_support import registry_confirmation, ShutdownTestCase
 
 
@@ -98,7 +98,7 @@ def configure_test_zone() -> None:
 
 
 from scripts.production.staff_test_support import (
-    StaffTestCase, fixture_runtime_id, fixture_showrunner_name, showrunner_relationship, unit_membership,
+    StaffTestCase, fixture_runtime_id, fixture_showrunner_name, unit_membership,
 )
 
 
@@ -239,8 +239,7 @@ class AddUnitTestCase(ShutdownTestCase):
                     "CODEX_CATALOG_SYNC_STATE_FILE": str(sync_state)}
         self.env["STAFF_FILE"] = str(self.staff.staff_file)
         self.env["HERDR_PANE_RECORD_DIR"] = str(self.staff.source_root / "panes")
-        self.staff.register_production("build-followups", self.doc)
-        _ = showrunner_relationship(fixture_showrunner_name("build-followups", self.doc))
+        _ = self.staff.record_production("build-followups", self.doc)
         self.herdr_overrides = {}
         fake_path = self.bin / "fake-herdr"
         source = (SCRIPT.parents[1] / "herdr/fake_herdr.py").read_text()
@@ -313,13 +312,8 @@ class AddUnitTestCase(ShutdownTestCase):
         self.prepare_herdr_launch("alpha", "--plan", "docs/plans/given.md")
 
     def quota_reading(self, login: str, left: float, reset_days: float) -> None:
-        file = Path(self.env["HOME"]) / ".local/state/agent-notes/usage.json"
-        saved = cast(dict[str, usage_store.StoredUsage], json.loads(file.read_text())) if file.exists() else {}
-        now = datetime.now(timezone.utc)
-        saved[login] = {"weekly": {"left": left, "at": now.isoformat(),
-                                  "resets": (now + timedelta(days=reset_days)).isoformat()}}
-        file.parent.mkdir(parents=True, exist_ok=True)
-        _ = file.write_text(json.dumps(saved))
+        with patch.dict(os.environ, self.env):
+            stored_room(login, left, datetime.now(timezone.utc) + timedelta(days=reset_days))
 
     def select_unit_account(self, label: str) -> Path:
         with patch.dict(os.environ, self.env):
@@ -692,7 +686,7 @@ class AddUnitTestCase(ShutdownTestCase):
             identity = self.env.get("FAKE_RESTORED_SESSION_ID", "62ccbd64-f22e-5647-b20e-7899aa39d766")
             if row.current_session != identity:
                 row = staff.update_current_session(row.current_session, staff.native_id(identity))
-            row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", worktree))
+            row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", worktree), expected=row.worktree)
             config_plan = (unit_config.StandbyPlan() if plan == "standby"
                            else unit_config.PlanFile(Path(plan)))
             _ = unit_config.write(worktree, unit_config.UnitConfig(config_plan, unit_config.NoAppPort(), ()))
@@ -736,7 +730,7 @@ class AddUnitTestCase(ShutdownTestCase):
             _ = self.git("worktree", "add", "-b", request.branch, str(request.worktree), "build-followups")
         with patch.dict(os.environ, self.env):
             row = unit_membership(fixture_showrunner_name("build-followups", self.doc), request.unit_id)
-            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", request.worktree))
+            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", request.worktree), expected=row.worktree)
             _ = unit_config.write(request.worktree, unit_config.UnitConfig(
                 unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.NoAppPort(), ()))
         git_run = subprocess.run
@@ -905,7 +899,7 @@ class AddUnitTestCase(ShutdownTestCase):
         _ = self.git("add", str(self.doc.relative_to(self.checkout)))
         _ = self.git("commit", "-m", "Add sample fixture production")
         _ = self.git("push", "origin", "build-followups")
-        self.staff.register_production("sample", self.doc)
+        _ = self.staff.record_production("sample", self.doc)
 
         result = self.successful(unit, "--plan", "docs/plans/given.md")
         self.assertIn(f"{unit} started", result.stdout)

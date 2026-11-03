@@ -24,6 +24,8 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.git_exclude import ensure_excluded
+from scripts.lib.atomic_file import write_text_atomic
 import add_unit
 import production_units
 import dailies_render
@@ -179,6 +181,9 @@ class WaitingTests(unittest.TestCase):
         _ = self.git("push", "-u", "origin", "production")
         _ = self.git("worktree", "add", "-b", "alpha-branch", str(self.alpha), "production")
         _ = self.git("worktree", "add", "-b", "beta-branch", str(self.beta), "production")
+        ensure_excluded(self.checkout, "/.unit.toml")
+        for folder, plan in ((self.alpha, "alpha"), (self.beta, "beta")):
+            write_text_atomic(folder / ".unit.toml", f'plan = "docs/{plan}.md"\nresponsibilities = []\n')
         self.write(self.log, "# Production log — example\n\n### STATE\n")
 
     def write(self, path: Path, content: str) -> None:
@@ -265,8 +270,11 @@ class WaitingTests(unittest.TestCase):
         owner = showrunner_relationship("showrunner-example")
         _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", self.doc))
         _ = write_timer(self.root / "notifier", "example", owner.id, "", self.doc)
-        for unit in (ALPHA, BETA):
-            _ = unit_membership("showrunner-example", unit)
+        for unit, folder, plan in ((ALPHA, self.alpha, "alpha"), (BETA, self.beta, "beta")):
+            row = unit_membership("showrunner-example", unit)
+            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", folder), expected=row.worktree)
+            if folder.exists():
+                write_text_atomic(folder / ".unit.toml", f'plan = "docs/{plan}.md"\nresponsibilities = []\n')
 
     def add_gamma(self) -> None:
         _ = unit_membership("showrunner-example", GAMMA)
@@ -310,7 +318,7 @@ class WaitingTests(unittest.TestCase):
 
     def test_named_unit_refuses_retired_row(self) -> None:
         _ = staff.set_worktree(unit_membership("showrunner-example", ALPHA).id,
-                               staff.RemovedWorktree(local_machine(), self.alpha))
+                               staff.RemovedWorktree(local_machine(), self.alpha), expected=unit_membership("showrunner-example", ALPHA).worktree)
         content = self.doc.read_text(encoding="utf-8")
         self.write(self.doc, content.replace("`docs/alpha.md`", "(retired by the user)", 1))
         production = production_units.read_production(self.doc)
@@ -747,7 +755,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
 
     def test_waits_hide_retired_waiting_unit_but_keep_live_wait_on_it(self) -> None:
         _ = staff.set_worktree(unit_membership("showrunner-example", ALPHA).id,
-                               staff.RemovedWorktree(local_machine(), self.alpha))
+                               staff.RemovedWorktree(local_machine(), self.alpha), expected=unit_membership("showrunner-example", ALPHA).worktree)
         content = self.doc.read_text(encoding="utf-8")
         self.write(self.doc, content.replace("`docs/alpha.md`", "retired after completion", 1))
         now = datetime.now(ZoneInfo("America/Los_Angeles"))

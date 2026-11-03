@@ -854,7 +854,7 @@ def alert_floor_lock(path: str, free: int, floor: int) -> None:
         holder = floor_lock_holder(path)
         if not isinstance(holder, KnownFloorLockHolder):
             return
-        seconds = int(conf.number("lint", FLOOR_LOCK_ALERT_KEY) * 60)
+        seconds = int(conf.read("lint").number(FLOOR_LOCK_ALERT_KEY) * 60)
         now = time.time()
         if now - holder.started_at < seconds:
             return
@@ -2976,17 +2976,19 @@ def local_origin_git_dir(common: str) -> str | None:
     return None
 
 
-def budget_bytes(environ: dict[str, str], config: str, repo: str | None) -> tuple[int | None, str]:
+def budget_bytes(environ: dict[str, str], config: str | conf.ConfigRead, repo: str | None) -> tuple[int | None, str]:
     """The sweep budget, None when its value is malformed, and where it came from."""
     raw = environ.get(BUDGET_ENV, "")
     if raw:
         return size_bytes(raw, GIB), f"{BUDGET_ENV} in the environment"
-    values = conf.values(Path(config))
+    settings_read = config if isinstance(config, conf.ConfigRead) else conf.read(Path(config))
+    config = str(settings_read.source)
+    values = settings_read.values()
     keys = [f"{BUDGET_KEY}.{repo}", BUDGET_KEY] if repo else [BUDGET_KEY]
     for key in keys:
         if values.get(key):
             return size_bytes(values[key], GIB), f"{key} in {config}"
-    return int(conf.number(Path(config), BUDGET_KEY) * GIB), f"{BUDGET_KEY} in {config}"
+    return int(settings_read.number(BUDGET_KEY) * GIB), f"{BUDGET_KEY} in {config}"
 
 
 def doc_index_bytes() -> int | None:
@@ -3296,8 +3298,9 @@ def main(argv: list[str]) -> int:
             return 2
     config = str(conf.path("lint"))
     try:
-        values = conf.values(Path(config))
-        recent_seconds = int(conf.number("lint", RECENT_KEY) * 60)
+        settings_read = conf.read("lint")
+        values = settings_read.values()
+        recent_seconds = int(settings_read.number(RECENT_KEY) * 60)
         floor, floor_key = floor_bytes(values, socket.gethostname())
     except conf.Unusable as error:
         print(f"lint sweep: {error}", file=sys.stderr)
@@ -3306,7 +3309,7 @@ def main(argv: list[str]) -> int:
     if floor is None and floor_key is not None:
         print(f"lint sweep: {floor_key} in {config} must be a non-negative number of GiB", file=sys.stderr)
         return 2
-    status = 0 if floor_only else sweep_workspace(target_dir, config, dry_run, recent_minutes)
+    status = 0 if floor_only else sweep_workspace(target_dir, settings_read, dry_run, recent_minutes)
     if floor_only:
         status = tmp_sweep.run_if_due(dry_run) or status
     if floor is not None:
@@ -3314,7 +3317,7 @@ def main(argv: list[str]) -> int:
     return status
 
 
-def sweep_workspace(target_dir: str | None, config: str, dry_run: bool,
+def sweep_workspace(target_dir: str | None, config: str | conf.ConfigRead, dry_run: bool,
                     recent_minutes: float) -> int:
     """Sweep target_dir, or the working directory's workspace, to its budget."""
     budget, source = budget_bytes(dict(os.environ), config, repo_name(os.getcwd()))

@@ -6,11 +6,14 @@ import io
 import os
 import runpy
 import signal
+import shutil
 import subprocess
+from subprocess import run as run_git
 import tempfile
 import time
 import unittest
 from datetime import datetime, timedelta
+from dataclasses import replace
 from contextlib import contextmanager, redirect_stdout
 from collections.abc import Generator
 from pathlib import Path
@@ -23,11 +26,13 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+GIT: str = shutil.which("git") or "git"
+
 from scripts.accounts import accounts, next_moves, outage_alerts, refusal_watch, role_map, unit_watchdog
 from scripts.accounts import test_refusal_watch as fixtures
 from scripts.production import showrunners, staff
 from scripts.shutdown.remote import local_machine
-from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
+from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership, recorded_unit
 from scripts.shutdown import folder_trust, stop_resume
 from scripts.shutdown import pane_record as hook_pane_record
 from scripts.notify.push_texts import RenderedPush
@@ -136,10 +141,11 @@ class UnitWatchdogTests(unittest.TestCase):
         for name in self.units:
             member = unit_membership("fixture", name)
             tree = self.home / name
+            _ = recorded_unit("fixture", name, tree, self.doc, plan="docs/plan.md")
             if name in self.retired:
-                _ = staff.set_worktree(member.id, staff.RemovedWorktree(local_machine(), tree))
+                _ = staff.set_worktree(member.id, staff.RemovedWorktree(local_machine(), tree), expected=member.worktree)
             tree.mkdir(exist_ok=True)
-            _ = (tree / ".git").write_text("gitdir: scratch\n")
+            _ = run_git([GIT, "init", "-b", "fixture", str(tree)], check=True, capture_output=True)
             events: list[dict[str, object]] = [{"event_type": "run_started", "working_dir": str(tree), "run_started_at": 1}]
             if name in self.finished:
                 events.append({"event_type": "run_finished"})
@@ -195,6 +201,8 @@ class UnitWatchdogTests(unittest.TestCase):
         return stop_resume.ClaudeUp(identity, identity, to)
 
     def command(self, argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+        if argv[0] == "git":
+            return run_git([GIT, *argv[1:]], capture_output=True, text=True, check=False)
         self.assertIn("--recover", argv)
         self.assertLessEqual(cast(float, options["timeout"]), 5)
         self.assertIn("--no-block", argv)
@@ -336,6 +344,11 @@ class UnitWatchdogTests(unittest.TestCase):
 
     def test_explicit_resume_after_public_stop_allows_recovery_of_a_later_crash(self) -> None:
         owner = self.add_unit("alpha")
+        member = unit_membership("fixture", "alpha")
+        record = staff.StaffSnapshot(tuple(
+            replace(row, id=staff.StaffId(owner["session_id"]),
+                    current_session=staff.StaffId(owner["session_id"])) if row.id == member.id else row
+            for row in staff.snapshot().rows))
 
         def start(tab: herdr.TabSession, entry: pane_record.PaneLaunch, label: str, message: str) -> sessions.LiveSessionProcess:
             self.assertIn("maintenance", message)
@@ -359,10 +372,15 @@ class UnitWatchdogTests(unittest.TestCase):
             self.assertEqual(stop_resume.stop("alpha"), stop_resume.Stopped("alpha", owner["pid"]))
             self.assertTrue(pane_record.read("shared")["alpha"].get("ended", False))
             with (patch.object(stop_resume, "_start_session", side_effect=start),
+                  patch.object(herdr.Herdr, "retitle", return_value=False) as retitle,
+                  patch.object(staff, "initial_snapshot", return_value=record),
                   patch.object(stop_resume, "_detach"), patch("unit_runs.held", return_value=[]),
                   patch.object(folder_trust, "heal", return_value=herdr.Trusted(
                       Path(owner["cwd"]), config / ".claude.json", Path(owner["cwd"])))):
                 result = self.shared_resume("alpha", why="maintenance complete")
+                row = record.by_current_session(owner["session_id"])
+                assert row is not None
+                retitle.assert_called_once_with("alpha", row.name)
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         entry = pane_record.read("shared")["alpha"]
         self.assertFalse(entry.get("ended", False))
@@ -1489,7 +1507,8 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = self.pass_at(0)
         elapsed = [0.0]
         def slow(argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-            elapsed[0] += cast(float, options["timeout"])
+            if argv[0] != "git":
+                elapsed[0] += cast(float, options["timeout"])
             return self.command(argv, **options)
         with (patch.object(time, "monotonic", side_effect=lambda: elapsed[0]),
               patch.object(subprocess, "run", side_effect=slow)):

@@ -173,15 +173,24 @@ class LifecycleTests(LifecycleFixture):
         runner, alpha, beta, child = self.staff_tree()
         target = runner.id if retire_showrunner else alpha.id
         original_doc, original_worktree = staff.set_doc, staff.set_worktree
-        def interrupted(staff_id: staff.StaffId, value: staff.LiveDoc | staff.WrappedDoc | staff.PresentWorktree | staff.RemovedWorktree) -> staff.StaffRow:
-            if isinstance(value, (staff.LiveDoc, staff.WrappedDoc)):
-                row = original_doc(staff_id, value)
-            else:
-                row = original_worktree(staff_id, value)
+        def interrupted_doc(staff_id: staff.StaffId, value: staff.LiveDoc | staff.WrappedDoc) -> staff.StaffRow:
+            row = original_doc(staff_id, value)
             if staff_id == target:
                 raise OSError("stopped after staff retirement")
             return row
-        with mock.patch.object(staff, "set_doc" if retire_showrunner else "set_worktree", side_effect=interrupted):
+
+        def interrupted_worktree(staff_id: staff.StaffId, value: staff.PresentWorktree | staff.RemovedWorktree, *,
+                                 expected: staff.PresentWorktree | staff.RemovedWorktree | staff.WorktreeUnfilled) -> staff.StaffRow:
+            original = staff.by_id(staff_id)
+            assert original is not None
+            self.assertEqual(expected, original.worktree)
+            row = original_worktree(staff_id, value, expected=expected)
+            if staff_id == target:
+                raise OSError("stopped after staff retirement")
+            return row
+
+        with mock.patch.object(staff, "set_doc" if retire_showrunner else "set_worktree",
+                               side_effect=interrupted_doc if retire_showrunner else interrupted_worktree):
             first = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
         self.assertTrue((self.state / "showrunner/example/wrap_release.json").exists())
@@ -929,6 +938,9 @@ class LifecycleTests(LifecycleFixture):
         _ = self.git("push", "origin", "production")
         self.doc = kept
 
+        runner = next(row for row in staff.find(kind="showrunner") if row.name == "old-showrunner")
+        _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", kept))
+
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assert_step(result, "ok")
         relative = "archive/checkout/example/example-production.md"
@@ -952,6 +964,8 @@ class LifecycleTests(LifecycleFixture):
         _ = self.git("commit", "-m", "keep the doc in productions/")
         _ = self.git("push", "origin", "production")
         self.doc = kept
+        runner = next(row for row in staff.find(kind="showrunner") if row.name == "old-showrunner")
+        _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", kept))
         real_checked = production_lifecycle.checked
 
         def stop_at_commit(checkout: Path, step: str, *arguments: str) -> str:

@@ -87,7 +87,7 @@ It prints a `# set …` or `# cleared …` line, then `/agent <function>` output
 
 ```text
 /agent                                    show all assignments and rows
-/agent module_review                      show just module_review's rows
+/agent direct                             show the direct rows
 /agent claude                             every function switches to the claude family
 /agent sol                                every function on the newest sol, efforts kept
 /agent direct sol                         /unit:direct on the newest sol, efforts kept

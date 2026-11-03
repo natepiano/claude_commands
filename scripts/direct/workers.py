@@ -1314,7 +1314,7 @@ def resolve_live_unit_director(
     director died.
     """
     from scripts.lib import unit_runs
-    from scripts.production import unit_lookup
+    from scripts.production import session_staff, unit_lookup
     from scripts.shutdown.launch_permission import shutdown_state_root
 
     director = unit_runs.director(run, dependencies=dependencies)
@@ -1342,8 +1342,11 @@ def resolve_live_unit_director(
         same_unit = False
         if production and unit and host.get("unit") == unit:
             try:
+                identity = previous.get("session_id")
+                reference = (session_staff.StoredReference(identity)
+                             if isinstance(identity, str) and identity else session_staff.BY_NAME)
                 same_unit = unit_lookup.unit_parent(
-                    str(unit), str(previous.get("session_id", "")), record=record, sources=sources).slug == production
+                    str(unit), reference, record=record, sources=sources).slug == production
             except OSError:
                 pass
         if not (same_run or same_unit or (director and previous.get("session_id") == director)):

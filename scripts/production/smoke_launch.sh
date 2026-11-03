@@ -30,6 +30,7 @@ CALL_SECONDS=$(conf_value production smoke_call_seconds)
 SIGNAL_GRACE_SECONDS=$(conf_value production smoke_signal_grace_seconds)
 POLL_SECONDS=$(conf_value production smoke_poll_seconds)
 HOST=$(conf_value hana_shot host)
+CHECKOUT="$(cd "$CHECKOUT" && pwd)"
 
 : >"$LOG"
 # Log stamps are in the user's zone setting; the machine's zone when the setting cannot be read.
@@ -58,10 +59,12 @@ brp() {
 }
 brp rpc.discover >/dev/null 2>&1 && fail "port $PORT already answers BRP"
 
+checkout_cargo() ( cd "$CHECKOUT" && direnv exec "$CHECKOUT" cargo "$@" )
+
 log "build: cargo build -p hana at $CHECKOUT ($SHA)"
-direnv exec "$CHECKOUT" cargo build --manifest-path "$CHECKOUT/Cargo.toml" -p hana --bin hana >>"$LOG" 2>&1 \
+checkout_cargo build --manifest-path "$CHECKOUT/Cargo.toml" -p hana --bin hana >>"$LOG" 2>&1 \
     || fail "cargo build -p hana"
-TARGET_DIR="$(direnv exec "$CHECKOUT" cargo metadata --no-deps --format-version 1 \
+TARGET_DIR="$(checkout_cargo metadata --no-deps --format-version 1 \
     --manifest-path "$CHECKOUT/Cargo.toml" 2>>"$LOG" | jq -r .target_directory)"
 BIN="$TARGET_DIR/debug/hana"
 [[ -x "$BIN" ]] || fail "no binary at $BIN"
