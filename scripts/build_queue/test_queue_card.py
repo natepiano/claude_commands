@@ -1,6 +1,8 @@
 """A card answers whether the selected step is next and explains its place."""
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import admission_policy_fixture
+
 from dataclasses import replace
 import unittest
 
@@ -67,7 +69,7 @@ class QueueCardTests(QueueFixtureTests):
         self.assertNotIn("run-owner", plain(card))
 
     def test_step_ahead_keeps_its_run_place_instead_of_joining_earlier(self) -> None:
-        inputs = self.fixture.inputs(policy=gate.DEFAULT_ADMISSION_POLICY)
+        inputs = self.fixture.inputs(policy=admission_policy_fixture())
         first_path, first = inputs.ordered[0]
         second_path, second = inputs.ordered[1]
         first = {**first, "priority_since": 0, "priority_rank": 1,
@@ -75,7 +77,7 @@ class QueueCardTests(QueueFixtureTests):
         second = {**second, "priority_since": 0, "priority_rank": 1,
                   "since": NOW - 300}
         reading = gate.queue_read_from(replace(inputs, ordered=[(first_path, first), (second_path, second)]),
-            gate.resolve_admission_limits(60 * gate.GIB), policy=gate.DEFAULT_ADMISSION_POLICY)
+            gate.resolve_admission_limits(60 * gate.GIB, gate.read_memory_config()), policy=admission_policy_fixture())
         model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
         text = plain(queue_card.render_selection(model, "2", 400))
         selected = text.split("\nHost:", 1)[0]
@@ -84,10 +86,10 @@ class QueueCardTests(QueueFixtureTests):
         self.assertIn("#1", selected)
 
     def test_expired_follower_prints_estimate_before_its_own_resource_checks(self) -> None:
-        inputs = self.fixture.inputs(policy=gate.DEFAULT_ADMISSION_POLICY)
+        inputs = self.fixture.inputs(policy=admission_policy_fixture())
         path, row = inputs.ordered[1]
         reading = gate.queue_read_from(replace(inputs, ordered=[inputs.ordered[0],
-            (path, {**row, "estimated_at": NOW - 600})]), gate.resolve_admission_limits(60 * gate.GIB), policy=gate.DEFAULT_ADMISSION_POLICY)
+            (path, {**row, "estimated_at": NOW - 600})]), gate.resolve_admission_limits(60 * gate.GIB, gate.read_memory_config()), policy=admission_policy_fixture())
         model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
         text = plain(queue_card.render_card(model, [2], 400))
         self.assertIn("✗ estimate       the estimate expired at 10:36; the client refreshes it through the admission service", text)
@@ -95,7 +97,7 @@ class QueueCardTests(QueueFixtureTests):
         self.assertLess(text.index("✗ estimate"), text.index("Free memory:"))
 
     def test_strict_room_follower_that_fits_has_a_passing_order_check(self) -> None:
-        inputs = self.fixture.inputs(policy=gate.DEFAULT_ADMISSION_POLICY)
+        inputs = self.fixture.inputs(policy=admission_policy_fixture())
         path, head = inputs.ordered[0]
         follower_path, follower = inputs.ordered[1]
         reading = gate.queue_read_from(replace(inputs,
@@ -103,7 +105,7 @@ class QueueCardTests(QueueFixtureTests):
             running=(replace(inputs.running[0], promise=gate.GIB, measured=gate.MeasuredMemory(gate.GIB)),),
             reservations=({**inputs.reservations[0], "need": gate.GIB},), ordered=[
                 (path, {**head, "need": 15 * gate.GIB, "priority_since": NOW - 60}),
-                (follower_path, {**follower, "need": gate.GIB})]), gate.resolve_admission_limits(60 * gate.GIB), policy=gate.DEFAULT_ADMISSION_POLICY)
+                (follower_path, {**follower, "need": gate.GIB})]), gate.resolve_admission_limits(60 * gate.GIB, gate.read_memory_config()), policy=admission_policy_fixture())
         self.assertIsInstance(reading.view.waiting[1].reason, gate.ReadyForAdmission)
         from scripts.build_queue import queue_view
         self.assertEqual(queue_view.reason_phrase(reading.view.waiting[1].reason, reading.view.waiting),
@@ -168,7 +170,7 @@ class QueueCardTests(QueueFixtureTests):
         follower = gate.WaitingStep(102, "small-id", "small", "clippy", "/tmp/small", NOW - 60,
             gate.GIB, gate.ReadyForAdmission())
         reading = queue_read_fixture(gate.QueueView((head, follower), (), 10 * gate.GIB, 0,
-                                                    3 * gate.GIB, NOW), policy=gate.DEFAULT_ADMISSION_POLICY)
+                                                    3 * gate.GIB, NOW), policy=admission_policy_fixture())
         model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
         text = plain(queue_card.render_card(model, [2], 400))
         self.assertIn("Next? Yes. It starts at the next check.", text)

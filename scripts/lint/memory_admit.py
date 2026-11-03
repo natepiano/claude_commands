@@ -96,7 +96,6 @@ store: BuildLogStore = cast(BuildLogStore, cast(object, importlib.import_module(
 file_marks: BuildLogFileMarks = cast(BuildLogFileMarks, cast(object, importlib.import_module("index")))
 
 GIB = 1 << 30
-FALLBACK = 12 * GIB
 # 111 natedev filtered single-test runs with no recompilation in the 14 days
 # to 2026-10-29 had anon p90 0.671 GiB and p95 0.784 GiB.
 FILTERED_FLOOR = GIB
@@ -115,25 +114,25 @@ DEV_HEADROOM = 4.2034275337646125
 
 @dataclass(frozen=True)
 class AdmissionTiming:
-    ramp_seconds: int = 120
-    head_seconds: int = 600
-    strict_seconds: int = 600
-    backfill_seconds: int = 120
-    recovery_start_seconds: int = 30
-    recovery_window_seconds: int = 120
-    fresh_test_seconds: float = 5.0
+    ramp_seconds: int
+    head_seconds: int
+    strict_seconds: int
+    backfill_seconds: int
+    recovery_start_seconds: int
+    recovery_window_seconds: int
+    fresh_test_seconds: float
 
 
 @dataclass(frozen=True)
 class PressurePolicy:
-    full_avg10_limit: float = 5.0
-    swap_used_limit: float = 85.0
-    some_avg10_limit: float = 25.0
+    full_avg10_limit: float
+    swap_used_limit: float
+    some_avg10_limit: float
 
 
 @dataclass(frozen=True)
 class PeakHold:
-    default_seconds: int = 1500
+    default_seconds: int
     by_kind: Mapping[str, int] = field(default_factory=dict[str, int])
 
     def __post_init__(self) -> None:
@@ -145,12 +144,11 @@ class PeakHold:
 
 @dataclass(frozen=True)
 class AdmissionPolicy:
-    timing: AdmissionTiming = AdmissionTiming()
-    pressure: PressurePolicy = PressurePolicy()
-    peak_hold: PeakHold = field(default_factory=PeakHold)
+    timing: AdmissionTiming
+    pressure: PressurePolicy
+    peak_hold: PeakHold
 
 
-DEFAULT_ADMISSION_POLICY = AdmissionPolicy()
 PROC = Path("/proc")
 # These cargo subcommands compile; arbitrary programs and merge gates run.
 CARGO_COMPILE_KINDS = frozenset({"build", "test", "nextest", "clippy", "check", "lint", "doc", "mend", "final"})
@@ -261,7 +259,7 @@ class TestPhaseNeed:
     width: int
     recorded_width: int
     form: TestPhaseNeedForm
-    margin: float = field(default_factory=lambda: test_phase_margin())
+    margin: float
 
 
 @dataclass(frozen=True)
@@ -1214,7 +1212,7 @@ class QueueRead:
     view: QueueView
     explanation: QueueExplanation
     ordered: list[tuple[Path, Waiter]]
-    fallbacks: tuple[ConfigFallback, ...] = ()
+    diagnostics: tuple[ConfigurationDiagnostic, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1465,18 +1463,18 @@ def _positive_gib_bytes(raw: str) -> int | None:
 
 
 @dataclass(frozen=True)
-class ConfigFallback:
+class ConfigurationDiagnostic:
     diagnostic: str
 
 
-_warned_config_fallbacks: set[ConfigFallback] = set()
+_warned_configuration_diagnostics: set[ConfigurationDiagnostic] = set()
 
 
-def warn_config_fallbacks(fallbacks: tuple[ConfigFallback, ...]) -> None:
-    for fallback in fallbacks:
-        if fallback not in _warned_config_fallbacks:
-            _warned_config_fallbacks.add(fallback)
-            print(fallback.diagnostic, file=sys.stderr)
+def warn_configuration_diagnostics(diagnostics: tuple[ConfigurationDiagnostic, ...]) -> None:
+    for diagnostic in diagnostics:
+        if diagnostic not in _warned_configuration_diagnostics:
+            _warned_configuration_diagnostics.add(diagnostic)
+            print(diagnostic.diagnostic, file=sys.stderr)
 
 
 @dataclass(frozen=True)
@@ -1499,97 +1497,93 @@ class MemoryConfig:
     program_sample_seconds: float
     program_stop_seconds: float
     peak_wave_seconds: float
-    fallbacks: tuple[ConfigFallback, ...] = field(default=(), compare=False)
+    diagnostics: tuple[ConfigurationDiagnostic, ...] = field(default=(), compare=False)
 
 
-def _test_phase_margin_value(raw: object) -> float:
-    """Use the live margin when an old record has no valid margin."""
-    if isinstance(raw, bool) or not isinstance(raw, (str, int, float)):
-        return test_phase_margin()
-    try:
-        value = float(raw)
-    except (ValueError, OverflowError):
-        return test_phase_margin()
-    return value if math.isfinite(value) and value >= 1.0 else test_phase_margin()
-
-
-def test_phase_margin() -> float:
-    return conf.read("lint").number("test_phase_margin")
+def _gib_bytes(value: float) -> int:
+    return max(1, int(value * GIB))
 
 
 def build_budget_bytes() -> int:
-    """Read the environment override or the live configured build budget."""
-    environment_budget = _positive_gib_bytes(os.environ.get("BUILDLOG_BUILD_BUDGET_GIB", ""))
-    if environment_budget is not None:
-        return environment_budget
-    return max(1, int(conf.read("lint").number("build_budget_gib") * GIB))
+    return _configured_budget(read_memory_config())
 
 
-def request_max_bytes() -> int:
-    return conf.read("lint").whole("request_max_bytes")
-
-def running_pass_seconds() -> float:
-    return conf.read("lint").number("running_pass_seconds")
-
-def waiting_pass_seconds() -> float:
-    return conf.read("lint").number("waiting_pass_seconds")
-
-def wait_reply_seconds() -> float:
-    return conf.read("lint").number("wait_reply_seconds")
-
-def replay_retention_seconds() -> float:
-    return conf.read("lint").number("replay_retention_seconds")
-
-def reconnect_seconds() -> float:
-    return conf.read("lint").number("reconnect_seconds")
-
-def silence_seconds() -> float:
-    return conf.read("lint").number("silence_seconds")
-
-def outage_notice_seconds() -> float:
-    return conf.read("lint").number("outage_notice_seconds")
-
-def source_check_seconds() -> float:
-    return conf.read("lint").number("source_check_seconds")
-
-def source_settle_seconds() -> float:
-    return conf.read("lint").number("source_settle_seconds")
-
-def override_reconnect_seconds() -> float:
-    return conf.read("lint").number("override_reconnect_seconds")
+def configuration_diagnostics(messages: Iterable[str]) -> tuple[ConfigurationDiagnostic, ...]:
+    return tuple(ConfigurationDiagnostic(message) for message in dict.fromkeys(messages))
 
 
 def read_memory_config(*, report: bool = True) -> MemoryConfig:
     """Resolve the live configuration for one admission decision."""
-    with conf.diagnostics(report=report) as diagnostics:
-        settings_read = conf.read("lint")
-        values = settings_read.values()
-        timing = AdmissionTiming(*(settings_read.whole(key) for key in (
-            "ramp_seconds", "head_seconds", "strict_seconds", "backfill_seconds",
-            "recovery_start_seconds", "recovery_window_seconds")))
-        pressure = PressurePolicy(*(settings_read.number(key) for key in (
-            "full_pressure_limit", "swap_used_limit", "some_pressure_limit")))
-        kinds = {key.removeprefix("peak_hold_seconds."): settings_read.whole(key)
-                 for key in values if key.startswith("peak_hold_seconds.")}
-        first_peaks = {key.removeprefix("program_first_peak_gib."):
-                       max(1, int(settings_read.number(key) * GIB))
-                       for key in values if key.startswith("program_first_peak_gib.")}
-        config = MemoryConfig(
-            policy=AdmissionPolicy(timing, pressure, PeakHold(settings_read.whole("peak_hold_seconds"), kinds)),
-            test_phase_margin=settings_read.number("test_phase_margin"),
-            build_budget_bytes=max(1, int(settings_read.number("build_budget_gib") * GIB)),
-            running_pass_seconds=settings_read.number("running_pass_seconds"), waiting_pass_seconds=settings_read.number("waiting_pass_seconds"),
-            wait_reply_seconds=settings_read.number("wait_reply_seconds"), replay_retention_seconds=settings_read.number("replay_retention_seconds"),
-            reconnect_seconds=settings_read.number("reconnect_seconds"), silence_seconds=settings_read.number("silence_seconds"),
-            outage_notice_seconds=settings_read.number("outage_notice_seconds"), source_check_seconds=settings_read.number("source_check_seconds"),
-            source_settle_seconds=settings_read.number("source_settle_seconds"), override_reconnect_seconds=settings_read.number("override_reconnect_seconds"),
-            request_max_bytes=settings_read.whole("request_max_bytes"), program_first_peaks=first_peaks,
-            program_sample_seconds=settings_read.number("program_sample_seconds"),
-            program_stop_seconds=settings_read.number("program_stop_seconds"),
-            peak_wave_seconds=settings_read.number("peak_wave_seconds"))
-    return replace(config, policy=replace(config.policy, timing=replace(config.policy.timing,
-                   fresh_test_seconds=config.running_pass_seconds)),
-                   fallbacks=tuple(ConfigFallback(message) for message in dict.fromkeys(diagnostics)))
+    with conf.diagnostics(report=False) as messages:
+        settings_read = conf.read("build_admission")
+        keys = settings_read.settings
+        values = keys if isinstance(keys, dict) else settings_read.values()
+
+        def value[Value](key: str, convert: Callable[[str], Value]) -> Value:
+            result = settings_read.origin(key, convert)
+            if isinstance(result, conf.UnavailableValue):
+                raise conf.Unusable(f"{result.reason}; no usable committed value")
+            if isinstance(result, conf.RecoveredValue):
+                messages.append(f"warning: {result.reason}")
+            return result.value
+
+        def number(key: str) -> float:
+            return value(key, float)
+
+        def whole(key: str) -> int:
+            return value(key, int)
+
+        def gib(key: str) -> int:
+            return value(key, lambda raw: _gib_bytes(float(raw)))
+
+        try:
+            running_interval = number("running_pass_seconds")
+            timing = AdmissionTiming(*(whole(key) for key in (
+                "ramp_seconds", "head_seconds", "strict_seconds", "backfill_seconds",
+                "recovery_start_seconds", "recovery_window_seconds")), fresh_test_seconds=running_interval)
+            pressure = PressurePolicy(*(number(key) for key in (
+                "full_pressure_limit", "swap_used_limit", "some_pressure_limit")))
+            kinds = {key.removeprefix("peak_hold_seconds."): whole(key)
+                     for key in values if key.startswith("peak_hold_seconds.")}
+            first_peaks = {key.removeprefix("program_first_peak_gib."): gib(key)
+                           for key in values if key.startswith("program_first_peak_gib.")}
+            if "cargo" not in first_peaks:
+                first_peaks["cargo"] = gib("program_first_peak_gib.cargo")
+            config = MemoryConfig(
+                policy=AdmissionPolicy(timing, pressure, PeakHold(whole("peak_hold_seconds"), kinds)),
+                test_phase_margin=number("test_phase_margin"), build_budget_bytes=gib("build_budget_gib"),
+                running_pass_seconds=running_interval, waiting_pass_seconds=number("waiting_pass_seconds"),
+                wait_reply_seconds=number("wait_reply_seconds"), replay_retention_seconds=number("replay_retention_seconds"),
+                reconnect_seconds=number("reconnect_seconds"), silence_seconds=number("silence_seconds"),
+                outage_notice_seconds=number("outage_notice_seconds"), source_check_seconds=number("source_check_seconds"),
+                source_settle_seconds=number("source_settle_seconds"), override_reconnect_seconds=number("override_reconnect_seconds"),
+                request_max_bytes=whole("request_max_bytes"), program_first_peaks=first_peaks,
+                program_sample_seconds=number("program_sample_seconds"), program_stop_seconds=number("program_stop_seconds"),
+                peak_wave_seconds=number("peak_wave_seconds"))
+        finally:
+            diagnostics = configuration_diagnostics(messages)
+    config = replace(config, diagnostics=diagnostics)
+    if report:
+        warn_configuration_diagnostics(diagnostics)
+    return config
+
+
+@dataclass(frozen=True)
+class UsableAdmissionConfiguration:
+    config: MemoryConfig
+
+
+@dataclass(frozen=True)
+class UnusableAdmissionConfiguration:
+    reason: str
+
+
+def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdmissionConfiguration:
+    """Resolve one pass without preventing cleanup when a setting is unavailable."""
+    try:
+        return UsableAdmissionConfiguration(read_memory_config(report=False))
+    except conf.Unusable as error:
+        return UnusableAdmissionConfiguration(str(error))
 
 
 def memory_config() -> MemoryConfig:
@@ -1601,18 +1595,8 @@ def _configured_budget(config: MemoryConfig) -> int:
     return environment_budget if environment_budget is not None else config.build_budget_bytes
 
 
-@dataclass(frozen=True)
-class ReadMemoryConfiguration:
-    pass
-
-
-READ_MEMORY_CONFIGURATION = ReadMemoryConfiguration()
-
-
-def resolve_admission_limits(total: int | UnknownHostTotal,
-                             config: MemoryConfig | ReadMemoryConfiguration = READ_MEMORY_CONFIGURATION) -> AdmissionLimits:
-    resolved = read_memory_config() if isinstance(config, ReadMemoryConfiguration) else config
-    return AdmissionLimits(_configured_budget(resolved), total * 5 // 100 if isinstance(total, int) else 0)
+def resolve_admission_limits(total: int | UnknownHostTotal, config: MemoryConfig) -> AdmissionLimits:
+    return AdmissionLimits(_configured_budget(config), total * 5 // 100 if isinstance(total, int) else 0)
 
 
 def decide(available: int, total: int | UnknownHostTotal, need: int, running: list[StepMemory],
@@ -1621,7 +1605,7 @@ def decide(available: int, total: int | UnknownHostTotal, need: int, running: li
     """Apply the build budget, free-memory floor and pressure limit together."""
     promised = sum(growth_headroom(row) for row in running)
     measured = sum(row.bytes for row in running if isinstance(row, MeasuredMemory))
-    resolved = limits if isinstance(limits, AdmissionLimits) else resolve_admission_limits(total)
+    resolved = limits if isinstance(limits, AdmissionLimits) else resolve_admission_limits(total, read_memory_config())
     charged = sum(build_charge(row) for row in running)
     budget, reserve = resolved.budget, resolved.reserve
     threshold = need + promised + reserve
@@ -1700,7 +1684,8 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
                   test_threads: int | None = None, *, scope: TestScope = "full",
                   filters: tuple[str, ...] = (), package: str = "",
                   fresh: bool = False,
-                  shape: BuildShape | NoBuildShape = NO_BUILD_SHAPE) -> ExpectedPeak:
+                  shape: BuildShape | NoBuildShape = NO_BUILD_SHAPE,
+                  first_peak_bytes: int, budget: int) -> ExpectedPeak:
     """The process-memory promise of a step over HISTORY_DAYS.
 
     The gate pools every test width: one width's history is thin and rebuild-heavy, and the
@@ -1708,25 +1693,27 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
     one width, for width_trial.py's report.
     """
     if step == "build":
-        return build_expected_peak(repository, shape, host, now, root)
+        return build_expected_peak(repository, shape, host, now, root, first_peak_bytes, budget)
     if isinstance(repository, UnknownRepository):
-        return ExpectedPeak(FALLBACK, "fallback", 0)
+        return ExpectedPeak(first_peak_bytes, "fallback", 0)
     if fresh and step == "nextest" and package:
         compile_peak = expected_peak(repository, step, host, now, root, test_threads,
-                                     scope=scope, filters=filters, package=package)
+                                     scope=scope, filters=filters, package=package,
+                                     first_peak_bytes=first_peak_bytes, budget=budget)
         return fresh_test_peak(repository, step, host, now, root, test_threads,
                                scope, tuple(sorted(set(filters))), package, compile_peak)
     if scope == "filtered" and package:
         filtered = filtered_peak(repository, step, host, now, root, test_threads,
                                  tuple(sorted(set(filters))), package)
-        full = expected_peak(repository, step, host, now, root, test_threads, scope="full")
+        full = expected_peak(repository, step, host, now, root, test_threads, scope="full",
+                             first_peak_bytes=first_peak_bytes, budget=budget)
         # A filtered run builds the same targets and runs fewer tests than the full suite.
         return ExpectedPeak(min(filtered.bytes, full.bytes), filtered.source, filtered.count)
     cutoff = store.utc_iso((now - timedelta(days=HISTORY_DAYS)).timestamp())
     before = store.utc_iso(now.timestamp())
     measured: list[int] = []
     # Every repo's runs of this step on this host: a checkout with fewer than 5 runs of its own (a gate
-    # copy, a clone) uses their p90, not FALLBACK. Doc steps held 2157 of 4702 wait minutes in the week
+    # copy, a clone) uses their p90, not the configured first peak. Doc steps held 2157 of 4702 wait minutes in the week
     # to 2026-10-28 on that fallback; the measured doc p90 over all repos was 4.15 GiB.
     pooled: list[int] = []
     try:
@@ -1785,7 +1772,7 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
         return ExpectedPeak(int(percentile(peaks) * ANON_SHARE), "buildlog", len(peaks))
     if len(pooled) >= 5:
         return ExpectedPeak(percentile(pooled), "pooled", len(pooled))
-    return ExpectedPeak(FALLBACK, "fallback", 0)
+    return ExpectedPeak(first_peak_bytes, "fallback", 0)
 
 
 @dataclass(frozen=True)
@@ -1853,7 +1840,7 @@ def build_peaks(repository: RepositoryIdentity, host: str, now: datetime, root: 
 
 
 def build_expected_peak(repository: Repository, shape: BuildShape | NoBuildShape,
-                        host: str, now: datetime, root: Path) -> ExpectedPeak:
+                        host: str, now: datetime, root: Path, first_peak_bytes: int, budget: int) -> ExpectedPeak:
     rows = build_peaks(repository, host, now, root) if isinstance(repository, RepositoryIdentity) else []
     same = [row for row in rows if row.shape == shape]
     floor: FailedPeakFloor | NoFloor = NoFloor()
@@ -1870,7 +1857,7 @@ def build_expected_peak(repository: Repository, shape: BuildShape | NoBuildShape
         base = max(row.peak for row in same)
         basis = ShapeLargest(count)
     else:
-        base = max([FALLBACK, *(row.peak for row in rows
+        base = max([first_peak_bytes, *(row.peak for row in rows
                                if isinstance(shape, BuildShape) and row.shape.profile == shape.profile)])
         basis = ShapeFallback()
     if isinstance(basis, (ShapeP90, ShapeLargest)):
@@ -1886,7 +1873,6 @@ def build_expected_peak(repository: Repository, shape: BuildShape | NoBuildShape
         basis = replace(basis, floor=floor, factor=factor)
     else:
         uncapped = base
-    budget = build_budget_bytes()
     cap: CappedAtBudget | UnderBudget = (CappedAtBudget(uncapped)
                                        if uncapped > budget else UnderBudget())
     basis = replace(basis, cap=cap)
@@ -1934,7 +1920,15 @@ def _read_need_record(raw: object) -> NeedBasis | BasisNotRecorded | TestPhaseNe
         numbers = [row.get(name) for name in ("bytes", "runs", "width", "recorded_width")]
         if (all(type(number) is int and number > 0 for number in numbers)
                 and row.get("form") in ("same_width", "wider_unscaled", "scaled_up")):
-            margin = _test_phase_margin_value(row.get("margin"))
+            raw_margin = row.get("margin")
+            if isinstance(raw_margin, bool) or not isinstance(raw_margin, (str, int, float)):
+                return NoTestPhaseNeed("not_recorded")
+            try:
+                margin = float(raw_margin)
+            except (ValueError, OverflowError):
+                return NoTestPhaseNeed("not_recorded")
+            if not math.isfinite(margin) or margin < 1.0:
+                return NoTestPhaseNeed("not_recorded")
             return TestPhaseNeed(cast(int, numbers[0]), cast(int, numbers[1]),
                                  cast(int, numbers[2]), cast(int, numbers[3]),
                                  cast(TestPhaseNeedForm, row["form"]), margin)
@@ -1948,7 +1942,7 @@ def _read_need_record(raw: object) -> NeedBasis | BasisNotRecorded | TestPhaseNe
         cap: CappedAtBudget | UnderBudget = UnderBudget()
         if cap_row["kind"] == "budget":
             uncapped = cap_row["uncapped"]
-            if not isinstance(uncapped, int) or uncapped <= build_budget_bytes():
+            if type(uncapped) is not int or uncapped <= 0:
                 return BasisNotRecorded()
             cap = CappedAtBudget(uncapped)
         elif cap_row["kind"] != "none":
@@ -2006,7 +2000,7 @@ def read_test_phase_need(raw: object) -> TestPhaseNeed | NoTestPhaseNeed:
 
 
 def test_phase_need_from_rows(rows: Iterable[Mapping[str, object]],
-                             row: Mapping[str, object], host: str, now: datetime) -> TestPhaseNeed | NoTestPhaseNeed:
+                             row: Mapping[str, object], host: str, now: datetime, margin: float) -> TestPhaseNeed | NoTestPhaseNeed:
     """Choose narrow-family history at the closest usable width; read no external state."""
     recorded = row.get("test_threads")
     width = recorded.threads if isinstance(recorded, RequestedTestWidth) else recorded
@@ -2047,20 +2041,16 @@ def test_phase_need_from_rows(rows: Iterable[Mapping[str, object]],
     need = percentile(peaks)
     if form == "scaled_up":
         need = (need * width + recorded_width - 1) // recorded_width
-    return TestPhaseNeed(max(FILTERED_FLOOR, need), len(peaks), width, recorded_width, form)
+    return TestPhaseNeed(max(FILTERED_FLOOR, need), len(peaks), width, recorded_width, form, margin)
 
 
 def test_phase_need(row: Mapping[str, object], host: str, now: datetime, root: Path, *,
                     history_path: Path | None = None,
-                    config: MemoryConfig | ReadMemoryConfiguration = READ_MEMORY_CONFIGURATION
+                    config: MemoryConfig
                     ) -> TestPhaseNeed | NoTestPhaseNeed:
     try:
         path = history_path if history_path is not None else root / "admission/anon_peaks.jsonl"
-        need = test_phase_need_from_rows(anonymous_history_rows(path), row, host, now)
-        if isinstance(need, TestPhaseNeed):
-            resolved = read_memory_config() if isinstance(config, ReadMemoryConfiguration) else config
-            return replace(need, margin=resolved.test_phase_margin)
-        return need
+        return test_phase_need_from_rows(anonymous_history_rows(path), row, host, now, config.test_phase_margin)
     except OSError:
         return NoTestPhaseNeed("no_history")
 
@@ -3118,6 +3108,7 @@ def no_build_history_generation() -> NoBuildHistoryGeneration:
 
 def step_estimate(argv: list[str], cwd: str, profile: InferFromArgv | StepProfile | ProgramProfile,
                   now: datetime | Callable[[], datetime], root: Path, policy: AdmissionPolicy, *,
+                  first_peak_bytes: int, budget: int,
                   build_history_generation: Callable[[], BuildHistoryGeneration | NoBuildHistoryGeneration] = no_build_history_generation
                   ) -> StepEstimate:
     """Resolve one estimate before admission connects."""
@@ -3152,7 +3143,8 @@ def step_estimate(argv: list[str], cwd: str, profile: InferFromArgv | StepProfil
             estimate_time = now()
         peak = expected_peak(repository, step, host, estimate_time, root, scope=scope,
                              package=package, filters=filters, fresh=fresh,
-                             shape=build_shape(argv) if step == "build" else NoBuildShape())
+                             shape=build_shape(argv) if step == "build" else NoBuildShape(),
+                             first_peak_bytes=first_peak_bytes, budget=budget)
         profile = StepProfile(repo, step, worktree, peak, repository, scope, estimate_time.timestamp(),
                               generation)
     elif isinstance(profile, StepProfile) and not profile.estimated_at:
@@ -3832,7 +3824,7 @@ class AdmissionWaitSnapshot:
     repo: str
     step: str
     policy: AdmissionPolicy
-    fallbacks: tuple[ConfigFallback, ...]
+    diagnostics: tuple[ConfigurationDiagnostic, ...]
     head_need: int = 0
     head_label: str = ""
     head_reason: WaitReason = ReadyForAdmission()
@@ -3879,6 +3871,16 @@ def build_queue_inputs(ordered: list[tuple[Path, Waiter]],
             activity.started_at if isinstance(activity, ScopeProcesses) else 0.0))
     return QueueInputs(sorted(ordered, key=lambda item: waiter_order(item[1])), tuple(running), tuple(rows),
                        readings.host, readings.pressure, readings.recovery, override, now, priority)
+
+
+def inputs_after_reservations_end(inputs: QueueInputs, live_reservations: set[str]) -> QueueInputs:
+    """Remove ended reservations by identity without reading memory or configuration."""
+    paired = {row.get("reservation_id", ""): step for row, step in zip(
+        inputs.reservations, (step for step in inputs.running if running_has_reservation(step)), strict=True)}
+    kept_steps = {id(step) for reservation, step in paired.items() if reservation in live_reservations}
+    return replace(inputs,
+        reservations=tuple(row for row in inputs.reservations if row.get("reservation_id") in live_reservations),
+        running=tuple(step for step in inputs.running if not running_has_reservation(step) or id(step) in kept_steps))
 
 
 def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessIdentity], proc: Path,

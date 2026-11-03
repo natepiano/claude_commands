@@ -1,6 +1,8 @@
 """The fixed queue stays one row per step and explains waits once."""
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import admission_policy_fixture
+
 from dataclasses import replace
 import os
 from pathlib import Path
@@ -28,7 +30,7 @@ class QueueViewTests(QueueFixtureTests):
     @override
     def setUp(self) -> None:
         super().setUp()
-        config = self.fixture.root / "lint.conf"
+        config = self.fixture.root / "build_admission.conf"
         write_memory_config(config)
         _ = cast(object, self.enterContext(mock.patch.dict("os.environ", {"CONF_DIR": str(config.parent)})))
 
@@ -176,13 +178,13 @@ class QueueViewTests(QueueFixtureTests):
             self.assertEqual(page.count("Free memory: free 12.0 GiB"), 1)
 
     def test_expired_head_with_passing_checks_has_an_error_hold_at_sixty_cells(self) -> None:
-        inputs = self.fixture.inputs(policy=gate.DEFAULT_ADMISSION_POLICY)
+        inputs = self.fixture.inputs(policy=admission_policy_fixture())
         path, row = inputs.ordered[0]
         inputs = replace(inputs, running=(), reservations=(), pressure=gate.NoPressureHold(),
             host=gate.HostMemory(60 * gate.GIB, 60 * gate.GIB),
             ordered=[(path, {**row, "need": gate.GIB, "estimated_at": NOW - 600,
                             "priority_since": NOW - 42}), inputs.ordered[1]])
-        reading = gate.queue_read_from(inputs, gate.AdmissionLimits(gate.GIB, 3 * gate.GIB), policy=gate.DEFAULT_ADMISSION_POLICY)
+        reading = gate.queue_read_from(inputs, gate.AdmissionLimits(gate.GIB, 3 * gate.GIB), policy=admission_policy_fixture())
         head = reading.explanation.head
         assert isinstance(head, gate.HeadExplanation)
         self.assertTrue(head.budget.passes)
@@ -200,7 +202,7 @@ class QueueViewTests(QueueFixtureTests):
                             for line in lines for span in line))
 
     def test_pressure_threshold_text_uses_the_policy_in_the_reading(self) -> None:
-        config = self.fixture.root / "lint.conf"
+        config = self.fixture.root / "build_admission.conf"
         write_memory_config(config, full_pressure_limit="9", swap_used_limit="70", some_pressure_limit="12", recovery_start_seconds="45")
         with mock.patch.dict("os.environ", {"CONF_DIR": str(config.parent)}):
             policy = gate.read_memory_config().policy
@@ -261,7 +263,7 @@ class QueueViewTests(QueueFixtureTests):
         steps = tuple(replace(model.reading.view.waiting[0], pid=pid,
                               session_id=f"row-{pid}", folder=f"/tmp/row-{pid}")
                       for pid in range(4000))
-        reading = queue_read_fixture(replace(model.reading.view, waiting=steps), policy=gate.DEFAULT_ADMISSION_POLICY)
+        reading = queue_read_fixture(replace(model.reading.view, waiting=steps), policy=admission_policy_fixture())
         facts = model.facts
         assert isinstance(facts, head_facts.HeadFacts)
         empty = replace(model, reading=reading, facts=replace(facts, bump_records=()))
@@ -289,7 +291,7 @@ class QueueViewTests(QueueFixtureTests):
         model = self.fixture.model()
         step = model.reading.view.waiting[0]
         steps = tuple(replace(step, pid=pid) for pid in range(1, 101))
-        model = replace(model, reading=queue_read_fixture(replace(model.reading.view, waiting=steps), policy=gate.DEFAULT_ADMISSION_POLICY))
+        model = replace(model, reading=queue_read_fixture(replace(model.reading.view, waiting=steps), policy=admission_policy_fixture()))
         rows = waiting_rows(queue_view.render_view(model, 140))
         self.assertEqual(len(rows), 100)
         for row, position in zip(rows[98:], (99, 100)):
@@ -356,7 +358,7 @@ class QueueViewTests(QueueFixtureTests):
 
     def test_empty_queue_keeps_budget_and_header_without_invented_steps(self) -> None:
         model = self.fixture.budget_model()
-        reading = queue_read_fixture(gate.QueueView((), (), 24 * gate.GIB, 0, 3 * gate.GIB, NOW), policy=gate.DEFAULT_ADMISSION_POLICY)
+        reading = queue_read_fixture(gate.QueueView((), (), 24 * gate.GIB, 0, 3 * gate.GIB, NOW), policy=admission_policy_fixture())
         rendered = queue_view.render_view(replace(model, reading=reading, facts=gate.NoWaiter()), 100)
         text = plain(rendered)
         self.assertTrue(text.startswith("Build queue · 10:46\n\n"))

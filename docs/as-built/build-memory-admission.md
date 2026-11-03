@@ -110,9 +110,27 @@ After a restart, the service restores live run places and removes ended run plac
 `admission_protocol.py` defines every request and reply. `admission_client.py` handles connections, retries, wait output, and bounded queries.
 `memory_admit.py` owns the estimates, readers, pure admission rules, projection, and finalizer.
 
-Every pass reads one `MemoryConfig` from `[memory]` in `config/lint.conf`.
+Every pass reads one `MemoryConfig` from `[memory]` in `config/build_admission.conf`.
+`read_admission_configuration()` returns `UsableAdmissionConfiguration` or `UnusableAdmissionConfiguration`.
+`read_memory_config()` resolves each key through `ConfigRead.origin()` once.
+It collects recovery diagnostics and emits them only after a successful read.
+Estimates receive the cargo peak, budget, and test margin from that resolved configuration.
+A recovered setting remains usable and produces one warning per process.
+An unavailable setting stops grants and returns a refusal that names the file and key.
+The service listens during a refusal and watches the nearest existing configuration directory.
+`scripts.lib.inotify` reports directory replacement, permission repairs, completed writes, and overflow events.
+Each relevant event re-arms the watch before a configuration read; no stamp filter discards repairs.
+Watch registration tries each ancestor and tolerates filesystem errors.
+When no ancestor accepts a watch, the service retries after the last usable source-check interval or the protocol cleanup interval.
+Only configuration resolution decides usability; watch errors do not stop cleanup.
+The service retains the last usable `MemoryConfig` for transport bounds, timers, and replay retention.
+Cleanup requests have bounded strings and a protocol size limit, independent of the configured request limit.
+Persistence reads no admission configuration.
+Program places retain their acquisition configuration for reservation endings and scope cleanup.
+Standalone cleanup uses the timing saved with its grant, or the fixed protocol timing when no saved timing exists.
+The service removes its AWS queue snapshot during a configuration refusal.
 The pass uses that policy for readings, decisions, and explanations. Its stored inputs preserve the evidence for counterfactual release advice.
-Queries project the stored `PassResult` through `queue_read_from_pass`. Queries perform no second admission walk.
+Queries project the stored `PassResult` through `queue_read_from_pass`. A release marks the stored result stale; the next query computes its evidence once without granting a step.
 `queue_read()` supplies one `QueueRead` for the complete queue page.
 A failed query raises `AdmissionUnavailable` within the query bound. Commands print `build queue: admission service unavailable: <reason>` and exit 2.
 `/build:queue <position|session|folder>` shows the full queue, one blank line, and the selected cards.
@@ -147,8 +165,9 @@ The pane passes its session id to mutating commands. Read-only commands keep the
 Mutation requests have replay ids. The service persists each terminal reply before delivery.
 A replay returns the same reply. Live grants remain in the ledger until their reservation ends.
 Ended replies expire under `replay_retention_seconds`. Wait replies remain only on their connection.
-`Wait` carries the decision, readings, need, policy, and configuration fallbacks from the same pass.
-Client commands print each fallback once per process. The protocol carries data without warning text.
+`Wait` carries the decision, readings, need, policy, and `ConfigurationDiagnostic` records from the same pass.
+Client commands print each recovery warning once per process.
+Unavailable settings produce refusals rather than replacement policy values.
 
 ### Durable state and lifetime
 
@@ -211,6 +230,7 @@ One estimate worker calls `test_phase_need` through `anonymous_history_rows`.
 Each job carries the reservation, width, revision, and event's resolved `MemoryConfig`.
 The loop accepts results only when the reservation and revision still match. Width changes increment the revision.
 A failed job stores nothing. A frozen need keeps its recorded margin; a later width request reads the margin again.
+A legacy need without a recorded margin decodes as `NoTestPhaseNeed("not_recorded")`. The step measures again.
 The first selected charge evidence is persisted outside the pure pass. A failed optional evidence write does not undo admission.
 
 Each pass counts `sccache.service` and unowned child scopes under `builds.slice`.
@@ -241,6 +261,10 @@ Wait for a run's result as the next message, or put more files in one run.
 Exit 3 still means the caller is not a mesh worker; only that exit permits attached execution.
 
 `queue_place` uses the client in process. Its public call retains `before_check`.
+`release()` and `token_wait()` take explicit cleanup timing or the place's acquisition configuration.
+`Admitted.cleanup_timing` supplies `CleanupTiming`; the shell retains it in `BUILDLOG_MEM_CLEANUP_TIMING`.
+Stored `Admitted` replies without cleanup timing receive `PROTOCOL_CLEANUP_TIMING` before strict parsing.
+Existing stored timing and valid shell timing retain their values.
 The hook runs before each attempt and after a grant. An exception after a grant returns the reservation before program startup.
 `popen` starts the program in its own scope, nested when the holder already runs in `builds.slice`.
 Without a scope, it raises `QueuePlaceRefused` before the fork.
@@ -521,7 +545,7 @@ Turns end as `TurnCompleted | TurnRefusedForCapacity | TurnFailed`; runs as `Run
 
 - **Unfaked memory pressure.** On 2026-10-29, `test_brp_launch_gate.py` took 169 s against a 6 s median because its pressure reading was unfaked.
 
-- **Memory gate sizes.** The fallback need is 12 GiB. Build steps use shape tiers. Other steps retain measured, build-log, and pooled tiers. The service reads process memory before host memory during each pass.
+- **Memory gate sizes.** The first need comes from `program_first_peak_gib.cargo` in `config/build_admission.conf`. Build steps use shape tiers. Other steps retain measured, build-log, and pooled tiers. The service reads process memory before host memory during each pass.
 - **One admitter after a hold release.** The service reads memory, decides, and persists grants in its loop. Lifetime promises retain the full need until the step ends. Other steps use the configured ramp and peak rules. Simultaneous callers cannot reserve the same room.
 - **Release outcomes vanish with the last holder file**; set-aside `*.damaged-*` files are never cleaned up. A holder joining a no-cycle hold learns nothing until the final release line tells it to broadcast.
 - **earlyoom never logs "killed";** its line is `sending SIGTERM to process <pid> uid ... "<comm>": ...`.
@@ -598,3 +622,11 @@ Python queue layouts, evidence tables and production dailies share `scripts/lib/
 The service commits proposals and stores the pass. Queries project that pass through `queue_read_from_pass`.
 `QueueExplanation.decided_from` keeps the inputs for release calculations. Those calculations admit nothing and write nothing.
 `apply_queue_priority` supplies the priority order. The generic codec stores domain records for replies and service state.
+
+Admission callers retain one hash of their loaded admission sources.
+`admission_code.py` owns `ADMISSION_CODE_PATHS` and `admission_code_version()` and includes itself in the hash.
+The shell runs this module directly with isolated Python; the module imports only standard-library modules.
+Requests carry `code_version`; the service records it by process identity in `ServiceState.caller_versions`.
+Persistence removes dead caller identities, including reused PIDs, and retains live callers without reservations.
+The shell retains its version in `BUILDLOG_ADMISSION_CODE_VERSION` before admission starts.
+The drain check requires matching entry content and a matching recorded version; an unknown version prevents a completed drain.

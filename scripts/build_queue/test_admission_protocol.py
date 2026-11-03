@@ -1,10 +1,13 @@
 """The wire transports admission's domain records without another representation."""
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import admission_policy_fixture
+
 from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import subprocess
 import unittest
 from typing import cast
 from unittest import mock
@@ -12,11 +15,35 @@ from zoneinfo import ZoneInfo
 
 from scripts.lint import memory_admit as gate
 from scripts.build_queue import admission_protocol as wire, queue_evidence
+from scripts.build_queue import admission_code
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, NOW
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_shell_and_protocol_share_a_version_that_includes_the_version_module(self) -> None:
+        with AdmissionFixture() as fixture:
+            source = Path(__file__).resolve().parents[1]
+            scripts = fixture.root / "scripts"
+            for relative in (*admission_code.ADMISSION_CODE_PATHS, "build_hold/override_guard.sh"):
+                target = scripts / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                _ = target.write_bytes((source / relative).read_bytes())
+            before = wire.admission_code_version(scripts)
+            environment = {key: value for key, value in os.environ.items() if key != "BUILDLOG_ADMISSION_CODE_VERSION"}
+            command = '''source "$1"
+printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
+printf '\\n# Changed version code.\\n' >> "$2"
+source "$1"
+printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
+'''
+            result = subprocess.run(["bash", "-c", command, "bash", str(scripts / "lint/memory_gate.sh"),
+                                     str(scripts / "build_queue/admission_code.py")],
+                                    env=environment, capture_output=True, text=True, timeout=10, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), [before, before])
+            self.assertNotEqual(wire.admission_code_version(scripts), before)
+
     def test_every_request_round_trips_with_profiles_width_and_call_states(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request()
@@ -50,9 +77,9 @@ class ProtocolTests(unittest.TestCase):
             inputs, limits = fixture.server.last_inputs, fixture.server.last_limits
             assert isinstance(inputs, gate.QueueInputs)
             assert isinstance(limits, gate.AdmissionLimits)
-            reading = gate.queue_read_from(inputs, limits, policy=gate.DEFAULT_ADMISSION_POLICY)
+            reading = gate.queue_read_from(inputs, limits, policy=admission_policy_fixture())
             replies: tuple[wire.Reply, ...] = (
-                wait_reply(gate.EstimateExpired(NOW - gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds), 1, "head", "estimate expired"),
+                wait_reply(gate.EstimateExpired(NOW - admission_policy_fixture().timing.head_seconds), 1, "head", "estimate expired"),
                 admitted_reply("stem", GIB, "future-source", "stem.max", "stem.wave"),
                 wire.LaunchAdmitted(GIB, "future-source"), wire.Refused("no"), wire.Ok(),
                 wire.ViewReply(reading), wire.ExplainReply(reading.explanation), wire.MineReply(reading))
@@ -103,12 +130,12 @@ class ProtocolTests(unittest.TestCase):
     def test_expired_explanation_keeps_release_advice_and_decided_from_over_wire(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
-            _ = fixture.server.handle_request(fixture.request(age=gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds))
+            _ = fixture.server.handle_request(fixture.request(age=admission_policy_fixture().timing.head_seconds))
             inputs, limits = fixture.server.last_inputs, fixture.server.last_limits
             assert isinstance(inputs, gate.QueueInputs)
             assert isinstance(limits, gate.AdmissionLimits)
             inputs = replace(inputs, recovery=gate.RecoveryStarts(NOW + 120, NOW + 30))
-            local = gate.queue_read_from(inputs, limits, policy=gate.DEFAULT_ADMISSION_POLICY).explanation
+            local = gate.queue_read_from(inputs, limits, policy=admission_policy_fixture()).explanation
             parsed = wire.parse_reply(wire.encode_reply(wire.ExplainReply(local)))
             assert isinstance(parsed, wire.ExplainReply)
             self.assertEqual(parsed.explanation, local)

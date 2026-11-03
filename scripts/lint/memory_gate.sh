@@ -18,6 +18,12 @@ buildlog_memory_python() {
     fi
 }
 
+# Keep the version of the code this shell loads, even after source files change.
+if [[ -z "${BUILDLOG_ADMISSION_CODE_VERSION:-}" ]]; then
+    BUILDLOG_ADMISSION_CODE_VERSION="$(buildlog_memory_python -I "${BUILDLOG_MEM_ADMIT_SCRIPT%/*}/admission_code.py")" || exit 2
+    export BUILDLOG_ADMISSION_CODE_VERSION
+fi
+
 # Status 0 when the holder directory is missing or readable with no entry.
 # This shell must expand patterns unfiltered; any doubt starts Python.
 build_hold_nothing_held() {
@@ -186,6 +192,7 @@ buildlog_wait_for_memory() {
 buildlog_release_memory() {
     local reservation="${BUILDLOG_MEM_RESERVATION:-}"
     BUILDLOG_MEM_RESERVATION=""
+    export BUILDLOG_MEM_CLEANUP_TIMING
     [[ -n "$reservation" ]] || return 0
     buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" release "$reservation" "${1:-0}" >/dev/null 2>&1 || true
 }
@@ -193,6 +200,7 @@ buildlog_release_memory() {
 buildlog_token_wait() {
     local reservation="${BUILDLOG_MEM_RESERVATION:-}" status=0
     [[ -n "$reservation" ]] || return 0
+    export BUILDLOG_MEM_CLEANUP_TIMING
     buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" token-wait "$reservation" >/dev/null || status=$?
     if (( status != 0 )); then
         buildlog_memory_refuse "cannot enter token wait (exit $status)"

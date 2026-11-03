@@ -7,25 +7,33 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import errno
+import math
 import os
 from pathlib import Path
 import socket
 import shlex
 import subprocess
 import sys
-from typing import Callable, Protocol, cast
+from typing import TYPE_CHECKING, Callable, Protocol, cast
 import uuid
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.build_queue import admission_code
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_service import SystemClock
 from scripts.lib.user_zone import user_zone
 from scripts.lint import memory_admit as gate
 
+if TYPE_CHECKING:
+    from scripts.lib import conf
+else:
+    import conf
+
 QUERY_TIMEOUT_SECONDS = 0.5
 LAUNCH_WAIT_LIMIT_REASON = "launch wait limit reached without admission"
+LOADED_ADMISSION_CODE_VERSION = os.environ.get("BUILDLOG_ADMISSION_CODE_VERSION") or admission_code.admission_code_version()
 
 
 class ClientClock(Protocol):
@@ -78,12 +86,16 @@ def _line(connection: socket.socket, pending: bytearray, deadline: float) -> byt
 
 
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest) -> wire.Reply:
+    request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
     deadline = CLOCK.monotonic() + QUERY_TIMEOUT_SECONDS
     try:
         with _connect(QUERY_TIMEOUT_SECONDS) as connection:
             connection.sendall(wire.encode_request(request).encode())
             line = _line(connection, bytearray(), deadline)
-            return wire.parse_reply(line, request)
+            reply = wire.parse_reply(line, request)
+            if isinstance(reply, wire.Refused):
+                raise wire.AdmissionUnavailable(reply.reason)
+            return reply
     except FileNotFoundError as error:
         raise wire.AdmissionUnavailable("no socket") from error
     except ConnectionRefusedError as error:
@@ -103,9 +115,10 @@ class EstimateConnection:
 _ESTIMATE_CONNECTION: ContextVar[EstimateConnection | None] = ContextVar("estimate_connection", default=None)
 
 
-def build_history_generation() -> gate.BuildHistoryGeneration:
+def build_history_generation(configuration: gate.MemoryConfig | None = None) -> gate.BuildHistoryGeneration:
     """Read the generation before reading build history."""
-    reply = _call(wire.BuildHistoryRequest(), lambda _wait: None, channel=_ESTIMATE_CONNECTION.get())
+    reply = _call(wire.BuildHistoryRequest(), lambda _wait: None, channel=_ESTIMATE_CONNECTION.get(),
+                  configuration=configuration)
     if isinstance(reply, LeftQueue):
         raise _QueueLeft()
     if isinstance(reply, wire.Refused):
@@ -119,7 +132,7 @@ def view() -> gate.QueueRead:
     reply = _query(wire.ViewRequest())
     if not isinstance(reply, wire.ViewReply):
         raise wire.AdmissionUnavailable("invalid view answer")
-    gate.warn_config_fallbacks(reply.reading.fallbacks)
+    gate.warn_configuration_diagnostics(reply.reading.diagnostics)
     return reply.reading
 
 
@@ -127,7 +140,7 @@ def explain() -> gate.QueueExplanation:
     reply = _query(wire.ExplainRequest())
     if not isinstance(reply, wire.ExplainReply):
         raise wire.AdmissionUnavailable("invalid explanation answer")
-    gate.warn_config_fallbacks(reply.fallbacks)
+    gate.warn_configuration_diagnostics(reply.diagnostics)
     return reply.explanation
 
 
@@ -135,7 +148,7 @@ def mine(session_id: str) -> gate.QueueRead:
     reply = _query(wire.MineRequest(session_id))
     if not isinstance(reply, wire.MineReply):
         raise wire.AdmissionUnavailable("invalid step answer")
-    gate.warn_config_fallbacks(reply.reading.fallbacks)
+    gate.warn_configuration_diagnostics(reply.reading.diagnostics)
     return reply.reading
 
 
@@ -171,16 +184,18 @@ class AcquisitionRetry:
     launch_without_wait: bool = False
     next_leave: float = float("inf")
     last_outage_line: float = float("-inf")
+    leave_interval: float = float("inf")
 
-    def start_leave_schedule(self) -> None:
+    def start_leave_schedule(self, interval: float) -> None:
+        self.leave_interval = interval
         if self.next_leave == float("inf") and (
                 os.environ.get("LINT_QUEUE_LEAVE_HOOK") or os.environ.get("BUILDLOG_MAC_IDLE_HOOK")):
-            self.next_leave = CLOCK.monotonic() + gate.read_memory_config().running_pass_seconds
+            self.next_leave = CLOCK.monotonic() + self.leave_interval
 
     def left_queue(self) -> bool:
         if CLOCK.monotonic() < self.next_leave:
             return False
-        self.next_leave = CLOCK.monotonic() + gate.read_memory_config().running_pass_seconds
+        self.next_leave = CLOCK.monotonic() + self.leave_interval
         return _leave_queue()
 
     def bound(self, seconds: float) -> float:
@@ -217,7 +232,8 @@ def _refused(reason: str, *, checker: bool = False) -> wire.Refused:
 
 def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
           refresh: Callable[[], wire.AdmitRequest | wire.LaunchRequest] | None = None,
-          *, attempt: Callable[[], None] = _no_attempt_hook, channel: EstimateConnection | None = None
+          *, attempt: Callable[[], None] = _no_attempt_hook, channel: EstimateConnection | None = None,
+          configuration: gate.MemoryConfig | wire.CleanupTiming | None = None
           ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue:
     acquisition = isinstance(request, (wire.AdmitRequest, wire.LaunchRequest, wire.BuildHistoryRequest))
     retry = _ACQUISITION_RETRY.get() if acquisition else None
@@ -228,21 +244,32 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                                  launch_without_wait=launch and limit == 0)
     token = _ACQUISITION_RETRY.set(retry)
     try:
-        return _acquire(request, on_wait, refresh, attempt=attempt, channel=channel, retry=retry)
+        resolved = configuration if configuration is not None else gate.read_memory_config(report=False)
+        request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
+        reply = _acquire(request, on_wait, refresh, attempt=attempt, channel=channel, retry=retry,
+                         configuration=resolved)
+        if not isinstance(reply, wire.Refused) and isinstance(resolved, gate.MemoryConfig):
+            gate.warn_configuration_diagnostics(resolved.diagnostics)
+        return reply
     except _QueueLeft:
         return LeftQueue()
+    except conf.Unusable as error:
+        return _refused(str(error), checker=True)
     finally:
         _ACQUISITION_RETRY.reset(token)
 
 
 def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
              refresh: Callable[[], wire.AdmitRequest | wire.LaunchRequest] | None,
-             *, attempt: Callable[[], None], channel: EstimateConnection | None, retry: AcquisitionRetry
+             *, attempt: Callable[[], None], channel: EstimateConnection | None, retry: AcquisitionRetry,
+             configuration: gate.MemoryConfig | wire.CleanupTiming
              ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue:
     first = request
+    leave_interval = (configuration.running_pass_seconds if isinstance(configuration, gate.MemoryConfig)
+                      else configuration.reconnect_seconds)
     generation_query = isinstance(first, wire.BuildHistoryRequest)
     if generation_query:
-        retry.start_leave_schedule()
+        retry.start_leave_schedule(leave_interval)
     launch = isinstance(first, wire.LaunchRequest)
     failure_limit = _whole_seconds("BUILDLOG_MEM_CHECK_RETRY_S", 60)
     had_wait = False
@@ -258,7 +285,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
             return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
         attempt()
         try:
-            timeout = gate.silence_seconds()
+            timeout = configuration.silence_seconds
             if generation_query:
                 timeout = min(timeout, QUERY_TIMEOUT_SECONDS)
             timeout = retry.bound(timeout)
@@ -270,7 +297,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                 connection.sendall(wire.encode_request(request).encode())
                 pending = active_channel.pending if active_channel is not None else bytearray()
                 while True:
-                    deadline = max(last_valid, last_silence_notice) + gate.silence_seconds()
+                    deadline = max(last_valid, last_silence_notice) + configuration.silence_seconds
                     if generation_query:
                         deadline = min(deadline, CLOCK.monotonic() + QUERY_TIMEOUT_SECONDS)
                     try:
@@ -287,8 +314,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                             raise
                         if retry.launch_without_wait:
                             return _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
-                        since = datetime.fromtimestamp(CLOCK.now() - (CLOCK.monotonic() - last_valid), user_zone()).strftime("%H:%M")
-                        print(f"admission service not answering since {since}", file=sys.stderr)
+                        _silence_notice(last_valid)
                         last_silence_notice = CLOCK.monotonic()
                         continue
                     try:
@@ -318,7 +344,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                         try:
                             if isinstance(attempt, AdmissionHoldCheck):
                                 if not attempt.admits() and isinstance(reply, wire.Admitted):
-                                    _ = release(reply.reservation, 1)
+                                    _ = release(reply.reservation, 1, reply.cleanup_timing)
                                     if not isinstance(first, wire.AdmitRequest):
                                         raise CheckerFailure("grant does not match admission request")
                                     first = replace(first, episode=uuid.uuid4().hex)
@@ -328,7 +354,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                                 attempt()
                         except BaseException:
                             if isinstance(reply, wire.Admitted):
-                                _ = release(reply.reservation, 1)
+                                _ = release(reply.reservation, 1, reply.cleanup_timing)
                             raise
                         return reply
                     if not isinstance(reply, wire.Wait):
@@ -337,11 +363,11 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                         raise CheckerFailure(reply.reason.reason)
                     if launch and retry.launch_without_wait:
                         return _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
-                    retry.start_leave_schedule()
+                    retry.start_leave_schedule(leave_interval)
                     had_wait = True
                     failed_since = None
                     last_valid = CLOCK.monotonic()
-                    gate.warn_config_fallbacks(reply.snapshot.fallbacks)
+                    gate.warn_configuration_diagnostics(reply.snapshot.diagnostics)
                     on_wait(reply)
                     if retry.left_queue():
                         return LeftQueue()
@@ -352,7 +378,8 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                             raise CheckerFailure("estimate cannot be refreshed")
                         refresh_pending = True
                         try:
-                            request = _refreshed(first, refresh, channel=EstimateConnection(connection, pending))
+                            request = replace(_refreshed(first, refresh, channel=EstimateConnection(connection, pending)),
+                                              code_version=LOADED_ADMISSION_CODE_VERSION)
                             refresh_pending = False
                         except (_QueueLeft, OSError, TransportUnavailable):
                             raise
@@ -372,7 +399,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                     return _refused(reason, checker=True)
                 if retry.left_queue():
                     return LeftQueue()
-                delay = min(gate.reconnect_seconds(), failure_limit - (CLOCK.monotonic() - failed_since))
+                delay = min(configuration.reconnect_seconds, failure_limit - (CLOCK.monotonic() - failed_since))
                 CLOCK.sleep(retry.bound(delay))
                 if retry.left_queue():
                     return LeftQueue()
@@ -382,7 +409,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                 if not refresh_pending or refresh is None or not isinstance(first, (wire.AdmitRequest, wire.LaunchRequest)):
                     break
                 try:
-                    request = _refreshed(first, refresh)
+                    request = replace(_refreshed(first, refresh), code_version=LOADED_ADMISSION_CODE_VERSION)
                     refresh_pending = False
                     break
                 except _QueueLeft:
@@ -397,11 +424,11 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                     print("admission service restarted; waiting again", file=sys.stderr)
                     restarted = True
                 continue
-            if CLOCK.monotonic() - retry.last_outage_line >= gate.outage_notice_seconds():
+            if CLOCK.monotonic() - retry.last_outage_line >= (configuration.outage_notice_seconds if isinstance(configuration, gate.MemoryConfig) else configuration.silence_seconds):
                 reason = "no socket" if isinstance(error, FileNotFoundError) else "connect refused" if isinstance(error, ConnectionRefusedError) else str(error)
                 print(f"admission service unavailable: {reason}; waiting again", file=sys.stderr)
                 retry.last_outage_line = CLOCK.monotonic()
-            CLOCK.sleep(retry.bound(gate.reconnect_seconds()))
+            CLOCK.sleep(retry.bound(configuration.reconnect_seconds))
 
 
 def admit(request: wire.AdmitRequest, on_wait: Callable[[wire.Wait], None],
@@ -415,12 +442,18 @@ def launch(request: wire.LaunchRequest, on_wait: Callable[[wire.Wait], None],
     return cast(wire.LaunchAdmitted | wire.Refused | LeftQueue, _call(request, on_wait, refresh))
 
 
-def _mutation(request: wire.ReleaseRequest | wire.WidthRequest | wire.AdmitHeadRequest | wire.PrioritySetRequest | wire.PriorityClearRequest | wire.TokenWaitRequest) -> wire.Ok | wire.Refused:
-    return cast(wire.Ok | wire.Refused, _call(request, lambda _wait: None))
+def _silence_notice(last_valid: float) -> None:
+    since = datetime.fromtimestamp(CLOCK.now() - (CLOCK.monotonic() - last_valid), user_zone()).strftime("%H:%M")
+    print(f"admission service not answering since {since}", file=sys.stderr)
 
 
-def release(reservation: str, status: int) -> wire.Ok | wire.Refused:
-    return _mutation(wire.ReleaseRequest(uuid.uuid4().hex, reservation, status))
+def _mutation(request: wire.ReleaseRequest | wire.WidthRequest | wire.AdmitHeadRequest | wire.PrioritySetRequest | wire.PriorityClearRequest | wire.TokenWaitRequest,
+              configuration: gate.MemoryConfig | wire.CleanupTiming | None = None) -> wire.Ok | wire.Refused:
+    return cast(wire.Ok | wire.Refused, _call(request, lambda waiting: None, configuration=configuration))
+
+
+def release(reservation: str, status: int, configuration: gate.MemoryConfig | wire.CleanupTiming) -> wire.Ok | wire.Refused:
+    return _mutation(wire.ReleaseRequest(uuid.uuid4().hex, reservation, status), configuration)
 
 
 def width(reservation: str, width: int) -> wire.Ok | wire.Refused:
@@ -439,8 +472,8 @@ def priority_clear(actor: str) -> wire.Ok | wire.Refused:
     return _mutation(wire.PriorityClearRequest(uuid.uuid4().hex, actor))
 
 
-def token_wait(reservation: str) -> wire.Ok | wire.Refused:
-    return _mutation(wire.TokenWaitRequest(uuid.uuid4().hex, reservation))
+def token_wait(reservation: str, configuration: gate.MemoryConfig | wire.CleanupTiming) -> wire.Ok | wire.Refused:
+    return _mutation(wire.TokenWaitRequest(uuid.uuid4().hex, reservation), configuration)
 
 
 def wait_reasons(result: gate.AdmissionWaitSnapshot) -> tuple[str, ...]:
@@ -482,12 +515,12 @@ class WaitOutput:
         changed = (reasons != self.last_reasons or reply.snapshot.peak.bytes != self.last_need
                    or reply.position != self.last_position)
         if first:
-            self.next_notice, self.held = now + gate.read_memory_config().wait_reply_seconds, True
+            self.next_notice, self.held = now + gate.read_memory_config(report=False).wait_reply_seconds, True
             self.on_event("first")
         elif now < self.next_notice and not changed:
             return
         elif now >= self.next_notice:
-            self.next_notice = now + gate.read_memory_config().wait_reply_seconds
+            self.next_notice = now + gate.read_memory_config(report=False).wait_reply_seconds
         self.last_reasons, self.last_need = reasons, reply.snapshot.peak.bytes
         snapshot = reply.snapshot
         decision, peak = snapshot.decision, snapshot.peak
@@ -554,9 +587,11 @@ def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sid
                  episode: str, profile: gate.InferFromArgv | wire.Profile = gate.INFER_FROM_ARGV,
                  *, run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
                  ) -> wire.AdmitRequest:
+    config = gate.read_memory_config()
     estimate = gate.step_estimate(argv, cwd, profile, lambda: datetime.fromtimestamp(CLOCK.now(), UTC),
-                                  gate.store.root(), gate.memory_config().policy,
-                                  build_history_generation=build_history_generation)
+                                  gate.store.root(), config.policy, first_peak_bytes=config.program_first_peaks["cargo"],
+                                  budget=gate.resolve_admission_limits(gate.UnknownHostTotal(), config).budget,
+                                  build_history_generation=lambda: build_history_generation(config))
     width_value = gate.test_threads(argv)
     width_value = width_value or (int(os.environ["NEXTEST_TEST_THREADS"]) if os.environ.get("NEXTEST_TEST_THREADS", "").isdecimal() else None)
     width_value_typed: gate.TestWidth = (gate.RequestedTestWidth(width_value) if width_value else
@@ -576,21 +611,23 @@ def write_shell_grant(path: Path, grant: wire.Admitted | wire.LaunchAdmitted, el
     values = {"BUILDLOG_MEM_OUTCOME": "Granted", "BUILDLOG_MEM_WAIT_S": str(elapsed)}
     if isinstance(grant, wire.Admitted):
         values.update(BUILDLOG_MEM_RESERVATION=grant.reservation, BUILDLOG_MEM_MAX_PATH=grant.max_path,
-            BUILDLOG_MEM_WAVE_PATH=grant.wave_path, BUILDLOG_MEM_SAMPLING_CONTEXT=wire.encode_record(grant.sampling_context))
+            BUILDLOG_MEM_WAVE_PATH=grant.wave_path, BUILDLOG_MEM_SAMPLING_CONTEXT=wire.encode_record(grant.sampling_context),
+            BUILDLOG_MEM_CLEANUP_TIMING=wire.encode_record(grant.cleanup_timing))
     _ = path.write_text("".join(f"{key}={shlex.quote(value)}\n" for key, value in values.items()))
 
 
 def down_alert() -> int:
     from scripts.accounts import outage_alerts
+    configuration = gate.read_memory_config()
     started = CLOCK.monotonic()
     while True:
         try:
             _ = view()
             return 0
         except wire.AdmissionUnavailable:
-            if CLOCK.monotonic() - started >= gate.silence_seconds():
+            if CLOCK.monotonic() - started >= configuration.silence_seconds:
                 break
-            CLOCK.sleep(gate.reconnect_seconds())
+            CLOCK.sleep(configuration.reconnect_seconds)
     claimed = outage_alerts.claim("build-admission")
     if not isinstance(claimed, outage_alerts.AlertClaim):
         return 0
@@ -605,10 +642,22 @@ def down_alert() -> int:
     return 0
 
 
+def _saved_cleanup_timing() -> wire.CleanupTiming:
+    raw = os.environ.get("BUILDLOG_MEM_CLEANUP_TIMING")
+    if raw:
+        try:
+            timing = wire.parse_record(raw, wire.CleanupTiming)
+            if all(math.isfinite(value) and value > 0 for value in (timing.silence_seconds, timing.reconnect_seconds)):
+                return timing
+        except (ValueError, TypeError):
+            pass
+    return wire.PROTOCOL_CLEANUP_TIMING
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
-    for name in ("view", "explain", "down-alert", "priority-clear"):
+    for name in ("view", "explain", "down-alert", "priority-clear", "code-version"):
         _ = subcommands.add_parser(name)
     for name in ("admit", "launch"):
         admission = subcommands.add_parser(name)
@@ -644,6 +693,9 @@ def main(argv: list[str] | None = None) -> int:
         wait_events: bool = False
         argv: list[str] = []
     args = parser.parse_args(argv, namespace=Arguments())
+    if args.command == "code-version":
+        print(LOADED_ADMISSION_CODE_VERSION)
+        return 0
     output = WaitOutput(on_event=(lambda event: print(event, flush=True))
                         if args.wait_events else lambda _event: None)
     launch_limit = _whole_seconds("BUILDLOG_MEM_WAIT_LIMIT_S", 900)
@@ -686,7 +738,7 @@ def main(argv: list[str] | None = None) -> int:
                     write_shell_grant(args.shell_state, grant, output.elapsed_seconds())
                 except BaseException:
                     if isinstance(grant, wire.Admitted):
-                        _ = release(grant.reservation, 1)
+                        _ = release(grant.reservation, 1, grant.cleanup_timing)
                     raise
             outcome = "Granted"
             output.finished()
@@ -694,9 +746,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(wire.encode_reply(grant), end="")
             return 0
         result = (view() if args.command == "view" else explain() if args.command == "explain" else
-                  mine(args.session_id) if args.command == "mine" else release(args.reservation, args.value)
+                  mine(args.session_id) if args.command == "mine" else release(args.reservation, args.value, _saved_cleanup_timing())
                   if args.command == "release" else width(args.reservation, args.value)
-                  if args.command == "width" else token_wait(args.reservation) if args.command == "token-wait" else
+                  if args.command == "width" else token_wait(args.reservation, _saved_cleanup_timing()) if args.command == "token-wait" else
                   priority_set(args.unit, args.why, gate.require_showrunner()) if args.command == "priority-set" else
                   priority_clear(gate.require_showrunner()) if args.command == "priority-clear" else
                   admit_head(args.why, gate.require_showrunner()))

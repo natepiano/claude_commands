@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import admission_policy_fixture
+
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue import admission_client as client
 
@@ -52,7 +54,7 @@ class QueueEvidenceTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        config = self.root / "lint.conf"
+        config = self.root / "build_admission.conf"
         write_memory_config(config)
         self.directory = self.root / "buildlog/admission"
         self.directory.mkdir(parents=True)
@@ -172,7 +174,7 @@ class QueueEvidenceTests(unittest.TestCase):
                     f"some avg10={some}.00 avg60=0.00 avg300=0.00 total=0\n"
                     + f"full avg10={full}.00 avg60=0.00 avg300=0.00 total=0\n")
                 host = gate.HostMemory(20 * GIB, 60 * GIB, 100 * GIB, (100 - swap) * GIB)
-                policy = gate.DEFAULT_ADMISSION_POLICY
+                policy = admission_policy_fixture()
                 pressure = gate.read_pressure(host, policy=policy)
                 assert isinstance(pressure, gate.MemoryPressure)
                 changed = replace(policy, pressure=replace(policy.pressure,
@@ -296,13 +298,13 @@ class QueueEvidenceTests(unittest.TestCase):
     def test_test_phase_charge_explains_the_mark_need_history_width_and_margin(self) -> None:
         need = gate.TestPhaseNeed(2 * GIB, 7, 8, 12, "wider_unscaled", 1.5)
         charge = gate.TestPhaseCharge(gib(3), gib(0.4), need, NOW - 60)
-        self.assertEqual(queue_evidence.charge_text(charge, user_zone(), policy=gate.DEFAULT_ADMISSION_POLICY, step="nextest"),
+        self.assertEqual(queue_evidence.charge_text(charge, user_zone(), policy=admission_policy_fixture(), step="nextest"),
                          "tests since 21:50: peak so far 0.4 GiB, need 2.0 GiB "
                          + "(wider_unscaled, p90 of 7 runs at width 12), × 1.5")
 
     def test_expired_head_explains_refresh_even_when_all_resource_checks_pass(self) -> None:
         self.reset_running(available=60, need=1)
-        self.change_head(estimated_at=NOW - gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds)
+        self.change_head(estimated_at=NOW - admission_policy_fixture().timing.head_seconds)
         text = self.output()
         self.assertIn("the estimate expired at 21:41; the client refreshes it through the admission service", text)
         explanation = gate.explain_queue()
@@ -313,7 +315,7 @@ class QueueEvidenceTests(unittest.TestCase):
     def test_expired_head_release_advice_requires_refresh_instead_of_queue_order_or_a_start_time(self) -> None:
         self.reset_running(available=40, need=1)
         _ = self.running(800, "holder", "clippy", 1, 1, 3600)
-        expired_at = NOW - gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds
+        expired_at = NOW - admission_policy_fixture().timing.head_seconds
         self.change_head(estimated_at=expired_at)
         for recovering in (False, True):
             with self.subTest(recovering=recovering):
@@ -481,9 +483,9 @@ class QueueEvidenceTests(unittest.TestCase):
         if not isinstance(reason, gate.HeadAdmissionStatus):
             self.fail(f"expected head admission status, got {reason}")
         running = [row.measured for row in view.running]
-        head = gate.head_priority([row for _, row in ordered], view.available, 60 * GIB, running, NOW, policy=gate.DEFAULT_ADMISSION_POLICY)
+        head = gate.head_priority([row for _, row in ordered], view.available, 60 * GIB, running, NOW, policy=admission_policy_fixture())
         decision = gate.admission_walk(view.available, 60 * GIB, [row for _, row in ordered], running, head,
-                                      gate.NoPressureHold(), recovery=gate.NoRecoverySpacing(), now=NOW, policy=gate.DEFAULT_ADMISSION_POLICY)[0].decision
+                                      gate.NoPressureHold(), recovery=gate.NoRecoverySpacing(), now=NOW, policy=admission_policy_fixture())[0].decision
         self.assertEqual(reason.decision, decision)
         self.assertEqual(decision.state, "hold")
         self.assertAlmostEqual(decision.charged / GIB, 18.1, places=5)
@@ -623,14 +625,14 @@ class QueueEvidenceTests(unittest.TestCase):
     def test_gate_cap_need_and_charge_text_stay_the_same_after_head_seconds(self) -> None:
         self.reset_running(available=40, need=20)
         path = self.running(700, "gate", "merge-gate", 6, 1,
-                            int(gate.DEFAULT_ADMISSION_POLICY.timing.ramp_seconds + 1), peak=5)
+                            int(admission_policy_fixture().timing.ramp_seconds + 1), peak=5)
         row = cast(dict[str, object], json.loads(path.read_text()))
         row["queue_waiter"] = {"need_source": "cap"}
         _ = path.write_text(json.dumps(row))
         self.change_head(step="merge-gate", need_source="cap", need_runs=0,
                          need_basis=gate.need_basis_record(gate.ProgramMemoryCap("merge-gate")))
         lines: list[tuple[str, str]] = []
-        for elapsed in (0, gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds + 1):
+        for elapsed in (0, admission_policy_fixture().timing.head_seconds + 1):
             with mock.patch.object(time, "time", return_value=NOW + elapsed):
                 reading = gate.queue_read()
             assert isinstance(reading, gate.QueueRead)
@@ -647,11 +649,11 @@ class QueueEvidenceTests(unittest.TestCase):
         for step, name in (("merge-gate", "merge gate"), ("build", "release build")):
             with self.subTest(step=step):
                 text = queue_evidence.charge_text(gate.LifetimePromise(6 * GIB), user_zone(),
-                                             gate.DEFAULT_ADMISSION_POLICY, step)
+                                             admission_policy_fixture(), step)
                 self.assertEqual(text, f"{name} promise: holds until the step ends")
 
     def test_aged_cap_waiter_has_no_refresh_text_but_history_waiter_does(self) -> None:
-        expired_at = NOW - gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds - 1
+        expired_at = NOW - admission_policy_fixture().timing.head_seconds - 1
         for sizing in (gate.FixedCapSizing(6 * GIB),
                        gate.HistoryPeakSizing(6 * GIB, gate.MeasuredProgramPeak(6 * GIB, 10), expired_at)):
             with self.subTest(sizing=sizing):
@@ -678,7 +680,7 @@ class QueueEvidenceTests(unittest.TestCase):
                     self.assertIn("the client refreshes it through the admission service", text)
 
     def test_ramp_text_uses_the_explanations_policy_after_config_changes(self) -> None:
-        config = self.root / "lint.conf"
+        config = self.root / "build_admission.conf"
         write_memory_config(config, ramp_seconds="420")
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
             policy = gate.read_memory_config().policy
@@ -706,7 +708,7 @@ class QueueEvidenceTests(unittest.TestCase):
         self.assertNotIn("compiling", program)
 
     def test_old_sampler_peak_text_uses_the_kinds_hold_and_activity(self) -> None:
-        config = self.root / "lint.conf"
+        config = self.root / "build_admission.conf"
         write_memory_config(config, peak_hold_seconds="1500", **{"peak_hold_seconds.merge-gate": "180"})
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
             policy = gate.read_memory_config().policy
@@ -722,7 +724,7 @@ class QueueEvidenceTests(unittest.TestCase):
                     self.assertNotIn("25 min", text)
 
     def test_selected_page_warns_about_a_bad_config_key_once_per_process(self) -> None:
-        config = self.root / "lint.conf"
+        config = self.root / "build_admission.conf"
         write_memory_config(config)
         commit_config_fixture(config)
         write_memory_config(config, head_seconds="abc")
@@ -731,7 +733,7 @@ class QueueEvidenceTests(unittest.TestCase):
                 _ = admission.server.run_pass()
             with admission.serving(), \
                  mock.patch.object(gate, "queue_read", side_effect=client.view), \
-                 mock.patch.object(gate, "_warned_config_fallbacks", set[gate.ConfigFallback]()), \
+                 mock.patch.object(gate, "_warned_configuration_diagnostics", set[gate.ConfigurationDiagnostic]()), \
                  mock.patch("sys.argv", ["build_queue.py", "--columns", "400", "1"]), \
                  redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
                 self.assertEqual(build_queue.main(), 0)
@@ -740,11 +742,11 @@ class QueueEvidenceTests(unittest.TestCase):
                 "head_seconds='abc'"), 1)
 
     def test_lifetime_charge_text_says_the_promise_holds_until_the_step_ends(self) -> None:
-        text = queue_evidence.charge_text(gate.LifetimePromise(16 * GIB), user_zone(), policy=gate.DEFAULT_ADMISSION_POLICY, step="nextest")
+        text = queue_evidence.charge_text(gate.LifetimePromise(16 * GIB), user_zone(), policy=admission_policy_fixture(), step="nextest")
         self.assertIn("promise", text)
         self.assertIn("until the step ends", text)
         self.assertNotIn("first 2 min", text)
-        self.assertEqual(queue_evidence.charge_text(gate.RampPromise(16 * GIB), user_zone(), policy=gate.DEFAULT_ADMISSION_POLICY, step="nextest"),
+        self.assertEqual(queue_evidence.charge_text(gate.RampPromise(16 * GIB), user_zone(), policy=admission_policy_fixture(), step="nextest"),
                          "ramp promise: first 2 min after admission")
 
     def test_failed_floor_clause_uses_the_users_local_clock(self) -> None:

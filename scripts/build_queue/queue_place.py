@@ -238,6 +238,7 @@ class QueuePlace:
     status: int = 1
     program: ProgramNotStarted | StartedProgram = field(default_factory=ProgramNotStarted, init=False)
     on_started: Callable[[], None] = no_hold_wait
+    configuration: memory_admit.MemoryConfig = field(kw_only=True, repr=False)
     _samples: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def observe(self, peak_bytes: int, current_bytes: int) -> None:
@@ -249,7 +250,7 @@ class QueuePlace:
                 self.peak_bytes = peak_bytes
                 atomic_sample(self.path.with_suffix(".wave"), f"{peak_bytes} {int(now)}\n")
                 self.wave_at = now
-            elif self.peak_bytes and current_bytes >= self.peak_bytes / 2 and now - self.wave_at >= memory_admit.read_memory_config().peak_wave_seconds:
+            elif self.peak_bytes and current_bytes >= self.peak_bytes / 2 and now - self.wave_at >= self.configuration.peak_wave_seconds:
                 atomic_sample(self.path.with_suffix(".wave"), f"{self.peak_bytes} {int(now)}\n")
                 self.wave_at = now
 
@@ -289,7 +290,7 @@ class QueuePlace:
                 while not self.sidecar.read_text().strip():
                     if process.poll() is not None and not self.sidecar.read_text().strip():
                         raise QueuePlaceRefused("the program exited before it published its memory scope")
-                    time.sleep(memory_admit.read_memory_config().program_sample_seconds)
+                    time.sleep(self.configuration.program_sample_seconds)
             self.on_started()
         return process
 
@@ -315,7 +316,7 @@ class QueuePlace:
                     self.observe(reading.bytes, reading.bytes)
             except (OSError, ValueError, StopIteration):
                 pass  # A process or scope can disappear between sampling reads.
-            if stopped.wait(memory_admit.read_memory_config().program_sample_seconds):
+            if stopped.wait(self.configuration.program_sample_seconds):
                 return
 
     def finish(self, *, failed: bool = False) -> None:
@@ -325,7 +326,7 @@ class QueuePlace:
         process = program.process
         try:
             completed = process.poll()
-            config = memory_admit.read_memory_config()
+            config = self.configuration
             deadline = time.monotonic() + config.program_stop_seconds
             if isinstance(program.tracking, ScopedProgram):
                 stop_scope(Path(self.sidecar.read_text().strip()), deadline, config.program_sample_seconds)
@@ -367,7 +368,7 @@ def queue_place(program: str, repo: Path, *,
     if isinstance(sizing, ConfiguredFirstPeak):
         first = config.program_first_peaks.get(program)
         if first is None:
-            raise QueuePlaceRefused(f"no first peak for {program} in lint.conf [memory]; {conf.path('lint')}: program_first_peak_gib.{program} is missing or invalid")
+            raise QueuePlaceRefused(f"no first peak for {program} in build_admission.conf [memory]; {conf.path('build_admission')}: program_first_peak_gib.{program} is missing or invalid")
         sizing = memory_admit.HistoryPeakSizing(first, memory_admit.FirstProgramPeak(first), 0.0)
     profile: memory_admit.ProgramProfile | memory_admit.StepProfile = memory_admit.ProgramProfile(
         program, str(Path.home() / ".claude"), str(repo.resolve()), sizing)
@@ -393,7 +394,7 @@ def queue_place(program: str, repo: Path, *,
             if isinstance(grant, admission_client.LeftQueue):
                 raise QueuePlaceRefused("left the admission queue")
             output.finished()
-            place = QueuePlace(Path(grant.max_path).with_suffix(""), sidecar)
+            place = QueuePlace(Path(grant.max_path).with_suffix(""), sidecar, configuration=config)
             failed = False
             try:
                 yield place
@@ -404,7 +405,7 @@ def queue_place(program: str, repo: Path, *,
             finally:
                 with defer_cleanup_signals():
                     place.finish(failed=failed)
-                    _ = admission_client.release(grant.reservation, place.status)
+                    _ = admission_client.release(grant.reservation, place.status, place.configuration)
         finally:
             with defer_cleanup_signals():
                 for number, handler in handlers.items():

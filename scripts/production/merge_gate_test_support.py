@@ -441,8 +441,10 @@ class MergeGateFixture(unittest.TestCase):
                 peak = memory_admit.ExpectedPeak(reply.need, reply.source, waiter.get("need_runs", 0),
                     memory_admit.read_need_basis(waiter.get("need_basis")))
                 available = inputs.host.available if isinstance(inputs.host, memory_admit.HostMemory) else 0
+                policy = server.last_policy
+                assert isinstance(policy, memory_admit.AdmissionPolicy)
                 observe(memory_admit.AdmissionWaitSnapshot(outcome.decision, peak, tuple(inputs.running),
-                    available, record.repo, record.step, server.last_policy, server.last_fallbacks))
+                    available, record.repo, record.step, policy, server.last_diagnostics))
             return previous(reply)
 
         server.reply_filter = observed

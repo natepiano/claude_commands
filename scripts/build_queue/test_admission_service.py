@@ -1,6 +1,8 @@
 """In-process service decisions, persistence and owner events."""
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import admission_configuration_fixture, admission_policy_fixture
+
 from dataclasses import replace
 from datetime import datetime
 import io
@@ -15,18 +17,23 @@ import socket
 import sys
 import tempfile
 import unittest
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from unittest import mock
 
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture
 from scripts.lint import memory_admit as gate
-from scripts.lib import test_hang_guard
+if TYPE_CHECKING:
+    from scripts.lib import conf
+else:
+    import conf
+from scripts.lib import inotify, test_hang_guard
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.user_zone import user_zone
 from scripts.message.roster import UnitLabels
 from scripts.lint.build_shape import build_shape
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service
-from scripts.build_queue import queue_snapshot, queue_view
+from scripts.build_queue import admission_code, queue_snapshot, queue_view
+from scripts.build_queue.queue_fixture import write_memory_config
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, only_admitted
 
 
@@ -69,10 +76,12 @@ class ServiceTests(unittest.TestCase):
             previous = queue_snapshot.read_queue_snapshot(fixture.state_dir)
             inputs = fixture.server.last_inputs
             assert isinstance(inputs, gate.QueueInputs)
+            policy = fixture.server.last_policy
+            assert isinstance(policy, gate.AdmissionPolicy)
             with mock.patch.object(os, "replace", side_effect=OSError("snapshot unavailable")):
                 with self.assertRaises(OSError):
                     queue_snapshot.write_queue_snapshot(fixture.state_dir, replace(inputs, now=inputs.now + 1),
-                                                        fixture.server.last_policy)
+                                                        policy)
             self.assertEqual(queue_snapshot.read_queue_snapshot(fixture.state_dir), previous)
             self.assertFalse((fixture.state_dir / "queue.json.tmp").exists())
             with mock.patch.object(queue_snapshot, "write_queue_snapshot", side_effect=OSError("snapshot unavailable")):
@@ -138,7 +147,7 @@ class ServiceTests(unittest.TestCase):
                     fixture.clock.advance(10)
                     _ = fixture.server.run_pass()
                     self.assertEqual(fixture.server.override, override)
-                    # Read both live settings at readiness, rather than restore.
+                    # Keep the last read settings until another service pass.
                     fixture.configure(override_reconnect_seconds=1, reconnect_seconds=6)
                     ready_at = fixture.clock.monotonic()
                     if inherited:
@@ -157,12 +166,12 @@ class ServiceTests(unittest.TestCase):
                                 fixture.server.start()
                     else:
                         fixture.server.start()
-                    self.assertEqual(fixture.server.override_reconnect_until, service.ReconnectDeadline(ready_at + 6))
-                    self.assertEqual(fixture.server.next_pass, min(ready_at + 6,
+                    self.assertEqual(fixture.server.override_reconnect_until, service.ReconnectDeadline(ready_at + 4))
+                    self.assertEqual(fixture.server.next_pass, min(ready_at + 4,
                         ready_at + gate.read_memory_config().running_pass_seconds))
-                    fixture.clock.advance(5.9)
+                    fixture.clock.advance(3.9)
                     fixture.server.start()
-                    self.assertEqual(fixture.server.override_reconnect_until, service.ReconnectDeadline(ready_at + 6))
+                    self.assertEqual(fixture.server.override_reconnect_until, service.ReconnectDeadline(ready_at + 4))
                     fixture.server.run_once(0)
                     self.assertEqual(fixture.server.override, override)
                     fixture.clock.advance(0.1)
@@ -639,9 +648,11 @@ class ServiceTests(unittest.TestCase):
                 fixture.free(free)
                 with mock.patch.object(gate, "admission_pass", wraps=gate.admission_pass) as run:
                     result = fixture.server.run_pass()
+                assert isinstance(result, gate.PassResult)
                 self.assertEqual(run.call_count, 1)
                 inputs, limits = fixture.server.last_inputs, fixture.server.last_limits
                 policy = fixture.server.last_policy
+                assert isinstance(policy, gate.AdmissionPolicy)
                 assert isinstance(inputs, gate.QueueInputs)
                 assert isinstance(limits, gate.AdmissionLimits)
                 self.assertEqual(result, gate.admission_pass(inputs, inputs.now, limits, policy=policy))
@@ -675,6 +686,7 @@ class ServiceTests(unittest.TestCase):
             _ = fixture.server.handle_request(request)
             inputs, limits = fixture.server.last_inputs, fixture.server.last_limits
             result, policy = fixture.server.last_result, fixture.server.last_policy
+            assert isinstance(policy, gate.AdmissionPolicy)
             assert isinstance(inputs, gate.QueueInputs)
             assert isinstance(limits, gate.AdmissionLimits)
             assert isinstance(result, gate.PassResult)
@@ -695,6 +707,7 @@ class ServiceTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             fixture.free(0)
             policy = fixture.server.last_policy
+            assert isinstance(policy, gate.AdmissionPolicy)
             request = fixture.request(age=policy.timing.head_seconds + 1)
             request = replace(request, profile=gate.ProgramProfile("merge-gate", "repo", "tree",
                 gate.FixedCapSizing(6 * GIB)), fresh_test=True)
@@ -720,6 +733,7 @@ class ServiceTests(unittest.TestCase):
                 self.assertTrue(any(isinstance(reply, wire.Wait) for reply in peer.replies()))
             fixture.free(60 * GIB)
             result = fixture.server.run_pass()
+            assert isinstance(result, gate.PassResult)
             expected = sorted((row for row in result.rows if isinstance(row.admission, gate.ProposedAdmission)),
                               key=lambda row: row.admission.rank if isinstance(row.admission, gate.ProposedAdmission) else -1)
             grants = [only_admitted(peer.replies()) for peer in peers]
@@ -755,16 +769,16 @@ class ServiceTests(unittest.TestCase):
 
     def test_running_and_idle_views_refresh_at_the_configured_interval(self) -> None:
         with AdmissionFixture() as fixture:
-            config = fixture.root / "lint.conf"
+            config = fixture.root / "build_admission.conf"
             _ = write_config_fixture(config, "running_pass_seconds=3\n")
             request = fixture.request()
             request = replace(request, sidecar=str(fixture.scope(request.owner)))
-            need = gate.TestPhaseNeed(2 * GIB, 5, 8, 8, "same_width")
+            need = gate.TestPhaseNeed(2 * GIB, 5, 8, 8, "same_width", margin=admission_configuration_fixture().test_phase_margin)
             with mock.patch.object(gate, "test_phase_need", return_value=need):
                 granted = only_admitted(fixture.server.handle_request(request))
                 fixture.server.resolve_estimates()
             self.assertEqual(fixture.server.reservations[request.episode].test_phase_need, need)
-            fixture.clock.advance(gate.DEFAULT_ADMISSION_POLICY.timing.ramp_seconds)
+            fixture.clock.advance(admission_policy_fixture().timing.ramp_seconds)
             row = service.reservation_row(fixture.server.reservations[request.episode])
             phase = gate.test_phase_path(row)
             assert isinstance(phase, Path)
@@ -986,7 +1000,7 @@ class ServiceTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             fixture.free(4 * GIB)
             fixture.compiler(8 * GIB)
-            request = fixture.launch(since=fixture.clock.now() - gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds - 1)
+            request = fixture.launch(since=fixture.clock.now() - admission_policy_fixture().timing.head_seconds - 1)
             replies = fixture.server.handle_request(request)
             self.assertIsInstance(replies[0], wire.Wait)
             expected = gate.decide(4 * GIB, 60 * GIB, 8 * GIB, [gate.CompilerServiceMemory(8 * GIB)])
@@ -1010,7 +1024,7 @@ class ServiceTests(unittest.TestCase):
     def test_expiry_and_refresh_keep_episode_place_and_order_fields(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
-            request = fixture.request(age=gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds - 1)
+            request = fixture.request(age=admission_policy_fixture().timing.head_seconds - 1)
             young = fixture.server.handle_request(request)[0]
             assert isinstance(young, wire.Wait)
             self.assertNotIsInstance(young.reason, gate.EstimateExpired)
@@ -1302,8 +1316,10 @@ class CutoverServiceTests(unittest.TestCase):
                 blockers.append((request, grant))
             fixture.clock.advance(1)
             fixture.free(0)
+            policy = fixture.server.last_policy
+            assert isinstance(policy, gate.AdmissionPolicy)
             head = fixture.request(need=12 * GIB,
-                since=fixture.clock.now() - fixture.server.last_policy.timing.head_seconds)
+                since=fixture.clock.now() - policy.timing.head_seconds)
             _ = fixture.server.handle_request(head)
             fixture.server.waiters[head.episode].row["priority_since"] = fixture.clock.now()
             fixture.free(60 * GIB)
@@ -1327,9 +1343,11 @@ class CutoverServiceTests(unittest.TestCase):
             first, second = blockers
             self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
                 "first-blocker", first[1].reservation, 0)), [wire.Ok()])
+            _ = fixture.server.run_pass()
             self.assertNotIn(head.episode, fixture.server.reservations)
             self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
                 "second-blocker", second[1].reservation, 0)), [wire.Ok()])
+            _ = fixture.server.run_pass()
             self.assertIn(head.episode, fixture.server.reservations)
             self.assertNotIn(head.episode, fixture.server.waiters)
             place, = [place for place in fixture.server.places.values() if place.owner == head.owner]
@@ -1375,6 +1393,7 @@ class CutoverServiceTests(unittest.TestCase):
             grant = only_admitted(fixture.server.handle_request(request))
             fixture.scoped_peak(grant, 8 * GIB)
             policy = fixture.server.last_policy
+            assert isinstance(policy, gate.AdmissionPolicy)
             fixture.clock.advance(policy.timing.ramp_seconds + 1000)
             _ = Path(grant.wave_path).write_text(f"{8 * GIB} {int(fixture.clock.now() - 200)}")
             for old, new, charged in ((180, 300, 8 * GIB), (300, 180, GIB)):
@@ -1612,7 +1631,7 @@ class CutoverServiceTests(unittest.TestCase):
         from scripts.lib.user_zone import user_zone
         from scripts.build_queue.queue_fixture import write_memory_config
         with AdmissionFixture() as fixture:
-            write_memory_config(fixture.root / "lint.conf", **{"peak_hold_seconds.merge-gate": "180"})
+            write_memory_config(fixture.root / "build_admission.conf", **{"peak_hold_seconds.merge-gate": "180"})
             request = fixture.request(step="merge-gate")
             request = replace(request, sidecar=str(fixture.scope(request.owner)),
                 profile=gate.ProgramProfile("merge-gate", "repo", "tree", gate.FixedCapSizing(6 * GIB)),
@@ -2354,17 +2373,17 @@ class CutoverServiceTests(unittest.TestCase):
                                           "same_width", config.test_phase_margin)
 
             from scripts.lint.test_memory_admit import write_memory_config
-            write_memory_config(fixture.root / "lint.conf", test_phase_margin="1.2")
+            write_memory_config(fixture.root / "build_admission.conf", test_phase_margin="1.2")
             with mock.patch.object(gate, "test_phase_need", side_effect=need):
                 grant = only_admitted(fixture.server.handle_request(fixture.request(width=gate.RequestedTestWidth(2))))
                 self.assertTrue(entered.wait(5))
                 record, = fixture.server.reservations.values()
                 self.assertIsInstance(record.test_phase_need, gate.NoTestPhaseNeed)
-                write_memory_config(fixture.root / "lint.conf", test_phase_margin="1.5")
+                write_memory_config(fixture.root / "build_admission.conf", test_phase_margin="1.5")
                 _ = fixture.server.handle_request(wire.WidthRequest("four", grant.reservation, 4))
-                write_memory_config(fixture.root / "lint.conf", test_phase_margin="1.8")
+                write_memory_config(fixture.root / "build_admission.conf", test_phase_margin="1.8")
                 _ = fixture.server.handle_request(wire.WidthRequest("two-again", grant.reservation, 2))
-                write_memory_config(fixture.root / "lint.conf", test_phase_margin="2.0")
+                write_memory_config(fixture.root / "build_admission.conf", test_phase_margin="2.0")
                 resume.set()
                 fixture.server.resolve_estimates(3)
             self.assertEqual(margins, [1.2, 1.5, 1.8])
@@ -2468,7 +2487,7 @@ class CutoverServiceTests(unittest.TestCase):
                 _ = fixture.server.run_pass()
                 evidence = fixture.server.reservations[request.episode].charge_use
                 from scripts.build_queue.queue_fixture import write_memory_config
-                write_memory_config(fixture.root / "lint.conf", test_phase_margin="2")
+                write_memory_config(fixture.root / "build_admission.conf", test_phase_margin="2")
                 inputs = fixture.server.last_inputs
                 assert isinstance(inputs, gate.QueueInputs)
                 memory, = inputs.running
@@ -2537,12 +2556,12 @@ class CutoverServiceTests(unittest.TestCase):
             request, grant, phase, need = self.phase_grant(fixture)
             persist = fixture.server.persist
             failures: list[str] = []
-            def reject_evidence(config: gate.MemoryConfig | None = None) -> None:
+            def reject_evidence() -> None:
                 record = fixture.server.reservations[request.episode]
                 if not isinstance(record.charge_use, gate.NoTestPhaseChargeUse):
                     failures.append(record.reservation_id)
                     raise OSError("evidence disk unavailable")
-                persist(config) if config is not None else persist()
+                persist()
             with mock.patch.object(fixture.server, "persist", side_effect=reject_evidence):
                 _ = fixture.server.run_pass()
             self.assertEqual(failures, [grant.reservation])
@@ -2596,6 +2615,7 @@ class CutoverServiceTests(unittest.TestCase):
                 _ = fixture.server.run_pass()
             self.assertFalse(fixture.server.reservations)
             policy = fixture.server.last_policy
+            assert isinstance(policy, gate.AdmissionPolicy)
             fixture.free(60 * GIB)
             fixture.clock.advance(1)
             _ = fixture.server.run_pass()
@@ -2626,7 +2646,9 @@ class CutoverServiceTests(unittest.TestCase):
     def test_estimate_expiry_keeps_recovery_place_and_basis_until_refresh(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
-            request = fixture.request(age=fixture.server.last_policy.timing.head_seconds - 1)
+            policy = fixture.server.last_policy
+            assert isinstance(policy, gate.AdmissionPolicy)
+            request = fixture.request(age=policy.timing.head_seconds - 1)
             _ = fixture.server.handle_request(request)
             place = dict(fixture.server.waiters[request.episode].row)
             fixture.server.recovery = gate.RecoveryStarts(fixture.clock.now() + 120, fixture.clock.now() + 30)
@@ -2685,9 +2707,9 @@ class CutoverServiceTests(unittest.TestCase):
             with mock.patch.object(gate, "git_identity", return_value=(repository, "clone")) as identity, \
                  mock.patch.object(gate, "expected_peak", return_value=peak) as history:
                 first = gate.step_estimate(argv, str(fixture.root), gate.InferFromArgv(),
-                    datetime.fromtimestamp(fixture.clock.now(), UTC), fixture.state_dir.parent, policy)
+                    datetime.fromtimestamp(fixture.clock.now(), UTC), fixture.state_dir.parent, policy, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes)
                 second = gate.step_estimate(argv, str(fixture.root), first.profile,
-                    datetime.fromtimestamp(fixture.clock.now() + 1, UTC), fixture.state_dir.parent, policy)
+                    datetime.fromtimestamp(fixture.clock.now() + 1, UTC), fixture.state_dir.parent, policy, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"], budget=admission_configuration_fixture().build_budget_bytes)
             self.assertEqual((identity.call_count, history.call_count), (1, 1))
             self.assertEqual(history.call_args.kwargs["package"], "hana")
             self.assertEqual(history.call_args.kwargs["filters"], ("native_rate",))
@@ -2809,6 +2831,7 @@ class CutoverServiceTests(unittest.TestCase):
             with mock.patch.object(fixture.proc, "processes", wraps=fixture.proc.processes) as tables:
                 result = fixture.server.run_pass()
             tables.assert_called_once_with()
+            assert isinstance(result, gate.PassResult)
             self.assertEqual((result.totals.promised, result.totals.measured), (7 * GIB // 2, 3 * GIB // 2))
             self.assertEqual({record.owner.pid for record in fixture.server.reservations.values()},
                 {fresh.owner.pid, mature.owner.pid})
@@ -3166,3 +3189,407 @@ class RunPlaceTests(unittest.TestCase):
             fixture.clock.advance(300)
             _ = fixture.server.run_pass()
             self.assertEqual(eligible_steps(settings, int(fixture.clock.now()), configuration), 1)
+
+
+class AdmissionConfigurationTests(unittest.TestCase):
+    def test_old_ledger_grants_restore_replay_and_release_without_usable_configuration(self) -> None:
+        with AdmissionFixture() as fixture:
+            old_request = fixture.request(need=4 * GIB)
+            old_grant = only_admitted(fixture.server.handle_request(old_request))
+            saved_request = fixture.request(need=4 * GIB)
+            saved_grant = only_admitted(fixture.server.handle_request(saved_request))
+            saved_grant = replace(saved_grant, cleanup_timing=wire.CleanupTiming(17, 3))
+            fixture.server.ledger[saved_request.episode] = replace(
+                fixture.server.ledger[saved_request.episode], reply=saved_grant)
+            self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest("absent", "absent", 0)), [wire.Ok()])
+            fixture.server.close()
+            record = wire.parse_record(fixture.state_text(), dict[str, object])
+            ledger = cast(dict[str, dict[str, object]], record["ledger"])
+            reply = cast(dict[str, object], ledger[old_request.episode]["reply"])
+            del reply["cleanup_timing"]
+            _ = (fixture.state_dir / "state.json").write_text(wire.encode_record(record))
+            write_memory_config(fixture.root / "build_admission.conf", head_seconds="invalid")
+            fixture.server = fixture.new_server()
+            expected = replace(old_grant, cleanup_timing=wire.PROTOCOL_CLEANUP_TIMING)
+            self.assertEqual(only_admitted(fixture.server.handle_request(old_request)), expected)
+            self.assertEqual(only_admitted(fixture.server.handle_request(saved_request)), saved_grant)
+            self.assertEqual(fixture.server.ledger["absent"].reply, wire.Ok())
+            with mock.patch.object(conf, "read", side_effect=AssertionError("release read config")):
+                for grant in (expected, saved_grant):
+                    self.assertEqual(fixture.server.handle_request(
+                        wire.ReleaseRequest(f"release-{grant.reservation}", grant.reservation, 0)), [wire.Ok()])
+            self.assertFalse(service.read_state(fixture.state_dir).reservations)
+
+    def test_watch_errors_keep_cleanup_available_and_retry_configuration_recovery(self) -> None:
+        for operation in ("is_dir", "add_watch"):
+            with self.subTest(operation=operation), AdmissionFixture() as fixture:
+                grant = only_admitted(fixture.server.handle_request(fixture.request()))
+                folder = fixture.root / "watched-config"
+                config = folder / "build_admission.conf"
+                write_memory_config(config, head_seconds="invalid")
+                with mock.patch.dict(os.environ, {"CONF_DIR": str(folder)}):
+                    fixture.restart()
+                    config.unlink()
+                    folder.rmdir()
+                    is_dir = Path.is_dir
+                    ancestors = {folder, *folder.parents}
+
+                    def inaccessible(path: Path) -> bool:
+                        if path in ancestors:
+                            raise OSError(errno.EACCES, "watch folder unavailable")
+                        return is_dir(path)
+
+                    patch = (mock.patch.object(Path, "is_dir", inaccessible) if operation == "is_dir" else
+                             mock.patch.object(inotify, "add_watch", side_effect=OSError(errno.EACCES, "watch denied")))
+                    with patch:
+                        fixture.server.run_once(0)
+                        self.assertFalse(fixture.server.stopped)
+                        self.assertEqual(fixture.server.config_watch, -1)
+                        self.assertTrue(math.isfinite(fixture.server.next_pass))
+                        self.assertEqual(fixture.connect(wire.ReleaseRequest("release", grant.reservation, 0)).replies(),
+                                         [wire.Ok()])
+                        self.assertFalse(fixture.server.reservations)
+                    write_memory_config(config)
+                    fixture.clock.advance(wire.PROTOCOL_CLEANUP_TIMING.reconnect_seconds)
+                    fixture.server.run_once(0)
+                    self.assertIsInstance(fixture.server.last_policy, gate.AdmissionPolicy)
+                    self.assertIsInstance(fixture.connect(wire.ViewRequest()).replies()[0], wire.ViewReply)
+                    request = fixture.request()
+                    self.assertEqual(only_admitted(fixture.server.handle_request(request)).need, request.profile.peak.bytes)
+
+    def test_persist_prunes_dead_and_reused_callers_but_keeps_live_callers_without_reservations(self) -> None:
+        with AdmissionFixture() as fixture:
+            dead, reused, live = (fixture.request() for _ in range(3))
+            for request in (dead, reused, live):
+                _ = fixture.finish_step(request)
+            fixture.proc.kill(dead.owner)
+            owner_start = fixture.proc.owner_start
+
+            def current_start(pid: int) -> service.LiveOwnerIdentity | service.OwnerProcessGone:
+                return service.LiveOwnerIdentity(reused.owner.start_time + "1") if pid == reused.owner.pid else owner_start(pid)
+
+            write_memory_config(fixture.root / "build_admission.conf", head_seconds="invalid")
+            _ = fixture.server.run_pass()
+            with mock.patch.object(fixture.proc, "owner_start", side_effect=current_start):
+                fixture.server.persist()
+            self.assertFalse(fixture.server.reservations)
+            self.assertEqual(service.read_state(fixture.state_dir).caller_versions,
+                             {f"{live.owner.pid}-{live.owner.start_time}": live.code_version})
+
+    def test_release_keeps_unrelated_running_evidence_and_defers_admission_until_query(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.compiler(GIB)
+            scope = fixture.root / "builds.slice/cache.scope"
+            scope.mkdir(parents=True)
+            _ = (scope / "memory.current").write_text(str(GIB))
+            _ = (scope / "cgroup.procs").write_text("")
+            first = fixture.request(need=4 * GIB)
+            grant = only_admitted(fixture.server.handle_request(first))
+            second = fixture.request(need=4 * GIB)
+            _ = only_admitted(fixture.server.handle_request(second))
+            waiting = fixture.request(need=14 * GIB)
+            self.assertIsInstance(fixture.server.handle_request(waiting)[0], wire.Wait)
+            before = fixture.server.last_inputs
+            assert isinstance(before, gate.QueueInputs)
+            other_running = tuple(step for step in before.running if step.session_id != first.identity.session_id)
+            with mock.patch.object(gate, "admission_pass", side_effect=AssertionError("release ran admission")):
+                self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest("release", grant.reservation, 0)), [wire.Ok()])
+            after = fixture.server.last_inputs
+            assert isinstance(after, gate.QueueInputs)
+            self.assertEqual(after.running, other_running)
+            self.assertEqual({row["pid"] for row in after.reservations}, {second.owner.pid})
+            self.assertNotIn(waiting.episode, fixture.server.reservations)
+            with mock.patch.object(gate, "admission_pass", wraps=gate.admission_pass) as passed:
+                self.assertIsInstance(fixture.server.handle_request(wire.ViewRequest())[0], wire.ViewReply)
+            self.assertEqual(passed.call_count, 1)
+            self.assertNotIn(waiting.episode, fixture.server.reservations)
+            fixture.server.run_once(0)
+            self.assertIn(waiting.episode, fixture.server.reservations)
+
+    def test_drain_ignores_current_socket_waiters_and_counts_older_caller_code(self) -> None:
+        scripts = Path(__file__).resolve().parents[1]
+        for relative in ("direct/verify.sh", "lint/invoke.sh", "production/merge_gate.py", "build_queue/admission_client.py"):
+            with self.subTest(script=relative), AdmissionFixture() as fixture:
+                caller = fixture.proc.spawn()
+                script = fixture.root / Path(relative).name
+                current = (scripts / relative).read_bytes()
+                _ = script.write_bytes(current)
+                _ = (fixture.proc.path / str(caller.pid) / "cmdline").write_bytes(
+                    f"python3\0{script}\0".encode())
+                request = replace(fixture.request(owner=caller), code_version=wire.admission_code_version())
+                grant = only_admitted(fixture.server.handle_request(request))
+                _ = fixture.server.handle_request(wire.ReleaseRequest("release", grant.reservation, 0))
+                for older in (False, True):
+                    with self.subTest(older=older), mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                        _ = script.write_bytes(current + b"\n# older caller snapshot\n" if older else current)
+                        status = service.drain_check(fixture.state_dir, service=True,
+                                                     include_gate_callers=True, proc=fixture.proc)
+                    self.assertEqual(status, 1 if older else 0)
+                    if older:
+                        self.assertIn(f"clients: 1: {caller.pid}", output.getvalue())
+                    else:
+                        self.assertEqual(output.getvalue(), "drained\n")
+
+    def test_drain_counts_a_caller_with_an_older_imported_admission_module(self) -> None:
+        with AdmissionFixture() as fixture:
+            scripts = fixture.root / "scripts"
+            source = Path(__file__).resolve().parents[1]
+            for relative in admission_code.ADMISSION_CODE_PATHS:
+                target = scripts / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                _ = target.write_bytes((source / relative).read_bytes())
+            caller = fixture.proc.spawn()
+            script = scripts / "direct/verify.sh"
+            _ = (fixture.proc.path / str(caller.pid) / "cmdline").write_bytes(
+                f"bash\0{script}\0".encode())
+            loaded_version = wire.admission_code_version(scripts)
+            request = replace(fixture.request(owner=caller), code_version=loaded_version)
+            grant = only_admitted(fixture.server.handle_request(request))
+            _ = fixture.server.handle_request(wire.ReleaseRequest("release", grant.reservation, 0))
+            with mock.patch.object(service, "__file__", str(scripts / "build_queue/admission_service.py")):
+                with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                    self.assertEqual(service.drain_check(fixture.state_dir, service=True,
+                        include_gate_callers=True, proc=fixture.proc), 0)
+                self.assertEqual(output.getvalue(), "drained\n")
+                imported = scripts / "lint/memory_admit.py"
+                _ = imported.write_bytes(imported.read_bytes() + b"\n# Changed admission code.\n")
+                with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                    self.assertEqual(service.drain_check(fixture.state_dir, service=True,
+                        include_gate_callers=True, proc=fixture.proc), 1)
+                self.assertIn(f"clients: 1: {caller.pid}", output.getvalue())
+
+    def test_drain_counts_a_caller_without_a_recorded_admission_version(self) -> None:
+        with AdmissionFixture() as fixture:
+            caller = fixture.proc.spawn()
+            script = Path(__file__).resolve().parents[1] / "direct/verify.sh"
+            _ = (fixture.proc.path / str(caller.pid) / "cmdline").write_bytes(
+                f"bash\0{script}\0".encode())
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                self.assertEqual(service.drain_check(fixture.state_dir, service=True,
+                    include_gate_callers=True, proc=fixture.proc), 1)
+            self.assertIn(f"clients: 1: {caller.pid}", output.getvalue())
+
+    def test_unusable_configuration_bounds_requests_and_keeps_the_last_usable_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "build_admission.conf"
+            write_memory_config(config, request_max_bytes="invalid")
+            with AdmissionFixture(root=root) as fixture:
+                oversized = fixture.connect("x" * (wire.CLEANUP_REQUEST_MAX_BYTES + 1))
+                refused, = oversized.replies()
+                self.assertIsInstance(refused, wire.Refused)
+                self.assertIn(str(config), wire.encode_reply(refused))
+                self.assertIn("request_max_bytes", wire.encode_reply(refused))
+                self.assertFalse(fixture.server.reservations)
+                maximum_cleanup = wire.ReleaseRequest("\0" * wire.CLEANUP_STRING_MAX,
+                    "\0" * wire.CLEANUP_STRING_MAX, wire.CLEANUP_STATUS_MIN,
+                    code_version="\0" * wire.CLEANUP_STRING_MAX)
+                self.assertEqual(fixture.connect(maximum_cleanup).replies(), [wire.Ok()])
+                write_memory_config(config, request_max_bytes="512")
+                fixture.server.run_once(0)
+                request = fixture.request()
+                grant = only_admitted(fixture.server.handle_request(request))
+                write_memory_config(config, request_max_bytes="invalid")
+                fixture.server.run_once(0)
+                large = replace(request, argv=("cargo", "x" * 1024))
+                refused, = fixture.connect(large).replies()
+                self.assertIsInstance(refused, wire.Refused)
+                self.assertIn("exceeds", wire.encode_reply(refused))
+                cleanup = wire.ReleaseRequest("r" * wire.CLEANUP_STRING_MAX, grant.reservation, 0)
+                self.assertGreater(len(wire.encode_request(cleanup).encode()), 512)
+                self.assertEqual(fixture.connect(cleanup).replies(), [wire.Ok()])
+                self.assertFalse(fixture.server.reservations)
+
+    def test_missing_config_folder_rearms_its_watch_before_the_file_arrives(self) -> None:
+        with AdmissionFixture() as fixture:
+            folder = fixture.root / "new-config"
+            config = folder / "build_admission.conf"
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(folder)}):
+                fixture.restart()
+                request = fixture.request()
+                refused, = fixture.server.handle_request(request)
+                self.assertIsInstance(refused, wire.Refused)
+                self.assertIn(str(config), wire.encode_reply(refused))
+                folder.mkdir()
+                fixture.server.run_once(0)
+                self.assertFalse(fixture.server.reservations)
+                write_memory_config(config)
+                fixture.server.run_once(0)
+                view, = fixture.server.handle_request(wire.ViewRequest())
+                self.assertIsInstance(view, wire.ViewReply)
+                grant = only_admitted(fixture.server.handle_request(request))
+                self.assertEqual(grant.need, request.profile.peak.bytes)
+                self.assertEqual(len(fixture.server.reservations), 1)
+
+    def test_config_permission_repair_recovers_without_an_inode_or_mtime_change(self) -> None:
+        with AdmissionFixture() as fixture:
+            config = fixture.root / "build_admission.conf"
+            before = config.stat()
+            config.chmod(0)
+            try:
+                fixture.server.run_once(0)
+                request = fixture.request()
+                refused, = fixture.server.handle_request(request)
+                self.assertIsInstance(refused, wire.Refused)
+                self.assertIn(str(config), wire.encode_reply(refused))
+                self.assertFalse(fixture.server.reservations)
+            finally:
+                config.chmod(stat.S_IMODE(before.st_mode))
+            self.assertEqual((config.stat().st_ino, config.stat().st_mtime_ns),
+                             (before.st_ino, before.st_mtime_ns))
+            fixture.server.run_once(0)
+            view, = fixture.server.handle_request(wire.ViewRequest())
+            self.assertIsInstance(view, wire.ViewReply)
+            grant = only_admitted(fixture.server.handle_request(request))
+            self.assertEqual(grant.need, request.profile.peak.bytes)
+            self.assertEqual(len(fixture.server.reservations), 1)
+
+    def test_one_config_read_supplies_a_complete_service_pass(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            _ = fixture.server.handle_request(fixture.request())
+            with mock.patch.object(conf, "read", wraps=conf.read) as reader:
+                _ = fixture.server.run_pass()
+            reader.assert_called_once_with("build_admission")
+
+    def test_unusable_config_restart_replays_one_existing_reservation(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            grant = only_admitted(fixture.server.handle_request(request))
+            write_memory_config(fixture.root / "build_admission.conf", head_seconds="invalid")
+            _ = fixture.server.run_pass()
+            fixture.restart()
+            for attempt in range(2):
+                with self.subTest(attempt=attempt):
+                    self.assertEqual(only_admitted(fixture.server.handle_request(request)), grant)
+                    self.assertEqual(set(fixture.server.reservations), {request.episode})
+                    record = fixture.server.reservations[request.episode]
+                    self.assertEqual(record.owner, request.owner)
+                    self.assertEqual(record.queue_waiter["since"], request.since)
+            fixture.end_owner(request.owner)
+            self.assertFalse(fixture.server.reservations)
+            self.assertFalse(service.read_state(fixture.state_dir).reservations)
+
+    def test_unusable_startup_serves_refusal_and_recovers_on_the_next_pass(self) -> None:
+        for bad in (None, "invalid"):
+            with self.subTest(value=bad), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config = root / "build_admission.conf"
+                write_memory_config(config, head_seconds=bad)
+                with AdmissionFixture(root=root) as fixture:
+                    self.assertTrue(fixture.socket_path.is_socket())
+                    request = fixture.request()
+                    replies = fixture.server.handle_request(request)
+                    self.assertFalse(any(isinstance(reply, wire.Admitted) for reply in replies))
+                    self.assertFalse(fixture.server.reservations)
+                    reply, = fixture.server.handle_request(wire.ViewRequest())
+                    encoded = wire.encode_reply(reply)
+                    self.assertIn(str(config), encoded)
+                    self.assertIn("head_seconds", encoded)
+                    self.assertEqual(wire.parse_reply(encoded), reply)
+                    socket_reply, = fixture.connect(wire.ViewRequest()).replies()
+                    self.assertEqual(socket_reply, reply)
+                    self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest("absent", "absent", 0)), [wire.Ok()])
+                    write_memory_config(config, head_seconds="600")
+                    _ = fixture.server.run_pass()
+                    granted = only_admitted(fixture.server.handle_request(request))
+                    self.assertEqual(granted.need, request.profile.peak.bytes)
+                    self.assertEqual(len(fixture.server.reservations), 1)
+
+    def test_bad_live_key_stops_grants_and_repair_keeps_the_waiter_identity(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            request = fixture.request()
+            _ = fixture.server.handle_request(request)
+            place, = service.read_state(fixture.state_dir).places.values()
+            config = fixture.root / "build_admission.conf"
+            write_memory_config(config, build_budget_gib="invalid")
+            fixture.free(60 * GIB)
+            _ = fixture.server.run_pass()
+            self.assertFalse(fixture.server.reservations)
+            saved_place, = service.read_state(fixture.state_dir).places.values()
+            self.assertEqual(saved_place, place)
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            self.assertIn("build_budget_gib", wire.encode_reply(reply))
+            write_memory_config(config, build_budget_gib="9")
+            os.environ["BUILDLOG_BUILD_BUDGET_GIB"] = ""
+            _ = fixture.server.run_pass()
+            granted = only_admitted(fixture.server.handle_request(request))
+            self.assertEqual(granted.need, request.profile.peak.bytes)
+            self.assertEqual(fixture.server.reservations[request.episode].owner, request.owner)
+            self.assertEqual(fixture.server.reservations[request.episode].queue_waiter["since"], request.since)
+            limits = fixture.server.last_limits
+            assert isinstance(limits, gate.AdmissionLimits)
+            self.assertEqual(limits.budget, 9 * GIB)
+
+    def test_committed_recovery_warns_once_and_grants_with_the_recovered_value(self) -> None:
+        with AdmissionFixture() as fixture:
+            config = fixture.root / "build_admission.conf"
+            write_memory_config(config, head_seconds="321")
+            commit_config_fixture(config)
+            write_memory_config(config, head_seconds="invalid")
+            request = fixture.request()
+            with mock.patch.object(gate, "_warned_configuration_diagnostics", set[gate.ConfigurationDiagnostic]()), \
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as errors:
+                granted = only_admitted(fixture.server.handle_request(request))
+                _ = fixture.server.run_pass()
+            policy = fixture.server.last_policy
+            assert isinstance(policy, gate.AdmissionPolicy)
+            self.assertEqual(policy.timing.head_seconds, 321)
+            self.assertEqual(granted.need, request.profile.peak.bytes)
+            self.assertEqual(errors.getvalue(), "")
+            diagnostic, = fixture.server.last_diagnostics
+            self.assertIn(str(config), diagnostic.diagnostic)
+            self.assertIn("head_seconds='invalid'", diagnostic.diagnostic)
+
+    def test_release_finishes_history_and_persists_without_configuration(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            request = replace(request, sidecar=str(fixture.scope(request.owner)))
+            granted = only_admitted(fixture.server.handle_request(request))
+            fixture.scoped_peak(granted, 7 * GIB)
+            write_memory_config(fixture.root / "build_admission.conf", replay_retention_seconds="invalid")
+            with mock.patch.object(conf, "read", side_effect=AssertionError("release read config")):
+                self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest("release-bad-config", granted.reservation, 137)), [wire.Ok()])
+                fixture.server.persist()
+            self.assertNotIn(request.episode, fixture.server.reservations)
+            self.assertFalse(service.read_state(fixture.state_dir).reservations)
+            row, = fixture.history()
+            self.assertEqual(row["anon_peak_bytes"], 7 * GIB)
+            self.assertEqual(row["status"], 137)
+
+    def test_restart_and_run_exit_preserve_step_arrivals_during_config_refusal(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            first = fixture.request(run=run)
+            _ = fixture.finish_step(first, end_owner=True)
+            fixture.free(0)
+            fixture.clock.advance(1)
+            peer = fixture.request()
+            _ = fixture.server.handle_request(peer)
+            fixture.clock.advance(1)
+            child = fixture.request(run=run)
+            _ = fixture.server.handle_request(child)
+            config = fixture.root / "build_admission.conf"
+            self.assertEqual(fixture.queue_pids(), [child.owner.pid, peer.owner.pid])
+            saved = service.read_state(fixture.state_dir)
+            write_memory_config(config, head_seconds="invalid")
+            fixture.restart()
+            restored = service.read_state(fixture.state_dir)
+            self.assertEqual(restored.places, saved.places)
+            self.assertEqual(restored.run_places, saved.run_places)
+            _ = fixture.server.handle_request(child)
+            _ = fixture.server.handle_request(peer)
+            self.assertEqual(fixture.server.waiters[child.episode].row["since"], child.since)
+            self.assertEqual(fixture.server.waiters[peer.episode].row["since"], peer.since)
+            fixture.end_run(run)
+            self.assertFalse(service.read_state(fixture.state_dir).run_places)
+            write_memory_config(config)
+            _ = fixture.server.run_pass()
+            self.assertEqual(fixture.queue_pids(), [peer.owner.pid, child.owner.pid])
+            fixture.free(60 * GIB)
+            _ = fixture.server.run_pass()
+            granted = only_admitted(fixture.server.handle_request(child))
+            fixture.restart()
+            self.assertEqual(only_admitted(fixture.server.handle_request(child)), granted)
+            self.assertEqual(len([record for record in fixture.server.reservations.values() if record.owner == child.owner]), 1)

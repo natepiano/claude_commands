@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import admission_policy_fixture
+
 from dataclasses import replace
 from datetime import UTC, datetime
 import json
@@ -518,7 +520,7 @@ class HeadFactsTests(AdmissionLogTests):
         self.assertEqual(head_facts.bump_text(facts, ZONE, short=True), "bumps: unknown")
 
     def test_no_waiter_does_not_open_the_bump_log(self) -> None:
-        reading = queue_read_fixture(gate.QueueView((), (), 30 * gate.GIB, 0, 3 * gate.GIB, NOW), policy=gate.DEFAULT_ADMISSION_POLICY)
+        reading = queue_read_fixture(gate.QueueView((), (), 30 * gate.GIB, 0, 3 * gate.GIB, NOW), policy=admission_policy_fixture())
         with mock.patch.object(store, "host_file", side_effect=AssertionError("nothing waits")):
             self.assertEqual(head_facts.read_head_facts(reading), gate.NoWaiter())
 

@@ -12,6 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.build_queue import queue_place
+from scripts.lint.memory_test_support import admission_configuration_fixture
 
 
 @final
@@ -37,7 +38,8 @@ class UnqueuedStylePlace:
         if self.real_startup:
             sidecar = Path(self.storage.name) / "program.cgroup"
             _ = sidecar.write_text("")
-            place = queue_place.QueuePlace(Path(self.storage.name) / "private.reservation", sidecar)
+            place = queue_place.QueuePlace(Path(self.storage.name) / "private.reservation", sidecar,
+                                           configuration=admission_configuration_fixture())
             self.startups.append(place)
             def started() -> None:
                 self.before_started()

@@ -476,18 +476,22 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 **Ruled out:** A `build-why` alias; separate `head_since` state; live configuration reads for recorded evidence.
 
-### Phase 10c — The admission settings live in config/build_admission.conf, and the code keeps no copy of them  · status: todo
+### Phase 10c — The admission settings live in config/build_admission.conf, and the code keeps no copy of them  · status: done
 **Depends on:** Phase 10 (scripts/lib/conf.py reads in memory_admit.py); Phase 10b (same memory_admit.py and build_queue files)
 **Config reader (builds showrunner, 2026-11-02):** devtools Phase 4r replaces `conf.text`, `number`, `whole`, `words` and `values` with `conf.read(file) -> ConfigRead`. If 4r is on main when this phase starts, use `conf.read`.
 
 **Why.** Showrunner request, 2026-11-02 (builds): config phase 2 gets a place in this plan. The `[memory]` admission keys sit in `config/lint.conf`, and `scripts/lint/memory_admit.py` keeps copies of their values (`FALLBACK = 12 * GIB` for `program_first_peak_gib.cargo`, `FALLBACK_BUILD_BUDGET_BYTES = 21 * GIB`, `FALLBACK_TEST_PHASE_MARGIN = 1.2`, `DEFAULT_MEMORY_CONFIG`). User rule 2026-10-31: tunables live in config, read at use; no hard-coded copy. The External note in Phase 10 holds this move until now.
 
-**Work Order.**
+#### Work Order
+
+**Goal:** The admission settings live in `config/build_admission.conf`, the code keeps no copy of them, and an unusable key stops grants but never a release or cleanup.
+
+**Spec:**
 1. Move every `[memory]` key from `config/lint.conf` to `config/build_admission.conf`, with its comments. Add `program_first_peak_gib.cargo=12`. Read the file through `scripts/lib/conf.py`, the approved reader on main.
 2. Remove the value copies from `memory_admit.py`: `FALLBACK` as a config value, `FALLBACK_BUILD_BUDGET_BYTES`, `FALLBACK_TEST_PHASE_MARGIN` and the default policy values. A missing or invalid key refuses with one line that names the file and the key: the service holds the queue and says why; a client exits with its checker-failure status. No silent default.
 3. Measured constants that are not tunables stay in code with their evidence comments (`RELEASE_HEADROOM`, `ANON_SHARE`, `FILTERED_FLOOR`, `HISTORY_DAYS`).
 4. The `ConfigFallback` warning path goes with the fallbacks. The views and `explain` show a config refusal in its place.
-5. Tests read a fixture `build_admission.conf` through `CONF_DIR`; no test depends on the live file.
+5. Tests read a fixture `build_admission.conf` through `CONF_DIR`; no test depends on the live file. The fixture pins test values, so a tuning change in the live file does not change a test.
 6. Update `docs/as-built/build-memory-admission.md` and every doc that names `config/lint.conf` `[memory]`.
 
 **Constraints from the Phase 10 architect review (2026-11-03):**
@@ -502,8 +506,20 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 - Startup and recovery: `AdmissionServer.__init__` (`admission_service.py:482`) reads config before it listens, and queries need a completed pass. The service listens with unusable config, answers views and releases, grants nothing, shows the refusal in the view, and reads the config again on each pass. Tests: start with an unusable key, see the refusal and a working cleanup, repair the key, see the next pass grant.
 - Keep the Phase 10b and 11 guarantees: a run exit and a service restart while config is unusable keep the run place, the queue order, each step's arrival time, and one reservation per replay. Keep the tests that read memory pressure through the supplied policy, and the recorded-evidence tests.
 - drain-check (`admission_service.py` `drain_check`) counts each `verify.sh`, `invoke.sh` and `merge_gate.py` process by name. After a cut-over, new-code callers that wait for the socket keep it undrained for good (seen 2026-11-03). Count only callers that run admission code older than the service: compare the script a caller runs with the code the service runs. Test: a new-code caller that waits for the socket does not stop a drain.
-- First item: `/build:queue` lists no running row for a merge-gate reservation, so three admitted gates looked like 18.9 GiB taken by nothing (2026-11-03 11:21). Every live reservation shows as a running row with its owner and memory. Test: a merge-gate reservation shows as a running row.
+- First item: `/build:queue` lists no running row for a merge-gate reservation, so three admitted gates looked like 18.9 GiB taken by nothing (2026-11-03 11:21). Every live reservation shows as a running row with its owner and memory. Test: a merge-gate reservation shows as a running row. Done in fd09c7d44 (Phase 10b follow-up); keep its tests.
 - `admission_service.py` `main()` must leave argparse defaults to argparse: a namespace class attribute hides the default (hotfix 955d7949b). Keep `test_serve_without_state_dir_uses_the_buildlog_admission_folder`.
+
+**Files:**
+- `config/build_admission.conf` — every `[memory]` admission key, with comments
+- `config/lint.conf` — the `[memory]` section goes
+- `scripts/lint/memory_admit.py` — no config value copies; one `ConfigRead` per pass; usable/unusable result
+- `scripts/build_queue/admission_service.py` — listens with unusable config, grants nothing, says why; release and cleanup need no config; drain-check counts only old-code callers
+- `scripts/build_queue/admission_client.py`, `scripts/build_queue/queue_place.py`, `scripts/build_queue/queue_view.py` — config consumers and the refusal line in the view
+- `scripts/build_queue/admission_protocol.py` — `ExplainReply` carries `ConfigurationDiagnostic` diagnostics instead of `ConfigFallback`; no alias
+- `scripts/mac_test/loopback_proof.py` — reads `cargo_first_peak_bytes()` instead of the removed `FALLBACK` copy
+- `docs/as-built/build-memory-admission.md` — the settings now live in `config/build_admission.conf`; update every other doc that names the `[memory]` section too
+- `scripts/build_queue/` — tests use a fixture config through `CONF_DIR`
+- `scripts/lint/test_memory_admit.py` — tests use a fixture config through `CONF_DIR`
 
 **Workers:** `1 writer + 1 tester`
 - `impl` — `config/build_admission.conf`, `config/lint.conf`, `memory_admit.py`, the service and client consumers, `queue_place.py`, the docs; hub: `scripts/lint/memory_admit.py`
@@ -549,6 +565,29 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 - `test` — the runner-account fixtures, the authorization denial tests, the estimate-without-home test and the two-job ordering test
 
 **Acceptance.** Two hana CI jobs that cannot fit together under the admission checks run one after the other, and two that fit run at the same time, shown in `/build:queue` with the CI label; no CI rustc dies at the slice cap. Change-Review: in the Build queue pane during a hana CI run, the CI step shows as "hana CI · <runner> · <job>" and waits behind a session build when memory is short.
+
+### Phase 10e — A merge gate's grant comes from its recorded peak, not a fixed 6 GiB  · status: todo
+**Why.** Showrunner decision, 2026-11-03 (builds), after the 14:18 EST queue stall: two merge gates each held 6 GiB of the 24 GiB budget while they used 0.2 to 1.5 GiB. The Work Order follows before dispatch.
+
+**Moved here from 10c (round 6).** These items are not regressions, so 10c lands without them:
+1. F014: `_read_need_record` in `scripts/lint/memory_admit.py` keeps three identical rejection returns. Make one.
+2. F044: move the `struct` import in `admission_service.py` `_record_caller_version` to the module imports.
+
+### Phase 10f — The queue names every build folder it makes and deletes it when its work ends  · status: todo
+**Why.** The user, 2026-11-03, via the builds showrunner: "our build-queue is supposed to handle making sure we name things and delete them when they are completed". The showrunner asks first for a naming map of every build folder on every host, with the user's naming requirements and the gaps. The user approves the map; 10f builds to it. The Work Order follows the approved map.
+
+**Removal record (aws-unit ask via the builds showrunner, 2026-11-03):** each folder removal writes one record with: time, target, host, repository key, slot, folder path, bytes freed, free GiB before and after, and the reason (`floor` or `trim`). Source today: `scripts/mac_test/linux_runner.py:601-658` removes or trims a slot build folder after each step and prints only `mac_cleanup=0|1|kept` (`offload.py:765` parses it); no record names the folder or the bytes freed. aws-unit's weekly report (cold steps after a floor removal, time lost) reads this record.
+
+### Phase 10g — The queue decides where every step runs  · status: todo
+**Why.** The user, 2026-11-03: "should verify be handling this or should the build queue be handling what goes where - why is verify involved?" Showrunner ruling (builds, 2026-11-03): the queue owns placement; one owner decides where every step runs. Today `verify.sh` picks the host once at start and the queue admits memory only on natedev; at 14:04-14:17 a disk decline sent two hana tests to natedev and nothing sent them back to the free Mac.
+
+**Outline (the Work Order follows at phase start, after verify's Phase 27 hotfix lands):**
+1. A step's admission request carries its eligible hosts (natedev, the Mac, SSH slots) and each host's exclusion reason.
+2. The queue service places each step on the first host that is free for it, and decides again on every pass while the step waits (Mac free, Mac disk over the floor, slot free).
+3. `verify.sh` and the offload path run the step where the queue says; they make no host choice.
+4. `build_targets.py` eligibility, slot reserve and the spending-guard exclusion move behind the queue decision.
+5. Owners: queue-unit switches every caller; verify-unit owns `verify.sh` routing and offload today, aws-unit owns target selection; the edits are agreed with both at phase start.
+6. Runs beside 10e and 10f where the file sets are disjoint.
 
 ### Phase 11 — Every later step of one verify.sh run keeps the queue place of the run's first step  · status: done
 

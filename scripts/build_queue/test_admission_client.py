@@ -11,12 +11,18 @@ import unittest
 from unittest import mock
 
 from scripts.lint import memory_admit as gate
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from scripts.lib import conf
+else:
+    import conf
 from scripts.build_queue import admission_client as client, admission_protocol as wire
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
 from scripts.build_queue.admission_test_support import (
     AdmissionFixture, Exchange, GIB, ScriptedTransport, TimedChunk, reply_bytes,
 )
 from scripts.build_queue.queue_fixture import write_memory_config
+from scripts.lint.memory_test_support import commit_config_fixture
 
 WAIT = wait_reply(gate.NeedsMemory(), 1, "head", "free memory")
 EXPIRED = wait_reply(gate.EstimateExpired(1), 1, "head", "estimate expired")
@@ -29,6 +35,19 @@ class ClientTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(client, "CLOCK", fixture.clock))
         _ = self.enterContext(mock.patch("scripts.build_queue.admission_client.socket.socket", side_effect=transport.socket))
         return transport
+
+    def test_unusable_config_exits_with_checker_failure_and_names_the_key(self) -> None:
+        with AdmissionFixture() as fixture:
+            original = fixture.request()
+            config = fixture.root / "build_admission.conf"
+            write_memory_config(config, head_seconds="invalid")
+            with fixture.serving(), redirect_stderr(io.StringIO()) as errors:
+                status = client.main(["admit", "--pid", str(original.owner.pid), "--", "cargo", "nextest"])
+            self.assertEqual(status, 2)
+            self.assertIn(str(config), errors.getvalue())
+            self.assertIn("head_seconds", errors.getvalue())
+            self.assertEqual(len(errors.getvalue().splitlines()), 1)
+            self.assertFalse(fixture.server.reservations)
 
     def test_hold_after_grant_releases_before_waiting_and_uses_a_new_episode(self) -> None:
         with AdmissionFixture() as fixture:
@@ -86,9 +105,9 @@ class ClientTests(unittest.TestCase):
             _ = self.use_transport(fixture, Exchange(reply_bytes(GRANTED)), Exchange(reply_bytes(wire.Ok())))
             released: list[str] = []
             release = client.release
-            def observe_release(reservation: str, status: int) -> wire.Ok | wire.Refused:
+            def observe_release(reservation: str, status: int, configuration: gate.MemoryConfig | wire.CleanupTiming) -> wire.Ok | wire.Refused:
                 released.append(reservation)
-                return release(reservation, status)
+                return release(reservation, status, configuration)
             with mock.patch.object(client, "step_request", return_value=original), \
                  mock.patch.object(gate, "process_start_time", return_value=original.owner.start_time), \
                  mock.patch.object(client, "write_shell_grant", side_effect=OSError("grant disk failed")), \
@@ -141,8 +160,10 @@ class ClientTests(unittest.TestCase):
                     return gate.ExpectedPeak(12 * GIB, "fallback", 0)
                 with mock.patch.object(gate, "git_identity", return_value=(gate.UnknownRepository(), str(fixture.root))), \
                         mock.patch.object(gate, "expected_peak", side_effect=history_peak) as history:
-                    request = client.step_request(["cargo", "build"], str(fixture.root), owner.owner,
-                        owner.since, "", owner.episode, profile)
+                    with mock.patch.object(conf, "read", wraps=conf.read) as reader:
+                        request = client.step_request(["cargo", "build"], str(fixture.root), owner.owner,
+                            owner.since, "", owner.episode, profile)
+                    reader.assert_called_once_with("build_admission")
                     self.assertEqual(client.admit(request, lambda _wait: None, lambda: request), GRANTED)
                 self.assertEqual(history.call_count, 1)
                 self.assertEqual(sum(isinstance(item, wire.BuildHistoryRequest) for item in transport.requests), 1)
@@ -257,7 +278,7 @@ class ClientTests(unittest.TestCase):
     def test_split_grant_survives_a_declined_leave_hook(self) -> None:
         for kind, partial_at_deadline in (("admit", False), ("launch", False), ("admit", True), ("launch", True)):
             with self.subTest(kind=kind, partial_at_deadline=partial_at_deadline), AdmissionFixture() as fixture:
-                write_memory_config(fixture.root / "lint.conf", running_pass_seconds="5")
+                write_memory_config(fixture.root / "build_admission.conf", running_pass_seconds="5")
                 interval = gate.read_memory_config().running_pass_seconds
                 request = fixture.request() if kind == "admit" else fixture.launch()
                 grant = GRANTED if kind == "admit" else wire.LaunchAdmitted(GIB, "new-source")
@@ -293,16 +314,16 @@ class ClientTests(unittest.TestCase):
 
     def test_split_reply_survives_a_silence_timeout(self) -> None:
         mutations: dict[str, Callable[[], object]] = {
-            "release": lambda: client.release("stem", 137),
+            "release": lambda: client.release("stem", 137, gate.read_memory_config()),
             "width": lambda: client.width("stem", 3),
             "admit-head": lambda: client.admit_head("urgent", "director"),
             "priority-set": lambda: client.priority_set("unit", "urgent", "director"),
             "priority-clear": lambda: client.priority_clear("director"),
-            "token-wait": lambda: client.token_wait("stem")}
+            "token-wait": lambda: client.token_wait("stem", gate.read_memory_config())}
         for kind in ("admit", "launch", *mutations):
             with self.subTest(kind=kind), AdmissionFixture() as fixture:
-                write_memory_config(fixture.root / "lint.conf", silence_seconds="7")
-                interval = gate.silence_seconds()
+                write_memory_config(fixture.root / "build_admission.conf", silence_seconds="7")
+                interval = gate.read_memory_config().silence_seconds
                 request = fixture.request() if kind == "admit" else fixture.launch()
                 grant = GRANTED if kind == "admit" else wire.LaunchAdmitted(GIB, "new-source")
                 expected = grant if kind in ("admit", "launch") else wire.Ok()
@@ -330,10 +351,82 @@ class ClientTests(unittest.TestCase):
                 self.assertNotIn("check failed", errors.getvalue())
                 self.doCleanups()
 
+    def test_cleanup_uses_acquired_silence_after_configuration_becomes_unusable(self) -> None:
+        for kind in ("release", "token-wait"):
+            with self.subTest(kind=kind), AdmissionFixture() as fixture:
+                config = fixture.root / "build_admission.conf"
+                write_memory_config(config, silence_seconds="7")
+                acquired = gate.read_memory_config()
+                write_memory_config(config, silence_seconds="invalid")
+                encoded = reply_bytes(wire.Ok())
+                split = len(encoded) // 2
+                transport = self.use_transport(fixture,
+                    Exchange(encoded[:split], TimeoutError(), encoded[split:]))
+                with mock.patch.object(gate, "read_memory_config", side_effect=AssertionError("cleanup read config")), \
+                        redirect_stderr(io.StringIO()) as errors:
+                    result = client.release("stem", 137, acquired) if kind == "release" else client.token_wait("stem", acquired)
+                self.assertEqual(result, wire.Ok())
+                self.assertEqual(fixture.clock.monotonic(), 7)
+                self.assertEqual(len(transport.requests), 1)
+                self.assertEqual(len(transport.attempts), 1)
+                self.assertEqual(errors.getvalue().count("admission service not answering since"), 1)
+                self.assertNotIn("check failed", errors.getvalue())
+                self.doCleanups()
+
+    def test_standalone_release_succeeds_after_configuration_is_corrupted(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            grant, = fixture.server.handle_request(request)
+            assert isinstance(grant, wire.Admitted)
+            config = fixture.root / "build_admission.conf"
+            write_memory_config(config, silence_seconds="invalid")
+            with fixture.serving(), redirect_stderr(io.StringIO()) as errors, \
+                    mock.patch("sys.stdout", io.StringIO()) as output:
+                status = client.main(["release", grant.reservation, "137"])
+            self.assertEqual(status, 0)
+            self.assertEqual(errors.getvalue(), "")
+            self.assertEqual(wire.parse_record(output.getvalue(), wire.Ok), wire.Ok())
+            self.assertFalse(fixture.server.reservations)
+
+    def test_recovered_cargo_peak_warns_once_for_the_complete_step_request(self) -> None:
+        with AdmissionFixture() as fixture:
+            config = fixture.root / "build_admission.conf"
+            write_memory_config(config, **{"program_first_peak_gib.cargo": "7"})
+            commit_config_fixture(config)
+            write_memory_config(config, **{"program_first_peak_gib.cargo": "invalid"})
+            original = fixture.request()
+            repository = gate.RepositoryIdentity("github.com/team/project", "project")
+            with mock.patch.object(gate, "git_identity", return_value=(repository, "tree")), \
+                    mock.patch.object(conf, "read", wraps=conf.read) as reader, \
+                    redirect_stderr(io.StringIO()) as errors:
+                request = client.step_request(["cargo", "clippy"], str(fixture.root), original.owner,
+                                              original.since, "", original.episode)
+            reader.assert_called_once_with("build_admission")
+            self.assertEqual(request.profile.peak.bytes, 7 * GIB)
+            self.assertEqual(request.profile.peak.source, "fallback")
+            self.assertEqual(errors.getvalue().count("program_first_peak_gib.cargo='invalid'"), 1)
+            self.assertEqual(len(errors.getvalue().splitlines()), 1)
+
+    def test_recovered_key_with_an_unavailable_key_prints_only_the_refusal(self) -> None:
+        with AdmissionFixture() as fixture:
+            config = fixture.root / "build_admission.conf"
+            write_memory_config(config, head_seconds="321", **{"program_first_peak_gib.cargo": None})
+            commit_config_fixture(config)
+            write_memory_config(config, head_seconds="invalid", **{"program_first_peak_gib.cargo": "invalid"})
+            original = fixture.request()
+            with redirect_stderr(io.StringIO()) as errors:
+                status = client.main(["admit", "--pid", str(original.owner.pid), "--", "cargo", "clippy"])
+            self.assertEqual(status, 2)
+            self.assertIn(str(config), errors.getvalue())
+            self.assertIn("program_first_peak_gib.cargo='invalid'", errors.getvalue())
+            self.assertEqual(len(errors.getvalue().splitlines()), 1)
+            self.assertNotIn("warning:", errors.getvalue())
+            self.assertFalse(fixture.server.reservations)
+
     def test_split_generation_reply_survives_a_declined_leave_hook(self) -> None:
         for stage in ("initial", "refresh"):
             with self.subTest(stage=stage), AdmissionFixture() as fixture:
-                write_memory_config(fixture.root / "lint.conf", running_pass_seconds="0.25")
+                write_memory_config(fixture.root / "build_admission.conf", running_pass_seconds="0.25")
                 interval = gate.read_memory_config().running_pass_seconds
                 original = fixture.request(step="build")
                 encoded = reply_bytes(wire.BuildHistoryReply(7))
@@ -379,7 +472,7 @@ class ClientTests(unittest.TestCase):
     def test_complete_reply_retains_the_partial_next_reply(self) -> None:
         for next_reply in ("grant", "generation"):
             with self.subTest(next_reply=next_reply), AdmissionFixture() as fixture:
-                write_memory_config(fixture.root / "lint.conf", running_pass_seconds="0.25")
+                write_memory_config(fixture.root / "build_admission.conf", running_pass_seconds="0.25")
                 interval = gate.read_memory_config().running_pass_seconds
                 request = fixture.request(step="build")
                 first = WAIT if next_reply == "grant" else EXPIRED
@@ -476,9 +569,11 @@ class ClientTests(unittest.TestCase):
                 if fixture.clock.monotonic() == 3:
                     fixture.configure(reconnect_seconds=4, outage_notice_seconds=6)
             fixture.clock.on_sleep = reconfigure
-            with redirect_stderr(io.StringIO()) as output:
+            with redirect_stderr(io.StringIO()) as output, \
+                    mock.patch.object(gate, "read_memory_config", wraps=gate.read_memory_config) as reader:
                 self.assertEqual(client.admit(request, lambda _wait: None, lambda: request), GRANTED)
-            self.assertEqual(transport.attempts, [0, 3, 7, 11])
+            reader.assert_called_once_with(report=False)
+            self.assertEqual(transport.attempts, [0, 3, 6, 9])
             self.assertEqual(output.getvalue().count("admission service unavailable:"), 2)
 
     def test_silence_notice_uses_the_configured_interval(self) -> None:
@@ -491,6 +586,41 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(fixture.clock.monotonic(), 7)
             self.assertEqual(transport.timeouts, [7, 7, 7])
             self.assertEqual(output.getvalue().count("admission service not answering since"), 1)
+
+    def test_edited_transport_timing_applies_to_the_next_call(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            fixture.configure(reconnect_seconds=3, outage_notice_seconds=5)
+            transport = self.use_transport(fixture,
+                Exchange(connect_error=FileNotFoundError()), Exchange(reply_bytes(GRANTED)),
+                Exchange(connect_error=FileNotFoundError()), Exchange(reply_bytes(GRANTED)))
+            with redirect_stderr(io.StringIO()), \
+                    mock.patch.object(gate, "read_memory_config", wraps=gate.read_memory_config) as reader:
+                self.assertEqual(client.admit(request, lambda _wait: None, lambda: request), GRANTED)
+                fixture.configure(reconnect_seconds=7, outage_notice_seconds=11)
+                self.assertEqual(client.admit(request, lambda _wait: None, lambda: request), GRANTED)
+            self.assertEqual(reader.call_args_list, [mock.call(report=False), mock.call(report=False)])
+            self.assertEqual(transport.attempts, [0, 3, 3, 10])
+
+    def test_recovered_service_setting_warns_once_at_the_client_boundary(self) -> None:
+        with AdmissionFixture() as fixture:
+            config = fixture.root / "build_admission.conf"
+            write_memory_config(config, head_seconds="321")
+            commit_config_fixture(config)
+            write_memory_config(config, head_seconds="invalid")
+            request = fixture.request()
+            with fixture.serving(), mock.patch.object(gate, "_warned_configuration_diagnostics", set[gate.ConfigurationDiagnostic]()), \
+                    mock.patch.object(client, "CLOCK", fixture.clock), redirect_stderr(io.StringIO()) as errors:
+                first = client.admit(request, lambda _wait: None, lambda: request)
+                second = client.admit(request, lambda _wait: None, lambda: request)
+            self.assertIsInstance(first, wire.Admitted)
+            self.assertEqual(second, first)
+            policy = fixture.server.last_policy
+            assert isinstance(policy, gate.AdmissionPolicy)
+            self.assertEqual(policy.timing.head_seconds, 321)
+            self.assertIn(str(config), errors.getvalue())
+            self.assertIn("head_seconds='invalid'", errors.getvalue())
+            self.assertEqual(len(errors.getvalue().splitlines()), 1)
 
     def test_wait_callback_then_admission_accepts_new_source_names(self) -> None:
         with AdmissionFixture() as fixture:
@@ -680,7 +810,7 @@ class ClientTests(unittest.TestCase):
 
     def test_mutations_resend_the_same_request_id_after_transport_closes(self) -> None:
         mutations: tuple[Callable[[], object], ...] = (
-            lambda: client.release("stem", 137), lambda: client.width("stem", 3),
+            lambda: client.release("stem", 137, gate.read_memory_config()), lambda: client.width("stem", 3),
             lambda: client.admit_head("urgent", "director"))
         for mutation in mutations:
             with self.subTest(mutation=mutation), AdmissionFixture() as fixture:
