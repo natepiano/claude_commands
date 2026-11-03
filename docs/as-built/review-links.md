@@ -204,7 +204,12 @@ The short URL ends in `/changes.html`.
 The page retains the plain, narrow layout and fits a phone.
 Each row shows its kind, description once, proof, and answer controls.
 The user can select Works, Not works, Validate yourself, Send feedback, or Ask a question.
-The feedback field accepts one line, which matches the verdict command's table-cell format.
+The feedback box is a textarea with `feedback_rows` rows.
+The setting starts at 5.
+The box accepts line breaks for every outcome.
+The server converts CRLF, CR, and Unicode line separators to newline characters.
+The verdict cell joins stripped, nonblank lines with one space.
+The message and a question keep the normalized line breaks.
 Works with text saves `works: <text>`.
 Not works with text saves `not works: <text>`.
 Send feedback saves the user's text without a prefix.
@@ -223,9 +228,8 @@ The CLI keeps its current form and still moves the pinned item.
 An unknown key raises `NextError` before the queue changes.
 Rows from an earlier list use their qualified keys.
 
-**Ask a question** uses the one-line feedback field.
-The server refuses empty questions.
-It refuses every line break in the feedback field for every outcome, including trailing Unicode separators.
+**Ask a question** uses the feedback box.
+The server refuses empty questions and questions that contain only whitespace.
 It saves no verdict and runs no feature-log command.
 The server stores the question before it sends one message to the tab's showrunner.
 The message names the row, list, production, change, and question.
@@ -259,7 +263,7 @@ The request cannot select a local path, command, or recipient.
 The server never serves private manifests.
 Each form contains only row, token, outcome, and feedback.
 Each browser form names its page as the save URL.
-Unknown rows, extra fields, wrong tokens, POST queries, invalid outcomes, and multiline feedback receive 4xx.
+Unknown rows, extra fields, wrong tokens, POST queries, and invalid outcomes receive 4xx.
 Path fields, command fields, and non-ASCII tokens also receive 4xx.
 
 Older selected-row links still work with their existing plain HTML forms and 303 responses.
@@ -342,6 +346,7 @@ The page shows **Saved: <answer>**, **The showrunner will validate this**, or **
 The page shows no delivery state, attention links, or resend buttons.
 
 The server reads `config/review_links.conf` through `scripts/lib/conf.py` when delivery starts.
+Each page render reads `feedback_rows` once to set every feedback box's height.
 `delivery_tries` starts at 3; `delivery_pause_seconds` starts at 5.
 Tests use a zero pause.
 Each round sends once to every recipient that has not succeeded.
@@ -466,7 +471,7 @@ Both machines import `/etc/nixos/modules/common/review-links.nix`. It defines th
 - **Atomic per file, not per bundle.** During a refresh of several files, a reader can see one new file next to one old file.
 - **A bad index stops all publishing.** If `.index.json` is not valid JSON or is not a JSON object, every run exits 2 until someone repairs or removes the file.
 - **`REVIEW_LINKS_ROOT` in a session.** A session that sets it publishes to a folder that the service does not serve, and its links return 404. The `curl` check finds this.
-- **Code changes need a restart.** A running server keeps its imported code. Restart the service after a change to `serve.py` or `private_name` in `review_link.py`. Restart it after a change to the temporary-name shape in `atomic_file.py`. Other publisher changes take effect at the next publisher run. These changes need no rebuild.
+- **Code changes need a restart.** A running server keeps its imported code. Restart the service after changes to `serve.py`, `change_page.py`, `change_browser.py`, or `private_name` in `review_link.py`. Restart it after a change to the temporary-name shape in `atomic_file.py`. Other publisher changes take effect at the next publisher run. These changes need no rebuild.
 - **Sweep and refresh at the same moment.** The sweep takes no lock. A refresh of the folder that the sweep deletes at that moment can fail, or can print a link that returns 404. The `curl` check finds this, and a second run gets a new ID.
 
 ## Why
@@ -521,6 +526,7 @@ The scripts read `config/review_links.conf` through `scripts/lib/conf.py` when e
 `snapshot_sweep_seconds` and `tailscale_check_seconds` control the server checks.
 `snapshot_allocation_tries` limits folder allocation attempts.
 `delivery_tries` and `delivery_pause_seconds` control message attempts.
+`feedback_rows` sets the textarea height from 1 to 20 rows and starts at 5.
 `unrouted_alert_recipient` selects the alert recipient.
 `unrouted_alert_retry_seconds` controls repeated alerts.
 
