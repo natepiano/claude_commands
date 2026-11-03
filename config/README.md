@@ -159,7 +159,11 @@ Deployment settings require the account inputs before preparation.
 `deployment_profile` names the administrator profile. `credentials_profile` names the scaler profile.
 `stack_name`, `availability_zone`, `vpc_id`, and `subnet_id` select the deployment location.
 `ami_id`, `ami_owner_id`, `nixos_release`, and `root_device_name` identify the official x86_64 NixOS image.
-`notification_email` receives the Budget notices. The `budget_notice_*_percent` keys set their thresholds.
+`notification_email_file` names a private file with one address for Budget notices.
+The default path is `~/.config/aws-build/notification-email`.
+Keep this file outside the public repository. Never put the address in a tracked file.
+Only `prepare` and `apply` read the address file. `bootstrap` needs no address file.
+The `budget_notice_*_percent` keys set the notice thresholds.
 `budget_stop_percent` sets the stop threshold. The live spending guard remains the primary limit.
 `root_volume_gib` sizes the root volume.
 `data_volume_gib`, `data_volume_iops`, and `data_volume_throughput` fix the retained volume settings through their conf limits.

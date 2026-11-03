@@ -40,6 +40,7 @@ There is no separate charge timer.
 6. Select one available zone in `us-east-2` from those reads.
 7. Read the standard Spot vCPU quota. Request an increase if it is below 16.
 8. Record the Spot price and its read time just before `deploy.py prepare`. Deployment refuses a price older than `price_max_age_seconds`.
+   Confirm that `notification_email_file` names an existing private file before `deploy.py prepare`.
 9. Confirm that the fixed components sum to `fixed_usd_per_month`.
 10. Confirm that `limit_reserve_usd` covers the configured drain and idle intervals.
 
@@ -103,7 +104,14 @@ Record the image's root device name.
 Do not substitute an unverified third-party image.
 
 1. Fill `region`, `availability_zone`, `ami_id`, `ami_owner_id`, and `nixos_release`.
-2. Fill `vpc_id`, `subnet_id`, `notification_email`, and the deployment profile.
+2. Fill `vpc_id`, `subnet_id`, and the deployment profile.
+   Write the Budget address to its private file at your terminal:
+
+   ```sh
+   (umask 077; mkdir -p ~/.config/aws-build; printf '%s\n' '<address>' > ~/.config/aws-build/notification-email)
+   ```
+
+   Keep the address outside the public repository. Never put it in a tracked file, commit, message, or test fixture.
 3. Confirm public HTTPS egress and a usable route for SSM and public packages.
 4. Permit inbound UDP 41641 for Tailscale transport.
 5. Permit no inbound TCP ports.
