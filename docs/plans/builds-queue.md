@@ -417,134 +417,30 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 - A shadow run beside the old checker (user, 2026-10-31): one cut-over, no second admitter.
 
 ### Phase 10a — One function names every /tmp and /dev/shm build folder  · status: done
-**Depends on:** Phase 10 (the queue service names the admission and build folders)
 
-Asked by the builds showrunner on 2026-11-02, after the Phase 10 checkpoint. Spec at phase start: list every place that makes a build folder under `/tmp` or `/dev/shm`, name the one function that makes the name, and move each maker to it. No code before the Phase 10 checkpoint.
+#### As-built
 
-Inventory and Work Order: Phase 10 architect review, 2026-11-03.
-
-#### Work Order
-
-**Goal:** One function names temporary build folders under `/tmp`, `/dev/shm`, or an inherited temporary parent. Existing helpers retain their ownership and cleanup rules.
-
-**Spec:**
-
-1. Add `scripts/lib/build_folders.py::create_build_folder` as the common entry point.
-2. Provide a CLI for shell callers of this function.
-3. Use named request variants for unique temporary folders and stable owner folders.
-4. Preserve explicit parents, existing prefixes, permissions, and cleanup lifetimes.
-5. Keep folder creation atomic.
-6. Delegate registered task folders to `scripts.lib.scratch.new()`.
-7. Retain `scratch.target()` as the task naming rule.
-8. Obtain scratch roots from `copy_record.root()` and `copy_record.copies_root()`.
-9. Obtain unit run roots from `unit_runs.run_roots()`.
-10. Replace the separate sweep-state default in `memory_admit.py` with `tmp_sweep.state_dir()`.
-11. Preserve the existing sweep classification of each folder.
-12. Update cleanup readers only where the common function changes their inputs.
-
-**Inventory and Files:**
-
-Paths below are relative to the repository. “Not named” means the supplied ownership documents assign no owner.
-
-| Maker or helper | Existing names or purpose | Required change | Owner |
-|---|---|---|---|
-| `scripts/production/merge_gate.py` | `merge-gate-*`, module folders, `promotion-index-*`, `merge-gate-nightly-*` | Use the common function, including the explicit `/dev/shm` parent. | natedev showrunner |
-| `scripts/production/fast_track.py` | Check, promotion, checkout, and temporary index folders | Use the common function. | Not named |
-| `scripts/production/waiting.py` | `production-scratch-*` test checkout | Use the common function. | Not named |
-| `scripts/production/bump_gate.py` | `bump-gate-*` checkout beneath the record parent | Preserve the explicit parent. | Not named |
-| `scripts/production/ci_points.py` | `ci-point-*` validation checkout beneath the state directory | Preserve the explicit parent. | Not named |
-| `scripts/style/bulk_run.py` | `bulk-rule-test-*` checkout | Use the common function. | Not named |
-| `scripts/style/style_sync.py` | `style-sync-lint-*` checkout and control files | Preserve owner records and interrupted-run cleanup. | Not named |
-| `scripts/buildlog/rust_release.py` | `rust-release-trial-<version>` beneath `default_trial_parent()` | Preserve replacement and retry behavior. | report-unit |
-| `scripts/direct/verify.sh` | Run `tmp/`, `verify-tree.*`, `verify-doc-*`, `verify-copy.*`, `verify-hold.*` | Use the common function through its CLI. | verify-unit |
-| `scripts/lint/invoke.sh` | Creates inherited `TMPDIR`; names the `lint-sweep` stamp directory | Use the common naming rule where it creates these folders. | verify-unit |
-| `scripts/direct/prepare_session.sh` | `/tmp/claude/unit/<uuid>` | Use the existing unit-root authority through the common entry point. | Not named |
-| `scripts/direct/implement.sh` | Session `tmp/` | Use the common function through its CLI. | Not named |
-| `scripts/agents/codex_mesh.py::_set_run` | Run `tmp/` | Preserve the exported `TMPDIR` and ownership. | Not named |
-| `scripts/hooks/session-start-temp-root.py` | `/tmp/claude/session/<session>` | Preserve stable names, permissions, and short socket paths. | resources-unit |
-| `scripts/lib/scratch.py` | Registered task folders | Retain registration and task lifetime rules. | resources-unit |
-| `scripts/lib/copy_record.py` | Scratch and copy roots | Retain the existing root readers. | Not named |
-| `scripts/lib/unit_runs.py` | Current and former unit roots | Retain current and former root handling. | Not named |
-| `scripts/build_queue/queue_place.py` | `queue-place-*` sidecar parent | Preserve the folder until program cleanup and release finish. | queue-unit |
-| `scripts/build_queue/admission_test_support.py` | `admit-test-*`, short `/tmp/admit-sock-*` parent | Preserve private state and socket isolation. | queue-unit |
-| `scripts/mac_test/copy_watch.py` | `copy-watch.*` control folder | Use the common function. | verify-unit |
-| `scripts/mac_test/linux_runner.py` | Staging folders beneath cache and mirror parents | Preserve explicit parents, including temporary fixture parents. | verify-unit |
-| `scripts/lint/style_review.py` | Review folders beneath a phase directory | Preserve the phase parent and ownership records. | Not named |
-| `scripts/hooks/pre-tool-use-checkpoint-doc-gate.py` | `checkpoint-doc-*`, `checkpoint-paths-*` | Use the common function for these build-check folders. | verify-unit |
-| `scripts/lint/memory_admit.py` | Separate `LINT_SWEEP_STATE_DIR` default | Call `scripts.lint.tmp_sweep.state_dir()`. | queue-unit |
-
-The scan also finds temporary folders for screenshots, messages, configuration validation, installation, and proposal text. These folders do not contain builds.
-
-`smoke_launch.sh` creates application configuration after the build finishes. Its temporary folder is an application launch folder.
-
-`demo_refusals.sh` creates a director demonstration fixture. It does not create a build workspace.
-
-Ordinary test roots remain private `tempfile` roots. Shared fixtures that name build or admission folders use the common function.
+- `scripts.lib.build_folders.create_build_folder(request: BuildFolderRequest) -> Path` accepts `UniqueBuildFolder(prefix, parent)` or `StableOwnerFolder(name, parent, mode)`. Unique allocation is atomic with mode `0700`. Stable allocation preserves existing contents and permissions.
+- `InheritedTemporaryParent` reads `TMPDIR` at allocation. `ExplicitBuildParent` preserves the supplied parent. `SystemTemporaryParent` selects `/tmp`. `UnitRunParent` uses `unit_runs.run_roots()`. The merge gate requires `/dev/shm` without a disk fallback.
+- `FOLDER_PREFIXES` defines build names. `MKDTEMP_SUFFIX_PATTERN` defines eight-character allocator suffixes. `temporary_build_folder(request: UniqueBuildFolder) -> Generator[Path]` uses standard-library cleanup and permission repair. Callers retain ownership records and cleanup order.
+- The CLI prints one path. Forms are `unique --kind KIND [--owner TEXT] [--parent PATH | --system-temp]` and `unique --prefix TEXT [--parent PATH | --system-temp]`. Stable forms are `stable --name NAME (--parent PATH | --unit-root)`, `stable --path PATH`, and `stable --run-temp RUN`. `run-temp-path RUN` only names the path.
+- `scratch.new()` and `scratch.target()` retain registration and task naming. `copy_record.root()` and `copy_record.copies_root()` retain root authority. `unit_runs.RUN_TEMP_NAME` names run temporary folders. `unit_runs.activate()` maintains current and former markers.
+- `memory_admit.is_fresh_test()` reads `tmp_sweep.state_dir()` at use. `tmp_sweep.TARGET_DELETES_NAME` names the shared deletion record. Private sweep roots select private copies folders. Admission state and snapshots remain outside temporary build folders.
 
 **Files:**
 
-- `scripts/lib/build_folders.py` — new: `create_build_folder` and its CLI
-- `scripts/lib/test_build_folders.py` — new: the helper tests
-- `scripts/production/merge_gate.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/production/fast_track.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/production/waiting.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/production/bump_gate.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/production/ci_points.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/style/bulk_run.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/style/style_sync.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/buildlog/rust_release.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/direct/verify.sh` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/lint/invoke.sh` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/direct/prepare_session.sh` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/direct/implement.sh` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/agents/codex_mesh.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/hooks/session-start-temp-root.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/build_queue/queue_place.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/build_queue/admission_test_support.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/mac_test/copy_watch.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/mac_test/linux_runner.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/lint/style_review.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/hooks/pre-tool-use-checkpoint-doc-gate.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/lint/memory_admit.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/lint/test_memory_admit.py` — the shared sweep-state reader
-- `scripts/lint/test_tmp_sweep.py`, `scripts/lib/test_folder_audit.py`, `scripts/lib/test_scratch.py` — preserved cleanup classifications
-- `docs/as-built/build-memory-admission.md` — the folder naming rule
-  The tests beside each changed maker change with it. The notice records each cross-owner change.
+- `scripts/lib/build_folders.py`, `scripts/lib/unit_runs.py`, `scripts/lib/socket_test_support.py` — naming, run paths, markers, and short socket parents.
+- `scripts/production/{merge_gate,fast_track,waiting,bump_gate,ci_points}.py`, `scripts/style/{bulk_run,style_sync}.py` — temporary checkout and index callers.
+- `scripts/buildlog/rust_release.py` — shared trial prefix and inherited parent; Git creates the clone.
+- `scripts/direct/{verify,prepare_session,implement}.sh`, `scripts/lint/invoke.sh`, `scripts/agents/codex_mesh.py` — CLI allocations and run temporary folders.
+- `scripts/hooks/{session-start-temp-root,pre-tool-use-checkpoint-doc-gate}.py` — stable session roots and temporary checkpoint folders.
+- `scripts/build_queue/{queue_place,admission_test_support}.py`, `scripts/mac_test/{copy_watch,linux_runner}.py`, `scripts/lint/style_review.py` — sidecar, admission, staging, and review folders.
+- `scripts/lint/{tmp_sweep,sweep,folder_audit,memory_admit}.py` — shared names, ownership classification, and sweep-state reads.
+- `docs/as-built/build-memory-admission.md`, `scripts/lib/test_build_folders.py`, and adjacent tests — naming reference and cleanup coverage.
 
-**Workers:** `1 writer + 1 tester`
+**Gotchas:** `verify.sh` prepares a missing `TMPDIR` through `invoke.sh --prepare-temp` before environment loading. Script-copy fixtures require adjacent dependencies. `test_verify_nix_shell`, `test_verify_ssh_targets`, and `test_verify_step_owner` cover these dependencies. Sweeps also accept six-character shell suffixes until 2026-12-03. The SSH promotion check uses self-contained `tempfile.TemporaryDirectory(prefix="promotion-index-")` before the Mac fetch. The assertion guard can associate a decorator with the preceding test.
 
-- `impl` — The common function, its CLI, production callers, and documentation. Hub: `scripts/lib/build_folders.py`.
-- `test` — The new helper tests, shared fixtures, cleanup regressions, and affected caller tests.
-
-**State:** Existing scratch records, owner records, and unit markers keep their formats. The phase creates no second registry.
-
-**Constraints from prior phases:**
-
-1. Keep durable admission state outside temporary build folders.
-2. Preserve `admission/state.json` and the service-owned `admission/queue.json`.
-3. Preserve the short socket parent used by `AdmissionFixture`.
-4. Preserve Mac temporary-root handling.
-5. Preserve scope cleanup before queue-place release.
-6. Keep `tmp_sweep.state_dir()` as the sweep-state authority.
-7. Keep scratch task registration in `scratch.py`.
-8. Do not access the live admission service from tests.
-
-**Acceptance gate:**
-
-1. Test every inventory category through the common function.
-2. Test an inherited `TMPDIR`, an explicit parent, and `/dev/shm`.
-3. Test stable owner names and concurrent unique allocations.
-4. Test paths containing spaces.
-5. Test refusal when the required memory filesystem is unavailable.
-6. Test cleanup after normal completion and interruption.
-7. Test that live scratch ownership still prevents deletion.
-8. Test that `memory_admit.py` observes a changed `LINT_SWEEP_STATE_DIR` through `tmp_sweep.state_dir()`.
-9. Retain the admission fixture test with a long `TMPDIR`.
-10. Retain the service snapshot tests and AWS snapshot refusal test.
-11. Run affected tests and the full merge gate.
-12. Require `basedpyright` to report `0 errors, 0 warnings, 0 notes`.
-
-**Change-Review line:** build folders use one naming function | run a merge gate and a verify step with a private `TMPDIR` | their folders use the common function, and cleanup preserves live work.
+**Ruled out:** Unused `RegisteredTaskFolder`, `ScratchParent`, `CopiesParent`, `RequiredMemoryParent`, `task`, and `--mode` wrappers; their existing authorities remain separate.
 
 ### Phase 10b — The /build:queue card carries the build-why facts, and build-why goes  · status: todo
 **Depends on:** Phase 10 (the card reads the queue service); Phase 10a (same build_queue files)
