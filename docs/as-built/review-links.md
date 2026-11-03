@@ -128,7 +128,11 @@ An unrouted row retains verdict controls when its list's staff showrunner has an
 Its owner remains unrouted and receives no message.
 
 `merge_checkpoint`, `merge_gate`, and `change_review.py append` store each checkpoint unit's Producer id.
-The gate reads the staff record before the merge, so a missing record refuses the run before the push.
+`merge_gate` reads the staff record before the merge.
+`merge_checkpoint` reads the staff record before the push.
+An unreadable staff record stops either run before anything is pushed.
+`merge_checkpoint` also undoes its unpushed local merge.
+One read supplies the rows for each run.
 Each writer matches the branch to its Units row and finds the staff unit by the Worktree path.
 An exact Branch name wins over a Plan, Unit, or worktree alias.
 The staff lookup prefers present worktrees, then the latest row within each worktree state.
