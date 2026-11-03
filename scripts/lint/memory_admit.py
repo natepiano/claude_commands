@@ -2774,6 +2774,7 @@ def stored_waiter(row: Waiter) -> Waiter:
     """Keep resolved queue order in the snapshot, never in a durable row."""
     saved = row.copy()
     _ = saved.pop("priority_rank", None)
+    _ = saved.pop("order_since", None)
     return saved
 
 
@@ -2793,7 +2794,7 @@ def waiter_label(row: Waiter) -> str:
 
 
 def waiter_order(row: Waiter) -> tuple[int, float, int]:
-    return row.get("priority_rank", 1), row["since"], row["pid"]
+    return row.get("priority_rank", 1), row.get("order_since", row["since"]), row["pid"]
 
 
 def head_priority(waiters: list[Waiter], available: int, total: int | UnknownHostTotal,

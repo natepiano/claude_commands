@@ -311,6 +311,7 @@ class AdmissionFixture(ExitStack):
             "LINT_CONFIG_READER": str(Path(__file__).resolve().parents[1] / "lint/lint_config.sh"),
             "ADMISSION_SOCKET": str(self.socket_path), "BUILDLOG_DIR": str(self.state_dir.parent),
             "BUILDLOG_PROC": str(self.proc.path), "LINT_CONFIG_FILE": str(self.root / "lint.conf"),
+            "BUILDLOG_RUN": "",
             "BUILDLOG_BUILD_BUDGET_GIB": "21", "NOTIFY_SOCKET": "", "LISTEN_FDS": "",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC",
             "HOME": str(self.root)}
@@ -421,6 +422,36 @@ class AdmissionFixture(ExitStack):
         self.proc.register(owner)
         return owner
 
+    def run_owner(self) -> wire.RunIdentity:
+        """Give a verify run its own process and real pidfd lifetime."""
+        owner = self.proc.spawn(used=0)
+        return wire.RunIdentity(owner.pid, owner.start_time)
+
+    def end_run(self, run: wire.RunIdentity) -> None:
+        """Deliver the run's real exit event while its child steps remain alive."""
+        self.end_owner(wire.Owner(run.pid, run.start_time))
+
+    def end_owner(self, owner: wire.Owner) -> None:
+        """End a real fixture process and deliver its exit event."""
+        self.proc.kill(owner)
+        self.server.run_once(0)
+
+    def finish_step(self, request: wire.AdmitRequest, *, end_owner: bool = False) -> wire.Admitted:
+        """Admit and release a step without retaining its memory charge."""
+        granted = only_admitted(self.server.handle_request(request))
+        replies = self.server.handle_request(wire.ReleaseRequest(f"finish-{request.episode}", granted.reservation, 0))
+        if replies != [wire.Ok()]:
+            raise AssertionError(f"step release failed: {replies!r}")
+        if end_owner:
+            self.end_owner(request.owner)
+        return granted
+
+    def queue_pids(self) -> list[int]:
+        """Read the queue order through the public view request."""
+        reply, = self.server.handle_request(wire.ViewRequest())
+        assert isinstance(reply, wire.ViewReply)
+        return [row["pid"] for _, row in reply.reading.ordered]
+
     def end_fixture_owner(self, pid: int) -> None:
         with self.loop_turn():
             del self.proc.fixture_owners[pid]
@@ -439,7 +470,8 @@ class AdmissionFixture(ExitStack):
     def request(self, *, need: int = 8 * GIB, owner: wire.Owner | None = None,
                 episode: str = "", since: float | None = None, age: float = 0,
                 width: gate.TestWidth = DEFAULT_WIDTH,
-                call: gate.Call = DEFAULT_CALL, step: str = "nextest") -> wire.AdmitRequest:
+                call: gate.Call = DEFAULT_CALL, step: str = "nextest",
+                run: wire.RunIdentity | wire.NoRun = wire.NO_RUN) -> wire.AdmitRequest:
         owner = owner or self.proc.spawn()
         generation: gate.BuildHistoryGeneration | gate.NoBuildHistoryGeneration = gate.NoBuildHistoryGeneration()
         if step == "build":
@@ -449,7 +481,7 @@ class AdmissionFixture(ExitStack):
         return wire.AdmitRequest(episode or f"episode-{owner.pid}", owner, ("cargo", step),
             str(self.root), self.clock.now() if since is None else since, "",
             wire.Identity(f"session-{owner.pid}", "fixture", step, str(self.root)), call, width,
-            profile, False)
+            profile, False, run=run)
 
     def launch(self, *, need: int = 8 * GIB, since: float | None = None) -> wire.LaunchRequest:
         request = self.request(need=need, since=since)

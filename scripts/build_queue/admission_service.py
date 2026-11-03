@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping
 import errno
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import os
 from pathlib import Path
@@ -253,6 +253,7 @@ class ServiceState:
     priority: gate.QueuePriority | gate.NoQueuePriority = gate.NO_QUEUE_PRIORITY
     legacy_cleanup: tuple[str, ...] = ()
     build_history_generation: int = 0
+    run_places: dict[str, wire.RunPlace] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -455,6 +456,7 @@ class AdmissionServer:
         self.launches: dict[str, WaitingAdmission] = {}
         self.reservations: dict[str, ReservationRecord] = {}
         self.places: dict[str, WaiterPlace] = {}
+        self.run_places: dict[str, wire.RunPlace] = {}
         self.build_history_generation: int = 0
         self.ledger: dict[str, ReplayEntry] = {}
         self.recovery: gate.RecoverySpacing = gate.NoRecoverySpacing()
@@ -572,6 +574,7 @@ class AdmissionServer:
             self.recovery, self.override, self.priority = state.recovery, state.override, state.priority
             self.legacy_cleanup = state.legacy_cleanup
             self.build_history_generation = state.build_history_generation
+            self.run_places = state.run_places
             self._persisted = wire.encode_record(state)
             self._finish_import()
             if not isinstance(self.override, gate.NoHeadAdmissionOverride):
@@ -580,7 +583,7 @@ class AdmissionServer:
             self._import_legacy()
         for episode, record in list(self.reservations.items()):
             row = reservation_row(record)
-            live = self.proc.owner_start(record.owner.pid) == LiveOwnerIdentity(record.owner.start_time)
+            live = self._live(record.owner)
             lifetime = self.proc.lifetime(row, live)
             if "finalization" in row or not isinstance(record.ending, NotEnding) or isinstance(lifetime, gate.EndedStep):
                 try:
@@ -606,7 +609,7 @@ class AdmissionServer:
                        if isinstance(entry.ended_at, LiveGrant) or now - entry.ended_at < resolved.replay_retention_seconds}
         encoded = wire.encode_record(ServiceState(
             self.reservations, self.places, self.ledger, self.recovery, self.override, self.priority,
-            self.legacy_cleanup, self.build_history_generation))
+            self.legacy_cleanup, self.build_history_generation, self.run_places))
         if encoded == self._persisted:
             return
         write_text_atomic(self.state_dir / "state.json", encoded)
@@ -660,14 +663,23 @@ class AdmissionServer:
         owners = {record.owner for record in self.reservations.values()}
         owners.update(waiting.request.owner for waiting in (*self.waiters.values(), *self.launches.values()))
         owners.update(place.owner for place in self.places.values())
+        owners.update(wire.Owner(place.run.pid, place.run.start_time) for place in self.run_places.values())
         for descriptor, watch in list(self.watchers.items()):
             if (isinstance(watch, OwnerWatch) and watch.owner not in owners
                     or isinstance(watch, ScopeWatch) and watch.episode not in self.reservations):
                 self._unwatch(descriptor)
 
     def _ordered_waiters(self) -> list[tuple[Path, gate.Waiter]]:
-        return sorted(((self.state_dir / gate.waiter_owner(waiting.row), waiting.row.copy())
-                       for waiting in self.waiters.values()), key=lambda item: gate.waiter_order(item[1]))
+        rows: list[tuple[Path, gate.Waiter]] = []
+        for waiting in self.waiters.values():
+            row = waiting.row.copy()
+            row["order_since"] = row["since"]
+            if isinstance(waiting.request, wire.AdmitRequest) and isinstance(waiting.request.run, wire.RunIdentity):
+                place = self.run_places.get(self._run_key(waiting.request.run))
+                if place is not None:
+                    row["order_since"] = min(place.since, row["since"])
+            rows.append((self.state_dir / gate.waiter_owner(row), row))
+        return sorted(rows, key=lambda item: gate.waiter_order(item[1]))
 
     def _queue_order(self) -> tuple[list[tuple[Path, gate.Waiter]], gate.QueuePriority | gate.NoQueuePriority]:
         labels: Mapping[str, gate.UnitMembership] = (
@@ -690,9 +702,31 @@ class AdmissionServer:
             return False
         return True
 
+    def _prune_runs(self) -> None:
+        for key, place in list(self.run_places.items()):
+            owner = wire.Owner(place.run.pid, place.run.start_time)
+            if self._live(owner):
+                self._watch_owner(owner)
+            else:
+                del self.run_places[key]
+
+    @staticmethod
+    def _run_key(run: wire.RunIdentity) -> str:
+        return f"{run.pid}-{run.start_time}"
+
+    def _run_place(self, request: wire.AdmitRequest | wire.LaunchRequest, place: WaiterPlace) -> None:
+        if not isinstance(request, wire.AdmitRequest) or not isinstance(request.run, wire.RunIdentity):
+            return
+        run = request.run
+        key = self._run_key(run)
+        if key not in self.run_places and self._live(wire.Owner(run.pid, run.start_time)):
+            self.run_places[key] = wire.RunPlace(run, place.since, request.owner)
+
+    def _live(self, owner: wire.Owner) -> bool:
+        return self.proc.owner_start(owner.pid) == LiveOwnerIdentity(owner.start_time)
+
     def _prune_places(self) -> None:
-        self.places = {key: place for key, place in self.places.items()
-                       if self.proc.owner_start(place.owner.pid) == LiveOwnerIdentity(place.owner.start_time)}
+        self.places = {key: place for key, place in self.places.items() if self._live(place.owner)}
 
     def _row(self, request: wire.AdmitRequest | wire.LaunchRequest, place: WaiterPlace) -> gate.Waiter:
         profile, identity = request.profile, request.identity
@@ -741,7 +775,7 @@ class AdmissionServer:
         now = self.clock.now()
         policy = config.policy
         lifetimes = {episode: self.proc.lifetime(reservation_row(record),
-            self.proc.owner_start(record.owner.pid) == LiveOwnerIdentity(record.owner.start_time))
+            self._live(record.owner))
             for episode, record in self.reservations.items()}
         processes = (self.proc.processes() if any(isinstance(lifetime, gate.LiveOwnerProcess)
                      for lifetime in lifetimes.values()) else {})
@@ -781,6 +815,7 @@ class AdmissionServer:
         return inputs, limits
 
     def run_pass(self) -> gate.PassResult:
+        self._prune_runs()
         config = gate.read_memory_config(report=False)
         policy = config.policy
         self.last_fallbacks = config.fallbacks
@@ -807,6 +842,7 @@ class AdmissionServer:
             for waiting in self.waiters.values():
                 if gate.waiter_owner(waiting.row) == mark.path.name:
                     waiting.row = mark.waiter.copy()
+                    _ = waiting.row.pop("order_since", None)
                     self._save_place(waiting)
         by_owner = {gate.waiter_owner(waiting.row): episode for episode, waiting in self.waiters.items()}
         starts = sorted((row for row in result.rows if isinstance(row.admission, gate.ProposedAdmission)),
@@ -1015,7 +1051,7 @@ class AdmissionServer:
         if replay is not None:
             return [replay.reply]
         if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)):
-            if self.proc.owner_start(request.owner.pid) != LiveOwnerIdentity(request.owner.start_time):
+            if not self._live(request.owner):
                 return self._mutation_reply(key, wire.Refused("owner no longer exists"))
             if any(record.owner == request.owner for record in self.reservations.values()):
                 return self._mutation_reply(key, wire.Refused("owner already has a reservation"))
@@ -1031,6 +1067,7 @@ class AdmissionServer:
                 return self._pending_replies.pop(key, [])
             place_key = _place_key(request.owner, request.since)
             place = self.places.get(place_key, WaiterPlace(request.owner, request.since, key))
+            self._run_place(request, place)
             self.waiters[key] = WaitingAdmission(request, self._row(request, place), connection)
             self._save_place(self.waiters[key])
             self._watch_owner(request.owner)
@@ -1312,10 +1349,10 @@ class AdmissionServer:
                 else:
                     self._unwatch(descriptor)
                 for episode, waiting in list(self.waiters.items()):
-                    if self.proc.owner_start(waiting.request.owner.pid) != LiveOwnerIdentity(waiting.request.owner.start_time):
+                    if not self._live(waiting.request.owner):
                         del self.waiters[episode]
                 for episode, waiting in list(self.launches.items()):
-                    if self.proc.owner_start(waiting.request.owner.pid) != LiveOwnerIdentity(waiting.request.owner.start_time):
+                    if not self._live(waiting.request.owner):
                         del self.launches[episode]
                 self._prune_places()
                 self._prune_watches()
@@ -1379,6 +1416,8 @@ def read_state(directory: Path) -> ServiceState:
         # The first state form stores neither a queue priority nor pending import cleanup.
         record["priority"] = gate.snapshot_value(gate.NO_QUEUE_PRIORITY)
         record["legacy_cleanup"] = gate.snapshot_value(())
+    if "run_places" not in record:
+        record["run_places"] = {}
     old_fields = gate.snapshot_fields(ServiceState).keys() - {"build_history_generation"} | {"kind"}
     if record.keys() == old_fields | {"build_invalidations"}:
         del record["build_invalidations"]

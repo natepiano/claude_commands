@@ -79,6 +79,31 @@ The two ceilings (44G + 18G) deliberately exceed physical RAM together; decision
 
 On 2026-10-06 06:54 PDT, two hung hana tests in one local `verify.sh test` step held 11.4 GB and 15.5 GB; earlyoom first sent SIGTERM to 26 other processes, including six CI compilers (four hana CI jobs failed), and killed the tests last. `builds.slice` peaked at 37.7 GiB, under its 44G, because zram (10 GiB), sessions (8 GiB) and CI (3.4 GiB) had already taken the machine to earlyoom's 5% line.
 
+### The verify run place
+
+The outer Linux `verify.sh` sets `BUILDLOG_RUN` after detachment.
+The value contains its PID and the start-time string from `/proc/<pid>/stat`, separated by `:`.
+Nested calls retain that value.
+The Mac uses `NoRun` and retains claim admission without reading `/proc`.
+
+`admission_client.py admit` inherits the exported `BUILDLOG_RUN` through `memory_gate.sh`.
+The client parses the value once into `RunIdentity` or `NoRun`.
+A missing or malformed value gives the step its own place.
+
+The first step creates one `RunPlace` with its arrival time and its `Owner`.
+The service sets `order_since` on snapshot row copies from the run place.
+It uses the earlier of the run time and the step arrival time.
+Durable waiter records retain only the step arrival time.
+Each step retains its own `since` for reconnects, waiting age, token reacquisition, and AWS eligibility.
+Each step also retains its own owner, episode, and reservation.
+Queue priority remains the first ordering field.
+
+The service retains the run's process watch between steps.
+The run holds no memory reservation or CPU token between steps.
+When the run ends, waiting steps use their own arrival times for order again.
+The service persists run places with waiter places through the generic codec in `state.json`.
+After a restart, the service restores live run places and removes ended run places.
+
 ### The admission service
 
 `scripts/build_queue/admission_service.py` is the only live admitter. Its epoll loop owns the queue and reservations.

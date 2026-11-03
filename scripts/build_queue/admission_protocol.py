@@ -32,6 +32,27 @@ class Owner:
 
 
 @dataclass(frozen=True)
+class RunIdentity:
+    pid: int
+    start_time: str
+
+
+@dataclass(frozen=True)
+class NoRun:
+    pass
+
+
+NO_RUN = NoRun()
+
+
+@dataclass(frozen=True)
+class RunPlace:
+    run: RunIdentity
+    since: float
+    first_owner: Owner
+
+
+@dataclass(frozen=True)
 class Identity:
     session_id: str
     name: str
@@ -56,6 +77,7 @@ class AdmitRequest:
     profile: Profile
     fresh_test: bool
     token_back_at: float = 0.0
+    run: RunIdentity | NoRun = NO_RUN
 
 
 @dataclass(frozen=True)
@@ -237,7 +259,10 @@ def _parse(line: str | bytes, variants: dict[str, type]) -> object:
         name = envelope.get("type")
         if not isinstance(name, str) or name not in variants or set(envelope) != {"v", "type", "data"}:
             raise ValueError("invalid admission envelope")
-        return gate.parse_snapshot_value(envelope["data"], variants[name])
+        data = envelope["data"]
+        if variants[name] is AdmitRequest and isinstance(data, dict) and "run" not in data:
+            data = {**cast(dict[str, object], data), "run": gate.snapshot_value(NO_RUN)}
+        return gate.parse_snapshot_value(cast(object, data), variants[name])
     except (KeyError, TypeError, UnicodeError) as error:
         raise ValueError("invalid admission message") from error
 

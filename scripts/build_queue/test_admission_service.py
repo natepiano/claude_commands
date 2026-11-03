@@ -46,7 +46,8 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(snapshot.inputs.running, inputs.running)
             self.assertEqual(snapshot.inputs.reservations, inputs.reservations)
             self.assertEqual([row for _, row in snapshot.inputs.ordered],
-                             [waiting.row for waiting in fixture.server.waiters.values()])
+                             [{**waiting.row, "order_since": waiting.row["since"]}
+                              for waiting in fixture.server.waiters.values()])
             self.assertEqual(snapshot.written_at, fixture.clock.now())
             self.assertEqual(snapshot.policy, fixture.server.last_policy)
             fixture.clock.advance(1)
@@ -2834,3 +2835,324 @@ class CutoverServiceTests(unittest.TestCase):
             self.assertEqual(fixture.server.handle_request(mutation), [wire.Ok()])
             fixture.restart()
             self.assertEqual(fixture.server.reservations[request.episode].test_width, gate.RequestedTestWidth(2))
+
+
+class RunPlaceTests(unittest.TestCase):
+    def reading(self, fixture: AdmissionFixture) -> gate.QueueRead:
+        reply, = fixture.server.handle_request(wire.ViewRequest())
+        assert isinstance(reply, wire.ViewReply)
+        return reply.reading
+
+    def test_phase_ten_client_reconnect_after_restart_keeps_place_and_replays_one_grant(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            request = fixture.request()
+            envelope = wire.parse_record(wire.encode_request(request), dict[str, object])
+            data = cast(dict[str, object], envelope["data"])
+            del data["run"]
+            legacy = wire.encode_record(envelope) + "\n"
+            peer = fixture.connect(legacy)
+            self.assertIsInstance(peer.replies()[0], wire.Wait)
+            peer.close()
+            fixture.restart()
+            fixture.clock.advance(1)
+            other = fixture.request()
+            _ = fixture.server.handle_request(other)
+            peer = fixture.connect(legacy)
+            self.assertIsInstance(peer.replies()[0], wire.Wait)
+            self.assertEqual(fixture.queue_pids(), [request.owner.pid, other.owner.pid])
+            self.assertEqual(fixture.server.waiters[request.episode].request, request)
+            self.assertFalse(service.read_state(fixture.state_dir).run_places)
+            fixture.free(60 * GIB)
+            _ = fixture.server.run_pass()
+            granted = only_admitted(peer.replies())
+            peer.close()
+            fixture.restart()
+            replay = fixture.connect(legacy)
+            self.assertEqual(only_admitted(replay.replies()), granted)
+            self.assertEqual(len([record for record in fixture.server.reservations.values()
+                                  if record.owner == request.owner]), 1)
+
+    def test_run_order_never_moves_an_earlier_step_behind_its_own_arrival(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            first = fixture.request(run=run)
+            _ = fixture.finish_step(first)
+            fixture.free(0)
+            peer = fixture.request(since=first.since - 10)
+            _ = fixture.server.handle_request(peer)
+            earlier = fixture.request(run=run, since=first.since - 20)
+            _ = fixture.server.handle_request(earlier)
+            self.assertEqual(fixture.queue_pids(), [earlier.owner.pid, peer.owner.pid])
+            row, = (row for _, row in self.reading(fixture).ordered if row["pid"] == earlier.owner.pid)
+            self.assertEqual(row["since"], earlier.since)
+            assert "order_since" in row
+            self.assertEqual(row["order_since"], earlier.since)
+
+    def test_later_child_keeps_run_order_and_run_exit_restores_step_arrival(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            first = fixture.request(run=run)
+            _ = fixture.finish_step(first, end_owner=True)
+            fixture.free(0)
+            fixture.clock.advance(10)
+            peers = [fixture.request()]
+            _ = fixture.server.handle_request(peers[0])
+            fixture.clock.advance(10)
+            peers.append(fixture.request())
+            _ = fixture.server.handle_request(peers[1])
+            fixture.clock.advance(10)
+            second = fixture.request(run=run)
+            _ = fixture.server.handle_request(second)
+            self.assertEqual(fixture.queue_pids(), [second.owner.pid, *(peer.owner.pid for peer in peers)])
+            row = next(row for _, row in self.reading(fixture).ordered if row["pid"] == second.owner.pid)
+            self.assertEqual(row["since"], second.since)
+            assert "order_since" in row
+            self.assertEqual(row["order_since"], first.since)
+            place = next(place for place in service.read_state(fixture.state_dir).places.values()
+                         if place.owner == second.owner)
+            self.assertEqual(place.since, second.since)
+            self.assertNotEqual(first.owner, second.owner)
+            fixture.end_run(run)
+            self.assertEqual(fixture.queue_pids(), [*(peer.owner.pid for peer in peers), second.owner.pid])
+            self.assertEqual(fixture.server.waiters[second.episode].row["since"], second.since)
+            state = service.read_state(fixture.state_dir)
+            self.assertFalse(state.run_places)
+            restored = next(place for place in state.places.values() if place.owner == second.owner)
+            self.assertEqual(restored.since, second.since)
+            row = next(row for _, row in self.reading(fixture).ordered if row["pid"] == second.owner.pid)
+            assert "order_since" in row
+            self.assertEqual(row["order_since"], second.since)
+            self.assertFalse(fixture.server.reservations)
+
+    def test_restart_between_steps_keeps_the_run_watch_without_a_memory_charge(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            first = fixture.request(run=run)
+            _ = fixture.finish_step(first, end_owner=True)
+            fixture.clock.advance(2)
+            state = service.read_state(fixture.state_dir)
+            self.assertEqual(list(state.run_places.values()), [wire.RunPlace(run, first.since, first.owner)])
+            self.assertFalse(state.reservations)
+            self.assertFalse(state.places)
+            fixture.restart()
+            fixture.free(0)
+            other = fixture.request()
+            _ = fixture.server.handle_request(other)
+            fixture.clock.advance(2)
+            second = fixture.request(run=run)
+            _ = fixture.server.handle_request(second)
+            self.assertEqual(fixture.queue_pids(), [second.owner.pid, other.owner.pid])
+            self.assertEqual(fixture.server.waiters[second.episode].row["since"], second.since)
+            row = next(row for _, row in self.reading(fixture).ordered if row["pid"] == second.owner.pid)
+            assert "order_since" in row
+            self.assertEqual(row["order_since"], first.since)
+            fixture.end_run(run)
+            self.assertEqual(fixture.queue_pids(), [other.owner.pid, second.owner.pid])
+            self.assertFalse(service.read_state(fixture.state_dir).run_places)
+
+    def test_run_exit_between_steps_removes_the_idle_watch_and_saved_place(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            first = fixture.request(run=run)
+            _ = fixture.finish_step(first, end_owner=True)
+            self.assertTrue(service.read_state(fixture.state_dir).run_places)
+            fixture.end_run(run)
+            self.assertFalse(service.read_state(fixture.state_dir).run_places)
+            self.assertFalse(fixture.server.reservations)
+            fixture.clock.advance(1)
+            fixture.free(0)
+            stale = fixture.request(run=run)
+            _ = fixture.server.handle_request(stale)
+            row, = (row for _, row in self.reading(fixture).ordered)
+            assert "order_since" in row
+            self.assertEqual(row["order_since"], stale.since)
+
+    def test_child_episodes_and_reservations_stay_separate_under_one_run(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            fixture.free(0)
+            first = fixture.request(run=run)
+            _ = fixture.server.handle_request(first)
+            fixture.clock.advance(1)
+            second = fixture.request(run=run)
+            _ = fixture.server.handle_request(second)
+            self.assertEqual(fixture.queue_pids(), [first.owner.pid, second.owner.pid])
+            for _, row in self.reading(fixture).ordered:
+                assert "order_since" in row
+                self.assertEqual(row["order_since"], first.since)
+            fixture.free(60 * GIB)
+            _ = fixture.server.run_pass()
+            one = only_admitted([fixture.server.ledger[first.episode].reply])
+            two = only_admitted([fixture.server.ledger[second.episode].reply])
+            self.assertNotEqual(first.episode, second.episode)
+            self.assertNotEqual(one.reservation, two.reservation)
+            self.assertEqual(set(fixture.server.reservations), {first.episode, second.episode})
+            for request, granted in ((first, one), (second, two)):
+                record = fixture.server.reservations[request.episode]
+                self.assertEqual(record.owner, request.owner)
+                self.assertEqual(record.queue_waiter["since"], request.since)
+                replay = only_admitted(fixture.server.handle_request(request))
+                self.assertEqual(replay, granted)
+            self.assertEqual(len(service.read_state(fixture.state_dir).run_places), 1)
+            _ = fixture.server.handle_request(wire.ReleaseRequest("release-one", one.reservation, 0))
+            self.assertEqual(set(fixture.server.reservations), {second.episode})
+            _ = fixture.server.handle_request(wire.ReleaseRequest("release-two", two.reservation, 0))
+            self.assertFalse(fixture.server.reservations)
+            self.assertEqual(len(service.read_state(fixture.state_dir).run_places), 1)
+
+    def test_reconnect_and_token_reacquire_use_the_child_arrival_key(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            first = fixture.request(run=run)
+            _ = fixture.finish_step(first)
+            fixture.clock.advance(10)
+            second = fixture.request(run=run)
+            two = only_admitted(fixture.server.handle_request(second))
+            _ = fixture.server.handle_request(wire.TokenWaitRequest("token-gap", two.reservation))
+            fixture.free(0)
+            fixture.clock.advance(1)
+            again = replace(second, episode="child-after-token", token_back_at=fixture.clock.now())
+            _ = fixture.server.handle_request(again)
+            fixture.restart()
+            _ = fixture.server.handle_request(again)
+            _ = fixture.server.handle_request(again)
+            places = [place for place in service.read_state(fixture.state_dir).places.values()
+                      if place.owner == second.owner]
+            self.assertEqual(len(places), 1)
+            self.assertEqual(places[0].since, second.since)
+            row, = (row for _, row in self.reading(fixture).ordered)
+            self.assertEqual(row["since"], second.since)
+            assert "order_since" in row
+            self.assertEqual(row["order_since"], first.since)
+            with (fixture.state_dir / "queue_times.jsonl").open("rb") as stream:
+                gaps = [row for row in gate.queue_times_backward(stream) if row.get("kind") == "token_gap"]
+            self.assertEqual(len(gaps), 1)
+            self.assertEqual(gaps[0]["episode"], again.episode)
+            fixture.free(60 * GIB)
+            _ = fixture.server.run_pass()
+            later = only_admitted([fixture.server.ledger[again.episode].reply])
+            self.assertNotEqual(later.reservation, two.reservation)
+
+    def test_reused_run_pid_and_no_run_keep_each_steps_own_order(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            first = fixture.request(run=run)
+            _ = fixture.finish_step(first)
+            fixture.free(0)
+            fixture.clock.advance(1)
+            ordinary = fixture.request()
+            _ = fixture.server.handle_request(ordinary)
+            requests: list[wire.AdmitRequest] = []
+            for identity in (wire.RunIdentity(run.pid, str(int(run.start_time) + 1)), wire.NoRun()):
+                fixture.clock.advance(1)
+                request = fixture.request(run=identity)
+                requests.append(request)
+                _ = fixture.server.handle_request(request)
+                row = next(row for _, row in self.reading(fixture).ordered if row["pid"] == request.owner.pid)
+                assert "order_since" in row
+                self.assertEqual(row["order_since"], request.since)
+            self.assertEqual(fixture.queue_pids(), [ordinary.owner.pid, *(request.owner.pid for request in requests)])
+            self.assertEqual(list(service.read_state(fixture.state_dir).run_places.values()),
+                             [wire.RunPlace(run, first.since, first.owner)])
+
+    def test_restart_drops_a_run_that_ended_while_the_service_was_stopped(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            run = fixture.run_owner()
+            first = fixture.request(run=run)
+            _ = fixture.server.handle_request(first)
+            fixture.clock.advance(1)
+            peer = fixture.request()
+            _ = fixture.server.handle_request(peer)
+            fixture.clock.advance(1)
+            second = fixture.request(run=run)
+            _ = fixture.server.handle_request(second)
+            fixture.server.close()
+            fixture.proc.kill(wire.Owner(run.pid, run.start_time))
+            fixture.server = fixture.new_server()
+            for request in (second, peer, first):
+                _ = fixture.server.handle_request(request)
+            self.assertEqual(fixture.queue_pids(), [first.owner.pid, peer.owner.pid, second.owner.pid])
+            self.assertFalse(service.read_state(fixture.state_dir).run_places)
+
+    def test_run_types_round_trip_in_admit_and_service_state(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            run = fixture.run_owner()
+            request = fixture.request(run=run)
+            for identity in (run, wire.NoRun()):
+                with self.subTest(identity=identity):
+                    message = replace(request, run=identity)
+                    self.assertEqual(wire.parse_request(wire.encode_request(message)), message)
+            _ = fixture.server.handle_request(request)
+            state = service.read_state(fixture.state_dir)
+            self.assertEqual(list(state.run_places.values()), [wire.RunPlace(run, request.since, request.owner)])
+            self.assertEqual(wire.parse_record(wire.encode_record(state), service.ServiceState), state)
+            for value, schema in ((run, wire.RunIdentity), (wire.NoRun(), wire.NoRun),
+                                  (wire.RunPlace(run, request.since, request.owner), wire.RunPlace)):
+                self.assertEqual(gate.parse_snapshot_value(gate.snapshot_value(value), schema), value)
+            fixture.restart()
+            self.assertEqual(service.read_state(fixture.state_dir), state)
+
+    def test_phase_ten_state_upgrade_preserves_pending_work_priority_and_replay(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request(step="build")
+            request = replace(request, sidecar=str(fixture.scope(request.owner)))
+            grant = only_admitted(fixture.server.handle_request(request))
+            fixture.scoped_peak(grant)
+            fixture.fault.stage = "after_finalization_intent"
+            with self.assertRaises(InjectedCrash):
+                _ = fixture.server.handle_request(wire.ReleaseRequest("pending-release", grant.reservation, 137))
+            saved = service.read_state(fixture.state_dir)
+            self.assertNotIsInstance(saved.reservations[request.episode].finalization, service.NoFinalizationIntent)
+            priority = gate.QueuePriority(unit="queue", why="the user", set_at=fixture.clock.now(), set_by="director")
+            expected = replace(saved, priority=priority, build_history_generation=7)
+            old = wire.parse_record(wire.encode_record(expected), dict[str, object])
+            del old["run_places"]
+            path = fixture.state_dir / "state.json"
+            _ = path.write_text(wire.encode_record(old))
+            before = path.read_text()
+            restored = service.read_state(fixture.state_dir)
+            self.assertEqual(restored, expected)
+            self.assertEqual(path.read_text(), before)
+            self.assertEqual(restored.ledger[request.episode].reply, grant)
+            self.assertEqual(restored.reservations[request.episode].ending, saved.reservations[request.episode].ending)
+
+    def test_display_age_and_aws_wait_threshold_use_child_arrival_not_run_order(self) -> None:
+        from collections.abc import Callable
+        from zoneinfo import ZoneInfo
+        from scripts.aws_target import aws_target
+        from scripts.aws_target.config import ControlSettings, read_control_settings
+        from scripts.build_queue import head_facts
+        from scripts.build_queue.queue_lines import plain
+        from scripts.lib import conf
+
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            first = fixture.request(run=run, since=fixture.clock.now() - 600)
+            _ = fixture.finish_step(first)
+            fixture.free(0)
+            second = fixture.request(run=run, step="check")
+            second = replace(second, profile=replace(second.profile,
+                repository=gate.RepositoryIdentity("github.com/team/project", "project")))
+            _ = fixture.server.handle_request(second)
+            reading = self.reading(fixture)
+            self.assertEqual(reading.view.waiting[0].since, second.since)
+            model = queue_view.QueueModel(reading, {}, gate.NoWaiter(), head_facts.PaceUnavailable(), ZoneInfo("UTC"),
+                queue_view.HostLoadUnavailable(), gate.smallest_head_release(reading.explanation))
+            rendered = plain(queue_view.render_view(model, 100))
+            row, = [line for line in rendered.splitlines() if "check" in line]
+            self.assertEqual(row.split()[4], "0", rendered)
+            settings_path = fixture.root / "aws_target.conf"
+            _ = write_config_fixture(settings_path, "offload=on\nkinds=check\nstart_after_wait_s=300\n"
+                                     + "region=us-east-1\ninstance_id=i-fixture\ncredentials_profile=fixture\n")
+            configuration = conf.read(settings_path)
+            settings = read_control_settings(configuration)
+            controller = aws_target.Controller(settings_path, fixture.root / "aws", fixture.state_dir)
+            eligible_steps = cast(Callable[[ControlSettings, int, conf.ConfigRead], int],
+                                  getattr(controller, "_queued"))
+            self.assertEqual(eligible_steps(settings, int(fixture.clock.now()), configuration), 0)
+            fixture.clock.advance(300)
+            _ = fixture.server.run_pass()
+            self.assertEqual(eligible_steps(settings, int(fixture.clock.now()), configuration), 1)

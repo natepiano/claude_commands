@@ -690,3 +690,75 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(len(transport.requests), 2)
                 self.assertEqual(transport.requests[0], transport.requests[1])
                 self.doCleanups()
+
+    def test_cli_sends_one_run_identity_through_estimate_refresh_and_reconnect(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            original = fixture.request()
+            transport = self.use_transport(fixture,
+                Exchange(reply_bytes(WAIT), reply_bytes(EXPIRED)),
+                Exchange(reply_bytes(GRANTED)))
+            calls: list[int] = []
+
+            def estimate(*_args: object, **_kwargs: object) -> gate.StepEstimate:
+                calls.append(len(calls))
+                if len(calls) == 2:
+                    os.environ["BUILDLOG_RUN"] = "999999:111111"
+                return gate.StepEstimate(original.profile, gate.ReusableEstimate())
+
+            with mock.patch.dict(os.environ, {"BUILDLOG_RUN": f"{run.pid}:{run.start_time}"}), \
+                 mock.patch.object(gate, "step_estimate", side_effect=estimate), \
+                 mock.patch.object(gate, "process_start_time", return_value=original.owner.start_time), \
+                 redirect_stderr(io.StringIO()), mock.patch("sys.stdout", io.StringIO()) as output:
+                status = client.main(["admit", "--pid", str(original.owner.pid),
+                                      "--since", str(original.since), "--wait-events", "--", "cargo", "nextest"])
+            self.assertEqual(status, 0)
+            self.assertEqual(len(calls), 2)
+            first, second = transport.requests
+            assert isinstance(first, wire.AdmitRequest)
+            assert isinstance(second, wire.AdmitRequest)
+            self.assertEqual((first.run, second.run), (run, run))
+            self.assertEqual((first.owner, first.episode, first.since),
+                             (second.owner, second.episode, second.since))
+            self.assertEqual(output.getvalue().splitlines(), ["first", "done"])
+
+    def test_missing_or_malformed_run_keeps_the_step_identity_and_admits(self) -> None:
+        for value in (None, "", "missing", "42", "0:123", "-4:123", "abc:123", "42:", "42:abc", "42:1:2"):
+            with self.subTest(value=value), AdmissionFixture() as fixture:
+                original = fixture.request()
+                transport = self.use_transport(fixture, Exchange(reply_bytes(GRANTED)))
+                environment = dict(os.environ)
+                if value is None:
+                    _ = environment.pop("BUILDLOG_RUN", None)
+                else:
+                    environment["BUILDLOG_RUN"] = value
+                with mock.patch.dict(os.environ, environment, clear=True), \
+                     mock.patch.object(gate, "step_estimate", return_value=gate.StepEstimate(
+                         original.profile, gate.ReusableEstimate())), \
+                     mock.patch.object(gate, "process_start_time", return_value=original.owner.start_time), \
+                     redirect_stderr(io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
+                    status = client.main(["admit", "--pid", str(original.owner.pid),
+                                          "--since", str(original.since), "--", "cargo", "nextest"])
+                self.assertEqual(status, 0)
+                request, = transport.requests
+                assert isinstance(request, wire.AdmitRequest)
+                self.assertIsInstance(request.run, wire.NoRun)
+                self.assertEqual((request.owner, request.since), (original.owner, original.since))
+            self.doCleanups()
+
+    def test_mac_client_sends_no_run_even_with_an_inherited_linux_identity(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            original = fixture.request()
+            transport = self.use_transport(fixture, Exchange(reply_bytes(GRANTED)))
+            with mock.patch.object(sys, "platform", "darwin"), \
+                 mock.patch.dict(os.environ, {"BUILDLOG_RUN": f"{run.pid}:{run.start_time}"}), \
+                 mock.patch.object(gate, "step_estimate", return_value=gate.StepEstimate(
+                     original.profile, gate.ReusableEstimate())), \
+                 mock.patch.object(gate, "process_start_time", return_value=original.owner.start_time), \
+                 redirect_stderr(io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
+                status = client.main(["admit", "--pid", str(original.owner.pid), "--", "cargo", "nextest"])
+            self.assertEqual(status, 0)
+            request, = transport.requests
+            assert isinstance(request, wire.AdmitRequest)
+            self.assertIsInstance(request.run, wire.NoRun)

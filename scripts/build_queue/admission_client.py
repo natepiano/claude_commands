@@ -540,8 +540,19 @@ class WaitOutput:
             print(text, file=sys.stderr, flush=True)
 
 
+def parse_run_identity(value: str) -> wire.RunIdentity | wire.NoRun:
+    """Parse the run identity at the client boundary."""
+    if sys.platform == "darwin":
+        return wire.NO_RUN
+    pid, separator, start = value.partition(":")
+    if separator and pid.isascii() and pid.isdecimal() and int(pid) > 0 and start.isascii() and start.isdecimal():
+        return wire.RunIdentity(int(pid), start)
+    return wire.NO_RUN
+
+
 def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sidecar: str,
-                 episode: str, profile: gate.InferFromArgv | wire.Profile = gate.INFER_FROM_ARGV
+                 episode: str, profile: gate.InferFromArgv | wire.Profile = gate.INFER_FROM_ARGV,
+                 *, run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
                  ) -> wire.AdmitRequest:
     estimate = gate.step_estimate(argv, cwd, profile, lambda: datetime.fromtimestamp(CLOCK.now(), UTC),
                                   gate.store.root(), gate.memory_config().policy,
@@ -557,7 +568,7 @@ def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sid
     return wire.AdmitRequest(episode, owner, tuple(argv), cwd, since, sidecar,
         wire.Identity(identity["session_id"], identity["session_name"], identity["step"], identity["folder"]),
         gate.CallRecord(call) if call else gate.NoCallRecord(), width_value_typed, estimate.profile,
-        isinstance(estimate.cache, gate.FreshTest), float(os.environ.get("BUILDLOG_MEM_TOKEN_BACK_AT", "0")))
+        isinstance(estimate.cache, gate.FreshTest), float(os.environ.get("BUILDLOG_MEM_TOKEN_BACK_AT", "0")), run)
 
 
 def write_shell_grant(path: Path, grant: wire.Admitted | wire.LaunchAdmitted, elapsed: int) -> None:
@@ -648,10 +659,11 @@ def main(argv: list[str] | None = None) -> int:
             if owner_start is None:
                 raise CheckerFailure("owner no longer exists")
             owner, episode, since = wire.Owner(args.pid, owner_start), uuid.uuid4().hex, args.since or CLOCK.now()
+            run = parse_run_identity(os.environ.get("BUILDLOG_RUN", ""))
             step_argv = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
             def refresh() -> wire.AdmitRequest:
                 try:
-                    request = step_request(step_argv, os.getcwd(), owner, since, args.sidecar, episode)
+                    request = step_request(step_argv, os.getcwd(), owner, since, args.sidecar, episode, run=run)
                 except _QueueLeft:
                     raise
                 except Exception as error:

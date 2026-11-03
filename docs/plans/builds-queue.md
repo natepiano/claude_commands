@@ -640,7 +640,7 @@ Queue-unit owns the Python queue files. Coordinate the pane tests with unit-boar
 
 **Acceptance.** Two hana CI jobs that would together pass the free budget run one after the other, shown in `/build:queue` with the CI label; no CI rustc dies at the slice cap. Change-Review: in the Build queue pane during a hana CI run, the CI step shows as "hana CI · <runner> · <job>" and waits behind a session build when memory is short.
 
-### Phase 11 — Every later step of one verify.sh run keeps the queue place of the run's first step  · status: todo
+### Phase 11 — Every later step of one verify.sh run keeps the queue place of the run's first step  · status: done
 **Depends on:** Phase 10 (the queue service holds the queue and the place record)
 **Blocked by:** none past Phase 10. Builds showrunner ask, 2026-10-31.
 
@@ -698,6 +698,7 @@ Queue-unit owns the Python queue files. Coordinate the pane tests with unit-boar
   - `RunPlace.first_owner` is an `Owner`, not a string.
   - Memory wait history: Phase 10's `--wait-events` path (`first`, `done`) keeps one balanced pair per step; `test_verify_token_memory_history` stays green. Durable grant replay keeps one reservation per step.
   - Replace "waits for its queue place once" in the live check with "keeps its order while each step passes admission".
+- Phase 10a: `verify.sh` and `lint/invoke.sh` load `lib/build_folders.py` beside themselves, and `invoke.sh` sets `BUILD_FOLDERS_SCRIPT` at the top level. Tests copy or slice these scripts: `test_verify_nix_shell`, `test_verify_ssh_targets` (through `verify_mac_offload_test_support.py`) and `test_verify_step_owner` (slices `sweep_after_step` and `buildlog_exec`). A new top-level variable or adjacent file in either script needs the same in those fixtures. Put these three modules in the targeted suite of every change to `verify.sh` or `invoke.sh`.
 
 **Acceptance gate:**
 - `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY python3 -m unittest scripts.build_queue.test_admission_protocol scripts.build_queue.test_admission_service scripts.build_queue.test_admission_client scripts.build_queue.test_admission_client_wait scripts.direct.test_verify_run_place` green.
