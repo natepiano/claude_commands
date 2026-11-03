@@ -330,48 +330,21 @@ def _append_event(session_dir: Path, state: dict[str, object], event: dict[str, 
     event.update(
         {
             "schema_version": SCHEMA_VERSION,
-            "event_id": event.get("event_id", str(uuid.uuid4())),
+            "event_id": str(uuid.uuid4()),
             "phase_instance_id": _string(state.get("phase_instance_id")),
             "phase_id": _string(state.get("phase_id")),
         }
     )
     history_file.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(event, separators=(",", ":"), sort_keys=True) + "\n"
-    with history_file.open("a+", encoding="utf-8") as handle:
+    with history_file.open("a", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        _ = handle.seek(0)
-        if any((_json_object(saved) or {}).get("event_id") == event["event_id"] for saved in handle):
-            return
         _ = handle.write(line)
         handle.flush()
         # Disposable fixtures may omit disk durability; production syncs by default.
         if (os.environ.get("UNIT_SYNC_WRITES") or os.environ.get("PLAN_DELEGATE_SYNC_WRITES", "1")) != "0":
             os.fsync(handle.fileno())
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
-def _save_event(session_dir: Path, state: dict[str, object], event: dict[str, object]) -> None:
-    _ = event.setdefault("event_id", str(uuid.uuid4()))
-    # Keep the last event identity for retries after either publication step.
-    state["pending_events"] = [event]
-    _write_state(session_dir, state)
-    _flush_events(session_dir, state, announce=False)
-
-
-def _flush_events(session_dir: Path, state: dict[str, object], *, announce: bool = True) -> None:
-    pending = _object_list(state.get("pending_events"))
-    history = _history_file(session_dir)
-    if history is None:
-        return
-    recorded = set[str]()
-    if history.exists():
-        recorded = {_string((_json_object(line) or {}).get("event_id"))
-                    for line in history.read_text(encoding="utf-8").splitlines()}
-    missing = [event for event in pending if _string(event.get("event_id")) not in recorded]
-    for event in missing:
-        _append_event(session_dir, state, event)
-    if missing and announce:
-        print("restored pending finding events")
 
 
 def _fresh_state(instance_id: str, phase_id: str, now: float) -> dict[str, object]:
@@ -387,7 +360,7 @@ def _fresh_state(instance_id: str, phase_id: str, now: float) -> dict[str, objec
 
 
 def _read_state(
-    session_dir: Path, now: float, phase: str = "", *, closed_phase_ok: bool = False, recover: bool = True, announce: bool = False,
+    session_dir: Path, now: float, phase: str = "", *, closed_phase_ok: bool = False,
 ) -> dict[str, object]:
     """Load the phase's ledger: the live file, a parked one, or a fresh one."""
     path = _state_path(session_dir)
@@ -408,12 +381,8 @@ def _read_state(
             except OSError as error:
                 raise SystemExit(f"Unable to read findings state {parked}: {error}") from error
             if kept is not None:
-                if recover:
-                    _flush_events(session_dir, kept, announce=announce)
                 return kept
         return _fresh_state(instance_id, phase_id, now)
-    if recover:
-        _flush_events(session_dir, state, announce=announce)
     return state
 
 
@@ -786,7 +755,8 @@ def _open(args: argparse.Namespace) -> None:
     }
     _findings(state)[finding_id] = entry
     state["next_ordinal"] = ordinal + 1
-    _save_event(
+    _write_state(session_dir, state)
+    _append_event(
         session_dir,
         state,
         {
@@ -850,7 +820,8 @@ def _verdict(args: argparse.Namespace) -> None:
         entry["state"] = STATE_OPEN
         entry["reopen_count"] = _integer(entry.get("reopen_count")) + 1
         entry["reopened_evidence"] = evidence
-    _save_event(
+    _write_state(session_dir, state)
+    _append_event(
         session_dir,
         state,
         {
@@ -926,7 +897,8 @@ def _gate(args: argparse.Namespace) -> None:
             + " before gating the next round"
         )
     payload = _gate_payload(state, session_dir, settings_read)
-    _save_event(
+    _write_state(session_dir, state)
+    _append_event(
         session_dir,
         state,
         {
@@ -997,7 +969,8 @@ def _route(args: argparse.Namespace) -> None:
     }
     entry["state"] = STATE_ROUTED
     entry["route"] = route.copy()
-    _save_event(session_dir, state, {"event_type": "finding_routed", **route})
+    _write_state(session_dir, state)
+    _append_event(session_dir, state, {"event_type": "finding_routed", **route})
     print(f"{finding_id} routed to {route['owner']}: {route['work_order']}")
 
 
@@ -1023,7 +996,8 @@ def _astra(args: argparse.Namespace) -> None:
     records = _object_list(entry.get("astra_reviews"))
     records.append(record)
     entry["astra_reviews"] = records
-    _save_event(session_dir, state, {"event_type": "finding_astra_review", **record})
+    _write_state(session_dir, state)
+    _append_event(session_dir, state, {"event_type": "finding_astra_review", **record})
     print(f"{finding_id} Astra review recorded")
 
 
@@ -1123,7 +1097,8 @@ def _dispatch(args: argparse.Namespace) -> None:
         }
     )
     state["rounds"] = rounds
-    _save_event(
+    _write_state(session_dir, state)
+    _append_event(
         session_dir,
         state,
         {
@@ -1151,18 +1126,6 @@ def _in_flight_round(state: dict[str, object]) -> dict[str, object] | None:
     return None
 
 
-def _landed_event(round_entry: dict[str, object]) -> dict[str, object]:
-    landed_at = _number(round_entry.get("landed_at"))
-    return {
-        "event_type": "finding_batch_landed",
-        "timestamp": _iso_time(landed_at),
-        "timestamp_epoch": landed_at,
-        "round": _integer(round_entry.get("round")),
-        "landed": round_entry.get("landed", round_entry.get("covered", [])),
-    }
-
-
-
 def _landed(args: argparse.Namespace) -> None:
     """Promote an in-flight round to review after its worker exited cleanly.
 
@@ -1177,7 +1140,7 @@ def _landed(args: argparse.Namespace) -> None:
     """
     session_dir = _session_dir(args)
     now = _now_epoch()
-    state = _read_state(session_dir, now, _arg_string(args, "phase"), announce=True)
+    state = _read_state(session_dir, now, _arg_string(args, "phase"))
     round_entry = _in_flight_round(state)
     in_flight = _in_flight_ids(state)
     if round_entry is None or not in_flight:
@@ -1189,8 +1152,18 @@ def _landed(args: argparse.Namespace) -> None:
         entry["landed_at"] = now
     round_entry["outcome"] = "landed"
     round_entry["landed_at"] = now
-    round_entry["landed"] = in_flight
-    _save_event(session_dir, state, _landed_event(round_entry))
+    _write_state(session_dir, state)
+    _append_event(
+        session_dir,
+        state,
+        {
+            "event_type": "finding_batch_landed",
+            "timestamp": _iso_time(now),
+            "timestamp_epoch": now,
+            "round": _integer(round_entry.get("round")),
+            "landed": in_flight,
+        },
+    )
     print(f"round {_integer(round_entry.get('round'))} landed: {', '.join(in_flight)}")
 
 
@@ -1229,7 +1202,8 @@ def _abandon(args: argparse.Namespace) -> None:
     round_entry["edits_landed"] = edits_landed
     if not edits_landed:
         round_entry["abandoned"] = True
-    _save_event(
+    _write_state(session_dir, state)
+    _append_event(
         session_dir,
         state,
         {
@@ -1266,7 +1240,7 @@ def _record_decision_event(session_dir: Path, state: dict[str, object], entry: d
             recorded = _json_object(line)
             if recorded is not None and all(recorded.get(key) == value for key, value in event.items()):
                 return
-    _save_event(session_dir, state, event)
+    _append_event(session_dir, state, event)
 
 
 def _decision(args: argparse.Namespace) -> None:
@@ -1299,6 +1273,7 @@ def _decision(args: argparse.Namespace) -> None:
             entry["decision_history"] = [*_object_list(entry.get("decision_history")), withdrew]
         entry["state"] = STATE_DECIDED
         entry["decision"] = decision
+        _write_state(session_dir, state)
     _record_decision_event(session_dir, state, entry)
     print(f"{entry['id']} decided: {decision['answer']}")
 
@@ -1306,7 +1281,7 @@ def _decision(args: argparse.Namespace) -> None:
 def _status(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     now = _now_epoch()
-    state = _read_state(session_dir, now, _arg_string(args, "phase"), closed_phase_ok=True, recover=False)
+    state = _read_state(session_dir, now, _arg_string(args, "phase"), closed_phase_ok=True)
     findings = [_summarize(_finding(state, key)) for key in sorted(_findings(state))]
     payload: dict[str, object] = {
         "phase_id": _string(state.get("phase_id")),

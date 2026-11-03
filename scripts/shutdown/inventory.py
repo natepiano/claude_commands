@@ -17,8 +17,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS.parent))
-from scripts.lib import process_start as process_identity
 # Sibling imports need this folder. Append it so a caller's own modules
 # (buildlog's record) keep precedence over shutdown's.
 if str(SCRIPTS / "shutdown") not in sys.path:
@@ -37,6 +35,7 @@ else:
     from worker_state import worker_ledger
 import herdr
 import sessions
+from sessions import process_start as _process_start
 from scripts.production import showrunners
 import unit_lookup
 from scripts.whoami.account import Account, label_for
@@ -107,7 +106,7 @@ def supervisor_identity(host: WindowHost | TerminalHost) -> SupervisorIdentity |
 def live_supervisor(host: WindowHost | TerminalHost) -> SupervisorIdentity | NoSupervisor:
     identity = supervisor_identity(host)
     if (identity["kind"] == "supervisor" and identity["proc_start"]
-            and process_identity.check_owner(identity["pid"], process_identity.parse_start(identity["proc_start"])) is process_identity.OwnerCheck.ALIVE):
+            and _process_start(identity["pid"]) == identity["proc_start"]):
         return identity
     return NoSupervisor(kind="no supervisor")
 
@@ -131,7 +130,7 @@ class ListedSession:
 class UnattributedSession(TypedDict):
     pid: int
     name: str
-    reason: Literal["account unreadable", "process start mismatch", "process identity unreadable"]
+    reason: Literal["account unreadable", "process start mismatch"]
 
 
 class Inventory(TypedDict):
@@ -215,7 +214,7 @@ def parse_inventory(text: str) -> Inventory:
         reason = _wire_string(
             _wire_required(report, "reason", place), f"{place}.reason"
         )
-        if reason not in {"account unreadable", "process start mismatch", "process identity unreadable"}:
+        if reason not in {"account unreadable", "process start mismatch"}:
             raise InvalidInventory(f"{place}.reason is invalid")
         unattributed.append(
             cast(
@@ -337,11 +336,10 @@ def _configuration_from_setting(
         return UnreadableSessionConfiguration()
 
 
-def _record_owner(record: SessionFile) -> process_identity.OwnerCheck:
+def _record_matches_process(record: SessionFile) -> bool:
     recorded = _string(record.get("procStart"))
-    if not recorded:
-        return process_identity.OwnerCheck.UNKNOWN
-    return process_identity.check_owner(record.get("pid", 0), process_identity.parse_start(recorded))
+    current = _process_start(record.get("pid", 0))
+    return bool(recorded) and current is not None and recorded == current
 
 
 def _conf(path: Path) -> dict[str, str]:
@@ -539,12 +537,9 @@ def _supervisor_process(pid: int) -> SupervisorIdentity | NoSupervisor:
             argv = []
     if any(Path(argument).name == "relaunch.py" and argv[index + 1:index + 3] == ["run", "--"]
            for index, argument in enumerate(argv)):
-        try:
-            start = process_identity.process_start(pid)
-        except process_identity.ProcessReadError:
-            return NoSupervisor(kind="no supervisor")
-        if not isinstance(start, process_identity.ProcessGone):
-            return SupervisorIdentity(kind="supervisor", pid=pid, proc_start=start.text)
+        start = _process_start(pid)
+        if start:
+            return SupervisorIdentity(kind="supervisor", pid=pid, proc_start=start)
     return NoSupervisor(kind="no supervisor")
 
 
@@ -794,10 +789,8 @@ def _launcher_command(pid: int) -> list[str]:
             if sys.platform == "linux":
                 process = Path(os.environ.get("HERDR_PROC", "/proc")) / str(pid)
                 argv = [os.fsdecode(part) for part in process.joinpath("cmdline").read_bytes().split(b"\0") if part]
-                stat = process_identity.read_stat(pid, process.parent)
-                if isinstance(stat, process_identity.ProcessGone):
-                    return []
-                parent = stat.ppid
+                fields = process.joinpath("stat").read_text().rsplit(")", 1)[1].split()
+                parent = int(fields[1])
             else:
                 process = darwin.get(pid)
                 if process is None or isinstance(process.arguments, herdr.UnreadableProcessArguments):
@@ -907,10 +900,7 @@ def _listed_session(
 ) -> ListedSession | UnattributedSession:
     pid = record.get("pid", 0)
     name = _string(record.get("name"))
-    owner = _record_owner(record)
-    if owner is process_identity.OwnerCheck.UNKNOWN:
-        return {"pid": pid, "name": name, "reason": "process identity unreadable"}
-    if owner.stale:
+    if not _record_matches_process(record):
         return {"pid": pid, "name": name, "reason": "process start mismatch"}
     attributed = _configuration_for_session(pid, home_state)
     if isinstance(attributed, UnreadableSessionConfiguration):
@@ -1002,14 +992,46 @@ class ProcessObservation:
 
 
 @dataclass(frozen=True)
+class ProcessLive:
+    started: str
+
+
+@dataclass(frozen=True)
+class ProcessGone:
+    """The process no longer exists (including a reaped/zombie identity)."""
+
+
+@dataclass(frozen=True)
 class ProcessUnknown:
     reason: str
 
 
-def shutdown_identity(pid: int) -> process_identity.ProcessStart | process_identity.ProcessGone | ProcessUnknown:
+ProcessIdentity = ProcessLive | ProcessGone | ProcessUnknown
+
+
+def shutdown_identity(pid: int, timeout: float = 5) -> ProcessIdentity:
     try:
-        return process_identity.process_start(pid, Path(os.environ.get("HERDR_PROC", "/proc")))
-    except process_identity.ProcessReadError as error:
+        if sys.platform == "darwin":
+            shown = subprocess.run(["ps", "-p", str(pid), "-o", "stat=,lstart="],
+                capture_output=True, text=True, check=False, timeout=timeout,
+                env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+            if shown.returncode == 1 and not shown.stdout.strip():
+                return ProcessGone()
+            if shown.returncode:
+                return ProcessUnknown(f"pid {pid}: ps exit {shown.returncode}: {shown.stderr.strip()}")
+            status, separator, started = shown.stdout.strip().partition(" ")
+            if not separator or not started.strip():
+                return ProcessUnknown(f"pid {pid}: malformed ps identity")
+            return ProcessGone() if status.startswith("Z") else ProcessLive(started.lstrip())
+        fields = Path(os.environ.get("HERDR_PROC", "/proc"), str(pid), "stat").read_bytes().rpartition(b")")[2].split()
+        return ProcessGone() if fields[0] == b"Z" else ProcessLive(fields[19].decode("ascii"))
+    except FileNotFoundError:
+        try:
+            present = Path(os.environ.get("HERDR_PROC", "/proc"), str(pid)).exists()
+        except OSError as error:
+            return ProcessUnknown(f"pid {pid}: identity unread: {error}")
+        return ProcessUnknown(f"pid {pid}: stat missing from existing process") if present else ProcessGone()
+    except (OSError, subprocess.SubprocessError, IndexError, UnicodeError) as error:
         return ProcessUnknown(f"pid {pid}: identity unread: {error}")
 
 
@@ -1027,8 +1049,8 @@ def shutdown_server_identities(timeout: float, *, server_unit: str = "") -> froz
         remaining = expires - time.monotonic()
         if pid <= 0 or remaining <= 0:
             return frozenset()
-        identity = shutdown_identity(pid)
-        return frozenset({(pid, identity.text)}) if isinstance(identity, (process_identity.ProcessStartTime, process_identity.ProcessStartDate)) else frozenset()
+        identity = shutdown_identity(pid, remaining)
+        return frozenset({(pid, identity.started)}) if isinstance(identity, ProcessLive) else frozenset()
     except (OSError, subprocess.SubprocessError):
         return frozenset()
 
@@ -1163,8 +1185,8 @@ def shutdown_processes(timeout: float = 5) -> ProcessObservation:
         try:
             if process.stat().st_uid != os.getuid():
                 continue
-            stat = process_identity.read_stat(int(process.name), root)
-            if isinstance(stat, process_identity.ProcessGone) or stat.gone:
+            fields = process.joinpath("stat").read_text().rsplit(")", 1)[1].split()
+            if fields[0] == "Z":
                 continue
             arguments = tuple(os.fsdecode(word) for word in process.joinpath("cmdline").read_bytes().split(b"\0") if word)
             environment: dict[str, str] = {}
@@ -1182,9 +1204,9 @@ def shutdown_processes(timeout: float = 5) -> ProcessObservation:
             scope = next((group.name for _hierarchy, group in cgroups
                           if "builds.slice" in group.parts and group.suffix in {".scope", ".service"}), "")
             pid = int(process.name)
-            result[pid] = ShutdownProcess(pid, stat.ppid, stat.start.text, arguments,
+            result[pid] = ShutdownProcess(pid, int(fields[1]), fields[19], arguments,
                 environment.get("CLAUDE_CODE_SESSION_ID", ""),
-                environment.get("UNIT_RUN_DIR") or environment.get("UNIT_SESSION_DIR", ""), scope, stat.session,
+                environment.get("UNIT_RUN_DIR") or environment.get("UNIT_SESSION_DIR", ""), scope, int(fields[3]),
                 ownership_unreadable=ownership_unreadable,
                 cgroups=frozenset(str(group) for _hierarchy, group in cgroups))
         except FileNotFoundError:

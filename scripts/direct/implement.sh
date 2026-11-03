@@ -217,7 +217,7 @@ worker_record() {
   "$PY" - "${1}" "${SESSION_DIR}" "${TEAM_ROLE}" "${MESH_NAME}" \
   "${AGENT_FAMILY}" "${AGENT_MODEL}" "${BG_ID_FILE}" \
   "${USE_CODEX_MESH}" "${SCRIPT_DIR}/../agents/codex_mesh.py" \
-  "${BOARD_HELPER}" "${COMPACT_ABOVE_TOKENS}" "${PASS_KIND}" "${AGENT_PID:-0}" <<'PY'
+  "${BOARD_HELPER}" "${COMPACT_ABOVE_TOKENS}" "${PASS_KIND}" <<'PY'
 import fcntl
 import json
 import os
@@ -227,20 +227,13 @@ from pathlib import Path
 
 (
     action, root_text, slot, name, family, model, bg_file, mesh, mesh_script,
-    board_helper, compact_above_text, pass_kind, agent_pid,
+    board_helper, compact_above_text, pass_kind,
 ) = sys.argv[1:]
 root = Path(root_text)
 compact_above = int(compact_above_text)
 claim_file = root / f"impl_claim_{slot}.json"
 sys.path.insert(0, str(Path(mesh_script).resolve().parents[2]))
 from scripts.astra import design_roles
-from scripts.lib import process_start
-if action in ("turn", "record") and int(agent_pid):
-    try:
-        if process_start.process_state(int(agent_pid)) is process_start.ProcessRunState.GONE:
-            raise SystemExit(3)
-    except process_start.ProcessReadError:
-        pass
 sys.path.insert(0, str(Path(mesh_script).parent.parent / "direct"))
 from worker_state import worker_claim_lock, worker_ledger, worker_record_path
 
@@ -582,17 +575,21 @@ AGENT_PID=$!
 if [[ -n "${FOLLOW_TO}" ]]; then
   if [[ "${AGENT_FAMILY}" == "codex" ]]; then
     for ((turn_wait=0; turn_wait<${UNIT_WORKER_WAIT_ATTEMPTS:-30}; turn_wait++)); do
-      turn_state=0
-      turn_id="$(worker_record turn 2>/dev/null)" || turn_state=$?
-      [[ -n "$turn_id" || "$turn_state" == 3 ]] && break
+      if [[ -n "$(worker_record turn 2>/dev/null || true)" ]]; then
+        break
+      fi
+      kill -0 "${AGENT_PID}" 2>/dev/null || break
+      [[ "$(ps -o stat= -p "${AGENT_PID}" 2>/dev/null || true)" == Z* ]] && break
       sleep "${UNIT_WORKER_POLL_SECS:-1}"
     done
   fi
 elif [[ "${AGENT_FAMILY}" == "claude" || "${USE_CODEX_MESH}" == "1" ]]; then
   for ((worker_wait=0; worker_wait<${UNIT_WORKER_WAIT_ATTEMPTS:-30}; worker_wait++)); do
-    record_state=0
-    worker_record record 2>/dev/null || record_state=$?
-    [[ "$record_state" == 0 || "$record_state" == 3 ]] && break
+    if worker_record record 2>/dev/null; then
+      break
+    fi
+    kill -0 "${AGENT_PID}" 2>/dev/null || break
+    [[ "$(ps -o stat= -p "${AGENT_PID}" 2>/dev/null || true)" == Z* ]] && break
     sleep "${UNIT_WORKER_POLL_SECS:-1}"
   done
 fi

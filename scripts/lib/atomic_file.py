@@ -42,12 +42,9 @@ def remove_dead_temporary_files(path: Path) -> None:
 
 
 @contextmanager
-def _flushed_temporary_file(path: Path, content: str | bytes, *, mode: int = 0o600, create_parent: bool = True) -> Generator[Path]:
+def _flushed_temporary_file(path: Path, content: str | bytes, *, mode: int = 0o600) -> Generator[Path]:
     """Keep a complete, private sibling file until publication finishes."""
-    if create_parent:
-        path.parent.mkdir(parents=True, exist_ok=True)
-    else:
-        _ = path.parent.stat()
+    path.parent.mkdir(parents=True, exist_ok=True)
     remove_dead_temporary_files(path)
     descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.{os.getpid()}.", suffix=".tmp", dir=path.parent)
     temporary = Path(name)
@@ -87,9 +84,9 @@ def prepared_replacement(path: Path, content: str | bytes, *, mode: int) -> Gene
         yield temporary
 
 
-def write_text_atomic(path: Path, text: str, *, new_file_mode: int | None = None, create_parent: bool = True) -> None:
+def write_text_atomic(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
     """Publish complete text; preserve existing permissions or use the supplied mode for a new file."""
-    _write_atomic(path, text, new_file_mode=new_file_mode, create_parent=create_parent)
+    _write_atomic(path, text, new_file_mode=new_file_mode)
 
 
 def write_bytes_atomic(path: Path, data: bytes, *, mode: int | None = None) -> None:
@@ -98,11 +95,11 @@ def write_bytes_atomic(path: Path, data: bytes, *, mode: int | None = None) -> N
 
 
 def _write_atomic(path: Path, content: str | bytes, *, mode: int | None = None,
-                  new_file_mode: int | None = None, create_parent: bool = True) -> None:
+                  new_file_mode: int | None = None) -> None:
     """Own the single replacement boundary for text and binary evidence."""
     replaced = False
     try:
-        with _flushed_temporary_file(path, content, mode=mode if mode is not None else 0o600, create_parent=create_parent) as temporary:
+        with _flushed_temporary_file(path, content, mode=mode if mode is not None else 0o600) as temporary:
             if mode is not None:
                 temporary.chmod(mode)
             elif path.exists():

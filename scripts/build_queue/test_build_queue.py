@@ -8,16 +8,12 @@ import fcntl
 import io
 import json
 import os
-import sys
 from pathlib import Path
 import time
 import unittest
 from unittest import mock
 from typing import Protocol, cast, override
 from zoneinfo import ZoneInfo
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 
 from scripts.build_queue import build_queue, head_facts, queue_card, queue_view
 from scripts.build_queue.queue_fixture import (

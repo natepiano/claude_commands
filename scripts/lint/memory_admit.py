@@ -26,7 +26,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, NoReturn, NotRequired, Protocol, TypedDict, cast, get_args, get_origin, get_type_hints, is_typeddict
+from typing import BinaryIO, Callable, Literal, NoReturn, NotRequired, Protocol, TypedDict, cast, get_args, get_origin, get_type_hints, is_typeddict
 from functools import lru_cache
 from itertools import chain
 from types import UnionType, MappingProxyType
@@ -34,12 +34,6 @@ from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-if TYPE_CHECKING:
-    from ..lib import process_start
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.lib import process_start
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
@@ -508,11 +502,6 @@ class CompilerServiceMemory(MeasuredMemory):
 
 
 @dataclass(frozen=True)
-class UnreadableMemory:
-    """The process identity could not be read; retain its promised allowance."""
-
-
-@dataclass(frozen=True)
 class GoneMemory:
     pass
 
@@ -682,7 +671,7 @@ def priority_set(unit: str, why: str) -> str:
             now = time.time()
             priority: QueuePriority = {"unit": unit, "why": why, "set_at": now, "set_by": actor}
             begin_priority_transition(directory, priority, "set", now)
-        processes = process_table(_buildlog_proc())
+        processes = process_table(Path(os.environ.get("BUILDLOG_PROC", "/proc")))
         readings.processes = processes
         snapshot = gather_queue_inputs(directory, processes, time.time(), readings=readings, policy=policy)
         place = next((place for place, (_, row) in enumerate(snapshot.ordered, 1)
@@ -862,7 +851,7 @@ def admit_head(why: str = "") -> str:
         if not ordered:
             raise AdmitHeadRefused("nothing waits; no head to admit")
         path, row = ordered[0]
-        proc = _buildlog_proc()
+        proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
         identities = QueueIdentityReader(process_table(proc), proc)
         identity = identities.identity(row["pid"], cast(dict[str, object], cast(object, row)))
         host = read_meminfo(Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")))
@@ -1383,16 +1372,6 @@ HeadAfterEnd = HeadRelease | HeadStillHeld | EstimateExpired | NoWaiter | Readin
 class ProcessIdentity:
     parent: int
     start: str
-
-
-@dataclass(frozen=True)
-class UnreadableProcessIdentity:
-    """This snapshot could not read the process; retain its memory promise."""
-
-    reason: str
-
-
-ProcessTable = Mapping[int, ProcessIdentity | UnreadableProcessIdentity]
 
 
 @dataclass(frozen=True)
@@ -2461,32 +2440,35 @@ def fresh_test_peak(repository: RepositoryIdentity, step: str, host: str, now: d
     return compile_peak
 
 
+def process_start_time(pid: int) -> str | None:
+    try:
+        stat = (Path("/proc") / str(pid) / "stat").read_text()
+        fields = stat.rsplit(") ", 1)[1].split()
+        return fields[19] if fields[0] not in ("Z", "X") else None
+    except (OSError, IndexError):
+        return None
 
-def _buildlog_proc() -> Path:
-    return Path(os.environ.get("BUILDLOG_PROC", "/proc"))
 
-
-def process_table(proc: Path = PROC) -> ProcessTable:
-    processes: dict[int, ProcessIdentity | UnreadableProcessIdentity] = {}
+def process_table(proc: Path = PROC) -> dict[int, ProcessIdentity]:
+    processes: dict[int, ProcessIdentity] = {}
     for entry in proc.iterdir():
         if not entry.name.isdecimal():
             continue
         try:
-            stat = process_start.read_stat(int(entry.name), proc)
-            if not isinstance(stat, process_start.ProcessGone) and not stat.gone:
-                processes[int(entry.name)] = ProcessIdentity(stat.ppid, stat.start.text)
-        except process_start.ProcessReadError as error:
-            processes[int(entry.name)] = UnreadableProcessIdentity(str(error))
+            fields = (entry / "stat").read_text().rsplit(") ", 1)[1].split()
+            if fields[0] not in ("Z", "X"):
+                processes[int(entry.name)] = ProcessIdentity(int(fields[1]), fields[19])
+        except (OSError, ValueError, IndexError):
+            continue
     return processes
 
 
-def process_tree(roots: Mapping[int, str], processes: ProcessTable) -> set[int]:
+def process_tree(roots: Mapping[int, str], processes: dict[int, ProcessIdentity]) -> set[int]:
     """Find live roots and their descendants from one process table reading."""
     children: dict[int, list[int]] = {}
     for child, identity in processes.items():
-        if isinstance(identity, ProcessIdentity):
-            children.setdefault(identity.parent, []).append(child)
-    pending = [pid for pid, start in roots.items() if isinstance(identity := processes.get(pid), ProcessIdentity) and identity.start == start]
+        children.setdefault(identity.parent, []).append(child)
+    pending = [pid for pid, start in roots.items() if pid in processes and processes[pid].start == start]
     seen: set[int] = set()
     while pending:
         child = pending.pop()
@@ -2514,11 +2496,9 @@ def process_memory(pids: set[int], proc: Path = PROC) -> MeasuredMemory:
     return MeasuredMemory(used, swap_bytes=swapped)
 
 
-def tree_memory(pid: int, start: str, processes: ProcessTable,
-                proc: Path = PROC) -> MeasuredMemory | GoneMemory | UnreadableMemory:
+def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
+                proc: Path = PROC) -> MeasuredMemory | GoneMemory:
     """Sum resident and swapped bytes from one process table reading."""
-    if isinstance(processes.get(pid), UnreadableProcessIdentity):
-        return UnreadableMemory()
     members = process_tree({pid: start}, processes)
     return process_memory(members, proc) if members else GoneMemory()
 
@@ -2558,12 +2538,10 @@ def reservation_lifetime(row: Reservation, owner_live: bool) -> PopulatedStepSco
     return LiveOwnerProcess() if owner_live else EndedStep()
 
 
-def step_memory(row: Reservation, now: datetime, processes: ProcessTable,
+def step_memory(row: Reservation, now: datetime, processes: dict[int, ProcessIdentity],
                 proc: Path = PROC, *, policy: AdmissionPolicy) -> StepMemory:
     identity = processes.get(row["pid"])
-    if isinstance(identity, UnreadableProcessIdentity):
-        return PromisedMemory(row["need"])
-    owner_live = isinstance(identity, ProcessIdentity) and identity.start == row["start_time"]
+    owner_live = identity is not None and identity.start == row["start_time"]
     lifetime = reservation_lifetime(row, owner_live)
     if isinstance(lifetime, EndedStep):
         return GoneMemory()
@@ -2581,8 +2559,6 @@ def step_memory(row: Reservation, now: datetime, processes: ProcessTable,
             reading = tree_memory(row["pid"], row["start_time"], processes, proc)
     else:
         reading = tree_memory(row["pid"], row["start_time"], processes, proc)
-    if isinstance(reading, UnreadableMemory):
-        return PromisedMemory(row["need"])
     return step_promise(row, now, reading, policy)
 
 
@@ -2615,7 +2591,7 @@ def test_phase_history(row: Reservation, reading: StepMemory,
 
 
 def reservation_memory(path: Path, row: Reservation, now: datetime,
-                       processes: ProcessTable, proc: Path, policy: AdmissionPolicy) -> StepMemory:
+                       processes: dict[int, ProcessIdentity], proc: Path, policy: AdmissionPolicy) -> StepMemory:
     reading = step_memory(row, now, processes, proc, policy=policy)
     try:
         peak = int(path.with_suffix(".max").read_text())
@@ -2856,11 +2832,8 @@ def reservation_rows(directory: Path) -> list[tuple[Path, Reservation]]:
 
 def live_reservations(directory: Path) -> list[tuple[Path, Reservation]]:
     """A read-only lookup: only the locked check or release finalizes rows."""
-    proc = _buildlog_proc()
     return [(path, row) for path, row in reservation_rows(directory)
-            if not isinstance(reservation_lifetime(row, not process_start.check_owner(
-                row["pid"], process_start.parse_start(row["start_time"]), proc).stale), EndedStep)]
-
+            if not isinstance(reservation_lifetime(row, process_start_time(row["pid"]) == row["start_time"]), EndedStep)]
 
 
 def read_waiter(path: Path) -> Waiter:
@@ -2878,16 +2851,14 @@ def stored_waiter(row: Waiter) -> Waiter:
 
 def live_waiters(directory: Path) -> list[tuple[Path, Waiter]]:
     live: list[tuple[Path, Waiter]] = []
-    proc = _buildlog_proc()
     for path in directory.glob("*.waiting"):
         try:
             row = read_waiter(path)
-            owner = process_start.check_owner(row["pid"], process_start.parse_start(row["start_time"]), proc)
+            if process_start_time(row["pid"]) == row["start_time"]:
+                live.append((path, row))
+                continue
         except (OSError, ValueError, KeyError, TypeError):
-            continue
-        if not owner.stale:
-            live.append((path, row))
-            continue
+            pass
         path.unlink(missing_ok=True)
     return live
 
@@ -3217,7 +3188,7 @@ def finish_token_wait(path: Path) -> None:
         pass
     else:
         _ = finalize_reservation(reservation, row, Completed(), datetime.now(UTC), 0)
-    if process_start.check_owner(waiter["pid"], process_start.parse_start(waiter["start_time"]), _buildlog_proc()) is process_start.OwnerCheck.ALIVE:
+    if process_start_time(waiter["pid"]) == waiter["start_time"]:
         target = path.parent / f"{waiter['pid']}-{waiter['start_time']}.waiting"
         write_text_atomic(target, json.dumps(waiter, separators=(",", ":")))
     path.unlink(missing_ok=True)
@@ -3297,7 +3268,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         # Lock contention must not consume the recovery spacing or ramp window.
         # Use one time for every decision and ledger write in this transaction.
         now = now if now is not None else datetime.now(UTC)
-        proc = _buildlog_proc()
+        proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
         processes = process_table(proc)
         snapshot.processes = processes
         live: list[tuple[Path, Reservation]] = []
@@ -3318,17 +3289,14 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
             live.append((path, row))
         compilers = sccache_memory()
         snapshot.compilers = compilers
-        try:
-            start_text = process_start.start_text(pid, proc) or ""
-        except process_start.ProcessReadError:
-            start_text = ""
-        mine = directory / f"{pid}-{start_text}.waiting"
+        start = process_start_time(pid)
+        mine = directory / f"{pid}-{start}.waiting"
         waiting = live_waiters(directory)
         previous = next((row for path, row in waiting if path == mine), None)
         waited_from = since or now.timestamp()
         if previous is not None:
             waited_from = min(waited_from, previous["since"])
-        waiter: Waiter = {"pid": pid, "start_time": start_text, "need": peak.bytes, "since": waited_from,
+        waiter: Waiter = {"pid": pid, "start_time": start or "", "need": peak.bytes, "since": waited_from,
                           "label": f"{worktree or repo} {step} ({os.environ.get('BUILDLOG_CALLER') or 'caller'} pid {pid})"}
         waiter["need_source"] = peak.source
         waiter["test_scope"] = profile.scope
@@ -3364,7 +3332,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
             back = float(os.environ["BUILDLOG_MEM_TOKEN_BACK_AT"])
             append_queue_time(directory, {
                 "kind": "token_gap", "session_id": identity["session_id"], "step": step,
-                "pid": pid, "start_time": start_text, "token_left_at": waiter["token_left_at"],
+                "pid": pid, "start_time": start or "", "token_left_at": waiter["token_left_at"],
                 "token_back_at": back}, now.timestamp())
             del waiter["token_left_at"]
             write_text_atomic(mine, json.dumps(stored_waiter(waiter), separators=(",", ":")))
@@ -3402,12 +3370,12 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                             peak.bytes, now.timestamp())
         snapshot.recovery = applied_recovery
         reservation: Reserved | NotReserved = NotReserved("held" if argv else "launch")
-        if argv and decision.state == "hold" and start_text:
+        if argv and decision.state == "hold" and start is not None:
             write_text_atomic(mine, json.dumps(stored_waiter(waiter), separators=(",", ":")))
         if argv and decision.state == "admit":
-            if start_text:
+            if start is not None:
                 existing = next((path for path, row in live
-                                 if step == "nextest" and row["pid"] == pid and row["start_time"] == start_text
+                                 if step == "nextest" and row["pid"] == pid and row["start_time"] == start
                                  and row["step"] == step and row["sidecar"] == sidecar
                                  and row["need"] == peak.bytes), None)
                 if existing is not None:
@@ -3415,8 +3383,8 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                     # has checked memory with every live reservation charged.
                     path = existing
                 else:
-                    path = directory / f"{pid}-{start_text}-{time.time_ns()}.reservation"
-                    row: Reservation = {"pid": pid, "start_time": start_text, "need": peak.bytes,
+                    path = directory / f"{pid}-{start}-{time.time_ns()}.reservation"
+                    row: Reservation = {"pid": pid, "start_time": start, "need": peak.bytes,
                                         "repo": repo, "step": step, "worktree": worktree,
                                         "admitted_at": store.utc_iso(now.timestamp()), "sidecar": sidecar,
                                         "test_threads": width,
@@ -3483,8 +3451,8 @@ def waiter_unit_name(identity: WaiterIdentity, pid: int) -> str:
 
 
 class QueueIdentityReader:
-    def __init__(self, processes: ProcessTable, proc: Path = PROC) -> None:
-        self.processes: ProcessTable = processes
+    def __init__(self, processes: dict[int, ProcessIdentity], proc: Path = PROC) -> None:
+        self.processes: dict[int, ProcessIdentity] = processes
         self.proc: Path = proc
         self.environments: dict[int, dict[str, str]] = {}
         self.names: dict[str, str] = {}
@@ -3504,7 +3472,7 @@ class QueueIdentityReader:
         folder = str(row.get("folder") or row.get("worktree") or "")
         step = str(row.get("step", ""))
         owner = self.processes.get(pid)
-        if not isinstance(owner, ProcessIdentity) or owner.start != row.get("start_time"):
+        if owner is None or owner.start != row.get("start_time"):
             return {"session_id": session, "session_name": name, "step": step, "folder": folder}
         if not folder:
             try:
@@ -3523,10 +3491,7 @@ class QueueIdentityReader:
             env = self.environments[current]
             session = env.get("CODEX_THREAD_ID") or env.get("CLAUDE_CODE_SESSION_ID", "")
             name = name or env.get("CLAUDE_SESSION_NAME", "")
-            parent = self.processes[current]
-            if isinstance(parent, UnreadableProcessIdentity):
-                break
-            current = parent.parent
+            current = self.processes[current].parent
         if not step:
             try:
                 argv = (self.proc / str(pid) / "cmdline").read_bytes().decode(errors="replace").split("\0")
@@ -3564,7 +3529,7 @@ def queue_wait_reason(decision: AdmissionDecision, need: int, available: int,
     return ReadyForAdmission()
 
 
-def queue_rows(directory: Path, suffix: str, processes: ProcessTable) -> list[tuple[Path, dict[str, object]]]:
+def queue_rows(directory: Path, suffix: str, processes: dict[int, ProcessIdentity]) -> list[tuple[Path, dict[str, object]]]:
     rows: list[tuple[Path, dict[str, object]]] = []
     for path in sorted(directory.glob(f"*.{suffix}")):
         try:
@@ -3572,7 +3537,7 @@ def queue_rows(directory: Path, suffix: str, processes: ProcessTable) -> list[tu
                    else cast(dict[str, object], cast(object, read_waiter(path))))
             pid = row["pid"]
             identity = processes.get(pid) if isinstance(pid, int) else None
-            if isinstance(pid, int) and (suffix == "reservation" or (isinstance(identity, UnreadableProcessIdentity) or (isinstance(identity, ProcessIdentity) and identity.start == row["start_time"]))):
+            if isinstance(pid, int) and (suffix == "reservation" or (identity is not None and identity.start == row["start_time"])):
                 rows.append((path, row))
         except (OSError, ValueError, KeyError, TypeError):
             continue
@@ -3676,7 +3641,7 @@ def blocking_index(owner: str, endings: tuple[PassResult, ...]) -> BlockingIndex
 
 
 def blocker_identity(index: BlockingIndex | NoSingleBlocker | BlockerNotRequested,
-                     reservations: list[Reservation], processes: ProcessTable, proc: Path) -> Blocker:
+                     reservations: list[Reservation], processes: dict[int, ProcessIdentity], proc: Path) -> Blocker:
     """Resolve a pass's unique blocker only at the process/sidecar boundary."""
     if not isinstance(index, BlockingIndex):
         return NoSingleBlocker()
@@ -3702,7 +3667,7 @@ def blocker_snapshot(waiter_path: Path) -> Blocker:
     if not waiter_path.exists():
         raise WaiterGone(f"waiter file is gone: {waiter_path}")
     directory = waiter_path.parent
-    proc = _buildlog_proc()
+    proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
     processes = process_table(proc)
     policy = read_memory_config().policy
     inputs = gather_queue_inputs(directory, processes, time.time(), policy=policy)
@@ -3740,14 +3705,14 @@ class ReadingNotTaken:
 READING_NOT_TAKEN = ReadingNotTaken()
 
 
-def gather_queue_inputs(directory: Path, processes: ProcessTable, now: float,
+def gather_queue_inputs(directory: Path, processes: dict[int, ProcessIdentity], now: float,
                         memory: Mapping[Path, StepMemory] = NO_MEMORY_READINGS, *,
                         readings: QueueSnapshotReadings | ReadingNotTaken = READING_NOT_TAKEN,
                         policy: AdmissionPolicy) -> QueueInputs:
     """Resolve every file, process and environment input before the pure decision walk."""
     if isinstance(readings, ReadingNotTaken):
         readings = QueueSnapshotReadings(ProcessesNotRead(), {}, policy=policy)
-    proc = _buildlog_proc()
+    proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
     identities = QueueIdentityReader(processes, proc)
     running: list[RunningStep] = []
     reservations: list[Reservation] = []
@@ -3895,14 +3860,14 @@ def _queue_read_live(inputs: QueueInputs, config: MemoryConfig) -> QueueRead:
     return queue_read_from(inputs, resolve_admission_limits(total, config), config.policy)
 
 
-def read_queue_pass(directory: Path, processes: ProcessTable, now: float) -> QueueRead:
+def read_queue_pass(directory: Path, processes: dict[int, ProcessIdentity], now: float) -> QueueRead:
     config = memory_config()
     inputs = gather_queue_inputs(directory, processes, now, policy=config.policy)
     total = inputs.host.total if isinstance(inputs.host, HostMemory) else UnknownHostTotal()
     return queue_read_from(inputs, resolve_admission_limits(total, config), config.policy)
 
 
-def read_queue(directory: Path, processes: ProcessTable, now: float) -> tuple[QueueView, list[tuple[Path, Waiter]]]:
+def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: float) -> tuple[QueueView, list[tuple[Path, Waiter]]]:
     result = read_queue_pass(directory, processes, now)
     return result.view, result.ordered
 
@@ -4062,7 +4027,7 @@ class ProcessesNotRead:
 @dataclass
 class QueueSnapshotReadings:
     policy: AdmissionPolicy = field(kw_only=True)
-    processes: ProcessTable | ProcessesNotRead
+    processes: dict[int, ProcessIdentity] | ProcessesNotRead
     memory: dict[Path, StepMemory]
     host: HostMemory | ReadingUnavailable | ReadingNotTaken = ReadingNotTaken()
     pressure: Pressure | ReadingNotTaken = ReadingNotTaken()
@@ -4086,7 +4051,7 @@ def exclusive_queue(directory: Path, *,
             yield readings
         finally:
             try:
-                processes = (process_table(_buildlog_proc())
+                processes = (process_table(Path(os.environ.get("BUILDLOG_PROC", "/proc")))
                              if isinstance(readings.processes, ProcessesNotRead) else readings.processes)
                 write_queue_snapshot(directory, gather_queue_inputs(
                     directory, processes, time.time(), readings.memory, readings=readings, policy=readings.policy), readings.policy)
@@ -4115,7 +4080,7 @@ def locked_queue_read(timeout: float = QUEUE_LOCK_TIMEOUT_SECONDS) -> QueueRead:
     try:
         lock = (directory / "lock").open("r")
     except FileNotFoundError:
-        return read_queue_pass(directory, process_table(_buildlog_proc()), time.time())
+        return read_queue_pass(directory, process_table(Path(os.environ.get("BUILDLOG_PROC", "/proc"))), time.time())
     with lock:
         previous = signal.signal(signal.SIGALRM, _queue_lock_timeout)
         try:
@@ -4124,7 +4089,7 @@ def locked_queue_read(timeout: float = QUEUE_LOCK_TIMEOUT_SECONDS) -> QueueRead:
         finally:
             _ = signal.setitimer(signal.ITIMER_REAL, 0)
             _ = signal.signal(signal.SIGALRM, previous)
-        return read_queue_pass(directory, process_table(_buildlog_proc()), time.time())
+        return read_queue_pass(directory, process_table(Path(os.environ.get("BUILDLOG_PROC", "/proc"))), time.time())
 
 
 def queue_view() -> QueueView:
@@ -4232,9 +4197,8 @@ def cancel_waiter(pid: int, root: Path | None = None) -> None:
     root = root if root is not None else store.root()
     directory = admission_dir(root)
     with exclusive_queue(directory):
-        start = process_start.process_start(pid, _buildlog_proc())
-        if not isinstance(start, process_start.ProcessGone):
-            (directory / f"{pid}-{start.text}.waiting").unlink(missing_ok=True)
+        start = process_start_time(pid)
+        (directory / f"{pid}-{start}.waiting").unlink(missing_ok=True)
 
 
 def test_phase_charge_use_path(path: Path) -> Path:
@@ -4440,11 +4404,9 @@ def run_action() -> None:
     argv = sys.argv[12:]
     profile: InferFromArgv | StepProfile = InferFromArgv()
     if cached_need != "-":
+        start = process_start_time(int(pid))
         try:
-            start = process_start.process_start(int(pid), _buildlog_proc())
-            if isinstance(start, process_start.ProcessGone):
-                raise ValueError("waiter has ended")
-            row = read_waiter(store.root() / "admission" / f"{pid}-{start.text}.waiting")
+            row = read_waiter(store.root() / "admission" / f"{pid}-{start}.waiting")
             basis = read_need_basis(row.get("need_basis"))
             # An empty key is the explicit unknown identity. Old rows must refresh.
             if (not row.get("fresh_test", False) and not isinstance(basis, BasisNotRecorded)

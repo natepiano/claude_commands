@@ -10,9 +10,6 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from scripts.message import sessions
-
-from scripts.lib import process_start as process_identity
 from typing import cast, override
 from unittest import mock
 
@@ -29,6 +26,7 @@ import fake_unit_host
 from scripts.production import showrunners
 import unit_lookup
 import herdr
+import sessions
 from fake_unit_host import HostedUnit
 from sessions import SessionRecord
 from unit_lookup import ClaudeNotRunning, ClaudeUnknown, LiveClaude, UnitState
@@ -904,9 +902,7 @@ print(observed.row.id)
         self.claude("trunk", "w4:p1")
         record = self.records / "trunk-1.json"
         data = cast(dict[str, object], json.loads(record.read_text()))
-        started = process_identity.process_start(os.getpid())
-        assert not isinstance(started, process_identity.ProcessGone)
-        data["procStart"] = started.text
+        data["procStart"] = sessions.process_start(os.getpid())
         data["messagingSocketPath"] = ""
         _ = record.write_text(json.dumps(data))
         found = unit_lookup.marked_units("show")["trunk-unit"]

@@ -14,31 +14,6 @@ from scripts.lib.atomic_file import write_text_atomic
 
 
 class AtomicFileTests(unittest.TestCase):
-    def test_publication_requires_an_existing_parent_when_requested(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            parent = Path(directory) / "retired"
-            path = parent / "result"
-            with self.assertRaises(atomic_file.AtomicPublicationFailed) as error:
-                write_text_atomic(path, "complete", create_parent=False)
-            self.assertEqual(error.exception.errno, errno.ENOENT)
-            self.assertFalse(parent.exists())
-            parent.mkdir()
-            write_text_atomic(path, "complete", create_parent=False)
-            self.assertEqual(path.read_text(), "complete")
-
-    def test_parent_removed_during_preparation_is_not_recreated(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            parent = Path(directory) / "retired"
-            parent.mkdir()
-            def retire_parent(path: Path) -> None:
-                self.assertEqual(path.parent, parent)
-                parent.rmdir()
-
-            with patch.object(atomic_file, "remove_dead_temporary_files", side_effect=retire_parent):
-                with self.assertRaises(atomic_file.AtomicPublicationFailed):
-                    write_text_atomic(parent / "result", "complete", create_parent=False)
-            self.assertFalse(parent.exists())
-
     def test_new_file_mode_publishes_complete_private_text_and_preserves_existing_permissions(self) -> None:
         for existing in (False, True):
             with self.subTest(existing=existing), tempfile.TemporaryDirectory() as directory:

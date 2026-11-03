@@ -13,8 +13,6 @@ from typing import TYPE_CHECKING, TypedDict, cast, override
 import unittest
 from unittest import mock
 
-from scripts.lib.process_start_test_support import stored_start_probe
-from scripts.lib import process_start
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, GIT_STUB
 from scripts.direct import verify_doc_test_support as doc_support
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
@@ -304,7 +302,7 @@ if count >= 3:
         paths: list[Path] = []
         with mock.patch.dict(os.environ, self.environment), \
              mock.patch.object(Path, "home", return_value=self.home), \
-             mock.patch.object(process_start, "process_start", side_effect=stored_start_probe(lambda pid: (eligibility_support.SshEligibilityTests().process_start)(pid) or "")), \
+             mock.patch.object(mac_test, "process_start_time", side_effect=eligibility_support.SshEligibilityTests().process_start), \
              mock.patch.object(mac_test, "target_claim_scope", return_value=mac_test.RepositoryScope(
                  "hana", "https://example.com/team/hana")):
             state = mac_test.state_paths("aws")
@@ -336,13 +334,11 @@ sys.path.insert(0, str(source))
 sys.path.insert(0, str(source / "scripts/buildlog"))
 from scripts.buildlog import mac_idle
 from scripts.direct import step_record
-from scripts.lib import process_start
-from scripts.lib.process_start_test_support import stored_start_probe
 
 if sys.argv[1] == "reserve":
     row = json.loads(step_record.record_path(os.environ["BUILDLOG_CALL_ID"]).read_text())
     process = mac_idle.LiveProcess(row["pid"], 1, row["proc_start"], ("verify.sh",), {}, row["repo"])
-    with mock.patch.object(process_start, "process_start", side_effect=stored_start_probe(lambda pid: process.start)):
+    with mock.patch.object(step_record, "process_start", return_value=process.start):
         calls = mac_idle.waiting_calls(mac_idle.watch_paths(), {process.pid: process})
     snapshot = {"markers": [call.marker_hook for call in calls],
                 "memory_hook": bool(os.environ.get("LINT_QUEUE_LEAVE_HOOK"))}
@@ -378,7 +374,7 @@ raise SystemExit(subprocess.run([sys.executable, str(source / "scripts/build_tar
         self.configure("natedev,mac")
         self.enable_mac()
         with mock.patch.dict(os.environ, self.environment), \
-             mock.patch.object(process_start, "process_start", side_effect=stored_start_probe(lambda pid: "old-owner" or "")):
+             mock.patch.object(mac_test, "process_start_time", return_value="old-owner"):
             paths = mac_test.state_paths("mac")
             args = mac_test.CliArguments()
             args.target, args.worktree, args.pid = "mac", str(self.root), 2147483000
@@ -793,7 +789,7 @@ class SshReservationTests(unittest.TestCase):
         self.assertEqual(self.reserve(71)[0], 0)
         state = mac_test.state_paths("aws")
         claim, = mac_test.read_claims(state)
-        with mock.patch.object(process_start, "process_start", side_effect=stored_start_probe(lambda pid: "reused-start" or "")):
+        with mock.patch.object(mac_test, "process_start_time", return_value="reused-start"):
             self.assertEqual(build_targets.command_release_wait(71), 0)
         self.assertTrue(claim.path.exists())
         self.assertEqual(mac_test.read_claims(state)[0].record, claim.record)

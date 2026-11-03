@@ -15,8 +15,6 @@ from pathlib import Path
 from typing import Protocol, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS.parent))
-from scripts.lib import process_start as process_identity
 for dependency in ("message", "production", "notify", "herdr", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
@@ -135,13 +133,8 @@ def launch_fixer(session_id: str, pid: int, proc_start: str, who: str, session: 
 
 
 def _observe(session_id: str, pid: int, proc_start: str) -> ConfirmedSession | RegistryUnavailable | SessionGone:
-    if not proc_start:
+    if not proc_start or sessions.process_start(pid) != proc_start:
         return SessionGone()
-    state = process_identity.check_owner(pid, process_identity.parse_start(proc_start))
-    if state.stale:
-        return SessionGone()
-    if state is process_identity.OwnerCheck.UNKNOWN:
-        return RegistryUnavailable()
     path = sessions.sessions_dir() / f"{pid}.json"
     try:
         value = cast(object, json.loads(path.read_text()))

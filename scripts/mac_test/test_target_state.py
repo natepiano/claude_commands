@@ -22,8 +22,6 @@ for directory in ("mac_test", "build_targets", "build_hold", "buildlog", "lib", 
     sys.path.insert(0, str(SCRIPTS / directory))
 
 if TYPE_CHECKING:
-    from ..lib import process_start
-    from ..lib.process_start_test_support import stored_start_probe
     from . import mac_test, offload
     from ..build_targets import targets
     from ..build_hold import build_hold
@@ -31,9 +29,6 @@ if TYPE_CHECKING:
     from ..lib import conf
     from ..lint.memory_test_support import write_config_fixture, config_environment
 else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.lib import process_start
-    from scripts.lib.process_start_test_support import stored_start_probe
     import mac_test
     import offload
     import targets
@@ -116,7 +111,7 @@ class IsolatedTargetState(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(time, "time", return_value=NOW.timestamp()))
         _ = self.enterContext(mock.patch.object(time, "monotonic", return_value=100.0))
         _ = self.enterContext(mock.patch.object(build_hold, "datetime", HoldClock))
-        _ = self.enterContext(mock.patch.object(process_start, "process_start", side_effect=stored_start_probe(lambda pid: "fake-start" or "")))
+        _ = self.enterContext(mock.patch.object(mac_test, "process_start_time", return_value="fake-start"))
         _ = self.enterContext(mock.patch.object(offload, "repository_identity",
                                               return_value=offload.KnownRepository("project")))
         _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=build_hold.NoOwningSession()))
@@ -464,7 +459,7 @@ class TargetStateTests(IsolatedTargetState):
         result = self.block("aws")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         before = self.snapshot()
-        with mock.patch.object(process_start, "process_start", side_effect=stored_start_probe(lambda pid: None or "")), \
+        with mock.patch.object(mac_test, "process_start_time", return_value=None), \
                 mock.patch.object(targets, "utc_now", return_value=NOW + timedelta(days=1)):
             self.assertIsInstance(targets.target_state(self.selected_target("linux-two")), targets.Free)
             state = targets.target_state(self.selected_target("aws"))

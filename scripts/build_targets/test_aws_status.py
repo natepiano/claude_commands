@@ -17,18 +17,13 @@ import build_targets
 import mac_test
 import offload
 
-
 if TYPE_CHECKING:
-    from ..lib import process_start
-    from ..lib.process_start_test_support import stored_start_probe
     from ..aws_target import aws_target, ledger
     from ..aws_target.control_test_support import AwsReplies
     from ..aws_target.measurement_test_support import MeasurementFixture, NOW, REPOSITORY, private_history, read_only_evidence
     from ..message import roster
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.lib import process_start
-    from scripts.lib.process_start_test_support import stored_start_probe
     from scripts.aws_target import aws_target, ledger
     from scripts.aws_target.control_test_support import AwsReplies
     from scripts.aws_target.measurement_test_support import MeasurementFixture, NOW, REPOSITORY, private_history, read_only_evidence
@@ -47,7 +42,7 @@ class AwsStatusTests(MeasurementFixture):
         _ = cast(object, self.enterContext(mock.patch.object(subprocess, "run", side_effect=private_history)))
         _ = cast(object, self.enterContext(mock.patch.object(subprocess, "Popen", side_effect=AssertionError("status must not start commands"))))
         _ = cast(object, self.enterContext(mock.patch.object(time, "time", return_value=float(NOW))))
-        _ = cast(object, self.enterContext(mock.patch.object(process_start, "process_start", side_effect=stored_start_probe(lambda pid: (self.process_start)(pid) or ""))))
+        _ = cast(object, self.enterContext(mock.patch.object(mac_test, "process_start_time", side_effect=self.process_start)))
         self.controller("running")
 
     @staticmethod

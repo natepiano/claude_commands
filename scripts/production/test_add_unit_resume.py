@@ -11,8 +11,6 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
-
-from scripts.lib import process_start as process_identity
 from typing import TypedDict, cast, final, override
 from unittest.mock import Mock, patch
 
@@ -182,9 +180,9 @@ class AddUnitResumeTests(AddUnitTestCase):
     def test_running_resume_refuses_before_any_launch_write(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
-        started = process_identity.process_start(os.getpid())
-        assert not isinstance(started, process_identity.ProcessGone)
-        self.write_resume_registry_record(started.text)
+        started = sessions.process_start(os.getpid())
+        assert started is not None
+        self.write_resume_registry_record(started)
         document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
         for mode in ([], ["--check"]):
@@ -223,7 +221,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.write_resume_registry_record("recorded-start")
         document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
-        with patch.object(process_identity, "process_start", side_effect=process_identity.ProcessReadError("unreadable process")):
+        with patch.object(sessions, "process_start", return_value=None):
             result = self.cli("alpha", "--permanent", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertEqual(result.stderr, "add_unit: cannot tell whether session 62ccbd64-f22e-5647-b20e-7899aa39d766 runs: "
@@ -234,7 +232,7 @@ class AddUnitResumeTests(AddUnitTestCase):
     def test_resume_with_stale_registry_identity_still_launches(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
-        self.write_resume_registry_record("0")
+        self.write_resume_registry_record("a-previous-process-start")
         result = self.successful("alpha", "--permanent", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
         self.assertIn("alpha-unit started:", result.stdout)
         arguments = self.agent_arguments()

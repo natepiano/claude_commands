@@ -136,32 +136,24 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0] if __doc__ else None)
     _ = parser.add_argument("runs", nargs="*", help="run folders whose scratch copies go")
     _ = parser.add_argument("--tracked", action="store_true", help="also end tracked scratch for these runs")
-    _ = parser.add_argument("--failed-runs", type=Path)
     args = parser.parse_args()
     runs = [Path(run) for run in cast("list[str]", args.runs)]
-    failures: set[Path] = set()
+    failed = 0
     for run in runs:
         removed = 0
         for folder in scratch_folders(run):
             try:
                 remove(folder)
             except OSError as error:
-                failures.add(run)
+                failed += 1
                 print(f"remove_run_scratch: could not remove {folder}: {error}", file=sys.stderr)
                 continue
             removed += 1
         if cast(bool, args.tracked):
-            try:
-                removed += end_tracked_scratch(run)
-            except OSError as error:
-                failures.add(run)
-                print(f"remove_run_scratch: could not end scratch for {run}: {error}", file=sys.stderr)
+            removed += end_tracked_scratch(run)
         if removed:
             print(f"remove_run_scratch: removed {removed} scratch folders from {run}")
-    failure_path = cast(Path | None, args.failed_runs)
-    if failure_path is not None:
-        _ = failure_path.write_text("".join(str(run) + "\n" for run in sorted(failures)))
-    return 1 if failures else 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

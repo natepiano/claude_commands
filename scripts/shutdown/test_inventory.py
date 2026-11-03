@@ -12,8 +12,6 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from scripts.lib import process_start as process_identity
-from scripts.lib.process_start_test_support import write_stat
 from typing import ClassVar, cast, final, override
 from unittest.mock import patch
 
@@ -525,8 +523,8 @@ class InventoryTests(ShutdownTestCase):
             object,
             self.enterContext(patch("inventory._process_environment", return_value={})),
         )
-        _ = self.enterContext(
-            patch.object(process_identity, "process_start", return_value=process_identity.parse_start(CURRENT_PROCESS_START))
+        _process_start_context: object = self.enterContext(
+            patch("inventory._process_start", return_value=CURRENT_PROCESS_START)
         )
 
         self.director_pid = os.getpid()
@@ -579,7 +577,7 @@ class InventoryTests(ShutdownTestCase):
     def herdr_process(self, pid: int, parent: int, arguments: list[str], environment: dict[str, str]) -> None:
         process = self.proc / str(pid)
         process.mkdir(exist_ok=True)
-        _ = write_stat(process.parent, int(process.name), ppid=parent)
+        _ = (process / "stat").write_text(f"{pid} (fixture) S {parent} 0 0\n")
         _ = (process / "cmdline").write_bytes(("\0".join(arguments) + "\0").encode())
         _ = (process / "environ").write_bytes(
             ("\0".join(f"{key}={value}" for key, value in environment.items()) + "\0").encode()
@@ -1109,7 +1107,7 @@ elif "comm=" in joined:
         with (patch.object(sys, "platform", "darwin"),
               patch.object(Path, "read_bytes", side_effect=FileNotFoundError),
               patch.object(subprocess, "run", side_effect=process),
-              patch.object(process_identity, "process_start", return_value=process_identity.parse_start("supervisor-start"))):
+              patch.object(inventory, "_process_start", return_value="supervisor-start")):
             host = inventory._terminal_host(101, inventory.DesktopNotInSnapshot(kind="not in snapshot"))  # pyright: ignore[reportPrivateUsage]
             self.assertEqual(host, {"kind": "terminal", "supervisor": {
                 "kind": "supervisor", "pid": 902, "proc_start": "supervisor-start"}})
@@ -1194,10 +1192,10 @@ elif "comm=" in joined:
     def test_reused_pid_with_different_process_start_is_unknown(self) -> None:
         path = self.records / f"{DESKTOP_PID}.json"
         record = cast(dict[str, object], cast(object, json.loads(path.read_text(encoding="utf-8"))))
-        record["procStart"] = "123"
+        record["procStart"] = "recorded-before-pid-reuse"
         _ = path.write_text(json.dumps(record), encoding="utf-8")
 
-        with patch.object(process_identity, "process_start", return_value=process_identity.ProcessStartTime(456)):
+        with patch("inventory._process_start", return_value="live-reused-pid-start"):
             found = inventory.inventory(TARGET_LOGIN)
 
         self.assertNotIn(DESKTOP_ID, {session["session_id"] for session in found["sessions"]})

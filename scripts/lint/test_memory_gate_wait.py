@@ -12,9 +12,6 @@ import sys
 import tempfile
 import time
 from typing import TypedDict, cast, override
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib.process_start_test_support import stored_start_probe
-from scripts.lib import process_start
 import unittest
 from unittest.mock import patch
 
@@ -45,7 +42,7 @@ def checker_main() -> None:
     if action not in {"fail", "silent-fail"}:
         with patch.object(gate, "git_identity", return_value=(gate.UnknownRepository(), "fixture")), \
              patch.object(gate, "expected_peak", return_value=gate.ExpectedPeak(7 * gate.GIB, "measured", 5)), \
-             patch.object(process_start, "process_start", side_effect=stored_start_probe(lambda pid: "wait-owner" or "")), \
+             patch.object(gate, "process_start_time", return_value="wait-owner"), \
              patch.object(gate, "process_table", return_value={pid: gate.ProcessIdentity(1, "wait-owner")}), \
              redirect_stdout(output):
             gate.main()

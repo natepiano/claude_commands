@@ -8,32 +8,6 @@ import json
 
 
 class VerifyLintScopeTests(support.VerifyLintCacheFixture):
-    def test_failed_judgment_repairs_and_formats_before_the_deciding_judgment(self) -> None:
-        source = self.root / "src/lib.rs"
-        formatted = "pub fn value() -> u8 {\n    2\n}\n"
-        self.environment.update({
-            "TEST_GIT_DIRTY": "1",
-            "TEST_FIX_SOURCE": "pub fn value()->u8{2}\n",
-            "TEST_FMT_SOURCE": formatted,
-        })
-        for final_status in (0, 43):
-            with self.subTest(final_status=final_status):
-                _ = source.write_text("pub fn value() -> u8 { 1 }\n", encoding="utf-8")
-                self.environment["TEST_CLIPPY_STATUSES"] = f"[101, {final_status}]"
-                result = self.invoke_verify("lint", "sample", cwd=self.root)
-                self.assertEqual(result.returncode, final_status, result.stdout + result.stderr)
-                self.assert_fix_and_judgment_calls(fix_passes=2)
-                self.assertEqual(source.read_text(encoding="utf-8"), formatted)
-                clippy = self.calls("clippy")
-                self.assertEqual(self.lint_stages(), [
-                    ["+nightly", "fmt", "-p", "sample"],
-                    ["clippy", *clippy[0]],
-                    ["clippy", *clippy[1]],
-                    ["+nightly", "fmt", "-p", "sample"],
-                    ["clippy", *clippy[2]],
-                    ["+nightly", "fmt", "-p", "sample"],
-                    ["clippy", *clippy[3]],
-                ])
 
     def test_fix_exposes_another_fix_before_the_final_judgment(self) -> None:
         original = "pub fn sum(a: f64, b: f64, c: f64) -> f64 { a * b + c }\n"

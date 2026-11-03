@@ -10,13 +10,8 @@ import json
 import os
 from pathlib import Path
 import socket
-import sys
 import tempfile
 from typing import cast
-
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import process_start
 
 
 @dataclass(frozen=True)
@@ -134,6 +129,14 @@ def record_path(call_id: str) -> Path:
     return record_directory() / f"{call_id}.json"
 
 
+def process_start(pid: int) -> str:
+    root = Path(os.environ.get("VERIFY_PROC_ROOT", "/proc"))
+    fields = (root / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+    if fields[0] == "Z":
+        raise ProcessLookupError("process has ended")
+    return fields[19]
+
+
 def _text(value: object) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError("record needs nonempty text")
@@ -191,16 +194,15 @@ def read(call_id: str) -> ReadResult:
         return UnreadableRecord(call_id, str(error))
     try:
         record = _decode(value, call_id)
-        recorded_start = process_start.parse_start(record.proc_start)
     except (ValueError, TypeError) as error:
         return UnreadableRecord(call_id, str(error))
-    owner = process_start.check_owner(record.pid, recorded_start,
-                                      Path(os.environ.get("VERIFY_PROC_ROOT", "/proc")))
-    if owner.stale:
+    try:
+        start = process_start(record.pid)
+    except (FileNotFoundError, ProcessLookupError):
         return StaleRecord(call_id)
-    if owner is process_start.OwnerCheck.UNKNOWN:
-        return UnreadableRecord(call_id, "process owner cannot be confirmed")
-    return record
+    except (OSError, IndexError) as error:
+        return UnreadableRecord(call_id, str(error))
+    return record if start == record.proc_start else StaleRecord(call_id)
 
 
 def live_records() -> list[StepRecord]:
@@ -318,10 +320,7 @@ def main() -> int:
                 raise ValueError("invalid step kind or run location")
             if location == "natedev_only" and not reason:
                 raise ValueError("natedev-only step needs a reason")
-            started = process_start.process_start(pid, Path(os.environ.get("VERIFY_PROC_ROOT", "/proc")))
-            if isinstance(started, process_start.ProcessGone):
-                raise ValueError("process has ended")
-            write(StepRecord(call_id, pid, started.text, Path(cast(str, args.repo)).resolve(), kind,
+            write(StepRecord(call_id, pid, process_start(pid), Path(cast(str, args.repo)).resolve(), kind,
                              cast(str | None, args.package), MacAllowed() if location == "mac_allowed" else
                              SshAllowed(tuple(filter(None, cast(str, args.eligible_targets).split(","))),
                                         tuple(filter(None, cast(str, args.mac_targets).split(","))))

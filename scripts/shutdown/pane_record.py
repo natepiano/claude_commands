@@ -31,8 +31,6 @@ if TYPE_CHECKING:
     from scripts.production import staff
 
 SCRIPTS = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(SCRIPTS.parent))
-from scripts.lib import process_start as process_identity
 sys.path.insert(0, str(SCRIPTS / "herdr"))
 sys.path.insert(0, str(SCRIPTS / "lib"))
 sys.path.insert(0, str(SCRIPTS / "whoami"))
@@ -262,6 +260,8 @@ def _mac_record(pid: int) -> tuple[list[str], dict[str, str]]:
     return list(parts.arguments), parts.environment
 
 
+def _process_stat(process: Path) -> list[str]:
+    return (process / "stat").read_text().rsplit(")", 1)[1].split()
 
 
 def process_parent(pid: int) -> int:
@@ -270,10 +270,7 @@ def process_parent(pid: int) -> int:
         result = subprocess.run([os.environ.get("HERDR_PS", "ps"), "-o", "ppid=", "-p", str(pid)],
                                 capture_output=True, text=True, check=True, timeout=5)
         return int(result.stdout)
-    stat = process_identity.read_stat(pid, Path(os.environ.get("HERDR_PROC") or PROC))
-    if isinstance(stat, process_identity.ProcessGone):
-        raise ProcessLookupError(pid)
-    return stat.ppid
+    return int(_process_stat(Path(os.environ.get("HERDR_PROC") or PROC) / str(pid))[1])
 
 
 def pane_shell_pid(place: herdr.HerdrPlace) -> int:

@@ -45,26 +45,6 @@ class RemoveRunScratchTests(unittest.TestCase):
         (run / "scratch" / "linked").symlink_to(outside)
         return run, outside
 
-    def test_cleanup_reports_the_failed_run_without_repeating_a_removal(self) -> None:
-        run, _ = self.make_run()
-        result_file = run.parent / "failed-runs"
-        cache = run / "verify_cache"
-        real_remove = remove_run_scratch.remove
-        seen: list[Path] = []
-        def remove(folder: Path) -> None:
-            seen.append(folder)
-            if folder == cache:
-                raise OSError("cache is busy")
-            real_remove(folder)
-        with mock.patch.object(sys, "argv", [str(SCRIPT), str(run), "--failed-runs", str(result_file)]), \
-             mock.patch.object(remove_run_scratch, "remove", side_effect=remove):
-            result = remove_run_scratch.main()
-        self.assertEqual(result, 1)
-        self.assertEqual(result_file.read_text().splitlines(), [str(run)])
-        self.assertEqual(seen.count(cache), 1)
-        self.assertTrue(cache.is_dir())
-        self.assertFalse((run / "p26_before").exists())
-
     def test_cleanup_keeps_the_checkout_holding_a_paused_workers_live_command(self) -> None:
         run, _ = self.make_run()
         checkout = run / "phases" / "p4" / "gate"

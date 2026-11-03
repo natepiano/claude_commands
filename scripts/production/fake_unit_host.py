@@ -12,9 +12,6 @@ import unittest
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-
-from scripts.lib import process_start as process_identity
-from scripts.lib.process_start_test_support import write_stat
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Literal, cast, final
 from unittest import mock
@@ -86,8 +83,7 @@ def process(env: Mapping[str, str], pid: int, parent: int, argv: Sequence[str], 
             session: int | None = None, cwd: Path | None = None) -> None:
     directory = Path(env["HERDR_PROC"]) / str(pid)
     directory.mkdir(parents=True, exist_ok=True)
-    _ = write_stat(directory.parent, pid, ppid=parent, pgrp=pid, session=session or pid,
-                   tty_nr=session or pid, start_ticks=int(started))
+    _ = (directory / "stat").write_text(f"{pid} (fixture) S {parent} {pid} {session or pid} {session or pid} 0 " + "0 " * 13 + started)
     _ = (directory / "cmdline").write_bytes(("\0".join(argv) + "\0").encode())
     _ = (directory / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in marks.items()).encode())
     link = directory / "cwd"
@@ -159,10 +155,7 @@ def place_process(env: Mapping[str, str], pid: int, pane: str, *, session: str =
     if len(matches) != 1:
         raise AssertionError(f"expected one hosted pane {session}:{pane}, found {len(matches)}")
     directory, marks = matches[0]
-    stat = process_identity.read_stat(int(directory.name), directory.parent)
-    if isinstance(stat, process_identity.ProcessGone):
-        raise ProcessLookupError(directory.name)
-    parent = stat.ppid
+    parent = int((directory / "stat").read_text().split()[3])
     process(env, pid, parent, ["claude"], marks)
     if exec_shell:
         # Generic launch fixtures use exec; pane-shell scenarios keep both processes.

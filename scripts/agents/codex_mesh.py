@@ -84,8 +84,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NoReturn, NotRequired, NamedTuple, Protocol, TextIO, TypedDict, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import process_start
-from scripts.lib.process_start import ProcessRunState as ProcessRunState
 from scripts.accounts.role_map import is_role_map_host, role_map_command, RoleMapUnavailable, RoleAccountUnavailable  # noqa: E402
 from scripts.direct import plan_history
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atomic
@@ -456,7 +454,6 @@ RosterRole = AssignedWorkerRole | RolelessThread
 
 
 class WorkerTaskRecord(TypedDict):
-    launcher_start_time: NotRequired[int | str]
     task: NotRequired[str]
     model: NotRequired[str]
     effort: NotRequired[str]
@@ -564,36 +561,6 @@ FOLLOWABLE_STATES = frozenset(("done", "failed", "paused"))
 
 
 @dataclass(frozen=True)
-class LegacyLauncherIdentity:
-    """A roster entry written without a process start time; check only its pid."""
-
-
-LauncherStart = process_start.ProcessStart | LegacyLauncherIdentity
-LEGACY_LAUNCHER_IDENTITY = LegacyLauncherIdentity()
-
-
-def launcher_start_text(pid: int) -> str:
-    started = process_start.start_text(pid)
-    if started is None:
-        raise ProcessLookupError("launcher has ended")
-    return started
-
-
-def launcher_is_live(pid: int, recorded: LauncherStart) -> bool:
-    if isinstance(recorded, LegacyLauncherIdentity):
-        return _pid_alive(pid)
-    return not process_start.check_owner(pid, recorded).stale
-
-
-def recorded_launcher_start(value: object) -> LauncherStart:
-    if isinstance(value, int):
-        return process_start.ProcessStartTime(value)
-    if isinstance(value, str) and value:
-        return process_start.parse_start(value)
-    return LegacyLauncherIdentity()
-
-
-@dataclass(frozen=True)
 class FollowableThread:
     thread_id: str
     status: Literal["done", "failed", "paused"]
@@ -604,21 +571,18 @@ class ActiveThread:
     thread_id: str
     turn_id: str
     launcher_pid: int
-    launcher_start: LauncherStart = LegacyLauncherIdentity()
 
 
 @dataclass(frozen=True)
 class WaitingCapacityThread:
     thread_id: str
     launcher_pid: int
-    launcher_start: LauncherStart = LegacyLauncherIdentity()
 
 
 @dataclass(frozen=True)
 class StartingThread:
     thread_id: str
     launcher_pid: int
-    launcher_start: LauncherStart = LegacyLauncherIdentity()
 
 
 @dataclass(frozen=True)
@@ -677,7 +641,6 @@ def _roster_thread(value: object) -> RosterThread:
     turn_id = _as_str(entry.get("turn_id"))
     pid = entry.get("launcher_pid")
     launcher_pid = pid if isinstance(pid, int) else 0
-    launcher_start = recorded_launcher_start(entry.get("launcher_start_time"))
     if not thread_id:
         return InvalidThread("missing thread id")
     adopted_to = _as_str(entry.get("adopted_to"))
@@ -690,11 +653,11 @@ def _roster_thread(value: object) -> RosterThread:
     if status == "paused":
         return FollowableThread(thread_id, "paused")
     if status == "running":
-        return ActiveThread(thread_id, turn_id, launcher_pid, launcher_start) if turn_id else InvalidThread("running thread has no turn id")
+        return ActiveThread(thread_id, turn_id, launcher_pid) if turn_id else InvalidThread("running thread has no turn id")
     if status == WAITING_CAPACITY:
-        return WaitingCapacityThread(thread_id, launcher_pid, launcher_start)
+        return WaitingCapacityThread(thread_id, launcher_pid)
     if status == "starting":
-        return StartingThread(thread_id, launcher_pid, launcher_start)
+        return StartingThread(thread_id, launcher_pid)
     if status == CAPACITY_EXHAUSTED:
         return ExhaustedThread(thread_id)
     if status == "ended":
@@ -1077,7 +1040,7 @@ class FollowEvents:
     def _roster_state(self) -> dict[str, object]:
         entry = _as_dict(_read_json_object(self.roster_path).get(self.name))
         return {key: entry.get(key) for key in (
-            "thread_id", "turn_id", "status", "port", "launcher_pid", "launcher_start_time", "continuation_owed", "adopted_to")}
+            "thread_id", "turn_id", "status", "port", "launcher_pid", "continuation_owed", "adopted_to")}
 
     def wait(self, connection: socket.socket, deadline: float) -> FileWaitResult:
         while time.monotonic() < deadline:
@@ -1483,17 +1446,10 @@ class RosterActiveLauncher:
     thread_id: str
     launcher_pids: tuple[int, ...]
 
-    def matches(self, record: dict[str, object]) -> bool:
-        return (record.get("thread_id") == self.thread_id and not record.get("adopted_to")
-                and record.get("launcher_pid") in self.launcher_pids)
-
     def owns(self, record: dict[str, object]) -> bool:
-        return self.matches(record) and record.get("status") in ("starting", "running", WAITING_CAPACITY)
-
-    def settled(self, record: dict[str, object]) -> bool:
-        return (self.matches(record) and record.get("status") in ("done", "failed")
-                and not isinstance(started := recorded_launcher_start(record.get("launcher_start_time")), LegacyLauncherIdentity)
-                and launcher_is_live(_as_int(record.get("launcher_pid")), started))
+        return (record.get("thread_id") == self.thread_id and not record.get("adopted_to")
+                and record.get("status") in ("starting", "running", WAITING_CAPACITY)
+                and record.get("launcher_pid") in self.launcher_pids)
 
 
 @dataclass(frozen=True)
@@ -1633,11 +1589,6 @@ def _write_roster_record(handle: worker_lifecycle.WorkerStateFile, roster: dict[
         pid = record.get("launcher_pid", previous.get("launcher_pid"))
         if isinstance(pid, int) and pid > 0:
             stored["launcher_pid"] = pid
-            if ("launcher_start_time" not in record
-                    and previous.get("launcher_pid") == pid):
-                started = previous.get("launcher_start_time")
-                if isinstance(started, (int, str)):
-                    stored["launcher_start_time"] = started
         port = record.get("port", previous.get("port"))
         if isinstance(port, int) and port > 0:
             stored["port"] = port
@@ -1875,12 +1826,10 @@ def _claim_follow_locked(
             claimed["previous_role"] = previous_role.role
         if stale:
             claimed["dead_launcher_recovery"] = True
-        start_text = launcher_start_text(launcher_pid)
         claimed.update({
             "thread_id": thread_id,
             "status": "starting",
             "launcher_pid": launcher_pid,
-            "launcher_start_time": start_text,
             "previous_status": previous_status,
             "role": role,
         })
@@ -1894,9 +1843,8 @@ def _claim_follow_locked(
 
 def _restore_follow_claim(session_dir: str, name: str, launcher_pid: int,
                           live_turn: str = "", *, finished: bool = False,
-                          expected_thread_id: str = "",
-                          expected_launcher_start: LauncherStart = LEGACY_LAUNCHER_IDENTITY) -> None:
-    """Release this launcher's unstarted or stale claim; retain a live active owner."""
+                          expected_thread_id: str = "") -> None:
+    """Release only this launcher's unstarted claim; retain a peer's live turn."""
     with worker_lifecycle.lock_worker(session_dir, name):
         path = _session_path(session_dir, ROSTER_FILE)
         with worker_lifecycle.locked_state(path) as handle:
@@ -1907,14 +1855,8 @@ def _restore_follow_claim(session_dir: str, name: str, launcher_pid: int,
                 return
             if expected_thread_id and entry.get("thread_id") != expected_thread_id:
                 return
-            recorded_start = recorded_launcher_start(entry.get("launcher_start_time"))
-            if (not isinstance(expected_launcher_start, LegacyLauncherIdentity)
-                    and not isinstance(recorded_start, LegacyLauncherIdentity)
-                    and recorded_start != expected_launcher_start):
-                return
             if entry.get("launcher_pid") != launcher_pid or not (
                 status == "starting" or (finished and status == "running")
-                or _launcher_died(_roster_thread(entry))
             ):
                 return
             thread_id = _as_str(entry.get("thread_id"))
@@ -1939,7 +1881,6 @@ def _restore_follow_claim(session_dir: str, name: str, launcher_pid: int,
                 _ = restored.pop("previous_role", None)
                 _ = restored.pop("turn_id", None)
                 _ = restored.pop("launcher_pid", None)
-                _ = restored.pop("launcher_start_time", None)
                 _ = restored.pop("port", None)
                 restored.update({
                     "thread_id": thread_id,
@@ -1992,12 +1933,11 @@ def _pid_alive(pid: int) -> bool:
         _signal_process(pid, 0)
     except OSError as exc:
         return exc.errno == errno.EPERM
-    if sys.platform != "linux":
-        return True
     try:
-        return process_start.process_state(pid) is not process_start.ProcessRunState.GONE
-    except process_start.ProcessReadError:
+        state = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()
+    except (OSError, UnicodeError):
         return True
+    return state[:1] != ["Z"]
 
 
 def _free_port() -> int:
@@ -3969,11 +3909,9 @@ def _follow_worker(args: argparse.Namespace) -> int:
                         _write_pending(handle, resumed.thread_id, carried,
                                        accepting_messages=not _messages_closed(handle, thread_id))
             if resumed.thread_replaced:
-                start_text = launcher_start_text(owner_pid)
                 thread_id = resumed.thread_id
                 if not _update_roster_if_expected(session_dir, name, {
                     "thread_id": thread_id, "status": "starting", "launcher_pid": owner_pid, "port": port,
-                    "launcher_start_time": start_text,
                 }, RosterOnThread(thread_id)):
                     _refuse_taken_follow_up(client, thread_id, session_dir)
                 _record_assignment(thread_id, role, _dispatch_lens(args))
@@ -4217,9 +4155,8 @@ def command_compact(args: argparse.Namespace) -> int:
 
 def _launcher_died(state: RosterThread) -> bool:
     """True when a live status names a launcher that is gone, which leaves the worker followable."""
-    if not isinstance(state, (ActiveThread, StartingThread, WaitingCapacityThread)) or state.launcher_pid <= 0:
-        return False
-    return not launcher_is_live(state.launcher_pid, state.launcher_start)
+    return isinstance(state, (ActiveThread, StartingThread, WaitingCapacityThread)) and (
+        state.launcher_pid > 0 and not _pid_alive(state.launcher_pid))
 
 
 def _follow_refusal(session_dir: str, state: RosterThread, *, name: str) -> str:
@@ -4291,11 +4228,8 @@ def command_can_follow(args: argparse.Namespace) -> int:
 
 
 def command_release_follow(args: argparse.Namespace) -> int:
-    start_text = _as_str(_attr(args, "claim_start_time"))
-    expected_start = recorded_launcher_start(start_text)
     _restore_follow_claim(_as_str(_attr(args, "session_dir")),
-                          _as_str(_attr(args, "to")), _as_int(_attr(args, "claim_pid")),
-                          expected_launcher_start=expected_start)
+                          _as_str(_attr(args, "to")), _as_int(_attr(args, "claim_pid")))
     return 0
 
 
@@ -4555,14 +4489,12 @@ def _attach_and_run(
                         _ = log.write(
                             f"[{stamp}] mesh: dropped {dropped} held messages for thread {previous_thread} on relaunch\n"
                         )
-                start_text = launcher_start_text(os.getpid())
                 starting: StartingRecord = {
                     "model": _as_str(_attr(args, "model")), "effort": _as_str(_attr(args, "effort")),
                     "thread_id": thread_id,
                     "status": "starting",
                     "port": port,
                     "launcher_pid": os.getpid(),
-                    "launcher_start_time": start_text,
                 }
                 task = _as_str(_attr(args, "task"))
                 if task:
@@ -4785,7 +4717,7 @@ def _stream_turn(
     )
     with worker_lifecycle.lock_worker(session_dir, name):
         record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
-        if not _stream_owns_work(stream, record):
+        if not _stream_launcher(stream).owns(record):
             return _worker_ownership_loss(record)
         end_marker.unlink(missing_ok=True)
         with _pending_file(session_dir, name) as handle:
@@ -5132,15 +5064,6 @@ def _stream_launcher(stream: TurnStream) -> RosterActiveLauncher:
                                (_as_int(_attr(stream.args, "claim_pid")) or os.getpid(), os.getpid()))
 
 
-def _stream_owns_work(stream: TurnStream, record: dict[str, object]) -> bool:
-    """Keep active work and detached results with their confirmed launcher."""
-    launcher = _stream_launcher(stream)
-    return launcher.owns(record) or (
-        stream.resident and not stream.end_marker.exists() and not _finished_run(stream.session_dir)
-        and launcher.settled(record)
-        and _waiting_on_detached_run(stream.session_dir, stream.name, stream.thread_id, stream.runs))
-
-
 def _stream_was_released(stream: TurnStream) -> bool:
     """A subscriber may act only while its launcher still owns worker work.
 
@@ -5150,7 +5073,7 @@ def _stream_was_released(stream: TurnStream) -> bool:
     if stream.ownership_released:
         return True
     record = _as_dict(_read_json_object(_session_path(stream.session_dir, ROSTER_FILE)).get(stream.name))
-    if not _stream_owns_work(stream, record):
+    if not _stream_launcher(stream).owns(record):
         stream.ownership_loss = _worker_ownership_loss(record)
         stream.ownership_released = True
     return stream.ownership_released
@@ -5414,13 +5337,11 @@ def _wait_out_capacity(stream: TurnStream, log: TextIO) -> bool:
     remaining = CAPACITY_BUDGET_SECS - stream.capacity_waited
     wait = min(CAPACITY_WAIT_SECS * 2.0 ** stream.capacity_retries,
                CAPACITY_MAX_WAIT_SECS, remaining)
-    start_text = launcher_start_text(os.getpid())
     with worker_lifecycle.lock_worker(stream.session_dir, stream.name), _pending_file(stream.session_dir, stream.name):
         if not _update_roster_if_expected(stream.session_dir, stream.name, {
                 "thread_id": stream.thread_id,
                 "status": WAITING_CAPACITY,
                 "launcher_pid": os.getpid(),
-                "launcher_start_time": start_text,
             }, _stream_launcher(stream)):
             stream.ownership_released = True
             return False
@@ -5461,12 +5382,10 @@ def _watch_turn_opened_while_owed(
                 }):
                 return StreamStep.FINISH
         else:
-            start_text = launcher_start_text(os.getpid())
             if not _record_stream_state(stream, {
                     "thread_id": stream.thread_id,
                     "status": "starting",
                     "launcher_pid": os.getpid(),
-                    "launcher_start_time": start_text,
                 }):
                 return StreamStep.FINISH
     return StreamStep.NEXT_FRAME
@@ -5554,7 +5473,8 @@ def _released_stream_outcome[Outcome: RunOutcome](stream: TurnStream, outcome: O
         return stream.ownership_loss
     # A resident can be marked done, or explicitly ended, without changing its
     # launcher. That terminal publication is not a transfer to another owner.
-    same_launcher = _stream_launcher(stream).matches(record)
+    same_launcher = (record.get("thread_id") == stream.thread_id
+                     and record.get("launcher_pid") in _stream_launcher(stream).launcher_pids)
     if same_launcher and record.get("status") in ("done", "ended"):
         return outcome
     return stream.ownership_loss if isinstance(outcome, RunCompleted) else outcome
@@ -7762,12 +7682,7 @@ def _process_executable(pid: int) -> Path:
 
 
 def _process_identity(pid: int) -> ProcessIdentity | UnreadCodexProcess:
-    try:
-        before = process_start.process_start(pid)
-    except process_start.ProcessReadError as error:
-        return UnreadCodexProcess(pid, str(error))
-    if isinstance(before, process_start.ProcessGone):
-        return UnreadCodexProcess(pid, "process has ended")
+    before = sessions.process_start(pid)
     try:
         if sys.platform == "darwin":
             record = account.mac_process_record(pid)
@@ -7779,10 +7694,10 @@ def _process_identity(pid: int) -> ProcessIdentity | UnreadCodexProcess:
             executable = _process_executable(pid)
     except OSError:
         return UnreadCodexProcess(pid, "process arguments or executable path could not be read")
-    if (process_start.check_owner(pid, before) is not process_start.OwnerCheck.ALIVE
-            or not arguments or not executable.is_absolute()):
+    after = sessions.process_start(pid)
+    if not before or before != after or not arguments or not executable.is_absolute():
         return UnreadCodexProcess(pid, "process start, arguments or executable path could not be read consistently")
-    return ProcessIdentity(pid, before.text, arguments, executable)
+    return ProcessIdentity(pid, before, arguments, executable)
 
 
 def _is_standalone_daemon(target: ProcessIdentity) -> bool:
@@ -7818,7 +7733,7 @@ def _running_daemons() -> list[DaemonTarget]:
         target = _daemon_record(int(fields[0]))
         if isinstance(target, (UnreadCodexProcess, CodexDaemon)):
             targets.append(target)
-        elif process_start.process_state(target.pid) is ProcessRunState.STOPPED:
+        elif _daemon_process_state(target.pid) is ProcessRunState.STOPPED:
             targets.append(target)
     return targets
 
@@ -7921,8 +7836,7 @@ def _daemon_process_tree(
     for pid in _family_candidate_ids(table, parent, tracked, swept_sessions, process_sessions):
         process = table[pid]
         identity = identities.get(pid, UnreadCodexProcess(pid, "process appeared during family snapshot"))
-        if (before.get(pid) != process or not isinstance(identity, ProcessIdentity)
-                or not _identity_matches(identity)):
+        if before.get(pid) != process or _process_identity(pid) != identity:
             identity = UnreadCodexProcess(pid, "process changed during family snapshot")
         result[pid] = FamilyProcess(process.parent, identity, process_sessions[pid])
     return result
@@ -7943,10 +7857,15 @@ def _family_members(table: dict[int, FamilyProcess], parent: int) -> list[Family
 
 def _identity_matches(target: ProcessIdentity) -> bool:
     current = _process_identity(target.pid)
-    return (process_start.check_owner(target.pid, process_start.parse_start(target.started))
-            is process_start.OwnerCheck.ALIVE and isinstance(current, ProcessIdentity)
-            and (current.pid, current.arguments, current.executable)
-            == (target.pid, target.arguments, target.executable))
+    return (isinstance(current, ProcessIdentity)
+            and (current.pid, current.started, current.arguments, current.executable)
+            == (target.pid, target.started, target.arguments, target.executable))
+
+
+class ProcessRunState(Enum):
+    RUNNING = "running"
+    STOPPED = "stopped"
+    GONE = "gone"
 
 
 class DaemonFreezeRefused(Exception):
@@ -7954,6 +7873,31 @@ class DaemonFreezeRefused(Exception):
         super().__init__(reason)
         self.pid: int = pid
         self.reason: str = reason
+
+
+def _daemon_process_state(pid: int) -> ProcessRunState:
+    """Read kernel scheduling state; zombies no longer execute or fork."""
+    if sys.platform == "darwin":
+        state = _cleanup_command(("ps", "-p", str(pid), "-o", "stat="), empty_selection=True).strip()
+        if not state:
+            return ProcessRunState.GONE
+    else:
+        try:
+            record = Path(f"/proc/{pid}/stat").read_text()
+        except FileNotFoundError:
+            return ProcessRunState.GONE
+        closing = record.rfind(")")
+        fields = record[closing + 1:].split()
+        if closing < 0 or not fields:
+            raise OSError("process scheduling state could not be read")
+        state = fields[0]
+    if state[0] in ("Z", "X"):
+        return ProcessRunState.GONE
+    if state[0] == "T":
+        return ProcessRunState.STOPPED
+    if state[0] not in "RSDIUtWPN":
+        raise OSError("process scheduling state could not be read")
+    return ProcessRunState.RUNNING
 
 
 def _signal_daemon_process(target: ProcessIdentity, signum: int) -> bool:
@@ -7975,7 +7919,7 @@ class FrozenDaemonMember:
 
 def _freeze_daemon_process(target: ProcessIdentity, frozen: list[FrozenDaemonMember]) -> None:
     unconfirmed = "member exited before the family was frozen; family absence is unconfirmed"
-    initial_state = process_start.process_state(target.pid)
+    initial_state = _daemon_process_state(target.pid)
     if initial_state is ProcessRunState.GONE:
         raise DaemonFreezeRefused(target.pid, unconfirmed)
     if initial_state is ProcessRunState.STOPPED:
@@ -7984,13 +7928,13 @@ def _freeze_daemon_process(target: ProcessIdentity, frozen: list[FrozenDaemonMem
         frozen.append(FrozenDaemonMember(target, stopped_by_cleanup=False))
         return
     if not _signal_daemon_process(target, signal.SIGSTOP):
-        reason = unconfirmed if process_start.process_state(target.pid) is ProcessRunState.GONE else "member identity changed or SIGSTOP failed"
+        reason = unconfirmed if _daemon_process_state(target.pid) is ProcessRunState.GONE else "member identity changed or SIGSTOP failed"
         raise DaemonFreezeRefused(target.pid, reason)
     # Record our STOP before any further reads, so even a failed read rolls back.
     frozen.append(FrozenDaemonMember(target, stopped_by_cleanup=True))
     deadline = time.monotonic() + REAP_WAIT_SECS
     while True:
-        state = process_start.process_state(target.pid)
+        state = _daemon_process_state(target.pid)
         if state is ProcessRunState.GONE:
             raise DaemonFreezeRefused(target.pid, unconfirmed)
         if not _identity_matches(target):
@@ -8008,13 +7952,13 @@ def _resume_daemon_family(frozen: list[FrozenDaemonMember]) -> None:
             continue
         identity = member.identity
         try:
-            if process_start.process_state(identity.pid) is ProcessRunState.GONE:
+            if _daemon_process_state(identity.pid) is ProcessRunState.GONE:
                 continue
         except (OSError, ValueError, subprocess.SubprocessError):
             # Scheduling state is not needed to identify a surviving process.
             pass
         try:
-            if process_start.check_owner(identity.pid, process_start.parse_start(identity.started)) is not process_start.OwnerCheck.ALIVE:
+            if sessions.process_start(identity.pid) != identity.started:
                 _ = _family_kept(identity.pid, "process start could not be confirmed; may still be stopped")
                 continue
             # A stopped process retains its pid. Its start time is enough for
@@ -8026,9 +7970,12 @@ def _resume_daemon_family(frozen: list[FrozenDaemonMember]) -> None:
 
 def _daemon_identity_gone(target: ProcessIdentity) -> bool:
     try:
-        if process_start.process_state(target.pid) is ProcessRunState.GONE:
+        if _daemon_process_state(target.pid) is ProcessRunState.GONE:
             return True
-        return process_start.check_owner(target.pid, process_start.parse_start(target.started)).stale
+        current = _process_identity(target.pid)
+        return isinstance(current, ProcessIdentity) and (
+            current.started, current.arguments, current.executable
+        ) != (target.started, target.arguments, target.executable)
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
 
@@ -8064,7 +8011,7 @@ def _recover_stopped_codex_members(
     """Report prior stops; recover verified detached default-home members only."""
     for member in members:
         try:
-            if process_start.process_state(member.pid) is not ProcessRunState.STOPPED:
+            if _daemon_process_state(member.pid) is not ProcessRunState.STOPPED:
                 continue
             reason = ""
             if isinstance(member, UnreadCodexProcess):
@@ -8092,7 +8039,7 @@ def _recover_stopped_codex_members(
             elif isinstance(member, ProcessIdentity):
                 # Recovery of a prior stop needs a full identity match, unlike
                 # rollback of a STOP issued by this invocation.
-                if process_start.check_owner(member.pid, process_start.parse_start(member.started)) is not process_start.OwnerCheck.ALIVE or not _signal_daemon_process(member, signal.SIGCONT):
+                if sessions.process_start(member.pid) != member.started or not _signal_daemon_process(member, signal.SIGCONT):
                     _ = _family_kept(member.pid, "found stopped; kept: could not resume member; may still be stopped")
                 else:
                     print(f"codex_mesh: daemon family: pid {member.pid} found stopped; resuming kept member", file=sys.stderr)
@@ -8108,18 +8055,16 @@ def _recover_kept_daemon(target: ProcessIdentity, *, resume: bool = True) -> boo
             return _family_kept(target.pid, "kept family identity could not be confirmed")
         members = [root, *_family_members(table, target.pid)]
         if (not isinstance(root.identity, ProcessIdentity)
-                or process_start.check_owner(target.pid, process_start.parse_start(target.started))
-                is not process_start.OwnerCheck.ALIVE
-                or (root.identity.pid, root.identity.arguments, root.identity.executable)
-                != (target.pid, target.arguments, target.executable)):
+                or (root.identity.pid, root.identity.started, root.identity.arguments, root.identity.executable)
+                != (target.pid, target.started, target.arguments, target.executable)):
             _recover_stopped_codex_members([member.identity for member in members], resume=False)
             return _family_kept(target.pid, "kept family identity could not be confirmed")
         was_stopped = False
         with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
-            was_stopped = process_start.process_state(target.pid) is ProcessRunState.STOPPED
+            was_stopped = _daemon_process_state(target.pid) is ProcessRunState.STOPPED
         _recover_stopped_codex_members([member.identity for member in members], resume=resume)
         return (resume and was_stopped and _identity_matches(target)
-                and process_start.process_state(target.pid) is ProcessRunState.RUNNING)
+                and _daemon_process_state(target.pid) is ProcessRunState.RUNNING)
 
     try:
         if not resume:
@@ -8183,7 +8128,8 @@ def _stop_daemon_locked(target: CodexDaemon) -> bool:
         root = table.get(target.pid)
         if root is None or isinstance(root.identity, UnreadCodexProcess) or not _identity_matches(target):
             return _family_kept(target.pid, "parent identity could not be confirmed")
-        if (root.identity.arguments, root.identity.executable) != (target.arguments, target.executable):
+        if (root.identity.started, root.identity.arguments, root.identity.executable) != (
+                target.started, target.arguments, target.executable):
             return _family_kept(target.pid, "parent identity changed")
         # Remember every seen member before stopping the parent. Reparenting
         # never removes a member from this identity ledger.
@@ -8230,7 +8176,7 @@ def _stop_daemon_locked(target: CodexDaemon) -> bool:
                     added = True
             for frozen_member in frozen:
                 member = frozen_member.identity
-                if process_start.process_state(member.pid) is not ProcessRunState.STOPPED:
+                if _daemon_process_state(member.pid) is not ProcessRunState.STOPPED:
                     raise DaemonFreezeRefused(member.pid, "member exited before the family was frozen; family absence is unconfirmed")
                 if not _identity_matches(member):
                     raise DaemonFreezeRefused(member.pid, "member identity changed while freezing")
@@ -8249,7 +8195,7 @@ def _stop_daemon_locked(target: CodexDaemon) -> bool:
             member = frozen_member.identity
             if not isinstance(_daemon_verdict(target), ServerUnused) or not _identity_matches(target):
                 raise DaemonFreezeRefused(target.pid, "parent identity or login changed")
-            if process_start.process_state(member.pid) is not ProcessRunState.STOPPED:
+            if _daemon_process_state(member.pid) is not ProcessRunState.STOPPED:
                 raise DaemonFreezeRefused(member.pid, "member is no longer frozen")
             verdict = _process_cleanup_verdict(member)
             if isinstance(verdict, ServerInUse):
@@ -8263,7 +8209,7 @@ def _stop_daemon_locked(target: CodexDaemon) -> bool:
                 # A new unrelated ps pid is not family evidence. Only surviving
                 # members of sessions whose leaders we froze can prevent success.
                 for pid in sorted(_session_process_ids(_table_process_sessions(_own_process_table()), swept_sessions)):
-                    if process_start.process_state(pid) is not ProcessRunState.GONE:
+                    if _daemon_process_state(pid) is not ProcessRunState.GONE:
                         return _family_kept(pid, "process remains in a swept session after shutdown")
                 succeeded = True
                 return True
@@ -8651,7 +8597,7 @@ def command_sweep(args: argparse.Namespace) -> int:
             elif stop:
                 label, reason = "kept", "unused at the first look, not stopped at the second"
         if label != "stopped":
-            if process_start.process_state(daemon.pid) is ProcessRunState.STOPPED:
+            if _daemon_process_state(daemon.pid) is ProcessRunState.STOPPED:
                 reason += "; found stopped"
             if _recover_kept_daemon(daemon, resume=stop):
                 label = "resumed"
@@ -8707,7 +8653,7 @@ def _launcher_sessions(folder: Path) -> tuple[str, ...]:
     for record in sessions.running_sessions():
         # Only a recorded process start proves the pid still belongs to this session.
         started = record.get("procStart", "")
-        if started and process_start.check_owner(record["pid"], process_start.parse_start(started)) is process_start.OwnerCheck.ALIVE:
+        if started and started == sessions.process_start(record["pid"]):
             _ = names.setdefault(record["pid"], record["sessionId"])
     found: list[str] = []
     for pid in pids:
@@ -8965,11 +8911,9 @@ def command_resume_account_move(args: argparse.Namespace) -> int:
             marker.thread_id, datetime.now(timezone.utc),
         )
         lens = assignment.lens if isinstance(assignment, agents_log.Assignment) and assignment.role == role.role else None
-        start_text = launcher_start_text(os.getpid())
         claimed: StartingRecord = {
             "thread_id": marker.thread_id, "status": "starting", "launcher_pid": os.getpid(),
             "role": role.role, "previous_role": role.role, "previous_status": "failed",
-            "launcher_start_time": start_text,
         }
         if not _update_roster_if_expected(session_dir, name, claimed,
                                          RosterUnchanged(marker.thread_id, _roster_revision(record))):
@@ -9713,8 +9657,6 @@ def main(argv: list[str] | None = None) -> int:
     _ = release_follow.add_argument("--session-dir", required=True)
     _ = release_follow.add_argument("--to", required=True)
     _ = release_follow.add_argument("--claim-pid", type=int, required=True)
-    _ = release_follow.add_argument("--claim-start-time",
-                                    help="release only this recorded process start time")
     release_follow.set_defaults(handler=command_release_follow)
 
     send = subparsers.add_parser(

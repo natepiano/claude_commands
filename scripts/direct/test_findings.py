@@ -3,12 +3,12 @@
 
 from __future__ import annotations
 
-from argparse import ArgumentParser, Namespace
+from argparse import Namespace
 from collections.abc import Callable
 import json
 import os
 from pathlib import Path
-from typing import TextIO, cast
+from typing import cast
 import unittest
 from unittest.mock import patch
 
@@ -64,32 +64,6 @@ class FindingsLedgerTests(FindingsLedgerFixture):
                 self.assertEqual(events[-1]["timestamp_epoch"], at)
                 previous = current
         self.assertEqual(self.gate(), gate_before)
-
-    def test_an_open_event_is_recovered_once_after_the_state_write(self) -> None:
-        self.write_progress_state("recovery-phase")
-        append = cast(Callable[[Path, dict[str, object], dict[str, object]], None], vars(findings)["_append_event"])
-        attempts = 0
-        def fail_first(session_dir: Path, state: dict[str, object], event: dict[str, object]) -> None:
-            nonlocal attempts
-            attempts += 1
-            if attempts == 1:
-                raise OSError("event log is unavailable")
-            append(session_dir, state, event)
-        with patch.dict(os.environ, self.environment(1000)), patch.object(findings, "_append_event", side_effect=fail_first):
-            with self.assertRaisesRegex(OSError, "event log is unavailable"):
-                open_event = cast(Callable[[Namespace], None], vars(findings)["_open"])
-                parser = cast(Callable[[], ArgumentParser], vars(findings)["_build_parser"])()
-                open_event(parser.parse_args([
-                    "open", "--session-dir", str(self.session_dir), "--severity", "minor",
-                    "--title", "Recover the saved event", "--caught-by", "worker",
-                ]))
-        self.assertEqual(len(self.finding_rows()), 1)
-        self.assertFalse(any(row["event_type"] == "finding_opened" for row in self.events()))
-        _ = self.gate()
-        first = [row for row in self.events() if row["event_type"] == "finding_opened"]
-        self.assertEqual(len(first), 1)
-        _ = self.gate()
-        self.assertEqual([row for row in self.events() if row["event_type"] == "finding_opened"], first)
 
     def test_retry_after_a_failed_decision_event_preserves_one_withdrawal(self) -> None:
         finding_id = self.decided_finding("declined", "Keep the retry.", at=1_010)
@@ -453,32 +427,6 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         result = self.run_failing_command("abandon", "--reason", "nothing to abandon")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("No repair round is in flight", result.stderr)
-
-    def test_landed_rerun_restores_the_event_after_the_state_write(self) -> None:
-        self.write_progress_state("phase-repair")
-        finding = self.open_finding("blocker", "missing event")
-        _ = self.run_command("dispatch", "--covers", finding)
-        original = Path.open
-
-        def stop_event(path: Path, mode: str = "r", *, encoding: str | None = None,
-                       errors: str | None = None, newline: str | None = None) -> TextIO:
-            if path == self.history_file and mode == "a+":
-                raise OSError("stopped before landed event")
-            return cast(TextIO, original(path, mode, encoding=encoding, errors=errors, newline=newline))
-
-        with patch.object(Path, "open", stop_event), self.assertRaisesRegex(OSError, "stopped before"):
-            _ = self.run_command("landed", at=1100)
-        self.assertEqual(self.status()["in_flight"], [])
-        self.assertFalse(any(event["event_type"] == "finding_batch_landed" for event in self.events()))
-        result = self.run_command("landed", at=1200)
-        self.assertIn("restored", result)
-        events = [event for event in self.events() if event["event_type"] == "finding_batch_landed"]
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["round"], 1)
-        self.assertEqual(events[0]["landed"], [finding])
-        self.assertEqual(events[0]["timestamp_epoch"], 1100)
-        self.assertEqual(self.run_command("landed", at=1300), "no repair round in flight")
-        self.assertEqual([event for event in self.events() if event["event_type"] == "finding_batch_landed"], events)
 
     def test_landed_is_quiet_when_no_repair_is_in_flight(self) -> None:
         """Implementation dispatches call it too, and must not fail because of it."""

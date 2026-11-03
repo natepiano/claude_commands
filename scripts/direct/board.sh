@@ -53,9 +53,6 @@
 set -euo pipefail
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
-BOARD_REPOSITORY="$(cd "${BASH_SOURCE[0]%/*}/../.." && pwd -P)"
-BOARD_PY="$BOARD_REPOSITORY/scripts/lib/py"
-BOARD_PROCESS_START="$BOARD_REPOSITORY/scripts/lib/process_start.py"
 
 MAX_MESSAGE_CHARS=900
 DEFAULT_HOLD_SECONDS=900
@@ -171,7 +168,7 @@ lock_guard() {
     return 2
   fi
   local status
-  if "$BOARD_PY" -c 'import fcntl, sys
+  if python3 -c 'import fcntl, sys
 try:
     fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
 except BlockingIOError:
@@ -199,15 +196,19 @@ lock_is_expired() {
 }
 
 pid_is_gone() {
-  local state
-  state="$("$BOARD_PY" "$BOARD_PROCESS_START" state "$1" 2>/dev/null)" || return 1
-  [[ "$state" == gone ]]
+  local state status
+  if state="$(ps -p "$1" -o stat= 2>/dev/null)"; then
+    [[ "$state" == Z* ]]
+  else
+    status=$?
+    [[ "$status" -eq 1 && -z "$state" ]]
+  fi
 }
 
 lock_stale_reason() {
   local holder_pid
   holder_pid="$(cat "$1/holder_pid" 2>/dev/null || true)"
-  if [[ "$holder_pid" =~ ^[1-9][0-9]*$ ]] && { [[ "${2:-}" == "$holder_pid" && "${3:-}" == gone ]] || { [[ -z "${2:-}" ]] && pid_is_gone "$holder_pid"; }; }; then
+  if [[ "$holder_pid" =~ ^[1-9][0-9]*$ ]] && pid_is_gone "$holder_pid"; then
     printf 'pid %s' "$holder_pid"
     return 0
   fi
@@ -230,22 +231,29 @@ write_lock_meta() {
 cleanup_owned_group() {
   local dir="$1"
   [[ -f "$dir/owned" ]] || return 0
-  "$BOARD_PY" - "$dir/owned" "${BASH_SOURCE[0]%/*}/../lib" "$BOARD_REPOSITORY" <<'PY'
+  python3 - "$dir/owned" "${BASH_SOURCE[0]%/*}/../lib" <<'PY'
 from __future__ import annotations
 
 import json
 from pathlib import Path
 import subprocess
-import signal
 import sys
-sys.path.insert(0, sys.argv[3])
 import time
 
 record = Path(sys.argv[1])
 
-sys.path.insert(0, sys.argv[2])
-from scripts.lib import process_start
-from scripts.lib.process_group import send_process_group
+def identity(pid: int) -> str | None:
+    try:
+        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()
+        # A zombie leader still owns its PID, so its start time is safe to
+        # check while live children remain in the group.
+        return fields[19]
+    except (OSError, IndexError):
+        try:
+            return subprocess.check_output(['ps', '-p', str(pid), '-o', 'lstart='],
+                                           text=True, stderr=subprocess.DEVNULL).strip()
+        except subprocess.CalledProcessError:
+            return None
 
 def live_group(group: int) -> bool:
     try:
@@ -260,20 +268,19 @@ def live_group(group: int) -> bool:
 try:
     saved = json.loads(record.read_text())
     group = int(saved['group'])
-    start = process_start.parse_start(str(saved['start']))
+    start = str(saved['start'])
 except (OSError, ValueError, KeyError, TypeError):
     print('board.sh: invalid step ownership record', file=sys.stderr)
     sys.exit(1)
 
-check = process_start.check_group_leader(group, start)
-if check.stale:
+if identity(group) != start:
+    if live_group(group):
+        print('board.sh: step group leader identity changed', file=sys.stderr)
+        sys.exit(1)
     sys.exit(0)
-if check is not process_start.OwnerCheck.ALIVE:
-    print("board.sh: cannot verify step group leader", file=sys.stderr)
-    sys.exit(1)
 
 try:
-    send_process_group(group, signal.SIGKILL)
+    if (sent := subprocess.run([str(Path(sys.argv[2]).resolve() / "py"), str(Path(sys.argv[2]).resolve() / "process_group.py"), str(group), "KILL"], capture_output=True, text=True)).returncode: raise ProcessLookupError if sent.returncode == 3 else SystemExit("board.sh: process group helper failed: " + " ".join(sent.stderr.splitlines()))
 except ProcessLookupError:
     pass
 
@@ -312,13 +319,8 @@ cmd_acquire() {
   local deadline=$(( $(now_epoch) + wait_secs ))
 
   while :; do
-    local recorded_pid states waiter_state owner_state
-    recorded_pid="$(cat "$dir/holder_pid" 2>/dev/null || true)"
-    states="$("$BOARD_PY" "$BOARD_PROCESS_START" state "${holder_pid:-0}" "${recorded_pid:-0}" 2>/dev/null || true)"
-    waiter_state="${states%%$'\n'*}"
-    owner_state="${states#*$'\n'}"
     # A waiter whose run has ended would take the token for a dead pid.
-    if [[ -n "$holder_pid" && "$waiter_state" == gone ]]; then
+    if [[ -n "$holder_pid" ]] && pid_is_gone "$holder_pid"; then
       printf 'gone %s: pid %s ended while it waited\n' "$resource" "$holder_pid" >&2
       return 4
     fi
@@ -332,7 +334,7 @@ cmd_acquire() {
 
     # Only one waiter can remove a stale lock. Check it again under the guard,
     # since another waiter may have replaced it after the first check.
-    if lock_stale_reason "$dir" "${recorded_pid:-0}" "$owner_state" >/dev/null; then
+    if lock_stale_reason "$dir" >/dev/null; then
       if lock_guard "$guard"; then
         local reason previous previous_pid reclaimed_holders
         if reason="$(lock_stale_reason "$dir")"; then

@@ -14,8 +14,6 @@ from collections.abc import Mapping
 from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
-
-from scripts.lib import process_start as process_identity
 from typing import cast, override
 from unittest import mock
 
@@ -331,12 +329,12 @@ class TopLevelRunningRecordTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")))
 
     def write_record(self, pid: int, *, socket_path: str, updated: int, proc_start: str = "") -> None:
-        started = process_identity.process_start(pid)
-        assert not isinstance(started, process_identity.ProcessGone)
-        self.process_starts[pid] = started.text
+        started = sessions.process_start(pid)
+        assert started is not None
+        self.process_starts[pid] = started
         record = sessions.SessionRecord(
             pid=pid, sessionId="019b3a40-4250-7000-8000-000000000202", name="shared", messagingSocketPath=socket_path,
-            updatedAt=updated, tmux="", formerNames=[], procStart=proc_start or started.text,
+            updatedAt=updated, tmux="", formerNames=[], procStart=proc_start or started,
         )
         _ = (self.directory / f"{pid}.json").write_text(json.dumps(record), encoding="utf-8")
 
@@ -347,10 +345,8 @@ class TopLevelRunningRecordTests(unittest.TestCase):
         def record(
             command: list[str] | tuple[str, ...], **_options: object,
         ) -> subprocess.CompletedProcess[bytes] | subprocess.CompletedProcess[str]:
-            if tuple(command[:3]) == ("ps", "-o", "lstart=,stat="):
-                return subprocess.CompletedProcess(command, 0, self.process_starts[int(command[-1])] + " S\n", "")
-            if tuple(command[:3]) == ("ps", "-o", "stat="):
-                return subprocess.CompletedProcess(command, 0, "S\n", "")
+            if command[:3] == ("ps", "-o", "lstart="):
+                return subprocess.CompletedProcess(command, 0, self.process_starts[int(command[-1])] + "\n", "")
             self.assertEqual(Path(command[1]).name, "build_hold.py")
             self.assertEqual(command[2], "record-recipient")
             recorded.append(list(command))

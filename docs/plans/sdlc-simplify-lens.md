@@ -202,37 +202,3 @@ The second live simplify run (2026-11-02, pass 1 through `review.sh`) raised 25 
 **Constraints from prior phases:** `decision` never applies the proposed change; it records words only. Only the user's own words go into `--user-words` (memory: record only the user's answer).
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/direct -p test_findings.py` and `test_findings_simplify.py` pass; `basedpyright scripts/direct/findings.py scripts/direct/test_findings.py` reports 0 errors, 0 warnings, 0 notes.
-
-### Phase 3 — Phase 20 changes that main lacks reach sdlc  · status: done
-
-#### Work Order
-
-**Goal:** Each change of the sdlc-phases Phase 17 and Phase 20 commits that origin/main lacks reaches sdlc-simplify-lens with its own tests. A change main already has is dropped as a copy.
-
-**Spec:**
-1. The source commits are on branch sdlc-phases (worktree `/home/natepiano/worktrees/claude-build-followups-sdlc-phases`), from `git log --no-merges sdlc-phases --not origin/sdlc`: 81e41ae50, be1478486 (Phase 17, five rerun faults clear on a rerun); f83e5d1a5, b8afa5695, 6af2af4c9, 73646aaf8, 5bdd53aa4 (Phase 20, a stopped verify.sh wait closes on a rerun; a held Mac check step with an unset token); f5645c552 (lint judges before it fixes; build rules in every worker prompt); 70d081f5a (codex_mesh test fixture). Shrink and plan-doc hunks are history only: skip them.
-2. Split each commit into its separate changes (one behavior each). For each change, read origin/main and decide one of:
-   - `dropped` — main has the same behavior; name the main commit that has it (natedev-verify Phase 20 already made clippy judge first);
-   - `kept` — main lacks it; it is ported here;
-   - `obsolete` — main replaced the code the change touched; name the main commit.
-3. Write the list to `docs/plans/sdlc-phase20-port.md`: one row per change with commit, change, files, decision and main commit or port note.
-4. Port each `kept` change onto this branch's current tree by hand. Do not cherry-pick a whole commit and do not resolve the old 38 conflicts. Bring each change's own tests with it, adapted to the current code.
-5. Keep each port to the change's behavior. Do not change code that main or sdlc changed after the source commit, except where the port needs it.
-
-**Files:**
-- `docs/plans/sdlc-phase20-port.md` — the kept and dropped list (new)
-- `scripts/direct/` — verify.sh, progress_history.py, step_record.py, tree_watch.py, launchers and their tests
-- `scripts/lib/` — process_start.py, atomic_file.py and their tests
-- `scripts/mac_test/` — copy_watch.py, mac_test.py and their tests
-- `scripts/agents/` — codex_mesh.py and its tests
-- `scripts/build_hold/`, `scripts/build_targets/`, `scripts/build_queue/`, `scripts/buildlog/`, `scripts/lint/`, `scripts/message/`, `scripts/nix_env/`, `scripts/production/`, `scripts/shutdown/`, `scripts/herdr/`, `scripts/hooks/` — only where a kept change touches them
-- `docs/direct/compose_work_order.md`, `docs/direct/write_prompt_contract.md`, `docs/as-built/` — only for a kept doc change
-
-**Workers:** 1 writer; the compare must come before any port, and one reader keeps the list consistent.
-- `impl` — the list and every port
-
-**State:** none.
-
-**Constraints from prior phases:** sdlc order (2026-11-02): do not resolve the 38 conflicts on sdlc-phases; port only what main lacks, as a new phase from origin/sdlc. Copy removals are never held.
-
-**Acceptance gate:** the list covers every change of the source commits; each kept change has a test that fails without it; each changed test file passes alone; `basedpyright` on each changed Python file reports 0 errors, 0 warnings, 0 notes; `merge_gate.py --tests-only` is green.

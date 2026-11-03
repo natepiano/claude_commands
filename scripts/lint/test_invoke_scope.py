@@ -20,10 +20,6 @@ if TYPE_CHECKING:
 else:
     from scripts.lib import test_hang_guard
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import process_start
-
-
 if TYPE_CHECKING:
     from ..buildlog.cgroup_test_support import write_cgroup
     from ..buildlog.test_memory_window import write_lint_config
@@ -416,10 +412,13 @@ buildlog_sample_anon "$1" "$2" "$$"
             return False
         except PermissionError:
             return True
-        try:
-            return process_start.process_state(pid) is not process_start.ProcessRunState.GONE
-        except process_start.ProcessReadError:
-            return True
+        stat = Path(f"/proc/{pid}/stat")
+        if stat.exists():
+            try:
+                return stat.read_text().rsplit(") ", 1)[1][0] != "Z"
+            except FileNotFoundError:
+                return False
+        return True
 
     def test_unreserved_scoped_step_removes_cgroup_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

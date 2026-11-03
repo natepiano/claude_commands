@@ -21,9 +21,6 @@ from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-from scripts.lib import process_start as process_identity
-from scripts.lib.process_start_test_support import write_stat
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
@@ -207,8 +204,8 @@ class RosterTests(unittest.TestCase):
             self.addCleanup(listener.close)
         record_pid = (991100 if file_name == "director" else os.getpid()) if pid is None else pid
         if not with_socket and not proc_start:
-            started = process_identity.process_start(record_pid)
-            proc_start = "fixture" if isinstance(started, process_identity.ProcessGone) else started.text
+            started = sessions.process_start(record_pid)
+            proc_start = started or "fixture"
         _ = (self.sessions / f"{file_name}.json").write_text(json.dumps({
             "pid": record_pid,
             "sessionId": session_id,
@@ -1707,7 +1704,7 @@ class RosterTests(unittest.TestCase):
     def _herdr_process(self, pid: int, parent: int, argv: list[str], **environment: str) -> None:
         path = Path(os.environ["HERDR_PROC"]) / str(pid)
         path.mkdir(parents=True)
-        _ = write_stat(path.parent, int(path.name), ppid=parent)
+        _ = (path / "stat").write_text(f"{pid} (fixture) S {parent} 0 0")
         _ = (path / "cmdline").write_bytes("\0".join(argv).encode())
         _ = (path / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in environment.items()).encode())
         (path / "cwd").symlink_to(self.home)
@@ -2140,9 +2137,7 @@ class RosterTests(unittest.TestCase):
         path = self.sessions / "director.json"
         data = cast(dict[str, object], json.loads(path.read_text()))
         data["messagingSocketPath"] = ""
-        started = process_identity.process_start(os.getpid())
-        assert not isinstance(started, process_identity.ProcessGone)
-        data["procStart"] = started.text
+        data["procStart"] = sessions.process_start(os.getpid())
         _ = path.write_text(json.dumps(data))
         result, lines, errors = self._run_main("--snapshot")
         self.assertEqual((result, errors), (0, []))
@@ -2253,11 +2248,10 @@ class CodexHolderLabelsTests(unittest.TestCase):
         # Only their declared session labels and run metadata come from fixture files.
         for pid, sid, name in ((os.getppid(), self.director_id, "report-director"),
                                (os.getpid(), self.runner_id, "builds-runner")):
-            start = process_identity.process_start(pid)
+            start = sessions.process_start(pid)
             self.assertIsNotNone(start)
-            assert not isinstance(start, process_identity.ProcessGone)
             _ = (self.registry / f"{pid}.json").write_text(json.dumps({
-                "pid": pid, "sessionId": sid, "name": name, "procStart": start.text,
+                "pid": pid, "sessionId": sid, "name": name, "procStart": start,
                 "messagingSocketPath": "", "updatedAt": 1, "cwd": str(self.root / name),
             }))
         self.process(991099, 0, ["herdr", "--session", "native", "server"])
@@ -2285,7 +2279,8 @@ class CodexHolderLabelsTests(unittest.TestCase):
 
     def process(self, pid: int, parent: int, argv: list[str], environment: str = "") -> None:
         directory = self.root / "proc" / str(pid)
-        _ = write_stat(directory.parent, pid, ppid=parent, command="fixture")
+        directory.mkdir(parents=True)
+        _ = (directory / "stat").write_text(f"{pid} (fixture) S {parent} 0 0")
         _ = (directory / "cmdline").write_bytes("\0".join(argv).encode())
         _ = (directory / "environ").write_bytes(environment.encode())
         (directory / "cwd").symlink_to(self.root)

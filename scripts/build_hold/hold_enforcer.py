@@ -20,12 +20,6 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
-if TYPE_CHECKING:
-    from ..lib import process_start
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.lib import process_start
-
 import build_hold
 from hold_applies import BUILDING_CARGO_VERBS, cargo_verb
 
@@ -331,7 +325,7 @@ class StopBuildsAndTests:
         self.register: Callable[[str], str] = register
 
     def signal_if_current(self, identity: build_hold.ProcessIdentity, signum: int) -> bool:
-        if process_start.check_owner(identity.pid, process_start.parse_start(identity.start_time), self.proc_root) is not process_start.OwnerCheck.ALIVE:
+        if build_hold.process_start_time(identity.pid, self.proc_root) != identity.start_time:
             return False
         try:
             self.signal_process(identity.pid, signum)
@@ -366,7 +360,7 @@ class StopBuildsAndTests:
             return
         ancestors = build_hold.audit_ancestors(root, processes)
         # An ancestor can exit or a PID can be reused after the table read.
-        if any(process_start.check_owner(item.identity.pid, process_start.parse_start(item.identity.start_time), self.proc_root) is not process_start.OwnerCheck.ALIVE
+        if any(build_hold.process_start_time(item.identity.pid, self.proc_root) != item.identity.start_time
                for item in (root, *ancestors)):
             return
         write_refusal(self.proc_root, build)

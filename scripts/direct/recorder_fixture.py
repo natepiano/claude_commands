@@ -166,7 +166,7 @@ def prepare_launcher_runtime(root: Path) -> tuple[Path, Path, Path]:
     direct, agents, lib = (root / "scripts" / name for name in ("direct", "agents", "lib"))
     for directory in (direct, agents, lib, root / "scripts/production"):
         directory.mkdir(parents=True)
-    for name in ("py", "process_start.py", "process_group.py", "atomic_file.py", "user_zone.py", "unit_runs.py", "agents_registry.py", "codex_models_cache.py"):
+    for name in ("py", "process_group.py", "atomic_file.py", "user_zone.py", "unit_runs.py", "agents_registry.py", "codex_models_cache.py"):
         _ = shutil.copy2(source / "lib" / name, lib / name)
     home_lib = root / ".claude/scripts/lib"
     home_lib.mkdir(parents=True, exist_ok=True)

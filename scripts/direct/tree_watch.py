@@ -22,10 +22,6 @@ import time
 from types import SimpleNamespace
 from typing import NotRequired, Protocol, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import process_start
-
-
 
 class Dependency(TypedDict, total=False):
     path: str | None
@@ -236,6 +232,17 @@ class TreeInputs:
         return key.hexdigest(), watch_key
 
 
+def parent_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        stat = Path(f"/proc/{pid}/stat")
+        return not stat.exists() or stat.read_text().rsplit(") ", 1)[1].split()[0] != "Z"
+    except (ProcessLookupError, FileNotFoundError):
+        return False
+    except PermissionError:
+        return True
+
+
 def main(args: list[str]) -> int:
     metadata = sys.stdin.read()
     if args[0] in ("--key", "--watch-key"):
@@ -263,22 +270,13 @@ def main(args: list[str]) -> int:
             interval = 5
     except ValueError:
         interval = 5
-    parent_pid = int(parent)
-    while True:
-        try:
-            recorded = process_start.process_start(parent_pid)
-            break
-        except process_start.ProcessReadError:
-            time.sleep(interval)  # An unreadable parent is not a dead parent.
-    if isinstance(recorded, process_start.ProcessGone):
-        return 3
-    while not process_start.check_owner(parent_pid, recorded).stale:
+    while parent_alive(int(parent)):
         try:
             _, key = inputs.keys(cache=False)
             if key and key != start_key:
                 _ = Path(fired_file).write_text(key + "\n")
-                if notify and process_start.check_owner(parent_pid, recorded) is process_start.OwnerCheck.ALIVE:
-                    os.kill(parent_pid, signal.SIGUSR2)
+                if notify:
+                    os.kill(int(parent), signal.SIGUSR2)
                 return 0
         except (OSError, ValueError, subprocess.SubprocessError):
             pass  # An unreadable tree cannot establish that the result is stale.

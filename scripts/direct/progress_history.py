@@ -31,7 +31,6 @@ from scripts.direct import phase_reservation, plan_history, recorder_state  # no
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
-from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production import production_doc  # noqa: E402
@@ -112,8 +111,6 @@ WAIT_KINDS = (
 )
 
 HOLDER_WAIT_KINDS = ("WaitingForQuotaRefusal", "WaitingForMemoryOrSlot", "ReadyWithoutCapacity")
-WAIT_NEVER_STARTED_STATUS = 4
-WAIT_ABANDONED_STATUS = 5
 
 
 class AgentIdentity(TypedDict):
@@ -2428,42 +2425,29 @@ LEGACY_BOTH_LENS = "both"
 LEGACY_BOTH_LENSES: tuple[str, ...] = ("adversary", "contract")
 
 
-@dataclass(frozen=True)
-class CompleteRunHistory:
-    events: list[dict[str, object]]
+def _run_events(state: dict[str, object]) -> list[dict[str, object]]:
+    """Every event this run recorded, oldest first.
 
-
-@dataclass(frozen=True)
-class WaitHistoryUnavailable:
-    reason: str
-
-
-def _read_run_history(state: dict[str, object]) -> CompleteRunHistory | WaitHistoryUnavailable:
-    """Read all records, so absence is proved only by a complete history."""
+    Scoped to the one run rather than `_load_events`' whole history: the stage
+    table describes the phase in front of the reader, and reading every past run
+    to build it would grow with the machine's history instead of the phase.
+    """
     history_file = _string(state.get("history_file"))
     if not history_file:
-        return WaitHistoryUnavailable("progress state has no history_file")
+        return []
     try:
         with Path(history_file).open(encoding="utf-8") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
             lines = handle.read().splitlines()
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    except (OSError, UnicodeError) as error:
-        return WaitHistoryUnavailable(f"cannot read {history_file}: {error}")
+    except OSError:
+        return []
     events: list[dict[str, object]] = []
-    for number, line in enumerate(lines, 1):
+    for line in lines:
         event = _json_object(line)
-        if event is None or _integer(event.get("schema_version")) != SCHEMA_VERSION:
-            return WaitHistoryUnavailable(f"malformed history {history_file}, line {number}")
-        events.append(event)
-    return CompleteRunHistory(events)
-
-
-def _run_events(state: dict[str, object]) -> list[dict[str, object]]:
-    history = _read_run_history(state)
-    if isinstance(history, WaitHistoryUnavailable):
-        raise SystemExit(f"WaitHistoryUnavailable: {history.reason}")
-    return history.events
+        if event is not None and _integer(event.get("schema_version")) == SCHEMA_VERSION:
+            events.append(event)
+    return events
 
 
 def _agent_display(model: str, effort: str) -> str:
@@ -4813,195 +4797,11 @@ def _eta(args: argparse.Namespace) -> None:
 def _waits_by_id(events: list[dict[str, object]]) -> dict[str, dict[str, object]]:
     waits: dict[str, dict[str, object]] = {}
     for event in events:
-        if event.get("event_type") in ("wait_started", "wait_finished", "wait_unclosed", "wait_not_recorded", "wait_abandoned"):
+        if event.get("event_type") in ("wait_started", "wait_finished", "wait_unclosed", "wait_not_recorded"):
             wait_id = _string(event.get("wait_id"))
             if wait_id:
                 waits[wait_id] = event
     return waits
-
-
-@dataclass(frozen=True)
-class RecordedWait:
-    event: dict[str, object]
-
-
-@dataclass(frozen=True)
-class NeverStartedWait:
-    wait_id: str
-
-
-def read_wait(state: dict[str, object], wait_id: str) -> RecordedWait | NeverStartedWait | WaitHistoryUnavailable:
-    history = _read_run_history(state)
-    if isinstance(history, WaitHistoryUnavailable):
-        return history
-    wait = _waits_by_id(history.events).get(wait_id)
-    return NeverStartedWait(wait_id) if wait is None else RecordedWait(wait)
-
-
-def _require_wait(state: dict[str, object], wait_id: str) -> RecordedWait | NeverStartedWait:
-    wait = read_wait(state, wait_id)
-    if isinstance(wait, WaitHistoryUnavailable):
-        raise SystemExit(f"WaitHistoryUnavailable: wait {wait_id}: {wait.reason}")
-    return wait
-
-
-def close_wait_id(session_dir: Path, wait_id: str) -> None:
-    try:
-        _finish_wait(argparse.Namespace(session_dir=str(session_dir), wait_id=wait_id))
-    except SystemExit as error:
-        if error.code != WAIT_NEVER_STARTED_STATUS:
-            raise
-
-
-@dataclass(frozen=True)
-class WaitIdFile:
-    path: Path
-
-
-@dataclass(frozen=True)
-class TurnWaitFile:
-    path: Path
-    owner_session: str
-
-
-@dataclass(frozen=True)
-class NoWaitFile:
-    """A caller that has not yet adopted durable wait publication."""
-
-
-@contextmanager
-def wait_run_lock(session_dir: Path) -> Generator[None, None, None]:
-    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        yield
-
-
-def _publish_wait_file(publication: WaitIdFile | TurnWaitFile, wait_id: str) -> None:
-    """Publish the complete recovery marker before any start event can exist."""
-    path = publication.path
-    text = (json.dumps({"wait_id": wait_id, "owner_session": publication.owner_session})
-            if isinstance(publication, TurnWaitFile) else wait_id) + "\n"
-    # Recovery may have retired the folder; publication must not restore it.
-    write_text_atomic(path, text, create_parent=False)
-
-
-def _existing_wait_id(wait: RecordedWait) -> str:
-    wait_id = _string(wait.event.get("wait_id"))
-    if wait.event.get("event_type") == "wait_abandoned":
-        print(f"Wait {wait_id} was abandoned (never started)", file=sys.stderr)
-        raise SystemExit(WAIT_ABANDONED_STATUS)
-    return wait_id
-
-
-@dataclass(frozen=True)
-class WaitPublicationAttribution:
-    """The phase and pass that must still own a start when it is appended."""
-
-    phase_instance_id: str
-    phase_status: str
-    pass_instance_id: str
-    run_status: str
-
-
-def _wait_publication_attribution(state: dict[str, object], args: argparse.Namespace) -> WaitPublicationAttribution:
-    resolution = _wait_phase(state, args)
-    instance_id = (_string(resolution.phase.get("instance_id"))
-                   if isinstance(resolution, (WaitPhaseResolved, ResolvedWorkerPass)) else "")
-    phases = [*_parked_phases(state), _object_dict(state.get("phase")) or {}]
-    phase_status = next((_string(phase.get("status")) for phase in phases
-                         if instance_id and phase.get("instance_id") == instance_id), "historical")
-    current_pass = _open_passes(state).get(_optional_arg(args, "slot"), {}) if hasattr(args, "slot") else {}
-    pass_id = (resolution.pass_instance_id if isinstance(resolution, ResolvedWorkerPass)
-               else _string(current_pass.get("instance_id")))
-    return WaitPublicationAttribution(instance_id, phase_status, pass_id, _string(state.get("status")))
-
-
-def _abandon_wait(state: dict[str, object], wait_id: str, reason: str) -> None:
-    event = _event(state, "wait_abandoned", plan_history.now_epoch(), phase_record={})
-    event.update(wait_id=wait_id, wait_end={"state": "NeverStarted"}, wait_abandon_reason=reason)
-    _append_event(state, event)
-
-
-def _commit_wait_publication(state: dict[str, object], args: argparse.Namespace, event: dict[str, object],
-                             publication: WaitIdFile | TurnWaitFile | NoWaitFile,
-                             attribution: WaitPublicationAttribution, previous: RecordedWait | NeverStartedWait | None = None) -> str:
-    """Append only while this id still owns its marker and attribution, under the run lock."""
-    wait_id = _string(event.get("wait_id"))
-    previous = _require_wait(state, wait_id) if previous is None else previous
-    if isinstance(previous, RecordedWait):
-        return _existing_wait_id(previous)
-    invalid_reason = ""
-    if not isinstance(publication, NoWaitFile):
-        try:
-            text = publication.path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as error:
-            invalid_reason = f"wait marker unavailable: {error}"
-        else:
-            recorded_id = (_string((_json_object(text) or {}).get("wait_id"))
-                           if isinstance(publication, TurnWaitFile) else text.strip())
-            if recorded_id != wait_id:
-                invalid_reason = "wait marker no longer names this id"
-    if event.get("event_type") == "wait_started" and _wait_publication_attribution(state, args) != attribution:
-        invalid_reason = "; ".join(part for part in (invalid_reason, "wait phase or pass changed before publication") if part)
-    if invalid_reason:
-        _abandon_wait(state, wait_id, invalid_reason)
-        print(f"Wait {wait_id} was abandoned (never started): {invalid_reason}", file=sys.stderr)
-        raise SystemExit(WAIT_ABANDONED_STATUS)
-    _append_event(state, event)
-    return wait_id
-
-
-def publish_wait(session_dir: Path, args: argparse.Namespace,
-                 publication: WaitIdFile | TurnWaitFile | NoWaitFile) -> str:
-    """Own the id and marker; validate marker and attribution at the locked append."""
-    if os.environ.get(PROBE_ENV) == "1" or (hasattr(args, "probe") and cast(bool, args.probe)):
-        return ""
-    wait_id = _optional_arg(args, "wait_id") or str(uuid.uuid4())
-    with wait_run_lock(session_dir):
-        state = _read_state(session_dir)
-        if isinstance(publication, TurnWaitFile):
-            supplier = (_turn_supplier(state, _arg_string(args, "reason"))
-                        if _arg_string(args, "kind") == "WaitingForSupplier" else _showrunner_supplier(state))
-            args.expected_supplier = _supplier_fields(supplier)
-            try:
-                marker = _json_object(publication.path.read_text(encoding="utf-8")) or {}
-            except FileNotFoundError:
-                marker = {}
-            history = _read_run_history(state)
-            if isinstance(history, WaitHistoryUnavailable):
-                raise SystemExit(f"WaitHistoryUnavailable: {history.reason}")
-            waits = _waits_by_id(history.events)
-            marker_id = _string(marker.get("wait_id"))
-            previous_turn = waits.get(marker_id) if marker_id else None
-            if previous_turn is not None and previous_turn.get("event_type") == "wait_started":
-                if (previous_turn.get("owner_session") == publication.owner_session
-                        and previous_turn.get("wait_kind") == _arg_string(args, "kind")
-                        and previous_turn.get("expected_supplier") == cast(object, args.expected_supplier)):
-                    return _existing_wait_id(RecordedWait(previous_turn))
-                _end_wait(state, previous_turn, plan_history.now_epoch(), unclosed=True)
-            elif marker_id and previous_turn is None:
-                _abandon_wait(state, marker_id, "turn marker has no start in the complete history")
-            prior = waits.get(wait_id)
-            if prior is not None:
-                return _existing_wait_id(RecordedWait(prior))
-        elif _optional_arg(args, "wait_id"):
-            previous = _require_wait(state, wait_id)
-            if isinstance(previous, RecordedWait):
-                return _existing_wait_id(previous)
-        event = _wait_start_event(state, args, wait_id)
-        attribution = _wait_publication_attribution(state, args)
-        if not isinstance(publication, WaitIdFile):
-            # A turn has no surviving verify child to recover. Its marker check,
-            # replacement and start must share one lock, including declarations
-            # that race a prompt or another declaration.
-            if isinstance(publication, TurnWaitFile):
-                _publish_wait_file(publication, wait_id)
-            return _commit_wait_publication(state, args, event, publication, attribution, NeverStartedWait(wait_id))
-    # A stopped verify shell can leave this child alive. Recovery must be able
-    # to abandon its marker while the child is paused before the append lock.
-    _publish_wait_file(publication, wait_id)
-    with wait_run_lock(session_dir):
-        return _commit_wait_publication(_read_state(session_dir), args, event, publication, attribution)
 
 
 @dataclass(frozen=True)
@@ -5450,12 +5250,11 @@ def _wait_phase(state: dict[str, object], args: argparse.Namespace) -> (
 def _start_wait(args: argparse.Namespace) -> None:
     if cast(bool, args.probe) or os.environ.get(PROBE_ENV) == "1":
         return
-    path = _optional_arg(args, "wait_file")
-    publication = WaitIdFile(Path(path)) if path else NoWaitFile()
-    print(publish_wait(_session_dir(args), args, publication))
+    state = _read_state(_session_dir(args))
+    print(_record_wait(state, args))
 
 
-def _wait_start_event(state: dict[str, object], args: argparse.Namespace, wait_id: str) -> dict[str, object]:
+def _record_wait(state: dict[str, object], args: argparse.Namespace) -> str:
     holder = _holder_from_args(args, _arg_string(args, "kind"))
     resolution = _wait_phase(state, args)
     owner = _arg_string(args, "owner_session") or _string((_object_dict(state.get("main_agent")) or {}).get("session_id"))
@@ -5469,6 +5268,7 @@ def _wait_start_event(state: dict[str, object], args: argparse.Namespace, wait_i
     # or the current phase when attribution failed.
     event = _event(state, "wait_not_recorded" if missing_reason else "wait_started", now,
                    phase_record=resolution.phase if isinstance(resolution, (WaitPhaseResolved, ResolvedWorkerPass)) else {})
+    wait_id = str(uuid.uuid4())
     event.update({"wait_id": wait_id, "wait_kind": _arg_string(args, "kind"),
                   "wait_reason": _arg_string(args, "reason"),
                   "unit": _arg_string(args, "unit") or _string(state.get("worktree")),
@@ -5498,7 +5298,8 @@ def _wait_start_event(state: dict[str, object], args: argparse.Namespace, wait_i
                      requested_slot=_optional_arg(args, "slot"),
                      requested_phase_id=_optional_arg(args, "phase_id"),
                      requested_phase_instance_id=_optional_arg(args, "phase_instance_id"))
-    return event
+    _append_event(state, event)
+    return wait_id
 
 
 def _end_wait(state: dict[str, object], wait: dict[str, object], now: float, *, unclosed: bool) -> None:
@@ -5515,29 +5316,15 @@ def _finish_wait(args: argparse.Namespace) -> None:
         return
     state = _read_state(_session_dir(args))
     wait_id = _arg_string(args, "wait_id")
-    wait = _require_wait(state, wait_id)
-    if isinstance(wait, NeverStartedWait):
-        _abandon_wait(state, wait_id, "finish found no start in the complete history")
-    if isinstance(wait, NeverStartedWait) or wait.event.get("event_type") == "wait_abandoned":
-        print(f"Wait {wait_id} never started; id abandoned", file=sys.stderr)
-        raise SystemExit(WAIT_NEVER_STARTED_STATUS)
-    if wait.event.get("event_type") != "wait_started":
+    wait = _waits_by_id(_run_events(state)).get(wait_id)
+    if wait is None:
+        raise SystemExit(f"Wait {wait_id} was not recorded in this run")
+    if wait.get("event_type") != "wait_started":
         return
     now = plan_history.now_epoch()
-    if now < _number(wait.event.get("wait_started_epoch")):
+    if now < _number(wait.get("wait_started_epoch")):
         raise SystemExit("Cannot finish a wait before its start")
-    _end_wait(state, wait.event, now, unclosed=False)
-
-
-def _recover_wait_folder(args: argparse.Namespace) -> None:
-    if os.environ.get(PROBE_ENV) == "1":
-        return
-    from scripts.direct import wait_folders
-
-    try:
-        wait_folders.recover(_session_dir(args), Path(_arg_string(args, "directory")))
-    except (OSError, SystemExit) as error:
-        raise SystemExit(f"verify.sh: wait history NotRecorded: {error}") from error
+    _end_wait(state, wait, now, unclosed=False)
 
 
 def _checkpoint(args: argparse.Namespace) -> None:
@@ -5592,10 +5379,6 @@ def _external_wait_file() -> Path:
 
 def _external_wait_events() -> list[dict[str, object]]:
     # This reader creates no file or parent directory.
-    try:
-        _ = _external_wait_file().stat()
-    except FileNotFoundError:
-        return []
     return _run_events({"history_file": str(_external_wait_file())})
 
 
@@ -5891,9 +5674,27 @@ def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) 
         kind = "WaitingForSupplier"
     else:
         return False
-    args = argparse.Namespace(missing_reason="", kind=kind, reason=reason,
-                              owner_session=owner_session, unit="")
-    _ = publish_wait(session_dir, args, TurnWaitFile(session_dir / "turn_wait.json", owner_session))
+    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        state = _read_state(session_dir)
+        supplier = _turn_supplier(state, reason) if kind == "WaitingForSupplier" else _showrunner_supplier(state)
+        supplier_fields = _supplier_fields(supplier)
+        marker_path = session_dir / "turn_wait.json"
+        try:
+            marker = _json_object(marker_path.read_text(encoding="utf-8")) or {}
+        except FileNotFoundError:
+            marker = {}
+        previous = _waits_by_id(_run_events(state)).get(_string(marker.get("wait_id")))
+        if previous is not None and previous.get("event_type") == "wait_started":
+            if (previous.get("owner_session") == owner_session and previous.get("wait_kind") == kind
+                    and previous.get("expected_supplier") == supplier_fields):
+                return True
+            _end_wait(state, previous, plan_history.now_epoch(), unclosed=True)
+        args = argparse.Namespace(missing_reason="", kind=kind, reason=reason,
+                                  owner_session=owner_session, unit="", expected_supplier=supplier_fields)
+        wait_id = _record_wait(state, args)
+        _ = marker_path.write_text(json.dumps({"wait_id": wait_id, "owner_session": owner_session}) + "\n",
+                                   encoding="utf-8")
     return True
 
 
@@ -5901,7 +5702,8 @@ def finish_turn_wait(session_dir: Path, owner_session: str, *, source: str, prom
     """Finish only for typed input or a message from the recorded supplier."""
     if os.environ.get(PROBE_ENV) == "1" or not (session_dir / "turn_wait.json").exists():
         return
-    with wait_run_lock(session_dir):
+    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         marker_path = session_dir / "turn_wait.json"
         try:
             marker = _json_object(marker_path.read_text(encoding="utf-8")) or {}
@@ -5910,17 +5712,8 @@ def finish_turn_wait(session_dir: Path, owner_session: str, *, source: str, prom
         if marker.get("owner_session") != owner_session:
             return
         state = _read_state(session_dir)
-        recorded = read_wait(state, _string(marker.get("wait_id")))
-        if isinstance(recorded, WaitHistoryUnavailable):
-            print(f"WaitHistoryUnavailable: {recorded.reason}", file=sys.stderr)
-            return
-        if isinstance(recorded, NeverStartedWait):
-            close_wait_id(session_dir, recorded.wait_id)
-            marker_path.unlink()
-            return
-        wait = recorded.event
-        if wait.get("event_type") != "wait_started":
-            marker_path.unlink()
+        wait = _waits_by_id(_run_events(state)).get(_string(marker.get("wait_id")))
+        if wait is None or wait.get("event_type") != "wait_started":
             return
         supplier = _object_dict(wait.get("expected_supplier")) or {}
         message = (_supplier_message(_string(supplier.get("address")), prompt, owner_session)
@@ -6044,12 +5837,7 @@ def _read_waits(args: argparse.Namespace) -> None:
     ignored += len(without_id)
     histories = _wait_holder_history(events)
     records: list[dict[str, object]] = []
-    abandoned = [wait for wait in _waits_by_id(events).values()
-                 if wait.get("event_type") == "wait_abandoned"
-                 and since <= _number(wait.get("timestamp_epoch")) < until]
     for wait in _waits_by_id(events).values():
-        if wait.get("event_type") == "wait_abandoned":
-            continue
         key = (_string(wait.get("run_id")), _string(wait.get("wait_id")))
         epoch = _number(wait.get("wait_started_epoch"))
         holders = histories.get(key, [{"at": _iso_time(epoch), "epoch": epoch,
@@ -6130,7 +5918,6 @@ def _read_waits(args: argparse.Namespace) -> None:
                       "uncertain_phase_n": sum(phase["state"] == "UncertainCoverage" for phase in phases),
                       "production_handoff_n": len(handoffs), "handoffs": handoffs,
                       "ignored_n": ignored, "wait_without_id_n": len(without_id),
-                      "abandoned_n": len(abandoned), "abandoned": abandoned,
                       "phases": phases, "waits": waits, "missing": missing}, sort_keys=True))
 
 
@@ -6505,8 +6292,6 @@ def _build_parser() -> argparse.ArgumentParser:
     start_wait = subparsers.add_parser("start-wait")
     _ = start_wait.add_argument("--session-dir", required=True)
     _ = start_wait.add_argument("--kind", choices=WAIT_KINDS, required=True)
-    _ = start_wait.add_argument("--wait-id", default="")
-    _ = start_wait.add_argument("--wait-file", default="")
     wait_phase = start_wait.add_mutually_exclusive_group()
     _ = wait_phase.add_argument("--phase-id", default=argparse.SUPPRESS)
     _ = wait_phase.add_argument("--slot", default=argparse.SUPPRESS)
@@ -6531,11 +6316,6 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = finish_wait.add_argument("--session-dir", required=True)
     _ = finish_wait.add_argument("--wait-id", required=True)
     finish_wait.set_defaults(handler=_finish_wait)
-
-    recover_wait_folder = subparsers.add_parser("recover-wait-folder")
-    _ = recover_wait_folder.add_argument("--session-dir", required=True)
-    _ = recover_wait_folder.add_argument("--directory", required=True)
-    recover_wait_folder.set_defaults(handler=_recover_wait_folder)
 
     checkpoint = subparsers.add_parser("checkpoint")
     _ = checkpoint.add_argument("--session-dir", required=True)
@@ -6747,7 +6527,7 @@ def main() -> None:
     if not callable(handler_value):
         raise SystemExit("No command handler selected")
     handler = cast(Callable[[argparse.Namespace], None], handler_value)
-    if _arg_string(args, "command") in ("waits", "receipts", "start-wait", "recover-wait-folder"):
+    if _arg_string(args, "command") in ("waits", "receipts"):
         handler(args)
         return
     session_value: object = getattr(args, "session_dir", "")
@@ -6757,8 +6537,12 @@ def main() -> None:
         return
     session_dir = Path(session_text).expanduser().resolve()
     session_dir.mkdir(parents=True, exist_ok=True)
-    with wait_run_lock(session_dir):
-        handler(args)
+    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            handler(args)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 if __name__ == "__main__":

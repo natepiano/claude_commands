@@ -1,7 +1,6 @@
 """One private admission server, fake clock and fault boundary for service tests."""
 from __future__ import annotations
 
-from scripts.lib import process_start
 from scripts.lint.test_memory_admit import write_memory_config
 
 from collections import Counter
@@ -143,7 +142,7 @@ class TestProcesses:
     def spawn(self, used: int = GIB) -> wire.Owner:
         child = subprocess.Popen(["sleep", "300"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.children.append(child)
-        start = process_start.start_text(child.pid)
+        start = gate.process_start_time(child.pid)
         if start is None:
             raise RuntimeError("child has no process start time")
         self.starts[child.pid] = start
@@ -152,10 +151,10 @@ class TestProcesses:
 
     def processes(self) -> dict[int, gate.ProcessIdentity]:
         return {pid: gate.ProcessIdentity(1, start) for pid, start in self.starts.items()
-                if self.owner_check(wire.Owner(pid, start)) is process_start.OwnerCheck.ALIVE}
+                if self.owner_start(pid) == start}
 
-    def owner_check(self, owner: wire.Owner) -> process_start.OwnerCheck:
-        return process_start.check_owner(owner.pid, process_start.parse_start(owner.start_time))
+    def owner_start(self, pid: int) -> str | None:
+        return gate.process_start_time(pid)
 
     def pidfd(self, pid: int) -> int:
         return os.pidfd_open(pid)
@@ -194,7 +193,7 @@ class PrivateReadings:
         return gate.sccache_memory()
 
     def reservation(self, path: Path, row: gate.Reservation, now: datetime,
-                    processes: gate.ProcessTable, proc: Path,
+                    processes: dict[int, gate.ProcessIdentity], proc: Path,
                     policy: gate.AdmissionPolicy) -> gate.StepMemory:
         self.counts[f"reservation:{row['pid']}"] += 1
         return gate.reservation_memory(path, row, now, processes, proc, policy)
@@ -363,7 +362,7 @@ class AdmissionFixture(ExitStack):
         if not line.isdigit():
             raise unittest.SkipTest("user systemd refused the transient scope")
         pid = int(line)
-        start = process_start.start_text(pid)
+        start = gate.process_start_time(pid)
         if start is None:
             raise RuntimeError("scope shell exited before the test")
         query = subprocess.run(["systemctl", "--user", "show", "--property=ControlGroup", "--value", unit],

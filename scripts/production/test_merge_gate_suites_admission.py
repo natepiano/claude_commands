@@ -15,8 +15,6 @@ from datetime import UTC, datetime, timedelta, tzinfo
 from typing import cast, final, override
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
-from scripts.lib.process_start_test_support import stored_start_probe
-from scripts.lib import process_start
 from scripts.production import merge_gate
 from scripts.build_queue import queue_place as queue
 from scripts.lint import memory_admit
@@ -76,7 +74,7 @@ class SharedGateAdmissionTests(GateSuitesFixture):
         environment = {**self.environment, "BUILDLOG_BUILD_BUDGET_GIB": "0.6", "BUILDLOG_PROC": str(self.root / "proc")}
         output = io.StringIO()
 
-        def candidate_start(candidate: int) -> str:
+        def process_start(candidate: int) -> str:
             return processes[candidate].start
 
         def next_poll(_seconds: float) -> None:
@@ -84,7 +82,7 @@ class SharedGateAdmissionTests(GateSuitesFixture):
 
         with mock.patch.dict(os.environ, environment), \
              mock.patch.object(memory_admit, "process_table", return_value=processes), \
-             mock.patch.object(process_start, "process_start", side_effect=stored_start_probe(lambda pid: (candidate_start)(pid) or "")), \
+             mock.patch.object(memory_admit, "process_start_time", side_effect=process_start), \
              mock.patch.object(time, "sleep", side_effect=next_poll), redirect_stdout(output):
             with merge_gate.gate_reservation(self.checkout, 512, self.state, merge_gate.BuildHoldWait()):
                 pass
