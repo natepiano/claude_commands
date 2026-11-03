@@ -71,16 +71,17 @@ resolver before calling `exec`.
 | Path | Integration |
 | --- | --- |
 | `herdr/herdr.py` | `launch_agent` checks `ensure(cwd, base_env)` before `open_tab`. It returns `AgentLaunched(pane, outcome)` or a typed `Refused`; refusal creates no pane and starts no agent. |
-| `production/add_unit.py` | New units, resumes, renames, transfers, watchdog recovery and account moves use `launch_agent`. |
+| `production/add_unit.py` | Unit launches use `launch_agent`. Account moves and watchdog recovery use the shared stop and resume path. |
 | `production/add_showrunner.py` | Child showrunners use `launch_agent`. |
-| `shutdown/restart.py` | Claude restarts and Codex snapshot restores prepare the saved cwd and account environment before `restore_server` can open a desktop window, then use `launch_prepared_agent`. A refusal leaves the snapshot available and opens no window or tab. |
+| `shutdown/restart.py` | Record-driven restarts prepare the saved cwd and account environment before `restore_server`, then use `launch_prepared_agent`. Refusal retains the record. |
+| `shutdown/stop_resume.py` | Shared resume runs the account exec command in the session's pane. The exec path prepares the launch shell. |
 | `shutdown/pane_restore.py` | Saved Claude panes use `launch_agent` before replacing their old tab. |
 | `herdr/herdr_sessions.py` | Standalone starts and resumes use `launch_agent`. |
 | `berth_fix/launch.sh` | Proves the worktree before opening a window; both window and current-terminal starts use `nix_env.py exec`. Worktree approval failure is fatal. |
 | `agents/agent_bg.sh` | Proves the cwd while making worker settings, passes the loaded env through settings for the long-lived background daemon, and starts the CLI through `exec`. |
 | `agents/agent_exec.sh` | Claude print runs use `exec` after changing to their requested directory. |
 | `agents/codex_mesh.py` | The shared Codex app-server calls `ensure(worktree, environment)` and starts Codex directly with the loaded env. Protected account, run, temporary-directory and held-role values come from the caller. `Refused` logs the helper's line, remembers the failed shell, and falls back to the caller env so other workers keep their shared server. The recorded pid is the server's pid. |
-| `accounts/accounts.py` | `exec` calls `launch_shell_environment(cwd)` for every Claude and Codex label. That guard dynamically loads `nix_env` and calls `ensure(cwd, os.environ)`, puts the caller's HOME back, and exits 1 with the helper's reason on `Refused`. |
+| `accounts/accounts.py` | Normal `exec` launches call `launch_shell_environment(cwd)`. It calls `ensure`, restores the caller's HOME, and refuses an unusable shell. `codex update` bypasses account launch. |
 | `cli_agent/cli_agent.sh` | Interactive and command Claude launches use `exec` in the caller's directory. |
 | `notify/review.py` | Loads the current directory's env before the Claude reviewer starts; refusal returns an unreviewed result. |
 | `make_a_worktree/direnv_allow.sh` | Thin, silent-on-success `ensure` call; failure retains the helper's stderr and exit status. `commands/make_a_worktree.md` requires stopping on failure. |

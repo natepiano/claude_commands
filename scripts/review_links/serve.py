@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
@@ -18,6 +19,7 @@ from typing import TYPE_CHECKING, BinaryIO, TypeVar, cast
 from urllib.parse import parse_qs, unquote, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production import change_routing
 from scripts.review_links import change_page, change_browser
 from scripts.review_links.review_link import private_name
 
@@ -301,6 +303,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.next_sweep: float = time.monotonic() + SWEEP_SECONDS
         _ = sweep_snapshots(self.root, time.time())
         super().__init__(address, ReviewLinksHandler)
+        threading.Thread(target=change_page.recover_pending, args=(self.delivery_status,), daemon=True).start()
 
     @override
     def service_actions(self) -> None:
@@ -327,7 +330,7 @@ def main(arguments: list[str]) -> int:
     args = parser.parse_args(arguments)
     try:
         address = tailscale_ip()
-        root = Path(os.environ.get("REVIEW_LINKS_ROOT") or Path.home() / ".local/share/review-links").expanduser()
+        root = change_routing.review_root()
         root.mkdir(parents=True, exist_ok=True)
         with ReviewLinksServer((address, cast(int, args.port)), root) as server:
             print(f"review-links: serving {root} on {address}:{server.server_port}", flush=True)

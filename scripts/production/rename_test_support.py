@@ -24,12 +24,12 @@ from scripts.astra import design_roles
 from scripts.direct import workers
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_unit_host
-from scripts.production import staff
+from scripts.production import staff, unit_config
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, unit_membership, StaffTestCase, isolated_source_readers
 from scripts.lib.atomic_file import write_text_atomic
 import fake_herdr
 import herdr
-from scripts.shutdown import pane_record
+from scripts.shutdown import pane_record, remote
 from scripts.direct import progress_history
 from scripts.message import sessions
 from scripts.direct.recorder_state import STATE_FILENAME
@@ -510,16 +510,41 @@ def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members
         state = Path(environment["SHOWRUNNER_STATE_DIR"])
         with mock.patch.object(tidy_wrapped, "STATE_DIR", state), unit_move.production_lock():
             pass
+    productions: dict[str, production_units.Production] = {}
     for source in showrunners.read_sources(unreadable=showrunners.UnreadableTimerPolicy.RAISE):
         if source.timer.slug in members:
             production = production_units.read_production(source.timer.doc)
+            productions[source.timer.slug] = production
             with merge_checkpoint.merge_lock(production.checkout, source.timer.slug):
                 pass
+    for slug in members.keys() - productions.keys():
+        candidates = [production for path in sorted(case.root.rglob(f"{slug}-production.md"))
+                      if (production := production_units.read_production(path)).doc.is_relative_to(production.checkout)]
+        case.assertEqual(len(candidates), 1, f"{slug}: expected one production document in its checkout")
+        production = candidates[0]
+        productions[slug] = production
+        with merge_checkpoint.merge_lock(production.checkout, slug):
+            pass
     with staff.operation():
         for slug, units in members.items():
-            row = fixture_member("showrunner", name=slug)
+            production = productions[slug]
+            row = fixture_member("showrunner", name=slug,
+                                 doc=staff.LiveDoc(remote.local_machine(), production.doc))
+            cells_by_name = {unit_names.name(production_units.cell_value(cells["Unit"])): cells
+                             for cells in production_units.unit_table(production.doc.read_text().splitlines())}
             for unit in units:
-                _ = fixture_member("unit", name=unit_names.name(unit), parent=row.id)
+                name = unit_names.name(unit)
+                cells = cells_by_name[name]
+                tree = Path(production_units.cell_value(cells["Worktree"])).expanduser()
+                _ = fixture_member("unit", name=name, parent=row.id,
+                                   worktree=(staff.PresentWorktree(remote.local_machine(), tree)
+                                             if tree.is_dir() else staff.WorktreeUnfilled()))
+                if not tree.is_dir():
+                    continue
+                plan = production_units.cell_value(cells["Plan"])
+                mode = (unit_config.StandbyPlan() if plan == "standby" else
+                        unit_config.PermanentPlan() if plan == "permanent" else unit_config.PlanFile(Path(plan)))
+                _ = unit_config.write(tree, unit_config.UnitConfig(mode, unit_config.NoAppPort(), ()))
 
 
 class ProductionRenameFixture(StaffTestCase):
@@ -718,6 +743,8 @@ class ProductionRenameFixture(StaffTestCase):
             old = self.worktrees / unit
             destination = self.unit_worktree(OLD, unit)
             _ = self.git("worktree", "move", str(old), str(destination))
+            row = unit_membership(OLD, unit)
+            _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), destination))
             text = text.replace(f"`{old}`", f"`{destination}`")
             _ = self.git("push", "origin", f"old-{unit}")
         self.write(self.doc, text)

@@ -21,9 +21,9 @@ from zoneinfo import ZoneInfo
 from scripts.production import showrunners
 import showrunner_tree
 import unit_lookup
-from scripts.production import staff
+from scripts.production import staff, unit_names
 from production_units import Production, read_production
-from production_units import Refusal, cell_value, production_field, unit_table
+from production_units import Refusal, cell_value, production_field
 from unit_lookup import live_unit_table
 from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
 from dailies_counts import CountsFailure, production_counts
@@ -245,13 +245,17 @@ class JudgmentOutsideNumberedPlan(NamedTuple):
 JudgmentPlanPhase = JudgmentNumberedPlanPhase | JudgmentOutsideNumberedPlan
 
 
+class UnitRunUnavailable(NamedTuple):
+    reason: str
+
+
 class UnitRow(NamedTuple):
     name: str
     # The unit's session name at this moment, read from its live session; empty when none runs.
     # It addresses the unit and is never a key: every record is kept under the unit's name.
     session: str
     # Read from the records of the unit's /unit:direct runs.
-    run: unit_lookup.UnitState
+    run: unit_lookup.UnitState | UnitRunUnavailable
 
 
 class DailiesFailure(Exception):
@@ -302,25 +306,32 @@ def bounded_bevy_update(text: str) -> str:
 
 def units_from_doc(lines: list[str], slug: str, *, record: staff.StaffSnapshot | None = None) -> tuple[UnitRow, ...]:
     record = record if record is not None else staff.snapshot()
-    live_rows = live_unit_table(lines, slug, record=record)
-    if unit_table(lines) and not live_rows:
+    sources = unit_lookup.member_sources()
+    live_rows = live_unit_table(lines, slug, record=record, sources=sources)
+    if unit_lookup.retired_units(lines, slug, record=record, sources=sources) and not live_rows:
         raise DailiesFailure("production", "no live units: every Units row is retired")
     try:
-        marked = unit_lookup.marked_units(slug, record=record)
+        marked = {unit_names.name(name): place
+                  for name, place in unit_lookup.marked_units(slug, record=record, sources=sources).items()}
     except OSError as error:
         raise DailiesFailure("production", f"the unit sessions could not be looked up: {error}") from error
     try:
         runs = unit_lookup.read_run_states()
     except OSError as error:
         raise DailiesFailure("production", f"the run records of {slug} could not be read: {error}") from error
+    members = {row.name: row
+               for row in unit_lookup.production_members(record, sources).get(showrunners.canonical_slug(slug), ())}
     units: list[UnitRow] = []
     for cells in live_rows:
         name = cell_value(cells.get("Unit", ""))
         if not name:
             raise DailiesFailure("production", f"invalid Units row: {cells}")
-        found = marked.get(name)
+        key = unit_names.name(name)
+        found = marked.get(key)
         claude = found.claude if found is not None else None
-        run = runs.state(Path(cell_value(cells.get("Worktree", ""))))
+        tree = members[key].worktree
+        run = (runs.state(tree.path) if isinstance(tree, staff.PresentWorktree)
+               else UnitRunUnavailable("the unit has no present worktree"))
         units.append(UnitRow(name, claude.name if isinstance(claude, unit_lookup.LiveClaude) else "", run))
     return tuple(units)
 

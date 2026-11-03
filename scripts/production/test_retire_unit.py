@@ -380,7 +380,7 @@ class RetireUnitTests(unittest.TestCase):
 
         self.calls = []
         self.claude = [session(DIRECTOR, "alpha", 4101), session(SEAT, "alpha-seat", 4102)]
-        self.staff.register_production("alpha", self.doc)
+        _ = self.staff.record_production("alpha", self.doc)
         parent = fixture_member("showrunner", name="alpha")
         self.unit_staff_id = fixture_member("unit", name="alpha", parent=parent.id, runtime_id=DIRECTOR,
                          worktree=staff.PresentWorktree("natedev", self.worktree)).id
@@ -551,7 +551,7 @@ class RetireUnitTests(unittest.TestCase):
         _ = new_doc.write_text("- **Merge branch:** main\n"
                                + f"- **Showrunner checkout:** {self.checkout}\n- **Log:** log.md\n"
                                + new_doc.read_text())
-        receiving = fixture_member("showrunner", name="receiving")
+        receiving = fixture_member("showrunner", name="receiving", doc=staff.LiveDoc("natedev", new_doc))
         before = self.staff.staff_file.read_bytes(), self.staff.staff_file.stat().st_mtime_ns
         with self.assertRaisesRegex(production_units.Refusal, "resume.*remove.*free the name"):
             _ = add_unit.ensure_staff_unit(read_production(self.staff.source_root / "receiving-production.md"),

@@ -77,6 +77,16 @@ class ReviewPage(HTMLParser):
 
 
 class PrivateNameTests(unittest.TestCase):
+    def test_atomic_temporary_names_are_private_for_metadata_and_public_files(self) -> None:
+        for target in (".index.json", ".index.lock", ".review-link-delivery-abc123.json",
+                       ".review-link-changes.json", ".review-link-browser.json", "report.1.2.html"):
+            for name in (f".{target}.123.456.tmp", f".{target}.123.456.TMP".upper()):
+                with self.subTest(name=name):
+                    self.assertTrue(review_link.private_name(name))
+        for name in (".index.json.bak", "index.json"):
+            with self.subTest(name=name):
+                self.assertFalse(review_link.private_name(name))
+
     def test_private_names_ignore_case_without_hiding_similar_public_names(self) -> None:
         for name, expected in (
             (".index.json", True),
@@ -145,6 +155,24 @@ class ReviewLinkTests(unittest.TestCase):
             [sys.executable, str(SCRIPT), *arguments], env=self.env,
             text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
+
+    def test_standalone_help_runs_without_pythonpath_from_another_directory(self) -> None:
+        environment = dict(self.env)
+        _ = environment.pop("PYTHONPATH", None)
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--help"], env=environment, cwd=self.root,
+            text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("usage:", result.stdout)
+
+    def test_a_snapshot_input_with_an_atomic_temporary_name_is_refused_before_publication(self) -> None:
+        source = self.source(".draft.txt.123.456.tmp", "private unfinished content")
+        with patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.snapshots), "REVIEW_LINKS_HOST": "natedev"}):
+            with self.assertRaisesRegex(ValueError, "reserved snapshot filename"):
+                _ = review_link.snapshot([source])
+        self.assertFalse(self.snapshots.exists())
+        self.assertFalse((self.snapshots / ".index.json").exists())
 
     def linked_snapshot(self, url: str) -> Path:
         address = urlsplit(url)
@@ -563,7 +591,10 @@ class SnapshotIdAllocationTests(unittest.TestCase):
                     self.assertEqual(review_link.snapshot([source]), initial)
                 self.assertEqual(replaced, [source.name, ".index.json"])
                 self.assertEqual(destination.read_text(encoding="utf-8"), "new")
-                self.assertEqual(list(snapshots.rglob(".review-link-*")), [])
+                self.assertEqual(
+                    {file.relative_to(snapshots) for file in snapshots.rglob("*") if file.is_file()},
+                    {Path(".index.json"), Path(".index.lock"), destination.relative_to(snapshots)},
+                )
 
     def test_failed_refresh_keeps_the_previous_file_and_cleans_the_temporary(self) -> None:
         with tempfile.TemporaryDirectory(prefix="review-atomic-test-") as directory:
@@ -581,7 +612,10 @@ class SnapshotIdAllocationTests(unittest.TestCase):
                 destination = snapshots / urlsplit(initial[0]).path.lstrip("/")
                 self.assertEqual(destination.read_text(encoding="utf-8"), "old")
                 self.assertEqual((snapshots / ".index.json").read_bytes(), index)
-                self.assertEqual(list(snapshots.rglob(".review-link-*")), [])
+                self.assertEqual(
+                    {file.relative_to(snapshots) for file in snapshots.rglob("*") if file.is_file()},
+                    {Path(".index.json"), Path(".index.lock"), destination.relative_to(snapshots)},
+                )
 
     def test_taken_id_retries_without_overwriting_the_existing_snapshot(self) -> None:
         with tempfile.TemporaryDirectory(prefix="review-id-test-") as directory:
