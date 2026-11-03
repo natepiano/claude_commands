@@ -17,7 +17,6 @@ from unittest.mock import patch
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, nix_env_fake as fixtures
 from scripts.lib.code_kind import is_test_code
-from scripts.shutdown import launch_permission
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -200,8 +199,6 @@ class ExecLaunchShellTests(unittest.TestCase):
             "KEEP": "base", "UNSET_BY_SHELL": "old", "AGENT_NOTES_DIR": str(self.home / "notes"),
             "SHUTDOWN_STATE_DIR": str(self.home / "shutdown"),
             "NOTIFIER_SESSIONS_DIR": str(self.home / "sessions")}, clear=True)))
-        _ = self.enterContext(patch.object(launch_permission, "launch_permission",
-            return_value=launch_permission.AllowedByShutdownState()))
         _ = self.enterContext(patch.object(Path, "cwd", return_value=self.folder))
         _ = self.enterContext(patch.object(sys.stdin, "isatty", return_value=False))
         prepared = accounts.PreparedAccount({"CLAUDE_CONFIG_DIR": str(self.home / ".claude4")},

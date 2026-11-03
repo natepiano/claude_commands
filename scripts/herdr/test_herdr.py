@@ -1214,7 +1214,7 @@ class LaunchDestinationTests(unittest.TestCase):
             with self.subTest(ratio=ratio), self.assertRaises(ValueError):
                 _ = herdr.SplitPane("parent", "right", ratio, "worker")
 
-    def test_all_destinations_share_the_claim_and_start_and_label_before_start(self) -> None:
+    def test_all_destinations_start_and_label_before_start(self) -> None:
         for destination in (herdr.NewTab("workers", "worker"),
                             herdr.SplitPane("parent", "right", 0.3, "worker"),
                             herdr.ExistingPane("worker-pane", "terminal-one")):
@@ -1231,14 +1231,10 @@ class LaunchDestinationTests(unittest.TestCase):
                     events.append("start")
                     return herdr.PromptSubmissionNotRequired()
                 prepared = herdr.PreparedAgentEnvironment(Path("/tmp"), {"CODEX_HOME": "/account", "PATH": "/bin"})
-                with (patch.object(herdr, "Herdr", return_value=client),
-                      patch.object(herdr, "open_tab", return_value="worker-pane") as opened,
-                      patch("scripts.shutdown.launch_permission.claim_launch_pane") as claimed,
-                      patch.object(herdr, "start_agent", side_effect=start) as started):
+                with (patch.object(herdr, "Herdr", return_value=client), patch.object(herdr, "open_tab", return_value="worker-pane") as opened, patch.object(herdr, "start_agent", side_effect=start) as started):
                     result = herdr.launch_prepared_agent("agents", destination, prepared,
                         "codex", ["resume", "conversation"], herdr.NoOpeningPrompt(), 5000, agent="worker")
                 self.assertEqual(result.pane, "worker-pane")
-                claimed.assert_called_once_with("agents", "worker-pane")
                 started.assert_called_once_with("agents", "worker-pane", "codex", ["resume", "conversation"],
                     herdr.NoOpeningPrompt(), 5000, agent="worker")
                 if isinstance(destination, herdr.NewTab):
@@ -1293,12 +1289,7 @@ class LaunchDestinationTests(unittest.TestCase):
                     cast(Mock, client.panes).return_value = [{"pane_id": "worker", "terminal_id": "terminal-one"}]
                     cast(Mock, client.pane_activity).return_value = herdr.PaneAtShell()
                     cast(Mock, client.startup_processes).return_value = herdr.PaneStartupObservation(herdr.PaneShell(123), herdr.PaneAtShell())
-                    with (patch.object(herdr, "Herdr", return_value=client),
-                          patch.object(herdr, "open_tab", return_value="worker"),
-                          patch.object(herdr, "close_agent") as closed_tab,
-                          patch("scripts.shutdown.launch_permission.claim_launch_pane"),
-                          patch.object(herdr, "start_agent", side_effect=herdr.HerdrFailure("start failed")),
-                          self.assertRaisesRegex(herdr.HerdrFailure, "start failed")):
+                    with (patch.object(herdr, "Herdr", return_value=client), patch.object(herdr, "open_tab", return_value="worker"), patch.object(herdr, "close_agent") as closed_tab, patch.object(herdr, "start_agent", side_effect=herdr.HerdrFailure("start failed")), self.assertRaisesRegex(herdr.HerdrFailure, "start failed")):
                         _ = herdr.launch_prepared_agent("agents", destination,
                             herdr.PreparedAgentEnvironment(Path("/tmp"), {}), "codex", [],
                             herdr.NoOpeningPrompt(), 5000, agent="worker")
@@ -1320,14 +1311,7 @@ class LaunchDestinationTests(unittest.TestCase):
             cast(Mock, client.startup_processes).return_value = herdr.PaneStartupObservation(
                 herdr.PaneShell(123), herdr.AgentProcessPresent((herdr.AgentProcessIdentity(456, 789),)))
             cast(Mock, client.wait_until).return_value = herdr.ObservedAgentState(herdr.AgentStatus.UNKNOWN)
-            with (patch.object(herdr, "Herdr", return_value=client),
-                  patch("scripts.shutdown.launch_permission.claim_launch_pane"),
-                  patch.object(os, "pidfd_open", return_value=99, create=True),
-                  patch.object(os, "close") as released,
-                  patch.object(signal, "pidfd_send_signal", create=True) as signalled,
-                  patch.object(herdr, "_startup_processes", return_value=herdr.AgentProcessPresent((herdr.AgentProcessIdentity(456, 789),))),
-                  patch.object(herdr, "start_agent", side_effect=herdr.HerdrFailure("start failed")),
-                  self.assertRaisesRegex(herdr.HerdrFailure, "start failed")):
+            with (patch.object(herdr, "Herdr", return_value=client), patch.object(os, "pidfd_open", return_value=99, create=True), patch.object(os, "close") as released, patch.object(signal, "pidfd_send_signal", create=True) as signalled, patch.object(herdr, "_startup_processes", return_value=herdr.AgentProcessPresent((herdr.AgentProcessIdentity(456, 789),))), patch.object(herdr, "start_agent", side_effect=herdr.HerdrFailure("start failed")), self.assertRaisesRegex(herdr.HerdrFailure, "start failed")):
                 _ = herdr.launch_prepared_agent("agents", herdr.ExistingPane("worker", "terminal-one"),
                     herdr.PreparedAgentEnvironment(Path("/tmp"), {}), "codex", [],
                     herdr.NoOpeningPrompt(), 5000, agent="worker")
@@ -1356,10 +1340,7 @@ class LaunchDestinationTests(unittest.TestCase):
         client = Mock(spec=herdr.Herdr)
         cast(Mock, client.panes).return_value = [{"pane_id": "worker", "terminal_id": "terminal-one"}]
         cast(Mock, client.pane_activity).return_value = herdr.PaneAtShell()
-        with (patch.object(herdr, "Herdr", return_value=client),
-              patch.object(herdr.nix_env, "ensure", return_value=herdr.nix_env.NoEnvrc({"PATH": "/bin"})),
-              patch("scripts.shutdown.launch_permission.claim_launch_pane"),
-              patch.object(herdr, "start_agent", return_value=herdr.PromptSubmissionNotRequired())):
+        with (patch.object(herdr, "Herdr", return_value=client), patch.object(herdr.nix_env, "ensure", return_value=herdr.nix_env.NoEnvrc({"PATH": "/bin"})), patch.object(herdr, "start_agent", return_value=herdr.PromptSubmissionNotRequired())):
             prepared = herdr.prepare_agent_environment("/tmp", {}, frozenset({"EXCLUDED_TOKEN"}))
             self.assertIsInstance(prepared, herdr.PreparedAgentEnvironment)
             _ = herdr.launch_prepared_agent("agents", herdr.ExistingPane("worker", "terminal-one"),
@@ -1427,10 +1408,7 @@ class LaunchDestinationTests(unittest.TestCase):
             def failed(*_args: object, **_kwargs: object) -> None:
                 pane_launch.save(path, {"worker": entry})
                 raise herdr.HerdrFailure("start failed")
-            with (patch.object(herdr, "Herdr", return_value=client),
-                  patch("scripts.shutdown.launch_permission.claim_launch_pane"),
-                  patch.object(herdr, "start_agent", side_effect=failed),
-                  self.assertRaisesRegex(herdr.HerdrFailure, "closure is not confirmed")):
+            with (patch.object(herdr, "Herdr", return_value=client), patch.object(herdr, "start_agent", side_effect=failed), self.assertRaisesRegex(herdr.HerdrFailure, "closure is not confirmed")):
                 _ = herdr.launch_prepared_agent("agents", herdr.SplitPane("parent", "down", 0.5, "worker"),
                     herdr.PreparedAgentEnvironment(Path("/tmp"), {}), "codex", [], herdr.NoOpeningPrompt(), 5000, agent="worker")
             self.assertEqual(pane_launch.read_strict(path)["worker"], entry)
@@ -1949,13 +1927,7 @@ class HerdrTests(unittest.TestCase):
                 cast(Mock, client.panes).return_value = [{"pane_id": "pane-1", "terminal_id": "terminal-one"}]
                 cast(Mock, client.pane_activity).side_effect = [herdr.PaneAtShell(), herdr.PaneRunning(("claude",))]
                 cast(Mock, client.startup_processes).return_value = observation
-                with (native_process_commands(11, generations=(herdr.AgentProcessIdentity(11, after),)),
-                      patch.object(herdr, "Herdr", return_value=client),
-                      patch.object(os, "kill") as signalled,
-                      patch.object(herdr, "os", SimpleNamespace(environ=os.environ, getuid=os.getuid, kill=signalled)),
-                      patch("scripts.shutdown.launch_permission.claim_launch_pane"),
-                      patch.object(herdr, "start_agent", side_effect=herdr.HerdrFailure("start failed")),
-                      self.assertRaisesRegex(herdr.HerdrFailure, "pane left open")):
+                with (native_process_commands(11, generations=(herdr.AgentProcessIdentity(11, after),)), patch.object(herdr, "Herdr", return_value=client), patch.object(os, "kill") as signalled, patch.object(herdr, "os", SimpleNamespace(environ=os.environ, getuid=os.getuid, kill=signalled)), patch.object(herdr, "start_agent", side_effect=herdr.HerdrFailure("start failed")), self.assertRaisesRegex(herdr.HerdrFailure, "pane left open")):
                     _ = herdr.launch_prepared_agent("fixture", herdr.ExistingPane("pane-1", "terminal-one"),
                         herdr.PreparedAgentEnvironment(self.root, {}), "claude", [],
                         herdr.NoOpeningPrompt(), 1000, agent="worker")
@@ -1989,13 +1961,7 @@ class HerdrTests(unittest.TestCase):
         cast(Mock, client.startup_processes).return_value = herdr.PaneStartupObservation(
             herdr.PaneShell(10), herdr.AgentProcessPresent((original,)))
         cast(Mock, client.pane_activity).return_value = herdr.PaneAtShell()
-        with (native_process_commands(11, generations=(weak,)),
-              patch.object(herdr, "Herdr", return_value=client),
-              patch.object(os, "kill") as signalled,
-              patch.object(herdr, "os", SimpleNamespace(environ=os.environ, getuid=os.getuid, kill=signalled)),
-              patch("scripts.shutdown.launch_permission.claim_launch_pane"),
-              patch.object(herdr, "start_agent", side_effect=herdr.HerdrFailure("start failed")),
-              self.assertRaisesRegex(herdr.HerdrFailure, "pane left open")):
+        with (native_process_commands(11, generations=(weak,)), patch.object(herdr, "Herdr", return_value=client), patch.object(os, "kill") as signalled, patch.object(herdr, "os", SimpleNamespace(environ=os.environ, getuid=os.getuid, kill=signalled)), patch.object(herdr, "start_agent", side_effect=herdr.HerdrFailure("start failed")), self.assertRaisesRegex(herdr.HerdrFailure, "pane left open")):
             _ = herdr.launch_prepared_agent("fixture", herdr.SplitPane("parent", "right", 0.5, "worker"),
                 herdr.PreparedAgentEnvironment(self.root, {}), "claude", [],
                 herdr.NoOpeningPrompt(), 1000, agent="worker")
@@ -2021,13 +1987,7 @@ class HerdrTests(unittest.TestCase):
         cast(Mock, client.result).return_value = {"pane": {"pane_id": "pane-1"}}
         cast(Mock, client.startup_processes).return_value = herdr.PaneStartupObservation(herdr.PaneShell(10), second)
         cast(Mock, client.pane_activity).return_value = herdr.PaneAtShell()
-        with (native_process_commands(11, generations=(weak,)),
-              patch.object(herdr, "Herdr", return_value=client),
-              patch.object(os, "kill") as signalled,
-              patch.object(herdr, "os", SimpleNamespace(environ=os.environ, getuid=os.getuid, kill=signalled)),
-              patch("scripts.shutdown.launch_permission.claim_launch_pane"),
-              patch.object(herdr, "start_agent", side_effect=herdr.HerdrFailure("start failed")),
-              self.assertRaises(herdr.HerdrFailure)):
+        with (native_process_commands(11, generations=(weak,)), patch.object(herdr, "Herdr", return_value=client), patch.object(os, "kill") as signalled, patch.object(herdr, "os", SimpleNamespace(environ=os.environ, getuid=os.getuid, kill=signalled)), patch.object(herdr, "start_agent", side_effect=herdr.HerdrFailure("start failed")), self.assertRaises(herdr.HerdrFailure)):
             _ = herdr.launch_prepared_agent("fixture", herdr.SplitPane("parent", "right", 0.5, "worker"),
                 herdr.PreparedAgentEnvironment(self.root, {}), "claude", [],
                 herdr.NoOpeningPrompt(), 1000, agent="worker")

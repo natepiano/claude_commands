@@ -1,6 +1,7 @@
 """Session and recovery data shared by observation and shutdown storage."""
 from __future__ import annotations
 
+import sys
 from typing import Literal, NotRequired, TypedDict, cast
 
 
@@ -300,9 +301,10 @@ def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
                         session_name=name, session_host="herdr",
                         plan=_parse_unit_plan(wire_required(data, "plan", place), f"{place}.plan"))
     if kind == "herdr":
-        presentation = wire_string(data.get("presentation", "detached"), f"{place}.presentation")
-        if presentation not in {"attached window", "detached"}:
-            raise InvalidInventory(f"{place}.presentation: expected attached window or detached")
+        presentation = data.get("presentation", "detached")
+        if presentation not in ("attached window", "detached"):
+            print(f"{place}: presentation anomaly: {presentation}", file=sys.stderr)
+            presentation = "detached"
         return {
             "kind": "herdr",
             "herdr_session": wire_string(
@@ -311,7 +313,7 @@ def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
             "pane_id": wire_string(
                 wire_required(data, "pane_id", place), f"{place}.pane_id"
             ),
-            "presentation": cast(Literal["attached window", "detached"], presentation),
+            "presentation": presentation,
         }
     if kind in {"tmux", "legacy tmux"}:
         key = "tmux_session" if kind == "tmux" else "session_name"
@@ -324,9 +326,7 @@ def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
                 wire_required(data, "window_shell", place),
                 f"{place}.window_shell",
             ),
-            "desktop": _parse_desktop(
-                wire_required(data, "desktop", place), f"{place}.desktop"
-            ),
+            "desktop": _parse_desktop(wire_required(data, "desktop", place), f"{place}.desktop"),
             "supervisor": _parse_supervisor(data.get("supervisor"), f"{place}.supervisor"),
         }
         return cast(WindowHost, cast(object, window))
@@ -335,9 +335,9 @@ def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
             return {"kind": "terminal", "supervisor": _parse_supervisor(
                 data["supervisor"], f"{place}.supervisor")}
         return {"kind": "terminal"}
-    if kind == "unknown":
-        return {"kind": "unknown"}
-    raise InvalidInventory(f"{place}.kind is invalid")
+    if kind != "unknown":
+        print(f"{place}: host anomaly: {kind}", file=sys.stderr)
+    return {"kind": "unknown"}
 
 
 def _parse_supervisor(value: object, place: str) -> SupervisorIdentity | NoSupervisor:
@@ -458,21 +458,12 @@ def _parse_codex_server(value: object, place: str) -> CodexServer:
     }
 
 
-def parse_session(value: object, place: str, *, require_updated_at: bool = False) -> Session:
+def parse_session(value: object, place: str) -> Session:
     """Validate and return one session from an inventory or shutdown record."""
     data = wire_object(value, place)
     kind = wire_kind(data, place)
     if kind not in {"showrunner", "unit", "worker", "top-level"}:
         raise InvalidInventory(f"{place}.kind is invalid")
-    servers = [
-        _parse_codex_server(item, f"{place}.codex_servers[{index}]")
-        for index, item in enumerate(
-            wire_list(
-                wire_required(data, "codex_servers", place),
-                f"{place}.codex_servers",
-            )
-        )
-    ]
     parsed: dict[str, object] = {
         "kind": kind,
         "session_id": wire_string(
@@ -486,32 +477,17 @@ def parse_session(value: object, place: str, *, require_updated_at: bool = False
             wire_required(data, "name", place), f"{place}.name"
         ),
         "cwd": wire_string(wire_required(data, "cwd", place), f"{place}.cwd"),
-        "status": wire_string(
-            wire_required(data, "status", place), f"{place}.status"
-        ),
-        # Old shutdown records predate this field; zero cannot answer a pause.
-        "updated_at": wire_integer(
-            wire_required(data, "updated_at", place) if require_updated_at else data.get("updated_at", 0),
-            f"{place}.updated_at",
-        ),
-        "model": _parse_model(
-            wire_required(data, "model", place), f"{place}.model"
-        ),
-        "checkout": _parse_checkout(
-            wire_required(data, "checkout", place), f"{place}.checkout"
-        ),
-        "run_dirs": wire_strings(
-            wire_required(data, "run_dirs", place), f"{place}.run_dirs"
-        ),
-        "codex_servers": servers,
-        "timers": wire_strings(
-            wire_required(data, "timers", place), f"{place}.timers"
-        ),
+        "status": wire_string(data.get("status", ""), f"{place}.status"),
+        "updated_at": wire_integer(data.get("updated_at", 0), f"{place}.updated_at"),
+        "model": _parse_model(wire_required(data, "model", place), f"{place}.model"),
+        "checkout": _parse_checkout(wire_required(data, "checkout", place), f"{place}.checkout"),
+        "run_dirs": wire_strings(data.get("run_dirs", []), f"{place}.run_dirs"),
+        "codex_servers": [],
+        "timers": wire_strings(data.get("timers", []), f"{place}.timers"),
+        "probe": data.get("probe") is True,
     }
-    probe = data.get("probe", False)
-    if not isinstance(probe, bool):
-        raise InvalidInventory(f"{place}.probe must be a boolean")
-    parsed["probe"] = probe
+    parsed["codex_servers"] = [_parse_codex_server(item, f"{place}.codex_servers[{index}]")
+        for index, item in enumerate(wire_list(data.get("codex_servers", []), f"{place}.codex_servers"))]
     if "config_dir" in data:
         parsed["config_dir"] = wire_string(
             data["config_dir"], f"{place}.config_dir"
@@ -519,10 +495,6 @@ def parse_session(value: object, place: str, *, require_updated_at: bool = False
     host = _parse_host(
         wire_required(data, "host", place), f"{place}.host", kind == "unit"
     )
-    if kind == "unit" and host["kind"] not in {"unit", "legacy tmux unit"}:
-        raise InvalidInventory(f"{place}.host.kind is invalid")
-    if kind != "unit" and host["kind"] in {"unit", "legacy tmux unit"}:
-        raise InvalidInventory(f"{place}.host.kind is invalid")
     parsed["host"] = host
     if kind == "showrunner":
         parsed["production"] = wire_string(
