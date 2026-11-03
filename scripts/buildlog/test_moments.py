@@ -134,6 +134,13 @@ class MomentTests(unittest.TestCase):
             build("end-exclusive", 172800, repo="hana", duration_s=99999),
         ]
 
+    def assert_rates(self, rates: moments.WindowRates, expected: dict[moments.MetricKey, float]) -> None:
+        for key, value in expected.items():
+            with self.subTest(rate=key):
+                actual = rates.rates[key]
+                self.assertIsInstance(actual, float)
+                self.assertAlmostEqual(cast(float, actual), value)
+
     def test_each_rate_uses_actual_window_days_and_the_documented_pair_rules(self) -> None:
         self.progress([
             {"event_type": "phase_finished", "status": "completed", "timestamp_epoch": START.timestamp() + 1,
@@ -156,13 +163,13 @@ class MomentTests(unittest.TestCase):
             "pass_reruns": 0.5, "pass_hours": 0.25, "fail_reruns": 0.5, "fail_hours": 1 / 12,
             "clippy": 1.0, "nextest_per_phase": 2.5, "clippy_per_phase": 1.0,
             "clone_rebuilds": 1.5, "clone_hours": 0.75, "clone_repeats_pct": 100 / 3,
+            "run_hours_hana_per_phase": 2.5, "wait_hours_hana_per_phase": 2 / 3,
+            "failed_per_phase": 1.0, "reruns_per_phase": 1.0,
+            "clone_rebuilds_per_phase": 1.5, "clone_hours_per_phase": 0.75,
+            "fail_reruns_per_phase": 0.5, "wait_hours_per_run_hour": 4 / 15,
         }
         self.assertEqual(set(rates.rates), set(expected))
-        for key, value in expected.items():
-            with self.subTest(rate=key):
-                actual = rates.rates[key]
-                self.assertIsInstance(actual, (int, float))
-                self.assertAlmostEqual(cast(float, actual), value)
+        self.assert_rates(rates, expected)
         self.assertEqual(rates.totals["nextest"], 5)
         self.assertEqual(rates.totals["pass_reruns"], 1)
         self.assertAlmostEqual(rates.totals["run_hours_hana"], 5)
@@ -171,8 +178,63 @@ class MomentTests(unittest.TestCase):
         with closing(self.connection(build("hana", 10, repo="hana"))) as connection:
             rates = moments.window_rates(connection, START, END)
         self.assertEqual(rates.phase_count, 0)
-        self.assertIsInstance(rates.rates["nextest_per_phase"], moments.RateUnavailable)
-        self.assertIsInstance(rates.rates["clippy_per_phase"], moments.RateUnavailable)
+        for row in moments.RATE_ROWS:
+            if row.unit in ("runs_per_phase", "hours_per_phase"):
+                with self.subTest(rate=row.key):
+                    self.assertEqual(rates.rates[row.key], moments.RateUnavailable("no natedev hana phases"))
+        self.assertEqual(rates.rates["wait_hours_per_run_hour"], 0)
+
+    def test_phase_rates_use_finished_phases_instead_of_elapsed_days(self) -> None:
+        phases = tuple(moments.PhaseFinished(START.timestamp() + number, f"phase-{number}", "/r/hana")
+                       for number in range(3))
+        with closing(self.connection(*self.rate_records())) as connection:
+            rates = moments.window_rates(connection, START, END, phases=phases)
+        expected: dict[moments.MetricKey, float] = {
+            "nextest_per_phase": 5 / 3, "clippy_per_phase": 2 / 3,
+            "run_hours_hana_per_phase": 5 / 3, "wait_hours_hana_per_phase": 4 / 9,
+            "failed_per_phase": 2 / 3, "reruns_per_phase": 2 / 3,
+            "clone_rebuilds_per_phase": 1, "clone_hours_per_phase": 0.5,
+            "fail_reruns_per_phase": 1 / 3,
+        }
+        self.assertEqual(rates.phase_count, 3)
+        self.assert_rates(rates, expected)
+
+    def test_zero_run_hours_have_no_wait_ratio_but_zero_totals_have_phase_rates(self) -> None:
+        phase = moments.PhaseFinished(START.timestamp(), "phase", "/r/hana")
+        with closing(self.connection(build("waiting", 10, repo="hana", duration_s=0, mem_wait_s=3600))) as connection:
+            rates = moments.window_rates(connection, START, END, phases=(phase,))
+        self.assertEqual(rates.rates["wait_hours_per_run_hour"], moments.RateUnavailable("no run_hours_hana"))
+        self.assertEqual(rates.rates["run_hours_hana_per_phase"], 0)
+        self.assertEqual(rates.rates["wait_hours_hana_per_phase"], 1)
+        self.assertEqual(rates.rates["failed_per_phase"], 0)
+        self.assertEqual(rates.rates["clone_rebuilds_per_phase"], 0)
+
+    def test_rate_table_orders_work_rates_first_and_names_every_unit(self) -> None:
+        phases = (moments.PhaseFinished(START.timestamp(), "before", "/r/hana"),
+                  moments.PhaseFinished(END.timestamp(), "after", "/r/hana"))
+        with closing(self.connection(*self.rate_records())) as connection:
+            before = moments.window_rates(connection, START, END, phases=phases)
+            after = moments.window_rates(connection, END, END + timedelta(days=1), phases=phases)
+        lines = report.moment_rate_table(before, after, moments.BuildMoment(END, "fixture change", "all"))
+        self.assertEqual(lines[0], "| Rate | Before | After | Change |")
+        rows = [line.split("|")[1:5] for line in lines[2:] if line.startswith("|")]
+        self.assertEqual([row[0].strip() for row in rows[:10]], [
+            "Hana nextest / phase", "Hana clippy / phase", "Hana run hours / phase",
+            "Hana wait hours / phase", "Hana nextest failed / phase", "Hana nextest reruns / phase",
+            "Hana clone rebuilds / phase", "Hana clone rebuild hours / phase",
+            "Hana same-worker fail then fail / phase", "Hana wait hours / run hour",
+        ])
+        cells = {row[0].strip(): row[1].strip() for row in rows}
+        self.assertEqual(cells["Hana nextest / phase"], "5.0 /phase")
+        self.assertEqual(cells["Hana run hours / phase"], "5.0 h /phase")
+        self.assertEqual(cells["Hana wait hours / run hour"], "0.3 h wait / h run")
+        self.assertEqual(cells["Run hours, hana"], "2.5 h /day")
+        self.assertEqual(cells["Hana nextest steps"], "2.5 /day")
+        self.assertEqual(cells["Hana nextest failed"], "40.0%")
+        self.assertIn("Hana phases finished: before 1, after 1.", lines)
+        self.assertIn("Per-day rows follow load; per-phase counts do not. "
+                      + "Per-phase hours still fall on a quieter machine. "
+                      + "We assume phases have about the same size on both sides.", lines)
 
     def test_redirected_log_uses_fixture_progress_when_no_progress_override_is_set(self) -> None:
         self.progress([{
@@ -218,7 +280,7 @@ class MomentTests(unittest.TestCase):
         self.assertEqual([(entry.args[1], entry.args[2]) for entry in grouped.call_args_list],
                          [(at - timedelta(days=7), at), (at, now)])
         nextest = next(line for line in lines if line.startswith("| Hana nextest steps |"))
-        self.assertEqual([cell.strip() for cell in nextest.strip("|").split("|")][2], "4.0")
+        self.assertEqual([cell.strip() for cell in nextest.strip("|").split("|")][2], "4.0 /day")
         self.assertEqual(self.fixture.rows(lines)[0][3:], ["1", "20.0 s", "1", "40.0 s", "—"])
         self.assertIn("Before: 7.000 days; after: 0.250 days (thin).", lines)
 
@@ -383,6 +445,7 @@ class MomentTests(unittest.TestCase):
         lines = self.section(day="2026-10-31")
         comparisons = [line for line in lines if line.startswith("Before ")]
         expected = (
+            ("Queue test-phase charge (2a819dfd)", "2026-10-31 20:36:00 UTC"),
             ("Build rules 1 (Moment 1)", "2026-10-31 10:50:00 UTC"),
             ("Floor sweep (e3b8e391)", "2026-10-29 18:26:00 UTC"),
             ("hana Bevy dylib", "2026-10-29 09:33:00 UTC"),
