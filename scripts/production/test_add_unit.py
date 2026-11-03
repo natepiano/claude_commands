@@ -47,6 +47,33 @@ def setUpModule() -> None:
 from scripts.production import staff, unit_config
 
 class NativeClaudeUnitTests(StaffTestCase):
+    def test_resume_uses_the_renamed_native_owner_for_arguments_and_tab(self) -> None:
+        document = self.production("demo")
+        _ = document.write_text(document.read_text() + "\n- **Merge branch:** `main`\n"
+                                + f"- **Showrunner checkout:** `{self.root}`\n- **Log:** `demo-log.md`\n")
+        runner = fixture_member("showrunner", name="demo", doc=staff.LiveDoc("natedev", document))
+        owner = fixture_member("unit", name="saved-name", parent=runner.id)
+        current = staff.native_id(fixture_runtime_id("renamed-unit-current"))
+        _ = staff.update_current_session(owner.current_session, current)
+        _ = staff.rename(owner.id, "row-name")
+        _ = fixture_member("unit", name="saved-name", parent=runner.id, runtime_id=fixture_runtime_id("decoy-unit"))
+        request = add_unit.UnitLaunch(
+            production=production_units.read_production(document), branch="kept", worktree=self.root,
+            plan=add_unit.PlanGiven(Path("plan.md")), port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(),
+            session=add_unit.ResumedSession(current, self.root), launch_kind=add_unit.NewWorkLaunch(), timeout=5,
+            identity=add_unit.UnitIdentity("saved-name-unit", "saved-name"))
+        from scripts.accounts.accounts import NamedAccount
+
+        with (patch.object(herdr, "start_server"), patch.object(herdr, "launch_agent", return_value=
+              herdr.AgentLaunched("w1:p1", herdr.PromptSubmitted(LAUNCHED_AT))) as launch):
+            _ = add_unit.launch_session(request, add_unit.DirectorAgent("fixture", add_unit.DefaultEffort()),
+                "resume", NamedAccount("claude1", self.root))
+        arguments = cast(list[str], launch.call_args.kwargs["agent_arguments"])
+        self.assertEqual(arguments[arguments.index("-n") + 1], "row-name")
+        self.assertEqual(arguments[arguments.index("--remote-control") + 1], "row-name")
+        self.assertEqual(launch.call_args.args[2], "row-name")
+        self.assertNotIn("STAFF_ID", cast(dict[str, str], launch.call_args.args[4]))
+
     def test_fresh_unit_uses_the_observed_claude_id_before_its_opening_prompt(self) -> None:
         document = self.production("demo")
         _ = document.write_text(document.read_text() + "\n- **Merge branch:** `main`\n"

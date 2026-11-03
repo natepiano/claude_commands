@@ -925,6 +925,7 @@ def launch_session(
     """Start Claude in a tab of the shared herdr session, carrying its session labels."""
     import herdr
     from scripts.accounts import accounts
+    from scripts.shutdown.launch_names import LaunchNames
     from scripts.whoami.account import named_account_environment
 
     environment = {unit_lookup.PRODUCTION_MARK: request.production.slug,
@@ -950,8 +951,9 @@ def launch_session(
         session_id = ""
     if autocompact_window:
         arguments.extend(["--autocompact", autocompact_window])
-    session_name = (request.launch_kind.session_name if isinstance(request.launch_kind, UnitRestoreLaunch)
-                    else request.identity.session)
+    saved_name = (request.launch_kind.session_name if isinstance(request.launch_kind, UnitRestoreLaunch)
+                  else request.identity.session)
+    session_name = LaunchNames.read().name(session_id, saved_name)
     profile = request.profile
     flags = profile.flags if isinstance(profile, ProfiledLaunch) else ("--settings", '{"disableAgentView": true}')
     if isinstance(request.launch_kind, UnitRestoreLaunch) and request.launch_kind.probe:

@@ -13,6 +13,7 @@ import tempfile
 import time
 import unittest
 from datetime import datetime, timedelta
+from dataclasses import replace
 from contextlib import contextmanager, redirect_stdout
 from collections.abc import Generator
 from pathlib import Path
@@ -343,6 +344,11 @@ class UnitWatchdogTests(unittest.TestCase):
 
     def test_explicit_resume_after_public_stop_allows_recovery_of_a_later_crash(self) -> None:
         owner = self.add_unit("alpha")
+        member = unit_membership("fixture", "alpha")
+        record = staff.StaffSnapshot(tuple(
+            replace(row, id=staff.StaffId(owner["session_id"]),
+                    current_session=staff.StaffId(owner["session_id"])) if row.id == member.id else row
+            for row in staff.snapshot().rows))
 
         def start(tab: herdr.TabSession, entry: pane_record.PaneLaunch, label: str, message: str) -> sessions.LiveSessionProcess:
             self.assertIn("maintenance", message)
@@ -366,10 +372,15 @@ class UnitWatchdogTests(unittest.TestCase):
             self.assertEqual(stop_resume.stop("alpha"), stop_resume.Stopped("alpha", owner["pid"]))
             self.assertTrue(pane_record.read("shared")["alpha"].get("ended", False))
             with (patch.object(stop_resume, "_start_session", side_effect=start),
+                  patch.object(herdr.Herdr, "retitle", return_value=False) as retitle,
+                  patch.object(staff, "initial_snapshot", return_value=record),
                   patch.object(stop_resume, "_detach"), patch("unit_runs.held", return_value=[]),
                   patch.object(folder_trust, "heal", return_value=herdr.Trusted(
                       Path(owner["cwd"]), config / ".claude.json", Path(owner["cwd"])))):
                 result = self.shared_resume("alpha", why="maintenance complete")
+                row = record.by_current_session(owner["session_id"])
+                assert row is not None
+                retitle.assert_called_once_with("alpha", row.name)
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         entry = pane_record.read("shared")["alpha"]
         self.assertFalse(entry.get("ended", False))

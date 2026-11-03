@@ -28,6 +28,7 @@ for dependency in ("shutdown", "herdr", "message", "whoami", "lib"):
 
 import herdr
 import pane_record
+from scripts.shutdown.launch_names import LaunchNames
 import pane_launch
 from scripts.shutdown import folder_trust
 from scripts.lib.resume_message import (
@@ -36,7 +37,6 @@ from scripts.lib.resume_message import (
     resume_message as resume_message,
     resume_worker_command as resume_worker_command,
 )
-from scripts.production import session_staff
 from scripts.shutdown.stop_results import (
     Stopped as Stopped, NotRunning as NotRunning, StopFailed as StopFailed,
     ClaudeUp as ClaudeUp, ResumePending as ResumePending, MoveHandedOff as MoveHandedOff, ResumeFailed as ResumeFailed,
@@ -178,7 +178,7 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
 
 
 def resume_arguments(entry: pane_record.PaneLaunch) -> list[str]:
-    return pane_record.resume_arguments(pane_record.resume_launch(entry))
+    return pane_record.resume_arguments(LaunchNames.read().resume(entry))
 
 
 def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account: str, message: str) -> sessions.LiveSessionProcess:
@@ -192,7 +192,7 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
     _ = environment.pop("STAFF_ID", None)
     command = ["env", "-u", "HERDR_TAB_ID", "-u", "STAFF_ID", *(f"{key}={value}" for key, value in environment.items()),
                sys.executable, str(SCRIPTS / "accounts/accounts.py"), "exec", account,
-               *resume_arguments(entry)]
+               *pane_record.resume_arguments(entry)]
     launched_at = datetime.now(timezone.utc)
     client.run_in_pane(tab.pane_id, command)
     deadline = monotonic() + START_SECONDS
@@ -245,9 +245,10 @@ def _running_on_account(identity: str, pane_id: str, target: str | None) -> Clau
 def resume(session: str, *, why: str, to: str | None = None, requester: str = "",
            restore_missing: bool = False) -> ClaudeUp | ResumeFailed | SessionNotFound:
     policy = sessions.retry_policy()
+    names = LaunchNames.read()
     attempt = 0
     while True:
-        result = _resume_once(session, why=why, to=to, requester=requester, restore_missing=restore_missing)
+        result = _resume_once(session, why=why, to=to, requester=requester, restore_missing=restore_missing, names=names)
         attempt += 1
         if not isinstance(result, ResumeFailed) or attempt >= policy.resume_attempts:
             return result
@@ -255,15 +256,13 @@ def resume(session: str, *, why: str, to: str | None = None, requester: str = ""
 
 
 def _resume_once(session: str, *, why: str, to: str | None = None, requester: str = "",
-                 restore_missing: bool = False) -> ClaudeUp | ResumeFailed | SessionNotFound:
+                 restore_missing: bool = False, names: LaunchNames) -> ClaudeUp | ResumeFailed | SessionNotFound:
     began = monotonic()
     identity = session
     original: pane_launch.LaunchPublication | None = None
     attempt_pane = ""
     try:
-        from scripts.production import staff
-
-        member = staff.initial_snapshot().by_id(staff.StaffId(session))
+        member = names.tab_record.by_member_reference(session)
         if member is not None:
             session = identity = member.current_session
         tab = _tab_of(session)
@@ -271,7 +270,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         if isinstance(tab, SessionNotFound):
             if not restore_missing:
                 return tab
-            original = pane_record.publication_for_session(session)
+            original = pane_record.publication_for_session(session, record=names.tab_record)
             if original is None:
                 return tab
             if original.path != pane_record.record_path(client.session):
@@ -285,7 +284,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             if entry is not None:
                 original = pane_launch.LaunchPublication(pane_record.record_path(client.session), entry)
         if entry is not None:
-            entry = pane_record.resume_launch(entry)
+            entry = names.resume(entry)
         pane_id = entry["pane_id"] if isinstance(tab, SessionNotFound) and entry is not None else (
             tab.pane_id if isinstance(tab, herdr.TabSession) else "")
         running = _running_on_account(identity, pane_id, to)
@@ -299,7 +298,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             return ResumeFailed(identity, "Claude was closed by hand")
         if not entry.get("flags_read", False):
             return ResumeFailed(identity, "pane launch flags are unknown")
-        entry = session_staff.record_membership(entry)
+        entry["environment"] = names.environment(entry)
         from inventory import codex_seats
         import unit_runs
 
@@ -323,9 +322,9 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         entry["config_dir"] = str(target_dir)
         entry["environment"] = {**entry["environment"], **account_environment}
         if isinstance(tab, SessionNotFound):
-            pane = client.open_tab(entry["environment"].get("SHOWRUNNER_UNIT", "agents"),
-                entry["name"] or identity, entry["cwd"],
-                entry["environment"])
+            with herdr.restore_staff(names.tab_record, labels=names.labels):
+                pane = client.open_tab(entry["environment"].get("SHOWRUNNER_UNIT", "agents"),
+                    entry["name"] or identity, entry["cwd"], entry["environment"])
             entry = entry.copy()
             entry["pane_id"] = pane
             attempt_pane = pane
@@ -333,6 +332,9 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             if tab is None:
                 raise herdr.HerdrFailure("new recovery pane is unavailable")
             tab = replace(tab, session_id=identity)
+        elif entry["name"]:
+            with herdr.restore_staff(names.tab_record, labels=names.labels):
+                _ = client.retitle(tab.pane_id, entry["name"])
         copied_from = trust.source if isinstance(trust, herdr.TrustCopied) else ""
         workers = ResumeWorkers(codex_seats([Path(run) for run in unit_runs.held(identity)]), entry["cwd"])
         message = resume_message(why, moved_from=source_label if to else None,
@@ -353,7 +355,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         if not generation:
             raise herdr.HerdrFailure(f"process identity unreadable for pid {live.pid}")
         attempt = pane_launch.resume_attempt(original.path, tab.pane_id)
-        proof = pane_launch.VerifiedResume(entry, frozenset({original.entry["session_id"], identity}))
+        proof = names.resume_proof(original.entry, entry)
         attempt_pane = ""
         pane_launch.finish_restore(original.path, original.entry, attempt, proof, close=client.close_tab_confirmed)
         _detach(["stay", "--session", identity, "--pane", tab.pane_id,

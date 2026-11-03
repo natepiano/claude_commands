@@ -16,7 +16,6 @@ import shlex
 import subprocess
 import sys
 import syslog
-import tempfile
 import time
 from threading import Lock
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -46,6 +45,8 @@ from scripts.whoami.account import (  # noqa: E402
 )
 from scripts.shutdown import folder_trust, stop_resume  # noqa: E402
 import pane_record  # noqa: E402
+from scripts.shutdown.launch_names import LaunchNames, LaunchNamesNotRead, SavedLaunchNames
+from pane_launch import StaffLabelsRead  # noqa: E402
 import production_units  # noqa: E402
 from scripts.production import staff, staff_sources, session_staff  # noqa: E402
 import herdr  # noqa: E402
@@ -444,6 +445,15 @@ class DesktopLaunchState:
     starting_desktop: str = ""
     started_windows: int = 0
     presentation_lock: Lock = field(default_factory=Lock)
+    names: LaunchNames | LaunchNamesNotRead = field(default_factory=LaunchNamesNotRead)
+    names_lock: Lock = field(default_factory=Lock)
+
+    def launch_names(self) -> LaunchNames:
+        """Read the staff names once for this restore operation."""
+        with self.names_lock:
+            if isinstance(self.names, LaunchNamesNotRead):
+                self.names = LaunchNames.read()
+            return self.names
 
     def restore(self, *, dry_run: bool = False) -> None:
         """Return to the desktop where this sequence of window launches began."""
@@ -681,6 +691,11 @@ def _conversation_launch(session_id: str, config_dir: Path) -> ResumeConversatio
 
 
 @dataclass(frozen=True)
+class SavedSessionName:
+    """A command built elsewhere keeps its saved session name."""
+
+
+@dataclass(frozen=True)
 class ResumeParts:
     """A conversation launch before any host-specific command rendering."""
 
@@ -690,6 +705,8 @@ class ResumeParts:
     opening_prompt: str
     account: RetainResumeAccount | MoveResumeAccount
     conversation: ResumeConversation | StartFreshConversation
+    name: str | SavedSessionName = field(default_factory=SavedSessionName)
+    names: LaunchNames | SavedLaunchNames = field(default_factory=SavedLaunchNames)
 
 
 @dataclass(frozen=True)
@@ -729,7 +746,11 @@ class HerdrDestinationTaken(OSError):
     """A desktop restart found another launch's server listener, before opening a pane."""
 
 
-def _resume_parts(session: Session, prompt: str, target: str = "", *, login: str = "", at: str = "", probe: bool = False, source_fallback: bool = False) -> ResumeParts:
+_SAVED_LAUNCH_NAMES = SavedLaunchNames()
+
+
+def _resume_parts(session: Session, prompt: str, target: str = "", *, login: str = "", at: str = "", probe: bool = False, source_fallback: bool = False,
+                  names: LaunchNames | SavedLaunchNames = _SAVED_LAUNCH_NAMES) -> ResumeParts:
     from scripts.accounts import accounts
 
     config_dir = Path(session.get("config_dir", str(accounts.main_config_dir()))).expanduser()
@@ -758,13 +779,16 @@ def _resume_parts(session: Session, prompt: str, target: str = "", *, login: str
     entry = pane_record.PaneLaunch(pane_id="", session_id=session["session_id"], config_dir=str(config_dir),
         cwd=session["cwd"], name=session["name"], model=model["name"] if model["kind"] == "model" else "",
         remote_control=True, environment=environment, flags_read=True, ended=False, written_at=at)
-    entry = pane_record.resume_launch(entry)
+    entry = names.resume(entry) if isinstance(names, LaunchNames) else pane_record.resume_launch(entry)
     conversation = _conversation_launch(entry["session_id"], launch_config_dir)
-    environment = session_staff.record_membership(entry)["environment"]
-    argv = stop_resume.resume_arguments(entry)
+    if isinstance(names, LaunchNames):
+        environment = names.environment(entry)
+    else:
+        environment = session_staff.record_membership(entry)["environment"]
+    argv = pane_record.resume_arguments(entry)
     if isinstance(conversation, StartFreshConversation):
         del argv[:2]
-    return ResumeParts(session["cwd"], environment, tuple(argv), prompt, account, conversation)
+    return ResumeParts(session["cwd"], environment, tuple(argv), prompt, account, conversation, entry["name"], names)
 
 
 def _resume_shell(parts: ResumeParts) -> str:
@@ -844,18 +868,9 @@ def _note_path(record: SessionShutdown, session_id: str) -> Path:
 def _write_note(path: Path, note: str, dry_run: bool) -> None:
     if dry_run:
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            _ = output.write(note + "\n")
-        os.replace(temporary, path)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
+    from scripts.lib.atomic_file import write_text_atomic
+
+    write_text_atomic(path, note + "\n")
 
 
 def _prompt_outcome_path(record: SessionShutdown) -> Path:
@@ -1139,7 +1154,12 @@ def _herdr_launch(
     name = destination.name
     config_dir = Path(environment["CLAUDE_CONFIG_DIR"])
     _heal_folder_trust(session, Path(parts.cwd), config_dir, dry_run=dry_run)
-    record = staff.initial_snapshot()
+    if isinstance(parts.names, SavedLaunchNames):
+        record = staff.initial_snapshot()
+    elif isinstance(parts.names.record, staff.StaffSnapshot):
+        record = parts.names.record
+    else:
+        record = staff.StaffSnapshot(())
     if dry_run:
         location = (destination.pane_id if isinstance(destination, RecordedHerdrPane)
                     else f"a new tab in {herdr_space(session, record)}")
@@ -1181,12 +1201,15 @@ def _herdr_launch(
                 _ = staff.update_current_session(owner.current_session, staff.native_id(transcript.session_id))
 
         expected_identity = parts.conversation.session_id if isinstance(parts.conversation, ResumeConversation) else ""
-        launched = herdr.launch_prepared_agent(name, herdr.NewTab(herdr_space(session, record), session["name"]), prepared_environment,
-            kind="claude", agent=session["name"], agent_arguments=list(parts.claude_arguments),
-            opening=herdr.OpeningPrompt(parts.opening_prompt,
-                herdr.SessionTranscript(config_dir, expected_identity), publish_identity), timeout_ms=90_000)
+        title = session["name"] if isinstance(parts.name, SavedSessionName) else parts.name
+        labels = parts.names.labels if isinstance(parts.names, LaunchNames) else StaffLabelsRead.UNAVAILABLE
+        with herdr.restore_staff(record, labels=labels):
+            launched = herdr.launch_prepared_agent(name, herdr.NewTab(herdr_space(session, record), title), prepared_environment,
+                kind="claude", agent=title, agent_arguments=list(parts.claude_arguments),
+                opening=herdr.OpeningPrompt(parts.opening_prompt,
+                    herdr.SessionTranscript(config_dir, expected_identity), publish_identity), timeout_ms=90_000)
         pane, outcome = launched.pane, launched.outcome
-        _present_restored_pane(server, client, pane, session["name"])
+        _present_restored_pane(server, client, pane, title)
         if isinstance(parts.conversation, StartFreshConversation):
             print(f"{session['name']}: no conversation to resume; started a new one")
         return HerdrLaunch(server, outcome if isinstance(outcome, (herdr.PromptSubmitted, herdr.PromptNotSubmitted))
@@ -1336,7 +1359,8 @@ def _launch_session(
     if session["kind"] == "showrunner" and (account_moved or "force_stop_note" in record or record.get("codex_seats")):
         prompt += " " + note
     parts = _resume_parts(session, prompt, record.get("target", ""), login=record["login"],
-                          at=record["requested_at"], probe=record.get("probe", False), source_fallback=source_fallback)
+                          at=record["requested_at"], probe=record.get("probe", False), source_fallback=source_fallback,
+                          names=desktop_state.launch_names())
     if host["kind"] == "herdr":
         # Every restart lands in the shared session; one recorded elsewhere moves there.
         shared = herdr.shared_session()
@@ -1874,7 +1898,7 @@ def _launch_recovery_record(
     if saved["session"]["kind"] == "unit":
         return _claimed_unit_launch(saved, note, desktop_state)
     parts = _resume_parts(saved["session"], note, saved.get("target", ""), login=saved["login"],
-                          at=saved["requested_at"], probe=saved.get("probe", False))
+                          at=saved["requested_at"], probe=saved.get("probe", False), names=desktop_state.launch_names())
     launch_record: SessionShutdown = saved
     environment = {key: value for key, value in os.environ.items()
                    if key not in {*NAMED_ACCOUNT_VARIABLES, "CLAUDE_CODE_OAUTH_TOKEN"}}
@@ -2622,15 +2646,21 @@ def progress_line(action: str, name: str, detail: str = "") -> None:
         print(f"{clock}  {action:<6}  {name}" + (f"  {detail}" if detail else ""), flush=True)
 
 
-def _restore_workspace_names(records: Sequence[SessionShutdown]) -> frozenset[str]:
-    record = staff.initial_snapshot()
-    names: set[str] = set()
+def _restore_workspace_names(records: Sequence[SessionShutdown],
+                             names: LaunchNames | SavedLaunchNames = _SAVED_LAUNCH_NAMES) -> frozenset[str]:
+    if isinstance(names, SavedLaunchNames):
+        record = staff.initial_snapshot()
+    elif isinstance(names.record, staff.StaffSnapshot):
+        record = names.record
+    else:
+        record = staff.StaffSnapshot(())
+    workspaces: set[str] = set()
     for saved in records:
         try:
-            names.add(herdr_space(saved["session"], record))
+            workspaces.add(herdr_space(saved["session"], record))
         except (OSError, ValueError):
             pass
-    return frozenset(names)
+    return frozenset(workspaces)
 
 
 def _prepare_restore_server(records: Sequence[SessionShutdown], state: DesktopLaunchState) -> None:
@@ -2638,7 +2668,7 @@ def _prepare_restore_server(records: Sequence[SessionShutdown], state: DesktopLa
     server = herdr.restore_server(name, 90_000, session_kind=state.session_kind)
     if isinstance(server, (herdr.ServerCreated, herdr.WindowServerCreated)):
         print(f"started herdr server {name} for restore", flush=True)
-    workspaces = _restore_workspace_names(records)
+    workspaces = _restore_workspace_names(records, state.launch_names())
     herdr.Herdr(name).prepare_restore_workspaces(workspaces)
 
 
