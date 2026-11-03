@@ -1333,66 +1333,43 @@ The Phase 26 checkpoint did not name two narrowed assertions; this phase's check
 
 ### Phase 48 — The test Hana tool gets a clear name: `hanas` becomes `hana_instances`  · status: done
 
-#### Work Order
+#### As-built
 
-The user asked for a better name than `hanas`. The builds showrunner chose `hana_instances`; no file or command uses it now. Keep every config key and value, and every behavior.
+- The test Hana tool is `scripts/hana_instances/hana_instances.py` (tests in `test_hana_instances.py`), with settings in `config/hana_instances.conf` read by `conf.read("hana_instances")`. Keys, values and behavior are unchanged from `hanas`.
+- Its output prefix is `hana-instances:`, the shell command is `hana-instances`, and the sweep job is `hana-instances-sweep` (nixos `modules/common/agents.nix`, branch `resources-hanas-sweep`).
+- Callers use the new names: `scripts/lint/folder_audit.py`, `scripts/production/mac_run.sh`, `config/README.md`, `docs/as-built/hana-test-windows.md` and `docs/as-built/build-memory-admission.md`. The Mac runs `mac_run.sh stop-checkout` from its own `~/.claude`, so it uses the new name after it takes main.
 
-1. Move `scripts/hanas/` to `scripts/hana_instances/`: `hana_instances.py` and `test_hana_instances.py`. Use `git mv`.
-2. Move `config/hanas.conf` to `config/hana_instances.conf`, keys and values unchanged. Every `conf.read("hanas")` becomes `conf.read("hana_instances")`.
-3. Change every caller and doc: `scripts/lint/folder_audit.py` and its test, `scripts/production/mac_run.sh` and `test_mac_run.py`, `config/README.md`, `docs/as-built/hana-test-windows.md`, `docs/as-built/build-memory-admission.md`. The tool's output prefix `hanas:` becomes `hana-instances:`.
-4. The shell command becomes `hana-instances`, and its sweep job becomes `hana-instances-sweep`. Change the nixos branch `resources-hanas-sweep` (ee026629, `modules/common/agents.nix`) with a new commit on that branch, without a checkout in `/etc/nixos`. The showrunner tells natedev about the branch.
-5. `git grep -w hanas` finds only completed-phase history in `docs/plans/builds-resources.md`.
-
-**Files:** `scripts/hanas/` → `scripts/hana_instances/`, `config/hanas.conf` → `config/hana_instances.conf`, `scripts/lint/folder_audit.py`, `scripts/lint/test_folder_audit.py`, `scripts/production/mac_run.sh`, `scripts/production/test_mac_run.py`, `config/README.md`, `docs/as-built/hana-test-windows.md`, `docs/as-built/build-memory-admission.md`; nixos `modules/common/agents.nix` on branch `resources-hanas-sweep`.
-
-**Acceptance:** the `hana_instances`, folder-audit and `mac_run` suites pass; basedpyright is clean on the changed Python files; `git grep -w hanas` finds no live use. The Mac runs `mac_run.sh`'s `stop-checkout` from its own `~/.claude` checkout, so the rename works there only after the Mac takes the same main.
+**Files:**
+- `scripts/hana_instances/` — the tool and its tests
+- `config/hana_instances.conf` — its settings
 
 ### Phase 49 — A hold that starts during a merge gate stops whole test modules, so the gate runs them again after the release  · status: done
 
-#### Work Order
+#### As-built
 
-Builds found the defect: the merge gate for report 15cddc6 started at 08:57, and a builds hold started at 09:02. The hold enforcer stopped build-like processes deep inside running test modules (a stub `cargo nextest` that a test starts). Each module kept running, saw its child exit with -15, and failed. Five modules went red with the hold text in stderr: `buildlog/test_test_phase_peak.py`, `buildlog/test_record_rerun.py`, `direct/test_verify_hold_wait.py`, `direct/test_verify_hold_mac.py`, `production/test_merge_gate_suites_resources.py`. Log: `/tmp/claude-1000/-home-natepiano-worktrees-claude-natedev-builds/51505394-82db-43d3-a528-136f4ee38d7a/scratchpad/merge_15cddc6_test.log`.
+- When a process to stop has a waiting-gate ancestor (`is_waiting_gate`: `merge_gate.py` or `verify.sh`), `scripts/build_hold/hold_enforcer.py` stops that gate's child job that contains it, with all its descendants. The gate stays protected, sees its job end on SIGTERM during the hold, and queues the module again ("stopped during a natedev hold; queued again").
+- A process is kept when its step record's controller is kept or has a kept ancestor, as well as by live ancestry.
+- `verify.sh` `step_stopped_by_hold` reads a hold stop only when the step ended on a signal; a step that fails on its own with the refusal text in its log is a failure.
+- Kept holders, the sole holder, sccache, user terminals, the refusal line and the stop record are unchanged.
 
-The user's rule stays: during a hold, no test of another session runs, and the enforcer stops running ones. The gate already queues a module again when the module itself ends on a signal during a hold (`merge_gate.py`, "stopped during a natedev hold; queued again"). So the fix is in the enforcer's choice of process to stop:
-
-1. In `scripts/build_hold/hold_enforcer.py`, a stopped process that has a waiting-gate ancestor (`is_waiting_gate`: `merge_gate.py` or `verify.sh`) is not stopped alone. The enforcer stops that gate's child that contains it (the gate's job), with all its descendants. The gate itself stays protected.
-2. Keep every other route the same: kept holders, the sole holder, step records, sccache, user terminals, the refusal line, and the stop record.
-3. The gate then sees its job end on SIGTERM while the hold is in force, and its existing path queues the module again after the release. `verify.sh` keeps its `step_stopped_by_hold` path.
-4. Tests in `scripts/build_hold/test_build_hold.py`: a build-like grandchild under a merge-gate job makes the enforcer stop the job root, not only the grandchild; a process with no gate ancestor is stopped as before. In `scripts/production/test_merge_gate_holds.py`, prove that a job stopped this way is queued again and is not red.
-5. A kept run and all its descendants run to the end. Builds took its hold with `--keep 1912105` (a `verify.sh test` for hana). At 14:03:40Z the enforcer still stopped `sleep 1` (pid 1620929) with that step's `BUILDLOG_CALL_ID`: the keep check walks only live ancestors, and this process was not under 1912105 in the process table. Keep a process when its step record's controller is kept or has a kept ancestor, as well as by ancestry. Test: a process with a kept step's call id and no kept ancestor is kept.
-6. The refusal line then reached that step's log after a real test failure (5126 of 5127 passed), and `verify.sh` read it as a hold stop and waited at the hold. `verify.sh` reads a hold stop only when the step ended on a signal, not from log text alone. Test: a step that fails on its own with the refusal text in its log is a failure, not a hold stop.
-
-**Files:** `scripts/build_hold/hold_enforcer.py`, `scripts/build_hold/test_build_hold.py`, `scripts/production/test_merge_gate_holds.py`, `scripts/direct/verify.sh` (only `step_stopped_by_hold`) and its hold test.
-
-**Acceptance:** the build-hold and merge-gate hold suites pass after the cut-over hold ends; basedpyright is clean on the changed files. A gate run that a hold interrupts shows "stopped during a natedev hold; queued again" for each stopped module and no red from the hold.
+**Files:**
+- `scripts/build_hold/hold_enforcer.py` — gate-job stop and step-record keep
+- `scripts/direct/verify.sh` — signal-only hold stop
+- `scripts/build_hold/test_build_hold.py`, `scripts/direct/test_verify_hold_wait.py` — the tests
 
 ### Phase 50 — The Mac runs the floor sweep, and it never deletes a mirror target that a Mac test claim holds  · status: done
 
-Owner: builds-resources. Asked by verify-unit; builds approved 2026-11-03 14:05 EST as its own phase, merged first.
+#### As-built
 
-**Why.** The Mac has 46 GiB free. The Mac test minimum is 100 GiB (`config/mac_test.conf` `free_floor_gib`), so every test step stays on natedev, and the Mac has run no test for 22 h. Today only natedev runs the floor sweep. The Mac has no floor job. On the Mac, `sweep.py` cannot see which targets are in use, because it reads `/proc`, and the Mac has none (`scripts/lint/sweep.py:744`).
+- `sweep.py --floor-only --host mac` runs the floor sweep on the Mac. verify-unit calls it over ssh when Mac test admission declines for disk, and a nix-darwin job (branch `resources-mac-floor`) calls it on the interval of `disk-floor.nix`.
+- The Mac floor is `config/mac_test.conf` `sweep_floor_gib`, read at use through `conf.read`. A missing value, or one below `free_floor_gib`, refuses with one line.
+- The sweep never deletes a mirror target that a live Mac test claim holds. `scripts/mac_test/floor_claims.py` reads the claims that `scripts/mac_test/offload.py` writes, with no `/proc`; an unreadable claim counts as busy.
+- It takes only the shortfall, least recently used idle target first, from the Mac roots only: builds and mirrors this tooling created in tmp and `~/rust` (user rule 2026-11-03). It prints one line with the bytes removed, free space before and after, and busy targets skipped.
 
-**Spec.**
-1. **One entry point.** `sweep.py --floor-only --host mac` runs the floor sweep for the Mac. verify-unit calls it over ssh (`ssh mac '~/.claude/scripts/lib/py ~/.claude/scripts/lint/sweep.py --floor-only --host mac'`) when Mac test admission declines for disk, then reads free space again. Use the existing floor sweep. Do not add a second sweeper.
-2. **One floor key.** On the Mac, the floor is one new key, `config/mac_test.conf` `sweep_floor_gib`, read at use through `conf.read`. The on-demand call and the timer use the same key. Its value must be at or above `free_floor_gib` (the Mac test minimum, 100); a lower or missing value refuses with one line. The committed value is 100 until the user approves a higher one (builds asked the user for 150 on 2026-11-03). Do not add a `sweep_free_floor_gib.mac` key. Natedev's floor stays `lint.conf` `sweep_free_floor_gib.natedev`.
-3. **The claim check without /proc.** The sweep never deletes a mirror target that a live Mac test claim holds. Find the claim record that `scripts/mac_test/offload.py` writes for a run on the Mac mirror (its slot, target and owner). A claim is live while its owner runs. A target that a live claim holds is busy. Where liveness cannot be read, treat the target as busy (fail closed).
-4. **The order stays the same.** Take only the shortfall, least recently used idle target first, as on natedev. On the Mac the roots are only those in item 7; `lint.conf` `sweep_floor_roots` stays natedev's. The Mac test mirror stays at `~/.local/state/mac-test/mirror` (the user, 2026-11-03: "yes ~/.local/state/mac-test/mirror can definitely be part of what we manage").
-5. **Output.** One line: the bytes removed, the free space before and after, and the number of busy targets skipped. Exit 0 when the floor is reached or no idle target remains; the caller reads the free space again.
-6. **No config value changes.** Every existing key and value stays the same.
-7. **The Mac roots (the user, 2026-11-03, verbatim):** "the mac cleanup needs to be cleaning up only things we have created - basically builds / mirrors whatever - in tmp - - and similarly builds/mirrors we/ve created in ~/rust - everytihng else is offlimits". The Mac sweep and timer roots are exactly three: our build output and mirrors under the Mac's tmp folders, our build output and mirrors under ~/rust, and `~/.local/state/mac-test/mirror`. They live in config (one key). Nothing else is a root. A test refuses any path outside them, also through a symlink or `..`. "Ours" means a folder that our tools made (a cargo target with our stamp, a mirror or copy record); a folder with no such mark is not touched.
-8. **A scheduled Mac floor run.** A nix-darwin job in `/etc/nixos/modules/darwin/` (on the branch `resources-mac-floor`, not main) calls the same entry point, like `modules/linux/disk-floor.nix` on natedev. Use the interval of disk-floor.nix. The natedev showrunner pushes nixos main.
-
-**Out of scope.** The verify call site (verify-unit Phase 25). The 150 GiB value until the user approves it. The build drive paths (the next phase).
-
-**Checks.**
-- Tests in `scripts/lint/test_sweep.py`:
-  1. a held mirror target is not deleted;
-  2. an unreadable claim is treated as busy;
-  3. the floor comes from `mac_test.conf` `sweep_floor_gib`, and a value below `free_floor_gib` or a missing value refuses with one line;
-  4. `--host mac` with no `/proc` still finds idle targets;
-  5. the order is least recently used first, and only the shortfall is removed.
-- basedpyright 0/0/0 on the changed files and their callers.
-- Read-only proof on the Mac: `ssh mac` runs the entry point with `--dry-run`. It prints the targets it would remove, and it deletes nothing.
+**Files:**
+- `scripts/lint/sweep.py` — the Mac floor entry point
+- `scripts/mac_test/floor_claims.py` — the live claim check
+- `config/mac_test.conf` — `sweep_floor_gib`
 
 ### Phase 51 — Build output moves to the /build drive, and every tool that reads build folders follows it  · status: done
 
@@ -1416,13 +1393,14 @@ Owner: builds-resources. Asked by verify-unit; builds approved 2026-11-03 14:05 
 
 ### Phase 52 — The build hold audit classifies a reused pid and an admitted step correctly under load  · status: done
 
-Owner: builds-resources. Asked by builds 2026-11-03 15:00 EST; it held natest's merge.
+#### As-built
 
-**Fault.** On origin/builds f91716183, scripts/build_hold/test_build_hold.py BuildAuditTests fails now and then under load (load 25-44, 1 red in 2 full runs): ERROR in test_reused_pid_does_not_match_admission_or_new_parent, and 'other_session' where 'admitted' was expected. Log: /tmp/claude-1000/-home-natepiano-worktrees-claude-natedev-builds/51505394-82db-43d3-a528-136f4ee38d7a/scratchpad/merge_92e8915_test.log.
+- The build hold audit reads admitted owners from durable grants: `admitted_processes()` (`scripts/build_hold/build_hold.py`) reads `admission_service.read_state(store.root() / "admission")`, which the service writes before it replies and before its next decision pass. An unreadable state raises `OSError`.
+- A pid matches an admission only with the same start time as its grant, so a reused pid is never `admitted`, and an admitted step stays `admitted` when the system is slow.
 
-**Spec.** Find the cause in the code (pid identity and admission classification), and fix it there. Do not change the test's timing, add sleeps or retries, or widen a timeout. A pid match needs the same start time as the admission record. A step whose admission record matches it is 'admitted' even when the system is slow.
-
-**Checks.** A test that reproduces the fault without load (for example, a forced slow read or a stale /proc start time). test_build_hold.py and test_hold_enforcer.py pass. basedpyright 0/0/0 on the changed files and their callers.
+**Files:**
+- `scripts/build_hold/build_hold.py` — admitted owners from durable grants
+- `scripts/build_hold/test_build_hold.py` — reused-pid and slow-read tests
 
 ### Phase 53 — After the /build switch, cleanup removes a checkout's outside build cache, and the disk reports show each drive  · status: done
 
