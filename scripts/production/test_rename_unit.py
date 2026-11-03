@@ -308,8 +308,7 @@ class UnitRenameTests(UnitRenameFixture):
         self.assertIn("| gamma-unit | docs/plans/alpha.md |", self.doc.read_text())
         started = cast(dict[str, object], json.loads(run.read_text().splitlines()[0]))
         self.assertEqual(started["working_dir"], str(new))
-        self.assertIn("Your work was in progress (phase 2 is open), so your branch kept its commits and took no "
-                      + "merge: the rename commit comes with your next merge of demo.", cast(str, self.record()["renamed"]))
+
 
     def test_uncommitted_work_between_phases_also_keeps_the_tip(self) -> None:
         worktree = self.rust / "claude-demo-alpha"

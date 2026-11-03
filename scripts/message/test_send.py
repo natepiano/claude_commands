@@ -49,16 +49,13 @@ import silence
 from test_postmaster import FakeClock
 import codex_daemon
 from codex_test_support import FakeDaemon, daemon_session_row, receive_frame, reply, write_codex_account
-import shutdown_record
-import restart
 import roster
 import sessions
-import restart_support
 if TYPE_CHECKING:
     from ..accounts import accounts
 else:
     from scripts.accounts import accounts
-from test_support import ShutdownTestCase, ShutdownSendLeaf
+from test_support import ShutdownTestCase
 from user_zone import user_zone
 from user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired, first_line
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -2905,66 +2902,6 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertNotIn("old unkeyed stop result", pending)
         self.assertIn("latest stop result", pending)
 
-    def test_real_cancel_and_restart_senders_retire_old_settle_instructions(self) -> None:
-        # The subprocess needs its own roster fixture; parent patches do not cross exec.
-        real_send = self.root / "real-send.py"
-        _ = real_send.write_text(
-            f"#!{sys.executable}\n"
-            + "import sys\n"
-            + f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
-            + "import roster, send\n"
-            + "from scripts.production import staff\n"
-            + "staff.snapshot = lambda: staff.StaffSnapshot(tuple(staff.StaffRow(staff.StaffId(x), 'unit', x, None, current_session=staff.StaffId(x)) for x in ('cancelled', 'restarted')))\n"
-            + "from scripts.lib import names\nfrom scripts.lib.test_names import fixture_names\n"
-            + "names.load_names = lambda: fixture_names()\n"
-            + "roster.roster = lambda environment, scope, **kwargs: roster.Roster([], [])\n"
-            + "roster.peer_roster = lambda environment: roster.Roster([], [])\n"
-            + "raise SystemExit(send.main(sys.argv[1:]))\n",
-            encoding="utf-8",
-        )
-        real_send.chmod(0o755)
-        child_state = self.root / "child-state"
-
-        def shutdown_fixture(session_id: str) -> shutdown_record.SessionShutdown:
-            from test_restart import entry, top_level
-
-            saved = entry(top_level(session_id), state=shutdown_record.SessionWaiting(kind="waiting"))
-            self.assertTrue(shutdown_record.create_session(saved))
-            return saved
-
-        self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
-        self.allow_leaf(ShutdownSendLeaf.RETIRE_SHUTDOWN_MESSAGES)
-        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
-
-        with (
-            mock.patch.object(send, "STATE", child_state / "message"),
-            mock.patch.dict(
-                os.environ,
-                {
-                    "XDG_STATE_HOME": str(child_state),
-                    "SHUTDOWN_SEND": str(real_send),
-                    "SHUTDOWN_STATE_DIR": str(child_state / "shutdown"),
-                },
-            ),
-        ):
-            restarted = shutdown_fixture("restarted")
-            old_restart = restart_support.send_message(
-                "session:restarted",
-                "old shutdown",
-                "Old unkeyed shutdown instruction.",
-            )
-            self.assertEqual(old_restart["kind"], "queued")
-            restart._retire(restarted, dry_run=False)  # pyright: ignore[reportPrivateUsage]
-            delivery = restart._send_restart_note(  # pyright: ignore[reportPrivateUsage]
-                restarted,
-                "Restarted; continue.",
-                dry_run=False,
-            )
-            self.assertEqual(delivery["kind"], "queued")
-            self.session("restarted", "restart-recipient")
-            restart_pending = send.pending("restart-recipient")
-            self.assertNotIn("shutdown instruction", restart_pending)
-            self.assertIn("Restarted; continue.", restart_pending)
 
     def test_unique_claude_roster_name_delivers_to_its_session_address(self) -> None:
         recipient = self.claude_row("id-1", "recipient")

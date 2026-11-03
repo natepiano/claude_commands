@@ -32,7 +32,6 @@ from scripts.agents import codex_mesh, worker_lifecycle, test_codex_mesh as mesh
 from scripts.direct import progress_history, workers
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
-from scripts.message import sessions
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id, StaffTestCase, isolated_source_readers, showrunner_relationship, recorded_unit
 
@@ -118,24 +117,6 @@ class DirectorResolutionTests(StaffTestCase):
 
         self.assertEqual(workers.live_unit_director(run), workers.LiveUnitDirector("director", os.getpid()))
 
-    def test_live_unit_director_prefers_the_newest_running_name_match(self) -> None:
-        older = self.session_record("older-director", "builders-unit")
-        newer = self.session_record("newer-director", "builders-unit")
-        record = json_object(newer)
-        record["updatedAt"] = 2
-        self.write_json(newer, record)
-        run = self.worker_run("demo", "builders-unit", "former-director")
-        self.write_json(self.root / "shutdown/account/history/restart.json", {"session": {
-            "session_id": "former-director", "name": "builders-unit", "run_dirs": [str(run)],
-            "host": {"kind": "unit", "unit": "builders-unit", "session_name": "builders-unit"},
-        }})
-        registry = sessions.read_registry()
-        entries = {item.record["sessionId"]: item for item in registry.entries}
-        # Present readable records in the older-first order that caused the defect.
-        with patch.object(sessions, "read_registry", return_value=sessions.RegistryRead(
-            (entries[older.stem], entries[newer.stem]), registry.unreadable,
-        )):
-            self.assertEqual(workers.live_unit_director(run), workers.LiveUnitDirector("newer-director", os.getpid()))
 
 
 class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):

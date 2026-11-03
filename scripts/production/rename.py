@@ -10,7 +10,7 @@ from contextlib import contextmanager, nullcontext
 from collections.abc import Generator
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+from typing import Literal, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -34,17 +34,9 @@ from scripts.astra import design_roles  # noqa: E402
 from scripts.production import staff, staff_sources
 from scripts.lib import git_exclude
 
-if TYPE_CHECKING:
-    from scripts.shutdown import shutdown_record
-    from scripts.shutdown.shutdown_record import SessionShutdown
-else:
-    import shutdown_record
-    from shutdown_record import SessionShutdown
-
 
 class StoppedUnitRestore(TypedDict):
     kind: Literal["stopped"]
-    login: str
     session_id: str
 
 
@@ -693,16 +685,11 @@ def _stopped_unit(plan: RenamePlan, name: str) -> None:
 
 
 def _stopped_restore(plan: RenamePlan, name: str) -> UnitRestore:
-    records = [*rename_unit.shutdown_records(plan.old, (name,)),
-               *rename_unit.shutdown_records(plan.new, (name,))]
-    if not records:
-        return UnitWithoutRestore(kind="absent")
-    if len(records) != 1:
-        raise RenameRefused(f"{name} has {len(records)} shutdown records; settle them first")
-    saved = records[0]
-    if saved["progress"]["kind"] not in rename_unit.STOPPED:
-        raise RenameRefused(f"{name}'s shutdown record reads {saved['progress']['kind']}; settle it first")
-    return StoppedUnitRestore(kind="stopped", login=saved["login"], session_id=saved["session"]["session_id"])
+    for slug in (plan.new, plan.old):
+        member = staff_sources.member(staff_sources.UnitMember(slug, name), staff.snapshot())
+        if not isinstance(member, staff_sources.NoSuchMember):
+            return StoppedUnitRestore(kind="stopped", session_id=str(member.row.current_session))
+    return UnitWithoutRestore(kind="absent")
 
 
 def _saved_restore(record: dict[str, object]) -> UnitRestore:
@@ -711,31 +698,7 @@ def _saved_restore(record: dict[str, object]) -> UnitRestore:
         return UnitWithoutRestore(kind="absent")
     if restore.get("kind") != "stopped":
         raise RenameRefused("invalid unit restore in rename journal")
-    return StoppedUnitRestore(kind="stopped", login=_string(restore, "login"),
-                              session_id=_string(restore, "session_id"))
-
-
-def _repoint_unit_restore(_plan: RenamePlan, name: str, record: dict[str, object],
-                          restore: StoppedUnitRestore) -> None:
-    import herdr
-
-    old, new = _string(record, "old_worktree"), _string(record, "new_worktree")
-    branch = _string(record, "new_branch")
-    note = (f"While you were paused the production moved your unit: your worktree is now {new} "
-            f"on branch {branch}. {old} no longer exists; wherever your instructions name it, use {new}.")
-    host_names = {herdr.generated_session_name(_string(record, "old_branch")):
-                  herdr.generated_session_name(branch)}
-
-    def change(saved: SessionShutdown) -> None:
-        host = saved["session"]["host"]
-        if host["kind"] != "unit" or host["unit"] != name:
-            raise RenameRefused(f"shutdown record {restore['session_id']} is not {name}'s")
-        rename_unit.repoint_shutdown_worktree(saved, old, new, host_names, note)
-
-    try:
-        _ = shutdown_record.update_session(restore["login"], restore["session_id"], change)
-    except (shutdown_record.NoLiveRecord, shutdown_record.InvalidRecord, OSError) as error:
-        raise RenameRefused(f"{name}'s shutdown record: {error}") from error
+    return StoppedUnitRestore(kind="stopped", session_id=_string(restore, "session_id"))
 
 
 def _prepare_unit(plan: RenamePlan, name: str, row: dict[str, str]) -> dict[str, object]:
@@ -930,10 +893,6 @@ def unit(new: str, name: str) -> None:
             record["staff_id"] = member.row.id
             write_json(result.journal, journal)
         restore = _saved_restore(record)
-        if not record.get("restore_repointed", False):
-            # Check again before changing a branch or worktree on a resumed move.
-            if _stopped_restore(result, name) != restore:
-                raise RenameRefused(f"{name}'s shutdown record changed during the move")
         completed = record.get("step")
         if type(completed) is not int or not 0 <= completed <= 5:
             raise RenameRefused(f"{name}: invalid unit rename progress")
@@ -953,11 +912,6 @@ def unit(new: str, name: str) -> None:
         if not record.get("workers_repointed", False):
             _repoint_unit_workers(result, name, record)
             record["workers_repointed"] = True
-            write_json(result.journal, journal)
-        if not record.get("restore_repointed", False):
-            if restore["kind"] == "stopped":
-                _repoint_unit_restore(result, name, record, restore)
-            record["restore_repointed"] = True
             write_json(result.journal, journal)
         if completed < 3:
             _move_unit_configs(record)
@@ -979,7 +933,7 @@ def unit(new: str, name: str) -> None:
         if restore["kind"] == "stopped":
             print(f"relaunch: shutdown.py restart --only {shlex.quote(restore['session_id'])}")
         else:
-            print(f"{name} has no shutdown record to relaunch from")
+            print(f"{name} has no staff session to resume")
         print(f"{name} moved to {_string(record, 'new_worktree')}; add_unit writes the herdr mark at next launch")
 
 

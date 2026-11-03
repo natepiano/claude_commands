@@ -14,7 +14,7 @@ from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from io import StringIO
 from threading import Event
 from time import monotonic
@@ -105,6 +105,13 @@ def _record_launches(selected: list[str]) -> None:
 
 
 def stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
+    from scripts.production import staff
+
+    with staff.row_operation(session):
+        return _stop_recorded(session)
+
+
+def _stop_recorded(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
     """Stop on purpose; retain its launch for an explicit resume, not crash recovery."""
     _record_launches([session])
     result = _stop(session)
@@ -156,11 +163,14 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
             return tab if member is None and isinstance(tab, SessionNotFound) else NotRunning(identity)
         if isinstance(live, sessions.SessionLivenessUnknown):
             return StopFailed(identity, live.reason)
-        started = sessions.process_start(live.pid)
-        if not started:
-            return StopFailed(identity, f"process identity unreadable for pid {live.pid}")
+        proved = herdr.native_process(live.pid, "claude")
+        if proved.identity != identity:
+            return StopFailed(identity, "process runs another conversation; no signal sent")
+        started = proved.started
         if not _same_claude(live.pid, started):
             return NotRunning(identity)
+        if herdr.native_process(live.pid, "claude") != proved:
+            return StopFailed(identity, "process identity changed; no signal sent")
         os.kill(live.pid, signal.SIGTERM)
         deadline = monotonic() + STOP_GRACE_SECONDS
         while _same_claude(live.pid, started):
@@ -171,6 +181,8 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
         else:
             return Stopped(identity, live.pid)
         if _same_claude(live.pid, started):
+            if herdr.native_process(live.pid, "claude") != proved:
+                return StopFailed(identity, "process identity changed; no signal sent")
             os.kill(live.pid, signal.SIGKILL)
             deadline = monotonic() + KILL_GRACE_SECONDS
             while _same_claude(live.pid, started):
@@ -284,6 +296,13 @@ def _nearby_resume_names(reference: str, names: LaunchNames) -> list[str]:
 
 
 def resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "") -> ResumeResult:
+    from scripts.production import staff
+
+    with staff.row_operation(session):
+        return _resume(session, why=why, to=to, requester=requester)
+
+
+def _resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "") -> ResumeResult:
     names = LaunchNames.read()
     record = names.tab_record
     member = record.by_member_reference(session)
@@ -571,50 +590,55 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                 tab = _tab_of(session)
                 if isinstance(tab, herdr.TabSession) and tab.session_id == caller:
                     handoff_failures[session] = StopFailed(caller, str(error))
-    with ThreadPoolExecutor(max_workers=len(selected)) as pool:
-        if warn_seconds:
-            warning_until = monotonic() + warn_seconds
-            warnings = [pool.submit(_warn_session, session, target, why, warn_seconds) for session in selected]
-            for warning in warnings:
-                try:
-                    warning.result()
-                except Exception:
-                    pass  # An undeliverable warning cannot prevent the requested interruption.
-            _ = Event().wait(max(0.0, warning_until - monotonic()))
-        stops = [pool.submit(handoff_failures.__getitem__, session) if session in handoff_failures else
-                 pool.submit(already_up.__getitem__, session) if session in already_up else
-                 pool.submit(_stop, session) for session in selected]
-        stopped: list[Stopped | NotRunning | StopFailed | SessionNotFound | ClaudeUp] = []
-        for session, future in zip(selected, stops):
-            try:
-                result = future.result()
-                if isinstance(result, (Stopped, NotRunning)):
-                    _retire_prompt(result.session_id)
-                stopped.append(result)
-            except Exception as error:
-                stopped.append(StopFailed(session, str(error)))
-        def resume_moved(identity: str) -> ResumeResult:
-            result = (resume(identity, why=why, to=target, requester=requester) if requester else
-                      resume(identity, why=why, to=target))
-            return replace(result, elapsed_seconds=monotonic() - began) if isinstance(result, ClaudeUp) else result
+    from scripts.production import staff
 
-        resumes = {index: pool.submit(resume_moved, result.session_id)
-                   for index, result in enumerate(stopped) if isinstance(result, (Stopped, NotRunning))}
-        outcomes: list[MoveResult] = []
-        for index, result in enumerate(stopped):
-            if isinstance(result, (StopFailed, SessionNotFound, ClaudeUp)):
-                outcomes.append(result)
-                continue
-            try:
-                resumed = resumes[index].result()
-                if isinstance(resumed, ClaudeUp):
-                    outcomes.append(resumed)
-                else:
-                    reason = "session has no tab after stop" if isinstance(resumed, SessionNotFound) else resumed.reason
-                    outcomes.append(ResumePending(result.session_id, target, reason))
-            except Exception as error:
-                outcomes.append(ResumePending(result.session_id, target, str(error)))
-        return outcomes
+    with ExitStack() as locks:
+        for session in selected:
+            _ = locks.enter_context(staff.row_operation(session))
+        with ThreadPoolExecutor(max_workers=len(selected)) as pool:
+            if warn_seconds:
+                warning_until = monotonic() + warn_seconds
+                warnings = [pool.submit(_warn_session, session, target, why, warn_seconds) for session in selected]
+                for warning in warnings:
+                    try:
+                        warning.result()
+                    except Exception:
+                        pass  # An undeliverable warning cannot prevent the requested interruption.
+                _ = Event().wait(max(0.0, warning_until - monotonic()))
+            stops = [pool.submit(handoff_failures.__getitem__, session) if session in handoff_failures else
+                     pool.submit(already_up.__getitem__, session) if session in already_up else
+                     pool.submit(_stop, session) for session in selected]
+            stopped: list[Stopped | NotRunning | StopFailed | SessionNotFound | ClaudeUp] = []
+            for session, future in zip(selected, stops):
+                try:
+                    result = future.result()
+                    if isinstance(result, (Stopped, NotRunning)):
+                        _retire_prompt(result.session_id)
+                    stopped.append(result)
+                except Exception as error:
+                    stopped.append(StopFailed(session, str(error)))
+            def resume_moved(identity: str) -> ResumeResult:
+                result = (resume(identity, why=why, to=target, requester=requester) if requester else
+                          resume(identity, why=why, to=target))
+                return replace(result, elapsed_seconds=monotonic() - began) if isinstance(result, ClaudeUp) else result
+
+            resumes = {index: pool.submit(resume_moved, result.session_id)
+                       for index, result in enumerate(stopped) if isinstance(result, (Stopped, NotRunning))}
+            outcomes: list[MoveResult] = []
+            for index, result in enumerate(stopped):
+                if isinstance(result, (StopFailed, SessionNotFound, ClaudeUp)):
+                    outcomes.append(result)
+                    continue
+                try:
+                    resumed = resumes[index].result()
+                    if isinstance(resumed, ClaudeUp):
+                        outcomes.append(resumed)
+                    else:
+                        reason = "session has no tab after stop" if isinstance(resumed, SessionNotFound) else resumed.reason
+                        outcomes.append(ResumePending(result.session_id, target, reason))
+                except Exception as error:
+                    outcomes.append(ResumePending(result.session_id, target, str(error)))
+            return outcomes
 
 
 def move(session: str, target: str, *, why: str) -> MoveResult:

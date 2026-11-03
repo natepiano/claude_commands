@@ -625,7 +625,8 @@ def plan(from_slug: str, unit: str, to_doc: Path, scratch: Path) -> UnitTransfer
 
 
 def apply(from_slug: str, unit: str, to_doc: Path, scratch: Path) -> UnitTransfer:
-    with staff.operation(), design_roles.record_operation():
+    prepared = _resumed(journal(from_slug), unit, to_doc) or build(from_slug, unit, to_doc, scratch)
+    with staff.row_operation(str(prepared.staff_id)), staff.operation(), design_roles.record_operation():
         return _apply(from_slug, unit, to_doc, scratch)
 
 

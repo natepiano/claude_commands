@@ -26,6 +26,7 @@ from scripts.direct.wait_for_test_state import wait_until
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_test_support import bind_staff_fixture
 from scripts.production.staff_test_support import fixture_member, StaffTestCase, unit_membership
+from scripts.message import sessions
 from scripts.shutdown import stop_resume
 from scripts.production import staff, unit_config
 from scripts.lib.atomic_file import write_text_atomic
@@ -42,11 +43,9 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 if TYPE_CHECKING:
     from scripts.style import style_ledger
-    from scripts.shutdown import shutdown_record
 else:
     import style_ledger
     # rename_unit puts the shutdown folder on the path.
-    import shutdown_record
 
 SCRIPT = Path(__file__).with_name("rename_unit.py")
 SLUG = "demo"
@@ -92,6 +91,20 @@ class UnitRenameFixture(StaffTestCase):
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.bind_fixture(self.fixture_root)
         bind_staff_fixture(self, self.env, {SLUG: ("alpha-unit", "mul_add-unit")})
+        original_run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+        def run(command: list[str], *args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            if (len(command) > 2 and command[1] == str(SCRIPT.parents[1] / "shutdown/shutdown.py")
+                    and command[2] == "restart"):
+                identity = command[command.index("--only") + 1]
+                row = staff.initial_snapshot().by_member_reference(identity)
+                assert row is not None
+                if row.kind == "unit" and not any(item["sessionId"] == row.current_session for item in sessions.live_sessions()):
+                    _ = self.mark_live(row.name + "-unit", str(row.current_session), row.name)
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return original_run(command, *args, **kwargs)
+
+        _ = self.enterContext(mock.patch.object(subprocess, "run", run))
         # These modules also bind paths at import time; environment changes alone
         # do not isolate their journals, locks, or stall-watch state.
         for module, name, value in (
@@ -348,7 +361,7 @@ class UnitRenameFixture(StaffTestCase):
 
     def snapshot(self) -> dict[str, bytes]:
         return {str(path.relative_to(self.root)): path.read_bytes()
-                for path in self.root.rglob("*") if path.is_file() and path != self.root / "herdr.jsonl"}
+                for path in self.root.rglob("*") if path.is_file() and not path.name.endswith(".lock") and path != self.root / "herdr.jsonl"}
 
     def style_production(self) -> tuple[Path, Path, Path]:
         worktree = self.rust / "demo-names"
@@ -393,19 +406,10 @@ class UnitRenameFixture(StaffTestCase):
 
     def seed_record(self, progress: Literal["waiting", "ready", "stopped"] = "stopped", name: str = "alpha", host_session: str = "demo-alpha", *,
                     unit: str = "alpha-unit", slug: str = SLUG) -> Path:
-        """A stopped unit's shutdown record, from before the conductor was removed."""
-        old = self.rust / "claude-demo-alpha"
-        saved = fake_unit_host.stopped_record(self.home / ".claude", old,
-            name=name, cwd=old / "sub", production=slug, unit=unit, doc=self.doc,
-            host_session=host_session, branch="demo-alpha", plan=old / "docs/plans/alpha.md", progress=progress,
-            runtime_id=unit_membership(slug, unit).id)
-        saved["codex_seats"] = [{"run_dir": str(self.root / "runs/r1"), "seat": "impl", "role": "impl",
-                                 "thread_id": "thread-impl", "turn_live": True, "launcher_command": [
-                                     "bash", "/scripts/direct/implement.sh", "--to", "impl", str(self.root / "runs/r1"),
-                                     str(old), "/runs/r1/prompt.md", "impl", "task", "impl", "working", "0", "impl"]}]
-        self.write(self.root / "runs/r1/impl.resume-prompt.md", "Continue the task you were on.\n")
-        with mock.patch.dict(os.environ, self.env):
-            self.assertTrue(shutdown_record.create_session(saved))
+        """Record the relaunch command without changing the staff identity."""
+        del progress, host_session, unit, slug
+        if name != "alpha":
+            _ = self.enterContext(mock.patch.object(rename_unit, "_session_name", return_value=name))
         log = self.root / "shutdown-calls.jsonl"
         self.write(log, "")
         stub = self.root / "fake_shutdown.py"
@@ -415,9 +419,6 @@ class UnitRenameFixture(StaffTestCase):
         self.env["RENAME_UNIT_SHUTDOWN_LOG"] = str(log)
         return log
 
-    def record(self) -> dict[str, object]:
-        directory = self.home / ".local/state/shutdown/owner@example.com/sessions"
-        return cast(dict[str, object], json.loads((directory / "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3.json").read_text()))
 
     def record_live_launch(self) -> None:
         pane_record.write("demo-alpha-unit", pane_record.PaneLaunch(
@@ -432,7 +433,7 @@ class UnitRenameFixture(StaffTestCase):
         The session and its pane label are called `name`, the unit's stem when it is empty.
         """
         name = name or unit.removesuffix("-unit")
-        row = unit_membership(SLUG, unit)
+        row = staff.initial_snapshot().by_current_session(session_id) or unit_membership(SLUG, unit)
         held = fake_showrunner.write_session(self.root / "state/sessions", name, session_id)
         self.addCleanup(held.close)
         fake_unit_host.write(self.env, [fake_unit_host.HostedUnit(
@@ -444,7 +445,6 @@ class UnitRenameFixture(StaffTestCase):
             held.close()
             fake_unit_host.write(self.env, [])
         return end
-
 
 
 def apply_in_fixture(root: Path) -> int:

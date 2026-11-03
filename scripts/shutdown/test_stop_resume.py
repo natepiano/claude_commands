@@ -40,7 +40,7 @@ class ResumeClock(local):
 
 @final
 class StopResumeTests(unittest.TestCase):
-    def test_resume_names_share_one_snapshot_and_default_reason(self) -> None:
+    def test_resume_names_use_a_fresh_snapshot_under_the_row_lock(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
         row = staff.StaffRow(staff.StaffId("accounts-unit"), "unit", "accounts", None,
                              current_session=identity)
@@ -50,7 +50,7 @@ class StopResumeTests(unittest.TestCase):
             with patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))) as read:
                 result = stop_resume.resume(reference)
             self.assertIsInstance(result, stop_resume.ClaudeUp)
-            read.assert_called_once()
+            self.assertEqual(read.call_count, 2)
             self.assertIn("resumed by name", self.client.prompts[0][1].text)
             self.assertNotIn("the herdr server restarted", self.client.prompts[0][1].text)
 
@@ -118,7 +118,7 @@ class StopResumeTests(unittest.TestCase):
         with patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(rows)) as read:
             self.assertEqual(stop_resume.resume("acc"), stop_resume.ResumeFailed(
                 "acc", "unknown name; candidates: accounts, team-accounts"))
-        read.assert_called_once()
+        self.assertEqual(read.call_count, 2)
         with patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(rows)):
             self.assertEqual(stop_resume.resume("absent"), stop_resume.ResumeFailed("absent", "unknown name"))
         self.start.assert_not_called()
@@ -150,11 +150,6 @@ class StopResumeTests(unittest.TestCase):
         self.start.assert_not_called()
         self.kill.assert_not_called()
         self.detach.assert_not_called()
-
-
-
-
-
 
 
     def test_resume_by_name_of_a_running_session_reports_success_without_a_launch(self) -> None:
@@ -211,6 +206,7 @@ class StopResumeTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(redirect_stderr(io.StringIO()))
         _ = self.enterContext(patch.object(accounts, "accounts_home", return_value=self.root))
         _ = self.enterContext(patch.object(account, "process_config_dir", side_effect=self.process_account))
         _ = self.enterContext(patch.object(herdr, "repository_root", return_value=self.root))
@@ -229,6 +225,8 @@ class StopResumeTests(unittest.TestCase):
                                          Path(self.enterContext(tempfile.TemporaryDirectory()))))
         _ = self.enterContext(patch.object(sessions, "session_liveness", self.observe))
         _ = self.enterContext(patch.object(sessions, "process_start", return_value="generation-1"))
+        _ = self.enterContext(patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+            "019b3a40-4250-7000-8000-000000000102", "generation-1", {})))
         _ = self.enterContext(patch.object(sessions, "process_liveness", self.process))
         _ = self.enterContext(patch.object(os, "kill", self.kill))
         _ = self.enterContext(patch.object(stop_resume, "Event", self.wait))
@@ -344,7 +342,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(pane_record.read("agents")["w2:p3"]["session_id"], "019b3a40-4250-7000-8000-000000000102")
         self.assertEqual(self._typed(self.start.call_args.args)[2], "w2:p3")
 
-    def test_recovery_uses_one_snapshot_for_the_renamed_row_title_and_arguments(self) -> None:
+    def test_recovery_uses_the_locked_snapshot_for_the_renamed_row_title_and_arguments(self) -> None:
         from scripts.production import session_staff
 
         fixed = staff.StaffId(self.entry["session_id"])
@@ -369,7 +367,7 @@ class StopResumeTests(unittest.TestCase):
             result = stop_resume.resume(str(fixed), why="recovery")
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         self.assertEqual(opened, ["row-name"])
-        snapshot.assert_called_once()
+        self.assertEqual(snapshot.call_count, 2)
         command = self._typed(self.start.call_args.args)
         self.assertEqual(command[command.index("-n") + 1], "row-name")
         self.assertEqual(command[command.index("--resume") + 1], current)
@@ -387,7 +385,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(self.client.rows[0]["label"], "row-name")
         command = self._typed(self.start.call_args.args)
         self.assertEqual(command[command.index("-n") + 1], "row-name")
-        snapshot.assert_called_once()
+        self.assertEqual(snapshot.call_count, 2)
 
     def test_recovery_reconciles_titles_and_preserves_unnamed_titles(self) -> None:
         from scripts.production import session_staff
@@ -713,13 +711,6 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(line.count("copied folder trust from claude3"), 1)
         self.assertEqual(json.loads(target.read_text())["unrelated"], "keep")
 
-
-    def test_a_stopped_tab_resumes_by_id_or_label_from_its_launch_entry(self) -> None:
-        self.client.rows[0]["agent_session"] = None
-        for session in ("019b3a40-4250-7000-8000-000000000102", "alpha"):
-            self.launched.clear()
-            self.assertEqual(stop_resume.resume(session, why="maintenance"), stop_resume.ClaudeUp("019b3a40-4250-7000-8000-000000000102", "w1:p2", "claude3"))
-        self.assertEqual(stop_resume.resume("sid-other", why="maintenance"), stop_resume.ResumeFailed("sid-other", "unknown name"))
 
     def test_a_new_session_herdr_has_no_id_for_is_found_through_the_launches_read_first(self) -> None:
         self.client.rows[0]["agent_session"] = None

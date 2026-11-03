@@ -9,17 +9,16 @@ import sys
 import threading
 import time
 import unittest
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Literal, cast, final
+from typing import TYPE_CHECKING, cast, final
 from unittest import mock
 
 if TYPE_CHECKING:
     import herdr
     import unit_lookup
-    import shutdown_record
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 import herdr
@@ -284,77 +283,20 @@ class PaneShellFixture:
                 session=os_session, cwd=self.worktree)
 
 
-def stopped_record(root: Path, worktree: Path, *, name: str = "alpha", cwd: Path | None = None,
-                   production: str = "demo", unit: str = "alpha-unit", doc: Path | None = None,
-                   host_session: str = "agents", branch: str = "", plan: Path | None = None,
-                   progress: Literal["waiting", "ready", "stopped"] = "stopped",
-                   runtime_id: str = "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3") -> shutdown_record.SessionShutdown:
-    """One typed unit record builder; callers override only their scenario's values."""
-    del production, doc  # Parentage is supplied by staff, never persisted here.
-    saved: shutdown_record.SessionShutdown = {
-        "login": "owner@example.com", "label": "claude2", "machine": "natedev",
-        "requested_at": "2026-10-09T21:49:10+00:00", "request_id": "request",
-        "requested_by": {"kind": "terminal"}, "hold": "session", "then": "stop", "force": "wait for ready",
-        "alerts": "none", "probe": False,
-        "session": {
-            "session_id": runtime_id, "config_dir": str(root), "pid": 4242, "proc_start": "1",
-            "name": name, "cwd": str(cwd or worktree), "status": "idle", "updated_at": 0, "probe": False,
-            "model": {"kind": "no reply yet"},
-            "checkout": {"kind": "git", "path": str(worktree), "head": {"kind": "branch", "name": branch},
-                         "upstream": {"kind": "tracking", "ahead": 0}, "dirty": []} if branch else {"kind": "not a checkout"},
-            "run_dirs": [], "codex_servers": [], "timers": [], "kind": "unit",
-            "host": {"kind": "unit", "unit": unit,
-                     "session_name": host_session, "session_host": "herdr",
-                     "plan": {"kind": "plan", "path": str(plan)} if plan is not None else {"kind": "no run record"}},
-        },
-        "workers": [], "timers": [], "settle_message": {"kind": "not sent"}, "where": {"kind": "not said"},
-        "progress": {"kind": "stopped", "at": "2026-10-09T21:50:00+00:00"},
-        "stop_issues": [], "trail": [], "codex_seats": [],
-    }
-    if progress == "waiting":
-        saved["progress"] = {"kind": "waiting"}
-    elif progress == "ready":
-        saved["progress"] = {"kind": "ready", "at": "2026-10-09T21:50:00+00:00"}
-    return saved
-
-
-def assert_shared_stop_record(case: unittest.TestCase, seed: Callable[[], Path], path: Path) -> None:
-    """Required/default record fields come from one builder in every lifecycle fixture."""
-    def with_new_default[**P](build: Callable[P, shutdown_record.SessionShutdown]) -> Callable[P, shutdown_record.SessionShutdown]:
-        def changed(*args: P.args, **kwargs: P.kwargs) -> shutdown_record.SessionShutdown:
-            saved = build(*args, **kwargs)
-            saved["request_id"] = "shared-default-request"
-            return saved
-        return changed
-
-    with mock.patch(__name__ + ".stopped_record", side_effect=with_new_default(stopped_record)) as builder:
-        _ = seed()
-    builder.assert_called_once()
-    case.assertEqual(json.loads(path.read_text())["request_id"], "shared-default-request")
-
-
 def record_shutdown(case: unittest.TestCase, pane: PaneShellFixture, path: Path, *,
                     destination: tuple[str, str, str]) -> None:
     """A shutdown boundary that records a clean stop and one marked relaunch."""
     import rename_unit
-    import shutdown_record
     import unit_lookup
     import herdr
     stopped_event = threading.Event()
-    initial = cast(dict[str, object], json.loads(path.read_text()))
-    if cast(dict[str, object], initial['progress']).get('kind') == 'stopped':
-        stopped_event.set()
+    del path
     pane.environment['RENAME_UNIT_STOP_WAIT'] = str(TEST_HANG_GUARD_SECS)
 
     def shutdown(*arguments: str) -> None:
         pane.stop_calls.append(' '.join(arguments))
         if arguments[0] == 'stop':
             pane.stopped()
-            fields = cast(dict[str, str], json.loads(path.read_text()))
-            def stopped(saved: shutdown_record.SessionShutdown) -> None:
-                saved['progress'] = {'kind':'stopped','at':'2026-10-09T21:50:00+00:00'}
-                saved['stop_issues'] = []
-            _ = shutdown_record.update_session(fields['login'], pane.native_id, stopped)
             stopped_event.set()
         elif arguments[0] == 'restart':
             pane.slug, pane.unit, name = destination

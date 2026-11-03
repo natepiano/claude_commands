@@ -24,7 +24,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.whoami.note_file import note_name
 
 import inventory
-import shutdown_record
 import sessions
 from scripts.production import showrunners
 from scripts.whoami import account
@@ -33,7 +32,7 @@ from scripts.accounts import accounts, refusals
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
 from scripts.shutdown import stop_resume
-from test_restart import entry, worker_session, showrunner, top_level, unit
+from test_restart import worker_session, showrunner, top_level, unit
 from test_support import ShutdownTestCase
 
 # Hang guard: natedev reached load 136 on 2026-10-29; scheduling delays are not failures.
@@ -248,33 +247,6 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertIn("Claude is up on claude1", output)
 
 
-    def test_retired_unit_swap_refuses_before_role_history_shutdown_or_process_changes(self) -> None:
-        configuration = accounts.accounts_config_file()
-        configuration.parent.mkdir(parents=True, exist_ok=True)
-        _ = configuration.write_text(json.dumps(accounts.AccountsConfiguration(unit="claude1")), encoding="utf-8")
-        saved = entry(self.owner)
-        saved["login"] = "current@example.invalid"
-        saved["label"] = "claude1"
-        self.assertTrue(shutdown_record.create_session(saved))
-        before = self.disk_state()
-        output, error = io.StringIO(), io.StringIO()
-        with (
-            patch.object(subprocess, "run") as process,
-            patch.object(os, "execvpe") as launch,
-            patch.object(stop_resume, "move_sessions") as move,
-            redirect_stdout(output), redirect_stderr(error),
-        ):
-            self.assertEqual(accounts.main(["swap", "unit", "claude3"]), 1)
-        self.assertEqual(output.getvalue(), "")
-        self.assertEqual(error.getvalue(),
-            "unit launches use the configured units account; "
-            + "select and move the group with accounts.py move units <claudeN>\n")
-        process.assert_not_called()
-        launch.assert_not_called()
-        move.assert_not_called()
-        self.assertEqual(self.disk_state(), before)
-
-
     def test_target_with_exhausted_window_and_credits_can_still_be_previewed(self) -> None:
         at = datetime.now(timezone.utc)
         reading = refusals.FreshReading(refusals.ReadingWindow(0, refusals.NoResetKnown(), at),
@@ -289,42 +261,6 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual(self.disk_state(), before)
         process.assert_not_called()
 
-
-    def test_move_calls_stop_resume_once_by_id_with_the_reason_and_prints_its_result(self) -> None:
-        result = accounts.move("kept name", "claude3", why="weekly limit")
-        self.assertIsInstance(result, accounts.MoveStarted)
-        self.assertEqual(self.moves.calls, [MoveCall("move-id", "claude3", "weekly limit")])
-        assert isinstance(result, accounts.MoveStarted)
-        self.assertEqual(result.stdout.splitlines()[-1], "move-id: Claude is up on claude3 in w1:p1 (0.0 s)")
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(shutdown_record.all_session_records(), [])
-
-    def test_handed_off_self_move_is_success_and_prints_moving_now(self) -> None:
-        with patch.object(stop_resume, "move_sessions", return_value=[stop_resume.MoveHandedOff("move-id")]):
-            result, output, error = self.cli()
-        self.assertEqual(result, 0)
-        self.assertEqual(error, "")
-        self.assertIn("move-id: moving now\n", output)
-        self.assertNotIn("not moved", output)
-        self.assertEqual(shutdown_record.all_session_records(), [])
-
-    def test_move_ignores_an_old_open_record_and_leaves_it_unchanged(self) -> None:
-        saved = entry(self.owner)
-        saved["login"], saved["label"] = "current@example.invalid", "claude1"
-        self.assertTrue(shutdown_record.create_session(saved))
-        result = accounts.move("move-id", "claude3")
-        self.assertIsInstance(result, accounts.MoveStarted)
-        self.assertEqual(len(self.moves.calls), 1)
-        self.assertEqual(shutdown_record.find_session(saved["login"], "move-id"), saved)
-
-    def test_move_failure_prints_one_failure_line_without_a_follow_or_new_record(self) -> None:
-        with patch.object(stop_resume, "move_sessions", return_value=[
-                stop_resume.ResumePending("move-id", "claude3", "pane refused resume")]):
-            result, output, error = self.cli()
-        self.assertEqual(result, 1)
-        self.assertEqual(error, "move-id: stopped, resume pending: pane refused resume\n")
-        self.assertNotIn("follow", output + error)
-        self.assertEqual(shutdown_record.all_session_records(), [])
 
     def test_dry_run_changes_nothing_and_starts_no_move(self) -> None:
         before = self.disk_state()

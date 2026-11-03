@@ -68,6 +68,24 @@ def concurrent_ensure(
 
 
 class NativeRuntimeIdentityTests(StaffTestCase):
+    def test_guarded_cli_adds_an_agent_without_a_parent_and_reads_its_locations(self) -> None:
+        identity = fixture_runtime_id("morty-agent")
+        for field, state in (("worktree", "present"), ("doc", "live")):
+            with self.subTest(field=field):
+                self.staff_file.unlink(missing_ok=True)
+                result = self.cli("ensure", "agent", "--name", "morty", "--runtime-id", identity,
+                                  "--" + field, "natedev", str(self.root / "morty"), state, "--json")
+                payload = cast(object, json.loads(result.stdout))
+                row = staff.StaffRow.from_json(payload)
+                self.assertEqual((row.id, row.current_session, row.kind, row.name, row.parent),
+                                 (identity, identity, "agent", "morty", None))
+                self.assertEqual(staff.snapshot().rows, (row,))
+                self.assertEqual(staff.by_path("morty"), row)
+                shown = self.cli("show", "--kind", "agent")
+                self.assertIn("morty", shown.stdout)
+                self.assertIn("agent", shown.stdout)
+                self.assertEqual(staff.StaffRow.from_json(row.to_json()), row)
+
     def test_repeated_id_lookups_scan_the_staff_rows_at_most_once(self) -> None:
         _, unit, _ = self.tree()
         expected = tuple(replace(unit, id=staff.StaffId(fixture_runtime_id(f"indexed-{number}")))

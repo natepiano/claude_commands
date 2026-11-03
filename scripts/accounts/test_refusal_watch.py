@@ -106,6 +106,8 @@ class RefusalWatchTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(redirect_stdout(io.StringIO()))
+        _ = self.enterContext(redirect_stderr(io.StringIO()))
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         _ = self.enterContext(patch.object(pane_record, "RECORD_DIR", self.home / "herdr-panes"))
         _ = cast(object, self.enterContext(scratch_account_home(self.home, {
@@ -2223,7 +2225,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual({command.target for command in self.moves.calls}, {"claude2"})
         self.assertEqual({identity for command in self.moves.calls for identity in command.session_id.split(",")},
                          {"probe-one", "probe-two"})
-        self.assertEqual(shutdown_record.all_session_records(), [])
+        self.assertEqual(shutdown_record.read(), [])
         self.assertEqual(groups.read_bytes(), before)
         self.assertFalse(accounts.roles_history_file().exists())
         self.assertEqual(len(self.moves.calls), 2)
@@ -2259,7 +2261,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertFalse(accounts.groups_file().exists())
         self.assertFalse(accounts.roles_history_file().exists())
         self.assertEqual(moves.read_moves(), [])
-        self.assertEqual(shutdown_record.all_session_records(), [])
+        self.assertEqual(shutdown_record.read(), [])
         self.assertEqual(self.moves.calls, [])
 
     def test_units_group_preview_on_current_account_prints_no_live_session_moves(self) -> None:
@@ -2458,7 +2460,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(error, "")
         self.assertIn("no claude account has room", output)
         self.assertEqual(self.moves.calls, [])
-        self.assertEqual(shutdown_record.all_session_records(), [])
+        self.assertEqual(shutdown_record.read(), [])
         self.assertEqual(path.read_bytes(), before)
 
     def test_partial_group_reconciliation_skips_unresolved_target_refusal_without_new_transcript(self) -> None:
@@ -2470,7 +2472,7 @@ class RefusalWatchTests(unittest.TestCase):
         before = path.read_bytes()
         _ = self.cli()
         self.assertEqual(self.moves.calls, [])
-        self.assertEqual(shutdown_record.all_session_records(), [])
+        self.assertEqual(shutdown_record.read(), [])
         self.assertEqual(path.read_bytes(), before)
 
     def test_unconfigured_group_does_not_adopt_live_default_login_aliases(self) -> None:
@@ -2529,7 +2531,7 @@ class RefusalWatchTests(unittest.TestCase):
                     self.assertIn(f"accounts.py move {group} <claudeN>", output)
                 self.assertFalse(accounts.groups_file().exists())
                 self.assertEqual(self.moves.calls, [])
-                self.assertEqual(shutdown_record.all_session_records(), [])
+                self.assertEqual(shutdown_record.read(), [])
 
     def test_refusal_dry_run_keeps_missing_group_file_absent(self) -> None:
         _ = self.owner("refused", host="unit")
@@ -2753,7 +2755,7 @@ class RefusalWatchTests(unittest.TestCase):
         command = self.moves.calls[0]
         self.assertEqual(command.target, "claude3")
         self.assertIn("weekly limit until", command.why)
-        self.assertEqual(shutdown_record.all_session_records(), [])
+        self.assertEqual(shutdown_record.read(), [])
         self.assertEqual(refusals.load()[refusals.key("claude", SOURCE_LOGIN)].at, NOW - timedelta(seconds=1))
 
     def test_unchanged_transcript_rescan_keeps_refusal_time_and_never_repeats_move(self) -> None:
@@ -3311,7 +3313,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual((code, error), (0, ""))
         self.assertIn("owner refused: refused; move", output)
         self.assertEqual(len(self.moves.calls), 1)
-        self.assertEqual(shutdown_record.all_session_records(), [])
+        self.assertEqual(shutdown_record.read(), [])
 
     def assert_five_hour_moves(self, reset: datetime) -> None:
         _ = self.owner("refused")
@@ -3319,7 +3321,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.reading(SOURCE_LOGIN, 80, five=0, five_reset=reset)
         _ = self.cli()
         self.assertEqual(len(self.moves.calls), 1)
-        self.assertEqual(shutdown_record.all_session_records(), [])
+        self.assertEqual(shutdown_record.read(), [])
 
     def test_exactly_twenty_minutes_remaining_moves_instead_of_waiting(self) -> None:
         self.assert_five_hour_moves(NOW + timedelta(minutes=20))

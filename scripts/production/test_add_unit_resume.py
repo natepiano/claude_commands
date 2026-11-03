@@ -290,13 +290,6 @@ class AddUnitResumeTests(AddUnitTestCase):
                 shutdown.assert_not_called()
                 self.assert_no_launch_change(document, head)
 
-    def test_attach_uses_live_source_without_consulting_stale_holds(self) -> None:
-        prior, trace = self.prepare_attach()
-        self.write_shutdown_record(self.shutdown_record("down"))
-        result = self.cli("alpha", "--permanent", "--attach", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
-        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
-        self.assertEqual(trace, ["stop", "launch"])
-        self.assertIn("--resume 62ccbd64-f22e-5647-b20e-7899aa39d766", self.launch_command())
 
     def test_attach_refuses_process_still_registered_after_stop(self) -> None:
         prior, trace = self.prepare_attach(after_stop=(303,))

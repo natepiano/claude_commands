@@ -368,4 +368,4 @@ Run these suites on the Mac with a scratch home. Run the command from the root o
 - **Server environment check.** Panes inherit the server's environment. An adopted server started from a shell with another account's variables would launch Claude on the wrong account.
 - **No client window from Linux launchers.** Launchers start only the server, as a systemd user unit, and print the attach command. Restart opens a window only for a session that had one and has no client now.
 - **The Mac starts servers from the desktop.** The keychain is only readable in the Aqua session. Outside it, the Ghostty window starts the server, or the restart refuses with an instruction rather than bringing Claude back signed out.
-- **Legacy records stay parseable.** A crash or an old shutdown record can still name a tmux host. Turning it into a manual command keeps the conversation recoverable without bringing tmux back as a host.
+- Shutdown restart reads staff row IDs. It does not read old host records.
