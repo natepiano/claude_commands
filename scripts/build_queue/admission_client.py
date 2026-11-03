@@ -31,7 +31,6 @@ if TYPE_CHECKING:
 else:
     import conf
 
-QUERY_TIMEOUT_SECONDS = 0.5
 LAUNCH_WAIT_LIMIT_REASON = "launch wait limit reached without admission"
 LOADED_ADMISSION_CODE_VERSION = os.environ.get("BUILDLOG_ADMISSION_CODE_VERSION") or admission_code.admission_code_version()
 
@@ -69,12 +68,16 @@ def _connect(timeout: float) -> socket.socket:
     return connection
 
 
+def _remaining_seconds(deadline: float) -> float:
+    left = deadline - CLOCK.monotonic()
+    if left <= 0:
+        raise TimeoutError("no answer")
+    return left
+
+
 def _line(connection: socket.socket, pending: bytearray, deadline: float) -> bytes:
     while b"\n" not in pending:
-        left = deadline - CLOCK.monotonic()
-        if left <= 0:
-            raise TimeoutError("no answer")
-        connection.settimeout(left)
+        connection.settimeout(_remaining_seconds(deadline))
         chunk = connection.recv(65536)
         if not chunk:
             raise TransportUnavailable("closed connection")
@@ -87,10 +90,12 @@ def _line(connection: socket.socket, pending: bytearray, deadline: float) -> byt
 
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest) -> wire.Reply:
     request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
-    deadline = CLOCK.monotonic() + QUERY_TIMEOUT_SECONDS
+    timeout = gate.read_memory_config().query_timeout_seconds
+    deadline = CLOCK.monotonic() + timeout
     try:
         for main_service in (False, True):
-            with _connect(QUERY_TIMEOUT_SECONDS) as connection:
+            with _connect(_remaining_seconds(deadline)) as connection:
+                connection.settimeout(_remaining_seconds(deadline))
                 connection.sendall(wire.encode_request(request, main_service=main_service).encode())
                 line = _line(connection, bytearray(), deadline)
                 reply = wire.parse_reply(line, request)
@@ -104,7 +109,7 @@ def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest) -
     except ConnectionRefusedError as error:
         raise wire.AdmissionUnavailable("connect refused") from error
     except TimeoutError as error:
-        raise wire.AdmissionUnavailable("no answer in 0.5 s") from error
+        raise wire.AdmissionUnavailable(f"no answer in {timeout:g} s") from error
     except (OSError, ValueError) as error:
         raise wire.AdmissionUnavailable(str(error) or "invalid answer") from error
 
@@ -291,7 +296,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
         try:
             timeout = configuration.silence_seconds
             if generation_query:
-                timeout = min(timeout, QUERY_TIMEOUT_SECONDS)
+                timeout = min(timeout, configuration.reconnect_seconds)
             timeout = retry.bound(timeout)
             active_channel, channel = channel, None
             with nullcontext(active_channel.connection) if active_channel is not None else _connect(timeout) as connection:
@@ -303,7 +308,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                 while True:
                     deadline = max(last_valid, last_silence_notice) + configuration.silence_seconds
                     if generation_query:
-                        deadline = min(deadline, CLOCK.monotonic() + QUERY_TIMEOUT_SECONDS)
+                        deadline = min(deadline, CLOCK.monotonic() + configuration.reconnect_seconds)
                     try:
                         line = _line(connection, pending, min(deadline, retry.deadline, retry.next_leave))
                     except TimeoutError:

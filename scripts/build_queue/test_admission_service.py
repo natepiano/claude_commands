@@ -874,6 +874,46 @@ class ServiceTests(unittest.TestCase):
                 self.assertFalse(Path(granted.max_path).exists())
                 self.assertFalse(fixture.server.reservations)
 
+    def test_normal_release_appends_without_reading_history_rows(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            request = replace(request, sidecar=str(fixture.scope(request.owner)))
+            grant = only_admitted(fixture.server.handle_request(request))
+            fixture.scoped_peak(grant, 9 * GIB)
+            history = fixture.state_dir / "anon_peaks.jsonl"
+            gate.store.append_line(history, {"reservation_id": "earlier"})
+            with mock.patch.object(gate.store, "whole_rows", side_effect=AssertionError("normal release scanned history")):
+                self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest("end", grant.reservation, 0)), [wire.Ok()])
+            rows = fixture.history()
+            self.assertEqual([row["reservation_id"] for row in rows], ["earlier", grant.reservation])
+            self.assertEqual(rows[1]["anon_peak_bytes"], 9 * GIB)
+            self.assertFalse(fixture.server.reservations)
+
+    def test_crash_recovery_finds_the_existing_record_after_the_saved_history_offset(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            request = replace(request, sidecar=str(fixture.scope(request.owner)))
+            grant = only_admitted(fixture.server.handle_request(request))
+            fixture.scoped_peak(grant, 9 * GIB)
+            history = fixture.state_dir / "anon_peaks.jsonl"
+            gate.store.append_line(history, {"reservation_id": "earlier"})
+            offset = history.stat().st_size
+            fixture.fault.stage = "after_history_append"
+            release = wire.ReleaseRequest("end", grant.reservation, 137)
+            with self.assertRaises(InjectedCrash):
+                _ = fixture.server.handle_request(release)
+            saved = service.read_state(fixture.state_dir).reservations[request.episode].finalization
+            assert isinstance(saved, dict)
+            self.assertEqual(saved.get("history_start"), offset)
+            with mock.patch.object(gate.store, "whole_rows", wraps=gate.store.whole_rows) as scan:
+                fixture.restart()
+                scan.assert_any_call(mock.ANY, offset)
+            self.assertEqual(fixture.server.handle_request(release), [wire.Ok()])
+            rows = fixture.history()
+            self.assertEqual([row["reservation_id"] for row in rows], ["earlier", grant.reservation])
+            self.assertEqual((rows[1]["outcome"], rows[1]["status"]), ("killed", 137))
+            self.assertFalse(fixture.server.reservations)
+
     def test_mutation_request_ids_replay_without_repeating_changes(self) -> None:
         with AdmissionFixture() as fixture:
             granted = only_admitted(fixture.server.handle_request(fixture.request()))

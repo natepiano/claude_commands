@@ -83,6 +83,7 @@ class BuildLogStore(Protocol):
     def locked_append(self, path: Path) -> AbstractContextManager[BinaryIO]: ...
     def append_locked(self, handle: BinaryIO, record: object) -> None: ...
     def whole_rows(self, handle: BinaryIO, start: int) -> Iterator[dict[str, object]]: ...
+    def read_last_whole_row_end(self, path: Path) -> int: ...
     def host_file(self, host: str, epoch: float) -> Path: ...
 
 
@@ -332,6 +333,7 @@ class FinalizationIntent(TypedDict):
     scoped: bool
     outcome: Literal["completed", "failed", "killed", "owner_gone"]
     ended_at: str
+    history_start: NotRequired[int]
     status: NotRequired[int]
     test_phase_peak_bytes: NotRequired[int]
     test_phase_started_at: NotRequired[float]
@@ -1466,6 +1468,7 @@ class MemoryConfig:
     running_pass_seconds: float
     waiting_pass_seconds: float
     wait_reply_seconds: float
+    query_timeout_seconds: float
     replay_retention_seconds: float
     reconnect_seconds: float
     silence_seconds: float
@@ -1534,7 +1537,8 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 policy=AdmissionPolicy(timing, pressure, PeakHold(whole("peak_hold_seconds"), kinds)),
                 test_phase_margin=number("test_phase_margin"), build_budget_bytes=gib("build_budget_gib"),
                 running_pass_seconds=running_interval, waiting_pass_seconds=number("waiting_pass_seconds"),
-                wait_reply_seconds=number("wait_reply_seconds"), replay_retention_seconds=number("replay_retention_seconds"),
+                wait_reply_seconds=number("wait_reply_seconds"), query_timeout_seconds=number("query_timeout_seconds"),
+                replay_retention_seconds=number("replay_retention_seconds"),
                 reconnect_seconds=number("reconnect_seconds"), silence_seconds=number("silence_seconds"),
                 outage_notice_seconds=number("outage_notice_seconds"), source_check_seconds=number("source_check_seconds"),
                 source_settle_seconds=number("source_settle_seconds"), override_reconnect_seconds=number("override_reconnect_seconds"),
@@ -3734,7 +3738,9 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
                          intents: FinalizationIntents) -> HistoryRecorded | NoHistoryRecorded:
     """Save the peak before removing evidence; the service owns reservation state."""
     maximum = path.with_suffix(".max")
-    if "finalization" not in row:
+    history_path = path.parent / "anon_peaks.jsonl"
+    recovering = "finalization" in row
+    if not recovering:
         try:
             peak = int(maximum.read_text())
         except (FileNotFoundError, ValueError):
@@ -3758,16 +3764,17 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
         charge_use = row.get("test_phase_charge_use", NoTestPhaseChargeUse())
         if isinstance(charge_use, dict):
             intent["test_phase_charge_use"] = charge_use
+        if peak > 0 and intent["scoped"]:
+            intent["history_start"] = store.read_last_whole_row_end(history_path)
         row["finalization"] = intent
         intents.save(row, intent)
     intent = row["finalization"]
     result: HistoryRecorded | NoHistoryRecorded = NoHistoryRecorded()
-    history_path = path.parent / "anon_peaks.jsonl"
     if intent["peak"] > 0 and intent["scoped"]:
         # The store repairs an unfinished tail before the identity lookup.
         with store.locked_append(history_path) as handle:
-            recorded = any(previous.get("reservation_id") == intent["reservation_id"]
-                           for previous in anonymous_history_rows(handle))
+            recorded = recovering and any(previous.get("reservation_id") == intent["reservation_id"]
+                                          for previous in store.whole_rows(handle, intent.get("history_start", 0)))
             if not recorded:
                 history: dict[str, object] = {
                     "host": store.host_name(), "repo": row["repo"], "step": row["step"],

@@ -22,7 +22,7 @@ from scripts.build_queue import admission_client as client, admission_protocol a
 from scripts.build_queue import queue_evidence
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
 from scripts.build_queue.admission_test_support import (
-    AdmissionFixture, Exchange, GIB, ScriptedTransport, TimedChunk, reply_bytes,
+    AdmissionFixture, Exchange, GIB, ScriptedTransport, ScriptSocket, TimedChunk, reply_bytes,
 )
 from scripts.build_queue.queue_fixture import write_memory_config
 from scripts.lint.memory_test_support import commit_config_fixture
@@ -813,6 +813,43 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(client.main(), 2)
                 self.assertIn("admission service unavailable: no socket", output.getvalue())
                 self.doCleanups()
+
+    def test_query_timeout_uses_configuration_for_the_complete_reply(self) -> None:
+        with AdmissionFixture() as fixture:
+            reply = fixture.server.handle_request(wire.ViewRequest())[0]
+            assert isinstance(reply, wire.ViewReply)
+            encoded = reply_bytes(reply)
+            connect, send = ScriptSocket.connect, ScriptSocket.sendall
+            for timeout in (0.8, 1.4):
+                fixture.configure(query_timeout_seconds=timeout)
+                for succeeds in (True, False):
+                    with self.subTest(timeout=timeout, succeeds=succeeds):
+                        start = fixture.clock.monotonic()
+                        last_chunk = TimedChunk(timeout / 4, encoded[-1:]) if succeeds else TimeoutError()
+                        transport = self.use_transport(fixture, Exchange(
+                            TimedChunk(timeout / 4, encoded[:-1]), last_chunk))
+
+                        def connect_slowly(connection: ScriptSocket, path: str) -> None:
+                            connect(connection, path)
+                            fixture.clock.advance(timeout / 8)
+
+                        def send_slowly(connection: ScriptSocket, data: bytes) -> None:
+                            send(connection, data)
+                            fixture.clock.advance(timeout / 8)
+
+                        with mock.patch.object(ScriptSocket, "connect", connect_slowly), \
+                             mock.patch.object(ScriptSocket, "sendall", send_slowly):
+                            if succeeds:
+                                self.assertEqual(client.view(), reply.reading)
+                            else:
+                                with self.assertRaises(wire.AdmissionUnavailable) as error:
+                                    _ = client.view()
+                                self.assertEqual(error.exception.reason, f"no answer in {timeout:g} s")
+                        self.assertAlmostEqual(fixture.clock.monotonic() - start, timeout * (0.75 if succeeds else 1))
+                        self.assertAlmostEqual(transport.timeouts[1], timeout * 7 / 8)
+                        self.assertEqual(len(transport.attempts), 1)
+                        self.assertFalse(fixture.clock.sleeps)
+                        self.doCleanups()
 
     def test_successful_queries_return_the_domain_record(self) -> None:
         with AdmissionFixture() as fixture:

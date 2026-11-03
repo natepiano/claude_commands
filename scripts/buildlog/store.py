@@ -102,16 +102,16 @@ def whole_rows(handle: BinaryIO, start: int) -> Iterator[dict[str, object]]:
     end = last_whole_row_end(handle)
     if start >= end:
         return
-    if start > 0:
-        _ = handle.seek(start - 1)
-        if handle.read(1) != b"\n":
-            _ = handle.readline(end - start)
-    else:
-        _ = handle.seek(0)
+    _ = handle.seek(max(0, start - 1))
+    contents = bytearray()
     while handle.tell() < end:
-        line = handle.readline(end - handle.tell())
-        if not line:
+        block = handle.read(end - handle.tell())
+        if not block:
             break
+        contents.extend(block)
+    if start > 0:
+        contents = contents.partition(b"\n")[2]
+    for line in contents.split(b"\n")[:-1]:
         try:
             decoded = cast(object, json.loads(line.decode("utf-8")))
         except (UnicodeDecodeError, ValueError):

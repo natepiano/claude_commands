@@ -226,6 +226,7 @@ class BuildBudgetTests(unittest.TestCase):
         readers = (
             ("waiting_pass_seconds", lambda: gate.read_memory_config().waiting_pass_seconds, 1),
             ("wait_reply_seconds", lambda: gate.read_memory_config().wait_reply_seconds, 60),
+            ("query_timeout_seconds", lambda: gate.read_memory_config().query_timeout_seconds, 0.5),
             ("replay_retention_seconds", lambda: gate.read_memory_config().replay_retention_seconds, 86400),
             ("reconnect_seconds", lambda: gate.read_memory_config().reconnect_seconds, 2),
             ("silence_seconds", lambda: gate.read_memory_config().silence_seconds, 120),
