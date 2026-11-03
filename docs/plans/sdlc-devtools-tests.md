@@ -615,30 +615,17 @@ Remaining gaps include shell command positions, executable Python aliases, and s
 
 ### Phase 4p — Every checkout files a question in the showrunner's own folder  · status: done
 
-Source: Phase 4k phase review, 2026-11-02. A follow-up to the 4k fix.
+#### As-built
 
-#### Work Order
+- `question_folder` (`scripts/production/update_registration.py`) resolves the Proposals folder from the owner row's doc (`owner.doc.path`), so a relative Proposals line gives the showrunner's folder from every checkout.
+- `update_registration.main`, `footer_counts.sources` and `tidy_wrapped` catch `StaffRefused`. `ask` and the readers print the refusal (`questions: refused — <reason>`) and exit 2. `tidy` raises `TidyRefused` and changes nothing.
+- `_document_checkout(path) -> CheckoutDocument | OutsideGitCheckout | UnreadableGitCheckout(path, reason)` (`scripts/production/staff.py`). A path with no `.git` is `OutsideGitCheckout` and matches only exactly.
+- `by_doc` matches exactly first. It refuses with `StaffRefused` when the asked document's own checkout is unreadable. It skips a candidate row whose checkout is unreadable. Two rows that match by repository still refuse as ambiguous.
+- Tests: `test_staff.DocumentLookupTests` (unreadable asked checkout refuses, unreadable candidate is skipped), `test_update_registration_questions.py` and `test_tidy_wrapped.py` (refusal and unchanged state per consumer, relative Proposals line from a linked worktree).
 
-**Goal:** a question filed from any checkout of the production doc lands in the folder the showrunner reads, and an ambiguous or unreadable lookup refuses with a message instead of a crash or a silent empty result.
+**Gotchas:** a stale staff row whose `.git` names a missing gitdir is normal; a lookup must skip it, not refuse.
 
-**Spec:**
-1. `question_folder` (`update_registration.py:808`) resolves the Proposals folder from the owner row's doc (`owner.doc.path`), not from the document the caller supplied. A relative Proposals line then gives the same folder from every checkout.
-2. `update_registration.main`, `footer_counts.sources` and `tidy_wrapped` catch `StaffRefused` from `by_doc`. `ask` and the readers print the refusal and exit nonzero. `tidy` changes nothing on a refusal.
-3. `_document_checkout` (`staff.py`) returns a third outcome when `.git` metadata exists but cannot be read. `by_doc` refuses on it after an exact match fails, so a reader never shows an empty queue for an unreadable checkout. A path with no `.git` stays `OutsideGitCheckout` (exact match only).
-
-**Files:**
-- `scripts/production/update_registration.py`, `scripts/production/footer_counts.py`, `scripts/production/tidy_wrapped.py`, `scripts/production/staff.py` — source.
-- `scripts/production/test_update_registration_questions.py`, `scripts/production/test_staff.py`, `scripts/production/test_tidy_wrapped.py` — regressions.
-
-**Workers:** `1 writer + 1 tester`.
-- `impl` — the four source files.
-- `test` — the three test files.
-
-**State:** none; a refusal writes nothing.
-
-**Constraints from prior phases:** Phase 4k: `by_doc` matches exactly first, then by git common directory and repo-relative path, and raises `StaffRefused` when two rows match by repository.
-
-**Acceptance gate:** a test with a relative Proposals line files from a linked worktree and lists the question from the showrunner checkout; a test per consumer shows the ambiguous-lookup refusal and unchanged state; a test with an unreadable `.git` file refuses; `basedpyright` on the changed files footer `0 errors, 0 warnings, 0 notes`; per-file `unittest discover`; full gate.
+**Ruled out:** refusing on any unreadable candidate row — one stale row would block every lookup.
 
 ### Phase 4o — A unit folder moves at an open phase  · status: todo
 
@@ -669,6 +656,8 @@ Source: the user via morty and sdlc, 2026-11-02 18:4x. herdr-unit agreed 18:5x: 
 **Acceptance gate:** one test each: a running unit resumes, a paused unit stays paused, a running worker resumes on its same thread, a paused worker stays paused (herdr-unit 4o Work Order, 2026-11-02); the existing `test_unit_move.py` tests pass; tests also show: a paused unit stays paused; paused workers stay paused; a process that is not the unit's own refuses; a rerun prints `unchanged` and exits 0. basedpyright 0/0/0 on changed files and every caller module; `test_unit_move.py` green in its own `discover` run; full merged-tree gate green.
 
 ### Phase 4q — The folder move uses its owners' readers  · status: todo
+
+**Depends on:** Phase 4o
 
 Source: Phase 4o review (simplify lens), 2026-11-02. Each item removes a copy that Phase 4o added; the owners' modules are outside the 4o file set.
 
