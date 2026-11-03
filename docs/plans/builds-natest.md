@@ -97,7 +97,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Ruled out:** a `Protocol` `isinstance` check on a subtest's `test_case` attribute — `addSubTest` already receives the parent test.
 
-### Phase 2 — The merge gate records every run  · status: todo
+### Phase 2 — The merge gate records every run  · status: done
 **Depends on:** Phase 1
 
 #### Work Order
