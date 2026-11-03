@@ -29,15 +29,15 @@ to config needs no approval and does not use `/tune`.
 
 Example configuration for the `/blender:bake_textures` command. Copy and modify this template to specify blend files, objects, texture maps, and export settings for texture baking.
 
-## agents.conf
+## models.conf
 
 Global agent registry with three layers: `[assignments]` maps each function to
 an agent family; `[<function>.<family>]` maps each subtask to an
 `agent[:effort]` row; and `[<family>.agents]` catalogs each valid agent and its
 allowed efforts. Omit `:effort` to use the agent CLI's default.
 
-`config/agents.conf` is the shared registry on both machines; there is no
-local override file. `/agent` and `/showrunner:effort` edit it atomically,
+`config/models.conf` is the shared registry on both machines; there is no
+local override file. `/default_models` and `/showrunner:effort` edit it atomically,
 then publish a `config(agents): …` commit containing only this path to origin.
 The writer fetches and fast-forwards before editing, and replays all pending
 local row changes on a newer remote tip if a push races another writer (three
@@ -45,13 +45,13 @@ tries). Repeating an interrupted edit finishes its publication, even when the
 requested value is already in the local file. A lost push acknowledgement
 reconciles the accepted commit without creating another one.
 Other staged and unstaged work is preserved. Tests set
-`AGENTS_CONFIG_PUBLISH=0`; temporary registries never publish.
+`MODELS_CONFIG_PUBLISH=0`; temporary registries never publish.
 
 The Codex catalog sync reads `~/.codex/config.toml` and
 `~/.codex/models_cache.json`. It adds models and efforts without removing
 anything another machine knows, and publishes only additions. Retired catalog
 models require an explicit edit to `[codex.agents]` in the shared registry;
-`/agent` does not delete catalog rows. The freshness check runs at login, every
+`/default_models` does not delete catalog rows. The freshness check runs at login, every
 five minutes, and when a source is newer than the last successful sync. The
 Claude catalog is hand-maintained; the sync warns when the Claude CLI
 advertises a model alias that `[claude.agents]` does not yet list.
