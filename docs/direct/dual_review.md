@@ -48,25 +48,26 @@ The Codex lenses use the unit's own read-only reviewer. Dispatch with
 busy. Keep both threads across phases and plans. Writers keep their own roles.
 
 The `simplify` lens uses the fresh reviewer path in `review.sh`, with task `direct.simplify` and no worker address.
-It keeps `Agent` for four agents: reuse, simplification, efficiency, and altitude.
+It keeps `Agent` for the agents in `SIMPLIFY_AGENTS`.
 This lens alone permits Claude subagents.
 `config/agents.conf` selects its model and effort.
 `assign.py` reads `SIMPLIFY_LENS=on|off` from `config/direct.conf` at each launch.
-It reads `config/review/simplify.md` at each new run.
+The review launcher reads `config/review/simplify.md` after it obtains the lock.
 That file defines the report rules and the standing instructions.
-The launcher disables background tasks for `direct.simplify`.
+The report permits a heading or preamble before `Pass` or item 1.
+Every Claude print launch disables background tasks and returns an error for `is_error` or an `errors` array.
 At each launch, the shared account picker selects a Claude account with room.
 The launcher prints its label on stderr and in the review log.
 No available quota, a Claude error, an empty report, or a busy run produces `error`; the phase continues under <DualReview/> step 6.
-`assign.py` replaces itself with `review.sh` after it prepares the prompt and diff digest.
-`review.sh` owns the launch lock, result files, and cache.
-Only `reviewed` results enter the cache; failed reviews run again on the same diff.
-Each failure sends an urgent message to `SIMPLIFY_FAILURE_TARGET` from `config/direct.conf`.
-The message names the unit, phase, and reason.
-`UNIT_REVIEW_PROOF=1` adds `PROOF, no action: ` before the failure message text and summary.
-`send.py` suppresses repeated messages for the same recipient, diff, and reason during `SIMPLIFY_FAILURE_REPEAT_MINUTES`.
-`SIMPLIFY_AGENT_COUNT` sets the required number of completed agents.
-A send failure prints its reason and preserves the review status.
+`assign.py` replaces itself with `review.sh`.
+After it obtains the lock, `review.sh` clears the earlier report and writes the prompt.
+Every simplify launch starts a fresh review, including a retry after failure.
+`SIMPLIFY_AGENTS` supplies the prompt names and the required number of completed agents.
+`review.sh` holds `${PHASE_DIR}/review_launch_simplify.lock` until the review child exits.
+The lock owner alone writes the report, status, and summary.
+The status file contains one atomic status line.
+A rejected launch reports its reason on stderr and changes none of the shared files.
+`simplify_result finish` prints the review failure reason once.
 
 The worker is the address and the lens is the judgment. Pass the lens to
 `assign.sh`; its returned handle names the selected worker and summary. Each

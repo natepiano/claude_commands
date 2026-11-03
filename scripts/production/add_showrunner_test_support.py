@@ -19,6 +19,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production.cli_fixture import invoke_cli
 from scripts.accounts import accounts
+from scripts.whoami.account_test_support import write_claude_account
 from scripts.production import add_showrunner
 from scripts.production import showrunners
 from scripts.herdr import herdr
@@ -188,15 +189,8 @@ class AddShowrunnerFixture(unittest.TestCase):
         notes = home / "notes"
         notes.mkdir()
         self.env["AGENT_NOTES_DIR"] = str(notes)
-        _ = (notes / "claude2.md").write_text("---\nlogin: main@example.invalid\n---\n")
-        now = datetime.now(timezone.utc)
-        file = home / ".local/state/agent-notes/usage.json"
-        file.parent.mkdir(parents=True)
-        _ = file.write_text(json.dumps({"main@example.invalid": {"weekly": {"left": 1,
-            "at": now.isoformat(), "resets": (now + timedelta(days=2)).isoformat()}}}))
         with patch.dict(os.environ, self.env):
-            self.assertEqual(accounts.setup("claude2"), [])
-            _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "main@example.invalid"}}))
+            write_claude_account("claude2", "main@example.invalid", 1, datetime.now(timezone.utc) + timedelta(days=2))
         _ = self.configure_groups()
         self.timer("top", PARENT_SESSION)
 
