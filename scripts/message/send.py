@@ -273,6 +273,25 @@ def parse_outcome(stdout: str) -> OutcomeHeader | NoOutcomeHeader:
     return NoOutcomeHeader()
 
 
+@dataclass(frozen=True)
+class ConfirmedSendOutcome:
+    """The first result header agrees with the command's exit code."""
+    header: OutcomeHeader
+
+
+@dataclass(frozen=True)
+class UnconfirmedSendOutcome:
+    """The command did not confirm a consistent send result."""
+
+
+def send_outcome(returncode: int | None, stdout: str) -> ConfirmedSendOutcome | UnconfirmedSendOutcome:
+    """Check the first result header against the command's exit code."""
+    header = parse_outcome(stdout)
+    if isinstance(header, OutcomeHeader) and returncode == EXIT[header.outcome]:
+        return ConfirmedSendOutcome(header)
+    return UnconfirmedSendOutcome()
+
+
 def acknowledged_skip_reason(key: str, at: str) -> str:
     """Name the acknowledgement that prevents a keyed send."""
     return f"key {key!r}{_ACKNOWLEDGED_AT}{at}; `send.py reopen` to resume"
@@ -2657,13 +2676,17 @@ def deliver_repeat_notice(state: repeat_guard.SenderState, notice: repeat_guard.
                  "--text", text]
     arguments += ["--key", "repeat:" + notice.id + ":" + notice.kind, "--repeat-minutes", "0"]
     code, out, err = run(arguments, "", limits.notice_timeout_seconds)
-    if code == 0 and out.startswith("SENT:"):
-        return "delivered"
-    if (code == 1 and out.startswith("QUEUED:")) or (code == 0 and out.startswith("KEPT:")):
-        return "queued"
+    result = send_outcome(code, out)
+    if isinstance(result, ConfirmedSendOutcome):
+        if result.header.outcome == "sent":
+            return "delivered"
+        if result.header.outcome in {"queued", "kept"}:
+            return "queued"
     print(f"repeat notice {notice.kind}: {one_line(err or out)}", file=sys.stderr)
-    # At-least-once: abnormal termination and SKIPPED never prove acceptance.
-    return "unknown" if code is None or code < 0 or out.startswith("SKIPPED:") or code == 0 else "failed"
+    # A skipped or replaced notice does not prove delivery of this notice.
+    if isinstance(result, ConfirmedSendOutcome):
+        return "unknown" if result.header.outcome in {"skipped", "replaced"} else "failed"
+    return "unknown" if code is None or code <= 0 else "failed"
 
 
 def attempt_repeat_notice(state: repeat_guard.SenderState, notice: repeat_guard.Notice,

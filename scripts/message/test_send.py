@@ -297,6 +297,44 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             with self.subTest(output=output):
                 self.assertIsInstance(send.parse_outcome(output), send.NoOutcomeHeader)
 
+    def test_send_outcome_confirms_each_header_with_its_documented_exit(self) -> None:
+        for header, code, outcome in (("SENT", 0, "sent"), ("SKIPPED", 0, "skipped"),
+                                      ("QUEUED", 1, "queued"), ("FAILED", 3, "failed"),
+                                      ("REFUSED", 2, "refused"), ("HELD", 4, "held"),
+                                      ("REPLACED", 0, "replaced"), ("KEPT", 0, "kept")):
+            with self.subTest(header=header):
+                result = send.send_outcome(code, header + ": fixture\nbody\n")
+                self.assertIsInstance(result, send.ConfirmedSendOutcome)
+                assert isinstance(result, send.ConfirmedSendOutcome)
+                self.assertEqual((result.header.outcome, result.header.detail, result.header.payload), (outcome, "fixture", "body"))
+
+    def test_send_outcome_uses_the_first_header_after_diagnostics(self) -> None:
+        result = send.send_outcome(1, "checking recipient\nQUEUED: offline\nsaved body\n")
+        self.assertIsInstance(result, send.ConfirmedSendOutcome)
+        assert isinstance(result, send.ConfirmedSendOutcome)
+        self.assertEqual((result.header.outcome, result.header.detail, result.header.payload), ("queued", "offline", "saved body"))
+
+    def test_send_outcome_does_not_replace_the_first_result_with_payload_text(self) -> None:
+        output = "FAILED: transport failed\nQUEUED: quoted earlier result\n"
+        result = send.send_outcome(3, output)
+        self.assertIsInstance(result, send.ConfirmedSendOutcome)
+        assert isinstance(result, send.ConfirmedSendOutcome)
+        self.assertEqual(result.header.outcome, "failed")
+        self.assertEqual(result.header.payload, "QUEUED: quoted earlier result")
+        self.assertIsInstance(send.send_outcome(1, output), send.UnconfirmedSendOutcome)
+
+    def test_send_outcome_requires_a_header_and_matching_exit(self) -> None:
+        for code, output in ((0, ""), (1, ""), (0, "sent: lowercase"), (0, "finished"),
+                             (0, "QUEUED: offline"), (1, "SENT: delivered"), (3, "SKIPPED: duplicate"),
+                             (0, "FAILED: unavailable"), (2, "HELD: review")):
+            with self.subTest(code=code, output=output):
+                self.assertIsInstance(send.send_outcome(code, output), send.UnconfirmedSendOutcome)
+
+    def test_send_outcome_does_not_confirm_an_interrupted_process(self) -> None:
+        for code in (None, -9, -15):
+            with self.subTest(code=code):
+                self.assertIsInstance(send.send_outcome(code, "SENT: apparent delivery"), send.UnconfirmedSendOutcome)
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()

@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Literal, TypedDict, cast
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS.parent))
 from scripts.lib import nix_env
-from scripts.message import sessions
+from scripts.message import send, sessions
 sys.path.insert(0, str(SCRIPTS / "notify"))
 if TYPE_CHECKING:
     from scripts.notify import push_texts
@@ -307,7 +307,8 @@ def alert(session: HealSession, history: HealHistory, reason: str) -> None:
     command = push_texts.user_send_argv(push, key=f"nix-heal-{session.session_id}")
     command.extend(["--clears-when", check])
     result = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
-    if result.returncode == 0 or (result.returncode == 1 and "QUEUED:" in result.stdout + result.stderr):
+    outcome = send.send_outcome(result.returncode, result.stdout)
+    if isinstance(outcome, send.ConfirmedSendOutcome) and outcome.header.outcome in {"sent", "skipped", "replaced", "queued", "kept"}:
         history["notified"] = True
     else:
         log(session, history, "push_failed", (result.stderr or result.stdout).strip() or f"exit {result.returncode}")

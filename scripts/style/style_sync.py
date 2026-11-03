@@ -29,6 +29,7 @@ import process_group
 
 from add_style import NoStyleProduction, standing_style_production
 from production_units import Refusal
+from scripts.message import send
 from scripts.production import showrunners
 import style_ledger
 from process_failure import failure_detail
@@ -409,11 +410,13 @@ def handoff_notice(slug: str, parent: str, checkpoint: str) -> HandoffDelivery:
         "--text", f"From the showrunner of {slug}: hand-off {checkpoint}",
         "--timeout", str(SEND_SECONDS),
     ], capture_output=True, text=True, check=False, timeout=SEND_RUN_SECONDS)
-    if result.returncode == 1 and result.stdout.startswith("QUEUED:"):
-        return "queued"
-    if result.returncode:
-        raise Refusal(f"send.py: {failure_detail(result)}")
-    return "sent"
+    outcome = send.send_outcome(result.returncode, result.stdout)
+    if isinstance(outcome, send.ConfirmedSendOutcome):
+        if outcome.header.outcome in {"queued", "kept"}:
+            return "queued"
+        if outcome.header.outcome in {"sent", "skipped", "replaced"}:
+            return "sent"
+    raise Refusal(f"send.py: {failure_detail(result)}")
 
 
 @dataclass(frozen=True)
