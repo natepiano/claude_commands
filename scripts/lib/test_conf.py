@@ -330,11 +330,29 @@ class ConfTests(unittest.TestCase):
 
     def test_inclusive_and_open_ended_ranges_accept_their_boundaries(self) -> None:
         for limits, value in (("1..4", "1"), ("1..4", "4"), ("..-2", "-2"),
-                              ("2..", "2"), ("1.5..2.5", "2.5"), ("..", "-100")):
+                              ("2..", "2"), ("1.5..2.5", "2.5"), ("..", "-100"),
+                              ("1..4", "1.0000000000000000"), ("1..4", "4.0000000000000000")):
             with self.subTest(limits=limits, value=value):
                 self.write(f"# range: {limits}\namount={value}\n")
                 self.assertEqual(conf.read("example").number("amount"), float(value))
+                self.assertEqual((conf.read("example").origin("amount", Decimal),
+                                  type(conf.read("example").number("amount"))),
+                                 (conf.UsableLiveValue(Decimal(value)), float))
                 conf.check("example", "amount", value)
+
+    def test_configuration_import_does_not_load_decimal(self) -> None:
+        result = subprocess.run(
+            [sys.executable, '-S', '-c',
+             "import sys; from scripts.lib import conf; print('decimal' in sys.modules)"],
+            cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'False')
+
+    def test_check_refuses_values_that_overflow_the_numeric_reader(self) -> None:
+        self.write("# range: 0.001..\namount=1\n")
+        with self.assertRaises(conf.Unusable):
+            conf.check("example", "amount", "1e400")
+        self.assertEqual(conf.read("example").number("amount"), 1.0)
 
     def test_one_of_limits_accept_members_and_reject_other_values(self) -> None:
         self.write("# one of: small, medium, large\nsize=medium\n")
@@ -350,6 +368,8 @@ class ConfTests(unittest.TestCase):
             (conf.ConfigRead.number, "bad"), (conf.ConfigRead.number, "nan"), (conf.ConfigRead.number, "inf"),
             (conf.ConfigRead.number, ""), (conf.ConfigRead.whole, "1.5"), (conf.ConfigRead.whole, "true"),
             (conf.ConfigRead.number, "0"), (conf.ConfigRead.number, "5"),
+            (conf.ConfigRead.number, "4.0000000000000001"),
+            (conf.ConfigRead.number, "0.99999999999999999"),
         )
         for reader, value in readers:
             with self.subTest(reader=reader.__name__, value=value):

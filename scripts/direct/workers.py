@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from scripts.lib.names import JobKey
 
 from scripts.agents import worker_lifecycle
-from scripts.production import worker_admission
+from scripts.production import unit_names, worker_admission
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 
 ROSTER = "mesh_roster.json"
@@ -1758,17 +1758,10 @@ def _former_worktrees(current: UnitWorktree, former: tuple[str, ...]) -> tuple[P
         f"-{current.production}-", f"-{name}-", 1)) for name in former if name != current.production)
 
 
-def _plan_unit(state: dict[str, object], old: Path, current: UnitWorktree) -> tuple[str, str]:
-    plan = _text(state.get("project_plan_doc")) or _text(state.get("plan_doc"))
-    if not plan:
-        return "", ""
-    path = Path(plan).expanduser()
-    if path.is_absolute():
-        path = Path(_moved_path(str(path), old, current.path))
-    else:
-        path = current.path / path
+def _run_unit(state: dict[str, object]) -> tuple[str, str]:
     from scripts.direct.progress_history import ProductionUnitIdentity, resolve_production_unit
-    identity = resolve_production_unit({"plan_doc": str(path), "working_dir": str(current.path)})
+    # A candidate folder is not evidence of the run's ownership.
+    identity = resolve_production_unit(state)
     return (identity.production, identity.unit) if isinstance(identity, ProductionUnitIdentity) else ("", "")
 
 
@@ -1801,9 +1794,13 @@ def find_moved_unit_runs(units: tuple[UnitWorktree, ...], former: tuple[str, ...
                 if production == "adhoc":
                     production, unit = "", ""
                 if not production or not unit:
-                    production, unit = _plan_unit(state, old, current)
+                    production, unit = _run_unit(state)
                 if production and unit:
-                    accepted = unit == current.unit and production in (*former, current.production)
+                    try:
+                        accepted = (unit_names.name(unit) == unit_names.name(current.unit)
+                                    and production in (*former, current.production))
+                    except unit_names.BadName:
+                        accepted = False
                 else:
                     accepted = old in known_old
                 if accepted:

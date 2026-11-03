@@ -13,7 +13,11 @@ import re
 import socket
 import subprocess
 import sys
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
+
+
+if TYPE_CHECKING:
+    from decimal import Decimal
 
 
 _warning_sink: ContextVar[Callable[[str], None] | None] = ContextVar("configuration_warning_sink", default=None)
@@ -249,18 +253,27 @@ def _limits(setting: Setting) -> None:
         bounds = limit.removeprefix(form).strip().split("..")
         if len(bounds) != 2:
             raise ValueError(f"invalid limit {limit}")
-        convert = _whole if form == "# whole:" else _number
+        convert = _whole if form == "# whole:" else decimal
         value = convert(setting.value)
         low, high = (bound.strip() for bound in bounds)
         if (low and value < convert(low)) or (high and value > convert(high)):
             raise ValueError(f"outside range {low}..{high}")
 
 
-def _number(value: str) -> float:
-    result = float(value)
-    if not math.isfinite(result):
+def decimal(value: str) -> Decimal:
+    from decimal import Decimal, InvalidOperation
+
+    try:
+        result = Decimal(value)
+    except InvalidOperation as error:
+        raise ValueError("expected a finite number") from error
+    if not result.is_finite() or not math.isfinite(float(result)):
         raise ValueError("expected a finite number")
     return result
+
+
+def _number(value: str) -> float:
+    return float(decimal(value))
 
 
 def _whole(value: str) -> int:

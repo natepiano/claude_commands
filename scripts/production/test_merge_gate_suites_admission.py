@@ -61,7 +61,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             checked.assert_not_called()
         self.assertIn(str(config), str(refused.exception))
         self.assertIn("build_budget_gib", str(refused.exception))
-        self.assertIn("could not convert string to float", str(refused.exception))
+        self.assertIn("build_budget_gib='invalid': expected a finite number", str(refused.exception))
         self.assertIn("no usable committed value", str(refused.exception))
         self.assertIn("warning:", diagnostics.getvalue())
         self.assert_gate_released()
