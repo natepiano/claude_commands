@@ -1607,7 +1607,7 @@ class CutoverServiceTests(unittest.TestCase):
             self.assertEqual(len(fixture.history()), 1)
 
     def test_fixed_cap_stays_charged_after_peak_decay_and_restart(self) -> None:
-        from scripts.build_queue import build_why
+        from scripts.build_queue import queue_evidence
         from scripts.lib.user_zone import user_zone
         from scripts.build_queue.queue_fixture import write_memory_config
         with AdmissionFixture() as fixture:
@@ -1651,10 +1651,11 @@ class CutoverServiceTests(unittest.TestCase):
                 waiter = row.get("queue_waiter", {})
                 self.assertEqual(waiter.get("need_source"), "cap")
                 self.assertEqual(gate.read_need_basis(waiter.get("need_basis")), gate.ProgramMemoryCap("merge-gate"))
-                self.assertEqual(build_why.charge_text(running.basis, user_zone(), explained.explanation.policy,
+                self.assertEqual(queue_evidence.charge_text(running.basis, user_zone(), explained.explanation.policy,
                     running.step.step), "merge gate promise: holds until the step ends")
-                self.assertEqual(build_why.need_text(gate.RecordedNeed("cap", 0, gate.HISTORY_DAYS,
-                    "full", "", (), gate.WidthNotRecorded(), gate.read_need_basis(waiter.get("need_basis")))),
+                self.assertEqual(queue_evidence.need_text(gate.RecordedNeed("cap", 0, gate.HISTORY_DAYS,
+                    "full", "", (), gate.WidthNotRecorded(), gate.read_need_basis(waiter.get("need_basis"))),
+                    budget=explained.explanation.limits.budget, zone=user_zone()),
                     "the merge gate's memory cap")
                 self.assertEqual(fixture.server.reservations[request.episode].need, 6 * GIB)
 
@@ -2637,7 +2638,7 @@ class CutoverServiceTests(unittest.TestCase):
             self.assertNotIsInstance(fixture.server.waiters[request.episode].last_reply, service.NoWaitReply)
 
     def test_policy_changes_reclassify_new_passes_without_changing_an_earlier_reply(self) -> None:
-        from scripts.build_queue import build_why
+        from scripts.build_queue import queue_evidence
         with AdmissionFixture() as fixture:
             request = fixture.request(need=12 * GIB)
             grant = only_admitted(fixture.server.handle_request(request))
@@ -2659,7 +2660,7 @@ class CutoverServiceTests(unittest.TestCase):
             self.assertEqual(gate.smallest_head_release(old.explanation), old_release)
             self.assertEqual(fixture.server.reservations[request.episode].reservation_id, grant.reservation)
             self.assertEqual(record.need, 12 * GIB)
-            self.assertEqual(build_why.charge_text(old.explanation.running[0].basis,
+            self.assertEqual(queue_evidence.charge_text(old.explanation.running[0].basis,
                 user_zone(), old.explanation.policy, "nextest"), "ramp promise: first 2 min after admission")
 
 

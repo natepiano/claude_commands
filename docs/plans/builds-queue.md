@@ -36,11 +36,11 @@ only I can bump
 
 ## Delegation Context
 
-- **Project:** `~/.claude` — the build queue: memory admission, the `/build:queue` and build-why views, and the unit-board queue pane.
+- **Project:** `~/.claude` — the build queue: memory admission, the `/build:queue` view and evidence cards, and the unit-board queue pane.
 - **Project started:** 2026-10-30T11:26:00-04:00
 - **Stack:** Python 3.13 (basedpyright strict, unittest); TypeScript mod under `mods/unit-board/` (its own tests in `mods/unit-board/tests/`).
-- **Layout:** `scripts/build_queue/` (`build_queue.py`, `build_why.py`, `head_facts.py` from report-unit 4e); `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`; `scripts/message/roster.py`; `mods/unit-board/hooks/` and `mods/unit-board/tests/`; `commands/build/queue.md`.
-- **Key files:** `scripts/lint/memory_admit.py` — admission decisions, the queue rows and `explain_queue`; `scripts/build_queue/build_queue.py` — the queue view and the bump CLI; `scripts/build_queue/build_why.py` — why the head waits; `scripts/build_queue/head_facts.py` — bump rows, head time, token waits; `mods/unit-board/hooks/register.tsx` — `tablePane()` and the `build:queue` command; `mods/unit-board/hooks/queue.tsx` — the pane view; `scripts/build_queue/admission_protocol.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/admission_client.py` — the queue service, its socket protocol and its client (new in Phase 5).
+- **Layout:** `scripts/build_queue/` (`build_queue.py`, `queue_evidence.py`, `head_facts.py` from report-unit 4e); `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`; `scripts/message/roster.py`; `mods/unit-board/hooks/` and `mods/unit-board/tests/`; `commands/build/queue.md`.
+- **Key files:** `scripts/lint/memory_admit.py` — admission decisions, the queue rows and `explain_queue`; `scripts/build_queue/build_queue.py` — the queue view and the bump CLI; `scripts/build_queue/queue_evidence.py` — recorded need, charge, and release text; `scripts/build_queue/head_facts.py` — bump rows, head time, token waits; `mods/unit-board/hooks/register.tsx` — `tablePane()` and the `build:queue` command; `mods/unit-board/hooks/queue.tsx` — the pane view; `scripts/build_queue/admission_protocol.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/admission_client.py` — the queue service, its socket protocol and its client (new in Phase 5).
 - **Test lanes:** `scripts/build_queue/test_*.py`, `scripts/lint/test_memory_admit.py`, `mods/unit-board/tests/queue.test.ts`.
 - **Test:** `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY python3 -m unittest <module>` from the worktree root; the mod's test command as `docs/as-built/unit-board.md` names it.
 - **Lint:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python <the slot's own Python files>`; footer must read `0 errors, 0 warnings, 0 notes`.
@@ -442,12 +442,12 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 **Ruled out:** Unused `RegisteredTaskFolder`, `ScratchParent`, `CopiesParent`, `RequiredMemoryParent`, `task`, and `--mode` wrappers; their existing authorities remain separate.
 
-### Phase 10b — The /build:queue card carries the build-why facts, and build-why goes  · status: todo
+### Phase 10b — The /build:queue card carries the build-why facts, and build-why goes  · status: done
 **Depends on:** Phase 10 (the card reads the queue service); Phase 10a (same build_queue files)
 
 The user returned change review C683 on 2026-11-02: "this seems to be duplicative with /build:queue # - both are showing information about where an item sits in a queue - these capabilities should be combined into the /build:queue # command". The builds showrunner decided: put the build-why facts in the card and keep one place for each fact.
 
-Decision (queue-unit, 2026-11-02): remove `build_why.py` and the `build-why` command; keep no alias, so there is one way to see a step. The card (shown below the queue view since Phase 10) gains the facts build-why showed and the card lacks: the head's recorded evidence, how long the first step has been head, and the release advice. Each fact appears once on the page. Spec at phase start: list build-why's facts against the card's, and every caller and doc of `build_why.py`.
+Decision (queue-unit, 2026-11-02): remove `build_why.py` and the `build-why` command; keep no alias, so there is one way to see a step. The card (shown below the queue view since Phase 10) gains the facts build-why showed and the card lacks: the head's recorded evidence, queue arrival and time waiting, and the release advice. Each fact appears once on the page. Spec at phase start: list build-why's facts against the card's, and every caller and doc of `build_why.py`.
 
 Resources Phase 42's card rules are not part of this phase (builds showrunner, 2026-11-03): the user keeps Phase 42 paused, so 10b builds the card without them. They return only when the user releases Phase 42.
 

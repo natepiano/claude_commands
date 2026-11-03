@@ -4948,9 +4948,10 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
         host = gate.HostMemory(20 * GIB, 60 * GIB, 10 * GIB, 2 * GIB)
         self.write_config(full_pressure_limit="3", swap_used_limit="95", some_pressure_limit="30")
         with patch.object(gate, "read_memory_config", side_effect=AssertionError("reader reread config")):
-            self.assertEqual(gate.read_pressure(host, policy=policy), gate.MemoryPressure(8, 15, 80))
+            self.assertEqual(gate.read_pressure(host, policy=policy), gate.MemoryPressure(8, 15, 80, condition="swap"))
             self.assertIsInstance(gate.read_pressure(policy=policy), gate.NoPressureHold)
-            self.assertEqual(gate.read_pressure(host, policy=gate.DEFAULT_ADMISSION_POLICY), gate.MemoryPressure(8))
+            self.assertEqual(gate.read_pressure(host, policy=gate.DEFAULT_ADMISSION_POLICY),
+                             gate.MemoryPressure(8, 15, 80, condition="full"))
 
     def test_missing_kind_peak_hold_inherits_the_default_without_a_fallback(self) -> None:
         self.write_config(peak_hold_seconds="900")

@@ -11,7 +11,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.lint import memory_admit as gate
-from scripts.build_queue import admission_protocol as wire, build_why
+from scripts.build_queue import admission_protocol as wire, queue_evidence
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, NOW
 
@@ -115,12 +115,12 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(parsed.explanation.decided_from, inputs)
             self.assertIsInstance(gate.smallest_head_release(parsed.explanation), gate.EstimateExpired)
             zone = ZoneInfo("UTC")
-            self.assertEqual(build_why.release_text(parsed.explanation, {}, zone),
-                             build_why.release_text(local, {}, zone))
-            self.assertTrue(build_why.release_text(parsed.explanation, {}, zone).startswith("the estimate expired at"))
+            self.assertEqual(queue_evidence.release_text(gate.smallest_head_release(parsed.explanation), parsed.explanation, {}, zone),
+                             queue_evidence.release_text(gate.smallest_head_release(local), local, {}, zone))
+            self.assertTrue(queue_evidence.release_text(gate.smallest_head_release(parsed.explanation), parsed.explanation, {}, zone).startswith("the estimate expired at"))
             assert isinstance(local.head, gate.HeadExplanation)
             assert isinstance(local.head.waiter.reason, gate.EstimateExpired)
             assert isinstance(parsed.explanation.head, gate.HeadExplanation)
             assert isinstance(parsed.explanation.head.waiter.reason, gate.EstimateExpired)
-            self.assertEqual(build_why.estimate_refresh_text(parsed.explanation.head.waiter.reason, zone),
-                             build_why.estimate_refresh_text(local.head.waiter.reason, zone))
+            self.assertEqual(queue_evidence.estimate_refresh_text(parsed.explanation.head.waiter.reason, zone),
+                             queue_evidence.estimate_refresh_text(local.head.waiter.reason, zone))

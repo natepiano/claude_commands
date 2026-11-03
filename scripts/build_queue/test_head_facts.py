@@ -10,7 +10,7 @@ from typing import cast
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from scripts.build_queue import admission_client, head_facts
+from scripts.build_queue import admission_client, head_facts, queue_view
 from scripts.build_queue.queue_fixture import (
     AdmissionLogTests, bump_line as bump_line, head_reading, queue_read_fixture as queue_read_fixture,
     queue_time_line as queue_time_line, token_gap_line as token_gap_line,
@@ -48,6 +48,23 @@ class HeadFactsTests(AdmissionLogTests):
             self.fail(f"complete fixture log must be readable: {result}")
         return result
 
+    def test_head_facts_use_recorded_limits_without_configuration_reads(self) -> None:
+        original = head_reading()
+        head = original.explanation.head
+        assert isinstance(head, gate.HeadExplanation)
+        for budget in (9 * gate.GIB, 19 * gate.GIB):
+            with self.subTest(budget=budget):
+                reading = replace(original, explanation=replace(original.explanation,
+                    limits=replace(original.explanation.limits, budget=budget)))
+                with mock.patch("conf.read", side_effect=AssertionError("live configuration")), \
+                     mock.patch.object(gate, "read_memory_config", side_effect=AssertionError("live policy")), \
+                     mock.patch.object(gate, "memory_config", side_effect=AssertionError("live policy")), \
+                     mock.patch.object(gate, "build_budget_bytes", side_effect=AssertionError("live budget")):
+                    facts = self.facts(reading)
+                self.assertEqual(facts.budget, budget)
+                self.assertEqual(facts.head_need, head.waiter.need)
+                self.assertEqual(facts.joined_at, head.waiter.since)
+
     def test_one_bump_uses_singular_text_and_plural_counts_stay_plural(self) -> None:
         write_bumps(NOW, [bump_line(NOW - 1)])
         facts = self.facts(head_reading())
@@ -60,7 +77,7 @@ class HeadFactsTests(AdmissionLogTests):
     def test_bump_table_remainder_uses_singular_for_one_remaining_bump(self) -> None:
         write_bumps(NOW, [bump_line(NOW - 20 + number, session=f"session-{number}")
                           for number in range(9)])
-        self.assertTrue(head_facts.bump_remainder(self.facts(head_reading())).endswith("with 1 bump"))
+        self.assertTrue(head_facts.bump_lines(self.facts(head_reading()), ZONE, {})[-1].endswith("with 1 bump"))
 
     def test_bumps_include_join_and_now_but_exclude_earlier_and_future_rows(self) -> None:
         since = NOW - 600
@@ -236,7 +253,11 @@ class HeadFactsTests(AdmissionLogTests):
         reading = replace(reading, explanation=replace(reading.explanation, priority=priority))
         write_bumps(NOW, [bump_line(NOW - 5)])
         facts = self.facts(reading)
-        self.assertIn("queue priority: resources (the user's bump)", head_facts.order_text(facts, ZONE))
+        model = queue_view.QueueModel(reading, {}, facts, head_facts.PaceUnavailable(), ZONE,
+            queue_view.HostLoadUnavailable(), gate.NoWaiter())
+        self.assertIn("queue priority: resources (the user's bump)",
+                      "\n".join("".join(span.text for span in line) for line in queue_view.render_view(model, 100)))
+        self.assertNotIn("queue priority", head_facts.order_text(facts, ZONE))
         self.assertEqual(self.history(reading).total, 1)
         self.assertEqual(head_facts.bump_text(facts, ZONE), "Bumps since it joined at 06:50:00: 1")
 

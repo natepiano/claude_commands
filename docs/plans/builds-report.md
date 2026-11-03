@@ -77,7 +77,7 @@ Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's n
 **Files:**
 - `scripts/lint/memory_admit.py` — the admission reader, with `queue_rows()` and `write_head_since()`
 - `scripts/lint/memory_gate.sh` — cargo-token left and back times
-- `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_build_queue.py`, `scripts/build_queue/test_build_why.py` — both sides' tests
+- `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_build_queue.py`, `scripts/build_queue/test_queue_evidence.py` — both sides' tests
 - `docs/as-built/build-memory-admission.md`, `docs/as-built/unit-board.md` — the merged as-built text
 
 ### Phase 1 — The build report compares build rates before and after each build moment  · status: done

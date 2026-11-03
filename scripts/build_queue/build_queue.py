@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -11,8 +12,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.build_queue import head_facts, admission_client, admission_protocol
 from scripts.build_queue.queue_card import select_waiters
-from scripts.build_queue.queue_lines import age as age, json_form, plain
-from scripts.build_queue.queue_view import QueueModel, field as field, render_view, step_labels as step_labels
+from scripts.build_queue.queue_lines import json_form, plain
+from scripts.build_queue.queue_evidence import step_labels
+from scripts.build_queue.queue_view import QueueModel, HostLoad, HostLoadUnavailable, UnknownCpuCount, render_view
 from scripts.lint import memory_admit
 from scripts.lib.user_zone import user_zone
 from scripts.message import unit_labels
@@ -42,7 +44,8 @@ def default_columns() -> int:
 def bump(selector: str, actor: str) -> int:
     reading = memory_admit.queue_read()
     labels = unit_labels.unit_labels_for([step.session_id for step in reading.view.waiting], os.environ)
-    model = QueueModel(reading, labels, memory_admit.NoWaiter(), head_facts.PaceUnavailable(), user_zone())
+    model = QueueModel(reading, labels, memory_admit.NoWaiter(), head_facts.PaceUnavailable(), user_zone(),
+                       HostLoadUnavailable(), memory_admit.NoWaiter())
     matches = select_waiters(model, selector)
     if not matches:
         print(f"build queue: no waiting step matches {selector}")
@@ -62,6 +65,16 @@ def bump(selector: str, actor: str) -> int:
     detail = f"first step now #{place}" if place else "no waiting step now"
     print(f"queue priority set for {unit} (step #{selected_place}): {detail}")
     return 0
+
+
+def read_host_load() -> HostLoad | HostLoadUnavailable:
+    try:
+        load = float((Path(os.environ.get("BUILDLOG_PROC", "/proc")) / "loadavg").read_text().split()[0])
+        if not math.isfinite(load) or load < 0:
+            return HostLoadUnavailable()
+        return HostLoad(load, os.cpu_count() or UnknownCpuCount())
+    except (OSError, ValueError, IndexError):
+        return HostLoadUnavailable()
 
 
 def main() -> int:
@@ -123,8 +136,11 @@ def main() -> int:
         ids.extend(head_facts.session_ids(facts))
         labels = unit_labels.unit_labels_for(ids, os.environ)
         pace = head_facts.read_pace(reading.explanation.now) if words else head_facts.PaceUnavailable()
-        model = QueueModel(reading, labels, facts, pace, user_zone())
-        lines = render_view(model, arguments.columns, colour=arguments.json, you=arguments.you)
+        load = read_host_load() if words else HostLoadUnavailable()
+        release = memory_admit.smallest_head_release(reading.explanation) if words else memory_admit.NoWaiter()
+        model = QueueModel(reading, labels, facts, pace, user_zone(), load, release)
+        lines = render_view(model, arguments.columns, colour=arguments.json, you=arguments.you,
+                            selector=words[0] if words else "")
         if words:
             from scripts.build_queue.queue_card import render_selection
 

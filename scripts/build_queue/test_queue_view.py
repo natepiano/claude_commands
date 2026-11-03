@@ -12,7 +12,8 @@ from scripts.build_queue import head_facts, queue_card, queue_view
 from scripts.build_queue.queue_fixture import (
     ASKING_SESSION, GOLDEN, NOW, QueueFixture, QueueFixtureTests, queue_read_fixture, waiting_rows, with_waiting,
 )
-from scripts.build_queue.queue_lines import json_form, plain, terminal_width, wrap
+from scripts.build_queue.queue_lines import json_form, plain, wrap
+from scripts.lib.terminal_cells import terminal_width
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import fake_memory_readings
 from scripts.message.unit_labels import UnitLabels
@@ -61,12 +62,11 @@ class QueueViewTests(QueueFixtureTests):
             model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
             view = plain(queue_view.render_view(model, 400))
             card = plain(queue_card.render_card(model, [1], 400))
-            for text in (view, card):
-                self.assertIn("replay.scope: 17.4 GiB (unowned)", text)
-                self.assertIn(f"reserve {head.free.reserve / gate.GIB:.1f} GiB; need 8.0 GiB", text)
-                self.assertNotIn("owned.scope:", text)
-            self.assertIn("Head: free 12.0 GiB", view)
-            self.assertIn("Free 12.0 GiB", card)
+            page = view + "\n\n" + card
+            self.assertEqual(page.count("replay.scope: 17.4 GiB (unowned)"), 1)
+            self.assertIn(f"need 8.0 + earlyoom {head.free.reserve / gate.GIB:.1f}", page)
+            self.assertNotIn("owned.scope:", page)
+            self.assertEqual(page.count("Free memory: free 12.0 GiB"), 1)
 
     def test_expired_head_with_passing_checks_has_an_error_hold_at_sixty_cells(self) -> None:
         inputs = self.fixture.inputs(policy=gate.DEFAULT_ADMISSION_POLICY)
@@ -103,10 +103,10 @@ class QueueViewTests(QueueFixtureTests):
             explanation=replace(model.reading.explanation, policy=policy)))
         with mock.patch.object(gate, "read_memory_config", side_effect=AssertionError("render read config")):
             _, full = queue_view.pressure_check(gate.MemoryPressure(10), model)
-            _, swap = queue_view.pressure_check(gate.MemoryPressure(0, 15, 80), model)
+            _, swap = queue_view.pressure_check(gate.MemoryPressure(0, 15, 80, condition="swap"), model)
             _, recovery = queue_view.pressure_check(gate.MemoryPressure(0, next_start_at=NOW + 45), model)
-        self.assertIn("starts below 9.0", full)
-        self.assertIn("swap is at most 70% or some avg10 at most 12.0", swap)
+        self.assertIn("starts below full avg10 9.0%", full)
+        self.assertIn("swap is at most 70% or some avg10 is at most 12.0%", swap)
         self.assertIn("one start per 45 s", recovery)
 
     def test_live_priority_marks_and_cards_use_the_snapshot_without_bump_history(self) -> None:
@@ -125,8 +125,8 @@ class QueueViewTests(QueueFixtureTests):
             card = plain(queue_card.render_card(model, [1], 100))
             frozen = gate.head_after_steps_end(model.reading.explanation, ())
         self.assertIn("queue priority: cables (the user's bump)", view)
-        self.assertIn("queue priority: cables (the user's bump)", card)
-        self.assertIn("Waited 36 min", card)
+        self.assertEqual((view + "\n" + card).count("queue priority: cables (the user's bump)"), 1)
+        self.assertIn("waiting 36 min", card)
         for text in (view, card):
             self.assertNotIn("head_since", text)
             self.assertNotIn("became first", text)
@@ -207,12 +207,15 @@ class QueueViewTests(QueueFixtureTests):
         model = self.fixture.model()
         for columns in (400, 60, 30):
             with self.subTest(columns=columns):
-                lines = [row for check in queue_view.check_lines(queue_view.step_checks(model, 1), model)
+                checks = queue_view.step_checks(model, 1)
+                assert isinstance(checks, gate.HeadExplanation)
+                shared_pressure = queue_view.check_line(*queue_view.pressure_check(checks.decision.pressure, model))
+                lines = [row for check in [shared_pressure, *queue_view.check_lines(checks, model)]
                          for row in wrap(check, columns)]
                 text = "".join(plain(lines).split())
-                for fact in ("✗ memory pressure: full avg10 7.7 now; starts below 5.0",
-                             "✓ build budget: 11.1 of 21.0 GiB held; needs 7.6",
-                             "✓ free memory 24.5 GiB; needs 16.6: this step 7.6 + earlyoom 3.0 + promised not yet used 6.0"):
+                for fact in ("✗ memory pressure: full avg10 7.7%, some avg10 0.0%, swap used 0.0%; starts below full avg10 5.0%",
+                             "✓ Build budget: charged 11.1 + need 7.6 = 18.7 GiB <= 21.0 GiB: pass",
+                             "✓ Free memory: free 24.5 GiB >= need 7.6 + earlyoom 3.0 + promise not yet used 6.0 = 16.6 GiB: pass"):
                     self.assertIn("".join(fact.split()), text)
                 self.assertEqual(sum(span.text.count("✗") for row in lines for span in row if span.tone == "error"), 1)
                 self.assertEqual(sum(span.text.count("✓") for row in lines for span in row if span.tone == "success"), 2)
@@ -259,8 +262,8 @@ class QueueViewTests(QueueFixtureTests):
         with mock.patch.object(gate, "decide", side_effect=AssertionError("admission decides once")), \
              mock.patch.object(gate, "build_charge", side_effect=AssertionError("recorded charge")):
             text = plain(queue_view.check_lines(queue_view.step_checks(model, 1), model))
-        self.assertIn("11.1 of 21.0 GiB held; needs 7.6", text)
-        self.assertIn("needs 16.6", text)
+        self.assertIn("Build budget: charged 11.1 + need 7.6 = 18.7 GiB <= 21.0 GiB", text)
+        self.assertIn("= 16.6 GiB: pass", text)
 
 
 
@@ -373,7 +376,7 @@ class BudgetViewTests(QueueFixtureTests):
         step = replace(head.waiter, need=budget)
         model = with_waiting(model, [step])
         model = replace(model, reading=replace(model.reading,
-            explanation=replace(model.reading.explanation, host=replace(host, budget=budget),
+            explanation=replace(model.reading.explanation, limits=replace(model.reading.explanation.limits, budget=budget),
                 totals=replace(model.reading.explanation.totals, charged=0),
                 head=replace(head, waiter=step, budget=replace(head.budget, need=budget, budget=budget)))))
         lines = queue_view.render_view(model, 100, colour=True)

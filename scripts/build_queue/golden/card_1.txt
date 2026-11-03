@@ -37,20 +37,39 @@ budget 21.0                                        ░░░░░░░░░�
 30 tool-based-ui     trunk             nextest   2 ██████████▊ 10.8
 31 tool-based-ui     fastest           clippy    1 ██████▊ 6.8
 32 tool-based-ui     assembly          clippy    0 ██████▊ 6.8
-Head: free 24.5 GiB; reserve 3.0 GiB; need 7.6 GiB
 
 #1 of 32 · tool-based-ui · cables · work-pan · mend · 7.6 GiB
-Folder /tmp/tree. Waited 36 min (since 10:10). Likely start ~10:47.
-queue priority: cables (the user's bump)
+Folder /tmp/tree. Queue arrival 10:10; waiting 36 min. Likely start ~10:47.
 
-Free 24.5 GiB; reserve 3.0 GiB; need 7.6 GiB.
 Next? Yes, it is first. It starts when the checks below pass.
 
 Waits on
   ✓ queue order
-  ✓ build budget: 11.1 of 21.0 GiB held; needs 7.6
-  ✓ free memory 24.5 GiB; needs 16.6: this step 7.6 + earlyoom 3.0 + promised not yet used 6.0
-  ✗ memory pressure: full avg10 7.7 now; starts below 5.0
+  ✓ Build budget: charged 11.1 + need 7.6 = 18.7 GiB <= 21.0 GiB: pass; starts when charged falls to
+    13.4 GiB
+  ✓ Free memory: free 24.5 GiB >= need 7.6 + earlyoom 3.0 + promise not yet used 6.0 = 16.6 GiB:
+    pass
 
 Likely start ~10:47: 1st in line at 44 steps an hour, an estimate.
   Each step moved up ahead of it adds about 1 min.
+
+Host: available RAM 24.5 GiB; total RAM 60.0 GiB
+✗ memory pressure: full avg10 7.7%, some avg10 0.0%, swap used 0.0%; starts below full avg10 5.0%
+Host load: unavailable
+Running:
+tool-based-ui / widget / widget-enhancements-title, nextest: admitted 10:45 (0 min ago); promise
+  11.1 GiB, charge 11.1 GiB, using now 5.1 GiB; ramp promise: first 2 min after admission
+Total current use: 5.1 GiB
+
+Need source: source not recorded
+Package, filters and width: not recorded
+Bumps since it joined at 10:10:00: 4
+  work-lead nextest, /tmp/work: 2 bumps; by work-lead; last bump 10:46:00
+  widget-enhancements-title nextest, /tmp/widget: 1 bumps; by widget; last bump 10:43:00
+  work-lead nextest, /tmp/measure-repair2: 1 bumps; by work-lead; last bump 10:40:00
+Order rule: head priority: window start not recorded; younger steps wait
+Cargo token waits: unknown
+Followers: 31 waiting; 0 fit now under both checks; needs from 1.0 GiB to 12.1 GiB; oldest waiting
+  39 min
+Frees when: all running steps ending still leaves pressure holding the head; the pressure hold or
+  recovery spacing must also clear.

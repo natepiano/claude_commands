@@ -88,8 +88,18 @@ On 2026-10-06 06:54 PDT, two hung hana tests in one local `verify.sh test` step 
 Every pass reads one `MemoryConfig` from `[memory]` in `config/lint.conf`.
 The pass uses that policy for readings, decisions, and explanations. Its stored inputs preserve the evidence for counterfactual release advice.
 Queries project the stored `PassResult` through `queue_read_from_pass`. Queries perform no second admission walk.
-`queue_read()` is the one adapter for the view, cards, and build-why.
+`queue_read()` supplies one `QueueRead` for the complete queue page.
 A failed query raises `AdmissionUnavailable` within the query bound. Commands print `build queue: admission service unavailable: <reason>` and exit 2.
+`/build:queue <position|session|folder>` shows the full queue, one blank line, and the selected cards.
+`mine` uses the same layout. The page resolves labels once and reads optional history once through `head_facts.read_head_facts()`.
+`queue_evidence.py` formats the recorded need, charge basis, resource arithmetic, pressure, and release advice.
+The card uses the reply's policy and limits. It reads no current admission configuration to reinterpret the reply.
+The evidence includes host RAM, optional load, running promises, charges, current use, and total current use.
+It also includes estimate history, shape tiers, failed-peak floors, factors, caps, package, filters, width, and completed CPU-token waits.
+A missing optional record remains unknown. Queue arrival and time waiting use `joined_at`; the order-window deadline remains separate.
+Admission and release calculations remain in `memory_admit.py`. An expired estimate requires a client refresh through the service.
+The page prints priority and unowned memory once in the queue view. It prints shared evidence once below the selected cards.
+`build_why.py` and its command are removed. There is no alias.
 The pane keeps the last successful page after a failed refresh.
 A failed first query shows `Build queue could not be read.`
 
@@ -557,7 +567,7 @@ A test-width update persists the reservation in `state.json` through `os.replace
 
 A cleanup plan is written to a temporary file and linked into place only when no plan exists; a rerun over an incomplete older plan names the file and asks the caller to inspect and remove it before making a new plan.
 
-Python queue layouts, build-why tables and production dailies share `scripts/lib/terminal_cells.py::terminal_width`: combining marks occupy zero cells and wide characters two.
+Python queue layouts, evidence tables and production dailies share `scripts/lib/terminal_cells.py::terminal_width`: combining marks occupy zero cells and wide characters two.
 
 **One decision pass.** `admission_pass(inputs, now, limits, policy)` returns decisions, blockers, proposals, head marks, and recovery outcomes.
 The service commits proposals and stores the pass. Queries project that pass through `queue_read_from_pass`.

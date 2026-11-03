@@ -186,7 +186,14 @@ def queue_read_fixture(view: gate.QueueView, policy: gate.AdmissionPolicy) -> ga
         {"pid": step.pid, "start_time": str(step.pid), "need": step.need, "since": step.since,
          "session_id": step.session_id, "session_name": step.session_name,
          "step": step.step, "folder": step.folder}) for step in view.waiting]
-    inputs = gate.QueueInputs(ordered, view.running, (),
+    reservations: tuple[gate.Reservation, ...] = tuple({
+        "pid": index, "start_time": str(index), "need": step.promise,
+        "repo": "fixture", "step": step.step, "worktree": step.folder,
+        "admitted_at": "", "sidecar": "", "test_threads": gate.NoTestWidth(),
+        "call_id": gate.NoCallRecord(),
+    } for index, step in enumerate(view.running, 1)
+        if gate.running_has_reservation(step))
+    inputs = gate.QueueInputs(ordered, view.running, reservations,
         gate.HostMemory(view.available, gate.UnknownHostTotal()), gate.NoPressureHold(),
         gate.NoRecoverySpacing(),
         gate.NoHeadAdmissionOverride(), view.now)
@@ -354,7 +361,8 @@ class QueueFixture(ExitStack):
     def model(self) -> queue_view.QueueModel:
         reading = self.read()
         return queue_view.QueueModel(reading, self.labels, head_facts.read_head_facts(reading),
-                                     head_facts.read_pace(NOW), ZONE)
+                                     head_facts.read_pace(NOW), ZONE, queue_view.HostLoadUnavailable(),
+                                     gate.smallest_head_release(reading.explanation))
 
     def budget_model(self) -> queue_view.QueueModel:
         """The compact page uses the captured rows and the drawing's budget split."""
@@ -375,7 +383,7 @@ class QueueFixture(ExitStack):
         reading = replace(model.reading, explanation=explanation,
             view=replace(model.reading.view, waiting=(step, *model.reading.view.waiting[1:])),
             ordered=cast(list[tuple[Path, gate.Waiter]], ordered))
-        return replace(model, reading=reading)
+        return replace(model, reading=reading, release=gate.smallest_head_release(reading.explanation))
 
 
 class QueueFixtureTests(unittest.TestCase):

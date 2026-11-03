@@ -22,7 +22,8 @@ from scripts.build_queue.queue_fixture import (
     NOW, ZONE, QueueFixture, bump_line, head_reading, queue_read_fixture,
     queue_time_line, token_gap_line, waiting_rows, write_bumps, write_process, write_token_gaps,
 )
-from scripts.build_queue.queue_lines import QueueLines, Span, json_form, plain, terminal_width
+from scripts.build_queue.queue_lines import QueueLines, Span, json_form, plain
+from scripts.lib.terminal_cells import terminal_width
 from scripts.buildlog import store
 from scripts.lint import memory_admit
 from scripts.build_queue.queue_fixture import write_memory_config
@@ -62,16 +63,24 @@ class QueueTests(unittest.TestCase):
     def entry(session: str, name: str) -> tuple[str, UnitLabels]:
         return session, UnitLabels(name)
 
-    def model(self, reading: memory_admit.QueueRead, zone: ZoneInfo = ZONE) -> queue_view.QueueModel:
+    def model(self, reading: memory_admit.QueueRead, zone: ZoneInfo = ZONE,
+              *, selected: bool = False) -> queue_view.QueueModel:
         return queue_view.QueueModel(reading, self.labels_read.return_value,
-            head_facts.read_head_facts(reading), head_facts.read_pace(reading.explanation.now), zone)
+            head_facts.read_head_facts(reading) if selected else memory_admit.NoWaiter(),
+            head_facts.read_pace(reading.explanation.now) if selected else head_facts.PaceUnavailable(), zone,
+            build_queue.read_host_load() if selected else queue_view.HostLoadUnavailable(),
+            memory_admit.smallest_head_release(reading.explanation) if selected else memory_admit.NoWaiter())
 
     def render(self, view: memory_admit.QueueView, columns: int = 400) -> str:
         return plain(queue_view.render_view(self.model(queue_read_fixture(view, policy=memory_admit.DEFAULT_ADMISSION_POLICY)), columns))
 
     def checks(self, view: memory_admit.QueueView) -> str:
         model = self.model(queue_read_fixture(view, policy=memory_admit.DEFAULT_ADMISSION_POLICY))
-        return plain(queue_view.check_lines(queue_view.step_checks(model, 1), model))
+        checks = queue_view.step_checks(model, 1)
+        lines = queue_view.check_lines(checks, model)
+        if not isinstance(checks, memory_admit.ReadingUnavailable):
+            lines.insert(0, queue_view.check_line(*queue_view.pressure_check(checks.decision.pressure, model)))
+        return plain(lines)
 
     def invoke(self, reading: memory_admit.QueueRead, *arguments: str) -> tuple[int, str, str]:
         output, errors = io.StringIO(), io.StringIO()
@@ -115,6 +124,23 @@ class QueueTests(unittest.TestCase):
     @staticmethod
     def snapshot_text(data: QueueLines) -> str:
         return "\n".join("".join(span["text"] for span in row) for row in data["lines"])
+
+    def test_terminal_and_pane_share_the_recorded_complete_page(self) -> None:
+        fixture = self.enterContext(QueueFixture())
+        reading = fixture.read()
+        self.labels_read.return_value = fixture.labels
+        fixture_path = Path(__file__).parents[2] / "mods/unit-board/tests/selected_page_fixture.ts"
+        recorded = cast(QueueLines, json.loads(fixture_path.read_text().removeprefix("export default ").strip().removesuffix(";")))
+        # The shared fixture uses the pane width of 100 columns.
+        status, output, errors = self.invoke(reading, "--json", "--columns", "100", "1")
+        self.assertEqual((status, errors), (0, ""))
+        self.assertEqual(json.loads(output), recorded)
+        status, terminal, errors = self.invoke(reading, "--columns", "100", "1")
+        self.assertEqual((status, errors), (0, ""))
+        def cells(text: str) -> str:
+            return text.translate(str.maketrans({glyph: "█" for glyph in "░▏▎▍▌▋▊▉"}))
+        self.assertEqual(cells(self.snapshot_text(recorded)), cells(terminal.rstrip("\n")))
+        self.assertIn("Frees when:", self.snapshot_text(recorded))
 
     def test_head_line_uses_singular_for_one_recorded_bump(self) -> None:
         write_bumps(NOW, [bump_line(NOW - 1)])
@@ -287,27 +313,25 @@ class QueueTests(unittest.TestCase):
                 self.assertEqual(errors.getvalue(), f"build queue: {error}\n")
 
 
-    def test_head_and_why_share_the_same_read_and_never_recalculate_checks(self) -> None:
-        from scripts.build_queue import build_why
-        from scripts.build_queue.test_build_why import BuildWhyTests
-        fixture = BuildWhyTests()
+    def test_head_and_card_share_the_same_read_and_never_recalculate_checks(self) -> None:
+        from scripts.build_queue.test_queue_evidence import QueueEvidenceTests
+        fixture = QueueEvidenceTests()
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
         _ = self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", self.labels_read))
         reading = memory_admit.queue_read()
-        facts = head_facts.read_head_facts(reading)
-        why = "\n".join(build_why.render_explanation(reading.explanation, ZONE, {}, facts))
+        evidence = plain(queue_card.render_selection(self.model(reading, selected=True), "1", 400))
         legacy = replace(reading.view.waiting[0], reason=memory_admit.ReadyForAdmission(), need=GIB)
         reading = replace(reading, view=replace(reading.view, available=0, waiting=(legacy, )))
+        model = self.model(reading)
         with mock.patch.object(memory_admit, "decide", side_effect=AssertionError("one decision")), \
              mock.patch.object(memory_admit, "build_charge", side_effect=AssertionError("recorded charges")):
-            model = self.model(reading)
             text = plain(queue_view.check_lines(queue_view.step_checks(model, 1), model))
         for value in ("18.1", "11.8", "16.3", "9.2"):
             self.assertIn(value, text)
-            self.assertIn(value, why)
-        self.assertIn("free memory 16.3 GiB; needs 20.3", text)
-        self.assertIn("Waiting because: build budget, free memory", why)
+            self.assertIn(value, evidence)
+        self.assertIn("Free memory: free 16.3 GiB < need 11.8 + earlyoom 3.0 + promise not yet used 5.5 = 20.3 GiB: blocked", text)
+        self.assertIn("Frees when:", evidence)
         with mock.patch.object(memory_admit, "queue_view", side_effect=AssertionError("no separate queue read")):
             data = self.snapshot(reading)
         self.assertEqual(self.snapshot_text(data), plain(queue_view.render_view(model, 400, colour=True)))
@@ -349,7 +373,7 @@ class QueueTests(unittest.TestCase):
     def test_legacy_head_clock_is_ignored_in_view_card_and_json(self) -> None:
         reading = head_reading(since=NOW - 2400, now=NOW,
             fields={"head_state": "head", "head_since": NOW - 125})
-        model = self.model(reading)
+        model = self.model(reading, selected=True)
         for lines in (queue_view.render_view(model, 400), queue_card.render_card(model, [1], 400)):
             text = plain(lines)
             self.assertIn("40", text)
@@ -471,7 +495,7 @@ class QueueTests(unittest.TestCase):
         self.assertIn("report", text)
         self.assertIn("taken 3.0", text)
         self.assertIn("12.0", text)
-        self.assertIn("free memory 20.0 GiB; needs 15.0: this step 12.0 + earlyoom 3.0", self.checks(view))
+        self.assertIn("Free memory: free 20.0 GiB >= need 12.0 + earlyoom 3.0", self.checks(view))
         self.assertNotIn("gone-session", text)
         self.assertNotIn("Roster:", text)
 
@@ -529,10 +553,10 @@ class QueueTests(unittest.TestCase):
         head = memory_admit.WaitingStep(10, "head", "head-worker", "check", "/tmp/head", row["since"], 12 * GIB,
             memory_admit.head_wait_reason(decision, 12 * GIB, 30 * GIB, row, NOW, policy=memory_admit.DEFAULT_ADMISSION_POLICY))
         view = memory_admit.QueueView((head,), running, 30 * GIB, 4 * GIB, 3 * GIB, NOW)
-        model = self.model(queue_read_fixture(view, policy=memory_admit.DEFAULT_ADMISSION_POLICY))
+        model = self.model(queue_read_fixture(view, policy=memory_admit.DEFAULT_ADMISSION_POLICY), selected=True)
         text = self.checks(view) + "\n" + plain(queue_card.render_selection(model, "holder", 400))
         text += "\n" + plain(queue_card.render_selection(model, "starting", 400))
-        self.assertIn("14.8 of 20.0 GiB held; needs 12.0", text)
+        self.assertIn("Build budget: charged 14.8 + need 12.0 = 26.8 GiB > 20.0 GiB", text)
         measured = next(line for line in text.splitlines() if "widget-enhancements-title" in line)
         self.assertIn("0.5", measured)
         self.assertIn("10.8", measured)
@@ -548,7 +572,7 @@ class QueueTests(unittest.TestCase):
                 step = memory_admit.WaitingStep(10, "head", "worker", "nextest", "/tmp/head", NOW - elapsed,
                     8 * GIB, memory_admit.NeedsBuildBudget(8 * GIB, 19 * GIB, 20 * GIB))
                 text = self.checks(memory_admit.QueueView((step, ), (), available, 0, 3 * GIB, NOW))
-                self.assertIn("✗ build budget: 19.0 of 20.0 GiB held; needs 8.0", text)
+                self.assertIn("✗ Build budget: charged 19.0 + need 8.0 = 27.0 GiB > 20.0 GiB: blocked", text)
                 self.assertNotIn("Stalled:", text)
 
     def test_unavailable_head_never_claims_a_stall_even_after_fifteen_minutes(self) -> None:
@@ -556,7 +580,7 @@ class QueueTests(unittest.TestCase):
         text = self.checks(memory_admit.QueueView((step, ), (), 0, 0, 0, NOW))
         self.assertIn("memory reading unavailable", text)
         self.assertNotIn("Stalled:", text)
-        self.assertNotIn("free memory 0.0", text)
+        self.assertNotIn("Free memory: free 0.0", text)
 
     def test_both_tables_resolve_workers_directors_showrunners_and_unmatched_sessions(self) -> None:
         identities = (("worker-id", "clone88ci"), ("director-id", "old-director"), ("showrunner-id", "old-showrunner"),
@@ -570,13 +594,18 @@ class QueueTests(unittest.TestCase):
             memory_admit.ReadyForAdmission()) for index, (session, name) in enumerate(identities, 1))
         running = tuple(memory_admit.RunningStep(session, name, "clippy", f"/tmp/tree-{index}", GIB, memory_admit.MeasuredMemory(GIB))
             for index, (session, name) in enumerate(identities, 1))
-        model = self.model(queue_read_fixture(memory_admit.QueueView(waiting, running, 20 * GIB, 0, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY))
-        text = "\n".join(plain(queue_card.render_selection(model, session, 400)).splitlines()[0]
-                         + "\n" + plain(queue_card.render_selection(model, session, 400)).splitlines()[-1]
-                         for session, _ in identities)
+        model = self.model(queue_read_fixture(memory_admit.QueueView(waiting, running, 20 * GIB, 0, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY), selected=True)
+        text = "\n".join("\n".join(line for line in
+            plain(queue_card.render_selection(model, session, 400)).splitlines()
+            if line.startswith("#") or line.startswith("Selected running step:"))
+            for session, _ in identities)
         for label in ("hana · organon · organon-ci88", "hana · merge · merge-gate", "hana · hana-showrunner",
                       "standalone", "offline · orphan", "recorded", "tree-7"):
-            self.assertEqual(sum(label in row for row in text.splitlines() if "clippy" in row or "nextest" in row), 2)
+            cards = [row for row in text.splitlines() if row.startswith("#")]
+            running_rows = [row for row in text.splitlines() if row.startswith("Selected running step:")]
+            self.assertEqual(sum(label in row for row in cards), 1)
+            session_label = label.split(" · ")[-1]
+            self.assertEqual(sum(session_label in row for row in running_rows), 1)
         self.assertNotIn("clone88ci", text)
         self.assertNotIn("Roster:", text)
 
@@ -590,7 +619,7 @@ class QueueTests(unittest.TestCase):
         self.assertEqual((other_status, other_errors), (0, ""))
         text += other
         self.assertEqual(status, 0, errors)
-        self.assertIn("builds · live-name", text)
+        self.assertIn("builds / — / live-name", text)
         self.assertIn("recorded", text)
         self.assertNotIn("Roster:", text)
 
@@ -653,7 +682,7 @@ class QueueTests(unittest.TestCase):
         first = memory_admit.WaitingStep(10, "head-id", "clone88ci", "nextest", "/tmp/head", NOW - 2400, GIB, memory_admit.ReadyForAdmission())
         follower = memory_admit.WaitingStep(11, "follower-id", "follower", "doc", "/tmp/follower", NOW - 300, GIB,
             memory_admit.BehindHead("clone88ci", NOW - 2400, "head-id"))
-        model = self.model(queue_read_fixture(memory_admit.QueueView((first, follower), (), 20 * GIB, 0, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY))
+        model = self.model(queue_read_fixture(memory_admit.QueueView((first, follower), (), 20 * GIB, 0, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY), selected=True)
         text = plain(queue_card.render_card(model, [2], 400))
         self.assertIn("organon-ci88", text)
         self.assertIn("  #1 ", text)
@@ -687,8 +716,8 @@ class QueueTests(unittest.TestCase):
         self.assertIn("  5 ", rows[1])
         self.assertIn("11.6", rows[1])
         self.assertIn("tree", rows[1])
-        self.assertIn("15.0 of 21.0 GiB held; needs 10.9; starts when held falls to 10.1", text)
-        self.assertIn("free memory 23.1 GiB", text)
+        self.assertIn("Build budget: charged 15.0 + need 10.9 = 25.9 GiB > 21.0 GiB: blocked; starts when charged falls to 10.1 GiB", text)
+        self.assertIn("Free memory: free 23.1 GiB", text)
         self.assertNotIn("head-id", text)
         self.assertNotIn("follower-id", text)
         self.assertNotIn("Running", self.render(view))
@@ -711,29 +740,30 @@ class QueueTests(unittest.TestCase):
         follower = replace(first, pid=11, session_id="follower", session_name="other", step="doc")
         text = self.checks(memory_admit.QueueView((first, follower), (), 0, 0, 0, NOW))
         self.assertIn("memory reading unavailable", text)
-        self.assertNotIn("free memory 0.0", text)
+        self.assertNotIn("Free memory: free 0.0", text)
         self.assertNotIn("✓", text)
 
-    def test_running_rows_show_signed_delta_and_totals(self) -> None:
+    def test_running_records_show_promise_use_and_totals(self) -> None:
         running = (memory_admit.RunningStep("session-id", "unit", "lint", "/tmp/tree", 8 * GIB, memory_admit.MeasuredMemory(int(1.2 * GIB))),
             memory_admit.RunningStep("other-id", "link", "build", "/tmp/link", 4 * GIB, memory_admit.MeasuredMemory(5 * GIB)))
         view = memory_admit.QueueView((), running, 20 * GIB, 8 * GIB, GIB, NOW)
-        model = self.model(queue_read_fixture(view, policy=memory_admit.DEFAULT_ADMISSION_POLICY))
+        model = self.model(queue_read_fixture(view, policy=memory_admit.DEFAULT_ADMISSION_POLICY), selected=True)
         text = "\n".join(plain(queue_card.render_selection(model, step.session_id, 400)) for step in running)
-        rows = [row for row in text.splitlines() if "runs now:" in row]
+        rows = [row for row in text.splitlines() if "Selected running step:" in row]
         self.assertEqual(len(rows), 2)
-        self.assertIn("1.2", rows[0])
-        self.assertIn("5.0", rows[1])
+        self.assertIn("promise 8.0 GiB, charge 1.2 GiB, using now 1.2 GiB", rows[0])
+        self.assertIn("promise 4.0 GiB, charge 5.0 GiB, using now 5.0 GiB", rows[1])
         self.assertIn("unit", rows[0])
         self.assertIn("link", rows[1])
         self.assertIn("taken 6.2", self.render(view))
 
+
     def test_pending_and_ended_steps_do_not_report_zero_measured_use(self) -> None:
         pending = memory_admit.RunningStep("first", "", "check", "/one", 8 * GIB, memory_admit.PromisedMemory(8 * GIB))
         ended = memory_admit.RunningStep("second", "", "test", "/two", 12 * GIB, memory_admit.GoneMemory())
-        model = self.model(queue_read_fixture(memory_admit.QueueView((), (pending, ended), 20 * GIB, 8 * GIB, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY))
+        model = self.model(queue_read_fixture(memory_admit.QueueView((), (pending, ended), 20 * GIB, 8 * GIB, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY), selected=True)
         text = plain(queue_card.render_selection(model, "first", 400))
-        row = next(row for row in text.splitlines() if "runs now:" in row)
+        row = next(row for row in text.splitlines() if "Selected running step:" in row)
         self.assertIn("8.0", row)
         self.assertIn("—", row)
         self.assertNotIn("second", text)
@@ -757,12 +787,12 @@ class QueueTests(unittest.TestCase):
     def test_one_row_per_table_uses_names_and_escapes_cell_text(self) -> None:
         waiting = memory_admit.WaitingStep(10, "hidden-id", "", "doc", "/tmp/hana/", NOW - 60, GIB, memory_admit.ReadyForAdmission())
         running = memory_admit.RunningStep("other-hidden-id", "lfo|trunk\nunit", "check", "/tmp/lfo", 2 * GIB, memory_admit.MeasuredMemory(GIB))
-        model = self.model(queue_read_fixture(memory_admit.QueueView((waiting,), (running,), 20 * GIB, GIB, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY))
+        model = self.model(queue_read_fixture(memory_admit.QueueView((waiting,), (running,), 20 * GIB, GIB, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY), selected=True)
         text = plain(queue_card.render_selection(model, "hana", 400)) + "\n"
         text += plain(queue_card.render_selection(model, "other-hidden-id", 400))
         self.assertIn("lfo|trunk unit", text)
         self.assertIn("hana", text)
-        self.assertEqual(sum("runs now:" in row for row in text.splitlines()), 1)
+        self.assertEqual(sum("Selected running step:" in row for row in text.splitlines()), 1)
         self.assertNotIn("hidden-id", text)
 
     def test_ten_thousand_waiting_and_running_rows_render_in_under_one_second(self) -> None:
@@ -770,7 +800,11 @@ class QueueTests(unittest.TestCase):
             12 * GIB, memory_admit.NeedsMemory(12 * GIB, 20 * GIB)) for pid in range(10000))
         running = tuple(memory_admit.RunningStep(f"session-{pid}", "", "test", f"/tmp/tree-{pid}", 8 * GIB,
             memory_admit.MeasuredMemory(GIB)) for pid in range(10000))
-        model = self.model(queue_read_fixture(memory_admit.QueueView(waiting, running, 20 * GIB, 10 * GIB, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY))
+        reading = queue_read_fixture(memory_admit.QueueView(waiting, running, 20 * GIB, 10 * GIB, GIB, NOW),
+                                     policy=memory_admit.DEFAULT_ADMISSION_POLICY)
+        with mock.patch.object(memory_admit, "smallest_head_release",
+                               side_effect=AssertionError("an unselected view must not search releases")):
+            model = self.model(reading)
         started = time.perf_counter()
         lines = queue_view.render_view(model, 100)
         elapsed = time.perf_counter() - started
@@ -779,6 +813,27 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(sum("tree-9999" in plain([line]) for line in lines), 0)
         self.assertLess(elapsed, 1., f"render took {elapsed:.6f} s")
         print(f"queue render: 20000 rows in {elapsed:.6f} s")
+
+    def test_selected_card_with_thirty_two_waiters_and_eight_running_steps_stays_fast(self) -> None:
+        waiting = tuple(memory_admit.WaitingStep(pid, f"waiter-{pid}", "worker", "check",
+            f"/tmp/waiter-{pid}", NOW - 600, 16 * GIB,
+            memory_admit.NeedsMemory(16 * GIB, 18 * GIB)) for pid in range(32))
+        running = tuple(memory_admit.RunningStep(f"runner-{pid}", "runner", "test",
+            f"/tmp/runner-{pid}", 8 * GIB, memory_admit.MeasuredMemory(GIB)) for pid in range(8))
+        reading = queue_read_fixture(memory_admit.QueueView(waiting, running, 18 * GIB, 0, 3 * GIB, NOW),
+                                     policy=memory_admit.DEFAULT_ADMISSION_POLICY)
+        started = time.perf_counter()
+        with mock.patch.object(memory_admit, "smallest_head_release",
+                               wraps=memory_admit.smallest_head_release) as release:
+            model = self.model(reading, selected=True)
+            text = plain(queue_card.render_selection(model, "1", 100))
+        elapsed = time.perf_counter() - started
+        release.assert_called_once_with(reading.explanation)
+        self.assertIsInstance(model.release, memory_admit.HeadAdmitsAfterEnd)
+        self.assertIn("#1 of 32", text)
+        self.assertIn("Frees when:", text)
+        self.assertLess(elapsed, 1., f"selected card took {elapsed:.6f} s")
+        print(f"selected card: 32 waiters, 8 running steps in {elapsed:.6f} s")
 
     def test_head_reason_keeps_required_free_threshold_when_both_limits_hold(self) -> None:
         need, available = int(10.9 * GIB), 12 * GIB
@@ -792,9 +847,9 @@ class QueueTests(unittest.TestCase):
         view = memory_admit.QueueView((waiting, ), (), available, 0, 3 * GIB, NOW)
         text = self.checks(view)
         self.assertIn("10.9", text)
-        self.assertIn("16.1 of 21.0 GiB held", text)
-        self.assertIn("starts when held falls to 10.1", text)
-        self.assertIn("free memory 12.0 GiB; needs 13.9: this step 10.9 + earlyoom 3.0", text)
+        self.assertIn("Build budget: charged 16.1 + need 10.9 = 27.0 GiB > 21.0 GiB", text)
+        self.assertIn("starts when charged falls to 10.1", text)
+        self.assertIn("Free memory: free 12.0 GiB < need 10.9 + earlyoom 3.0", text)
 
     def test_memory_reason_names_free_memory_and_earlyoom_reserve(self) -> None:
         pending = int(23.5 * GIB)
@@ -811,7 +866,7 @@ class QueueTests(unittest.TestCase):
         )
         view = memory_admit.QueueView((waiting, ), running, int(23.1 * GIB), pending, 3 * GIB, NOW)
         text = self.checks(view)
-        self.assertIn("free memory 23.1 GiB; needs 38.1: this step 11.6 + earlyoom 3.0 + promised not yet used 23.5", text)
+        self.assertIn("Free memory: free 23.1 GiB < need 11.6 + earlyoom 3.0 + promise not yet used 23.5 = 38.1 GiB: blocked", text)
 
     def test_memory_hold_above_step_need_names_every_threshold_part(self) -> None:
         waiting = memory_admit.WaitingStep(
@@ -822,7 +877,7 @@ class QueueTests(unittest.TestCase):
         )
         view = memory_admit.QueueView((waiting, ), (), int(11.5 * GIB), int(13.4 * GIB), 3 * GIB, NOW)
         text = self.checks(view)
-        self.assertIn("free memory 11.5 GiB; needs 19.4: this step 3.0 + earlyoom 3.0 + promised not yet used 13.4", text)
+        self.assertIn("Free memory: free 11.5 GiB < need 3.0 + earlyoom 3.0 + promise not yet used 13.4 = 19.4 GiB: blocked", text)
 
     def test_head_free_threshold_names_step_growth_and_reserve(self) -> None:
         decision = memory_admit.decide(5 * GIB, 60 * GIB, 3 * GIB,
@@ -834,7 +889,7 @@ class QueueTests(unittest.TestCase):
         )
         view = memory_admit.QueueView((waiting, ), (), 5 * GIB, 4 * GIB, 3 * GIB, NOW)
         text = self.checks(view)
-        self.assertIn("free memory 5.0 GiB; needs 10.0: this step 3.0 + earlyoom 3.0 + promised not yet used 4.0", text)
+        self.assertIn("Free memory: free 5.0 GiB < need 3.0 + earlyoom 3.0 + promise not yet used 4.0 = 10.0 GiB: blocked", text)
 
     def test_budget_reason_names_charged_builds_and_the_limit(self) -> None:
         waiting = memory_admit.WaitingStep(
@@ -843,7 +898,7 @@ class QueueTests(unittest.TestCase):
         )
         view = memory_admit.QueueView((waiting, ), (), 30 * GIB, 0, 3 * GIB, NOW)
         text = self.checks(view)
-        self.assertIn("17.6 of 20.0 GiB held; needs 10.8", text)
+        self.assertIn("Build budget: charged 17.6 + need 10.8 = 28.4 GiB > 20.0 GiB", text)
 
     def test_head_reason_names_measured_budget_limit_and_start_level(self) -> None:
         need, available = int(15.1 * GIB), int(19.5 * GIB)
@@ -857,7 +912,7 @@ class QueueTests(unittest.TestCase):
         )
         view = memory_admit.QueueView((waiting, ), (), available, 0, 3 * GIB, NOW)
         text = self.checks(view)
-        self.assertIn("13.2 of 20.0 GiB held; needs 15.1; starts when held falls to 4.9", text)
+        self.assertIn("Build budget: charged 13.2 + need 15.1 = 28.3 GiB > 20.0 GiB: blocked; starts when charged falls to 4.9 GiB", text)
 
     def test_head_reason_names_only_free_memory_when_budget_passes(self) -> None:
         need, available = int(15.1 * GIB), 18 * GIB
@@ -869,8 +924,8 @@ class QueueTests(unittest.TestCase):
         )
         view = memory_admit.QueueView((waiting, ), (), available, 0, 3 * GIB, NOW)
         text = self.checks(view)
-        self.assertIn("free memory 18.0 GiB; needs 18.1: this step 15.1 + earlyoom 3.0", text)
-        self.assertIn("✓ build budget", text)
+        self.assertIn("Free memory: free 18.0 GiB < need 15.1 + earlyoom 3.0", text)
+        self.assertIn("✓ Build budget", text)
 
     def test_free_memory_head_uses_the_existing_decision_threshold_and_available_reading(self) -> None:
         need, available = 8 * GIB, 7 * GIB
@@ -881,7 +936,7 @@ class QueueTests(unittest.TestCase):
         view = memory_admit.QueueView((head, ), (), available, 0, 3 * GIB, NOW)
         with mock.patch.object(memory_admit, "decide", side_effect=AssertionError("one decision")):
             text = self.checks(view)
-        self.assertIn("free memory 7.0 GiB; needs 11.0: this step 8.0 + earlyoom 3.0", text)
+        self.assertIn("Free memory: free 7.0 GiB < need 8.0 + earlyoom 3.0", text)
 
     def test_pressure_head_uses_the_pressure_decision_instead_of_a_budget_explanation(self) -> None:
         need, available = 8 * GIB, 30 * GIB
@@ -896,28 +951,20 @@ class QueueTests(unittest.TestCase):
                                           memory_admit.MeasuredMemory(19 * GIB))
         text = self.checks(memory_admit.QueueView((head, ), (running, ), available, 0, 3 * GIB, NOW))
         self.assertIn("memory pressure: full avg10 23.4", text)
-        self.assertIn("19.0 of 20.0 GiB held; needs 8.0", text)
+        self.assertIn("Build budget: charged 19.0 + need 8.0 = 27.0 GiB > 20.0 GiB", text)
 
-    def test_memory_reason_omits_parts_that_round_to_zero(self) -> None:
-        for growth, reserve, present in (
-            (0, 3 * GIB, {"earlyoom"}),
-            (1, 1, set[str]()),
-            (0, 0, set[str]()),
-            (3 * GIB, 3 * GIB, {"earlyoom", "promised not yet used"}),
-        ):
+    def test_memory_arithmetic_keeps_every_term_including_rounded_zero(self) -> None:
+        for growth, reserve in ((0, 3 * GIB), (1, 1), (0, 0), (3 * GIB, 3 * GIB)):
             with self.subTest(growth=growth, reserve=reserve):
                 need = 0 if (growth, reserve) == (0, 0) else 3 * GIB
+                threshold = need + growth + reserve
                 step = memory_admit.WaitingStep(10, "waiting-id", "unit", "clippy", "/tmp/tree", NOW, need,
-                    memory_admit.NeedsMemory(need, 0, threshold=need + growth + reserve,
+                    memory_admit.NeedsMemory(need, 0, threshold=threshold,
                         growth=growth, reserve=reserve))
-                text = self.checks(memory_admit.QueueView((step, ), (), 0, growth, reserve, NOW))
-                self.assertIn(f"this step {need / GIB:.1f}", text)
-                for label, amount in (("earlyoom", reserve), ("promised not yet used", growth)):
-                    part = f"{label} {amount / GIB:.1f}"
-                    if label in present:
-                        self.assertIn(part, text)
-                    else:
-                        self.assertNotIn(part, text)
+                text = self.checks(memory_admit.QueueView((step,), (), 0, growth, reserve, NOW))
+                self.assertIn(f"Free memory: free 0.0 GiB < need {need / GIB:.1f} "
+                    + f"+ earlyoom {reserve / GIB:.1f} + promise not yet used {growth / GIB:.1f} "
+                    + f"= {threshold / GIB:.1f} GiB: blocked", text)
 
     def test_head_backfill_label_uses_the_since_zone_and_becomes_strict_at_ten_minutes(self) -> None:
         now = 1793214000.0
@@ -947,16 +994,16 @@ class QueueTests(unittest.TestCase):
                     self.fail("fixture needs a head")
                 reading = replace(reading, explanation=replace(reading.explanation,
                     head=replace(head, has_priority=True)))
-                model = self.model(reading)
+                model = self.model(reading, selected=True)
                 line = plain(queue_card.render_card(model, [2], 400))
                 self.assertIn(suffix, line)
                 head_checks = plain(queue_view.check_lines(head, model))
                 self.assertIn(
-                    f"free memory 18.0 GiB; needs {need_gib + 3:.1f}: this step {need_gib:.1f} + earlyoom 3.0",
+                    f"Free memory: free 18.0 GiB < need {need_gib:.1f} + earlyoom 3.0",
                     head_checks)
                 if need_gib >= 21:
                     self.assertIn(
-                        f"build budget: 1.0 of 21.0 GiB held; needs {need_gib:.1f}; starts when held falls to {21 - need_gib:.1f}",
+                        f"Build budget: charged 1.0 + need {need_gib:.1f} = {1 + need_gib:.1f} GiB > 21.0 GiB: blocked; starts when charged falls to {21 - need_gib:.1f} GiB",
                         head_checks)
 
     def test_view_and_card_use_one_label_read_and_never_wait_for_a_full_roster(self) -> None:
@@ -1111,7 +1158,6 @@ if __name__ == "__main__":
 
 class ServiceQueryFailureTests(unittest.TestCase):
     def test_views_fail_within_one_second_for_missing_and_silent_services(self) -> None:
-        from scripts.build_queue import build_why
         for silent in (False, True):
             with self.subTest(silent=silent), AdmissionFixture() as fixture:
                 if silent:
@@ -1121,13 +1167,12 @@ class ServiceQueryFailureTests(unittest.TestCase):
                     fixture.server.close()
                     fixture.socket_path.unlink(missing_ok=True)
                 with fixture.serving() if silent else mock.patch.dict(os.environ, {}):
-                    for main, arguments in ((build_queue.main, []), (build_queue.main, ["4"]),
-                                            (build_why.main, [])):
+                    for arguments in ([], ["4"], ["--json", "1"]):
                         output, errors = io.StringIO(), io.StringIO()
                         started = time.monotonic()
                         with mock.patch("sys.argv", ["queue", *arguments]), \
                              redirect_stdout(output), redirect_stderr(errors):
-                            status = main()
+                            status = build_queue.main()
                         self.assertLess(time.monotonic() - started, 1)
                         self.assertEqual(status, 2)
                         self.assertEqual(output.getvalue(), "")

@@ -7,10 +7,28 @@ from functools import cached_property
 from typing import assert_never
 from zoneinfo import ZoneInfo
 
-from scripts.build_queue import head_facts
-from scripts.build_queue.queue_lines import Line, Span, age, clip, cut_tail, pad_left, pad_right, plain, terminal_width
+from scripts.build_queue import head_facts, queue_evidence
+from scripts.build_queue.queue_evidence import step_labels
+from scripts.build_queue.queue_lines import Line, Span, age, clip, cut_tail, pad_left, pad_right, plain, field
+from scripts.lib.terminal_cells import terminal_width
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
+
+
+@dataclass(frozen=True)
+class UnknownCpuCount:
+    pass
+
+
+@dataclass(frozen=True)
+class HostLoad:
+    load: float
+    cpus: int | UnknownCpuCount
+
+
+@dataclass(frozen=True)
+class HostLoadUnavailable:
+    pass
 
 
 @dataclass(frozen=True)
@@ -20,6 +38,8 @@ class QueueModel:
     facts: head_facts.HeadFacts | gate.NoWaiter
     pace: head_facts.RecordedPace | head_facts.PaceUnavailable
     zone: ZoneInfo
+    load: HostLoad | HostLoadUnavailable
+    release: gate.HeadAfterEnd
 
     @cached_property
     def moves(self) -> head_facts.QueueMoves:
@@ -35,24 +55,19 @@ def step_checks(model: QueueModel, position: int) -> gate.HeadExplanation | gate
         return step.reason
     if position == 1 and isinstance(explanation.head, gate.HeadExplanation):
         return explanation.head
-    return next(item for item in explanation.line.steps if item.waiter == step)
-
-
-def field(text: str) -> str:
-    return " ".join(text.split())
-
-
-def step_labels(step: gate.WaitingStep | gate.RunningStep, labels: Mapping[str, UnitLabels]) -> UnitLabels:
-    identity = labels.get(step.session_id)
-    if identity is not None:
-        return identity
-    fallback = field(step.session_name) or step.folder.rstrip("/").rpartition("/")[2] or "unknown"
-    return UnitLabels(fallback)
+    return next((item for item in explanation.line.steps if item.waiter == step),
+                gate.ReadingUnavailable("step admission checks unavailable"))
 
 
 def shown_waiters(selector: str, reading: gate.QueueRead, labels: Mapping[str, UnitLabels]) -> list[int]:
     return [position for position, step in enumerate(reading.view.waiting, 1)
             if step_labels(step, labels).session == selector]
+
+
+def running_matches_selector(step: gate.RunningStep, selector: str, labels: Mapping[str, UnitLabels]) -> bool:
+    return (selector == step_labels(step, labels).session
+            or gate.step_matches(selector, step)
+            or isinstance(step.measured, gate.UnownedSliceMemory) and selector == step.measured.owner)
 
 
 def name_spans(step: gate.WaitingStep | gate.RunningStep, labels: Mapping[str, UnitLabels],
@@ -104,15 +119,9 @@ def has_move_priority(model: QueueModel, position: int) -> bool:
 
 
 def pressure_check(pressure: gate.Pressure, model: QueueModel) -> tuple[bool, str]:
-    policy = model.reading.explanation.policy
     if isinstance(pressure, gate.NoPressureHold):
         return True, "memory pressure: no hold"
-    if pressure.next_start_at:
-        return False, f"recovery spacing: one start per {policy.timing.recovery_start_seconds:g} s; next start at " + clock(model, pressure.next_start_at, seconds=True)
-    if pressure.swap_used_percent > policy.pressure.swap_used_limit and pressure.some_avg10 > policy.pressure.some_avg10_limit:
-        return False, (f"memory pressure: swap {pressure.swap_used_percent:.1f}% used and some avg10 {pressure.some_avg10:.1f}; "
-                       + f"starts when swap is at most {policy.pressure.swap_used_limit:g}% or some avg10 at most {policy.pressure.some_avg10_limit:.1f}")
-    return False, (f"memory pressure: full avg10 {pressure.full_avg10:.1f} now; starts below {policy.pressure.full_avg10_limit:.1f}")
+    return False, queue_evidence.pressure_text(pressure, model.zone, model.reading.explanation.policy)
 
 
 def check_line(passes: bool, text: str) -> Line:
@@ -120,25 +129,11 @@ def check_line(passes: bool, text: str) -> Line:
 
 
 def check_lines(checks: gate.HeadExplanation | gate.LineWaiter | gate.ReadingUnavailable,
-                model: QueueModel, *, pressure_first: bool = True) -> list[Line]:
+                model: QueueModel) -> list[Line]:
     if isinstance(checks, gate.ReadingUnavailable):
         return [(Span(reason_phrase(checks, model.reading.view.waiting)),)]
-    budget, free = checks.budget, checks.free
-    held = f"{budget.charged / gate.GIB:.1f} of {budget.budget / gate.GIB:.1f} GiB held; needs {budget.need / gate.GIB:.1f}"
-    if not budget.passes:
-        held += f"; starts when held falls to {budget.starts_at / gate.GIB:.1f}"
-    elif budget.need > budget.budget:
-        held += " (runs alone)"
-    parts = [f"this step {free.need / gate.GIB:.1f}"]
-    for label, value in (("earlyoom", free.reserve), ("promised not yet used", free.growth)):
-        amount = f"{value / gate.GIB:.1f}"
-        if amount != "0.0":
-            parts.append(f"{label} {amount}")
-    available = (f"free memory {free.available / gate.GIB:.1f} GiB; needs {free.threshold / gate.GIB:.1f}: "
-                 + " + ".join(parts))
-    pressure = check_line(*pressure_check(checks.decision.pressure, model))
-    memory = [check_line(budget.passes, "build budget: " + held), check_line(free.passes, available)]
-    return [pressure, *memory] if pressure_first else [*memory, pressure]
+    return [check_line(checks.budget.passes, queue_evidence.budget_text(checks.budget)),
+            check_line(checks.free.passes, queue_evidence.free_text(checks.free))]
 
 
 def reason_phrase(reason: gate.WaitReason, waiting: Sequence[gate.WaitingStep]) -> str:
@@ -227,11 +222,10 @@ def budget_bar(budget: float, free: float, *, colour: bool) -> Line:
     return (*result, Span(size_bar(remaining / 8, budget), "suggestion"))
 
 
-def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: str = "") -> list[Line]:
+def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: str = "",
+                selector: str = "") -> list[Line]:
     explanation = model.reading.explanation
-    head, host = explanation.head, explanation.host
-    budget_bytes = (host.budget if isinstance(host, gate.HostAvailable) else
-                    head.budget.budget if isinstance(head, gate.HeadExplanation) else gate.build_budget_bytes())
+    budget_bytes = explanation.limits.budget
     budget = budget_bytes / gate.GIB
     taken = explanation.totals.charged / gate.GIB
     free = max(0.0, budget - taken)
@@ -292,11 +286,8 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
             Span(bar, "warning"), Span(f" {step.need / gate.GIB:.1f}", tone),
         )
         lines.append((*row, *status) if index == 0 else row)
-    head = explanation.head
-    if isinstance(head, gate.HeadExplanation) and head.decision.state == "hold":
-        lines.append((Span(f"Head: free {head.free.available / gate.GIB:.1f} GiB; "
-            + f"reserve {head.free.reserve / gate.GIB:.1f} GiB; need {head.free.need / gate.GIB:.1f} GiB"),))
     for step in model.reading.view.running:
         if isinstance(step.measured, gate.UnownedSliceMemory):
-            lines.append((Span(f"{step.measured.owner}: {step.measured.bytes / gate.GIB:.1f} GiB (unowned)"),))
+            prefix = "Selected running step: " if selector and running_matches_selector(step, selector, model.labels) else ""
+            lines.append((Span(prefix + f"{step.measured.owner}: {step.measured.bytes / gate.GIB:.1f} GiB (unowned)"),))
     return [clip(line, columns) for line in lines]

@@ -6,11 +6,15 @@ Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py $ARGU
 
 The admission service supplies the queue through `memory_admit.queue_read()`. The view and cards use the service's stored decision.
 The budget bar shows free (`░`) and taken (`█`) GiB. Each waiter shows its showrunner, unit, step, wait, and need.
-`▸` marks your steps. The head shows its free memory, reserve, need, and queue window.
+`▸` marks your steps. The head shows its need and queue window. The selected page shows the full admission arithmetic.
 Unowned scopes show their memory as separate rows.
 
 A position, session, or folder shows the full queue, one blank line, and the selected card on one page.
-`mine` uses the same layout for your steps. `build-why` shows the head's recorded evidence and release advice.
+`mine` uses the same layout for your steps.
+The card includes the head's recorded estimate, running charges, completed CPU-token waits, and release advice.
+It shows queue arrival and time waiting. It shows the order-window deadline separately.
+The page uses one service reply, one optional history read, and one label resolution.
+The service refreshes an expired estimate. There is no separate build-why command or alias.
 The pane refreshes every ten seconds. A failed refresh keeps the last page and its selection.
 A failed first query shows `Build queue could not be read.`
 `close` closes the pane.

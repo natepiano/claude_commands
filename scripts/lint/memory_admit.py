@@ -552,6 +552,7 @@ class MemoryPressure:
     some_avg10: float = 0.0
     swap_used_percent: float = 0.0
     next_start_at: float = 0.0
+    condition: Literal["full", "swap"] = "full"
 
 
 @dataclass(frozen=True)
@@ -576,6 +577,7 @@ class Waiter(TypedDict):
     start_time: str
     need: int
     since: float
+    order_since: NotRequired[float]
     label: NotRequired[str]
     session_id: NotRequired[str]
     session_name: NotRequired[str]
@@ -2647,8 +2649,8 @@ def read_pressure(host: HostMemory = NO_HOST_SWAP, *, policy: AdmissionPolicy) -
     full, some = readings.get("full", 0.0), readings.get("some", 0.0)
     swap = 100 * max(0, host.swap_total - host.swap_free) / host.swap_total if host.swap_total else 0.0
     if swap > policy.pressure.swap_used_limit and some > policy.pressure.some_avg10_limit:
-        return MemoryPressure(full, some, swap)
-    return MemoryPressure(full) if full > policy.pressure.full_avg10_limit else NO_PRESSURE_HOLD
+        return MemoryPressure(full, some, swap, condition="swap")
+    return MemoryPressure(full, some, swap) if full > policy.pressure.full_avg10_limit else NO_PRESSURE_HOLD
 
 
 def read_recovery(directory: Path) -> RecoverySpacing:
@@ -2696,7 +2698,7 @@ def pressure_with_recovery(recovery: RecoverySpacing, pressure: Pressure, now: f
 def pressure_text(pressure: MemoryPressure, policy: AdmissionPolicy) -> str:
     if pressure.next_start_at:
         return f"memory pressure recovery: starts at least {policy.timing.recovery_start_seconds:g} s apart"
-    if pressure.swap_used_percent > policy.pressure.swap_used_limit:
+    if pressure.condition == "swap":
         return f"memory pressure: swap {pressure.swap_used_percent:.1f}% used; some avg10 {pressure.some_avg10:.1f}"
     return f"memory pressure: full avg10 {pressure.full_avg10:.1f}"
 
@@ -3322,6 +3324,11 @@ def released_resident_bytes(running: tuple[RunningStep, ...], ended: frozenset[i
                and isinstance(step.measured, MeasuredMemory))
 
 
+def running_has_reservation(step: RunningStep) -> bool:
+    """Identify running rows that consume one reservation in the same order."""
+    return not isinstance(step.measured, (CompilerServiceMemory, UnownedSliceMemory))
+
+
 def inputs_after_steps_end(inputs: QueueInputs, ended: frozenset[int]) -> QueueInputs:
     """Keep the same evidence, removing ended rows and returning their resident bytes."""
     freed = released_resident_bytes(inputs.running, ended)
@@ -3329,7 +3336,7 @@ def inputs_after_steps_end(inputs: QueueInputs, ended: frozenset[int]) -> QueueI
     reservations: list[Reservation] = []
     reservation_index = 0
     for index, step in enumerate(inputs.running):
-        if not isinstance(step.measured, (CompilerServiceMemory, UnownedSliceMemory)):
+        if running_has_reservation(step):
             if index not in ended:
                 reservations.append(inputs.reservations[reservation_index])
             reservation_index += 1
@@ -3416,7 +3423,7 @@ def queue_read_from_pass(inputs: QueueInputs, limits: AdmissionLimits, policy: A
     for step in running:
         reading = step.measured
         admitted_at: float | AdmissionTimeNotRecorded = AdmissionTimeNotRecorded()
-        if not isinstance(reading, (CompilerServiceMemory, UnownedSliceMemory)):
+        if running_has_reservation(step):
             admitted_at = _epoch(reservations[reservation_index]["admitted_at"])
             reservation_index += 1
         explained.append(ExplainedRunningStep(step, admitted_at, step.promise,
