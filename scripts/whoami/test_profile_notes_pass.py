@@ -91,7 +91,7 @@ class ProfileNotesPassTests(unittest.TestCase):
         )
         for module, attribute, value in paths:
             _ = self.enterContext(patch.object(module, attribute, value))
-        for attribute in ("CONFIG", "NOTIFIER_STATE_DIR", "SESSIONS_DIR", "SHOWRUNNER_STATE_DIR"):
+        for attribute in ("CONFIG", "NOTIFIER_STATE_DIR", "SHOWRUNNER_STATE_DIR"):
             _ = self.enterContext(patch.object(self.pass_.showrunners, attribute, self.home / attribute))
         _ = self.enterContext(patch.object(import_module("scripts.message.process_table"), "PS", [str(self.bin / "ps")]))
         _ = (self.home / "showrunners.json").write_text(json.dumps({

@@ -1,6 +1,3 @@
 # Registry reads include the initial read: one reread across a concurrent write.
 registry_reads = 2
 registry_delay_seconds = 0.05
-# Resume retries include the first launch; reruns use the same saved pane launch.
-resume_attempts = 3
-resume_delay_seconds = 0.0

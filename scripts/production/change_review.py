@@ -90,7 +90,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import issues  # noqa: E402
 from production_units import Refusal, cell_value, production_field, unit_table  # noqa: E402
 from proposals_folder import owner_docs, scope_docs, slug_of  # noqa: E402
-from scripts.production import change_routing, staff
+from scripts.production import change_routing, staff, staff_sources, unit_lookup
 from scripts.shutdown import remote
 
 TRAILER = "Change-Review"
@@ -863,35 +863,70 @@ def credited(production: Path) -> Path:
 
 @dataclass(frozen=True)
 class MissingUnitWorktree:
-    """The Units row has no retained worktree path."""
+    """The unit's branch worktree is unavailable."""
+
+
+@dataclass(frozen=True)
+class UnknownProducer:
+    """The change has no known staff producer."""
 
 
 @dataclass(frozen=True)
 class UnitSource:
-    """The production document and retained worktree of a Units row."""
+    """The production document and branch worktree of a unit."""
 
     production: Path
     worktree: Path | MissingUnitWorktree
     name: str
+    producer: staff.StaffId | UnknownProducer = UnknownProducer()
 
 
 def unit_branches(docs: Iterable[Path]) -> dict[str, UnitSource]:
     """Resolve exact Branch names before Plan, Unit, and worktree aliases."""
+    try:
+        record = staff.snapshot()
+    except staff.StaffUnreadable as error:
+        print(f"change review: {error}", file=sys.stderr)
+        record = staff.StaffSnapshot(())
+    return _unit_branches(docs, record, unit_lookup.member_sources())
+
+
+def _unit_branches(docs: Iterable[Path], record: staff.StaffSnapshot,
+                   sources: unit_lookup.MemberSources) -> dict[str, UnitSource]:
+    """Resolve branch names and aliases with one staff context."""
     found: dict[str, UnitSource] = {}
     aliases: list[tuple[UnitSource, tuple[str, ...]]] = []
     for doc in docs:
         try:
             rows = unit_table(doc.read_text(encoding="utf-8").splitlines())
-        except (Refusal, OSError):
+        except (Refusal, OSError) as error:
+            print(f"change review: {doc}: {error}", file=sys.stderr)
             continue
+        worktrees: dict[str, Path] = {}
+        producers: dict[str, staff.StaffId] = {}
+        try:
+            slug = unit_lookup.production_slug_for_document(doc, record, sources)
+        except (staff.StaffUnreadable, staff.StaffRefused) as error:
+            print(f"change review: {doc}: {error}", file=sys.stderr)
+        else:
+            for row in rows:
+                unit = cell_value(row.get("Unit", ""))
+                try:
+                    selected = sources.member(staff_sources.UnitMember(slug, unit), record)
+                    if isinstance(selected, staff_sources.MemberFound):
+                        producers[unit] = selected.row.id
+                    worktrees[unit] = unit_lookup.plan_worktree(row, selected)
+                except (staff.StaffUnreadable, staff.StaffRefused) as error:
+                    print(f"change review: {unit}: {error}", file=sys.stderr)
         for row in rows:
-            location = cell_value(row.get("Worktree", ""))
-            worktree = Path(location).expanduser().absolute() if location else MissingUnitWorktree()
-            source = UnitSource(doc, worktree, cell_value(row.get("Unit", "")))
+            unit = cell_value(row.get("Unit", ""))
+            worktree = worktrees.get(unit, MissingUnitWorktree())
+            source = UnitSource(doc, worktree, unit, producers.get(unit, UnknownProducer()))
             branch = cell_value(row.get("Branch", ""))
             if branch:
                 _ = found.setdefault(branch, source)
-            names = (Path(cell_value(row.get("Plan", ""))).stem, source.name, Path(location).name)
+            names = (Path(cell_value(row.get("Plan", ""))).stem, source.name,
+                     worktree.name if isinstance(worktree, Path) else "")
             aliases.append((source, names))
     for source, names in aliases:
         for name in names:
@@ -908,11 +943,6 @@ def _owner_of(commit: Commit, branches: dict[str, UnitSource]) -> Path | None:
 
 
 @dataclass(frozen=True)
-class UnknownProducer:
-    """The change has no known staff producer."""
-
-
-@dataclass(frozen=True)
 class PublicationChange:
     """One checkpoint change with its unit and fixed producer identity."""
 
@@ -922,9 +952,13 @@ class PublicationChange:
 
 
 def producer_for(source: UnitSource, record: staff.StaffSnapshot, machine: str) -> staff.StaffId | UnknownProducer:
-    """Resolve a Units row through its exact retained worktree."""
-    member = record.unit_by_worktree(machine, source.worktree) if isinstance(source.worktree, Path) else None
-    return member.id if member is not None else UnknownProducer()
+    """Use the fixed producer from the shared member join on this machine."""
+    if isinstance(source.producer, UnknownProducer):
+        return UnknownProducer()
+    member = record.by_id(source.producer)
+    if member is None or member.kind != "unit" or isinstance(member.worktree, staff.WorktreeUnfilled):
+        return UnknownProducer()
+    return member.id if member.worktree.machine == machine else UnknownProducer()
 
 
 def producer_at(directory: Path) -> staff.StaffId | UnknownProducer:
@@ -937,8 +971,9 @@ def producer_at(directory: Path) -> staff.StaffId | UnknownProducer:
 
 def publication_changes(commits: list[Commit], production: Path) -> list[PublicationChange]:
     """Resolve each visible change's unit and producer in one pass."""
-    branches = unit_branches(owner_docs(production))
     record = staff.snapshot()
+    sources = unit_lookup.member_sources()
+    branches = _unit_branches(owner_docs(production), record, sources)
     machine = remote.local_machine()
     changes: list[PublicationChange] = []
     noted: set[UnitSource | str] = set()
@@ -1421,7 +1456,8 @@ def foreign_units(production: Path) -> set[str]:
         docs = list(showrunners.timer_docs().values())
         root = showrunner_tree.root_of(slug_of(production))
         top = next((doc for doc in docs if slug_of(doc) == root), production)
-        return set(unit_branches(docs)) - set(unit_branches(owner_docs(top)))
+        return {name for name, source in unit_branches(docs).items()
+                if source.production not in set(owner_docs(top))}
     except (OSError, ValueError, Refusal):
         return set()
 

@@ -22,6 +22,16 @@ from scripts.production.rename_test_support import CHECK_TIMER_HANDOFF, FAIL_GIT
 
 @final
 class ProductionRenameTests(support.ProductionRenameFixture):
+    def test_production_rename_uses_staff_without_a_worktree_column(self) -> None:
+        from scripts.production.staff_test_support import without_worktree_column
+        without_worktree_column(self.doc)
+        _ = self.git("add", str(self.doc))
+        _ = self.git("commit", "-m", "Remove the display column")
+        self.assert_success(self.run_rename("apply"))
+        self.assertTrue(self.new_doc.is_file())
+        self.assertFalse(self.doc.exists())
+
+
     def test_document_rename_updates_a_wrapped_location_without_reactivating_its_row(self) -> None:
         row = self.production_row()
         _ = staff.set_doc(row.id, staff.WrappedDoc("natedev", self.doc))
@@ -596,6 +606,8 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.write(self.state / "new/rename.json", json.dumps(journal))
         self.write(self.new_doc, self.new_doc.read_text().replace(
             str(self.unit_worktree(OLD, "beta-unit")), str(self.unit_worktree(NEW, "alpha-unit"))))
+        beta = next(row for row in staff.find(kind="unit") if row.name == "beta")
+        _ = staff.set_worktree(beta.id, staff.RemovedWorktree("natedev", self.unit_worktree(NEW, "alpha-unit")), expected=beta.worktree)
         before = self.snapshot()
         fixed = self.run_command("repair-workers", NEW)
         self.assert_success(fixed)

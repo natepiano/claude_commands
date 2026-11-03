@@ -11,6 +11,7 @@ import socket
 import sqlite3
 import subprocess
 import shlex
+import signal
 import shutil
 import sys
 import tempfile
@@ -49,18 +50,15 @@ import silence
 from test_postmaster import FakeClock
 import codex_daemon
 from codex_test_support import FakeDaemon, daemon_session_row, receive_frame, reply, write_codex_account
-import shutdown_record
-import restart
 import roster
 import sessions
-import restart_support
 if TYPE_CHECKING:
     from ..accounts import accounts
 else:
     from scripts.accounts import accounts
-from test_support import ShutdownTestCase, ShutdownSendLeaf
+from test_support import ShutdownTestCase
 from user_zone import user_zone
-from user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired, first_line
+from user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
 from scripts.accounts.home_test_support import scratch_accounts_config
@@ -100,7 +98,66 @@ INIT: dict[str, object] = {"type": "system", "subtype": "init", "permissionMode"
 
 REAL_OPEN_CASE = rca.open_case
 
+
+def write_send_config(path: Path, values: str) -> int:
+    """Keep timing settings when a test changes the sender authority setting."""
+    defaults = Path(send.__file__).resolve().parents[2] / "config"
+    for name in ("postmaster", "codex_daemon", "send_repeat_guard", "rca"):
+        _ = (path.parent / f"{name}.conf").write_text((defaults / f"{name}.conf").read_text())
+    timings = "\n".join(line for line in (defaults / "send.conf").read_text().splitlines()
+                        if not line.startswith("MORTY_NATIVE_ID="))
+    return path.write_text(timings + "\n" + values)
+
 class RelayAccountTests(unittest.TestCase):
+    def test_relay_reads_its_cleanup_budget_before_starting_the_process(self) -> None:
+        class TimedOutRelay:
+            returncode: int = 0
+
+            def __init__(self) -> None:
+                self.timeouts: list[float] = []
+                self.inputs: list[str | None] = []
+                self.signals: list[int] = []
+
+            def communicate(self, stdin: str | None = None, *, timeout: float) -> tuple[str, str]:
+                self.inputs.append(stdin)
+                self.timeouts.append(timeout)
+                if len(self.timeouts) == 1:
+                    raise subprocess.TimeoutExpired("relay", timeout)
+                return "", ""
+
+            def send_signal(self, sig: int) -> None:
+                self.signals.append(sig)
+
+        process = TimedOutRelay()
+        started = False
+
+        @contextmanager
+        def launch() -> Generator[TimedOutRelay]:
+            nonlocal started
+            started = True
+            yield process
+
+        def read_grace() -> float:
+            self.assertFalse(started)
+            return 0.5
+
+        with (mock.patch.object(subprocess, "Popen", return_value=launch()),
+              mock.patch.object(send, "kill_grace", new=read_grace),
+              mock.patch.dict(os.environ, {"SEND_REPEAT_NOTICE_JOB": "1"})):
+            self.assertEqual(send.run(["relay"], "body", 1), (None, "", ""))
+        self.assertEqual(process.timeouts, [1, 0.5])
+        self.assertEqual(process.inputs, ["body", None])
+        self.assertEqual(process.signals, [signal.SIGTERM])
+
+    def test_parser_default_timeout_changes_without_a_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory)
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
+                for seconds in (11, 17):
+                    _ = (config / "send.conf").write_text(f"# range: 0.001..\ndelivery_timeout={seconds}\n")
+                    self.assertEqual(send.parse(["--to", "user", "--summary", "Title", "--text", "Body", "--no-action"]).timeout,
+                                     seconds)
+
     def test_relay_publishes_its_sender_before_exec_and_keeps_the_socket_owners_pid(self) -> None:
         with short_socket_directory() as directory:
             root = Path(directory)
@@ -151,11 +208,12 @@ class RelayAccountTests(unittest.TestCase):
                 with (
                     self.subTest(status=status),
                     mock.patch.dict(os.environ, {"HOME": str(home)}, clear=True),
-                    scratch_accounts_config(),
+                    scratch_accounts_config() as config,
                     mock.patch.object(send, "claude_binary", return_value="claude"),
                     mock.patch.object(send, "STATE", home / "message-state"),
                     mock.patch.object(send, "run", return_value=(0, stream(INIT, call(delivered), answer(OK)), "")) as launch,
                 ):
+                    _ = write_send_config(config / "send.conf", "")
                     result = send.relay(send.Message("uds:/recipient", "sender-address", "Preview", original, None,
                                                     "sdlc · roles · worker test"), 10)
                 self.assertEqual(result.outcome, "sent")
@@ -177,10 +235,11 @@ class RelayAccountTests(unittest.TestCase):
                 "oauthAccount": {"emailAddress": "legacy@example.invalid"}}))
             with (mock.patch.dict(os.environ, {"HOME": str(home), "CLAUDE_CODE_SESSION_ID": "caller",
                                               "CLAUDE_CODE_REMOTE_MEMORY_DIR": "inherited-memory"}, clear=True),
-                  scratch_accounts_config(),
+                  scratch_accounts_config() as config,
                   mock.patch.object(send, "claude_binary", return_value="claude"),
                   mock.patch.object(send, "STATE", home / "message-state"),
                   mock.patch.object(send, "run", return_value=(0, "", "")) as launch):
+                _ = write_send_config(config / "send.conf", "")
                 _ = send.relay(send.Message("uds:/unused", "test", "hello", "body", None), 10)
             launch.assert_called_once()
             environment = cast(dict[str, str], launch.call_args.args[3])
@@ -235,9 +294,49 @@ def answer(body: str, tool_id: str = "t1", error: bool = False) -> dict[str, obj
 OK = '{"success":true,"message":"queued there","msg_id":"m1"}'
 
 
+def registered_arguments(arguments: list[str]) -> list[str]:
+    """Give existing delivery fixtures a registered phone route."""
+    if "--to" not in arguments or arguments[arguments.index("--to") + 1] != "user" or "--text-id" in arguments:
+        return arguments
+    if "--summary" not in arguments or "--text" not in arguments:
+        return arguments
+    def value(flag: str, default: str = "") -> str:
+        return arguments[arguments.index(flag) + 1] if flag in arguments else default
+    if "--action" in arguments and "--no-action" not in arguments:
+        text_id = "alert.blocked" if value("--need") == "blocked" or value("--priority") == "2" else "alert.decision"
+        values = {"sender": value("--from", send.own_session_name() or "test"), "title": value("--summary"),
+                  "action": value("--action"), "body": value("--text")}
+    elif "--no-action" in arguments and value("--need", "note") == "note":
+        text_id = "nate.adhoc"
+        values = {"sender": value("--from", send.own_session_name() or "test"), "title": value("--summary"), "description": value("--text")}
+    else:
+        return arguments
+    result: list[str] = []
+    index = 0
+    while index < len(arguments):
+        flag = arguments[index]
+        if flag in ("--summary", "--text", "--action"):
+            index += 2
+        elif flag == "--no-action":
+            index += 1
+        else:
+            result.append(flag)
+            index += 1
+    if text_id == "alert.decision" and value("--need", "note") == "note" and "--priority" not in arguments:
+        result.extend(["--priority", "0"])
+    if "--from" not in arguments and send.own_session_name() and "--answerable" not in result:
+        result.append("--answerable")
+    return [*result, "--text-id", text_id,
+            *(item for key, text in values.items() for item in ("--value", f"{key}={text}"))]
+
+
+def registered_main(arguments: list[str]) -> int:
+    return send.main(registered_arguments(arguments))
+
+
 def local_options(arguments: list[str]) -> send.Options:
     """Keep pre-peer transport cases on the machine their fixtures describe."""
-    return send.parse([*([] if "--machine" in arguments else ["--here"]), *arguments])
+    return send.parse(registered_arguments([*([] if "--machine" in arguments else ["--here"]), *arguments]))
 
 
 class RecipientStaffFixture:
@@ -390,7 +489,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             mock.patch.object(roster, "roster", return_value=self.recipient_roster([], []))
         )
         (self.root / "config").mkdir()
-        _ = (self.root / "config/send.conf").write_text(
+        _ = write_send_config(self.root / "config/send.conf",
             "MORTY_NATIVE_ID=codex:00000000-0000-4000-8000-000000000001\n")
         _ = self.enterContext(mock.patch.object(staff, "runtime_id", return_value=""))
 
@@ -445,7 +544,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         stamp = send.ClaudeSender("00000000-0000-4000-8000-000000000002")
         message = send.Message("recipient", "morty", "Decision", "Use the plan.", None, stamp=stamp)
         self.assertNotIn("Authority:", send.agent_text(message))
-        _ = (self.root / "config/send.conf").write_text(
+        _ = write_send_config(self.root / "config/send.conf",
             "MORTY_NATIVE_ID=session:00000000-0000-4000-8000-000000000002\n")
         self.assertIn("Authority: morty (speaks for the user)", send.agent_text(message))
 
@@ -466,7 +565,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
     def test_missing_or_invalid_morty_config_never_grants_authority(self) -> None:
         for config in ("", "MORTY_NATIVE_ID=codex:bad", "MORTY_NATIVE_ID=unavailable"):
             with self.subTest(config=config):
-                _ = (self.root / "config/send.conf").write_text(config)
+                _ = write_send_config(self.root / "config/send.conf", config)
                 with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "00000000-0000-4000-8000-000000000001"}):
                     self.assertEqual(self.send("--text", config or "Missing config").outcome, "sent")
                 self.assertNotIn("Authority:", send.agent_text(self.relayed[-1]))
@@ -618,7 +717,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 self.assertIn("\n> Authority: morty (speaks for the user)", replay)
                 self.assertNotIn(separator, replay)
                 with mock.patch.object(send, "run", return_value=(0, "SENT: worker", "")) as launch:
-                    self.assertEqual(send.codex(message, "/fixture/run", send.TIMEOUT).outcome, "sent")
+                    self.assertEqual(send.codex(message, "/fixture/run", send.delivery_timeout()).outcome, "sent")
                 command = cast(list[str], launch.call_args.args[0])
                 self.assertEqual(command[command.index("--message") + 1], forms[0])
                 self.assertEqual(command[command.index("--guard-text") + 1], body)
@@ -1018,7 +1117,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued()) as queue, \
                 mock.patch.object(roster, "roster", return_value=self.recipient_roster([self.daemon_row("remote-thread")], [])):
             self.assertEqual(send.send(received).outcome, "sent")
-        queue.assert_called_once_with(self.daemon_owner(), "remote-thread", "body\nSender native id: unavailable\nShown sender: sdlc · roles · worker test", timeout=send.TIMEOUT)
+        queue.assert_called_once_with(self.daemon_owner(), "remote-thread", "body\nSender native id: unavailable\nShown sender: sdlc · roles · worker test", timeout=send.delivery_timeout())
 
     def test_queued_sender_display_survives_roster_changes_and_legacy_records_use_raw_sender(self) -> None:
         queued_at = datetime(2026, 10, 20, tzinfo=timezone.utc)
@@ -1067,7 +1166,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(command[command.index("--to") + 1], "mesh-address")
         self.assertEqual(command[command.index("--session-dir") + 1], "/fixture/run")
         self.assertEqual(command[command.index("--message") + 1], expected)
-        queue.assert_called_once_with(self.daemon_owner(), "thread-address", expected, timeout=send.TIMEOUT)
+        queue.assert_called_once_with(self.daemon_owner(), "thread-address", expected, timeout=send.delivery_timeout())
         self.assertEqual([(row["from"], row["to"], row["text"]) for row in self.log()], [
             ("sender-address", "mesh-address", original), ("sender-address", "codex:thread-address", original),
         ])
@@ -1122,7 +1221,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                     self.assertEqual(send.send(received).outcome, "sent")
                 expected = ("Message from sender-address: Preview\nSender native id: unavailable\n\nbody" if display == "sender-address" else
                             "Message from sender-address: Preview\nSender native id: unavailable\nShown sender: sdlc · roles · worker test\n\nbody")
-                queue.assert_called_once_with(self.daemon_owner(), "remote-thread", expected, timeout=send.TIMEOUT)
+                queue.assert_called_once_with(self.daemon_owner(), "remote-thread", expected, timeout=send.delivery_timeout())
                 logged = self.log()[-1]
                 self.assertEqual((logged["from"], logged["to"], logged["key"], logged["text"]),
                                  ("sender-address", "codex:remote-thread", "reply-key", original))
@@ -1492,14 +1591,14 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                     with self.assertRaises(KeyboardInterrupt):
                         _ = send.send(options)
                 before = (self.root / "keys.json").read_bytes()
-                with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.TIMEOUT - 1)):
+                with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.delivery_timeout() - 1)):
                     self.assertEqual(send.send(options).outcome, "pending")
                 self.assertEqual((self.root / "keys.json").read_bytes(), before)
                 self.assertEqual(len(self.relayed), delivered)
-                with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.TIMEOUT + 1)):
+                with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.delivery_timeout() + 1)):
                     self.assertEqual(send.send(options).outcome, "sent")
-                self.assertEqual(self.claims(key), {"staff:recipient": (started + timedelta(seconds=send.TIMEOUT + 1)).isoformat()})
-                with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.TIMEOUT * 2 + 2)):
+                self.assertEqual(self.claims(key), {"staff:recipient": (started + timedelta(seconds=send.delivery_timeout() + 1)).isoformat()})
+                with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.delivery_timeout() * 2 + 2)):
                     self.assertEqual(send.send(options).outcome, "skipped")
                 self.assertEqual(len(self.relayed), delivered + 1)
         self.assertEqual(len(self.relayed), 2)
@@ -1547,11 +1646,11 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         _ = path.write_text(json.dumps({"notice": state}))
         before = path.read_bytes()
         options = local_options(["--to", "recipient", "--key", "notice", "--repeat-minutes", "30", "--text", "Notice"])
-        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.TIMEOUT - 1)):
+        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.delivery_timeout() - 1)):
             self.assertEqual(send.send(options).outcome, "pending")
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(self.relayed, [])
-        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.TIMEOUT + 1)):
+        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.delivery_timeout() + 1)):
             self.assertEqual(send.send(options).outcome, "sent")
         self.assertEqual(len(self.relayed), 1)
 
@@ -2046,8 +2145,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     @staticmethod
     def emergency(*extra: str) -> list[str]:
-        return ["--here", "--to", "user", "--from", "hana", "--summary", "GitHub credentials are cold", "--need", "blocked",
-                "--clears-when", "true", "--action", "Run github-warmup on natedev", "--text", "The push waits.", *extra]
+        return registered_arguments(["--here", "--to", "user", "--from", "hana", "--summary", "GitHub credentials are cold", "--need", "blocked",
+                "--clears-when", "true", "--action", "Run github-warmup on natedev", "--text", "The push waits.", *extra])
 
     def emergency_at(self, at: datetime, *extra: str) -> send.Result:
         with mock.patch.object(send, "now", return_value=at):
@@ -2060,7 +2159,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             self.assertEqual(self.emergency_at(sent, "--key", "github-cold").outcome, "sent")
             with mock.patch.object(send, "now", return_value=sent + timedelta(seconds=23)), \
                  redirect_stdout(io.StringIO()) as output:
-                code = send.main(self.emergency("--key", "github-cold"))
+                code = registered_main(self.emergency("--key", "github-cold"))
         self.assertEqual(code, 0)
         self.assertEqual(channel.call_count, 1)
         self.assertEqual(output.getvalue(), (
@@ -2114,12 +2213,12 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         note = ["--here", "--to", "user", "--from", "hana", "--summary", "Build done", "--key", "build", "--no-action",
                 "--text", "The build passed."]
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as channel:
-            self.assertEqual([send.send(send.parse(note)).outcome for _ in range(2)], ["sent", "sent"])
+            self.assertEqual([send.send(send.parse(registered_arguments(note))).outcome for _ in range(2)], ["sent", "sent"])
         self.assertEqual(channel.call_count, 2)
 
     def test_a_remote_emergency_push_holds_its_window_on_this_host_only(self) -> None:
         with mock.patch.object(send, "run", return_value=(0, "SENT: to the user\n", "")) as run:
-            self.assertEqual(send.send(send.parse(self.emergency()[1:] + ["--machine", "mac"])).outcome, "sent")
+            self.assertEqual(send.send(send.parse(registered_arguments(self.emergency()[1:] + ["--machine", "mac"]))).outcome, "sent")
         forwarded = shlex.split(cast(list[str], run.call_args.args[0])[-1])
         self.assertEqual(forwarded[forwarded.index("--repeat-minutes") + 1], "0")
         self.assertEqual(forwarded[forwarded.index("--key") + 1], send.user_emergency_key("hana", "GitHub credentials are cold"))
@@ -2140,13 +2239,13 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def clear_check(self, at: datetime | None = None, timeout: float = 0) -> tuple[int, list[str]]:
         with mock.patch.object(send, "now", return_value=at or send.now()):
-            return send.clear_check(timeout or send.CHECK_TIMEOUT_S)
+            return send.clear_check(timeout or send.check_timeout())
 
     def test_an_emergency_push_with_no_clear_step_is_refused(self) -> None:
         bare = [argument for argument in self.emergency("--key", "github-cold") if argument not in ("--clears-when", "true")]
         with (mock.patch.object(send, "run") as channel, redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(send.main(bare), 2)
-            self.assertEqual(send.main([*bare[:-2], "--priority", "2", *bare[-2:]]), 2)
+            self.assertEqual(registered_main(bare), 2)
+            self.assertEqual(registered_main([*bare[:-2], "--priority", "2", *bare[-2:]]), 2)
         channel.assert_not_called()
         self.assertEqual(output.getvalue(), f"REFUSED: {send.NO_CLEAR_STEP}\n" * 2)
         self.assertIn('--clears-when "<command that exits 0 when fixed>"', send.NO_CLEAR_STEP)
@@ -2154,7 +2253,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         # A refusal claims nothing: the resend with a clear step goes out at once.
         self.assertFalse(self.keyed("github-cold"))
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")):
-            self.assertEqual(send.send(send.parse(self.emergency("--key", "github-cold"))).outcome, "sent")
+            self.assertEqual(send.send(send.parse(registered_arguments(self.emergency("--key", "github-cold")))).outcome, "sent")
 
     def test_clears_when_goes_only_with_a_blocked_push_to_the_user(self) -> None:
         note = ["--to", "user", "--from", "hana", "--summary", "Build done", "--no-action", "--text", "Done."]
@@ -2183,7 +2282,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_clear_check_retires_a_push_whose_check_passes(self) -> None:
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")):
-            self.assertEqual(send.send(send.parse(self.emergency("--key", "github-cold"))).outcome, "sent")
+            self.assertEqual(send.send(send.parse(registered_arguments(self.emergency("--key", "github-cold")))).outcome, "sent")
         self.assertTrue(self.keyed("github-cold"))
         with (mock.patch.object(send, "run", return_value=(0, "pushover: cancelled 1\n", "")) as channel,
               mock.patch.object(silence, "drop", return_value=0)):
@@ -2239,7 +2338,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_clear_check_retires_a_push_posted_on_another_host_there(self) -> None:
         with mock.patch.object(send, "run", return_value=(0, "SENT: to the user\n", "")):
-            self.assertEqual(send.send(send.parse(self.emergency("--key", "github-cold")[1:] + ["--machine", "natedev"]))
+            self.assertEqual(send.send(send.parse(registered_arguments(self.emergency("--key", "github-cold")[1:] + ["--machine", "natedev"])))
                              .outcome, "sent")
         far = "retired 0 queued messages\ndropped 0 kept pushes\ncancelled: the emergency push for github-cold stopped\n"
         with mock.patch.object(send, "run", return_value=(0, far, "")) as channel, \
@@ -2420,7 +2519,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                     _ = self.relay_record(42, name)
                 output, errors = io.StringIO(), io.StringIO()
                 with redirect_stdout(output), redirect_stderr(errors):
-                    code = send.main(["--here", "--to", address, "--from", "survey", "--text", "reply"])
+                    code = registered_main(["--here", "--to", address, "--from", "survey", "--text", "reply"])
                 self.assertEqual(code, 3)
                 self.assertIn("FAILED:", output.getvalue())
                 self.assertIn(address, errors.getvalue())
@@ -2451,7 +2550,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.outcome = send.Result("queued", "ECONNREFUSED")
         output, errors = io.StringIO(), io.StringIO()
         with redirect_stdout(output), redirect_stderr(errors):
-            code = send.main(["--here", "--to", address, "--from", "survey", "--text", "reply"])
+            code = registered_main(["--here", "--to", address, "--from", "survey", "--text", "reply"])
         self.assertEqual(code, 3)
         self.assertIn("FAILED:", output.getvalue())
         self.assertIn(address, errors.getvalue())
@@ -2905,66 +3004,6 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertNotIn("old unkeyed stop result", pending)
         self.assertIn("latest stop result", pending)
 
-    def test_real_cancel_and_restart_senders_retire_old_settle_instructions(self) -> None:
-        # The subprocess needs its own roster fixture; parent patches do not cross exec.
-        real_send = self.root / "real-send.py"
-        _ = real_send.write_text(
-            f"#!{sys.executable}\n"
-            + "import sys\n"
-            + f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
-            + "import roster, send\n"
-            + "from scripts.production import staff\n"
-            + "staff.snapshot = lambda: staff.StaffSnapshot(tuple(staff.StaffRow(staff.StaffId(x), 'unit', x, None, current_session=staff.StaffId(x)) for x in ('cancelled', 'restarted')))\n"
-            + "from scripts.lib import names\nfrom scripts.lib.test_names import fixture_names\n"
-            + "names.load_names = lambda: fixture_names()\n"
-            + "roster.roster = lambda environment, scope, **kwargs: roster.Roster([], [])\n"
-            + "roster.peer_roster = lambda environment: roster.Roster([], [])\n"
-            + "raise SystemExit(send.main(sys.argv[1:]))\n",
-            encoding="utf-8",
-        )
-        real_send.chmod(0o755)
-        child_state = self.root / "child-state"
-
-        def shutdown_fixture(session_id: str) -> shutdown_record.SessionShutdown:
-            from test_restart import entry, top_level
-
-            saved = entry(top_level(session_id), state=shutdown_record.SessionWaiting(kind="waiting"))
-            self.assertTrue(shutdown_record.create_session(saved))
-            return saved
-
-        self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
-        self.allow_leaf(ShutdownSendLeaf.RETIRE_SHUTDOWN_MESSAGES)
-        self.allow_leaf(ShutdownSendLeaf.RESTART_RETIRE)
-
-        with (
-            mock.patch.object(send, "STATE", child_state / "message"),
-            mock.patch.dict(
-                os.environ,
-                {
-                    "XDG_STATE_HOME": str(child_state),
-                    "SHUTDOWN_SEND": str(real_send),
-                    "SHUTDOWN_STATE_DIR": str(child_state / "shutdown"),
-                },
-            ),
-        ):
-            restarted = shutdown_fixture("restarted")
-            old_restart = restart_support.send_message(
-                "session:restarted",
-                "old shutdown",
-                "Old unkeyed shutdown instruction.",
-            )
-            self.assertEqual(old_restart["kind"], "queued")
-            restart._retire(restarted, dry_run=False)  # pyright: ignore[reportPrivateUsage]
-            delivery = restart._send_restart_note(  # pyright: ignore[reportPrivateUsage]
-                restarted,
-                "Restarted; continue.",
-                dry_run=False,
-            )
-            self.assertEqual(delivery["kind"], "queued")
-            self.session("restarted", "restart-recipient")
-            restart_pending = send.pending("restart-recipient")
-            self.assertNotIn("shutdown instruction", restart_pending)
-            self.assertIn("Restarted; continue.", restart_pending)
 
     def test_unique_claude_roster_name_delivers_to_its_session_address(self) -> None:
         recipient = self.claude_row("id-1", "recipient")
@@ -3251,7 +3290,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
 
         self.assertEqual(code, 0)
         self.assertEqual(output.getvalue(), "SENT: queued on Codex session thread-one\n")
-        queue.assert_called_once_with(self.daemon_owner(), "thread-one", "hello\nSender native id: unavailable", timeout=send.TIMEOUT)
+        queue.assert_called_once_with(self.daemon_owner(), "thread-one", "hello\nSender native id: unavailable", timeout=send.delivery_timeout())
         read_roster.assert_called_once()
 
     def test_named_codex_session_uses_its_display_name_in_the_outcome(self) -> None:
@@ -3269,7 +3308,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             ]))
 
         self.assertEqual(result, send.Result("sent", "queued on Codex session Codex window"))
-        queue.assert_called_once_with(self.daemon_owner(), "thread-window", "hello\nSender native id: unavailable", timeout=send.TIMEOUT)
+        queue.assert_called_once_with(self.daemon_owner(), "thread-window", "hello\nSender native id: unavailable", timeout=send.delivery_timeout())
 
     def test_codex_queue_failure_and_timeout_are_failed_and_never_kept(self) -> None:
         failures = (
@@ -3355,6 +3394,30 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(result.outcome, "failed")
         self.assertEqual(send.pending("bogus"), "")
 
+    def test_remote_delivery_and_retirement_follow_the_configured_transport_allowance(self) -> None:
+        directory = self.root / "remote-budget-config"
+        directory.mkdir()
+        config = directory / "send.conf"
+        _ = write_send_config(config, "MORTY_NATIVE_ID=codex:fixture\n")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(directory)}):
+            options = send.parse(["--to", "session:recipient", "--from", "Sender", "--text", "body"])
+            message = send.Message("session:recipient", "Sender", "Summary", "body", None)
+            record = send.Emergency(key="remote", sender="Sender", check="true", machine="fixture-peer",
+                                    sent=send.now().isoformat(), expires=send.now().isoformat())
+            budgets: list[tuple[float, float]] = []
+            for allowance in (30, 90):
+                source = Path(__file__).resolve().parents[2] / "config/send.conf"
+                _ = config.write_text(source.read_text().replace("remote_transport_seconds=30",
+                                                               f"remote_transport_seconds={allowance}"))
+                with mock.patch.object(send, "run", return_value=(0, "SENT: fixture\n", "")) as run:
+                    self.assertEqual(send.remote(message, "fixture-peer", options).outcome, "sent")
+                    delivery = cast(float, run.call_args.args[2])
+                    self.assertEqual(send.retire_record(record)[0], 0)
+                    retirement = cast(float, run.call_args.args[2])
+                budgets.append((delivery, retirement))
+            self.assertEqual(budgets[1][0] - budgets[0][0], 60)
+            self.assertEqual(budgets[1][1] - budgets[0][1], 60)
+
     def test_remote_reports_its_outcome_and_ssh_failure_is_failed(self) -> None:
         commands: list[list[str]] = []
 
@@ -3373,6 +3436,20 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         with mock.patch.object(send, "run", return_value=(255, "", "ssh: connect to host mac: timed out")):
             self.assertEqual(self.send("--machine", "mac", "--text", "hi").outcome, "failed")
 
+    def test_user_without_a_template_is_refused_before_any_delivery_work(self) -> None:
+        for need, action in (("note", ["--no-action"]), ("decision", ["--action", "Choose retry"]),
+                             ("blocked", ["--action", "Repair now", "--self-clearing"])):
+            with (self.subTest(need=need), mock.patch.object(send, "run") as run,
+                  mock.patch.object(send, "claim") as claim,
+                  mock.patch.object(review, "user_send_seconds") as reviewed,
+                  redirect_stdout(output := io.StringIO())):
+                code = send.main(["--to", "user", "--summary", "Title", "--text", "Body", "--need", need, *action])
+            self.assertEqual(code, 2)
+            self.assertEqual(output.getvalue(), "REFUSED: " + push_texts.TEMPLATE_REQUIRED + "\n")
+            run.assert_not_called()
+            claim.assert_not_called()
+            reviewed.assert_not_called()
+
     def test_the_user_is_reached_with_a_title_and_a_need_and_never_queued(self) -> None:
         commands: list[list[str]] = []
 
@@ -3388,12 +3465,54 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             # Another title is another event: the first emergency push does not skip it.
             told[told.index("natedev: disk")] = "natedev: memory"
             self.assertEqual(send.send(local_options(told)).outcome, "failed")
-        self.assertEqual(commands[0][2:], ["--priority", "2", "--source", "test",
-                                           "--key", send.user_emergency_key("test", "natedev: disk"),
-                                           "--action", "free disk space", "natedev: disk", "full"])
+        self.assertIn("--text-id", commands[0])
+        self.assertEqual(commands[0][commands[0].index("--text-id") + 1], "alert.blocked")
+        self.assertEqual(commands[0][commands[0].index("--priority") + 1], "2")
+        self.assertEqual(commands[0][commands[0].index("--source") + 1], "test")
+        self.assertEqual(commands[0][commands[0].index("--key") + 1], send.user_emergency_key("test", "natedev: disk"))
+        self.assertIn("title=natedev: disk", commands[0])
+        self.assertIn("body=full", commands[0])
+        self.assertIn("action=free disk space", commands[0])
         self.assertEqual(self.relayed, [])
         self.assertEqual(send.pending("user"), "")
         self.assertEqual([entry["to"] for entry in self.log()], ["user", "user"])
+
+    def test_decision_due_survives_registry_remote_and_channel_arguments(self) -> None:
+        due = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+        rendered = push_texts.RenderedPush("test", "script", "decision", "Choose retry",
+            ActionRequired("Reply yes or no."), "The build stopped.", {})
+        with mock.patch.object(push_texts, "render", return_value=rendered):
+            options = send.parse(push_texts.user_send_argv(rendered, due=due)[2:])
+        self.assertEqual(options.due, due)
+        message = send.Message("user", "script", rendered.title, rendered.body, None)
+        with mock.patch.object(send, "run", return_value=(0, "SENT: to the user", "")) as run:
+            self.assertEqual(send.remote(message, "mac", options).outcome, "sent")
+            command = cast(list[str], run.call_args.args[0])[-1]
+            forwarded = shlex.split(command)[3:]
+            self.assertEqual(forwarded[forwarded.index("--due") + 1], due)
+        with mock.patch.object(send, "run", return_value=(0, "", "")) as run:
+            self.assertEqual(send.user(message, "decision", rendered.action, 40, due=due).outcome, "sent")
+            command = cast(list[str], run.call_args.args[0])
+            self.assertEqual(command[command.index("--priority") + 1], "1")
+            self.assertEqual(command[command.index("--due") + 1], due)
+
+    def test_decision_priority_one_without_a_due_time_reaches_the_channel_as_normal(self) -> None:
+        options = local_options(["--to", "user", "--from", "test", "--summary", "Choose retry",
+            "--priority", "1", "--action", "Reply yes or no.", "--text", "The build stopped."])
+        with mock.patch.object(send, "run", return_value=(0, "", "")) as run:
+            self.assertEqual(send.send(options).outcome, "sent")
+        command = cast(list[str], run.call_args.args[0])
+        self.assertEqual(command[command.index("--priority") + 1], "0")
+
+    def test_due_requires_an_offset_and_a_user_decision(self) -> None:
+        base = ["--to", "user", "--from", "test", "--summary", "Choose retry", "--need", "decision",
+                "--action", "Reply yes or no.", "--text", "The build stopped."]
+        for due in ("tomorrow", "2026-11-03T12:15:00"):
+            with self.subTest(due=due), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                _ = local_options([*base, "--due", due])
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            _ = local_options(["--to", "bogus", "--from", "test", "--text", "Body",
+                               "--due", "2026-11-03T12:15:00+00:00"])
 
     def test_registry_argv_preserves_values_and_blocked_need_across_remote_rendering(self) -> None:
         rendered = push_texts.RenderedPush("test", "script", "note", "Build stopped", ActionRequired("Choose retry."), "The build stopped.", {"name": "builder=one two"})
@@ -3542,7 +3661,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
               mock.patch.object(send, "log", side_effect=AssertionError("probe wrote a message log")) as log,
               mock.patch.object(review, "review_timeout_seconds", side_effect=AssertionError("probe began review")) as reviewed,
               redirect_stdout(output := io.StringIO()), redirect_stderr(error := io.StringIO())):
-            self.assertEqual(send.main(arguments), 0)
+            self.assertEqual(registered_main(arguments), 0)
         self.assertIn("not sent: probe sessions never push to the phone", output.getvalue())
         self.assertEqual(error.getvalue(), "")
         transport.assert_not_called()
@@ -3556,7 +3675,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                      "--action", "Choose retry.", "--text", "The build stopped."]
         with mock.patch.object(review, "review_timeout_seconds", return_value=90):
             for extra, expected in (([], 205), (["--timeout", "5"], 205),
-                                    (["--timeout", "250"], 250), (["--machine", "natedev"], 245)):
+                                    (["--timeout", "250"], 250), (["--machine", "natedev"], 285)):
                 with self.subTest(extra=extra), mock.patch.object(send, "run", return_value=(0, "SENT: to the user\n", "")) as run:
                     self.assertEqual(send.send(local_options([*arguments, *extra])).outcome, "sent")
                 self.assertEqual(run.call_args.args[2], expected)
@@ -3581,7 +3700,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(result, send.Result("sent", "on natedev: to the user"))
         self.assertIn("--need decision", commands[0][-1])
         self.assertIn("--here", commands[0][-1])
-        self.assertIn("--action 'log in'", commands[0][-1])
+        self.assertIn("action=log in", commands[0][-1])
 
     def test_pushover_refusal_exits_2_and_keeps_nothing(self) -> None:
         refused = f"pushover: {REFUSED_BEFORE_SENDING}: priority 2 requires --action"
@@ -3589,7 +3708,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         arguments = ["--to", "user", "--from", "test", "--summary", "natedev: disk", "--no-action",
                      "--text", "full"]
         with mock.patch.object(send, "run", return_value=(2, "", refused)), redirect_stdout(output):
-            code = send.main(arguments)
+            code = registered_main(arguments)
         self.assertEqual(code, 2)
         self.assertEqual(output.getvalue(), f"REFUSED: {refused}\n")
         self.assertEqual(send.pending("user"), "")
@@ -3600,7 +3719,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         output = io.StringIO()
         arguments = ["--to", "user", "--from", "test", "--summary", "news", "--no-action", "--text", "done"]
         with mock.patch.object(send, "run", return_value=(2, "", keys_missing)), redirect_stdout(output):
-            code = send.main(arguments)
+            code = registered_main(arguments)
         self.assertEqual(code, 3)
         self.assertEqual(output.getvalue(), f"FAILED: the user was not reached: {keys_missing} {send.UNREVIEWED_FALLBACK}\n")
         self.assertEqual(send.pending("user"), "")
@@ -3737,8 +3856,8 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 self.assertEqual(send.send(options).outcome, "sent")
             # The review reads the whole alert with its waits sentence, and holds it back at most 30 s.
             [(draft, limit)] = self.reviews
-            self.assertEqual(limit, send.WAITS_REVIEW_SECONDS)
-            self.assertEqual(send.WAITS_REVIEW_SECONDS, 30)
+            self.assertEqual(limit, send.waits_review_seconds())
+            self.assertEqual(send.waits_review_seconds(), 30)
             self.assertIn("Auto mode refused 2 shell commands in the modules session. The P542 build waits for them.\n", draft.body)
             pushed = cast(list[str], run.call_args.args[0])
             self.assertIn("waits_line= The P542 build waits for them." if kept else "waits_line=", pushed)
@@ -3797,7 +3916,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         for title, text in (("types: auto mode stopped", "It waits."), ("Build stopped", "Auto-mode DENIED two commands in types.")):
             with (self.subTest(title=title), mock.patch.object(send, "run", side_effect=AssertionError("pushed")),
                   redirect_stdout(io.StringIO()) as output):
-                code = send.main(["--here", "--to", "user", "--summary", title, "--need", "decision",
+                code = registered_main(["--here", "--to", "user", "--summary", title, "--need", "decision",
                                   "--action", "Approve in the types pane", "--key", "auto", "--repeat-minutes", "30",
                                   "--text", text])
             self.assertEqual(code, 4)
@@ -3864,7 +3983,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                                     ("trunk waits for your go", "Steps 130 and 140 clash.", "Answer in the trunk pane")):
             with (self.subTest(title=title, text=text), mock.patch.object(send, "run", side_effect=AssertionError("pushed")),
                   redirect_stdout(io.StringIO()) as output):
-                code = send.main(["--here", "--to", "user", "--summary", title, "--need", "decision",
+                code = registered_main(["--here", "--to", "user", "--summary", title, "--need", "decision",
                                   "--action", action, "--key", "go", "--repeat-minutes", "30", "--text", text])
             self.assertEqual(code, 4)
             self.assertTrue(output.getvalue().startswith("HELD: not sent: this push asks the user to type a go."))
@@ -3947,7 +4066,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                                     ("Codex workers", "They now use Paid-Credit time.", "Choose in natedev terminal.")):
             with (self.subTest(title=title, text=text), mock.patch.object(send, "run", side_effect=AssertionError("pushed")),
                   redirect_stdout(io.StringIO()) as output):
-                code = send.main(["--here", "--to", "user", "--summary", title, "--need", "decision",
+                code = registered_main(["--here", "--to", "user", "--summary", title, "--need", "decision",
                                   "--action", action, "--key", "credits", "--repeat-minutes", "30", "--text", text])
             self.assertEqual(code, 4)
             self.assertTrue(output.getvalue().startswith("HELD: not sent: this push reports paid credit use."))
@@ -3973,7 +4092,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                                            "on natedev: " + reason)):
             with (self.subTest(extra=extra), mock.patch.object(send, "run", return_value=(code, reply, "")),
                   redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
-                self.assertEqual(send.main([*([] if extra else ["--here"]), *self.user_arguments(*extra)]), 0)
+                self.assertEqual(registered_main([*([] if extra else ["--here"]), *self.user_arguments(*extra)]), 0)
             self.assertEqual(output.getvalue(), "REPLACED: " + detail + "\n")
             self.assertEqual(errors.getvalue(), "")
             self.assertFalse(self.failure_marker().exists())
@@ -3987,7 +4106,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                                       (["--machine", "natedev"], "KEPT: " + detail + "\n", "KEPT: on natedev: " + detail)):
             with (self.subTest(extra=extra), mock.patch.object(send, "run", return_value=(0, reply, "")),
                   redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
-                self.assertEqual(send.main([*([] if extra else ["--here"]), *self.user_arguments(*extra)]), 0)
+                self.assertEqual(registered_main([*([] if extra else ["--here"]), *self.user_arguments(*extra)]), 0)
             self.assertEqual(output.getvalue(), printed + "\n")
             self.assertEqual(errors.getvalue(), "")
             self.assertFalse(self.failure_marker().exists())
@@ -4018,7 +4137,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
              "SENT: to the user, rewritten:\n" + rewritten + "\n"),
         ):
             with self.subTest(code=code), mock.patch.object(send, "run", return_value=(code, out, err)), redirect_stdout(io.StringIO()) as printed:
-                self.assertEqual(send.main(["--here", *self.user_arguments("--from", "script")]), code)
+                self.assertEqual(registered_main(["--here", *self.user_arguments("--from", "script")]), code)
             self.assertEqual(printed.getvalue(), expected)
             self.assertFalse(self.failure_marker().exists())
 
@@ -4050,9 +4169,9 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             with self.subTest(code=code), mock.patch.object(send, "run", return_value=(code, stdout, "post unavailable")), mock.patch.object(time, "time", return_value=1234567890.0):
                 result = send.send(local_options(self.user_arguments()))
             self.assertEqual(result.outcome, "failed")
-            self.assertTrue(result.detail.endswith("fallback text:\nRetry needs your choice — Action: Choose retry. Use natedev."))
+            self.assertTrue(result.detail.endswith(send.UNREVIEWED_FALLBACK))
             self.assertEqual(send.as_dict(send.loads(self.failure_marker().read_text()))["fallback"],
-                             "Retry needs your choice — Action: Choose retry. Use natedev.")
+                             "Title: Retry needs your choice\n" + expected_message + "\n\nSent by: Build writer · Template: alert.decision")
             marker = send.as_dict(send.loads(self.failure_marker().read_text()))
             self.assertIs(marker["reviewed"], True)
             self.assertEqual(marker["need"], "note")
@@ -4074,7 +4193,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             self.assertEqual(send.send(local_options(self.user_arguments())).outcome, "failed")
         self.assertFalse(self.failure_marker().exists())
 
-    def test_unreviewed_failures_offer_fallback_only_for_blocked_locally_and_remotely(self) -> None:
+    def test_unreviewed_failures_never_offer_fallback_locally_or_remotely(self) -> None:
         self.writer_session()
         for remote in (False, True):
             for need in ("note", "decision", "blocked"):
@@ -4084,12 +4203,12 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                     with (self.subTest(remote=remote, need=need, code=code),
                           mock.patch.object(send, "run", return_value=(code, "", "delivery unavailable")),
                           redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
-                        self.assertEqual(send.main(self.user_arguments(*extra)), 3)
+                        self.assertEqual(registered_main(self.user_arguments(*extra)), 3)
                     marker = send.as_dict(send.loads(self.failure_marker().read_text()))
                     self.assertIs(marker["reviewed"], False)
                     self.assertEqual(marker["need"], need)
-                    self.assertEqual("fallback text:" in output.getvalue(), need == "blocked")
-                    self.assertEqual(send.UNREVIEWED_FALLBACK in output.getvalue(), need != "blocked")
+                    self.assertNotIn("fallback text:", output.getvalue())
+                    self.assertIn(send.UNREVIEWED_FALLBACK, output.getvalue())
                     transport = send.as_dict(send.loads(errors.getvalue().split("send.py: failed push JSON: ")[1]))
                     self.assertIs(transport["reviewed"], False)
                     self.assertEqual(transport["need"], need)
@@ -4103,11 +4222,11 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                   mock.patch.object(send, "run", return_value=(3, "FAILED: post failed\n",
                     "send.py: failed push JSON: " + json.dumps(record))),
                   redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
-                self.assertEqual(send.main(self.user_arguments("--machine", "natedev", "--need", "decision")), 3)
+                self.assertEqual(registered_main(self.user_arguments("--machine", "natedev", "--need", "decision")), 3)
             marker = send.as_dict(send.loads(self.failure_marker().read_text()))
             self.assertIs(marker["reviewed"], reviewed)
             self.assertEqual(marker["need"], "decision")
-            self.assertEqual("fallback text:" in output.getvalue(), reviewed)
+            self.assertNotIn("fallback text:", output.getvalue())
             transport = send.as_dict(send.loads(errors.getvalue().split("send.py: failed push JSON: ")[1]))
             self.assertIs(transport["reviewed"], reviewed)
 
@@ -4120,7 +4239,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             with (self.subTest(need=need), mock.patch.object(send, "run", return_value=(255, "",
                   "send.py: failed push JSON: " + json.dumps(record))),
                   redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
-                self.assertEqual(send.main(self.user_arguments("--machine", "natedev", "--need", "decision")), 3)
+                self.assertEqual(registered_main(self.user_arguments("--machine", "natedev", "--need", "decision")), 3)
             marker = send.as_dict(send.loads(self.failure_marker().read_text()))
             self.assertIs(marker["reviewed"], True)
             self.assertEqual(marker["need"], need)
@@ -4128,8 +4247,13 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                              (record["title"], record["action"], record["body"]))
             self.assertEqual((marker["held_source"], marker["held_identity"], marker["held_machine"]),
                              ("writer source", "original-hold-hash", "natedev"))
-            self.assertIn("fallback text:\nReviewed choice — Action: Choose retry.", output.getvalue())
-            self.assertNotIn(send.UNREVIEWED_FALLBACK, output.getvalue())
+            self.assertEqual("fallback text:" in output.getvalue(), need == "blocked")
+            if need == "blocked":
+                self.assertIn("Title: Reviewed choice\nAction: Choose retry.\nThe reviewed build stopped.", output.getvalue())
+                self.assertIn("Sent by: Build writer · Template: alert.decision", output.getvalue())
+                self.assertNotIn(send.UNREVIEWED_FALLBACK, output.getvalue())
+            else:
+                self.assertIn(send.UNREVIEWED_FALLBACK, output.getvalue())
             transport = send.as_dict(send.loads(errors.getvalue().split("send.py: failed push JSON: ")[1]))
             self.assertIs(transport["reviewed"], True)
             self.assertEqual(transport["need"], need)
@@ -4151,7 +4275,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             ("FAILED: post failed fallback text:", "Build stopped — Action: Choose in natedev terminal.", 3),
         ):
             with self.subTest(header=header), mock.patch.object(send, "run", return_value=(code, "remote banner\n" + header + "\n" + payload + "\n", "")) as run:
-                result = send.send(send.parse(self.user_arguments("--machine", "natedev")))
+                result = send.send(send.parse(registered_arguments(self.user_arguments("--machine", "natedev"))))
             if code == 3:
                 self.assertEqual(result.detail, "on natedev: post failed " + send.UNREVIEWED_FALLBACK)
             else:
@@ -4160,9 +4284,10 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             self.assertTrue(cast(list[str], run.call_args.args[0])[-1].startswith("CLAUDE_PID= "))
             if code == 3:
                 marker = send.as_dict(send.loads(self.failure_marker().read_text()))
-                self.assertEqual(marker["fallback"], payload)
+                self.assertEqual(marker["fallback"], "Title: Build stopped\nAction: Choose in natedev terminal.\n"
+                                 + "Choose whether to retry.\n\nSent by: Build writer · Template: alert.decision")
         with mock.patch.object(send, "run", return_value=(255, "", "ssh unavailable")):
-            result = send.send(send.parse(self.user_arguments("--machine", "natedev")))
+            result = send.send(send.parse(registered_arguments(self.user_arguments("--machine", "natedev"))))
         self.assertIn(send.UNREVIEWED_FALLBACK, result.detail)
         self.assertTrue(self.failure_marker().exists())
 
@@ -4173,20 +4298,21 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         payload = "Build choice — Action: Choose retry. Use natedev."
         with mock.patch.object(send, "run", return_value=(3, "FAILED: post failed fallback text:\n" + payload + "\n",
                                                          "send.py: failed push JSON: " + json.dumps(record) + "\n")):
-            result = send.send(send.parse(self.user_arguments("--machine", "natedev")))
-        self.assertTrue(result.detail.endswith(payload))
+            result = send.send(send.parse(registered_arguments(self.user_arguments("--machine", "natedev"))))
+        self.assertTrue(result.detail.endswith(send.UNREVIEWED_FALLBACK))
         marker = send.as_dict(send.loads(self.failure_marker().read_text()))
         self.assertEqual(marker["action"], record["action"])
         self.assertEqual(marker["body"], record["body"])
-        self.assertEqual(marker["fallback"], payload)
+        self.assertEqual(marker["fallback"], "Title: Build choice\nAction: Choose retry.\nUse natedev.\n"
+                         + "The build stopped.\nChoose retry or stop.\n\nSent by: Build writer · Template: alert.decision")
 
-    def test_no_action_failure_marker_and_unwritable_marker_keep_fallback_output(self) -> None:
+    def test_no_action_failure_and_unwritable_marker_keep_the_refusal(self) -> None:
         self.writer_session()
         arguments = ["--to", "user", "--summary", "Update ready", "--no-action", "--text", "Update is ready."]
         reviewed = "pushover: reviewed JSON: " + json.dumps({"title": "Update ready", "action": None, "body": "Update is ready."})
         with mock.patch.object(send, "run", return_value=(1, reviewed, "post failed")):
             result = send.send(local_options(arguments))
-        self.assertTrue(result.detail.endswith("fallback text:\nUpdate ready — No action needed."))
+        self.assertTrue(result.detail.endswith(send.UNREVIEWED_FALLBACK))
         marker = send.as_dict(send.loads(self.failure_marker().read_text()))
         self.assertIsNone(marker["action"])
         self.assertEqual(marker["message"], "No action needed.\nUpdate is ready.")
@@ -4196,7 +4322,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             # The message log uses a direct append, so only the failure marker write fails.
             result = send.send(local_options(arguments))
         self.assertEqual(result.outcome, "failed")
-        self.assertIn("fallback text:", result.detail)
+        self.assertIn(send.UNREVIEWED_FALLBACK, result.detail)
         self.assertIn("could not write fallback marker", errors.getvalue())
 
     def test_remote_uses_the_first_outcome_header_and_no_far_side_marker(self) -> None:
@@ -4242,17 +4368,25 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             self.assertEqual(result.failure.action, ActionRequired("Choose retry."))
             self.assertEqual(result.failure.body, record["body"])
 
-    def test_fallback_is_one_line_and_truncates_at_a_word_boundary(self) -> None:
-        """F001: the built-in push has only a short message."""
-        for action in (ActionRequired("Choose retry.\nUse natedev."), NoActionRequired()):
-            failed = send.FailedPush("Build stopped", action, "Body is excluded.")
-            self.assertNotIn("\n", failed.text)
-            self.assertNotIn("Body is excluded.", failed.text)
-            self.assertEqual(failed.text, "Build stopped — " + " ".join(first_line(action).split()))
-        failed = send.FailedPush("Build " * 60, ActionRequired("Choose retry."), "body")
-        self.assertLessEqual(len(failed.text), 200)
-        self.assertTrue(failed.text.endswith("…"))
-        self.assertTrue(("Build " * 60).startswith(failed.text[:-1] + " "))
+    def test_fallback_keeps_the_full_registered_rendering(self) -> None:
+        failed = send.FailedPush("Build stopped", ActionRequired("Choose retry.\nUse natedev."), "Full body.",
+                                 reviewed=True, need="blocked", text_id="alert.blocked", sender="writer")
+        self.assertTrue(failed.fallback_allowed)
+        self.assertEqual(failed.text, "Title: Build stopped\nAction: Choose retry.\nUse natedev.\nFull body.\n\n"
+                         + "Sent by: writer · Template: alert.blocked")
+        self.assertFalse(replace(failed, text_id="").fallback_allowed)
+        self.assertFalse(replace(failed, reviewed=False).fallback_allowed)
+        self.assertFalse(replace(failed, held=True).fallback_allowed)
+        self.assertFalse(replace(failed, need="note").fallback_allowed)
+
+    def test_unreviewed_channel_record_never_permits_an_emergency_fallback(self) -> None:
+        record = {"title": "Build stopped", "action": "Repair the disk.", "body": "The disk is full.",
+                  "reviewed": False, "text_id": "alert.blocked"}
+        original = send.FailedPush("Build stopped", ActionRequired("Repair the disk."), "The disk is full.",
+                                   need="blocked", text_id="alert.blocked", sender="writer")
+        failed = send.reviewed_failure("pushover: reviewed JSON: " + json.dumps(record), original)
+        self.assertFalse(failed.reviewed)
+        self.assertFalse(failed.fallback_allowed)
 
     def test_remote_payload_headers_never_change_the_delivery_outcome(self) -> None:
         """F002: payload text cannot become an outcome header."""
@@ -4263,7 +4397,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         ):
             with self.subTest(outcome=outcome), mock.patch.object(send, "run", return_value=(
                     3 if marker else 0, header + "\n" + payload + "\n", "")):
-                result = send.send(send.parse(self.user_arguments("--machine", "natedev")))
+                result = send.send(send.parse(registered_arguments(self.user_arguments("--machine", "natedev"))))
             self.assertEqual(result.outcome, outcome)
             self.assertIn(payload, result.detail)
             self.assertEqual(self.failure_marker().exists(), marker)
@@ -4279,8 +4413,8 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             reply = (3, "FAILED: post failed\n", records) if remote else (1, records, "post failed")
             arguments = self.user_arguments("--machine", "natedev") if remote else self.user_arguments("--here")
             with self.subTest(remote=remote), mock.patch.object(send, "run", return_value=reply):
-                result = send.send(send.parse(arguments))
-            self.assertTrue(result.detail.endswith("fallback text:\nReviewed choice — Action: Choose retry."))
+                result = send.send(send.parse(registered_arguments(arguments)))
+            self.assertTrue(result.detail.endswith(send.UNREVIEWED_FALLBACK))
             marker = send.as_dict(send.loads(self.failure_marker().read_text()))
             self.assertEqual(marker["title"], "Reviewed choice")
             self.assertEqual(marker["body"], "Real body.")
@@ -4296,7 +4430,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 1, "pushover: reviewed JSON: " + json.dumps(record), "post failed")
             arguments = self.user_arguments("--machine", "natedev") if remote else self.user_arguments("--here")
             with self.subTest(remote=remote), mock.patch.object(send, "run", return_value=reply):
-                _ = send.send(send.parse(arguments))
+                _ = send.send(send.parse(registered_arguments(arguments)))
             marker = send.as_dict(send.loads(self.failure_marker().read_text()))
             self.assertEqual(marker["held_source"], "writer source")
             self.assertEqual(marker["held_identity"], "original-hold-hash")
@@ -4321,14 +4455,19 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             self.assertIn("go with --to user", errors.getvalue())
 
     def test_usage_errors_exit_2(self) -> None:
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(send.main(["--to", "user", "--text", "t"]), 2)
         for argv in (["--to", "x", "--repeat-minutes", "5", "--text", "t"], ["--to", "x", "--codex", "--text", "t"],
-                     ["--to", "x", "--text", "  "], ["ack"], ["--to", "user", "--text", "t"],
+                     ["--to", "x", "--text", "  "], ["ack"],
                      ["--to", "user", "--summary", "s", "--action", "none", "--text", "t"],
                      ["--to", "user", "--summary", "s", "--action", "do it", "--no-action", "--text", "t"],
                      ["--to", "user", "--summary", "s", "--need", "decision", "--no-action", "--text", "t"],
                      ["--to", "x", "--need", "decision", "--text", "t"]):
+            if "user" in argv:
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(send.main(argv), 2)
             with self.assertRaises(SystemExit) as raised, mock.patch("sys.stderr"):
-                _ = send.main(argv)
+                _ = send.parse(argv) if "user" in argv else send.main(argv)
             self.assertEqual(raised.exception.code, 2, argv)
 
 
@@ -4429,7 +4568,7 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         output, errors = io.StringIO(), io.StringIO()
         with redirect_stdout(output), redirect_stderr(errors):
             try:
-                status = send.main(["--to", to, "--from", "fixture sender", *options, "--text", text])
+                status = registered_main(["--to", to, "--from", "fixture sender", *options, "--text", text])
             except SystemExit as error:
                 status = int(cast(int, error.code))
         return status, output.getvalue(), errors.getvalue()
@@ -4714,7 +4853,7 @@ class AccountDaemonRoutingTests(unittest.TestCase):
         (self.homes[1] / "sessions").symlink_to(self.homes[0] / "sessions", target_is_directory=True)
         (self.root / "claude-sessions").mkdir()
         (self.root / "config").mkdir()
-        _ = (self.root / "config/send.conf").write_text(
+        _ = write_send_config(self.root / "config/send.conf",
             "MORTY_NATIVE_ID=codex:00000000-0000-4000-8000-000000000001\n")
         binaries = self.root / "bin"
         binaries.mkdir()

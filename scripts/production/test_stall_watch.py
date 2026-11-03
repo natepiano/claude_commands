@@ -426,7 +426,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             return real_run(command, capture_output=capture_output, text=text, check=check, timeout=timeout, env=env)
 
         with (mock.patch.object(subprocess, "run", run),
-              mock.patch.multiple(stall_watch, STATE_DIR=self.state, SESSIONS_DIR=self.sessions,
+              mock.patch.multiple(stall_watch, STATE_DIR=self.state,
                                   PROJECTS_DIR=self.projects, SESSIONS=self.sessions_script,
                                   SEND=self.bin / "send.py", PS="ps"),
               mock.patch.multiple(rca, STATE=self.root / "state/message/rca",

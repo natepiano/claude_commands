@@ -63,7 +63,6 @@ def production_paths(environment: Mapping[str, str]) -> Generator[None]:
             "CONFIG": Path(environment.get("SHOWRUNNERS_CONFIG") or
                            str(Path(showrunners.__file__).parents[2] / "config/showrunners.json")),
             "NOTIFIER_STATE_DIR": Path(environment.get("NOTIFIER_STATE_DIR") or str(home / ".local/state/notifier")),
-            "SESSIONS_DIR": Path(environment.get("NOTIFIER_SESSIONS_DIR") or str(home / ".claude/sessions")),
             "SHOWRUNNER_STATE_DIR": Path(environment.get("SHOWRUNNER_STATE_DIR") or str(home / ".local/state/showrunner")),
             "SESSIONS": Path(environment.get("SHOWRUNNERS_SESSIONS") or
                              str(Path(showrunners.__file__).parents[1] / "message/sessions.py")),

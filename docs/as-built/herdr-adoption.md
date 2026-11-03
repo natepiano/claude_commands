@@ -168,7 +168,7 @@ Before starting the agent, add_unit saves its exact opening, conversation id, ac
 - A plain `--resume` of an existing Units row, active or retired, continues its transcript without requiring a Production header in the row’s own plan document, so a condensed as-built remains usable; new units and attaches still require the header, and a resume with a different plan still refuses.
 - A plain `--resume` of a retired Units row may use `--cwd` outside its worktree: the raw Plan cell supplies the retired state, the row keeps its worktree and branch, and the launch creates neither and leaves the row for resume_unit to unmark; other cwd mismatches retain their refusal.
 - On a resume of a unit with session labels, `ClaudeUnknown` refuses, and `ClaudeNotRunning` closes that place's tab with `close_agent` before the relaunch.
-- A restore records its prompt as scheduled (`record_scheduled_restore_prompt`). The resumed model is the transcript's last real assistant model unless `--model` is given.
+- A restore's prompt carries the script envelope, which marks it as a script prompt; it writes no scheduled-prompt record. The resumed model is the transcript's last real assistant model unless `--model` is given.
 - A new unit waits until `read_place` shows `/remote-control is active`.
 - It prints `<unit> started: <attach_hint>` or `<unit> restore launched: <attach_hint>`, the unit's tab in its production's workspace.
 - Exit 1 on `AgentNotReady` (prints the screen), 2 on a refusal, 1 on other failures.
@@ -368,4 +368,4 @@ Run these suites on the Mac with a scratch home. Run the command from the root o
 - **Server environment check.** Panes inherit the server's environment. An adopted server started from a shell with another account's variables would launch Claude on the wrong account.
 - **No client window from Linux launchers.** Launchers start only the server, as a systemd user unit, and print the attach command. Restart opens a window only for a session that had one and has no client now.
 - **The Mac starts servers from the desktop.** The keychain is only readable in the Aqua session. Outside it, the Ghostty window starts the server, or the restart refuses with an instruction rather than bringing Claude back signed out.
-- **Legacy records stay parseable.** A crash or an old shutdown record can still name a tmux host. Turning it into a manual command keeps the conversation recoverable without bringing tmux back as a host.
+- Shutdown restart reads staff row IDs. It does not read old host records.
