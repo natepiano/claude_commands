@@ -1300,23 +1300,11 @@ The Phase 26 checkpoint did not name two narrowed assertions; this phase's check
 
 ### Phase 46 — Each shared config key has a test that proves its reader uses it  · status: done
 
-**Approved:** the builds showrunner, 2026-11-02 23:55 EST: put the six regression tests in the next phase as a current follow-up. They are part of the configuration work the user released.
+#### As-built
 
-**Depends on:** Phase 45.
+- Six regression tests guard the Phase 45 shared-key reads, each with a private `CONF_DIR` value that differs from the default: `tmp_sweep` folder age, folder-audit configured visible root and `repo_skip`, `smoke_launch.sh` refused port and host (curl stubbed), `mac_run.sh` connect timeout rounded up for ssh, and the first sweep message width.
+- Each test fails when its read goes back to the old fixed value (8 mutation checks).
 
-#### Work Order
+**Files:** `scripts/lint/test_tmp_sweep.py`, `scripts/lint/test_folder_audit.py`, `scripts/production/test_mac_run.py`, `scripts/lint/test_sweep.py`.
 
-**Goal:** Each of the six shared-key reads from Phase 45 has a regression test that fails without the read. No source or config change.
-
-**Spec:** one test per read. Each test sets a value in its own `CONF_DIR` that differs from the default:
-
-1. `scripts/lint/tmp_sweep.py` `wide_idle_seconds()` uses `lint.conf` `folder_remove_after_seconds`.
-2. `scripts/lint/folder_audit.py` keeps the configured `scratch.conf` `visible_root` under the Rust folder.
-3. `scripts/lint/folder_audit.py` skips the names in `scratch.conf` `repo_skip`.
-4. `scripts/production/smoke_launch.sh` uses `hana_shot.conf` `refused_port` and `host`.
-5. `scripts/production/mac_run.sh` uses `mac_test.conf` `connect_timeout_s` and rounds a fraction up.
-6. `scripts/lint/sweep.py` holder messages use the first `lint.conf` `sweep_message_path_widths` entry.
-
-**Acceptance:** each new test fails when its read goes back to the old fixed value; `test_tmp_sweep`, `test_folder_audit`, `test_mac_run`, `test_sweep` and basedpyright on the changed test files pass.
-
-**Workers:** `1 tester` — `sweep-test`.
+**Gotchas:** a test that copies the repo `lint.conf` must set every value its expected text depends on; the `mac_run` command stub links `curl`, so no test reaches the network.
