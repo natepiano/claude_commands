@@ -43,7 +43,7 @@ Each operation is a short list of plain steps. A rerun with nothing to change pr
 6. **Transfer:** write `parent`. Move the unit's Units row to the new production doc.
 7. **`/clear`:** write `current_session`.
 8. **Family switch:** start a session of the other family in the same slot, with the transcript extract. Write `current_session`. `id` and `name` stay.
-9. **Retire:** stop the unit and its workers (step 1). Remove the worktree and the branch. Write `worktree` state `removed`; the row stays, so a resume by `id` still works. Delete the Units row. Refuse only on refusal 4; an uncommitted `Project started` plan line alone is not uncommitted work.
+9. **Retire:** stop the unit and its workers (step 1). Remove the worktree and the branch. Write `worktree` state `removed`; the row stays, so a resume by `id` still works. Delete the Units row. Refuse only on refusal 4; an uncommitted `Project started` plan line alone is not work.
 
 ## 4. The only refusals
 
@@ -52,7 +52,7 @@ A check stays only if it prevents a catastrophe:
 1. The target folder exists (git's own error).
 2. A second operation on the same row runs at the same time (one lock for each row).
 3. A second copy of a running session would start.
-4. Uncommitted work would be deleted.
+4. Work would be deleted: uncommitted changes, or commits that the merge branch does not hold.
 5. A signal, keystroke or pane close would reach a process that is not the target (a reused pid, another conversation, a pane with other live work).
 
 Bad input (an unknown or unclear name, a session on the other machine) is an error message, not a refusal.
