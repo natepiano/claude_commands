@@ -71,7 +71,7 @@ class SilenceTests(unittest.TestCase):
         _ = silence.keep(PUSH, "Linux")
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(silence.off(self.runner, lambda _push: 1), 1)
-        self.assertIn("1 kept push delivered; 1 failed", output.getvalue())
+        self.assertIn("0 kept pushes delivered; 1 failed", output.getvalue())
 
     def test_manual_off_logs_an_automatic_end_before_releasing_pushes(self) -> None:
         record: silence.SilenceRecord = {"since": "2026-11-03T06:00:00+00:00", "until": None,

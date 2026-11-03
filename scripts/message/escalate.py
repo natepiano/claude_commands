@@ -2,7 +2,7 @@
 """Hold news for the user, and send it when they have not typed in a terminal in time.
 
   escalate.py hold KEY --text-id ID --value KEY=VALUE ...
-                   [--minutes 15]
+                   [--minutes 15] [--question PATH]
   escalate.py close KEY    the news is over; the next hold of KEY starts a new wait, and a sent
                            --need blocked push stops repeating (send.py retire --to user)
   escalate.py typed        the user typed in a terminal: the prompt hook's call
@@ -39,6 +39,7 @@ from scripts.production.showrunners import load_settings
 from scripts.production import staff
 from scripts.message import send_budget
 import push_texts
+import push_reference
 if TYPE_CHECKING:
     from ..whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
                                         codex_account, workers_home)
@@ -58,7 +59,7 @@ PY = Path(__file__).resolve().parent.parent / "lib" / "py"
 JOB = "escalate"
 KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 USAGE = ("usage: escalate.py hold KEY --text-id ID --value KEY=VALUE ... "
-         + "[--minutes N] "
+         + "[--minutes N] [--question PATH] "
          + " | close KEY | typed | due | list")
 
 Outcome = Literal["waiting", "sent", "answered", "review_held"]
@@ -143,6 +144,7 @@ class StoredHeldMessage(TypedDict):
     review_reason: NotRequired[str]
     text_id: NotRequired[str]
     values: NotRequired[dict[str, str]]
+    reference: NotRequired[push_reference.PushReference]
 
 
 @dataclass(frozen=True)
@@ -186,6 +188,7 @@ class HeldMessage:
 class RegisteredHold(HeldMessage):
     text_id: str
     values: tuple[tuple[str, str], ...]
+    reference: push_reference.PushReference = field(default_factory=lambda: push_reference.NO_REFERENCE)
 
 
 @dataclass(frozen=True)
@@ -308,9 +311,13 @@ def read(path: Path) -> ReadHeld:
         return UnreadableHeld()
     push = SessionPush(legacy.summary, legacy.text, action, legacy.need)
     if text_id:
+        try:
+            reference = push_reference.read_reference(record.get("reference"))
+        except ValueError:
+            return UnreadableHeld()
         return RegisteredHold(push, legacy.held_at, legacy.minutes, legacy.outcome,
             owner, _read_relays(record.get("relays")), origin, review_reason,
-            text_id=cast(str, text_id), values=tuple(registered_values.items()))
+            text_id=cast(str, text_id), values=tuple(registered_values.items()), reference=reference)
     return HeldMessage(push, legacy.held_at, legacy.minutes, legacy.outcome,
                        owner, _read_relays(record.get("relays")), origin, review_reason)
 
@@ -354,6 +361,7 @@ def write(path: Path, held: HeldMessage) -> None:
     if isinstance(held, RegisteredHold):
         record["text_id"] = held.text_id
         record["values"] = dict(held.values)
+        record["reference"] = held.reference
     if isinstance(held.origin, SessionQuestionOrigin):
         record["origin_session"] = held.origin.session_id
     if held.relays:
@@ -393,10 +401,11 @@ def _stored_action(action: UserAction) -> _StoredUserAction:
 
 
 def hold(key: str, push: SessionPush | push_texts.RenderedPush, minutes: int = 15,
-         *, owner: HoldOwner = UNOWNED_HOLD,
+         *, question: str = "", owner: HoldOwner = UNOWNED_HOLD,
          relays: tuple[HeldRelay, ...] = (), origin: QuestionOrigin = UNKNOWN_QUESTION_ORIGIN) -> bool:
     """Start KEY's wait; false when KEY is already held."""
     rendered = push if isinstance(push, push_texts.RenderedPush) else None
+    reference = push_reference.NO_REFERENCE if rendered is None else push_reference.admission_reference(rendered.id, question)
     if rendered is not None:
         push = SessionPush(rendered.title, rendered.body, rendered.action, rendered.need)
     if isinstance(push.action, NoActionRequired) and push.need != "note":
@@ -412,14 +421,14 @@ def hold(key: str, push: SessionPush | push_texts.RenderedPush, minutes: int = 1
         held = HeldMessage(cast(SessionPush, push), time.time(), minutes, "waiting", owner, relays, origin)
         if rendered is not None:
             held = RegisteredHold(held.push, held.held_at, minutes, "waiting", owner, relays, origin,
-                                  "", text_id=rendered.id, values=tuple(rendered.values.items()))
+                                  "", text_id=rendered.id, values=tuple(rendered.values.items()), reference=reference)
         write(path, held)
     return True
 
 
-def discard_script_hold(path: Path, held: RetiredScriptHold) -> Settled:
+def discard_script_hold(path: Path, held: RetiredScriptHold | RegisteredHold,
+                        reason: str = "script warnings no longer escalate to the phone") -> Settled:
     """Under the state lock, log an obsolete script hold once and close it."""
-    reason = "script warnings no longer escalate to the phone"
     record: RetiredHoldRecord = {"time": time.time(), "key": path.stem,
                                 "text_id": held.text_id, "reason": reason}
     with (STATE / "log.jsonl").open("a", encoding="utf-8") as output:
@@ -503,7 +512,8 @@ def deliver(held: HeldMessage, key: str) -> str:
         return "template revision required"
     rendered = push_texts.render(held.text_id, **dict(held.values))
     command = push_texts.user_send_argv(rendered, sender=JOB, key=user_key(key),
-                                      self_clearing=held.need == "blocked")
+                                      self_clearing=held.need == "blocked",
+                                      question=held.reference["path"] if held.reference["kind"] == "question" else "")
     command[1] = str(SEND)
     done = subprocess.run(command, capture_output=True, text=True, check=False,
                           timeout=send_budget.user_seconds(review.user_send_seconds()))
@@ -565,6 +575,17 @@ def due(now: float) -> list[Settled]:
                 continue
             if held.outcome != "waiting":
                 continue
+            if held.reference["kind"] == "question":
+                try:
+                    opening = push_reference.read_question(Path(held.reference["path"]))
+                except (OSError, ValueError) as error:
+                    settled.append(Settled(f"{path.stem}: NOT sent: {error}", True))
+                    continue
+                reason = ("question closed" if opening.status == "closed" else
+                          "question reopened" if opening.since != held.reference["since"] else "")
+                if reason:
+                    settled.append(discard_script_hold(path, held, reason))
+                    continue
             if (path.stem == "five-hour-codex" or isinstance(held.owner, KnownCodexAccount)) and isinstance(identity, UnknownCodexAccount):
                 continue
             if (isinstance(identity, KnownCodexAccount)
@@ -614,8 +635,9 @@ def listing(now: float) -> list[str]:
     return lines or ["nothing held"]
 
 
-def registered_hold_options(arguments: list[str]) -> tuple[push_texts.RenderedPush, int]:
+def registered_hold_options(arguments: list[str]) -> tuple[push_texts.RenderedPush, int, str]:
     text_id = ""
+    question = ""
     minutes = "15"
     values: dict[str, str] = {}
     index = 0
@@ -625,6 +647,8 @@ def registered_hold_options(arguments: list[str]) -> tuple[push_texts.RenderedPu
         option, value = arguments[index:index + 2]
         if option == "--text-id" and not text_id:
             text_id = value
+        elif option == "--question":
+            question = value
         elif option == "--minutes":
             minutes = value
         elif option == "--value":
@@ -637,15 +661,15 @@ def registered_hold_options(arguments: list[str]) -> tuple[push_texts.RenderedPu
         index += 2
     if not text_id or not minutes.isdigit():
         raise ValueError(USAGE + "; " + push_texts.TEMPLATE_REQUIRED)
-    return push_texts.render(text_id, **values), int(minutes)
+    return push_texts.render(text_id, **values), int(minutes), question
 
 
 def main(arguments: list[str]) -> int:
     match arguments:
         case ["hold", key, *pairs] if KEY.fullmatch(key):
             try:
-                rendered, minutes = registered_hold_options(pairs)
-                started = hold(key, rendered, minutes, origin=current_question_origin())
+                rendered, minutes, question = registered_hold_options(pairs)
+                started = hold(key, rendered, minutes, question=question, origin=current_question_origin())
             except ValueError as error:
                 print(f"escalate.py: {error}", file=sys.stderr)
                 return 2
