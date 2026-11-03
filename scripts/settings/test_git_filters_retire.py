@@ -1,6 +1,8 @@
 """Tests for git_filters_retire: a retired clean filter leaves no stale index entry and no driver."""
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import registry_text
+
 import os
 import shutil
 import subprocess
@@ -8,14 +10,12 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import final, override
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 TABLE = Path(__file__).with_name("git_filters_table.sh")
 BASH = shutil.which("bash") or "/bin/bash"
-DEFAULTS = "[direct.codex]\nimpl=gpt-a:xhigh\n"
-LOCAL = "[direct.codex]\nimpl=gpt-b:high   # this machine's row, longer than the default\n"
+DEFAULTS = registry_text({"direct.codex": {"impl": "gpt-a:xhigh"}, "codex.agents": {"gpt-a": "high,xhigh", "gpt-b": "high,xhigh"}})
+LOCAL = registry_text({"direct.codex": {"impl": "gpt-b:high   # this machine's row, longer than the default"}, "codex.agents": {"gpt-a": "high,xhigh", "gpt-b": "high,xhigh"}})
 # The clean filter the repo used to run on config/agents.conf: it pinned the index blob.
 PIN = """#!/usr/bin/env bash
 git rev-parse --verify --quiet :config/agents.conf >/dev/null || exec cat

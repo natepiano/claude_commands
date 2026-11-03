@@ -6,13 +6,22 @@ from __future__ import annotations
 import json
 import os
 import stat
-import subprocess
 import sys
-from collections.abc import Iterator
+import time
+import tomllib
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import Enum
+from importlib import import_module
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
+
+if __package__:
+    from .process_identity import process_start as process_start
+    from .relay_identity import RelayIdentity, live_relay_identity, relay_senders_directory
+else:
+    from process_identity import process_start as process_start
+    from relay_identity import RelayIdentity, live_relay_identity, relay_senders_directory
 
 
 # Claude's entrypoint for a print-mode run starts with this; an interactive session's is "cli".
@@ -34,6 +43,10 @@ class SessionRecord(TypedDict):
     # How Claude was started: "cli" for an interactive session, "sdk-cli" for a `claude -p` run.
     # Older records and callers may omit it; read_session normalizes absence to empty.
     entrypoint: NotRequired[str]
+    # The conversation's folder, for the exact staff-worktree join. Older records may omit it.
+    cwd: NotRequired[str]
+    # Older records omit status. The reader converts absence to an empty string.
+    status: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -80,7 +93,40 @@ class RegistryRead:
     unreadable: tuple[Path, ...]
 
 
-def read_registry() -> RegistryRead:
+@dataclass(frozen=True)
+class SessionRetryPolicy:
+    registry_reads: int
+    registry_delay_seconds: float
+    resume_attempts: int
+    resume_delay_seconds: float
+
+
+def retry_policy() -> SessionRetryPolicy:
+    """Read tuning at use; a missing or invalid setting never invents a retry budget."""
+    path = Path(__file__).resolve().parents[2] / "config/session_retries.toml"
+    with path.open("rb") as source:
+        values = cast(dict[str, object], tomllib.load(source))
+    counts: list[int] = []
+    for key in ("registry_reads", "resume_attempts"):
+        value = values[key]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"{path}: {key} must be a positive integer")
+        counts.append(value)
+    delays: list[float] = []
+    for key in ("registry_delay_seconds", "resume_delay_seconds"):
+        value = values[key]
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value < float("inf"):
+            raise ValueError(f"{path}: {key} must be finite and nonnegative")
+        delays.append(float(value))
+    return SessionRetryPolicy(counts[0], delays[0], counts[1], delays[1])
+
+
+@dataclass(frozen=True)
+class RegistryRecordGone:
+    """The file vanished, or its filename's process is proven gone."""
+
+
+def read_registry(*, dependencies: Callable[[Path], None] | None = None) -> RegistryRead:
     """Keep unreadable directories and records visible to complete observers."""
     directory = sessions_dir()
     try:
@@ -89,17 +135,15 @@ def read_registry() -> RegistryRead:
         return RegistryRead((), (directory,))
     entries: list[RegistryObservation] = []
     unreadable: list[Path] = []
+    policy = retry_policy()
     for path in paths:
-        try:
-            raw = cast(object, json.loads(path.read_text()))
-            record = parse_session(raw)
-        except (OSError, ValueError, TypeError):
-            record = UnreadableSessionRecord.FOUND
-            raw = {}
-        if isinstance(record, UnreadableSessionRecord):
+        observation = _read_observation(path, policy, dependencies=dependencies)
+        if isinstance(observation, RegistryRecordGone):
+            continue
+        if isinstance(observation, UnreadableSessionRecord):
             unreadable.append(path)
         else:
-            entries.append(RegistryObservation(record, cast(RegistryDetails, raw)))
+            entries.append(observation)
     return RegistryRead(tuple(entries), tuple(unreadable))
 
 
@@ -117,6 +161,8 @@ def parse_session(parsed: object) -> RegistryEntry:
     tmux = data.get("tmux")
     former = data.get("formerNames")
     entrypoint = data.get("entrypoint")
+    cwd = data.get("cwd")
+    status = data.get("status")
     if (
         not isinstance(pid, int)
         or isinstance(pid, bool)
@@ -139,14 +185,40 @@ def parse_session(parsed: object) -> RegistryEntry:
         formerNames=[name for name in cast(list[object], former) if isinstance(name, str)]
         if isinstance(former, list) else [],
         entrypoint=entrypoint if isinstance(entrypoint, str) else "",
+        cwd=cwd if isinstance(cwd, str) else "",
+        status=status if isinstance(status, str) else "",
     )
 
 
+def _read_observation(path: Path, policy: SessionRetryPolicy, *, dependencies: Callable[[Path], None] | None = None) -> RegistryObservation | UnreadableSessionRecord | RegistryRecordGone:
+    """Reread a concurrent write; only a live unreadable record remains uncertain."""
+    for attempt in range(policy.registry_reads):
+        try:
+            if dependencies is not None:
+                dependencies(path)
+            raw = cast(object, json.loads(path.read_text()))
+            record = parse_session(raw)
+            if not isinstance(record, UnreadableSessionRecord):
+                return RegistryObservation(record, cast(RegistryDetails, raw))
+        except FileNotFoundError:
+            return RegistryRecordGone()
+        except (OSError, ValueError, TypeError):
+            pass
+        if attempt + 1 < policy.registry_reads:
+            time.sleep(policy.registry_delay_seconds)
+    if path.stem.isdigit():
+        try:
+            os.kill(int(path.stem), 0)
+        except (ProcessLookupError, OverflowError):
+            return RegistryRecordGone()
+        except OSError:
+            pass  # A denied process probe does not prove absence.
+    return UnreadableSessionRecord.FOUND
+
+
 def read_session(path: Path) -> RegistryEntry:
-    try:
-        return parse_session(cast(object, json.loads(path.read_text())))
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return UnreadableSessionRecord.FOUND
+    observation = _read_observation(path, retry_policy())
+    return observation.record if isinstance(observation, RegistryObservation) else UnreadableSessionRecord.FOUND
 
 
 def remote_control(record: SessionRecord) -> Literal["active", "absent"]:
@@ -162,40 +234,18 @@ def remote_control(record: SessionRecord) -> Literal["active", "absent"]:
     return "absent"
 
 
-def process_start(pid: int) -> str | None:
-    """The process identity stored in session records, in this platform's native units."""
-    if sys.platform == "darwin":
-        # Claude writes procStart under this locale and zone; other text never matches.
-        try:
-            result = subprocess.run(
-                ("ps", "-o", "lstart=", "-p", str(pid)),
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-                env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        started = result.stdout.strip()
-        return started if result.returncode == 0 and started else None
-    try:
-        # The kernel can truncate the process name inside a UTF-8 character.
-        _, separator, fields = Path(f"/proc/{pid}/stat").read_bytes().rpartition(b")")
-        if not separator:
-            return None
-        started = fields.split()[19].decode("ascii")
-        return started if started.isdigit() else None
-    except (OSError, IndexError, UnicodeDecodeError):
-        return None
+def headless_process(pid: int, entrypoint: str = "") -> bool:
+    """Exclude SDK and relay processes even before a session record exists."""
+    return (entrypoint.startswith(HEADLESS_ENTRYPOINT_PREFIX)
+            or isinstance(live_relay_identity(pid, relay_senders_directory()), RelayIdentity))
 
 
 def headless(record: SessionRecord) -> bool:
-    """A `claude -p` run, such as send.py's relay, which takes its sender's name for one message.
+    """A `claude -p` run, or a process identified by the relay launcher's PID record.
 
     It is no session: no roster lists it, and no name lookup finds it.
     """
-    return record.get("entrypoint", "").startswith(HEADLESS_ENTRYPOINT_PREFIX)
+    return headless_process(record["pid"], record.get("entrypoint", ""))
 
 
 def running_session(record: SessionRecord) -> bool:
@@ -243,18 +293,12 @@ class SessionProcesses:
 
 
 def _session_observations(session_id: str) -> Iterator[LiveSessionProcess | SessionLivenessUnknown]:
-    try:
-        paths = [path for path in sessions_dir().iterdir() if path.suffix == ".json"]
-    except OSError as error:
-        reason = str(error).splitlines()
-        yield SessionLivenessUnknown(f"session registry unreadable: {reason[0] if reason else type(error).__name__}")
+    registry = read_registry()
+    if sessions_dir() in registry.unreadable:
+        yield SessionLivenessUnknown("session registry unreadable: " + str(sessions_dir()))
         return
-    unreadable_records: list[str] = []
-    for path in paths:
-        registered = read_session(path)
-        if isinstance(registered, UnreadableSessionRecord):
-            unreadable_records.append(path.name)
-            continue
+    for observation in registry.entries:
+        registered = observation.record
         if registered["sessionId"] != session_id:
             continue
         if running_session(registered):
@@ -263,8 +307,8 @@ def _session_observations(session_id: str) -> Iterator[LiveSessionProcess | Sess
             observed = process_liveness(registered["pid"], registered.get("procStart", ""))
             if not isinstance(observed, SessionNotLive):
                 yield observed
-    if unreadable_records:
-        yield SessionLivenessUnknown("unreadable session registry record: " + unreadable_records[0])
+    if registry.unreadable:
+        yield SessionLivenessUnknown("unreadable session registry record: " + registry.unreadable[0].name)
 
 
 def session_liveness(session_id: str) -> LiveSessionProcess | SessionNotLive | SessionLivenessUnknown:
@@ -345,8 +389,17 @@ def latest_transcript(session_id: str, projects: Path) -> Path | None:
     return transcripts[-1] if transcripts else None
 
 
+def member_target(target: str) -> str:
+    """Resolve a retained staff reference to its current conversation at delivery."""
+    if not target.startswith("session:"):
+        return target
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    resolve = cast(Callable[[str], str], import_module("scripts.production.staff").current_session_target)
+    return resolve(target)
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 3 or argv[1] not in {"socket", "address", "id"} or not argv[2]:
+    if len(argv) != 3 or argv[1] not in {"socket", "member-socket", "address", "id"} or not argv[2]:
         print(
             "usage: sessions.py socket <session:id|name> | address <session:id|name> | id <pid|name>",
             file=sys.stderr,
@@ -354,19 +407,17 @@ def main(argv: list[str]) -> int:
         return 2
 
     command, target = argv[1:]
-    directory = sessions_dir()
-    try:
-        paths = sorted(path for path in directory.iterdir() if path.suffix == ".json")
-    except OSError as error:
-        detail = str(error).splitlines()
-        print(
-            f"sessions: cannot list registry: {detail[0] if detail else type(error).__name__}",
-            file=sys.stderr,
-        )
-        return 3
-    reads = [read_session(path) for path in paths]
-    unreadable = any(read is UnreadableSessionRecord.FOUND for read in reads)
-    records = (read for read in reads if not isinstance(read, UnreadableSessionRecord))
+    if command == "member-socket":
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        try:
+            target = member_target(target)
+        except (OSError, ValueError) as error:
+            print(f"sessions: staff target unavailable: {error}", file=sys.stderr)
+            return 3
+        command = "socket"
+    registry = read_registry()
+    unreadable = bool(registry.unreadable)
+    records = (observation.record for observation in registry.entries)
     if command != "id" and target.startswith("session:"):
         matches = (record for record in records if record["sessionId"] == target[8:])
     elif command != "id":

@@ -1,7 +1,7 @@
 import type { SessionReceiveInput } from "claude-code";
 import { stateDirectory } from "./outbox";
 import { PATHS, REPLY_WINDOW_MS, isDeliveryRouteFile } from "./protocol";
-import type { DeliveryRoute, DeliveryRouteFile, PostmasterCalls, Replies, ReplyDestination, ReplyLog } from "./protocol";
+import type { DeliveryRoute, DeliveryRouteFile, ForwardLog, PostmasterCalls, Replies, ReplyDestination, ReplyLog } from "./protocol";
 
 type ReplyWrapper = { kind: "reply"; socket: string; name: string; body: string } | { kind: "not a reply" };
 
@@ -110,8 +110,15 @@ export async function startReplies(calls: PostmasterCalls): Promise<Replies> {
       const senders = [...new Set(matching.map(route => route.sender))];
       const targets = new Set<string>();
       for (const route of matching) if (route.destination.kind === "session") targets.add(route.destination.sessionId);
+      const replying = matching[matching.length - 1];
+      if (replying === undefined) return { kind: "pass" };
       const answerTo = senders.length === 1 ? senders.join(", ") : `one of ${senders.join(", ")}`;
       const key = `${at_ms}-${++replyCount}`;
+      const log: ReplyLog = {
+        at_ms, socket: reply.socket, name: reply.name, session_id: replying.sessionId, senders, body: reply.body, targets: [...targets],
+      };
+      // Each file is written once, before any reader can need it: the engine fs has no rename, so a rewrite could be read torn.
+      await calls.fs.write(path(PATHS.replies, key), JSON.stringify(log));
       const forwarded: string[] = [];
       for (const sessionId of targets) {
         const text = `Message from ${reply.name} (their answer to ${answerTo}, passed on by postmaster) [${at_ms}-${++forwardCount}]:\n\n${reply.body}`;
@@ -120,10 +127,7 @@ export async function startReplies(calls: PostmasterCalls): Promise<Replies> {
           if (answer.isDelivered) forwarded.push(sessionId);
         } catch { /* The answer is still logged and consumed when forwarding fails. */ }
       }
-      const replying = matching[matching.length - 1];
-      if (replying === undefined) return { kind: "pass" };
-      const log: ReplyLog = { at_ms, socket: reply.socket, name: reply.name, session_id: replying.sessionId, senders, body: reply.body, forwarded };
-      await calls.fs.write(path(PATHS.replies, key), JSON.stringify(log));
+      await calls.fs.write(path(PATHS.forwards, key), JSON.stringify({ forwarded } satisfies ForwardLog));
       return { kind: "consumed", reason: "postmaster reply" };
     },
   };

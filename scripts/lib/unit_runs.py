@@ -23,7 +23,7 @@ import json
 import os
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast
 
@@ -38,6 +38,8 @@ HEARTBEAT = "heartbeat.log"
 LIVE_HEARTBEAT_SECS = 600
 # The Claude session that directs the run, one line, rewritten by each dispatch.
 DIRECTOR_FILE = "director"
+# The run's Claude worker launch log, separate from the unit's durable worker ledger.
+WORKERS_LOG = "workers"
 # Names the run's history, whose first line is the `run_started` event `start-run` writes.
 STATE_FILE = "progress_history_state.json"
 # Every run's durable history: runs/, review_turns/, archives. The former name is read until
@@ -105,6 +107,20 @@ def marker(session_id: str, override: str | Path | None = None) -> Path:
     return next((path for path in candidates if path.is_file()), candidates[0])
 
 
+def marker_must_stay(path: Path) -> bool:
+    """Keep another session's marker when its owner is live or liveness is unknown.
+
+    The marker name is the session id; its age and target's existence say nothing
+    about the owning process. Reuse the registry's process-identity check.
+    """
+    if TYPE_CHECKING:
+        from ..message import sessions
+    else:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
+        import sessions
+    return not isinstance(sessions.session_liveness(path.name), sessions.SessionNotLive)
+
+
 def record_director(run: Path, session_id: str) -> None:
     """Name the run's director. A Codex worker that dispatches a peer inherits the director's
     session id, so it writes the same one; a Claude worker has its own, so a session the run lists
@@ -128,47 +144,73 @@ def _claude_worker(run: Path, session_id: str) -> bool:
         if record.get("family") == "claude" and record.get("worker_id") == session_id:
             return True
     try:
-        ledger = (run / "workers").read_text(encoding="utf-8").splitlines()
+        ledger = (run / WORKERS_LOG).read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError):
         return False
     return any(short and session_id.startswith(short) for short in (line.partition("\t")[0].strip() for line in ledger))
 
 
-def director(run: Path) -> str:
+def director(run: Path, *, dependencies: Callable[[Path], None] | None = None) -> str:
     """The run's director: its recorded one, else the session that started it, from the
     `run_started` event that opens its history, for a run nothing has dispatched in since
     dispatches began recording it. The state's own `main_agent` is not used: in runs started before
     2026-10-17 a pass opened inside a worker rewrote it with that worker's thread, and
     progress_history reads the director from here to repair it."""
+    if dependencies is not None:
+        dependencies(run / DIRECTOR_FILE)
     try:
         recorded = (run / DIRECTOR_FILE).read_text(encoding="utf-8").strip()
     except (OSError, UnicodeError):
         recorded = ""
-    return recorded or _started_by(run)
+    return recorded or _started_by(run, dependencies=dependencies)
 
 
-def held(session_id: str, root_override: str | Path | None = None,
-         active_override: str | Path | None = None) -> list[str]:
-    """Every run folder the session directs: its marker's run first, as the marker writes it, then
-    each folder under the run roots that names it as director. A plain scan, since reading the
-    director of every folder costs about 25 ms for the 224 live ones (2026-10-17)."""
-    if not session_id:
-        return []
-    try:
-        lines = marker(session_id, active_override).read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        lines = []
-    runs = [lines[0].strip()] if lines and lines[0].strip() else []
-    seen = {Path(run).resolve() for run in runs}
+def held_by_session(root_override: str | Path | None = None) -> dict[str, list[str]]:
+    """Read each folder's director once, in root order and then name order."""
+    found: dict[str, list[str]] = {}
+    seen: set[Path] = set()
     for root in run_roots(root_override):
         try:
             folders = sorted(root.iterdir())
         except OSError:
             continue
         for folder in folders:
-            if folder.is_dir() and folder.resolve() not in seen and director(folder) == session_id:
-                seen.add(folder.resolve())
-                runs.append(str(folder))
+            resolved = folder.resolve()
+            if folder.is_dir() and resolved not in seen:
+                seen.add(resolved)
+                found.setdefault(director(folder), []).append(str(folder))
+    return found
+
+
+def held(session_id: str, root_override: str | Path | None = None,
+         active_override: str | Path | None = None, *,
+         scanned: dict[str, list[str]] | None = None) -> list[str]:
+    """List directed folders with the verified marker first, then the shared scan's order."""
+    if not session_id:
+        return []
+    folders = held_by_session(root_override) if scanned is None else scanned
+    try:
+        lines = marker(session_id, active_override).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        lines = []
+    runs: list[str] = []
+    if lines and (target := lines[0].strip()):
+        resolved = Path(target).resolve()
+        owner = next((session for session, paths in folders.items()
+                      if any(Path(path).resolve() == resolved for path in paths)), None)
+        if owner is None:
+            owner = director(Path(target))
+            if owner == session_id:
+                # Cache an outside target only after its marker owner matches its director.
+                folders.setdefault(owner, []).append(target)
+        if owner == session_id:
+            runs.append(target)
+    seen = {Path(run).resolve() for run in runs}
+    for folder in folders.get(session_id, ()):
+        resolved = Path(folder).resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            runs.append(folder)
     return runs
 
 
@@ -180,11 +222,15 @@ def _json_object(text: str) -> dict[str, object]:
     return cast(dict[str, object], raw) if isinstance(raw, dict) else {}
 
 
-def _started_by(run: Path) -> str:
+def _started_by(run: Path, *, dependencies: Callable[[Path], None] | None = None) -> str:
+    if dependencies is not None:
+        dependencies(run / STATE_FILE)
     try:
         history = _json_object((run / STATE_FILE).read_text(encoding="utf-8")).get("history_file")
         if not isinstance(history, str) or not history:
             return ""
+        if dependencies is not None:
+            dependencies(Path(history))
         with Path(history).open(encoding="utf-8") as handle:
             event = _json_object(handle.readline())
     except (OSError, UnicodeError):
@@ -208,13 +254,13 @@ def former_owners(running: Mapping[str, str]) -> list[FormerOwner]:
         return []
     owners: list[FormerOwner] = []
     for path in markers:
-        if path.name not in running:
+        if path.name not in running and not marker_must_stay(path):
             continue
         try:
             run = path.read_text(encoding="utf-8").strip()
         except (OSError, UnicodeError):
             run = "an unreadable marker"
-        owners.append(FormerOwner(path.name, running[path.name], run))
+        owners.append(FormerOwner(path.name, running.get(path.name, "live or uncheckable session"), run))
     return owners
 
 

@@ -15,10 +15,8 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.usage import agents_log
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 SCRIPT = Path(__file__).with_name("agents_log.py")
@@ -94,6 +92,14 @@ class AgentsLogTests(unittest.TestCase):
             datetime.fromtimestamp(roster_stamp, timezone.utc),
             datetime.fromtimestamp(ledger_stamp, timezone.utc),
         )
+
+    def test_rerun_assignment_survives_cli_append_and_show(self) -> None:
+        result = self.cli("append", "--id", "rerun-worker", "--role", "review", "--lens", "rerun")
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(self.records()[0]["lens"], "rerun")
+        shown = self.cli("show", "--id", "rerun-worker")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertIn("| rerun-worker | review | rerun |", shown.stdout)
 
     def test_state_directory_uses_the_environment_override(self) -> None:
         self.assertEqual(agents_log.state_dir(), self.state)

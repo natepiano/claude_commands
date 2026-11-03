@@ -14,14 +14,15 @@ from typing import TYPE_CHECKING, cast, final
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
-import add_unit
+import production_units
 import pins
 import upgrade_record
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 if TYPE_CHECKING:
     from typing import override
@@ -45,7 +46,7 @@ class RecordTests(unittest.TestCase):
     @override
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
-        self.production = add_unit.Production(Path(), "demo", "demo", Path(), Path(), ZoneInfo("UTC"))
+        self.production = production_units.Production(Path(), "demo", "demo", Path(), Path(), ZoneInfo("UTC"))
         self.current_pins = pins.Pins((), frozenset(), ())
 
     @override
@@ -67,7 +68,7 @@ class RecordTests(unittest.TestCase):
             + "- **Log:** log.md\n- **User zone:** America/New_York\n\n## Units\n",
             encoding="utf-8",
         )
-        self.production = add_unit.read_production(doc)
+        self.production = production_units.read_production(doc)
         self.current_pins = pins.Pins(("0.19.1",), frozenset({"bevy_ecs"}),
                                       (dependent("alpha"), dependent("zeta")))
         _ = cast(object, self.enterContext(mock.patch.dict(
@@ -98,14 +99,14 @@ class RecordTests(unittest.TestCase):
         script = (
             "import sys\nfrom pathlib import Path\n"
             + "sys.path.insert(0, sys.argv[1])\nsys.path.insert(0, sys.argv[2])\n"
-            + "import record\nimport upgrade_record\nimport upgrade_report\n"
-            + "assert Path(record.__file__).resolve() == Path(sys.argv[2]) / 'record.py'\n"
+            + "import shutdown_record\nimport upgrade_record\nimport upgrade_report\n"
+            + "assert Path(shutdown_record.__file__).resolve() == Path(sys.argv[2]) / 'shutdown_record.py'\n"
             + "assert Path(upgrade_record.__file__).resolve() == Path(sys.argv[1]) / 'upgrade_record.py'\n"
             + "assert Path(upgrade_report.__file__).resolve() == Path(sys.argv[1]) / 'upgrade_report.py'\n"
         )
         result = subprocess.run([sys.executable, "-c", script, str(directory), str(shutdown)],
                                 env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-                                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
+                                capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_start_builds_the_specified_record_without_default_answers(self) -> None:

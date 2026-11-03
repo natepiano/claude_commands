@@ -40,17 +40,13 @@ from datetime import datetime, timezone, tzinfo
 from enum import Enum
 from importlib import import_module
 from pathlib import Path
+from collections.abc import Awaitable
 from typing import Literal, Protocol, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-# Sibling scripts and package callers must share the same account identity classes.
-if __name__ == "agent_accounts":
-    _ = sys.modules.setdefault("scripts.whoami.agent_accounts", sys.modules[__name__])
-elif __name__ == "scripts.whoami.agent_accounts":
-    _ = sys.modules.setdefault("agent_accounts", sys.modules[__name__])
-
 from scripts.lib.user_zone import user_zone as setting_zone  # noqa: E402
+from scripts.maintenance.schedule import IntervalHistory
 
 
 @dataclass(frozen=True)
@@ -310,6 +306,8 @@ class UsageReadOutcome(str, Enum):
     HELD = "held"
     OK = "ok"
     STALE_TOKEN = "stale_token"
+    NO_LOGIN_TOKEN = "no_login_token"
+    CREDENTIALS_UNAVAILABLE = "credentials_unavailable"
     REFUSED_401 = "refused_401"
     RATE_LIMITED_429 = "rate_limited_429"
     ERROR = "error"
@@ -351,6 +349,25 @@ class UnknownUsageLogin:
     """The caller has no login to use if the identity read fails."""
 
 
+@dataclass(frozen=True)
+class UsageClaimFailed:
+    reason: str
+
+
+@dataclass(frozen=True)
+class UsageSaveFailed:
+    reason: str
+
+
+UsageStoreWarning = UsageClaimFailed | UsageSaveFailed
+
+
+def usage_store_warning_line(warning: UsageStoreWarning) -> str:
+    if isinstance(warning, UsageClaimFailed):
+        return f"usage store: could not claim the read; {warning.reason}; read without a hold"
+    return f"usage store: could not save the read; {warning.reason}; keep the live report"
+
+
 @dataclass
 class Report:
     """One tool's account. `problem` replaces the account lines; `quota_problem` follows them."""
@@ -374,6 +391,7 @@ class Report:
     usage_read_outcome: UsageReadOutcome = UsageReadOutcome.ERROR
     usage_read_claim: UsageReadClaim | UsageReadUnclaimed = field(default_factory=UsageReadUnclaimed)
     last_known_login: KnownUsageLogin | UnknownUsageLogin = field(default_factory=UnknownUsageLogin)
+    store_warnings: tuple[UsageStoreWarning, ...] = ()
 
     @property
     def weekly_reset(self) -> datetime | None:
@@ -525,9 +543,17 @@ def command_json(*args: str, environment: dict[str, str] | None = None) -> objec
         result = subprocess.run(command, capture_output=True, text=True, timeout=15)
     else:
         result = subprocess.run(command, capture_output=True, text=True, timeout=15, env=environment)
-    if result.returncode:
+    # Claude reports a signed-out session as JSON with exit 1.
+    if result.returncode and (result.returncode != 1 or args != ("claude", "auth", "status")):
         raise RuntimeError("account command failed")
-    return cast(object, json.loads(result.stdout))
+    decoded = cast(object, json.loads(result.stdout))
+    if result.returncode and not signed_out_answer(decoded):
+        raise RuntimeError("account command failed")
+    return decoded
+
+
+def signed_out_answer(decoded: object) -> bool:
+    return isinstance(decoded, dict) and cast(dict[str, object], decoded).get("loggedIn") is False
 
 
 def claude_config_dir() -> Path:
@@ -696,17 +722,24 @@ def codex_can_work(report: Report, now: datetime, credits: CodexCreditsSetting) 
 # --- Claude ------------------------------------------------------------------
 
 
+class ClaudeCredentialsUnavailable(RuntimeError):
+    """This process cannot read the account credentials in its session."""
+
+
 def claude_credentials(config_dir: Path | None = None) -> ClaudeCredentials:
     path = (claude_config_dir() if config_dir is None else config_dir) / ".credentials.json"
-    if path.exists():
-        return cast(ClaudeCredentials, json.loads(path.read_text()))
+    try:
+        if path.exists():
+            return cast(ClaudeCredentials, json.loads(path.read_text()))
+    except OSError as error:
+        raise ClaudeCredentialsUnavailable("usage credentials unavailable") from error
     if sys.platform == "darwin":
         try:
             return cast(ClaudeCredentials, command_json(
                 "security", "find-generic-password", "-s", claude_keychain_service(config_dir), "-w"))
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
-            raise RuntimeError("usage credentials unavailable") from error
-    raise RuntimeError("usage credentials unavailable")
+            raise ClaudeCredentialsUnavailable("usage credentials unavailable") from error
+    raise ClaudeCredentialsUnavailable("usage credentials unavailable")
 
 
 def claude_usage_quotas(usage: dict[str, object]) -> list[Quota]:
@@ -763,7 +796,8 @@ def claude_live(config_dir: Path | None = None, *, use_disk_identity: bool = Fal
         report.problem = "Account unavailable (claude auth status failed)"
         return report
     if not account.get("loggedIn"):
-        report.problem = "Not logged in"
+        report.usage_read_outcome = UsageReadOutcome.CREDENTIALS_UNAVAILABLE
+        report.problem = "Login credentials unavailable in this session"
         return report
     report.email = account.get("email")
     report.plan = account.get("subscriptionType") or account.get("authMethod")
@@ -787,7 +821,9 @@ def claude_live(config_dir: Path | None = None, *, use_disk_identity: bool = Fal
                 report.quota_problem = "Weekly quota: not read (stale token; a Claude session on this account refreshes it)"
                 return report
         if not token:
-            raise RuntimeError("usage credentials unavailable")
+            report.usage_read_outcome = UsageReadOutcome.NO_LOGIN_TOKEN
+            report.quota_problem = "Weekly quota: not read (no login token; start a Claude session on this account)"
+            return report
         request = urllib.request.Request(
             "https://api.anthropic.com/api/oauth/usage",
             headers={"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"},
@@ -796,8 +832,9 @@ def claude_live(config_dir: Path | None = None, *, use_disk_identity: bool = Fal
             raise RuntimeError("usage login unavailable")
         try:
             claim = store.claim_read(report.email, datetime.now(timezone.utc))
-        except (OSError, ValueError):
-            print("usage store: could not claim the read; read without a hold", file=sys.stderr)
+        except (OSError, ValueError) as error:
+            report.store_warnings += (UsageClaimFailed(str(error)),)
+            print(usage_store_warning_line(report.store_warnings[-1]), file=sys.stderr)
         else:
             if isinstance(claim, UsageReadHeld):
                 report.usage_read_outcome = UsageReadOutcome.HELD
@@ -812,6 +849,9 @@ def claude_live(config_dir: Path | None = None, *, use_disk_identity: bool = Fal
             report.usage_read_outcome = UsageReadOutcome.OK
         if not any(quota.label == "Weekly" for quota in report.quotas):
             report.quota_problem = "Weekly quota: unavailable"
+    except ClaudeCredentialsUnavailable:
+        report.usage_read_outcome = UsageReadOutcome.CREDENTIALS_UNAVAILABLE
+        report.quota_problem = "Weekly quota: not read (login credentials unavailable in this session)"
     except urllib.error.HTTPError as error:
         report.usage_read_outcome = (UsageReadOutcome.REFUSED_401 if error.code == 401 else
                                      UsageReadOutcome.RATE_LIMITED_429 if error.code == 429 else UsageReadOutcome.ERROR)
@@ -822,8 +862,9 @@ def claude_live(config_dir: Path | None = None, *, use_disk_identity: bool = Fal
         if report.email and isinstance(claim, UsageReadClaim):
             try:
                 store.finish_read(report.email, claim, report)
-            except (OSError, ValueError):
-                print("usage store: could not save the read; keep the live report", file=sys.stderr)
+            except (OSError, ValueError) as error:
+                report.store_warnings += (UsageSaveFailed(str(error)),)
+                print(usage_store_warning_line(report.store_warnings[-1]), file=sys.stderr)
     return report
 
 
@@ -1140,7 +1181,24 @@ def reset_credits(report: Report, summary: object) -> None:
     report.limit_reset_expirations.sort()
 
 
-async def live_reports(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome) -> list[Report]:
+@dataclass(frozen=True)
+class UnscheduledUsageReads:
+    """Read every selected account; its normal claim guard still applies."""
+
+
+UNSCHEDULED_USAGE_READS = UnscheduledUsageReads()
+
+
+@dataclass(frozen=True)
+class ScheduledUsageReads:
+    """Independent account attempt times and the configured eligibility interval."""
+
+    history: IntervalHistory
+    interval_seconds: float
+
+
+async def live_reports(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome, *,
+                       schedule: ScheduledUsageReads | UnscheduledUsageReads = UNSCHEDULED_USAGE_READS) -> list[Report]:
     """Live Claude directories and every Codex home, fetched concurrently."""
     homes = codex_homes(workers_home)
     directories = list(dict.fromkeys([
@@ -1150,9 +1208,31 @@ async def live_reports(selection: ClaudeAccountsInUse, workers_home: Path | NoWo
     home_login = claude_on_disk(Path.home() / ".claude").email
     if home_login and Path.home() / ".claude" not in directories:
         directories.append(Path.home() / ".claude")
+    if isinstance(schedule, ScheduledUsageReads):
+        checked_at = time.time()
+        directories = [directory for directory in directories
+                       if schedule.history.is_due(str(directory), schedule.interval_seconds, checked_at)]
+        homes = [home for home in homes
+                 if schedule.history.is_due(str(home), schedule.interval_seconds, checked_at)]
+
+    async def read_account(directory: Path, reading: Awaitable[Report]) -> Report:
+        started_at = time.time() if isinstance(schedule, ScheduledUsageReads) else 0
+        try:
+            report = await reading
+        except Exception:
+            if isinstance(schedule, ScheduledUsageReads):
+                schedule.history.record(str(directory), started_at)
+            raise
+        if isinstance(schedule, ScheduledUsageReads) and report.usage_read_outcome != UsageReadOutcome.HELD:
+            at = (report.usage_read_claim.at.timestamp()
+                  if isinstance(report.usage_read_claim, UsageReadClaim) else started_at)
+            schedule.history.record(str(directory), at)
+        return report
+
     reports = list(await asyncio.gather(
-        *(asyncio.to_thread(claude_live, directory, use_disk_identity=True) for directory in directories),
-        *(codex_live(home) for home in homes),
+        *(read_account(directory, asyncio.to_thread(claude_live, directory, use_disk_identity=True))
+          for directory in directories),
+        *(read_account(home, codex_live(home)) for home in homes),
     ))
     known = {named.directory: named.identity.login for named in selection.named_accounts}
     if home_login:

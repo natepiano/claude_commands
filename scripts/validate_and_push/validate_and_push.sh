@@ -17,11 +17,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 #                          recorded checkpoint commit is never rewritten
 #   --quick                run only the cargo-mend, rustfmt and taplo steps
 #                          (see validate_ci.sh)
+#   --validate-only        run validation without choosing a push path or pushing
 #   --cancel-prior         cancel superseded queued or running CI after a push
 PUSH_TARGET_BRANCH=""
 CANCEL_PRIOR=false
+VALIDATE_ONLY=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --validate-only) VALIDATE_ONLY=true; shift ;;
     --to) PUSH_TARGET_BRANCH="${2:?--to needs a branch name}"; shift 2 ;;
     --fix-commit) export VALIDATE_FIX_COMMIT_MESSAGE="${2:?--fix-commit needs a message}"; shift 2 ;;
     --quick) export VALIDATE_QUICK=1; shift ;;
@@ -30,52 +33,18 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-cancel_prior_runs() {
-  local branch sha workflows workflow runs run_id head_sha status live_status
-  branch="${PUSH_TARGET_BRANCH:-$(git branch --show-current)}"
-  sha="$(git rev-parse HEAD)"
-  if ! workflows="$(gh run list --branch "$branch" --commit "$sha" --json workflowName \
-    --jq '[.[].workflowName | select(. != null)] | unique[]' 2>/dev/null)"; then
-    printf 'warning: failed to list runs for %s on %s\n' "${sha:0:7}" "$branch" >&2
-    return 0
-  fi
-  if [ -z "$workflows" ]; then
-    printf 'no run for %s yet; nothing cancelled\n' "${sha:0:7}"
-    return 0
-  fi
-
-  while IFS= read -r workflow; do
-    for live_status in queued in_progress; do
-      if ! runs="$(gh run list --workflow "$workflow" --branch "$branch" --status "$live_status" \
-        --json databaseId,headSha,status \
-        --jq '.[] | "\(.databaseId)\t\(.headSha)\t\(.status)"' 2>/dev/null)"; then
-        printf 'warning: failed to list %s runs for %s on %s\n' "$live_status" "$workflow" "$branch" >&2
-        continue
-      fi
-      [ -n "$runs" ] || continue
-      while IFS=$'\t' read -r run_id head_sha status; do
-        if [ "$head_sha" != "$sha" ] && { [ "$status" = queued ] || [ "$status" = in_progress ]; }; then
-          if gh run cancel "$run_id" >/dev/null 2>&1; then
-            printf 'cancelled run %s (%s)\n' "$run_id" "${head_sha:0:7}"
-          else
-            printf 'warning: failed to cancel run %s\n' "$run_id" >&2
-          fi
-        fi
-      done <<< "$runs"
-    done
-  done <<< "$workflows"
-}
+export CANCEL_PRIOR
 
 echo "=== STEP: validation ==="
 bash "${SCRIPT_DIR}/run_validation.sh"
+if [ "$VALIDATE_ONLY" = true ]; then
+  exit 0
+fi
 
 push_status=0
 if [ -n "$PUSH_TARGET_BRANCH" ]; then
   echo "=== STEP: direct push to ${PUSH_TARGET_BRANCH} ==="
   PUSH_TARGET_BRANCH="$PUSH_TARGET_BRANCH" bash "${SCRIPT_DIR}/push_direct.sh" || push_status=$?
-  if [ "$CANCEL_PRIOR" = true ]; then
-    cancel_prior_runs
-  fi
   exit "$push_status"
 fi
 
@@ -91,7 +60,4 @@ fi
 
 echo "=== STEP: direct push ==="
 bash "${SCRIPT_DIR}/push_direct.sh" || push_status=$?
-if [ "$CANCEL_PRIOR" = true ]; then
-  cancel_prior_runs
-fi
 exit "$push_status"

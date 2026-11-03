@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import sys
 import tempfile
@@ -11,14 +12,22 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import change_review
 import footer_counts
 import next_item
 import proposal_issue
 import proposals_folder
-import showrunners
+from scripts.production import showrunners
+import showrunner_tree
+from scripts.production import staff
+from scripts.statusline import counts_row
 from footer_counts import FooterCounts
+from scripts.production.staff_test_support import (
+    fixture_member, isolated_source_readers, isolated_staff_file, source_environment,
+)
 
 LIST = """# Change review
 
@@ -80,6 +89,10 @@ class FooterCountsTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, source_environment(self.root / "sources"))))
+        _ = self.enterContext(isolated_source_readers())
+        _ = fixture_member("showrunner", name="fixture")
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"NEXT_STATE_DIR": str(self.root / "next")})))
         # The doc's own line names the list; no live showrunner's list is looked up.
@@ -89,22 +102,66 @@ class FooterCountsTests(unittest.TestCase):
         self.tree = {}
         self.below = {}
         _ = self.enterContext(mock.patch.object(showrunners, "timer_docs", side_effect=lambda: self.tree))
-        _ = self.enterContext(mock.patch.object(showrunners, "descendants_of",
+        _ = self.enterContext(mock.patch.object(showrunner_tree, "descendants_of",
                                                 side_effect=self.productions_below))
         # Each production below a root reports to that root.
-        _ = self.enterContext(mock.patch.object(showrunners, "edges", side_effect=self.parents))
+        _ = self.enterContext(mock.patch.object(showrunner_tree, "edges", side_effect=self.parents))
 
-    def parents(self, slugs: set[str] | None = None) -> dict[str, str]:
-        del slugs
+    def parents(self, slugs: set[str] | None = None, *,
+                record: staff.StaffSnapshot | None = None) -> dict[str, str]:
+        del slugs, record
         return {child: parent for parent, children in self.below.items() for child in children}
 
-    def productions_below(self, slug: str) -> list[str]:
+    def productions_below(self, slug: str, *,
+                          record: staff.StaffSnapshot | None = None) -> list[str]:
+        del record
         return self.below.get(slug, [])
 
     def doc(self, *fields: str) -> Path:
         path = self.root / "production.md"
         _ = path.write_text("# Production\n\n" + "".join(f"{field}\n" for field in fields), encoding="utf-8")
         return path
+
+    def test_footer_counts_and_watches_questions_without_a_proposals_line(self) -> None:
+        doc = self.root / "example-production.md"
+        _ = doc.write_text("> **Status: PRODUCTION — running.** Example\n- **User zone:** UTC\n")
+        owner = fixture_member("showrunner", name="renamed-owner", doc=staff.LiveDoc("natedev", doc))
+        state = self.root / "showrunner"
+        folder = state / owner.id / "questions"
+        folder.mkdir(parents=True)
+        record = folder / "question-layout.md"
+        fields = {"since": "2000-01-01T08:00", "text": "Choose the layout",
+                  "question": "Keep this layout?", "asked_by": str(owner.id)}
+        _ = record.write_text("---\nrecord_type: question\nstatus: open\n"
+                              + f"production_id: {owner.id}\nasked_by: {owner.id}\n"
+                              + f"registration: {json.dumps(fields)}\n---\n# Choose the layout\n")
+        instance = self.root / "notifier/showrunner-example"
+        instance.mkdir(parents=True)
+        _ = (instance / "conf").write_text(
+            f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/production_check.sh {doc}\n")
+        with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(state), "USER_ZONE": "UTC"}):
+            line, due, sources = counts_row.row(instance)
+        self.assertEqual(line, "For you: 1 question")
+        self.assertEqual(due, "")
+        self.assertIn(folder, sources)
+        self.assertIn(record, sources)
+        self.assertFalse((state / "outstanding/example.json").exists())
+
+    def test_sources_keep_the_document_when_the_proposals_folder_is_unreadable(self) -> None:
+        folder = self.root / "issues"
+        folder.mkdir()
+        doc = self.doc(f"- **Proposals:** {folder}")
+        glob = Path.glob
+
+        def read_folder(path: Path, pattern: str) -> object:
+            if path == folder:
+                raise PermissionError("The proposals folder is unreadable")
+            return glob(path, pattern)
+
+        with mock.patch.object(Path, "glob", side_effect=read_folder, autospec=True):
+            sources = footer_counts.sources(doc)
+        self.assertIn(doc, sources)
+        self.assertIn(folder, sources)
 
     def test_each_count_is_read_from_the_source_its_doc_line_names(self) -> None:
         listing = self.root / "change-review.md"

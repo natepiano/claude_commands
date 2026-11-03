@@ -12,10 +12,16 @@ from pathlib import Path
 from typing import final, override
 from unittest import mock
 
+
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import issues
 import proposals_folder
 import proposals_table
-import showrunners
+from scripts.production import showrunners
+import showrunner_tree
 from proposals_table import ADD_ON_STATE, IN_PROGRESS_STATE, REVIEW_STATE, Row
 
 # Importable once proposals_table has put scripts/direct on the path.
@@ -34,7 +40,7 @@ class ProposalsTableTests(unittest.TestCase):
         self.root = Path(folder.name)
         # No live update timer names a production below the test's own.
         _ = self.enterContext(mock.patch.object(showrunners, "timer_docs", return_value={}))
-        _ = self.enterContext(mock.patch.object(showrunners, "descendants_of", return_value=[]))
+        _ = self.enterContext(mock.patch.object(showrunner_tree, "descendants_of", return_value=[]))
 
     @contextlib.contextmanager
     def runs_of(self, runs: dict[Path, list[Path]]) -> Generator[None]:

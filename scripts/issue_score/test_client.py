@@ -190,6 +190,32 @@ class ClientTests(unittest.TestCase):
         http.assert_not_called()
         self.assertEqual(self.ledger.read_text(), prior)
 
+    def test_interrupted_pending_write_preserves_prior_reservations_and_allows_rerun(self) -> None:
+        pending = self.ledger.with_suffix(".pending.json")
+        earlier = {"unfinished-earlier-request": 0.25}
+        _ = pending.write_text(json.dumps(earlier), encoding="utf-8")
+        with mock.patch.object(os, "replace", side_effect=SystemExit("stopped before replace")), \
+                mock.patch.object(client, "urlopen", return_value=FixtureHTTPResponse(
+                    (FIXTURES / "main_response.json").read_bytes())) as http:
+            with self.assertRaises(SystemExit):
+                _ = self.call()
+        http.assert_not_called()
+        self.assertEqual(json.loads(pending.read_text()), earlier)
+
+        def rerun(request: Request, timeout: float = 60) -> FixtureHTTPResponse:
+            _ = request, timeout
+            reserved = cast(dict[str, float], json.loads(pending.read_text()))
+            self.assertEqual(reserved["unfinished-earlier-request"], 0.25)
+            self.assertEqual(len(reserved), 2)
+            return FixtureHTTPResponse((FIXTURES / "main_response.json").read_bytes())
+
+        with mock.patch.object(client, "urlopen", side_effect=rerun) as http:
+            response = self.call()
+        http.assert_called_once()
+        self.assertIn("impact", response["answers"])
+        self.assertEqual(json.loads(pending.read_text()), earlier)
+        self.assertEqual(len(self.ledger.read_text().splitlines()), 1)
+
     def test_budget_exhausted_during_backoff_refuses_the_retry(self) -> None:
         charged = json.dumps({"input_tokens": 1, "cost_usd": questions.BUDGET_USD}) + "\n"
 

@@ -1,5 +1,5 @@
 ---
-description: Walk through decisions one at a time using behavior-first, decision-ready context, one atomic question, a recommendation, relevant pending decisions, and a transient decision doc by default.
+description: Review decisions one at a time.
 ---
 
 Use this when the user has just received a long list — recommendations, findings, options, todos — and wants to review them deliberately one by one instead of responding to the whole wall of text.

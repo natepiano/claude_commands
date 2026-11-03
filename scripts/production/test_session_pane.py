@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import cast, override
@@ -15,10 +16,13 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 
+from scripts.lib.socket_test_support import short_socket_directory
 import session_pane
 from herdr import AgentBlocked, HerdrPlace, HerdrRefusal, SessionListResult
-from fake_herdr import CommandResponse, herdr_listener
+from fake_herdr import CommandResponse
+import fake_unit_host
 from sessions import SessionRecord
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
 SCRIPT = Path(__file__).with_name("session_pane.py")
 
@@ -41,12 +45,10 @@ class SessionPaneTests(unittest.TestCase):
             "HERDR_PROC": str(self.root / "proc"), "NOTIFIER_SESSIONS_DIR": str(self.records),
             "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "conversation-pause"),
         }
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        _ = unit_membership("show", "herdr-unit")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
         self.responses()
-        self.process(991000, 0, ["herdr", "--session", "native", "server"], {})
-        herdr_listener(self.root / "proc", 991000, "native", self.environment)
-        self.process(991001, 991000, ["zsh"], {"HERDR_PANE_ID": "w1:p1",
-                     "SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "herdr-unit"})
 
     def responses(self, *, blocked: bool = False, failed: bool = False) -> None:
         sessions: SessionListResult = {"sessions": [{"name": "native", "running": True, "default": False,
@@ -59,19 +61,23 @@ class SessionPaneTests(unittest.TestCase):
             "default": {"stdout": "native screen\n", "code": 1 if failed else 0},
         }
         _ = (self.root / "responses.json").write_text(json.dumps(responses))
+        fake_unit_host.write(self.environment, [
+            fake_unit_host.HostedUnit("native", "w1:p1", {
+                "SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "herdr-unit"}, "native screen\n"),
+            fake_unit_host.HostedUnit("native", "w1:p2", {}, "native screen\n")])
+        if failed:
+            responses = cast(dict[str, CommandResponse], json.loads((self.root / "responses.json").read_text()))
+            for command, response in responses.items():
+                if command.startswith("--session native pane read "):
+                    response["code"] = 1
+            _ = (self.root / "responses.json").write_text(json.dumps(responses))
 
     def process(self, pid: int, parent: int, argv: list[str], environment: dict[str, str]) -> None:
-        path = self.root / "proc" / str(pid)
-        path.mkdir(parents=True, exist_ok=True)
-        _ = (path / "stat").write_text(f"{pid} (fixture) S {parent} 0 0")
-        _ = (path / "cmdline").write_bytes("\0".join(argv).encode())
-        _ = (path / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in environment.items()).encode())
-        if not (path / "cwd").exists():
-            (path / "cwd").symlink_to(self.root)
+        fake_unit_host.process(self.environment, pid, parent, argv, environment, cwd=self.root)
 
     def record(self, environment: dict[str, str], parent: int = 0) -> SessionRecord:
         self.process(os.getpid(), parent, ["claude"], environment)
-        path = self.root / "session.sock"
+        path = Path(self.enterContext(short_socket_directory())) / "session.sock"
         held = socket.socket(socket.AF_UNIX)
         held.bind(str(path))
         self.addCleanup(held.close)
@@ -107,6 +113,19 @@ class SessionPaneTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout, output)
                     self.assertEqual(self.log("herdr")[-1], command)
+
+    def test_pane_text_and_status_forward_the_same_deadline_to_execution(self) -> None:
+        place = HerdrPlace("native", "w1:p1")
+        reply = subprocess.CompletedProcess(["fixture"], 0,
+            '{"result":{"agents":[{"pane_id":"w1:p1","agent":"claude","agent_status":"blocked"}]}}', "")
+        with (mock.patch.object(time, "monotonic", return_value=100.0),
+              mock.patch("herdr.run_program", return_value=reply) as program):
+            for deadline, expected in ((100.5, 0.5), (99.0, 0.0), (float("inf"), 10.0)):
+                with self.subTest(deadline=deadline):
+                    self.assertEqual(session_pane.read_place(place, deadline=deadline), reply.stdout)
+                    self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), expected)
+                    self.assertEqual(session_pane.agent_status(place, deadline=deadline), "blocked")
+                    self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), expected)
 
     def test_every_verb_targets_the_units_herdr_pane(self) -> None:
         target = ("unit", "show", "herdr-unit")
@@ -168,7 +187,8 @@ class SessionPaneTests(unittest.TestCase):
         result = self.run_cli("type", "unit", "show", "herdr-unit", "hello")
         self.assertEqual((result.returncode, result.stderr.strip()),
                          (4, "unit show herdr-unit: blocked at a prompt; nothing typed"))
-        actions = [row for row in self.log("herdr") if row[2:4] != ["session", "list"]]
+        actions = [row for row in self.log("herdr") if row[2:4] not in (
+            ["session", "list"], ["pane", "list"], ["pane", "process-info"])]
         self.assertEqual(actions, [["--session", "native", "agent", "prompt", "w1:p1", "hello"]])
         with self.assertRaises(AgentBlocked):
             session_pane.type_place(HerdrPlace("native", "w1:p1"), "hello")

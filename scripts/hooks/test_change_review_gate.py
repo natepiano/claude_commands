@@ -7,12 +7,15 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Protocol, cast, override
+
+from scripts.direct.test_assertion_guard import GitRepositoryFixture, MergeInProgressFixture
 
 HOOK = Path(__file__).with_name("pre-tool-use-change-review-gate.py")
 spec = importlib.util.spec_from_file_location("change_review_gate", HOOK)
@@ -52,6 +55,7 @@ class RefusalTest(unittest.TestCase):
         self.git("init", "-q", "-b", "unit")
         self.stage("base.py")
         self.git("commit", "-q", "-m", "base")
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
 
     def refused(self, command: str) -> str:
         return gate.refusal(command, self.repo)
@@ -111,6 +115,95 @@ class RefusalTest(unittest.TestCase):
         _ = (target / "code.py").write_text("changed", encoding="utf-8")
         _ = subprocess.run(["git", "-C", str(target), "add", "code.py"], capture_output=True, check=True)
         self.assertIn("no Change-Review line", self.refused(f'git -C"{target}" commit -m "checkpoint(u): code"'))
+
+    def weaken_assertion(self, *, stage: bool = True) -> None:
+        source = self.repo / "test_value.py"
+        _ = source.write_text("def test_bottom(self):\n    self.assertEqual(bottom, expected)\n", encoding="utf-8")
+        self.git("add", "test_value.py")
+        self.git("commit", "-q", "-m", "test baseline")
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        _ = source.write_text("def test_bottom(self):\n    self.assertLessEqual(bottom, expected)\n", encoding="utf-8")
+        if stage:
+            self.git("add", "test_value.py")
+
+    def test_checkpoint_with_weaker_assertion_is_refused_after_change_review_passes(self) -> None:
+        self.weaken_assertion()
+        reason = self.refused('git commit -m "checkpoint(u): bounds" -m "Change-Review: none — tests only"')
+        self.assertIn("test_value.py", reason)
+        self.assertIn("test_bottom", reason)
+        self.assertIn("weaker", reason)
+
+    def test_checkpoint_with_assertion_ruling_in_message_passes(self) -> None:
+        self.weaken_assertion()
+        command = ('git commit -m "checkpoint(u): bounds" -m "Change-Review: none — tests only"'
+                   + ' -m "Assertion-Change: test_value.py::test_bottom — Approved bound contract."')
+        self.assertEqual(self.refused(command), "")
+
+    def test_non_checkpoint_commit_does_not_check_weaker_assertions(self) -> None:
+        self.weaken_assertion()
+        self.assertEqual(self.refused('git commit -m "fix: bounds"'), "")
+
+    def test_checkpoint_all_checks_unstaged_assertion_changes(self) -> None:
+        self.weaken_assertion(stage=False)
+        message = ' -m "checkpoint(u): bounds" -m "Change-Review: none — tests only"'
+        self.assertEqual(self.refused("git commit" + message), "")
+        self.assertIn("weaker", self.refused("git commit -a" + message))
+
+    def test_checkpoint_checks_its_parent_without_a_remote_default_base(self) -> None:
+        self.weaken_assertion()
+        self.git("update-ref", "-d", "refs/remotes/origin/main")
+        reason = self.refused('git commit -m "checkpoint(u): bounds" -m "Change-Review: none — tests only"')
+        self.assertIn("test_bottom weaker:", reason)
+        self.assertNotIn("assertion guard could not run", reason)
+
+
+def assert_commit_answers_match(case: GitRepositoryFixture, message: str, *,
+                                bases: tuple[str, ...], expected_status: int) -> None:
+    message_file = case.root / "commit message.txt"
+    _ = message_file.write_text(message, encoding="utf-8")
+    base_arguments = [word for base in bases for word in ("--base", base)]
+    direct = case.guard(*base_arguments, "--staged", "--rulings", str(message_file))
+    case.assertEqual(direct.returncode, expected_status, direct.stdout + direct.stderr)
+    case.assertEqual(direct.stderr, "")
+    command = f"git -C {shlex.quote(str(case.repo))} commit -F {shlex.quote(str(message_file))}"
+    reason = gate.refusal(command, case.repo)
+    case.assertEqual(reason, direct.stdout.strip() if expected_status else "")
+
+
+class CommitAssertionAgreementTests(GitRepositoryFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.save("test_history.py", self.python("self.assertEqual(old, expected)", "test_history"))
+        _ = self.save("test_current.py", self.python("self.assertEqual(current, expected)", "test_current"))
+        self.commit_base()
+        # An earlier branch change has no ruling. It is not part of this commit.
+        _ = self.save("test_history.py", self.python("self.assertLessEqual(old, expected)", "test_history"))
+        _ = self.git("add", "test_history.py")
+        _ = self.git("commit", "-q", "-m", "earlier branch change")
+        _ = self.save("test_current.py", self.python("self.assertLessEqual(current, expected)", "test_current"))
+        _ = self.git("add", "test_current.py")
+
+    def test_commit_message_file_ruling_matches_guard_against_head(self) -> None:
+        message = ("checkpoint(unit): current assertion\n\nChange-Review: none — tests only\n\n"
+                   + "Assertion-Change: test_current.py::test_current — Approved bound contract.\n")
+        assert_commit_answers_match(self, message, bases=("HEAD",), expected_status=0)
+
+    def test_commit_message_file_without_ruling_matches_only_current_guard_finding(self) -> None:
+        message = "checkpoint(unit): current assertion\n\nChange-Review: none — tests only\n"
+        assert_commit_answers_match(self, message, bases=("HEAD",), expected_status=1)
+
+
+class MergeCommitAgreementTests(MergeInProgressFixture):
+    def test_hook_and_guard_accept_removals_inherited_from_incoming_parent(self) -> None:
+        message = "checkpoint(unit): merge incoming\n\nChange-Review: none — tests only\n"
+        assert_commit_answers_match(self, message, bases=("HEAD", "MERGE_HEAD"), expected_status=0)
+
+    def test_hook_and_guard_refuse_our_unruled_removal_during_merge(self) -> None:
+        _ = self.save("test_merge.py", self.merge_source(incoming=False, ours=False))
+        _ = self.git("add", "test_merge.py")
+        message = "checkpoint(unit): merge incoming\n\nChange-Review: none — tests only\n"
+        assert_commit_answers_match(self, message, bases=("HEAD", "MERGE_HEAD"), expected_status=1)
 
 
 class HookTest(unittest.TestCase):

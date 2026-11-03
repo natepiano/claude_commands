@@ -17,7 +17,7 @@ from unittest import mock
 
 from scripts.direct import phase_table
 from scripts.production import fake_showrunner
-from scripts.production import test_rename as rename_tests
+from scripts.production import rename_test_support as rename_tests
 
 
 OLD_LINK = "https://github.com/natepiano/claude_commands/blob/main/docs/plans/old-production.md"
@@ -208,14 +208,20 @@ class PhaseNoteRetargetTests(unittest.TestCase):
 
 @final
 class ProductionRenamePhaseNoteTests(unittest.TestCase):
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        rename_tests.ProductionRenameFixture.setUpClass()
+        cls.addClassCleanup(rename_tests.ProductionRenameFixture.doClassCleanups)
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
-        self.fixture = rename_tests.ProductionRenameTests()
+        self.fixture = rename_tests.ProductionRenameFixture()
         self.vault = Path()
 
     @override
     def setUp(self) -> None:
-        self.fixture = rename_tests.ProductionRenameTests()
+        self.fixture = rename_tests.ProductionRenameFixture()
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
         self.vault = self.fixture.root / "vault/showrunners"
@@ -319,7 +325,7 @@ class ProductionRenamePhaseNoteTests(unittest.TestCase):
         # These are all the apply steps before phase-note repair was added.
         journal["completed"] = [
             "_rename_doc", "_rewrite_plans", "_rename_timer", "_rename_showrunner_state",
-            "_rename_stall_watch", "_rename_review_pool", "_rename_unit_workers", "_rename_branch",
+            "_rename_stall_watch", "_rename_unit_workers", "_rename_branch",
         ]
         fixture.write(fixture.state / "new/rename.json", json.dumps(journal))
         note = write_note(self.vault, "runner", "alpha-unit", f'production_file: "{OLD_LINK}"')

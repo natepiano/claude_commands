@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -17,12 +18,12 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
-import usage_store
-import agent_accounts
-from agent_accounts import NoWeeklyReadSkip, Quota, Report, StaleTokenSkip, UsageReadOutcome
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.whoami import usage_store
+from scripts.whoami import agent_accounts
+from scripts.whoami.agent_accounts import NoWeeklyReadSkip, Quota, Report, StaleTokenSkip, UsageReadOutcome
 
 READ = datetime(2026, 10, 12, 14, 30, tzinfo=timezone.utc)
 RESETS = datetime(2026, 10, 15, 16, 0, tzinfo=timezone.utc)
@@ -326,6 +327,35 @@ class UsageStoreTests(unittest.TestCase):
         self.assertEqual(usage_store.store_file().read_bytes(), before)
         self.assertEqual(stored["main@example.invalid"].get("attempted_at"), READ.isoformat())
         self.assertEqual(stored["main@example.invalid"].get("attempt_outcome"), UsageReadOutcome.RATE_LIMITED_429)
+
+    def test_scoped_read_cadence_preserves_rate_limit_backoff_and_restores_default(self) -> None:
+        login = "main@example.invalid"
+        with usage_store.read_cadence(45):
+            claim = usage_store.claim_read(login, READ)
+            assert isinstance(claim, agent_accounts.UsageReadClaim)
+            usage_store.finish_read(login, claim, Report("Claude", email=login,
+                usage_read_outcome=UsageReadOutcome.RATE_LIMITED_429))
+            self.assertIsInstance(usage_store.claim_read(login, READ + timedelta(seconds=60)),
+                                  agent_accounts.UsageReadHeld)
+            self.assertIsInstance(usage_store.claim_read(login, READ + timedelta(seconds=599)),
+                                  agent_accounts.UsageReadHeld)
+            self.assertIsInstance(usage_store.claim_read(login, READ + timedelta(seconds=600)),
+                                  agent_accounts.UsageReadClaim)
+        self.assertIsInstance(usage_store.claim_read(login, READ + timedelta(seconds=660)),
+                              agent_accounts.UsageReadHeld)
+        self.assertIsInstance(usage_store.claim_read(login, READ + timedelta(seconds=690)),
+                              agent_accounts.UsageReadClaim)
+
+    def test_unavailable_credentials_create_no_failure_or_directory_mapping(self) -> None:
+        report = Report("Claude", email="desktop@example.invalid",
+            source=agent_accounts.ClaudeDirectorySource(self.home / ".claude2"),
+            usage_read_outcome=UsageReadOutcome.CREDENTIALS_UNAVAILABLE)
+        stored = usage_store.UsageReadings()
+        self.assertFalse(usage_store.merge(stored, [report], READ))
+        self.assertEqual(stored, {})
+        self.assertEqual(stored.directory_logins, {})
+        usage_store.save([report], READ)
+        self.assertFalse(usage_store.store_file().exists())
 
     def test_a_late_save_of_a_good_read_keeps_a_newer_failed_attempt(self) -> None:
         login = "main@example.invalid"

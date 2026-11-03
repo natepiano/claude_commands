@@ -1,5 +1,9 @@
 # Production rename
 
+Code reviews now use the unit's persistent `review` and `review2` workers
+through `assign.sh --role review`. Any pool maintenance paths described below
+remain only for the pending archive cleanup; they do not dispatch new reviews.
+
 ## What it is
 
 `scripts/production/rename.py` changes a registered production's slug, then
@@ -23,7 +27,6 @@ name. Each unit keeps its old branch until its replacement has been pushed.
 | `scripts/production/showrunners.py` | Reads timer CHECK paths and resolves Formerly names. |
 | `scripts/production/unit_lookup.py` | Groups marked sessions by current slug and reports Claude state. |
 | `scripts/production/stall_watch.py` | Supplies hashed state paths and matches inherited process marks by current slug. |
-| `scripts/direct/review_pool.py` | `_production` resolves the production argument to its current pool. |
 | `commands/showrunner/rename.md` | Showrunner workflow and recovery instructions. |
 | `docs/production_format.md` | Production Context's Formerly field. |
 
@@ -46,7 +49,6 @@ class RenamePlan:
     timer: PathMove                # showrunner-<old> -> showrunner-<new>
     state: tuple[PathMove, ...]    # owned_paths(old) -> owned_paths(new)
     stall: tuple[PathMove, ...]    # one per unit
-    review_pool: PathMove
     # properties: journal = state[-1].destination / "rename.json"; message = commit subject;
     # renames_branch = merge_branch == old; branch = new if renames_branch else merge_branch
 ```
@@ -74,8 +76,7 @@ duplicate detection. A slug with an existing `showrunner-<slug>` notifier
 directory is current and needs no timer-doc read; any other slug resolves
 through `canonical_slug` once per distinct discovered slug. Stall-watch
 likewise resolves each distinct inherited process slug once per call, so
-detached work with old marks still counts as running. Review-pool arguments use
-the same resolver.
+detached work with old marks still counts as running.
 
 ## Production changes
 
@@ -96,10 +97,11 @@ branch is renamed, and no unfinished prior rename journal for the old slug.
 | 1 | Add or extend Formerly as the first bullet of Production Context, write the new doc, point CHECK at it, and `git mv` the doc. |
 | 2 | Rewrite unit-plan Production headers (both header forms) and their production-doc references; add a header where a plan has none. |
 | 3 | Rename `showrunner-<old>` to `showrunner-<new>` and keep the updated CHECK. |
-| 4 | Move `footers-off/<slug>`, `review-paused/<slug>.json`, `outstanding/<slug>.json`, `counts/<slug>`, `reports/<slug>.json`, then each entry of `<slug>/` into the new directory; rewrite matching `*/parent` contents; each guild design the showrunner holds takes `ShowrunnerHolder(<new>)` (`roles.move_holder`). Then `rename_outside.apply`: move the `next-`, `proposal-` and `question-<slug>` pins (and their `-all-below` forms) and rename their `<old>: ` item keys; rewrite Production cells naming `<old>` on the change-review list; point each child doc's Parent production line at the new doc; move the bevy upgrade record and notifier job (`RUN` names the new doc, `FROM` the new instance) and drop its lock; remove the derived `unit-board/<old>.json`; a Log line naming `<old>-log.md` takes `<new>-log.md`, the log and its `-recovered` copy move, and an info/exclude line naming an old one gains one for the new. The production's own log and its `-recovered` copy, by either name, may stand untracked: every clean-checkout check (`_dirty`, `_check_edits`) skips them, since a log is never committed. Every part repeats safely. |
+| 4 | Move `footers-off/<slug>`, `review-paused/<slug>.json`, `outstanding/<slug>.json`, `counts/<slug>`, `reports/<slug>.json`, then each entry of `<slug>/` into the new directory; rewrite matching `*/parent` contents; each held design the showrunner holds takes `ShowrunnerHolder(<new>)` (`design_roles.move_holder`). Then `rename_outside.apply`: move the `next-`, `proposal-` and `question-<slug>` pins (and their `-all-below` forms) and rename their `<old>: ` item keys; rewrite Production cells naming `<old>` on the change-review list; point each child doc's Parent production line at the new doc; move the bevy upgrade record and notifier job (`RUN` names the new doc, `FROM` the new instance) and drop its lock; remove the derived `unit-board/<old>.json`; a Log line naming `<old>-log.md` takes `<new>-log.md`, the log and its `-recovered` copy move, and an info/exclude line naming an old one gains one for the new. The production's own log and its `-recovered` copy, by either name, may stand untracked: every clean-checkout check (`_dirty`, `_check_edits`) skips them, since a log is never committed. Every part repeats safely. |
 | 5 | Move each Units row's stall-watch file from `sha256(old\0unit).json` to `sha256(new\0unit).json`. |
-| 6 | Move the production's review-pool directory, including leases. |
+| 6 | Move the units' worker ledgers from the old production to the new one. |
 | 7 | Renamed merge branch: create and switch to `<new>` at the saved tip and update Merge branch. Kept merge branch: stay on it. Then commit documents and push with upstream. |
+| 8 | Retarget phase notes from the old production to the current new doc. |
 
 The journal sits in `<new>/` from step 0, so step 4 merges the old directory's
 entries into it: a prior journal goes to `rename-history/<old>.json`, the old
@@ -148,9 +150,31 @@ exists, must stay at the recorded tip before each later change.
 | 0 | Saved old and new branch names, worktree paths and tips. |
 | 1 | Created `<new>-<stem>` at the old tip and pushed it. |
 | 2 | Ran `git worktree move`, `git worktree repair` and switched the moved worktree to its new branch. |
-| 3 | Moved account project directories and copied trust entries; each guild design the unit holds took `UnitHolder(<new>, <unit>)` and the new worktree paths (`roles.move_holder`). |
+| 3 | Moved account project directories and copied trust entries; each held design the unit holds took `UnitHolder(<new>, <unit>)` and the new worktree paths (`design_roles.move_holder`). |
 | 4 | Committed the Units row's Worktree and Branch cells and pushed the merge branch. |
 | 5 | Verified the new remote tip and deleted the old remote and local unit branch. |
+
+After step 2, `workers.repoint_unit_worktree` sets each run's production and
+unit, moves its `working_dir`, `plan_doc` and `project_plan_doc` paths, and
+updates roster worker `cwd` paths under the old worktree. It uses the unit
+ledger's run history and the run roots to find callers. A former-production
+or older adhoc ledger moves through the existing ledger migration code.
+Threads, Codex homes and paused state stay the same. The journal records
+`workers_repointed` after these writes; a retry repeats partial writes safely
+and skips a completed worker step.
+
+`rename.py repair-workers <production> [--dry-run]` reads journaled moves
+at step 2 or later and the current production doc's Units rows. It also works
+without a rename journal, using the doc named by the update timer. Missing
+old worktrees in run state or worker roster paths are matched by saved unit
+identity, a plan header, then the old folder name. Former production names
+come from the journal and the doc's Formerly line. A run that matches two
+units is named and skipped. Each change and each unit with nothing to change
+gets one line; no matches prints the reason. Dry run writes no file or lock.
+A second repair changes nothing.
+
+Apply updates its own journal fields and retains all other keys, including
+`unit_moves`, later step names and the completed `done` value on a rerun.
 
 The destination is a sibling named `<repository>-<new>-<stem>`. The repository
 prefix comes from the conventional old basename, or the showrunner checkout's
@@ -175,38 +199,49 @@ showrunner's own checkout, a linked worktree, to a new path. The default path
 is the checkout's basename with a Formerly name replaced by the slug
 (`claude-build-followups-trunk` becomes `claude-natedev-trunk`); a basename
 with no Formerly name in it needs the path argument. The showrunner cannot
-move the folder it runs in, so the move happens in the shutdown conductor
-between its stop and its launch:
-
-1. The first run refuses an existing destination, a main worktree, and a
-   showrunner that already has a shutdown record. It then runs
-   `shutdown.py down --only <session> --restart --here --checkout-move OLD NEW`
-   for the session the update timer's `TARGET` names, and refuses when the
-   record it made does not carry `checkout_move`.
-2. The conductor's launch (`restart.move_checkout`) calls
-   `rename_checkout.move(old, new)`: `git worktree move` and `git worktree
-   repair`, the Claude project folder and each account's folder trust, every
-   timer's `CHECK` and `RUN` line, each child doc's Parent production line,
-   herdr pane `cwd` keys, and a commit on the merge branch of the doc's
-   Showrunner checkout line. The git move refuses processes still inside the
-   folder before it moves anything; every later part repeats safely.
-3. A run after the restart finds the doc naming the new path. It commits the
-   Showrunner checkout line if the callback could not, then pushes the merge
-   branch when its tip is that commit.
-
-When the callback fails part way, the showrunner still launches: in the new
-folder when the git move happened, else in the old one (see
-`shutdown-and-restart.md`). Only the doc line states where the checkout is;
-logs and design docs that name the old path are history and keep it.
+move the folder it runs in. `rename_checkout.checkout` calls `stop_resume.stop`,
+moves the checkout with `rename_checkout.move`, then calls `stop_resume.resume`.
+An existing destination, a main worktree, or a pre-existing shutdown record refuses.
+The move runs `git worktree move` and `git worktree repair`. It updates the
+Claude project folder, folder trust, timer commands, child doc parent lines,
+herdr pane cwd keys, and the Showrunner checkout line. Processes still inside
+the folder block the git move. A failed step reports its error; a rerun finishes
+idempotent updates. A later run pushes the doc commit. Only the doc line states
+where the checkout is; logs and design docs keep historical paths.
 
 ## Journal and recovery
 
-`SHOWRUNNER_STATE_DIR/<new>/rename.json` stores `version: 1`, the recorded
-plan, the completed apply `step` and `done`. Apply reaches step 7 with
-`done: false`. `unit_moves[<unit>]` stores each unit's paths, branches, tips
-and completed `step`. All modifying verbs hold the same `<new>/rename.lock`
-through `flock`; `plan` takes no lock. Individual moves and writes are atomic;
-the whole rename resumes rather than rolling back.
+`SHOWRUNNER_STATE_DIR/<new>/rename.json` stores `version: 1`, the old and
+new slugs, original branch and tip, unit identities, checkout-relative plan
+names, completed apply step names and `done`. It does not store the current
+checkout, production doc paths, timer, state or stall-watch paths.
+On resume these are resolved from the current update timer and configured
+state roots. Until `_rename_timer` is recorded complete, the old slug's timer
+is required, except while that step is pending and its source instance has
+already moved: recovery validates the new timer and retries the timer step
+before recording it complete. Afterwards the new slug's timer is required. The old timer may
+already name the new doc: `_rename_doc` points CHECK there before moving the
+doc, and `_rename_timer` moves the instance later. A missing or unreadable
+expected timer refuses with both slugs and the next step outside that move
+recovery window. An unreadable source instance is never bypassed. Recovery
+never guesses a checkout from a journal path. A kept merge branch can already
+hold the rename commit when its push fails or progress was not saved; the
+recorded base, commit parent and subject identify it, and apply retries its
+push without making a second commit. Other tip changes still refuse.
+
+Older journals with absolute paths and counted progress still load. Their
+stored location fields are ignored; absolute plan entries are replaced by
+plans selected from the current doc's Units rows. Relative plan names resolve
+against the current checkout. Apply rewrites the journal without current
+locations, including a rerun with all steps already complete. Worker repair,
+unit moves and finish use the same resolver; read-only plan and dry-run repair
+do not rewrite the journal.
+
+`unit_moves[<unit>]` still stores the requested old/new unit worktree endpoints,
+branches, tips and completed unit step: these describe the move being recovered,
+not the showrunner's current location. Apply keeps these records and unknown
+future keys. All modifying verbs hold the production lock. Individual moves
+and writes are atomic; the whole rename resumes rather than rolling back.
 
 Rerun the same command after a refusal or interruption, once its cause is
 resolved. Apply's destination stays the selected new slug; its source accepts
@@ -216,7 +251,7 @@ so once the timer has moved they also accept the old or a former name. Leave
 `rename.lock` to the script. `rename-history/<source-slug>.json` files are
 archived completed journals and do not replace the current journal.
 
-Finish requires apply step 7, no unfinished unit moves, no non-retired row
+Finish requires all nine apply steps, no unfinished unit moves, no non-retired row
 with an `<old>-` branch, and the showrunner checkout on the merge branch after
 the rename. When the merge branch was renamed, it deletes the old one; a kept
 merge branch is not deleted, and finish prints `kept merge branch <name>`. `finish_step: 1` records remote deletion; `finish_step: 2` and
@@ -260,7 +295,7 @@ and 2 for invalid arguments.
 - `_lookup_slug`'s current-name fast path keeps the shutdown inventory within
   its timer-read budget: membership and missing-target checks share one read.
 - A `**Formerly:**` line outside `## Production Context` is ignored.
-- `test_unit_lookup` and `test_review_pool` use productions with no update
+- `test_unit_lookup` uses productions with no update
   timer; a strict lookup at those callers breaks them.
 - Every path honors the state-dir environment variables; never run the verbs
   against live state when testing.
@@ -268,12 +303,12 @@ and 2 for invalid arguments.
   slug: `outstanding/<slug>.history.jsonl` and the `review-health-<slug>`
   notifier instance. Step 4 moves the `bevy-upgrade-<slug>` instance and the
   `BEVY_UPGRADE_STATE_DIR/<slug>.json` record, and each held design role
-  through `roles.move_holder` (`docs/as-built/guilds.md`).
+  through `design_roles.move_holder` (`docs/as-built/long-lived-workers.md#lasting-roles`).
 
 ## Why
 
 - **Unknown slugs pass through.** A resolver that raised on an unknown slug
-  would break the review pool and unit lookup for timer-less productions.
+  would break legacy reviewer-state lookup and unit lookup for timer-less productions.
 
 - **Units move separately, between runs.** A moved cwd breaks a live session,
   and the rename must not modify another session's claims. That is also why
@@ -299,15 +334,21 @@ and 2 for invalid arguments.
 
 ## State roots and tests
 
-`test_rename.py` covers moves, kept history, interrupted steps, branch
-changes, account data, trust retries, refusals and repeated completion.
+`test_rename.py` covers planning, state moves and interrupted apply steps.
+`test_rename_units.py` covers unit worktree moves, account data and interrupted
+unit steps; `test_rename_workers.py` covers worker ledgers and repair.
+`test_rename_finish.py` covers trust retries, branch preservation and repeated
+completion. These suites share `rename_test_support.py`: each class seeds Git
+once and restores independent copies at the same paths, while synchronous
+commands call the real handlers in-process. One apply case retains the CLI
+subprocess boundary.
 `test_rename_checkout.py` moves a real linked worktree and repeats the move,
 refuses before the git move, and runs the `checkout` verb's stop and push.
 `test_showrunners.py`, `test_unit_lookup.py` and `test_stall_watch.py` cover
 Formerly resolution, old session marks, strict discovery and detached work.
 
 ```sh
-python3 -m unittest scripts.production.test_rename scripts.production.test_rename_checkout scripts.production.test_unit_lookup scripts.production.test_showrunners scripts.production.test_stall_watch
+python3 -m unittest scripts.production.test_rename scripts.production.test_rename_units scripts.production.test_rename_workers scripts.production.test_rename_finish scripts.production.test_rename_checkout scripts.production.test_unit_lookup scripts.production.test_showrunners scripts.production.test_stall_watch
 ```
 
 `unit_lookup.py` is shared: the shutdown inventory

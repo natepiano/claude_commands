@@ -1,4 +1,5 @@
 """Script phone texts and named cases reviewed before delivery."""
+from gpu_xid import XID_MEANINGS
 from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, SessionTemplate
 
 # Codex usage destination: https://learn.chatgpt.com/docs/pricing (read 2026-10-14).
@@ -8,6 +9,16 @@ from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, Se
 
 
 ENTRIES = (
+    PushText("vault.stopped", "buildlog", "note", "Mac vault copy is not updating",
+        ActionTemplate("{action}"),
+        "The hourly job that updates the hanadocs vault on the Mac skipped it. {reason} It tries again each hour and sends no more alerts until an update works. Until then, the Mac copy stays out of date.",
+        (PushExample("tracked_changes", {"reason": "Some files in ~/rust/hanadocs on the Mac have changes that are not committed.", "action": "In a terminal on the Mac, commit or discard the changes in ~/rust/hanadocs."}),
+         PushExample("branch", {"reason": "~/rust/hanadocs on the Mac is not on the main branch.", "action": "In a terminal on the Mac, switch ~/rust/hanadocs to the main branch."}),
+         PushExample("diverged", {"reason": "The Mac copy has commits that GitHub does not have, so a safe update is not possible.", "action": "In a terminal on the Mac, push the commits in ~/rust/hanadocs to GitHub."}),
+         PushExample("untracked", {"reason": "An update would replace a file on the Mac that git does not track.", "action": "In a terminal on the Mac, move the untracked file that blocks the hanadocs update out of ~/rust/hanadocs. Run git -C ~/rust/hanadocs merge --ff-only origin/main to see its name."}),
+         PushExample("unreachable", {"reason": "natedev could not reach the Mac for more than 24 hours.", "action": "Wake the Mac and connect it to the network."}),
+         PushExample("command", {"reason": "The update failed with an error the job does not know.", "action": "In the Claude session named natedev, ask it to read the vault update error in the hourly log."})),
+        purpose="The Mac vault cannot update. One alert is sent until a pull succeeds."),
     PushText("nix_heal.failed", "nix-heal", "blocked", "{session} builds will fail: no nix shell",
         ActionTemplate("On {machine}, fix the nix shell in {cwd}, then restart {session}"),
         "The nix shell for {session}'s worktree did not load, so its builds will fail. "
@@ -32,78 +43,33 @@ ENTRIES = (
             "request": "edit send.py"})),
         purpose="A session waits for you to answer its permission prompt.",
         session=SessionTemplate("{unit}")),
-    PushText("shutdown.holdout", "shutdown", "decision", "{session} {operation} is blocked",
-        ActionTemplate("answer the open form"),
-        "Reason: {operation} is blocked because {session}'s claude session is showing a form and it can't proceed.\n\n"
-        + "Answer the form (recommended): the session pauses, and the {operation} goes on.\n\n"
-        + "Stop the session: it ends, its uncommitted work stays, and the {operation} goes on without it. "
-        + "In a terminal on {machine}, run:\n\n{command}",
-        (PushExample("typical", {"session": "pm-move-ghostty", "machine": "natedev",
-            "operation": "restart",
-            "command": "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now claude4 --here --only d5b35898-290f-4b44-8e6f-6f2586c975a8"}),),
-        purpose="A shutdown or restart waits for a session that shows a form.",
-        session=SessionTemplate("{session}")),
-    PushText("shutdown.holdout_unanswered", "shutdown", "decision", "Your Claude {operation} is stuck",
-        ActionTemplate("In a terminal on {machine}, stop {session} with the command below"),
-        "Your Claude {operation} waits for each session to pause. The session {session} has not paused, so the {operation} is stuck.\n\n"
-        + "Stopping it ends only that session and keeps its uncommitted work. Then the {operation} goes on.\n\n{command}",
-        (PushExample("typical", {"session": "pm-move-ghostty", "machine": "natedev",
-            "operation": "restart",
-            "command": "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now claude4 --here --only d5b35898-290f-4b44-8e6f-6f2586c975a8"}),
-         PushExample("long_session", {"session": "build-followups-director", "machine": "Mac",
-            "operation": "shutdown",
-            "command": "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now claude2 --here --only 5b3a1624-bb7e-46af-8cb1-4d960d719a32"})),
-        purpose="A shutdown or restart is stuck on a session that did not pause.",
-        session=SessionTemplate("{session}")),
-    # Shutdown examples use test_settle.py and test_restart.py facts.
-    # The failing shutdown deliveries are recorded in notify/review.jsonl, 2026-10-14T02:05Z.
-    PushText("shutdown.stop_failed", "shutdown", "decision", "Claude account shutdown is incomplete",
-        ActionTemplate('In the Claude session named natedev on the natedev computer, run /shutdown now {account}.'),
-        "The shutdown of Claude account {account} did not finish on {machine}. "
-        + "{stopped} did not stop, so work may still be running there. The command above retries the cleanup.",
-        (PushExample("typical", {"account": 'claude2', "machine": "natedev", "stopped": "One session"}),
-         PushExample("many_long_names", {"account": '"claude-team-build-followups-12"', "machine": "Mac", "stopped": "14 sessions"})),
-        purpose="An account shutdown did not stop all of its sessions."),
-    PushText("shutdown.restart_failed", "shutdown", "decision", "Claude coding work is still stopped",
+    PushText("shutdown.restart_failed", "shutdown", "decision", "Claude coding work remains stopped",
         ActionTemplate('In the Claude session named natedev on the natedev computer, run /shutdown restart {account}.'),
-        "After your restart request, Claude coding work for account {account} is still stopped on {machine}. "
-        + "{stopped} did not restart, so that work stays paused.\n\n"
-        + "The restart gave this error: {cause}\n\n"
-        + "The command above retries the restart on natedev and the Mac.",
-        (PushExample("typical", {"account": 'claude2', "machine": "natedev", "stopped": "One session (organon-unit)",
+        "After your restart request, {stopped} on Claude account {account} did not restart on {machine}. "
+        + "Coding work stays stopped until the restart succeeds.\n\n"
+        + "The restart gave this error: {cause}.\n\n"
+        + "The command retries only stopped sessions. Running sessions keep their work.",
+        (PushExample("typical", {"account": 'claude2', "machine": "natedev", "stopped": "5 sessions",
              "cause": "window failed to open"}),
-         PushExample("one_long_name", {"account": '"claude-team-build-followups-12"', "machine": "Mac",
-             "stopped": "One session (build-followups-two-accounts-unit-director)",
+         PushExample("one_long_name", {"account": 'claude3', "machine": "Mac",
+             "stopped": "1 session",
              "cause": "restart prompt not submitted"})),
-        purpose="A restart did not start all stopped sessions again."),
-    # A retry of an untrusted folder fails the same way, so this push never asks for one first.
-    # The command is accounts.trust_command for the folder and the session's account.
-    PushText("shutdown.restart_untrusted", "shutdown", "decision", "Stopped Claude work needs your folder trust",
-        ActionTemplate("In a terminal on {machine}, run the command below, trust the folder and type /exit. "
+        purpose="One restart problem sends one push with the failed session count."),
+    PushText("shutdown.restart_untrusted", "shutdown", "decision", "Stopped Claude work needs folder trust",
+        ActionTemplate("In a terminal on {machine}, run ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py trust. "
                        + "Then run /shutdown restart {account} in the natedev session."),
-        "The Claude session {session} did not restart. No Claude account on {machine} trusts its folder. "
-        + "The command opens Claude there. Until you trust it, each restart fails.\n\n{command}",
-        (PushExample("typical", {"session": "organon-unit", "machine": "natedev", "account": "claude2",
-             "command": "cd /home/natepiano/worktrees/organon && CLAUDE_CONFIG_DIR=/home/natepiano/.claude2 "
-                        + "CLAUDE_CODE_REMOTE_MEMORY_DIR=/home/natepiano/.claude claude"}),
-         PushExample("long_folder", {"session": "build-followups-shutdown", "machine": "Mac", "account": "claude4",
-             "command": "cd /Users/natepiano/worktrees/claude-build-followups-shutdown && "
-                        + "CLAUDE_CONFIG_DIR=/Users/natepiano/.claude4 CLAUDE_CODE_REMOTE_MEMORY_DIR=/Users/natepiano/.claude claude"})),
-        purpose="A restart failed because no account trusts the session's folder."),
-    # The move form of shutdown.restart_untrusted: the record lives under the source account, and its
-    # restart resumes the move on the target, whose trust the command accepts.
-    PushText("shutdown.move_untrusted", "shutdown", "decision", "Stopped Claude work needs your folder trust",
-        ActionTemplate("In a terminal on {machine}, run the command below, trust the folder and type /exit. "
-                       + "Then run /shutdown restart {account} in the natedev session. That finishes the move to {target}."),
-        "The Claude session {session} did not start on {target} after its move from {account}. "
-        + "No Claude account on {machine} trusts its folder, so each restart fails until you do.\n\n{command}",
-        (PushExample("typical", {"session": "organon-unit", "machine": "natedev", "account": "claude2", "target": "claude3",
-             "command": "cd /home/natepiano/worktrees/organon && CLAUDE_CONFIG_DIR=/home/natepiano/.claude3 "
-                        + "CLAUDE_CODE_REMOTE_MEMORY_DIR=/home/natepiano/.claude claude"}),
-         PushExample("mac", {"session": "ups", "machine": "Mac", "account": "claude1", "target": "claude4",
-             "command": "cd /Users/natepiano/worktrees/claude-ups && "
-                        + "CLAUDE_CONFIG_DIR=/Users/natepiano/.claude4 CLAUDE_CODE_REMOTE_MEMORY_DIR=/Users/natepiano/.claude claude"})),
-        purpose="A move failed because no account trusts the session's folder."),
+        "After your restart request, {stopped} on Claude account {account} could not start on {machine}. Coding work stays stopped. "
+        + "The first command trusts the configured folders. The second retries stopped sessions.",
+        (PushExample("typical", {"stopped": "3 sessions", "machine": "natedev", "account": "claude2"}),),
+        purpose="One push counts sessions that need folder trust on one machine."),
+    PushText("shutdown.restart_untrusted_unlisted", "shutdown", "decision", "Stopped Claude work needs folder trust",
+        ActionTemplate('In the Claude session named natedev on the natedev computer, send: "Trust the folders of the stopped Claude sessions on {machine} from their shutdown records."'),
+        "After your restart request, {stopped} on Claude account {account} could not start on {machine}. "
+        + "Claude does not trust the folders. "
+        + "Coding work stays stopped until the folders are trusted and the sessions restart.",
+        (PushExample("one_session", {"stopped": "1 session", "machine": "Mac", "account": "claude3"}),
+         PushExample("several_sessions", {"stopped": "4 sessions", "machine": "natedev", "account": "claude2"})),
+        purpose="Stopped sessions need trust for folders outside the configured list."),
     PushText("shutdown.move_failed", "shutdown", "decision", "A Claude session did not finish its move",
         ActionTemplate('In the Claude session named natedev on the natedev computer, send: "Finish moving the Claude session named {session} to {target} from its shutdown record."'),
         "The Claude session {session} on {machine} stopped on account {source} to move to account {target}. "
@@ -121,12 +87,12 @@ ENTRIES = (
          PushExample("long_account", {"account": '"claude-team-build-followups-12"', "machine": "natedev"})),
         purpose="A restart ended, but its result could not be confirmed."),
     PushText("shutdown.manual_restart", "shutdown", "decision", "Stopped Claude coding work needs you",
-        ActionTemplate('In the Claude session named natedev on the natedev computer, send: "Resume the stopped Claude session named {session} on {machine} from its shutdown record."'),
-        "A Claude coding session on {machine} stopped during your shutdown. Its work is paused. "
-        + "Its terminal cannot restart on its own. Its shutdown record holds the command to resume it.",
-        (PushExample("typical", {"machine": "natedev", "session": "Owner"}),
-         PushExample("long_session", {"machine": "Mac", "session": "build-followups-message-clarity-unit-director-session-12"})),
-        purpose="A session stopped in a shutdown cannot restart on its own."),
+        ActionTemplate('In the Claude session named natedev on the natedev computer, send: "Resume the stopped Claude sessions on {machine} from their shutdown records."'),
+        "After your shutdown, {stopped} on {machine} cannot restart without help. "
+        + "Coding work stays stopped. The shutdown records hold the commands to resume the stopped sessions.",
+        (PushExample("typical", {"machine": "natedev", "stopped": "3 sessions"}),
+         PushExample("one_session", {"machine": "Mac", "stopped": "1 session"})),
+        purpose="Stopped Claude sessions need their saved commands to resume."),
     PushText("quota.claude_next_move", "quota_alert", "note", "Claude work on {account} may stop",
         ActionTemplate("In the natedev session, type /account_moves and the move you want, for example: when units reach 1% switch to claude2."),
         "{account} has {remaining} of its weekly usage left, and no move is set up for the units or showrunners on it. When it runs out, they move to a Claude account with room, or stop if none has any.",
@@ -242,6 +208,15 @@ ENTRIES = (
         (PushExample("typical", {"free": "149", "shortfall": "151"}),
          PushExample("no_free_space", {"free": "0", "shortfall": "300"})),
         purpose="Cleanup did not free enough disk on natedev. Delete your files."),
+    # GPU watch examples use the Xid codes in the user's 2026-10-30 alert request.
+    PushText("nixos.gpu_stopped", "gpu", "decision", "natedev GPU stopped",
+        ActionTemplate("Restart natedev to bring the GPU back."),
+        "The GPU stopped at {time}. Both displays are dark. "
+        + "The cause is a known bug in the NVIDIA firmware. "
+        + "The kernel reported Xid {xid}: {meaning}.",
+        (PushExample("xid_79_night", {"xid": "79", "meaning": XID_MEANINGS["79"], "time": "02:17 EDT"}),
+         PushExample("xid_119", {"xid": "119", "meaning": XID_MEANINGS["119"], "time": "14:05 EDT"})),
+        purpose="natedev's GPU stopped, and both displays are dark."),
     # Current ups.nix: low-runtime shutdown at five minutes or 30% charge.
     PushText("nixos.ups_battery", "ups", "blocked", "Power outage threatens open work",
         ActionTemplate("Save your open work on the natedev computer now."),
@@ -251,12 +226,52 @@ ENTRIES = (
         (PushExample("typical", {"charge": "80", "minutes": "20"}),
          PushExample("shutdown_threshold", {"charge": "30", "minutes": "5"})),
         purpose="Power is out, and natedev runs on battery. Save your work."),
+    PushText("nixos.ups_replace_battery", "ups", "note", "UPS battery needs replacing",
+        ActionTemplate("Replace the battery in the natedev UPS."),
+        "The natedev UPS reports that its battery is worn out. During a power outage it may not keep natedev on long enough to shut down safely.",
+        (PushExample("typical", {}),),
+        purpose="The UPS battery is worn out and needs replacement."),
+    PushText("nixos.ups_no_contact", "ups", "note", "natedev lost contact with its UPS",
+        ActionTemplate("Check the USB cable between the UPS and natedev."),
+        "natedev cannot read its UPS. During a power outage it gets no warning and cannot shut down safely.",
+        (PushExample("typical", {}),),
+        purpose="natedev cannot read the UPS and needs its USB connection checked."),
+    PushText("nixos.ups_power_back", "ups", "note", "Power is back", NoActionNeeded(),
+        "Mains power is back on the natedev computer. Battery charge: {charge}%.",
+        (PushExample("typical", {"charge": "80"}),),
+        purpose="Mains power returned to natedev after a battery alert."),
     PushText("nixos.ups_shutdown", "ups", "blocked", "Power outage stopped the computer",
         ActionTemplate("When power returns, start natedev if it stays off for three minutes."),
         "The natedev computer is shutting down because its backup battery is low. "
         + "Work cannot resume until it starts again. It should start automatically when mains power returns.",
         (PushExample("typical", {}),),
         purpose="Power is out, and the battery is low. natedev shuts down."),
+    PushText("mac.locked", "{sender}", "blocked", "Mac locked: GPU shots stopped",
+        ActionTemplate('Unlock the Mac and keep its display awake, then type "Mac unlocked" in the {sender} tab on natedev'),
+        "Every Mac screenshot is black. {waiting}. Code and test work goes on.",
+        (PushExample("typical", {"sender": "hana", "waiting": "One unit's phase waits for 2 shots"}),),
+        purpose="The Mac is locked and screenshots wait for you to unlock it."),
+    PushText("github.keys_cold", "{sender}", "blocked", "GitHub keys locked on {machine}",
+        ActionTemplate("Run github-warmup in a terminal on {machine}"), "",
+        (PushExample("typical", {"sender": "hana", "machine": "natedev"}),),
+        purpose="GitHub keys are cold. Unlock them once for every session."),
+    PushText("build_hold.blocking", "{sender}", "blocked", "{machine} build hold is blocking all work",
+        ActionTemplate("Say 'release' in the {holder} tab"),
+        "{holder} holds {machine} for: {reason}. That work finished at {finished}, but the hold still pauses every other build.",
+        (PushExample("typical", {"sender": "hana", "machine": "natedev", "holder": "builds",
+                                 "reason": "a compiler check", "finished": "09:10 EST"}),),
+        purpose="Finished work left a build hold that you must release."),
+    # Agent-written fields: short and to the point; live review selects a fixed text when one fits.
+    PushText("alert.blocked", "{sender}", "blocked", "{title}", ActionTemplate("{action}"), "{body}",
+        (PushExample("typical", {"sender": "hana", "title": "Hana crashes at start on the Mac",
+            "action": "On the Mac, tell the hana tab to roll back or keep the Bevy update",
+            "body": "Hana stops at start with a shader error since the Bevy update at 09:10. Mac screenshots wait until it starts again."}),),
+        purpose="Work stopped. Write title, action and body short and to the point.", agent_written=True),
+    PushText("alert.decision", "{sender}", "decision", "{title}", ActionTemplate("{action}"), "{body}",
+        (PushExample("typical", {"sender": "builds", "title": "Keep the old build cache?",
+            "action": "Say keep or delete in the builds tab",
+            "body": "The old build cache uses 120 GiB. Deleting it frees the space; the next build of each repo takes about 10 minutes longer."}),),
+        purpose="A choice for you. Write title, action and body short and to the point.", agent_written=True),
     # /nate adhoc: an agent writes the values at send time; review them like free text (user, 2026-10-28).
     # The user asked that the template name close each push; pushover.py's "Template:" line does that
     # for every push (user, 2026-10-27).

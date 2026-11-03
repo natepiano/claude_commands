@@ -1,7 +1,7 @@
 import { describe, expect, test } from "claude-code/testing";
 import type { FsEntry, SessionReceiveInput, SessionSendArgs, SessionSendResult } from "claude-code";
-import type { DeliveryRouteFile, OutboxEntry, PostmasterCalls, ReplyLog } from "../hooks/protocol";
-import { isDeliveryRouteFile, isReplyLog, REPLY_WINDOW_MS } from "../hooks/protocol";
+import type { DeliveryRouteFile, ForwardLog, OutboxEntry, PostmasterCalls, ReplyLog } from "../hooks/protocol";
+import { isDeliveryRouteFile, isForwardLog, isReplyLog, REPLY_WINDOW_MS } from "../hooks/protocol";
 import { startReplies } from "../hooks/replies";
 import { startOutbox } from "../hooks/outbox";
 
@@ -61,6 +61,13 @@ function fakeCalls() {
       return value;
     });
   }
+  function forwards(): ForwardLog[] {
+    return [...files].filter(([path]) => path.startsWith(`${directory}/forwards/`)).map(([, text]) => {
+      const value: unknown = JSON.parse(text);
+      if (!isForwardLog(value)) throw new Error("Invalid forward log");
+      return value;
+    });
+  }
   function routeFile(key: string): DeliveryRouteFile {
     const text = files.get(`${directory}/delivered/${key}.json`);
     if (text === undefined) throw new Error("Missing route file");
@@ -68,7 +75,7 @@ function fakeCalls() {
     if (!isDeliveryRouteFile(value)) throw new Error("Invalid route file");
     return value;
   }
-  return { calls, files, writes, sent, logs, routeFile,
+  return { calls, files, writes, sent, logs, forwards, routeFile,
     moveNow: (ms: number) => { now += ms; },
     answerSend: (answer: typeof sendAnswer) => { sendAnswer = answer; },
   };
@@ -76,6 +83,13 @@ function fakeCalls() {
 
 function firstLine(message: SessionSendArgs): string {
   return message.text.split("\n")[0] ?? "";
+}
+
+function onlyForwarded(forwards: ForwardLog[]): string[] {
+  expect(forwards.length).toBe(1);
+  const forward = forwards[0];
+  if (forward === undefined) throw new Error("Expected one forward log");
+  return forward.forwarded;
 }
 
 function onlyLog(logs: ReplyLog[]): ReplyLog {
@@ -99,7 +113,32 @@ describe("reply routes", () => {
     expect(firstLine(forward)).toEqual(expect.stringMatching(/^Message from Recipient \(their answer to Original sender, passed on by postmaster\) \[1000-\d+\]:$/));
     expect(forward.text.slice(forward.text.indexOf("\n") + 1)).toBe("\n" + body);
     expect(onlyLog(fake.logs())).toEqual({ at_ms: 1000, socket, name: "Recipient", session_id: "recipient",
-      senders: ["Original sender"], body, forwarded: ["original-session"] });
+      senders: ["Original sender"], body, targets: ["original-session"] });
+    expect(onlyForwarded(fake.forwards())).toEqual(["original-session"]);
+  });
+
+  test("the reply record is complete while the forward is pending and no record file is written twice", async () => {
+    const fake = fakeCalls();
+    const replies = await startReplies(fake.calls);
+    await replies.sending(entry(), fake.calls.now());
+    let began: () => void = () => {};
+    const forwarding = new Promise<void>(resolve => { began = resolve; });
+    let finish: () => void = () => { throw new Error("Forward not started"); };
+    fake.answerSend(() => new Promise<SessionSendResult>(resolve => {
+      finish = () => { resolve({ isDelivered: true }); };
+      began();
+    }));
+    const receiving = replies.receive(reply());
+    await forwarding;
+    expect(onlyLog(fake.logs())).toEqual({ at_ms: 1000, socket, name: "Recipient", session_id: "recipient",
+      senders: ["Original sender"], body: "My answer", targets: ["original-session"] });
+    expect(fake.forwards()).toEqual([]);
+    finish();
+    expect(await receiving).toEqual(consumed);
+    expect(onlyForwarded(fake.forwards())).toEqual(["original-session"]);
+    const records = fake.writes.map(write => write.path).filter(path => /\/(replies|forwards)\//.test(path));
+    expect(records.length).toBe(2);
+    expect(new Set(records).size).toBe(2);
   });
 
   test("a reply arriving before the original send returns already has a route", async () => {
@@ -124,7 +163,7 @@ describe("reply routes", () => {
     try {
       await sending;
       expect(await replies.receive(reply())).toEqual(consumed);
-      expect(onlyLog(fake.logs()).forwarded).toEqual(["original-session"]);
+      expect(onlyForwarded(fake.forwards())).toEqual(["original-session"]);
     } finally { finish(); await poll; outbox.cancel(); }
   });
 
@@ -181,7 +220,8 @@ describe("reply routes", () => {
     await replies.sending(entry("quota_alert", ""), fake.calls.now());
     expect(await replies.receive(reply())).toEqual(consumed);
     expect(onlyLog(fake.logs())).toEqual({ at_ms: 1000, socket, name: "Recipient", session_id: "recipient",
-      senders: ["quota_alert"], body: "My answer", forwarded: [] });
+      senders: ["quota_alert"], body: "My answer", targets: [] });
+    expect(onlyForwarded(fake.forwards())).toEqual([]);
     expect(fake.sent).toEqual([]);
   });
 
@@ -192,7 +232,8 @@ describe("reply routes", () => {
     fake.answerSend(async () => ({ isDelivered: false, reason: "session is gone" }));
     expect(await replies.receive(reply())).toEqual(consumed);
     expect(fake.sent.length).toBe(1);
-    expect(onlyLog(fake.logs()).forwarded).toEqual([]);
+    expect(onlyLog(fake.logs()).targets).toEqual(["original-session"]);
+    expect(onlyForwarded(fake.forwards())).toEqual([]);
   });
 
   test("a throwing forward still consumes the reply and logs an empty forwarded list", async () => {
@@ -201,7 +242,8 @@ describe("reply routes", () => {
     await replies.sending(entry(), fake.calls.now());
     fake.answerSend(async () => { throw new Error("forward cannot be confirmed"); });
     expect(await replies.receive(reply())).toEqual(consumed);
-    expect(onlyLog(fake.logs()).forwarded).toEqual([]);
+    expect(onlyLog(fake.logs()).targets).toEqual(["original-session"]);
+    expect(onlyForwarded(fake.forwards())).toEqual([]);
   });
 
   test("equal answers at the same time have distinct first lines and log files", async () => {
@@ -225,7 +267,7 @@ describe("reply routes", () => {
     for (const message of fake.sent) {
       expect(firstLine(message)).toEqual(expect.stringMatching(/^Message from Recipient \(their answer to one of Alice, Bob, passed on by postmaster\) \[1000-\d+\]:$/));
     }
-    expect(onlyLog(fake.logs()).forwarded).toEqual(["alice-session", "bob-session"]);
+    expect(onlyForwarded(fake.forwards())).toEqual(["alice-session", "bob-session"]);
     expect(onlyLog(fake.logs()).senders).toEqual(["Alice", "Bob"]);
   });
 
@@ -266,7 +308,7 @@ describe("reply routes", () => {
         .toEqual(state.accepted ? consumed : { kind: "pass" });
     }
     expect(fake.sent.length).toBe(1);
-    expect(onlyLog(fake.logs()).forwarded).toEqual(["original-session"]);
+    expect(onlyForwarded(fake.forwards())).toEqual(["original-session"]);
   });
 
   test("rolling back a second route leaves the first route and its open file intact", async () => {
@@ -280,7 +322,7 @@ describe("reply routes", () => {
     expect(fake.routeFile(first.key)).toEqual(route());
     expect(fake.routeFile(second.key)).toEqual({ ...route(), route: "withdrawn" });
     expect(await replies.receive(reply())).toEqual(consumed);
-    expect(onlyLog(fake.logs()).forwarded).toEqual(["original-session"]);
+    expect(onlyForwarded(fake.forwards())).toEqual(["original-session"]);
     expect(fake.sent.length).toBe(1);
   });
 
@@ -326,7 +368,7 @@ describe("reply routes", () => {
       });
       expect(states).toEqual(["open", "withdrawn"]);
       expect(await replies.receive(reply())).toEqual(consumed);
-      expect(onlyLog(fake.logs()).forwarded).toEqual(["original-session"]);
+      expect(onlyForwarded(fake.forwards())).toEqual(["original-session"]);
     } finally { outbox.cancel(); }
   });
 
@@ -384,7 +426,7 @@ describe("reply routes", () => {
     try {
       await outbox.poll();
       expect(await replies.receive(reply())).toEqual(consumed);
-      expect(onlyLog(fake.logs()).forwarded).toEqual(["original-session"]);
+      expect(onlyForwarded(fake.forwards())).toEqual(["original-session"]);
       const result = fake.files.get(`${directory}/results/${item.id}.json`);
       if (result === undefined) throw new Error("Expected the outbox result");
       expect(result).toContain('"outcome":"abandoned"');

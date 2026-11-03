@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# Materialize Codex's selected model and visible catalog in agents.conf.
+# Add Codex models and efforts to the shared registry without removing peer rows.
 
 set -euo pipefail
 
 AGENTS_CONFIG_FILE="${AGENTS_CONFIG_FILE:-$HOME/.claude/config/agents.conf}"
-# The catalog is read from, and stored to, the registry with its local overlay.
-# shellcheck source=/dev/null
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/agents_overlay.sh"
+# Source shared registry I/O without recursively triggering this sync.
+AGENTS_CONFIG_TIER_ONLY=1 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/agents_config.sh"
 CODEX_CONFIG_FILE="${CODEX_CONFIG_FILE:-$HOME/.codex/config.toml}"
 CODEX_MODELS_CACHE_FILE="${CODEX_MODELS_CACHE_FILE:-$HOME/.codex/models_cache.json}"
 CODEX_CATALOG_SYNC_STATE_FILE="${CODEX_CATALOG_SYNC_STATE_FILE:-$HOME/.local/state/codex-agent-catalog-sync/last_success}"
@@ -185,9 +184,13 @@ warn_missing_claude_aliases() {
 command -v jq >/dev/null || fail "jq is required"
 [[ -f "$AGENTS_CONFIG_FILE" ]] || fail "agent registry not found: $AGENTS_CONFIG_FILE"
 [[ -f "$CODEX_CONFIG_FILE" ]] || fail "Codex config not found: $CODEX_CONFIG_FILE"
-[[ -f "$CODEX_MODELS_CACHE_FILE" ]] || fail "Codex model cache not found: $CODEX_MODELS_CACHE_FILE"
+# Every query below uses the same complete snapshot, even if Codex rewrites the
+# live file between queries. Only the shared reader opens/parses that file.
+cache_reader="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)"
+cache_text="$("$cache_reader/py" "$cache_reader/codex_models_cache.py" "$CODEX_MODELS_CACHE_FILE")" || exit 1
 REGISTRY_VIEW="$(mktemp "${AGENTS_CONFIG_FILE}.view.XXXXXX")"
 agents_registry_text > "$REGISTRY_VIEW"
+AGENTS_REGISTRY_BASE="$(cat "$REGISTRY_VIEW")"
 trap 'rm -f "$REGISTRY_VIEW"; release_lock' EXIT
 
 codex_model="$({
@@ -233,13 +236,13 @@ models_text="$(
                 $models[] | [.slug, (.efforts | join(","))] | @tsv
             end
         end
-    ' "$CODEX_MODELS_CACHE_FILE"
+    ' <<< "$cache_text"
 )" || fail "invalid Codex model cache: $CODEX_MODELS_CACHE_FILE"
 
 cache_agents=()
 cache_agents_text="$(
     jq -r '.models[] | .slug | select(type == "string" and length > 0)' \
-        "$CODEX_MODELS_CACHE_FILE"
+        <<< "$cache_text"
 )"
 while IFS= read -r model; do
     [[ -n "$model" ]] && cache_agents+=("$model")
@@ -296,7 +299,7 @@ if [[ "$selected_is_visible" == false ]]; then
                     end;
                 first(.models[] | select(.slug == $selected) | efforts) // []
                 | join(",")
-            ' "$CODEX_MODELS_CACHE_FILE"
+            ' <<< "$cache_text"
         )" || fail "invalid Codex model cache: $CODEX_MODELS_CACHE_FILE"
         catalog_rows=("$codex_model=$selected_efforts" "${catalog_rows[@]}")
     else
@@ -322,7 +325,7 @@ families_text="$(
         | group_by(.family)[]
         | max_by([.version_numbers, .slug])
         | "\(.family)=\(.slug)"
-    ' "$CODEX_MODELS_CACHE_FILE"
+    ' <<< "$cache_text"
 )" || fail "invalid Codex model cache: $CODEX_MODELS_CACHE_FILE"
 
 assigned_rows="$(
@@ -445,8 +448,16 @@ done < "$REGISTRY_VIEW"
 
 [[ "$saw_codex_agents" == true ]] || fail "[codex.agents] section not found in $AGENTS_CONFIG_FILE"
 
-# The overlay inserts new rows at a section's end, so its whitespace and row
-# order can differ from the generator after a release. Compare catalog data.
+# Keep models/efforts seen on another machine and never downgrade a family.
+merged_file="$(mktemp "${AGENTS_CONFIG_FILE}.XXXXXX")"
+if ! "$AGENTS_CONFIG_DIR/../lib/py" "$AGENTS_CONFIG_DIR/../lib/agents_registry.py" catalog \
+    --before "$REGISTRY_VIEW" --after "$tmp_file" > "$merged_file"; then
+    rm -f "$merged_file"
+    fail "cannot merge Codex catalog additions"
+fi
+mv "$merged_file" "$tmp_file"
+
+# Compare catalog data rather than generated whitespace.
 catalog_current=true
 for section in codex.agents codex.families; do
     if [[ "$(registry_section_rows "$section" "$tmp_file" | LC_ALL=C sort)" \
@@ -458,6 +469,8 @@ done
 
 if [[ "$catalog_current" == true ]]; then
     if [[ "$CHECK_ONLY" == false ]]; then
+        # A prior sync may have stopped after writing but before publication.
+        agents_registry_store "$tmp_file" "add Codex catalog models and efforts" additive-catalog
         checkpoint_sync_state
     fi
     echo "Codex agent catalog is current."
@@ -469,7 +482,7 @@ if [[ "$CHECK_ONLY" == true ]]; then
     exit 1
 fi
 
-agents_registry_store "$tmp_file"
+agents_registry_store "$tmp_file" "add Codex catalog models and efforts" additive-catalog
 rm -f "$REGISTRY_VIEW"
 trap release_lock EXIT
 checkpoint_sync_state

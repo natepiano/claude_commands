@@ -1,8 +1,8 @@
-"""Keep a Claude session's herdr tab titled with the session's current name.
+"""Keep a Claude session's tab and pane names current.
 
 A launcher titles the tab with the name it gives the session. A later `/rename` changes only
-the session record, so at the end of each turn this hook gives the tab and its pane the name the
-record has now, and orders the workspace's tabs again. It acts only in a pane of the shared herdr
+the session record, so at the end of each turn this hook updates both names
+and orders changed tabs again. It acts only in a pane of the shared herdr
 session, and it never stops the turn: a fault leaves the title as it was.
 """
 
@@ -46,7 +46,9 @@ def sync(payload: StopPayload, environment: Mapping[str, str]) -> bool:
     if environment.get("HERDR_SESSION") != shared:
         return False
     name = current_name(session_id)
-    return bool(name) and herdr.Herdr(shared).retitle(pane, name)
+    if not name:
+        return False
+    return herdr.Herdr(shared).retitle(pane, name)
 
 
 def main() -> int:

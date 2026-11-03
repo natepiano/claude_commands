@@ -90,6 +90,20 @@ def main() -> None:
             conversation_pause.scheduled_senders,
             lambda: conversation_pause.read_scheduled_prompts(session_id),
         )
+        # Classify before matching the declared wait. A timer or unrelated
+        # message does not supply the answer. Read the marker directly so long
+        # waits survive active_run's liveness timeout.
+        from direct_run import marker_path
+
+        try:
+            run_text = marker_path(session_id).read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            run_text = ""
+        if run_text:
+            sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+            from scripts.direct.progress_history import finish_turn_wait
+
+            finish_turn_wait(Path(run_text), session_id, source=source.name, prompt=prompt)
         if source is conversation_pause.PromptSource.TYPED:
             _record_typed_prompt()
             _record_activity(session_id)

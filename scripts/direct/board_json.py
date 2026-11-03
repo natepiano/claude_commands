@@ -23,10 +23,11 @@ if not __package__:
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts" / "production"))
 
 import unit_table_cells
+import unit_lookup
 
 from scripts.direct import phase_table, plan_history
 from scripts.lib import unit_runs
-from scripts.production import production_units, showrunners, unit_run
+from scripts.production import production_units, showrunners, staff, unit_run
 
 
 def text(value: object) -> str:
@@ -143,6 +144,8 @@ def session_directory(run_id: str) -> Path:
 
 
 def workers(session: Path, sources: set[Path], mesh_prefix: str = "") -> list[dict[str, object]]:
+    from scripts.agents.codex_mesh import recorded_turn_settings
+
     roster = read_object(session / "mesh_roster.json")
     sources.update((session, session / "mesh_roster.json", session / "board.log"))
     metadata = list(session.glob("impl_worker_*.json"))
@@ -193,9 +196,12 @@ def workers(session: Path, sources: set[Path], mesh_prefix: str = "") -> list[di
         record = fields(roster[name])
         meta = by_name.get(name, {}) or by_slot.get(slot, {})
         status = text(record.get("status"))
+        settings = recorded_turn_settings(record)
+        model_label = f"{settings.model}:{settings.effort}" if settings.model and settings.effort else settings.model
         state = {"done": "idle"}.get(status, status)
         result.append({"slot": slot, "role": text(record.get("role")), "state": state,
-                       "model": "/".join(part for part in (text(meta.get("family")), text(meta.get("model"))) if part),
+                       "model": "/".join(part for part in (text(meta.get("family")), model_label) if part),
+                       "effort": settings.effort,
                        "doing": newest.get(slot, "")})
     return result
 
@@ -363,32 +369,54 @@ def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path]) -> dict[s
             "summary": summary, "steps": phase_steps(events, clock, current), "workers": worker_rows}
 
 
-def checkout(document: Path) -> Path:
-    return next((path for path in document.parents if (path / ".git").exists()), document.parent.parent if document.parent.name == "docs" else document.parent)
+@dataclass(frozen=True)
+class BoardSubtree:
+    record: staff.StaffSnapshot
+    runners: tuple[showrunners.Showrunner, ...]
 
 
-def resolve(cwd: str, production: str, session: str = "") -> list[showrunners.Showrunner]:
-    registered = showrunners.registered_showrunners()
-    if not production:
-        document = showrunners.production_of(session)
-        if document is not None:
-            production = next((runner["slug"] for runner in registered
-                               if Path(runner["doc"]).expanduser().resolve() == document.expanduser().resolve()), "")
-    if not production:
-        directory = Path(cwd).expanduser().resolve()
-        production = next((runner["slug"] for runner in registered
-                           if directory.is_relative_to(checkout(Path(runner["doc"])))), "")
-    by_slug = {runner["slug"]: runner for runner in registered}
-    if production not in by_slug:
-        return []
-    return [by_slug[slug] for slug in [production, *showrunners.descendants_of(production)] if slug in by_slug]
+@dataclass(frozen=True)
+class NoBoardSubtree:
+    pass
 
 
-def build(runner: showrunners.Showrunner) -> dict[str, object]:
+def resolve(production: str, session: str = "") -> BoardSubtree | NoBoardSubtree:
+    try:
+        record = staff.snapshot()
+        sources = unit_lookup.member_sources()
+        members = sources.showrunner_members(record)
+        if production:
+            root = members.get(production)
+        else:
+            found = unit_lookup.session_showrunner(session, record=record, sources=sources)
+            root = found.row if isinstance(found, unit_lookup.MemberFound) else None
+    except staff.StaffUnreadable as error:
+        print(f"board_json: {error}", file=sys.stderr)
+        return NoBoardSubtree()
+    by_slug = {runner["slug"]: runner for runner in showrunners.require_complete(
+        showrunners.registered_showrunners(membership=record))}
+    if root is None or root not in staff.active(record, "showrunner"):
+        return NoBoardSubtree()
+    slugs = {row.id: slug for slug, row in members.items()}
+    boards: list[showrunners.Showrunner] = []
+    level = [root]
+    while level:
+        for row in level:
+            slug = slugs.get(row.id, "")
+            if slug in by_slug:
+                boards.append(by_slug[slug])
+        level = sorted((child for row in level for child in staff.active(record, "showrunner") if child.parent == row.id),
+                       key=lambda row: slugs.get(row.id, row.name))
+    return BoardSubtree(record, tuple(boards))
+
+
+def build(runner: showrunners.Showrunner, *, record: staff.StaffSnapshot) -> dict[str, object]:
     clock = BoardClock(ZoneInfo(runner["zone"]), plan_history.now_epoch())
     document = Path(runner["doc"]).expanduser().resolve()
     sources = {document}
-    rows = production_units.live_unit_table(document.read_text(encoding="utf-8").splitlines(), runner["slug"])
+    rows = unit_lookup.live_unit_table(
+        document.read_text(encoding="utf-8").splitlines(), runner["slug"], record=record,
+    )
     offset = datetime.fromtimestamp(clock.now, clock.zone).utcoffset()
     return {"production": runner["slug"], "as_of": clock.time(clock.now), "zone": runner["zone"],
             "utc_offset_minutes": int(offset.total_seconds() / 60) if offset else 0,
@@ -410,21 +438,23 @@ def write_board(path: Path, board: dict[str, object]) -> None:
 
 def main(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    group = parser.add_mutually_exclusive_group(required=True)
-    _ = group.add_argument("--cwd", default="")
-    _ = group.add_argument("--production", default="")
     _ = parser.add_argument("--session", default="")
+    _ = parser.add_argument("--production", default="")
     args = parser.parse_args(arguments)
-    runners = resolve(cast(str, args.cwd), cast(str, args.production), cast(str, args.session))
+    session, production = cast(str, args.session), cast(str, args.production)
+    if not session and not production:
+        parser.error("--session or --production is required")
+    subtree = resolve(production, session)
     root = Path(os.environ.get("UNIT_BOARD_DIR") or str(Path(os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")) / "unit-board")).expanduser().resolve()
     files: list[str] = []
-    for runner in runners:
-        path = root / f"{runner['slug']}.json"
-        write_board(path, build(runner))
-        files.append(str(path))
+    if isinstance(subtree, BoardSubtree):
+        for runner in subtree.runners:
+            path = root / f"{runner['slug']}.json"
+            write_board(path, build(runner, record=subtree.record))
+            files.append(str(path))
     watch_sources = {showrunners.NOTIFIER_STATE_DIR, showrunners.SHOWRUNNER_STATE_DIR}
-    watch_sources.update(showrunners.SHOWRUNNER_STATE_DIR / runner["slug"]
-                         for runner in showrunners.registered_showrunners())
+    watch_sources.update(showrunners.SHOWRUNNER_STATE_DIR / source.timer.slug
+                         for source in showrunners.read_sources(unreadable=showrunners.UnreadableTimerPolicy.RAISE))
     watch = existing_sources(watch_sources)
     print(json.dumps({"files": files, "watch": watch}))
     return 0

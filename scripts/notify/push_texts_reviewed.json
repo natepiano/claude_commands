@@ -1,4 +1,20 @@
 {
+  "alert.blocked": {
+    "typical": {
+      "objections": [],
+      "reviewer": "user-spec: User approved push_template_drafts.txt with the 2026-11-01 changes",
+      "sha256": "d3e03a4b890d8fea463239329391f5c74cb27071c6f4455df198c1687b6ed98e",
+      "time": "2026-11-01T12:00:00-05:00"
+    }
+  },
+  "alert.decision": {
+    "typical": {
+      "objections": [],
+      "reviewer": "user-spec: User approved push_template_drafts.txt with the 2026-11-01 changes",
+      "sha256": "4a780daecea5853ba4002afa0c2262436aec9a53a80837441a2fdd7f3646d5c3",
+      "time": "2026-11-01T12:00:00-05:00"
+    }
+  },
   "auto_mode.refused": {
     "file_change_no_waits": {
       "objections": [
@@ -66,6 +82,14 @@
       "time": "2026-10-23T19:45:00.398996-04:00"
     }
   },
+  "build_hold.blocking": {
+    "typical": {
+      "objections": [],
+      "reviewer": "user-spec: User approved push_template_drafts.txt with the 2026-11-01 changes",
+      "sha256": "4188fcea7946f96a281742a220e199083769041c69341162f93af046b4f35f21",
+      "time": "2026-11-01T12:00:00-05:00"
+    }
+  },
   "codex.reset_ready": {
     "long_machine": {
       "reviewer": "opus",
@@ -76,6 +100,22 @@
       "reviewer": "opus",
       "sha256": "1f065b1a5dcd7b40a7239274d3d8c502bfbcb27763417405c9b8168bea52fd46",
       "time": "2026-10-14T04:25:55.369515-04:00"
+    }
+  },
+  "github.keys_cold": {
+    "typical": {
+      "objections": [],
+      "reviewer": "user-spec: User approved push_template_drafts.txt with the 2026-11-01 changes",
+      "sha256": "f8044fe25f39b5647778f07a98609db9352b8c97c87404e559754757f62bde9b",
+      "time": "2026-11-01T12:00:00-05:00"
+    }
+  },
+  "mac.locked": {
+    "typical": {
+      "objections": [],
+      "reviewer": "user-spec: User approved push_template_drafts.txt with the 2026-11-01 changes",
+      "sha256": "df8eb63669515b2838b8a43037d38eb35187c7ec7363e57be686b74024087c3a",
+      "time": "2026-11-01T12:00:00-05:00"
     }
   },
   "nate.adhoc": {
@@ -134,6 +174,18 @@
       "time": "2026-10-14T04:26:23.159330-04:00"
     }
   },
+  "nixos.gpu_stopped": {
+    "xid_119": {
+      "reviewer": "opus",
+      "sha256": "f66636a19338e55ae340c760b0ac4c6e0637ec1c8dcf9dffa45362501a3ce4e6",
+      "time": "2026-10-30T12:11:27.097632-04:00"
+    },
+    "xid_79_night": {
+      "reviewer": "opus",
+      "sha256": "f66636a19338e55ae340c760b0ac4c6e0637ec1c8dcf9dffa45362501a3ce4e6",
+      "time": "2026-10-30T12:11:19.862988-04:00"
+    }
+  },
   "nixos.ups_battery": {
     "shutdown_threshold": {
       "reviewer": "opus",
@@ -144,6 +196,30 @@
       "reviewer": "opus",
       "sha256": "0846956765230afe65d57d025036b245af20453c59348864ba08b614e449cc8d",
       "time": "2026-10-14T04:26:42.406180-04:00"
+    }
+  },
+  "nixos.ups_no_contact": {
+    "typical": {
+      "objections": [],
+      "reviewer": "user-spec: User-approved UPS texts in phases/ups-templates/implementation_prompt.md, 2026-11-02; reviewer: opus",
+      "sha256": "c382268a614a0127a76d5ac762d2242622f7b8d9de1abc4f22c8bff7e47fa3bd",
+      "time": "2026-11-02T02:00:46.845795-05:00"
+    }
+  },
+  "nixos.ups_power_back": {
+    "typical": {
+      "objections": [],
+      "reviewer": "user-spec: User approved push_template_drafts.txt with the 2026-11-01 changes",
+      "sha256": "df438eaa62caf54aab780d668d527bb6db81e3a8a69e53e0bea4b9a05081f3ee",
+      "time": "2026-11-01T12:00:00-05:00"
+    }
+  },
+  "nixos.ups_replace_battery": {
+    "typical": {
+      "objections": [],
+      "reviewer": "user-spec: User-approved UPS texts in phases/ups-templates/implementation_prompt.md, 2026-11-02; reviewer: opus",
+      "sha256": "ec108ac3bc1b39938bc60d1b54f2bcdfbc10616d7bca3baf509a18d1057313ae",
+      "time": "2026-11-02T02:00:37.488795-05:00"
     }
   },
   "nixos.ups_shutdown": {
@@ -677,61 +753,16 @@
       "time": "2026-10-21T08:04:49.559420-04:00"
     }
   },
-  "shutdown.holdout": {
-    "typical": {
-      "objections": [
-        {
-          "quote": "pm-move-ghostty restart is blocked",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "answer the open form",
-          "rule": "say-where-to-act"
-        },
-        {
-          "quote": "Answer the form (recommended): the session pauses, and the restart goes on.",
-          "rule": "every-choice-says-what-it-does"
-        },
-        {
-          "quote": "Reason: restart is blocked because pm-move-ghostty's claude session is showing a form and it can't proceed.",
-          "rule": "what-happened-why-what-you-do"
-        },
-        {
-          "quote": "pm-move-ghostty restart is blocked",
-          "rule": "title-names-the-stake"
-        },
-        {
-          "quote": "Session: pm-move-ghostty\nAction: On natedev, answer the form in the pm-move-ghostty session\nA restart is waiting because the pm-move-ghostty Claude session is showing a form. Until someone answers it, the restart cannot go on.\n\nAnswer the form (recommended): the session pauses, the restart goes on, and its work is kept.\n\nStop the session: it ends, and its uncommitted work stays. The restart goes on without it. In a terminal on natedev, run:\n\n~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now claude4 --here --only d5b35898-290f-4b44-8e6f-6f2586c975a8",
-          "rule": "push-body-under-500"
-        }
-      ],
-      "reviewer": "user-spec: the user's four lines for a blocked shutdown (2026-10-14, via the showrunner) stay; the user asked 2026-10-19 (change review C9, via the showrunner) to reword the stop line as its own step that says what stopping does. After 3 review passes the choice lines are in the reviewer's own rewrite verbatim; the remaining objections target the user's title, Action and Reason (recorded, not applied).; reviewer: opus",
-      "sha256": "5008e6e201af4b9dfd13f17a825a7b4a9f53922048deee920bd423f94e86e3a6",
-      "time": "2026-10-19T16:08:52.114457-04:00"
-    }
-  },
-  "shutdown.holdout_unanswered": {
-    "long_session": {
-      "reviewer": "opus",
-      "sha256": "39d83183464c5b7c29393976fe486518e8ea078f018d71d15d55220ba5813890",
-      "time": "2026-10-16T19:15:42.586534-04:00"
-    },
-    "typical": {
-      "reviewer": "opus",
-      "sha256": "39d83183464c5b7c29393976fe486518e8ea078f018d71d15d55220ba5813890",
-      "time": "2026-10-16T19:15:31.911755-04:00"
-    }
-  },
   "shutdown.manual_restart": {
-    "long_session": {
+    "one_session": {
       "reviewer": "opus",
-      "sha256": "9603dec07aeab9f9f235d21747a4caae3769a6b7430cda177b035bb9fb960b52",
-      "time": "2026-10-14T04:30:28.978102-04:00"
+      "sha256": "3c4cbdb225b283a3e2a18271acc1940d8e874db61cb7d331330603093c237760",
+      "time": "2026-11-01T22:43:40.334596-05:00"
     },
     "typical": {
       "reviewer": "opus",
-      "sha256": "9603dec07aeab9f9f235d21747a4caae3769a6b7430cda177b035bb9fb960b52",
-      "time": "2026-10-14T04:30:22.346233-04:00"
+      "sha256": "3c4cbdb225b283a3e2a18271acc1940d8e874db61cb7d331330603093c237760",
+      "time": "2026-11-01T22:43:31.298215-05:00"
     }
   },
   "shutdown.move_failed": {
@@ -761,13 +792,13 @@
   "shutdown.restart_failed": {
     "one_long_name": {
       "reviewer": "opus",
-      "sha256": "1c5bdd7ba6330bd03c3c3abaecea9c104a6fa2effc0a6ad652bcda66b8e22ddf",
-      "time": "2026-10-26T20:03:23.034661-04:00"
+      "sha256": "da53582edd216e5d1e0758383368fd76a554d8bd088e6b11ab8e05efa00a3188",
+      "time": "2026-11-01T22:39:12.544136-05:00"
     },
     "typical": {
       "reviewer": "opus",
-      "sha256": "1c5bdd7ba6330bd03c3c3abaecea9c104a6fa2effc0a6ad652bcda66b8e22ddf",
-      "time": "2026-10-26T20:03:15.200466-04:00"
+      "sha256": "da53582edd216e5d1e0758383368fd76a554d8bd088e6b11ab8e05efa00a3188",
+      "time": "2026-11-01T22:39:06.696247-05:00"
     }
   },
   "shutdown.restart_incomplete": {
@@ -783,27 +814,22 @@
     }
   },
   "shutdown.restart_untrusted": {
-    "long_folder": {
-      "reviewer": "opus",
-      "sha256": "3b93542505b329db050aa3ae4e95cf4561d4ebf613678c8ddcc91cd5277be6eb",
-      "time": "2026-10-26T20:04:34.245746-04:00"
-    },
     "typical": {
       "reviewer": "opus",
-      "sha256": "3b93542505b329db050aa3ae4e95cf4561d4ebf613678c8ddcc91cd5277be6eb",
-      "time": "2026-10-26T20:04:20.684453-04:00"
+      "sha256": "f57b6487a5078fa11193be0ca11dfc0b3c14d83684cc0d4d77e22cec98a3a7a6",
+      "time": "2026-11-01T23:38:17.230240-05:00"
     }
   },
-  "shutdown.stop_failed": {
-    "many_long_names": {
+  "shutdown.restart_untrusted_unlisted": {
+    "one_session": {
       "reviewer": "opus",
-      "sha256": "8efd8b84f8e237ada5cdb202c25229645bd2526c2f2b7a298effbb256131dc9e",
-      "time": "2026-10-14T17:14:12.173899-04:00"
+      "sha256": "9e6720e2a7760893f5c4b0e8069adca367392a4366f8d21682df33f65ebd97bb",
+      "time": "2026-11-01T23:41:12.323161-05:00"
     },
-    "typical": {
+    "several_sessions": {
       "reviewer": "opus",
-      "sha256": "8efd8b84f8e237ada5cdb202c25229645bd2526c2f2b7a298effbb256131dc9e",
-      "time": "2026-10-14T17:14:02.345122-04:00"
+      "sha256": "9e6720e2a7760893f5c4b0e8069adca367392a4366f8d21682df33f65ebd97bb",
+      "time": "2026-11-01T23:41:18.957713-05:00"
     }
   },
   "silence.auto_off": {
@@ -979,6 +1005,38 @@
       "reviewer": "user-spec: build-followups showrunner (natedev), 2026-10-21 ~01:40 EDT: approve the sweep.disk_floor text as proposed, after 3 failed reviewer rounds (memory attempts-disk-floor-page-text.md); reviewer: opus",
       "sha256": "497c66bfd2e2d3a1b9bb358bb53133cc0aab64af5eb4ef39857ce3135c0e0167",
       "time": "2026-10-21T00:55:22.184346-04:00"
+    }
+  },
+  "vault.stopped": {
+    "branch": {
+      "reviewer": "opus",
+      "sha256": "6da24c3fecf498c994e294d99ec8db48b3402fb8b4682fd1c50a57313cba21fc",
+      "time": "2026-10-30T21:49:21.935422-04:00"
+    },
+    "command": {
+      "reviewer": "opus",
+      "sha256": "6da24c3fecf498c994e294d99ec8db48b3402fb8b4682fd1c50a57313cba21fc",
+      "time": "2026-10-30T21:49:54.834725-04:00"
+    },
+    "diverged": {
+      "reviewer": "opus",
+      "sha256": "6da24c3fecf498c994e294d99ec8db48b3402fb8b4682fd1c50a57313cba21fc",
+      "time": "2026-10-30T21:49:29.417975-04:00"
+    },
+    "tracked_changes": {
+      "reviewer": "opus",
+      "sha256": "6da24c3fecf498c994e294d99ec8db48b3402fb8b4682fd1c50a57313cba21fc",
+      "time": "2026-10-30T21:49:15.140122-04:00"
+    },
+    "unreachable": {
+      "reviewer": "opus",
+      "sha256": "6da24c3fecf498c994e294d99ec8db48b3402fb8b4682fd1c50a57313cba21fc",
+      "time": "2026-10-30T21:49:47.624690-04:00"
+    },
+    "untracked": {
+      "reviewer": "opus",
+      "sha256": "6da24c3fecf498c994e294d99ec8db48b3402fb8b4682fd1c50a57313cba21fc",
+      "time": "2026-10-30T21:49:38.396991-04:00"
     }
   }
 }

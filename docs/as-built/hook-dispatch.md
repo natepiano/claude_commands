@@ -18,8 +18,8 @@ separate hooks.
 ## The tables
 
 Each row is a hook file in `scripts/hooks/`, the tool-name matcher it had in
-`settings.json`, and its timeout (600 s unless stated). The order is the
-`settings.json` order before the change.
+`settings.json`, and its timeout (600 s unless stated). The original hooks keep
+their old order; push-delivered runs last, for PushNotification only.
 
 | Event | Hooks, in order | Matcher |
 | --- | --- | --- |
@@ -27,6 +27,7 @@ Each row is a hook file in `scripts/hooks/`, the tool-name matcher it had in
 | | scratch-guard (10 s) | `Bash\|Write\|NotebookEdit` |
 | `post_tool_use` | basedpyright, fn-length | `Edit\|MultiEdit\|Write` |
 | | context-usage, banned-words | all tools |
+| | push-delivered | `PushNotification` |
 | `stop` | direct-continue, conversation-pause, prose-banned-words, herdr_tab_title | — |
 
 `settings.json` has one entry per event in place of those hooks:
@@ -35,7 +36,7 @@ Each row is a hook file in `scripts/hooks/`, the tool-name matcher it had in
 - PostToolUse: no matcher, timeout 2430 s.
 - Stop: no matcher, timeout 2430 s.
 
-Each outer timeout is the sum of the event's hook budgets plus 30 s of
+Each outer timeout covers the largest sum of hook budgets that match one tool, plus 30 s of
 dispatcher overhead, so every hook keeps its full budget.
 
 `scripts/hooks/test_hook_dispatch.py` checks that the tables match

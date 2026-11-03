@@ -1,0 +1,44 @@
+{
+  "harm_stops_work": {
+    "current_harm": {
+      "type": "noul",
+      "instructions": "Does `issue` describe a failure happening now that stops people from using the product or doing their work?",
+      "criteria": {
+        "true": "A failure happens now, and people cannot use the product, finish a task or keep their data until it is fixed; no workaround is given.",
+        "false": "The defect is a visible flaw, a wrong look, a slow step or a rare failure with a workaround; people keep using the product and doing their work while it waits."
+      }
+    }
+  },
+  "category_deliverable": {
+    "category": {
+      "type": "choice",
+      "instructions": "What kind of work does `issue` describe, judged by what the work delivers when it is done?",
+      "criteria": {
+        "bug": "Something does not work as it was meant to: it crashes, gives a wrong result or breaks a stated behavior, and the work makes it work as intended. A look or behavior that works as designed but could be better is not a bug.",
+        "feature": "The work ships a capability that users or code cannot use at all today, such as a new tool, widget, command or integration, with a defined scope.",
+        "enhancement": "The work changes a capability that already exists so it works better, looks better or covers more cases; the issue names the existing thing it improves.",
+        "docs": "The deliverable is written documentation, such as a guide, a README or a reference page.",
+        "example": "The deliverable is a worked example or a demonstration program that shows how to use something.",
+        "refactor": "The work restructures, moves or renames code, or removes an old code path, and users see no change in behavior.",
+        "idea": "A creative concept or an inspiration is noted with no scope and no defined deliverable; nobody could start building it from the issue alone.",
+        "research": "The deliverable is a finding or a decision, not shipped code: evaluate an outside library, crate, tool or technique, or answer a stated question before an implementation is chosen. An issue that only names an outside project to look at is research.",
+        "business": "The work concerns trademarks, funding, recruiting, legal or commercial operations."
+      }
+    },
+    "category_reverse": {
+      "type": "choice",
+      "instructions": "What kind of work does `issue` describe, judged by what the work delivers when it is done?",
+      "criteria": {
+        "business": "The work concerns trademarks, funding, recruiting, legal or commercial operations.",
+        "research": "The deliverable is a finding or a decision, not shipped code: evaluate an outside library, crate, tool or technique, or answer a stated question before an implementation is chosen. An issue that only names an outside project to look at is research.",
+        "idea": "A creative concept or an inspiration is noted with no scope and no defined deliverable; nobody could start building it from the issue alone.",
+        "refactor": "The work restructures, moves or renames code, or removes an old code path, and users see no change in behavior.",
+        "example": "The deliverable is a worked example or a demonstration program that shows how to use something.",
+        "docs": "The deliverable is written documentation, such as a guide, a README or a reference page.",
+        "enhancement": "The work changes a capability that already exists so it works better, looks better or covers more cases; the issue names the existing thing it improves.",
+        "feature": "The work ships a capability that users or code cannot use at all today, such as a new tool, widget, command or integration, with a defined scope.",
+        "bug": "Something does not work as it was meant to: it crashes, gives a wrong result or breaks a stated behavior, and the work makes it work as intended. A look or behavior that works as designed but could be better is not a bug."
+      }
+    }
+  }
+}

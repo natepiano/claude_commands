@@ -16,9 +16,13 @@ It stays out of the way unless all of these hold:
   * context is at or past the same handoff threshold the PostToolUse hook uses
   * this turn is not already the product of a block (`stop_hook_active`)
   * the agent is the main thread, not a subagent
-  * nothing is in flight that will wake the session by itself -- a live worker
-    dispatch, or anything in the payload's `background_tasks`. That wake-up is
-    the next request, so compaction gets its chance without a block
+  * the agent has not declared a user or supplier wait
+  * no live entry in the payload's `background_tasks` will wake the session.
+    That wake-up supplies the next request, so compaction needs no block.
+
+Context is measured before the wake-source check. Below the handoff threshold,
+or when context cannot be measured, the stop passes. A fresh worker heartbeat
+does not prove a future wake-up: a finished worker writes it too.
 
 Blocking is deliberately once-only. The agent legitimately stops above the
 threshold to ask the user things -- verbose pre/post-phase gates, unresolved
@@ -37,6 +41,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 from typing import cast
 
 from context_usage import (
@@ -47,7 +52,7 @@ from context_usage import (
     pending_background_tasks,
     trigger_tokens,
 )
-from direct_run import active_run, workers_working
+from direct_run import active_run
 
 REASON = """\
 /unit:direct run active, {tokens:,} / {trigger:,} tokens ({percent}%). Do not end the \
@@ -59,17 +64,18 @@ Waiting on a user decision instead? State it in one line and end the turn — th
 will not block twice."""
 
 
+class StopPayload(HookInput, total=False):
+    last_assistant_message: str
+
+
 def build_reason(tokens: int, trigger: int) -> str:
     percent = round(100 * tokens / trigger) if trigger else 100
     return REASON.format(tokens=tokens, trigger=trigger, percent=percent)
 
 
 def main() -> None:
-    payload = cast(HookInput, json.loads(sys.stdin.read()))
+    payload = cast(StopPayload, json.loads(sys.stdin.read()))
 
-    # Already continuing because of a previous block -- let this one through.
-    if payload.get("stop_hook_active"):
-        return
     # Subagents do not orchestrate /unit:direct runs; their stop is a real result.
     if payload.get("agent_id"):
         return
@@ -80,20 +86,17 @@ def main() -> None:
     session_dir = active_run(session_id)
     if session_dir is None:
         return
-    # Parked on a completion waiter: the worker's own notification will supply
-    # the next request, and compaction fires there. Nothing to force.
-    if workers_working(session_dir):
-        return
-    # The same situation, read from the CLI instead of from a worker
-    # heartbeat: anything in `background_tasks` wakes this session on its own,
-    # and that wake-up is the request compaction needs. The heartbeat covers
-    # worker dispatches only, so a run waiting on ordinary Agent-tool
-    # subagents looked idle to `workers_working` and got ordered back to work
-    # with nothing to do -- a blocked stop, a restated "still waiting", and no
-    # compaction, since the count was nowhere near the trigger.
-    if pending_background_tasks(payload):
-        return
+    # A declared wait is a real stop, including a restated decision after a
+    # compaction block. Record before the compaction and background-work guards.
+    final_message = payload.get("last_assistant_message", "")
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.direct.progress_history import record_turn_wait
 
+    if record_turn_wait(session_dir, session_id, final_message):
+        return
+    # Already continuing because of a previous block -- let this one through.
+    if payload.get("stop_hook_active"):
+        return
     # Measure first: the window is clamped to the model's own context window, and
     # only the transcript names the model.
     measurement = measure(payload)
@@ -104,6 +107,11 @@ def main() -> None:
         return
     tokens = measurement["tokens"]
     if tokens < handoff_threshold(window):
+        return
+
+    # Only live tasks reported by the CLI supply a later request. A worker's
+    # heartbeat can be fresh even after its completion notice has arrived.
+    if pending_background_tasks(payload):
         return
 
     print(json.dumps({"decision": "block", "reason": build_reason(tokens, trigger_tokens(window))}))

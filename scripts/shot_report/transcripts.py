@@ -15,12 +15,14 @@ from collections.abc import Iterable, Iterator
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from typing import Literal, cast, override
 
 Agent = Literal["Claude", "Codex"]
 CallKind = Literal["shot", "other"]
 ProjectAttribution = Literal["repository", "scratchpad", "last_path", "removed_worktree", "scratchpad_target_missing"]
+DEFAULT_SCRATCHPAD_ROOTS = (Path("/tmp"), Path("/private/tmp"))
 type ParsedToolEventCategory = Literal[
     "builds_and_app_launches", "other_brp", "file_reads_searches_and_edits", "other_tool_calls",
 ]
@@ -503,21 +505,26 @@ class CachedScanEvidence:
     roots: tuple[str, str]
     files: dict[str, CachedTranscriptEvidence]
     timings: dict[tuple[str, str], CachedTimingEvidence]
+    scratchpad_roots: tuple[Path, ...]
 
 
 CACHE_FORMAT_VERSION = 7
 
 
-def _load_cache(cache: PersistentScanCache, roots: tuple[str, str]) -> CachedScanEvidence:
+def _load_cache(cache: PersistentScanCache, roots: tuple[str, str],
+                scratchpad_roots: tuple[Path, ...]) -> CachedScanEvidence:
     try:
         with cache.path.open("rb") as source:
             value = cast(object, pickle.load(source))
         if (isinstance(value, CachedScanEvidence) and value.format_version == CACHE_FORMAT_VERSION
                 and value.roots == roots):
-            return value
+            if not hasattr(value, "scratchpad_roots"):
+                value.scratchpad_roots = DEFAULT_SCRATCHPAD_ROOTS
+            if value.scratchpad_roots == scratchpad_roots:
+                return value
     except Exception:
         pass
-    return CachedScanEvidence(CACHE_FORMAT_VERSION, roots, {}, {})
+    return CachedScanEvidence(CACHE_FORMAT_VERSION, roots, {}, {}, scratchpad_roots)
 
 
 def _save_cache(cache: PersistentScanCache, evidence: CachedScanEvidence) -> None:
@@ -738,17 +745,21 @@ def _claude_encoded(path: Path) -> str:
     return re.sub(r"[^A-Za-z0-9]", "-", str(path))
 
 
-def _scratchpad_project(cwd: str, known_cwds: set[str]) -> tuple[str, ProjectAttribution]:
-    parts = Path(cwd).parts
-    for index, part in enumerate(parts):
-        if not part.startswith("claude-") or index + 1 >= len(parts):
+def _scratchpad_project(cwd: str, known_cwds: set[str],
+                        scratchpad_roots: tuple[Path, ...]) -> tuple[str, ProjectAttribution]:
+    for root in scratchpad_roots:
+        try:
+            parts = Path(cwd).relative_to(root).parts
+        except ValueError:
             continue
-        encoded = parts[index + 1]
-        if not encoded.startswith("-") or "scratchpad" not in parts[index + 2:]:
+        if len(parts) < 3 or not parts[0].startswith("claude-") or parts[0] == "claude-":
+            continue
+        encoded = parts[1]
+        if not encoded.startswith("-") or "scratchpad" not in parts[2:]:
             continue
         same_session = [name for name in known_cwds if _claude_encoded(Path(name)) == encoded]
         if same_session:
-            project, _ = _project(max(same_session, key=len), {})
+            project, _ = _repository_project(max(same_session, key=len))
             return project, "scratchpad"
         frontier = [Path("/")]
         best = Path("/")
@@ -758,7 +769,7 @@ def _scratchpad_project(cwd: str, known_cwds: set[str]) -> tuple[str, ProjectAtt
             if len(prefix) > len(_claude_encoded(best)):
                 best = path
             if prefix == encoded:
-                project, _ = _project(str(path), {})
+                project, _ = _repository_project(str(path))
                 return project, "scratchpad"
             if not encoded.startswith(("" if path == Path("/") else prefix) + "-"):
                 continue
@@ -770,7 +781,7 @@ def _scratchpad_project(cwd: str, known_cwds: set[str]) -> tuple[str, ProjectAtt
                 continue
         remainder = encoded[len(_claude_encoded(best)):].strip("-")
         if remainder and best != Path("/"):
-            parent_project, parent_attribution = _project(str(best), {})
+            parent_project, parent_attribution = _repository_project(str(best))
             if parent_attribution == "repository":
                 return (parent_project + "-" + remainder, "scratchpad_target_missing")
         return (remainder or best.name, "scratchpad_target_missing")
@@ -778,13 +789,19 @@ def _scratchpad_project(cwd: str, known_cwds: set[str]) -> tuple[str, ProjectAtt
 
 
 def _project(cwd: str, cache: dict[str, tuple[str, ProjectAttribution]],
-             known_cwds: set[str] | None = None) -> tuple[str, ProjectAttribution]:
+             known_cwds: set[str] | None = None, *,
+             scratchpad_roots: tuple[Path, ...]) -> tuple[str, ProjectAttribution]:
     if cwd in cache:
         return cache[cwd]
-    scratchpad = _scratchpad_project(cwd, known_cwds or set()) if "scratchpad" in cwd and "claude-" in cwd else ("", "last_path")
+    scratchpad = _scratchpad_project(cwd, known_cwds or set(), scratchpad_roots)
     if scratchpad[0]:
         cache[cwd] = scratchpad
         return cache[cwd]
+    cache[cwd] = _repository_project(cwd)
+    return cache[cwd]
+
+
+def _repository_project(cwd: str) -> tuple[str, ProjectAttribution]:
     original = Path(cwd).expanduser()
     current = original
     while not current.exists() and current != current.parent:
@@ -797,10 +814,8 @@ def _project(cwd: str, cache: dict[str, tuple[str, ProjectAttribution]],
         if result.returncode == 0:
             common_dir = Path(result.stdout.strip()).resolve()
             repo = common_dir.parent if common_dir.name == ".git" else current
-            cache[cwd] = (repo.name, "repository")
-            return cache[cwd]
-    cache[cwd] = (original.name or "unknown", "last_path")
-    return cache[cwd]
+            return repo.name, "repository"
+    return original.name or "unknown", "last_path"
 
 
 def _exec_shell_commands(value: str) -> str:
@@ -1809,7 +1824,8 @@ def _matching_lines(path: Path, markers: tuple[bytes, ...]) -> Iterator[bytes]:
 
 def _claude_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]],
                   matched_lines: Iterable[bytes] | None = None,
-                  progress: ClaudeTranscriptProgress | None = None) -> TranscriptEvidence:
+                  progress: ClaudeTranscriptProgress | None = None, *,
+                  scratchpad_roots: tuple[Path, ...]) -> TranscriptEvidence:
     state = progress if progress is not None else ClaudeTranscriptProgress()
     pending = state.pending_uses
     pending_writes = state.pending_writes
@@ -1894,7 +1910,7 @@ def _claude_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]
                     if classified is None:
                         continue
                     kind, origin, classified_command = classified
-                    project, attribution = _project(cwd, projects, known_cwds)
+                    project, attribution = _project(cwd, projects, known_cwds, scratchpad_roots=scratchpad_roots)
                     pending[use_id] = ClaudeToolUseAwaitingResult(
                         stamp, _string(row.get("sessionId")) or path.stem,
                         project, attribution, kind, origin, _without_inline_image_data(classified_command),
@@ -1939,7 +1955,8 @@ def _claude_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]
 
 def _codex_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]],
                  matched_lines: Iterable[bytes] | None = None,
-                 progress: CodexTranscriptProgress | None = None) -> TranscriptEvidence:
+                 progress: CodexTranscriptProgress | None = None, *,
+                 scratchpad_roots: tuple[Path, ...]) -> TranscriptEvidence:
     thread_suffix = CODEX_THREAD_SUFFIX.search(path.stem)
     fallback_session = thread_suffix.group(1) if thread_suffix is not None else path.stem
     state = progress if progress is not None else CodexTranscriptProgress(fallback_session, path.parent.name)
@@ -1985,7 +2002,7 @@ def _codex_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]]
             if row.get("type") == "session_meta":
                 session = _string(payload.get("id")) or session
                 cwd = _string(payload.get("cwd"))
-                project, attribution = _project(cwd, projects)
+                project, attribution = _project(cwd, projects, scratchpad_roots=scratchpad_roots)
                 state.session, state.cwd, state.project, state.attribution = session, cwd, project, attribution
                 continue
             if stamp is None or row.get("type") != "response_item":
@@ -2057,10 +2074,11 @@ def _codex_calls(path: Path, projects: dict[str, tuple[str, ProjectAttribution]]
     return TranscriptEvidence(calls, citations, tool_events)
 
 
-def _scan_file(file: tuple[Agent, Path]) -> TranscriptEvidence:
+def _scan_file(file: tuple[Agent, Path], scratchpad_roots: tuple[Path, ...]) -> TranscriptEvidence:
     agent, path = file
     projects: dict[str, tuple[str, ProjectAttribution]] = {}
-    return _claude_calls(path, projects) if agent == "Claude" else _codex_calls(path, projects)
+    return (_claude_calls(path, projects, scratchpad_roots=scratchpad_roots) if agent == "Claude"
+            else _codex_calls(path, projects, scratchpad_roots=scratchpad_roots))
 
 
 def _markers(agent: Agent) -> tuple[bytes, ...]:
@@ -2087,12 +2105,12 @@ def _new_progress(agent: Agent, path: Path) -> TranscriptProgress:
 
 
 def _parse_lines(path: Path, agent: Agent, lines: Iterable[bytes],
-                 progress: TranscriptProgress) -> TranscriptEvidence:
+                 progress: TranscriptProgress, scratchpad_roots: tuple[Path, ...]) -> TranscriptEvidence:
     projects: dict[str, tuple[str, ProjectAttribution]] = {}
     if agent == "Claude" and isinstance(progress, ClaudeTranscriptProgress):
-        return _claude_calls(path, projects, lines, progress)
+        return _claude_calls(path, projects, lines, progress, scratchpad_roots=scratchpad_roots)
     if agent == "Codex" and isinstance(progress, CodexTranscriptProgress):
-        return _codex_calls(path, projects, lines, progress)
+        return _codex_calls(path, projects, lines, progress, scratchpad_roots=scratchpad_roots)
     raise ValueError("Transcript agent and parser progress disagree")
 
 
@@ -2143,7 +2161,8 @@ def _complete_cursor(path: Path, size: int) -> int:
     return tail_start + last_newline + 1 if last_newline >= 0 else 0
 
 
-def _new_file_evidence(file: tuple[Agent, Path, str], candidate: bool = True) -> CachedTranscriptEvidence:
+def _new_file_evidence(file: tuple[Agent, Path, str], scratchpad_roots: tuple[Path, ...],
+                       candidate: bool = True) -> CachedTranscriptEvidence:
     agent, path, source_host = file
     stat = path.stat()
     progress = _new_progress(agent, path)
@@ -2154,11 +2173,11 @@ def _new_file_evidence(file: tuple[Agent, Path, str], candidate: bool = True) ->
     complete = _complete_cursor(path, stat.st_size)
     if complete == stat.st_size:
         lines = _matching_lines(path, _markers(agent))
-        evidence = _parse_lines(path, agent, lines, progress)
+        evidence = _parse_lines(path, agent, lines, progress, scratchpad_roots)
         cursor = stat.st_size
     else:
         read = TranscriptContentRead(0)
-        evidence = _parse_lines(path, agent, _appended_lines(path, agent, read), progress)
+        evidence = _parse_lines(path, agent, _appended_lines(path, agent, read), progress, scratchpad_roots)
         cursor = read.cursor
     evidence = TranscriptEvidence(
         [replace(call, source_host=source_host) for call in evidence.calls], evidence.citations,
@@ -2168,9 +2187,10 @@ def _new_file_evidence(file: tuple[Agent, Path, str], candidate: bool = True) ->
                                     stat.st_mtime_ns, evidence, progress, True)
 
 
-def _append_file_evidence(prior: CachedTranscriptEvidence, path: Path, stat: os.stat_result) -> int:
+def _append_file_evidence(prior: CachedTranscriptEvidence, path: Path, stat: os.stat_result,
+                          scratchpad_roots: tuple[Path, ...]) -> int:
     read = TranscriptContentRead(prior.cursor)
-    fresh = _parse_lines(path, prior.agent, _appended_lines(path, prior.agent, read), prior.progress)
+    fresh = _parse_lines(path, prior.agent, _appended_lines(path, prior.agent, read), prior.progress, scratchpad_roots)
     prior.evidence.calls.extend(replace(call, source_host=prior.source_host) for call in fresh.calls)
     prior.evidence.citations.extend(fresh.citations)
     fresh_event_ids = {event.tool_use_id for event in fresh.tool_events}
@@ -2232,9 +2252,9 @@ def _joined_tool_events(evidence: Iterable[TranscriptEvidence]) -> list[Transcri
 
 
 def _cached_scan(claude_root: Path, codex_root: Path, timing_source: TimingSource,
-                 cache: PersistentScanCache, source_host: str) -> TranscriptScan:
+                 cache: PersistentScanCache, source_host: str, scratchpad_roots: tuple[Path, ...]) -> TranscriptScan:
     roots = (str(claude_root), str(codex_root))
-    saved = _load_cache(cache, roots)
+    saved = _load_cache(cache, roots, scratchpad_roots)
     inventory = _file_inventory(claude_root, codex_root)
     initial = not saved.files
     candidates: set[str] = ({str(path) for path in (*_candidate_files(claude_root), *_codex_candidate_files(codex_root))}
@@ -2246,9 +2266,10 @@ def _cached_scan(claude_root: Path, codex_root: Path, timing_source: TimingSourc
         tasks.sort(key=lambda item: inventory[str(item[1])][2].st_size, reverse=True)
         if sum(inventory[str(path)][2].st_size for _, path, _ in tasks) > PARALLEL_SCAN_BYTES:
             with ProcessPoolExecutor(max_workers=min(4, os.cpu_count() or 2)) as workers:
-                initial_results = dict(zip((str(path) for _, path, _ in tasks), workers.map(_new_file_evidence, tasks)))
+                parse_file = partial(_new_file_evidence, scratchpad_roots=scratchpad_roots)
+                initial_results = dict(zip((str(path) for _, path, _ in tasks), workers.map(parse_file, tasks)))
         else:
-            initial_results = {str(task[1]): _new_file_evidence(task) for task in tasks}
+            initial_results = {str(task[1]): _new_file_evidence(task, scratchpad_roots) for task in tasks}
     changed = False
     # Count unique source byte offsets inspected in this run. Cold prefilter and parser
     # passes over the same file contribute its size once, even if both touch it.
@@ -2265,11 +2286,11 @@ def _cached_scan(claude_root: Path, codex_root: Path, timing_source: TimingSourc
         if (prior is not None and prior.device == stat.st_dev and prior.inode == stat.st_ino
                 and stat.st_size > prior.observed_size):
             if prior.candidate:
-                bytes_read += _append_file_evidence(prior, path, stat)
+                bytes_read += _append_file_evidence(prior, path, stat, scratchpad_roots)
             else:
                 read = TranscriptContentRead(prior.cursor)
                 if _appended_candidate(path, agent, read):
-                    saved.files[name] = _new_file_evidence((agent, path, source_host))
+                    saved.files[name] = _new_file_evidence((agent, path, source_host), scratchpad_roots)
                     bytes_read += stat.st_size
                 else:
                     prior.cursor, prior.observed_size, prior.modified_ns = read.cursor, stat.st_size, stat.st_mtime_ns
@@ -2277,9 +2298,10 @@ def _cached_scan(claude_root: Path, codex_root: Path, timing_source: TimingSourc
         elif name in initial_results:
             saved.files[name] = initial_results[name]
         elif initial:
-            saved.files[name] = _new_file_evidence((agent, path, source_host), False)
+            saved.files[name] = _new_file_evidence((agent, path, source_host), scratchpad_roots, False)
         else:
-            saved.files[name] = _new_file_evidence((agent, path, source_host), _whole_file_candidate(path, agent))
+            saved.files[name] = _new_file_evidence((agent, path, source_host), scratchpad_roots,
+                                                   _whole_file_candidate(path, agent))
             bytes_read += stat.st_size
         changed = True
     if isinstance(timing_source, AvailableTimingSource):
@@ -2308,12 +2330,16 @@ def _cached_scan(claude_root: Path, codex_root: Path, timing_source: TimingSourc
 
 
 def scan_calls(claude_root: Path, codex_root: Path, timings_path: Path | TimingSource = NO_TIMING_SOURCE,
-               cache: ScanCache = NO_SCAN_CACHE, source_host: str = "local") -> TranscriptScan:
-    """Read transcript evidence; a persistent cache reads only appended content."""
+               cache: ScanCache = NO_SCAN_CACHE, source_host: str = "local",
+               scratchpad_roots: tuple[Path, ...] = DEFAULT_SCRATCHPAD_ROOTS) -> TranscriptScan:
+    """Read transcript evidence; a persistent cache reads only appended content.
+
+    scratchpad_roots are the parents of Claude's per-user temporary folders.
+    """
     timing_source = (AvailableTimingSource(timings_path, source_host) if isinstance(timings_path, Path)
                      else timings_path)
     if isinstance(cache, PersistentScanCache):
-        return _cached_scan(claude_root, codex_root, timing_source, cache, source_host)
+        return _cached_scan(claude_root, codex_root, timing_source, cache, source_host, scratchpad_roots)
     claude_files = _candidate_files(claude_root)
     codex_files = _codex_candidate_files(codex_root)
     files: list[tuple[Agent, Path]] = [*(('Claude', path) for path in claude_files), *(('Codex', path) for path in codex_files)]
@@ -2322,10 +2348,10 @@ def scan_calls(claude_root: Path, codex_root: Path, timings_path: Path | TimingS
     evidence: list[TranscriptEvidence] = []
     if sum(size for size, _, _ in sized) > PARALLEL_SCAN_BYTES:
         with ProcessPoolExecutor(max_workers=min(4, os.cpu_count() or 2)) as workers:
-            evidence.extend(workers.map(_scan_file, ordered))
+            evidence.extend(workers.map(partial(_scan_file, scratchpad_roots=scratchpad_roots), ordered))
     else:
         for file in ordered:
-            evidence.append(_scan_file(file))
+            evidence.append(_scan_file(file, scratchpad_roots))
     evidence = [TranscriptEvidence(
         [replace(call, source_host=source_host) for call in item.calls], item.citations,
         [replace(event, source_host=source_host) for event in item.tool_events],

@@ -1,5 +1,15 @@
 # Two accounts: showrunners on one Claude account, unit directors on another
 
+Current maintenance: snapshot-removal replaces the historical snapshot-timer wiring below with `agent-notes` (`scripts/maintenance/agent_notes_job.py`, runtime schedules and limits in `config/agent_notes.toml`). `herdr-upkeep` owns layout saves and detection-rule refreshes, using `config/herdr_upkeep.toml`. The desktop note and shutdown recovery snapshots are deleted. Historical phase notes below describe the earlier implementation.
+
+> Scheduler update (2026-10-31): the agent-notes job in
+> `scripts/maintenance/agent_notes_job.py` now owns notes, quota alerts, the
+> pacer, refusal moves, crash recovery, phase-note pruning, the hierarchy note
+> and its vault commit. Runtime schedules and limits are in
+> `config/agent_notes.toml`. Earlier snapshot-timer descriptions below record
+> the previous implementation; the watchdog no longer sends notices or pushes.
+
+
 > **Status: IMPLEMENTATION PLAN — phases 1–6 are done; the cutover (Phase 7) moved all ten build-followups unit directors to claude 3 on 2026-10-11, with the spare dir and the cross-machine message check still open; Phase 8 moves any one session, or every showrunner off an account, by hand; Phases 14–17 drop the unit role so every new session picks the account with room, and move Codex workers and Claude sessions by themselves when their account refuses them; Phase 9 reads out a week of moves; Phases 10–12 add the Codex accounts: a home per account, one account for all workers with a swap, and alerts per account; Phase 13 repairs a worker launch that finished its turn while the seats account changed.** Phases 1–5 built everything and initiated nothing: no account dir, no login, no role. Phase 6 proved `~/.claude3` live. The design: each account the user has gets its own config dir, `~/.claude1`, `~/.claude2` and `~/.claude3`. Each holds only that account's login, and everything else is a symlink into `~/.claude`. Unit directors launch with `CLAUDE_CONFIG_DIR` set to the unit account's dir. Showrunners and every other session stay on `~/.claude`'s own login, as today. When the unit account runs low, one command swaps every unit onto a spare account through `/shutdown`'s safe stop and resume. Any one session, a showrunner included, moves to any account the same way with `/showrunner:accounts move` (Phase 8). Phased, delegate-ready once approved.
 
 > **As-built disposition: create**
@@ -58,7 +68,7 @@ Everything else is a symlink into `~/.claude`: `settings.json`, `CLAUDE.md`, `co
 
 **Calls I made (each a one-line revert):**
 
-- Showrunners, top-level sessions, the fix pipeline and the `send.py` relay stay on `~/.claude`'s login. The nightly review ran there too until 2026-10-11, when it moved to the unit role's account (Phase 7). Only units get a role account, because they spend about 70% and they are the sessions that can be stopped safely and resumed.
+- Showrunners, top-level sessions and the `send.py` relay stay on `~/.claude`'s login. The nightly review ran there too until 2026-10-11, when it moved to the unit role's account (Phase 7). Only units get a role account, because they spend about 70% and they are the sessions that can be stopped safely and resumed.
 - A swap reuses `/shutdown`'s safe stop and resume instead of moving each unit at its next checkpoint.
 - The Mac is out of scope: units launch only on natedev (`add_unit.py` used `systemd-run` and tmux then; it now starts each unit in its own herdr session). Mac sessions stay on `~/.claude`.
 - A long-lived `CLAUDE_CODE_OAUTH_TOKEN` per launch is ruled out: such a token "can't establish Remote Control sessions", and every unit runs with `--remote-control`.
@@ -102,7 +112,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 ## Delegation Context
 
-- **Project:** `~/.claude` config repo. Worktree `/home/natepiano/worktrees/claude-build-followups-two-accounts`, branch `build-followups-two-accounts` (unit `two-accounts-unit`); name both in every dispatch.
+- **Project:** `~/.claude` config repo. Worktree `/home/natepiano/worktrees/claude-natedev-accounts`, branch `natedev-accounts` (unit `accounts-unit`, production natedev); name both in every dispatch.
 - **Project started:** 2026-10-10T21:07:53.634+00:00
 - **Stack:** Python 3 standard library, checked by basedpyright. zsh launch strings. Claude Code 2.1.296.
 - **Layout:** new `scripts/accounts/` (`accounts.py`, `test_accounts.py`) · `scripts/production/` · `scripts/shutdown/` · `scripts/whoami/` · `scripts/message/` · new `commands/accounts.md` · `settings.json` · `docs/quota_alerts.md` · `docs/as-built/shutdown-and-restart.md`. Outside the repo, live, written only in Phases 6 and 7: `~/.claude1`, `~/.claude2`, `~/.claude3`, and `config/accounts.json` (gitignored like `config/showrunners.json`).
@@ -222,7 +232,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 - `scripts/production/add_unit.py` — unit-account check, guard env, launch prefix; puts the repo root on `sys.path`.
 - `scripts/production/test_add_unit.py` — prefix, refusal, held named account, role change after readiness, manual resume.
 - `scripts/shutdown/inventory.py` — `config_dir` capture on the session snapshot.
-- `scripts/shutdown/record.py` — ignores an obsolete entry-level `config_dir`.
+- `scripts/shutdown/shutdown_record.py` — ignores an obsolete entry-level `config_dir`.
 - `scripts/shutdown/restart.py` — prefix for non-unit resumes.
 - `scripts/shutdown/test_inventory.py`, `test_record.py`, `test_restart.py` — capture, round trip, prefix.
 - `scripts/delegate/test_remove_workers.py` — owner's dir inherited.
@@ -277,11 +287,11 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 **Files:**
 - `scripts/accounts/accounts.py` — `swap`, its outcome and inventory types, `set_role` identity check, `account_label` on role history.
 - `scripts/accounts/test_accounts.py` — swap refusals, dry run, rollback, peer refusal, one selection through write and shutdown, burn attribution across logout and re-login.
-- `scripts/shutdown/record.py` — `then` on `SessionShutdown` and `AccountHold`, `ShutdownContinuation`.
+- `scripts/shutdown/shutdown_record.py` — `then` on `SessionShutdown` and `AccountHold`, `ShutdownContinuation`.
 - `scripts/shutdown/settle.py` — `begin`/`down` with `then`, `report_stop`, `shutdown_command`, `alert_user`.
 - `scripts/shutdown/shutdown.py` — `down --restart`.
 - `scripts/shutdown/stop.py` — `_retry_owner_cleanup`.
-- `scripts/shutdown/test_record.py`, `test_settle.py`, `test_shutdown_cli.py`, `test_stop.py` — the above.
+- `scripts/shutdown/test_shutdown_record.py`, `test_settle.py`, `test_shutdown_cli.py`, `test_stop.py` — the above.
 - `commands/accounts.md` — `/showrunner:accounts`.
 - `docs/as-built/shutdown-and-restart.md` — `--restart`, the retry of a failed stop, restart per session.
 
@@ -354,7 +364,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 **Spec:** the director runs it with the user.
 
 1. `accounts.py check claude1`. It passed on 2026-10-15: `~/.claude1` was set up and logged in before "Live proof of the moves", whose moves restarted sessions there. Only if it fails, the user repairs it per the guide's "Log out and in" (`accounts.py setup claude1` when the folder is missing, then `/login`), and `check` passes again.
-2. The showrunner reaches each unit by message. Then `send.py` across machines and accounts: a unit on the units account and a session on the Mac each reach the other, and each reply comes back.
+2. The showrunner reaches each unit by message. Then `send.py` across machines and accounts: a unit on the units account and a session on the Mac each reach the other, and each reply comes back. Run it on the tree after the Phase 99 remerge (natedev with shutdown-unit phase 5 and the Phase 99 fixes). Only a matching reply received by the sender counts as receipt: a `QUEUED` or `SKIPPED` outcome, or a sent marker in a record, is not evidence.
 
 **Files:**
 
@@ -362,7 +372,16 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 
 **Workers:** nothing splits: the unit director runs both checks with the user.
 
-**Acceptance gate:** `accounts.py check claude1` passes; every message in item 2 and its reply arrive; the results are written here.
+**Who proves Phase 99's outcomes (plan review 2026-10-30):**
+
+| Outcome | What the user or showrunner sees | Owner and proof |
+| --- | --- | --- |
+| A showrunner line stays pending until sent, active or archived | The showrunner gets one stopping line and one outcome line; a failed send is retried | Phase 100 keeps the archived-replay and queued-fallback tests; this phase proves the showrunner receives the lines |
+| A registration is retired when its owner is gone | Launches stay blocked by a live registration and are unblocked after abandoned work ends | Phase 100's shutdown gate keeps the abandoned-registration and legacy-registration tests |
+| The timer snapshot is saved before the stop | Cancel or restart restores the timers the user had | Phase 96's checkpoint waits for both snapshot publication orders to pass; Phase 100 keeps the interrupted-stop cancel test |
+| A failed keyed send gives back its repeat window; a queued or delivered send keeps it | A caller can retry a failure with no duplicate of a kept send | Phase 100's message gate keeps the failed-send retry, queued-copy and later-run tests |
+
+**Acceptance gate:** `accounts.py check claude1` passes; every message in item 2 and its matching reply arrive, on the merged Phase 100b tree; a stop and restart of one throwaway session (`accounts.py exec --probe <account>`) sends its stopping line and its outcome line to the showrunner once each, and each reads delivered in the request record; the results are written here.
 
 #### Results so far (2026-10-11)
 
@@ -986,7 +1005,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `scripts/accounts/new_account.py`, `commands/new_account.md` — `/new_account` with `HomeLogin` and the per-folder deny line.
 - `scripts/nightly_review/settings.json` — one edit deny per account folder.
 - `scripts/production/waiting.py`, `showrunner_move.py`, `add_showrunner.py` — canonical quota holds, move target and new-showrunner label.
-- `scripts/shutdown/record.py` — both spellings read, `claudeN` stored.
+- `scripts/shutdown/shutdown_record.py` — both spellings read, `claudeN` stored.
 - `scripts/message/roster.py`, `scripts/statusline/statusline.jq` — a peer's legacy label parsed; the space-free `by-label.json` lookup.
 - `scripts/notify/push_catalog.py`, `push_texts_reviewed.json` — examples and approvals.
 - `docs/accounts.md`, `docs/quota_alerts.md`, `commands/showrunner/accounts.md` and the as-builts that print a label — labels without a space.
@@ -1210,7 +1229,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - Each machine changes over on its own. While `~/.claude` holds a login (`home_account_state() -> LegacyHomeLogin | ConfigOnlyHome`), a process with no `CLAUDE_CONFIG_DIR` reads as that login's account and the table prints `~/.claude holds a login; run accounts.py cutover-home` (on macOS the note names one `/login` in `~/.claude2` instead); once it holds none, such a process reads as no account everywhere and the status line shows no account piece. `account.process_config_dir(pid)` returns `ConfiguredClaudeFolder | NoAccountSetting | ProcessEnvironmentUnread`, and every consumer handles all three.
 - `accounts.py exec <claudeN|units|showrunners>` launches on a numbered folder or a group's account; `prepared_account` and `account_prefix` never unset `CLAUDE_CONFIG_DIR`. Launchers that choose no account (`message/send.py`, `cli_agent/cli_agent.sh`, `agents/agent_exec.sh`, `agent_bg.sh`, the style-eval and berth_fix launchers) go through `account_for_unscoped_launch(environment) -> ClaudeLaunchAccount | LegacyHomeLaunch`: the caller's numbered folder, else the showrunners group's folder, else `LegacyHomeLaunch` while `~/.claude` still holds a login. Shell launchers share `scripts/agents/claude_account.sh`. herdr's unit, child-showrunner, standalone and restart launches keep their pane path and carry the resolver's `CLAUDE_CONFIG_DIR`.
 - `accounts.py cutover-home <label>` renames `.credentials.json` and the `oauthAccount` block of `$HOME/.claude.json` into `~/.claudeN` (both atomic, never copied, never printed), under the journal `~/.local/state/accounts/cutover-home.json` written before the first rename; a rerun finishes an interrupted run and `--undo` renames back. It refuses while any Claude process uses the affected folder (`--undo`: `~/.claudeN`), when the destination holds a login or an `oauthAccount`, when a process's argv is unreadable, and on macOS in both directions. It appends a dated `home_cutovers` entry (label, login, time) to `config/accounts.json`.
-- History resolves a record naming `default` or `~/.claude` from a login the record carries or from a `home_cutovers` entry dated after it, else leaves it unresolved; today's login never names a past record. `burn`, `_historical_roles`, `_unit_role_history`, `group_accounts`, `moves.py` and `shutdown/record.py` follow this, and a resume of such a record goes to that label's folder.
+- History resolves a record naming `default` or `~/.claude` from a login the record carries or from a `home_cutovers` entry dated after it, else leaves it unresolved; today's login never names a past record. `burn`, `_historical_roles`, `_unit_role_history`, `group_accounts`, `moves.py` and `shutdown/shutdown_record.py` follow this, and a resume of such a record goes to that label's folder.
 - `$HOME/.claude.json` stays the seed and MCP baseline; the seed copies each project's trust entries into a new folder's `.claude.json`. On macOS `agent_accounts.claude_credentials` reads the keychain only for `~/.claude`; a numbered folder's keychain lookup is Phase 33's.
 
 **Files:**
@@ -1951,13 +1970,13 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `submit_opening_prompt` captures the recipient after input readiness, before typing. A recipient that changed by the time the turn appears gives `PromptNotSubmitted("prompt recipient changed during submission")`; each Enter retry first rechecks it (`"prompt recipient changed before Enter retry"`).
 - `restart._prompt_outcome` accepts a `PromptSubmitted` receipt only when its process equals the session's current registry process, under every progress kind; the attempt check while `restarting` stays, and a timer-only retry of the same process still reads its proof. Receipt saving stores the recipient the launcher captured and never samples the registry.
 - `prompt_in_input` takes the composer between the last two rule lines; every nonblank row after the closing rule must be wholly one enumerated footer phrase, else the bordered region is scrollback. The composer match allows a screen newline without a space only inside a word. The enumerated rows reject real Claude screens (labelled top rule; status-line, mode and agent rows), so Enter-only retries do not fire live; "Enter retries reach a real session's composer" replaces the phrase list with layout rules.
-- `restart_push(label, names, *, machine) -> tuple[RenderedPush, ...]` groups names greedily so each push keeps `stopped` ≤ 400 characters, message < 500 and title < 45, and every session is named; a name that alone exceeds the limits gets its own push, shortened to the longest fitting prefix plus a visible `…`; no names gives one `shutdown.restart_incomplete`. `restart.restart` and `settle.report_stop` send every push, and nothing raises through either.
-- `shutdown.restart_failed` catalog examples name one session each (`typical` "One session (organon-unit)", `many_long_names` "One session (build-followups-two-accounts-unit-director)"), approved under the user spec.
+- `restart_push(label, failures, *, machine)` returns one push with the failed session count. It never splits the list. Without known failures, it returns one `shutdown.restart_incomplete` push.
+- `shutdown.restart_failed` shows a retryable failure count, the machine and one retry command. Trust failures keep separate commands. Manual failures share one count push per machine. All changed examples require the normal text review.
 
 **Files:**
 - `scripts/herdr/herdr.py` — recipient identity and lookup, process-bound outcome, Enter-retry recheck, composer footer and wrap-aware match.
-- `scripts/shutdown/restart.py` — receipt read bound to the recipient process; `restart_push` splitting; `restart` sends each push.
-- `scripts/shutdown/settle.py` — `report_stop` sends each push.
+- `scripts/shutdown/restart.py` — process-bound receipts and one phone push per kind of fix in a restart problem.
+- `scripts/shutdown/restart_support.py` — `report_stop` uses the same fix groups and retains delivery marks.
 - `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json` — named `shutdown.restart_failed` examples and their approvals.
 - `scripts/herdr/test_herdr.py`, `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_shutdown_cli.py`, `scripts/notify/test_push_texts.py` — regressions through real receipt files, fake registry identities and fake panes.
 
@@ -2137,9 +2156,9 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `scripts/shutdown/settle.py` — `running_restart_line`, used by `report_stop` and `tell_showrunners_outcome`.
 - `scripts/shutdown/shutdown.py` — status and follow print the shared line.
 - `scripts/accounts/accounts.py` — `_prepare_move_shutdown`, `MoveShutdownReady`, the move, group and session paths.
-- `scripts/shutdown/record.py` — `forget_failed_restart`.
+- `scripts/shutdown/shutdown_record.py` — `forget_failed_restart`.
 - `scripts/accounts/refusal_watch.py` — the `open_ids` filter.
-- `scripts/shutdown/test_shutdown_cli.py`, `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_record.py`, `scripts/accounts/test_moves.py`, `scripts/accounts/test_refusal_watch.py` — the line on every surface, the move closing a live failed record and refusing the rest, the guarded archive, the watcher.
+- `scripts/shutdown/test_shutdown_cli.py`, `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_shutdown_record.py`, `scripts/accounts/test_moves.py`, `scripts/accounts/test_refusal_watch.py` — the line on every surface, the move closing a live failed record and refusing the rest, the guarded archive, the watcher.
 
 **Binds later work:** "Readout of the moves": a live `restart failed` record kept its session out of every move only until this code reached a machine (field case cargo-liner-style and cargo-liner, closed by hand with `forget` 2026-10-18 01:46 EDT); from then a move archives the record without a journal entry and moves the session on its own request. "The closing command names the machine that holds the record": `shutdown status` without `--here` draws peer records, but `forget` takes only local records, so the line's command fails for a peer record (`matches no local session`).
 
@@ -2589,108 +2608,538 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Depends on:** Phase 91
 
-#### Work Order
+#### As-built
 
-**Goal:** One reused 2-minute pass of `scripts/whoami/agent_notes.py` (no arguments, usage reading younger than 10 minutes) uses less CPU. After Phase 91 (live 2026-10-28 23:05 EDT) a run still uses 10–11 s of CPU (0.4–0.55 core) on natedev, and the usage read is no longer its largest part.
-
-**Spec:**
-- Profile one reused pass with `cProfile` (or another method that needs no py-spy). Run the argument-free `agent_notes.main()` twice in a scratch `HOME` with fixture notes, homes and sessions, and profile the second run, which reuses `timer-usage.json` (`usage_store.recent_timer_usage`). A by-hand `refresh` always reads live, so it shows no reuse.
-- The profile covers every step of the argument-free run: `update_alert_pass` (`accounts.sweep_claude_temp_files`, `rename_legacy_notes`, `note_file.read_notes`, `timer_usage_signature`, `urgent_usage_read`, `codex_alert_pass`, `accounts.group_note_labels`, `session_table.live_sessions`, `write_note` per note, `five_hour.watch`), then `alert`, `codex_pacer.tick` and `mark_tier`, then `refusal_watch.run` (with `unit_watchdog`). Name the largest costs by cumulative CPU time in the phase report, with the top entries of the profile.
-- Cut the largest cost. Keep each result of the pass the same: the note text, the sessions sections, the alerts, the pacer tier, the refusal placement and the watchdog.
-- Fixture reads stand in for every remote read: `role_map.is_role_map_host` and `roster.peer_snapshot` (the ssh peer read in `session_table.live_sessions`) are patched. Their CPU shows only in the live numbers.
-- No other behavior changes.
+- A reused argument-free pass of `scripts/whoami/agent_notes.py` gives the same note text, sessions sections, alerts, pacer tier, refusal placement and watchdog as before. Its two largest costs are outside `agent_notes.py`: the refusal watch transcript lookup and the Codex pacer rollout listing.
+- `refusal_watch.session_refusals(session_ids: list[str]) -> dict[str, TranscriptRefusal | ProofRefusal | NoSessionRefusal]` finds the transcripts of one pass with one `os.scandir` listing per project folder under `~/.claude/projects`. When a folder cannot be listed, it does known-name `exists()` lookups in that folder. An error on one path does not stop the other paths. `_run` calls it in place of one `session_refusal` glob per session. `transcript_refusal` and `session_refusals` share `_transcript_refusal(paths)`, which reads the newest transcript by mtime. The index lives for one pass; a new transcript or exchange is read on the next pass.
+- `codex_pacer.tick` lists rollouts once (`rollout_files`) and gives the list to `ingest` and to `prune(state, now, retained_rollouts)`. `rollout_files` sorts each day with `key=str`. `prune` keeps only the offsets of listed rollouts that still exist. `backfill` gives `prune` its own `rollout_files(now, SCAN_DAYS)`.
+- At a live-sized fixture the pass goes from 0.587 s to 0.212 s. On natedev the live CPU per run shows no measurable drop: 9.1–9.2 s before, 9.4–11.7 s after, at load 120–130.
 
 **Files:**
-- `scripts/whoami/agent_notes.py` and the module that holds the largest cost (named by the profile).
-- The test module beside each changed file (for example `scripts/whoami/test_agent_notes.py`): one test that proves the cut work no longer runs, or runs less, on a reused pass, and that the pass output stays the same.
-
-**Workers:** 1 writer, no split (the cut is in one place, named by the profile).
-- `impl` — the profile, the cut and its tests.
-
-**Constraints from prior phases:** Phase 91's reuse rules stay: the live-read triggers (`refresh`, a waiting next-moves queue on the role-map host, an in-use account at or below `LIVE_USAGE_REMAINING_THRESHOLD`, an active Codex fallback, a passed reset, a changed login or selection), and the refusal watch, unit watchdog, session table and note sessions sections on every pass. Tests and the profile use a scratch `HOME` and `AGENT_NOTES_DIR`, as `AgentNotesTests.setUp` does. They never touch live dirs, `~/.local/state`, usage stores, ssh or real sessions.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/<dir> -p 'test_*.py'` passes for `scripts/whoami`, `scripts/accounts` and each other touched dir; `basedpyright <changed files>` reads `0 errors, 0 warnings, 0 notes`. Live check (the director, not a worker test): on natedev, the CPU per run in the `Consumed … CPU time` lines of `journalctl --user -u agent-sessions-snapshot.service` and in the director's per-run sampler (it reads `/proc/<pid>/stat` utime + stime + reaped children of the next timer-run `agent_notes.py` until it exits; the Phase 91 after-number was 10–11 s), before and after the change is live, drops.
+- `scripts/accounts/refusal_watch.py` — `session_refusals`, `_transcript_refusal`, `_run`.
+- `scripts/whoami/codex_pacer.py` — `rollout_files`, `tick`, `prune`, `backfill`.
+- `scripts/accounts/test_refusal_watch.py` — one search per project with each latest exchange; a project folder that cannot be listed.
+- `scripts/whoami/test_codex_pacer.py` — filename order, one listing per tick with the same plan and state, a deleted rollout before its replacement.
 
 **Gotchas:**
-- The service runs `agent-sessions-snapshot.py`, which starts `agent_notes.py` as its own process. Its `Consumed` figure counts the whole service, so compare runs of the same service before and after.
-- The Mac has no snapshot timer; the live numbers come from natedev only.
+- A project folder can be traversable but not listable. Keep the known-name fallback, or readable transcripts are missed.
+- A saved offset for a deleted rollout must not apply to a new file at the same path; `prune` checks `exists()`.
+- The live 10 s target is not met. The rest of the live cost is outside what the fixture profile reaches.
 
-### Phase 95 — A failed restart shows its saved screen  · status: todo
+**Ruled out:**
+- A cut in `agent_notes.py`: its own work is not the largest cost in the profile.
+
+### Phase 95 — A failed restart shows its saved screen  · status: done
 
 **Depends on:** Phase 94 (order only)
 
 **Also touches:** shutdown-unit (`scripts/shutdown`).
 
-#### Work Order
+#### As-built
 
-**Goal:** A `restart failed` record whose opening-prompt submit failed shows the last screen that submit saw. Phase 69 saves the screen in the `<move note>.prompt-outcome.json` receipt, but no user surface shows it, so to diagnose `restart prompt not submitted` the user opens the receipt by hand.
-
-**Spec:**
-- One reader in `scripts/shutdown/restart.py`: `saved_prompt_screen(record) -> str | herdr.PromptScreenNotRead`. It reads the receipt through `_prompt_outcome(record)` (the request id, session id and target checks stay) and returns `outcome.screen` for a `herdr.PromptNotSubmitted` with a read screen, else `herdr.PromptScreenNotRead()`. The screen is ANSI-stripped, the last 40 lines (Phase 69).
-- Every surface that prints a `restart failed` record prints the screen under that record's line, when the reader returns one: a header line `  last screen of the failed prompt submit:`, then each screen line indented 4 spaces.
-  - `shutdown status`: `shutdown._shutdown_record_lines`, in both forms: the live-session line `settle.running_restart_line` and the lines of `settle.status_record_lines`. A screen added only to `status_record_lines` never shows for a live `restart failed` record.
-  - `shutdown follow`: `shutdown._follow_action` for a `restart failed` record, live or not.
-  - The stop report: `settle.report_stop`, after the `running_restart_line` line or the `<name>: <reason>` line of a `restart failed` record.
-- The receipt is in the record machine's `SHUTDOWN_STATE_DIR`. A peer record that `shutdown status` reads from `records --json` has no receipt here: it prints no screen.
-- The phone push stays the same (`restart.send_failure_pushes`, `settle.alert_user`), because a push carries only what the user must do. `settle.tell_showrunners_outcome` stays the same.
-- No other behavior changes.
+- A `restart failed` record whose opening-prompt submit failed shows the last screen that submit saw. The screen comes from the Phase 69 receipt `<SHUTDOWN_STATE_DIR>/<login>/restart-note-<session id>.prompt-outcome.json` (ANSI-stripped, last 40 lines).
+- `restart.saved_prompt_screen(record) -> str | herdr.PromptScreenNotRead` reads the receipt through `_prompt_outcome(record)`, with its request id, session id and target checks. It returns the screen of a `herdr.PromptNotSubmitted` that read one, else `herdr.PromptScreenNotRead()`.
+- `settle.failed_prompt_screen_lines(saved)` is the one render function: the header `  last screen of the failed prompt submit:`, then each screen line indented 4 spaces. It gives lines only for a `restart failed` record with a screen.
+- Three surfaces put these lines under the record line:
+  - `shutdown status`: `shutdown._shutdown_record_lines`, for the live form (`settle.running_restart_line`) and for `settle.status_record_lines`, only when `local_observation` is true. A peer record read from `records --json` has no local receipt and prints no screen.
+  - `shutdown follow`: `shutdown._follow_action`, for a live and a not-live `restart failed` record, with no machine check (follow reads only local records).
+  - The stop report: `settle.report_stop`, after the `running_restart_line` line or the `<name>: <reason>` line, when `saved["machine"].casefold() == local_machine().casefold()`.
+- Phone pushes (`restart.send_failure_pushes`, `settle.alert_user`) and `settle.tell_showrunners_outcome` do not change.
 
 **Files:**
 - `scripts/shutdown/restart.py` — `saved_prompt_screen`.
+- `scripts/shutdown/settle.py` — `failed_prompt_screen_lines`, `report_stop`.
 - `scripts/shutdown/shutdown.py` — `_shutdown_record_lines`, `_follow_action`.
-- `scripts/shutdown/settle.py` — `report_stop`, and one shared function that renders the screen lines.
 - `scripts/shutdown/test_restart.py` — the reader: a matching receipt with a screen, one with no screen, one of another request, a missing or unreadable file.
-- `scripts/shutdown/test_shutdown_cli.py`, `scripts/shutdown/test_settle.py` — status (live and not live), follow and the stop report print the screen; a peer record and a record without a screen print none; the push text is unchanged.
+- `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_shutdown_cli.py` — the stop report (live, absent, mixed-case machine), status (live and not live), follow, a peer record, a receipt with no screen, unchanged push text.
 - `docs/as-built/shutdown-and-restart.md` — where the saved screen shows.
 
-**Workers:** 1 writer, no split (three modules in one directory share one render function).
-- `impl` — all files.
-
-**Constraints from prior phases:** Phase 70: a `restart failed` record can belong to a live session; the liveness reads (`_restart_failed_liveness`, `restart_failed_liveness`) and the printed commands stay as they are. Phase 71/72: `settle.running_restart_line` stays the one source of the live-session line, and its text does not change. Tests set `HOME` and `SHUTDOWN_STATE_DIR` to scratch folders and write fixture receipts; they never touch `~/.local/state/shutdown`, live dirs, ssh or real sessions.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` passes; `basedpyright scripts/shutdown/restart.py scripts/shutdown/shutdown.py scripts/shutdown/settle.py` and the three test files read `0 errors, 0 warnings, 0 notes`.
+**Binds later work:** `settle.failed_prompt_screen_lines` holds a function-local `import restart as restart_work`. It is a sibling shutdown import, the same as the other function-local ones in `settle.py`, and is not a shared whoami module import ("All consumers import shared whoami modules by one name").
 
 **Gotchas:**
-- A receipt holds a screen only after the first typing; a failure before any typing has `PromptScreenNotRead`, and the surfaces print nothing for it.
+- Compare machine names with `casefold()`: a record can name `Mac` on a host that reports `mac` (`test_stop_report_shows_saved_screen_when_local_machine_case_differs`).
+- A receipt holds a screen when the submit read the pane at least once. `herdr.wait_for_prompt_input` keeps the last screen it read, so a failure before any typing can hold one too (`destination never became ready for input` after a `destination has no empty composer` read). A receipt has `PromptScreenNotRead` when no pane read happened, or when `restart.py` saved its own reason (`launch has no submit proof`, `restart launcher supplied no submit proof`). The surfaces print nothing for it.
+- `scripts/accounts/test_unit_watchdog.py` calls `settle.report_stop`. A gate for a change to `report_stop` runs the accounts suite too, not only `scripts/shutdown`.
 
-### Phase 96 — All consumers import shared whoami modules by one name  · status: todo
+### Phase 94b — Cut the top live cost of the notes timer pass  · status: done
 
 **Depends on:** Phase 95 (order only)
 
-**Also touches:** the herdr, shutdown, message, production and agents owners.
+**Also touches:** herdr-unit (`scripts/herdr`).
 
-#### Work Order
+#### As-built
 
-**Goal:** Every consumer imports each shared whoami module by its package name, `scripts.whoami.<module>`, and the two-name registrations go. Today sibling imports (`import note_file`) and package imports (`from scripts.whoami import note_file`) coexist. Six modules register both names in `sys.modules` to keep one module object, so type identity and patched settings stay shared: `agent_accounts`, `account`, `note_file`, `session_table`, `run_out` and `usage_store`.
-
-**Spec:**
-- The package name is the one name: it works from every directory with only the repository root on `sys.path`, and the agents, herdr, usage and nix_env consumers already use it.
-- Change every bare import of the six modules (`import <module>`, `from <module> import …`, also inside functions) to the package form. Bare-import consumers found at planning:
-  - `scripts/whoami`: `five_hour.py`, `quota_alert.py`, `codex_pacer.py`, `agent_notes.py`, `run_out.py`, `session_table.py`, `whoami.py`.
-  - `scripts/accounts`: `accounts.py`, `new_account.py`, `refusal_watch.py`, `refusals.py`, `unit_watchdog.py`.
-  - `scripts/shutdown`: `inventory.py`, `pane_record.py`, `pane_restore.py`, `record.py`, `restart.py`, `settle.py`, `shutdown.py`.
-  - `scripts/production`: `cli_fixture.py`, `dailies_render.py`, `showrunner_move.py`.
-  - `scripts/message/roster.py`; `scripts/nightly_review/nightly_review.py` (not in the next-items entry; found at planning).
-  - 27 test files in `scripts/whoami`, `scripts/accounts`, `scripts/shutdown`, `scripts/production` and `scripts/nightly_review`.
-  - `scripts/agents/agent_exec.sh`: its inline Python puts only `scripts/whoami` on `sys.path` and runs `from agent_accounts import workers_home`. It puts the repository root (`$script_dir/../..`) on `sys.path` and imports `scripts.whoami.agent_accounts`.
-- Remove the `if __name__ == "<module>": … elif __name__ == "scripts.whoami.<module>": …` block from each of the six modules.
-- Other whoami modules (`quota_alert`, `five_hour`, `codex_pacer`, `agent_notes`) keep their current import names; `scripts/lib/nix_env.py` keeps its own two-name block. Both are out of scope.
-- No other behavior changes.
+- One notes timer pass does one herdr process scan. `herdr.process_snapshot()` is a scope that `agent_notes` main opens; in it, every `herdr_processes` reader gets the same cached scan. `herdr.process_action()` reads fresh and retires the snapshot for the rest of the pass. A copied context obeys a retired ancestor scope.
+- `refusal_watch.session_observation` records the registry identities (sessionId, pid, procStart) before the report snapshot opens. Committed-group completion enters `process_action` only when the identities changed, no observation exists, or the cached members pass the completion filters. Inside that scope it builds the membership again and applies the same filters before holds, account preparation or session moves. Refusal placement and ready queued moves keep their fresh reads. An unchanged idle pass, the watchdog report included, does one scan.
+- `unit_watchdog._live_account` has the `@herdr.process_action()` decorator, so each call scans fresh. The outage check proves a reported outage fresh before recovery. For an observed-live unit with a pending job, `_live_account` confirms the unit before the recovery-result delete, the outage-alert clear and the `restarted on` line. An absent fresh result goes to the not-running branch; an unreadable one keeps the outage and result evidence through the `watchdog: <production>: <error>` line.
+- `scripts/whoami/profile_notes_pass.py` (`--stats`, `--scratch`, `--peer-python HOST=/nix/store/<python-package>/bin/python3`) runs `agent_notes.main` in-process under `cProfile`. Each write and act is a no-op patch, and state files are copies in a private scratch folder. Child reads go through one `TrustedChildRead` table: a pinned canonical executable, an exact argv grammar and a fixed environment per row; all other children are refused and counted as suppressed. Local Python reads run `sys.executable -B -I -S` directly, with no `py` wrapper. The output gives CPU, `incomplete components`, the top 25 cumulative entries, child counts and each patched call.
+- Live A/B on natedev at load 134–142: 9.18/8.37 s → 5.61/5.24 s CPU per pass (−38%); herdr scans 3 (4.62 s cumulative) → 1 (1.45 s).
 
 **Files:**
-- `scripts/whoami/agent_accounts.py`, `account.py`, `note_file.py`, `session_table.py`, `run_out.py`, `usage_store.py` — the registration blocks.
-- The consumer files and test files listed in the Spec.
-- `scripts/agents/agent_exec.sh` — the inline Python import.
-- `scripts/agents/codex_mesh.py`, `scripts/herdr/herdr_sessions.py` — already package form; read to confirm, change only a bare import found.
+- `scripts/herdr/herdr.py` — `process_snapshot`, `process_action`, the scan cache.
+- `scripts/accounts/refusal_watch.py` — `session_observation`, the completion precheck, `_action_group_members`.
+- `scripts/accounts/unit_watchdog.py` — the fresh outage proof, the `_live_account` decorator, the observed-live order.
+- `scripts/whoami/agent_notes.py` — opens the snapshot and observation scopes.
+- `scripts/whoami/profile_notes_pass.py` — the profile script.
+- Tests: `scripts/herdr/test_herdr.py` (scopes, copied context), `scripts/accounts/test_refusal_watch.py` (one scan on an idle pass, a unit started after the snapshot, a changed pid or process start), `scripts/accounts/test_unit_watchdog.py` (`test_live_report_without_fresh_confirmation_keeps_recovery_evidence`, `test_unreadable_fresh_confirmation_preserves_recovery_result_and_job`), `scripts/whoami/test_agent_notes.py`, `scripts/whoami/test_profile_notes_pass.py` (child table, pinned Python, patch list).
 
-**Workers:** 2 writers, split by directory (no file in both).
-- `whoami` — `scripts/whoami` modules and tests, the six registration blocks.
-- `consumers` — `scripts/accounts`, `scripts/shutdown`, `scripts/production`, `scripts/message`, `scripts/nightly_review`, `scripts/agents`, `scripts/herdr`, and their tests.
-
-**Constraints from prior phases:** Tests sit beside the code (Delegation Context); after this phase they import the six modules by the package name, the same object the code uses. Tests never touch live dirs: `HOME`, `AGENT_NOTES_DIR` and the patched `note_file.AGENTS_DIR` point at scratch folders. No `Any`, no file-level ignores.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/<dir> -p 'test_*.py'` passes for `whoami`, `accounts`, `shutdown`, `production`, `message`, `nightly_review`, `agents`, `herdr`, `usage`, `nix_env` and `lib`; `basedpyright` on every changed file and each caller module reads `0 errors, 0 warnings, 0 notes`; `grep -rnE '^\s*(import|from) (agent_accounts|account|note_file|session_table|run_out|usage_store)\b' scripts` finds nothing (it covers the `.sh` inline Python too); no `sys.modules.setdefault` remains in `scripts/whoami`.
+**Binds later work:**
+- `_live_account` is wrapped in `herdr.process_action()`, and its unreadable path keeps the `watchdog: <production>: <error>` line. The recovery-result branch still clears before it confirms, and the held or blocked branch relies on `_recovery_result` deleting the file ("The watchdog keeps recovery evidence until a fresh check confirms the unit").
+- `scripts/whoami/profile_notes_pass.py` imports `usage_store`, `run_out` and `agent_accounts` by bare name, in code and in `import_module("<name>")` strings. If a second module object exists, its no-op patches miss it and a profile run can write live state ("All consumers import shared whoami modules by one name").
 
 **Gotchas:**
-- A test that imports a module by the other name gets a second module object. Its `patch.object(note_file, "AGENTS_DIR", …)` then misses the object the code uses, and the code can write to the live notes dir. Change each test's import in the same commit as its module's consumers.
-- Type identity: a `KnownCodexAccount` or `Report` made from one module object fails `isinstance` against the other. A remaining bare import shows as a failing `isinstance` test, not an import error.
+- Put "an act reads fresh" around the act, not at the read boundary of a function that decides and acts; else every idle decision scans again.
+- A remote read in the profile needs `--peer-python`. With no pin it is refused and shows only in the suppressed-child count, not in `incomplete components`.
+- The profile's git rows do not stop a repository-local clean filter under `git status --porcelain`. The ~/.claude worktrees have `filter.claude-settings.clean` (jq, stdin to stdout); it is read-only in practice.
+- natedev load is often 100 or more, which makes CPU time read high. Compare runs at a similar load.
+- Never run `agent_notes.py` by hand without the profile script: it sends alerts and can move sessions.
+
+**Ruled out:**
+- A `py` wrapper row in the child table: the wrapper writes its interpreter cache.
+- `ssh -F /dev/null`: it drops the configured `mac` host mapping.
+
+### Phase 94c — Each account problem says what is wrong, why, and what to do  · status: done
+
+**Depends on:** Phase 94b (order only)
+
+#### As-built
+
+- Each problem under the accounts table is one line in the form `subject: what is wrong; cause; step`, with the facts, times and commands of the earlier texts. `render_status_problem` in `scripts/accounts/accounts.py` is the one formatter for the terminal table and for `status --json` `problems` (still `list[str]`; the unit board shows it as is). A footnote problem starts with `* ` in the terminal; `render_status_json` strips it.
+- `StatusProblem(subject, wrong, cause: ProblemCause | NoSeparateCause, step: ProblemStep | NoUserStep, footnote, origin, state_source: ObservedStateCause | NoObservedStateCause)`. `ProblemCause(kind, explanation, location, account, key: ProblemCauseKey | OwnProblemCause)`. `ProblemCauseKey(kind, account, location)` is the full identity of one cause on one account or home. `ObservedStateCause(diagnostic, key)` holds the direct directory or identity fault that explains an account state; `NoObservedStateCause` means that no direct fault is known.
+- One cause gives one line. `merge_status_problems` drops a derived account-state summary only when the direct cause that its `state_source` names is present. Then it keeps one problem per cause key and removes equal lines.
+- A test sign-in (`is_test_login`: `.invalid`, `.test`, `.example`, `.localhost`, `example.com`, `example.net`, `example.org` and their subdomains; RFC 2606 and 6761) is its own cause. Its line names the file and its `st_mtime` in the user's zone, and gives the step `delete <file>`. It drops only its own cutover-home and account-note advice; other problems of the same home stay. Status deletes nothing.
+- With stderr not a terminal, `read_status` holds stderr. A successful read keeps all notes on stdout and in `--json`, and writes nothing to stderr. The role-map cache line (the cache time in the user's zone and the real fetch failure, `natedev fetch failed: <reason>`) and usage claim and save failures (`agent_accounts.UsageClaimFailed`, `UsageSaveFailed` in `Report.store_warnings`) are problem lines. Other held lines become `accounts: read warning; <line>` problems. When a later read or render fails, the held stderr is written before the error (`StatusCommandWarnings.read_stderr`, replayed by `main`'s status branch).
+- `role_map.RoleMap.provenance` is `CurrentRoleMap | CachedAfterFetchFailure | ExplicitStoredRoleMap`. `role_map.observed_map_provenance()` gives the provenance of the map that the command used; `cached_map_warning(provenance)` is the raw stderr counterpart of the cached-map problem. Outside status, the stderr advisory names the real fetch failure, not "natedev unreachable".
+- Checkpoint `5ad6542f`. Its commit body holds the Assertion-Change lines for the changed problem texts.
+
+**Files:**
+- `scripts/accounts/accounts.py` — `StatusProblem`, the cause types, `render_status_problem`, `merge_status_problems`, `_bind_usage_cause`, `_bind_role_cause`, the test-login cause, `read_status` and `StatusCommandWarnings`.
+- `scripts/accounts/role_map.py` — `RoleMapProvenance`, `observed_map_provenance`, `cached_map_warning`.
+- `scripts/whoami/agent_accounts.py` — `UsageClaimFailed`, `UsageSaveFailed`, `Report.store_warnings`, `usage_store_warning_line`.
+- `docs/accounts.md` — the line form and the test-login line.
+- Tests: `scripts/accounts/test_accounts.py` (`StatusProblemCauseTests`, each problem line, the merged `~/.codex` case, each reserved domain, piped stderr), `scripts/accounts/test_cutover_home.py`, `scripts/accounts/test_role_map.py`, `scripts/accounts/test_refusal_watch.py`.
+
+**Binds later work:**
+- "Each derived account problem names the cause it comes from" owns findings F015-F017 and F019: `_bind_usage_cause` and `_bind_role_cause` still pick a cause by kind lists; the mcpServers check reads a stale `~/.claude.json`; typed problems (cache, stored map, usage claim and save failures) are lost when a later read or render fails, because `StatusCommandWarnings` holds raw stderr only. `check()` returns `AccountInspectionProblems`, a `list[str]` subclass that carries `state_source`, and `account_statuses` reads it by `isinstance`.
+
+**Gotchas:**
+- `_account_state_notes` matches `status.problems` text prefixes (`accounts: <path> is missing`, `is not a directory`, `is a link`, `is not logged in`, `accounts: could not read|inspect <path>:`). New words break the match with no error. The merge reads typed causes only, never text.
+- The fake sign-in in the live `~/.codex/auth.json` is removed only with the user's yes. The fixture leak in `scripts/agents/test_codex_mesh.py` belongs to shutdown-unit.
+
+**Ruled out:**
+- One cause-key form for all producers: derived symptoms cannot be matched to their cause by key parts; they must carry their source.
+
+### Phase 94d — The watchdog keeps recovery evidence until a fresh check confirms the unit  · status: done
+
+**Depends on:** Phase 94b (order only)
+
+#### As-built
+
+- `RecoveryFinished(failure, result_path)` in `scripts/accounts/unit_watchdog.py` is a finished recovery result that is read but not yet deleted. `_recovery_result` does not delete the result file; each branch of `run()` that uses up the result deletes it.
+- Recovery-result branch: the result is deleted and the job is popped only after a fresh `_live_account` read answers. A live unit gets `restarted on <account>`. An absent unit gets the retry line and the recovery. An unreadable read (`OSError`) keeps the result file, the job and the outage, and the error path writes `watchdog: <production>: <error>`; the next pass reports the restart or the retry.
+- Held or blocked branch (`(source.blocked and not owns_claim) or _held(source, dry_run=False)`): deletes the result file, then `del retained[key]`. No file stays in `unit-watchdog-results`.
+- No-recovery-source branch: deletes the result, then sets `dropped`, then pops the job. A failed delete keeps the job and writes no `dropped`, so a later pass retries cleanup and recovery when a source returns.
+- `test_child_launch_options_cannot_substitute_executable_or_run_hooks` rejects the ps listing form `("ps", "-eo", "pid=,ppid=,comm=,args=")` with a launch option, and a positive control starts the same argv once with no launch option. The test fails only when the launch-option check is missing.
+- Checkpoint `182c9f80`. Its commit body holds the Assertion-Change line for `scripts/whoami/test_profile_notes_pass.py::test_child_launch_options_cannot_substitute_executable_or_run_hooks`.
+
+**Files:**
+- `scripts/accounts/unit_watchdog.py` — `RecoveryFinished.result_path`, `_recovery_result`, the three branches of `run()` that use up a finished result.
+- `scripts/accounts/test_unit_watchdog.py` — seven tests: the unreadable second fresh read, live and absent confirmation, held, blocked, no recovery source, and the failed-cleanup retry (`test_failed_result_cleanup_retries_when_a_recovery_source_returns`).
+- `scripts/whoami/test_profile_notes_pass.py` — the launch-options test and its positive control.
+
+**Gotchas:**
+- Each branch that uses up a finished result deletes the result file before it writes a final mark (`dropped`, `del retained[key]`, the job pop). A failed delete is a third outcome next to live and absent: it must leave the job retryable. A saved `dropped` together with a job makes every later pass skip cleanup and recovery.
+
+**Ruled out:**
+- Delete the result after `dropped` is recorded in the no-recovery-source branch: a failed delete then stops recovery for good.
+
+### Phase 94e — Each derived account problem names the cause it comes from  · status: done
+
+**Depends on:** Phase 94c (order only)
+
+#### As-built
+
+- `scripts/accounts/accounts.py`: a derived account problem carries a reference to the direct cause that made it; the merge drops it only when that cause is present, and an unlinked problem stays visible. No kind, account or text fallback.
+- Usage failures link to a cause only when the usage reader knows it; a generic error, 401, 429 and stale token keep their own lines. Roles on a missing account become one line that names the account cause and lists `affected roles:`.
+- An unreadable `.claude.json` gives no mcpServers line. The mcpServers check compares each account with `~/.claude.json` (the file Claude reads for `~/.claude`), project by project: global servers plus each project's own.
+- `StatusDiagnostics` owns every observed problem until output succeeds: on failure it prints the typed problems, then the remaining raw warnings, then the error. Store warnings keep `warning.reason` (`scripts/whoami/agent_accounts.py`). `check()` returns a plain list.
+- Tests: producer pairing tests in `test_accounts.py` and `test_role_map.py`; Assertion-Change lines in checkpoint b8c75d3c.
+
+### Phase 96 — A stopped account setup, group move or wait is finished by its rerun  · status: done
+
+#### As-built
+
+A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes the work. A skipped, queued or unconfirmed message never counts as delivered.
+
+- **Seed.** `_seed_config` holds an exclusive `flock` on the account folder, calls `atomic_file.remove_dead_temporary_files`, then publishes the filtered seed with `atomic_file.create_text_atomic`. An existing empty regular `.claude.json` is an interrupted seed: `_seed_config` removes it and seeds again. Any other existing file stays untouched (it can hold a login).
+- **`atomic_file`.** `create_text_atomic(path, text) -> bool` links a private (0600), fsynced sibling temporary file into place with `os.link`, then syncs the folder; on `FileExistsError` it keeps the file and returns `False`. It shares the temporary-file step `_flushed_temporary_text` with `write_text_atomic`. Public `remove_dead_temporary_files(path)` removes a `.<name>.<pid>.<random>.tmp` sibling only when its pid no longer runs.
+- **Group move.** `role_map.repair_selected_auto_moves(entries: tuple[AutoMoveTarget, ...], now, *, dry_run=False)` (`AutoMoveTarget`: `entry_id`, `group`, `label`) runs under `_groups_lock()` and `worker_names.roles_lock()`. A stored selection with `cause == "auto"`, `why == "auto: <entry id>"` and the target label counts as consumed. If its `roles.jsonl` row is missing, it appends one row with the `write_role_map` fields (shared `_role_history_entry`) and `at` set to the repair time, since `StoredGroupSelection` has no `at`. A dry run takes no lock and writes nothing. `refusal_watch._run_auto_moves_locked` reads consumed ids from it, so the queue head moves on.
+- **Five-hour wait.** Before destination preparation, `refusal_watch._run` finds a journaled `waited` row for a session whose saved state for the same entry is `retry`, `no room` or `waited`. The row matches on tool `claude`, session id, `reset` equal to the wait reset (the refusal's, else the saved one), and `at` not before the refusal time. From `retry` or `no room` it sets `waited` with that row's `move_id`. It appends a row only when none matches. A `waited` session in a blocked or unconfigured group still reaches the continuation path.
+- **Delivery.** `settle.message_was_delivered(outcome) -> bool` is true only for kind `sent` or `acknowledged`. `settle.send_message` returns the observed outcome for every call. `alert_user` accepts delivered, `kept` or `replaced`. The settle message record, `send_showrunner_line`, the restart note (timers restart only after delivery, else `restart failed` with `restart note not delivered`) and `refusal_watch._continue_session` read delivery through the predicate. The `LiveSessionMessenger` and `ShutdownServices` protocols carry `message_was_delivered`.
+
+**Files:**
+- `scripts/lib/atomic_file.py` — the one atomic text writer: replace and create-only publish, dead temporary-file removal.
+- `scripts/accounts/accounts.py` — `_seed_config`.
+- `scripts/accounts/role_map.py` — `AutoMoveTarget`, `repair_selected_auto_moves`, `_role_history_entry`.
+- `scripts/accounts/refusal_watch.py` — journaled-wait restore, consumed auto moves, continuation delivery.
+- `scripts/shutdown/settle.py` — `message_was_delivered`, `send_message`, `alert_user`, settle record, showrunner line.
+- `scripts/shutdown/restart.py` — restart note and timer restore.
+- Tests: `scripts/accounts/test_{accounts,role_map,refusal_watch}.py`, `scripts/lib/test_atomic_file.py`, `scripts/shutdown/test_{settle,restart}.py`.
+
+**Binds later work:** `atomic_file.create_text_atomic` and `remove_dead_temporary_files` are shared; a later writer calls them and adds no copy. `settle.message_was_delivered` is the one delivery predicate.
+
+**Gotchas:**
+- `showrunners.py` loads as two module objects (`showrunners` and `scripts.production.showrunners`). A test patch of one leaves the other on live paths, so the test can write the live showrunner registry.
+- Stop-and-rerun tests raise a test-local `class Killed(BaseException)`, so no `except Exception` or `except OSError` block runs.
+
+**Ruled out:** a seed-only temporary-file writer in `accounts.py` (a copy of `atomic_file`); counting a window skip, queued or unconfirmed send as sent when no repeat window is set.
+
+### Phase 97 — A stopped Codex fallback switch is finished by its rerun  · status: done
+
+**Depends on:** Phase 95 (order only)
+
+#### As-built
+
+- `PendingClaudeSwitch` (`scripts/whoami/quota_alert.py`) is saved in state before `switch_to_claude` edits the registry. A later switching pass that finds it completes the switch from the registry, writes the routing row once and tells the owner once.
+- Switch-back keeps a fallback that holds only the keys that failed to restore; a later pass retries them, and a newer switch keeps the keys still owed.
+- `RestorationOutcomeOwed`: the restore journal row and notice are saved as an owed outcome before the fallback is cleared, so a stop or a failed append is finished by the rerun.
+- A refusal reads the registry before it treats work as already on Claude. A workers queue entry is consumed only when the workers role names its target or a later row of its move exists; the role is read once per pass. `state_file()` only reads and saves state.
+- Tests: `scripts/whoami/test_quota_alert.py` (stop-and-rerun cases on `CodexRerunFixture` in `quota_alert_test_support.py`); `test_codex_alert_accounts.py::test_failed_restoration_is_attempted_and_reported_once` follows the retry (Assertion-Change); `test_quota_zero_episode.py` isolates state per subtest.
+
+### Phase 98 — A notice marked before it is sent is retried until it is sent  · status: done
+
+**Depends on:** Phase 95 (order only)
+
+#### As-built
+
+- `scripts/whoami/five_hour.py`: the five-hour warning is a claim while it relays and becomes sent only when every recipient got it. A delivery record keeps the recipients that got it, so a retry relays only to the rest.
+- Recovery saves an ended spell before it removes the marker or the record, so an old record never serves a new low spell. The cancel file is deleted only when every retire succeeds.
+- `scripts/production/codex_winddown.py`: the quiet alert uses a generation that each running count bumps, so a pass that read an older count never writes sent. A finished unit's zero notice is the owed state `ZeroNoticeOwed` until its send succeeds; a finished resumed group stays finished.
+- A zero-count pass skips each unit that a newer pass changed (projection re-read under the lock), and the owed notice is checked again before it is sent.
+- Tests: `test_five_hour.py` (retry per recipient; Assertion-Change on the renamed low-window test, send count 3), `test_codex_winddown.py` (stop-and-rerun, stale-pass cases).
+
+### Phase 99 — A stopped `down` or `now` is finished by its rerun  · status: done
+
+#### As-built
+
+- Each account hold registration names its owner (`RegistrationOwner`: pid and process start time). A rerun of `begin` calls `store.repair_abandoned_hold_registrations(login)`, which completes or withdraws each pending registration whose owner is gone. A legacy registration with no owner releases when its last session finishes.
+- `save_timers` writes the timer snapshot to the record before it stops any timer. A rerun stops each timer from the snapshot that still runs, so cancel or restart can restore them.
+- Each showrunner line is a claim on the request record in `showrunner_lines`: `ShowrunnerLinePending`, then `ShowrunnerLineQueued` (send.py keeps the line, no receipt yet) or `ShowrunnerLineDelivered`. `settle.send_showrunner_line` is the one path: under `store.showrunner_line_lock` it claims the line, calls `send_message`, and records `delivered` only when the send was delivered. `send.parse_outcome` reads the first outcome header of send.py's output. The next stop or outcome report sends a pending or queued line again, once per line; a skipped or failed send leaves the claim pending. Back and stopping lines key by request and line kind; a failure line also keys by its text. `showrunner_was_told` still reads the old `showrunner_told` field.
+- The `restart.py` source fallback sends its showrunner line through `settle.send_showrunner_line`.
+- In `send.py`, a keyed send that failed, was refused or was held does not keep the repeat window. A delivered or queued send keeps it.
+- Tests guard two behaviors that already held: `down` starts the conductor after every `begin`, and `now` reads the live sessions while `store.create_session` moves a finished stop record aside for a new stop.
+
+**Files:**
+- `scripts/shutdown/settle.py` — `begin`, `save_timers`, `now`, `send_showrunner_line`, `showrunner_was_told`, `tell_showrunner_stopping`, `tell_showrunners_outcome`.
+- `scripts/shutdown/shutdown_record.py` — registration owners, `registration_owner_running`, `repair_abandoned_hold_registrations`, the `ShowrunnerLine` record types.
+- `scripts/shutdown/restart.py` — source fallback through the shared claim-and-send path.
+- `scripts/message/send.py` — repeat window only for a delivered or queued keyed send.
+- `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_restart.py`, `scripts/message/test_send.py` — stop-and-rerun tests (a test-local `Killed(BaseException)` raised after the named call, then the same verb again) and send-window tests.
+- `scripts/shutdown/test_account_move.py`, `test_shutdown_cli.py`, `test_shutdown_record.py` — fixture setup only (a stub keyword, live registration owners).
+
+**Gotchas:** The timer snapshot reaches the record before any timer stops; `shutdown_record.merge_timer_restores` merges a saved snapshot with a later one so a disabled observation cannot erase an inherited enable intent. A showrunner line stays pending or queued until a send is delivered; only `ShowrunnerLineDelivered` ends its retries.
+
+**Ruled out:** trusting a stored registration id alone, without its owner check; marking a showrunner line sent before the send returns.
+
+### Phase 100 — All consumers import shared whoami modules by one name  · status: done
+
+#### As-built
+
+- Every consumer imports `agent_accounts`, `account`, `note_file`, `session_table`, `run_out` and `usage_store` as `scripts.whoami.<module>`, also inside functions and in `import_module` strings. Code and tests share one module object, so type identity (`KnownCodexAccount`, `Report`, `UsageClaimFailed`, `UsageSaveFailed`) and patched settings such as `note_file.AGENTS_DIR` hold.
+- The six modules carry no `if __name__ == "<module>": … elif __name__ == "scripts.whoami.<module>": …` two-name registration block; no `sys.modules.setdefault` remains in `scripts/whoami`.
+- Root-insert rule: each consumer puts `sys.path.insert(0, str(Path(__file__).resolve().parents[2]))` at module level before its first `scripts.` import, and none depends on the side-effect insert in `account.py` or `agent_accounts.py`. The inline Python in `scripts/agents/agent_exec.sh` puts the repository root (`$script_dir/../..`) on `sys.path` and imports `scripts.whoami.agent_accounts`.
+- `quota_alert`, `five_hour`, `codex_pacer` and `agent_notes` keep their own import names; `scripts/lib/nix_env.py` keeps its own two-name block.
+- The one approved relative import is `from ..whoami import account, agent_accounts` in `scripts/message/test_roster.py`.
+
+**Files:**
+- `scripts/whoami/{agent_accounts,account,note_file,session_table,run_out,usage_store}.py` — the six shared modules, registered under the package name only.
+- Consumers and tests in `scripts/{whoami,accounts,shutdown,production,message,nightly_review}` — package imports and module-level root inserts.
+- `scripts/whoami/profile_notes_pass.py` — loads and patches the package modules; `test_profile_notes_pass.py` takes the save counter key from the real patch entry.
+- `scripts/agents/agent_exec.sh` — inline Python imports the package name.
+
+**Binds later work:** a new consumer of the six modules uses the package form with a module-level root insert. `test_consumers_share_the_one_account_module` compares the `quota_alert` and `accounts` bindings with the one module object.
+
+**Gotchas:**
+- Suites run from the repository root put the root on `sys.path` and hide a missing root insert; only an import check from `/tmp`, with only the file's own directory on `sys.path`, finds one.
+- A name built from `owner.__name__` follows the package name, so a literal Counter key such as `"usage_store.save_timer_usage"` reads zero; take the key from the real patch entry.
+- A test that compares two import forms of one module now compares the module with itself and always passes; compare consumer bindings with the one module instead.
+- A module loaded under a second name is a second object: its patches miss the code's object (writes can reach live dirs), and the failure shows as a failing `isinstance`, not an import error.
+- A multi-name import (`import dailies_render, showrunners, note_file`) escapes a `^(import|from) <module>` grep; the multi-name grep catches it.
+
+### Phase 100b — Every consumer imports the showrunner registry by one name  · status: done
+
+#### As-built
+
+- Every consumer imports `scripts/production/showrunners.py` by its package name, `scripts.production.showrunners`. No bare `import showrunners`, `from showrunners import`, `import_module("showrunners")` or `"showrunners.…"` patch string remains, also not in `.sh` inline Python or generated test code.
+- One module object holds `NOTIFIER_STATE_DIR`, `SESSIONS_DIR` and `SHOWRUNNER_STATE_DIR`, so a test patch on it reaches all code. `showrunners.py` has no two-name block.
+- Each consumer with no module-level root insert runs `sys.path.insert(0, str(Path(__file__).resolve().parents[2]))` before its first `scripts.` import. This is the settled form, not a copy.
+- Fixtures that patched both copies now patch the one object. The registry setup for tests lives in one helper, `scratch_showrunner_registry` in `scripts/production/showrunner_registry_test_support.py`.
+- `test_dailies_render.py`'s cold-import test now expects `scripts.production.showrunners` in the loaded modules.
+
+**Files:**
+- `scripts/production/` — consumers, test support and tests on the package import; `showrunner_registry_test_support.py` holds `scratch_showrunner_registry`.
+- `scripts/{shutdown,message,style,hooks,bevy_upgrade,herdr,lint,accounts,whoami}/` — consumers and tests on the package import, with one patch each.
+- `pyrightconfig.json` — the `scripts/bevy_upgrade` environment has `.` in `extraPaths`.
+
+**Binds later work:** A new consumer imports `from scripts.production import showrunners` after the root insert. A test that isolates the registry uses `scratch_showrunner_registry`.
+
+**Gotchas:**
+- A second module object for one file misses a patch, fails `isinstance`, and a root insert that the working directory hides shows only in an import check run from `/tmp`.
+- A name built from `owner.__name__` follows the package name, so a literal key for the old name reads zero from a `Counter` and its guard can never fail.
+- A test that compares two import forms of one module compares it with itself once one form goes; test real consumers instead.
+- `pyrightconfig.json` environments need `.` in `extraPaths` for `scripts.production.*` imports.
+- The style suite needs the real HOME (`~/rust/nate_style`); a scratch HOME gives `setUpClass` errors that are not code defects.
+
+### Phase 100c — The five-hour alert test holds across daylight-saving  · status: done
+
+#### As-built
+
+- `five_hour.watch(reports, *, now: datetime | None = None, codex_readings=...)` resolves `now` once (the real UTC clock when absent) and passes it on; fixture reading times come from the same `now`, because `selected_codex_report` refuses readings whose times disagree.
+- `quota_alert.resolve_codex_readings(value, *, now)`, `ahead(resets, *, now)` and `low(notes, threshold, *, now)` take a required `now: datetime`; only the entry points `alert`, `refresh` and `_route_refusal` read the real clock, then pass it on.
+- Tests use fixed clocks: `test_five_hour.py` has one `NOW` of 2026-10-15 18:20 UTC with the reset at 21:20 UTC that day and keeps the literal `resets at 14:20 PDT`; `test_agent_notes.ResetTimeTests` passes one class-level fixed `now` to `ahead`; `test_quota_alert_claude` passes its `self.now` to `low`.
+- Alert text is unchanged. The whoami suite passes on any run date, also under faketime after the Nov 1 clock change.
+
+**Files:**
+- `scripts/whoami/five_hour.py` — `watch` with the injectable `now`.
+- `scripts/whoami/quota_alert.py` — helpers with a required `now`; entry points read the clock.
+- `scripts/whoami/test_five_hour.py` — fixed `NOW` and reset instant in PDT.
+- `scripts/whoami/test_agent_notes.py`, `scripts/whoami/test_quota_alert_claude.py` — fixed clock passed to `ahead` and `low`.
+
+**Gotchas:** The checkpoint assertion guard reads an assert whose call gains an argument as removed when a class attribute is inserted above it; such a commit needs Assertion-Change lines.
+
+**Ruled out:** Taking the expected text from the alert's formatter: the literal `resets at 14:20 PDT` stays so the test still catches a formatter defect.
+
+### Phase 101 — The account readout names a turned-off MCP server only where it differs from ~/.claude  · status: done
+
+**Depends on:** Phase 100 (order only; both edit `scripts/accounts/accounts.py`).
+
+#### As-built
+
+- `_mcp_differences` compares the home scope (`~`) and every project path from either file, sorted; a project absent from one file compares against that file's global servers. It returns `McpServerDifferences(entries: tuple[McpServerDifference, ...])`, each `McpServerDifference(server, direction: McpDirection, projects)`, with `McpDirection = Literal["off", "on"]`. A project where both files agree adds nothing.
+- `_inspect_mcp_configuration(directory) -> McpConfigurationInspection` is the one read of `~/.claude`'s config and the account's `.claude.json` under the linked-folder rule; `_status_for` and `mcp_projects` both call it. `AccountStatus.mcp_differences` replaces `missing_mcp_servers`/`extra_mcp_servers`.
+- The readout prints one line per account, server and direction: `claude2 turns brp off in 3 projects where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off` (`1 project` when one). The line's cause location is `McpServerCause(server, direction)`, so `merge_status_problems` keeps each line. Terminal and JSON `problems` carry the same lines; the `--detail` read-warning match follows the new text.
+- `accounts.py mcp-projects <account> <server> <off|on>` is read-only and prints one project path per line, `~` for the home scope. The printed command puts `--` before its arguments only when one starts with `-`.
+- `docs/accounts.md` describes the MCP line as the one exception to the problem-line form, and the command.
+
+**Files:**
+- `scripts/accounts/accounts.py` — comparison result, shared inspection, problem lines, cause identity, `--detail` match, `mcp-projects`.
+- `scripts/accounts/test_accounts.py` — acceptance cases and the leading-dash server regression.
+- `docs/accounts.md` — the MCP line and `mcp-projects`.
+
+**Gotchas:** Before Phase 101b, the accounts suite failed two `test_cutover_home` tests when run from a real home; Phase 101b fixed that.
+
+### Phase 101b — The accounts tests pass when run from a real home  · status: done
+
+**Depends on:** Phase 101 (order only; both edit `scripts/accounts/test_accounts.py`).
+
+#### As-built
+
+- `scripts/accounts/home_test_support.scratch_account_home(home, environment, *, clear=True)` is the one fixture that sets a test's `HOME`. It also enters `scripts/production/showrunner_registry_test_support.scratch_showrunner_registry(home)`, because `showrunners.py` computes its registry, sessions and notifier folders from `Path.home()` at import.
+- Nine accounts test files use it in place of their own `HOME` patches: `test_accounts`, `test_cutover_home`, `test_launch_accounts`, `test_moves`, `test_new_account`, `test_next_moves`, `test_refusal_watch`, `test_refusals`, `test_role_map`. No product change, no assertion change.
+- The suite passes from the real home and from a scratch `HOME` (835 tests).
+
+**Files:**
+- `scripts/accounts/home_test_support.py` — the fixture.
+- `scripts/accounts/test_*.py` (nine files above) — callers.
+
+### Phase 101c — A failed CI point names its cause  · status: done
+
+**Depends on:** none (order only).
+
+#### As-built
+
+- `scripts/lib/process_failure.failure_detail(result, *, lines=20)` returns the last `lines` lines of stderr and of stdout, each labelled (`stderr: …`, `stdout: …`), stderr first, an empty stream left out, and `exit <code>` when both are empty.
+- `ci_points.py` uses it in `required` and the review watch; `merge_checkpoint.push_validate` uses it for its validate_and_push failure. `report()` joins the lines with `; `, so each step is still one line. Since Phase 101i, CI-point validation saves both streams in `<state dir>/ci_validation.log` and reports `step <label> failed; log <path>`, or `exit <code>, no step named; log <path>` without a failure marker.
+- 37 other copies of the old pattern remain; Phase 101e moves them.
+
+**Files:**
+- `scripts/lib/process_failure.py`, `scripts/lib/test_process_failure.py` — helper and its tests.
+- `scripts/production/ci_points.py`, `scripts/production/merge_checkpoint.py` — callers.
+- `scripts/production/test_ci_points.py` — memory-wait stderr with the failing check on stdout.
+
+### Phase 101d — A CI point validates one fixed commit  · status: done
+
+#### As-built
+
+- `ci_points.py ci start` records the merge branch tip and validates it in a private `git clone --shared --no-checkout` copy under the state dir, with `CARGO_TARGET_DIR=<copy>/target`. The production checkout is never the validation tree. The copy is removed when the run ends, pass or fail.
+- `validate_and_push.sh --validate-only` runs validation in the copy and makes at most one fix commit there. It does not push.
+- Publish runs under `merge_checkpoint.merge_lock`: it fetches the copy's `HEAD` into the production checkout, does a guarded `git merge --ff-only`, then runs `push_direct.sh --publish-only <sha>`, which prints `<sha> pushed` or `<sha> contained`.
+- The publish rule: if `origin/<merge branch>` contains the sha, the run passes and nothing is pushed. A fix commit is pushed only when it fast-forwards `origin/<merge branch>`. Otherwise the run fails with `merge branch moved during validation`. Nothing is ever force-pushed.
+- After the lock is released, `push_direct.sh --follow-published <sha> <state>` runs the hook, the CI-run lookup and the cancellation of older runs (`CANCEL_PRIOR` env). The successful validation report line follows the publish receipt. Command failures keep `failure_detail` except validation itself: its combined output stays in `<state dir>/ci_validation.log` after copy removal, and its failure line names the last failing step (or exit code when unnamed) and that log.
+
+**Files:**
+- `scripts/production/ci_points.py` — the fixed sha, the copy, publish under `merge_lock`, the report line.
+- `scripts/validate_and_push/push_direct.sh` — the one publish rule (`--publish-only`), the follow step (`--follow-published`), `cancel_prior_runs`.
+- `scripts/validate_and_push/validate_and_push.sh` — `--validate-only`.
+- `scripts/production/test_ci_points.py` — copy, contained, fast-forward, moved-branch, retry and lock-wait cases.
+
+**Binds later work:** The publish rule and the cancellation of older runs live only in `push_direct.sh`; other callers use them there. A fix commit reaches the local merge branch through the fetch and `--ff-only` merge under `merge_lock`, so the local branch and `origin` stay equal. The outcomes `pushed`, `contained` and `merge branch moved during validation` show in the CI point's validation line.
+
+**Gotchas:**
+- A push of a fix commit from the copy alone leaves the local merge branch stale: collect rejects it, a rerun makes a second fix, and a later merge-gate push is refused. The fix must go through the checkout under the lock.
+- A retry after a failed publish starts with the local branch at fix F; the publish rule fast-forwards `origin` to F.
+- Copy disk use, peak memory and the fresh-target build time are not yet measured. They are measured at the first real CI point and reported to the showrunner.
+
+**Ruled out:** `--ci-base` (removed); validation in the production checkout; a shared cargo target folder with the checkout (a merge gate builds there at the same time); a second copy of the CI-run lookup or `cancel_prior_runs`.
+
+### Phase 101e — One helper reports a failed command's output  · status: done
+
+#### As-built
+
+- `failure_detail(result: subprocess.CompletedProcess[str], *, lines: int = 20) -> str` in `scripts/lib/process_failure.py` is the one way to describe a failed command. It returns labelled tails of both streams, `stderr: …` first and then `stdout: …`, each cut to the last `lines` lines. It omits an empty stream. When both streams are empty, it returns `exit <code>`. A `lines` value below 1 raises `ValueError`.
+- All 24 non-test modules that had a local `stderr.strip() or stdout.strip()` fallback (either order) now call `failure_detail`. `waiting.detail` stays as a one-call wrapper.
+- Callers keep their command-name prefix (`send.py: …`, `mesh: …`) in front of `failure_detail(result)`, so each message still names its source.
+- A scan test walks every non-test `.py` file under `scripts/` with `ast` and fails on a stream fallback outside `process_failure.py`. Conditions that test both streams (`if result.stdout.strip() or result.stderr.strip()`) do not match.
+
+**Files:**
+- `scripts/lib/process_failure.py` — `failure_detail`
+- `scripts/lib/test_process_failure.py` — the scan test and the helper's output tests
+- `scripts/production/unit_status_test_support.py` — the fixed list of lib files the unit-status fixture copies; includes `process_failure.py`
+- `scripts/production/` — 9 callers: `add_unit`, `codex_winddown`, `dailies_input`, `merge_checkpoint`, `merge_gate`, `production_lifecycle`, `unit_move`, `update_registration`, `waiting`
+- `scripts/{bevy_upgrade,build_hold,direct,herdr,lib,lint,message,nightly_review,shutdown,style,whoami}/` — the other 15 callers; their tests expect the `stderr:`/`stdout:` labels
+
+**Gotchas:** `unit_status_test_support.py` copies lib files into its fixture by a fixed list. A new lib helper that a copied module imports must join that list, or the unit-status suites fail on import.
+
+**Ruled out:** a local `stderr or stdout` fallback at a call site, because it drops one stream; the scan test fails on it.
+
+### Phase 101f — A queued quota alert counts as delivered again  · status: done
+
+#### As-built
+
+- `quota_alert.relay` reads `send.py`'s result with `scripts.message.send.parse_outcome`. For a QUEUED outcome (exit 1) it returns `QUEUED: <why>`, so `refusal_watch` treats a queued cleared-hold notice as delivered and enqueues it once. Every other failure still uses `failure_detail`.
+- The add-showrunner refusal test expects the labelled herdr stream: `herdr session list: stderr: …`.
+
+**Files:**
+- `scripts/whoami/quota_alert.py` — `relay` keeps send.py's QUEUED header
+- `scripts/production/test_add_showrunner.py` — the herdr refusal text
+
+**Gotchas:** `refusal_watch` decides "queued" from the text `not delivered: QUEUED:` in the delivery outcome line. A change to `relay`'s text breaks that check.
+
+### Phase 101g — The Mac account board shows no false problems, and Codex launches on the Mac  · status: done · e31212f7
+
+Showrunner ruling 2026-10-31 06:29 EDT; user asked for the Mac fix at 06:30.
+
+**As-built:** home row compares the `~/.claude` project in both files; `mcp-repair <label> <server>` matches an account to `~/.claude` for one server (dated backup, atomic write, a missing file created 0600); `cutover-home` archives a same-login `~/.codex/auth.json` through its journal, undo restores it; status shows one row per login; credit readings older than ten minutes show as stale with their time, and status reads Codex credits live when they are stale; a credentials entry with no access token reads as `NO_LOGIN_TOKEN`: "no login token; start a session on it", never a retry; the expired-token step no longer promises a notes pass, which the Mac lacks. Review: two lenses, then one fix round (F001 missing-file repair, F002 no-token outcome), closure approved.
+
+### Phase 101h — The Mac refreshes its account readings  · status: done · 20af9b84
+
+User 2026-10-31 07:5x EDT: claude3 showed a red dot on the Mac board while signed in.
+
+**As-built:** launchd job `account-usage` (`/etc/nixos/modules/darwin/account-usage.nix`, every 120 s, at login, Aqua session) runs `agent_notes.py usage-only`, which reads usage and sends no alerts and changes no routing; a read that cannot reach credentials (signed-out CLI answer, exit 1 over ssh) records CREDENTIALS_UNAVAILABLE and keeps the last good outcome. Review: two lenses found F001 (signed-out exit 1 still stored ERROR); one fix round; closure approved.
+
+### Phase 101i — A failed CI point names its failing step and log  · status: done · b3a0ca39
+
+Showrunner defect 2026-10-31 09:3x EDT, reported by hana: the validation line opened with memory-wait lines and hid a killed nextest; no log was kept.
+
+**As-built:** `ci_start` writes validation's stdout and stderr, in order, to `<state dir>/ci_validation.log`, replaced at each start and kept after the copy is removed. A failure reads `validation: failed — step <label> failed; log <path>` from the last `!!! VALIDATION FAILED at step: <label> !!!` line (`validate_ci.sh` `run_step`), or `exit <code>, no step named; log <path>`. The scan uses `errors="replace"`, so bytes that are not UTF-8 never hide the step. An `OSError` stays a `PointFailure("validation", …)`. `merge_checkpoint.push_validate` keeps `failure_detail`. Review: two lenses found F001 (strict UTF-8 scan); one fix round; closure approved.
+
+### Phase 101j — The account board lists only true problems, each with its full step  · status: done · b034f13e
+
+User 2026-11-01 07:4x EST: "please look at the problems coming from the script feeding the accounts board and correct them". Seen on the Mac board (stored-mode `accounts.py status`).
+
+**As-built:** a stored-mode read with a cached role map lists no role-map problem; with no cache it refuses as before. A usage reading not from today shows its date (`10-29 01:14`). The retry promise is gone: the line says `last read attempted at <time>` or `no usage read has been attempted`, because the notes timer can reuse a failed report for ten minutes. `MAC_HOME_LOGIN_STEP` gives the whole Mac step: `accounts.py exec claude2`, `/login`, `/exit`, then `accounts.py cutover-home claude2`, never `/logout`. When `~/.codex` and the numbered home hold the same login, one line reads `~/.codex still holds codex2's login; stop what uses ~/.codex (such as the ChatGPT app), then run accounts.py cutover-home codex2`; when the numbered home holds another login, one label-only line gives its repair instead of a cutover that would refuse. The login command is one shared `env CODEX_HOME=<quoted home> codex login`, which the `codex` alias cannot redirect, also used by `setup codexN`. No problem line prints a login; a test fails if one holds a fixture login. Review: two lenses found F001 (cutover step for a home holding another login) and F002 (false retry promise); two fix rounds; closure approved.
+
+### Phase 101k — The Mac reads account usage at an interval set in config, now one minute  · status: done · d7b8562d
+
+User 2026-11-01 09:2x EST, through the Mac session: "make that interval configurable - and to make the refresh interval 1 minute instead of 2 minutes". Director call: the key is for the Mac read only; natedev's usage read stays in `[parts.notes]` (120 s), because that pass also routes quota and moves sessions.
+
+**As-built:** `mac_usage.interval_seconds = 60` in `config/agent_notes.toml`, read at use; a bad or huge value refuses with the file and key. `agent_notes.py usage-only --poll-seconds 30` reads an account when its own last granted claim is at least interval minus half a poll (45 s) old, so start jitter never skips a poll and one slow account never delays another; a held claim leaves that account's time unchanged. The shared claim guard and the 600 s rate-limit backoff stay; natedev's 90 s guard is unchanged. Due checks share `scripts/maintenance/schedule.py` with `agent_notes_job.py`. Tests script two accounts with 0 s, 15 s and changing credential latency and assert per-account gaps of 45–90 s. The Mac job change (30 s launchd poll, `--poll-seconds 30`) is on /etc/nixos branch `accounts-mac-usage-interval` (afb41714), pushed by the showrunner; it takes effect after a Mac `rebuild`. Three repair rounds; the third used an Astra design.
+
+### Phase 101l — A legacy-login line and the brp registration each stay fixed  · status: done · 2967ed8b
+
+Found 2026-11-01: a leftover `oauthAccount` with no credential that `cutover-home` could not clear, and the nixos login job `claude-brp-mcp` re-adding brp at user scope at each login.
+
+**As-built:** `cutover-home` removes leftover account data (dated private backup, atomic write) when no credential file or keychain entry exists, also after a complete journal; an already-clean home exits 0 with one line and no write. `accounts.py exec claudeN` refuses a wrong sign-in with the label only and prints `env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=<home> claude`, then `/login`; `docs/accounts.md` matches. The brp job and its setup check share one script that removes user-scope brp and registers brp at local scope in `~/rust/{hana,nateroids,bevy_brp}` for `~/.claude` and each numbered home, writing only on a difference: /etc/nixos branch `accounts-brp-local-scope` (881cc227), pushed by the showrunner. Also: `mac_usage.interval_seconds` went back to 120, because at 60 the provider answered 429 across the four Claude accounts in turn while Codex read fine. One repair round (credential-file check on macOS; clean-home rerun).
+
+### Phase 101m — The accounts board shows how many sessions use each role  · status: done · ab8092aa
+
+User 2026-11-01: add a role count to the accounts board and order the columns account, left, role, count, resets, credits, enabled, in use, read; two roles show two counts in role order. The handler unit was told.
+
+**As-built:** `accounts.py` stored-status JSON carries `role_counts` per account: live members per role from the local session registry, launch history and the shared staff classifier, with no ssh or usage read. `mods/unit-board/hooks/accounts.tsx` shows the requested order; the count cell joins counts with `, ` in role order, blank for spare. `scripts/herdr/pane_launch.py` validates each history entry and skips only a damaged one. An unchanged board tick refreshes counts; a failed refresh keeps its retry. `in use` stays: it marks paid-credit use. Also fixed two tests the 101l gate turned red. Three repair rounds; style review PASS.
+
+### Phase 101n — Every Claude account trusts ~/worktrees  · status: done · fe60721b
+
+User 2026-11-01 (via the natedev showrunner and sdlc): trust `~/worktrees` once, so a new folder under it starts with no trust prompt. Claude Code carries trust from a parent folder to every folder below it, also after a move (herdr-unit test).
+
+**As-built:** `config/accounts.toml` `[trust] folders` lists `~/worktrees`. `accounts.py trust` sets `hasTrustDialogAccepted` for each folder in every Claude account file on the machine, touches no other key and prints one line per account; a rerun changes nothing. It follows Claude Code 2.1.296's `.claude.json.lock` protocol (waits for a held lock, 10 s stale rule; both timings in `[claude_config_lock]`, checked with the folders before any lock or write, fix c73d7e90), prepares and fsyncs outside the lock, and under the lock only compares bytes and mode and replaces (hold well under Claude's 1.5 s boot retry). A new account's seed carries the folders through the same helper. `scripts/lib/atomic_file.py` keeps late mode selection for its other callers. Residual, stated in `docs/accounts.md`: a Claude save that skips its own lock can lose any writer's change; rerun `trust`. Three repair rounds; style review PASS. Live apply and proof follow the user's confirmation.
+
+### Phase 101o — The accounts board shows busy, shell and idle counts and a total  · status: done · a4562e76
+
+User 2026-11-01: the role count of 68 workers counted idle workers too; asked for busy, shell, idle and total columns, a total row, and no `in use` column.
+
+**As-built:** each `role_counts` entry in `accounts.py` stored-status JSON is `{busy, shell, idle, total}`. A Claude session takes the `status` field of its session record through the shared reader in `scripts/message/sessions.py` (also used by `promote_showrunner.py`); a missing or other value counts as idle. A Codex worker is busy while its roster status is `running` or `starting`, else idle, with a null `shell`. `mods/unit-board/hooks/accounts.tsx` shows account, left, role, busy, shell, idle, total, resets, credits, enabled, read, and a last `total` row in the wide and narrow layouts; the JSON keeps `credits_in_use` for cargo-handler. One review round; two minors closed by the director (doc line, Assertion-Change lines); style review PASS.
+
+### Phase 101p — Each started-hold text in `next list` has a test  · status: done · 784b2637
+
+natedev showrunner 2026-11-01 (C35, cef58b5c): prove each started-hold form that `next list` prints.
+
+**As-built:** `test_started_fixed_expired_and_no_pace_holds_list_exact_rows_without_state_changes` runs the real `next list` path on scratch state for a fixed hold with time left, a fixed hold that is over, and the 40-minute default with no pace history. Each case asserts the full line and unchanged hold state. The half-point line with a pace stays in `test_started_hold_row_is_shared_by_list_add_hold_reply_and_the_mac`. Tests only.
+
+### Phase 101q — /theme never blocks a promotion  · status: done · 378b778c
+
+natedev showrunner 2026-11-02: the user ran /theme at 09:06 EST; Claude Code wrote `theme` into live `~/.claude/settings.json`, and merge_gate refused every promotion because the tracked file differed from HEAD.
+
+**As-built:** `theme` joins the per-machine keys in `scripts/settings/settings_local_keys.sh` (with `model`, `effortLevel`, `modelSettings`, `extraKnownMarketplaces`). The clean filter strips it, the sidecar keeps it, and the smudge restores it. The committed `settings.json` has no `theme`. `test_settings_local_keys.py` fixtures give each machine a different theme and still clean to one blob.
+
+### Phase 101r — The Mac renews an expired Claude login by itself  · status: done · ef9480b6
+
+User 2026-11-02: "i want accounts renewal on the mac for sure". natedev renewed idle logins in its notes job's refusal-watch pass; the Mac ran only `agent_notes.py usage-only`, which never renewed.
+
+**As-built:** `agent_notes.py usage-only` (Mac launchd job, nixos `modules/darwin/account-usage.nix`) runs `refusal_watch.renew_expired_logins` as a dry run after it saves usage. When an account is due, it starts `agent_notes.py renew-logins` as a detached child (`start_new_session`) and returns: launchd runs one job instance, so the usage job never waits on a 120 s probe. `renew-logins` holds the `login-renewal` schedule lock and calls the same function, which keeps the hourly limit and `~/.local/state/accounts/login_renewals.json`. Two repair rounds (F001: the probe held the usage job, first by its lock, then by launchd's one instance). Style review PASS. Live proof: the Mac after promotion.
+
+### Phase 101s — The accounts board has no read column  · status: done · 9b161976
+
+User 2026-11-02: remove the `read` column; a reading that fails or is old shows in the problems, not in a permanent column.
+
+**As-built:** `mods/unit-board/hooks/accounts.tsx` drops the `read` column and the narrow `read … ago` fact. `accounts.py` status adds a problem line for a usage or credits reading older than the existing ten-minute limit and sets `read_ok` false for it; a reading saved after status starts counts as fresh (F001). `read_at` and `read_ok` stay in the JSON; cargo-handler colours its dot from `read_ok` (handler-unit Phase 61 drops its own read column). One repair round; style review PASS.
+
+### Phase 101t — `codex update` works through the codex alias on both machines  · status: done · 2f0877b2
+
+User 2026-11-02 "go", via natedev: the `codex` alias set a numbered `CODEX_HOME`, so `codex update` failed with "Could not detect the Codex installation method".
+
+**As-built:** `_exec_codex_account` in `scripts/accounts/accounts.py` sends a first argument of `update` to `_update_codex`, with no account check. It runs the local program with `CODEX_HOME=~/.codex`, attached to the terminal, then reads its version. Then it runs `CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex" update >&2 && … --version` on `remote.other_machine()` over ssh (600 s limit; stderr discarded, so stdout holds only the version). It prints one version or failure line per machine; ssh 255 or a timeout prints `unreachable; run codex update there`. Exit 0 only when both machines updated. Two repair rounds (F001: update text could print as the version; F002: invalid stderr bytes raised a traceback). Style review PASS.
+
+### Phase 101u — The accounts board counts sessions on both machines  · status: done · 06901023
+
+User 2026-11-02 (via the Mac session): "the accounts board should show the counts for all configured machines for both Mac and for Nate Dev. If Mac is unavailable, it should show that."
+
+**As-built:** each status pass in `scripts/accounts/accounts.py` publishes this machine's per-account busy, shell, idle and total counts to `~/.local/state/accounts/session_counts.json` (`_publish_session_counts`), keyed by the machine alias. `_start_session_counts_fetch` starts a detached fetch of the other machine's file under a nonblocking lock, through `role_map.ssh_role_map(..., machine=)`, into `peer_session_counts.json`; the board read never waits on ssh. `_machine_role_counts` sums both machines into each count column and keeps them apart in the JSON field `role_counts_by_machine`. A missing, damaged, failed or older-than-ten-minutes copy adds one problem line, `<machine> unavailable: counts are <this machine> only`, and the board shows local counts. Legacy `~/.codex` sessions count, and numbered Codex homes count under `codex_home_label()`. The unit-board hook and types read the new field. Three findings closed in two repair rounds (F001 machine alias; F002 legacy `~/.codex` counts; F003 numbered-home label).
+
+### Phase 101v — Status reads stay read-only and test runs start no ssh  · status: done · cc347b39
+
+natedev 2026-11-02 (urgent): main was red from 101u (069010236): `test_role_map` and `test_refusal_watch`, 4 failures and 1 error.
+
+**As-built:** `_count_role_sessions` counts in memory and writes no file; `_session_counts_document` (was `_publish_session_counts`) builds the document that `session-counts-read` prints, and `_session_counts_file` is gone. `_machine_role_counts` takes the status `UsageSource` and starts the detached fetch only for `RefreshStaleUsage`, so `status --stored` reads only `peer_session_counts.json` and opens no lock. `test_role_map.py`, `test_refusal_watch.py` and `test_cutover_home.py` stub `_start_session_counts_fetch` for the whole module. New test `test_stored_status_starts_no_counts_fetch_and_writes_nothing`. 3251 tests in the accounts modules and their importers pass. No code review ran (urgent red-main repair; the director read the diff).
+
+### Phase 101x — The Mac voice setting stays local  · status: done · 0dc14b47
+
+natedev 2026-11-02 (urgent): the user turned on voice on the Mac; its `settings.json` gained a top-level `voice` key, and promotion and claude-sync refused the tracked edit from about 16:00 EST.
+
+**As-built:** `voice` joins `SETTINGS_LOCAL_KEYS_JSON` in `scripts/settings/settings_local_keys.sh`, beside `theme`. The Mac fixture in `scripts/settings/test_settings_local_keys.py` has `voice: {enabled: true, mode: hold}`; the cleaned copy has no `voice` key and the sidecar merge puts the full object back. Tests were not run at the checkpoint (hana build hold); the merge gate runs them.
+
+### Phase 101w — Account tunables live in config  · status: todo
+
+natedev 2026-11-02: the hard-coded values proposal, phase 3 (user approved 2026-11-01). Move each tunable value in the accounts code to config through `scripts/lib/conf.py`, with the same value.
+
+#### Work Order
+**Goal:** every tunable value in `scripts/accounts/` (a limit, a timeout, an interval, a size, an age, a count, a threshold, a path root) is read at use from `config/accounts.conf` through `scripts/lib/conf.py`, with its value unchanged.
+**Spec:**
+1. Inventory each tunable literal in the non-test modules of `scripts/accounts/`. A fixed format, protocol name, file name inside a state folder, or test value is not a tunable; leave it.
+2. Add one key per tunable to the new `config/accounts.conf`, with a comment line that says what it controls. Use the unit in the key name (`_seconds`, `_minutes`, `_percent`, `_bytes`).
+3. Read each key at use with `conf.whole`, `conf.number` or `conf.text`; no module-level copy, no second reader, no fallback literal in code.
+4. Keep every value exactly as it is now. Never change a value: the user approves each value change.
+5. Tests use `CONF_DIR` with a scratch copy of `config/accounts.conf`; add one test that each key in the file is read by the code and each value parses.
+6. docs/accounts.md: one short section that names `config/accounts.conf` and says a change needs no build.
+**Files:**
+- `config/accounts.conf`
+- `scripts/accounts/accounts.py`
+- `scripts/accounts/role_map.py`
+- `scripts/accounts/refusal_watch.py`
+- `scripts/accounts/next_moves.py`
+- `scripts/accounts/moves.py`
+- `scripts/accounts/unit_watchdog.py`
+- `scripts/accounts/new_account.py`
+- `scripts/accounts/refusals.py`
+- `scripts/accounts/outage_alerts.py`
+- `scripts/accounts/test_accounts.py`
+- `docs/accounts.md`

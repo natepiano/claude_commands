@@ -4,17 +4,15 @@ from __future__ import annotations
 
 import re
 import sys
+from pathlib import Path
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Literal, NamedTuple
 
-from note_file import canonical_label
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-if __name__ == "session_table":
-    _ = sys.modules.setdefault("scripts.whoami.session_table", sys.modules[__name__])
-elif __name__ == "scripts.whoami.session_table":
-    _ = sys.modules.setdefault("session_table", sys.modules[__name__])
+from scripts.whoami.note_file import canonical_label
 
 SessionRole = Literal["showrunner", "unit", "worker", "freestanding"]
 ROLE_ORDER: tuple[SessionRole, ...] = ("showrunner", "unit", "worker", "freestanding")
@@ -129,7 +127,7 @@ def live_sessions(environment: Mapping[str, str]) -> ReadSessions | SessionsUnre
     if isinstance(peer, roster.PeerNotReached):
         kept.add(peer.host)
         # SSH aliases (such as "mac") need not equal the hostname in saved rows.
-        from note_file import read_notes
+        from scripts.whoami.note_file import read_notes
 
         kept.update(row.machine for note in read_notes() for row in section_rows(note.text)
                     if row.machine not in machines_read)

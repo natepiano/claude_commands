@@ -71,6 +71,9 @@ that builds the wrong thing.
 - Work Specification: Goal, Spec, Files, Workers verbatim, plus command-line
   amendments. Workers is what <LaunchImplementation/> partitions and opens from;
   when a plan predates the field, the launch step decides and says so.
+  Copy the optional `**State:**` field after `**Workers:**`: what lasting state
+  the phase writes, or `none`. A Work Order validates with or without State.
+  Neither `none` nor an absent field skips <DualReview/>'s diff check.
 - Verification: translate Build/Test/Lint/Run/Smoke and Acceptance gate into
   <VerificationContract/> lines and rules. Remove any requirement to finish
   lint before starting test.
@@ -87,6 +90,7 @@ applicable plan section verbatim, or compose a complete spec from the
 conversation with files, behavior, APIs, edges, and constraints. Point to files
 instead of copying their contents. Do not load style. Derive verification per
 <VerificationContract/>.
+If State is supplied, put it after Workers and name the lasting writes or `none`.
 
 Build the fallback prompt only from this unit's own Work Order, plan and
 conversation. Never read, copy or transform another unit's prompt files under

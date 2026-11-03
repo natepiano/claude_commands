@@ -10,8 +10,8 @@
   ],
   "executionEnvironments": [
     {
-      "root": "scripts/guilds",
-      "extraPaths": [".", "scripts/guilds", "scripts/direct", "scripts/lib", "scripts/history", "scripts/agents", "scripts/astra", "scripts/production", "scripts/message"]
+      "root": "scripts/astra",
+      "extraPaths": [".", "scripts/direct", "scripts/lib", "scripts/history", "scripts/agents", "scripts/astra", "scripts/production", "scripts/message"]
     },
     {
       "root": "scripts/hierarchies",
@@ -159,6 +159,7 @@
     {
       "root": "scripts/lint",
       "extraPaths": [
+        ".",
         "scripts/lint",
         "scripts/lib"
       ]
@@ -217,6 +218,7 @@
     {
       "root": "scripts/bevy_upgrade",
       "extraPaths": [
+        ".",
         "scripts/bevy_upgrade",
         "scripts/production"
       ]

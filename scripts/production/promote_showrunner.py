@@ -15,6 +15,7 @@ stopped and the promotion did not finish, with what to run printed; 2 on a refus
 """
 from __future__ import annotations
 
+
 import argparse
 import json
 import os
@@ -22,22 +23,30 @@ import shlex
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import UTC, datetime
+from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.production import completion_receipt, staff, staff_sources
+from scripts.shutdown import remote
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from atomic_file import write_text_atomic
 
 import add_showrunner
-import showrunners
+from scripts.production import showrunners
 import unit_effort
 import unit_lookup
+import sessions
 import unit_runs
 import herdr
 from session_pane import HerdrFailure, read_place, type_place, where_place
-from add_unit import Production, commit_paths, read_production
-from production_units import Refusal, cell_value, plan_cell_is_retired, unit_headings, unit_rows, unit_table
+from add_unit import commit_paths
+from production_units import Production, Refusal, cell_value, plan_cell_is_retired, read_production, unit_headings, unit_rows, unit_table
 
 STOP_WAIT_S = float(os.environ.get("PROMOTE_STOP_WAIT_S") or 60)
 POLL_S = 0.5
@@ -74,12 +83,10 @@ def _unit_row(lines: list[str], unit: str) -> dict[str, str]:
 
 def _session_status(pid: int) -> str:
     """The session record's `status`: `busy` while a turn runs."""
-    try:
-        record = cast(object, json.loads((unit_lookup.sessions_dir() / f"{pid}.json").read_text(encoding="utf-8")))
-    except (OSError, ValueError) as error:
-        raise Refusal(f"cannot read the unit's session record: {error}") from error
-    status = cast(dict[str, object], record).get("status") if isinstance(record, dict) else None
-    return status if isinstance(status, str) else ""
+    record = sessions.read_session(unit_lookup.sessions_dir() / f"{pid}.json")
+    if isinstance(record, sessions.UnreadableSessionRecord):
+        raise Refusal("cannot read the unit's session record")
+    return record.get("status", "")
 
 
 def _quiet(unit: str, marked: unit_lookup.MarkedUnit, claude: unit_lookup.LiveClaude) -> None:
@@ -114,11 +121,20 @@ def _committed(doc: Path) -> None:
 
 def checked(name: str, child_doc: Path) -> Promotion:
     """Everything the promotion needs. Raises Refusal naming what is in the way."""
-    parent_doc = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+    parent_doc = showrunners.production_of(staff.runtime_id())
     if parent_doc is None:
         raise Refusal("this session runs no production, so it has no unit to promote")
     parent = read_production(parent_doc)
     unit = name if name.replace("_", "-").endswith("-unit") else f"{name}-unit"
+    pending = promotion_record(parent, unit)
+    if pending.exists():
+        fields = cast(dict[str, str], json.loads(pending.read_text(encoding="utf-8")))
+        if Path(fields["child_doc"]).resolve() != child_doc.expanduser().resolve():
+            raise Refusal(f"{unit} has an unfinished promotion to {fields['child_doc']}")
+        child = read_production(child_doc)
+        claude = unit_lookup.LiveClaude(fields["session"], fields["session_id"], fields["socket"], int(fields["pid"]))
+        marked = unit_lookup.MarkedUnit(unit, claude, herdr.HerdrPlace(fields["session"], fields["pane"]))
+        return Promotion(unit, parent, child, marked, claude, Path(fields["worktree"]), fields["plan"])
     try:
         cells = _unit_row(parent.doc.read_text(encoding="utf-8").splitlines(), unit)
         marked = unit_lookup.marked_unit(parent.slug, unit)
@@ -132,11 +148,55 @@ def checked(name: str, child_doc: Path) -> Promotion:
     _settled(unit, claude, worktree)
     child = read_production(child_doc)
     _committed(child.doc)
-    # Only the unit's herdr session will end before the same-named destination starts.
+    # Only the unit's herdr tab will end before the same-named destination starts.
     directory = showrunner_account_directory()
-    ending = marked.place.session
+    ending = add_showrunner.EndingUnitTab(marked.place.pane)
     _ = add_showrunner.checked(child, parent.slug, ending=ending, start_in=worktree, config_dir=directory)
     return Promotion(unit, parent, child, marked, claude, worktree, cell_value(cells.get("Plan", "")))
+
+
+def promotion_record(parent: Production, unit: str) -> Path:
+    path = _git(parent.checkout, "rev-parse", "--git-path", f"promotions/{unit}.json")
+    if path.returncode:
+        raise Refusal(f"cannot find the promotion record: {path.stderr.strip()}")
+    record = Path(path.stdout.strip())
+    return record if record.is_absolute() else parent.checkout / record
+
+
+def save_promotion(promotion: Promotion, target: Path) -> None:
+    """Keep the conversation and destination before ending the unit."""
+    path = promotion_record(promotion.parent, promotion.unit)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(path, json.dumps({
+        "unit": promotion.unit, "child_doc": str(promotion.child.doc), "target": str(target),
+        "session_id": promotion.claude.session_id, "session": promotion.marked.place.session,
+        "pane": promotion.marked.place.pane, "socket": promotion.claude.socket, "pid": str(promotion.claude.pid),
+        "worktree": str(promotion.worktree), "plan": promotion.plan,
+        "launched_at": datetime.now(UTC).isoformat(),
+    }) + "\n")
+
+
+def finish_child(promotion: Promotion, target: Path, pending: Path, pid: int) -> int:
+    """Finish our saved conversation in its child tab, without launching it again."""
+    place = herdr.herdr_place_of(pid)
+    if isinstance(place, herdr.NotInHerdr) or not any(
+        pane["pane_id"] == place.pane and pane.get("label") == promotion.child.slug
+        for pane in herdr.Herdr(place.session).panes()
+    ):
+        raise Refusal(f"session {promotion.claude.session_id} runs outside {promotion.child.slug}'s tab")
+    fields = cast(dict[str, str], json.loads(pending.read_text(encoding="utf-8")))
+    at = datetime.fromisoformat(fields["launched_at"])
+    prompt = f"/showrunner:produce {promotion.child.doc} resume"
+    transcript = herdr.SessionTranscript(target, promotion.claude.session_id)
+    outcome = herdr.submitted_prompt(transcript, prompt, at)
+    if not isinstance(outcome, herdr.PromptSubmitted):
+        outcome = herdr.Herdr(place.session).submit_opening_prompt(
+            place.pane, herdr.OpeningPrompt(prompt, transcript), at, 90_000)
+    if isinstance(outcome, herdr.PromptNotSubmitted):
+        return add_showrunner.SESSION_NOT_READY
+    if not add_showrunner.showrunner_appeared(promotion.child.slug):
+        return 1
+    return showrunners.main(["attach", promotion.child.slug, promotion.parent.slug])
 
 
 def _alive(pid: int) -> bool:
@@ -197,13 +257,15 @@ def retire(promotion: Promotion) -> None:
         parts = line.split("|")
         if cell_value(parts[headings.index("Unit") + 1].strip()) != promotion.unit:
             continue
+        if plan_cell_is_retired(parts[plan_at]):
+            break
         date = datetime.now(promotion.parent.zone).strftime("%Y-%m-%d")
         note = f"(retired {date}: promoted to showrunner of {promotion.child.slug})"
         parts[plan_at] = f" {note} {parts[plan_at].strip()} "
         lines[index] = "|".join(parts)
         break
-    _ = doc.write_text("\n".join(lines), encoding="utf-8")
-    commit_paths(promotion.parent, [doc], f"production({promotion.parent.slug}): retire {promotion.unit}, "
+    write_text_atomic(doc, "\n".join(lines))
+    _ = commit_paths(promotion.parent, [doc], f"production({promotion.parent.slug}): retire {promotion.unit}, "
                  + f"promoted to showrunner of {promotion.child.slug}")
 
 
@@ -214,7 +276,7 @@ def restore_line(promotion: Promotion) -> str:
         "--resume", promotion.claude.session_id, "--cwd", str(promotion.worktree)])
 
 
-def main(argv: list[str]) -> int:
+def _main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Promote a running unit to the showrunner of its own production.")
     _ = parser.add_argument("unit")
     _ = parser.add_argument("--production", required=True, type=Path, help="the child's production doc")
@@ -222,9 +284,30 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("--effort", required=True, help="pass your own effort level")
     _ = parser.add_argument("--check", action="store_true", help="run every refusal and stop nothing")
     args = parser.parse_args(argv)
+    record = staff.initial_snapshot()
     try:
+        parent_doc = showrunners.production_of(staff.runtime_id())
+        if parent_doc is not None:
+            parent = read_production(parent_doc)
+            unit_name = cast(str, args.unit)
+            unit_name = unit_name if unit_name.replace("_", "-").endswith("-unit") else f"{unit_name}-unit"
+            completed = promotion_record(parent, unit_name).with_suffix(".done.json")
+            receipt = completion_receipt.read_receipt(completed, record)
+            if isinstance(receipt, completion_receipt.OwnedReceipt):
+                if isinstance(receipt.owner.doc, staff.WrappedDoc):
+                    raise Refusal(f"{receipt.owner.name}: showrunner is wrapped; cannot complete this promotion")
+                old = staff_sources.member(staff_sources.UnitMember(parent.slug, unit_name), record)
+                child_doc = receipt.fields.get("child_doc")
+                if (receipt.owner.kind == "showrunner" and isinstance(child_doc, str)
+                        and Path(child_doc).resolve() == cast(Path, args.production).expanduser().resolve()
+                        and (isinstance(old, staff_sources.NoSuchMember)
+                             or isinstance(old.row.worktree, staff.RemovedWorktree))):
+                    print(f"{unit_name} already promoted")
+                    return 0
         promotion = checked(cast(str, args.unit), cast(Path, args.production))
-        target_directory = showrunner_account_directory()
+        pending = promotion_record(promotion.parent, promotion.unit)
+        target_directory = (Path(cast(dict[str, str], json.loads(pending.read_text(encoding="utf-8")))["target"])
+                            if pending.exists() else showrunner_account_directory())
         moved = account_line()
     except Refusal as refusal:
         print(f"promote_showrunner: {refusal}", file=sys.stderr)
@@ -232,10 +315,30 @@ def main(argv: list[str]) -> int:
     unit, slug = promotion.unit, promotion.child.slug
     if cast(bool, args.check):
         print(f"check: ok — would stop {unit} (herdr {promotion.marked.place.session}), resume it as the showrunner of "
-              + f"{slug} in {promotion.worktree} under {promotion.parent.slug}, and retire its row; {moved}")
+              + f"{slug} in {promotion.worktree} under {promotion.parent.slug}, and preserve its native row; {moved}")
         return 0
+    old_member = staff_sources.member(staff_sources.UnitMember(promotion.parent.slug, promotion.unit), record)
+    parent_member = staff_sources.member(staff_sources.ShowrunnerMember(promotion.parent.slug), record)
+    parent_row = parent_member.row if isinstance(parent_member, staff_sources.MemberFound) else None
+    if parent_row is None:
+        print(f"promote_showrunner: {promotion.parent.slug}: native showrunner identity is missing", file=sys.stderr)
+        return 2
+    _ = staff_sources.ensure_staff_showrunner(promotion.parent, runtime_id=parent_row.current_session)
+    was_pending = pending.exists()
+    if not was_pending:
+        save_promotion(promotion, target_directory)
     try:
-        stopped = stop(promotion)
+        current = unit_lookup.marked_unit(promotion.parent.slug, unit) if was_pending else promotion.marked
+        if current is not None and isinstance(current.claude, unit_lookup.ClaudeUnknown):
+            raise Refusal(f"cannot tell whether {unit} still runs: {current.claude.reason}")
+        if current is not None and isinstance(current.claude, unit_lookup.LiveClaude):
+            if current.claude.session_id != promotion.claude.session_id:
+                raise Refusal(f"{unit} now runs a different conversation; kept its promotion record")
+            stopped = stop(promotion._replace(marked=current, claude=current.claude))
+        else:
+            if current is not None:
+                herdr.close_agent(current.place.session, current.place.pane)
+            stopped = True
     except Refusal as refusal:
         print(f"promote_showrunner: {refusal}", file=sys.stderr)
         return 2
@@ -244,17 +347,59 @@ def main(argv: list[str]) -> int:
               + f"was restarted. Its pane is {where_place(promotion.marked.place)}; read it with "
               + f"`~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read session {promotion.claude.session_id}`.")
         return 1
-    started = add_showrunner.main(["--production", str(promotion.child.doc), "--model", cast(str, args.model),
-                                   "--effort", cast(str, args.effort), "--resume", promotion.claude.session_id,
-                                   "--cwd", str(promotion.worktree), "--config-dir", str(target_directory)])
+    native = staff.native_id(promotion.claude.session_id)
+    name = showrunners.herdr_space(slug, str(promotion.child.doc))
+    document = staff.LiveDoc(remote.local_machine(), promotion.child.doc.resolve())
+    retained = record.by_current_session(native)
+    if (retained is not None and retained.kind == "showrunner"
+            and (retained.name, retained.parent, retained.doc) == (name, parent_row.id, document)):
+        new_member = staff_sources.MemberFound(retained)
+    else:
+        new_member = staff_sources.MemberFound(staff.promote_unit(
+            retained.id if retained is not None else native, name=name, parent=parent_row.id, doc=document))
+    try:
+        if was_pending and showrunners.current_name(slug):
+            started = showrunners.main(["attach", slug, promotion.parent.slug])
+        else:
+            observed = sessions.session_liveness(promotion.claude.session_id) if was_pending else sessions.SessionNotLive()
+            if isinstance(observed, sessions.SessionLivenessUnknown):
+                raise Refusal(f"cannot tell whether session {promotion.claude.session_id} runs: {observed.reason}")
+            if isinstance(observed, sessions.LiveSessionProcess):
+                started = finish_child(promotion, target_directory, pending, observed.pid)
+            else:
+                started = add_showrunner.main(["--production", str(promotion.child.doc), "--model", cast(str, args.model),
+                                               "--effort", cast(str, args.effort), "--resume", promotion.claude.session_id,
+                                               "--cwd", str(promotion.worktree), "--config-dir", str(target_directory)])
+    except (staff.StaffRefused, staff.StaffUnreadable):
+        raise
+    except (Refusal, OSError, herdr.HerdrFailure) as error:
+        print(f"promote_showrunner: {error}", file=sys.stderr)
+        return 1
     if started == 2:
         print(f"{unit} is stopped and did not start as a showrunner; its Units row is unchanged. "
               + f"Bring it back as the unit it was with: {restore_line(promotion)}")
         return 1
-    return finish(promotion, started, moved)
+    result = finish(promotion, started, moved)
+    if isinstance(old_member, staff_sources.MemberFound):
+        workers = staff.find(kind="worker", parent=old_member.row.id)
+        for worker in workers:
+            print(f"kept worker {worker.id} {worker.name} under {old_member.row.name}")
+        if workers:
+            return 1
+    if result.exit_code == 0:
+        fields = cast(dict[str, object], json.loads(pending.read_text(encoding="utf-8")))
+        completion_receipt.write_receipt(pending.with_suffix(".done.json"), new_member.row.id, fields)
+        pending.unlink(missing_ok=True)
+    return result.exit_code
 
 
-def finish(promotion: Promotion, started: int, moved: str) -> int:
+@dataclass(frozen=True)
+class PromotionProgress:
+    unit_retired: bool
+    exit_code: int
+
+
+def finish(promotion: Promotion, started: int, moved: str) -> PromotionProgress:
     """Retire the Units row of a unit that now runs as the child's session, and say what is still owed.
 
     A session open without a proven prompt is no longer the unit either, so its row is retired too.
@@ -269,12 +414,19 @@ def finish(promotion: Promotion, started: int, moved: str) -> int:
         print(f"{unit} is open as the session {slug}, but its showrunner prompt is not proven to have run; {row}. "
               + f"Look at it with `{herdr.attach_hint(showrunners.herdr_space(slug, str(promotion.child.doc)), slug)}`; unless it runs the production, type: "
               + f"/showrunner:produce {promotion.child.doc} resume")
-        return 1
+        return PromotionProgress(retired, 1)
     if not retired:
         print(f"{unit} now runs as the showrunner of {slug}, but {row}")
-        return 1
+        return PromotionProgress(False, 1)
     print(f"{unit} is now the showrunner of {slug}; {moved}")
-    return started
+    return PromotionProgress(True, started)
+
+
+def main(argv: list[str]) -> int:
+    def run() -> int:
+        with staff.operation():
+            return _main(argv)
+    return staff.cli_result(run)
 
 
 if __name__ == "__main__":

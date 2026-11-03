@@ -1,7 +1,6 @@
 """Session and recovery data shared by observation and shutdown storage."""
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Literal, NotRequired, TypedDict, cast
 
 
@@ -19,9 +18,7 @@ UnitPlan = PlanFromRunRecord | NoRunRecord
 
 class UnitHost(TypedDict):
     kind: Literal["unit"]
-    production: str
     unit: str
-    doc: str
     session_name: str
     session_host: Literal["herdr"]
     plan: UnitPlan
@@ -29,9 +26,7 @@ class UnitHost(TypedDict):
 
 class LegacyTmuxUnitHost(TypedDict):
     kind: Literal["legacy tmux unit"]
-    production: str
     unit: str
-    doc: str
     session_name: str
 
 
@@ -212,83 +207,6 @@ class TimerRestore(TypedDict):
     was_enabled: bool
 
 
-class CodexSessionId(TypedDict):
-    kind: Literal["session id"]
-    session_id: str
-
-
-class CodexResumePicker(TypedDict):
-    kind: Literal["picker"]
-
-
-class CodexLaunch(TypedDict):
-    home: str
-    resume: CodexSessionId | CodexResumePicker
-
-
-class RecoveryHostProcess(TypedDict):
-    kind: Literal["process"]
-    pid: int
-    proc_start: str
-
-
-class RecoveryHostUnrecorded(TypedDict):
-    kind: Literal["not recorded"]
-
-
-class SnapshotClaudeSession(TypedDict):
-    agent: Literal["claude"]
-    session: Session
-    workers: list[Session]
-    timers: list[TimerRestore]
-    last_seen: str
-    boot_id: NotRequired[str]
-    crash: NotRequired[Literal["reboot", "host gone", "agent exited"]]
-    host_process: NotRequired[RecoveryHostProcess | RecoveryHostUnrecorded]
-    state: Literal["running", "unresolved"]
-
-
-class SnapshotCodexSession(TypedDict):
-    agent: Literal["codex"]
-    session: TopLevelSession
-    codex: CodexLaunch
-    workers: list[Session]
-    timers: list[TimerRestore]
-    last_seen: str
-    boot_id: NotRequired[str]
-    crash: NotRequired[Literal["reboot", "host gone"]]
-    host_process: NotRequired[RecoveryHostProcess | RecoveryHostUnrecorded]
-    state: Literal["running", "unresolved"]
-
-
-SnapshotSession = SnapshotClaudeSession | SnapshotCodexSession
-
-
-
-@dataclass(frozen=True)
-class KnownBoot:
-    boot_id: str
-
-
-@dataclass(frozen=True)
-class BootNotRecorded:
-    """An older caller supplied no boot observation."""
-
-
-@dataclass(frozen=True)
-class CompleteInventory:
-    machine: str
-    sessions: dict[str, list[SnapshotSession]]
-    labels: dict[str, str]
-    boot: KnownBoot | BootNotRecorded = BootNotRecorded()
-    gone_hosts: frozenset[tuple[str, str]] = frozenset()
-
-
-@dataclass(frozen=True)
-class PartialInventory:
-    failures: tuple[str, ...]
-
-
 class InvalidInventory(ValueError):
     """An inventory value does not satisfy its wire contract."""
 
@@ -374,14 +292,11 @@ def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
         session_host = data.get("session_host", "tmux")
         if session_host not in ("tmux", "herdr"):
             raise InvalidInventory(f"{place}.session_host is invalid")
-        production = wire_string(wire_required(data, "production", place), f"{place}.production")
         unit = wire_string(wire_required(data, "unit", place), f"{place}.unit")
-        doc = wire_string(wire_required(data, "doc", place), f"{place}.doc")
         name = wire_string(wire_required(data, name_key, place), f"{place}.{name_key}")
         if session_host == "tmux" or kind == "legacy tmux unit":
-            return LegacyTmuxUnitHost(kind="legacy tmux unit", production=production,
-                                     unit=unit, doc=doc, session_name=name)
-        return UnitHost(kind="unit", production=production, unit=unit, doc=doc,
+            return LegacyTmuxUnitHost(kind="legacy tmux unit", unit=unit, session_name=name)
+        return UnitHost(kind="unit", unit=unit,
                         session_name=name, session_host="herdr",
                         plan=_parse_unit_plan(wire_required(data, "plan", place), f"{place}.plan"))
     if kind == "herdr":

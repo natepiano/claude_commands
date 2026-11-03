@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import unittest
+import errno
 import json
 import os
 import re
 import shutil
 import sqlite3
+import subprocess
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from contextlib import closing
 from datetime import datetime, timezone
+from dataclasses import replace
 from typing import cast, final
 from unittest import mock
 import rules
@@ -18,13 +22,773 @@ import style_ledger
 import style_plan
 import berth_board
 import coverage_report
+import unit_files
 
 
-from ledger_test_support import (LedgerTestCase, LedgerStatus)
+from ledger_test_support import (remove_finding_anchor_schema, remove_generation_schema, LedgerTestCase, LedgerStatus)
 
 
 @final
 class StyleLedgerTicketsTests(LedgerTestCase):
+    def refusal_ticket(self, *, secondary: bool = False) -> tuple[style_ledger.Ledger, Path, tuple[str, ...]]:
+        """An assigned approved ticket with three findings, optionally from two decisions."""
+        ledger, issue = self.widen_ticket()
+        ledger.ticket_drop("names-1")
+        ledger.set_tip(self.initial_tip, "main")
+        first = ledger.proposal_findings(issue)[0]
+        extra = ledger.hold(first.rule, first.path, 22, "another binding", "rename", "another", "fresh_name",
+                            first.rule_blob, "outside")
+        ledger.file_held(extra.finding_id, issue)
+        findings = ledger.proposal_findings(issue)
+        ids = tuple(finding.finding_id for finding in findings)
+        decisions: tuple[Path, ...] = ()
+        if secondary:
+            other = self.root / "secondary.md"
+            _ = other.write_text(issue.read_text())
+            with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                _ = connection.execute("UPDATE held_findings SET proposal=? WHERE finding_id=?", (str(other), ids[1]))
+            decisions = (other,)
+        ledger.ticket_add("names-2", "names", "proposal", "names", "crates/alpha", list(self.sources[:2]),
+                          [findings[0].rule], proposal=str(issue), proposals=decisions, finding_ids=ids)
+        ledger.ticket_assign("names-2", "main")
+        return ledger, issue, ids
+
+    def test_ticket_refuse_keeps_other_findings_and_the_approved_gate_in_both_active_states(self) -> None:
+        ledger, issue, ids = self.refusal_ticket()
+        with closing(sqlite3.connect(ledger.database)) as connection, closing(sqlite3.connect(":memory:")) as pristine:
+            connection.backup(pristine)
+            for state in ("assigned", "checkpointed"):
+                with self.subTest(state=state):
+                    if state == "checkpointed":
+                        ledger.ticket_checkpoint("names-2", self.initial_tip)
+                    before = ledger.ticket_open("names")[0]
+                    # All membership/ownership writes remain in the existing release operation.
+                    with mock.patch.object(style_ledger.Ledger, "bulk_release", autospec=True,
+                                           side_effect=style_ledger.Ledger.bulk_release) as release:
+                        result = self.cli("ticket", "refuse", "--id", "names-2", "--finding", ids[0],
+                                          "--by", "Nate", "--reason", "would shadow an enclosing binding")
+                    release.assert_called_once()
+                    self.assertEqual(len(result.stdout.splitlines()), 1)
+                    origin = ledger.ticket_origin("names-2")
+                    self.assertIsInstance(origin, style_ledger.ApprovedProposal)
+                    assert isinstance(origin, style_ledger.ApprovedProposal)
+                    approved = style_plan.approved_ticket(ledger, "names-2", origin)
+                    self.assertEqual({finding.finding_id for finding in approved.findings}, set(ids[1:]))
+                    released, = ledger.named_held((ids[0],))
+                    self.assertEqual((released.state, released.build_ticket),
+                                     (style_ledger.Filed(issue), style_ledger.NoBuildTicket()))
+                    row, = ledger.bulk_refusals("names-2")
+                    self.assertEqual((row.finding_id, row.reason), (ids[0], "would shadow an enclosing binding"))
+                    after = ledger.ticket_open("names")[0]
+                    self.assertEqual((after["state"], after["checkpoint"], after["base"], after["files"], after["rules"]),
+                                     (before["state"], before["checkpoint"], before["base"], before["files"], before["rules"]))
+                    pristine.backup(connection)
+
+    def test_ticket_refuse_removes_an_already_waived_finding_and_the_gate_passes(self) -> None:
+        ledger, _, ids = self.refusal_ticket()
+        ledger.waive_held(ids[0], style_ledger.WaiveByPerson("Nate"))
+        waived, = ledger.named_held((ids[0],))
+        _ = self.cli("ticket", "refuse", "--id", "names-2", "--finding", ids[0],
+                     "--by", "Nate", "--reason", "would shadow")
+        released, = ledger.named_held((ids[0],))
+        self.assertEqual(released, replace(waived, build_ticket=style_ledger.NoBuildTicket()))
+        origin = ledger.ticket_origin("names-2")
+        assert isinstance(origin, style_ledger.ApprovedProposal)
+        self.assertEqual({finding.finding_id for finding in style_plan.approved_ticket(ledger, "names-2", origin).findings},
+                         set(ids[1:]))
+
+    def test_ticket_refuse_releases_multiple_named_findings_in_one_request(self) -> None:
+        ledger, _, ids = self.refusal_ticket()
+        _ = self.cli("ticket", "refuse", "--id", "names-2", "--finding", ids[0], "--finding", ids[1],
+                     "--by", "Nate", "--reason", "would shadow")
+        origin = ledger.ticket_origin("names-2")
+        assert isinstance(origin, style_ledger.ApprovedProposal)
+        self.assertEqual(origin.finding_ids, (ids[2],))
+        self.assertEqual({row.finding_id for row in ledger.bulk_refusals("names-2")}, set(ids[:2]))
+        self.assertEqual(len(style_plan.approved_ticket(ledger, "names-2", origin).findings), 1)
+
+    def test_ticket_refuse_rejects_unknown_and_foreign_ids_before_any_write(self) -> None:
+        ledger, _, ids = self.refusal_ticket()
+        finding, = ledger.named_held(ids[:1])
+        foreign = ledger.hold(finding.rule, self.sources[2], 1, "other finding", "rename", "old", "new",
+                              finding.rule_blob, "outside")
+        for identity, message in (("unknown", "unknown held finding"), (foreign.finding_id, "does not belong to ticket")):
+            with self.subTest(finding=identity):
+                before = self.ledger_contents(ledger)
+                result = self.cli("ticket", "refuse", "--id", "names-2", "--finding", ids[0], "--finding", identity,
+                                  "--by", "Nate", "--reason", "would shadow", success=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(message, result.stderr)
+                self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_ticket_refuse_preserves_every_contributing_issue_rule(self) -> None:
+        ledger, _, ids = self.refusal_ticket(secondary=True)
+        # Either primary or secondary losing its last finding must refuse the whole request.
+        for removing in ((ids[0], ids[2]), (ids[1],)):
+            with self.subTest(findings=removing):
+                finding, = ledger.named_held(removing[:1])
+                assert isinstance(finding.state, style_ledger.Filed)
+                before = self.ledger_contents(ledger)
+                arguments = [part for identity in removing for part in ("--finding", identity)]
+                result = self.cli("ticket", "refuse", "--id", "names-2", *arguments,
+                                  "--by", "Nate", "--reason", "would shadow", success=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(f"issue {finding.state.proposal} without a finding of its rule", result.stderr)
+                self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_ticket_refuse_requires_a_kept_finding_of_the_issue_rule(self) -> None:
+        ledger, issue, ids = self.refusal_ticket()
+        _ = issue.write_text(issue.read_text().replace("style_rule:", "style_rule: unrelated\nprevious_rule:"))
+        before = self.ledger_contents(ledger)
+        result = self.cli("ticket", "refuse", "--id", "names-2", "--finding", ids[0],
+                          "--by", "Nate", "--reason", "would shadow", success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(f"issue {issue} without a finding of its rule unrelated", result.stderr)
+        self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_ticket_refuse_requires_named_findings_a_person_and_a_nonempty_reason(self) -> None:
+        ledger, _, ids = self.refusal_ticket()
+        required = {"--finding": ids[0], "--by": "Nate", "--reason": "would shadow"}
+        for missing in required:
+            with self.subTest(missing=missing):
+                before = self.ledger_contents(ledger)
+                arguments = [part for flag, value in required.items() if flag != missing for part in (flag, value)]
+                result = self.cli("ticket", "refuse", "--id", "names-2", *arguments, success=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(f"the following arguments are required: {missing}", result.stderr)
+                self.assertEqual(self.ledger_contents(ledger), before)
+        for flag in ("--by", "--reason"):
+            for value in ("", " \t "):
+                with self.subTest(flag=flag, value=value):
+                    before = self.ledger_contents(ledger)
+                    arguments = [part for key, text in required.items() for part in (key, value if key == flag else text)]
+                    result = self.cli("ticket", "refuse", "--id", "names-2", *arguments, success=False)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("requires a non-empty --by and --reason", result.stderr)
+                    self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_ticket_refuse_rerun_is_one_line_and_changes_no_records(self) -> None:
+        ledger, _, ids = self.refusal_ticket()
+        arguments = ("ticket", "refuse", "--id", "names-2", "--finding", ids[0], "--finding", ids[0],
+                     "--by", "Nate", "--reason", "would shadow")
+        first = self.cli(*arguments)
+        before = self.ledger_contents(ledger)
+        repeated = self.cli(*arguments)
+        self.assertEqual(repeated.stdout, first.stdout)
+        self.assertEqual(len(repeated.stdout.splitlines()), 1)
+        self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_ticket_refuse_rejects_tickets_that_cannot_hold_unmerged_edits(self) -> None:
+        ledger, _, ids = self.refusal_ticket()
+        with closing(sqlite3.connect(ledger.database)) as connection, closing(sqlite3.connect(":memory:")) as pristine:
+            connection.backup(pristine)
+            for state in ("queued", "merged", "dropped"):
+                with self.subTest(state=state):
+                    _ = connection.execute("UPDATE tickets SET state=? WHERE id='names-2'", (state,))
+                    connection.commit()
+                    before = self.ledger_contents(ledger)
+                    result = self.cli("ticket", "refuse", "--id", "names-2", "--finding", ids[0],
+                                      "--by", "Nate", "--reason", "would shadow", success=False)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("refusal requires an assigned or checkpointed proposal ticket", result.stderr)
+                    self.assertEqual(self.ledger_contents(ledger), before)
+                    pristine.backup(connection)
+
+    def test_restored_restructure_findings_keep_their_merged_owner_after_rule_changes(self) -> None:
+        ledger, _, issue, ids, checkpoint = self.withdrawn_checkpointed_ticket()
+        # The incident's durable records contain restructure findings with no automatic applied check.
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.executemany("UPDATE held_findings SET kind='restructure' WHERE finding_id=?",
+                                       [(identity,) for identity in ids])
+        ledger.ticket_restore_checkpoint("names-1")
+        self.assertEqual(len(ledger.ticket_merge("names-1")), len(ids))
+        self.assertEqual(self.ticket_row("names-1")[0], "merged")
+        rule_file = self.rule_dir / "decision.md"
+        _ = rule_file.write_text(rule_file.read_text() + "New requirement after merge.\n")
+        definitions = {item.rule_id: item for item in rules.load_rules(self.repo)}
+        withdrawal = ledger.withdraw_superseded(definitions)
+        self.assertEqual(withdrawal.withdrawn, ())
+        self.assertEqual({item.finding.finding_id for item in withdrawal.kept}, set(ids))
+        for finding in ledger.named_held(ids):
+            self.assertEqual((finding.state, finding.build_ticket),
+                             (style_ledger.Filed(issue), style_ledger.BuildTicket("names-1")))
+        completed = ledger.mark_built_at_merge(ids, checkpoint, style_ledger.ReadByPerson("reviewer"))
+        self.assertEqual(len(completed), len(ids))
+        self.assertTrue(all(isinstance(finding.state, style_ledger.Built) for finding in ledger.named_held(ids)))
+
+    def test_rule_change_keeps_checkpointed_findings_for_their_normal_merge(self) -> None:
+        ledger, _, issue, ids, checkpoint = self.checkpointed_decision_ticket()
+        rule_file = self.rule_dir / "decision.md"
+        _ = rule_file.write_text(rule_file.read_text() + "New requirement.\n")
+        definitions = {item.rule_id: item for item in rules.load_rules(self.repo)}
+        result = ledger.withdraw_superseded(definitions)
+        self.assertEqual(result.withdrawn, ())
+        self.assertEqual({item.finding.finding_id for item in result.kept}, set(ids))
+        self.assertEqual([(ticket["state"], ticket["checkpoint"]) for ticket in ledger.ticket_open("names")],
+                         [("checkpointed", checkpoint)])
+        for finding in ledger.named_held(ids):
+            self.assertEqual((finding.state, finding.build_ticket), (style_ledger.Filed(issue), style_ledger.BuildTicket("names-1")))
+        self.assertEqual(ledger.ticket_merge("names-1"), ())
+        self.assertTrue(all(isinstance(finding.state, style_ledger.Built) for finding in ledger.named_held(ids)))
+        self.assertEqual(ledger.withdraw_superseded(definitions).withdrawn, ())
+
+    def test_rule_change_still_drops_assigned_and_queued_tickets(self) -> None:
+        ledger, rule, finding = self.site_fixture()
+        issue = self.root / "decision.md"
+        ledger.ticket_add("build-1", "build", "proposal", "names", "crates/alpha", [finding.path], [rule],
+                          proposal=str(issue), finding_ids=(finding.finding_id,))
+        ledger.ticket_assign("build-1", "main")
+        ledger.ticket_add("queued-1", "queued", "read", "names", "crates/beta", [self.sources[2]], [rule])
+        rule_file = self.rule_dir / "site-rule.md"
+        _ = rule_file.write_text(rule_file.read_text() + "New requirement.\n")
+        _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+        self.assertEqual(ledger.ticket_open("build"), ())
+        self.assertEqual(self.ticket_row("queued-1")[0], "dropped")
+        self.assertIsInstance(ledger.named_held((finding.finding_id,))[0].state, style_ledger.Withdrawn)
+
+    def test_rule_change_cannot_drop_a_checkpointed_successor_or_cancel_through_it(self) -> None:
+        ledger, _, _, ids, checkpoint = self.checkpointed_decision_ticket()
+        rule = self.rule("ancestor")
+        ledger.ticket_add("ancestor-1", "ancestor", "read", "names", "crates/beta", [self.sources[2]], [rule])
+        ledger.ticket_assign("ancestor-1", "main")
+        ledger.ticket_add("later-1", "later", "read", "names", "crates/beta", [self.sources[3]], [rule])
+        # A persisted dependency must not turn a checkpoint into cancellable work.
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.executemany("INSERT INTO ticket_predecessors VALUES (?,?)",
+                                       [("names-1", "ancestor-1"), ("later-1", "names-1")])
+        rule_file = self.rule_dir / "ancestor.md"
+        _ = rule_file.write_text(rule_file.read_text() + "New requirement.\n")
+        # The later ticket pins the current body; only the dependency could cancel it.
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET rule_blobs=? WHERE id='later-1'", (json.dumps({rule: self.blob(rule)}),))
+        _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+        self.assertEqual(ledger.ticket_open("ancestor"), ())
+        self.assertEqual(ledger.ticket_open("names")[0]["checkpoint"], checkpoint)
+        self.assertEqual(self.ticket_row("later-1")[0], "queued")
+        self.assertTrue(all(isinstance(finding.build_ticket, style_ledger.BuildTicket) for finding in ledger.named_held(ids)))
+
+    def test_restore_withdrawn_checkpoint_returns_its_findings_for_normal_merge(self) -> None:
+        ledger, _, issue, ids, checkpoint = self.withdrawn_checkpointed_ticket()
+        _ = self.cli("ticket", "restore-checkpoint", "--id", "names-1")
+        self.assertEqual((ledger.ticket_open("names")[0]["state"], ledger.ticket_open("names")[0]["checkpoint"]),
+                         ("checkpointed", checkpoint))
+        for finding in ledger.named_held(ids):
+            self.assertEqual((finding.state, finding.build_ticket), (style_ledger.Filed(issue), style_ledger.BuildTicket("names-1")))
+        self.assertEqual(ledger.ticket_merge("names-1"), ())
+        self.assertTrue(all(isinstance(finding.state, style_ledger.Built) for finding in ledger.named_held(ids)))
+
+    def test_restore_checkpoint_refuses_unproved_ticket_or_finding_without_writes(self) -> None:
+        ledger, _, _, ids, _ = self.withdrawn_checkpointed_ticket()
+        faults = (
+            ("UPDATE tickets SET checkpoint='' WHERE id='names-1'", (), "checkpoint"),
+            ("UPDATE tickets SET state='assigned' WHERE id='names-1'", (), "dropped"),
+            ("UPDATE tickets SET kind='read' WHERE id='names-1'", (), "proposal"),
+            ("UPDATE tickets SET finding_ids='[]' WHERE id='names-1'", (), "findings"),
+            ("DELETE FROM held_findings WHERE finding_id=?", (ids[1],), "finding"),
+            ("DELETE FROM rule_body_withdrawals WHERE finding_id=?", (ids[1],), "withdrawal"),
+            ("UPDATE held_findings SET updated_at='other-time' WHERE finding_id=?", (ids[1],), "withdrawal"),
+            ("UPDATE held_findings SET build_ticket='another-ticket' WHERE finding_id=?", (ids[1],), "withdrawal"),
+            ("UPDATE held_findings SET proposal='other-decision' WHERE finding_id=?", (ids[1],), "decision"),
+            ("UPDATE held_findings SET state='built' WHERE finding_id=?", (ids[1],), "withdrawal"),
+            ("UPDATE held_findings SET withdrawn_by=1 WHERE finding_id=?", (ids[1],), "withdrawal"),
+            ("UPDATE held_findings SET duplicate_of='duplicate' WHERE finding_id=?", (ids[1],), "withdrawal"),
+            ("UPDATE held_findings SET declaration_gone_at='gone' WHERE finding_id=?", (ids[1],), "withdrawal"),
+            ("UPDATE held_findings SET built_at='built-before' WHERE finding_id=?", (ids[1],), "withdrawal"),
+            ("UPDATE held_findings SET path='unrecorded.rs' WHERE finding_id=?", (ids[1],), "recorded files"),
+        )
+        with closing(sqlite3.connect(ledger.database)) as connection, closing(sqlite3.connect(":memory:")) as pristine:
+            connection.backup(pristine)
+            for sql, parameters, reason in faults:
+                with self.subTest(fault=sql):
+                    _ = connection.execute(sql, parameters)
+                    connection.commit()
+                    before = self.ledger_contents(ledger)
+                    result = self.cli("ticket", "restore-checkpoint", "--id", "names-1", success=False)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn(reason, result.stderr)
+                    self.assertEqual(self.ledger_contents(ledger), before)
+                    # Restore the same historical fixture before testing the next independent refusal.
+                    pristine.backup(connection)
+
+    def test_restore_checkpoint_restores_unchanged_members_released_in_the_same_cancellation(self) -> None:
+        ledger, _, _, ids, _ = self.withdrawn_checkpointed_ticket()
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET state='filed' WHERE finding_id=?", (ids[1],))
+            _ = connection.execute("DELETE FROM rule_body_withdrawals WHERE finding_id=?", (ids[1],))
+        _ = self.cli("ticket", "restore-checkpoint", "--id", "names-1")
+        self.assertEqual(ledger.ticket_merge("names-1"), ())
+        self.assertTrue(all(isinstance(finding.state, style_ledger.Built) for finding in ledger.named_held(ids)))
+
+    def test_restore_checkpoint_refuses_a_drop_without_any_rule_withdrawal_evidence(self) -> None:
+        ledger, _, _, _, _ = self.withdrawn_checkpointed_ticket()
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET state='filed'")
+        before = self.ledger_contents(ledger)
+        result = self.cli("ticket", "restore-checkpoint", "--id", "names-1", success=False)
+        self.assertIn("no findings prove rule-body withdrawal", result.stderr)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_restore_checkpoint_refuses_to_reopen_a_unit_with_new_work(self) -> None:
+        ledger, rule, _, _, _ = self.withdrawn_checkpointed_ticket()
+        ledger.ticket_add("names-2", "names", "read", "names", "crates/beta", [self.sources[2]], [rule])
+        before = self.ledger_contents(ledger)
+        result = self.cli("ticket", "restore-checkpoint", "--id", "names-1", success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unit has open tickets", result.stderr)
+        self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_restore_checkpoint_rolls_back_findings_if_the_ticket_write_fails(self) -> None:
+        ledger, _, _, _, _ = self.withdrawn_checkpointed_ticket()
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("CREATE TRIGGER stop_restore BEFORE UPDATE OF state ON tickets "
+                                   + "BEGIN SELECT RAISE(ABORT,'stop restore'); END")
+        before = self.ledger_contents(ledger)
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "stop restore"):
+            ledger.ticket_restore_checkpoint("names-1")
+        self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_proposal_migration_preserves_generations_and_backfills_legacy_decisions(self) -> None:
+        ledger, rule, finding = self.site_fixture()
+        issue = self.root / "decision.md"
+        ledger.ticket_add("legacy-1", "legacy", "proposal", "names", "crates/alpha", [finding.path], [rule],
+                          proposal=str(issue), finding_ids=(finding.finding_id,))
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("DROP TABLE ticket_proposals")
+            remove_finding_anchor_schema(connection)
+            _ = connection.execute("UPDATE schema_version SET version=30")
+            generations = connection.execute("SELECT * FROM rule_generations").fetchall()
+            judgments = connection.execute("SELECT * FROM active_judgments").fetchall()
+        for _ in range(2):
+            with style_ledger.Ledger(self.repo, ledger.database) as upgraded:
+                self.assertEqual(upgraded.ticket_proposals("legacy-1"), (issue,))
+                self.assertEqual(upgraded.ticket_proposals("judge-1"), ())
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
+            self.assertEqual(connection.execute("SELECT * FROM ticket_proposals").fetchall(), [("legacy-1", str(issue))])
+            self.assertEqual(connection.execute("SELECT * FROM rule_generations").fetchall(), generations)
+            self.assertEqual(connection.execute("SELECT * FROM active_judgments").fetchall(), judgments)
+
+    def test_explicitly_cancelled_checkpoint_reservation_is_retried_after_reopening(self) -> None:
+        session = self.held_reservation("modules-unit-1")
+        self.checkpointed_structure_ticket("modules-unit-1", "--session-dir", str(session), "--phase", "7")
+        with self.ledger() as ledger:
+            ticket, = ledger.ticket_open("modules-unit")
+            definition = next(item for item in rules.load_rules(self.repo) if item.rule_id == ticket["rules"][0])
+            _ = definition.path.write_text(definition.path.read_text() + "Changed body.\n")
+            _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+            self.assertEqual(self.ticket_row("modules-unit-1"), ("checkpointed", str(session), "7"))
+            ledger.ticket_drop("modules-unit-1")
+        # A crash here leaves the committed dropped state and its pending release intact.
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("dropped", str(session), "7"))
+        self.write("README.md", "Move off the held checkpoint.\n")
+        _ = self.commit("Reservation release must wait")
+        with self.ledger() as reopened:
+            changes = reopened.reconcile("main", "main")
+        self.assertTrue(any("reservation r1 stays held" in line for line in changes), changes)
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("dropped", str(session), "7"))
+        _ = self.git("reset", "-q", "--hard", self.initial_tip)
+        with self.ledger() as reopened:
+            self.assertIn("ticket modules-unit-1: phase 7: released reservation r1", reopened.reconcile("main", "main"))
+            self.assertEqual(self.ticket_row("modules-unit-1"), ("dropped", "", ""))
+            calls = self.berth_calls()
+            _ = reopened.reconcile("main", "main")
+            self.assertEqual(self.berth_calls(), calls)
+        self.assertFalse((session / "phases/7/delegated_phase_reservation_state.json").exists())
+
+    def test_removed_judgment_rechecks_cancellation_after_its_git_proof(self) -> None:
+        ledger, rule, _ = self.removed_ticket()
+        path = self.sources[1]
+        (self.repo / path).unlink()
+        deleting = self.commit("Ticket deletes the file")
+        original = style_ledger._cell_scope  # pyright: ignore[reportPrivateUsage]
+
+        def cancel_then_scope(definition: rules.Rule, cell: str, tip: style_ledger.RepositoryTip) -> style_ledger.CellInputScope:
+            with self.ledger() as other:
+                other.ticket_drop("names-1")
+            return original(definition, cell, tip)
+
+        with (mock.patch.object(style_ledger, "_cell_scope", side_effect=cancel_then_scope),
+              self.assertRaisesRegex(style_ledger.LedgerError, "cannot judge from dropped")):
+            ledger.record(rule, path, deleting, self.blob(rule), "removed", ticket="names-1", worker="test")
+        self.assertEqual(self.cell_rows(ledger, path), [])
+
+    def test_old_body_ticket_cannot_add_or_record_before_or_after_cancellation(self) -> None:
+        rule = self.rule("changed")
+        with self.ledger() as ledger:
+            ledger.set_tip(self.initial_tip, "main")
+            ledger.ticket_add("reader-1", "reader", "read", "names", "crates/alpha", [self.sources[0]], [rule])
+            ledger.ticket_assign("reader-1", "main")
+            old_blob = self.blob(rule)
+            rule_file = self.rule_dir / "changed.md"
+            _ = rule_file.write_text(rule_file.read_text() + "New body.\n")
+            for cancelled in (False, True):
+                if cancelled:
+                    _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+                for blob in (old_blob, self.blob(rule)):
+                    with self.subTest(cancelled=cancelled, blob=blob):
+                        with self.assertRaises(style_ledger.LedgerError):
+                            _ = ledger.hold(rule, self.sources[0], 1, "change", "rename", "old", "new", blob, "reader-1")
+                        with self.assertRaises(style_ledger.LedgerError):
+                            ledger.record(rule, self.sources[0], self.initial_tip, blob, "clean", ticket="reader-1")
+            self.assertEqual(ledger.held_findings(style_ledger.AllHeldFindings()), ())
+            self.assertEqual(ledger.latest_ticket_judgments("reader-1"), ())
+            self.assertEqual(ledger.ticket_open("reader"), ())
+
+    def test_batch_owner_migration_reruns_after_process_loss_before_version_write(self) -> None:
+        ledger, rule, finding = self.site_fixture()
+        ledger.ticket_add("legacy-1", "legacy", "read", "names", ".", [finding.path], [rule])
+        with closing(sqlite3.connect(ledger.database)) as older_reader:
+            _ = older_reader.execute("DROP TABLE ticket_batch_owners")
+            remove_generation_schema(older_reader)
+            _ = older_reader.execute("UPDATE schema_version SET version=27")
+            older_reader.commit()
+            before = list(older_reader.iterdump())
+            tickets = older_reader.execute("SELECT * FROM tickets").fetchall()
+            connect = sqlite3.connect
+
+            def migrating(database: Path, *, timeout: float) -> sqlite3.Connection:
+                connection = connect(database, timeout=timeout)
+
+                def stop(statement: str) -> None:
+                    # CREATE TABLE has executed, but neither it nor the version is committed.
+                    if statement == "DELETE FROM schema_version":
+                        os._exit(73)
+
+                connection.set_trace_callback(stop)
+                return connection
+
+            child = os.fork()
+            if child == 0:
+                try:
+                    with mock.patch.object(sqlite3, "connect", migrating):
+                        with style_ledger.Ledger(self.repo, ledger.database):
+                            pass
+                finally:
+                    os._exit(74)
+            _, status = os.waitpid(child, 0)
+            self.assertEqual(os.waitstatus_to_exitcode(status), 73)
+            self.assertEqual(list(older_reader.iterdump()), before)
+            with style_ledger.Ledger(self.repo, ledger.database) as upgraded:
+                self.assertEqual(upgraded.ticket_batch_owner("legacy-1"), style_ledger.UNBATCHED_TICKET)
+            # The pre-upgrade reader's queries still work; no existing table changed shape or data.
+            self.assertEqual(older_reader.execute("SELECT * FROM tickets").fetchall(), tickets)
+            self.assertEqual(older_reader.execute("SELECT version FROM schema_version").fetchone(),
+                             (max(style_ledger.MIGRATIONS),))
+
+    def test_batch_claim_owner_and_finding_claim_commit_or_roll_back_together(self) -> None:
+        ledger, rule, finding = self.site_fixture()
+        owner = style_ledger.BatchOwner("durable-intent")
+        for target in ("ticket_batch_owners", "held_findings"):
+            with self.subTest(fault=target):
+                event = "INSERT" if target == "ticket_batch_owners" else "UPDATE"
+                with closing(sqlite3.connect(ledger.database)) as connection:
+                    _ = connection.execute(
+                        f"CREATE TRIGGER stop_claim BEFORE {event} ON {target} "
+                        + "BEGIN SELECT RAISE(ABORT, 'claim fault'); END",
+                    )
+                    connection.commit()
+                before = self.ledger_contents(ledger)
+                with self.assertRaisesRegex(sqlite3.IntegrityError, "claim fault"):
+                    ledger.ticket_add("batch-1", "batch", "proposal", "names", ".", [finding.path], [rule],
+                                      proposal=str(self.root / "decision.md"), finding_ids=(finding.finding_id,),
+                                      batch_owner=owner)
+                self.assertEqual(self.ledger_contents(ledger), before)
+                with closing(sqlite3.connect(ledger.database)) as connection:
+                    _ = connection.execute("DROP TRIGGER stop_claim")
+                    connection.commit()
+        ledger.ticket_add("batch-1", "batch", "proposal", "names", ".", [finding.path], [rule],
+                          proposal=str(self.root / "decision.md"), finding_ids=(finding.finding_id,), batch_owner=owner)
+        with style_ledger.Ledger(self.repo, ledger.database) as reader:
+            self.assertEqual(reader.ticket_batch_owner("batch-1"), owner)
+            self.assertEqual(reader.named_held((finding.finding_id,))[0].build_ticket, style_ledger.BuildTicket("batch-1"))
+
+    def test_repeated_claim_cannot_replace_or_remove_its_batch_owner(self) -> None:
+        ledger, rule, finding = self.site_fixture()
+        owner = style_ledger.BatchOwner("original-intent")
+        for requested in (owner, owner, style_ledger.BatchOwner("another-intent"), style_ledger.UNBATCHED_TICKET):
+            with self.subTest(requested=requested):
+                before = self.ledger_contents(ledger)
+
+                def add() -> None:
+                    ledger.ticket_add("batch-1", "batch", "proposal", "names", ".", [finding.path], [rule],
+                                      proposal=str(self.root / "decision.md"), finding_ids=(finding.finding_id,),
+                                      batch_owner=requested)
+
+                if requested == owner:
+                    add()
+                else:
+                    with self.assertRaisesRegex(style_ledger.LedgerError, "different batch owner"):
+                        add()
+                    self.assertEqual(self.ledger_contents(ledger), before)
+                self.assertEqual(ledger.ticket_batch_owner("batch-1"), owner)
+
+    def test_batch_recovery_keeps_unbatched_and_foreign_claims(self) -> None:
+        ledger, rule, finding = self.site_fixture()
+        recovery_owner = style_ledger.BatchOwner("recovering-intent")
+        for number, actual in enumerate((style_ledger.UNBATCHED_TICKET, style_ledger.BatchOwner("foreign-intent")), 1):
+            with self.subTest(owner=actual):
+                ticket = f"batch-{number}"
+                ledger.ticket_add(ticket, "batch", "proposal", "names", ".", [finding.path], [rule],
+                                  proposal=str(self.root / "decision.md"), finding_ids=(finding.finding_id,),
+                                  batch_owner=actual)
+                before = self.ledger_contents(ledger)
+                with self.assertRaises(style_ledger.TicketBatchMismatch):
+                    ledger.ticket_drop_batch(ticket, recovery_owner)
+                self.assertEqual(self.ledger_contents(ledger), before)
+                ledger.ticket_drop(ticket)
+        ledger.ticket_add("batch-3", "batch", "proposal", "names", ".", [finding.path], [rule],
+                          proposal=str(self.root / "decision.md"), finding_ids=(finding.finding_id,),
+                          batch_owner=recovery_owner)
+        ledger.ticket_drop_batch("batch-3", recovery_owner)
+        self.assertEqual(ledger.proposal_tickets()[-1]["state"], "dropped")
+        self.assertEqual(ledger.named_held((finding.finding_id,))[0].build_ticket, style_ledger.NoBuildTicket())
+
+    def test_rule_hash_launch_failures_keep_ticket_context_and_cause(self) -> None:
+        rule = self.rule("probe")
+        ledger = self.ledger()
+        before = self.ledger_contents(ledger)
+        original = mock.Mock(wraps=subprocess.run)
+        for code in (errno.EMFILE, errno.ENOENT):
+            with self.subTest(errno=code):
+                failure = OSError(code, "PRIVATE launch diagnostic")
+
+                def fail_hash(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+                    if tuple(command) == ("git", "hash-object", "--stdin"):
+                        raise failure
+                    return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
+
+                with mock.patch.object(subprocess, "run", side_effect=fail_hash):
+                    with self.assertRaisesRegex(style_ledger.LedgerError, "ticket probe-1 add:") as refused:
+                        ledger.ticket_add("probe-1", "probe", "read", "names", "crates/alpha", [self.sources[0]], [rule])
+                cause = refused.exception.__cause__
+                self.assertIsInstance(cause, style_ledger.GitReadFailed)
+                assert isinstance(cause, style_ledger.GitReadFailed)
+                self.assertEqual(cause.command, ("git", "hash-object", "--stdin"))
+                self.assertIs(cause.__cause__, failure)
+                self.assertNotIn("PRIVATE", str(refused.exception))
+                self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_widen_callback_file_failure_is_not_a_git_failure(self) -> None:
+        ledger, _ = self.widen_ticket()
+        before = self.ledger_contents(ledger)
+        failure = PermissionError("decision file unreadable")
+        with self.assertRaises(PermissionError) as refused:
+            _ = ledger.ticket_widen("names-1", ("extra.rs",), "reference", "worker", mock.Mock(side_effect=failure))
+        self.assertIs(refused.exception, failure)
+        self.assertEqual(self.ledger_contents(ledger), before)
+
+    def git_read_failure(self) -> style_ledger.GitReadFailed:
+        return style_ledger.GitReadFailed(("git", "-C", str(self.repo), "rev-parse"), 128, "fatal: PRIVATE GIT STDERR")
+
+    def ledger_contents(self, ledger: style_ledger.Ledger) -> tuple[str, ...]:
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            return tuple(connection.iterdump())
+
+    def assert_git_refusal(self, ledger: style_ledger.Ledger, context: str, operation: Callable[[], object]) -> None:
+        before = self.ledger_contents(ledger)
+        with self.assertRaises(style_ledger.LedgerError) as refused:
+            _ = operation()
+        self.assertIn(context, str(refused.exception))
+        self.assertNotIn("PRIVATE GIT STDERR", str(refused.exception))
+        self.assertNotIn("fatal:", str(refused.exception))
+        self.assertIsInstance(refused.exception.__cause__, style_ledger.GitReadFailed)
+        self.assertEqual(self.ledger_contents(ledger), before, "failed proof must roll back all rows and reservations")
+
+    def test_git_boundary_checkpoint_restamp_failure_is_contextual_and_atomic(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        ledger.ticket_add("other-1", "other", "read", "names", "crates/beta", [self.sources[2]], [self.rule("read")])
+        ledger.ticket_assign("other-1", "main")
+        _ = ledger.ticket_base("other-1")
+        self.record(self.rule("read"), self.sources[2], self.initial_tip, ticket="other-1")
+        ledger._ancestors.clear()  # pyright: ignore[reportPrivateUsage]
+        original = mock.Mock(wraps=subprocess.run)
+
+        def fail_ancestry(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            if "merge-base" in command:
+                return subprocess.CompletedProcess(command, 128, b"", b"fatal: PRIVATE GIT STDERR")
+            return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
+
+        with mock.patch.object(subprocess, "run", side_effect=fail_ancestry):
+            self.assert_git_refusal(ledger, "ticket other-1 checkpoint:",
+                                    lambda: ledger.ticket_checkpoint("other-1", self.initial_tip, "held-run", "7"))
+        failure = self.git_read_failure()
+        with mock.patch.object(style_ledger, "_git", side_effect=failure):
+            # The catch inside checkpoint_restamps must propagate, rather than silently omit verdicts.
+            with self.assertRaises(style_ledger.GitReadFailed):
+                _ = ledger.checkpoint_restamps(ledger.ticket_open("other")[0], self.initial_tip)
+
+    def test_git_boundary_restamp_judgment_read_is_not_silently_skipped(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        rule = self.rule("restamp")
+        self.add_ticket("restamp-1", [rule], unit="restamp")
+        ledger.ticket_assign("restamp-1", "main")
+        _ = ledger.ticket_base("restamp-1")
+        for path in self.sources[:2]:
+            self.record(rule, path, self.initial_tip, ticket="restamp-1")
+        self.write("README.md", "a later checkpoint\n")
+        checkpoint = self.commit("Advance checkpoint")
+        original = mock.Mock(wraps=subprocess.run)
+
+        def fail_history(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            if "--full-history" in command:
+                return subprocess.CompletedProcess(command, 128, b"", b"fatal: PRIVATE GIT STDERR")
+            return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
+
+        with mock.patch.object(subprocess, "run", side_effect=fail_history):
+            self.assert_git_refusal(ledger, "ticket restamp-1 checkpoint:",
+                                    lambda: ledger.ticket_checkpoint("restamp-1", checkpoint, "held-run", "5"))
+
+    def test_git_boundary_pending_pipeline_writes_roll_back_for_each_transition(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        rule = ledger.ticket_open("read")[0]["rules"][0]
+        ledger.ticket_add("read-2", "read", "read", "names", "crates/beta", [self.sources[2]], [rule])
+        original = mock.Mock(wraps=subprocess.run)
+
+        def fail_changed_paths(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            if "log" in command and "--name-only" in command:
+                return subprocess.CompletedProcess(command, 128, b"", b"fatal: PRIVATE GIT STDERR")
+            return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
+
+        with mock.patch.object(subprocess, "run", side_effect=fail_changed_paths):
+            self.assert_git_refusal(ledger, "ticket read-2 assign:", lambda: ledger.ticket_assign("read-2", "main"))
+        ledger.ticket_assign("read-2", "main")
+        self.record(rule, self.sources[2], self.initial_tip, ticket="read-2")
+        with mock.patch.object(subprocess, "run", side_effect=fail_changed_paths):
+            self.assert_git_refusal(ledger, "ticket read-2 resume check:", lambda: ledger.check_ticket_pipeline("read-2"))
+            self.assert_git_refusal(ledger, "ticket read-2 checkpoint:",
+                                    lambda: ledger.ticket_checkpoint("read-2", self.initial_tip, "held-run", "8"))
+        with mock.patch.object(ledger, "_check_ticket_pipelines", side_effect=self.git_read_failure()):
+            self.assert_git_refusal(ledger, "ticket read-2 drop:", lambda: ledger.ticket_drop("read-2"))
+
+    def test_git_boundary_widen_callback_and_pending_writes_keep_reservations(self) -> None:
+        ledger, _ = self.widen_ticket()
+        original = mock.Mock(wraps=subprocess.run)
+
+        def fail_callback(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            if "cat-file" in command:
+                return subprocess.CompletedProcess(command, 128, b"", b"fatal: PRIVATE GIT STDERR")
+            return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
+
+        def approved() -> frozenset[str]:
+            _ = unit_files.file_text(self.repo, "HEAD", "decision.md")
+            return frozenset()
+
+        with mock.patch.object(subprocess, "run", side_effect=fail_callback):
+            self.assert_git_refusal(ledger, "ticket names-1 widen:",
+                lambda: ledger.ticket_widen("names-1", ("extra.rs",), "reference", "worker", approved))
+        with mock.patch.object(ledger, "_check_ticket_pipelines", side_effect=self.git_read_failure()):
+            self.assert_git_refusal(ledger, "ticket names-1 widen:",
+                lambda: ledger.ticket_widen("names-1", ("extra.rs",), "reference", "worker", lambda: frozenset()))
+
+    def test_git_boundary_all_public_operations_keep_typed_failure_context(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        rule = self.rule("new")
+        original = mock.Mock(wraps=subprocess.run)
+
+        def fail_hash(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            if tuple(command) == ("git", "hash-object", "--stdin"):
+                return subprocess.CompletedProcess(command, 128, b"", b"fatal: PRIVATE GIT STDERR")
+            return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
+
+        with mock.patch.object(subprocess, "run", side_effect=fail_hash):
+            self.assert_git_refusal(ledger, "ticket new-1 add:",
+                lambda: ledger.ticket_add("new-1", "new", "read", "names", "crates/alpha", [self.sources[0]], [rule]))
+        self.add_ticket("new-1", [rule], unit="new")
+        ledger.ticket_assign("new-1", "main")
+        with mock.patch.object(style_ledger, "_git", side_effect=self.git_read_failure()):
+            self.assert_git_refusal(ledger, "ticket new-1 base:", lambda: ledger.ticket_base("new-1"))
+            self.assert_git_refusal(ledger, "ticket read-1 merge:", lambda: ledger.ticket_merge("read-1"))
+        with mock.patch.object(ledger, "_yielded_findings", side_effect=self.git_read_failure()):
+            self.assert_git_refusal(ledger, "ticket new-1 yield:", lambda: ledger.ticket_yield("new-1", self.sources[0]))
+        _ = ledger.ticket_merge("read-1")
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            _ = connection.execute("UPDATE tickets SET reservation_session_dir='held-run',reservation_phase='3' WHERE id='read-1'")
+            connection.commit()
+        with mock.patch.object(style_ledger, "_git", side_effect=self.git_read_failure()):
+            self.assert_git_refusal(ledger, "ticket read-1 release:", lambda: ledger.release_held_reservation("read-1"))
+
+    def test_git_boundary_later_reconcile_failure_preserves_prior_commits_and_nested_context(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        self.add_ticket("other-1", [self.rule("other")], unit="other")
+        ledger.ticket_assign("other-1", "missing-branch")
+        # other sorts before read; reconcile commits its drop before a later read-1 merge fails.
+        with mock.patch.object(ledger, "_load_rules", side_effect=self.git_read_failure()):
+            with self.assertRaisesRegex(style_ledger.LedgerError, r"ticket read-1 reconcile \(merge\): git rev-parse failed") as refused:
+                _ = ledger.reconcile("main", "main")
+        self.assertNotIn("PRIVATE GIT STDERR", str(refused.exception))
+        self.assertFalse(ledger.ticket_open("other"))
+        self.assertEqual(ledger.ticket_open("read")[0]["state"], "checkpointed")
+        with mock.patch.object(style_ledger, "_git", side_effect=self.git_read_failure()):
+            self.assert_git_refusal(ledger, "reconcile refs/heads/main:", lambda: ledger.reconcile("main", "main"))
+
+    def test_git_boundary_proof_catches_preserve_failures_and_negative_git_answers(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        original = mock.Mock(wraps=subprocess.run)
+
+        def negative(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            if "merge-base" in command or "grep" in command:
+                return subprocess.CompletedProcess(command, 1, b"", b"")
+            return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
+
+        with mock.patch.object(subprocess, "run", side_effect=negative):
+            self.assertFalse(ledger._is_ancestor("missing", "other"))  # pyright: ignore[reportPrivateUsage]
+            self.assertFalse(ledger.files_naming(self.initial_tip, "absent_name"))
+        tip = ledger._tip(self.initial_tip)  # pyright: ignore[reportPrivateUsage]
+        with mock.patch.object(ledger, "_tip", side_effect=self.git_read_failure()):
+            with self.assertRaises(style_ledger.GitReadFailed):
+                _ = ledger._judgment_inputs_match(  # pyright: ignore[reportPrivateUsage]
+                    style_ledger.Judgment("blob", "different", self.initial_tip, "clean", style_ledger.CellInputScope.CRATE,
+                                          style_ledger.DeclaredInputScope.RULE),
+                    tip, style_ledger.CellInputScope.CRATE, self.sources[0], "modules")
+        outside = style_ledger.GitReadFailed(("git", "rev-parse", "--show-toplevel"), 128,
+                                            "fatal: not a git repository: PRIVATE GIT STDERR")
+        self.assertIn("not a git repository", str(outside))
+        self.assertNotIn("PRIVATE GIT STDERR", str(outside))
+        self.assertNotIn("fatal:", str(outside))
+
+    def test_git_boundary_cli_failure_exits_two_and_schema_errors_stay_separate(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        original = mock.Mock(wraps=subprocess.run)
+
+        def fail_checkpoint(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            if "missing-commit^{commit}" in command:
+                return subprocess.CompletedProcess(command, 128, b"", b"fatal: PRIVATE GIT STDERR")
+            return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
+
+        with mock.patch.object(subprocess, "run", side_effect=fail_checkpoint):
+            refused = self.cli("ticket", "checkpoint", "--id", "read-1", "--commit", "missing-commit", success=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("ticket read-1 checkpoint:", refused.stderr)
+        self.assertNotIn("PRIVATE GIT STDERR", refused.stderr)
+        self.assertNotIn("fatal:", refused.stderr)
+        error = style_ledger.CheckCouldNotRun("unsupported ledger schema version 999")
+        with mock.patch.object(ledger, "_style_branch_tip", side_effect=error):
+            with self.assertRaises(style_ledger.CheckCouldNotRun) as refused_schema:
+                _ = ledger.ticket_merge("read-1")
+        self.assertIs(refused_schema.exception, error)
+
+    def test_git_boundary_repeats_and_invalid_states_make_zero_git_calls(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        rule = ledger.ticket_open("read")[0]["rules"][0]
+        with mock.patch.object(subprocess, "run", wraps=subprocess.run) as git:
+            ledger.ticket_add("read-1", "read", "read", "names", "crates/alpha", list(self.sources[:2]), [rule])
+            ledger.ticket_checkpoint("read-1", self.initial_tip)
+            self.assertEqual(ledger.ticket_base("read-1"), self.initial_tip)
+            for operation in (lambda: ledger.ticket_assign("read-1", "main"),
+                              lambda: ledger.ticket_yield("read-1", self.sources[0])):
+                with self.assertRaises(style_ledger.LedgerError):
+                    _ = operation()
+            git.assert_not_called()
+        _ = ledger.ticket_merge("read-1")
+        with mock.patch.object(subprocess, "run", wraps=subprocess.run) as git:
+            self.assertEqual(ledger.ticket_merge("read-1"), ())
+            self.assertIsNone(ledger.release_held_reservation("read-1"))
+            for operation in (lambda: ledger.ticket_drop("read-1"), lambda: ledger.check_ticket_pipeline("read-1")):
+                with self.assertRaises(style_ledger.LedgerError):
+                    _ = operation()
+            git.assert_not_called()
+
     def test_widen_records_each_path_with_its_reason_name_and_time(self) -> None:
         ledger, issue = self.widen_ticket()
         extra, more = "crates/alpha/src/extra.rs", "crates/alpha/src/more.rs"
@@ -344,7 +1108,9 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         _ = path.write_text(path.read_text() + "Additional rule requirement\n")
 
         self.assertEqual(self.states(rule_id), dict.fromkeys(self.sources, "stale"))
-        self.record(rule_id, self.sources[0], self.initial_tip, rule_blob=old_blob)
+        refused = self.cli("record", "--rule", rule_id, "--path", self.sources[0], "--commit", self.initial_tip,
+                           "--rule-blob", old_blob, "--verdict", "clean", "--ticket", "unit-1", "--worker", "test", success=False)
+        self.assertIn("rule body changed", refused.stderr)
         self.assertEqual(self.states(rule_id)[self.sources[0]], "stale")
         self.record(rule_id, self.sources[0], self.initial_tip)
         self.assertEqual(self.states(rule_id)[self.sources[0]], "current")
@@ -453,7 +1219,7 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         self.set_tip(self.initial_tip)
         _ = self.hold_finding(rule_id, 1, ticket="A")
         self.record(rule_id, self.sources[0], self.initial_tip, "held", ticket="A")
-        self.record(rule_id, self.sources[0], self.initial_tip, "clean", ticket="B")
+        self.record(rule_id, self.sources[0], self.initial_tip, "exception", ticket="B", detail="Reviewed exception")
         self.record(rule_id, self.sources[0], self.initial_tip, "held", ticket="A")
 
         row = next(line.split("\t") for line in self.cli("status").stdout.splitlines() if line.startswith(rule_id + "\t"))
@@ -1587,6 +2353,349 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         self.record(rule, self.sources[0], self.initial_tip, ticket="another-ticket")
         self.assertEqual(self.states(rule)[self.sources[0]], "current")
 
+    def checkpointed_read_transition(self) -> style_ledger.Ledger:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        self.add_ticket("read-1", [rule], unit="read")
+        ledger.ticket_assign("read-1", "main")
+        _ = ledger.ticket_base("read-1")
+        for path in self.sources[:2]:
+            self.record(rule, path, self.initial_tip, ticket="read-1")
+        ledger.ticket_checkpoint("read-1", self.initial_tip)
+        return ledger
+
+    def successor_after_style_fast_forward(self, *, import_docs: bool = True,
+                                           merge_predecessor: bool = True) -> tuple[style_ledger.Ledger, str]:
+        """An assigned beta successor inherits its alpha predecessor and optional imported style work."""
+        ledger = self.checkpointed_read_transition()
+        _ = self.git("branch", "style/main", self.initial_tip)
+        ledger.set_tip(self.initial_tip, "style/main")
+        if not merge_predecessor:
+            self.write(self.sources[0], "pub fn predecessor_work() {}\n")
+            checkpoint = self.commit("Checkpoint predecessor before its merge")
+            ledger.ticket_checkpoint("read-1", checkpoint)
+        rule = ledger.ticket_open("read")[0]["rules"][0]
+        ledger.ticket_add("read-2", "read", "read", "names", "crates/beta", [self.sources[2]], [rule])
+        ledger.ticket_assign("read-2", "main")
+        _ = ledger.ticket_base("read-2")
+        if merge_predecessor:
+            _ = ledger.ticket_merge("read-1")
+        style_tip = self.initial_tip
+        if import_docs:
+            self.write("docs/another-unit.md", "Another unit's merged notes.\n")
+            style_tip = self.commit("Other unit's style work arrives by fast-forward")
+            _ = self.git("branch", "-f", "style/main", style_tip)
+        return ledger, style_tip
+
+    def test_successor_gate_ignores_docs_imported_by_a_style_fast_forward(self) -> None:
+        ledger, _ = self.successor_after_style_fast_forward()
+        self.write(self.sources[2], "pub fn successor_work() {}\n")
+        _ = self.commit("Successor changes only its reserved source")
+        ledger.check_ticket_pipeline("read-2")
+        self.assertEqual(ledger.ticket_open("read")[0]["id"], "read-2")
+
+    def test_successor_own_commit_on_a_predecessor_path_is_refused(self) -> None:
+        ledger, _ = self.successor_after_style_fast_forward(import_docs=False, merge_predecessor=False)
+        self.write(self.sources[0], "pub fn overlapping_work() {}\n")
+        _ = self.commit("Successor changes a path its predecessor protects")
+        with self.assertRaisesRegex(style_ledger.LedgerError, "overlap:.*" + self.sources[0]):
+            ledger.check_ticket_pipeline("read-2")
+
+    def test_successor_disjoint_commit_excludes_its_unmerged_predecessors_commits(self) -> None:
+        ledger, _ = self.successor_after_style_fast_forward(import_docs=False, merge_predecessor=False)
+        self.write(self.sources[2], "pub fn successor_work() {}\n")
+        _ = self.commit("Successor builds on an unmerged predecessor with disjoint work")
+        ledger.check_ticket_pipeline("read-2")
+        self.assertEqual({ticket["state"] for ticket in ledger.ticket_open("read")}, {"checkpointed", "assigned"})
+
+    def test_set_tip_accepts_a_successor_that_imported_another_units_docs(self) -> None:
+        ledger, style_tip = self.successor_after_style_fast_forward()
+        ledger.set_tip(style_tip, "style/main")
+        self.assertEqual(ledger.synced_commit(), style_tip)
+
+    def test_transition_audit_checkpoint_missing_commit_names_ticket_and_verb(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        refused = self.cli("ticket", "checkpoint", "--id", "read-1", "--commit", "missing-commit", success=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("ticket read-1 checkpoint: git rev-parse failed", refused.stderr)
+        self.assertNotIn("fatal:", refused.stderr)
+        self.assertEqual(ledger.ticket_open("read")[0]["checkpoint"], self.initial_tip)
+        with mock.patch.object(style_ledger, "_git", side_effect=self.git_read_failure()):
+            with self.assertRaisesRegex(style_ledger.LedgerError, "ticket read-1 checkpoint: git rev-parse failed"):
+                ledger.ticket_checkpoint("read-1", "missing-commit")
+
+    def repaired_read_checkpoint(self) -> tuple[style_ledger.Ledger, str]:
+        ledger = self.checkpointed_read_transition()
+        self.write(self.sources[0], "pub fn value() -> u32 { 2 }\nmod a; mod b; mod c; mod other;\n")
+        repair = self.commit("Repair the checkpointed ticket")
+        _ = self.cli("ticket", "checkpoint", "--id", "read-1", "--commit", repair)
+        return ledger, repair
+
+    def test_recheckpoint_racing_merge_rechecks_repair_containment_before_writing(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        _ = self.git("branch", "style/main", self.initial_tip)
+        ledger.set_tip(self.initial_tip, "style/main")
+        self.write(self.sources[0], "pub fn value() -> u32 { 2 }\nmod a; mod b; mod c; mod other;\n")
+        repair = self.commit("Repair while the previous checkpoint merges")
+        style_tip = ledger._style_branch_tip  # pyright: ignore[reportPrivateUsage]
+        repaired = False
+
+        def repair_after_branch_read() -> tuple[str, str]:
+            nonlocal repaired
+            with closing(sqlite3.connect(ledger.database)) as connection:
+                # A second writer must be able to take the lock during the Git proof.
+                _ = connection.execute("BEGIN IMMEDIATE")
+            tip = style_tip()
+            if not repaired:
+                repaired = True
+                ledger.ticket_checkpoint("read-1", repair)
+            return tip
+
+        with mock.patch.object(ledger, "_style_branch_tip", side_effect=repair_after_branch_read):
+            with self.assertRaisesRegex(style_ledger.LedgerError,
+                                        f"read-1: checkpoint {repair[:7]} is not on refs/heads/style/main"):
+                _ = ledger.ticket_merge("read-1")
+        ticket, = ledger.ticket_open("read")
+        self.assertEqual((ticket["state"], ticket["checkpoint"]), ("checkpointed", repair))
+        _ = self.git("branch", "-f", "style/main", repair)
+        _ = ledger.ticket_merge("read-1")
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT state,checkpoint FROM tickets WHERE id='read-1'").fetchone(),
+                             ("merged", repair))
+
+    def test_recheckpoint_descendant_repair_moves_checkpoint_and_restamps(self) -> None:
+        ledger, repair = self.repaired_read_checkpoint()
+        self.assertEqual(ledger.ticket_open("read")[0]["checkpoint"], repair)
+        latest = ledger.latest_ticket_judgments("read-1")
+        self.assertEqual({(judgment.path, judgment.commit) for judgment in latest},
+                         {(path, repair) for path in self.sources[:2]})
+        ledger.set_tip(repair, "main")
+        self.assertEqual(self.states(self.rule("read"))[self.sources[0]], "current")
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            commits = cast(list[tuple[str, int]], connection.execute(
+                'SELECT "commit",COUNT(*) FROM judgments WHERE ticket=? GROUP BY "commit"',
+                ("read-1",)).fetchall())
+        self.assertEqual(dict(commits), {self.initial_tip: 2, repair: 2})
+
+    def test_recheckpoint_non_descendant_keeps_checkpoint_and_restamps(self) -> None:
+        ledger, repair = self.repaired_read_checkpoint()
+        _ = self.git("checkout", "-q", "-b", "other", self.initial_tip)
+        self.write(self.sources[0], "pub fn unrelated() {}\n")
+        unrelated = self.commit("An unrelated checkpoint")
+        before = self.ledger_contents(ledger)
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"read-1: checkpointed at {repair}"):
+            ledger.ticket_checkpoint("read-1", unrelated)
+        self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_recheckpoint_repair_must_be_on_the_assigned_branch(self) -> None:
+        ledger, repair = self.repaired_read_checkpoint()
+        _ = self.git("checkout", "-q", "-b", "other")
+        self.write("README.md", "Repair on another branch\n")
+        other = self.commit("A descendant outside the ticket branch")
+        before = self.ledger_contents(ledger)
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"checkpoint {other[:7]} is not on refs/heads/main"):
+            ledger.ticket_checkpoint("read-1", other)
+        self.assertEqual(self.ledger_contents(ledger), before)
+        self.assertEqual(ledger.ticket_open("read")[0]["checkpoint"], repair)
+        _ = self.git("branch", "-f", "main", other)
+        ledger.ticket_checkpoint("read-1", other)
+        self.assertEqual(ledger.ticket_open("read")[0]["checkpoint"], other)
+
+    def test_recheckpoint_merged_repair_refuses_a_later_descendant(self) -> None:
+        ledger, repair = self.repaired_read_checkpoint()
+        _ = ledger.ticket_merge("read-1")
+        self.write("README.md", "Too late for a repair\n")
+        later = self.commit("After merge")
+        before = self.ledger_contents(ledger)
+        with self.assertRaisesRegex(style_ledger.LedgerError, "cannot become checkpointed from merged"):
+            ledger.ticket_checkpoint("read-1", later)
+        self.assertEqual(self.ledger_contents(ledger), before)
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            stored = cast(tuple[str], connection.execute("SELECT checkpoint FROM tickets WHERE id='read-1'").fetchone())
+        self.assertEqual(stored, (repair,))
+
+    def test_recheckpoint_same_repair_is_an_exact_no_op_without_git_or_restamps(self) -> None:
+        ledger, repair = self.repaired_read_checkpoint()
+        before = self.ledger_contents(ledger)
+        with (mock.patch.object(subprocess, "run", side_effect=AssertionError("repeat reads Git")),
+              mock.patch.object(ledger, "checkpoint_restamps", side_effect=AssertionError("repeat restamps"))):
+            ledger.ticket_checkpoint("read-1", repair)
+        self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_recheckpoint_repair_preserves_adds_and_refuses_reservations(self) -> None:
+        ledger, repair = self.repaired_read_checkpoint()
+        ledger.ticket_checkpoint("read-1", repair, "held-run", "7")
+        self.write("README.md", "Another repair\n")
+        later = self.commit("Repair with the reservation still held")
+        before = self.ledger_contents(ledger)
+        with self.assertRaisesRegex(style_ledger.LedgerError, "checkpointed holding the reservation of phase 7 in held-run"):
+            ledger.ticket_checkpoint("read-1", later, "held-run", "8")
+        self.assertEqual(self.ledger_contents(ledger), before)
+        ledger.ticket_checkpoint("read-1", later)
+        self.assertEqual(self.ticket_row("read-1"), ("checkpointed", "held-run", "7"))
+        self.write("README.md", "Last repair\n")
+        last = self.commit("Repair naming the same reservation")
+        ledger.ticket_checkpoint("read-1", last, "held-run", "7")
+        self.assertEqual(ledger.ticket_open("read")[0]["checkpoint"], last)
+        self.assertEqual(self.ticket_row("read-1"), ("checkpointed", "held-run", "7"))
+
+    def test_transition_audit_exact_checkpoint_repeat_counts_zero_git_calls(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        with mock.patch.object(style_ledger, "_git", return_value=self.initial_tip) as git:
+            with mock.patch.object(subprocess, "run", wraps=subprocess.run) as process:
+                ledger.ticket_checkpoint("read-1", self.initial_tip)
+            self.assertEqual(process.call_count, 0)
+            self.assertEqual(git.call_count, 0)
+
+    def test_transition_audit_empty_first_checkpoint_is_not_an_exact_repeat(self) -> None:
+        ledger = self.ledger()
+        rule = self.rule("read")
+        self.add_ticket("read-1", [rule], unit="read")
+        ledger.ticket_assign("read-1", "main")
+        with mock.patch.object(style_ledger, "_git", side_effect=self.git_read_failure()) as git:
+            with self.assertRaisesRegex(style_ledger.LedgerError, "ticket read-1 checkpoint: git rev-parse failed"):
+                ledger.ticket_checkpoint("read-1", "")
+            self.assertEqual(git.call_args, mock.call(self.repo, "rev-parse", "--verify", "^{commit}"))
+        self.assertEqual(ledger.ticket_open("read")[0]["state"], "assigned")
+
+    def test_transition_audit_queued_proposal_gate_keeps_pipeline_validation(self) -> None:
+        ledger, _ = self.widen_ticket()
+        with (mock.patch.object(ledger, "_check_ticket_pipelines") as proof,
+              mock.patch.object(style_ledger, "_git") as git):
+            ledger.check_ticket_pipeline("names-1")
+            proof.assert_called_once_with("names")
+            git.assert_not_called()
+
+    def test_transition_audit_assignment_unit_state_precedes_branch_git(self) -> None:
+        ledger = self.ledger()
+        rule = self.rule("read")
+        self.add_ticket("read-1", [rule], unit="read")
+        self.add_ticket("read-2", [rule], unit="read")
+        ledger.ticket_assign("read-1", "main")
+        with mock.patch.object(style_ledger, "_git", side_effect=self.git_read_failure()) as git:
+            with self.assertRaisesRegex(style_ledger.LedgerError, "already has read-1 in state assigned"):
+                ledger.ticket_assign("read-2", "main")
+            git.assert_not_called()
+
+    def test_transition_audit_merge_predecessor_state_precedes_git(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        rule = ledger.ticket_open("read")[0]["rules"][0]
+        ledger.ticket_add("read-2", "read", "read", "names", "crates/beta", [self.sources[2]], [rule])
+        ledger.ticket_assign("read-2", "main")
+        self.record(rule, self.sources[2], self.initial_tip, ticket="read-2")
+        ledger.ticket_checkpoint("read-2", self.initial_tip)
+        with mock.patch.object(style_ledger, "_git", side_effect=self.git_read_failure()) as git:
+            with self.assertRaisesRegex(style_ledger.LedgerError, "waiting for predecessor read-1"):
+                _ = ledger.ticket_merge("read-2")
+            git.assert_not_called()
+
+    def test_transition_audit_state_refusals_and_other_exact_repeats_use_no_git(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        with mock.patch.object(style_ledger, "_git", return_value=self.initial_tip) as git:
+            self.assertEqual(ledger.ticket_base("read-1"), self.initial_tip)
+            with self.assertRaisesRegex(style_ledger.LedgerError, "cannot become assigned from checkpointed"):
+                ledger.ticket_assign("read-1", "main")
+            with self.assertRaisesRegex(style_ledger.LedgerError, "cannot yield from checkpointed"):
+                _ = ledger.ticket_yield("read-1", self.sources[0])
+            git.assert_not_called()
+        _ = ledger.ticket_merge("read-1")
+        with mock.patch.object(style_ledger, "_git", return_value=self.initial_tip) as git:
+            self.assertEqual(ledger.ticket_merge("read-1"), ())
+            with self.assertRaisesRegex(style_ledger.LedgerError, "cannot become dropped from merged"):
+                ledger.ticket_drop("read-1")
+            with self.assertRaisesRegex(style_ledger.LedgerError, "cannot resume or gate from merged"):
+                ledger.check_ticket_pipeline("read-1")
+            git.assert_not_called()
+        self.add_ticket("drop-1", [self.rule("drop")], unit="drop")
+        ledger.ticket_drop("drop-1")
+        with mock.patch.object(style_ledger, "_git", return_value=self.initial_tip) as git:
+            ledger.ticket_drop("drop-1")
+            with self.assertRaisesRegex(style_ledger.LedgerError, "cannot record start commit in state dropped"):
+                _ = ledger.ticket_base("drop-1")
+            git.assert_not_called()
+        self.add_ticket("assign-1", [self.rule("assign")], unit="assign")
+        ledger.ticket_assign("assign-1", "main")
+        with mock.patch.object(style_ledger, "_git", return_value=self.initial_tip) as git:
+            ledger.ticket_assign("assign-1", "main")
+            git.assert_not_called()
+
+    def test_transition_audit_widen_repeat_and_reason_refusal_precede_approval_and_git(self) -> None:
+        ledger, _ = self.widen_ticket()
+        path = "crates/alpha/src/extra.rs"
+        first = ledger.ticket_widen("names-1", (path,), "reference", "worker", lambda: frozenset())
+        approved = mock.Mock(return_value=frozenset())
+        with (mock.patch.object(style_ledger, "_git", return_value=self.initial_tip) as git,
+              mock.patch.object(ledger, "_check_ticket_pipelines") as proof):
+            self.assertEqual(ledger.ticket_widen("names-1", (path,), "reference", "worker", approved), first)
+            with self.assertRaisesRegex(style_ledger.LedgerError, "already widened for another reason"):
+                _ = ledger.ticket_widen("names-1", (path,), "different", "worker", approved)
+            approved.assert_not_called()
+            proof.assert_not_called()
+            git.assert_not_called()
+
+    def test_transition_audit_git_errors_name_base_and_merge_operations(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        self.add_ticket("other-1", [self.rule("other")], unit="other")
+        ledger.ticket_assign("other-1", "main")
+        with mock.patch.object(style_ledger, "_git", side_effect=self.git_read_failure()):
+            with self.assertRaisesRegex(style_ledger.LedgerError, "ticket other-1 base: git rev-parse failed"):
+                _ = ledger.ticket_base("other-1")
+            with self.assertRaisesRegex(style_ledger.LedgerError, "ticket read-1 merge: git rev-parse failed"):
+                _ = ledger.ticket_merge("read-1")
+        with (mock.patch.object(ledger, "_style_branch_tip", return_value=("main", self.initial_tip)),
+              mock.patch.object(ledger, "_is_ancestor", side_effect=self.git_read_failure())):
+            with self.assertRaisesRegex(style_ledger.LedgerError, "ticket read-1 merge: git rev-parse failed"):
+                _ = ledger.ticket_merge("read-1")
+
+    def test_transition_audit_reconcile_git_errors_name_the_ticket(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        with mock.patch.object(ledger, "_is_ancestor", side_effect=self.git_read_failure()):
+            with self.assertRaisesRegex(style_ledger.LedgerError, "ticket read-1 reconcile: git rev-parse failed"):
+                _ = ledger.reconcile("main", "main")
+
+    def test_ticket_transition_state_refusals_precede_git_and_footprint_work(self) -> None:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        self.add_ticket("read-1", [rule], unit="read")
+        with (self.subTest(state="queued"),
+              mock.patch.object(style_ledger, "_git", side_effect=style_ledger.LedgerError("git before state check"))):
+            with self.assertRaisesRegex(style_ledger.LedgerError, "cannot become checkpointed from queued"):
+                ledger.ticket_checkpoint("read-1", "missing-commit")
+        ledger.ticket_assign("read-1", "main")
+        for path in self.sources[:2]:
+            self.record(rule, path, self.initial_tip, ticket="read-1")
+        ledger.ticket_checkpoint("read-1", self.initial_tip)
+        for state in ("checkpointed", "merged"):
+            with self.subTest(state=state):
+                if state == "merged":
+                    _ = ledger.ticket_merge("read-1")
+                with (mock.patch.object(style_ledger, "_git", side_effect=style_ledger.LedgerError("git before state check")),
+                      mock.patch.object(ledger, "_check_ticket_pipelines", side_effect=AssertionError("footprint before state check"))):
+                    with self.assertRaisesRegex(style_ledger.LedgerError, f"cannot become assigned from {state}"):
+                        ledger.ticket_assign("read-1", "missing-branch")
+                    if state == "merged":
+                        with self.assertRaisesRegex(style_ledger.LedgerError, "cannot become checkpointed from merged"):
+                            ledger.ticket_checkpoint("read-1", "missing-commit")
+
+    def test_ticket_assignment_with_an_unreadable_successor_branch_fails_closed_with_context(self) -> None:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        self.add_ticket("read-1", [rule], unit="read")
+        self.add_ticket("read-2", [rule], unit="read")
+        ledger.ticket_assign("read-1", "main")
+        for path in self.sources[:2]:
+            self.record(rule, path, self.initial_tip, ticket="read-1")
+        ledger.ticket_checkpoint("read-1", self.initial_tip)
+        refused = self.cli("ticket", "assign", "--id", "read-2", "--branch", "missing-branch", success=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("ticket read-2 assign: git rev-parse failed", refused.stderr)
+        self.assertNotIn("fatal:", refused.stderr)
+        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets("read")], ["read-2"])
+        self.assertEqual([ticket["id"] for ticket in ledger.ticket_open("read")], ["read-1"])
+
     def test_ticket_resume_transitions_repeats_and_rejected_skips(self) -> None:
         rule_id = self.rule("read")
         _ = self.cli("set-tip", "--tip", self.initial_tip, "--style-branch", "main")
@@ -1773,14 +2882,16 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         new_blob = self.blob(rule_id)
         self.add_ticket("read-1", [rule_id])
 
-        self.record(rule_id, self.sources[0], self.initial_tip, rule_blob=old_blob, ticket="read-1")
+        refused_old = self.cli("record", "--rule", rule_id, "--path", self.sources[0], "--commit", self.initial_tip,
+                               "--rule-blob", old_blob, "--verdict", "clean", "--ticket", "read-1", "--worker", "test", success=False)
+        self.assertIn("rule body changed", refused_old.stderr)
         _ = self.cli(
             "record", "--rule", rule_id, "--path", self.sources[1], "--commit", self.initial_tip,
-            "--verdict", "clean", "--ticket", "read-1", "--worker", "test",
+            "--verdict", "clean", "--ticket", "read-1", "--worker", "test", success=False,
         )
 
-        self.assertEqual(self.states(rule_id)[self.sources[0]], "stale")
-        self.assertEqual(self.states(rule_id)[self.sources[1]], "stale")
+        self.assertEqual(self.states(rule_id)[self.sources[0]], "open")
+        self.assertEqual(self.states(rule_id)[self.sources[1]], "open")
         refused = self.cli(
             "record", "--rule", rule_id, "--path", self.sources[0], "--commit", self.initial_tip,
             "--rule-blob", new_blob, "--verdict", "clean", "--ticket", "read-1", "--worker", "test",
@@ -1788,7 +2899,7 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         )
         self.assertEqual(refused.returncode, 2)
         self.assertIn(rule_id, refused.stderr)
-        self.assertEqual(self.states(rule_id)[self.sources[0]], "stale")
+        self.assertEqual(self.states(rule_id)[self.sources[0]], "open")
         unpinned = self.cli(
             "record", "--rule", rule_id, "--path", self.sources[2], "--commit", self.initial_tip,
             "--verdict", "clean", "--ticket", "external", "--worker", "test", success=False,
@@ -2419,6 +3530,7 @@ class StyleLedgerTicketsTests(LedgerTestCase):
             _ = connection.execute("ALTER TABLE processed_tips DROP COLUMN reason")
             _ = connection.execute("DROP TABLE refill_results")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN built_at")
+            remove_generation_schema(connection)
             _ = connection.execute("UPDATE schema_version SET version=6")
             connection.commit()
         with style_ledger.open_ledger(self.repo) as migrated:
@@ -2479,7 +3591,8 @@ class StyleLedgerTicketsTests(LedgerTestCase):
                               "--family", "names", "--crate", "crates/alpha", "--files", json.dumps([self.sources[0]]),
                               "--rules", json.dumps([rule]), success=False)
         self.assertEqual(result.returncode, 2)
-        self.assertEqual(result.stderr.strip(), "style_ledger: pin hash unavailable")
+        self.assertIn("style_ledger: ticket read-1 add: git hash-object failed (exit 17)", result.stderr)
+        self.assertNotIn("pin hash unavailable", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
         self.assertEqual(self.ledger().queued_tickets("read"), ())
         with closing(sqlite3.connect(self.ledger().database)) as connection:

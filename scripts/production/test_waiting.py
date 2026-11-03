@@ -18,19 +18,26 @@ import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import cast, final, override
+from typing import TextIO, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scripts.lib.socket_test_support import short_socket_directory
 import add_unit
+import production_units
 import dailies_render
 import merge_checkpoint
+from scripts.production import production_doc, staff
+from scripts.shutdown.remote import local_machine
+from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
+from fake_showrunner import write_timer
 import update_registration
 import waiting
-from cli_fixture import invoke_cli
+from cli_fixture import invoke_cli, production_paths
 from fake_herdr import CommandResponse
 import fake_unit_host
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -102,6 +109,8 @@ class WaitingTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        staff_environment: dict[str, str] = {}
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", staff_environment))
         self.checkout = self.root / "checkout"
         self.alpha = self.root / "alpha"
         self.beta = self.root / "beta"
@@ -136,6 +145,7 @@ class WaitingTests(unittest.TestCase):
         }))
         self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(home),
+            "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
             "CODEX_HOME": str(home / "codex-fixture"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
@@ -147,12 +157,13 @@ class WaitingTests(unittest.TestCase):
         self.host_pids = {}
         fake_unit_host.write(os.environ, [
             fake_unit_host.HostedUnit(unit, f"w{index}:p1", {"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": unit})
-            for index, unit in enumerate((ALPHA, BETA, GAMMA), start=1)])
-        for index, unit in enumerate((ALPHA, BETA, GAMMA), start=1):
+            for index, unit in enumerate((ALPHA, BETA), start=1)])
+        for index, unit in enumerate((ALPHA, BETA), start=1):
             self.claude(unit, f"w{index}:p1")
         self.env = {**os.environ, "HOME": str(home), "WAITING_TEST_BOARD": str(self.board),
                     "WAITING_TEST_SENDS": str(self.sends),
                     "PATH": str(self.bin_path) + os.pathsep + os.environ.get("PATH", "")}
+        _ = self.enterContext(production_paths(self.env))
         self.board_ready()
         self.origin = self.root / "origin.git"
         _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
@@ -221,7 +232,7 @@ class WaitingTests(unittest.TestCase):
 
     def claude(self, name: str, pane: str) -> None:
         """Record a live Claude called `name` in the fixture pane."""
-        path = self.root / f"claude-{pane.removeprefix("w").split(":")[0]}.sock"
+        path = Path(self.enterContext(short_socket_directory())) / f"claude-{pane.removeprefix("w").split(":")[0]}.sock"
         if not path.exists():
             held = socket.socket(socket.AF_UNIX)
             held.bind(str(path))
@@ -231,7 +242,7 @@ class WaitingTests(unittest.TestCase):
         pid = self.host_pids[pane]
         fake_unit_host.place_process(os.environ, pid, pane)
         self.write(self.root / "sessions" / f"{pane.removeprefix("w").split(":")[0]}.json", json.dumps({
-            "pid": pid, "sessionId": f"id-{name}", "name": name, "messagingSocketPath": str(path),
+            "pid": pid, "sessionId": unit_membership("showrunner-example", (ALPHA, BETA, GAMMA)[int(pane[1:].split(":")[0]) - 1]).id, "name": name, "messagingSocketPath": str(path),
             "updatedAt": 1, "tmux": ""}))
 
     def production_doc(self) -> None:
@@ -251,7 +262,14 @@ class WaitingTests(unittest.TestCase):
             "", "## Production rules", "", "- Merge each phase and push the merge branch.", "",
         )))
 
+        owner = showrunner_relationship("showrunner-example")
+        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", self.doc))
+        _ = write_timer(self.root / "notifier", "example", owner.id, "", self.doc)
+        for unit in (ALPHA, BETA):
+            _ = unit_membership("showrunner-example", unit)
+
     def add_gamma(self) -> None:
+        _ = unit_membership("showrunner-example", GAMMA)
         content = self.doc.read_text(encoding="utf-8")
         row = f"| `{GAMMA}` | `docs/gamma.md` | `{self.root / 'gamma'}` | `gamma-branch` | — | — |\n"
         self.write(self.doc, content.replace("\n\n## Gates", f"\n{row}\n## Gates"))
@@ -291,9 +309,11 @@ class WaitingTests(unittest.TestCase):
 
 
     def test_named_unit_refuses_retired_row(self) -> None:
+        _ = staff.set_worktree(unit_membership("showrunner-example", ALPHA).id,
+                               staff.RemovedWorktree(local_machine(), self.alpha))
         content = self.doc.read_text(encoding="utf-8")
         self.write(self.doc, content.replace("`docs/alpha.md`", "(retired by the user)", 1))
-        production = add_unit.read_production(self.doc)
+        production = production_units.read_production(self.doc)
         with self.assertRaisesRegex(waiting.WaitingFailure, f"unknown unit {ALPHA}"):
             _ = waiting.named_unit(production, ALPHA)
 
@@ -310,7 +330,7 @@ class WaitingTests(unittest.TestCase):
         return path
 
     def producer_launch_line(self, moment: datetime, *, session: str = ALPHA) -> str:
-        production = add_unit.read_production(self.doc)
+        production = production_units.read_production(self.doc)
         producer_log = self.root / "launch-producer.log"
         _ = producer_log.unlink(missing_ok=True)
         request = add_unit.UnitLaunch(
@@ -332,7 +352,7 @@ class WaitingTests(unittest.TestCase):
 
     def producer_merge_line(self, moment: datetime, unit_tip: str, merge_tip: str,
                             phase: str = "1") -> str:
-        production = add_unit.read_production(self.doc)
+        production = production_units.read_production(self.doc)
         producer_log = self.root / "merge-producer.log"
         _ = producer_log.unlink(missing_ok=True)
         unit = merge_checkpoint.Unit(ALPHA, self.root / "alpha-plan.md", self.alpha,
@@ -340,7 +360,7 @@ class WaitingTests(unittest.TestCase):
         request = merge_checkpoint.MergeRequest(
             production._replace(log=producer_log), unit, phase, unit_tip, (),
             merge_checkpoint.ShrinkCommit(), merge_checkpoint.ValidateAndPush(),
-            merge_checkpoint.NoPromotion(), (), frozenset(), frozenset(), (unit,), (), self.root,
+            production_doc.NoPromotion(), (), frozenset(), frozenset(), (unit,), (), self.root,
             (), merge_checkpoint.NoReviewTrial(), "", False, "", "", 0, 0, "",
         )
         with redirect_stdout(io.StringIO()):
@@ -349,7 +369,7 @@ class WaitingTests(unittest.TestCase):
         return f"- {moment:%H:%M %Z}: {produced}"
 
     def producer_state_block(self, moment: datetime, phases: dict[str, str]) -> str:
-        production = add_unit.read_production(self.doc)
+        production = production_units.read_production(self.doc)
         judgments = tuple(update_registration.UnitJudgment(session, phase, "none")
                           for session, phase in phases.items())
         state = update_registration.ShowrunnerState(judgments, (), update_registration.KeepOutstanding())
@@ -538,7 +558,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         lines = [line for line in result.stdout.splitlines() if line.startswith("scratch-test:")]
         self.assertEqual(len(lines), 2, result.stdout)
         self.assertIn("ok — green", lines[0])
-        self.assertIn("failed — temporary worktree cleanup: cleanup refused by test wrapper", lines[1])
+        self.assertIn("failed — temporary worktree cleanup: stderr: cleanup refused by test wrapper", lines[1])
 
     def test_search_reports_other_unit_branch_and_uncommitted_worktree_sites(self) -> None:
         _ = self.commit(self.beta, "src/beta.py", "old_public_name()\n")
@@ -549,6 +569,49 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertIn("src/beta.py:1", result.stdout)
         self.assertIn("src/draft.py:1", result.stdout)
         self.assertIn(BETA, result.stdout)
+
+    def test_eta_request_is_retried_when_output_stops_before_the_seen_mark(self) -> None:
+        arguments = ("eta-request", ALPHA, "--phase", PHASE, "--state-dir", str(self.state))
+        expected = self.run_waiting(*arguments)
+        path = self.state / "eta_seen.json"
+        expected_state = path.read_bytes()
+        path.unlink()
+        real_print = print
+
+        def stop_request(*values: object, sep: str | None = None, end: str | None = "\n",
+                         file: TextIO | None = None, flush: bool = False) -> None:
+            if values and str(values[0]).startswith("request /unit:eta:"):
+                raise RuntimeError("output stopped")
+            real_print(*values, sep=sep, end=end, file=file, flush=flush)
+
+        with mock.patch("builtins.print", side_effect=stop_request), self.assertRaises(RuntimeError):
+            _ = self.run_waiting(*arguments)
+        retried = self.run_waiting(*arguments)
+        self.assertEqual(retried.stdout, expected.stdout)
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual(path.read_bytes(), expected_state)
+
+    def test_agenda_retries_items_when_output_stops_before_the_seen_mark(self) -> None:
+        start = datetime.now(ZoneInfo("America/Los_Angeles")) - timedelta(hours=9)
+        self.agenda_log(start, PHASE)
+        expected = self.run_waiting("agenda", "--state-dir", str(self.state))
+        path = self.state / "agenda_seen.json"
+        expected_state = path.read_bytes()
+        path.unlink()
+        real_print = print
+
+        def stop_item(*values: object, sep: str | None = None, end: str | None = "\n",
+                         file: TextIO | None = None, flush: bool = False) -> None:
+            if values and str(values[0]).startswith(f"agenda: ok — {ALPHA}|"):
+                raise RuntimeError("output stopped")
+            real_print(*values, sep=sep, end=end, file=file, flush=flush)
+
+        with mock.patch("builtins.print", side_effect=stop_item), self.assertRaises(RuntimeError):
+            _ = self.run_waiting("agenda", "--state-dir", str(self.state))
+        retried = self.run_waiting("agenda", "--state-dir", str(self.state))
+        self.assertEqual(retried.stdout, expected.stdout)
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual(path.read_bytes(), expected_state)
 
     def test_eta_request_records_requested_alone_once_per_phase(self) -> None:
         seen_path = self.state / "eta_seen.json"
@@ -587,7 +650,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
     def test_parallel_eta_requests_for_different_phases_keep_every_record(self) -> None:
         phases = [f"Phase {number}: parallel record" for number in range(1, 13)]
         processes = [self.eta_request_process(phase) for phase in phases]
-        outputs = [process.communicate(timeout=300) for process in processes]
+        outputs = [process.communicate(timeout=TEST_HANG_GUARD_SECS) for process in processes]
         for process, (stdout, stderr) in zip(processes, outputs):
             self.assertEqual(process.returncode, 0, stdout + stderr)
         seen = cast(dict[str, object], json.loads((self.state / "eta_seen.json").read_text()))
@@ -596,7 +659,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
 
     def test_parallel_eta_requests_for_one_phase_print_once(self) -> None:
         processes = [self.eta_request_process(PHASE) for _ in range(12)]
-        outputs = [process.communicate(timeout=300) for process in processes]
+        outputs = [process.communicate(timeout=TEST_HANG_GUARD_SECS) for process in processes]
         for process, (stdout, stderr) in zip(processes, outputs):
             self.assertEqual(process.returncode, 0, stdout + stderr)
         self.assertEqual(sum(stdout.count(f"request /unit:eta: {ALPHA}")
@@ -642,15 +705,15 @@ runpy.run_path(sys.argv[0], run_name='__main__')
                     readable, _, _ = select.select([read_ready], [], [], 300)
                     self.assertEqual(readable, [read_ready], "child never reached the held lock")
                     if os.read(read_ready, 7) != b"blocked":
-                        stdout, stderr = process.communicate(timeout=300)
+                        stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                         self.fail("child exited before observing the state lock: " + stdout + stderr)
                     self.assertIsNone(process.poll())
                     fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-                    stdout, stderr = process.communicate(timeout=300)
+                    stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 finally:
                     if process.poll() is None:
                         process.kill()
-                    _ = process.communicate(timeout=300)
+                    _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         finally:
             os.close(read_ready)
             if write_ready != -1:
@@ -683,6 +746,8 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertNotIn(f"{BETA} on {ALPHA}: open", output.getvalue())
 
     def test_waits_hide_retired_waiting_unit_but_keep_live_wait_on_it(self) -> None:
+        _ = staff.set_worktree(unit_membership("showrunner-example", ALPHA).id,
+                               staff.RemovedWorktree(local_machine(), self.alpha))
         content = self.doc.read_text(encoding="utf-8")
         self.write(self.doc, content.replace("`docs/alpha.md`", "retired after completion", 1))
         now = datetime.now(ZoneInfo("America/Los_Angeles"))
@@ -873,7 +938,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
 
         output = io.StringIO()
         with mock.patch.object(waiting, "datetime", AgendaClock), redirect_stdout(output):
-            waiting.agenda(add_unit.read_production(self.doc), self.state)
+            waiting.agenda(production_units.read_production(self.doc), self.state)
         self.assertIn("agenda: ok — 0 new items", output.getvalue())
         self.assertFalse((self.state / "agenda_seen.json").exists())
 
@@ -904,7 +969,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         output = io.StringIO()
         clock = mock.Mock(wraps=datetime, now=mock.Mock(return_value=now))
         with mock.patch.dict(os.environ, self.env), mock.patch.object(waiting, "datetime", clock), redirect_stdout(output):
-            waiting.waits(add_unit.read_production(self.doc))
+            waiting.waits(production_units.read_production(self.doc))
         found = re.search(r"open (\d+) minutes", output.getvalue())
         self.assertIsNotNone(found, output.getvalue())
         age = int(found.group(1)) if found else 0

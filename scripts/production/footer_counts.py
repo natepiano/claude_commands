@@ -2,8 +2,8 @@
 
 The status line and the dailies report's own footer show it; no reply carries it (user,
 2026-10-18). Each count is the production's own: the showrunners above and below it count their
-own (user, 2026-10-27). Changes are the rows still to review that are the production's
-(change_review.scope_rows), proposals the issues and plan-backlog lines that /next proposal
+own (user, 2026-10-27). Changes are the production's open rows from its current and earlier
+lists (change_review.scope_rows), proposals the issues and plan-backlog lines that /next proposal
 lists for review (proposals_table.waiting_entries), and efficiency the proposed or deferred
 lines in its Efficiency ledger. Accepted plan-backlog lines are work in progress and do not count.
 """
@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import change_review
 import proposals_folder
 import proposals_table
 from production_units import Refusal, production_field
+
+if TYPE_CHECKING:
+    from update_registration import QuestionStaff
 
 EFFICIENCY_LEDGER_FIELD = "Efficiency ledger"
 COUNTS_HEAD = "For you: "
@@ -83,16 +86,15 @@ def read_counts(doc: Path, *, questions: int = 0) -> FooterCounts:
         return FooterCounts(questions=questions)
 
 
-def sources(doc: Path) -> list[Path]:
-    """The files the counts read, so a copy of them can tell when it is out of date.
+def sources(doc: Path, *, identities: QuestionStaff | None = None) -> list[Path]:
+    """Return the files that affect the counts and their containing folders.
 
-    A proposal closes in place, so each open one is named beside its folder, which a new one
-    changes.
+    Watch each open record because closing it changes the file.
     """
     try:
-        listed: Path | None = change_review.scope_list(doc)
+        listed = [item.path for item in change_review.scope_lists(change_review.scope_list(doc), doc)]
     except (change_review.ChangeReviewError, OSError):
-        listed = None
+        listed = []
     folder = proposals_folder.issues_folder(doc)
     try:
         queue = proposals_folder.ledger(doc)
@@ -100,9 +102,23 @@ def sources(doc: Path) -> list[Path]:
     except OSError:
         queue = None
         efficiency_queue = None
-    found = [doc, *(path for path in (listed, folder, queue, efficiency_queue) if path is not None)]
+    found = [doc, *listed, *(path for path in (folder, queue, efficiency_queue) if path is not None)]
+    if folder is not None:
+        try:
+            found.extend(issue.path for issue in proposals_folder.open_proposals(doc))
+        except OSError:
+            pass
+    from update_registration import QuestionFolder, QuestionStaff, question_folder, question_records_for_document
+
     try:
-        found.extend(issue.path for issue in proposals_folder.open_proposals(doc))
+        if identities is None:
+            identities = QuestionStaff.read()
+        questions = question_folder(doc, identities)
+        if isinstance(questions, QuestionFolder):
+            if questions.path not in found:
+                found.append(questions.path)
+            found.extend(record.path for record in question_records_for_document(doc, identities)
+                         if record.status == "open")
     except OSError:
         pass
     return found

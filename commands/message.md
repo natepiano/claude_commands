@@ -1,5 +1,5 @@
 ---
-description: Rules every message between Claude sessions or Codex workers follows — first line, addressing, relaying, permission — and how scripts send one (send.py).
+description: Read agent message rules and delivery.
 ---
 
 # Message

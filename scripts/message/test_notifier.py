@@ -13,13 +13,14 @@ import time
 import unittest
 from datetime import datetime
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+from scripts.lib.process_group import send_process_group
+from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("notifier.sh")
 NOW = 1_700_000_123
@@ -64,9 +65,53 @@ class NotifierTests(unittest.TestCase):
         launcher.chmod(0o755)
         self.launcher_dir = launcher_dir
         self.addCleanup(self.live_socket.close)
-        self.socket_path = self.root / "live.sock"
+        self.socket_path = Path(self.enterContext(short_socket_directory())) / "live.sock"
         self.live_socket.bind(str(self.socket_path))
         self.record("sid-1")
+
+    def test_fixed_timer_delivers_to_current_session_after_clear_without_rewriting_its_target(self) -> None:
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_runtime_id
+
+        with mock.patch.dict(os.environ, {"STAFF_FILE": str(self.root / "staff.json")}):
+            owner = staff.ensure("showrunner", name="demo", runtime_id=fixture_runtime_id("timer-first"))
+            current = staff.native_id(fixture_runtime_id("timer-after-clear"))
+            _ = staff.update_current_session(owner.current_session, current)
+            self.record(current)
+            _ = self.successful("new", "example", "--to", "session:" + owner.id,
+                                "--every", "2", "--command", "the scheduled prompt")
+            configuration = self.state_dir / "example" / "conf"
+            before = configuration.read_bytes(), configuration.stat().st_mtime_ns
+            _ = self.successful("fire", "example")
+            arguments = self.send_args.read_text().splitlines()
+            self.assertEqual(arguments[arguments.index("--to") + 1], "uds:" + str(self.socket_path))
+            self.assertEqual(self.conf()["TARGET"], "session:" + owner.id)
+            self.assertEqual((configuration.read_bytes(), configuration.stat().st_mtime_ns), before)
+            retained = staff.by_id(owner.id)
+            assert retained is not None
+            self.assertEqual(retained.current_session, current)
+
+    def test_tick_drains_repeat_notices_only_from_the_configured_local_state(self) -> None:
+        pending = self.root / "repeat-outbox"
+        pending.mkdir()
+        launched = self.root / "drain.argv"
+        launcher = self.launcher_dir / "systemd-run"
+        _ = launcher.write_text("#!/usr/bin/env python3\nimport json,sys\nfrom pathlib import Path\n"
+            + f"Path({str(launched)!r}).write_text(json.dumps(sys.argv[1:]))\n")
+        config = self.root / "selected.conf"
+        with mock.patch.dict(os.environ, {"NOTIFIER_REPEAT_STATE": str(pending),
+                                         "SEND_REPEAT_CONFIG": str(config), "XDG_STATE_HOME": str(self.root / "xdg")}):
+            _ = self.successful("tick")
+            _ = self.successful("tick")
+        arguments = cast(list[str], json.loads(launched.read_text()))
+        self.assertIn("--no-block", arguments)
+        self.assertIn("SEND_REPEAT_STATE=" + str(pending), arguments)
+        self.assertIn("SEND_REPEAT_CONFIG=" + str(config), arguments)
+        self.assertIn("XDG_STATE_HOME=" + str(self.root / "xdg"), arguments)
+        self.assertEqual(arguments[-2:], [str(self.fake_send), "repeat-notices"])
+        self.assertIn("notices", arguments)
+        self.assertTrue(any(value.endswith("/repeat_guard.py") for value in arguments))
+        self.assertFalse(self.send_args.exists(), "the tick ran the drain synchronously")
 
     def record(self, session_id: str, path: Path | None = None, updated: int = 1) -> None:
         record = {
@@ -401,7 +446,7 @@ class NotifierTests(unittest.TestCase):
         self.assertIn(" | skip hold", self.lines()[-1])
         other = socket.socket(socket.AF_UNIX)
         self.addCleanup(other.close)
-        new_path = self.root / "replacement.sock"
+        new_path = Path(self.enterContext(short_socket_directory())) / "replacement.sock"
         other.bind(str(new_path))
         self.record("sid-1", new_path, updated=2)
         _ = self.successful("tick", now=MINUTE + 360)
@@ -502,7 +547,7 @@ class NotifierTests(unittest.TestCase):
             self.assertFalse(finished.exists())
         finally:
             try:
-                os.killpg(tick.pid, signal.SIGKILL)
+                send_process_group(tick.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
         self.assertEqual(self.wait_for_text(finished, "finished"), "finished")
@@ -562,7 +607,7 @@ elif action == "remove":
             pid_file = launch_state / "pid"
             if pid_file.exists():
                 try:
-                    os.killpg(int(pid_file.read_text()), signal.SIGKILL)
+                    send_process_group(int(pid_file.read_text()), signal.SIGKILL)
                 except ProcessLookupError:
                     pass
 

@@ -72,9 +72,16 @@ fi
 
 echo ""
 echo "Deleting branch: $BRANCH_NAME"
-if ! git branch -D "$BRANCH_NAME"; then
-    echo "Error: Failed to delete branch"
-    exit 1
+if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
+    if ! git branch -D "$BRANCH_NAME"; then
+        echo "Error: Failed to delete branch"
+        exit 1
+    fi
+else
+    BRANCH_LOOKUP_STATUS=$?
+    if [[ "$BRANCH_LOOKUP_STATUS" -ne 1 ]]; then
+        exit "$BRANCH_LOOKUP_STATUS"
+    fi
 fi
 echo "Branch deleted."
 

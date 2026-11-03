@@ -578,6 +578,25 @@ def _find_record(identifier: str) -> BackfillSourceRecord:
     raise InventoryError(f"unknown source record {identifier}")
 
 
+def _run_release(project: str, worker: str) -> int:
+    """Return a stopped worker's undisposed records to the pool; repeats are harmless."""
+    if not worker.strip():
+        raise InventoryError("--worker needs a nonempty worker")
+    with locked():
+        records = _read_ledger(project)
+        released: list[str] = []
+        for record in records:
+            claim = record["claim"]
+            if record["outcome"]["state"] == "undisposed" and claim["state"] == "claimed" and claim["worker"] == worker:
+                record["claim"] = {"state": "unclaimed"}
+                released.append(record["id"])
+        if released:
+            _write_ledger(project, records)
+    for identifier in released:
+        print(identifier)
+    return 0
+
+
 def _run_show(identifier: str) -> int:
     with locked():
         record = _find_record(identifier)
@@ -686,6 +705,9 @@ def _parser() -> InventoryArgumentParser:
     _ = next_parser.add_argument("--path", action="append", nargs="+", default=[])
     _ = next_parser.add_argument("--claim")
     _ = next_parser.add_argument("--limit", type=int, default=25)
+    release = commands.add_parser("release")
+    _ = release.add_argument("--project", required=True, choices=tuple(PROJECTS))
+    _ = release.add_argument("--worker", required=True)
     show = commands.add_parser("show")
     _ = show.add_argument("id")
     mark = commands.add_parser("mark")
@@ -711,6 +733,8 @@ def main(argv: list[str], sources: SourceTable = SOURCES) -> int:
         if command == "next":
             arguments.path = [prefix for group in cast(list[list[str]], arguments.path) for prefix in group]
             return _run_next(arguments)
+        if command == "release":
+            return _run_release(cast(str, arguments.project), cast(str, arguments.worker))
         if command == "show":
             return _run_show(cast(str, arguments.id))
         if command == "mark":

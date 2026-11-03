@@ -167,6 +167,12 @@ def reviewed_summary_events() -> list[dict[str, object]]:
 
 @final
 class RepairRoundTests(unittest.TestCase):
+    def test_rerun_finding_assigns_repair_to_code_review(self) -> None:
+        events = ledger_events(lens="rerun") + pass_events(BASE + 10, BASE + 20, name="rerun-repair")
+        repairs = rounds.phase_rounds(events)
+        self.assertEqual([(repair["cause"], repair["covered"], repair["fix_seconds"]) for repair in repairs],
+                         [("review-code", ["F1"], 10)])
+
     def test_restarted_fix_number_does_not_inherit_an_earlier_batch(self) -> None:
         events = ledger_events(lens="ux")
         events += pass_events(BASE + 10, BASE + 20, name="original")

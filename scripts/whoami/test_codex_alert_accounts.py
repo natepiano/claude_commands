@@ -16,17 +16,19 @@ from pathlib import Path
 from typing import Literal, cast, override
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.test_agents_registry import registry_text, write_registry
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import note_file
+from scripts.whoami import note_file
 import quota_alert
-import agent_accounts as sibling_agent_accounts
 from scripts.whoami import agent_accounts
-from agent_accounts import CodexHomeSource, Quota, Report
+from scripts.whoami.agent_accounts import CodexHomeSource, Quota, Report
 from scripts.accounts import accounts, moves, next_moves, refusals, role_map
 from scripts.lib import agents_registry
 from scripts.production import showrunners
-import usage_store
+from scripts.whoami import usage_store
 from push_texts import RenderedPush, catalog, render_entry
 from user_action import ActionRequired
 from test_quota_alert import REGISTRY
@@ -35,14 +37,13 @@ CURRENT_READING_AGE = timedelta()
 
 
 def registry_view() -> str:
-    """The registry as the alert reads it: the defaults with the overlay its edits write."""
+    """Read the shared registry containing the alert's edits."""
     return agents_registry.registry_text(quota_alert.REGISTRY)
 
 
 def reset_registry(text: str) -> None:
-    """Make `text` the whole registry: the defaults, and no overlay over them."""
-    _ = quota_alert.REGISTRY.write_text(text)
-    agents_registry.overlay_path(quota_alert.REGISTRY).unlink(missing_ok=True)
+    """Replace the shared test registry with `text` through the fixture writer."""
+    _ = write_registry(quota_alert.REGISTRY, base_text=text)
 
 
 class CodexAccountAlertTests(unittest.TestCase):
@@ -74,7 +75,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         _ = config.write_text(json.dumps({"threshold_percent": 1, "repeat_minutes": 30,
             "stall_minutes": 5, "faults_to": "director", "always": ["director"]}))
         registry = self.root / "agents.conf"
-        _ = registry.write_text(REGISTRY)
+        _ = write_registry(registry, base_text=REGISTRY)
         _ = self.enterContext(patch.object(quota_alert, "CONFIG", config))
         _ = self.enterContext(patch.object(quota_alert, "STATE", self.root / "alerts.json"))
         _ = self.enterContext(patch.object(quota_alert, "REGISTRY", registry))
@@ -1277,7 +1278,7 @@ class CodexAccountAlertTests(unittest.TestCase):
     def test_missing_and_old_fallback_records_decode_named_states_and_recover(self) -> None:
         with quota_alert.state_file() as state:
             self.assertIsInstance(state["fallback"], quota_alert.NoCodexQuotaFallback)
-        reset_registry(REGISTRY.replace("direct=codex", "direct=claude"))
+        reset_registry(registry_text({"assignments": {"direct": "claude"}}, base_text=REGISTRY))
         _ = quota_alert.STATE.write_text(json.dumps({"episodes": {}, "switch": {
             "at": self.now.isoformat(), "moved": ["direct"],
         }}))
@@ -1387,14 +1388,18 @@ class CodexAccountAlertTests(unittest.TestCase):
         with patch.object(quota_alert, "edit_registry", return_value="editor refused") as edit:
             _ = quota_alert.alert([self.note(1, "active", 90)], self.now, codex_readings=funded)
             count = edit.call_count
+            self.assertEqual(count, 2)
             messages = len(self.sent)
             with quota_alert.state_file() as state:
                 unseen = list(state.get("unseen", []))
             _ = quota_alert.alert([self.note(1, "active", 90)], self.now, codex_readings=funded)
-            self.assertEqual(edit.call_count, count)
+            self.assertEqual(edit.call_count, count * 2)
             self.assertEqual(len(self.sent), messages)
         with quota_alert.state_file() as state:
-            self.assertIsInstance(state["fallback"], quota_alert.NoCodexQuotaFallback)
+            fallback = state["fallback"]
+            self.assertIsInstance(fallback, quota_alert.AccountCodexQuotaFallback)
+            assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
+            self.assertEqual(fallback.moved, ("direct", "module_review"))
             self.assertEqual(state.get("unseen"), unseen)
 
     def test_unknown_refusal_logs_without_telling_any_session(self) -> None:
@@ -1471,9 +1476,13 @@ class CodexAccountAlertTests(unittest.TestCase):
                 self.assertTrue(any(attempted_failure in line for line in log), log)
         self.assertIn("direct=codex", registry_view())
 
-    def test_account_import_forms_share_module_and_identity_class(self) -> None:
-        self.assertIs(sibling_agent_accounts, agent_accounts)
-        self.assertIs(sibling_agent_accounts.KnownCodexAccount, agent_accounts.KnownCodexAccount)
+    def test_consumers_share_the_one_account_module(self) -> None:
+        for consumer in (quota_alert, accounts):
+            with self.subTest(consumer=consumer.__name__):
+                bound_accounts = cast(object, getattr(consumer, "agent_accounts"))
+                self.assertIs(bound_accounts, agent_accounts)
+                self.assertIs(cast(object, getattr(bound_accounts, "KnownCodexAccount")),
+                              agent_accounts.KnownCodexAccount)
 
     def test_account_identity_reads_leave_the_import_path_unchanged(self) -> None:
         a = self.account(1)

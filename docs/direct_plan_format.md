@@ -69,7 +69,7 @@ to rediscover after a context compaction lives in the doc.
   otherwise the project's exact test command>
 - **Lint:** <for Rust always `bash ~/.claude/scripts/direct/verify.sh lint <pkg>`;
   never raw cargo commands. <PhaseChecks/> defines scope and the phase's
-  style review in the unit director's main review; workers never load the guide>
+  style review under <ReviewPromptContract/>>
 - **Invariants:** <project-wide rules every phase must preserve; omit if none>
 
 ## Phases
@@ -116,6 +116,13 @@ This is the meat — do not paraphrase a resolved design down to a summary.>
      without `opens as` opens in its own name. A `test` worker with no test lane
      reads `opens as impl`. Writers hold disjoint files; every hub file has
      exactly one owner. Rule 7. -->
+
+**State:** <optional: lasting state this phase writes, or `none` — records,
+marks, locks, claims, state files, file moves or deletes, or a list of steps
+where one step can fail>
+<!-- Accepted with or without this field. Naming lasting state arms the rerun
+     review lens. `none` and an absent field do not arm it; /unit:direct always
+     checks the phase diff too, so neither can suppress a detected write. -->
 
 **Constraints from prior phases:** <concrete facts a worker would otherwise
 re-derive — what earlier phases built, decisions that bind this phase. Empty for

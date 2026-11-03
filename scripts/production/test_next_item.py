@@ -14,11 +14,22 @@ from zoneinfo import ZoneInfo
 from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 
+
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import change_review
+import footer_counts
 import next_item
-from add_unit import Production
+from production_units import Production
 import proposals_folder
-import showrunners
+from scripts.production import showrunners
+import showrunner_tree
+from scripts.production import staff
+from scripts.production.staff_test_support import (
+    fixture_member, isolated_source_readers, isolated_staff_file, source_environment, unit_membership,
+)
 from change_review import Visible
 from next_item import NextError, Queue
 
@@ -56,6 +67,13 @@ def run(*arguments: str) -> tuple[int, str, str]:
     return code, out.getvalue(), err.getvalue()
 
 
+def review_show(doc: Path) -> tuple[int, str, str]:
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = change_review.main(["show", "--production", str(doc)])
+    return code, out.getvalue(), err.getvalue()
+
+
 @final
 class NextItemTests(unittest.TestCase):
     root: Path = Path()
@@ -66,10 +84,15 @@ class NextItemTests(unittest.TestCase):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.root = Path(folder.name)
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, source_environment(self.root / "sources"))))
+        _ = self.enterContext(isolated_source_readers())
+        _ = fixture_member("showrunner", name="fixture")
         with contextlib.ExitStack() as stack:
             _ = cast(object, stack.enter_context(mock.patch.dict(
                 os.environ, {"NEXT_STATE_DIR": str(self.root / "next"), "NIGHTLY_REVIEW_NOTE": str(self.root / "note.md")})))
             _ = cast(object, stack.enter_context(mock.patch.object(candidates, "ROOT", self.root)))
+            _ = stack.enter_context(mock.patch.object(change_review, "LISTS", self.root / "change-review"))
             self.addCleanup(stack.pop_all().close)
         self.queues = {
             "change": Queue("change-natedev", [Entry("C1", "C1 Old change", since=at(1)),
@@ -136,7 +159,41 @@ class NextItemTests(unittest.TestCase):
             self.assertEqual(run("show", "--kind", "question")[1], "question\ndemo: Newest question\n")
             self.assertEqual(run("show", "--kind", "question", "--order", "oldest")[1], "question\ndemo: Newest question\n")
 
+    def test_move_to_end_uses_the_given_key_instead_of_the_pinned_item(self) -> None:
+        queue = self.queues["change"]
+        urgency.pin(queue.name, "C2")
+        with self.patched():
+            self.assertEqual(next_item.move_to_end("change", PRODUCTION, key="C1"),
+                             "change: moved C1 to the end")
+            self.assertEqual([entry.key for entry in urgency.queue_order(queue.entries, queue.name)], ["C2", "C1"])
+            self.assertEqual(set(urgency.ended(queue.name)), {"C1"})
+            self.assertEqual(urgency.pinned(queue.name), "C2")
+
+    def test_move_to_end_refuses_a_key_outside_the_queue_without_moving_the_pin(self) -> None:
+        queue = self.queues["change"]
+        urgency.pin(queue.name, "C1")
+        with self.patched(), self.assertRaisesRegex(NextError, "C999"):
+            _ = next_item.move_to_end("change", PRODUCTION, key="C999")
+        self.assertEqual(urgency.pinned(queue.name), "C1")
+        self.assertEqual(urgency.ended(queue.name), {})
+
+    def test_prepared_changes_keep_the_queue_order_and_move_without_reading_the_lists_again(self) -> None:
+        prepared = change_review.ChangeQueue("change-demo", change_review.row_entries([
+            {"#": "C1", "Change": "First", "Merged": "2026-10-01"},
+            {"#": "C2", "Change": "Second", "Merged": "2026-10-02"},
+        ]))
+        with mock.patch.object(change_review, "change_queue", side_effect=AssertionError("list read")), \
+                mock.patch.object(next_item, "read_queue", side_effect=AssertionError("queue read")):
+            queue = next_item.change_queue(PRODUCTION, prepared=prepared)
+            self.assertEqual([entry.item for entry in queue.entries], [
+                "C1 First\n  How to check: \n  Merged: 2026-10-01", "C2 Second\n  How to check: \n  Merged: 2026-10-02"])
+            self.assertEqual(next_item.move_to_end("change", PRODUCTION, key="C1", prepared=prepared),
+                             "change: moved C1 to the end")
+        self.assertEqual([entry.key for entry in urgency.queue_order(queue.entries, queue.name)], ["C2", "C1"])
+
     def test_the_efficiency_and_change_lists_read_their_real_files(self) -> None:
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = unit_membership("demo", "fixture-unit")
         _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
         doc = self.root / "docs" / "plans" / "demo-production.md"
         doc.parent.mkdir(parents=True)
@@ -176,6 +233,12 @@ class NextItemTests(unittest.TestCase):
             _ = (self.root / f"{slug}.md").write_text(f"- 2026-10-12 rust/{slug}: {slug}-item gain — proposed\n")
             _ = doc.write_text(f"# {slug}\n\n- **Efficiency ledger:** {self.root / f'{slug}.md'}\n"
                                + f"- **Proposals:** {issues_folder}\n")
+            parent_name = {"kid": "top", "grand": "kid"}.get(slug)
+            parent = next((row.id for row in staff.find(kind="showrunner") if row.name == parent_name), None)
+            owner = fixture_member("showrunner", name=slug, parent=parent, doc=staff.LiveDoc("natedev", doc))
+            timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{slug}"
+            timer.mkdir(parents=True)
+            _ = (timer / "conf").write_text(f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {doc}\n")
             _ = (issues_folder / f"{slug}-item.md").write_text(
                 f"---\nstatus: open\ntags: [issue, proposal]\nproposed_by: {slug}\ndate_created: 2026-10-01\n---\n")
             _ = (outstanding / f"{slug}.json").write_text(f'[{{"since": "2026-10-06T09:00", "text": "{slug}-item"}}]')
@@ -208,12 +271,13 @@ class NextItemTests(unittest.TestCase):
         def root_of(slug: str) -> str:
             return "top" if slug in tree["top"] else slug
 
-        def descendants_of(slug: str) -> list[str]:
+        def descendants_of(slug: str, *, record: staff.StaffSnapshot | None = None) -> list[str]:
+            del record
             return tree[slug][1:]
 
         with mock.patch.object(proposals_folder, "owner_docs", owner_docs), \
-                mock.patch.object(showrunners, "root_of", root_of), \
-                mock.patch.object(showrunners, "descendants_of", descendants_of), \
+                mock.patch.object(showrunner_tree, "root_of", root_of), \
+                mock.patch.object(showrunner_tree, "descendants_of", descendants_of), \
                 mock.patch.object(showrunners, "timer_docs", return_value=docs), \
                 mock.patch.object(change_review, "production_list", the_list), \
                 mock.patch.object(next_item, "read_production", production), \
@@ -246,11 +310,206 @@ class NextItemTests(unittest.TestCase):
             return path
 
         with mock.patch.object(change_review, "production_list", the_list), \
-                mock.patch.object(showrunners, "root_of", return_value="top"), \
+                mock.patch.object(showrunner_tree, "root_of", return_value="top"), \
                 mock.patch.object(showrunners, "timer_docs", return_value={"top": top, "kid": kid}), \
                 mock.patch.object(proposals_folder, "owner_docs", return_value=[kid]):
             self.assertEqual([entry.item.splitlines()[0] for entry in next_item.change_queue(kid).entries],
                              ["C1 kid change"])
+
+    def attached_changes(self) -> dict[str, Path]:
+        docs = {slug: self.root / f"{slug}-production.md" for slug in ("top", "kid", "grand")}
+        for slug, doc in docs.items():
+            _ = doc.write_text(f"# {slug}\n")
+        folder = self.root / "change-review"
+        folder.mkdir()
+        header = "## To review\n\n| # | Change | Merged | How to check | Production | Urgency |\n| --- | --- | --- | --- | --- | --- |\n"
+        _ = (folder / "change-review - top.md").write_text(header +
+            "| C1 | Root-only change | 2026-10-01 | Try root | | |\n" +
+            "| C9 | Current child change | 2026-10-15 | Try current | kid | |\n" +
+            "| C434 | Newest child change | 2026-10-29 | Try newest | kid | |\n" +
+            "| C2 | Current grandchild change | 2026-10-20 | Try grandchild | grand | |\n")
+        _ = (folder / "change-review - kid.md").write_text(header +
+            "| C9 | Earlier child change | 2026-10-02 | Try earlier | | |\n" +
+            "| C10 | Urgent child change | 2026-10-03 | Try urgent | kid | blocks |\n")
+        _ = (folder / "change-review - grand.md").write_text(header +
+            "| C1 | Earlier grandchild change | 2026-10-04 | Try earlier grandchild | | |\n")
+        tree = {"top": ["kid", "grand"], "kid": ["grand"], "grand": []}
+
+        def descendants(slug: str, *, record: staff.StaffSnapshot | None = None) -> list[str]:
+            del record
+            return tree[slug]
+
+        _ = self.enterContext(mock.patch.object(showrunner_tree, "root_of", return_value="top"))
+        _ = self.enterContext(mock.patch.object(showrunners, "timer_docs", return_value=docs))
+        _ = self.enterContext(mock.patch.object(showrunner_tree, "descendants_of", descendants))
+        _ = self.enterContext(mock.patch.object(change_review, "production_list",
+                                               return_value=folder / "change-review - top.md"))
+        return docs
+
+    def test_attached_earlier_rows_keep_list_names_in_show_move_and_count(self) -> None:
+        doc = self.attached_changes()["kid"]
+        lists = {path: path.read_bytes() for path in (self.root / "change-review").glob("*.md")}
+        for order, expected in (("urgent", "kid/C10 Urgent child change"),
+                                ("oldest", "kid/C9 Earlier child change"),
+                                ("newest", "C434 Newest child change")):
+            code, output, error = run("show", "--kind", "change", "--order", order, "--production", str(doc))
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(output.splitlines()[:2], ["change", expected])
+        _ = run("show", "--kind", "change", "--order", "oldest", "--production", str(doc))
+        self.assertEqual(run("move-to-end", "--kind", "change", "--production", str(doc)),
+                         (0, "change: moved kid/C9 to the end\n", ""))
+        self.assertEqual(run("show", "--kind", "change", "--order", "oldest", "--production", str(doc))[1].splitlines()[1],
+                         "kid/C10 Urgent child change")
+        queue = next_item.change_queue(doc)
+        self.assertEqual({entry.key for entry in queue.entries}, {"kid/C9", "kid/C10", "C9", "C434"})
+        self.assertEqual(footer_counts.changes(doc), len(queue.entries))
+        self.assertEqual(footer_counts.counts_line(footer_counts.read_counts(doc)), "For you: 4 changes")
+        self.assertEqual(set(lists) & set(footer_counts.sources(doc)),
+                         {change_review.list_file("top"), change_review.list_file("kid")})
+        self.assertEqual({path: path.read_bytes() for path in lists}, lists)
+
+    def test_all_below_merges_earlier_lists_once_and_keeps_pins_separate(self) -> None:
+        docs = self.attached_changes()
+        child_queue = next_item.change_queue(docs["kid"])
+        child_below = next_item.change_queue(docs["kid"], True)
+        root_below = next_item.change_queue(docs["top"], True)
+        self.assertEqual({entry.key for entry in child_below.entries},
+                         {"kid/C9", "kid/C10", "C9", "C434", "C2", "grand/C1"})
+        self.assertEqual({entry.key for entry in root_below.entries},
+                         {entry.key for entry in child_below.entries} | {"C1"})
+        self.assertEqual(len(root_below.entries), 7)
+        self.assertEqual(footer_counts.changes(docs["grand"]), 2)
+        _ = run("show", "--kind", "change", "--order", "oldest", "--production", str(docs["kid"]))
+        _ = run("show", "--kind", "change", "--order", "newest", "--all-below", "--production", str(docs["kid"]))
+        self.assertEqual(urgency.pinned(child_queue.name), "kid/C9")
+        self.assertEqual(urgency.pinned(child_below.name), "C434")
+        self.assertEqual(run("move-to-end", "--kind", "change", "--all-below", "--production", str(docs["kid"])),
+                         (0, "change: moved C434 to the end\n", ""))
+        self.assertEqual(urgency.pinned(child_queue.name), "kid/C9")
+
+    def test_change_review_shows_the_earlier_row_pinned_by_next_and_the_same_queue_count(self) -> None:
+        doc = self.attached_changes()["kid"]
+        next_code, next_output, next_error = run("show", "--kind", "change", "--order", "oldest",
+                                                  "--production", str(doc))
+        self.assertEqual((next_code, next_error), (0, ""))
+        self.assertEqual(next_output.splitlines()[1], "kid/C9 Earlier child change")
+        code, output, error = review_show(doc)
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(output.splitlines()[0], next_output.splitlines()[1])
+        self.assertEqual(output.splitlines()[-1], f"{footer_counts.changes(doc) - 1} more to review")
+        self.assertEqual(footer_counts.changes(doc), 4)
+        self.assertNotIn("Root-only", output)
+        self.assertEqual(run("move-to-end", "--kind", "change", "--production", str(doc)),
+                         (0, "change: moved kid/C9 to the end\n", ""))
+        self.assertEqual(review_show(doc)[1].splitlines()[0], "kid/C10 Urgent child change")
+
+    def test_next_keeps_the_change_review_pin_after_another_row_ranks_first(self) -> None:
+        doc = self.attached_changes()["kid"]
+        code, output, error = review_show(doc)
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(output.splitlines()[0], "kid/C10 Urgent child change")
+        earlier = change_review.list_file("kid")
+        _ = earlier.write_text(earlier.read_text().replace("| blocks |", "| |"))
+        next_code, next_output, next_error = run("show", "--kind", "change", "--production", str(doc))
+        self.assertEqual((next_code, next_error), (0, ""))
+        self.assertEqual(next_output.splitlines()[1], output.splitlines()[0])
+
+    def test_change_review_leaves_one_unreadable_list_out_and_matches_next(self) -> None:
+        doc = self.attached_changes()["kid"]
+        broken = change_review.list_file("kid")
+        _ = broken.write_bytes(b"\xff")
+        code, output, error = review_show(doc)
+        self.assertEqual(code, 0)
+        self.assertEqual(output.splitlines()[0], "C9 Current child change")
+        self.assertEqual(output.splitlines()[-1], "1 more to review")
+        self.assertEqual(len(error.splitlines()), 1)
+        self.assertIn(str(broken), error)
+        next_code, next_output, next_error = run("show", "--kind", "change", "--production", str(doc))
+        self.assertEqual(next_code, 0)
+        self.assertEqual(next_output.splitlines()[1], output.splitlines()[0])
+        self.assertEqual(next_error, error)
+
+    def test_unreadable_earlier_list_keeps_current_rows_with_one_stderr_line(self) -> None:
+        doc = self.attached_changes()["kid"]
+        broken = self.root / "change-review/change-review - kid.md"
+        _ = broken.write_bytes(b"\xff")
+        code, output, error = run("show", "--kind", "change", "--order", "oldest", "--production", str(doc))
+        self.assertEqual(code, 0)
+        self.assertEqual(output.splitlines()[1], "C9 Current child change")
+        self.assertEqual(len(error.splitlines()), 1)
+        self.assertIn(str(broken), error)
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            count = footer_counts.changes(doc)
+        self.assertEqual(count, 2)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+
+    def test_current_list_pin_still_moves_after_an_earlier_list_appears(self) -> None:
+        doc = self.attached_changes()["kid"]
+        earlier = change_review.list_file("kid")
+        saved = earlier.read_bytes()
+        earlier.unlink()
+        self.assertEqual(run("show", "--kind", "change", "--order", "newest", "--production", str(doc))[1].splitlines()[1],
+                         "C434 Newest child change")
+        queue = next_item.change_queue(doc)
+        self.assertEqual(urgency.pinned(queue.name), "C434")
+        _ = earlier.write_bytes(saved)
+        self.assertEqual(run("move-to-end", "--kind", "change", "--production", str(doc)),
+                         (0, "change: moved C434 to the end\n", ""))
+        self.assertIn("C434", urgency.ended(queue.name))
+
+    def test_current_list_moved_row_stays_last_after_an_earlier_list_appears(self) -> None:
+        doc = self.attached_changes()["kid"]
+        earlier = change_review.list_file("kid")
+        saved = earlier.read_bytes()
+        earlier.unlink()
+        _ = run("show", "--kind", "change", "--order", "newest", "--production", str(doc))
+        self.assertEqual(run("move-to-end", "--kind", "change", "--production", str(doc)),
+                         (0, "change: moved C434 to the end\n", ""))
+        queue = next_item.change_queue(doc)
+        self.assertIn("C434", urgency.ended(queue.name))
+        _ = earlier.write_bytes(saved)
+        code, output, error = run("show", "--kind", "change", "--order", "newest", "--production", str(doc))
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(output.splitlines()[1], "C9 Current child change")
+        self.assertIn("C434", urgency.ended(queue.name))
+        entries = urgency.queue_order(next_item.change_queue(doc).entries, queue.name)
+        self.assertEqual(entries[-1].key, "C434")
+
+    def test_stopped_root_keeps_columnless_rows_when_own_list_becomes_current(self) -> None:
+        production_list = change_review.production_list
+        doc = self.attached_changes()["kid"]
+        own = change_review.list_file("kid")
+        _ = doc.write_text(f"# Kid\n\n- **Change review:** {own}\n")
+        stopped = change_review.ChangeReviewError("the root showrunner is not running")
+        with mock.patch.object(change_review, "production_list", side_effect=production_list), \
+                mock.patch.object(change_review, "showrunner_of", side_effect=stopped):
+            self.assertEqual(change_review.scope_list(doc), own)
+            code, output, error = run("show", "--kind", "change", "--order", "oldest", "--production", str(doc))
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(output.splitlines()[1], "C9 Earlier child change")
+            self.assertEqual(footer_counts.changes(doc), 2)
+            self.assertEqual(footer_counts.counts_line(footer_counts.read_counts(doc)), "For you: 2 changes")
+
+    def test_bad_urgency_in_earlier_list_leaves_current_rows_in_show_and_count(self) -> None:
+        doc = self.attached_changes()["kid"]
+        broken = change_review.list_file("kid")
+        _ = broken.write_text(broken.read_text().replace("| blocks |", "| invalid |"))
+        code, output, error = run("show", "--kind", "change", "--order", "oldest", "--production", str(doc))
+        self.assertEqual(code, 0)
+        self.assertEqual(output.splitlines()[1], "C9 Current child change")
+        self.assertEqual(len(error.splitlines()), 1)
+        self.assertIn(str(broken), error)
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            queue = next_item.change_queue(doc)
+        self.assertEqual({entry.key for entry in queue.entries}, {"C9", "C434"})
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            count = footer_counts.changes(doc)
+        self.assertEqual(count, len(queue.entries))
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn(str(broken), errors.getvalue())
 
 
 if __name__ == "__main__":

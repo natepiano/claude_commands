@@ -84,7 +84,7 @@ if (( ${#RUNS[@]} > 0 )); then
     REMOVE_ARGS+=(--session-dir "${run}")
   done
   for run in "${RUNS[@]}"; do
-    "$PY" "${SCRIPT_DIR}/../guilds/roles.py" unbind-run "${run}" || exit 1
+    "$PY" "${SCRIPT_DIR}/../astra/design_roles.py" unbind-run "${run}" || exit 1
   done
   "$PY" "${SCRIPT_DIR}/remove_workers.py" "${REMOVE_ARGS[@]}" || true
   for run in "${RUNS[@]}"; do

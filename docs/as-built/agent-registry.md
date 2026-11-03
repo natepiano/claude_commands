@@ -1,5 +1,9 @@
 # Agent Registry — one place for family, agent, and effort assignments
 
+Code reviews now use the unit's persistent `review` and `review2` workers
+through `assign.sh --role review`. Any pool maintenance paths described below
+remain only for the pending archive cleanup; they do not dispatch new reviews.
+
 ## What it is
 
 Every external-CLI agent this configuration launches — `/unit:direct`'s implementer and reviewer, the production unit directors `add_unit.py` starts, the `~/.zshrc` CLI aliases, `/ask_a_friend`, and the `/team_review` / `/api_review` / `/module_review` review teams — resolves which vendor CLI to run, which model, and at what reasoning effort from one file (`config/agents.conf`) through one resolver (`scripts/agents/agents_config.sh`), and launches through one dispatcher (`scripts/agents/agent_exec.sh`). The problem it solves: without a registry each consumer carries its own private assignment state in its own conf file and hard-codes its own vendor flags, so switching a function between vendors means editing several scripts and auditing "what runs what" means reading all of them. Here, a major function switches between the `codex` and `claude` families, or a single sub-task is re-pointed to a different model or effort, with one `/agent` edit, and no consumer assembles vendor flags itself.
@@ -8,7 +12,11 @@ Every external-CLI agent this configuration launches — `/unit:direct`'s implem
 
 ### Registry schema
 
-`config/agents.conf` holds the committed defaults. Each machine's own rows live in the untracked `config/agents.local.conf`, which holds only the rows that differ: readers see the overlay row in place of the default row of the same section and key, and an overlay row or section the defaults lack is added. The overlay cannot remove a default row. `scripts/agents/agents_overlay.awk` does the merge for bash and Python readers alike, so they always see the same rows. Both files are INI-style, with four kinds of section. Comments (`#`) are stripped to end-of-line everywhere, including trailing inline comments on rows.
+`config/agents.conf` is the only registry, shared by both machines. Shell and Python readers read it directly. It is INI-style, with four kinds of section; `#` starts a comment, including trailing row comments.
+
+Every writer calls `scripts/lib/agents_registry.py:store_registry(registry, before, after, description, *, additive_catalog=False)`. It replays changed rows on the latest file and atomically renames a temporary file in the same directory over it, preserving its mode. On the real `~/.claude` registry it serializes writers and fetches origin. One fast-forward helper checks ancestry, unfinished merges, and Git's index/worktree rules with `read-tree --dry-run -m -u` against a copy of the current index. Accepted-push recovery substitutes only the registry entry in that temporary index. A refused check leaves the live registry, index and HEAD unchanged; races or filesystem errors after the check can still interrupt reconciliation or the merge. An isolated index and `commit-tree` produce a commit containing only `config/agents.conf`, with subject `config(agents): <description>`, then push it. Rejected pushes fetch and replay the same rows on the newer tip, at most three attempts; exhaustion reports that the file is edited but not shared. The published tip is integrated with fast-forward only. No other path is staged, committed, stashed, reset or rebased.
+
+Publishing requires the registry's realpath to be the Git toplevel of `~/.claude` plus `config/agents.conf`, and `AGENTS_CONFIG_PUBLISH` must not be `0`. Tests disable publishing or use a temporary registry. Catalog sync uses additive replay: models and efforts accumulate across machines, and family targets never move backwards. It writes and publishes only additions; retiring a catalog model requires an explicit shared-registry edit, since `/agent` does not delete catalog rows.
 
 ```ini
 [assignments]                 # <function>=<family>, plus optional <function>.<subtask>=<family>; `caller` = the family of the agent running it
@@ -67,7 +75,7 @@ Exact-task overrides exist for one-off cross-vendor setups; function-level assig
 
 ### Resolver API (`scripts/agents/agents_config.sh`)
 
-Sourcing the file sets `AGENTS_CONFIG_FILE` (overridable, defaults to `~/.claude/config/agents.conf`), `AGENTS_LOCAL_CONFIG_FILE` (overridable, defaults to the same name with `.local.conf`), `CODEX_CONFIG_FILE`, `CODEX_MODELS_CACHE_FILE`, `CODEX_CATALOG_SYNC_STATE_FILE`, and fires the catalog freshness sync (below).
+Sourcing the file sets `AGENTS_CONFIG_FILE` (overridable, defaults to `~/.claude/config/agents.conf`), `CODEX_CONFIG_FILE`, `CODEX_MODELS_CACHE_FILE`, `CODEX_CATALOG_SYNC_STATE_FILE`, and fires the catalog freshness sync (below).
 
 Public:
 
@@ -120,8 +128,8 @@ reach: a worker launched that way takes one prompt and is unreachable until it
 exits. `codex_mesh.py` is the alternative launch path that gives a codex worker
 an address, so peers and the unit director can message and interrupt it mid-run
 the way they already can a claude worker. It launches `/unit:direct`'s codex
-workers, `/ask_a_friend`'s codex friend (`start --resident`) and each
-production's pooled reviewers (`review-pool.md`). For workers it
+workers, including the unit-owned `review` and concurrent `review2`, and
+`/ask_a_friend`'s codex friend (`start --resident`). For workers it
 is selected per `[direct.options] codex_mesh` in the registry (`1` as shipped,
 so the mesh is the normal codex launch path), overridable for one run with
 `UNIT_CODEX_MESH`; `implement.sh` reads it and branches, and `0`, or a
@@ -152,12 +160,11 @@ codex_mesh.py sweep  [--root <dir>] [--stop]
 `follow`, `compact`, `can-follow`, `release-follow`, the roster's `role`,
 `revision` and `context_tokens`, and overflow press-on are described in
 `long-lived-workers.md`; the role log and guarded roster writes in `usage-ledger.md`.
-`prime`, `fork` and `reset`, and `follow`'s `--cwd`, `--read-only` and
-`--image`, serve the review pool's reviewers and are described in
-`review-pool.md`. `prime --held-design --held-role` starts a held design role's
-thread for `scripts/guilds/roles.py`; held roles, their access policy and the
+`follow` takes `--cwd`, `--read-only` and `--image` for unit reviewers.
+`prime --held-design --held-role` starts a held design role's
+thread for `scripts/astra/design_roles.py`; held roles, their access policy and the
 verbs that refuse them (`start`, `fork`, `reopen`, `set-instructions`, raw `stop`
-and `stop --pause`) are described in `guilds.md`.
+and `stop --pause`) are described in `long-lived-workers.md#lasting-roles`.
 
 `serve` spawns `codex app-server --listen ws://127.0.0.1:<free port>` detached
 (`start_new_session=True`) and records `{port, pid}` in
@@ -215,7 +222,7 @@ and the reap constants as module attributes.
 `send` and `steer` address a worker by mesh name through the roster file, which
 is why they work from an unrelated process — the unit director, or a peer
 worker. `send` to a held design role queues the text in the role store
-(`roles.queue_message`) and prints `queued for <name>; holder adds it to the next
+(`design_roles.queue_message`) and prints `queued for <name>; holder adds it to the next
 authorized assignment`. Otherwise `send` delivers only while a launcher is attached. To a `running` worker
 it calls `thread/queue/add`, and the message lands at the start of the target's
 **next** turn; to a `waiting_capacity` worker it stores the message in
@@ -231,7 +238,7 @@ a late message with nothing streaming it and nothing writing the summary.
 the `start` loop polls for, sets the worker's roster status to `ended`, and
 interrupts any live turn. Any other status, `ended` included, prints `<worker> is
 <status>; nothing to end` and exits 0, except that an `ended` held design role is
-ended again so `roles.py end` can confirm the thread release.
+ended again so `design_roles.py end` can confirm the thread release.
 
 `stop` sets every roster worker to `ended` (with `--pause`, a shutdown stop, every
 non-ended worker to the followable `paused` instead), SIGTERMs each recorded pid (SIGKILL
@@ -268,7 +275,7 @@ After a refused turn the app-server reports the thread as `systemError`, and `_r
 
 ### Catalog sync (`scripts/agents/sync_codex_catalog.sh`)
 
-Rewrites **only** `[codex.agents]`, leaving every other line of the file byte-identical. It requires `jq`, reads the top-level `model=` from `~/.codex/config.toml` and the visible models (`visibility == "list"`) from `~/.codex/models_cache.json`, and writes `slug=<efforts>` from each model's `supported_reasoning_levels[].effort` (order preserved; no levels → empty list). Details:
+Adds models and efforts to `[codex.agents]` and advances `[codex.families]` without deleting existing catalog entries; unrelated rows remain intact. It requires `jq`, reads the top-level `model=` from `~/.codex/config.toml` and the visible models (`visibility == "list"`) from `~/.codex/models_cache.json`, and writes `slug=<efforts>` from each model's `supported_reasoning_levels[].effort` (existing efforts retained; new efforts appended). Details:
 
 - Slugs must match `^[[:alnum:]][[:alnum:]./_-]*$` — notably no colon, which would collide with pair syntax; violators are skipped with a stderr warning.
 - If codex's selected model is not in the visible catalog it is prepended, with its cache efforts if present, empty otherwise.
@@ -299,15 +306,12 @@ A thin dispatcher over the resolver:
 
 | File | Role |
 | --- | --- |
-| `config/agents.conf` | The registry's committed defaults. |
-| `config/agents.local.conf` | This machine's rows that differ from the defaults. Untracked; every editor and the catalog sync write only this file. |
-| `scripts/agents/agents_overlay.sh` | `agents_registry_text` (the merged view) and `agents_registry_store` (keep only the differing rows); run directly, `migrate --from <copy>` moves a full registry's local rows into the overlay. |
-| `scripts/agents/agents_overlay.awk` | The view, store and rename programs: POSIX awk, so the Mac's BSD awk runs them. |
-| `scripts/lib/agents_registry.py` | The merged view for Python readers (`codex_pacer.py`, `quota_alert.py`, `context_usage.py`). |
+| `config/agents.conf` | The shared registry. |
+| `scripts/lib/agents_registry.py` | Shared-file Python reader and atomic registry-only publisher used by every writer. |
 | `config/README.md` | The `## agents.conf` section: three-layer schema, `/agent` as the editor, sync behavior. |
-| `scripts/agents/agents_config.sh` | Resolver + editors + freshness-gated sync trigger. |
+| `scripts/agents/agents_config.sh` | Resolver + editors + freshness-gated sync trigger; `agents_workers_home` reads the signed-in workers home for the shell launchers. |
 | `scripts/agents/agent_exec.sh` | Family dispatch launcher, dry-run hook. |
-| `scripts/agents/codex_mesh.py` | Addressable codex launcher: the default for codex `/unit:direct` workers the path for `/ask_a_friend`'s codex friend (`start --resident`), and the launcher of each production's pooled reviewers (`prime`/`fork`/`reset`, `docs/as-built/review-pool.md`). One app-server per session, one thread per worker, `send`/`steer`/`end`/`list`/`stop`, `follow`/`can-follow`/`release-follow` (a new turn on a finished worker's thread, for `implement.sh --to` and `review.sh --to`), `compact`, `sweep`, and a capacity backoff that resumes the same thread. |
+| `scripts/agents/codex_mesh.py` | Addressable codex launcher: the default for codex `/unit:direct` workers, including the unit-owned `review` and concurrent `review2`, and the path for `/ask_a_friend`'s codex friend (`start --resident`). One app-server per session, one thread per worker, `send`/`steer`/`end`/`list`/`stop`, `follow`/`can-follow`/`release-follow` (a new turn on a finished worker's thread, for `implement.sh --to` and `review.sh --to`), `compact`, `sweep`, and a capacity backoff that resumes the same thread. |
 | `scripts/agents/agent_admin.sh` | `/agent` backend. |
 | `scripts/agents/sync_codex_catalog.sh` + `.plist` | `[codex.agents]` materialization, staleness warnings. |
 | `scripts/agents/heartbeat.sh`, `heartbeat_watch.sh` | Liveness log helpers used by the worker wrappers (role header block, 60 s beats with an activity digest decoded from the agent log). |
@@ -317,7 +321,7 @@ A thin dispatcher over the resolver:
 | `scripts/direct/progress_history.py` | Cross-agent append-only unit-run event recorder and aggregator. Durable per-run JSONL lives under `~/.local/state/unit-history/runs/` (`unit_runs.history_root()`); live state remains in the session directory. `start-run` alone resolves and records the project clock from the supplied plan, matching worktree/branch history, or the run start. `progress` prints a short report (clocks table, phase heading, ETA line, worker lines, stage line, wall clock); the clocks table has separate project and phase rows, independent unchanged timers and unambiguous `HH:MM:SS` durations. `progress --tables` adds the round table. The legacy layout prints the clocks table only under `--tables`. It calibrates phase estimates from completed-phase history and records every stated ETA (`eta`, an `eta_stated` event per promise). `progress` requires `--cap-stage` on dual-layout calls and clamps the calibrated percentage to that stage's ceiling; `start-phase --work-order-file` records Work Order size metrics. |
 | `scripts/direct/findings.py` | The worker fix loop's convergence test — what replaced the fix-pass counter. Stable finding IDs (`F001…`) with states `open` / `fixed_pending_review` / `accepted`, held in `findings_state.json` beside the progress state for the current phase's `instance_id`; a displaced phase's ledger waits in `findings_state-<instance_id>.json` until it is current again. `gate` returns `converged` / `dispatch` / `stop`, gating on blocker+minor in round 1 and blocker only afterwards (nits never gate); `dispatch --covers` refuses a partial batch so one fix round repairs everything gating together. Stops on: a finding that failed to close twice, a finding reopened twice, two rounds with no decrease in the gating-open count, or a 10-round runaway backstop. Appends `finding_opened` / `finding_batch_dispatched` / `finding_verdict` / `finding_gate` to the same durable run JSONL. |
 | `scripts/direct/test_progress_history.py`, `test_findings.py` | `python3 -m unittest scripts.direct.test_progress_history scripts.direct.test_findings` from `~/.claude`. Both drive the real CLIs in a temp session dir with `UNIT_NOW_EPOCH` / `UNIT_HISTORY_DIR` pinning time and storage; `test_progress_history` runs the recorder's `main()` in-process through `recorder_fixture.invoke_recorder` and keeps one subprocess case for the CLI contract. |
-| `scripts/cli_agent/cli_agent.sh` | zshrc-alias dispatcher (`commit_no`, `commit_yes`, `merge`, `code`). `cli_agent_print_status` prints the four `cli.*` rows via `agents_resolve_print`; `cli_agent_run` maps no args → `cli.interactive` REPL and a skill name → `cli.<skill>` (unknown skill errors with the known list), then `exec`s codex with `agents_codex_args` (the registry tier included) or claude with `-- "/$invocation"`. It has no assignment editor — assignment changes go through `/agent`. |
+| `scripts/cli_agent/cli_agent.sh` | zshrc-alias dispatcher (`commit_no`, `commit_yes`, `merge`, `code`). `cli_agent_print_status` prints the four `cli.*` rows via `agents_resolve_print`; `cli_agent_run` maps no args → `cli.interactive` REPL and a skill name → `cli.<skill>` (unknown skill errors with the known list), then `exec`s codex on the signed-in workers account home with `agents_codex_args` (the registry tier included), overriding a caller's `CODEX_HOME`, or claude with `-- "/$invocation"`. An unavailable workers account refuses before Codex starts. It has no assignment editor — assignment changes go through `/agent`. |
 | `scripts/production/add_unit.py` | `production.director`, resolved directly (not through `agent_exec`) because a unit director is a long-lived herdr session: `director_agent` runs `bash -c` sourcing `agents_config.sh` and `agents_resolve production.director`, refuses any family but `claude`, and launches it through `herdr.start_agent(kind="claude", agent_arguments=[--model <agent>, [--effort <effort>], --remote-control …])`. `produce.md`'s Resume runs `add_unit.py ... --resume <session-id> --cwd <cwd>`, which resolves the same row and keeps the transcript's last model unless `--model` is given. |
 | `scripts/ask_a_friend/prepare_session.sh` / `launch_friend.sh` / `end_friend.sh` | `ask_a_friend.consultation`, resolved directly (not through `agent_exec`) because the friend is a live peer, not a one-shot: claude → `agent_bg.sh` with `AGENT_BG_DETACH=1` (the one `claude --bg --name <friend>` recipe; answers by `SendMessage`; `friend_id` for `claude stop`), codex → `codex_mesh.py start --resident --service-tier "$AGENT_SERVICE_TIER"` (a thread that outlives its turns; replies print between `=== reply from <friend> (N) ===` / `=== end reply ===`; `end` releases it). Protocol files: `friend_name`, `question.md`, `message_<N>.md`, `answer.txt` (codex), `status` `running\|ended\|error`, `agent.log`, provenance `consult_agent`. One friend carries consultation and implementation, so there is one row per family. |
 | `commands/team_review.md`, `api_review.md`, `module_review.md` | Call `agent_exec … readonly` directly, backgrounded, one call per lens/pass, with self-contained prompt files under wave-namespaced session dirs (`cycle2/`, `adversary/`, `pass3/`) and provenance captured in-session via `agents_resolve_print`. |
@@ -332,19 +336,14 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - Agent names stay disjoint between `[codex.agents]` and `[claude.agents]` — `agents_set_row` infers the family from the agent and refuses a name listed by both instead of picking a family for it.
 - Task names are exactly two segments. Empty effort means "omit the flag"; `agent:` with nothing after the colon is invalid; a catalog row with an empty effort list is valid and admits only bare pairs.
 - Only `agents_set_assignment`, `agents_set_all_assignments`, and `agents_set_model` change which family is live. `agents_set_row` writes a row (live or dormant) and `agents_set_service_tier` writes a tier (live or dormant); neither flips liveness. The one exception is a `caller` function: its live family is whichever agent is asking, it is written by hand in the file, and neither switch touches it.
-- The sync rewrites only `[codex.agents]` and never touches assignments. `[claude.agents]` stays hand-maintained; alias warnings never auto-add, vanished-agent warnings never auto-repoint.
+- The sync adds to `[codex.agents]` and advances `[codex.families]`; it never removes catalog entries or touches assignments. `[claude.agents]` stays hand-maintained; alias warnings never auto-add, vanished-agent warnings never auto-repoint.
 - New lookups use `_agents_registry_get` / `_agents_registry_has_key` (literal key comparison). Never match keys with an unescaped `^key=` regex — dotted keys like `direct.review` mis-match.
-- Any awk that writes a user-supplied value into the conf passes it through `ENVIRON`, not `awk -v`. Row rewrites preserve trailing inline comments and spacing byte-exactly; conf writes build the full registry in a tmp file, then `agents_registry_store` keeps the rows that differ from the defaults and moves them over the overlay (mode 644), never in place. A write that leaves no row different removes the overlay.
+- Any awk that writes a user-supplied value passes it through `ENVIRON`, not `awk -v`. Row rewrites preserve comments and spacing; `agents_registry_store` delegates atomic replacement and publication to `store_registry`.
 - `agent_exec` owns all redirection: wrappers must not redirect its stdout/stderr to a file, or dry-run output never reaches them. It exports nothing — provenance comes from the wrapper's own `agents_resolve`.
 - Callers pass **absolute** prompt/output/log paths to `agent_exec`.
-- `codex_mesh.py` is a launcher for `/unit:direct`, `/ask_a_friend` and the
-  review pool (`review_pool.py`), not a second dispatcher. It resolves
-  nothing: `implement.sh` and `launch_friend.sh`
-  resolve family, agent and effort through `agents_resolve`, exactly as for
-  `agent_exec`, and pass them in as `--model` / `--effort`, so the mesh path
-  changes only whether the worker has an address, never which agent runs or at
-  what effort. Anything else that needs a codex agent still goes through
-  `agent_exec`.
+- `codex_mesh.py` carries unit workers, held designs and ask-a-friend threads.
+  Unit allocation resolves its role through `agents_resolve`. Launchers pass
+  the selected model and effort on each turn; transport does not choose them.
 - Every worker in one run shares one app-server, and its pid file is the only
   record of it. A launch path that starts a server without writing
   `mesh_server.json` leaks a process that nothing will reap.
@@ -437,16 +436,16 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   A `send` to a finished codex peer holds the message for its current roster
   thread. Only the unit director's `implement.sh --to <worker>` or
   `review.sh --to <worker>` (`codex_mesh.py follow`) starts its next turn,
-  which receives held messages after its dispatch prompt
-  (a held design role is the exception: `implement.sh --to` refuses it, and only `roles.py resume` gives it a turn) —
+  which receives the held messages first and its dispatch prompt last
+  (a held design role is the exception: `implement.sh --to` refuses it, and only `design_roles.py resume` gives it a turn) —
   `<PhaseMesh/>` in `docs/direct/write_prompt_contract.md` states this, and the register
   line's `reach=` field is what tells a peer which of the two it is addressing.
 - `/unit:direct` is itself implemented by `scripts/direct/*`, so any rename or signature change to those launchers must land together with the `commands/unit/direct.md` call-site edits in one change.
 - `commands/unit/direct.md` holds the whole `/unit:direct` workflow, and it is a regular file. Call-site edits go in `direct.md`.
-- The `[worker.*]` section header comment in `config/agents.conf` still names `/plan:worker`, an older name for `/unit:direct`. It is a comment only. Changing it is a plain commit of `config/agents.conf`: a machine's own rows live in the overlay, so the merge does not touch them.
+- The `[worker.*]` header still names `/plan:worker`, an older name for `/unit:direct`; it is a comment only. Changes to it belong in the shared registry.
 - Every `implement.sh` dispatch is a member of a phase team: `team_role` is required, every artifact it writes is suffixed with that role, and every member carries a `pass_kind`, so a team phase records one pass per worker rather than one for the whole phase. The kind names the work the worker was assigned and nothing else: the `test` worker records `test`, a writing worker `impl`, the repairing worker `fix`. An earlier claim here that a `test` kind would rewrite the `implementation` stage across the back corpus was wrong -- adding a kind cannot change stored events, only adding a stage could. A kind never triggers behavior either: round resolution is `UNIT_RESOLVES_ROUND=1`, set on the one repairing worker, so recording `fix` never resolves a round by itself. The board, not the launcher, is what a third concurrent member would change.
 - No `/unit:direct` prompt tells an agent to acquire the `cargo` token. `verify.sh` takes it, and a prompt that takes it too deadlocks the agent against its own held token.
-- The catalog sync and the editors write only the overlay, so `git diff config/agents.conf` shows only deliberate edits to the defaults. `settings.json`'s app-generated key reorder stays excluded, and `settings.json`'s `model` / `statusLine`, `~/.zshrc`'s interactive `claude` alias, `scripts/claude_to_codex/`, and `~/.codex/config.toml` are out of scope.
+- Registry writers publish only `config/agents.conf`. `settings.json`, shell aliases, `scripts/claude_to_codex/`, and `~/.codex/config.toml` remain outside the edit.
 - Never use `AskUserQuestion` in the command docs; the review docs decide via in-session synthesis.
 
 ## Calibration / gotchas
@@ -476,7 +475,7 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - **A finished codex worker holds messages for its next dispatch.** Its thread
   persists, and `send` holds messages until the unit director starts its next
   turn through `implement.sh --to` or `review.sh --to`. That turn receives them
-  after its dispatch prompt. A thread started `--resident` (ask_a_friend's friend) stays
+  first, and its dispatch prompt last. A thread started `--resident` (ask_a_friend's friend) stays
   `running` across turns, prints each reply as it lands, and ends only on
   `codex_mesh.py end`. `send` still refuses ended, missing and
   capacity-exhausted workers.
@@ -488,7 +487,7 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - **awk gotchas.** `function` is a reserved awk word — pass it as `-v fn=`. `awk -v` decodes backslash escapes, so a value containing `\n` / `\t` would corrupt the row; user-supplied values go through `ENVIRON["…"]`.
 - **`codex --sandbox read-only` panics** codex's system-configuration crate on macOS in some contexts, which is why ask_a_friend's conceptually read-only consult ran `write` (`--full-auto`) while it went through `agent_exec`; today the friend is a mesh thread (`codex_mesh.py start --resident`) and never touches `--sandbox read-only`. The worker reviewer's `--sandbox read-only` usage is proven and stays, for a review outside a run; a review inside a run goes to an open worker and runs on that thread's own sandbox. Codex launched from a Claude Code session needs `dangerouslyDisableSandbox: true` (and usually `run_in_background: true`).
 - **The cli aliases run fast from the registry.** `cli_agent.sh` once hardcoded `-c service_tier="fast"` after `agents_codex_args`, which would have overridden any `/agent cli <tier>`; the hardcode is gone and each machine's `[cli.options]` carries `codex_service_tier=fast` instead.
-- **Last-writer-wins on conf rewrites.** The source-time sync and the `/agent` editors both rewrite the overlay with tmp + `mv` and no locking; interleaved writers can silently revert each other's change but never corrupt the file.
+- **Concurrent edits and recovery.** Each shell setter validates and transforms one registry snapshot. Storage replays only its changed rows on the latest registry. Publishing serializes local writers and carries every unshared local row across rejected-push retries, preserving earlier local edits. Repeating an interrupted edit publishes pending rows even if the requested value is already local. After a lost push acknowledgement, an accepted commit or matching remote rows finish publication without another commit.
 - **claude-family output needs `python3`.** The claude branch logs stream-JSON and extracts the final result event into the output file; without `python3` the output file would be empty even though the log is complete. Claude-family `readonly` reviewers running the style loader script under `--permission-mode plan --print` is untested — a family switch may silently degrade style loading.
 - **`_agents_registry_get` returns 0 on a miss** (prints nothing) so it is safe under `set -e` in command substitution; use `_agents_registry_has_key` when you need presence as a condition.
 - **The `cargo` build token belongs to `verify.sh`, and never to a prompt.** `verify.sh` acquires `board.sh … cargo` itself from `UNIT_RUN_DIR` / `UNIT_TEAM_ROLE` and releases it from one unified EXIT/INT/TERM path, so concurrent team members serialize their builds without being asked to. It acquires with `--pid $$`, so a `verify.sh` killed before that path runs leaves no stranded token: a waiter reclaims it as soon as that pid is gone (`build-memory-admission.md`, Cargo token reclaim). Putting the acquire in a prompt as well makes that agent wait out the full `--wait` against a token it already holds, and the symptom — a member that just sits there — is indistinguishable from a slow test. With either env var unset the token step is skipped entirely, which is what keeps a standalone `verify.sh` run unchanged.
@@ -500,12 +499,14 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 
 ## Why it is this way
 
-- **Warn-and-keep for vanished codex models.** If the sync simply dropped a model an assignment still uses, `agents_resolve` would hard-fail at the config layer and wedge the whole registry — `agents_list_assignments`, `/agent status`, every consumer. Keeping the previous catalog row leaves resolution green so a truly retired model fails only in that consumer's execution log, and the warning names the stale row plus the exact `/agent` commands to fix it. The keep condition is deliberately "would this row still resolve against the refreshed catalog *and* the cache", not bare cache membership: a hidden-but-cached assigned model still disappears from the sync output, and a selected-but-uncached model is prepended with an empty effort list, so cache membership alone would still wedge `agent:effort` assignments. Auto-repointing assignments was rejected — assignment edits are a human call.
+- **Keep models absent from a machine's catalog.** Each machine sees a different catalog. Sync retains every existing model and effort, including entries no local assignment uses. Warnings still identify assigned models missing from the cache; removing a retired entry requires an explicit shared-registry edit; `/agent` does not delete catalog rows.
 - **Warn-only for claude alias staleness.** The effort list for a new alias is a judgment call and omissions (haiku) are deliberate, so the sync reports and never edits. A help-text wording change or a missing `claude` binary degrades to a no-op rather than a false edit.
-- **No locking on conf writes.** Interleaved writers can only lose an edit, never corrupt the file, and this is a single-user machine; a lock would add failure modes (stale locks in launchd context) worse than the loss it prevents.
-- **No per-project overrides.** One global registry (`config/agents.conf` with this machine's overlay) governs everything. Per-project layering would reintroduce exactly the scattered, hard-to-audit assignment state the registry exists to prevent, and `/agent status` would stop being the truth.
+- **Serialized publication.** Real-registry writers take the repository's publication lock before fetching and replaying their row changes. The lock is released when the process exits.
+- **No per-project overrides.** One global registry (`config/agents.conf`) governs everything. Per-project layering would reintroduce exactly the scattered, hard-to-audit assignment state the registry exists to prevent, and `/agent status` would stop being the truth.
 - **Double resolution in the wrappers.** `agent_exec` deliberately exports nothing, so a wrapper that wants provenance resolves again itself. Both reads hit the same conf, so they agree; the alternative — `agent_exec` exporting or writing resolved values — would couple every consumer to the launcher's variable names and make the launcher responsible for file layout it does not own.
 - **Effort omission for a bare agent pair.** A row of just `agent` means "omit the effort flag entirely and let the CLI pick", which is materially different from any explicit level and is the only thing that validates against a catalog row with no reasoning levels. Hence no default-effort fallback anywhere: the stage scripts guard the flag with `[[ -n … ]]` rather than substituting a level, so the registry's silence is transmitted faithfully to the CLI.
 - **`systemError` reads as idle.** It means the last turn failed and none is active, which is what relaunch, `end` and the capacity loop need to know. Read as unknown, every capacity refusal on the real app-server ended the worker with `thread/read failed`, so the backoff and resume never ran outside a stub that answered `idle`. Any status the protocol does not define still reads as unknown, so a new upstream status is classified on purpose rather than defaulted to idle.
 - **A capacity budget per busy spell.** A turn that ends without a capacity refusal proves the model is answering again, so the next refusal starts a new spell. A budget for the whole run would let refusals hours apart add up and retire a long-lived worker, such as a resident friend, after one bad spell too many.
 - **An owed resume after a completed turn starts at once.** The completed turn shows the model is serving, so a wait would only delay the worker's own work; only a capacity refusal earns one.
+
+Accepted Codex turns record `turn_model` and `turn_effort` in the roster for display only. Board worker rows and progress worker notes read these fields. Durable identity model fields remain compatibility data and do not choose a dispatch model; worker reuse is by role and availability. Every turn resolves its current shared role default or an explicit dispatch override.

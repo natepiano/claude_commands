@@ -1,0 +1,489 @@
+"""Integration tests for review.sh's fresh and long-lived reviewer paths."""
+
+from __future__ import annotations
+
+from scripts.lib import test_hang_guard
+
+import json
+import shutil
+import subprocess
+from pathlib import Path
+from typing import TYPE_CHECKING, TypedDict, cast, override
+
+from scripts.direct.recorder_fixture import LauncherFixture, STUB_ATOMIC_JSON_WRITER, communicate_launcher, configure_launcher_fixture, launcher_environment, launcher_registry, prepare_launcher_runtime
+
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import config_environment, write_config_fixture
+else:
+    from scripts.lint.memory_test_support import config_environment, write_config_fixture
+
+
+DIRECT_DIR = Path(__file__).parent
+AGENTS_DIR = DIRECT_DIR.parent / "agents"
+
+
+
+# The wrapper calls this as: <task> readonly <working_dir> <prompt> <findings> <log>.
+# Writing both outputs and exiting immediately drives the wrapper's completion
+# branch without a model call.
+STUB_AGENT_EXEC = """#!/usr/bin/env bash
+set -euo pipefail
+printf 'No findings.\\n' > "$5"
+printf 'stub agent log\\n' > "$6"
+if [[ -n "${TEST_WORKER_STARTED:-}" ]]; then : > "$TEST_WORKER_STARTED"; fi
+"""
+
+STUB_MESH = "#!/usr/bin/env python3\n" + STUB_ATOMIC_JSON_WRITER + """
+import fcntl
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+
+verb = sys.argv[1]
+
+def option(name):
+    return sys.argv[sys.argv.index(name) + 1]
+
+session = pathlib.Path(option('--session-dir'))
+roster_path = session / 'mesh_roster.json'
+roster = json.loads(roster_path.read_text()) if roster_path.exists() else {}
+if os.environ.get('STUB_MESH_CALLS'):
+    with pathlib.Path(os.environ['STUB_MESH_CALLS']).open('a') as calls:
+        calls.write(json.dumps(sys.argv[1:]) + '\\n')
+if verb in ('start', 'compact', 'can-follow', 'follow'):
+    with (session / 'mesh_events.txt').open('a') as events:
+        events.write(verb + '\\n')
+
+name = option('--name') if verb == 'start' else option('--to')
+entry = roster.get(name, {})
+
+def save_entry():
+    with (session / 'fixture_workers.lock').open('a+') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        current = json.loads(roster_path.read_text()) if roster_path.exists() else {}
+        current[name] = entry
+        write_json(roster_path, current)
+
+if verb == 'start':
+    entry = {
+        'thread_id': 'thread-' + name,
+        'turn_id': 'turn-1',
+        'status': 'running',
+        'role': option('--role'),
+        'task': option('--task'),
+        'context_tokens': 12000,
+    }
+    (session / 'follow_message.txt').write_text(
+        pathlib.Path(option('--prompt-file')).read_text()
+    )
+    pathlib.Path(option('--summary-file')).write_text('No findings.\\n')
+    pathlib.Path(option('--log-file')).write_text('stub mesh log\\n')
+    entry['status'] = 'done'
+elif verb == 'compact':
+    if (roster_path.parent / 'compact_still_live').exists():
+        print('stub turn still live', file=sys.stderr)
+        sys.exit(3)
+    before = entry.get('context_tokens', 0)
+    entry['context_tokens'] = ('not_measured_since_compaction'
+                              if (session / 'compact_reports_zero').exists() else 12000)
+    save_entry()
+    if (session / 'compact_reports_zero').exists():
+        print(f'compacted {name}: {before} tokens, size not measured until its next turn')
+    else:
+        print(f'compacted {name}: {before} -> 12000 tokens')
+elif verb == 'can-follow':
+    same_claim = (entry.get('status') == 'starting'
+                  and entry.get('launcher_pid') == int(option('--claim-pid')))
+    if not same_claim and entry.get('status') not in ('done', 'failed', 'paused'):
+        print(f'codex_mesh: {name}: worker is busy or not followable; follow refused',
+              file=sys.stderr)
+        sys.exit(2)
+    if not same_claim:
+        entry['previous_status'] = entry['status']
+        if 'role' in entry:
+            entry['previous_role'] = entry['role']
+    entry['status'] = 'starting'
+    entry['role'] = option('--role')
+    entry['launcher_pid'] = int(option('--claim-pid'))
+elif verb == 'release-follow':
+    if (entry.get('status') == 'starting'
+            and entry.get('launcher_pid') == int(option('--claim-pid'))):
+        entry['status'] = entry.get('previous_status', 'failed')
+        if 'previous_role' in entry:
+            entry['role'] = entry['previous_role']
+        else:
+            entry.pop('role', None)
+        entry.pop('launcher_pid', None)
+        entry.pop('previous_status', None)
+        entry.pop('previous_role', None)
+elif verb == 'follow':
+    if (entry.get('status') != 'starting'
+            or entry.get('launcher_pid') != int(option('--claim-pid'))):
+        print(f'codex_mesh: {name}: follow claim changed after dispatch', file=sys.stderr)
+        sys.exit(1)
+    entry['status'] = 'running'
+    entry['role'] = option('--role')
+    entry['task'] = option('--task')
+    save_entry()
+    if os.environ.get('TEST_WORKER_STARTED'):
+        pathlib.Path(os.environ['TEST_WORKER_STARTED']).touch()
+    pathlib.Path(session / 'follow_message.txt').write_text(
+        pathlib.Path(option('--message-file')).read_text()
+    )
+    if os.environ.get('STUB_EXPECT_PREPARED_STYLE'):
+        prompt = pathlib.Path(option('--message-file')).read_text()
+        diff_line = next(line for line in prompt.splitlines() if line.startswith('- Diff '))
+        diff = pathlib.Path(diff_line.split(': ', 1)[1])
+        pathlib.Path(session / 'prepared_at_dispatch.diff').write_bytes(diff.read_bytes())
+    finish_file = os.environ.get('STUB_REVIEW_FINISH_FILE', '')
+    if finish_file:
+        sys.path.insert(0, os.environ['TEST_WAIT_HELPER_DIR'])
+        from wait_for_test_state import wait_for_file
+        wait_for_file(pathlib.Path(finish_file))
+    edit_path = os.environ.get('STUB_REVIEW_EDIT', '')
+    if edit_path:
+        pathlib.Path(edit_path).write_text('changed by reviewer\\n')
+    if os.environ.get('STUB_REVIEW_COMMIT', ''):
+        working_dir = os.environ['STUB_REVIEW_WORKING_DIR']
+        subprocess.run(
+            ['git', '-c', 'user.name=Review Test', '-c',
+             'user.email=review@example.com', 'add', '.'],
+            cwd=working_dir, check=True,
+        )
+        subprocess.run(
+            ['git', '-c', 'user.name=Review Test', '-c',
+             'user.email=review@example.com', 'commit', '-m', 'reviewer edit'],
+            cwd=working_dir, check=True,
+        )
+    pathlib.Path(option('--summary-file')).write_text(os.environ.get('STUB_FINDINGS', 'No findings.\\n'))
+    with pathlib.Path(option('--log-file')).open('a') as log:
+        log.write('stub mesh log\\n')
+    entry['status'] = 'done'
+    if os.environ.get('STUB_REPLACEMENT_THREAD'):
+        entry['thread_id'] = os.environ['STUB_REPLACEMENT_THREAD']
+    if os.environ.get('STUB_TURN_FAILURE'):
+        entry['status'] = 'failed'
+        save_entry()
+        sys.exit(1)
+else:
+    sys.exit(2)
+save_entry()
+if verb == 'follow' and os.environ.get('STUB_REVIEW_DONE_FILE'):
+    pathlib.Path(os.environ['STUB_REVIEW_DONE_FILE']).touch()
+"""
+
+
+class OpenPass(TypedDict):
+    kind: str
+    status: str
+
+
+# "pass" is a keyword, so the recorder's state key needs the functional form.
+# The recorder keys the open passes by the team slot that opened each one, so
+# the value is a map even when a single launcher is running.
+ProgressState = TypedDict("ProgressState", {"pass": dict[str, OpenPass]})
+
+
+AGENTS_REGISTRY = launcher_registry(("impl",), mesh=True)
+
+
+class ReviewLauncherFixture(LauncherFixture):
+    """The early-launch contract: before the sentinel, no pass is recorded.
+
+    The reviewer starts while the writer is still working, so the
+    implementation pass is open the whole time it runs. A start-pass before the
+    sentinel files a review pass for a verdict that cannot have read the final
+    diff, and does it under the reviewer's own slot, where nothing later
+    reconciles it against the diff it never saw.
+    """
+
+    review_script: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.prompt_file: Path = self.root / "review_prompt.md"
+        self.review_script = self.root / "scripts" / "direct" / "review.sh"
+
+    @override
+    def prepare_fixture(self) -> None:
+        self.prepare_project(
+            "feature/review", "review_prompt.md", "Review the diff.\n",
+            (
+                "UNIT_PROGRESS_INTERVAL_SECONDS=180",
+                "UNIT_COMPACT_ABOVE_TOKENS=100000",
+                "ROUTING_FROM_ROUND=4", "ASTRA_AFTER_FAILED_FIXES=2",
+                "",
+            ), AGENTS_REGISTRY,
+        )
+        _ = write_config_fixture(self.config_file, self.config_file.read_text(encoding="utf-8"))
+        _ = config_environment(self.root)
+        reviewed = self.working_dir / "reviewed.txt"
+        _ = reviewed.write_text("original\n", encoding="utf-8")
+        _ = subprocess.run(
+            ["git", "-c", "user.name=Review Test", "-c",
+             "user.email=review@example.com", "add", "reviewed.txt"],
+            cwd=self.working_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+        )
+        _ = subprocess.run(
+            ["git", "-c", "user.name=Review Test", "-c",
+             "user.email=review@example.com", "commit", "-m", "baseline"],
+            cwd=self.working_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+        )
+        self.review_script = self.build_script_tree()
+
+    def build_script_tree(self) -> Path:
+        """Copy the real wrapper beside a stub agent, so nothing calls a model.
+
+        Resolution, heartbeat writing, board and recorder helpers stay real.
+        Mesh and agent execution are controlled so tests spend
+        no model tokens. The real heartbeat watcher uses a short interval.
+        """
+        direct_dir, agents, lib = prepare_launcher_runtime(self.root)
+        _ = shutil.copy2(DIRECT_DIR.parent / "production/showrunners.py",
+                         self.root / "scripts/production/showrunners.py")
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib/probe_session.py", lib / "probe_session.py")
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib/process_failure.py", lib / "process_failure.py")
+        for name in ("conf.py", "conf.sh"):
+            _ = shutil.copy2(DIRECT_DIR.parent / "lib" / name, lib / name)
+        _ = shutil.copy2(DIRECT_DIR.parent / "production/fast_track.py",
+                         self.root / "scripts/production/fast_track.py")
+        config = self.root / "config"
+        config.mkdir(exist_ok=True)
+        _ = shutil.copy2(DIRECT_DIR.parents[1] / "config/fast_track.conf", config / "fast_track.conf")
+        for name in ("review.sh", "review_tree.py", "tag_inventory.py"):
+            _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
+        configure_launcher_fixture(direct_dir / "review.sh")
+        lint = self.root / "scripts/lint"
+        lint.mkdir()
+        for name in ("style_review.py", "lint_config.sh"):
+            _ = shutil.copy2(DIRECT_DIR.parent / "lint" / name, lint / name)
+        message = self.root / "scripts/message"
+        message.mkdir()
+        for name in ("sessions.py", "process_identity.py", "relay_identity.py"):
+            _ = shutil.copy2(DIRECT_DIR.parent / "message" / name, message / name)
+        review_config = self.root / "config/review"
+        review_config.mkdir(parents=True)
+        _ = shutil.copy2(DIRECT_DIR.parents[1] / "config/review/style.md", review_config / "style.md")
+        stub = agents / "agent_exec.sh"
+        _ = stub.write_text(STUB_AGENT_EXEC, encoding="utf-8")
+        stub.chmod(0o755)
+        mesh = agents / "codex_mesh.py"
+        _ = mesh.write_text(STUB_MESH, encoding="utf-8")
+        mesh.chmod(0o755)
+        return direct_dir / "review.sh"
+
+    @override
+    def environment(self) -> dict[str, str]:
+        environment = launcher_environment(self.root)
+        environment["LINT_CONFIG_FILE"] = str(self.root / "lint.conf")
+        environment["UNIT_EARLY_POLL_SECS"] = "0.01"
+        environment["TEST_WAIT_HELPER_DIR"] = str(DIRECT_DIR.resolve())
+        environment["FAST_TRACK_STATE_DIR"] = str(self.root / "fast-track-state")
+        environment["CONF_DIR"] = str(self.root)
+        # Early mode starts a detached Stage 2 run; the stub records its arguments instead.
+        mesh_runs = self.root / "mesh_runs_stub.py"
+        if not mesh_runs.exists():
+            _ = mesh_runs.write_text(
+                "import json, os, sys\n"
+                + "with open(os.environ['MESH_RUNS_CALLS'], 'a', encoding='utf-8') as calls:\n"
+                + "    _ = calls.write(json.dumps(sys.argv[1:]) + '\\n')\n", encoding="utf-8")
+        environment["MESH_RUNS_SCRIPT"] = str(mesh_runs)
+        environment["MESH_RUNS_CALLS"] = str(self.root / "mesh_runs_calls.jsonl")
+        return environment
+
+    def checked_review(
+        self, session: Path, *options: str, lens: str = "", early: str = "",
+    ) -> subprocess.CompletedProcess[str]:
+        environment = self.environment()
+        _ = environment.pop("TEST_LEGACY_LAUNCH", None)
+        environment["TEST_WORKER_STARTED"] = str(session / "review-worker-started")
+        return subprocess.run(
+            ["bash", str(self.review_script), *options, str(session), str(self.working_dir),
+             str(self.prompt_file), "review", "blind review", "reviewing the diff", "1", lens, early],
+            check=False, capture_output=True, text=True, env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+        )
+
+    def finish_early_launcher(self, process: subprocess.Popen[str], ready: Path,
+                              finish: Path, timeout: float = test_hang_guard.TEST_HANG_GUARD_SECS) -> tuple[str, str]:
+        ready.touch()
+        finish.touch()
+        return communicate_launcher(process, timeout)
+
+    def start_implementation(self, name: str) -> Path:
+        session_dir = self.start_phase(name)
+        self.recorder(
+            "start-pass", "--session-dir", str(session_dir), "--phase-id", "3",
+            "--pass-kind", "impl", "--activity", "writing the retry path",
+            "--called-task", "direct.impl", "--called-family", "codex",
+            "--called-model", "gpt-called", "--called-effort", "xhigh",
+        )
+        return session_dir
+
+    def review_command(
+        self, session_dir: Path, lens: str, ready_file: str, to: str = "",
+        new_slot: str = "",
+    ) -> list[str]:
+        command = [
+            "bash", str(self.review_script), str(session_dir), str(self.working_dir),
+            str(self.prompt_file), "review", "blind review", "reviewing the diff",
+            "1", lens, ready_file,
+        ]
+        if to:
+            command[2:2] = ["--to", to]
+        elif new_slot:
+            command[2:2] = ["--slot", new_slot]
+        return command
+
+    def run_review(self, session_dir: Path, ready_file: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            self.review_command(session_dir, "", str(ready_file)),
+            check=False,
+            capture_output=True,
+            text=True,
+            env=self.environment(),
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+        )
+
+    def run_assigned_review(
+        self,
+        session_dir: Path,
+        worker: str,
+        *,
+        edit_path: str = "",
+        commit_change: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = self.environment()
+        environment["STUB_REVIEW_WORKING_DIR"] = str(self.working_dir)
+        if edit_path:
+            environment["STUB_REVIEW_EDIT"] = edit_path
+        if commit_change:
+            environment["STUB_REVIEW_COMMIT"] = "1"
+        return subprocess.run(
+            self.review_command(session_dir, "", "", worker),
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+        )
+
+    def finish_implementation(self, session_dir: Path) -> None:
+        self.recorder(
+            "finish-pass", "--session-dir", str(session_dir), "--status", "completed"
+        )
+
+    def open_worker(
+        self, session_dir: Path, *, status: str = "done", context_tokens: int = 0,
+        name: str = "fixture-impl", role: str = "impl", thread_id: str = "thread-fixture",
+    ) -> str:
+        roster = session_dir / "mesh_roster.json"
+        records = cast(dict[str, object], json.loads(roster.read_text())) if roster.exists() else {}
+        records[name] = {
+            "thread_id": thread_id,
+            "turn_id": "turn-1",
+            "status": status,
+            "role": role,
+            "context_tokens": context_tokens,
+        }
+        _ = roster.write_text(
+            json.dumps(records),
+            encoding="utf-8",
+        )
+        return name
+
+    def unit_review_command(
+        self, session_dir: Path, lens: str = "contract", ready_file: str = "", *, slot: str = "review",
+    ) -> list[str]:
+        name = f"fixture-{slot}"
+        roster = session_dir / "mesh_roster.json"
+        records = cast(dict[str, object], json.loads(roster.read_text())) if roster.exists() else {}
+        if name not in records:
+            _ = self.open_worker(session_dir, name=name, role="review",
+                                 thread_id="thread-fixture" if slot == "review" else f"thread-{slot}")
+        return self.review_command(session_dir, lens, ready_file, name)
+
+    def events(self, name: str) -> list[dict[str, object]]:
+        path = self.history_dir / "runs" / f"{name}.jsonl"
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    def pass_events(self, name: str) -> list[dict[str, object]]:
+        return [
+            event
+            for event in self.events(name)
+            if str(event.get("event_type", "")).startswith("pass_")
+        ]
+
+
+
+    def turn_records(self, session_dir: Path) -> list[dict[str, object]]:
+        directory = self.history_dir / "review_turns" / session_dir.name
+        return [cast("dict[str, object]", json.loads(path.read_text(encoding="utf-8")))
+                for path in sorted(directory.glob("*.json"))]
+
+    def call_records(self, filename: str) -> list[dict[str, object]]:
+        return [cast("dict[str, object]", json.loads(line)) for line in
+                (self.root / filename).read_text(encoding="utf-8").splitlines()]
+
+    def trace_pass_recorder(self, environment: dict[str, str]) -> None:
+        recorder = self.review_script.parent / "progress_history.py"
+        _ = recorder.rename(recorder.with_name("progress_history_real.py"))
+        _ = recorder.write_text('''import json
+import os
+from pathlib import Path
+import sys
+
+if sys.argv[1] in ("start-pass", "finish-pass"):
+    with Path(os.environ["STUB_PASS_CALLS"]).open("a") as calls:
+        calls.write(json.dumps({"verb": sys.argv[1], "argv": sys.argv[2:]}) + "\\n")
+os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress_history_real.py")), *sys.argv[1:]])
+''', encoding="utf-8")
+        calls = self.root / "pass-calls.jsonl"
+        calls.touch()
+        environment["STUB_PASS_CALLS"] = str(calls)
+
+    def side_by_side_review(self, name: str, edited: str, *, commit_change: bool = False) -> tuple[
+            subprocess.CompletedProcess[str], Path]:
+        """Review phase 3 while phase 4, open beside it, holds `other.txt` and its writer edits `edited`."""
+        session = self.start_implementation(name)
+        self.finish_implementation(session)
+        # The stub's commit adds every file, so the plan start_implementation writes is committed first.
+        _ = subprocess.run(["git", "add", "plan.md"], cwd=self.working_dir, check=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+        _ = subprocess.run(
+            ["git", "-c", "user.name=Review Test", "-c", "user.email=review@example.com",
+             "commit", "-q", "-m", "plan"],
+            cwd=self.working_dir, check=True, capture_output=True, text=True,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+        )
+        for phase, files in (("3", "reviewed.txt\n"), ("4", "other.txt\n")):
+            directory = session / "phases" / phase
+            directory.mkdir(parents=True, exist_ok=True)
+            _ = (directory / "delegated_phase_reservation_state.json").write_text(
+                json.dumps({"state": "active", "phase": phase}), encoding="utf-8")
+            _ = (directory / "files").write_text(files, encoding="utf-8")
+        # A phase is open while the recorder lists it, so phase 4 starts there beside phase 3.
+        self.recorder("start-phase", "--session-dir", str(session), "--phase-id", "4", "--phase-title", "Parallel writer")
+        environment = self.environment()
+        environment["STUB_REVIEW_EDIT"] = str(self.working_dir / edited)
+        environment["STUB_REVIEW_WORKING_DIR"] = str(self.working_dir)
+        if commit_change:
+            environment["STUB_REVIEW_COMMIT"] = "1"
+        command = self.unit_review_command(session)
+        command[2:2] = ["--phase", "3"]
+        result = subprocess.run(command, env=environment, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+        return result, session / "phases" / "3"

@@ -18,21 +18,31 @@ export HOME="$scratch/home"
 export XDG_CACHE_HOME="$scratch/cache"
 export UNIT_HISTORY_DIR="$scratch/history" PLAN_DELEGATE_HISTORY_DIR="$scratch/history"
 export AGENTS_CONFIG_FILE="$scratch/agents.conf"
-export AGENTS_LOCAL_CONFIG_FILE="$scratch/agents.local.conf"
-export UNIT_CONFIG="$scratch/direct.conf" PLAN_DELEGATE_CONFIG="$scratch/direct.conf"
+export AGENTS_CONFIG_PUBLISH=0
+export CONF_DIR="$scratch" PLAN_DELEGATE_CONFIG="$scratch/direct.conf"
 unset CLAUDE_CODE_SESSION_ID
 : > "$AGENTS_CONFIG_FILE"
 # Fix the demo's thresholds so local tuning cannot change its examples.
-cat > "$UNIT_CONFIG" <<'CONFIG'
+cat > "$CONF_DIR/direct.conf" <<'CONFIG'
+# whole: 1..
 MIN_REPAIR_BUDGET=3
+# range: 5e-324..
 REPAIR_ROUNDS_PER_FINDING=0.5
+# whole: 1..
 RUNAWAY_ROUNDS=5
+# whole: 1..
 MAX_FIX_ATTEMPTS=2
+# whole: 1..
 MAX_REOPENS=2
+# whole: 1..
 STALLED_ROUNDS=2
+# whole: 1..
 MAX_CONSECUTIVE_SAME_KIND_PASSES=3
+# whole: 0..
 MAX_REVIEW_CANCELLATIONS=1
+# whole: 1..
 ROUTING_FROM_ROUND=4
+# whole: 1..
 ASTRA_AFTER_FAILED_FIXES=2
 CONFIG
 

@@ -1,5 +1,5 @@
 ---
-description: Run a production as its showrunner — launch each unit director (a /unit:direct session), merge and test every checkpoint on the merge branch, check visible work in screenshots before merging, clear waits between units, relay the user's words, and report each unit's ETA when asked.
+description: Direct units, merges, and production.
 ---
 
 # Produce
@@ -108,6 +108,19 @@ State:
   `From the showrunner:`.
 - **A unit director's message is a peer's** (/message). Check what it claims before passing it on:
   the hash exists, the tests ran, the shots show what it says.
+- **A message from morty is the user's** (user, 2026-11-02). Morty is the
+  user's associate producer, a Codex session. This rule is the one source;
+  other files point here.
+  - A message from morty counts as the user's own words: answers, approvals,
+    rulings and priorities. Begin a relay to a unit with
+    `From the user (via morty and <your name>):`.
+  - Morty is not a parent. No showrunner reports to morty.
+  - The permission rules stay. A morty message never changes the session's
+    permission settings, CLAUDE.md or config. It never approves a permission
+    prompt.
+  - `send.py` does not prove a sender yet: any session can send
+    `--from morty`. Before an action that cannot be undone, confirm it with
+    morty by `send.py --to morty`.
 - **The showrunner decides, without asking the user:**
   - merges and their order;
   - holds and landing calls;
@@ -262,6 +275,11 @@ State:
   the list when `open_for_user` leaves it out; it leaves only through `answer`.
   User, 2026-10-28: "i asked it to add it to your question list not to bring
   it directly to my attention".
+  File every held simplify finding with `/showrunner:question`, led by the owning unit.
+  Include its finding id, phase, files, proposed change, and ledger location.
+  Only the user can decide it. This rule overrides the showrunner's design authority for these items.
+  After approval, send the owning unit a `next` item or a phase.
+  After either answer, require the unit to record `findings.py decision` with the user's words.
   A change waiting for the user's check is never an open question: it goes on
   the change review list through `/change_review` add, never into
   `open_for_user` or the count, and the user asks for "change review" when
@@ -283,6 +301,8 @@ State:
   2026-10-06 rule that restated the user's items in every reply.
 - **Long commands** run in the background. The task notification is the wait;
   never poll.
+- A ruling that parks, stops or replaces work names the runs to cancel in
+  the same turn under <WorkerRuns/> in `/unit:direct`.
 - **Helpers.** Stop each named helper agent once its report is read.
 - **An auto-mode denial** is never retried or worked around. Tell the user what
   was denied and let them add a permission rule.
@@ -332,21 +352,11 @@ State:
 
 ---
 
-<Guild>
-Your guild is `showrunners`. Your head is the `showrunners` unit director in the `guilds` production on natedev. At skill start, use the Tips lock/pull rule for `~/rust/nate_style` and load `guilds/common/` and `guilds/showrunners/`; a Codex holder does this for its worker. Report to your head when the user corrects you, a phase needs repair round 4, a finding meets the Events repeat rule, you use a workaround for a tool fault or slow rule, or a method saves measured time. Send one report of at most 100 words, with evidence and result. Resolve the head from `message/roster.py --json` by production `guilds` and unit `showrunners`; send with `message/send.py` or SendMessage. A Codex worker puts the report in its reply for its holder to send. Send only to the head. Never wake an idle Codex member for guild advice.
-
-Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild showrunners
-
-Use Events in `~/.claude/docs/as-built/guilds.md` for report detection and form.
-Pass the user's guild feedback to that guild's head. A Codex holder includes the
-expanded block and loaded tip text in its worker prompt.
-</Guild>
-
 <HeldProductionDesign>
 The showrunner may hold one lasting Astra designer/reviewer pair for a production
-design through `roles.py`. It briefs, records cited rulings and acceptance, and
+design through `design_roles.py`. It briefs, records cited rulings and acceptance, and
 keeps the same threads across rounds, restarts and account moves. Configured
-`guild` models and explicit access policies apply. A writer needs an authorized
+`design_roles` models and explicit access policies apply. A writer needs an authorized
 production-design phase with exact output paths, baseline and reservation; until
 that phase exists, hold read-only roles only. New writing scope needs an idle
 rebind. Saved headed prompts and replies stay with the role; pending messages are
@@ -376,7 +386,10 @@ Run `python3 ~/.claude/scripts/production/production_lifecycle.py load
 the checkout, copies any state that `<SCRATCH>` holds and `STATE_DIR` does not, reads the last `### STATE` block of `LOG`, rebuilds each unit's
 last code checkpoint from first-parent merge history, and checks its herdr
 session. Use its lines to restore state. <StartUpdates/> registers this session
-again and retargets the instance. After a reboot, the herdr boot unit and `pane_restore.py` bring each pane back on its own account (`docs/as-built/herdr-restore.md`).
+again and retargets the instance. No boot restore unit is installed. `agents restart`
+restores selected sessions from recovery records on their own accounts. It starts or
+adopts herdr and opens a tab for each session. It does not run `pane_restore.py`
+for other panes. See `docs/as-built/herdr-restore.md`.
 
 When the production doc's **Production rules** say CI does not apply, pass
 `--no-ci` to this and every lifecycle subcommand.
@@ -395,11 +408,9 @@ after a failed step; it resumes at the first unfinished step.
 ---
 
 <LaunchUnits>
-When the production doc has a **Review pool** line, no unit runs the pool:
-the first review of each type primes it. Each unit keeps one permanent reviewer per type, and every
-code review goes to it (`docs/production_format.md`, unit rule 16). Before
-you mark a unit `retired`, run `review_pool.py retire` for it
-(`docs/production_format.md`, Units).
+Each unit owns its read-only reviewers. `assign.sh --role review` resumes
+`review`, then `review2` when the first is busy. Their context lasts across
+phases and plans; unit pause, move and end apply to them too.
 
 For each unit without a live unit director, run
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan>`.
@@ -554,6 +565,7 @@ Routing arrivals and ordering that queue are the showrunner's calls.
 
 <MergeCheckpoint>
 Input: the unit, phase, hash, shots, and `review trial:` line from its notice.
+File each `Held simplify:` item under <Throughout/> → Open questions before processing the checkpoint.
 Take the phase start time from the unit's previous merge time in `LOG`, or
 from its launch line in `LOG` for the first phase.
 
@@ -614,7 +626,11 @@ notice to the unit director before any merge command runs:
    `--as-built`; with either, omit `--review-trial`, `--parallel` and `--delivers`. Add
    `--cancel-prior` only with `Push: validate_and_push` when this push supersedes
    an older queued or running CI run on the merge branch and no CI point is
-   watching its result or diagnosing a red run. The script checks ancestry,
+   watching its result or diagnosing a red run. Add `--bump` only for a user's
+   bump: merge and push the code checkpoint first, then gate the pushed tip
+   in a detached clone in the background; red goes to the unit and the
+   showrunner, green to the showrunner. It refuses `--shrink`, `--as-built`
+   and `--from-child`. The script checks ancestry,
    origin, scope and conflicts, reports overlaps with other units, merges,
    tests, reruns red packages, pushes, promotes, and records the result. Its
    first `held` or `failed` line stops the run. Send its final `send <unit>:`
@@ -678,16 +694,19 @@ message.
 
 <CloseChangeReview>
 When the user gives a change-review verdict, in any production. A verdict
-beginning `works` or `fine` lands the row; any other returns it to its unit.
+beginning `works` or `fine`, after optional `okay`/`ok` and a row id (`c17`),
+lands the row. Case and later words do not affect the result; any other start
+returns it to its unit.
 
-1. **Feature log.** Only when the production's project closes out by change
-   review: Hana (`~/rust/hana`, `~/rust/hana_catalyst`) and `~/.claude`. Other
+1. **Feature log.** Use only `ProjectSpec.closes_by_change_review` in
+   `scripts/feature_log/feature_log.py` to select projects, such as Hana and `~/.claude`. Other
    projects close out through `/validate_and_push`, so skip to step 2. The
    review id is the row: bare `C<n>` on hana's list, `<showrunner>/C<n>` on any
    other, where `<showrunner>` is the name the list `change-review - <showrunner>.md`
    is named for (`natedev/C3`).
+   A row with no proposal skips this step.
    - A landing row runs `add --review <id>`, or `supersede --review <id>` when
-     its proposal has `--old`. Propose a missing row first; correct wrong
+     its proposal has `--old`. Correct wrong
      meaning by rerunning `propose` while it is open.
    - A returning row runs `drop --review <id> --verdict "<verdict>"`.
 
@@ -1119,36 +1138,16 @@ land a phase sooner. Each design check covers every view of the change at once
       checks and shots for both run on the combined tree.
 </CrossUnitChange>
 
+<StopResume>
+Stop a local session with `agents stop SESSION`. Resume it in its own tab with
+`agents resume SESSION --why "reason"`. Move one session or a group with
+`accounts.py move SESSION_OR_GROUP claudeN --why "reason"`; it stops all selected
+sessions, then resumes each on that account with one message to continue its work
+and its existing workers. See `commands/shutdown.md`.
+</StopResume>
+
 ---
 
-<PauseForMove>
-A message whose first line starts `Pause for move:` or `Pause for stop:` is the
-shutdown mover asking this session to stop so it can move or stop it. Act on it
-at once, in the turn it arrives:
-
-1. Stop mid-step and start nothing new: no merge, gate or launch that has not
-   begun. Leave uncommitted work in place.
-2. Append a `### STATE` block to your LOG, and stop any build you started or name
-   it in the line below.
-3. Run the `shutdown.py ready --where "<one line>"` command the message gives.
-4. End the turn.
-
-The session is resumed with that line, on the account the message names; continue
-from it. A unit of yours that vanished during a move is the mover's to bring back:
-do not restore it while its move is in progress.
-
-Before the mover stops one of your units, you get one line from `shutdown`:
-`<unit> is stopping: <why>; it comes back on <account> within minutes`, or that
-it stays stopped until the user restarts it. One more line follows:
-`<unit> is back on <account>`, or `<unit> did not come back: <reason>`. The user
-is told of a failure; you hold the unit's work until it is back.
-
-To move a session yourself, or stop one to change its account, run
-`/showrunner:move`: it pauses the session first and proves the account it comes
-back on. Never send `/exit` into a pane, run `shutdown.py now`, kill a Claude
-process or resume `claude` with a `CLAUDE_CONFIG_DIR` by hand; a hook refuses
-each in your session.
-</PauseForMove>
 
 ---
 
@@ -1168,11 +1167,6 @@ condition: wrap neither waits on it nor retires its worktree or branch.
    - any other item that cannot be undone gets the user's OK first;
    - back up user data before migrating it.
    Finish each item before passing its exact text as `--close-out-done "<item>"`.
-   With a **Review pool** line, run
-   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/review_pool.py stop --production <slug>`.
-   On failure, report its reason and run `stop` again; do not finish wrap
-   until it succeeds. `<slug>` is the production doc's file name without
-   `-production.md`.
 3. Run `python3 ~/.claude/scripts/production/production_lifecycle.py wrap
    --production PRODUCTION_DOC --ci-green <sha> --smoke-passed <sha>
    --close-out-done "<item>"` (repeat the last flag for every item), or pass
@@ -1193,7 +1187,7 @@ condition: wrap neither waits on it nor retires its worktree or branch.
 - The showrunner writes no implementation code, tests or Work Orders in a unit's
   files.
 - Only the showrunner pushes the merge branch and main, never with force.
-  Units push only their own branch.
+  Units push only their own branch except <FastTrack/> (`commands/unit/fast_track.md`).
 - Merge only from a checkpoint notice. Never merge a visible change before a
   fresh design-check pass on its shots (<MergeCheckpoint/> step 3).
 - **An out-of-date as-built doc may always be corrected.** You and every unit

@@ -9,42 +9,29 @@ import sqlite3
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
 import index
-import sample
+import cgroup_capture
+from cgroup_capture import SliceAbsent as SliceAbsent, SlicePresent as SlicePresent, SliceCollection as SliceCollection
 import store
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
 
+import conf
+
 GIB = 2**30
 SNAPSHOT_DISTANCE_S = 120
-EARLYOOM = re.compile(r'sending SIG(?:TERM|KILL) to process (\d+) uid \d+ "([^"]+)"')
+EARLYOOM = re.compile(
+    r'sending SIG(?:TERM|KILL) to process (?P<pid>\d+) uid \d+ "(?P<command>[^"]+)"'
+    + r'(?:[^\n]*?,\s*oom_score_adj (?P<adj>-?\d+))?'
+    + r'(?:[^\n]*?\bcmdline "(?P<cmdline>.*)")?[^\n]*$'
+)
 OOM_MEMCG = re.compile(r'oom_memcg=([^,\s]+)')
-
-
-class SliceAbsent(TypedDict):
-    state: Literal["absent"]
-
-
-class SliceEvents(TypedDict):
-    high: int
-    max: int
-    oom_kill: int
-
-
-class SlicePresent(TypedDict):
-    state: Literal["present"]
-    events: SliceEvents
-    peak_bytes: int
-    swap_peak_bytes: int
-    high: int | Literal["max"]
-    max: int | Literal["max"]
-    swap_max: int | Literal["max"]
-    stall_some_us: int | Literal["unavailable"]
 
 
 class ZramAbsent(TypedDict):
@@ -55,11 +42,6 @@ class ZramPresent(TypedDict):
     state: Literal["present"]
     data_bytes: int
     compressed_bytes: int
-
-
-class SliceCollection(TypedDict):
-    builds: SlicePresent | SliceAbsent
-    ci: SlicePresent | SliceAbsent
 
 
 class MemorySnapshot(TypedDict):
@@ -82,6 +64,38 @@ class JournalUnavailable(Enum):
     VALUE = "journal unavailable"
 
 
+class OomScoreAdjUnavailable(Enum):
+    VALUE = "oom_score_adj not recorded"
+
+
+class CmdlineUnavailable(Enum):
+    VALUE = "cmdline not recorded"
+
+
+def cmdline_program(cmdline: str) -> str:
+    """earlyoom joins argv with spaces without shell quoting."""
+    return cmdline.partition(" ")[0]
+
+
+@dataclass(frozen=True)
+class EarlyoomKill:
+    at: datetime
+    pid: int
+    command: str
+    oom_score_adj: int | OomScoreAdjUnavailable = OomScoreAdjUnavailable.VALUE
+    cmdline: str | CmdlineUnavailable = CmdlineUnavailable.VALUE
+
+    @property
+    def outside_build_gate(self) -> bool:
+        if self.oom_score_adj == conf.whole("lint", "build_oom_score_adj") or not isinstance(self.cmdline, str):
+            return False
+        return "/target/" in cmdline_program(self.cmdline)
+
+    @property
+    def is_build(self) -> bool:
+        return self.oom_score_adj == conf.whole("lint", "build_oom_score_adj") or self.outside_build_gate
+
+
 def service_state(value: int | None) -> ServiceState:
     if value is None:
         return "unavailable"
@@ -98,60 +112,29 @@ def stored_bound(instant: datetime) -> str:
 
 
 def builds_path() -> Path:
-    uid = os.getuid()
-    default = f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/builds.slice"
-    return Path(os.environ.get("BUILDLOG_BUILDS_CGROUP", default))
+    return cgroup_capture.builds_path()
 
 
 def slice_state(path: Path) -> SlicePresent | SliceAbsent:
-    if not path.is_dir():
-        return {"state": "absent"}
-    events: dict[str, int] = {}
-    for line in (path / "memory.events").read_text().splitlines():
-        name, value = line.split()
-        if name in ("high", "max", "oom_kill"):
-            events[name] = int(value)
-
-    def limit(name: str) -> int | Literal["max"]:
-        value = (path / name).read_text().strip()
-        return "max" if value == "max" else int(value)
-
-    stall_some_us: int | Literal["unavailable"] = "unavailable"
-    try:
-        some = sample.parse_pressure((path / "memory.pressure").read_text(), require_both=False).some_us
-        if isinstance(some, int):
-            stall_some_us = some
-    except OSError:
-        pass
-
-    return {
-        "state": "present",
-        "events": {"high": events["high"], "max": events["max"], "oom_kill": events["oom_kill"]},
-        "peak_bytes": int((path / "memory.peak").read_text().strip()),
-        "swap_peak_bytes": int((path / "memory.swap.peak").read_text().strip()),
-        "high": limit("memory.high"),
-        "max": limit("memory.max"),
-        "swap_max": limit("memory.swap.max"),
-        "stall_some_us": stall_some_us,
-    }
+    return cgroup_capture.read_cgroup(path)
 
 
 def zram_state(path: Path) -> ZramPresent | ZramAbsent:
     if not path.is_dir():
         return {"state": "absent"}
-    data, compressed, *_ = (path / "mm_stat").read_text().split()
-    return {"state": "present", "data_bytes": int(data), "compressed_bytes": int(compressed)}
+    try:
+        data, compressed, *_ = (path / "mm_stat").read_text().split()
+        return {"state": "present", "data_bytes": int(data), "compressed_bytes": int(compressed)}
+    except (OSError, ValueError, UnicodeError):
+        return {"state": "absent"}
 
 
-def write_snapshot(at: float, host: str) -> MemorySnapshot:
+def write_snapshot(at: float, host: str, slices: SliceCollection | None = None) -> MemorySnapshot:
     record: MemorySnapshot = {
         "kind": "memory_snapshot",
         "at": store.utc_iso(at),
         "host": host,
-        "slices": {
-            "builds": slice_state(builds_path()),
-            "ci": slice_state(Path(os.environ.get("BUILDLOG_CI_CGROUP", "/sys/fs/cgroup/hana.slice/hana-ci.slice"))),
-        },
+        "slices": slices if slices is not None else cgroup_capture.read_slices(),
         "zram": zram_state(Path(os.environ.get("BUILDLOG_ZRAM", "/sys/block/zram0"))),
     }
     store.append_line(store.sample_file(host, at), record)
@@ -262,6 +245,25 @@ def journal_messages(args: list[str], start: datetime, end: datetime) -> list[tu
     return messages
 
 
+def earlyoom_kills(start: datetime, end: datetime) -> list[EarlyoomKill] | JournalUnavailable:
+    """Read real kill lines once; startup threshold announcements are not kills."""
+    if store.host_name() != "natedev":
+        return JournalUnavailable.VALUE
+    messages = journal_messages(["-u", "earlyoom"], start, end)
+    if messages is JournalUnavailable.VALUE:
+        return messages
+    kills: list[EarlyoomKill] = []
+    for at, message in messages:
+        match = EARLYOOM.search(message)
+        if match is None or not start <= at < end:
+            continue
+        adj, cmdline = match.group("adj"), match.group("cmdline")
+        kills.append(EarlyoomKill(at, int(match.group("pid")), match.group("command"),
+                                 int(adj) if adj is not None else OomScoreAdjUnavailable.VALUE,
+                                 cmdline if cmdline is not None else CmdlineUnavailable.VALUE))
+    return kills
+
+
 def nearest_snapshot(connection: sqlite3.Connection, instant: datetime) -> SnapshotNearInstant:
     left = stored_bound(instant - timedelta(seconds=SNAPSHOT_DISTANCE_S))
     right = stored_bound(instant + timedelta(seconds=SNAPSHOT_DISTANCE_S))
@@ -286,14 +288,18 @@ def slice_line(name: Literal["builds", "ci"], start: SnapshotNearInstant, end: S
     earlier, later = start["slices"][name], end["slices"][name]
     if earlier["state"] == "absent" or later["state"] == "absent":
         return f"{label}: slice absent"
+    if any(not isinstance(row[key], int) for row in (earlier, later) for key in ("peak_bytes", "swap_peak_bytes")) or any(
+        not isinstance(row["events"][key], int) for row in (earlier, later) for key in ("high", "max", "oom_kill")
+    ):
+        return f"{label}: slice counters unavailable"
     first_stall = earlier.get("stall_some_us", "unavailable")
     last_stall = later.get("stall_some_us", "unavailable")
-    reset = later["peak_bytes"] < earlier["peak_bytes"] or any(
-        later["events"][key] < earlier["events"][key] for key in ("high", "max", "oom_kill")
+    reset = cast(int, later["peak_bytes"]) < cast(int, earlier["peak_bytes"]) or any(
+        cast(int, later["events"][key]) < cast(int, earlier["events"][key]) for key in ("high", "max", "oom_kill")
     ) or (isinstance(first_stall, int) and isinstance(last_stall, int) and last_stall < first_stall)
     prefix = f"{label}: reset in the window; since the reset " if reset else f"{label}: "
     events = ", ".join(
-        f"{key} {later['events'][key]}" if reset else f"{key} +{later['events'][key] - earlier['events'][key]}"
+        f"{key} {later['events'][key]}" if reset else f"{key} +{cast(int, later['events'][key]) - cast(int, earlier['events'][key])}"
         for key in ("high", "max", "oom_kill")
     )
     if not isinstance(first_stall, int) or not isinstance(last_stall, int):
@@ -302,9 +308,11 @@ def slice_line(name: Literal["builds", "ci"], start: SnapshotNearInstant, end: S
         stall = f"stall {last_stall / 1_000_000:.1f} s"
     else:
         stall = f"stall +{(last_stall - first_stall) / 1_000_000:.1f} s"
-    def peak(name: str, before: int, after: int, limit: int | Literal["max"]) -> str:
+    def peak(name: str, before: int | Literal["unavailable"], after: int | Literal["unavailable"], limit: int | Literal["max", "unavailable"]) -> str:
         """memory.peak is the slice's lifetime high, so it measures the window only when it rose in it."""
-        bound = "no limit" if limit == "max" else f"limit {limit / GIB:.1f} GiB"
+        if not isinstance(before, int) or not isinstance(after, int):
+            return f"{name} unavailable"
+        bound = f"limit {limit / GIB:.1f} GiB" if isinstance(limit, int) else "no limit" if limit == "max" else "limit unavailable"
         if reset or after > before:
             return f"{name} {after / GIB:.1f} GiB, {bound}"
         return f"{name} at most {after / GIB:.1f} GiB (no new high in the window), {bound}"
@@ -315,14 +323,12 @@ def slice_line(name: Literal["builds", "ci"], start: SnapshotNearInstant, end: S
 
 def window_report(connection: sqlite3.Connection, start: datetime, end: datetime) -> str:
     lines = [f"Memory, {local_time(start, with_date=True)} to {local_time(end, with_date=True)}"]
-    early_messages = journal_messages(["-u", "earlyoom"], start, end)
-    if early_messages is JournalUnavailable.VALUE:
+    early = earlyoom_kills(start, end)
+    if early is JournalUnavailable.VALUE:
         lines.append("earlyoom kills: journal unavailable")
     else:
-        early = [(at, match.group(2), match.group(1)) for at, message in early_messages
-                 if (match := EARLYOOM.search(message))]
         lines.append(f"earlyoom kills: {len(early)}")
-        lines.extend(f"{local_time(at)} {comm} pid {pid}" for at, comm, pid in early)
+        lines.extend(f"{local_time(kill.at)} {kill.command} pid {kill.pid}" for kill in early)
     kernel_messages = journal_messages(["-k"], start, end)
     if kernel_messages is JournalUnavailable.VALUE:
         lines.append("kernel OOM kills: journal unavailable")

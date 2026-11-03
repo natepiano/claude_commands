@@ -15,10 +15,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import NamedTuple, cast, override
 from unittest.mock import patch
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 HOOKS = Path(__file__).resolve().parent
 DISPATCH = HOOKS / "hook_dispatch.py"
@@ -504,11 +502,36 @@ class FakeHookTests(IsolatedHookTests):
 
 
 class SettingsRegistrationTests(IsolatedHookTests):
-    def test_dispatcher_outer_timeouts_cover_all_hooks_and_overhead(self) -> None:
+    def test_push_delivery_hook_runs_only_for_push_notifications(self) -> None:
         driver = (
             f"import sys, json\nsys.path.insert(0, {str(ROOT)!r})\n"
             + "from scripts.hooks import hook_dispatch as dispatch\n"
-            + "print(json.dumps({event: sum(spec.timeout for spec in table) "
+            + "calls = []\n"
+            + "from pathlib import Path\n"
+            + "def run_hook(path: Path, payload: str, timeout: float) -> dispatch.HookResult:\n"
+            + "    calls.append(path.name)\n"
+            + "    return dispatch.HookResult(path.name, 0, '', '')\n"
+            + "dispatch.run_hook = run_hook\n"
+            + "sys.argv = ['hook_dispatch.py', 'post_tool_use']\n"
+            + "try: dispatch.main()\n"
+            + "except SystemExit as result: assert result.code == 0\n"
+            + "print(json.dumps({'calls': calls}))\n"
+        )
+        for tool, expected in (("PushNotification", 1), ("Bash", 0)):
+            with self.subTest(tool=tool):
+                result = self.run_python(["-c", driver], {"tool_name": tool})
+                self.assertEqual((result.returncode, result.stderr), (0, ""))
+                calls = parsed_output(result.stdout)["calls"]
+                self.assertIsInstance(calls, list)
+                self.assertEqual(cast(list[object], calls).count("post-tool-use-push-delivered.py"), expected)
+
+    def test_dispatcher_outer_timeouts_cover_all_hooks_and_overhead(self) -> None:
+        driver = (
+            f"import sys, json, re\nsys.path.insert(0, {str(ROOT)!r})\n"
+            + "from scripts.hooks import hook_dispatch as dispatch\n"
+            + "tools = ('Bash', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'PushNotification', '')\n"
+            + "print(json.dumps({event: max(sum(spec.timeout for spec in table "
+            + "if spec.matcher is None or re.fullmatch(spec.matcher, tool)) for tool in tools) "
             + "+ dispatch.DISPATCH_OVERHEAD_SECONDS for event, table in dispatch.EVENTS.items()}))\n"
         )
         result = self.run_python(["-c", driver], {})
@@ -544,9 +567,12 @@ class SettingsRegistrationTests(IsolatedHookTests):
         )
         result = self.run_python(["-c", driver], {})
         self.assertEqual((result.returncode, result.stderr), (0, ""))
-        self.assertEqual(parsed_output(result.stdout), {
+        expected = {
             event: [list(row) for row in rows] for event, rows in LEGACY.items()
-        })
+        }
+        expected["post_tool_use"].append(["post-tool-use-push-delivered.py", "PushNotification", 600])
+        expected["post_tool_use"].append(["post-tool-use-sendmessage-miss.py", "SendMessage", 600])
+        self.assertEqual(parsed_output(result.stdout), expected)
 
     def test_each_event_registers_dispatch_once_and_removes_old_python_commands(self) -> None:
         settings = object_fields(cast(object, json.loads((ROOT / "settings.json").read_text(encoding="utf-8"))))

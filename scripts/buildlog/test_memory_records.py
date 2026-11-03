@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+
+
 import json
 import os
 import subprocess
@@ -13,14 +15,21 @@ from unittest import mock
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import config_environment
+else:
+    from memory_test_support import config_environment
 
 if TYPE_CHECKING:
     from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
 else:
     from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
 from test_index import Record, call, encode, point_root_at, sample, step
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 HERE = Path(__file__).parent
 CLI = HERE / "cli.py"
@@ -30,6 +39,8 @@ AT = "2026-10-04T21:00:00.000Z"
 
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    fixture_root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    unittest.enterModuleContext(mock.patch.dict(os.environ, config_environment(fixture_root)))
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
@@ -56,7 +67,7 @@ class MemoryRecordTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=TEST_HANG_GUARD_SECS,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
     def records(self) -> list[Record]:
@@ -86,6 +97,8 @@ class MemoryRecordTests(unittest.TestCase):
             "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
             "import sample, cli; proc = Path(sys.argv[2]); "
             "sample.MEMINFO = proc / 'meminfo'; sample.PRESSURE = proc / 'pressure'; "
+            "sample.CPU_PRESSURE = proc / 'cpu_pressure'; sample.IO_PRESSURE = proc / 'io_pressure'; "
+            "sample.STAT = proc / 'stat'; "
             "sample.BOOT_ID = proc / 'boot_id'; sys.exit(cli.main(['sample']))"
         )
         env = self.env(BUILDLOG_BUILDS_CGROUP=str(builds), BUILDLOG_CI_CGROUP=str(self.base / "absent-ci"),
@@ -93,7 +106,7 @@ class MemoryRecordTests(unittest.TestCase):
         def take_sample() -> None:
             result = subprocess.run(
                 [sys.executable, "-c", command, str(HERE), str(proc)],
-                env=env, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+                env=env, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
 

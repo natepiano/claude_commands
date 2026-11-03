@@ -1,5 +1,6 @@
 """The readings log and the weighted pace the dailies footer extends to 100% used."""
 
+import sys
 import json
 import math
 import tempfile
@@ -8,8 +9,10 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from run_out import HALF_LIFE, MAX_GAP, MIN_SPAN, Reading, read_readings, weighted_rate
-import run_out
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.whoami.run_out import HALF_LIFE, MAX_GAP, MIN_SPAN, Reading, read_readings, weighted_rate
+from scripts.whoami import run_out
 
 START = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
 

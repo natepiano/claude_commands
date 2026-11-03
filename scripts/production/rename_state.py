@@ -4,14 +4,19 @@
 from __future__ import annotations
 
 import json
-import os
-import tempfile
+import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import tidy_wrapped
 from unit_rename_sweep import token_pattern
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import atomic_file
+
+if TYPE_CHECKING:
+    from scripts.production.staff_sources import MemberSelector
 
 JsonObject = dict[str, object]
 
@@ -67,7 +72,29 @@ def rename_claim(slug: str) -> frozenset[str]:
 
 
 def write_json(path: Path, value: object) -> None:
-    write_text(path, json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+    write_text(path, json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def migrate_staff_ids(path: Path, fields: JsonObject,
+                      members: dict[str, tuple[MemberSelector, ...]]) -> JsonObject:
+    """Bind a legacy journal once, using members at either side of its saved changes."""
+    missing = {name: selectors for name, selectors in members.items() if name not in fields}
+    if not missing:
+        return fields
+    from scripts.production import staff, staff_sources
+
+    record = staff.snapshot()
+    migrated = fields.copy()
+    for name, selectors in missing.items():
+        for selector in selectors:
+            found = staff_sources.member(selector, record)
+            if isinstance(found, staff_sources.MemberFound):
+                migrated[name] = found.row.id
+                break
+        else:
+            raise staff.StaffRefused(f"{path}: no matching staff member for legacy {name}")
+    write_json(path, migrated)
+    return migrated
 
 
 def _rename_json(path: Path, update: Callable[[object], bool]) -> bool:
@@ -151,13 +178,13 @@ def _reword_items(items: object, fields: tuple[str, ...], words: Words) -> bool:
 
 
 def _reword_lists(value: object, words: Words) -> bool:
-    """The live lists `next` and `open_for_user` take the new names in their text: they are what the
-    showrunner still has to do, not history."""
+    """Keep held merge names current, and reword the showrunner's pending notes for readability."""
     if not isinstance(value, dict):
         return False
     state = cast(JsonObject, value)
-    changed = _reword_items(state.get("next"), (), words)
-    return _reword_items(state.get("open_for_user"), ("text", "question"), words) | changed
+    changed = _reword_items(state.get("merges_held"), (), words)
+    changed = _reword_items(state.get("next"), (), words) | changed
+    return _reword_reminders(state.get("open_for_user"), words) | changed
 
 
 def _rename_showrunner_state(value: object, words: Words) -> bool:
@@ -175,12 +202,26 @@ def reword_showrunner_lists(path: Path, words: Words) -> bool:
         raise RenameRefused(str(error)) from error
 
 
+def _reword_reminders(value: object, words: Words) -> bool:
+    """Reword reminders without changing questions or their fixed asker references."""
+    if not isinstance(value, list):
+        return False
+    reminders: list[object] = [cast(object, entry) for entry in cast(list[object], value)
+                 if not isinstance(entry, dict) or "question" not in entry]
+    changed = _reword_items(reminders, ("text",), words)
+    replacements = iter(reminders)
+    entries = cast(list[object], value)
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or "question" not in entry:
+            entries[index] = next(replacements)
+    return changed
+
+
 def rename_outstanding(slug: str, words: Words) -> bool:
-    """Reword OUTSTANDING as `open_for_user` is reworded, so the next `questions` run finds each item
-    stored and asks no new review."""
-    path = tidy_wrapped.owned_paths(slug)[2]
+    """Reword reminder text; question records remain unchanged during a rename."""
+    path = tidy_wrapped.outstanding_path(slug)
     try:
-        return _rename_json(path, lambda value: _reword_items(value, ("text", "question", "reviewed"), words))
+        return _rename_json(path, lambda value: _reword_reminders(value, words))
     except (OSError, ValueError) as error:
         raise RenameRefused(str(error)) from error
 
@@ -198,18 +239,8 @@ def _rename_top_level_key(value: object, old: str, new: str) -> bool:
 
 
 def write_text(path: Path, text: str) -> None:
-    """Replace a file atomically: a reader sees the old text or the new, never a part."""
-    temporary_name = ""
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False
-        ) as temporary:
-            temporary_name = temporary.name
-            _ = temporary.write(text)
-        os.replace(temporary_name, path)
-    finally:
-        if temporary_name:
-            Path(temporary_name).unlink(missing_ok=True)
+    """Publish state through the shared durable file writer."""
+    atomic_file.write_text_atomic(path, text)
 
 
 def _rename_lines(path: Path, old_prefix: str, new_prefix: str) -> bool:

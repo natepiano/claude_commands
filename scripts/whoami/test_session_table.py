@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import os
 import difflib
 import json
@@ -14,13 +15,15 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Self, cast, override
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.message import roster
 
-import session_table
+from scripts.whoami import session_table
 import agent_notes
-import agent_accounts
+from scripts.whoami import agent_accounts
 import five_hour
-import note_file
+from scripts.whoami import note_file
 from scripts.accounts import accounts
 
 

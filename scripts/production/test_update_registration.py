@@ -1,176 +1,36 @@
-"""Registration steps against a disposable production and notifier."""
+"""Registration behavior against a private seeded fixture."""
 
 from __future__ import annotations
 
+import json
 import io
-import json
 import os
-import re
 import shutil
-import subprocess
-import sys
-import tempfile
 import unittest
-from contextlib import redirect_stdout
-from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager, redirect_stdout
+from collections.abc import Generator
+from datetime import datetime
+from pathlib import Path
+from typing import IO, cast, final, override
 from unittest import mock
-from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, cast, override
+from zoneinfo import ZoneInfo
+
+from scripts.production import session_staff, staff
+from scripts.production.cli_fixture import production_paths
+from scripts.production.staff_test_support import fixture_member, fixture_showrunner_name, showrunner_relationship
+from scripts.production.update_registration_test_support import RegistrationFixture, review, dailies_render, registration
+
+import dailies_input
+import footer_counts
+import next_item
+import rename_state
+import tidy_wrapped
+from scripts.hooks import showrunner_footer
+
+from scripts.production.update_registration_test_support import setUpModule as setUpModule
 
 
-import update_registration as registration
-import showrunners
-import dailies_render
-from add_unit import read_production
-
-if TYPE_CHECKING:
-    from scripts.notify import review
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
-    import review
-
-SCRIPT = Path(__file__).with_name("update_registration.py")
-
-
-class QuestionRegistration(TypedDict):
-    time: str
-    text: str
-
-
-NOTIFIER = '''#!__PYTHON__
-import json
-import os
-from pathlib import Path
-import sys
-
-root = Path(os.environ["REGISTRATION_TEST_STATE"])
-args = sys.argv[1:]
-with (root / "notifier-argv.jsonl").open("a", encoding="utf-8") as output:
-    output.write(json.dumps(args) + "\\n")
-instance = root / ("instance-" + args[1]) if len(args) > 1 else root / "missing"
-if args[0] == "status":
-    if not instance.exists():
-        print(f"no such instance: {args[1]}", file=sys.stderr)
-        raise SystemExit(1)
-    mode = "stopped" if instance.read_text(encoding="utf-8") == "stopped" else "enabled"
-    print(f"{args[1]} → session:test every 15 min, {mode}")
-    print("next_due=1791334500 (2026-10-06 17:55 PDT)")
-elif args[0] == "new":
-    instance.touch()
-    print("next_due=1791334500 (2026-10-06 17:55 PDT)")
-elif args[0] == "remove":
-    instance.unlink(missing_ok=True)
-elif args[0] == "stop":
-    _ = instance.write_text("stopped", encoding="utf-8")
-else:
-    raise SystemExit(2)
-'''
-
-
-def setUpModule() -> None:
-    """The times these tests expect are Pacific; the user's zone setting must not change them."""
-    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
-
-
-class RegistrationTests(unittest.TestCase):
-    root: Path = Path()
-    home: Path = Path()
-    checkout: Path = Path()
-    doc: Path = Path()
-    state: Path = Path()
-    config: Path = Path()
-    env: dict[str, str] = {}
-
-    @override
-    def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.home = self.root / "home"
-        self.checkout = self.root / "checkout"
-        self.state = self.root / "state"
-        self.config = self.root / "showrunners.json"
-        self.doc = self.checkout / "docs/plans/example-production.md"
-        self.home.mkdir()
-        self.checkout.mkdir()
-        self.state.mkdir()
-        notifier = self.home / ".claude/scripts/message/notifier.sh"
-        notifier.parent.mkdir(parents=True)
-        _ = notifier.write_text(NOTIFIER.replace("__PYTHON__", sys.executable), encoding="utf-8")
-        notifier.chmod(0o755)
-        bin_dir = self.root / "bin"
-        bin_dir.mkdir()
-        # The command text names zsh; this shim runs only the disposable Python notifier.
-        zsh = bin_dir / "zsh"
-        _ = zsh.write_text("#!/bin/sh\nexec '" + sys.executable + "' \"$@\"\n", encoding="utf-8")
-        zsh.chmod(0o755)
-        self.env = {**os.environ, "HOME": str(self.home), "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
-                    "REGISTRATION_TEST_STATE": str(self.state), "SHOWRUNNER_STATE_DIR": str(self.state / "showrunner"),
-                    "NOTIFIER_STATE_DIR": str(self.state / "notifier"), "SHOWRUNNERS_CONFIG": str(self.config),
-                    "USAGE_STATE_DIR": str(self.state / "usage"),
-                    "MAC_TEST_STATE_DIR": str(self.state / "mac-test"), "NEXT_STATE_DIR": str(self.state / "next"),
-                    "CLAUDE_CODE_SESSION_ID": "current-session-id", "NOTIFIER_SESSIONS_DIR": str(self.state / "sessions")}
-        # Register refuses a session not named for its production's slug: both live sessions are named example.
-        (self.state / "sessions").mkdir()
-        for pid, session in ((os.getpid(), "current-session-id"), (os.getppid(), "resume-session-id")):
-            _ = (self.state / "sessions" / f"{pid}.json").write_text(
-                json.dumps({"pid": pid, "sessionId": session, "name": "example"}), encoding="utf-8")
-        _ = self.git("init", "-b", "production", str(self.checkout), cwd=self.root)
-        _ = self.git("config", "user.name", "Registration Test")
-        _ = self.git("config", "user.email", "registration@example.invalid")
-        self.doc.parent.mkdir(parents=True)
-        # A linked worktree, where `.git` is a file: herdr is never asked whether its unit is gone.
-        alpha = self.root / "alpha"
-        alpha.mkdir()
-        _ = (alpha / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
-        _ = self.doc.write_text("\n".join((
-            "# Production — example", "", "## Production Context", "",
-            "- **Merge branch:** `production`", f"- **Showrunner checkout:** `{self.checkout}`",
-            "- **Showrunner session:** first-showrunner", "- **Log:** `production.log`",
-            "- **User zone:** America/Los_Angeles", "- **Updates:** every 15 minutes", "",
-            "## Units", "", "| Unit | Plan | Worktree | Branch | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- |",
-            f"| `alpha-unit` | `docs/alpha.md` | `{alpha}` | `alpha` | — | — |",
-            "", "## Gates", "",
-        )), encoding="utf-8")
-        _ = self.git("add", ".")
-        _ = self.git("commit", "-m", "initial")
-
-    def git(self, *args: str, cwd: Path | None = None) -> str:
-        process = subprocess.run(["git", *args], cwd=cwd or self.checkout, env=self.env if self.env else None,
-                                 capture_output=True, text=True, check=False)
-        self.assertEqual(process.returncode, 0, process.stderr)
-        return process.stdout.strip()
-
-    def run_command(self, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), *args, "--production", str(self.doc)],
-                              cwd=self.checkout, env=env or self.env, capture_output=True, text=True, check=False)
-
-    def notifier_calls(self) -> list[list[str]]:
-        path = self.state / "notifier-argv.jsonl"
-        return ([cast(list[str], json.loads(line)) for line in path.read_text(encoding="utf-8").splitlines()]
-                if path.exists() else [])
-
-    def outstanding(self) -> Path:
-        path = self.state / "showrunner/outstanding/example.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        return path
-
-    def copied_command(self) -> Path:
-        tree = Path(tempfile.mkdtemp(prefix="command-copy-", dir=self.root))
-        _ = shutil.copytree(SCRIPT.parent, tree / "scripts/production")
-        for name in ("build_hold", "build_targets", "buildlog", "herdr", "lib", "lint", "mac_test", "message", "usage", "whoami"):
-            _ = shutil.copytree(SCRIPT.parent.parent / name, tree / "scripts" / name)
-        hooks = tree / "scripts/hooks"
-        hooks.mkdir(parents=True)
-        _ = shutil.copy2(SCRIPT.parent.parent / "hooks/showrunner_footer.py", hooks)
-        template = tree / "commands/showrunner/produce.md"
-        template.parent.mkdir(parents=True)
-        _ = shutil.copy2(SCRIPT.parents[2] / "commands/showrunner/produce.md", template)
-        return tree / "scripts/production/update_registration.py"
-
-    def run_copy(self, script: Path, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(script), *args, "--production", str(self.doc)],
-                              cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False)
-
+class RegistrationTests(RegistrationFixture):
     def test_start_and_resume_retarget_only_updates_and_retire_old_session(self) -> None:
         doc_bytes = self.doc.read_bytes()
         first = self.run_command("register")
@@ -201,45 +61,6 @@ class RegistrationTests(unittest.TestCase):
         for instance in ("stall-watch",):
             self.assertEqual(len([call for call in calls if call[:2] == ["new", instance]]), 1)
 
-    def test_register_reports_unexpected_usage_write_failure_and_completes(self) -> None:
-        harness = """
-import runpy
-import sys
-from pathlib import Path
-from unittest.mock import patch
-
-script, *arguments = sys.argv[1:]
-sys.path.insert(0, str(Path(script).parent))
-sys.path.insert(0, str(Path(script).parents[2]))
-from scripts.usage import agents_log
-sys.argv = [script, *arguments]
-with patch.object(agents_log, 'append', side_effect=RuntimeError('recording failed\\ntry later')):
-    runpy.run_path(script, run_name='__main__')
-"""
-        result = subprocess.run(
-            [sys.executable, "-c", harness, str(SCRIPT), "register", "--production", str(self.doc)],
-            cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False,
-        )
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stderr, "agents_log: recording failed try later\n")
-        self.assertIn("register: ok", result.stdout)
-        self.assertEqual(len([call for call in self.notifier_calls()
-                              if call[:2] == ["new", "showrunner-example"]]), 1)
-
-    def test_copied_command_registers_and_records_showrunner_usage(self) -> None:
-        result = self.run_copy(self.copied_command(), "register")
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stderr, "")
-        self.assertIn("register: ok", result.stdout)
-        ledger = self.state / "usage/agents.jsonl"
-        records = [cast(dict[str, object], json.loads(line))
-                   for line in ledger.read_text(encoding="utf-8").splitlines()]
-        self.assertEqual(len(records), 1)
-        self.assertEqual((records[0]["id"], records[0]["role"]), ("current-session-id", "showrunner"))
-        self.assertNotIn("lens", records[0])
-
     def test_on_demand_keeps_a_stopped_timer_as_the_showrunners_record(self) -> None:
         first = self.run_command("register")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
@@ -263,11 +84,6 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
                          ["new", "stop", "status"])
         self.assertEqual((self.state / "instance-showrunner-example").read_text(encoding="utf-8"), "stopped")
 
-    def without_updates_line(self) -> None:
-        doc = self.doc.read_text(encoding="utf-8")
-        _ = self.doc.write_text(doc.replace("- **Updates:** every 15 minutes\n", ""), encoding="utf-8")
-        _ = self.git("commit", "-qam", "no Updates line")
-
     def test_a_new_production_with_no_updates_line_starts_quiet(self) -> None:
         self.without_updates_line()
         first = self.run_command("register")
@@ -276,7 +92,6 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertIn("register: ok — showrunner-example on demand: no scheduled dailies", first.stdout)
         self.assertEqual((self.state / "instance-showrunner-example").read_text(encoding="utf-8"), "stopped")
         self.assertNotIn("footer", first.stdout)
-
 
     def test_a_line_asking_for_a_schedule_still_schedules(self) -> None:
         doc = self.doc.read_text(encoding="utf-8")
@@ -324,23 +139,6 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertIn("register: ok", result.stdout)
         self.assertNotEqual(self.notifier_calls(), [])
 
-    def test_missing_prompt_markers_fail_before_registration_changes(self) -> None:
-        for marker in ("The prompt:", "**A tick**"):
-            with self.subTest(marker=marker):
-                script = self.copied_command()
-                template = script.parents[2] / "commands/showrunner/produce.md"
-                _ = template.write_text(template.read_text(encoding="utf-8").replace(marker, "", 1), encoding="utf-8")
-                before = self.doc.read_bytes()
-                result = self.run_copy(script, "register", "--session", "resumed-showrunner")
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertIn("register: failed", result.stdout)
-                self.assertIn(marker, result.stdout)
-                self.assertEqual(self.doc.read_bytes(), before)
-                self.assertFalse(self.config.exists())
-                self.assertEqual(self.notifier_calls(), [])
-                self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
-                shutil.rmtree(script.parents[2])
-
     def test_registered_prompt_keeps_status_save_dailies_call_and_render_state(self) -> None:
         result = self.run_command("register", "--session", "first-showrunner")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -358,651 +156,456 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertIn(f"--production {self.doc}", prompt)
         self.assertNotIn("first-showrunner", prompt)
 
-    def test_time_converts_midnight_and_daylight_change_to_document_zone(self) -> None:
-        midnight = self.run_command("time", "2026-10-07T06:30:00+00:00")
-        self.assertEqual(midnight.returncode, 0, midnight.stdout + midnight.stderr)
-        self.assertIn("23:30 PDT", midnight.stdout)
-        winter = self.run_command("time", "2026-11-01T10:30:00+00:00")
-        self.assertEqual(winter.returncode, 0, winter.stdout + winter.stderr)
-        self.assertIn("02:30 PST", winter.stdout)
-        self.assertNotIn("UTC", midnight.stdout + winter.stdout)
 
-    def test_time_accepts_one_digit_hour_in_document_zone(self) -> None:
-        result = self.run_command("time", "9:05")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertRegex(result.stdout, r"^time: ok — 09:05 P[DS]T\n$")
+@final
+class QuestionIdentityTests(RegistrationFixture):
+    asker_id: staff.StaffId = staff.StaffId("")
+    issues: Path = Path()
 
-    def test_tenth_log_event_lists_every_doc_unit_without_state(self) -> None:
-        doc = self.doc.read_text(encoding="utf-8")
-        doc = doc.replace("\n## Gates", "| `beta-unit` | `docs/beta.md` | `/tmp/beta` | `beta` | `beta-session` | — | — |\n\n## Gates")
-        _ = self.doc.write_text(doc, encoding="utf-8")
-        for number in range(1, 11):
-            result = self.run_command("log", f"event {number}")
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        log = (self.checkout / "production.log").read_text(encoding="utf-8")
-        self.assertEqual(log.count("### STATE "), 1)
-        self.assertEqual(len(re.findall(r"^- \d{2}:\d{2} [A-Z]{3}: event \d+$", log, re.MULTILINE)), 10)
-        self.assertIn("alpha-unit: not stated; last merged none; waits on not stated", log)
-        self.assertIn("beta-unit: not stated; last merged none; waits on not stated", log)
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.issues = self.root / "issues"
+        self.issues.mkdir(exist_ok=True)
+        text = self.doc.read_text(encoding="utf-8")
+        if "- **Proposals:**" not in text:
+            _ = self.doc.write_text(text.replace("## Units", f"- **Proposals:** `{self.issues}`\n\n## Units"),
+                                    encoding="utf-8")
+            _ = self.git("commit", "-qam", "Set the private proposals folder")
+        self.timer("example")
+        parent = showrunner_relationship(fixture_showrunner_name("example", self.doc))
+        self.asker_id = fixture_member("unit", name="alpha", parent=parent.id,
+                                       worktree=staff.PresentWorktree("natedev", self.root / "alpha")).id
 
-    def test_state_block_matches_unit_and_merge_history_and_reads_outstanding(self) -> None:
-        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha-unit phase 2 (abc1234)")
-        outstanding = self.outstanding()
-        _ = outstanding.write_text(json.dumps([{"since": "2026-10-04T10:00", "text": "review colors"}]) + "\n",
-                                   encoding="utf-8")
-        state = self.root / "judgment.json"
-        _ = state.write_text(json.dumps({"units": [{"unit": "alpha-unit", "phase": "Phase 2 of 3: panels",
-                                                    "wait": "review"}],
-                                           "merges_held": ["alpha phase 2"],
-                                           "open_for_user": ["stale state item"],
-                                           "next": ["merge alpha phase 2 when its gate is green",
-                                                    "send the restarts plan at 03:30"]}), encoding="utf-8")
-        before = self.run_command("log", "compacting", "--state", str(state), "--before-compaction")
-        self.assertEqual(before.returncode, 0, before.stdout + before.stderr)
-        log = (self.checkout / "production.log").read_text(encoding="utf-8")
-        self.assertIn("alpha-unit: Phase 2 of 3: panels; last merged phase 2 (abc1234); waits on review", log)
-        self.assertIn("Merges accepted but held: alpha phase 2", log)
-        self.assertIn("Open for the user: review colors", log)
-        self.assertNotIn("stale state item", log)
-        self.assertIn("Next: merge alpha phase 2 when its gate is green; send the restarts plan at 03:30", log)
-
-    def test_the_first_call_moves_the_scratchpad_state_and_rewrites_the_tick_prompt(self) -> None:
-        slug = self.doc.name.removesuffix("-production.md")
-        timer = self.state / "notifier" / f"showrunner-{slug}"
-        timer.mkdir(parents=True)
-        _ = (timer / "conf").write_text("TARGET=session:old-showrunner\n", encoding="utf-8")
-        scratch = self.root / "tmp" / "claude-1000" / "-project" / "old-showrunner" / "scratchpad"
-        (scratch / "unit_status").mkdir(parents=True)
-        _ = (scratch / "unit_status" / "blocks_open").write_text("alpha-unit\n", encoding="utf-8")
-        _ = (scratch / "showrunner_state.json").write_text('{"merges_held": ["from scratch"]}\n', encoding="utf-8")
-        target = self.state / "showrunner" / slug / "session"
-        target.mkdir(parents=True)
-        _ = (target / "showrunner_state.json").write_text('{"merges_held": ["kept"]}\n', encoding="utf-8")
-        prompt = self.state / "showrunner" / slug / "prompt.txt"
-        _ = prompt.write_text("an old prompt with <SCRATCH>/unit_status\n", encoding="utf-8")
-        env = {**self.env, "SHOWRUNNER_SCRATCH_ROOT": str(self.root / "tmp")}
-
-        result = self.run_command("log", "first event", env=env)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn(f"state-dir: ok — copied unit_status to {target}", result.stdout)
-        self.assertEqual((target / "unit_status" / "blocks_open").read_text(encoding="utf-8"), "alpha-unit\n")
-        self.assertIn("kept", (target / "showrunner_state.json").read_text(encoding="utf-8"))
-        self.assertIn(f"unit_status.sh {target}/unit_status ", prompt.read_text(encoding="utf-8"))
-
-        again = self.run_command("log", "second event", env=env)
-        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
-        self.assertNotIn("state-dir", again.stdout)
-
-    def test_invalid_state_fails_log_without_writing(self) -> None:
-        log = self.checkout / "production.log"
-        _ = log.write_text("existing line\n", encoding="utf-8")
-        for key, value in (("unknown", 1), ("units", "wrong"), ("merges_held", "wrong"), ("next", ["two\nlines"])):
-            with self.subTest(key=key):
-                state = self.root / f"{key}.json"
-                _ = state.write_text(json.dumps({key: value}), encoding="utf-8")
-                before = log.read_bytes()
-                result = self.run_command("log", "event", "--state", str(state), "--before-compaction")
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertIn(f"log: failed — {state}: {key} must be", result.stdout)
-                self.assertEqual(log.read_bytes(), before)
-
-    def question_state(self, items: list[dict[str, str] | str]) -> Path:
-        path = self.root / "questions.json"
-        _ = path.write_text(json.dumps({"open_for_user": items}))
-        return path
-
-    def run_questions(self, state: Path) -> str:
-        with (mock.patch.dict(os.environ, self.env),
-              mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.state / "notifier"),
-              redirect_stdout(io.StringIO()) as output):
-            registration.questions(read_production(self.doc), state)
-        return output.getvalue()
-
-    def question_instance(self) -> Path:
-        instance = self.state / "notifier/showrunner-example"
-        instance.mkdir(parents=True, exist_ok=True)
-        _ = (instance / "conf").write_text("TARGET=session:current-session-id\n")
-        return instance
-
-    def test_new_object_question_requires_full_text_but_log_remains_a_parser(self) -> None:
-        state = self.question_state([{"text": "Choose layout"}])
-        parsed = registration.judgment_state(state, "log")
-        self.assertIsInstance(parsed.outstanding, registration.ReplaceOutstanding)
-        with self.assertRaisesRegex(registration.RegistrationFailure, "a new question needs its full text"):
-            _ = self.run_questions(state)
-        self.assertFalse(self.outstanding().exists())
-        self.assertFalse((self.state / "notifier/showrunner-example/pending_reviewed.json").exists())
-
-    def test_held_question_batch_writes_no_records_and_rerun_accepts_reviewed_text(self) -> None:
-        outstanding = self.outstanding()
-        _ = outstanding.write_text('[{"since":"2026-10-01T08:00","text":"Existing reminder"}]')
-        history = outstanding.with_suffix(".history.jsonl")
-        _ = history.write_text(json.dumps({"time": datetime.now(timezone.utc).isoformat(), "text": "Earlier"}) + "\n")
-        pending = self.state / "notifier/showrunner-example/pending_reviewed.json"
-        _ = self.question_instance()
-        _ = pending.write_text(json.dumps({"items": [{"kind": "reviewed", "text": "Earlier", "reviewed": "Earlier question?"}]}))
-        before = [path.read_bytes() for path in (outstanding, history, pending)]
-        full = "Build 42 failed.\nRetry (recommended) or stop?"
-        state = self.question_state([{"text": "Retry build", "question": full},
-                                     {"text": "Choose compiler", "question": "Use stable (recommended) or nightly?"}])
-        with mock.patch.object(review, "review_question", side_effect=[
-                review.QuestionAccepted(full),
-                review.QuestionAwaitingFacts("Use stable (recommended) or nightly?", ("Which target?",))]) as reviewer:
-            with self.assertRaisesRegex(registration.RegistrationFailure, "question held for review: Choose compiler: Which target"):
-                _ = self.run_questions(state)
-        self.assertEqual([path.read_bytes() for path in (outstanding, history, pending)], before)
-        self.assertEqual(reviewer.call_args_list[0].args, (review.QuestionKey("example", "Retry build"), full))
-        accepted = "Build 42 failed on natedev.\nRetry (recommended) or stop?"
-        with mock.patch.object(review, "review_question", side_effect=[
-                review.QuestionAccepted(accepted), review.QuestionAccepted("Use stable (recommended) or nightly?")]):
-            output = self.run_questions(state)
-        self.assertIn("reviewed question: " + accepted, output)
-        rows = cast(list[dict[str, str]], json.loads(outstanding.read_text()))
-        self.assertEqual(rows[0]["question"], full)
-        self.assertEqual(rows[0]["reviewed"], accepted)
-        lines = [cast(dict[str, str], json.loads(line)) for line in history.read_text().splitlines()]
-        self.assertEqual(lines[1]["reviewed"], accepted)
-
-    def test_question_rewrite_recheck_failure_keeps_registration_files_unchanged_and_revision(self) -> None:
-        outstanding = self.outstanding()
-        _ = outstanding.write_text("[]")
-        history = outstanding.with_suffix(".history.jsonl")
-        _ = history.write_text("")
-        pending = self.state / "notifier/showrunner-example/pending_reviewed.json"
-        pending.parent.mkdir(parents=True)
-        _ = pending.write_text('{"items":[]}')
-        paths = (outstanding, history, pending)
-        before = [path.read_bytes() for path in paths]
-        original, rewritten = "Retry it?", "Retry build 42 (recommended) or stop?"
-        state = self.question_state([{"text": "Retry build", "question": original}])
-        responses = iter([
-            review.VerdictRecord(verdict="rewrite", title="", action=None, body=rewritten, questions=[],
-                failed_rules=[{"rule": "reader-starts-cold", "quote": original}]),
-            review.VerdictRecord(verdict="ask", title="", action=None, body=rewritten, questions=["Which machine?"],
-                failed_rules=[{"rule": "reader-starts-cold", "quote": "build 42"}]),
-            review.VerdictRecord(verdict="send", title="", action=None, body=original, questions=[], failed_rules=[])])
-        calls: list[tuple[list[str], float, dict[str, str]]] = []
-        def runner(argv: list[str], *, timeout: float,
-                   env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-            calls.append((argv.copy(), timeout, env.copy()))
-            if argv[0] == "zsh":
-                return subprocess.CompletedProcess(argv, 0, "Question rules", "")
-            if argv[0] == "bash":
-                return subprocess.CompletedProcess(argv, 0, "agent=sonnet effort=high", "")
-            self.assertEqual(Path(argv[0]).name, "claude")
-            return subprocess.CompletedProcess(argv, 0, json.dumps(next(responses)), "")
-        real_review = review.review_question
-        def question_review(key: review.QuestionKey, question: str) -> review.QuestionOutcome:
-            return real_review(key, question, runner=runner)
-        with (mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(self.state / "notify")}),
-              mock.patch.object(review, "GUIDE", self.root),
-              mock.patch.object(review, "reviewer_environment", return_value=({}, "claude2")),
-              mock.patch.object(review, "reviewer_binary", return_value=review.ResolvedReviewerBinary(self.root / "claude")),
-              mock.patch.object(review, "review_question", side_effect=question_review)):
-            with self.assertRaisesRegex(registration.RegistrationFailure, "Which machine"):
-                _ = self.run_questions(state)
-            self.assertEqual([path.read_bytes() for path in paths], before)
-            self.assertTrue((self.state / "notify/questions" / (review.QuestionKey("example", "Retry build").digest + ".json")).exists())
-            self.assertIn("reviewed question: " + original, self.run_questions(state))
-        prompts = [call[0][-1] for call in calls if Path(call[0][0]).name == "claude"]
-        self.assertIn("Revision: true", prompts[-1])
-        self.assertEqual(len(prompts), 3)
-        self.assertTrue(all(0 < call[1] <= review.review_timeout_seconds() for call in calls))
-
-    def test_later_registration_keeps_reviewed_and_unavailable_questions_and_recall_is_multiline(self) -> None:
-        _ = self.question_instance()
-        full = "Build 42 failed.\nRetry (recommended) or stop?"
-        unavailable = "Use stable (recommended) or nightly?"
-        state = self.question_state([{"text": "Retry build", "question": full}])
-        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(full)):
-            _ = self.run_questions(state)
-        state = self.question_state(["Retry build", {"text": "Choose compiler", "question": unavailable}])
-        with mock.patch.object(review, "review_question", return_value=review.QuestionReviewUnavailable(unavailable, "timeout")):
-            _ = self.run_questions(state)
-        state = self.question_state([{"text": "Retry build", "after": "2099-01-01T08:00"}, "Choose compiler", "Reminder"])
-        with mock.patch.object(review, "review_question", side_effect=AssertionError("reminder reviewed")):
-            _ = self.run_questions(state)
-        rows = cast(list[dict[str, str]], json.loads(self.outstanding().read_text()))
-        self.assertEqual(rows[0]["reviewed"], full)
-        self.assertEqual(rows[0]["question"], full)
-        self.assertEqual(rows[1]["question"], unavailable)
-        self.assertEqual(rows[1]["review_unavailable"], "timeout")
-        self.assertNotIn("reviewed", rows[1])
-        with (mock.patch.dict(os.environ, self.env),
-              mock.patch.object(showrunners, "user_facing", return_value=["example"]),
-              redirect_stdout(io.StringIO()) as output):
-            registration.open_items(read_production(self.doc))
-        self.assertIn(full, output.getvalue())
-        self.assertIn(unavailable, output.getvalue())
-        self.assertIn("Reminder", output.getvalue())
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=1)
-        with mock.patch.dict(os.environ, self.env):
-            self.assertIn(" ".join(full.split()), review.registered_questions(cutoff))
-            _ = self.run_questions(self.question_state([]))
-            self.assertIn(" ".join(full.split()), review.registered_questions(cutoff))
-
-    def test_blank_reviewer_rewrite_stores_original_as_review_unavailable(self) -> None:
-        question = "Retry build 42?"
-        state = self.question_state([{"text": "Retry build", "question": question}])
-        real_review = review.review_question
-        for body in ("", " \n\t"):
-            with self.subTest(body=body):
-                self.outstanding().unlink(missing_ok=True)
-                decisions: list[review.VerdictRecord] = [
-                    review.VerdictRecord(verdict="rewrite", title="", action=None, body=body, questions=[],
-                        failed_rules=[{"rule": "reader-starts-cold", "quote": question}]),
-                    review.VerdictRecord(verdict="send", title="", action=None, body=body,
-                        questions=[], failed_rules=[])]
-                calls: list[tuple[list[str], float, dict[str, str]]] = []
-                def runner(argv: list[str], *, timeout: float,
-                           env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-                    calls.append((argv.copy(), timeout, env.copy()))
-                    if argv[0] == "zsh":
-                        return subprocess.CompletedProcess(argv, 0, "Question rules", "")
-                    if argv[0] == "bash":
-                        return subprocess.CompletedProcess(argv, 0, "agent=sonnet effort=high", "")
-                    self.assertEqual(Path(argv[0]).name, "claude")
-                    return subprocess.CompletedProcess(argv, 0, json.dumps(decisions.pop(0)), "")
-                def question_review(key: review.QuestionKey, text: str) -> review.QuestionOutcome:
-                    return real_review(key, text, runner=runner)
-                with (mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(self.state / "notify")}),
-                      mock.patch.object(review, "GUIDE", self.root),
-                      mock.patch.object(review, "reviewer_environment", return_value=({}, "claude2")),
-                      mock.patch.object(review, "reviewer_binary", return_value=review.ResolvedReviewerBinary(self.root / "claude")),
-                      mock.patch.object(review, "review_question", side_effect=question_review)):
-                    output = self.run_questions(state)
-                self.assertEqual(len([call for call in calls if Path(call[0][0]).name == "claude"]), 1)
-                rows = dailies_render.read_outstanding(self.outstanding())
-                self.assertEqual(len(rows), 1)
-                self.assertIsInstance(rows[0], dailies_render.ReviewUnavailableOutstandingQuestion)
-                row = rows[0]
-                assert isinstance(row, dailies_render.ReviewUnavailableOutstandingQuestion)
-                self.assertEqual(row.question, question)
-                self.assertIn("rewrite needs nonempty text", row.reason)
-                self.assertIn("reviewed question: " + question, output)
-
-    def test_reviewed_question_without_instance_does_not_create_a_timer_directory(self) -> None:
-        question = "Retry build 42?"
-        state = self.question_state([{"text": "Retry build", "question": question}])
+    def file_question(self, title: str = "Choose the layout", question: str = "Keep the layout?") -> None:
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(question)):
-            output = self.run_questions(state)
-        self.assertIn("reviewed question: " + question, output)
-        rows = dailies_render.read_outstanding(self.outstanding())
-        self.assertIsInstance(rows[0], dailies_render.ReviewedOutstandingQuestion)
-        self.assertFalse((self.state / "notifier/showrunner-example").exists())
-        self.assertEqual(showrunners.registered_showrunners(self.state / "notifier"), [])
+            result = self.run_command("ask", "--text", title, "--question", question,
+                                      "--unit", "alpha-unit")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = self.question_rows()
+        self.assertTrue(rows, "The filed question needs a canonical record")
+        self.assertEqual(rows[-1]["asked_by"], self.asker_id)
 
-    def test_duplicate_question_text_is_reviewed_and_recorded_once_using_first_occurrence(self) -> None:
-        _ = self.question_instance()
-        first = "Retry build 42?"
-        state = self.question_state([
-            {"text": "Retry build", "question": first},
-            {"text": "Retry build", "question": "Use build 43?", "after": "2099-01-01T08:00"},
-            "Reminder", "Reminder"])
-        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(first)) as reviewer:
-            _ = self.run_questions(state)
-        reviewer.assert_called_once_with(review.QuestionKey("example", "Retry build"), first)
-        rows = cast(list[dict[str, str]], json.loads(self.outstanding().read_text()))
-        self.assertEqual([row["text"] for row in rows], ["Retry build", "Reminder"])
-        self.assertEqual(rows[0]["question"], first)
-        self.assertNotIn("after", rows[0])
-        history = [cast(dict[str, str], json.loads(line))
-                   for line in self.outstanding().with_suffix(".history.jsonl").read_text().splitlines()]
-        self.assertEqual([row["text"] for row in history], ["Retry build", "Reminder"])
+    def question_rows(self) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for path in sorted(self.issues.glob("*.md")):
+            lines = path.read_text(encoding="utf-8").splitlines()
+            if "record_type: question" not in lines or "status: open" not in lines:
+                continue
+            saved = next(line.removeprefix("registration: ") for line in lines
+                         if line.startswith("registration: "))
+            rows.append(cast(dict[str, object], json.loads(saved)))
+        return rows
 
-    def test_questions_state_updates_outstanding_only_when_open_items_are_present(self) -> None:
-        outstanding = self.outstanding()
-        saved = [{"since": "2026-10-01T08:00", "text": "review colors"}]
-        _ = outstanding.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
-        before = outstanding.read_bytes()
-        state = self.root / "judgment.json"
-        _ = state.write_text(json.dumps({"units": []}), encoding="utf-8")
-        absent = self.run_command("questions", "--state", str(state))
-        self.assertEqual(absent.returncode, 0, absent.stdout + absent.stderr)
-        self.assertEqual(outstanding.read_bytes(), before)
-        _ = state.write_text(json.dumps({"open_for_user": ["review colors"]}), encoding="utf-8")
-        retained = self.run_command("questions", "--state", str(state))
-        self.assertEqual(retained.returncode, 0, retained.stdout + retained.stderr)
-        entries = cast(list[dict[str, str]], json.loads(outstanding.read_text(encoding="utf-8")))
-        self.assertEqual(entries[0]["since"], "2026-10-01T08:00")
-        _ = state.write_text(json.dumps({"open_for_user": []}), encoding="utf-8")
-        cleared = self.run_command("questions", "--state", str(state))
-        self.assertEqual(cleared.returncode, 0, cleared.stdout + cleared.stderr)
-        self.assertEqual(json.loads(outstanding.read_text(encoding="utf-8")), [])
+    @contextmanager
+    def forbid_legacy_question_access(self) -> Generator[None]:
+        legacy = self.outstanding()
+        real_open = Path.open
 
-    def test_questions_state_replaces_reports_only_when_report_to_user_is_present(self) -> None:
-        written = self.outstanding().parent.parent / "reports/example.json"
-        state = self.root / "judgment.json"
-        report = {"text": "hanadocs is back", "until": "2026-10-17T09:00"}
-        _ = state.write_text(json.dumps({"report_to_user": [report]}), encoding="utf-8")
-        saved = self.run_command("questions", "--state", str(state))
-        self.assertEqual(saved.returncode, 0, saved.stdout + saved.stderr)
-        self.assertEqual(json.loads(written.read_text(encoding="utf-8")), [report])
-        _ = state.write_text(json.dumps({"units": []}), encoding="utf-8")
-        kept = self.run_command("questions", "--state", str(state))
-        self.assertEqual(kept.returncode, 0, kept.stdout + kept.stderr)
-        self.assertEqual(json.loads(written.read_text(encoding="utf-8")), [report])
-        for bad in ([{"text": "x", "until": "tomorrow"}], [{"text": "", "until": "2026-10-17T09:00"}],
-                    [{"text": "x", "until": "2026-10-17T09:00", "question": "?"}], "x"):
-            with self.subTest(bad=bad):
-                _ = state.write_text(json.dumps({"report_to_user": bad}), encoding="utf-8")
-                refused = self.run_command("questions", "--state", str(state))
-                self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
-                self.assertIn("report_to_user", refused.stdout)
-        self.assertEqual(json.loads(written.read_text(encoding="utf-8")), [report])
+        def open_file(path: Path, mode: str = "r", buffering: int = -1,
+                      encoding: str | None = None, errors: str | None = None,
+                      newline: str | None = None) -> IO[str] | IO[bytes]:
+            if path == legacy:
+                raise AssertionError("A migrated question must use its record")
+            return cast(IO[str] | IO[bytes], real_open(path, mode, buffering, encoding, errors, newline))
 
-    def test_questions_records_only_new_questions_and_prunes_history_older_than_two_days(self) -> None:
-        outstanding = self.outstanding()
-        _ = outstanding.write_text(json.dumps([{"since": "2026-10-01T08:00", "text": "Choose a compiler."}]))
-        now = datetime.now(timezone.utc)
-        history = outstanding.with_suffix(".history.jsonl")
-        records = [QuestionRegistration(time=(now - timedelta(hours=49)).isoformat(), text="Expired question?"),
-                   QuestionRegistration(time=(now - timedelta(hours=1)).isoformat(), text="Recent question?")]
-        _ = history.write_text("\n".join(json.dumps(item) for item in records) + "\n")
-        state = self.root / "judgment.json"
-        _ = state.write_text(json.dumps({"open_for_user": ["Choose a compiler.", "Approve the release."]}))
-        for _ in range(2):
+        with (mock.patch.dict(os.environ, self.env), production_paths(self.env),
+              mock.patch.object(Path, "open", open_file)):
+            yield
+
+    def migrate(self) -> None:
+        migrated = self.run_command("migrate-questions")
+        self.assertEqual(migrated.returncode, 0, migrated.stdout + migrated.stderr)
+        path = self.outstanding()
+        if path.exists():
+            self.assertEqual(json.loads(path.read_text()), [])
+            path.unlink()
+
+    def test_migrated_question_commands_never_access_the_legacy_list(self) -> None:
+        self.file_question()
+        self.migrate()
+        with self.forbid_legacy_question_access():
+            for command in (("open",), ("next",), ("questions-table",),
+                            ("mark-important", "--item", "Choose the layout"),
+                            ("questions", "--state", str(self.question_state(["Choose the layout"]))),
+                            ("answer", "--item", "Choose the layout")):
+                with self.subTest(command=command):
+                    result = self.run_command(*command)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.question_rows(), [])
+
+    def test_next_reader_keeps_the_migrated_question_and_its_queue_key(self) -> None:
+        legacy = {"since": "2026-10-06T08:00", "text": "Choose the layout",
+                                        "question": "Keep the layout?", "reviewed": "Keep the layout?",
+                                        "asked_by": "alpha-unit", "urgency": "user"}
+        _ = self.outstanding().write_text(json.dumps([legacy]))
+        self.migrate()
+        with self.forbid_legacy_question_access():
+            after = next_item.read_queue("question", self.doc)
+        self.assertEqual(after.name, "question-example")
+        self.assertEqual(len(after.entries), 1)
+        self.assertEqual(after.entries[0].key, "example: Choose the layout")
+        self.assertEqual(after.entries[0].item,
+                         "example [user], since Tue Oct 06 08:00, asked by alpha-unit: Keep the layout?")
+
+    def test_dailies_reader_preserves_review_timing_and_rank_after_migration(self) -> None:
+        legacy = {"since": "2026-10-06T08:00", "text": "Choose the layout",
+                                        "question": "Keep the layout?", "review_unavailable": "offline",
+                                        "asked_by": str(self.asker_id), "after": "2099-01-02T08:00",
+                                        "urgency": "soon", "due": "2099-01-03", "follows": "Earlier choice"}
+        _ = self.outstanding().write_text(json.dumps([legacy]))
+        self.migrate()
+        with self.forbid_legacy_question_access():
+            after = dailies_render.read_outstanding(self.outstanding())
+        self.assertEqual(len(after), 1)
+        item = after[0]
+        self.assertIsInstance(item, dailies_render.ReviewUnavailableOutstandingQuestion)
+        assert isinstance(item, dailies_render.ReviewUnavailableOutstandingQuestion)
+        self.assertEqual((item.text, item.question, item.asked_by),
+                         ("Choose the layout", "Keep the layout?", self.asker_id))
+        self.assertEqual(item.since, datetime(2026, 10, 6, 8))
+        self.assertEqual(item.reason, "offline")
+        self.assertEqual(item.timing, dailies_render.DeferredUntil(datetime(2099, 1, 2, 8)))
+        self.assertEqual(item.rank.follows, "Earlier choice")
+
+    def test_footer_counts_read_migrated_records_without_the_legacy_list(self) -> None:
+        self.file_question()
+        self.migrate()
+        with self.forbid_legacy_question_access():
+            counts = footer_counts.read_counts(self.doc,
+                                                questions=len(dailies_render.read_outstanding(self.outstanding())))
+            sources = footer_counts.sources(self.doc)
+        self.assertEqual(counts.questions, 1)
+        self.assertEqual(footer_counts.counts_line(counts), "For you: 1 question")
+        for record in self.issues.glob("*.md"):
+            self.assertIn(record, sources)
+
+    def test_dailies_counts_read_migrated_records_without_the_legacy_list(self) -> None:
+        self.file_question()
+        self.migrate()
+        with self.forbid_legacy_question_access():
+            fields = dailies_input.child_fields("example", datetime.now(ZoneInfo("America/Los_Angeles")),
+                                                ZoneInfo("America/Los_Angeles"), expand=False,
+                                                record=staff.snapshot())
+        self.assertEqual(fields["open"], 1)
+        self.assertNotIn("unreadable", fields)
+
+    def test_showrunner_footer_reads_migrated_records_without_the_legacy_list(self) -> None:
+        self.file_question()
+        self.migrate()
+        production = showrunner_footer.Production("example", self.doc, "America/Los_Angeles",
+                                                  showrunner_footer.NoDailiesSchedule.PAUSED_OR_UNSCHEDULED)
+        with self.forbid_legacy_question_access():
+            self.assertEqual(showrunner_footer.open_questions([production]), 1)
+
+    def test_rename_state_keeps_a_migrated_question_and_its_fixed_asker(self) -> None:
+        self.file_question()
+        self.migrate()
+        before = {path: path.read_bytes() for path in self.issues.glob("*.md")}
+        with (self.forbid_legacy_question_access(),
+              mock.patch.object(tidy_wrapped, "STATE_DIR", self.state / "showrunner")):
+            self.assertFalse(rename_state.rename_outstanding("example", (("alpha-unit", "renamed-unit"),)))
+        self.assertEqual({path: path.read_bytes() for path in self.issues.glob("*.md")}, before)
+        self.assertEqual(self.question_rows()[0]["asked_by"], self.asker_id)
+
+    def test_tidy_removes_only_the_wrapped_productions_open_questions(self) -> None:
+        self.file_question()
+        self.migrate()
+        proposal = self.issues / "Keep this proposal.md"
+        _ = proposal.write_text("---\nstatus: open\ntags: [proposal]\n---\nKeep this proposal.\n")
+        before = proposal.read_bytes()
+        _ = self.doc.write_text(self.doc.read_text() + "\n> **Status: PRODUCTION — wrapped.** Complete.\n")
+        shutil.rmtree(self.state / "notifier/showrunner-example")
+        with (self.forbid_legacy_question_access(),
+              mock.patch.object(tidy_wrapped, "STATE_DIR", self.state / "showrunner"),
+              mock.patch.object(tidy_wrapped, "NOTIFIER_STATE_DIR", self.state / "notifier"),
+              redirect_stdout(io.StringIO())):
+            result = tidy_wrapped.main([str(self.doc)])
+        self.assertEqual(result, 0)
+        self.assertEqual(self.question_rows(), [])
+        self.assertEqual(proposal.read_bytes(), before)
+
+    def test_migration_rerun_completes_after_the_record_write(self) -> None:
+        legacy = {"since": "2026-10-06T08:00", "text": "Choose the layout",
+                  "question": "Keep the layout?", "asked_by": "alpha-unit",
+                  "review_unavailable": "offline", "after": "2099-01-02T08:00"}
+        _ = self.outstanding().write_text(json.dumps([legacy]))
+        original = self.outstanding().read_bytes()
+        replace = os.replace
+
+        def stop_after_record(source: Path, destination: Path) -> None:
+            if Path(destination) == self.outstanding():
+                self.assertEqual(len(self.question_rows()), 1)
+                raise KeyboardInterrupt("Stop before the legacy list removal")
+            replace(source, destination)
+
+        with mock.patch.object(os, "replace", side_effect=stop_after_record), self.assertRaises(KeyboardInterrupt):
+            _ = self.run_command("migrate-questions")
+        self.assertEqual(self.outstanding().read_bytes(), original)
+        self.migrate()
+        rows = self.question_rows()
+        self.assertEqual(rows, [{**legacy, "asked_by": self.asker_id}])
+        remaining: object = cast(object, json.loads(self.outstanding().read_text())) if self.outstanding().exists() else []
+        self.assertEqual(remaining, [])
+        before = self.store_snapshot()
+        self.migrate()
+        self.assertEqual(self.store_snapshot(), before)
+
+    def test_interrupted_migration_keeps_unwritten_questions_during_ordinary_writes(self) -> None:
+        for action in ("answer", "questions"):
+            with self.subTest(action=action):
+                for path in self.issues.glob("*.md"):
+                    path.unlink()
+                legacy = [{"since": "2026-10-06T08:00", "text": title,
+                           "question": title + "?", "asked_by": str(self.asker_id)}
+                          for title in ("Choose the layout", "Choose the compiler")]
+                _ = self.outstanding().write_text(json.dumps(legacy))
+                replace = os.replace
+                written: list[Path] = []
+
+                def stop_after_first_record(source: Path, destination: Path) -> None:
+                    target = Path(destination)
+                    if target.suffix == ".md" and target.parent == self.issues:
+                        if written:
+                            raise KeyboardInterrupt("Stop after the first question record")
+                        written.append(target)
+                    replace(source, destination)
+
+                with (mock.patch.object(os, "replace", side_effect=stop_after_first_record),
+                      self.assertRaises(KeyboardInterrupt)):
+                    _ = self.run_command("migrate-questions")
+                self.assertEqual(len(written), 1)
+                if action == "answer":
+                    result = self.run_command("answer", "--item", "Choose the layout")
+                    expected = ["Choose the compiler"]
+                else:
+                    state = self.question_state(["Choose the layout"])
+                    result = self.run_command("questions", "--state", str(state))
+                    expected = ["Choose the layout", "Choose the compiler"]
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.migrate()
+                self.assertCountEqual([row["text"] for row in self.question_rows()], expected)
+
+    def test_migration_keeps_identical_question_text_from_distinct_askers(self) -> None:
+        owner = staff.by_id(self.asker_id)
+        assert owner is not None
+        second = fixture_member("unit", name="beta", parent=owner.parent,
+                                worktree=staff.PresentWorktree("natedev", self.root / "beta"))
+        legacy = [{"since": "2026-10-06T08:00", "text": "Choose the layout",
+                   "question": "Keep the layout?", "asked_by": str(asker)}
+                  for asker in (self.asker_id, second.id)]
+        _ = self.outstanding().write_text(json.dumps(legacy))
+        self.migrate()
+        rows = self.question_rows()
+        self.assertEqual(len(rows), 2)
+        self.assertCountEqual([row["asked_by"] for row in rows], [self.asker_id, second.id])
+        before = self.store_snapshot()
+        self.migrate()
+        self.assertEqual(self.store_snapshot(), before)
+
+    def test_descendant_without_a_timer_remains_in_next_and_answer_search(self) -> None:
+        child_doc = self.document_for("child")
+        parent = staff.by_id(self.asker_id)
+        assert parent is not None
+        child = fixture_member("showrunner", name="child", parent=parent.parent,
+                               doc=staff.LiveDoc("natedev", child_doc))
+        self.write_open_for("child", {"since": "2026-10-06T08:00", "text": "Choose the compiler",
+                                      "question": "Use this compiler?", "asked_by": str(child.id)})
+        self.assertFalse((self.state / "notifier/showrunner-child").exists())
+        with mock.patch.dict(os.environ, self.env), production_paths(self.env):
+            queue = next_item.read_queue("question", self.doc, below=True)
+        self.assertEqual([entry.key for entry in queue.entries], ["child: Choose the compiler"])
+        answer = self.run_command("answer", "--item", "Choose the compiler")
+        self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+        self.assertIn("child: Choose the compiler", answer.stdout)
+        self.assertEqual(self.question_rows(), [])
+
+    def test_questions_table_uses_one_staff_snapshot_without_an_explicit_document(self) -> None:
+        self.file_question()
+        from scripts.production.cli_fixture import invoke_cli
+        owner = staff.by_id(self.fixture_staff_id())
+        assert owner is not None
+        environment = {**self.env, "CLAUDE_CODE_SESSION_ID": owner.current_session}
+        with (mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as snapshot,
+              mock.patch.object(session_staff, "member_sources",
+                                wraps=session_staff.member_sources) as sources):
+            result = invoke_cli(registration, registration.main, ["questions-table"],
+                                environment, self.checkout, production_state=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Choose the layout", result.stdout)
+        snapshot.assert_called_once_with()
+        self.assertEqual(sources.call_count, 1)
+
+    def test_footer_ignores_questions_when_the_document_has_no_local_staff_owner(self) -> None:
+        self.file_question()
+        owner = staff.by_id(self.asker_id)
+        assert owner is not None and owner.parent is not None
+        _ = staff.set_doc(owner.parent, staff.LiveDoc("macbook", self.doc))
+        with mock.patch.dict(os.environ, self.env), production_paths(self.env):
+            production = showrunner_footer.Production("example", self.doc, "America/Los_Angeles",
+                            showrunner_footer.NoDailiesSchedule.PAUSED_OR_UNSCHEDULED)
+            self.assertEqual(showrunner_footer.open_questions([production]), 0)
+            self.assertEqual(dailies_render.read_outstanding(self.outstanding()), [])
+            self.assertIn(self.doc, footer_counts.sources(self.doc))
+        refused = self.run_command("ask", "--text", "Choose the compiler", "--question", "Use it?")
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("no showrunner staff row", refused.stdout + refused.stderr)
+
+    def store_snapshot(self) -> dict[str, tuple[bytes, int]]:
+        paths = [*self.issues.rglob("*.md"), *self.outstanding().parent.glob("*.json"),
+                 *self.outstanding().parent.glob("*.jsonl")]
+        return {str(path.relative_to(self.root)): (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+
+    def test_answer_resolves_the_fixed_asker_after_a_rename(self) -> None:
+        self.file_question()
+        _ = staff.rename(self.asker_id, "renamed")
+        references: list[str] = []
+        resolve = staff.StaffSnapshot.by_member_reference
+
+        def resolve_reference(record: staff.StaffSnapshot, reference: str) -> staff.StaffRow | None:
+            references.append(reference)
+            return resolve(record, reference)
+
+        with mock.patch.object(staff.StaffSnapshot, "by_member_reference", resolve_reference):
+            result = self.run_command("answer", "--item", "Choose the layout")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(str(self.asker_id), references)
+        self.assertIn("renamed-unit", result.stdout)
+        self.assertNotIn("relay: to alpha-unit", result.stdout)
+
+    def test_answer_resolves_the_fixed_asker_after_a_transfer(self) -> None:
+        self.file_question()
+        destination = fixture_member("showrunner", name="destination")
+        _ = staff.move(self.asker_id, destination.id)
+        references: list[str] = []
+        resolve = staff.StaffSnapshot.by_member_reference
+
+        def resolve_reference(record: staff.StaffSnapshot, reference: str) -> staff.StaffRow | None:
+            references.append(reference)
+            return resolve(record, reference)
+
+        with mock.patch.object(staff.StaffSnapshot, "by_member_reference", resolve_reference):
+            result = self.run_command("answer", "--item", "Choose the layout")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(str(self.asker_id), references)
+        self.assertIn("destination", result.stdout)
+        self.assertIn("alpha-unit", result.stdout)
+
+    def test_reminder_replacement_and_answer_preserve_the_filed_question(self) -> None:
+        self.file_question()
+        state = self.question_state(["Review the release notes"])
+        with mock.patch.object(review, "review_question", side_effect=AssertionError("A reminder needs no review")):
             result = self.run_command("questions", "--state", str(state))
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        saved = [cast(QuestionRegistration, json.loads(line)) for line in history.read_text().splitlines()]
-        self.assertEqual([item["text"] for item in saved], ["Recent question?", "Approve the release."])
-        self.assertEqual(saved[0], records[1])
-        stamp = datetime.fromisoformat(saved[1]["time"])
-        self.assertIsNotNone(stamp.tzinfo)
-        self.assertGreaterEqual(stamp, now)
-
-    def test_questions_keeps_registration_history_when_the_question_closes(self) -> None:
-        outstanding = self.outstanding()
-        state = self.root / "judgment.json"
-        _ = state.write_text(json.dumps({"open_for_user": ["Would you retry the build?"]}))
-        opened = self.run_command("questions", "--state", str(state))
-        self.assertEqual(opened.returncode, 0, opened.stdout + opened.stderr)
-        history = outstanding.with_suffix(".history.jsonl")
-        before = history.read_bytes()
-        _ = state.write_text(json.dumps({"open_for_user": []}))
-        closed = self.run_command("questions", "--state", str(state))
-        self.assertEqual(closed.returncode, 0, closed.stdout + closed.stderr)
-        self.assertEqual(json.loads(outstanding.read_text()), [])
-        self.assertEqual(history.read_bytes(), before)
-        saved = cast(QuestionRegistration, json.loads(before.decode().strip()))
-        self.assertEqual(saved["text"], "Would you retry the build?")
-        self.assertIsNotNone(datetime.fromisoformat(saved["time"]).tzinfo)
-
-    def test_questions_rejects_bad_deferred_item_before_writing_outstanding(self) -> None:
-        outstanding = self.outstanding()
-        _ = outstanding.write_text('[{"since":"2026-10-01T08:00","text":"review colors"}]\n', encoding="utf-8")
-        before = outstanding.read_bytes()
-        state = self.root / "judgment.json"
-        _ = state.write_text(json.dumps({"open_for_user": [{"text": "choose layout", "after": "tomorrow"}]}), encoding="utf-8")
-        result = self.run_command("questions", "--state", str(state))
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("questions: failed", result.stdout)
-        self.assertEqual(outstanding.read_bytes(), before)
-
-
-    def test_a_stored_item_with_plumbing_is_named_and_a_new_one_is_refused(self) -> None:
-        outstanding = self.outstanding()
-        _ = outstanding.write_text('[{"since":"2026-10-01T08:00","text":"free the cargo-berth on the Mac"}]\n',
-                                   encoding="utf-8")
-        state = self.root / "judgment.json"
-        _ = state.write_text(json.dumps({"open_for_user": ["free the cargo-berth on the Mac", "review colors"]}),
-                             encoding="utf-8")
-        kept = self.run_command("questions", "--state", str(state))
-        self.assertEqual(kept.returncode, 0, kept.stdout + kept.stderr)
-        self.assertIn("questions: reword — free the cargo-berth on the Mac: 'berth' is the production's own plumbing",
-                      kept.stdout)
-        entries = cast(list[dict[str, str]], json.loads(outstanding.read_text(encoding="utf-8")))
-        self.assertEqual([entry["text"] for entry in entries], ["free the cargo-berth on the Mac", "review colors"])
-        before = outstanding.read_bytes()
-        _ = state.write_text(json.dumps({"open_for_user": ["review colors", "release the writers"]}), encoding="utf-8")
-        refused = self.run_command("questions", "--state", str(state))
-        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
-        self.assertIn("questions: failed — release the writers: 'writers' is the production's own plumbing",
-                      refused.stdout)
-        self.assertEqual(outstanding.read_bytes(), before)
-
-    def test_questions_store_what_waits_on_the_user_and_print_one_line(self) -> None:
-        outstanding = self.outstanding()
-        _ = outstanding.write_text('[{"since":"2026-10-01T08:00","text":"choose layout"}]')
-        state = self.root / "judgment.json"
-        _ = state.write_text(json.dumps({"open_for_user": [
-            "review colors", {"text": "choose layout", "after": "2099-01-01T08:00"}]}), encoding="utf-8")
-        stored = self.run_command("questions", "--state", str(state))
-        self.assertEqual(stored.returncode, 0, stored.stdout + stored.stderr)
-        # The reply carries no footer: the user reads the counts in the status line.
-        self.assertEqual(stored.stdout.strip(), "questions: ok — recorded")
-        entries = cast(list[dict[str, str]], json.loads(outstanding.read_text(encoding="utf-8")))
-        self.assertEqual([entry["text"] for entry in entries], ["review colors", "choose layout"])
-        self.assertEqual(entries[1]["after"], "2099-01-01T08:00")
-        before = outstanding.read_bytes()
-        _ = state.write_text(json.dumps({"units": []}), encoding="utf-8")
-        kept = self.run_command("questions", "--state", str(state))
-        self.assertEqual(kept.stdout.strip(), "questions: ok — recorded")
-        self.assertEqual(outstanding.read_bytes(), before)
-        _ = state.write_text(json.dumps({"open_for_user": [{"text": "choose layout", "after": "tomorrow"}]}),
-                             encoding="utf-8")
-        bad = self.run_command("questions", "--state", str(state))
-        self.assertEqual(bad.returncode, 2, bad.stdout + bad.stderr)
-        self.assertIn("questions: failed", bad.stdout)
-        self.assertEqual(outstanding.read_bytes(), before)
-
-
-    def timer(self, slug: str) -> None:
-        """A production with a complete update timer, so the tree counts it."""
-        instance = self.state / "notifier" / f"showrunner-{slug}"
-        instance.mkdir(parents=True)
-        _ = (instance / "conf").write_text(
-            f"TARGET=session:{slug}-session\nCHECK=zsh /x/production_check.sh {self.doc}\n", encoding="utf-8")
-
-    def attach(self, child: str, parent: str) -> None:
-        edge = self.state / "showrunner" / child / "parent"
-        edge.parent.mkdir(parents=True, exist_ok=True)
-        _ = edge.write_text(parent + "\n", encoding="utf-8")
-
-    def write_open_for(self, slug: str, *items: dict[str, str]) -> None:
-        _ = self.outstanding().with_name(f"{slug}.json").write_text(json.dumps(list(items)), encoding="utf-8")
-
-    def open_lines(self) -> list[str]:
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         listed = self.run_command("open")
         self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
-        return listed.stdout.splitlines()
+        self.assertIn("Review the release notes", listed.stdout)
+        self.assertIn("Keep the layout?", listed.stdout)
+        self.assertIn("2 due, 0 deferred", listed.stdout)
 
-
-    def test_open_lists_only_the_productions_own_items_in_full_never_those_below(self) -> None:
-        for slug in ("example", "kid", "grandkid", "stranger"):
-            self.timer(slug)
-        self.attach("kid", "example")
-        self.attach("grandkid", "kid")
-        self.write_open_for("example", {"since": "2026-10-06T09:00", "text": "choose layout"},
-                            {"since": "2026-10-05T07:00", "text": "review colors", "after": "2099-01-02T08:00"})
-        self.write_open_for("kid", {"since": "2026-10-06T08:00", "text": "merge today, or after the release?"})
-        self.write_open_for("grandkid", {"since": "2026-09-28T10:30", "text": "keep the old key binding?"})
-        self.write_open_for("stranger", {"since": "2026-10-01T08:00", "text": "not this tree's"})
-        # The showrunners below answer for their own items (user, 2026-10-27).
-        self.assertEqual(self.open_lines(), [
-            "1. example, since Tue Oct 06 09:00: choose layout",
-            "deferred until Fri Jan 02 08:00: example: review colors",
-            "open: ok — 1 due, 1 deferred",
-        ])
-
-    def test_open_names_an_unreadable_list(self) -> None:
-        self.timer("example")
-        _ = self.outstanding().write_text("{bad", encoding="utf-8")
-        self.assertEqual(self.open_lines(), [
-            "example: needs-user list unreadable",
-            "open: ok — 0 due, 0 deferred, 1 unreadable",
-        ])
-
-    def test_a_middle_showrunner_lists_its_own_items_and_marks_one_below_never_above(self) -> None:
-        for slug in ("top", "example", "kid"):
-            self.timer(slug)
-        self.attach("example", "top")
-        self.attach("kid", "example")
-        self.write_open_for("example", {"since": "2026-10-06T09:00", "text": "choose layout"})
-        self.write_open_for("kid", {"since": "2026-10-06T08:00", "text": "merge today?"})
-        self.write_open_for("top", {"since": "2026-10-06T07:00", "text": "ship it?"})
-        self.assertEqual(self.open_lines(), [
-            "1. example, since Tue Oct 06 09:00: choose layout",
-            "open: ok — 1 due, 0 deferred",
-        ])
-        # `/next all-below` can show the kid's item, so it can be marked from here; the top's never.
-        marked = self.run_command("mark-important", "--item", "merge today?")
-        self.assertEqual(marked.stdout.strip(), "mark-important: ok — merge today?", marked.stdout + marked.stderr)
-        self.assertNotEqual(self.run_command("mark-important", "--item", "ship it?").returncode, 0)
-
-    def test_open_with_nothing_attached_lists_its_own_items_or_none(self) -> None:
-        self.assertEqual(self.open_lines(), ["open: ok — 0 due, 0 deferred"])
-        self.write_open_for("example", {"since": "2026-10-06T09:00", "text": "choose layout"})
-        self.assertEqual(self.open_lines(), [
-            "1. example, since Tue Oct 06 09:00: choose layout",
-            "open: ok — 1 due, 0 deferred",
-        ])
-
-    def test_open_and_next_put_the_most_urgent_first_and_keep_the_shown_item(self) -> None:
-        self.write_open_for("example", {"since": "2026-10-01T09:00", "text": "old normal"},
-                            {"since": "2026-10-06T09:00", "text": "needs the old one", "urgency": "blocks",
-                             "follows": "later one"},
-                            {"since": "2026-10-02T09:00", "text": "later one", "urgency": "later"},
-                            {"since": "2026-10-05T09:00", "text": "by friday", "urgency": "soon", "due": "2026-10-09"})
-        self.assertEqual(self.open_lines(), [
-            "1. example [later], since Fri Oct 02 09:00: later one",
-            "2. example [blocks], since Tue Oct 06 09:00: needs the old one",
-            "3. example [soon, due 2026-10-09], since Mon Oct 05 09:00: by friday",
-            "4. example, since Thu Oct 01 09:00: old normal",
-            "open: ok — 4 due, 0 deferred",
-        ])
-        shown = self.run_command("next")
-        self.assertEqual(shown.stdout.splitlines(), ["example [later], since Fri Oct 02 09:00: later one",
-                                                     "next: ok — 3 more due"])
-        marked = self.run_command("mark-important", "--item", "old normal")
-        self.assertEqual(marked.stdout.strip(), "mark-important: ok — old normal", marked.stdout + marked.stderr)
-        # The shown item stays first until it is answered; the user's mark takes the next place.
-        lines = self.open_lines()
-        self.assertEqual(lines[0], "1. example [later], since Fri Oct 02 09:00: later one")
-        self.assertTrue(lines[1].startswith("2. example [user, marked "), lines[1])
-        self.write_open_for("example", *cast(list[dict[str, str]], json.loads(self.outstanding().read_text())[:2]))
-        self.assertTrue(self.run_command("next").stdout.startswith("example [user, marked "))
-        self.assertEqual(self.run_command("mark-important", "--item", "nothing like it").returncode, 2)
-
-    def test_questions_store_a_level_and_keep_the_users_mark(self) -> None:
-        outstanding = self.outstanding()
-        _ = outstanding.write_text('[{"since":"2026-10-01T08:00","text":"choose layout","urgency":"user",'
-                                   + '"marked":"2026-10-01T09:00"},{"since":"2026-10-01T08:00","text":"merge before the demo"}]')
-        state = self.root / "judgment.json"
-        _ = state.write_text(json.dumps({"open_for_user": [
-            {"text": "choose layout", "urgency": "later"},
-            {"text": "merge before the demo", "urgency": "soon", "due": "2026-10-09T12:00", "follows": "choose layout"},
-        ]}), encoding="utf-8")
-        with mock.patch.dict(os.environ, self.env):
-            parsed = registration.judgment_state(state, "questions")
-        self.assertIsInstance(parsed.outstanding, registration.ReplaceOutstanding)
-        stored = self.run_command("questions", "--state", str(state))
-        self.assertEqual(stored.returncode, 0, stored.stdout + stored.stderr)
-        entries = cast(list[dict[str, str]], json.loads(outstanding.read_text(encoding="utf-8")))
-        self.assertEqual({key: entries[0].get(key) for key in ("urgency", "marked")},
-                         {"urgency": "user", "marked": "2026-10-01T09:00"})
-        self.assertEqual({key: entries[1].get(key) for key in ("urgency", "due", "follows")},
-                         {"urgency": "soon", "due": "2026-10-09T12:00", "follows": "choose layout"})
-        _ = state.write_text(json.dumps({"open_for_user": [{"text": "choose layout", "urgency": "soon"}]}),
-                             encoding="utf-8")
-        bad = self.run_command("questions", "--state", str(state))
-        self.assertEqual(bad.returncode, 2, bad.stdout + bad.stderr)
-
-
-    def run_ask(self, text: str, question: str, unit: str = "") -> str:
-        with (mock.patch.dict(os.environ, self.env),
-              mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.state / "notifier"),
-              redirect_stdout(io.StringIO()) as output):
-            registration.ask(read_production(self.doc), text, question, unit, dailies_render.Ranking())
-        return output.getvalue()
-
-    def test_ask_files_a_units_question_with_its_review_and_shows_the_asker(self) -> None:
-        full = "Keep the old key binding? Keep (recommended — users know it) or drop it."
-        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(full + " Reviewed.")):
-            printed = self.run_ask("alpha-unit: keep the old key binding?", full, "alpha-unit")
-        self.assertIn("filed question: " + full + " Reviewed.", printed)
-        self.assertNotIn("reviewed question:", printed)
-        rows = cast(list[dict[str, str]], json.loads(self.outstanding().read_text()))
-        self.assertEqual([(row["text"], row["asked_by"], row["question"]) for row in rows],
-                         [("alpha-unit: keep the old key binding?", "alpha-unit", full)])
-        self.assertEqual(rows[0]["reviewed"], full + " Reviewed.")
-        history = self.outstanding().with_suffix(".history.jsonl").read_text()
-        self.assertIn("alpha-unit: keep the old key binding?", history)
-        listed = self.open_lines()
-        self.assertRegex(listed[0], r"^1\. example, since .*, asked by alpha-unit: " + re.escape(full) + "$")
-
-    def test_ask_refuses_an_unknown_unit_a_duplicate_and_a_held_review_without_writing(self) -> None:
-        with self.assertRaisesRegex(registration.RegistrationFailure, "beta-unit is not a unit of example"):
-            _ = self.run_ask("which?", "Which one?", "beta-unit")
-        held = review.QuestionAwaitingFacts("Retry it?", ("say which build",), ())
-        with (mock.patch.object(review, "review_question", return_value=held),
-              self.assertRaisesRegex(registration.RegistrationFailure, "question held for review: retry\\?: say which build")):
-            _ = self.run_ask("retry?", "Retry it?", "alpha-unit")
-        self.assertFalse(self.outstanding().exists())
-        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Retry it?")):
-            _ = self.run_ask("retry?", "Retry it?", "alpha-unit")
-            with self.assertRaisesRegex(registration.RegistrationFailure, "already open"):
-                _ = self.run_ask("retry?", "Retry it?", "alpha-unit")
-
-    def test_a_list_rewrite_keeps_a_filed_question_and_answer_names_the_unit(self) -> None:
-        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Retry it?")):
-            _ = self.run_ask("retry?", "Retry it?", "alpha-unit")
-        state = self.question_state(["Reminder"])
-        kept = self.run_questions(state)
-        self.assertIn("questions: kept — retry?: asked by alpha-unit", kept)
-        rows = cast(list[dict[str, str]], json.loads(self.outstanding().read_text()))
-        self.assertEqual([row["text"] for row in rows], ["Reminder", "retry?"])
-        self.assertEqual(rows[1]["asked_by"], "alpha-unit")
-        # A rewrite that names the item keeps its asker too.
-        _ = self.run_questions(self.question_state(["Reminder", "retry?"]))
-        self.assertEqual(cast(list[dict[str, str]], json.loads(self.outstanding().read_text()))[1]["asked_by"], "alpha-unit")
-        answered = self.run_command("answer", "--item", "retry?")
-        self.assertEqual(answered.stdout.splitlines(), ["relay: to alpha-unit", "answer: ok — example: retry?"],
-                         answered.stdout + answered.stderr)
-        self.assertEqual([row["text"] for row in cast(list[dict[str, str]], json.loads(self.outstanding().read_text()))],
-                         ["Reminder"])
-        reminder = self.run_command("answer", "--item", "Reminder")
-        self.assertEqual(reminder.stdout.splitlines()[0], "relay: none; the item belongs to this production")
-        self.assertEqual(self.run_command("answer", "--item", "retry?").returncode, 2)
-
-    def test_answer_reaches_a_list_below_and_relays_through_its_showrunner_never_above(self) -> None:
-        for slug in ("top", "example", "kid"):
-            self.timer(slug)
-        self.attach("example", "top")
-        self.attach("kid", "example")
-        self.write_open_for("kid", {"since": "2026-10-06T08:00", "text": "merge today?", "question": "Merge today?",
-                                    "asked_by": "kid-unit"})
-        self.write_open_for("top", {"since": "2026-10-06T07:00", "text": "ship it?", "question": "Ship it?",
-                                    "asked_by": "top-unit"})
-        answered = self.run_command("answer", "--item", "merge today?")
-        self.assertEqual(answered.stdout.splitlines(),
-                         ["relay: to the showrunner of kid, for kid-unit", "answer: ok — kid: merge today?"],
-                         answered.stdout + answered.stderr)
-        self.assertEqual(json.loads(self.outstanding().with_name("kid.json").read_text()), [])
-        self.assertEqual(self.run_command("answer", "--item", "ship it?").returncode, 2)
-
-    def test_answer_waits_for_the_lists_lock(self) -> None:
-        self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "retry?", "question": "Retry it?",
-                                        "asked_by": "alpha-unit"})
-        lock = self.outstanding().with_suffix(".lock")
-        holder = subprocess.Popen([sys.executable, "-c", (
-            "import fcntl, sys, time\n"
-            f"handle = open({str(lock)!r}, 'a')\n"
-            "fcntl.flock(handle, fcntl.LOCK_EX)\n"
-            "print('held', flush=True)\n"
-            "time.sleep(2)\n")], stdout=subprocess.PIPE, text=True)
-        self.addCleanup(holder.wait)
-        self.assertEqual(cast(io.TextIOWrapper, holder.stdout).readline().strip(), "held")
-        began = datetime.now()
-        answered = self.run_command("answer", "--item", "retry?")
+        answered = self.run_command("answer", "--item", "Review the release notes")
         self.assertEqual(answered.returncode, 0, answered.stdout + answered.stderr)
-        self.assertGreaterEqual((datetime.now() - began).total_seconds(), 1.0)
-        cast(io.TextIOWrapper, holder.stdout).close()
+        self.assertEqual(answered.stdout.splitlines(),
+                         ["relay: none; the item belongs to this production",
+                          "answer: ok — example: Review the release notes"])
+        remaining = self.run_command("next")
+        self.assertIn("Keep the layout?", remaining.stdout)
+        self.assertNotIn("Review the release notes", remaining.stdout)
 
-    def test_the_reader_refuses_an_asker_without_a_question(self) -> None:
-        _ = self.outstanding().write_text(json.dumps([{"since": "2026-10-06T08:00", "text": "x", "asked_by": "alpha-unit"}]))
-        with self.assertRaisesRegex(dailies_render.InputError, "question required"):
-            _ = dailies_render.read_outstanding(self.outstanding())
+    def test_next_keeps_the_shown_question_until_its_answer(self) -> None:
+        self.file_question()
+        first = self.run_command("next")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertIn("Keep the layout?", first.stdout)
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Ship the release?")):
+            filed = self.run_command("ask", "--text", "Choose the release", "--question", "Ship the release?",
+                                     "--unit", "alpha-unit", "--urgency", "user")
+        self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
+        repeated = self.run_command("next")
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertEqual(repeated.stdout.splitlines()[0], first.stdout.splitlines()[0])
+        self.assertIn("1 more due", repeated.stdout)
+        answered = self.run_command("answer", "--item", "Choose the layout")
+        self.assertEqual(answered.returncode, 0, answered.stdout + answered.stderr)
+        following = self.run_command("next")
+        self.assertEqual(following.returncode, 0, following.stdout + following.stderr)
+        self.assertIn("Ship the release?", following.stdout)
+        self.assertNotIn("Keep the layout?", following.stdout)
+
+    def test_question_table_lists_a_filed_question_beside_an_excluded_proposal(self) -> None:
+        proposal = self.issues / "A separate proposal.md"
+        _ = proposal.write_text("\n".join([
+            "---", "status: open", "tags: [issue, proposal]", "proposal_id: P1",
+            "proposed_by: example", "date_created: 2026-11-02", "---", "A separate proposal.", "",
+        ]), encoding="utf-8")
+        proposal_before = proposal.read_bytes()
+        self.file_question()
+        records = [path for path in self.issues.glob("*.md") if path != proposal]
+        self.assertEqual(len(records), 1)
+        stored = records[0].read_text(encoding="utf-8")
+        self.assertIn(str(self.asker_id), stored)
+        self.assertIn("Keep the layout?", stored)
+        listed = self.run_command("questions-table")
+        self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
+        self.assertIn("|", listed.stdout)
+        self.assertIn("Choose the layout", listed.stdout)
+        self.assertIn("alpha-unit", listed.stdout)
+        self.assertNotIn("A separate proposal", listed.stdout)
+        answered = self.run_command("answer", "--item", "Choose the layout")
+        self.assertEqual(answered.returncode, 0, answered.stdout + answered.stderr)
+        closed = self.run_command("questions-table")
+        self.assertEqual(closed.returncode, 0, closed.stdout + closed.stderr)
+        self.assertNotIn("Choose the layout", closed.stdout)
+        self.assertEqual(proposal.read_bytes(), proposal_before)
+
+    def test_question_store_migration_is_idempotent_and_preserves_next(self) -> None:
+        _ = self.outstanding().write_text(json.dumps([{"since": "2026-10-06T08:00", "text": "Choose the layout",
+                                        "question": "Keep the layout?", "reviewed": "Keep the layout?",
+                                        "asked_by": "alpha-unit"}]))
+        migrated = self.run_command("migrate-questions")
+        self.assertEqual(migrated.returncode, 0, migrated.stdout + migrated.stderr)
+        rows = self.question_rows()
+        self.assertEqual(rows[0]["asked_by"], self.asker_id)
+        remaining: object = cast(object, json.loads(self.outstanding().read_text())) if self.outstanding().exists() else []
+        self.assertEqual(remaining, [])
+        records = list(self.issues.glob("*.md"))
+        self.assertEqual(len(records), 1)
+        self.assertIn(str(self.asker_id), records[0].read_text(encoding="utf-8"))
+        following = self.run_command("next")
+        self.assertEqual(following.returncode, 0, following.stdout + following.stderr)
+        self.assertEqual(following.stdout.splitlines(),
+                         ["example, since Tue Oct 06 08:00, asked by alpha-unit: Keep the layout?",
+                          "next: ok — 0 more due"])
+        before = self.store_snapshot()
+        repeated = self.run_command("migrate-questions")
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertEqual(self.store_snapshot(), before)
+
+    def test_question_review_and_defer_keep_the_fixed_asker(self) -> None:
+        held = review.QuestionAwaitingFacts("Keep the layout?", ("Which layout?",))
+        with mock.patch.object(review, "review_question", return_value=held):
+            result = self.run_command("ask", "--text", "Choose the layout", "--question", "Keep the layout?",
+                                      "--unit", "alpha-unit")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("Which layout?", result.stdout + result.stderr)
+        self.assertEqual(list(self.issues.glob("*.md")), [])
+        with mock.patch.object(review, "review_question",
+                               return_value=review.QuestionReviewUnavailable("Keep the layout?", "fixture timeout")):
+            filed = self.run_command("ask", "--text", "Choose the layout", "--question", "Keep the layout?",
+                                     "--unit", "alpha-unit")
+        self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
+        state = self.question_state([{"text": "Choose the layout", "after": "2099-01-02T08:00"}])
+        deferred = self.run_command("questions", "--state", str(state))
+        self.assertEqual(deferred.returncode, 0, deferred.stdout + deferred.stderr)
+        listed = self.run_command("open")
+        self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
+        self.assertIn("deferred until", listed.stdout)
+        self.assertIn("Keep the layout?", listed.stdout)
+        self.assertIn("0 due, 1 deferred", listed.stdout)
+        rows = self.question_rows()
+        self.assertEqual(rows[0]["asked_by"], self.asker_id)
+        self.assertEqual(rows[0]["review_unavailable"], "fixture timeout")
+
 
 if __name__ == "__main__":
     _ = unittest.main()

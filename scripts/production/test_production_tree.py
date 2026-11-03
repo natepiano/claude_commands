@@ -1,6 +1,8 @@
 """The manager tree cargo-handler polls: every edge from fixture records, none from live state."""
 from __future__ import annotations
 
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+
 import contextlib
 import io
 import json
@@ -8,22 +10,30 @@ import os
 import resource
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.production import staff, staff_sources
+from scripts.production.staff_test_support import StaffTestCase
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import production_tree  # noqa: E402
-import showrunners
+from scripts.production import showrunners
+import showrunner_tree
 import unit_lookup
 from herdr import HerdrPlace
 import unit_runs
+import roster
 
-RUNNER, CHILD_RUNNER, GONE_RUNNER = "sid-runner", "sid-child-runner", "sid-gone-runner"
-DIRECTOR, OLD_DIRECTOR, ORPHAN = "sid-director", "sid-old-director", "sid-orphan"
+RUNNER, CHILD_RUNNER, GONE_RUNNER = "17058649-2f0a-5cbf-b652-118ad9afdcf5", "25f9ce3d-b694-5281-a407-3e1369686426", "da46e5c2-e05e-5af0-b745-29e7288c841f"
+DIRECTOR, OLD_DIRECTOR, ORPHAN = "db159174-782d-5cca-87c3-df4eadc6ee0f", "c748073f-6db4-5c9a-ab26-b7a847ba2e00", "06d7f3bf-8f51-5582-a8c7-d9fa5176a3ed"
 SCRIPT = Path(__file__).with_name("production_tree.py")
 
 
@@ -41,31 +51,29 @@ def server_recorded(run: Path) -> bool:
     return (run / "mesh_server.json").is_file()
 
 
-class ProductionTreeTests(unittest.TestCase):
-    root: Path = Path()
-
+class ProductionTreeTests(StaffTestCase):
     @override
     def setUp(self) -> None:
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
-        notifier, state = self.root / "notifier", self.root / "showrunner"
+        super().setUp()
+        notifier, state = self.source_root / "notifier", self.source_root / "showrunners"
+        rows: dict[str, staff.StaffRow] = {}
         for slug, session_id in (("main", RUNNER), ("child", CHILD_RUNNER), ("gone", GONE_RUNNER)):
-            (notifier / f"showrunner-{slug}").mkdir(parents=True)
-            _ = (notifier / f"showrunner-{slug}" / "conf").write_text(f"TARGET=session:{session_id}\nEVERY=30\n")
-        (state / "child").mkdir(parents=True)
-        _ = (state / "child" / "parent").write_text("main\n")
+            _ = self.production(slug, parent="main" if slug == "child" else "")
+            conf = notifier / f"showrunner-{slug}" / "conf"
+            target = showrunners.read_bound_source(conf.parent, self.source_root / f"{slug}-production.md").timer.target
+            write_text_atomic(conf, conf.read_text().replace("TARGET=" + target, "TARGET=session:" + session_id))
+            rows[slug] = fixture_member("showrunner", name=slug, parent=rows["main"].id if slug == "child" else None,
+                                        runtime_id=session_id)
         _ = cast(object, self.enterContext(mock.patch.dict(
             os.environ, {"ASTRA_ROLES_STATE": str(self.root / "astra-roles"),
-                         "GUILD_ROLES_STATE": str(self.root / "guild-roles"),
-                         "GUILD_OWNERSHIP_STATE": str(self.root / "guild-ownership")})))
+                         "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
+                         "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership")})))
         for patch in (
             mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", notifier),
             mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", state),
             mock.patch.object(unit_runs, "RUN_ROOT", self.root / "unit"),
             mock.patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "delegate"),
             mock.patch.object(production_tree, "_server_running", side_effect=server_recorded),
-            mock.patch.object(production_tree, "pool_root", return_value=self.root / "review-pool"),
         ):
             _ = self.enterContext(patch)
 
@@ -85,7 +93,14 @@ class ProductionTreeTests(unittest.TestCase):
             _ = (run / "mesh_server.json").write_text(json.dumps({"pid": 1}))
         return run
 
-    def tree(self, running: set[str], units: dict[str, dict[str, unit_lookup.MarkedUnit]]) -> list[production_tree.Edge]:
+    def session_tree(self, running: set[str], units: dict[str, dict[str, unit_lookup.MarkedUnit]]) -> list[production_tree.Edge]:
+        snapshot = staff.snapshot()
+        for slug, members in units.items():
+            parent = staff_sources.member(staff_sources.ShowrunnerMember(slug), snapshot)
+            assert isinstance(parent, staff_sources.MemberFound)
+            for name, member in members.items():
+                assert isinstance(member.claude, unit_lookup.LiveClaude)
+                _ = fixture_member("unit", name=name, parent=parent.row.id, runtime_id=member.claude.session_id)
         marked = unit_lookup.MarkedProductions(units, {})
         with mock.patch.object(production_tree, "running_sessions", return_value=[record(session_id) for session_id in running]), \
                 mock.patch.object(unit_lookup, "every_marked_unit", return_value=marked):
@@ -101,13 +116,81 @@ class ProductionTreeTests(unittest.TestCase):
             "pid": None if worker else os.getpid(),
         }))
 
+    def test_transferred_live_unit_edge_uses_its_staff_parent_despite_the_old_launch_mark(self) -> None:
+        for slug in ("natedev", "sdlc"):
+            _ = self.production(slug)
+            _ = fixture_member("showrunner", name=slug)
+        parent = staff_sources.member(staff_sources.ShowrunnerMember("sdlc"), staff.snapshot())
+        assert isinstance(parent, staff_sources.MemberFound)
+        row = fixture_member("unit", name="one", parent=parent.row.id, runtime_id=DIRECTOR)
+        other_parent = fixture_member("showrunner", name="other")
+        _ = fixture_member("unit", name="one", parent=other_parent.id)
+        self.pane("w1:p1", session_id=DIRECTOR, environment={
+            "STAFF_ID": row.id, "SHOWRUNNER_UNIT": "natedev", "SHOWRUNNER_UNIT_ID": "one",
+        })
+        with (mock.patch.object(production_tree, "running_sessions", return_value=[record(DIRECTOR)]),
+              mock.patch.object(unit_lookup, "observed_staff_marks", return_value=(
+                  ("natedev", replace(unit(DIRECTOR, "one"), staff_id=row.id)),
+              ))):
+            edges = production_tree.tree()
+        self.assertEqual(edges, [{"manager": parent.row.id, "member": DIRECTOR, "role": "unit"}])
+
+    def test_complete_tree_with_child_productions_reads_one_staff_snapshot(self) -> None:
+        with (mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads,
+              mock.patch.object(unit_lookup, "observed_staff_marks", return_value=()),
+              mock.patch.object(production_tree, "running_sessions", return_value=[record(RUNNER), record(CHILD_RUNNER)])):
+            edges = production_tree.tree()
+        self.assertIn({"manager": RUNNER, "member": CHILD_RUNNER, "role": "showrunner"}, edges)
+        self.assertEqual(reads.call_count, 1)
+
+    def test_seed_and_json_follow_staff_moves_despite_stale_documents_and_parent_files(self) -> None:
+        main, child, gone = (staff_sources.member(staff_sources.ShowrunnerMember(slug), staff.snapshot())
+                             for slug in ("main", "child", "gone"))
+        assert isinstance(main, staff_sources.MemberFound)
+        assert isinstance(child, staff_sources.MemberFound)
+        assert isinstance(gone, staff_sources.MemberFound)
+        _ = staff.rename(main.row.id, "tools")
+        document = self.source_root / "main-production.md"
+        self.units_doc(document, ("one",), workspace="tools")
+        _ = self.worktree("one")
+        director = fixture_member("unit", name="one", parent=main.row.id, runtime_id=DIRECTOR)
+        self.pane("w1:p1", session_id=DIRECTOR, environment={
+            "STAFF_ID": director.id, "SHOWRUNNER_UNIT": "main", "SHOWRUNNER_UNIT_ID": "one",
+        })
+        marked = unit_lookup.MarkedProductions({"main": {"one": unit(DIRECTOR, "one")}}, {})
+        with (mock.patch.object(production_tree, "running_sessions", return_value=[record(CHILD_RUNNER), record(DIRECTOR)]),
+              mock.patch.object(unit_lookup, "every_marked_unit", return_value=marked)):
+            with contextlib.redirect_stdout(io.StringIO()) as before:
+                self.assertEqual(production_tree.main(["--json"]), 0)
+            expected = ('{"schema":1,"edges":[{"manager":"17058649-2f0a-5cbf-b652-118ad9afdcf5","member":"25f9ce3d-b694-5281-a407-3e1369686426","role":"showrunner"},'
+                        '{"manager":"17058649-2f0a-5cbf-b652-118ad9afdcf5","member":"db159174-782d-5cca-87c3-df4eadc6ee0f","role":"unit"}]}\n')
+            self.assertEqual(before.getvalue(), expected)
+            parent_file = self.source_root / "showrunners/child/parent"
+            write_text_atomic(parent_file, "obsolete-parent\n")
+            with contextlib.redirect_stdout(io.StringIO()) as same:
+                self.assertEqual(production_tree.main(["--json"]), 0)
+            self.assertEqual(same.getvalue().encode(), before.getvalue().encode())
+            write_text_atomic(parent_file, "main\n")
+            _ = staff.move(child.row.id, gone.row.id)
+            _ = staff.move(director.id, gone.row.id)
+            with contextlib.redirect_stdout(io.StringIO()):
+                staff_sources.seed()
+            self.assertEqual(showrunner_tree.parent_of("child"), "gone")
+            self.assertEqual(showrunner_tree.children_of("gone"), ["child"])
+            with contextlib.redirect_stdout(io.StringIO()) as after:
+                self.assertEqual(production_tree.main(["--json"]), 0)
+            self.assertEqual(after.getvalue(), expected.replace('"manager":"17058649-2f0a-5cbf-b652-118ad9afdcf5"', '"manager":"da46e5c2-e05e-5af0-b745-29e7288c841f"'))
+        self.assertEqual(staff.by_id(director.id), staff.StaffRow(director.id, "unit", "one", gone.row.id, current_session=director.id))
+        self.assertEqual(parent_file.read_text(), "main\n")
+        self.assertIn("| `one` |", document.read_text())
+
     def test_astra_designer_and_reviewer_edges_carry_their_account_and_live_state(self) -> None:
         run = self.run_folder("unit", DIRECTOR, {
             "project-design": {"thread_id": "thread-design", "role": "impl", "status": "idle"},
         })
         self.astra_role("designer", "thread-design", DIRECTOR, str(run), "project-design")
         self.astra_role("reviewer", "thread-reviewer", RUNNER)
-        edges = self.tree({RUNNER, DIRECTOR}, {"main": {"one": unit(DIRECTOR, "one")}})
+        edges = self.session_tree({RUNNER, DIRECTOR}, {"main": {"one": unit(DIRECTOR, "one")}})
         self.assertCountEqual(edges, [
             {"manager": RUNNER, "member": DIRECTOR, "role": "unit"},
             {"manager": DIRECTOR, "member": "thread-design", "role": "astra-designer",
@@ -125,7 +208,7 @@ class ProductionTreeTests(unittest.TestCase):
         self.assertEqual(production_tree.worker_edges({DIRECTOR}), [
             {"manager": DIRECTOR, "member": "thread-test", "role": "test"},
         ])
-        self.assertCountEqual(self.tree({DIRECTOR}, {}), [
+        self.assertCountEqual(self.session_tree({DIRECTOR}, {}), [
             {"manager": DIRECTOR, "member": "thread-design", "role": "astra-designer",
              "codex_home": str(self.root / "codex-home"), "state": "busy"},
             {"manager": DIRECTOR, "member": "thread-test", "role": "test"},
@@ -133,7 +216,7 @@ class ProductionTreeTests(unittest.TestCase):
 
     def test_a_local_astra_thread_keeps_its_manager_on_another_machine(self) -> None:
         self.astra_role("reviewer", "thread-remote-manager", ORPHAN)
-        self.assertEqual(self.tree(set(), {}), [
+        self.assertEqual(self.session_tree(set(), {}), [
             {"manager": ORPHAN, "member": "thread-remote-manager", "role": "astra-reviewer",
              "codex_home": str(self.root / "codex-home"), "state": "busy"},
         ])
@@ -143,7 +226,7 @@ class ProductionTreeTests(unittest.TestCase):
         broken = self.root / "astra-roles" / "thread-broken.json"
         _ = broken.write_text("{not json")
         with contextlib.redirect_stderr(io.StringIO()) as errors:
-            edges = self.tree({RUNNER, CHILD_RUNNER}, {})
+            edges = self.session_tree({RUNNER, CHILD_RUNNER}, {})
         self.assertCountEqual(edges, [
             {"manager": RUNNER, "member": CHILD_RUNNER, "role": "showrunner"},
             {"manager": RUNNER, "member": "thread-readable", "role": "astra-reviewer",
@@ -167,7 +250,7 @@ class ProductionTreeTests(unittest.TestCase):
                 record["pid"] = True
             _ = (self.root / "astra-roles" / f"{thread}.json").write_text(json.dumps(record))
         with contextlib.redirect_stderr(io.StringIO()) as errors:
-            edges = self.tree({RUNNER, CHILD_RUNNER}, {})
+            edges = self.session_tree({RUNNER, CHILD_RUNNER}, {})
         self.assertCountEqual(edges, [
             {"manager": RUNNER, "member": CHILD_RUNNER, "role": "showrunner"},
             {"manager": RUNNER, "member": "thread-readable", "role": "astra-reviewer",
@@ -184,13 +267,13 @@ class ProductionTreeTests(unittest.TestCase):
     def test_every_kind_of_edge_between_running_sessions(self) -> None:
         _ = self.run_folder("unit", DIRECTOR, {
             "a-impl": {"thread_id": "thread-impl", "role": "impl", "status": "running"},
-            "a-test": {"thread_id": "thread-test", "status": "idle"},
+            "a-test": {"thread_id": "thread-test", "role": "test", "status": "idle"},
             "a-review": {"thread_id": "thread-review", "role": "review", "status": "ended"},
         })
         _ = self.run_folder("delegate", OLD_DIRECTOR, {
             "b-4": {"thread_id": "thread-fix", "role": "fix", "status": "done"},
         })
-        edges = self.tree({RUNNER, CHILD_RUNNER, DIRECTOR, OLD_DIRECTOR}, {
+        edges = self.session_tree({RUNNER, CHILD_RUNNER, DIRECTOR, OLD_DIRECTOR}, {
             "main": {"one": unit(DIRECTOR, "one"), "two": unit(OLD_DIRECTOR, "two")},
         })
         self.assertEqual(edges, [
@@ -202,34 +285,31 @@ class ProductionTreeTests(unittest.TestCase):
             {"manager": OLD_DIRECTOR, "member": "thread-fix", "role": "fix"},
         ])
 
-    def test_each_leased_pool_reviewer_reports_to_its_running_unit_director(self) -> None:
-        pool = self.root / "review-pool" / "main" / "pool.json"
-        pool.parent.mkdir(parents=True)
-        _ = pool.write_text(json.dumps({
-            "generation": 1, "next_index": 5,
-            "templates": {"code": {"thread_id": "thread-template"}},
-            "reviewers": {
-                "code1": {"type": "code", "thread_id": "thread-busy", "lease": {"unit": "one", "ordinal": 1},
-                          "busy_pid": os.getpid()},
-                "design2": {"type": "design", "thread_id": "thread-idle", "lease": {"unit": "one", "ordinal": 2},
-                            "busy_pid": None},
-                "code3": {"type": "code", "thread_id": "thread-free", "lease": None, "busy_pid": None},
-                "code4": {"type": "code", "thread_id": "thread-stopped", "lease": {"unit": "two", "ordinal": 1},
-                          "busy_pid": None},
-            },
-        }))
-        edges = self.tree({RUNNER, DIRECTOR}, {"main": {"one": unit(DIRECTOR, "one"), "two": unit(OLD_DIRECTOR, "two")}})
-        self.assertEqual([edge for edge in edges if edge["role"] == "review"], [
-            {"manager": DIRECTOR, "member": "thread-busy", "role": "review", "unit": "one",
-             "thread_id": "thread-busy", "state": "busy", "type": "code"},
-            {"manager": DIRECTOR, "member": "thread-idle", "role": "review", "unit": "one",
-             "thread_id": "thread-idle", "state": "idle", "type": "design"},
+    def test_record_assignment_wins_over_a_conflicting_name_suffix(self) -> None:
+        _ = self.run_folder("unit", DIRECTOR, {
+            "project-impl": {"thread_id": "thread-review", "role": "review", "status": "done"},
+            "no-job-in-name": {"thread_id": "thread-test", "role": "test", "status": "idle"},
+        })
+        self.assertCountEqual(production_tree.worker_edges({DIRECTOR}), [
+            {"manager": DIRECTOR, "member": "thread-review", "role": "review"},
+            {"manager": DIRECTOR, "member": "thread-test", "role": "test"},
         ])
+
+    def test_legacy_and_bad_assignments_never_gain_a_role_from_the_name(self) -> None:
+        _ = self.run_folder("unit", DIRECTOR, {
+            "legacy-impl": {"thread_id": "thread-old", "status": "idle"},
+            "invalid-review": {"thread_id": "thread-bad", "status": "idle", "role": "designer"},
+        })
+        self.assertEqual(production_tree.worker_edges({DIRECTOR}), [])
+        self.assertEqual(production_tree._worker_role({}), roster.AssignmentUnrecorded())  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(production_tree._worker_role({"role": "designer"}),  # pyright: ignore[reportPrivateUsage]
+                         roster.AssignmentUnreadable("designer"))
+
 
     def test_a_manager_on_another_machine_keeps_its_edges(self) -> None:
         _ = self.run_folder("unit", DIRECTOR, {"a-impl": {"thread_id": "thread-impl", "role": "impl", "status": "running"}}, server=False)
         _ = self.run_folder("unit", ORPHAN, {"c-impl": {"thread_id": "thread-orphan", "role": "impl", "status": "running"}})
-        edges = self.tree({CHILD_RUNNER, DIRECTOR, ORPHAN}, {
+        edges = self.session_tree({CHILD_RUNNER, DIRECTOR, ORPHAN}, {
             "main": {"one": unit(DIRECTOR, "one")},
             "gone": {"orphan": unit(ORPHAN, "orphan")},
         })
@@ -243,16 +323,30 @@ class ProductionTreeTests(unittest.TestCase):
         ])
 
     def test_a_member_that_is_not_running_here_leaves_its_edges_out(self) -> None:
-        edges = self.tree({RUNNER}, {"main": {"one": unit(DIRECTOR, "one")}})
+        edges = self.session_tree({RUNNER}, {"main": {"one": unit(DIRECTOR, "one")}})
         self.assertEqual(edges, [])
 
-    def test_unreadable_unit_marks_keep_the_other_edges(self) -> None:
+    def test_unreadable_staff_marks_keep_the_other_edges(self) -> None:
         with mock.patch.object(production_tree, "running_sessions", return_value=[record(RUNNER), record(CHILD_RUNNER)]), \
                 mock.patch.object(unit_lookup, "every_marked_unit", side_effect=OSError("herdr: gone")), \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
             edges = production_tree.tree()
         self.assertEqual(edges, [{"manager": RUNNER, "member": CHILD_RUNNER, "role": "showrunner"}])
         self.assertIn("unit marks unreadable: herdr: gone", errors.getvalue())
+
+    def test_unreadable_staff_omits_membership_edges_and_keeps_worker_edges(self) -> None:
+        _ = self.run_folder("unit", DIRECTOR, {
+            "unit-impl": {"thread_id": "thread-impl", "role": "impl", "status": "running"},
+        })
+        _ = self.write_document({"schema": 99, "rows": []})
+        marked = unit_lookup.MarkedProductions({"main": {"one": unit(DIRECTOR, "one")}}, {})
+        with (mock.patch.object(production_tree, "running_sessions",
+                                return_value=[record(CHILD_RUNNER), record(DIRECTOR)]),
+              mock.patch.object(unit_lookup, "every_marked_unit", return_value=marked),
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            edges = production_tree.tree()
+        self.assertEqual(edges, [{"manager": DIRECTOR, "member": "thread-impl", "role": "impl"}])
+        self.assertIn("staff unreadable", errors.getvalue())
 
     def test_claude_workers_take_their_slot_role_from_the_board_without_a_server(self) -> None:
         run = self.run_folder("unit", DIRECTOR, {}, server=False)
@@ -273,7 +367,7 @@ class ProductionTreeTests(unittest.TestCase):
         # The test worker has no launch record yet: its ledger short id prefixes its session id, and
         # its name ends with its slot, so its role is the one its slot took over on the board.
         _ = (run / "workers").write_text("sid-claude-t\tproj-test\nsid-claude-s\tproj-stray\nsid-nobody\tproj-impl\n")
-        edges = self.tree({DIRECTOR, "sid-claude-impl", "sid-claude-test", "sid-claude-stray", "thread-codex-fix"}, {})
+        edges = self.session_tree({DIRECTOR, "sid-claude-impl", "sid-claude-test", "sid-claude-stray", "thread-codex-fix"}, {})
         self.assertEqual(edges, [
             {"manager": DIRECTOR, "member": "sid-claude-impl", "role": "impl"},
             {"manager": DIRECTOR, "member": "sid-claude-test", "role": "impl"},
@@ -285,7 +379,7 @@ class ProductionTreeTests(unittest.TestCase):
         _ = (run / "impl_worker_fix.json").write_text(json.dumps(
             {"name": "proj-fix", "slot": "fix", "family": "claude", "model": "m", "worker_id": "sid-claude-fix"}))
         _ = (run / "workers").write_text("sid-clau\tproj-fix\n")
-        edges = self.tree({DIRECTOR, "sid-claude-fix"}, {})
+        edges = self.session_tree({DIRECTOR, "sid-claude-fix"}, {})
         self.assertEqual(edges, [
             {"manager": DIRECTOR, "member": "thread-impl", "role": "impl"},
             {"manager": DIRECTOR, "member": "sid-claude-fix", "role": "fix"},
@@ -296,7 +390,7 @@ class ProductionTreeTests(unittest.TestCase):
         _ = (run / "board.log").write_text("2026-10-16T09:00:00-0400 [impl] register: impl launcher up; role=impl\n")
         _ = (run / "impl_worker_impl.json").write_text(json.dumps(
             {"name": "proj-impl", "slot": "impl", "family": "claude", "model": "m", "worker_id": "sid-claude-impl"}))
-        self.assertEqual(self.tree({DIRECTOR, "sid-claude-impl"}, {}), [])
+        self.assertEqual(self.session_tree({DIRECTOR, "sid-claude-impl"}, {}), [])
 
     def test_runs_side_by_side_under_one_director_each_list_their_workers(self) -> None:
         # A director's marker names one run; the phase it runs beside that one has its own folder.
@@ -306,7 +400,7 @@ class ProductionTreeTests(unittest.TestCase):
                             name="run-phase-2")
         (self.root / "delegate" / "active").mkdir()
         _ = (self.root / "delegate" / "active" / DIRECTOR).write_text(f"{main}\n")
-        edges = self.tree({DIRECTOR}, {})
+        edges = self.session_tree({DIRECTOR}, {})
         self.assertEqual(edges, [
             {"manager": DIRECTOR, "member": "thread-p1", "role": "impl"},
             {"manager": DIRECTOR, "member": "thread-p2", "role": "fix"},
@@ -319,16 +413,16 @@ class ProductionTreeTests(unittest.TestCase):
             "history_file": str(self.root / "history" / f"{run.name}.jsonl"),
             "main_agent": {"family": "codex", "session_id": "thread-impl"},
         }))
-        edges = self.tree({DIRECTOR, "thread-impl"}, {})
+        edges = self.session_tree({DIRECTOR, "thread-impl"}, {})
         self.assertEqual(edges, [{"manager": DIRECTOR, "member": "thread-impl", "role": "impl"}])
 
     def test_the_recorded_director_names_a_run_opened_without_start_run(self) -> None:
         run = self.run_folder("unit", DIRECTOR, {"a-impl": {"thread_id": "thread-a", "role": "impl", "status": "running"}},
                               name="run-by-hand")
         (run / "progress_history_state.json").unlink()
-        self.assertEqual(self.tree({DIRECTOR}, {}), [])
+        self.assertEqual(self.session_tree({DIRECTOR}, {}), [])
         unit_runs.record_director(run, DIRECTOR)
-        self.assertEqual(self.tree({DIRECTOR}, {}), [{"manager": DIRECTOR, "member": "thread-a", "role": "impl"}])
+        self.assertEqual(self.session_tree({DIRECTOR}, {}), [{"manager": DIRECTOR, "member": "thread-a", "role": "impl"}])
 
     def test_a_run_without_a_started_history_has_no_director(self) -> None:
         no_state = self.run_folder("unit", DIRECTOR, {"a-impl": {"thread_id": "thread-a", "role": "impl", "status": "running"}},
@@ -341,16 +435,17 @@ class ProductionTreeTests(unittest.TestCase):
                                     name="run-unstarted")
         _ = (self.root / "history" / f"{unstarted.name}.jsonl").write_text(json.dumps({"event_type": "phase_started"}) + "\n")
         _ = (self.root / "unit" / "stray-file").write_text("not a run\n")
-        self.assertEqual(self.tree({DIRECTOR}, {}), [])
+        self.assertEqual(self.session_tree({DIRECTOR}, {}), [])
 
     def test_a_large_tree_answers_well_under_a_second(self) -> None:
-        directors = [f"sid-director-{number}" for number in range(40)]
+        directors = [fixture_runtime_id(f"large-tree-director:{number}") for number in range(40)]
         for director in directors:
             _ = self.run_folder("unit", director, {
-                f"w{seat}-impl": {"thread_id": f"{director}-{seat}", "role": "impl", "status": "running"} for seat in range(6)
+                f"w{seat}-impl": {"thread_id": fixture_runtime_id(f"large-tree-worker:{director}:{seat}"), "role": "impl", "status": "running"} for seat in range(6)
             })
         started = time.process_time()
-        edges = self.tree({RUNNER, *directors}, {"main": {director: unit(director, director) for director in directors}})
+        edges = self.session_tree({RUNNER, *directors}, {"main": {f"unit{number}": unit(director, f"unit{number}")
+                                                               for number, director in enumerate(directors)}})
         self.assertLess(time.process_time() - started, 0.25)
         self.assertEqual(len(edges), 40 + 40 * 6)
 

@@ -14,7 +14,9 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
+from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, nix_env_fake as fixtures
+from scripts.lib.code_kind import is_test_code
 from scripts.shutdown import launch_permission
 
 
@@ -194,7 +196,7 @@ class ExecLaunchShellTests(unittest.TestCase):
         self.home.mkdir()
         self.loader = fixtures.fake_nix_loader()
         _ = cast(object, self.enterContext(patch.object(accounts, "import_module", side_effect=fixtures.imports_with_nix_loader(self.loader))))
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home), "PATH": os.defpath,
+        _ = cast(object, self.enterContext(scratch_account_home(self.home, {"PATH": os.defpath,
             "KEEP": "base", "UNSET_BY_SHELL": "old", "AGENT_NOTES_DIR": str(self.home / "notes"),
             "SHUTDOWN_STATE_DIR": str(self.home / "shutdown"),
             "NOTIFIER_SESSIONS_DIR": str(self.home / "sessions")}, clear=True)))
@@ -383,7 +385,7 @@ def launch():
         source = '''
 def launch():
     selected = accounts.role_account("unit")
-    herdr.open_tab("unit", "ad-hoc", "unit", cwd, named_account_environment(selected.dir))
+    herdr.open_tab("unit", "production", "unit", cwd, named_account_environment(selected.dir))
     herdr.start_agent("unit", pane, kind="claude", agent="unit", agent_arguments=[])
 '''
         problems = launch_account_violations(source, "fixture.py")
@@ -447,14 +449,14 @@ def _resume_parts(session: Session, prompt: str):
     def test_all_python_claude_launchers_use_the_shared_account_resolver(self) -> None:
         violations: list[str] = []
         for path in sorted(ROOT.rglob("*.py")):
-            if path.name.startswith(("test_", "fake_")):
+            if is_test_code(path):
                 continue
             violations.extend(launch_account_violations(path.read_text(encoding="utf-8"), str(path.relative_to(ROOT))))
         self.assertEqual(violations, [], "\n".join(violations))
 
     def test_shell_launches_without_any_account_selection_are_rejected(self) -> None:
         for path, source in (
-                ("fix/style-eval-review-all.sh", 'claude --print --dangerously-skip-permissions -- "$prompt" > "$log" 2>&1'),
+                ("fixtures/unresolved-launch.sh", 'claude --print --dangerously-skip-permissions -- "$prompt" > "$log" 2>&1'),
                 ("berth_fix/launch.sh", 'exec env -u CLAUDE_CODE_MESSAGING_SOCKET \\\n    claude -n "$session_name" --permission-mode auto /berth_fix\n'
                  + 'open_window claude -n "$session_name" /berth_fix'),
                 ("agents/agent_bg.sh", '"${CLAUDE_BIN}" "${launch_args[@]}"')):
@@ -481,7 +483,7 @@ subprocess.run([claude, "agents", "--json"], capture_output=True, text=True)
                     self.assertEqual(shell_launch_account_violations(rendering, "fixture.sh"), [])
         violations: list[str] = []
         for path in sorted(ROOT.rglob("*.sh")):
-            if path.name.startswith(("test_", "fake_")):
+            if is_test_code(path):
                 continue
             violations.extend(shell_launch_account_violations(path.read_text(encoding="utf-8"), str(path.relative_to(ROOT))))
         self.assertEqual(violations, [], "\n".join(violations))

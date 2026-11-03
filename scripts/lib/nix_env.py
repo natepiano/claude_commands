@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """Load and prove a worktree's nix environment before starting a process.
 
-Only envrc files below ~/rust, ~/worktrees or ~/.claude* are allowed
-automatically. Other directories keep direnv's explicit approval boundary.
+Envrc files below ~/rust, ~/worktrees or ~/.claude*, and in linked worktrees
+registered by repositories below those roots, are allowed automatically.
+Registered scratch copies also qualify when their regular top-level envrc
+matches the recorded source commit in a repository below those roots.
+Other directories keep direnv's explicit approval boundary.
 No envrc means the caller's environment is retained, without running direnv.
 """
 from __future__ import annotations
 
-import json
 import os
-import shlex
-import subprocess
+import stat
 import sys
-from collections.abc import Mapping
-from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, NamedTuple, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 if __name__ == "nix_env":
     _ = sys.modules.setdefault("scripts.lib.nix_env", sys.modules[__name__])
@@ -29,19 +31,16 @@ HEAL_SESSION_ENV = "NIX_HEAL_PREPARED_SESSION"
 HEAL_DIRECTORY_ENV = "NIX_HEAL_PREPARED_DIRECTORY"
 
 
-@dataclass(frozen=True)
-class Loaded:
+class Loaded(NamedTuple):
     env: dict[str, str]
     envrc: Path
 
 
-@dataclass(frozen=True)
-class NoEnvrc:
+class NoEnvrc(NamedTuple):
     env: dict[str, str]
 
 
-@dataclass(frozen=True)
-class Refused:
+class Refused(NamedTuple):
     reason: str
 
 
@@ -52,14 +51,94 @@ def nearest_envrc(directory: Path) -> Path | None:
                  if (parent / ".envrc").is_file()), None)
 
 
-def trusted_envrc(envrc: Path) -> bool:
-    """Approval belongs to the file's resolved location, never a symlink alias."""
+def trusted_root(path: Path) -> bool:
+    """Whether the resolved path belongs to an automatically approved root."""
     try:
-        relative = envrc.resolve().relative_to(Path.home().resolve())
-    except ValueError:
+        relative = path.resolve().relative_to(Path.home().resolve())
+    except (OSError, ValueError, RuntimeError):
         return False
     return bool(relative.parts and (relative.parts[0] in {"rust", "worktrees"}
                                   or relative.parts[0].startswith(".claude")))
+
+
+def registered_worktree(folder: Path) -> bool:
+    """Prove registration by a trusted repository using only git's pointer files."""
+    try:
+        folder = folder.resolve(strict=True)
+        git_file = folder / ".git"
+        if not stat.S_ISREG(git_file.lstat().st_mode):
+            return False
+        lines = git_file.read_text(encoding="utf-8").splitlines()
+        if len(lines) != 1 or not lines[0].startswith("gitdir: "):
+            return False
+        pointer = lines[0][len("gitdir: "):]
+        if not pointer:
+            return False
+        entry = (folder / pointer).resolve(strict=True)
+        if not entry.is_dir() or entry.parent.name != "worktrees":
+            return False
+        common_text = (entry / "commondir").read_text(encoding="utf-8").strip()
+        back_text = (entry / "gitdir").read_text(encoding="utf-8").strip()
+        if not common_text or not back_text or len(common_text.splitlines()) != 1 or len(back_text.splitlines()) != 1:
+            return False
+        common = (entry / common_text).resolve(strict=True)
+        back_pointer = (entry / back_text).resolve(strict=True)
+        return (common.is_dir() and common == entry.parent.parent
+                and trusted_root(common) and back_pointer == git_file)
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def _git_environment() -> dict[str, str]:
+    """Keep caller overrides from choosing git's repository or object store."""
+    return {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+
+
+def registered_copy(envrc: Path) -> bool:
+    """Prove a copy's envrc matches its recorded commit in a trusted source."""
+    # Keep copy_record and subprocess off the no-envrc and trusted-root paths.
+    import subprocess
+
+    try:
+        if not stat.S_ISREG(envrc.lstat().st_mode):
+            return False
+        folder = envrc.parent.resolve(strict=True)
+        repository_root = str(Path(__file__).resolve().parents[2])
+        if repository_root not in sys.path:
+            sys.path.insert(0, repository_root)
+        from scripts.lib import copy_record
+
+        if envrc.name != ".envrc" or copy_record.copy_folder(folder) != folder:
+            return False
+        record = copy_record.read_record(folder / copy_record.RECORD)
+        if not isinstance(record, copy_record.Registered):
+            return False
+        source_path = record.fields.get("source_path")
+        source_commit = record.fields.get("source_commit")
+        if not isinstance(source_path, str) or not source_path or not isinstance(source_commit, str) or not source_commit:
+            return False
+        source = Path(source_path).resolve(strict=True)
+        if not source.is_dir() or not trusted_root(source):
+            return False
+        environment = _git_environment()
+        expected = subprocess.run(
+            ["git", "rev-parse", "--verify", "--end-of-options", f"{source_commit}:.envrc"],
+            cwd=source, env=environment, capture_output=True, text=True, timeout=TIMEOUT_SECONDS, check=True)
+        actual = subprocess.run(
+            ["git", "hash-object", "--no-filters", "--", str(folder / ".envrc")],
+            cwd=source, env=environment, capture_output=True, text=True, timeout=TIMEOUT_SECONDS, check=True)
+        return bool(expected.stdout.strip()) and expected.stdout.strip() == actual.stdout.strip()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return False
+
+
+def trusted_envrc(envrc: Path) -> bool:
+    """Approval belongs to the file's resolved location, never a symlink alias."""
+    try:
+        resolved = envrc.resolve(strict=True)
+        return trusted_root(resolved) or registered_worktree(resolved.parent) or registered_copy(envrc)
+    except (OSError, ValueError, RuntimeError):
+        return False
 
 
 def last_line(text: str, fallback: str) -> str:
@@ -77,19 +156,33 @@ def ensure(directory: Path, base_env: Mapping[str, str] = os.environ) -> Loaded 
         environment = dict(base_env)
         if envrc is None:
             return NoEnvrc(environment)
+        # Avoid subprocess's startup cost when no envrc needs loading.
+        import subprocess
+
         trusted = trusted_envrc(envrc)
         commands = (["direnv", "allow", str(envrc)], ["direnv", "export", "json"]) if trusted else (
             ["direnv", "export", "json"],)
         exported = ""
-        for command in commands:
-            result = subprocess.run(command, cwd=directory, env=environment, capture_output=True,
-                                    text=True, timeout=TIMEOUT_SECONDS, check=False)
-            if result.returncode:
-                reason = last_line(result.stderr, f"direnv exit {result.returncode}")
-                if not trusted and any(word in result.stderr.lower() for word in ("not allowed", "blocked", "denied")):
-                    reason += "; run " + shlex.join(["direnv", "allow", str(envrc)])
-                return Refused(f"nix_env: {directory}: {reason}")
-            exported = result.stdout
+        try:
+            for command in commands:
+                result = subprocess.run(command, cwd=directory, env=environment, capture_output=True,
+                                        text=True, timeout=TIMEOUT_SECONDS, check=False)
+                if result.returncode:
+                    reason = last_line(result.stderr, f"direnv exit {result.returncode}")
+                    if not trusted and any(word in result.stderr.lower() for word in ("not allowed", "blocked", "denied")):
+                        # Pay shlex's startup cost only for an explicit approval hint.
+                        import shlex
+
+                        reason += "; run " + shlex.join(["direnv", "allow", str(envrc)])
+                    return Refused(f"nix_env: {directory}: {reason}")
+                exported = result.stdout
+        except subprocess.TimeoutExpired as error:
+            detail = error.stderr
+            stderr = detail.decode(errors="replace") if isinstance(detail, bytes) else detail or ""
+            return Refused(f"nix_env: {directory}: " + last_line(stderr, "direnv timed out after 600 s"))
+        # Pay JSON's startup cost only when decoding an envrc export.
+        import json
+
         # direnv's no-update path succeeds without emitting an export object.
         diff: object = json.loads(exported) if exported.strip() else {}
         if not isinstance(diff, dict):
@@ -107,10 +200,6 @@ def ensure(directory: Path, base_env: Mapping[str, str] = os.environ) -> Loaded 
         if not environment.get("IN_NIX_SHELL"):
             return Refused(f"nix_env: {directory}: .envrc loaded but no nix shell (IN_NIX_SHELL unset)")
         return Loaded(environment, envrc)
-    except subprocess.TimeoutExpired as error:
-        detail = error.stderr
-        stderr = detail.decode(errors="replace") if isinstance(detail, bytes) else detail or ""
-        return Refused(f"nix_env: {directory}: " + last_line(stderr, "direnv timed out after 600 s"))
     except (OSError, ValueError) as error:
         return Refused(f"nix_env: {directory}: " + last_line(str(error), type(error).__name__))
 
@@ -121,6 +210,9 @@ def main(arguments: list[str]) -> int:
         if isinstance(outcome, Refused):
             print(outcome.reason, file=sys.stderr)
             return 1
+        # Pay JSON's startup cost only when the CLI serializes an environment.
+        import json
+
         print(json.dumps(outcome.env))
         return 0
     if len(arguments) >= 2 and arguments[0] == "exec":
@@ -132,6 +224,10 @@ def main(arguments: list[str]) -> int:
         if isinstance(outcome, Refused):
             print(outcome.reason, file=sys.stderr)
             return 1
+        if isinstance(outcome, Loaded):
+            outcome.env["NIX_ENV_ENVRC"] = str(outcome.envrc.resolve())
+        else:
+            _ = outcome.env.pop("NIX_ENV_ENVRC", None)
         try:
             os.execvpe(program, arguments[1:], outcome.env)
         except OSError as error:

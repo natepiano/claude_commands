@@ -11,15 +11,25 @@ from bisect import bisect_right
 from dataclasses import dataclass, replace
 import difflib
 from enum import StrEnum
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from itertools import accumulate
 import re
 
 import style_footprint
-from approved_renames import ITEM_KEYWORDS, type_path
 
+# The keywords that declare an item directly in a module, trait or impl body.
+ITEM_KEYWORDS = frozenset({"fn", "struct", "enum", "union", "trait", "type", "const", "static", "mod"})
 # The items whose body is in braces; the other items end at their semicolon.
 BRACED_KEYWORDS = frozenset({"fn", "struct", "enum", "union", "trait", "mod", "impl"})
+
+
+def type_path(words: tuple[str, ...]) -> tuple[str, ...]:
+    """Return the path segments from an impl header, or an empty tuple for an unreadable path."""
+    finish = next((i for i, word in enumerate(words) if word in {"<", "where"}), len(words))
+    path = words[:finish]
+    readable = len(path) % 2 == 1 and all(
+        word == "::" if i % 2 else style_footprint.IDENTIFIER.fullmatch(word) is not None for i, word in enumerate(path))
+    return path[::2] if readable else ()
 
 
 @dataclass(frozen=True)
@@ -302,6 +312,11 @@ class DeclaredFile:
             return NoDeclarationAtLine()
         return max(holding, key=lambda entry: entry[:3])[3]
 
+    @cached_property
+    def _body_spans(self) -> tuple[style_footprint.TokenSpan, ...]:
+        """Immutable source offsets shared by every item body in this file."""
+        return style_footprint.token_spans("\n".join(self.source_lines))
+
     def item_body(self: DeclaredFile, item: DeclaredItem) -> ReadableBody | UnreadableBody:
         """Read only source inside this item's braces, including comments and header-line fragments."""
         index = self.declared_items.index(item)
@@ -310,7 +325,7 @@ class DeclaredFile:
             return UnreadableBody()
         text = "\n".join(self.source_lines)
         try:
-            spans = style_footprint.token_spans(text)
+            spans = self._body_spans
         except style_footprint.UnreadableTokenSpans:
             return UnreadableBody()
         if body.close >= len(spans):

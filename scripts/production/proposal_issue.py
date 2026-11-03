@@ -52,6 +52,8 @@ from enum import Enum
 from pathlib import Path
 from typing import cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import urgency  # noqa: E402
 from user_zone import user_zone  # noqa: E402
@@ -289,7 +291,7 @@ APPROVAL_FIELDS = ("showrunner", "unit", "plan", "approved_by", "approved_in")
 
 def calling_showrunner() -> str:
     """The production slug of the showrunner this session runs, from its update timer."""
-    import showrunners  # only approve and unapprove read the update timers
+    from scripts.production import showrunners  # only approve and unapprove read the update timers
 
     doc = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
     if doc is None:

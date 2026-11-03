@@ -10,7 +10,7 @@ restart through the supported shutdown path when idle.
 
 `scripts/lib/nix_env.py` uses only Python's standard library on Linux and macOS.
 `ensure(directory: Path, base_env: Mapping[str, str] = os.environ)` returns one
-of three frozen dataclasses:
+of three immutable named tuples:
 
 | Result | Meaning |
 | --- | --- |
@@ -20,7 +20,32 @@ of three frozen dataclasses:
 
 It searches the start directory and then its parents. Resolved `.envrc` files
 under `~/rust`, `~/worktrees`, and `~/.claude*` are approved with
-`direnv allow <envrc>`. Files elsewhere require existing explicit approval;
+`direnv allow <envrc>`. Linked worktrees outside those roots are also approved
+when their `.git`, `commondir`, and `gitdir` back pointer prove registration by
+a repository under a trusted root, using file reads alone. This covers
+style-sync lint snapshots made with `git worktree add` under `/tmp/claude/session`;
+forged links still require explicit approval.
+
+Copies registered by `copies.py` under the configured scratch copies root
+(normally `/tmp/claude/copies/<pair>/<copy>`) also qualify when `.envrc` is a
+regular file, not a symlink, at the copy's top level. `registered_copy` uses
+`copy_record.copy_folder` to prove that location and `copy_record.read_record` to
+require a readable `copy_record.Registered` record. Its `source_path` must resolve
+to a directory under a trusted root. Git resolves `.envrc` at the record's
+`source_commit` and hashes the copy's file with `hash-object --no-filters`;
+approval requires equal blob hashes. Both git commands run in the trusted
+source repository with no `GIT_*` variables in their environment, so the copy supplies no git configuration or filters.
+Missing, malformed, unreadable or mismatching evidence requires explicit
+approval; an unregistered clone or a copied record outside the copies root
+does not qualify. `scripts/lib/copy_record.py` owns the copy locations and record
+reader using only the standard library, so importing it does not reach scratch
+or herdr. It is imported only when checking a copy, preserving the helper's
+cheap startup.
+
+This rule checks only `.envrc`. Files it loads, including `flake.nix`, are not
+checked and may differ from the source commit.
+
+Files elsewhere require existing explicit approval;
 a blocked-file refusal names the `direnv allow <path>` command. Each direnv
 command has a 600-second timeout. `direnv export json` runs in the requested
 directory with the supplied base environment. Strings replace variables;
@@ -34,6 +59,10 @@ and exits 0, or prints one `nix_env: ...` stderr line and exits 1.
 `nix_env.py exec <absolute program> [args...]` ensures its current directory and
 uses `os.execvpe` with that environment. A relative program is a usage error
 (exit 2), preventing a PATH wrapper from finding itself by a bare name.
+For `Loaded`, exec sets `NIX_ENV_ENVRC` to the resolved `.envrc` path; for
+`NoEnvrc`, it removes an inherited `NIX_ENV_ENVRC`. The `ensure` API and its
+JSON output keep their existing environment-diff behavior; only `exec` adds
+or clears this provenance marker.
 Launchers resolve Claude with `command -v` or the existing absolute-binary
 resolver before calling `exec`.
 
@@ -50,11 +79,20 @@ resolver before calling `exec`.
 | `berth_fix/launch.sh` | Proves the worktree before opening a window; both window and current-terminal starts use `nix_env.py exec`. Worktree approval failure is fatal. |
 | `agents/agent_bg.sh` | Proves the cwd while making worker settings, passes the loaded env through settings for the long-lived background daemon, and starts the CLI through `exec`. |
 | `agents/agent_exec.sh` | Claude print runs use `exec` after changing to their requested directory. |
-| `agents/codex_mesh.py` | The shared Codex app-server calls `ensure(worktree, environment)` and starts Codex directly with the loaded env. Protected account, run, temporary-directory and guild values come from the caller. `Refused` logs the helper's line, remembers the failed shell, and falls back to the caller env so other workers keep their shared server. The recorded pid is the server's pid. |
+| `agents/codex_mesh.py` | The shared Codex app-server calls `ensure(worktree, environment)` and starts Codex directly with the loaded env. Protected account, run, temporary-directory and held-role values come from the caller. `Refused` logs the helper's line, remembers the failed shell, and falls back to the caller env so other workers keep their shared server. The recorded pid is the server's pid. |
 | `accounts/accounts.py` | `exec` calls `launch_shell_environment(cwd)` for every Claude and Codex label. That guard dynamically loads `nix_env` and calls `ensure(cwd, os.environ)`, puts the caller's HOME back, and exits 1 with the helper's reason on `Refused`. |
 | `cli_agent/cli_agent.sh` | Interactive and command Claude launches use `exec` in the caller's directory. |
 | `notify/review.py` | Loads the current directory's env before the Claude reviewer starts; refusal returns an unreviewed result. |
 | `make_a_worktree/direnv_allow.sh` | Thin, silent-on-success `ensure` call; failure retains the helper's stderr and exit status. `commands/make_a_worktree.md` requires stopping on failure. |
+
+The berth fixer reserves its conversation id before launch. It uses `-r` only
+when that id's transcript exists in `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects`;
+otherwise a rerun keeps the id and uses `--session-id`. Claude encodes the
+worktree path by replacing each character outside ASCII letters and digits
+with `-`, including slashes, dots and underscores. Every launch also repairs
+history left under the legacy worktree path after an interrupted checkout move,
+using the selected account's projects directory. It moves the old history only
+when that folder exists and the new one does not.
 
 `herdr agent start --help` and the herdr adoption documentation specify that
 `--kind claude` selects the executable itself. Prefixing its argument list with
@@ -70,18 +108,20 @@ The existing `start_agent` APIs retain their signatures and prompt proof.
 `launch_prepared_agent` opens that directory without another direnv load.
 
 Before tool setup or record access, `verify.sh` repairs a missing nix shell.
-When `IN_NIX_SHELL` is empty or unset, it calls `nix_env.py ensure` for its current
-directory. The helper owns the nearest `.envrc` search, including ancestors.
-No `.envrc` means no notice or re-exec. A proved shell triggers one stderr
-notice and `exec` through the sibling `lib/py` and `nix_env.py exec` with the
-absolute script path, the same cwd and every original argument, including empty
-arguments. The `exec` helper proves the environment used by the new invocation;
-a refusal exits nonzero with its one `nix_env:` line before verification runs.
-A caller already in the nix shell takes the original path silently. An internal
-`VERIFY_NIX_ENV_REEXEC` marker refuses a re-run whose proof has disappeared,
-with one line instead of another re-exec, and is removed before tool setup.
+When `IN_NIX_SHELL` is empty or unset, it sets `VERIFY_NIX_ENV_REEXEC` and re-execs
+once through the sibling `lib/py -S` and `nix_env.py exec`, preserving the absolute
+script path, cwd and every original argument, including empty arguments. The
+helper owns the nearest `.envrc` search, including ancestors, and runs direnv
+export at most once. In the re-run, shell proof triggers one stderr notice;
+no `.envrc` means no direnv call or notice. A helper refusal exits nonzero with
+only its `nix_env:` line before verification runs. A caller already in the nix
+shell takes the original path silently. If the re-run loses shell proof while
+`NIX_ENV_ENVRC` still names the loaded file, it refuses with one line instead
+of another re-exec. The internal marker is removed before tool setup.
 The final command's exit status passes through. This also covers Codex workers
 whose shared mesh server cannot carry each worktree's environment.
+`user_clock` runs `user_zone.py` with `python3 -S`; that helper and `/zone` share
+the `stored_zone` configuration reader.
 
 Launch scan: `scripts/lib/test_claude_launch_scan.py` checks Python process calls
 whose argv starts Claude, Codex or `herdr agent start`, typed `start_agent`
@@ -112,21 +152,13 @@ and after the environment read so a reused pid never becomes a restart target.
 Run `heal.py sweep`, or restrict it with `--only <session id>`. For each broken
 session it checks this machine's build-target hold state, then requires `idle`
 or `shell`. Unreadable hold state also prevents restart. It calls `ensure(cwd)`
-before requesting `shutdown.py down <account> --here --only <id>` without a
-restart continuation, using the account resolved from the config directory.
-`down` hands off to a detached conductor; its exit does not prove a stop.
-The healer saves a pending restart and uses the conductor's typed shutdown
-record to confirm the exact process stopped, without waiting in a loop. It
-rechecks holds before stopping and before the separate
-`shutdown.py restart <saved account> --only <id> --here` launch. A hold between these steps
-keeps the restart pending. Each sweep processes pending recoveries first,
-including sessions that have left the live registry, then new broken sessions.
-After release, it proves the environment again when the stop is complete, then
-checks the hold. It passes that loaded environment to the restart process with
-`NIX_HEAL_PREPARED_SESSION` and `NIX_HEAL_PREPARED_DIRECTORY`. The restart requires
-the same session, resolved cwd, and nix proof, applies the target account and its
-variable removals, and consumes this handoff without another load. The markers
-remain in that consuming process. Herdr's child-environment filter strips them
+before calling `stop_resume.stop` for that session. Its existing journal keeps a
+pending recovery across a hold. Process liveness proves the original generation
+has ended; shutdown records do not decide stop completion. It rechecks the hold
+and the environment before `stop_resume.resume`. Account exec loads the shell
+through the normal account launch path. Pending recoveries run before new broken
+sessions, including sessions that have left the live registry.
+
 from server starts, pane overlays and agent-start CLI processes, including explicit
 environment overrides. Later panes cannot inherit another session's proof from
 the server. Unit restores through `add_unit` consume the same handoff

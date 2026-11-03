@@ -45,7 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 import phase_reservation  # noqa: E402
 import unit_runs  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.guilds import roles  # noqa: E402
+from scripts.astra import design_roles  # noqa: E402
 
 
 def _seat_session_dir() -> Path | None:
@@ -94,10 +94,10 @@ def decide(raw: str) -> int:
         return 0
     session_dir = _seat_session_dir()
     paths = phase_reservation.patch_paths(patch)
-    held = os.environ.get("GUILD_DESIGN_ID", "")
+    held = os.environ.get("HELD_DESIGN_ID", "")
     if held:
         try:
-            binding = roles.check_patch(held, int(os.environ.get("GUILD_BINDING_GENERATION", "0")), Path(cwd), paths)
+            binding = design_roles.check_patch(held, int(os.environ.get("DESIGN_BINDING_GENERATION", "0")), Path(cwd), paths)
             session_dir = Path(binding.run_directory)
         except (OSError, ValueError) as error:
             return _refuse(str(error))
@@ -114,14 +114,14 @@ def decide(raw: str) -> int:
         # An unreadable recorder state gives no recorder list; check as before the recorder listed phases.
         phases = phase_reservation.held_phases(session_dir)
     phases = phase_reservation.enrolled_phases(phases, root, session_id)
-    missing = phase_reservation.missing_record_phases(phases, scopes)
+    missing = phase_reservation.missing_record_phases(phases, scopes, root)
     if missing:
         commands = "; ".join(phase_reservation.repair_command(session_dir, phase.phase, root) for phase in missing)
         return _refuse(f"phase reservation record missing; restore it from berth's ledger: {commands}.")
-    attribution = phase_reservation.attribute(phases, scopes) if phases else None
-    if attribution is not None and attribution.refused:
+    attribution = phase_reservation.attribute(phases, scopes, root)
+    if isinstance(attribution, phase_reservation.Attribution) and attribution.refused:
         return _refuse(phase_reservation.refusal_reason(phases, attribution.refused))
-    groups = list(attribution.by_phase.items()) if attribution is not None else [(None, scopes)]
+    groups = list(attribution.by_phase.items()) if isinstance(attribution, phase_reservation.Attribution) else [(None, scopes)]
     for phase, phase_scopes in groups:
         answer = phase_reservation.phase_check(root, phase_scopes, session_id, phase)
         if answer.status in phase_reservation.FAILS_OPEN:

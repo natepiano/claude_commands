@@ -16,10 +16,10 @@ The keys are in KEYS_FILE (PUSHOVER_USER, PUSHOVER_TOKEN; 0600, filled in by the
 user). Nothing here prints them. (user, 2026-10-05) Each LOG_FILE JSON line
 holds the local time, source, priority, posted title and message, and outcome.
 
-Every posted push ends with two lines, after the review: "Sent by: <sender>" and, last,
-"Template: <text id>", or "Template: none (free text)" for a push with no --text-id. The
-sender is the source; "send.py in hana" shows as "hana". A long body is cut so the two lines
-always fit. A push with no sender is refused and nothing is posted.
+Every posted push ends with one line after review: "Sent by: <sender> · Template: <text id>",
+or "Sent by: <sender> · Template: none (free text)" for a push with no --text-id. The
+sender is the source; "send.py in hana" shows as "hana". A long body is cut so that last line
+always fits. A push with no sender is refused and nothing is posted.
 
 While the user's silence is on (silence.py), a push below priority 2 is kept,
 not posted: it prints "pushover: kept: silence until ..." and exits 0, and
@@ -256,7 +256,7 @@ def parse(argv: list[str]) -> Arguments | None:
         header = rendered.header
     elif values:
         return None
-    if len(positionals) != 2 or not all(value.strip() for value in positionals):
+    if len(positionals) != 2 or not positionals[0].strip() or (not text_id and not positionals[1].strip()):
         return None
     if not text_id:
         session, positionals[1] = split_session(positionals[1])
@@ -347,7 +347,8 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
         version = draft
         detail = "review: off"
     else:
-        outcome = review.review(draft, revision=claimed)
+        outcome = (review.review(draft, revision=claimed, text_id=arguments["text_id"]) if registered_text
+                   else review.review(draft, revision=claimed))
         # For registered texts that are not agent-written, review is a logged check only.
         version = draft if registered_text else review.best_version(draft, outcome)
         if isinstance(outcome, review.Unreviewed):
@@ -357,7 +358,8 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
     if isinstance(outcome, review.Questions):
         outcome = review.Failed(outcome.best_version, outcome.failed_rules, outcome.metadata, outcome.failures)
     rejected = isinstance(outcome, (review.Failed, review.Withheld))
-    send_anyway = rejected and (priority == "2" or registered_text)
+    template_required = not registered_text and isinstance(outcome, (review.Failed, review.Withheld)) and any(rule.startswith("use-registered-template:") for rule in outcome.failed_rules)
+    send_anyway = rejected and not template_required and (priority == "2" or registered_text)
     if send_anyway:
         detail = "sent despite failed review: " + ", ".join(outcome.failed_rules if isinstance(outcome, (review.Failed, review.Withheld)) else [])
     record: ReviewedPushRecord = {**review.message_record(version)}
@@ -440,7 +442,11 @@ def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
 
 
 def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
-    """Post a push kept during silence, exactly as it was kept."""
+    """Discard retired flood alerts. Post other pushes as silence kept them."""
+    if push["text_id"] == "message.repeat_flood":
+        log(push["source"], push["priority"], push["title"], push["message"],
+            "dropped: retired template message.repeat_flood")
+        return 0
     detail = ", ".join(part for part in ("kept during silence", push["detail"]) if part)
     return post_message(push["source"], push["priority"], push["title"], push["message"], keys_file, post, detail,
                         push["key"], push["text_id"])
@@ -448,14 +454,14 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
 
 def post_message(source: str, priority: str, title: str, message: str,
                  keys_file: Path, post: Post, detail: str, key: str = "", text_id: str = "") -> int:
-    """Every push to the phone goes out here, with its "Sent by" and "Template" lines last."""
+    """Every push to the phone goes out here, with its sender and template on one last line."""
     suffix = f", {detail}" if detail else ""
     sender = sender_name(source)
     if not sender:
         log(source, priority, title, message, f"{REFUSED_BEFORE_SENDING}: no sender" + suffix)
         print(f"pushover: {REFUSED_BEFORE_SENDING}: no sender. Name the sender with --source NAME.", file=sys.stderr)
         return 2
-    footer = f"\n\nSent by: {sender}\nTemplate: {text_id or FREE_TEXT}"
+    footer = f"\n\nSent by: {sender} · Template: {text_id or FREE_TEXT}"
     message = message[:MESSAGE_MAX - len(footer)].rstrip() + footer
     keys = read_keys(keys_file)
     if keys is None:

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import cast
 
 from scripts.production.fake_showrunner import write_session
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class FakeShowrunnerTests(unittest.TestCase):
@@ -26,9 +27,9 @@ class FakeShowrunnerTests(unittest.TestCase):
             self.assertTrue(path.is_socket())
             self.assertEqual(path.parent.parent, Path("/tmp"))
             held.listen(1)
-            held.settimeout(2)
+            held.settimeout(TEST_HANG_GUARD_SECS)
             with socket.socket(socket.AF_UNIX) as client:
-                client.settimeout(2)
+                client.settimeout(TEST_HANG_GUARD_SECS)
                 client.connect(str(path))
                 connection = held.accept()[0]
                 connection.close()

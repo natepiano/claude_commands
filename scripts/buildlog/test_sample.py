@@ -15,13 +15,18 @@ import unittest
 from contextlib import redirect_stderr
 from datetime import datetime
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from unittest.mock import patch
 
 import cli
 import sample
 import store
+from cgroup_test_support import CPU, write_cgroup
 from test_index import use_test_log
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 use_test_log()
 
@@ -35,6 +40,170 @@ class SampleTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())) / "buildlog"
+        proc = self.root / "proc"
+        proc.mkdir(parents=True, exist_ok=True)
+        for name, content in (
+            ("cpu_pressure", "some total=12000000\nfull total=3000000\n"),
+            ("io_pressure", "some total=4000000\nfull total=1000000\n"),
+            ("stat", "cpu  100 20 30 400 50 6 7 8 90 10\ncpu0 1 2 3 4 5 6 7 8\n"),
+        ):
+            _ = (proc / name).write_text(content)
+        for name, filename in (("CPU_PRESSURE", "cpu_pressure"), ("IO_PRESSURE", "io_pressure"), ("STAT", "stat")):
+            _ = self.enterContext(patch.object(sample, name, proc / filename))
+        _ = self.enterContext(patch.object(sample, "POWER_PROFILE_STATE", self.root / "absent-profile"))
+
+    def test_filesystem_reading_does_not_import_disk_or_sweep(self) -> None:
+        command = (
+            "import sys; sys.path.insert(0, sys.argv[1]); import sample; "
+            "reading = sample.filesystem_reading(); "
+            "assert reading['state'] == 'measured', reading; "
+            "assert 'disk' not in sys.modules, 'filesystem reading imported disk'; "
+            "assert 'sweep' not in sys.modules, 'filesystem reading imported sweep'"
+        )
+        result = subprocess.run(
+            ["python3", "-c", command, str(CLI.parent)],
+            cwd=CLI.parents[2],
+            env={**os.environ, "BUILDLOG_DIR": str(self.root), "BUILDLOG_TARGET_FILESYSTEM": str(self.root)},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_pool_token_readings_use_read_only_commands_and_short_timeouts(self) -> None:
+        with patch.object(subprocess, "run", side_effect=[
+            subprocess.CompletedProcess(["stevie"], 0, "31\n", ""),
+            subprocess.CompletedProcess(["stevie"], 0, "14\n", ""),
+        ]) as run:
+            self.assertEqual(sample.free_pool_tokens("/dev/steve"), {"state": "measured", "free_pool_tokens": 31})
+            self.assertEqual(sample.free_pool_tokens("/dev/steve-ci"), {"state": "measured", "free_pool_tokens": 14})
+        self.assertEqual([call.args[0] for call in run.call_args_list],
+                         [["stevie", "-t"], ["stevie", "-s", "/dev/steve-ci", "-t"]])
+        self.assertTrue(all(0 < call.kwargs["timeout"] <= 1 for call in run.call_args_list))
+
+    def test_pool_failure_timeout_and_bad_output_are_unavailable(self) -> None:
+        outcomes = [FileNotFoundError("missing stevie"), subprocess.TimeoutExpired("stevie", 0.5),
+                    subprocess.CompletedProcess(["stevie"], 1, "0", "failed"),
+                    subprocess.CompletedProcess(["stevie"], 0, "invalid", ""),
+                    subprocess.CompletedProcess(["stevie"], 0, "-1", "")]
+        for outcome in outcomes:
+            with self.subTest(outcome=outcome), patch.object(subprocess, "run") as run:
+                if isinstance(outcome, BaseException):
+                    run.side_effect = outcome
+                else:
+                    run.return_value = outcome
+                self.assertEqual(sample.free_pool_tokens("/dev/steve"), {"state": "unavailable"})
+
+    def test_sample_shares_slice_capture_and_preserves_ci_when_builds_file_is_unreadable(self) -> None:
+        import cgroup_capture
+
+        builds, ci = self.root / "builds.slice", self.root / "ci.slice"
+        write_cgroup(builds, with_io=False)
+        write_cgroup(ci)
+        (builds / "memory.current").unlink()
+        (builds / "memory.current").mkdir()
+        with patch.object(cgroup_capture, "builds_path", return_value=builds), \
+             patch.object(cgroup_capture, "ci_path", return_value=ci):
+            row = self.power_profile_sample(self.root / "missing.ini")
+        slices = cast(dict[str, Record], row["slices"])
+        self.assertEqual(slices["builds"]["current_bytes"], "unavailable")
+        self.assertEqual(slices["builds"]["cpu"], CPU)
+        self.assertEqual(slices["builds"]["io"], {"state": "unavailable"})
+        self.assertEqual(slices["ci"]["current_bytes"], 12 * 2**30)
+        self.assertEqual(row["jobserver"], {"builds": {"state": "measured", "free_pool_tokens": 7},
+                                            "ci": {"state": "measured", "free_pool_tokens": 7}})
+
+    def test_cli_sample_reads_each_slice_file_once_for_both_sample_rows(self) -> None:
+        import cgroup_capture
+
+        builds, ci = self.root / "builds.slice", self.root / "ci.slice"
+        write_cgroup(builds)
+        write_cgroup(ci)
+        reads: dict[Path, int] = {}
+        original = Path.read_text
+
+        def read(path: Path, *args: object, **kwargs: object) -> str:
+            reads[path] = reads.get(path, 0) + 1
+            return original(path, *args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+        with patch.object(cgroup_capture, "builds_path", return_value=builds), \
+             patch.object(cgroup_capture, "ci_path", return_value=ci), patch.object(Path, "read_text", read):
+            row = self.power_profile_sample(self.root / "missing.ini", via_cli=True)
+        self.assertEqual(cast(dict[str, Record], row["slices"])["builds"]["current_bytes"], 12 * 2**30)
+        for scope in (builds, ci):
+            for name in ("memory.current", "memory.stat", "cpu.stat", "io.stat"):
+                self.assertEqual(reads.get(scope / name), 1, str(scope / name))
+
+    def test_cpu_ticks_uses_aggregate_and_excludes_guest_fields(self) -> None:
+        ticks = sample.parse_cpu_ticks("cpu0 9 9 9 9 9 9 9 9\ncpu 100 20 30 400 50 6 7 8 900 100\n")
+        self.assertEqual((ticks.idle, ticks.iowait, ticks.total), (400, 50, 621))
+
+    def test_cpu_ticks_rejects_missing_short_and_malformed_aggregate(self) -> None:
+        for text in ("cpu0 1 2 3 4 5 6 7 8\n", "cpu 1 2 3 4 5 6 7\n", "cpu 1 2 bad 4 5 6 7 8\n"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                _ = sample.parse_cpu_ticks(text)
+
+    def test_sample_records_cpu_io_and_tick_counters(self) -> None:
+        reads: dict[Path, int] = {}
+        original_read = Path.read_text
+
+        def read_text(path: Path) -> str:
+            reads[path] = reads.get(path, 0) + 1
+            return original_read(path)
+
+        with patch.object(Path, "read_text", read_text):
+            record = self.power_profile_sample(self.root / "missing.ini")
+        for filename in ("cpu_pressure", "io_pressure", "stat"):
+            self.assertEqual(reads[self.root / "proc" / filename], 1)
+        self.assertEqual(
+            [record[name] for name in ("cpu_stall_some_us", "cpu_stall_full_us", "io_stall_some_us", "io_stall_full_us",
+                                       "cpu_idle_ticks", "cpu_iowait_ticks", "cpu_total_ticks")],
+            [12_000_000, 3_000_000, 4_000_000, 1_000_000, 400, 50, 621],
+        )
+
+    def test_cpu_pressure_without_full_keeps_some_and_other_readings(self) -> None:
+        _ = (self.root / "proc/cpu_pressure").write_text("some total=1234567\n")
+        record = self.power_profile_sample(self.root / "missing.ini")
+        self.assertEqual(record["cpu_stall_some_us"], 1_234_567)
+        self.assertIsNone(record["cpu_stall_full_us"])
+        self.assertEqual(record["io_stall_full_us"], 1_000_000)
+        self.assertEqual(record["cpu_total_ticks"], 621)
+
+    def test_missing_optional_reading_only_nulls_its_own_counters(self) -> None:
+        groups = {
+            "cpu_pressure": ("cpu_stall_some_us", "cpu_stall_full_us"),
+            "io_pressure": ("io_stall_some_us", "io_stall_full_us"),
+            "stat": ("cpu_idle_ticks", "cpu_iowait_ticks", "cpu_total_ticks"),
+        }
+        for filename, fields in groups.items():
+            with self.subTest(reading=filename):
+                path = self.root / "proc" / filename
+                original = path.read_text()
+                path.unlink()
+                try:
+                    record = self.power_profile_sample(self.root / "missing.ini")
+                    for field in fields:
+                        self.assertIsNone(record[field])
+                    for other_file, other_fields in groups.items():
+                        if other_file != filename:
+                            for field in other_fields:
+                                self.assertIsInstance(record[field], int)
+                    self.assertEqual(record["stall_some_us"], 100)
+                    self.assertEqual(record["mem_used_bytes"], 12 * 1024)
+                finally:
+                    for log in self.root.glob("*/samples-*.jsonl"):
+                        log.unlink()
+                    _ = path.write_text(original)
+
+    def test_malformed_optional_readings_still_write_memory_sample(self) -> None:
+        _ = (self.root / "proc/stat").write_text("cpu 1 2 bad 4 5 6 7 8\n")
+        _ = (self.root / "proc/io_pressure").write_text("some total=bad\nfull total=bad\n")
+        record = self.power_profile_sample(self.root / "missing.ini")
+        for field in ("cpu_idle_ticks", "cpu_iowait_ticks", "cpu_total_ticks", "io_stall_some_us", "io_stall_full_us"):
+            self.assertIsNone(record[field])
+        self.assertEqual(record["cpu_stall_some_us"], 12_000_000)
+        self.assertEqual(record["stall_full_us"], 20)
 
     def test_meminfo_fixture_gives_used_memory_and_swap_bytes(self) -> None:
         meminfo = (
@@ -55,14 +224,14 @@ class SampleTests(unittest.TestCase):
             "full avg10=0.00 avg60=0.00 avg300=0.00 total=456789\n"
         )
         stalls = sample.parse_pressure(pressure)
-        self.assertIsInstance(stalls, sample.MemoryStallTotals)
+        self.assertIsInstance(stalls, sample.StallTotals)
         self.assertEqual(stalls.some_us, 1_234_567)
         self.assertEqual(stalls.full_us, 456_789)
 
     def test_pressure_parser_can_leave_missing_scope_counters_unmeasured(self) -> None:
         pressure = "some avg10=0.00 total=1250000\nfull avg10=0.00 total=invalid\n"
         stalls = sample.parse_pressure(pressure, require_both=False)
-        self.assertIsInstance(stalls, sample.PartialMemoryStallTotals)
+        self.assertIsInstance(stalls, sample.PartialStallTotals)
         self.assertEqual(stalls.some_us, 1_250_000)
         self.assertIs(stalls.full_us, sample.Unmeasured.VALUE)
         with self.assertRaises(ValueError):
@@ -75,7 +244,7 @@ class SampleTests(unittest.TestCase):
             _ = sample.parse_boot_id(" \n")
 
     def test_power_profile_state_reads_name_and_mtime_once(self) -> None:
-        self.root.mkdir(parents=True)
+        self.root.mkdir(parents=True, exist_ok=True)
         state = self.root / "state.ini"
         since = 1_792_031_396.125
         for name in ("performance", "balanced", "power-saver"):
@@ -94,7 +263,7 @@ class SampleTests(unittest.TestCase):
                 read_file.assert_called_once()
 
     def test_power_profile_path_replacement_keeps_open_file_profile_and_mtime(self) -> None:
-        self.root.mkdir(parents=True)
+        self.root.mkdir(parents=True, exist_ok=True)
         state = self.root / "state.ini"
         replacement = self.root / "replacement.ini"
         _ = state.write_text("[State]\nProfile=balanced\n")
@@ -120,7 +289,7 @@ class SampleTests(unittest.TestCase):
         self.assertIs(sample.read_power_profile(self.root / "missing.ini"), sample.Unmeasured.VALUE)
 
     def test_power_profile_without_state_or_value_is_unmeasured(self) -> None:
-        self.root.mkdir(parents=True)
+        self.root.mkdir(parents=True, exist_ok=True)
         state = self.root / "state.ini"
         for text in ("[Other]\nProfile=performance\n", "[State]\nCpuDriver=amd_pstate\n",
                      "[State]\nProfile=\n", "[State]\nProfile=   \n",
@@ -130,13 +299,13 @@ class SampleTests(unittest.TestCase):
                 self.assertIs(sample.read_power_profile(state), sample.Unmeasured.VALUE)
 
     def test_power_profile_unreadable_file_is_unmeasured(self) -> None:
-        self.root.mkdir(parents=True)
+        self.root.mkdir(parents=True, exist_ok=True)
         state = self.root / "state.ini"
         _ = state.write_text("[State]\nProfile=performance\n")
         with patch.object(Path, "open", side_effect=PermissionError("unreadable")):
             self.assertIs(sample.read_power_profile(state), sample.Unmeasured.VALUE)
 
-    def power_profile_sample(self, state: Path) -> Record:
+    def power_profile_sample(self, state: Path, *, via_cli: bool = False) -> Record:
         proc = self.root / "proc"
         proc.mkdir(parents=True, exist_ok=True)
         _ = (proc / "meminfo").write_text("MemTotal: 16 kB\nMemAvailable: 4 kB\nSwapTotal: 8 kB\nSwapFree: 1 kB\n")
@@ -149,14 +318,21 @@ class SampleTests(unittest.TestCase):
              patch.object(sample, "PRESSURE", proc / "pressure"), \
              patch.object(sample, "BOOT_ID", proc / "boot_id"), \
              patch.object(sample, "POWER_PROFILE_STATE", state), \
-             patch.object(subprocess, "Popen", side_effect=AssertionError("sample must not fork")):
-            _ = sample.sample()
+             patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(["stevie"], 0, "7\n", "")):
+            if via_cli:
+                with patch.object(store, "host_name", return_value="fixture-host"):
+                    self.assertEqual(cli.main(["sample"]), 0)
+            else:
+                _ = sample.sample()
         lines = next(self.root.glob("*/samples-*.jsonl")).read_text().splitlines()
-        self.assertEqual(len(lines), 1)
-        return cast(Record, json.loads(lines[0]))
+        self.assertEqual(len(lines), 2 if via_cli else 1)
+        row = cast(Record, json.loads(lines[0]))
+        if via_cli:
+            self.assertEqual(cast(Record, json.loads(lines[1]))["slices"], row["slices"])
+        return row
 
     def test_sample_writes_power_profile_and_utc_state_mtime(self) -> None:
-        self.root.mkdir(parents=True)
+        self.root.mkdir(parents=True, exist_ok=True)
         state = self.root / "state.ini"
         _ = state.write_text("[State]\nProfile=performance\n")
         since = 1_792_031_396.125
@@ -200,7 +376,7 @@ class SampleTests(unittest.TestCase):
 
     def test_cli_sample_appends_sample_and_snapshot_under_buildlog_dir(self) -> None:
         proc = self.root / "proc"
-        proc.mkdir(parents=True)
+        proc.mkdir(parents=True, exist_ok=True)
         _ = (proc / "meminfo").write_text("MemTotal: 16384 kB\nMemAvailable: 4096 kB\nSwapTotal: 8192 kB\nSwapFree: 1024 kB\n")
         _ = (proc / "pressure").write_text("some total=100\nfull total=20\n")
         _ = (proc / "boot_id").write_text("d963a34a-50fa-48a8-8485-8b219c45fe02\n")
@@ -227,7 +403,14 @@ class SampleTests(unittest.TestCase):
             "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
             "import sample, cli; proc = Path(sys.argv[2]); "
             "sample.MEMINFO = proc / 'meminfo'; sample.PRESSURE = proc / 'pressure'; "
-            "sample.BOOT_ID = proc / 'boot_id'; sys.exit(cli.main(['sample']))"
+            "sample.BOOT_ID = proc / 'boot_id'; "
+            "from unittest.mock import patch; from contextlib import ExitStack; "
+            "stack = ExitStack(); "
+            "stack.enter_context(patch.object(sample, 'CPU_PRESSURE', proc / 'cpu_pressure')); "
+            "stack.enter_context(patch.object(sample, 'IO_PRESSURE', proc / 'io_pressure')); "
+            "stack.enter_context(patch.object(sample, 'STAT', proc / 'stat')); "
+            "stack.enter_context(patch.object(sample, 'POWER_PROFILE_STATE', proc / 'absent-profile')); "
+            "sys.exit(cli.main(['sample']))"
         )
         result = subprocess.run(
             [sys.executable, "-c", command, str(CLI.parent), str(proc)],
@@ -235,7 +418,7 @@ class SampleTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=60,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         files = list(self.root.glob("*/*.jsonl"))
@@ -267,7 +450,7 @@ class SampleTests(unittest.TestCase):
 
     def test_snapshot_failure_still_keeps_minute_sample(self) -> None:
         proc = self.root / "proc"
-        proc.mkdir(parents=True)
+        proc.mkdir(parents=True, exist_ok=True)
         _ = (proc / "meminfo").write_text("MemTotal: 16 kB\nMemAvailable: 4 kB\nSwapTotal: 8 kB\nSwapFree: 1 kB\n")
         _ = (proc / "pressure").write_text("some total=100\nfull total=20\n")
         _ = (proc / "boot_id").write_text("test-boot\n")

@@ -74,21 +74,6 @@ def active_run(session_id: str) -> Path | None:
     return session_dir if _recently_active(session_dir) else None
 
 
-def workers_working(session_dir: Path) -> bool:
-    """True when a worker is mid-dispatch, judged by a moving heartbeat.
-
-    An agent parked on a completion waiter has nothing to do until the worker
-    finishes, and the completion notification re-invokes it anyway -- that
-    re-invocation is a new request, so compaction fires there on its own. There
-    is nothing to gain by refusing that stop.
-    """
-    try:
-        age = time.time() - (session_dir / unit_runs.HEARTBEAT).stat().st_mtime
-    except OSError:
-        return False
-    return age <= unit_runs.LIVE_HEARTBEAT_SECS
-
-
 def _text(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8").strip()

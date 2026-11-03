@@ -3,24 +3,38 @@
 from __future__ import annotations
 
 import argparse
+import json
+from dataclasses import replace
+from datetime import datetime
 import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import NamedTuple, cast
 
-import showrunners
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.production import staff, staff_sources, unit_config
+from scripts.shutdown.remote import local_machine
+from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_untracked_ignored
+
+from scripts.production import showrunners
+import showrunner_tree
 import tidy_wrapped
 import unit_lookup
-from add_unit import Production, read_production
+from production_units import Production, read_production
 from production_units import Refusal, cell_value, production_field, unit_table
-from merge_checkpoint import (CodeCheckpoint, MacCheckout, MergeEntry, NoMerge, NoPromotion,
+from merge_checkpoint import (CodeCheckpoint, MergeEntry, NoMerge,
                               PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed,
-                              PromoteTo, Stop,
+                              Stop,
                               git, good, merge_branch_history, promote_local_checkout,
-                              promotion_from_doc, pull_mac_checkout, report)
+                              pull_mac_checkout, report)
+from scripts.production import production_doc
+from update_registration import QuestionStaff
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from atomic_file import write_text_atomic
+from process_failure import failure_detail
 import berth_board
 
 PHASE_TABLE = Path(__file__).resolve().parent.parent / "direct" / "phase_table.py"
@@ -61,10 +75,6 @@ class UnitRow(NamedTuple):
     branch: str
 
 
-class RunningStyleChildren(NamedTuple):
-    slugs: tuple[str, ...]
-
-
 class LifecycleStop(Exception):
     def __init__(self, step: str, state: str, detail: str) -> None:
         super().__init__(detail)
@@ -80,8 +90,7 @@ def checked(checkout: Path, step: str, *args: str) -> str:
 def command(step: str, cwd: Path, *args: str) -> str:
     result = subprocess.run(args, cwd=cwd, capture_output=True, text=True, check=False)
     if result.returncode:
-        raise LifecycleStop(step, "failed", result.stderr.strip() or result.stdout.strip()
-                            or f"{' '.join(args)} exited {result.returncode}")
+        raise LifecycleStop(step, "failed", f"{' '.join(args)}: {failure_detail(result)}")
     return result.stdout.strip()
 
 
@@ -103,24 +112,28 @@ def doc_status(lines: list[str]) -> ProductionPlanned | ProductionRunning | Prod
 
 
 def production_name(lines: list[str]) -> str:
-    heading = next((line for line in lines if line.startswith("# Production — ")), "")
-    if not heading:
-        raise LifecycleStop("input", "failed", "production doc lacks its name")
-    return heading.removeprefix("# Production — ").strip()
+    name = production_doc.production_name(lines)
+    if isinstance(name, production_doc.ProductionNameNotRecorded):
+        raise LifecycleStop("input", "failed", name.reason)
+    return name.value
 
 
 def units(lines: list[str], production: Production) -> tuple[UnitRow, ...]:
     parsed: list[UnitRow] = []
+    permanent: list[str] = []
     for cells in unit_table(lines):
         row = {heading: cell_value(cell) for heading, cell in cells.items()}
         if not all(heading in row for heading in ("Unit", "Plan", "Worktree", "Branch", "Port", "Owns")):
             raise LifecycleStop("input", "failed", f"invalid Units row: {cells}")
-        # A permanent unit outlives the production: wrap neither waits on it nor retires it.
         if row["Plan"] == "permanent":
+            permanent.append(row["Unit"])
             continue
         plan = Path(row["Plan"]).expanduser()
         parsed.append(UnitRow(row["Unit"], plan if plan.is_absolute() else production.checkout / plan,
                               Path(row["Worktree"]).expanduser(), row["Branch"]))
+    if permanent:
+        raise LifecycleStop("wrap", "held", "; ".join(
+            f"permanent child {name}: transfer it before wrapping" for name in permanent))
     return tuple(parsed)
 
 
@@ -203,14 +216,19 @@ def open_production(production: Production, lines: list[str]) -> None:
         updated = [line.replace("**Status: PRODUCTION — planned.**", "**Status: PRODUCTION — running.**")
                    for line in updated]
     if updated != lines:
-        _ = production.doc.write_text("\n".join(updated) + "\n", encoding="utf-8")
+        write_text_atomic(production.doc, "\n".join(updated) + "\n")
     report("doc", "ok", "running")
     rows = units(updated, production)
     paths = [doc_path_in_checkout(production, production.doc)]
-    paths.extend(doc_path_in_checkout(production, unit.plan) for unit in rows)
+    for unit in rows:
+        if unit.plan.exists():
+            paths.append(doc_path_in_checkout(production, unit.plan))
+        else:
+            report("plan", "ok", f"{unit.name}: no plan yet at {unit.plan}; not committed")
     subject = f"production({production_name(updated)}): plans for {len(rows)} units"
     subjects = checked(production.checkout, "commit", "log", "--format=%s", production.merge_branch)
-    if subject in subjects.splitlines():
+    committed_paths = checked(production.checkout, "commit", "ls-tree", "-r", "--name-only", "HEAD", "--", *paths)
+    if subject in subjects.splitlines() and set(paths).issubset(committed_paths.splitlines()):
         report("commit", "ok", "plans already committed")
     else:
         _ = checked(production.checkout, "commit", "add", "--", *paths)
@@ -231,18 +249,14 @@ def open_production(production: Production, lines: list[str]) -> None:
         report("push", "ok", f"{production.merge_branch} at {tip}")
     else:
         report("push", "ok", f"already at {tip}")
-    common = Path(checked(production.checkout, "log", "rev-parse", "--git-common-dir"))
-    common = common if common.is_absolute() else production.checkout / common
-    exclude = common / "info/exclude"
-    exclude.parent.mkdir(parents=True, exist_ok=True)
     log_name = production.log.relative_to(production.checkout).as_posix()
-    existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
-    if log_name not in existing.splitlines():
-        with exclude.open("a", encoding="utf-8") as stream:
-            _ = stream.write(("" if not existing or existing.endswith("\n") else "\n") + log_name + "\n")
+    try:
+        ensure_excluded(production.checkout, log_name)
+    except ExcludeRefused as error:
+        raise LifecycleStop("log", "failed", str(error)) from error
     if not production.log.exists():
         production.log.parent.mkdir(parents=True, exist_ok=True)
-        _ = production.log.write_text(f"# Production log — {production_name(updated)}\n", encoding="utf-8")
+        write_text_atomic(production.log, f"# Production log — {production_name(updated)}\n")
     report("log", "ok", f"excluded and initialized {log_name}")
 
 
@@ -284,8 +298,8 @@ def promote_main(production: Production, lines: list[str], no_ci: bool,
     if git(production.checkout, "merge-base", "--is-ancestor", "origin/main", tip).returncode:
         raise LifecycleStop("main", "held", f"origin/main has commits absent from {tip}")
     report("main", "ok", f"origin/main is behind {tip}")
-    promotion = promotion_from_doc(lines)
-    if isinstance(promotion, NoPromotion) or not promotion.checkouts:
+    promotion = production_doc.promotion_from_doc(lines)
+    if isinstance(promotion, production_doc.NoPromotion) or not promotion.checkouts:
         remote = checked(production.checkout, "promote", "rev-parse", "origin/main")
         if remote != tip:
             _ = checked(production.checkout, "push", "push", "origin", f"{tip}:refs/heads/main")
@@ -304,7 +318,7 @@ def promote_main(production: Production, lines: list[str], no_ci: bool,
             else:
                 detail = f"{destination}: advanced to {tip}"
             report("promote", "ok", detail)
-    if isinstance(promotion, PromoteTo) and isinstance(promotion.mac, MacCheckout):
+    if isinstance(promotion, production_doc.PromoteTo) and isinstance(promotion.mac, production_doc.MacCheckout):
         source = promotion.checkouts[0] if promotion.checkouts else production.checkout
         pull_mac_checkout(promotion.mac.path, source)
         report("promote", "ok", f"mac {promotion.mac.path} main pulled")
@@ -327,6 +341,20 @@ def archived_doc(production: Production) -> Path | None:
     return production.doc.parent.parent / "archive" / common.parent.name / production.slug / production.doc.name
 
 
+def wrap_production(doc: Path) -> Production:
+    """Find a doc that an earlier wrap moved into the archive."""
+    doc = doc.expanduser().absolute()
+    if doc.exists() or doc.parent.name != "productions":
+        return read_production(doc)
+    common = Path(checked(doc.parent, "wrap", "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    slug = doc.name.removesuffix("-production.md")
+    archive = doc.parent.parent / "archive" / common.parent.name / slug / doc.name
+    tracked = git(doc.parent, "ls-files", "--error-unmatch", "--", str(archive))
+    if tracked.returncode != 0:
+        return read_production(doc)
+    return read_production(archive)
+
+
 def retire_reservations(worktree: Path) -> None:
     board = berth_board.read_board(worktree)
     if isinstance(board, berth_board.BoardUnavailable):
@@ -338,13 +366,16 @@ def retire_reservations(worktree: Path) -> None:
             report("retire", "ok", f"released reservation {reservation.reservation_id} for {worktree}")
 
 
-def refuse_running_children(slug: str) -> RunningStyleChildren:
+def refuse_running_children(slug: str, record: staff.StaffSnapshot) -> None:
     """Hold a wrap for running product children; keep style children attached until retirement."""
     try:
-        children = showrunners.stored_children(slug)
-        styles: list[str] = []
+        children = showrunner_tree.stored_children(slug, record=record)
         running: list[str] = []
-        for child in showrunners.registered_showrunners():
+        discovered = showrunners.registered_showrunners()
+        failures = [failure.reason for failure in discovered.lookup_failures if failure.production in children]
+        if failures:
+            raise OSError("; ".join(failures))
+        for child in discovered:
             if child["slug"] not in children or not child["socket"]:
                 continue
             lines = Path(child["doc"]).read_text(encoding="utf-8").splitlines()
@@ -352,49 +383,152 @@ def refuse_running_children(slug: str) -> RunningStyleChildren:
                 is_style = production_field(lines, "Kind") == "style"
             except Refusal:
                 is_style = False
-            (styles if is_style else running).append(child["slug"])
+            if not is_style:
+                running.append(child["slug"])
     except (OSError, UnicodeError) as error:
         raise LifecycleStop("children", "failed", str(error)) from error
     if running:
         raise LifecycleStop("children", "held", f"{', '.join(running)} still report{'s' if len(running) == 1 else ''} "
                             + f"to {slug}; wrap each first, or detach it with `showrunners.py detach <child>`")
-    return RunningStyleChildren(tuple(styles))
 
 
-def detach_style_children(slug: str, children: RunningStyleChildren) -> None:
-    for child in children.slugs:
-        try:
-            _ = showrunners.detach(child)
-        except (OSError, ValueError) as error:
-            raise LifecycleStop("children", "failed", str(error)) from error
-        text = (f"{slug} wrapped, so you are a root now: run style_sync.py resume and merge your own hand-offs "
-                + "(docs/style_production.md, Merging back).")
-        told = showrunners.tell_others({child: text}, f"showrunner-tree:{child}")
-        report("children", "ok", "; ".join([f"detached {child}; now root", *told]))
+def release_path(slug: str) -> Path:
+    return showrunners.SHOWRUNNER_STATE_DIR / slug / "wrap_release.json"
 
 
-def release_edges(slug: str) -> None:
-    """Drop the wrapped production's place in the showrunner tree, and tell each production it reported to or had."""
-    released = showrunners.release_edges(slug)
-    if not released.parent and not released.orphans:
-        report("tree", "ok", "no parent and no child showrunners")
-        return
-    told: list[str] = []
-    if released.parent:
-        told += showrunners.tell_others({released.parent: f"{slug} wrapped, so it no longer reports to you."},
-                                        f"showrunner-tree:{slug}")
-    for child in released.orphans:
-        told += showrunners.tell_others({child: f"{slug} wrapped, so {child} reports to no one: it is a root now."},
-                                        f"showrunner-tree:{child}")
-    above = f"detached from {released.parent}" if released.parent else ""
-    below = f"{', '.join(released.orphans)} now root{'' if len(released.orphans) == 1 else 's'}" if released.orphans else ""
-    report("tree", "ok", "; ".join(part for part in (above, below, *told) if part))
+def save_release(slug: str, released: showrunner_tree.WrapRelease) -> None:
+    path = release_path(slug)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(path, json.dumps({
+        "former_parent": released.former_parent.parent if isinstance(released.former_parent, showrunner_tree.ReportedTo) else None,
+        "former_children": released.former_children, "told": released.told,
+    }, indent=2, sort_keys=True) + "\n")
 
 
-def tidy_state(slug: str) -> None:
-    """Delete the production's own footer, pause, open-question and state files; a failure keeps them for the sweep."""
+def capture_release(slug: str, *, record: staff.StaffSnapshot | None = None) -> showrunner_tree.WrapRelease:
+    path = release_path(slug)
+    if not path.exists():
+        released = showrunner_tree.edges_to_release(slug, record=record)
+        save_release(slug, released)
+        return released
+    value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    if not isinstance(value, dict):
+        raise ValueError(f"{path}: expected a release object")
+    fields = cast(dict[str, object], value)
+    parent, children, told = (fields.get(key) for key in ("former_parent", "former_children", "told"))
+    if (parent is not None and not isinstance(parent, str)) or not isinstance(children, list) or not isinstance(told, list):
+        raise ValueError(f"{path}: invalid release capture")
+    if not all(isinstance(item, str) for item in [*cast(list[object], children), *cast(list[object], told)]):
+        raise ValueError(f"{path}: release slugs must be strings")
+    return showrunner_tree.WrapRelease(showrunner_tree.ReportedTo(parent) if isinstance(parent, str) else showrunner_tree.Root(),
+                                   tuple(cast(list[str], children)), tuple(cast(list[str], told)))
+
+
+def release_edges(slug: str, *, record: staff.StaffSnapshot | None = None) -> None:
+    """Release captured edges and persist each completed notice before continuing."""
+    released = capture_release(slug, record=record)
+    showrunner_tree.release_edges(slug, released, record=record)
+    notices: dict[str, str] = {}
+    if isinstance(released.former_parent, showrunner_tree.ReportedTo):
+        notices[released.former_parent.parent] = f"{slug} wrapped; its recorded parent is retained for history."
+    for child in released.former_children:
+        notices[child] = f"{slug} wrapped; {child} keeps its recorded parent for history."
+    messages: list[str] = []
+    for target, text in notices.items():
+        if target not in released.told:
+            told = showrunners.tell_others({target: text}, f"showrunner-tree:{slug if isinstance(released.former_parent, showrunner_tree.ReportedTo) and target == released.former_parent.parent else target}")
+            if told.failed:
+                raise LifecycleStop("tree", "failed", "; ".join(told.lines))
+            released = replace(released, told=(*released.told, target))
+            save_release(slug, released)
+            messages.extend(told.lines)
+    above = f"retained parent {released.former_parent.parent}" if isinstance(released.former_parent, showrunner_tree.ReportedTo) else ""
+    below = f"retained children {', '.join(released.former_children)}" if released.former_children else ""
+    report("tree", "ok", "; ".join(part for part in (above, below, *messages) if part) or "no parent and no child showrunners")
+
+
+class PreparedWrapUnit(NamedTuple):
+    unit: UnitRow
+    member: staff.StaffRow
+    config: unit_config.UnitConfig
+
+
+def prepare_wrap_units(production: Production, lines: list[str], rows: tuple[UnitRow, ...],
+                       members: tuple[staff_sources.MemberFound | staff_sources.NoSuchMember, ...],
+                       sources: unit_lookup.MemberSources) -> tuple[PreparedWrapUnit, ...]:
+    """Validate all retirement evidence before the first worktree is removed."""
+    prepared: list[PreparedWrapUnit] = []
+    cells_by_name = {cell_value(cells.get("Unit", "")): cells for cells in unit_table(lines)}
+    for unit, found in zip(rows, members, strict=True):
+        if isinstance(found, staff_sources.NoSuchMember):
+            raise LifecycleStop("retire", "held", f"{unit.name}: no staff row")
+        location = found.row.worktree
+        if isinstance(location, staff.WorktreeUnfilled):
+            raise LifecycleStop("retire", "held", f"{unit.name}: worktree is unfilled")
+        if location.machine != local_machine() or location.path != unit.worktree:
+            raise LifecycleStop("retire", "held", f"{unit.name}: staff worktree conflicts with Units row")
+        pair = unit_config.place(found.row.id, unit.worktree, cleanup=False)
+        if isinstance(pair, unit_config.Both) and not pair.same:
+            raise LifecycleStop("retire", "held", f"{pair.worktree} and {pair.parked}: configurations differ; no file was changed")
+        saved = unit_config.read_parked(found.row.id, cleanup=False)
+        current = unit_config.read(unit.worktree, cleanup=False)
+        if isinstance(saved, unit_config.UnitConfig):
+            if not isinstance(saved.retired, unit_config.RetiredSession) or not isinstance(saved.retired.start_folder, unit_config.RecordedStartFolder):
+                raise LifecycleStop("retire", "held", f"{unit.name}: parked retirement facts are incomplete")
+            config = saved
+        else:
+            if isinstance(current, unit_config.ConfigMissing):
+                raise LifecycleStop("retire", "held", current.reason)
+            try:
+                config = staff_sources.prepare_retirement(cells_by_name[unit.name], sources, found,
+                            production.slug, date=datetime.now(production.zone).date().isoformat())
+            except ValueError as error:
+                raise LifecycleStop("retire", "held", str(error)) from error
+            config = replace(config, responsibilities=current.responsibilities)
+            if replace(config, retired=unit_config.NoRetiredSession()) != current:
+                raise LifecycleStop("retire", "held", f"{unit.name}: .unit.toml conflicts with Units row")
+        assert isinstance(config.retired, unit_config.RetiredSession)
+        if config.retired.branch.value != unit.branch:
+            raise LifecycleStop("retire", "held", f"{unit.name}: parked branch conflicts with Units row")
+        if unit.worktree.exists():
+            if isinstance(location, staff.RemovedWorktree):
+                raise LifecycleStop("retire", "held", f"{unit.name}: removed worktree path is occupied")
+            require_untracked_ignored(unit.worktree, ".unit.toml")
+            actual = checked(unit.worktree, "retire", "symbolic-ref", "--quiet", "--short", "HEAD")
+            if actual != unit.branch:
+                raise LifecycleStop("retire", "held", f"{unit.name}: worktree branch {actual} conflicts with {unit.branch}")
+        prepared.append(PreparedWrapUnit(unit, found.row, config))
+    return tuple(prepared)
+
+
+def retire_wrap_rows(rows: tuple[UnitRow, ...], record: staff.StaffSnapshot,
+                     members: tuple[staff_sources.MemberFound | staff_sources.NoSuchMember, ...],
+                     runner: staff_sources.MemberFound | staff_sources.NoSuchMember) -> bool:
+    """Keep worker and parent rows; removal is proved by the wrap's file step."""
+    pending: list[staff.StaffId] = []
+    for unit, found in zip(rows, members, strict=True):
+        if isinstance(found, staff_sources.NoSuchMember):
+            raise LifecycleStop("staff", "held", f"{unit.name}: no staff row")
+        if unit.worktree.exists():
+            raise LifecycleStop("staff", "held", f"{unit.name}: worktree has not been removed")
+        workers = record.find(kind="worker", parent=found.row.id)
+        for worker in workers:
+            print(f"kept worker {worker.id} {worker.name} under {unit.name}")
+        if workers:
+            pending.append(found.row.id)
+    if isinstance(runner, staff_sources.NoSuchMember):
+        raise LifecycleStop("staff", "held", "no showrunner staff row")
+    if record.find(kind="worker", parent=runner.row.id):
+        pending.append(runner.row.id)
+    if pending:
+        staff.defer_retire(pending)
+    return bool(pending)
+
+
+def tidy_state(slug: str, document: Path, *, identities: QuestionStaff) -> None:
+    """Close owned questions and delete state files. Keep the files when cleanup fails."""
     try:
-        removed = tidy_wrapped.tidy(slug)
+        removed = tidy_wrapped.tidy(slug, document, identities=identities)
     except (tidy_wrapped.TidyRefused, OSError) as error:
         report("tidy", "kept", f"{error}; tidy_wrapped.py removes them once the doc says wrapped")
         return
@@ -405,25 +539,38 @@ def tidy_state(slug: str) -> None:
 
 def wrap(production: Production, lines: list[str], no_ci: bool,
          ci_green: CommitVerdict | VerdictMissing,
-         smoke_passed: CommitVerdict | VerdictMissing, done: tuple[str, ...]) -> None:
+         smoke_passed: CommitVerdict | VerdictMissing, done: tuple[str, ...],
+         moved_from: tuple[Path, ...] = ()) -> int:
+    held = False
     status = doc_status(lines)
     if isinstance(status, ProductionPlanned):
         raise LifecycleStop("wrap", "held", "production must be running")
-    style_children = RunningStyleChildren(())
+    record = staff.initial_snapshot()
     if isinstance(status, ProductionRunning):
-        style_children = refuse_running_children(production.slug)
+        refuse_running_children(production.slug, record)
     state = checkout_ready(production)
     if isinstance(state, PlanPending):
         raise LifecycleStop("wrap", "held", "merge branch does not exist")
     rows = units(lines, production)
-    tip = checked(production.checkout, "wrap", "rev-parse", "HEAD")
-    commit_count = "0"
+    sources = unit_lookup.member_sources()
+    productions = dict(sources.productions)
+    if production.slug not in productions:
+        productions[production.slug] = showrunners.ShowrunnerSource(
+            showrunners.Timer(production.slug, "session:unrecorded", production.doc, ""), "\n".join(lines))
+    sources = replace(sources, productions=productions)
+    runner = sources.member(staff_sources.ShowrunnerMember(production.slug), record)
+    if isinstance(runner, staff_sources.NoSuchMember):
+        raise LifecycleStop("staff", "held", "no showrunner staff row")
+    members = tuple(sources.member(staff_sources.UnitMember(production.slug, row.name), record) for row in rows)
     if isinstance(status, ProductionRunning):
-        items = close_out_items(lines)
-        for item in items:
+        for item in close_out_items(lines):
             if item not in done:
                 raise LifecycleStop("close-out", "held", f'{item} is not recorded done; finish it or get the owner\'s OK, then pass --close-out-done "{item}"')
             report("close-out", "ok", f"{item} (recorded done)")
+    prepared = prepare_wrap_units(production, lines, rows, members, sources)
+    tip = checked(production.checkout, "wrap", "rev-parse", "HEAD")
+    commit_count = "0"
+    if isinstance(status, ProductionRunning):
         ci_steps(production, tip, no_ci, ci_green, smoke_passed)
         for unit in rows:
             if unit.worktree.exists():
@@ -452,27 +599,33 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         _ = checked(production.checkout, "main", "fetch", "origin", "main")
         commit_count = checked(production.checkout, "main", "rev-list", "--count", "origin/main..HEAD")
         tip = promote_main(production, lines, no_ci, ci_green, smoke_passed, verdict_checked=True)
-        for unit in rows:
-            if unit.worktree.exists():
-                retire_reservations(unit.worktree)
-                _ = checked(production.checkout, "retire", "worktree", "remove", str(unit.worktree))
-                report("retire", "ok", f"removed {unit.name} worktree")
-            if git(production.checkout, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}").returncode == 0:
-                _ = checked(production.checkout, "retire", "branch", "-d", unit.branch)
-                report("retire", "ok", f"deleted local {unit.branch}")
-            remote = git(production.checkout, "ls-remote", "--exit-code", "--heads", "origin", unit.branch)
-            if remote.returncode == 0:
-                _ = checked(production.checkout, "retire", "push", "origin", "--delete", unit.branch)
-                report("retire", "ok", f"deleted origin/{unit.branch}")
-            elif remote.returncode != 2:
-                raise LifecycleStop("retire", "failed", remote.stderr.strip() or f"ls-remote exited {remote.returncode}")
+    if isinstance(status, ProductionRunning):
+        _ = capture_release(production.slug, record=record)
+    for item in prepared:
+        unit = item.unit
+        assert isinstance(item.config.retired, unit_config.RetiredSession)
+        _ = unit_config.park(item.member.id, unit.worktree, item.config.retired)
+        if unit.worktree.exists():
+            retire_reservations(unit.worktree)
+            _ = checked(production.checkout, "retire", "worktree", "remove", str(unit.worktree))
+            report("retire", "ok", f"removed {unit.name} worktree")
+        _ = staff.set_worktree(item.member.id, staff.RemovedWorktree(local_machine(), unit.worktree))
+        if git(production.checkout, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}").returncode == 0:
+            _ = checked(production.checkout, "retire", "branch", "-d", unit.branch)
+            report("retire", "ok", f"deleted local {unit.branch}")
+        remote = git(production.checkout, "ls-remote", "--exit-code", "--heads", "origin", unit.branch)
+        if remote.returncode == 0:
+            _ = checked(production.checkout, "retire", "push", "origin", "--delete", unit.branch)
+            report("retire", "ok", f"deleted origin/{unit.branch}")
+        elif remote.returncode != 2:
+            raise LifecycleStop("retire", "failed", remote.stderr.strip() or f"ls-remote exited {remote.returncode}")
+    held = retire_wrap_rows(rows, record, members, runner) or held
+    if isinstance(status, ProductionRunning):
         notifier = Path.home() / ".claude/scripts/message/notifier.sh"
         # The update timer is the one record of the showrunner, so removing it unregisters it.
         _ = command("notifier", production.checkout, str(notifier), "remove", f"showrunner-{production.slug}")
         report("notifier", "ok", "update timer removed")
-        detach_style_children(production.slug, style_children)
-        release_edges(production.slug)
-        tidy_state(production.slug)
+        release_edges(production.slug, record=record)
         archived = command(
             "phase-notes",
             production.checkout,
@@ -492,14 +645,21 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         )
         updated = [line.replace("**Status: PRODUCTION — running.**", "**Status: PRODUCTION — wrapped.**")
                    for line in lines]
-        _ = production.doc.write_text("\n".join(updated) + "\n", encoding="utf-8")
-    doc_paths = [doc_path_in_checkout(production, production.doc)]
+        write_text_atomic(production.doc, "\n".join(updated) + "\n")
+    doc_paths = [doc_path_in_checkout(production, path) for path in (*moved_from, production.doc)]
     archive = archived_doc(production)
     if archive is not None:
         archive.parent.mkdir(parents=True, exist_ok=True)
         doc_paths.append(doc_path_in_checkout(production, archive))
         _ = checked(production.checkout, "wrap", "mv", "--", *doc_paths)
         report("wrap", "ok", f"moved the doc out of productions/ to {doc_paths[1]}")
+    final_doc = archive if archive is not None else production.doc
+    if not final_doc.is_file():
+        raise LifecycleStop("staff", "held", f"wrapped production doc is missing: {final_doc}")
+    wrapped_runner = staff.set_doc(runner.row.id, staff.WrappedDoc(local_machine(), final_doc))
+    record = replace(record, rows=tuple(wrapped_runner if row.id == wrapped_runner.id else row for row in record.rows))
+    if record.pending_retire:
+        _ = staff.retire_pending()
     if git(production.checkout, "diff", "--quiet", "HEAD", "--", *doc_paths).returncode == 1:
         _ = checked(production.checkout, "wrap", "add", "--", doc_paths[-1])
         _ = checked(production.checkout, "wrap", "commit", "--only", "-m",
@@ -537,6 +697,9 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
                    else f"promoted to {tip[:7]} by the earlier run")
     print(f"| Main | {main_result} |")
     print("| Next | close herdr sessions |")
+    if not held:
+        tidy_state(production.slug, final_doc, identities=QuestionStaff.for_record(record, sources))
+    return 1 if held else 0
 
 
 def main() -> int:
@@ -561,7 +724,8 @@ def main() -> int:
             raise LifecycleStop("input", "failed", "--no-ci excludes the verdict flags")
         ci_green = CommitVerdict(ci_sha) if ci_sha is not None else VerdictMissing()
         smoke_passed = CommitVerdict(smoke_sha) if smoke_sha is not None else VerdictMissing()
-        production = read_production(cast(Path, args.production))
+        given_doc = cast(Path, args.production)
+        production = wrap_production(given_doc) if action == "wrap" else read_production(given_doc)
         lines = doc_lines(production)
         if action == "load":
             load(production, lines, cast(bool, args.resume), cast(Path | None, args.scratch))
@@ -570,14 +734,16 @@ def main() -> int:
         elif action == "promote-main":
             _ = promote_main(production, lines, no_ci, ci_green, smoke_passed)
         else:
-            wrap(production, lines, no_ci, ci_green, smoke_passed,
-                 tuple(cast(list[str], args.close_out_done)))
+            with staff.operation():
+                return wrap(production, lines, no_ci, ci_green, smoke_passed,
+                 tuple(cast(list[str], args.close_out_done)),
+                 (given_doc.expanduser().absolute(),) if production.doc != given_doc.expanduser().resolve() else ())
         return 0
     except LifecycleStop as error:
         report(error.step, error.state, error.detail.replace("\n", "; "))
     except Stop as error:
         report(error.step, error.state, error.detail.replace("\n", "; "))
-    except (Refusal, OSError, ValueError) as error:
+    except (staff.StaffRefused, staff.StaffNotFound, Refusal, OSError, ValueError) as error:
         report("input", "failed", str(error).replace("\n", "; "))
     return 2
 

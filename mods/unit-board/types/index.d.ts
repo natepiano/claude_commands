@@ -21,6 +21,6 @@ export type AccountsPaneState<Status> =
 /** Missing keys are closed panes. Timers belong to the module, never persisted. */
 declare module 'claude-code' {
   interface PluginState {
-    'unit-board': { panes: Record<string, PaneState<unknown>>; accountsPanes: Record<string, AccountsPaneState<unknown>> };
+    'unit-board': { panes: Record<string, PaneState<unknown>>; accountsPanes: Record<string, AccountsPaneState<unknown>>; queuePanes: Record<string, import('./queue').QueuePaneState> };
   }
 }

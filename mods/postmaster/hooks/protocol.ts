@@ -4,7 +4,7 @@ export const POLL_MS = 500;
 export const BATCH = 20;
 export const VERSION = "0.1.0";
 export const REPLY_WINDOW_MS = 30 * 60 * 1000;
-export const PATHS = { outbox: "outbox", claimed: "claimed", results: "results", heartbeat: "heartbeat.json", errors: "errors", delivered: "delivered", replies: "replies" } as const;
+export const PATHS = { outbox: "outbox", claimed: "claimed", results: "results", heartbeat: "heartbeat.json", errors: "errors", delivered: "delivered", replies: "replies", forwards: "forwards" } as const;
 
 export type OutboxEntry = {
   id: string;
@@ -62,8 +62,9 @@ export type ReplyLog = {
   session_id: string;
   senders: string[];
   body: string;
-  forwarded: string[];
+  targets: string[];
 };
+export type ForwardLog = { forwarded: string[] };
 export type Replies = {
   sending(entry: OutboxEntry, atMs: number): Promise<RouteToken>;
   notDelivered(token: RouteToken): Promise<void>;
@@ -107,6 +108,9 @@ export function isDeliveryRouteFile(value: unknown): value is DeliveryRouteFile 
     && typeof value.reply_to_session_id === "string"
     && typeof value.session_id === "string" && value.session_id !== "" && timestamp(value.at_ms);
 }
+function sessionIds(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((id: unknown) => typeof id === "string" && id !== "");
+}
 export function isReplyLog(value: unknown): value is ReplyLog {
   return record(value) && timestamp(value.at_ms)
     && typeof value.socket === "string" && value.socket.startsWith("uds:/")
@@ -114,5 +118,8 @@ export function isReplyLog(value: unknown): value is ReplyLog {
     && typeof value.session_id === "string" && value.session_id !== ""
     && Array.isArray(value.senders) && value.senders.length > 0
     && value.senders.every((sender: unknown) => typeof sender === "string" && sender !== "") && typeof value.body === "string"
-    && Array.isArray(value.forwarded) && value.forwarded.every((id: unknown) => typeof id === "string" && id !== "");
+    && sessionIds(value.targets);
+}
+export function isForwardLog(value: unknown): value is ForwardLog {
+  return record(value) && sessionIds(value.forwarded);
 }

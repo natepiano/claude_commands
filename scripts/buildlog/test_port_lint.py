@@ -24,6 +24,10 @@ else:
     from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
 from test_index import Record, encode, point_root_at, step
 from test_treekey import GIT_ENVIRONMENT
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 SCRIPT = Path(__file__).with_name("port_lint.py")
 CLIPPY = ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
@@ -229,7 +233,7 @@ class CommandTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=60,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
     def record(self, **fields: object) -> None:

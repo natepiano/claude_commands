@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import hashlib
 import os
 import re
 import shlex
@@ -16,10 +17,11 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
-from typing import Callable, Literal, NamedTuple, NoReturn, TypedDict, cast
+from typing import Callable, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
+from atomic_file import write_text_atomic  # noqa: E402
 
 
 class ProjectSpec(NamedTuple):
@@ -27,6 +29,7 @@ class ProjectSpec(NamedTuple):
     crates: frozenset[str]
     published: frozenset[str]
     checkouts: tuple[Path, ...]
+    closes_by_change_review: bool = False
 
 
 PROJECTS: dict[str, ProjectSpec] = {
@@ -74,9 +77,10 @@ PROJECTS: dict[str, ProjectSpec] = {
             }
         ),
         (Path.home() / "rust/hana", Path.home() / "rust/hana_catalyst"),
+        closes_by_change_review=True,
     ),
     "natedev": ProjectSpec(
-        "natepiano/nixos", frozenset(), frozenset(), (Path("/etc/nixos"),)
+        "natepiano/nixos", frozenset(), frozenset(), (Path("/etc/nixos"),), closes_by_change_review=False,
     ),
     "cargo-liner": ProjectSpec(
         "natepiano/cargo-liner",
@@ -93,6 +97,7 @@ PROJECTS: dict[str, ProjectSpec] = {
         ),
         frozenset({"cargo-mend", "cargo-port", "cargo-tile", "tui_pane"}),
         (Path.home() / "rust/cargo-liner",),
+        closes_by_change_review=False,
     ),
     "bevy_brp": ProjectSpec(
         "natepiano/bevy_brp",
@@ -108,21 +113,24 @@ PROJECTS: dict[str, ProjectSpec] = {
         ),
         frozenset({"bevy_brp_extras", "bevy_brp_mcp", "bevy_brp_mcp_macros"}),
         (Path.home() / "rust/bevy_brp",),
+        closes_by_change_review=False,
     ),
     "obsidian_knife": ProjectSpec(
         "natepiano/obsidian_knife",
         frozenset({"obsidian_knife"}),
         frozenset(),
         (Path.home() / "rust/obsidian_knife",),
+        closes_by_change_review=False,
     ),
     "nateroids": ProjectSpec(
         "natepiano/nateroids",
         frozenset({"nateroids"}),
         frozenset(),
         (Path.home() / "rust/nateroids",),
+        closes_by_change_review=False,
     ),
     "claude": ProjectSpec(
-        "natepiano/claude_commands", frozenset(), frozenset(), (Path.home() / ".claude",)
+        "natepiano/claude_commands", frozenset(), frozenset(), (Path.home() / ".claude",), closes_by_change_review=True,
     ),
 }
 
@@ -196,6 +204,7 @@ class AmendEvent(TypedDict):
     old_completed: str
     new_completed: str
     releases_added: list[str]
+    content: NotRequired[str]
 
 
 class ReleaseEvent(TypedDict):
@@ -984,25 +993,12 @@ def locked() -> Generator[None, None, None]:
 
 def _write_note(path: Path, note: Note) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    try:
-        _ = temporary.write_text(render_note(note), encoding="utf-8")
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    write_text_atomic(path, render_note(note))
 
 
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    try:
-        _ = temporary.write_text(
-            json.dumps(value, separators=(",", ":"), ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    write_text_atomic(path, json.dumps(value, separators=(",", ":"), ensure_ascii=False) + "\n")
 
 
 def _event_time() -> str:
@@ -1058,6 +1054,7 @@ def _amend_event(
         "old_completed": old["completed_date"],
         "new_completed": updated["completed_date"],
         "releases_added": sorted(set(updated["release"]) - set(old["release"])),
+        "content": hashlib.sha256(render_note(updated).encode("utf-8")).hexdigest(),
     }
 
 
@@ -1190,10 +1187,11 @@ def _parse_event(line: str, line_number: int) -> FeatureLogEvent:
             }
         _require_json_keys(
             value,
-            legacy_keys | {"old_link", "new_link", "old_completed", "new_completed", "releases_added"},
+            legacy_keys | {"old_link", "new_link", "old_completed", "new_completed", "releases_added"}
+            | (frozenset({"content"}) if "content" in value else frozenset[str]()),
             "amend event",
         )
-        return {
+        event: AmendEvent = {
             "at": _json_string(value.get("at"), "event at"),
             "verb": "amend",
             "project": _json_string(value.get("project"), "event project"),
@@ -1206,6 +1204,9 @@ def _parse_event(line: str, line_number: int) -> FeatureLogEvent:
             "new_completed": _json_string(value.get("new_completed"), "event new_completed"),
             "releases_added": _json_string_list(value.get("releases_added"), "event releases_added"),
         }
+        if "content" in value:
+            event["content"] = _json_string(value["content"], "amend content")
+        return event
     raise FeatureLogError(f"events.jsonl line {line_number} has unknown verb {verb}")
 
 
@@ -1651,11 +1652,14 @@ def _run_propose(arguments: argparse.Namespace) -> int:
     return 0
 
 
-def _run_review_land(verb: Literal["add", "supersede"], row_value: str) -> int:
+def _run_review_land(verb: Literal["add", "supersede"], row_value: str, if_proposed: bool) -> int:
     row = _review_row(row_value)
     with locked():
         proposal = _read_proposal(row)
         if proposal is None:
+            if if_proposed:
+                print(f"skipped: no proposal for {row}")
+                return 0
             raise FeatureLogError(f"no proposal for {row}; run propose first")
         if proposal["verb"] != verb:
             raise FeatureLogError(
@@ -1696,6 +1700,9 @@ def _run_drop(arguments: argparse.Namespace) -> int:
     with locked():
         proposal = _read_proposal(row)
         if proposal is None:
+            if cast(bool, arguments.if_proposed):
+                print(f"skipped: no proposal for {row}")
+                return 0
             raise FeatureLogError(f"no proposal for {row}; run propose first")
         if proposal["status"] == "dropped":
             print(f"unchanged: {row}")
@@ -1845,7 +1852,11 @@ def _run_amend(arguments: argparse.Namespace) -> int:
             changed.append("evidence")
 
         if not changed:
-            if not _event_recorded("amend", note["project"], note["title"]):
+            content = hashlib.sha256(render_note(note).encode("utf-8")).hexdigest()
+            previous = next((event for event in reversed(_read_events())
+                             if event["verb"] == "amend" and event["project"] == note["project"]
+                             and event["title"] == note["title"]), None)
+            if previous is None or previous.get("content") != content:
                 _append_event(_amend_event(note, note, backfill, requested_fields))
             print(f"unchanged: {_relative(path)}")
             return 0
@@ -2241,8 +2252,10 @@ def _run_digest(arguments: argparse.Namespace) -> int:
         else:
             since_label = _digest_time_label(_event_time())
         cursor_value: DigestCursor = {"line": len(events), "at": _event_time()}
+        result = _print_digest(selected, since_label)
+        _ = sys.stdout.flush()
         _write_json(state_dir() / "digest.json", cursor_value)
-    return _print_digest(selected, since_label)
+    return result
 
 
 def _github_slug(remote: str) -> str | None:
@@ -2334,10 +2347,12 @@ def _parser() -> FeatureLogArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     add = subparsers.add_parser("add")
+    _ = add.add_argument("--if-proposed", action="store_true")
     _ = add.add_argument("--review")
     _add_new_note_arguments(add, required=False)
 
     supersede = subparsers.add_parser("supersede")
+    _ = supersede.add_argument("--if-proposed", action="store_true")
     _ = supersede.add_argument("--review")
     _ = supersede.add_argument("--old", action="append")
     _ = supersede.add_argument(
@@ -2352,6 +2367,7 @@ def _parser() -> FeatureLogArgumentParser:
     _add_new_note_arguments(propose, required=True)
 
     drop = subparsers.add_parser("drop")
+    _ = drop.add_argument("--if-proposed", action="store_true")
     _ = drop.add_argument("--review", required=True)
     _ = drop.add_argument("--verdict", required=True)
 
@@ -2432,7 +2448,9 @@ def main(
         if command == "add":
             review = cast(str | None, arguments.review)
             if review is not None:
-                return _run_review_land("add", review)
+                return _run_review_land("add", review, cast(bool, arguments.if_proposed))
+            if cast(bool, arguments.if_proposed):
+                raise FeatureLogError("--if-proposed requires --review")
             _require_new_note_arguments(arguments)
             return _run_add(arguments)
         if command == "supersede":
@@ -2441,7 +2459,9 @@ def main(
             if review is not None:
                 if isinstance(policy, ExtendReplacementSet):
                     raise FeatureLogError("--split cannot be combined with --review")
-                return _run_review_land("supersede", review)
+                return _run_review_land("supersede", review, cast(bool, arguments.if_proposed))
+            if cast(bool, arguments.if_proposed):
+                raise FeatureLogError("--if-proposed requires --review")
             _require_new_note_arguments(arguments)
             if cast(list[str] | None, arguments.old) is None:
                 raise FeatureLogError("the following arguments are required: --old")

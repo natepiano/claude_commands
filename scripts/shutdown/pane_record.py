@@ -1,133 +1,237 @@
-"""Each herdr pane's Claude launch, so a restore can resume the pane on its own account.
+"""Retain each pane's launch so restore can use its account and conversation.
 
-One file per herdr session, `~/.local/state/herdr-panes/<session>.json`, maps HERDR_PANE_ID to the
-launch of the Claude in that pane: its account folder, its cwd, its name and model flags and the
-environment marks it started with. The SessionStart hook (`session-start-pane-record.py`) writes
-the entry from its own Claude process at every start, resume, clear and compaction, so a pane
-started by hand is covered the same as one restart or add_unit started (user, 2026-10-19).
+Each herdr session has one file under `~/.local/state/herdr-panes`.
+The file maps each pane to its account folder, working folder, flags, and retained environment.
+The Claude SessionStart hook records Claude launches.
+The normal herdr start path records Codex launches after it proves the foreground process.
 
-The conversation id is herdr's: its own hook keeps `agent_session` for each pane. The id here is
-the one the pane had at its last start, a check on herdr's, never a second source.
+Stored member references use fixed staff ids.
+Runtime observations prove the current conversation before a stop or resume.
+An intentional exit marks its launch ended, so restore keeps that session stopped.
+A proved resume clears the ended state.
 
-A pane herdr no longer has is ignored, so a stale entry needs no cleanup. A session that ends
-other than by a signal (`/exit`, logout) marks its entry ended (`session-end-pane-record.py`), so a
-restore leaves a Claude closed by hand closed.
-
-`seed` writes the entries for the Claudes already running, read from herdr's process info.
-
-Linux reads a process from /proc. The Mac has no /proc: it reads the parent with `ps` and the
-arguments and environment from the kernel's KERN_PROCARGS2 record, split by
-`account.procargs2_parts`. Of an environment, only the names below are kept; every other value is
-dropped as it is read and never written or printed.
+Linux reads process evidence from /proc.
+The Mac reads parents through `ps` and arguments through KERN_PROCARGS2.
+Environment readers retain only the names below.
 """
 
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
 import subprocess
 import sys
-import tempfile
-from collections.abc import Generator, Mapping, Sequence
-from contextlib import contextmanager
-from datetime import datetime, timezone
+from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from scripts.production import staff
 
 SCRIPTS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS / "herdr"))
 sys.path.insert(0, str(SCRIPTS / "lib"))
 sys.path.insert(0, str(SCRIPTS / "whoami"))
-import herdr  # noqa: E402
-from probe_session import PROBE_ENV  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-RECORD_DIR = Path(os.environ.get("HERDR_PANE_RECORD_DIR") or Path.home() / ".local/state/herdr-panes")
-# The launch environment a resume must give back. Credentials never enter the record.
-KEPT_NAMES = frozenset({"ENABLE_TOOL_SEARCH", PROBE_ENV})
-KEPT_PREFIXES = ("SHOWRUNNER_",)
-# Claude flags whose value the resume repeats; every other argument stays out of the record.
-NAME_FLAGS = frozenset({"-n", "--name"})
-MODEL_FLAGS = frozenset({"--model"})
+import herdr  # noqa: E402
+import pane_launch
+import sessions
+from pane_launch import PaneLaunch as PaneLaunch
+from pane_launch import (
+    CLAUDE_VALUE_FLAGS as CLAUDE_VALUE_FLAGS,
+    KEPT_NAMES as KEPT_NAMES,
+    KEPT_PREFIXES as KEPT_PREFIXES,
+    MODEL_FLAGS as MODEL_FLAGS,
+    NAME_FLAGS as NAME_FLAGS,
+    RESUME_FLAGS as RESUME_FLAGS,
+    ClaudeArguments as ClaudeArguments,
+    launch as launch,
+    parse_claude_arguments as parse_claude_arguments,
+)
+
+RECORD_DIR = pane_launch.record_directory()
 ANCESTOR_LIMIT = 16
 PROC = Path(os.environ.get("HERDR_PROC", "/proc"))
 
 
-class PaneLaunch(TypedDict):
-    pane_id: str
-    session_id: str
-    config_dir: str
-    cwd: str
-    name: str
-    model: str
-    remote_control: bool
-    environment: dict[str, str]
-    # False when the launch flags could not be read: a restore refuses it.
-    flags_read: bool
-    ended: bool
-    written_at: str
+def record_directory() -> Path:
+    """Use the configured store, including an explicit binding by an embedded caller."""
+    return RECORD_DIR
 
 
 def record_path(session: str) -> Path:
-    return RECORD_DIR / f"{session}.json"
+    return record_directory() / f"{session}.json"
+
+
+def read_strict(session: str, *, dependencies: Callable[[Path], None] | None = None) -> dict[str, PaneLaunch]:
+    """Read validated launch evidence; only an absent file means there are no entries."""
+    path = record_path(session)
+    if dependencies is not None:
+        dependencies(path)
+    return pane_launch.read_strict(path)
 
 
 def read(session: str) -> dict[str, PaneLaunch]:
     """The session's entries by pane id; an absent or unreadable file reads as none."""
-    try:
-        value = cast(object, json.loads(record_path(session).read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        return {}
-    return cast(dict[str, PaneLaunch], value) if isinstance(value, dict) else {}
+    return pane_launch.read(record_path(session))
 
 
-@contextmanager
-def _locked(session: str) -> Generator[None]:
-    RECORD_DIR.mkdir(parents=True, exist_ok=True)
-    with open(RECORD_DIR / f".{session}.lock", "w", encoding="utf-8") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        yield
+def launches() -> list[PaneLaunch]:
+    """Read retained launches through the same per-session reader as restore."""
+    return [entry for path in record_directory().glob("*.json") for entry in read(path.stem).values()]
 
 
-def _save(session: str, entries: dict[str, PaneLaunch]) -> None:
-    handle, temporary = tempfile.mkstemp(dir=RECORD_DIR, prefix=f".{session}.", suffix=".tmp")
-    with os.fdopen(handle, "w", encoding="utf-8") as file:
-        json.dump(entries, file, indent=2, sort_keys=True)
-        _ = file.write("\n")
-    os.replace(temporary, record_path(session))
+def launch_for_session(session_id: str) -> PaneLaunch | None:
+    """Read a conversation's newest launch, including account moves and intentional exits."""
+    publication = publication_for_session(session_id)
+    return publication.entry if publication is not None else None
+
+
+def publication_for_session(session_id: str) -> pane_launch.LaunchPublication | None:
+    """Keep the source file and exact publication for a conversation."""
+    from scripts.production import staff
+
+    owner = staff.initial_snapshot().by_current_session(session_id)
+    reference = owner.id if owner is not None else session_id
+    matches = [pane_launch.LaunchPublication(path, entry)
+               for path in sorted(record_directory().glob("*.json"))
+               for entry in pane_launch.read_strict(path).values()
+               if entry["session_id"] in (reference, session_id)]
+    if not matches:
+        return None
+    return max(matches, key=lambda publication: publication.entry["written_at"])
+
+
+def resume_launch(entry: PaneLaunch) -> PaneLaunch:
+    """Resolve a retained member reference to its current conversation for resume."""
+    from scripts.production import staff
+
+    owner = staff.initial_snapshot().by_id(staff.StaffId(entry["session_id"]))
+    if owner is None or owner.current_session == entry["session_id"]:
+        return entry
+    current = entry.copy()
+    current["session_id"] = owner.current_session
+    return current
+
+
+def resume_arguments(entry: PaneLaunch) -> list[str]:
+    """Build backend arguments from a launch with its current conversation id."""
+    if pane_launch.agent_kind(entry) == "codex":
+        arguments = ["resume", entry["session_id"]]
+        if entry["model"]:
+            arguments.extend(("--model", entry["model"]))
+        return arguments
+    arguments = ["--resume", entry["session_id"]]
+    if entry["name"]:
+        arguments.extend(("-n", entry["name"]))
+    if entry["remote_control"]:
+        arguments.extend(("--remote-control", entry["name"]) if entry["name"] else ("--remote-control",))
+    if entry["model"]:
+        arguments.extend(("--model", entry["model"]))
+    arguments.extend(("--settings", '{"disableAgentView": true}'))
+    return arguments
+
+
+def locked(session: str) -> AbstractContextManager[None]:
+    return pane_launch.locked(record_path(session))
+
+
+def save(session: str, entries: dict[str, PaneLaunch]) -> None:
+    pane_launch.save(record_path(session), entries)
+
+
+def move_cwd(unit: str, old: Path, new: Path, record: "staff.StaffSnapshot") -> None:
+    """Update only this member's retained launch paths under each session lock."""
+    for path in sorted(record_directory().glob("*.json")):
+        with locked(path.stem):
+            entries = read_strict(path.stem)
+            changed = False
+            for entry in entries.values():
+                owner = record.by_member_reference(entry["session_id"])
+                if owner is None or owner.id != unit:
+                    continue
+                if entry["cwd"] not in (str(old), str(new)):
+                    raise ValueError(f"{unit}: retained launch has a different working folder")
+                if entry["cwd"] != str(new):
+                    entry["cwd"] = str(new)
+                    changed = True
+            if changed:
+                save(path.stem, entries)
 
 
 def write(session: str, launch: PaneLaunch) -> None:
-    """Replace the pane's entry and keep every other pane's."""
-    with _locked(session):
-        entries = read(session)
-        entries[launch["pane_id"]] = launch
-        _save(session, entries)
+    """Delegate retained launch publication to the shared writer."""
+    pane_launch.write(record_path(session), launch)
 
 
-def end(session: str, pane_id: str, session_id: str) -> None:
+def retained_environment(launch: PaneLaunch, history: Sequence[PaneLaunch]) -> dict[str, str]:
+    """Keep a conversation's identity when its terminal command lost the environment."""
+    environment: dict[str, str] = {}
+    for previous in sorted(history, key=lambda item: item["written_at"]):
+        if previous["session_id"] == launch["session_id"]:
+            environment.update({key: value for key, value in previous["environment"].items()
+                                if key in herdr.MEMBER_MARKS or key.startswith(KEPT_PREFIXES)})
+    environment.update({key: value for key, value in launch["environment"].items() if key != "STAFF_ID"})
+    return environment
+
+
+def matching_launch(place: herdr.HerdrPlace, session_id: str) -> PaneLaunch | None:
+    """A pane's retained launch is evidence only for that exact conversation."""
+    entries = read(place.session)
+    exact = pane_launch.matching_launch(entries, place, session_id)
+    if exact is not None:
+        return exact
+    from scripts.production import staff
+
+    owner = staff.initial_snapshot().by_current_session(session_id)
+    if owner is None:
+        return None
+    retained = pane_launch.matching_launch(entries, place, owner.id)
+    if retained is None:
+        return None
+    projected = retained.copy()
+    projected["session_id"] = session_id
+    return projected
+
+
+def end(session: str, pane_id: str, session_id: str, *, record: "staff.StaffSnapshot | None" = None) -> None:
     """Mark the pane's entry ended when it is still this conversation's."""
-    with _locked(session):
+    _set_ended(session, pane_id, session_id, True, record)
+
+
+def _set_ended(session: str, pane_id: str, session_id: str, ended: bool,
+               record: "staff.StaffSnapshot | None") -> None:
+    from scripts.production import staff
+
+    record = staff.initial_snapshot() if record is None else record
+    owner = record.by_current_session(session_id)
+    stale = record.by_id(staff.StaffId(session_id))
+    if owner is None and stale is not None:
+        return
+    reference = owner.id if owner is not None else session_id
+    with locked(session):
         entries = read(session)
         entry = entries.get(pane_id)
-        if entry is None or entry["session_id"] != session_id:
+        if entry is None or entry["session_id"] not in (reference, session_id):
+            if not ended:
+                raise ValueError(f"{session_id}: retained launch changed before resume publication")
             return
-        entry["ended"] = True
-        _save(session, entries)
+        if entry.get("ended", False) != ended:
+            entry["ended"] = ended
+            save(session, entries)
 
 
 def forget_unit(unit_id: str) -> list[str]:
     """Drop every entry of a unit's director, in each session's record; a rename relaunches it in a new pane."""
     dropped: list[str] = []
-    for path in sorted(RECORD_DIR.glob("*.json")):
-        with _locked(path.stem):
-            entries = read(path.stem)
-            kept = {pane: entry for pane, entry in entries.items()
-                    if entry["environment"].get("SHOWRUNNER_UNIT_ID") != unit_id}
-            if len(kept) != len(entries):
-                _save(path.stem, kept)
-                dropped.extend(f"{path.stem}:{pane}" for pane in entries if pane not in kept)
+    for path in sorted(record_directory().glob("*.json")):
+        for pane, entry in pane_launch.read_strict(path).items():
+            if entry["environment"].get("SHOWRUNNER_UNIT_ID") == unit_id:
+                pane_launch.retire_launch(path, pane, entry)
+                dropped.append(f"{path.stem}:{pane}")
     return dropped
 
 
@@ -143,18 +247,32 @@ def _environment(parts: Sequence[bytes]) -> dict[str, str]:
 
 def _mac_record(pid: int) -> tuple[list[str], dict[str, str]]:
     # Imported here: the Linux hook never needs the account module.
-    from account import kern_procargs2, procargs2_parts
+    from scripts.whoami.account import kern_procargs2, procargs2_parts
 
     parts = procargs2_parts(kern_procargs2(pid), _needed)
     return list(parts.arguments), parts.environment
 
 
-def _parent(pid: int) -> int:
-    if sys.platform == "darwin":
-        result = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, check=False)
+def _process_stat(process: Path) -> list[str]:
+    return (process / "stat").read_text().rsplit(")", 1)[1].split()
+
+
+def process_parent(pid: int) -> int:
+    """Read the OS parent; callers decide how unavailable evidence is handled."""
+    if (os.environ.get("HERDR_PLATFORM") or sys.platform) == "darwin":
+        result = subprocess.run([os.environ.get("HERDR_PS", "ps"), "-o", "ppid=", "-p", str(pid)],
+                                capture_output=True, text=True, check=True, timeout=5)
         return int(result.stdout)
-    stat = (PROC / str(pid) / "stat").read_text()
-    return int(stat.rsplit(")", 1)[1].split()[1])
+    return int(_process_stat(Path(os.environ.get("HERDR_PROC") or PROC) / str(pid))[1])
+
+
+def pane_shell_pid(place: herdr.HerdrPlace) -> int:
+    info = herdr.json_object(herdr.Herdr(place.session).result(
+        "pane", "process-info", "--pane", place.pane).get("process_info"), "pane process info")
+    shell = info.get("shell_pid")
+    if isinstance(shell, bool) or not isinstance(shell, int) or shell <= 0:
+        raise ValueError("pane process info: expected a positive shell_pid")
+    return shell
 
 
 def _arguments(pid: int) -> list[str]:
@@ -164,13 +282,18 @@ def _arguments(pid: int) -> list[str]:
     return [os.fsdecode(part) for part in raw.split(b"\0") if part]
 
 
+def process_arguments(pid: int) -> list[str]:
+    """Read arguments for an exact process without selecting an ancestor."""
+    return _arguments(pid)
+
+
 def claude_arguments(pid: int) -> list[str]:
     """The argv of the nearest Claude process above `pid`; empty when none is found."""
     for _ in range(ANCESTOR_LIMIT):
         try:
-            pid = _parent(pid)
+            pid = process_parent(pid)
             arguments = _arguments(pid)
-        except (OSError, ValueError, IndexError):
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
             return []
         if herdr.is_claude_process(arguments):
             return arguments
@@ -179,39 +302,29 @@ def claude_arguments(pid: int) -> list[str]:
     return []
 
 
-def _flag_value(arguments: Sequence[str], flags: frozenset[str]) -> str:
-    value = ""
-    for index, argument in enumerate(arguments):
-        name, equals, inline = argument.partition("=")
-        if name in flags:
-            value = inline if equals else (arguments[index + 1] if index + 1 < len(arguments) else "")
-    return value
-
-
-def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, str],
-           arguments: Sequence[str]) -> PaneLaunch:
-    config_dir = environment.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
-    return {
-        "pane_id": pane_id,
-        "session_id": session_id,
-        "config_dir": config_dir,
-        "cwd": cwd,
-        "name": _flag_value(arguments, NAME_FLAGS),
-        "model": _flag_value(arguments, MODEL_FLAGS),
-        "remote_control": any(argument.partition("=")[0] == "--remote-control" for argument in arguments),
-        "environment": {key: value for key, value in sorted(environment.items())
-                        if key in KEPT_NAMES or key.startswith(KEPT_PREFIXES)},
-        "flags_read": bool(arguments),
-        "ended": False,
-        "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }
-
-
 def _process_environment(pid: int) -> dict[str, str]:
     """The needed part of `pid`'s environment."""
     if sys.platform == "darwin":
         return _mac_record(pid)[1]
     return _environment((PROC / str(pid) / "environ").read_bytes().split(b"\0"))
+
+
+def running_launch(record: sessions.SessionRecord, place: herdr.HerdrPlace, cwd: str) -> PaneLaunch:
+    """Capture one verified live Claude using the existing argv and environment readers."""
+    if not sessions.running_session(record):
+        raise ValueError(f"{record['sessionId']}: Claude is no longer running")
+    environment = _process_environment(record["pid"])
+    arguments = _arguments(record["pid"])
+    if not herdr.is_claude_process(arguments):
+        raise ValueError(f"{record['sessionId']}: process is not Claude")
+    entry = launch(place.pane, record["sessionId"], cwd, environment, arguments)
+    entry["name"] = record["name"]
+    entry["pid"] = record["pid"]
+    started = sessions.process_start(record["pid"])
+    if not started:
+        raise ValueError(f"{record['sessionId']}: process start is unavailable")
+    entry["proc_start"] = started
+    return entry
 
 
 def _conversation_of(config_dir: str, pid: int) -> str:
@@ -224,11 +337,13 @@ def _conversation_of(config_dir: str, pid: int) -> str:
     return session_id if isinstance(session_id, str) else ""
 
 
-def seed(session: str) -> int:
+def seed(session: str, *, select: Callable[[herdr.PaneIdentity], bool] | None = None) -> int:
     """Write the entry of each pane whose foreground runs Claude; name each pane it cannot read."""
     client = herdr.Herdr(session)
     for pane in client.panes():
         pane_id = pane["pane_id"]
+        if select is not None and not select(pane):
+            continue
         context = f"herdr {session}:{pane_id} process info"
         info = herdr.json_object(client.result("pane", "process-info", "--pane", pane_id).get("process_info"), context)
         processes = [herdr.json_object(item, context) for item in herdr.json_items(info.get("foreground_processes"), context)]
@@ -253,7 +368,14 @@ def seed(session: str) -> int:
             print(f"{pane_id}: no conversation id for {pid}")
             continue
         cwd = found[0].get("cwd")
-        write(session, launch(pane_id, session_id, cwd if isinstance(cwd, str) else "", environment, arguments))
+        entry = launch(pane_id, session_id, cwd if isinstance(cwd, str) else "", environment, arguments)
+        entry["pid"] = pid
+        started = sessions.process_start(pid)
+        if not started:
+            print(f"{pane_id}: process start is unavailable for {pid}")
+            continue
+        entry["proc_start"] = started
+        write(session, entry)
         print(f"{pane_id}: {pane.get('label') or ''} {session_id}")
     return 0
 

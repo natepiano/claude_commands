@@ -1,5 +1,5 @@
 ---
-description: Compile a design/plan doc into a direct-ready phased implementation plan — strip design narrative, bake in the codebase context every phase needs, and front each phase with a self-contained Work Order so /unit:direct can dispatch by assembly with zero research.
+description: Create a plan with dispatchable phases.
 ---
 
 # Phase Plan
@@ -164,8 +164,8 @@ block — nothing else. The prompt must include:
      Build = `bash ~/.claude/scripts/direct/verify.sh check <pkg>`;
      Test = `bash ~/.claude/scripts/direct/verify.sh test <pkg>`;
      Lint = `bash ~/.claude/scripts/direct/verify.sh lint <pkg>`.
-     <PhaseChecks/> defines the lint scope and the phase's style review in
-     the unit director's main review; workers never load the guide. For
+     <PhaseChecks/> defines the lint scope and the phase's style review under
+     <ReviewPromptContract/>. For
      non-Rust projects, record the exact commands the project uses (read
      `package.json`/`justfile`/CI config; do not invent).
   6. **Invariants** — project-wide rules every phase must preserve (from the plan

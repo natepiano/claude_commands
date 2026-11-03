@@ -30,8 +30,20 @@ REAL_REVIEW = review.review
 
 if TYPE_CHECKING:
     from ..accounts import accounts
+    from ..production import staff
+    from ..production.update_registration_test_support import RegistrationFixture
+    from ..production.cli_fixture import production_paths
+    from ..production.staff_test_support import (
+        fixture_member, isolated_staff_file, isolated_source_readers, source_environment,
+    )
 else:
     from scripts.accounts import accounts
+    from scripts.production import staff
+    from scripts.production.update_registration_test_support import RegistrationFixture
+    from scripts.production.cli_fixture import production_paths
+    from scripts.production.staff_test_support import (
+        fixture_member, isolated_staff_file, isolated_source_readers, source_environment,
+    )
 
 
 class VerdictJSON(TypedDict):
@@ -103,8 +115,8 @@ class FakeReviewer:
 
 
 def with_footer(message: str, sender: str, template: str = "none (free text)") -> str:
-    """A posted push: the message, then its "Sent by" and "Template" lines last."""
-    return f"{message}\n\nSent by: {sender}\nTemplate: {template}"
+    """A posted push: the message, then its sender and template on one last line."""
+    return f"{message}\n\nSent by: {sender} · Template: {template}"
 
 
 def verdict(draft: review.Draft, decision: str = "send", /, **changes: object) -> VerdictJSON:
@@ -129,6 +141,11 @@ class LocalReviewTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        environment = source_environment(self.root / "sources")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", environment))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
+        _ = self.enterContext(isolated_source_readers())
+        _ = self.enterContext(production_paths(environment))
         notes = self.root / "notes"
         notes.mkdir()
         (self.root / ".claude").mkdir()
@@ -155,6 +172,52 @@ class LocalReviewTests(unittest.TestCase):
         _ = binary.write_text("fake reviewer\n")
         binary.chmod(0o700)
         _ = self.enterContext(mock.patch.object(shutil, "which", return_value=str(binary)))
+
+    def question_record(self, fields: dict[str, str], *, slug: str) -> Path:
+        folder = self.root / "proposals" / slug
+        folder.mkdir(parents=True, exist_ok=True)
+        document = self.root / f"{slug}-production.md"
+        _ = document.write_text(f"# Production — {slug}\n\n- **Proposals:** `{folder}`\n")
+        owner = fixture_member("showrunner", name=slug, doc=staff.LiveDoc("natedev", document))
+        record = folder / "question-fixture.md"
+        fields = {**fields, "asked_by": owner.id}
+        _ = record.write_text(f"---\nrecord_type: question\ntags: [question]\nstatus: open\n"
+                              + f"production_id: {owner.id}\nasked_by: {owner.id}\n"
+                              + f"registration: {json.dumps(fields)}\n---\n# {fields['text']}\n")
+        return record
+
+    def test_review_receives_catalog_purposes_and_refuses_a_matching_fixed_template(self) -> None:
+        draft = review.Draft("hana", "1", "Mac shots stopped", ActionRequired("Unlock the Mac."),
+                             "Every Mac screenshot is black.", False)
+        failure: review.RuleFailureRecord = {"rule": "use-registered-template:mac.locked", "quote": draft.body}
+        runner = FakeReviewer(verdict(draft, "withhold", failed_rules=[failure]))
+        outcome = review.review(draft, False, runner=runner)
+        self.assertIsInstance(outcome, review.Withheld)
+        self.assertIn("use-registered-template:mac.locked", outcome.failed_rules if isinstance(outcome, review.Withheld) else [])
+        prompt = runner.calls[-1].argv[runner.calls[-1].argv.index("--system-prompt") + 1]
+        for entry in push_texts.catalog():
+            if not entry.agent_written:
+                self.assertIn(f"{entry.id}: {entry.purpose}", prompt)
+        self.assertIn("return withhold with rule use-registered-template:<id>", prompt)
+
+    def test_fixed_registered_live_review_omits_template_fit_instruction(self) -> None:
+        draft = review.Draft("ups", "0", "Power is back", NoActionRequired(), "Mains power is back.", False)
+        runner = FakeReviewer(verdict(draft))
+        self.assertIsInstance(review.review(draft, False, runner=runner, text_id="nixos.ups_power_back"), review.Approved)
+        prompt = runner.calls[-1].argv[runner.calls[-1].argv.index("--system-prompt") + 1]
+        self.assertNotIn("use-registered-template:", prompt)
+        self.assertNotIn("When a registered template fits", prompt)
+
+    def test_catalog_review_omits_template_fit_instruction(self) -> None:
+        entry = push_texts.PushText("test", "script", "note", "Finished", push_texts.NoActionNeeded(),
+                                   "The check passed.", (push_texts.PushExample("typical", {}),), purpose="Test.")
+        draft = review.Draft("script", "0", entry.title, NoActionRequired(), entry.body, False)
+        runner = FakeReviewer(verdict(draft))
+        with mock.patch.object(push_texts, "catalog", return_value=(entry,)), redirect_stdout(io.StringIO()):
+            self.assertEqual(review.texts(["test"], runner=runner), 0)
+        prompt = runner.calls[-1].argv[runner.calls[-1].argv.index("--system-prompt") + 1]
+        self.assertNotIn("use-registered-template:", prompt)
+        self.assertNotIn("When a registered template fits", prompt)
 
     def test_questions_keep_multiline_headers_and_long_text_without_push_limits(self) -> None:
         for prefix in ("Session: Owner", "Action: choose one", "No action needed."):
@@ -665,9 +728,11 @@ class LocalReviewTests(unittest.TestCase):
         item = {"since": "2026-10-15T10:00", "text": "Retry build",
                 "question": "Retry it?", "reviewed": accepted}
         current = directory / "demo.json"
-        _ = current.write_text(json.dumps([item]))
+        _ = current.write_text("[]")
+        record = self.question_record(item, slug="demo")
         with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(directory.parent)}):
             self.assertIn(" ".join(accepted.split()), review.registered_questions(cutoff))
+            record.unlink()
             _ = current.write_text("[]")
             history = review.QuestionRegistration(time=datetime.now(timezone.utc).isoformat(),
                 text=item["text"], question=item["question"], reviewed=accepted)
@@ -680,7 +745,8 @@ class LocalReviewTests(unittest.TestCase):
         choices = "Yes (recommended): retry the build.\nNo: keep the current build."
         registration = self.root / "showrunner/outstanding/build.json"
         registration.parent.mkdir(parents=True)
-        _ = registration.write_text(json.dumps([{"text": question}, {"text": registered_text}]))
+        _ = registration.write_text(json.dumps([{"since": "2026-10-13T10:00", "text": question},
+                                                  {"since": "2026-10-13T10:00", "text": registered_text}]))
         cases = [(question + "\n" + choices, 0),
                  ("Would you change the compiler?\n" + choices, 1),
                  (registered_text + ".\n" + choices, 0),
@@ -705,12 +771,14 @@ class LocalReviewTests(unittest.TestCase):
             ("2026-10-13T11:00:00Z", "The build passed.", "end_turn")])
         registration = self.root / "showrunner/outstanding/build.json"
         registration.parent.mkdir(parents=True)
-        item = {"text": "Run check", "question": question, "reviewed": question}
-        _ = registration.write_text(json.dumps([item]))
+        item = {"since": "2026-10-13T10:00", "text": "Run check", "question": question, "reviewed": question}
+        _ = registration.write_text("[]")
+        record = self.question_record(item, slug="build")
         draft = review.Draft("review.sample", "0", "", NoActionRequired(), "The build passed.", False)
         for closed in (False, True):
             with self.subTest(closed=closed):
                 if closed:
+                    record.unlink()
                     _ = registration.write_text("[]")
                     _ = registration.with_suffix(".history.jsonl").write_text(
                         json.dumps(dict(item, time="2026-10-13T10:00:00+00:00")) + "\n")
@@ -797,6 +865,61 @@ class LocalReviewTests(unittest.TestCase):
                 result = review.review(self.draft, False, runner=runner)
                 self.assertIsInstance(result, expected)
                 configured.assert_called_once()
+
+    def test_unavailable_rewrite_check_keeps_original_failures_in_the_delivery_log(self) -> None:
+        revised = replace(self.draft, body="Choose whether to retry the nightly build.")
+        cases: tuple[tuple[str, Literal["none", "timeout", "json"], VerdictJSON], ...] = (
+            ("timeout", "timeout", verdict(revised)),
+            ("json", "json", verdict(revised)),
+            ("validation", "none", verdict(revised, action=None)),
+        )
+        for label, failure, second in cases:
+            with self.subTest(failure=label):
+                first = verdict(self.draft, "rewrite", body=revised.body)
+                passes = iter((FakeReviewer(first), FakeReviewer(second, failure=failure)))
+
+                def runner(argv: list[str], *, timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+                    selected = next(passes) if Path(argv[0]).name == "claude" else FakeReviewer(first)
+                    return selected(argv, timeout=timeout, env=env)
+
+                outcome = review.review(self.draft, False, runner=runner)
+                self.assertIsInstance(outcome, review.Unreviewed)
+                self.assertEqual(review.best_version(self.draft, outcome), self.draft)
+                review.log_review(self.draft, outcome, review.Sent(self.draft))
+                entry = self.entries()[-1]
+                self.assertIn("reader-starts-cold", cast(list[str], entry["failed_rules"]))
+                self.assertEqual(entry["draft"], entry["sent"])
+                self.assertTrue(cast(str, entry["verdict"]).startswith("unreviewed:"))
+
+    def test_failed_rewrite_check_logs_only_failures_from_the_draft_that_was_sent(self) -> None:
+        revised = replace(self.draft, body="Choose whether to retry the nightly build.")
+        first = verdict(self.draft, "rewrite", body=revised.body)
+        second = verdict(revised, "rewrite", action=None)
+        replies = iter((first, second))
+
+        def runner(argv: list[str], *, timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+            value = next(replies) if Path(argv[0]).name == "claude" else first
+            return FakeReviewer(value)(argv, timeout=timeout, env=env)
+
+        outcome = review.review(self.draft, False, runner=runner)
+        self.assertIsInstance(outcome, review.Unreviewed)
+        self.assertEqual(review.best_version(self.draft, outcome), self.draft)
+        review.log_review(self.draft, outcome, review.Sent(self.draft))
+        entry = self.entries()[-1]
+        self.assertEqual(entry["draft"], entry["sent"])
+        self.assertEqual(entry["failed_rules"], ["reader-starts-cold"])
+        self.assertEqual(entry["failures"], [{"rule": "reader-starts-cold", "quote": self.draft.body[:10]}])
+
+    def test_first_pass_validation_error_keeps_supported_failures_in_the_log(self) -> None:
+        value = verdict(self.draft, "rewrite", action=None)
+        outcome = review.review(self.draft, False, runner=FakeReviewer(value))
+        self.assertIsInstance(outcome, review.Unreviewed)
+        assert isinstance(outcome, review.Unreviewed)
+        self.assertEqual(outcome.why, "action form changed")
+        review.log_review(self.draft, outcome, review.Sent(self.draft))
+        entry = self.entries()[-1]
+        self.assertEqual(entry["failed_rules"], ["reader-starts-cold"])
+        self.assertEqual(entry["draft"], entry["sent"])
 
     def test_a_review_limit_caps_the_whole_review_and_a_review_out_of_time_is_unreviewed(self) -> None:
         revised = replace(self.draft, body="Choose whether to retry the nightly build.")
@@ -975,9 +1098,9 @@ class LocalReviewTests(unittest.TestCase):
                     _ = review.main(arguments)
                 self.assertEqual(error.exception.code, 2)
             texts.assert_not_called()
-            self.assertEqual(review.main(["texts", "--id", "shutdown.holdout", "--approve",
+            self.assertEqual(review.main(["texts", "--id", "shutdown.manual_restart", "--approve",
                                           "--user-spec", "User words"]), 0)
-        texts.assert_called_once_with(["shutdown.holdout"], True, authority=review.UserSpecifiedText("User words"))
+        texts.assert_called_once_with(["shutdown.manual_restart"], True, authority=review.UserSpecifiedText("User words"))
 
     def test_list_and_show_cli_print_the_catalog(self) -> None:
         listing = push_texts.listing(push_texts.catalog())
@@ -1709,6 +1832,22 @@ class LocalReviewTests(unittest.TestCase):
         self.assertTrue(self.entries()[0]["dry"])
         self.assertIsNone(self.entries()[0]["sent"])
         self.assertFalse(pushover.LOG_FILE.exists())
+
+
+class MigratedQuestionTests(RegistrationFixture):
+    def test_registered_questions_include_open_records_older_than_the_sample_window(self) -> None:
+        self.timer("example")
+        self.write_open_for("example", {"since": "2026-10-01T08:00", "text": "Choose a compiler",
+                                        "question": "Which compiler should we use?"})
+        self.outstanding().unlink()
+        _ = self.outstanding().with_suffix(".history.jsonl").write_text(json.dumps({
+            "time": "2026-10-01T08:00:00+00:00", "text": "Choose a compiler",
+            "question": "Which compiler should we use?"}) + "\n")
+        cutoff = datetime.fromisoformat("2026-10-12T00:00:00+00:00")
+        with mock.patch.dict(os.environ, self.env), production_paths(self.env):
+            questions = review.registered_questions(cutoff)
+        self.assertIn("Which compiler should we use?", questions)
+        self.assertFalse(self.outstanding().exists())
 
 
 if __name__ == "__main__":

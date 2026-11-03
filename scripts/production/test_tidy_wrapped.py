@@ -2,6 +2,7 @@
 """Tests for tidy_wrapped.py: only a wrapped production with no update timer loses its state files."""
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -9,6 +10,14 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import override
+from unittest import mock
+
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production.staff_test_support import (
+    fixture_member, isolated_source_readers, isolated_staff_file, source_environment,
+)
+from scripts.production import staff
+from scripts.production.cli_fixture import invoke_cli
 
 SCRIPT = Path(__file__).with_name("tidy_wrapped.py")
 
@@ -28,6 +37,7 @@ class TidyWrappedTests(unittest.TestCase):
         self.state = self.root / "showrunner"
         self.notifier = self.root / "notifier"
         self.notifier.mkdir()
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
 
     def write(self, path: Path, content: str) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -45,7 +55,8 @@ class TidyWrappedTests(unittest.TestCase):
     def run_tidy(self, *docs: Path) -> subprocess.CompletedProcess[str]:
         env = {**os.environ, "SHOWRUNNER_STATE_DIR": str(self.state), "NOTIFIER_STATE_DIR": str(self.notifier)}
         return subprocess.run([sys.executable, str(SCRIPT), *map(str, docs)], env=env,
-                              capture_output=True, text=True, check=False)
+                              capture_output=True, text=True, check=False,
+                              timeout=TEST_HANG_GUARD_SECS)
 
     def test_a_wrapped_production_loses_its_own_files_and_keeps_the_others(self) -> None:
         own = self.state_files("done")
@@ -57,6 +68,38 @@ class TidyWrappedTests(unittest.TestCase):
         self.assertFalse((self.state / "done").exists())
         self.assertTrue(all(path.exists() for path in other))
 
+    def test_wrap_closes_and_retains_questions_without_a_proposals_line(self) -> None:
+        import tidy_wrapped
+
+        doc = self.doc("done", "wrapped")
+        owner = fixture_member("showrunner", name="renamed-owner", doc=staff.WrappedDoc("natedev", doc))
+        other_doc = self.doc("live", "running")
+        other = fixture_member("showrunner", name="other", doc=staff.LiveDoc("natedev", other_doc))
+        records: list[Path] = []
+        for member, title in ((owner, "Choose the layout"), (other, "Choose the release")):
+            fields = {"since": "2000-01-01T08:00", "text": title,
+                      "question": title + "?", "asked_by": str(member.id)}
+            records.append(self.write(self.state / member.id / "questions/question-layout.md",
+                "---\nrecord_type: question\nstatus: open\n"
+                + f"production_id: {member.id}\nasked_by: {member.id}\n"
+                + f"registration: {json.dumps(fields)}\n---\n# {title}\n"))
+        own, unrelated = records
+        unrelated_before = unrelated.read_bytes(), unrelated.stat().st_mtime_ns
+        reminders = self.write(self.state / "outstanding/done.json", "[]\n")
+        environment = {**os.environ, **source_environment(self.root / "sources"),
+                       "HOME": str(self.root), "SHOWRUNNER_STATE_DIR": str(self.state),
+                       "NOTIFIER_STATE_DIR": str(self.notifier)}
+        with (mock.patch.dict(os.environ, environment), isolated_source_readers(),
+              mock.patch.object(tidy_wrapped, "STATE_DIR", self.state),
+              mock.patch.object(tidy_wrapped, "NOTIFIER_STATE_DIR", self.notifier)):
+            result = invoke_cli(tidy_wrapped, lambda: tidy_wrapped.main([str(doc)]),
+                                [str(doc)], environment, self.root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("status: closed", own.read_text().splitlines())
+        self.assertIn(f"asked_by: {owner.id}", own.read_text().splitlines())
+        self.assertEqual((unrelated.read_bytes(), unrelated.stat().st_mtime_ns), unrelated_before)
+        self.assertFalse(reminders.exists())
+
     def test_a_running_production_keeps_every_file(self) -> None:
         own = self.state_files("live")
         result = self.run_tidy(self.doc("live", "running"))
@@ -64,6 +107,15 @@ class TidyWrappedTests(unittest.TestCase):
         self.assertIn("kept: ", result.stderr)
         self.assertIn("live-production.md: not wrapped", result.stderr)
         self.assertTrue(all(path.exists() for path in own))
+
+    def test_wrap_removes_its_answered_history_and_keeps_another_productions(self) -> None:
+        answered = self.write(self.state / "outstanding/done.answered.jsonl", '{"text":"answered question"}\n')
+        other = self.write(self.state / "outstanding/live.answered.jsonl", '{"text":"keep this answer"}\n')
+        before = other.read_bytes()
+        result = self.run_tidy(self.doc("done", "wrapped"))
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "done: removed 1 state file\n", ""))
+        self.assertFalse(answered.exists())
+        self.assertEqual(other.read_bytes(), before)
 
     def test_a_wrapped_doc_whose_timer_remains_keeps_every_file(self) -> None:
         own = self.state_files("done")

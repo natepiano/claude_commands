@@ -8,32 +8,9 @@ from __future__ import annotations
 import json
 import os
 import socket
-import tempfile
 from pathlib import Path
-from typing import override
 
-
-class _SessionSocket(socket.socket):
-    """A session socket that owns its short path and private directory until close."""
-
-    def __init__(self) -> None:
-        super().__init__(socket.AF_UNIX)
-        self._socket_path: Path = Path(tempfile.mkdtemp(prefix="showrunner-", dir="/tmp")) / "s"
-
-    @override
-    def close(self) -> None:
-        try:
-            super().close()
-        finally:
-            self._socket_path.unlink(missing_ok=True)
-            try:
-                self._socket_path.parent.rmdir()
-            except FileNotFoundError:
-                pass
-
-    def bind_session(self) -> Path:
-        self.bind(str(self._socket_path))
-        return self._socket_path
+from scripts.lib.socket_test_support import ShortUnixSocket
 
 
 def write_timer(notifier_dir: Path, slug: str, session_id: str, zone: str, doc: Path | str) -> Path:
@@ -60,9 +37,9 @@ def write_session(sessions_dir: Path, name: str, session_id: str, pid: int | Non
     """Record a live Claude session called `name`. The caller closes the returned socket at cleanup."""
     sessions_dir.mkdir(parents=True, exist_ok=True)
     process = os.getpid() if pid is None else pid
-    held = _SessionSocket()
+    held = ShortUnixSocket()
     try:
-        path = held.bind_session()
+        path = held.bind_socket()
         _ = (sessions_dir / f"{process}.json").write_text(json.dumps({
             "pid": process, "sessionId": session_id, "name": name, "messagingSocketPath": str(path),
             "updatedAt": 1, "tmux": ""}), encoding="utf-8")

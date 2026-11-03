@@ -114,8 +114,8 @@ def inventory(root: Path, entry: str = "commands/unit/direct.md") -> TagInventor
     all_bodies = [body for path, text in documents.items() for body in _bodies(path, text)]
     routes = {path: dict(_table_routes(text)) for path, text in documents.items()}
     # Table files and their document dependencies share the contract namespace.
-    # Other commands join it only through a table; a linked command's own Guild
-    # and other private sections stay outside this command's namespace.
+    # Other commands join it only through a table; a linked command's private
+    # sections stay outside this command's namespace.
     primary = {entry}
     pending = [entry]
     while pending:

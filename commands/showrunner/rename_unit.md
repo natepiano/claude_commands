@@ -1,9 +1,18 @@
 ---
-description: Rename one unit of this production. It stops the unit, moves every place that names it, relaunches it and verifies the result.
+description: Rename a unit and its records.
 argument-hint: "<old> <new>"
 ---
 
 # Rename unit
+
+Move a folder without a rename only at a phase boundary:
+
+```sh
+python3 ~/.claude/scripts/production/unit_move.py move-folder --unit <staff id> --to <path>
+```
+
+The command keeps the branch, account, conversation and pane.
+A stopped unit stays down. Rerun the command after an interruption.
 
 Run from the showrunner session, at any time, also in the middle of a phase. `<old>` is the unit's id, its stem, or its Claude session's name. When the id already is `<new>`, only the session takes the new name: the plan shows the other steps as already matching.
 `<new>` can be an id or a stem, and it becomes `<stem>-unit`. A stem starting with `<slug>-`
@@ -28,9 +37,10 @@ The script lives at
 2. Run `apply` once, in the background: one run does the whole rename, with no rerun. It waits for the
    unit to stop (up to an hour), for a merge gate that is running, and for the relaunched unit to come
    up. It journals each step, so a rerun after a refusal resumes from the step that stopped. The steps are:
-   1. stop the unit and its Codex workers at once through the shutdown path (`down`, then `now`), then
-      stop its runs' app-servers (`codex_mesh.py stop`) and SIGTERM their supervisors and app-server
-      watchers left in the worktree;
+   1. stop the unit through the shutdown path (`down`, then `now`), then pause its runs' workers
+      (`codex_mesh.py stop --pause`) and SIGTERM the processes left in the worktree, except a paused
+      worker's detached run. While such a run works inside the worktree, apply refuses: `detached run
+      <id> of <worker> works inside <worktree>; rerun apply once it ends`;
    2. merge the merge branch into the unit, except while its work is in progress (an open phase or
       uncommitted work): then the branch keeps its tip, steps 2 and 6 merge nothing, and the unit
       takes the merge branch and the rename commit at its own next merge;
