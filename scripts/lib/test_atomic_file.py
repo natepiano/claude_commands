@@ -14,6 +14,26 @@ from scripts.lib.atomic_file import write_text_atomic
 
 
 class AtomicFileTests(unittest.TestCase):
+    def test_new_file_mode_publishes_complete_private_text_and_preserves_existing_permissions(self) -> None:
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "private.json"
+                if existing:
+                    _ = path.write_text("old content")
+                    path.chmod(0o640)
+                replace = os.replace
+
+                def publish(temporary: Path, destination: Path) -> None:
+                    self.assertEqual(destination.exists(), existing)
+                    self.assertEqual(temporary.read_text(), '{"complete": true}')
+                    self.assertEqual(stat.S_IMODE(temporary.stat().st_mode), 0o640 if existing else 0o600)
+                    replace(temporary, destination)
+
+                with patch.object(os, "replace", side_effect=publish):
+                    write_text_atomic(path, '{"complete": true}', new_file_mode=0o600)
+                self.assertEqual(path.read_text(), '{"complete": true}')
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o640 if existing else 0o600)
+
     def test_publication_failure_identifies_whether_the_complete_replacement_is_visible(self) -> None:
         for binary in (False, True):
             for stage in ("write", "flush", "fsync", "replace", "folder fsync"):

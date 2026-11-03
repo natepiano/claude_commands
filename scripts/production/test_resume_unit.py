@@ -64,6 +64,16 @@ class ResumeUnitTests(unittest.TestCase):
     calls: list[list[str]] = []
     launch_code: int = 0
 
+    def test_resume_command_uses_the_row_name_and_current_native_session(self) -> None:
+        row = unit_membership("alpha", "alpha-unit")
+        self.assertNotEqual(row.id, row.current_session)
+        unit = resume_unit.find_unit("alpha", "alpha")
+        self.assertEqual(unit.display_name, row.name)
+        command = resume_unit.launch_command(replace(unit, name="stale-table-unit"))
+        self.assertEqual(command[command.index("--production") + 2], row.name)
+        self.assertEqual(command[command.index("--resume") + 1], row.current_session)
+        self.assertNotIn("STAFF_ID", " ".join(command))
+
     def test_current_config_only_resume_keeps_recovery_facts_after_a_failed_launch(self) -> None:
         row = unit_membership("alpha", "alpha-unit")
         saved = unit_config.read_parked(row.id)
@@ -212,7 +222,7 @@ class ResumeUnitTests(unittest.TestCase):
 
     def assert_resumed(self, code: int, output: str) -> None:
         self.assertEqual(code, 0, output)
-        self.assertEqual(self.calls[-1], ["add_unit.py", "--production", str(self.doc), "alpha-unit", "--resume", DIRECTOR,
+        self.assertEqual(self.calls[-1], ["add_unit.py", "--production", str(self.doc), "alpha", "--resume", DIRECTOR,
                                           "--cwd", str(self.worktree), "--plan", "docs/plans/alpha.md"])
         self.assertEqual(git(self.worktree, "branch", "--show-current"), "alpha-branch")
         self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), git(self.checkout, "rev-parse", "main~1"))
@@ -551,7 +561,7 @@ class ResumeUnitTests(unittest.TestCase):
         code, output = self.resume()
 
         self.assertEqual(code, 0, output)
-        self.assertEqual(self.calls, [["add_unit.py", "--production", str(self.doc), "alpha-unit",
+        self.assertEqual(self.calls, [["add_unit.py", "--production", str(self.doc), "alpha",
                                       "--resume", DIRECTOR, "--cwd", str(self.worktree), "--plan", plan]])
         self.assertIn(f"| `{plan}` (run done) |", self.row())
         self.assertNotIn("(retired", self.row())
@@ -679,7 +689,7 @@ class ResumeUnitTests(unittest.TestCase):
         self.write_row(f"(retired 2026-10-28, worktree removed, session {DIRECTOR}, folder {folder}) `docs/plans/alpha.md` (run done)")
         code, output = self.resume()
         self.assertEqual(code, 0, output)
-        self.assertEqual(self.calls, [["add_unit.py", "--production", str(self.doc), "alpha-unit", "--resume", DIRECTOR,
+        self.assertEqual(self.calls, [["add_unit.py", "--production", str(self.doc), "alpha", "--resume", DIRECTOR,
                                       "--cwd", str(folder), "--plan", "docs/plans/alpha.md"]])
         self.assertTrue(self.worktree.is_dir())
         self.assertIn("| `docs/plans/alpha.md` (run done) |", self.row())
