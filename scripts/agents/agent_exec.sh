@@ -16,34 +16,11 @@ agents_exec_print_argv() {
     done
 }
 
-# claude --print with --output-format stream-json writes one JSON event per
-# line to the log as it happens (so heartbeat_watch.sh can narrate long turns);
-# this extracts the final result event's text into the output file to keep the
-# caller contract: output_file = final answer, log_file = full log.
+# Every Claude print launch sets CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1.
+# An is_error result or errors array gives ERROR: <reason> and exit 1.
+# The output holds the final answer. The log holds the complete event stream.
 agents_claude_extract_result() {
-    "$PY" - "$1" "$2" <<'PY'
-import json
-import sys
-
-log_path, out_path = sys.argv[1], sys.argv[2]
-result = None
-try:
-    with open(log_path, encoding="utf-8", errors="replace") as log:
-        for line in log:
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") == "result" and isinstance(event.get("result"), str):
-                result = event["result"]
-except OSError:
-    pass
-with open(out_path, "w", encoding="utf-8") as out:
-    out.write(result if result is not None else "")
-PY
+    "$PY" "$(dirname "${BASH_SOURCE[0]}")/claude_result.py" "$1" "$2"
 }
 
 agents_exec_main() {
@@ -58,7 +35,7 @@ agents_exec_main() {
     local prompt_file="$4"
     local output_file="$5"
     local log_file="$6"
-    local script_dir prompt family_args_line claude_code workers_home
+    local script_dir prompt family_args_line claude_code workers_home extraction_code
     local -a family_args extra_args command task_args=()
 
     if [[ ! -f "$prompt_file" ]]; then
@@ -122,10 +99,20 @@ agents_exec_main() {
             ;;
         claude)
             source "$script_dir/claude_account.sh"
-            claude_launch_environment workers || return 1
+            if [[ "$task" == direct.simplify ]]; then
+                if [[ "${AGENT_EXEC_DRY_RUN:-}" == 1 ]]; then
+                    claude_launch_environment quota || return 1
+                else
+                    claude_launch_environment quota 2>"$log_file" || return 1
+                    cat "$log_file" >&2
+                fi
+            else
+                claude_launch_environment workers || return 1
+                [[ "${AGENT_EXEC_DRY_RUN:-}" == 1 ]] || : > "$log_file"
+            fi
             family_args_line="$(agents_claude_args)"
             read -r -a family_args <<< "$family_args_line"
-            command=("$PY" "$script_dir/../lib/nix_env.py" exec "$(command -v claude)" --print)
+            command=(env CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 "$PY" "$script_dir/../lib/nix_env.py" exec "$(command -v claude)" --print)
             if [[ "$mode" == "write" ]]; then
                 command+=(--dangerously-skip-permissions)
             else
@@ -156,8 +143,12 @@ agents_exec_main() {
                 return 0
             fi
             claude_code=0
-            ( cd "$working_dir" && "${command[@]}" < "$prompt_file" > "$log_file" 2>&1 ) || claude_code=$?
-            agents_claude_extract_result "$log_file" "$output_file" || true
+            ( cd "$working_dir" && "${command[@]}" < "$prompt_file" >> "$log_file" 2>&1 ) || claude_code=$?
+            extraction_code=0
+            agents_claude_extract_result "$log_file" "$output_file" || extraction_code=$?
+            if [[ "$extraction_code" == 1 ]]; then
+                claude_code=1
+            fi
             return "$claude_code"
             ;;
         *)
@@ -167,4 +158,6 @@ agents_exec_main() {
     esac
 }
 
-agents_exec_main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    agents_exec_main "$@"
+fi

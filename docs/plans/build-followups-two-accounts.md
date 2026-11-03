@@ -3104,3 +3104,37 @@ User 2026-11-02 "go", via natedev: the `codex` alias set a numbered `CODEX_HOME`
 User 2026-11-02 (via the Mac session): "the accounts board should show the counts for all configured machines for both Mac and for Nate Dev. If Mac is unavailable, it should show that."
 
 **As-built:** each status pass in `scripts/accounts/accounts.py` publishes this machine's per-account busy, shell, idle and total counts to `~/.local/state/accounts/session_counts.json` (`_publish_session_counts`), keyed by the machine alias. `_start_session_counts_fetch` starts a detached fetch of the other machine's file under a nonblocking lock, through `role_map.ssh_role_map(..., machine=)`, into `peer_session_counts.json`; the board read never waits on ssh. `_machine_role_counts` sums both machines into each count column and keeps them apart in the JSON field `role_counts_by_machine`. A missing, damaged, failed or older-than-ten-minutes copy adds one problem line, `<machine> unavailable: counts are <this machine> only`, and the board shows local counts. Legacy `~/.codex` sessions count, and numbered Codex homes count under `codex_home_label()`. The unit-board hook and types read the new field. Three findings closed in two repair rounds (F001 machine alias; F002 legacy `~/.codex` counts; F003 numbered-home label).
+
+### Phase 101v — Status reads stay read-only and test runs start no ssh  · status: done · cc347b39
+
+natedev 2026-11-02 (urgent): main was red from 101u (069010236): `test_role_map` and `test_refusal_watch`, 4 failures and 1 error.
+
+**As-built:** `_count_role_sessions` counts in memory and writes no file; `_session_counts_document` (was `_publish_session_counts`) builds the document that `session-counts-read` prints, and `_session_counts_file` is gone. `_machine_role_counts` takes the status `UsageSource` and starts the detached fetch only for `RefreshStaleUsage`, so `status --stored` reads only `peer_session_counts.json` and opens no lock. `test_role_map.py`, `test_refusal_watch.py` and `test_cutover_home.py` stub `_start_session_counts_fetch` for the whole module. New test `test_stored_status_starts_no_counts_fetch_and_writes_nothing`. 3251 tests in the accounts modules and their importers pass. No code review ran (urgent red-main repair; the director read the diff).
+
+### Phase 101x — The Mac voice setting stays local  · status: done · 0dc14b47
+
+natedev 2026-11-02 (urgent): the user turned on voice on the Mac; its `settings.json` gained a top-level `voice` key, and promotion and claude-sync refused the tracked edit from about 16:00 EST.
+
+**As-built:** `voice` joins `SETTINGS_LOCAL_KEYS_JSON` in `scripts/settings/settings_local_keys.sh`, beside `theme`. The Mac fixture in `scripts/settings/test_settings_local_keys.py` has `voice: {enabled: true, mode: hold}`; the cleaned copy has no `voice` key and the sidecar merge puts the full object back. Tests were not run at the checkpoint (hana build hold); the merge gate runs them.
+
+### Phase 101w — Account tunables live in config  · status: done · 5d9b3eec
+
+natedev 2026-11-02: the hard-coded values proposal, phase 3 (user approved 2026-11-01).
+
+**As-built:** `config/accounts.conf` holds one commented key per accounts tunable (timeouts, intervals, ages, counts, the nixos and notes path roots), each with its old value; the code reads each key at use through `scripts/lib/conf.py` with no fallback literal. Owner loops (refusal watch placement and pick) read the usage age once and pass it down. `scripts/whoami/note_file.py` resolves the notes folder as `AGENT_NOTES_DIR`, then the `AGENTS_DIR` override, then `notes_directory`, read once per process (`functools.cache`); `new_account.py` and the missing-note repair steps in `accounts.py` use that one helper. Tests run on a scratch `CONF_DIR` copy (`scratch_accounts_config` in `scripts/accounts/home_test_support.py`); caller test fixtures that clear `CONF_DIR` (herdr sessions, account move, send, codex mesh, profile notes pass) enter it too. `docs/accounts.md` names the file and says a change needs no build, and a new process for a notes-folder change.
+
+### Phase 101z — Accounts config reads work in temp-home tests  · status: done · 046009a3b
+**Depends on:** Phase 101w (order only).
+
+**As-built:** `scripts/lib/conf.py` resolves a value from the live file, then, for the default `~/.claude/config` only, the repository's `config/<stem>.conf` when the file or key is absent, then Git recovery. `CONF_DIR` stays authoritative: a missing value there still refuses. Invalid present values keep Git recovery. `value_origin`, the typed readers and `values` share `_resolve` and `_repository_path`. `scripts/lib/test_conf.py` covers each case. Full merge gate passed; merged to main 4da324700.
+
+### Phase 101y — A new settings key on one machine never blocks promotion  · status: done
+**Depends on:** Phase 101x (order only; both edit `scripts/settings/settings_local_keys.sh`).
+
+natedev 2026-11-02 accepted the general rule after 101x: a top-level key in the live `~/.claude/settings.json` that `HEAD`'s `settings.json` does not have is machine-local by default.
+
+**As-built:** The clean and smudge filters keep the listed keys (`theme` and `voice` included) and every live top-level key absent from `HEAD:settings.json` on the machine, in the sidecar, and strip them from the tracked copy. A key that an incoming committed blob supplies becomes shared once `HEAD` holds it; a listed key stays local. An unreadable committed baseline is an error, never an empty baseline. `clean_settings_json.sh` reads stdin once into a temporary file; the snapshot (`settings_local_keys_snapshot <input path>`) and the clean read that one copy and record one notice per new local key in a ledger apart from the sidecar. `refresh_filtered_index.sh` and `ensure_git_filters.sh` call `git_filters_refresh_all`, stop with `<name>: clean failed; index refresh stopped.` on a failed clean, then run `settings_local_keys_notices deliver`, which sends through `scripts/settings/local_key_notices.py` to `local_key_notice_to` in `config/settings.conf` (initial value `natedev`), read at use. An accepted notice does not repeat for the same key and machine; a failed one stays for retry. `git_filters_refresh_path` copies the file once, takes its raw hash and guarded clean from that copy, and skips the path when the index entry is unmerged, when the clean output differs from the index blob, or (with `core.filemode` on) when the executable bit differs from the index mode. Otherwise it runs `update-index -q --refresh -- <path>` with a clean override that returns the index blob only while the stdin raw hash and `:<path>` still match, so a concurrent edit or staging is never hidden. Tests in `test_settings_local_keys.py` and `test_local_key_notices.py` use scratch repositories and a fake sender.
+
+**Gotchas:** a path after `update-index --refresh` is an index update: it can stage a mode change or replace unmerged entries, so the override checks both hashes under Git's index lock. A path-less `--refresh` runs no clean filter when the raw and cleaned sizes differ.
+
+**Ruled out:** a temporary index published under the real index lock — the checked path form gives the same guarantee with less machinery.

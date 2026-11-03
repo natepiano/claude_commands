@@ -7,28 +7,19 @@ import html
 import json
 import re
 import secrets
-import subprocess
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from scripts.lib import urgency
-from scripts.production import change_review, showrunners, staff
-from scripts.production.production_units import Refusal, cell_value, production_field, unit_table
+from scripts.production import change_review, change_routing, showrunners, staff
+from scripts.production.change_routing import UnavailableProduction, list_documents
 from scripts.production.proposals_folder import slug_of
 from scripts.review_links import change_page
 from scripts.review_links.change_page import ReviewBrowser as ReviewBrowser
 
 MANIFEST = change_page.BROWSER_MANIFEST
-
-
-@dataclass(frozen=True)
-class UnavailableProduction:
-    review_list: Path
-    reason: str = "The production document is not available. This change cannot accept an answer."
 
 
 @dataclass(frozen=True)
@@ -38,10 +29,13 @@ class WaitingChange:
     page: change_page.AssignedReviewPage | UnavailableProduction
     row: dict[str, str]
     validation_requested: bool = False
+    anomaly: str = ""
+    question: change_page.NoQuestion | change_page.OpenQuestion | change_page.AnsweredQuestion = change_page.NoQuestion()
 
     @property
     def waiting(self) -> bool:
-        return not self.row.get("Verdict") and not self.validation_requested
+        return (not self.row.get("Verdict") and not self.validation_requested
+                and not (isinstance(self.question, change_page.OpenQuestion) and self.question.awaiting_answer))
 
 
 @dataclass(frozen=True)
@@ -49,23 +43,6 @@ class PreparedReviews:
     changes: tuple[WaitingChange, ...]
     queues: dict[str, change_review.ChangeQueue]
     delivery: change_page.DeliveryReadView
-
-
-@dataclass(frozen=True)
-class CommitNode:
-    parents: tuple[str, ...]
-    message: str
-
-
-@dataclass(frozen=True)
-class CheckpointSelection:
-    repository: Path
-    commits: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class NoCheckpoints:
-    """No known checkpoint identifies this row's unit."""
 
 
 def page_at(root: Path, path: str) -> ReviewBrowser:
@@ -94,213 +71,6 @@ def row_token(browser: ReviewBrowser, key: str) -> str:
     return hmac.new(browser.token.encode(), key.encode(), hashlib.sha256).hexdigest()
 
 
-def list_documents(text: str) -> list[Path]:
-    front = text.split("---", 2)
-    if len(front) != 3:
-        return []
-    documents: list[Path] = []
-    productions = False
-    for line in front[1].splitlines():
-        if line and not line[0].isspace():
-            productions = line.strip() == change_review.PRODUCTIONS + ":"
-        if productions and (match := re.match(r"\s+-\s+(.+)$", line)):
-            path = Path(match[1].strip('"\'')).expanduser()
-            if path.is_absolute() and path.is_file():
-                documents.append(path)
-    return documents
-
-
-class StaffRouting:
-    """Read staff edges and commit messages once, without a live session probe."""
-
-    def __init__(self, record: staff.StaffSnapshot, documents: dict[str, Path]) -> None:
-        self.runners: dict[staff.StaffId, staff.StaffRow] = {r.id: r for r in record.rows if r.kind == "showrunner"}
-        self.units: tuple[staff.StaffRow, ...] = tuple(r for r in record.rows if r.kind == "unit" and r.parent in self.runners)
-        self.documents: dict[str, Path] = documents
-        self.graphs: dict[Path, dict[str, CommitNode]] = {}
-        self.hashes: dict[Path, dict[str, list[str]]] = {}
-        self.ancestors: dict[Path, dict[str, int]] = {}
-        self.checkpoints: dict[Path, int] = {}
-        self.commit_order: dict[Path, list[str]] = {}
-        self.loaded_messages: dict[Path, set[str]] = defaultdict(set)
-        self.unit_cache: dict[str, set[staff.StaffId]] = {}
-        self.list_paths: dict[str, Path] = {}
-        self.repositories: dict[str, Path] = {}
-        self.repository_keys: dict[Path, Path] = {}
-        self.selections: dict[tuple[str, str, str], CheckpointSelection | NoCheckpoints] = {}
-        self.branches: dict[str, set[staff.StaffId]] = defaultdict(set)
-        for runner in self.runners.values():
-            if isinstance(runner.doc, (staff.LiveDoc, staff.WrappedDoc)) and runner.doc.path.is_file():
-                self.documents[runner.name] = runner.doc.path
-                self.documents[slug_of(runner.doc.path)] = runner.doc.path
-        for doc in dict.fromkeys(self.documents.values()):
-            names = [name for name, known in self.documents.items() if known == doc]
-            try:
-                lines = doc.read_text(encoding="utf-8").splitlines()
-                repository = Path(production_field(lines, "Showrunner checkout")).expanduser()
-                self.repositories.update(dict.fromkeys(names, repository))
-                try:
-                    review_list = Path(production_field(lines, "Change review")).expanduser()
-                    self.list_paths.update(dict.fromkeys(names, review_list))
-                except Refusal:
-                    pass
-                for cells in unit_table(lines):
-                    unit_name = cell_value(cells.get("Unit", ""))
-                    for unit in self.units:
-                        if unit_name == unit.name or unit_name.endswith("-" + unit.name):
-                            for column in ("Branch", "Plan", "Worktree"):
-                                value = cell_value(cells.get(column, ""))
-                                if value:
-                                    self.branches[Path(value).stem].add(unit.id)
-            except (OSError, Refusal):
-                continue
-
-    def repository_key(self, repo: Path) -> Path:
-        if repo not in self.repository_keys:
-            directory = repo / ".git"
-            if directory.is_file():
-                value = directory.read_text(encoding="utf-8").removeprefix("gitdir:").strip()
-                directory = repo / value
-            common = directory / "commondir"
-            if common.is_file():
-                directory /= common.read_text(encoding="utf-8").strip()
-            self.repository_keys[repo] = directory.resolve()
-        return self.repository_keys[repo]
-
-    def graph(self, repo: Path) -> dict[str, CommitNode]:
-        if repo not in self.graphs:
-            result = subprocess.run(["git", "--git-dir", str(repo), "log", "--all", "--reverse", "--topo-order",
-                                     "--format=%H%x1f%s", "--"], capture_output=True, text=True, check=False)
-            graph: dict[str, CommitNode] = {}
-            ancestors: dict[str, int] = {}
-            checkpoints = 0
-            order: list[str] = []
-            if result.returncode == 0:
-                records = [line.split("\x1f", 1) for line in result.stdout.splitlines()]
-                parent_rows = change_review.read_commit_parents(repo, (record[0] for record in records))
-                for sha, subject in records:
-                    parents = parent_rows[sha]
-                    graph[sha] = CommitNode(parents, subject)
-                    inherited = 0
-                    for parent in parents:
-                        inherited |= ancestors.get(parent, 0)
-                    if subject.startswith("checkpoint("):
-                        bit = 1 << len(order)
-                        order.append(sha)
-                        inherited |= bit
-                        checkpoints |= bit
-                    ancestors[sha] = inherited
-            self.graphs[repo] = graph
-            self.ancestors[repo] = ancestors
-            self.checkpoints[repo] = checkpoints
-            self.commit_order[repo] = order
-            prefixes: dict[str, list[str]] = defaultdict(list)
-            for sha in graph:
-                prefixes[sha[:7]].append(sha)
-            self.hashes[repo] = prefixes
-        return self.graphs[repo]
-
-    def checkpoint_unit(self, message: str) -> set[staff.StaffId]:
-        match = re.match(r"checkpoint\(([^)]+)\):", message)
-        if match is None:
-            return set()
-        name = match[1]
-        if name in self.unit_cache:
-            return self.unit_cache[name]
-        exact = self.branches.get(name, set())
-        if exact:
-            return exact
-        matches = [unit for unit in self.units if name == unit.name or name.endswith("-" + unit.name)
-                   or isinstance(unit.worktree, (staff.PresentWorktree, staff.RemovedWorktree))
-                   and unit.worktree.path.name == name]
-        longest = max((len(unit.name) for unit in matches), default=0)
-        found = {unit.id for unit in matches if len(unit.name) == longest}
-        self.unit_cache[name] = found
-        return found
-
-    def selection(self, row: dict[str, str], fallback: str) -> CheckpointSelection | NoCheckpoints:
-        production = row.get(change_review.PRODUCTION, "")
-        key = (production, row.get("Merged", ""), fallback)
-        if key in self.selections:
-            return self.selections[key]
-        selected: CheckpointSelection | NoCheckpoints = NoCheckpoints()
-        repo = self.repositories.get(production) or self.repositories.get(fallback)
-        match = re.search(r"\b[0-9a-f]{7,40}\b", row.get("Merged", ""))
-        if self.units and repo is not None and match is not None:
-            repo = self.repository_key(repo)
-            graph = self.graph(repo)
-            hashes = [sha for sha in self.hashes[repo].get(match[0][:7], []) if sha.startswith(match[0])]
-            if len(hashes) == 1:
-                commit = graph[hashes[0]]
-                ancestors = self.ancestors[repo]
-                if len(commit.parents) > 1:
-                    included = ancestors.get(commit.parents[1], 0) & ~ancestors.get(commit.parents[0], 0)
-                elif graph[hashes[0]].message.startswith("checkpoint("):
-                    included = 1 << self.commit_order[repo].index(hashes[0])
-                else:
-                    included = 0
-                included &= self.checkpoints[repo]
-                commits: list[str] = []
-                while included:
-                    bit = included & -included
-                    included ^= bit
-                    sha = self.commit_order[repo][bit.bit_length() - 1]
-                    if self.checkpoint_unit(graph[sha].message):
-                        commits.append(sha)
-                selected = CheckpointSelection(repo, tuple(commits))
-        self.selections[key] = selected
-        return selected
-
-    def read_messages(self, selection: CheckpointSelection) -> None:
-        repo = selection.repository
-        missing = set(selection.commits) - self.loaded_messages[repo]
-        if not missing:
-            return
-        result = subprocess.run(["git", "--git-dir", str(repo), "log", "--no-walk", "--stdin",
-                                 "--format=%x1e%H%x1f%B", "--"], input="\n".join(sorted(missing)) + "\n",
-                                capture_output=True, text=True, check=False)
-        if result.returncode:
-            raise change_review.ChangeReviewError("cannot read checkpoint messages")
-        graph = self.graphs[repo]
-        for part in result.stdout.split("\x1e")[1:]:
-            sha, message = part.split("\x1f", 1)
-            graph[sha] = CommitNode(graph[sha].parents, message)
-        self.loaded_messages[repo].update(missing)
-
-    def candidate_units(self, selection: CheckpointSelection) -> set[staff.StaffId]:
-        return {unit for sha in selection.commits
-                for unit in self.checkpoint_unit(self.graphs[selection.repository][sha].message)}
-
-    def owner(self, row: dict[str, str], fallback: str) -> str:
-        selection = self.selection(row, fallback)
-        if isinstance(selection, CheckpointSelection):
-            candidates = self.candidate_units(selection)
-            if len(candidates) > 1:
-                self.read_messages(selection)
-                for sha in selection.commits:
-                    message = self.graphs[selection.repository][sha].message
-                    if any(isinstance(item, change_review.Visible) and item.change == row.get("Change")
-                           for item in change_review.entries(message)):
-                        candidates = self.checkpoint_unit(message)
-                        break
-            if len(candidates) == 1:
-                identity = next(iter(candidates))
-                unit = next(unit for unit in self.units if unit.id == identity)
-                if unit.parent is not None and unit.parent in self.runners:
-                    return self.runners[unit.parent].name
-        return fallback
-
-    def production_for_list(self, path: Path) -> Path | UnavailableProduction:
-        """Use the registered production or the list's existing production references."""
-        name = path.stem.removeprefix(change_review.PREFIX)
-        candidates = ([self.documents[name]] if name in self.documents else [])
-        candidates.extend(doc for key, doc in self.documents.items() if self.list_paths.get(key) == path)
-        for doc in candidates:
-            if any(repo_name in self.repositories and known == doc
-                   for repo_name, known in self.documents.items()):
-                return doc
-        return UnavailableProduction(path)
-
 
 def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> PreparedReviews:
     delivery = status.read_view()
@@ -313,25 +83,9 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
             _ = documents.setdefault(slug_of(doc), doc)
         if docs:
             _ = documents.setdefault(path.stem.removeprefix(change_review.PREFIX), docs[0])
-    routing = StaffRouting(staff.snapshot(), documents)
-    repositories = {routing.repository_key(repo)
-                    for path, snapshot in snapshots.items() for row in snapshot.pending
-                    if routing.units and row.get("Merged") and (repo := routing.repositories.get(row.get(change_review.PRODUCTION, ""))
-                                             or routing.repositories.get(path.stem.removeprefix(change_review.PREFIX))) is not None}
-    if len(repositories) > 1:
-        with ThreadPoolExecutor() as executor:
-            _ = tuple(executor.map(routing.graph, repositories))
-    messages: dict[Path, set[str]] = defaultdict(set)
-    for path, snapshot in snapshots.items():
-        fallback = path.stem.removeprefix(change_review.PREFIX)
-        for row in snapshot.pending:
-            selection = routing.selection(row, fallback)
-            if isinstance(selection, CheckpointSelection) and len(routing.candidate_units(selection)) > 1:
-                messages[selection.repository].update(selection.commits)
-    if messages:
-        with ThreadPoolExecutor() as executor:
-            _ = tuple(executor.map(routing.read_messages,
-                                   (CheckpointSelection(repo, tuple(commits)) for repo, commits in messages.items())))
+    routing = change_routing.StaffRouting(staff.snapshot(), documents, change_review)
+    routing.prepare((path.stem.removeprefix(change_review.PREFIX), snapshot.pending)
+                    for path, snapshot in snapshots.items())
     grouped: dict[str, list[WaitingChange]] = {path.stem.removeprefix(change_review.PREFIX): [] for path in snapshots}
     grouped.update({runner.name: [] for runner in routing.runners.values()})
     defaults: dict[str, Path] = {}
@@ -342,15 +96,18 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
         recovery = [row for row in snapshot.reviewed if isinstance(delivery.slots(
             change_page.ReviewPage(path, path, (row["#"],), ""), row["#"]).selected(True), change_page.DeliveryIntent)]
         for row in [*snapshot.pending, *recovery]:
-            tab = routing.owner(row, fallback)
+            owner = routing.owner(row, fallback)
+            tab = owner.tab
             key = fallback + "/" + row["#"]
-            doc = routing.documents.get(tab) if tab != fallback and tab in routing.repositories else None
+            doc = (routing.documents.get(tab) if isinstance(source_doc, Path)
+                   and tab != fallback and tab in routing.repositories else None)
             doc = doc or source_doc
-            page = (change_page.AssignedReviewPage(path, doc, (row["#"],), row_token(browser, key), tab)
+            page = (change_page.AssignedReviewPage(path, doc, (row["#"],), row_token(browser, key), owner)
                     if isinstance(doc, Path) else doc)
-            validation = delivery.slots(change_page.ReviewPage(path, path, (row["#"],), ""), row["#"]).validation
+            slots = delivery.slots(change_page.ReviewPage(path, path, (row["#"],), ""), row["#"])
             grouped.setdefault(tab, []).append(WaitingChange(
-                key, tab, page, row, isinstance(validation, change_page.ValidationRequested)))
+                key, tab, page, row, isinstance(slots.validation, change_page.ValidationRequested),
+                owner.note if isinstance(owner, change_routing.UnroutedChange) else "", slots.question))
     queues: dict[str, change_review.ChangeQueue] = {}
     changes: list[WaitingChange] = []
     for tab, items in sorted(grouped.items()):
@@ -383,27 +140,34 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
         changes.extend(by_key[entry.key] for entry in urgency.queue_order(prepared.entries, prepared.name))
         changes.extend(item for item in items if not item.waiting)
         queues[tab] = prepared
+    queues = dict(sorted(queues.items(), key=lambda item: not item[1].entries))
     return PreparedReviews(tuple(changes), queues, delivery)
 
 
 def section(change: WaitingChange, status: change_page.DeliveryReadView) -> str:
     page, row = change.page, change.row
+    anomaly = f"<p>{html.escape(change.anomaly)}</p>" if change.anomaly else ""
     if isinstance(page, UnavailableProduction):
         return f'''<section hidden data-key="{html.escape(change.key)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
 <p class="kind">{html.escape(row.get(change_review.KIND) or 'Kind not recorded')}</p>
 <div class="id">{html.escape(change.key)}</div><h1>{html.escape(row.get('Change', ''))}</h1>
-<h2>Proof</h2><pre>{html.escape(row.get(change_review.CHECK, ''))}</pre><p>{html.escape(page.reason)}</p></section>'''
+<h2>Proof</h2><pre>{html.escape(row.get(change_review.CHECK, ''))}</pre>
+{anomaly}{change_page.question_html(change.question)}<p>{html.escape(page.reason)}</p></section>'''
     verdict = row.get("Verdict", "")
     intent = status.slots(page, row["#"]).selected(bool(verdict))
     notice = ""
     retry = ""
     feedback = ""
     if isinstance(intent, change_page.DeliveryIntent):
-        feedback = intent.feedback
+        feedback = change.question.text if isinstance(change.question, change_page.OpenQuestion) else intent.feedback
         notice = ("The message may not have sent" if intent.state == "pending"
-                  else "Saved, but the message did not send" if verdict else "The validation message did not send")
+                  else "Saved, but the message did not send" if verdict
+                  else "The question message did not send" if isinstance(change.question, change_page.OpenQuestion)
+                  else "The validation message did not send")
         if not verdict:
-            retry = '<button type="button" data-resend>Send validation request again</button>'
+            retry = ('<button type="button" data-resend data-outcome="retry">Send question again</button>'
+                     if isinstance(change.question, change_page.OpenQuestion)
+                     else '<button type="button" data-resend>Send validation request again</button>')
     form = change_page.answer_form(page, change_page.AnswerNotice(row["#"], feedback=feedback))
     if verdict:
         form = f'''<form method="post"><input type="hidden" name="row" value="{html.escape(row['#'])}">
@@ -411,6 +175,10 @@ def section(change: WaitingChange, status: change_page.DeliveryReadView) -> str:
 <button name="outcome" value="retry">Send saved answer again</button></form>'''
     elif change.validation_requested:
         form = ""
+    elif isinstance(change.question, change_page.OpenQuestion):
+        form = (f'''<form method="post"><input type="hidden" name="row" value="{html.escape(row['#'])}">
+<input type="hidden" name="token" value="{html.escape(page.token)}">
+<input type="hidden" name="feedback" value=""></form>''' if retry else "")
     form = form.replace('<form method="post">', f'<form method="post" action="{change_page.PAGE_NAME}">')
     saved = (f'<p>Saved: {html.escape(verdict)}</p>' if verdict else
              '<p>The showrunner will validate this</p>' if change.validation_requested else "")
@@ -420,7 +188,7 @@ def section(change: WaitingChange, status: change_page.DeliveryReadView) -> str:
 <h1>{html.escape(row.get('Change', ''))}</h1>
 <h2>{'Proof' if row.get(change_review.KIND) == 'Read only' else 'How to check'}</h2>
 <pre>{html.escape(row.get(change_review.CHECK, ''))}</pre>
-{saved}<p role="status" data-save-state>{html.escape(notice)}</p>{form}{retry}</section>'''
+{anomaly}{change_page.question_html(change.question)}{saved}<p role="status" data-save-state>{html.escape(notice)}</p>{form}{retry}</section>'''
 
 
 def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
@@ -430,9 +198,11 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
                    for tab in prepared.queues)
     recovery = ''.join('<p><a href="#' + html.escape(urlencode({"showrunner": item.tab, "row": item.key}))
                        + '">Message needs attention: ' + html.escape(item.key) + '</a></p>'
-                       for item in prepared.changes if item.row.get("Verdict"))
+                       for item in prepared.changes if item.row.get("Verdict") or (
+                           isinstance(item.question, change_page.OpenQuestion)
+                           and isinstance(item.question.delivery, change_page.DeliveryIntent)))
     content = ('''<style>[hidden]{display:none!important}nav{display:flex;gap:4px;overflow-x:auto;padding-bottom:8px}
-nav button{white-space:nowrap;margin:0}nav button[aria-selected=true]{outline:2px solid currentColor}
+nav button{white-space:nowrap;margin:0}nav button[aria-selected=true]{outline:2px solid currentColor;outline-offset:-2px}
 section+section{border:0;margin:0;padding:0}
 .navigation{position:sticky;bottom:0;padding:12px 0;background:Canvas}button{min-height:44px}
 </style><h1>Changes to review</h1><nav role="tablist" aria-label="Showrunner">''' + tabs + '</nav>' + recovery
@@ -443,7 +213,7 @@ section+section{border:0;margin:0;padding:0}
     return change_page.document(content)
 
 
-def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery, str]:
+def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     if set(fields) != {"row", "token", "outcome", "feedback"} or any(len(value) != 1 for value in fields.values()):
         raise change_page.AnswerRefused("use the answer form on this page")
@@ -466,12 +236,13 @@ def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus
         documents = dict(showrunners.timer_docs())
         for doc in list_documents(change_review.read(paths[source])):
             _ = documents.setdefault(slug_of(doc), doc)
-        routing = StaffRouting(staff.snapshot(), documents)
-        tab = routing.owner(row, source)
+        routing = change_routing.StaffRouting(staff.snapshot(), documents, change_review)
+        owner = routing.owner(row, source)
+        tab = owner.tab
         doc = routing.production_for_list(paths[source])
         if isinstance(doc, UnavailableProduction):
             raise change_page.AnswerRefused("the production document is not available")
-        page = change_page.AssignedReviewPage(paths[source], doc, (row_id,), row_token(browser, key), tab)
+        page = change_page.AssignedReviewPage(paths[source], doc, (row_id,), row_token(browser, key), owner)
         found = WaitingChange(key, tab, page, row)
     if isinstance(found.page, UnavailableProduction):
         raise change_page.AnswerRefused("the production document is not available")
@@ -483,7 +254,7 @@ def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus
         queue = replace(queue, entries=[*queue.entries, replace(entry, key=change_page.queue_key(found.page, found.row["#"]))])
     delivery = change_page.submit(found.page, rewritten, status, prepared=queue)
     answer = ""
-    if fields["outcome"] != ["validate"]:
+    if fields["outcome"] not in (["validate"], ["question"]):
         answer = next(row.get("Verdict", "") for row in change_review.review_rows(found.page.review_list)
                       if row["#"] == found.row["#"])
     return delivery, answer
@@ -526,7 +297,7 @@ async function save(row,form,outcome){
   const response=await fetch(form.action,{method:'POST',body:data,headers:{Accept:'application/json'}});
   const reply=await response.json();
   if(!response.ok) throw new Error(reply.reason || 'The answer could not be saved. Try again.');
-  state.textContent=reply.answer ? 'Saved: '+reply.answer : 'The showrunner will validate this';
+  state.textContent=reply.answer ? 'Saved: '+reply.answer : outcome==='question' || row.querySelector('[data-resend][data-outcome="retry"]') ? 'The showrunner will answer this' : 'The showrunner will validate this';
   row.dataset.saveState='saved';
   row.dataset.pending='false';form.hidden=true;
   row.querySelector('[data-resend]')?.remove();
@@ -544,6 +315,6 @@ rows.forEach(row=>{
  if(!form) return;
  form.addEventListener('submit',event=>{event.preventDefault();save(row,form,event.submitter.value);});
  const retry=row.querySelector('[data-resend]');
- if(retry) retry.onclick=()=>save(row,form,'validate'); });
+ if(retry) retry.onclick=()=>save(row,form,retry.dataset.outcome || 'validate'); });
 window.addEventListener('hashchange',()=>{if(location.hash!==shownHash) navigation++;show();});show();
 '''

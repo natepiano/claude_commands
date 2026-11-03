@@ -99,15 +99,20 @@ class UnitRenameStateTests(UnitRenameFixture):
         # sdlc, 2026-10-21: verify called the showrunner's own `next` text unclassified after a rename.
         self.write(self.root / "scratch/showrunner_state.json", json.dumps({
             "units": [{"unit": "alpha-unit"}], "next": ["merge alpha-unit from demo-alpha", "keep the per-unit gate"],
-            "open_for_user": [{"text": "alpha-unit asks", "question": "Does alpha-unit ship?"}]}))
+            "open_for_user": [{"text": "alpha-unit asks", "question": "Does alpha-unit ship?"},
+                              {"text": "review alpha-unit"}]}))
         outstanding = self.state / "outstanding/demo.json"
         self.write(outstanding, json.dumps([{"since": "2026-10-21T09:00", "text": "alpha-unit asks",
-                                             "question": "Does alpha-unit ship?"}]))
+                                             "question": "Does alpha-unit ship?"},
+                                            {"since": "2026-10-21T09:00", "text": "review alpha-unit"}]))
         self.assert_ok(self.rename("apply"))
         state = cast(dict[str, object], json.loads((self.root / "scratch/showrunner_state.json").read_text()))
         self.assertEqual(state["next"], ["merge gamma-unit from demo-gamma", "keep the per-unit gate"])
-        self.assertEqual(state["open_for_user"], [{"text": "gamma-unit asks", "question": "Does gamma-unit ship?"}])
-        self.assertEqual(cast(list[dict[str, str]], json.loads(outstanding.read_text()))[0]["text"], "gamma-unit asks")
+        self.assertEqual(state["open_for_user"], [{"text": "alpha-unit asks", "question": "Does alpha-unit ship?"},
+                                                 {"text": "review gamma-unit"}])
+        self.assertEqual(cast(list[dict[str, str]], json.loads(outstanding.read_text())), [
+            {"since": "2026-10-21T09:00", "text": "alpha-unit asks", "question": "Does alpha-unit ship?"},
+            {"since": "2026-10-21T09:00", "text": "review gamma-unit"}])
         self.assert_ok(self.rename("verify"))
 
     def test_other_showrunners_lists_take_the_new_name_unless_their_production_has_the_id(self) -> None:
@@ -123,14 +128,19 @@ class UnitRenameStateTests(UnitRenameFixture):
                            + shlex.join(["zsh", "/scripts/production_check.sh", str(doc)]) + "\n")
             states[slug] = self.state / slug / "session/showrunner_state.json"
             self.write(states[slug], json.dumps({"next": ["wait for alpha-unit"],
-                                                 "open_for_user": [{"text": "alpha-unit asks", "question": "Q?"}]}))
+                                                 "open_for_user": [{"text": "alpha-unit asks", "question": "Q?"},
+                                                                   {"text": "review alpha-unit"}]}))
         outstanding = self.state / "outstanding/parent.json"
-        self.write(outstanding, json.dumps([{"since": "2026-10-21T09:00", "text": "alpha-unit asks", "question": "Q?"}]))
+        self.write(outstanding, json.dumps([{"since": "2026-10-21T09:00", "text": "alpha-unit asks", "question": "Q?"},
+                                            {"since": "2026-10-21T09:00", "text": "review alpha-unit"}]))
         self.assert_ok(self.rename("apply"))
         parent = cast(dict[str, object], json.loads(states["parent"].read_text()))
         self.assertEqual(parent["next"], ["wait for gamma-unit"])
-        self.assertEqual(parent["open_for_user"], [{"text": "gamma-unit asks", "question": "Q?"}])
-        self.assertEqual(cast(list[dict[str, str]], json.loads(outstanding.read_text()))[0]["text"], "gamma-unit asks")
+        self.assertEqual(parent["open_for_user"], [{"text": "alpha-unit asks", "question": "Q?"},
+                                                  {"text": "review gamma-unit"}])
+        self.assertEqual(cast(list[dict[str, str]], json.loads(outstanding.read_text())), [
+            {"since": "2026-10-21T09:00", "text": "alpha-unit asks", "question": "Q?"},
+            {"since": "2026-10-21T09:00", "text": "review gamma-unit"}])
         # twin has its own alpha-unit, and orphan's production cannot be read: both keep their text.
         for slug in ("twin", "orphan"):
             self.assertIn("wait for alpha-unit", states[slug].read_text())

@@ -556,7 +556,7 @@ class StaffTestCase(unittest.TestCase):
             text = "\n".join(line.replace("`standby`", note) if line.startswith(f"| `{unit}` |") else line
                              for line in text.splitlines()) + "\n"
         if wrapped:
-            from scripts.production.tidy_wrapped import WRAPPED
+            from scripts.production.production_units import WRAPPED
 
             text = f"{WRAPPED}\n{text}"
         write_text_atomic(doc, text)

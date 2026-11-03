@@ -42,7 +42,7 @@ sys.path.insert(0, str(SCRIPTS / "whoami"))
 
 from scripts.whoami import account  # noqa: E402
 from scripts.whoami.account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
-from scripts.lib import atomic_file, unit_runs  # noqa: E402
+from scripts.lib import atomic_file, conf, unit_runs  # noqa: E402
 from scripts.lib.agent_program import resolve_program as resolve_program
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.whoami import agent_accounts  # noqa: E402
@@ -177,8 +177,6 @@ TABLE_HEADINGS = (
     "Folder", "Label", "Role", "Weekly left", "Weekly resets",
     "On credits", "Credits left", "Read",
 )
-# A stored reading older than this is read again before the table shows it.
-STALE_AFTER = timedelta(minutes=10)
 
 
 class ProjectSeed(TypedDict, total=False):
@@ -1572,7 +1570,7 @@ def _update_codex(arguments: list[str]) -> int:
             print(f"{machine}: update failed (exit {updated.returncode})", flush=True)
         else:
             version = subprocess.run([program, "--version"], env=environment,
-                capture_output=True, text=True, timeout=15, check=False)
+                capture_output=True, text=True, timeout=conf.whole("accounts", "codex_version_timeout_seconds"), check=False)
             local_ok = version.returncode == 0 and bool(version.stdout.strip())
             detail = version.stdout.strip().splitlines()[-1] if local_ok else f"version read failed (exit {version.returncode})"
             print(f"{machine}: {detail}", flush=True)
@@ -1584,8 +1582,8 @@ def _update_codex(arguments: list[str]) -> int:
     machine = remote.other_machine()
     command = 'CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex" update >&2 && "$HOME/.local/bin/codex" --version'
     try:
-        updated = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", machine, command],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=600, check=False)
+        updated = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={conf.whole("accounts", "codex_update_connect_timeout_seconds")}", machine, command],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=conf.whole("accounts", "codex_update_timeout_seconds"), check=False)
     except (subprocess.TimeoutExpired, OSError):
         print(f"{machine}: unreachable; run codex update there")
         return 1
@@ -1664,12 +1662,13 @@ def login_renewal_attempts() -> dict[str, LoginRenewalAttempt]:
 def renew_login(label: str) -> LoginRenewed | LoginRenewalFailed:
     """Run a quiet probe, then keep its new usage reading. Never expose probe output."""
     directory = claude_account_dir(label)
+    timeout_seconds = conf.whole("accounts", "login_probe_timeout_seconds")
     try:
         probe = subprocess.run([sys.executable, str(SCRIPTS / "accounts" / "accounts.py"),
-            "exec", "--probe", label, "-p", "hello"], cwd="/tmp", stdin=subprocess.DEVNULL,
-            timeout=120, capture_output=True)
+            "exec", "--probe", label, "-p", "hello"], cwd=conf.text("accounts", "login_probe_directory"), stdin=subprocess.DEVNULL,
+            timeout=timeout_seconds, capture_output=True)
     except subprocess.TimeoutExpired:
-        return LoginRenewalFailed("timed out after 120 s")
+        return LoginRenewalFailed(f"timed out after {timeout_seconds:g} s")
     except OSError:
         return LoginRenewalFailed("probe could not start")
     if probe.returncode != 0:
@@ -1706,9 +1705,7 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False) -> in
             "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_REMOTE_MEMORY_DIR", "CLAUDE_CODE_OAUTH_TOKEN",
         }))
     else:
-        prepared = prepared_account(label, resume="--resume" in arguments)
-    if isinstance(prepared, AccountRefused):
-        raise AccountsError(prepared.reason)
+        prepared = prepare_claude_launch(label, resume="--resume" in arguments)
     environment = launch_shell_environment(Path.cwd())
     for name in prepared.remove:
         _ = environment.pop(name, None)
@@ -1804,6 +1801,23 @@ def _claude_role_selection(group: ClaudeGroup, label: str) -> NamedAccount:
     return NamedAccount(label, claude_account_dir(label))
 
 
+def prepare_claude_launch(label: str, *, resume: bool) -> PreparedAccount:
+    """Prepare the account or report its refusal."""
+    prepared = prepared_account(label, resume=resume)
+    if isinstance(prepared, AccountRefused):
+        raise AccountsError(prepared.reason)
+    return prepared
+
+
+def claude_account_with_room(now: datetime) -> NamedAccount:
+    """Select and prepare a Claude account with quota."""
+    selected = pick("claude", now)
+    if isinstance(selected, NoAccountWithRoom):
+        raise AccountsError(no_room_line("claude", selected))
+    _ = prepare_claude_launch(selected.label, resume=False)
+    return NamedAccount(selected.label, selected.dir)
+
+
 def account_for_group_launch(role: Literal["unit", "showrunner"], *, resume: bool,
                              target: str = "", config_dir: str = "", source_fallback: bool = False) -> ClaudeLaunchAccount:
     """Use the group account, except for a moved unit restored on its source."""
@@ -1821,9 +1835,7 @@ def account_for_group_launch(role: Literal["unit", "showrunner"], *, resume: boo
     requested = claude_account_dir(target) if target else Path(config_dir).expanduser() if config_dir else directory
     if requested.resolve() != directory.resolve():
         raise AccountsError(f"accounts: {group} account is {label}; --account and --config-dir must name {label}")
-    prepared = prepared_account(label, resume=resume)
-    if isinstance(prepared, AccountRefused):
-        raise AccountsError(prepared.reason)
+    _ = prepare_claude_launch(label, resume=resume)
     return selected
 
 
@@ -1839,9 +1851,7 @@ def account_for_unscoped_launch(environment: Mapping[str, str], *, workers: bool
         target = read_role_map().workers_claude
         if isinstance(target, role_map.NamedWorkersClaudeAccount) and datetime.now(timezone.utc) < target.until:
             selected = claude_workers_account(target.label)
-            prepared = prepared_account(target.label, resume=True)
-            if isinstance(prepared, AccountRefused):
-                raise AccountsError(prepared.reason)
+            _ = prepare_claude_launch(target.label, resume=True)
             return selected
     configured = environment.get("CLAUDE_CONFIG_DIR", "")
     if not configured:
@@ -1852,9 +1862,7 @@ def account_for_unscoped_launch(environment: Mapping[str, str], *, workers: bool
     if not isinstance(identity, agent_accounts.NumberedAccount):
         raise AccountsError("accounts: caller has no numbered Claude account")
     directory = claude_account_dir(identity.label)
-    prepared = prepared_account(identity.label, resume=False)
-    if isinstance(prepared, AccountRefused):
-        raise AccountsError(prepared.reason)
+    _ = prepare_claude_launch(identity.label, resume=False)
     return NamedAccount(identity.label, directory)
 
 
@@ -1925,10 +1933,14 @@ def home_account_label(tool: Literal["claude", "codex"]) -> str:
     return agent_accounts.codex_home_role_label(home)
 
 
+def _account_note_template(tool: Literal["claude", "codex"]) -> str:
+    return _codex_folder(note_file.notes_dir() / f"{tool}N.md")
+
+
 def unnoted_home_line(home: Path, login: str) -> str:
     tool = "codex" if home.name.startswith(".codex") else "claude"
     return (f"~/{home.name} — no account note, not selectable: "
-            f"add ~/rust/hanadocs/agents/{tool}N.md with login: {login}")
+            f"add {_account_note_template(tool)} with login: {login}")
 
 
 def refuse_default(label: str) -> None:
@@ -2027,6 +2039,14 @@ _NO_EXCLUSIONS: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
+class ConfiguredReadingAge:
+    """Read the usage age from configuration for this selection."""
+
+
+_CONFIGURED_READING_AGE = ConfiguredReadingAge()
+
+
+@dataclass(frozen=True)
 class EarliestReset:
     at: datetime
 
@@ -2066,7 +2086,8 @@ def _codex_reading_can_work(reading: FreshReading, now: datetime, credits: agent
     return isinstance(agent_accounts.codex_can_work(report, now, credits), agent_accounts.CodexWorkAvailable)
 
 
-def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[str] = _NO_EXCLUSIONS, keep: KeepAccount | NoKeep = _NO_KEEP, prefer_weekly_room: bool = False) -> PickedAccount | NoAccountWithRoom:
+def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[str] = _NO_EXCLUSIONS, keep: KeepAccount | NoKeep = _NO_KEEP, prefer_weekly_room: bool = False,
+         reading_age_minutes: int | ConfiguredReadingAge = _CONFIGURED_READING_AGE) -> PickedAccount | NoAccountWithRoom:
     """Keep a working account, otherwise spend the weekly allowance resetting soonest."""
     exclude = frozenset(numbered_account_label(label, tool).label for label in exclude)
     keep = KeepAccount(numbered_account_label(keep.label, tool).label) if isinstance(keep, KeepAccount) else keep
@@ -2110,13 +2131,16 @@ def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[
     except refusals.RefusalsError as error:
         held_refusals = {}
         refusal_problem = str(error)
+    stale_minutes = (conf.whole("accounts", "usage_stale_minutes")
+                     if isinstance(reading_age_minutes, ConfiguredReadingAge) else reading_age_minutes)
+    stale_after = timedelta(minutes=stale_minutes)
     for label, directory, login in candidates:
         excluded = (any(agent_accounts.codex_home_matches_label(directory, omitted) for omitted in exclude)
                     if tool == "codex" else label in exclude)
         if excluded or login.casefold() in seen:
             continue
         seen.add(login.casefold())
-        reading = refusals.stored_reading(tool, login, now)
+        reading = refusals.stored_reading_with_age(tool, login, now, stale_after)
         any_fresh = any_fresh or isinstance(reading, FreshReading)
         weekly: ReadingWindow | NoWindow = reading.weekly if isinstance(reading, (FreshReading, StaleReading)) else NoWindow()
         five: ReadingWindow | NoWindow = reading.five_hour if isinstance(reading, (FreshReading, StaleReading)) else NoWindow()
@@ -2135,14 +2159,14 @@ def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[
         ):
             reason = "no room"
         elif tool == "claude":
-            reason = "has room" if isinstance(reading, FreshReading) else "has room; no reading in the last 10 minutes"
+            reason = "has room" if isinstance(reading, FreshReading) else f"has room; no reading in the last {stale_minutes} minutes"
             candidate = PickedAccount(label, directory, weekly.left if isinstance(weekly, ReadingWindow) and isinstance(reading, FreshReading) else 0,
                 weekly.reset if isinstance(weekly, ReadingWindow) and isinstance(reading, FreshReading) else NoResetKnown())
             available.append(candidate)
             if not isinstance(reading, FreshReading):
                 fallback.append(candidate)
         elif not isinstance(reading, FreshReading):
-            reason = "no reading in the last 10 minutes"
+            reason = f"no reading in the last {stale_minutes} minutes"
             fallback.append(PickedAccount(
                 label, directory, weekly.left if isinstance(weekly, ReadingWindow) else 0,
                 weekly.reset if isinstance(weekly, ReadingWindow) else NoResetKnown(),
@@ -2361,9 +2385,13 @@ def account_labels_for_logins(logins: frozenset[str]) -> frozenset[str]:
     return frozenset(labels)
 
 
-def placement(group: ClaudeGroup, now: datetime, *, exclude: frozenset[str] = _NO_EXCLUSIONS) -> GroupPlacement:
+def placement(group: ClaudeGroup, now: datetime, *, exclude: frozenset[str] = _NO_EXCLUSIONS,
+              reading_age_minutes: int | ConfiguredReadingAge = _CONFIGURED_READING_AGE) -> GroupPlacement:
     """Rank Claude accounts with room for a group using the picker's reading rules."""
-    chosen = pick("claude", now, exclude=exclude, keep=NoKeep())
+    stale_minutes = (conf.whole("accounts", "usage_stale_minutes")
+                     if isinstance(reading_age_minutes, ConfiguredReadingAge) else reading_age_minutes)
+    stale_after = timedelta(minutes=stale_minutes)
+    chosen = pick("claude", now, exclude=exclude, keep=NoKeep(), reading_age_minutes=stale_minutes)
     if isinstance(chosen, NoAccountWithRoom):
         label = group_label(group_accounts(), group)
         directory = claude_account_dir(label) if isinstance(label, str) and _label_is(label, "claude") else GROUP_NOT_CONFIGURED
@@ -2376,7 +2404,7 @@ def placement(group: ClaudeGroup, now: datetime, *, exclude: frozenset[str] = _N
         identity = account_identity(directory)
         if not isinstance(identity, agent_accounts.NumberedAccount):
             continue
-        reading = refusals.stored_reading("claude", identity.login, now)
+        reading = refusals.stored_reading_with_age("claude", identity.login, now, stale_after)
         weekly = reading.weekly if isinstance(reading, FreshReading) else NoWindow()
         eligible.append(PickedAccount(reason.label, directory, weekly.left if isinstance(weekly, ReadingWindow) else 0,
             weekly.reset if isinstance(weekly, ReadingWindow) else NoResetKnown()))
@@ -2843,7 +2871,7 @@ def _mac_login_keychain_visible() -> bool:
     try:
         result = subprocess.run(
             ("security", "list-keychains"),
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=15,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=conf.whole("accounts", "mac_identity_timeout_seconds"),
         )
         paths = shlex.split(result.stdout)
     except (OSError, subprocess.SubprocessError, UnicodeError, ValueError) as error:
@@ -2858,7 +2886,7 @@ def _mac_keychain_has_entry(folder: Path) -> bool:
     try:
         result = subprocess.run(
             ("security", "find-generic-password", "-s", agent_accounts.claude_keychain_service(folder)),
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=conf.whole("accounts", "mac_identity_timeout_seconds"),
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise AccountsError("accounts: cannot check the keychain entry") from error
@@ -2873,7 +2901,7 @@ def _delete_legacy_keychain_entry() -> None:
     try:
         result = subprocess.run(
             ("security", "delete-generic-password", "-s", agent_accounts.claude_keychain_service(main_config_dir())),
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=conf.whole("accounts", "mac_identity_timeout_seconds"),
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise AccountsError("accounts: cannot delete the legacy keychain entry; rerun cutover-home") from error
@@ -3035,7 +3063,7 @@ def list_codex_home_processes() -> list[CodexHomeProcess]:
                if sys.platform == "darwin" else
                ("ps", "-u", str(os.getuid()), "-o", "pid=,comm=,args="))
     try:
-        listing = subprocess.run(command, capture_output=True, text=True, check=True, timeout=5)
+        listing = subprocess.run(command, capture_output=True, text=True, check=True, timeout=conf.whole("accounts", "process_list_timeout_seconds"))
     except (OSError, subprocess.SubprocessError) as error:
         raise AccountsError("accounts: cannot list Codex processes; no login moved") from error
     found: list[CodexHomeProcess] = []
@@ -3799,10 +3827,10 @@ def _is_known_private(name: str) -> bool:
 
 
 def sweep_claude_temp_files(now: datetime) -> None:
-    """Remove only regular atomic-write remnants older than a day, without following links."""
+    """Remove old regular temporary files without following links."""
     home = accounts_home()
     folders = [home]
-    stale_before = (now - timedelta(days=1)).timestamp()
+    stale_before = (now - timedelta(days=conf.whole("accounts", "temporary_file_age_days"))).timestamp()
     for folder in folders:
         try:
             descriptor = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -4266,7 +4294,7 @@ def _read_at(usage: usage_store.StoredUsage | None) -> datetime | None:
 
 def _is_stale(usage: usage_store.StoredUsage | None, now: datetime) -> bool:
     read = _read_at(usage)
-    return read is None or now - read > STALE_AFTER
+    return read is None or now - read > timedelta(minutes=conf.whole("accounts", "usage_stale_minutes"))
 
 
 @dataclass(frozen=True)
@@ -4485,7 +4513,7 @@ class StatusDocument(TypedDict):
 
 def _reading_is_old(read_at: datetime, now: datetime) -> bool:
     """Use one age limit for usage and credits; future readings are fresh."""
-    return now - read_at > STALE_AFTER
+    return now - read_at > timedelta(minutes=conf.whole("accounts", "usage_stale_minutes"))
 
 
 def _credit_reading(
@@ -4568,7 +4596,7 @@ def _status_row_cells(row: StatusRow, zone: tzinfo, checked_at: datetime) -> tup
         read_cell = read.cell
     else:
         local = read.astimezone(zone)
-        date_format = "%m-%d %H:%M %Z" if (failed or checked_at - read > STALE_AFTER) and local.date() != checked_at.astimezone(zone).date() else "%H:%M %Z"
+        date_format = "%m-%d %H:%M %Z" if (failed or checked_at - read > timedelta(minutes=conf.whole("accounts", "usage_stale_minutes"))) and local.date() != checked_at.astimezone(zone).date() else "%H:%M %Z"
         read_cell = local.strftime(date_format)
     if failed:
         read_cell += "*"
@@ -4937,12 +4965,12 @@ def _status_problems(status: AccountStatus | CodexStatus, *, detail: bool, zone:
         problems = [replace(problem, step=ProblemStep(f"repair the account note for {subject} with its login; {setup}"))
                     if isinstance(problem.cause, ProblemCause) and problem.cause.kind == "unreadable note"
                     else replace(problem, step=ProblemStep(
-                        f"add ~/rust/hanadocs/agents/{'codex' if isinstance(status, CodexStatus) else 'claude'}N.md with the login for {subject}; {setup}"))
+                        f"add {_account_note_template('codex' if isinstance(status, CodexStatus) else 'claude')} with the login for {subject}; {setup}"))
                     if isinstance(problem.cause, ProblemCause) and problem.cause.kind == "note"
                     else problem for problem in problems]
     if unnoted in status.problems and not test_signin:
         tool = "codex" if isinstance(status, CodexStatus) else "claude"
-        instruction = f"add ~/rust/hanadocs/agents/{tool}N.md with the login for {subject}"
+        instruction = f"add {_account_note_template(tool)} with the login for {subject}"
         if isinstance(status, CodexStatus) and status.home == accounts_home() / ".codex":
             label = home_account_label("codex")
             instruction += f"; then run accounts.py cutover-home {label if _label_is(label, 'codex') else '<codexN>'}"
@@ -5182,7 +5210,7 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
             (status.role,) if status.role in (CODEX_ROLE, "spare") else ()) for status in codex),
     )
     rows, session_inputs = _count_role_sessions(rows)
-    rows, count_problems = _machine_role_counts(rows, now)
+    rows, count_problems = _machine_role_counts(rows, now, source)
     session_inputs = (*session_inputs, str(_session_counts_cache()))
     home_step = "run accounts.py cutover-home"
     all_statuses: list[AccountStatus | CodexStatus] = [*statuses, *codex]
@@ -5469,9 +5497,8 @@ def _local_session_counts() -> tuple[dict[tuple[Path, str], dict[str, str]], tup
 
 
 def _count_role_sessions(rows: tuple[StatusRow, ...]) -> tuple[tuple[StatusRow, ...], tuple[str, ...]]:
-    """Count local members and publish their counts for the other machine."""
+    """Count local members without changing saved state."""
     counts, inputs = _local_session_counts()
-    _ = _publish_session_counts(counts)
     counted = tuple(replace(row, role_counts=tuple(
         NoRoleCount() if role == "spare" else _role_session_counts(
             tuple(counts.get((Path(row.folder).expanduser(), role), {}).values()), row.tool)
@@ -5485,12 +5512,8 @@ class MachineSessionCounts(TypedDict):
     accounts: dict[str, dict[str, RoleSessionCountsDocument]]
 
 
-def _session_counts_file() -> Path:
-    return accounts_home() / ".local/state/accounts/session_counts.json"
-
-
 def _session_counts_cache() -> Path:
-    return _session_counts_file().with_name("peer_session_counts.json")
+    return accounts_home() / ".local/state/accounts/peer_session_counts.json"
 
 
 def _session_counts_machine() -> str:
@@ -5498,7 +5521,7 @@ def _session_counts_machine() -> str:
     return "mac" if remote.other_machine() == "natedev" else "natedev"
 
 
-def _publish_session_counts(counts: dict[tuple[Path, str], dict[str, str]]) -> MachineSessionCounts:
+def _session_counts_document(counts: dict[tuple[Path, str], dict[str, str]]) -> MachineSessionCounts:
     mapped: dict[tuple[str, str], dict[str, str]] = {}
     for (directory, role), members in counts.items():
         label = directory.name.removeprefix(".")
@@ -5515,7 +5538,6 @@ def _publish_session_counts(counts: dict[tuple[Path, str], dict[str, str]]) -> M
             shell=count.shell if isinstance(count.shell, int) else None, idle=count.idle, total=count.total)
     document = MachineSessionCounts(machine=_session_counts_machine(),
         at=datetime.now(timezone.utc).isoformat(), accounts=values)
-    atomic_file.write_text_atomic(_session_counts_file(), json.dumps(document))
     return document
 
 
@@ -5579,7 +5601,9 @@ def _start_session_counts_fetch() -> bool:
     return True
 
 
-def _machine_role_counts(rows: tuple[StatusRow, ...], now: datetime) -> tuple[tuple[StatusRow, ...], tuple[str, ...]]:
+def _machine_role_counts(
+    rows: tuple[StatusRow, ...], now: datetime, source: UsageSource = REFRESH_STALE_USAGE,
+) -> tuple[tuple[StatusRow, ...], tuple[str, ...]]:
     local, peer = _session_counts_machine(), remote.other_machine()
     try:
         document = _decode_session_counts(_session_counts_cache().read_text(), peer)
@@ -5591,8 +5615,9 @@ def _machine_role_counts(rows: tuple[StatusRow, ...], now: datetime) -> tuple[tu
     except (OSError, ValueError):
         peer_accounts = {}
         available = False
-    started = _start_session_counts_fetch()
-    available = available and started
+    if isinstance(source, RefreshStaleUsage):
+        started = _start_session_counts_fetch()
+        available = available and started
     if not available:
         peer_accounts = {}
     counted: list[StatusRow] = []
@@ -5716,7 +5741,7 @@ def _workers_status_lines(now: datetime, selected: CodexWorkersAccount) -> list[
 
 def _move_status_lines(entries: list[moves.MoveEntry], zone: tzinfo) -> list[str]:
     lines: list[str] = []
-    for entry in entries[-10:]:
+    for entry in entries[-conf.whole("accounts", "move_status_count"):]:
         at = datetime.fromisoformat(entry["at"]).astimezone(zone).strftime("%Y-%m-%d %H:%M:%S %Z")
         detail: str = entry["kind"]
         if entry["kind"] == "requested":
@@ -5874,7 +5899,7 @@ def _parser() -> argparse.ArgumentParser:
 def group_half_point_hold(group: ClaudeGroup, now: datetime) -> next_moves.ResolvedHold:
     label = group_label(group_accounts(), group)
     return (next_moves.resolve_hold(next_moves.HalfPointHold(), label, now) if isinstance(label, str)
-            else next_moves.ResolvedHold(40, next_moves.NoUsablePace()))
+            else next_moves.ResolvedHold(conf.whole("accounts", "hold_default_minutes"), next_moves.NoUsablePace()))
 
 
 def validate_next_move_target(entry: next_moves.NextMove) -> None:
@@ -5897,7 +5922,7 @@ def main(argv: list[str]) -> int:
     try:
         if options.action == "session-counts-read":
             counts, _inputs = _local_session_counts()
-            print(json.dumps(_publish_session_counts(counts)))
+            print(json.dumps(_session_counts_document(counts)))
             return 0
         if options.action == "session-counts-fetch":
             try:

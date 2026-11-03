@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import redirect_stderr
+from decimal import Decimal
 import io
 import os
 from pathlib import Path
@@ -110,6 +111,94 @@ class ConfTests(unittest.TestCase):
         self.assertEqual(conf.whole("example", "count"), 2)
         self.write("# whole: ..\ncount=11\n")
         self.assertEqual(conf.whole("example", "count"), 11)
+
+    def test_temp_home_without_config_reads_the_repository_accounts_value(self) -> None:
+        home = self.root / "home"
+        home.mkdir()
+        with (mock.patch.dict(os.environ), redirect_stderr(io.StringIO()) as warning,
+              mock.patch.object(conf, "_git", side_effect=AssertionError("unexpected Git recovery"))):
+            del os.environ["CONF_DIR"]
+            self.assertEqual(conf.whole("accounts", "usage_stale_minutes"), 10)
+            self.assertEqual(conf.text("accounts", "usage_stale_minutes"), "10")
+            self.assertEqual(conf.words("accounts", "usage_stale_minutes"), ("10",))
+            self.assertEqual(conf.values("accounts")["usage_stale_minutes"], "10")
+            self.assertEqual(conf.path("accounts"), home / ".claude/config/accounts.conf")
+        self.assertEqual(warning.getvalue(), "")
+        self.assertEqual(list(home.iterdir()), [])
+
+    def test_missing_override_file_refuses_until_a_live_file_exists(self) -> None:
+        with redirect_stderr(io.StringIO()), self.assertRaises(conf.Unusable):
+            _ = conf.whole("accounts", "usage_stale_minutes")
+        with redirect_stderr(io.StringIO()), self.assertRaises(conf.Unusable):
+            _ = conf.values("accounts")
+        self.assertIsInstance(
+            conf.value_origin("accounts", "usage_stale_minutes", int), conf.UnavailableValue,
+        )
+        source = self.directory / "accounts.conf"
+        _ = source.write_text("# whole: 1..\nusage_stale_minutes=23\n")
+        self.assertEqual(conf.whole("accounts", "usage_stale_minutes"), 23)
+        self.assertEqual(conf.values("accounts"), {"usage_stale_minutes": "23"})
+
+    def test_missing_live_key_uses_repository_without_changing_live_values(self) -> None:
+        del os.environ["CONF_DIR"]
+        source = self.root / "home/.claude/config/accounts.conf"
+        source.parent.mkdir(parents=True)
+        contents = "# whole: 1..\nusage_stale_minutes=23\n"
+        _ = source.write_text(contents)
+        self.assertEqual(conf.whole("accounts", "usage_stale_minutes"), 23)
+        with mock.patch.object(conf, "_git", side_effect=AssertionError("unexpected Git recovery")):
+            self.assertEqual(conf.text("accounts", "notes_directory"), "~/rust/hanadocs/agents")
+            origin = conf.value_origin("accounts", "notes_directory", str)
+        self.assertIsInstance(origin, conf.RecoveredValue)
+        if isinstance(origin, conf.RecoveredValue):
+            self.assertEqual(origin.value, "~/rust/hanadocs/agents")
+        self.assertEqual(source.read_text(), contents)
+
+    def test_missing_override_key_refuses_repository_values(self) -> None:
+        source = self.directory / "accounts.conf"
+        contents = "# whole: 1..\nusage_stale_minutes=23\n"
+        _ = source.write_text(contents)
+        self.assertEqual(conf.whole("accounts", "usage_stale_minutes"), 23)
+        with redirect_stderr(io.StringIO()), self.assertRaises(conf.Unusable):
+            _ = conf.text("accounts", "notes_directory")
+        self.assertIsInstance(conf.value_origin("accounts", "notes_directory", str), conf.UnavailableValue)
+        self.assertEqual(source.read_text(), contents)
+
+    def test_missing_accounts_key_uses_git_before_repository(self) -> None:
+        self.history()
+        source = self.directory / "accounts.conf"
+        _ = source.write_text("# whole: 1..\nusage_stale_minutes=23\n")
+        _ = self.git("add", "config/accounts.conf")
+        _ = self.git("commit", "-qm", "accounts configuration revision")
+        _ = source.write_text("other=2\n")
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(conf.whole("accounts", "usage_stale_minutes"), 23)
+        origin = conf.value_origin("accounts", "usage_stale_minutes", int)
+        self.assertIsInstance(origin, conf.RecoveredValue)
+        if isinstance(origin, conf.RecoveredValue):
+            self.assertEqual(origin.value, 23)
+
+    def test_value_origin_uses_repository_for_an_absent_file(self) -> None:
+        del os.environ["CONF_DIR"]
+        origin = conf.value_origin("accounts", "usage_stale_minutes", int)
+        self.assertIsInstance(origin, conf.RecoveredValue)
+        if isinstance(origin, conf.RecoveredValue):
+            self.assertEqual(origin.value, 10)
+
+    def test_existing_invalid_key_and_explicit_missing_path_do_not_use_repository(self) -> None:
+        del os.environ["CONF_DIR"]
+        source = self.root / "home/.claude/config/accounts.conf"
+        source.parent.mkdir(parents=True)
+        with redirect_stderr(io.StringIO()), self.assertRaises(conf.Unusable):
+            _ = conf.whole(source, "usage_stale_minutes")
+        for contents in ("# whole: 1..\nusage_stale_minutes=broken\n", "# whole: 1..\nusage_stale_minutes=0\n"):
+            with self.subTest(contents=contents):
+                _ = source.write_text(contents)
+                with redirect_stderr(io.StringIO()), self.assertRaises(conf.Unusable):
+                    _ = conf.whole("accounts", "usage_stale_minutes")
+                self.assertIsInstance(
+                    conf.value_origin("accounts", "usage_stale_minutes", int), conf.UnavailableValue,
+                )
 
     def test_host_override_uses_its_own_adjacent_limits_for_reads_and_check(self) -> None:
         self.write("# whole: 1..4\ncount=3\n# whole: 8..10\ncount.testhost=9\n")
@@ -342,6 +431,46 @@ class ConfTests(unittest.TestCase):
                 redirect_stderr(io.StringIO()) as warning:
             override_guard.refuse_overrides(script, "lib/probe.py")
         self.assertIn("CONF_DIR", warning.getvalue())
+
+    def test_value_origin_distinguishes_live_permission_from_recovered_limits(self) -> None:
+        self.history()
+        self.commit("# range: 0..\namount=40\n")
+        self.write("# range: 0..\namount=20\n")
+        live = conf.value_origin("example", "amount", Decimal)
+        self.assertIsInstance(live, conf.UsableLiveValue)
+        if not isinstance(live, conf.UsableLiveValue):
+            self.fail("The valid live limit must identify live permission")
+        self.assertEqual(live.value, Decimal("20"))
+        for source in ("other=1\n", "# range: 0..\namount=broken\n",
+                       "# range: 0..\namount=-1\n"):
+            with self.subTest(source=source), redirect_stderr(io.StringIO()):
+                self.write(source)
+                recovered = conf.value_origin("example", "amount", Decimal)
+                self.assertIsInstance(recovered, conf.RecoveredValue)
+                if not isinstance(recovered, conf.RecoveredValue):
+                    self.fail("History must remain distinct from live spending permission")
+                self.assertEqual(recovered.value, Decimal("40"))
+                self.assertEqual(conf.number("example", "amount"), 40)
+
+    def test_value_origin_reports_unavailable_data_without_an_implicit_limit(self) -> None:
+        self.write("# range: 0..\namount=broken\n")
+        with redirect_stderr(io.StringIO()):
+            result = conf.value_origin("example", "amount", Decimal)
+        self.assertIsInstance(result, conf.UnavailableValue)
+
+    def test_value_origin_reads_changed_live_limits_after_history_recovery(self) -> None:
+        self.history()
+        self.commit("# range: 0..\namount=40\n")
+        self.write("amount=broken\n")
+        with redirect_stderr(io.StringIO()):
+            recovered = conf.value_origin(self.path, "amount", Decimal)
+        self.assertIsInstance(recovered, conf.RecoveredValue)
+        self.write("# range: 0..\namount=7.25\n")
+        live = conf.value_origin(self.path, "amount", Decimal)
+        self.assertIsInstance(live, conf.UsableLiveValue)
+        if not isinstance(live, conf.UsableLiveValue):
+            self.fail("A repaired live limit must replace the recovered state")
+        self.assertEqual(live.value, Decimal("7.25"))
 
 
 if __name__ == "__main__":

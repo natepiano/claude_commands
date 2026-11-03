@@ -29,6 +29,7 @@ from sessions import SessionRecord, UnreadableSessionRecord, read_session
 from scripts.production import showrunners
 from scripts.shutdown import launch_permission
 from scripts.accounts import accounts
+from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
@@ -583,6 +584,7 @@ class StandaloneLaunchTests(unittest.TestCase):
             "HERDR_PROC": str(self.proc), "FAKE_HERDR_LOG": str(self.log),
             "FAKE_HERDR_RESPONSES": str(self.responses_path),
         }, clear=True))
+        _ = self.enterContext(scratch_accounts_config())
         self.responses = {"default": {"stdout": json.dumps({"result": {
             "workspaces": [], "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}, "tabs": [], "panes": [],
         }}), "code": 0}}

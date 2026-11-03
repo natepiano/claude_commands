@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 import threading
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -653,9 +653,7 @@ def reviewer_environment() -> tuple[dict[str, str], str]:
     for key in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR"):
         _ = environment.pop(key, None)
     selected = accounts.role_account("unit")
-    prepared = accounts.prepared_account(selected.label, resume=False)
-    if isinstance(prepared, accounts.AccountRefused):
-        raise accounts.AccountsError(prepared.reason)
+    prepared = accounts.prepare_claude_launch(selected.label, resume=False)
     for name in prepared.remove:
         _ = environment.pop(name, None)
     environment.update(prepared.variables)
@@ -1334,21 +1332,16 @@ def registered_questions(since: datetime) -> list[str]:
     """Read outstanding questions and registrations made within the sample window."""
     root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
     questions: list[str] = []
-    for path in (root / "outstanding").glob("*.json"):
-        try:
-            records = cast(object, json.loads(path.read_text(encoding="utf-8")))
-            if not isinstance(records, list):
-                continue
-            for item in cast(list[object], records):
-                record = _object(item)
-                for field in ("text", "reviewed", "question"):
-                    text = record.get(field)
-                    if isinstance(text, str) and text.strip():
-                        prose = reply_asks.question_prose(text)
-                        if prose:
-                            questions.append(prose)
-        except (OSError, ValueError):
-            continue
+    sys.path.insert(0, str(ROOT))
+    question_store = importlib.import_module("scripts.production.update_registration")
+    read_fields = cast(Callable[[], Sequence[Mapping[str, str]]], question_store.read_all_open_fields)
+    for fields in read_fields():
+        for field in ("text", "reviewed", "question"):
+            text = fields.get(field)
+            if isinstance(text, str) and text.strip():
+                prose = reply_asks.question_prose(text)
+                if prose:
+                    questions.append(prose)
     for path in (root / "outstanding").glob("*.history.jsonl"):
         try:
             lines = path.read_text(encoding="utf-8").splitlines()

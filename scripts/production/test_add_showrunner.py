@@ -29,6 +29,7 @@ import production_units
 from scripts.production import showrunners
 import showrunner_tree
 from scripts.whoami import usage_store
+from scripts.whoami.account_test_support import stored_room
 import herdr as runtime
 from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
@@ -468,11 +469,9 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             _ = (caller / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "unit@example.invalid"}}))
         self.env["CLAUDE_CONFIG_DIR"] = str(caller)
         now = datetime.now(timezone.utc)
-        saved = {"main@example.invalid": {"weekly": {"left": 99, "at": now.isoformat(),
-                  "resets": (now + timedelta(hours=1)).isoformat()}},
-                 "target@example.invalid": {"weekly": {"left": 0, "at": now.isoformat(),
-                  "resets": (now + timedelta(days=4)).isoformat()}}}
-        _ = (home / ".local/state/agent-notes/usage.json").write_text(json.dumps(saved))
+        with patch.dict(os.environ, self.env):
+            stored_room("main@example.invalid", 99, now + timedelta(hours=1))
+            stored_room("target@example.invalid", 0, now + timedelta(days=4))
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         before = path.read_bytes()
         result = self.run_command("kid")
@@ -548,12 +547,9 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             "projects": {str(self.root / "kid-checkout"): {"hasTrustDialogAccepted": True}}}))
         _ = (directory / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": "target@example.invalid"}, "projects": {}}))
-        file = home / ".local/state/agent-notes/usage.json"
-        saved = cast(dict[str, usage_store.StoredUsage], json.loads(file.read_text()))
         now = datetime.now(timezone.utc)
-        saved["target@example.invalid"] = {"weekly": {"left": 1, "at": now.isoformat(),
-            "resets": (now + timedelta(days=1)).isoformat()}}
-        _ = file.write_text(json.dumps(saved))
+        with patch.dict(os.environ, self.env):
+            stored_room("target@example.invalid", 1, now + timedelta(days=1))
         result = self.run_command("kid")
         self.refused(result, f"kid: Claude is not trusted in {self.root / 'kid-checkout'} on claude3. Run:")
         self.assertIn(f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))}", result.stderr)

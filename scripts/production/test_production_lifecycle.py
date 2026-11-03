@@ -1000,6 +1000,44 @@ class LifecycleTests(LifecycleFixture):
         self.assertEqual(sent[sent.index("--text") + 1], "example wrapped; its recorded parent is retained for history.")
         self.assertIn("wrapped", self.doc.read_text())
 
+    def test_wrap_closes_document_owned_questions_after_its_timer_stops(self) -> None:
+        self.merged_units()
+        runner = next(row for row in staff.find(kind="showrunner") if row.name == "old-showrunner")
+        other_doc = self.doc.with_name("other-production.md")
+        self.write(other_doc, "# Production — other\n")
+        other = fixture_member("showrunner", name="other", doc=staff.LiveDoc("natedev", other_doc))
+        folder = self.root / "questions"
+        self.write(self.doc, self.doc.read_text().replace(
+            "## Units", f"- **Proposals:** `{folder}`\n\n## Units"))
+        records: list[Path] = []
+        for owner, title in ((runner, "Choose the layout"), (other, "Choose the release")):
+            fields = {"since": "2026-10-06T08:00", "text": title,
+                      "question": title + "?", "asked_by": owner.id}
+            path = folder / f"question-{owner.id}.md"
+            self.write(path, f"---\nrecord_type: question\ntags: [question]\nstatus: open\n"
+                       + f"production_id: {owner.id}\nasked_by: {owner.id}\n"
+                       + f"registration: {json.dumps(fields)}\n---\n# {title}\n")
+            records.append(path)
+        own, unrelated = records
+        unrelated_before = unrelated.read_bytes(), unrelated.stat().st_mtime_ns
+        _ = self.git("add", str(self.doc), str(other_doc))
+        _ = self.git("commit", "-m", "Set the private question folder")
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((self.state / "notifier/showrunner-example").exists())
+        self.assertIn("status: closed", own.read_text().splitlines())
+        self.assertEqual((unrelated.read_bytes(), unrelated.stat().st_mtime_ns), unrelated_before)
+        owner_after_wrap = staff.snapshot().by_doc("natedev", self.doc)
+        self.assertIsNotNone(owner_after_wrap)
+        assert owner_after_wrap is not None
+        self.assertEqual(owner_after_wrap.id, runner.id)
+
+    def test_wrap_reuses_its_staff_context_for_question_cleanup(self) -> None:
+        from update_registration import QuestionStaff
+
+        with mock.patch.object(QuestionStaff, "read", side_effect=AssertionError("Reuse the wrap staff context")):
+            self.test_wrap_closes_document_owned_questions_after_its_timer_stops()
+
     def test_wrap_deletes_its_own_state_files_and_keeps_other_productions(self) -> None:
         self.merged_units()
         state = self.state / "showrunner"

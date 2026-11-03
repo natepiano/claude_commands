@@ -1494,7 +1494,7 @@ class RetirementPlan:
 def retirement_plan(scan: _FillSources, documents: tuple[FillDocument, ...],
                     joined: _MemberSources, machine: str, *, check_format: bool = True) -> RetirementPlan:
     """Prove retired facts once for fill and the native-id migration."""
-    from scripts.production.tidy_wrapped import WRAPPED
+    from scripts.production.production_units import WRAPPED
 
     owners: dict[str, WrappedFillDoc] = {}
     units: dict[tuple[str, str], RetiredFillUnit] = {}
@@ -1911,7 +1911,7 @@ class _LiveFillSources(_FillSources):
         document = next(iter(documents.values()))
         common = _fill_git(document.path.parent, "rev-parse", "--path-format=absolute", "--git-common-dir")
         self.manifest.add(f"repository {common}")
-        from scripts.production.tidy_wrapped import WRAPPED
+        from scripts.production.production_units import WRAPPED
 
         if WRAPPED in document.text or re.search(r"(?im)^- \*\*Status:\*\*\s*wrapped\b", document.text):
             raise ValueError(f"{document.path}: production is wrapped")

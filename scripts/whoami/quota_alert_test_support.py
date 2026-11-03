@@ -20,7 +20,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.test_agents_registry import ExactRows, registry_text, write_registry
-from scripts.whoami.note_file import note_name
+from scripts.whoami.account_test_support import create_claude_account
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -266,28 +266,13 @@ class QuotaReminderFixture(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(account, "account_of",
             return_value=account.Account("claude", identity.login, identity.label)))
 
-    def stored_room(self, login: str, left: float, days: float) -> None:
-        from scripts.whoami import usage_store
-        saved = usage_store.load()
-        saved[usage_store.key("Claude", login)] = usage_store.StoredUsage(weekly=usage_store.StoredWindow(
-            left=left, at=datetime.now(timezone.utc).isoformat(),
-            resets=(datetime.now(timezone.utc) + timedelta(days=days)).isoformat()))
-        file = usage_store.store_file()
-        file.parent.mkdir(parents=True, exist_ok=True)
-        _ = file.write_text(json.dumps(saved))
-
     def configure_claude_roles(self) -> None:
         _ = (self.root / ".claude").mkdir(exist_ok=True)
         _ = (self.root / ".claude.json").write_text(
             json.dumps({"oauthAccount": {"emailAddress": "showrunner@example.invalid"}}), encoding="utf-8",
         )
-        _ = (self.root / "claude2.md").write_text("---\nlogin: showrunner@example.invalid\n---\n")
         for label, login in (("claude1", "spare@example.invalid"), ("claude2", "showrunner@example.invalid"), ("claude3", "unit@example.invalid")):
-            self.assertEqual(accounts.setup(label), [])
-            _ = (self.root / note_name(label)).write_text(f"---\nlogin: {login}\n---\n")
-            _ = (accounts.account_dir(label) / ".claude.json").write_text(
-                json.dumps({"oauthAccount": {"emailAddress": login}}), encoding="utf-8",
-            )
+            create_claude_account(label, login)
         self.set_claude_activity("claude3")
 
     def assignments(self) -> dict[str, str]:

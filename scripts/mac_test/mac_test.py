@@ -82,6 +82,7 @@ class RemoteJobClaim(ClaimOwnerRecord):
 
     remote_host: str
     cleanup_pending: NotRequired[bool]
+    instance_generation: NotRequired[str]
 
 
 RunRecord = ProcessBoundClaim | RemoteJobClaim
@@ -445,6 +446,9 @@ class CliArguments(argparse.Namespace):
         self.repo_root: str = ""
         self.copy: bool = False
         self.target: str = ""
+        self.from_pid: int = 0
+        self.package: str = ""
+        self.verb: offload.MacVerb = "nextest"
 
 
 class StatePaths:
@@ -599,6 +603,11 @@ def read_run(path: Path) -> RunState:
     if not isinstance(host, str) or not host.strip():
         raise StateReadError(f"{path} has an invalid remote_host")
     remote: RemoteJobClaim = {**record, "remote_host": host}
+    if 'instance_generation' in values:
+        generation = required_string(values, 'instance_generation', path)
+        if not generation:
+            raise StateReadError(f'{path} has an invalid instance_generation')
+        remote['instance_generation'] = generation
     if "cleanup_pending" in values:
         if values["cleanup_pending"] is not True:
             raise StateReadError(f"{path} has an invalid cleanup_pending")
@@ -2006,7 +2015,16 @@ def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobCl
     return ClaimFinished(13)
 
 
-def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope) -> ClaimAttempt:
+def bind_instance_generation(paths: StatePaths, claim: RemoteJobClaim) -> None:
+    """Bind new AWS work without changing retained claim evidence."""
+    if target_config.is_aws_target(offload.configured_ssh_target(paths.target)):
+        generation = offload.expected_instance_generation(paths.target)
+        if generation:
+            claim['instance_generation'] = generation
+
+
+def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
+               *, reserve_wait: bool = False) -> ClaimAttempt:
     """One claim attempt under state.lock: take over, refuse, or write the claim."""
     try:
         claims = live_claims(paths)
@@ -2046,7 +2064,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope) -> Clai
                 scope = selected
                 overlapping = ()
                 break
-    if isinstance(args.remote, str):
+    if isinstance(args.remote, str) or reserve_wait:
         for claim in overlapping:
             record = claim.record
             if scopes_overlap(claim.scope, scope) and run_is_kept(record):
@@ -2075,6 +2093,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope) -> Clai
         claimed["copy"] = True
     if isinstance(args.remote, str):
         remote_claim: RemoteJobClaim = {**claimed, "remote_host": args.remote}
+        bind_instance_generation(paths, remote_claim)
         claimed = remote_claim
     if isinstance(owner, build_hold.OwningSession):
         claimed["holder_session"] = owner.session_id
@@ -2112,16 +2131,62 @@ def stop_copy(holder: RunRecord) -> None:
         pass
 
 
-def command_claim(args: CliArguments, paths: StatePaths) -> int:
+def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope) -> ClaimAttempt:
+    """Transfer a live reservation under the target lock without releasing capacity."""
+    start = process_start_time(args.pid)
+    if start is None:
+        return ClaimFinished(12)
+    claims = read_claims(paths)
+    owners = [claim for claim in claims if scopes_overlap(claim.scope, scope)
+              and claim.record["pid"] == args.from_pid
+              and ("remote_host" not in claim.record or claim.record.get("cleanup_pending"))
+              and process_start_time(args.from_pid) == claim.record["proc_start"]
+              and (claim.record["worktree"] == args.worktree or claim.record.get("cleanup_pending"))]
+    if len(owners) != 1 or not isinstance(args.remote, str):
+        return ClaimFinished(12)
+    claim = owners[0]
+    record: RemoteJobClaim
+    if "remote_host" in claim.record:
+        record = {**claim.record}
+    else:
+        record = {**claim.record, "remote_host": args.remote}
+        bind_instance_generation(paths, record)
+    record["pid"] = args.pid
+    record["proc_start"] = start
+    write_json(claim.path, record)
+    if isinstance(claim.scope, RepositoryScope) and claim.scope.slot:
+        remember_slot(paths, claim.scope, record)
+        print(f"slot: {claim.scope.slot}")
+    if record.get("cleanup_pending"):
+        print(f"leftovers: {record['remote_host']}")
+        return ClaimFinished(13)
+    print("claimed")
+    return ClaimFinished(0)
+
+
+def command_claim_wait(args: CliArguments, paths: StatePaths) -> int:
+    """Reserve a slot for a live local wait without starting remote work."""
+    settings = Path(args.settings) if args.settings else config_path(args.target)
+    config = offload.read_config(settings)
+    if isinstance(offload.mac_step_eligibility(config, Path(args.repo_root), args.package,
+                                             args.verb, args.target), offload.IneligibleMacStep):
+        return 1
+    args.worktree = args.repo_root
+    args.what = f"{args.verb} {args.package or 'workspace'}"
+    return command_claim(args, paths, watch_claim=False)
+
+
+def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = True) -> int:
     scope = target_claim_scope(paths, args.worktree)
     deadline = time.monotonic() + max(args.wait, 0.0)
     yield_deadline = 0.0
     stopped: set[tuple[int, str]] = set()
     while True:
         with locked(paths.lock):
-            attempt = claim_once(args, paths, scope)
+            attempt = (adopt_wait_claim(args, paths, scope) if args.from_pid
+                       else claim_once(args, paths, scope, reserve_wait=not watch_claim))
         if isinstance(attempt, ClaimFinished):
-            if attempt.status in (0, 13):
+            if watch_claim and attempt.status in (0, 13):
                 start_claim_watcher(paths)
             return attempt.status
         if isinstance(attempt, ClaimHeldByCopy):
@@ -2559,6 +2624,14 @@ def parser() -> argparse.ArgumentParser:
     _ = claim.add_argument("--remote", type=remote_host_argument, default=NO_REMOTE_JOB)
     _ = claim.add_argument("--copy", action="store_true")
 
+    _ = claim.add_argument("--from-pid", type=int, default=0)
+    wait_claim = commands.add_parser("claim-wait")
+    _ = wait_claim.add_argument("--pid", type=int, required=True)
+    _ = wait_claim.add_argument("--settings", default="")
+    _ = wait_claim.add_argument("--repo-root", required=True)
+    _ = wait_claim.add_argument("--package", default="")
+    _ = wait_claim.add_argument("--verb", choices=("nextest", "check", "doc", "clippy", "mend-check"), default="nextest")
+
     release = commands.add_parser("release")
     _ = release.add_argument("--pid", type=int, required=True)
 
@@ -2601,6 +2674,8 @@ def main() -> int:
 def dispatch_command(args: CliArguments, paths: StatePaths) -> int:
     if args.command == "claim":
         return command_claim(args, paths)
+    if args.command == "claim-wait":
+        return command_claim_wait(args, paths)
     if args.command == "release":
         return command_release(args, paths)
     if args.command == "free-now":
@@ -2617,6 +2692,69 @@ def dispatch_command(args: CliArguments, paths: StatePaths) -> int:
     if args.command == "watch-claim":
         return command_watch_claim(paths, config)
     return command_status(paths, config)
+
+
+
+
+RELEASE_STATES = ('stopping', 'stopped', 'terminated')
+
+
+@dataclass(frozen=True)
+class StoppedInstanceEvidence:
+    target: str
+    generation: str
+    state: str
+    observed_at: float
+    claims: tuple[HeldClaim, ...]
+    remote_host: str
+
+
+def release_host(paths: StatePaths, generation: str, state: str) -> str:
+    configured = offload.configured_ssh_target(paths.target)
+    if not target_config.is_aws_target(configured) or state not in RELEASE_STATES or not generation:
+        raise StateReadError('instance evidence cannot release these claims')
+    return offload.read_connection_settings(configured.settings).host
+
+
+def claim_matches_instance(claim: HeldClaim, host: str, generation: str) -> bool:
+    return (claim.record.get('remote_host') == host
+            and claim.record.get('instance_generation') == generation)
+
+
+def capture_release_evidence(paths: StatePaths, generation: str, state: str,
+                             observed_at: float) -> StoppedInstanceEvidence:
+    """Capture claims bound to the observed instance and host."""
+    with locked(paths.lock):
+        host = release_host(paths, generation, state)
+        claims = tuple(claim for claim in read_claims(paths)
+                       if claim_matches_instance(claim, host, generation)
+                       and datetime.fromisoformat(claim.record['since']).timestamp() <= observed_at)
+    return StoppedInstanceEvidence(paths.target, generation, state, observed_at, claims, host)
+
+
+def release_stopped_claims(paths: StatePaths, evidence: StoppedInstanceEvidence) -> int:
+    """Release only unchanged claims bound to the confirmed stopped instance."""
+    if evidence.target != paths.target:
+        raise StateReadError('instance evidence does not match the target')
+    released = 0
+    with locked(paths.lock):
+        host = release_host(paths, evidence.generation, evidence.state)
+        if host != evidence.remote_host:
+            raise StateReadError('instance host evidence does not match the target')
+        current = {claim.path: claim for claim in read_claims(paths)}
+        for claim in evidence.claims:
+            if claim.path not in current or current[claim.path].record != claim.record:
+                continue
+            if not claim_matches_instance(claim, host, evidence.generation):
+                continue
+            proof: dict[str, object] = {'target': evidence.target, 'generation': evidence.generation,
+                     'remote_host': host, 'state': evidence.state, 'observed_at': evidence.observed_at,
+                     'path': str(claim.path), 'claim': dict(claim.record)}
+            (paths.directory / 'release-evidence').mkdir(parents=True, exist_ok=True)
+            write_json(paths.directory / 'release-evidence' / claim.path.name, proof)
+            claim.path.unlink(missing_ok=True)
+            released += 1
+    return released
 
 
 if __name__ == "__main__":

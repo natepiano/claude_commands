@@ -934,7 +934,10 @@ class RosterTests(unittest.TestCase):
         peer = self._entry('natedev', 'freestanding', 'session:peer-session')
         os.environ['SSH_SNAPSHOT'] = roster.RosterSnapshot(roster.Roster([peer], [])).encode()
         output, errors = io.StringIO(), io.StringIO()
-        with mock.patch.object(send, 'STATE', self.root / 'send-state'), \
+        membership = staff.StaffSnapshot((staff.StaffRow(staff.StaffId('peer-session'), 'showrunner',
+            'natedev', None, current_session=staff.StaffId('peer-session')),))
+        with mock.patch.object(staff, 'snapshot', return_value=membership), \
+                mock.patch.object(send, 'STATE', self.root / 'send-state'), \
                 mock.patch.object(send, 'remote', return_value=send.Result('sent', 'fixture peer')) as deliver, \
                 mock.patch.object(send, 'user', side_effect=AssertionError('no real notification')), \
                 redirect_stdout(output), redirect_stderr(errors):
@@ -1276,8 +1279,9 @@ class RosterTests(unittest.TestCase):
             found = roster.roster(os.environ, roster.ThisMachine())
         self.assertNotIn("d2d1a6c7-68f1-5f01-b1af-3a7622ca03c6", [entry.session.session_id for entry in found.entries
                                        if isinstance(entry.session, roster.ClaudeSession)])
-        self.assertEqual(send.resolve_recipient("free-claude", send.LocalOnly(), found),
-                         send.ClaudeRecipient("session:abd1a227-f410-5c76-bc96-a0c77c0f3ef0"))
+        with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())):
+            self.assertEqual(send.resolve_recipient("free-claude", send.LocalOnly(), found),
+                             send.ClaudeRecipient("session:abd1a227-f410-5c76-bc96-a0c77c0f3ef0"))
         self.assertEqual([entry for entry in found.entries if entry.name == relay_name], [])
 
     def test_socketless_record_with_another_process_start_is_absent_from_the_roster(self) -> None:
@@ -1409,6 +1413,14 @@ class RosterTests(unittest.TestCase):
             ),
         )
         self.assertNotIn("contract reviewer", entries)
+
+    def test_the_roster_recognizes_the_simplify_status_writer(self) -> None:
+        from scripts.lib.atomic_file import write_text_atomic
+
+        write_text_atomic(self.director_run / "review_status_adversary", "reviewing\n")
+        with mock.patch.object(os, "readlink", return_value="/review/cwd"):
+            entries = self._entries()
+        self.assertEqual(entries["adversary reviewer"].status, "running")
 
     def test_review_status_in_a_phase_directory_finds_its_reviewer(self) -> None:
         phase = self.director_run / "phases" / "4"

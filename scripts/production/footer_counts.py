@@ -1,22 +1,19 @@
-"""The counts line: how much waits on the user, read at render time and never stored.
-
-The status line and the dailies report's own footer show it; no reply carries it (user,
-2026-10-18). Each count is the production's own: the showrunners above and below it count their
-own (user, 2026-10-27). Changes are the production's open rows from its current and earlier
-lists (change_review.scope_rows), proposals the issues and plan-backlog lines that /next proposal
-lists for review (proposals_table.waiting_entries), and efficiency the proposed or deferred
-lines in its Efficiency ledger. Accepted plan-backlog lines are work in progress and do not count.
-"""
+"""Count the user's waiting items through the same staff routing as the change page."""
 from __future__ import annotations
 
 import re
+import os
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import change_review
+from scripts.production import change_routing, showrunners, staff
 import proposals_folder
 import proposals_table
 from production_units import Refusal, production_field
+
+if TYPE_CHECKING:
+    from update_registration import QuestionStaff
 
 EFFICIENCY_LEDGER_FIELD = "Efficiency ledger"
 COUNTS_HEAD = "For you: "
@@ -28,6 +25,7 @@ class FooterCounts(NamedTuple):
     proposals: int = 0
     questions: int = 0
     efficiency: int = 0
+    unrouted: int = 0
 
 
 def total(each: list[FooterCounts]) -> FooterCounts:
@@ -36,7 +34,21 @@ def total(each: list[FooterCounts]) -> FooterCounts:
 
 def changes(doc: Path) -> int:
     try:
-        return len(change_review.scope_rows(change_review.scope_list(doc), doc))
+        root = Path(os.environ.get("REVIEW_LINKS_ROOT") or Path.home() / ".local/share/review-links").expanduser()
+        return sum(change_routing.waits_for_user(entry.review_list.path, entry.entry.item, root)
+                   for entry in change_review.scoped_review_entries(change_review.scope_list(doc), doc))
+    except (change_review.ChangeReviewError, OSError):
+        return 0
+
+
+def unrouted_changes(doc: Path) -> int:
+    """Count the same global unrouted tab as the change page."""
+    try:
+        current = change_review.scope_list(doc)
+        root = Path(os.environ.get("REVIEW_LINKS_ROOT") or Path.home() / ".local/share/review-links").expanduser()
+        return sum(isinstance(owner, change_routing.UnroutedChange)
+                   and change_routing.waits_for_user(item.path, row, root)
+                   for item, owner, row in change_review.routed_review_entries(current, doc))
     except (change_review.ChangeReviewError, OSError):
         return 0
 
@@ -78,16 +90,25 @@ def efficiency(doc: Path) -> int:
 def read_counts(doc: Path, *, questions: int = 0) -> FooterCounts:
     """Each count for one production doc; a source that cannot be read counts nothing."""
     try:
-        return FooterCounts(changes(doc), proposals(doc), questions, efficiency(doc))
+        return FooterCounts(changes(doc), proposals(doc), questions, efficiency(doc), unrouted_changes(doc))
     except OSError:
         return FooterCounts(questions=questions)
 
 
-def sources(doc: Path) -> list[Path]:
-    """The files the counts read, so a copy of them can tell when it is out of date.
+def routing_sources() -> list[Path]:
+    """Watch staff, all review lists, and delivery records for tab count changes."""
+    root = Path(os.environ.get("REVIEW_LINKS_ROOT") or Path.home() / ".local/share/review-links").expanduser()
+    record = staff.snapshot()
+    routing = change_routing.StaffRouting(record, showrunners.timer_docs(), change_review.ReviewHistoryReader())
+    return [*(source for repo in routing.repository_choices({}, "") for source in change_routing.history_sources(repo)),
+            change_review.LISTS, *change_review.LISTS.glob(change_review.PREFIX + "*.md"),
+            *(Path(path) for path in record.inputs), root, *root.glob(".review-link-delivery-*")]
 
-    A proposal closes in place, so each open one is named beside its folder, which a new one
-    changes.
+
+def sources(doc: Path, *, identities: QuestionStaff | None = None) -> list[Path]:
+    """Return the files that affect the counts and their containing folders.
+
+    Watch each open record because closing it changes the file.
     """
     try:
         listed = [item.path for item in change_review.scope_lists(change_review.scope_list(doc), doc)]
@@ -101,8 +122,22 @@ def sources(doc: Path) -> list[Path]:
         queue = None
         efficiency_queue = None
     found = [doc, *listed, *(path for path in (folder, queue, efficiency_queue) if path is not None)]
+    if folder is not None:
+        try:
+            found.extend(issue.path for issue in proposals_folder.open_proposals(doc))
+        except OSError:
+            pass
+    from update_registration import QuestionFolder, QuestionStaff, question_folder, question_records_for_document
+
     try:
-        found.extend(issue.path for issue in proposals_folder.open_proposals(doc))
+        if identities is None:
+            identities = QuestionStaff.read()
+        questions = question_folder(doc, identities)
+        if isinstance(questions, QuestionFolder):
+            if questions.path not in found:
+                found.append(questions.path)
+            found.extend(record.path for record in question_records_for_document(doc, identities)
+                         if record.status == "open")
     except OSError:
         pass
     return found
@@ -122,5 +157,6 @@ def counts_line(counts: FooterCounts) -> str | None:
         (counts.questions, plural(counts.questions, "question")),
         (counts.changes, plural(counts.changes, "change")),
         (counts.efficiency, f"{counts.efficiency} efficiency"),
-        (counts.proposals, plural(counts.proposals, "proposal"))) if count]
+        (counts.proposals, plural(counts.proposals, "proposal")),
+        (counts.unrouted, f"{counts.unrouted} unrouted")) if count]
     return COUNTS_HEAD + ", ".join(parts) if parts else None

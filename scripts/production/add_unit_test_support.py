@@ -45,7 +45,7 @@ from scripts.whoami.note_file import NumberedAccountLabel, note_name, parse_acco
 import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.production.fake_unit_host import confirm_tab_close, native_claude
-from scripts.whoami import usage_store
+from scripts.whoami.account_test_support import stored_room
 from test_support import registry_confirmation, ShutdownTestCase
 
 
@@ -312,13 +312,8 @@ class AddUnitTestCase(ShutdownTestCase):
         self.prepare_herdr_launch("alpha", "--plan", "docs/plans/given.md")
 
     def quota_reading(self, login: str, left: float, reset_days: float) -> None:
-        file = Path(self.env["HOME"]) / ".local/state/agent-notes/usage.json"
-        saved = cast(dict[str, usage_store.StoredUsage], json.loads(file.read_text())) if file.exists() else {}
-        now = datetime.now(timezone.utc)
-        saved[login] = {"weekly": {"left": left, "at": now.isoformat(),
-                                  "resets": (now + timedelta(days=reset_days)).isoformat()}}
-        file.parent.mkdir(parents=True, exist_ok=True)
-        _ = file.write_text(json.dumps(saved))
+        with patch.dict(os.environ, self.env):
+            stored_room(login, left, datetime.now(timezone.utc) + timedelta(days=reset_days))
 
     def select_unit_account(self, label: str) -> Path:
         with patch.dict(os.environ, self.env):
