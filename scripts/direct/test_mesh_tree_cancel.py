@@ -69,6 +69,7 @@ class MeshTreeCancelTests(VerifyTreeCancelFixture):
         self.addCleanup(VerifyTreeCancelFixture.doClassCleanups)
         other = VerifyTreeCancelFixture()
         other.setUp()
+        self.addCleanup(other.doCleanups)
         self.addCleanup(other.tearDown)
         first_identity, second_identity = "edited-worker", "stable-worker"
         first_path = self.start_detached(self, first_identity, done_message=True)
