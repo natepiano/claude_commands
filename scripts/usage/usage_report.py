@@ -19,8 +19,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.production import production_units, session_staff, staff, unit_lookup, unit_names
 from scripts.usage import collect, outcomes, weights
-from scripts.production import session_staff, staff
 from scripts.shutdown import remote
 from scripts.lib.user_zone import user_zone_name
 from scripts.usage.rollouts import parse_timestamp
@@ -286,7 +286,12 @@ class UnitWorktree:
 
 def document_units(path: Path, *, resolver: session_staff.RowResolver | None = None) -> tuple[UnitWorktree, ...]:
     """Read a document owner's unit worktrees from one staff snapshot."""
-    resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+    try:
+        resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+        cells = production_units.unit_table(path.read_text(encoding="utf-8").splitlines())
+    except (staff.StaffUnreadable, OSError, UnicodeError, production_units.Refusal) as error:
+        print(f"usage_report: {path}: {error}", file=sys.stderr)
+        return ()
     owner = resolver.record.by_doc(remote.local_machine(), path)
     if owner is None:
         print(f"usage_report: {path}: no staff owner binds the document", file=sys.stderr)
@@ -297,7 +302,19 @@ def document_units(path: Path, *, resolver: session_staff.RowResolver | None = N
         if isinstance(tree, staff.WorktreeUnfilled):
             print(f"usage_report: {row.name}: the worktree is not recorded", file=sys.stderr)
         else:
-            found.append(UnitWorktree(row.name, tree.path))
+            folder = tree.path
+            name = row.name
+            for unit_cells in cells:
+                if unit_names.name(outcomes.cell_value(unit_cells.get("Unit", ""))) != row.name:
+                    continue
+                name = outcomes.cell_value(unit_cells["Unit"])
+                if outcomes.cell_value(unit_cells.get("Plan", "")) and isinstance(tree, staff.PresentWorktree):
+                    try:
+                        folder = unit_lookup.plan_worktree(unit_cells, session_staff.MemberFound(row))
+                    except staff.StaffUnreadable as error:
+                        print(f"usage_report: {row.name}: {error}", file=sys.stderr)
+                break
+            found.append(UnitWorktree(name, folder))
     return tuple(found)
 
 

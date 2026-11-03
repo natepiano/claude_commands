@@ -39,6 +39,7 @@ class ProducerBackfillTests(ProducerFixture):
     def test_a_renamed_unit_maps_its_old_plan_to_its_fixed_staff_id(self) -> None:
         self.old_row(self.merge("old-plan"))
         _ = staff.rename(self.unit.id, "latest-name")
+        _ = self.doc.write_text(self.doc.read_text().replace("| new-unit |", "| latest-name |"))
         self.assertEqual(self.backfill().filled, {"C1": self.unit.id})
 
     def test_an_old_prefixed_name_maps_without_a_units_key_and_saves_once(self) -> None:
@@ -142,7 +143,7 @@ class ProducerBackfillTests(ProducerFixture):
     def test_each_change_in_a_multi_unit_merge_selects_its_own_checkpoint(self) -> None:
         runner = staff.snapshot().by_path("top")
         assert runner is not None
-        second = fixture_member("unit", name="second-unit", parent=runner.id,
+        second = fixture_member("unit", name="second", parent=runner.id,
             worktree=staff.PresentWorktree("natedev", self.root / "second"))
         _ = self.doc.write_text(self.doc.read_text() + f"| second-unit | second.md | {self.root / 'second'} | second |\n")
         _ = self.git("checkout", "-b", "old-branch")
@@ -158,7 +159,7 @@ class ProducerBackfillTests(ProducerFixture):
     def test_a_checkpoint_merge_subject_names_the_producer_when_its_delta_has_no_matching_change(self) -> None:
         for name in ("first", "second"):
             runner = fixture_member("showrunner", name=name)
-            _ = fixture_member("unit", name=name + "-unit", parent=runner.id,
+            _ = fixture_member("unit", name=name, parent=runner.id,
                 worktree=staff.PresentWorktree("natedev", self.root / name))
             _ = self.doc.write_text(self.doc.read_text()
                 + f"| {name}-unit | {name}.md | {self.root / name} | {name} |\n")
@@ -206,7 +207,7 @@ class ProducerBackfillTests(ProducerFixture):
     def test_an_exact_branch_wins_over_an_earlier_alias_during_backfill(self) -> None:
         runner = staff.snapshot().by_path("top")
         assert runner is not None
-        second = fixture_member("unit", name="second-unit", parent=runner.id,
+        second = fixture_member("unit", name="second", parent=runner.id,
                                 worktree=staff.PresentWorktree("natedev", self.root / "second"))
         _ = self.doc.write_text(self.doc.read_text().replace("| new-unit |", "| branch-b |")
             .replace("| old-branch |", "| branch-a |")

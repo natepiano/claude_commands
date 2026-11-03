@@ -41,6 +41,8 @@ def main() -> None:
         return
     session = environment.get("HERDR_SESSION") or "default"
     arguments = pane_record.claude_arguments(os.getpid())
+    if "-p" in arguments or "--print" in arguments:
+        return
     launch = pane_record.launch(pane_id, session_id, payload.get("cwd") or os.getcwd(), environment, arguments)
     pid = os.getppid()
     for depth in range(pane_record.ANCESTOR_LIMIT):

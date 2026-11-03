@@ -16,6 +16,7 @@ from typing import Literal, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import unit_runs
 from scripts.usage import collect
+from scripts.production import staff, staff_sources, unit_lookup
 from production_units import Refusal, cell_value, unit_table
 
 
@@ -142,7 +143,15 @@ def main(arguments: list[str]) -> int:
     if row is None:
         print(f"unit_run: no Units row for {unit}", file=sys.stderr)
         return 1
-    worktree = cell_value(row.get("Worktree", ""))
+    try:
+        record = staff.snapshot()
+        sources = unit_lookup.member_sources()
+        slug = unit_lookup.production_slug_for_document(cast(Path, args.production), record, sources)
+        worktree = str(unit_lookup.local_worktree(sources.member(
+            staff_sources.UnitMember(slug, unit), record)).path)
+    except (staff.StaffUnreadable, staff.StaffRefused) as error:
+        print(f"unit_run: {error}", file=sys.stderr)
+        return 1
     root_argument = cast(str, args.root)
     root = Path(root_argument).expanduser() if root_argument else unit_runs.history_root()
     found = local_run(root, worktree)

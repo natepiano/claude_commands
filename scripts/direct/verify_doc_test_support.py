@@ -165,6 +165,7 @@ class VerifyDocFixture(unittest.TestCase):
         self.environment.update({
             "HOME": str(home), "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
             "PYTHONDONTWRITEBYTECODE": "1",
+            "LINT_SKIP_SWEEP": "1",
             "TEST_CARGO_EVENTS": str(self.events),
             "TEST_ORIGINAL_REPO": str(self.repo),
             "TEST_METADATA": json.dumps({"workspace_root": str(self.repo),

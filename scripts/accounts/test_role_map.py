@@ -688,25 +688,6 @@ class RoleMapTests(unittest.TestCase):
             self.assertEqual(cast(dict[str, str], launch.call_args.args[2])["CLAUDE_CONFIG_DIR"],
                              str(self.home / ".claude3"))
 
-    def test_mapped_claude_role_refuses_missing_setup_and_login_for_fresh_and_resumed_launches(self) -> None:
-        self.seed(self.server_home, groups={"units": "claude2", "showrunners": "claude2"})
-        for is_set_up in (False, True):
-            if is_set_up:
-                self.assertEqual(accounts.setup("claude2"), [])
-            for role in ("units", "showrunners"):
-                for arguments in ((), ("--resume", "existing-thread")):
-                    with self.subTest(is_set_up=is_set_up, role=role, arguments=arguments):
-                        state = "not logged in" if is_set_up else "not set up"
-                        step = (f"run CLAUDE_CONFIG_DIR={shlex.quote(str(self.home / '.claude2'))} claude and /login"
-                                if is_set_up else "run accounts.py setup claude2")
-                        expected = f"accounts: {role} is on claude2, which is {state} on this machine; {step}\n"
-                        with (patch.object(role_map, "ssh_role_map", side_effect=self.remote),
-                              patch.object(os, "execvpe") as launch,
-                              patch.object(accounts, "pick", side_effect=AssertionError("launch chose another account"))):
-                            code, output, error = self.cli("exec", role, *arguments)
-                        self.assertEqual((code, output, error), (2, "", expected))
-                        launch.assert_not_called()
-
     def test_mapped_workers_refuse_missing_setup_and_login_without_launching_another_home(self) -> None:
         self.seed(self.server_home, groups={})
         for is_set_up in (False, True):

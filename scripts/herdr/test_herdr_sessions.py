@@ -13,6 +13,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from scripts.lib.script_envelope import script_prompt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from datetime import datetime, timezone
@@ -75,7 +76,6 @@ class HerdrSessionsTests(unittest.TestCase):
         _ = self.enterContext(patch.object(herdr_sessions, "live_session", side_effect=self.record_is_live))
         _ = self.enterContext(patch.object(sessions, "running_session", side_effect=self.record_is_live))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.state))
-        _ = self.enterContext(patch.object(showrunners, "SESSIONS_DIR", self.records))
         _ = self.enterContext(patch.object(showrunners, "socket_for", return_value="fake-socket"))
         _ = self.enterContext(patch.object(showrunners, "_session_name", side_effect=self.registered_name))
         _ = self.enterContext(patch.object(showrunners, "user_zone_name", return_value="UTC"))
@@ -583,7 +583,9 @@ class StandaloneLaunchTests(unittest.TestCase):
             "HERDR_PROC": str(self.proc), "FAKE_HERDR_LOG": str(self.log),
             "FAKE_HERDR_RESPONSES": str(self.responses_path),
         }, clear=True))
-        _ = self.enterContext(scratch_accounts_config())
+        configuration = self.enterContext(scratch_accounts_config())
+        _ = (configuration / "script_prompts.conf").write_text(
+            (Path(__file__).resolve().parents[2] / "config/script_prompts.conf").read_text())
         self.responses = {"default": {"stdout": json.dumps({"result": {
             "workspaces": [], "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}, "tabs": [], "panes": [],
         }}), "code": 0}}
@@ -809,7 +811,7 @@ class StandaloneLaunchTests(unittest.TestCase):
         start, = self.agent_starts()
         self.assertEqual(start[start.index("--") + 1:], ["--model", "opus", "--remote-control", "kept name", "--settings", '{"x":true}', "--resume", "recorded-id", "-n", "solo"])
         prompts = [command for command in self.commands() if command[2:4] == ["agent", "prompt"]]
-        self.assertEqual(prompts, [["--session", "agents", "agent", "prompt", "w1:p1", "first line\nsecond line\n"]])
+        self.assertEqual(prompts, [["--session", "agents", "agent", "prompt", "w1:p1", script_prompt("first line\nsecond line\n")]])
         self.tab_opened("solo")
         workspace, = [command for command in self.commands() if command[2:4] == ["workspace", "create"]]
         self.assertIn(f"CLAUDE_CONFIG_DIR={directory}", workspace)
