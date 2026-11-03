@@ -151,11 +151,13 @@ class HerdrLaunchTests(NixFixture):
             branch="fixture", worktree=self.root / "unused-checkout", plan=add_unit.Standby(),
             port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(), session=add_unit.ResumedSession("sid", self.work),
             launch_kind=add_unit.NewWorkLaunch(), timeout=1)
-        with isolated_staff_file(self.root / "staff.json", self.env):
+        errors = io.StringIO()
+        with isolated_staff_file(self.root / "staff.json", self.env), redirect_stderr(errors):
             member = unit_membership("child", "unit")
             member = staff.set_worktree(member.id, staff.PresentWorktree(local_machine(), request.worktree), expected=member.worktree)
             self.refusal(lambda: add_unit.launch_session(request, add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
                 "resume", accounts.NamedAccount("claude3", self.home / ".claude3")))
+        self.assertIn("launch names: sid (worker): no staff row; saved name retained", errors.getvalue())
 
     def test_add_showrunner_uses_requested_cwd_before_opening(self) -> None:
         self.refusal(lambda: add_showrunner.launch(self.production(), "opus", "high", None, self.work,

@@ -2385,7 +2385,25 @@ Config: `config/agents.conf`, `config/README.md:7, 14, 15, 20`, `.gitignore:23-2
 
 ### Probe results (Phase 6 writes them)
 
-none yet.
+Measured 2026-11-02 on natedev, herdr 0.9.5 (protocol 22), in probe workspaces of `agents` and in a private herdr server. The probes did not restart the shared `agents` server and did not replace a live credential. Each probe workspace was closed after use.
+
+| Probe | Result | Who uses it |
+| --- | --- | --- |
+| Which side `--ratio` measures | The original pane: the left side of a `right` split, the top of a `down` split. `pane split --direction right --ratio 0.3` gave the original pane 27 of 91 columns. | Phase 7 split sizes |
+| `split_ratio` on a nested split | It changes the nearest split that holds the pane. The root split kept its ratio 0.3. | Phase 7 |
+| A close rebalances the rest | No. The closed branch collapses into its sibling. The other split ratios stay. | Phase 7, Phase 10 |
+| Label after the agent exits | Kept. After `/exit`, Codex and Claude panes kept their `label_pane` label and their `terminal_id`. | Phase 7 finds a stopped worker's shell by its label |
+| Label after a cross-workspace move | Kept, with the same `terminal_id`. The pane id changes (`w1P:p2` became `w1Q:p1`). | Phase 7 |
+| A message typed mid-turn | Both CLIs processed a second prompt sent right after the first. That the second arrived during an active turn is not proved. herdr's state read `idle` right after the prompt, so state reads can lag a turn. | Decision 4: only a `DONE <dispatch id>` line ends a pass |
+| herdr's Codex state over a 10-minute turn | `working` at the start, `done` at the end: 605 s, `Worked for 10m 5s`. The probe read the start and the end only. | Phase 7 |
+| Prompt by path, and an image named in a prompt file | Both CLIs read `/tmp/.../prompt.txt` and opened the image it named (Claude about 9 s, Codex about 22 s). This is the interactive prompt-file workflow, not a CLI flag. | Phase 7 |
+| The Codex input that names a session | `/rename <name>` typed in the session. `codex --help` shows no `--name`. Claude takes `--name <name>` at start. | Phase 7 |
+| `native_session` for a Codex pane | Fails before the first turn ("Codex launch identity is unavailable"). After the first turn it returns the thread id, from the rollout file Codex opens. | Phase 7 must handle the interval before the first turn |
+| Confirmed pane close | It closes only the target pane. The sibling in the same tab stays with its record. A rerun changes nothing. | Phases 7, 10-12 |
+| `resume_agents_on_restore` keeps each pane's `--env` | **Negative.** With `resume_agents_on_restore = true`, a private server stop and start brought back the shell only: `agent get` gave `agent_not_found`, and the pane-only `--env` marker was absent from the restored shell. | Phase 10: our split-tab restore stays; questions list item 1(e) applies |
+| Interactive Codex picks up a new `auth.json` by itself | Not proved. After a private `auth.json` was replaced with an invalid key, the running Codex still answered. That shows it kept its old credentials, not that it read new ones. | Reference job 8: the sign-in restart stays |
+
+Probe logs: `/tmp/claude/unit/32b26811-c966-489a-8843-ba1bd158abce/mesh_runs/` runs `20261102T111252-3094000-c5b2` (start and prompt probes), `20261102T112920-297660-034d` (confirmed close) and `20261102T120803-3311603-53df` (10-minute turn, restore, `auth.json`). They are kept only while that run folder exists.
 
 ### Risks
 
