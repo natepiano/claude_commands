@@ -913,6 +913,7 @@ assertion_rulings_args
 # runs this same call under a supervisor outside the worker's process group,
 # returns at once, and sends the result to the worker as its next message.
 # Exit 3 means the caller is not a mesh worker; this call then runs attached.
+# Exit 4 refuses the run at its live-run limit; never run that command attached.
 # The detached run sets UNIT_DETACHED_RUN, so it does not detach again.
 MESH_RUNS_SCRIPT="${VERIFY_MESH_RUNS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../agents" && pwd)/mesh_runs.py}"
 if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" ]]; then
@@ -923,6 +924,7 @@ if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" ]]; then
     case "$DETACH_STATUS" in
         0) exit 0 ;;
         3) ;;
+        4) exit 4 ;;
         *) echo "verify.sh: mesh_runs.py could not detach this run (exit $DETACH_STATUS); running attached" >&2 ;;
     esac
 fi
