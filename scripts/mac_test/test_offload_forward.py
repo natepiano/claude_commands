@@ -12,9 +12,9 @@ from typing import TYPE_CHECKING, cast
 import offload
 from offload_test_support import HANA, OffloadCommandFixture
 if TYPE_CHECKING:
-    from ..lib.test_hang_guard import TEST_HANG_GUARD_SECS
+    from ..lib import test_hang_guard
 else:
-    from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+    from scripts.lib import test_hang_guard
 
 
 class OffloadForwardTests(OffloadCommandFixture):
@@ -289,11 +289,11 @@ class OffloadForwardTests(OffloadCommandFixture):
             self.wait_for_path(self.stub_directory / "pull-started")
             self.assertTrue((self.state_directory / "fetched/call-forward.partial").is_dir())
             process.send_signal(signal.SIGTERM)
-            output, _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            output, _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         finally:
             if process.poll() is None:
                 process.kill()
-                _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 143, output)
         self.assertFalse((self.state_directory / "fetched/call-forward.partial").exists())
         self.assertFalse((self.state_directory / "fetched/call-forward").exists())

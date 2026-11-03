@@ -255,39 +255,20 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **Gotchas:**
 - Only `okay`/`ok` and a row id may come before `works` or `fine`, so "yes works" now returns its row (Assertion-Change in checkpoint 1afb985d).
 
-### Phase 6 — The four-week review: which waits slow Hana, which links helped, and which trial steps stay  · status: todo
-**Depends on:** Phase 6a's checkpoint (`compare`), Phase 6c's checkpoint (the Hana trunk walk), and the checkpoints of Phases 3, 4 and 5, and the three review records: the Phase 3 and Phase 5 re-runs, which the unit director runs on 2026-11-12 (two weeks after both merged into sdlc as 3c5dea67 on 2026-10-29) and records in the design doc under Steps 1 and 4 (the push-audit re-run also confirms that `measure.py` and `push_audit.py` agree; each re-run record holds the report's source-problem lines, because both reports exit 0 with source problems), Phase 12's checkpoint (merged before the 2026-11-12 re-run), Phase 15's checkpoint (`compare` prints through its `blocks`), and four weeks from the experiment start in design doc Step 2: the first day on which each holder producer (builds' `verify.sh`, models-unit's `codex_mesh.py`) has recorded a `NamedHolder`, read live from `progress_history.py waits`. At Phase 10's checkpoint (bece20e1) neither had, and Step 2 says `start not set`; the unit director sets the start and the review date when both have. Also models-unit's checkpoint that adds `codex_mesh.py end --cleanup-only` (routed from Phase 6a), merged into sdlc, and one `worker_owners.py end` run after that merge: until then every cleanup retry exits 2, so `end_cleanup_pending` counts the missing flag, not a held worker. The phase starts on the latest of these dates, never before.
+### Phase 6 — Trace recent Hana features from choice to working, and propose one fix for the largest delay  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** design Step 5: the doc reports which waits slow Hana (HI7), which Hana links helped (HI2), and keep or drop for each trial step (HI1).
-
-**Hana link:** direct. The review keeps a step only by its effect on Hana.
-
-**Spec:**
-- Run Phase 6a's `measure.py compare --before <Baseline window> --after <the four-week window>` and the two re-run records, and judge each step on the measure and review point each of Phases 3–5 names.
-- Design doc section **Results**: per step, the measure, its change, keep or drop. The link records (Step 3) set beside Hana merges and closures. A wait with a named non-Hana cause brings a new proposal (HI10), as Phase 6a's Spec defines.
-- Step 3 evidence: `compare` has no link measure. Before dispatch, the unit director gets from roles-unit (which writes the link duty) the admissions in the review window (new units, later runs, added work and board pulls in build-followups, sdlc and cargo) and the work-note path of each, and gives the writer that list. The writer reads each note's Hana link line and reports the share of new work with a recorded link, with n. An admission whose note or link line is not found counts as `not recorded` and is named.
-- A defect `compare` shows on live data is fixed in `measure.py` or `push_audit.py` with its test, in this phase.
-- Routed from Phase 6a (2026-10-30):
-  - F002 and F003: Phase 6a's repair rounds already made `--full` one row per measure per window and kept the good build rows with a count of the bad ones (`test_full_comparison_keeps_one_block_per_measure_as_event_counts_grow`, `test_bad_build_rows_keep_good_minutes_and_one_diagnostic_in_baseline_and_compare`). The 8564 lines and 101 s were measured before those repairs. On live data, confirm the `--full` line count, the run time and the bad-row label, and fix any output, run-time or label defect that remains.
-  - F007 (fixture-proven, fix before the Results): `compact_wait_rows` prints the per-wait `holder_evidence_row` only when `evidence.malformed`. Print it for every wait whose `wait_evidence` has not-named minutes, so ordinary partial waits (4/6 and 5/7) stay apart beside the malformed 0/10 and 4/6.
-  - Unknown saved Baseline value: `evaluate_row` prints the before side of a `Snapshot(NotRecorded(text))` as the saved text with no marker. Print it as `not recorded (saved: <text>)`; the change stays `not recorded`.
+- Replaced the four-week review (user, 2026-10-31: the push audit and worker cleanup are too small for faster Hana delivery). Built on Astra review item 7.
+- The design doc section **Hana delivery trace** follows three Hana features from choice to working: the LFO live dot (trunk bd80a1f86d, verdict C18), the cable drag plane (02f492f0a0, C68) and palette match highlighting (5ba63fd303, C70). Each table names its source, window and n; parts no record covers read `not recorded`.
+- Largest delay to target (a judgment): the palette phase's mixed repair and validation, a 17.95 h repair union over 23 fix passes, shared with other widget changes.
+- Proposal, sent to the user through sdlc as one question: a one-week widget-unit trial under the hana showrunner that carries one prioritized outcome to a working demo before optional adjacent changes join its phase, and defers the palette-footer rewrite. It names a one-week measure and a rollback rule.
+- Steps 1 and 4 closed with the 2026-10-31 re-runs (0 unapproved pushes; OwnerUnknown 0, DirectorGone 8). Step 2 runs apart. The routed Phase 6a reporting follow-ups are dropped.
 
 **Files:**
-- `docs/plans/build-followups-hierarchies-design.md` — Results
-- `scripts/hierarchies/measure.py`, `scripts/hierarchies/test_measure.py` — F007, the unknown saved value marker, and a defect live data shows
-- `scripts/hierarchies/push_audit.py`, `scripts/hierarchies/test_push_audit.py` — only for a defect live data shows
+- `docs/plans/build-followups-hierarchies-design.md` — the trace and the step closures
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `measure.py`, `push_audit.py`, and the design doc's Results, from the `compare` output, the re-run records and the Step 3 list the unit director gives it
-- `test` — `test_measure.py` and `test_push_audit.py`: the F007 fixtures (ordinary 4/6 and 5/7 apart, malformed 0/10 and 4/6) and the unknown saved value, each checked on rendered `compare` output
-
-**State:** none.
-
-**Constraints from prior phases:** as Phase 6a, plus the As-builts of Phases 6a, 6b and 6c. Results quotes the Hana merges row's source as printed: the recorded tip count, the oldest tip time and the 90-day reflog limit (before that tip the count follows the first parent). In `--full` text a table heading names its common window and source once, and a collapsed wait row's n counts phases or waits, with every id in its source. Results quotes `compare`'s markers as printed: an unknown saved snapshot stays `not recorded`; a `RowsSkipped` problem keeps the good counts and adds `; incomplete: N rows skipped`; a `SourceUnreadable` problem keeps its unavailable-source reason. `codex_mesh.py` is models-unit's file; this phase never edits it.
-
-**Acceptance gate:** Results holds real numbers for each step, judged on the measure and review point each of Phases 3–5 names; the F007 and unknown saved value tests pass on rendered `compare` output; unit tests, per-slot `basedpyright` (`0 errors, 0 warnings, 0 notes`) and merge gate green when code changed. **Measure and review point:** this phase is the review point for Steps 1, 2 and 4. Step 4's keep-or-drop reads `worker_owners.py report` `end_cleanup_pending` and the cleanup outcomes in `ends.jsonl` beside the ownerless-worker count: a worker ended with its cleanup still pending is not released capacity. At phase end the unit director sends the showrunner the Results and the keep-or-drop list as one question for the user.
+**Gotchas:** old LFO and cable run folders are gone; the durable run files under `~/.local/state/plan-delegate/runs/` carry their history. No record holds first-demo time, user-blocked time or exclusive build delay, and build step hours overlap.
 
 ### Phase 7 — The baseline measure and the push audit count failed checks by one rule, and session names come from config  · status: done
 
@@ -516,3 +497,36 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - `scripts/production/test_review_regime.py` — a second add keeps the first row byte for byte and exits 0 (was `test_the_same_unit_plan_and_phase_is_refused`).
 - `scripts/production/test_merge_checkpoint_history.py` — a merge, then a repair merge of the same phase with the real `review_regime.py` and a test `HOME`: `record: ok` with the kept line, one ledger row, two log lines; a rerun prints "checkpoint already recorded".
 - `scripts/production/test_merge_checkpoint.py` — a failing add after a first merge stops record and keeps the first log line; a retry records the repair once.
+
+### Phase 17 — The held-merge message says the covering commit cannot be a merge commit  · status: done
+
+#### As-built
+
+- `merge_checkpoint.change_review_commits`: the `change review: held` next step now starts `commit a checkpoint (a plain commit, not a merge: the gate does not read merge commits)`, because `change_review.unit_commits` reads with `--no-merges`. The stage, status and refused list are unchanged.
+- `change_review.COVERS` (`Change-Review-Covers`) is the one name for the Covers trailer; the `_COVERS` regex and the held text use it. The module docstring states the plain-commit rule.
+- Review routed three items to Phase 18: the hook accepts a line on a merge commit (F005), 31 checkpoint merge commits carry unread visible lines (F006), and `merge_gate.py` gives no next step (F008).
+
+**Files:**
+- `scripts/production/merge_checkpoint.py`, `scripts/production/change_review.py`.
+- `scripts/production/test_merge_checkpoint_validation.py` — the held-before-merge test requires exit 1, the refused short hash, the plain-commit phrase and `change_review.COVERS` (no second gate run).
+- `docs/as-built/showrunner-automation.md` — a later plain (non-merge) commit carries the Covers line.
+
+### Phase 18 — The change-review hook and the merge gate read one rule for merge commits  · status: todo
+
+**Depends on:** Phase 17 (the held next-step text that change_review will own)
+
+#### Work Order
+
+**Goal:** A unit cannot put a Change-Review or Covers line on a merge commit. The hook refuses it at commit time, by the same rule the merge gate reads, so no line is accepted that the gate ignores.
+
+**Spec:**
+- Source: Phase 17 simplify review (F005, F006, F008), settled by the sdlc showrunner on 2026-11-03. sdlc: "Each phase now deletes more lines than it adds" (user: "everything is too complex").
+- One rule in `scripts/production/change_review.py` says that a merge commit carries no Change-Review or Covers lines. The hook (`scripts/hooks/pre-tool-use-change-review-gate.py`, `refusal`) and the merge gates read that one rule. Add no second check.
+- The hook knows a merge commit: a `git merge` command, or a `git commit` while `MERGE_HEAD` exists. Its refusal says: put the lines on a plain commit after the merge.
+- `change_review` owns the gate's next-step text (Phase 17's held message). `merge_checkpoint.py` and `scripts/production/merge_gate.py:1443` both import it; `merge_gate`'s refusal then names the next step.
+- Read-only check (F006): list the checkpoint merge commits on HEAD that carry a visible Change-Review line (31 found in review, for example `0d18aaa4c`, `d34684ce7`) and say for each one whether a plain commit also carries its lines. Send that list to sdlc before any row is added; the list is the user's. Add no row in this phase.
+- The phase deletes more lines than it adds.
+
+**Files:** `scripts/production/change_review.py`, `scripts/hooks/pre-tool-use-change-review-gate.py`, `scripts/production/merge_checkpoint.py`, `scripts/production/merge_gate.py`, and their tests. The exact list is set at phase start.
+
+**State:** none (the check is read-only).

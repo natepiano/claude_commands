@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import itertools
 import os
-import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -26,7 +25,6 @@ sys.path.insert(0, str(SCRIPTS.parent))
 sys.path.insert(0, str(SCRIPTS / "production"))
 from scripts.production.showrunners import registered_showrunners, require_complete  # noqa: E402
 
-from scripts.shutdown import launch_permission  # noqa: E402
 from scripts.accounts import accounts  # noqa: E402
 from scripts.whoami import account  # noqa: E402
 from scripts.production import staff  # noqa: E402
@@ -100,26 +98,6 @@ def _attach(pane: str) -> None:
     os.execvp(binary, [binary, "session", "attach", shared])
 
 
-def _launch_rerun(verb: str, options: LaunchOptions, folder: Path, claude_arguments: list[str]) -> str:
-    command = [sys.executable, str(Path(__file__).resolve()), verb]
-    if options.name is not None:
-        command.extend(["--name", options.name] if verb == "start" else [options.name])
-    command.extend(["--cwd", str(folder)])
-    if verb == "resume":
-        command.extend(["--session-id", options.session_id])
-        if options.config_dir:
-            command.extend(["--config-dir", str(Path(options.config_dir).expanduser().resolve())])
-        if options.restore:
-            command.append("--restore")
-        if options.prompt_file:
-            command.extend(["--prompt-file", str(Path(options.prompt_file).resolve())])
-        if options.attach:
-            command.append("--attach")
-    if claude_arguments:
-        command.extend(["--", *claude_arguments])
-    return shlex.join(command)
-
-
 def _launch(verb: str, arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(prog=f"herdr_sessions.py {verb}")
     if verb == "start":
@@ -157,76 +135,41 @@ def _launch(verb: str, arguments: list[str]) -> int:
         config_dir = selected.dir
         pane_environment = account.named_account_environment(config_dir)
         claude_json = config_dir / ".claude.json"
-    environment = dict(os.environ)
-    for variable in unset_variables:
-        _ = environment.pop(variable, None)
-    environment.update(pane_environment)
     trust = herdr.claude_trust(folder, claude_json)
     if isinstance(trust, (herdr.Untrusted, herdr.UnreadableTrustFile)):
         reason = str(trust) if isinstance(trust, herdr.UnreadableTrustFile) else f"Claude has not trusted {folder}"
-        trust_command = (f"cd {shlex.quote(str(folder))} && env -u CLAUDE_CONFIG_DIR "
-                         + "-u CLAUDE_CODE_REMOTE_MEMORY_DIR -u CLAUDE_CODE_OAUTH_TOKEN claude"
-                         if isinstance(selected, accounts.LegacyHomeLaunch)
-                         else accounts.trust_command(folder, selected))
-        if isinstance(trust, herdr.UnreadableTrustFile):
-            print(f"herdr_sessions: {reason}. Run: {trust_command}", file=sys.stderr)
-        else:
-            rerun = _launch_rerun(verb, options, folder, claude_arguments)
-            print(f"herdr_sessions: {reason}.\n"
-                  + "Paste this, accept Claude's trust prompt, then exit Claude; the session then starts:\n"
-                  + f"{trust_command} && {rerun}", file=sys.stderr)
-        return 1
+        print(f"herdr_sessions: trust anomaly: {reason}", file=sys.stderr)
     opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt = herdr.NoOpeningPrompt()
     if options.prompt_file:
         opening = herdr.OpeningPrompt(Path(options.prompt_file).read_text(),
                                       herdr.SessionTranscript(config_dir, options.session_id))
-    purpose: launch_permission.LaunchPurpose = (
-        launch_permission.RecordedSessionRestoreLaunchPurpose(options.session_id)
-        if options.restore else launch_permission.NewWorkLaunchPurpose()
-    )
-    try:
-        barrier = launch_permission.launch_barrier()
-        _ = barrier.__enter__()
-    except OSError as error:
-        print(f"herdr_sessions: shutdown state unreadable: launch barrier: {error}", file=sys.stderr)
+    shared = herdr.shared_session()
+    _ = herdr.start_server(shared, 90_000, session_kind=session_kind)
+    server_environment = herdr.server_environment(shared)
+    for variable in sorted(unset_variables):
+        if variable in server_environment:
+            raise herdr.HerdrFailure(
+                f"herdr server {shared} carries {variable} from where it started, so a new tab would "
+                + "inherit it; start that server again from a shell without it"
+            )
+    taken = {pane.get("label") for pane in herdr.Herdr(shared).panes()}
+    if options.name in taken:
+        raise herdr.HerdrFailure(f"a tab named {options.name} is already open in herdr session {shared}")
+    name = options.name or next(candidate for candidate in (
+        herdr.generated_session_name(folder.name, str(suffix)) for suffix in itertools.count(1))
+        if candidate not in taken)
+    if verb == "resume":
+        claude_arguments.extend(["--resume", options.session_id])
+    claude_arguments.extend(["-n", name])
+    launched = herdr.launch_agent(shared, name, name, str(folder), pane_environment,
+        kind="claude", agent=name, agent_arguments=claude_arguments, opening=opening, timeout_ms=90_000)
+    if isinstance(launched, herdr.nix_env.Refused):
+        raise herdr.HerdrFailure(launched.reason)
+    pane, outcome = launched.pane, launched.outcome
+    if isinstance(opening, herdr.OpeningPrompt) and not isinstance(outcome, herdr.PromptSubmitted):
+        reason = outcome.reason if isinstance(outcome, herdr.PromptNotSubmitted) else "launcher supplied no submit proof"
+        print(f"herdr_sessions: {name}: opening prompt not submitted: {reason}", file=sys.stderr)
         return 1
-    try:
-        permission = launch_permission.launch_permission(environment, purpose)
-        if isinstance(permission, launch_permission.BlockedByShutdown):
-            print(f"herdr_sessions: {permission.reason}", file=sys.stderr)
-            return 1
-        if isinstance(permission, launch_permission.ShutdownStateUnreadable):
-            print(f"herdr_sessions: shutdown state unreadable: {permission.detail}", file=sys.stderr)
-            return 1
-        shared = herdr.shared_session()
-        _ = herdr.start_server(shared, 90_000, session_kind=session_kind)
-        server_environment = herdr.server_environment(shared)
-        for variable in sorted(unset_variables):
-            if variable in server_environment:
-                raise herdr.HerdrFailure(
-                    f"herdr server {shared} carries {variable} from where it started, so a new tab would "
-                    + "inherit it; start that server again from a shell without it"
-                )
-        taken = {pane.get("label") for pane in herdr.Herdr(shared).panes()}
-        if options.name in taken:
-            raise herdr.HerdrFailure(f"a tab named {options.name} is already open in herdr session {shared}")
-        name = options.name or next(candidate for candidate in (
-            herdr.generated_session_name(folder.name, str(suffix)) for suffix in itertools.count(1))
-            if candidate not in taken)
-        if verb == "resume":
-            claude_arguments.extend(["--resume", options.session_id])
-        claude_arguments.extend(["-n", name])
-        launched = herdr.launch_agent(shared, name, name, str(folder), pane_environment,
-            kind="claude", agent=name, agent_arguments=claude_arguments, opening=opening, timeout_ms=90_000)
-        if isinstance(launched, herdr.nix_env.Refused):
-            raise herdr.HerdrFailure(launched.reason)
-        pane, outcome = launched.pane, launched.outcome
-        if isinstance(opening, herdr.OpeningPrompt) and not isinstance(outcome, herdr.PromptSubmitted):
-            reason = outcome.reason if isinstance(outcome, herdr.PromptNotSubmitted) else "launcher supplied no submit proof"
-            print(f"herdr_sessions: {name}: opening prompt not submitted: {reason}", file=sys.stderr)
-            return 1
-    finally:
-        _ = barrier.__exit__(None, None, None)
     if verb == "start" or options.attach:
         _attach(pane)
     return 0

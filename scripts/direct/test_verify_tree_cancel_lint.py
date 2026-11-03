@@ -107,7 +107,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
 if stage == os.environ.get("TEST_BLOCK_STAGE", "test"):''')
         _ = cargo.write_text(source)
         process = self.start_verify("lint", TEST_BLOCK_STAGE="clippy", TEST_FINISH="1",
-                                    TEST_REWRITE_STAGES="mend,fix,fmt")
+                                    TEST_REWRITE_STAGES="mend,fix,fmt", TEST_FAIL_FIRST_JUDGMENT="1")
         self.release_lint_rewrites(process)
         self.wait_for_running(self.control / "running", process)
         self.assert_resources_held()
