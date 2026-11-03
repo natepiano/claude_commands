@@ -344,7 +344,7 @@ class AddUnitResumeTests(AddUnitTestCase):
                           "--cwd", str(elsewhere), "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertEqual(result.stderr,
-                         f"add_unit: unit trunk-unit resumes in {elsewhere.resolve()}; its Units row names {recorded}\n")
+                         f"add_unit: unit trunk-unit resumes in {elsewhere.resolve()}; its staff row names {recorded}\n")
         self.assert_no_launch_change(document, head)
 
     def test_retired_plan_resume_cannot_bypass_the_retained_row_restore(self) -> None:
@@ -403,6 +403,8 @@ class AddUnitResumeTests(AddUnitTestCase):
             plan=f"(retired 2026-10-28, worktree removed, session 62ccbd64-f22e-5647-b20e-7899aa39d766) `{plan}` (run done)"))
         worktree = self.root / "project-alpha"
         _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
+        member = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
+        _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", worktree), expected=member.worktree)
         document = self.doc.read_bytes()
 
         _ = self.successful("alpha", "--plan", plan, "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(worktree))
@@ -445,6 +447,8 @@ class AddUnitResumeTests(AddUnitTestCase):
             plan="(retired 2026-10-28, worktree removed, session 62ccbd64-f22e-5647-b20e-7899aa39d766) docs/plans/given.md"))
         worktree = self.root / "project-alpha"
         _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
+        member = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
+        _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", worktree), expected=member.worktree)
         before = self.repository_state()
 
         _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766",

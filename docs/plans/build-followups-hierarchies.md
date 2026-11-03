@@ -511,22 +511,22 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - `scripts/production/test_merge_checkpoint_validation.py` — the held-before-merge test requires exit 1, the refused short hash, the plain-commit phrase and `change_review.COVERS` (no second gate run).
 - `docs/as-built/showrunner-automation.md` — a later plain (non-merge) commit carries the Covers line.
 
-### Phase 18 — The change-review hook and the merge gate read one rule for merge commits  · status: todo
+### Phase 18 — The change-review hook and the merge gate read one rule for merge commits  · status: done
 
-**Depends on:** Phase 17 (the held next-step text that change_review will own)
+#### As-built
 
-#### Work Order
+- `change_review.merge_review_problem(message, *, is_merge)` is the one rule for merge commits: a merge may carry only `Change-Review: none — <why>` lines (`Invisible`); a visible line or any `Change-Review-Covers:` line is refused with "put the lines on a plain commit after the merge".
+- The commit hook (`pre-tool-use-change-review-gate.py`) calls it for `git merge` without `--squash`, a `git commit` while `assertion_guard.pending_merge_bases` finds a pending merge, and `--amend` of a merge commit, and skips `change_review.problem` there. `change_review.unit_commits` reads merges in one `git log -z` call: a merge that breaks the rule raises `ChangeReviewError`; other merges are left out. `drift` reads with `--no-merges`, so a merge commit's own lines never count.
+- `change_review.HELD_NEXT_STEP` is the one held next-step text, used by `merge_checkpoint.change_review_commits` and `merge_gate`'s change-review refusal.
+- Both commit hooks share one command parser, `scripts/hooks/checkpoint_gate.py`; `pre-tool-use-checkpoint-doc-gate.py` is a small entry point. Rules: own-call and unreadable-message refusals apply only to checkpoints (unreadable only when a Cargo checkpoint is possible); merge `--abort`/`--quit` and help-only `git commit -h`/`git merge -h`/`--help` pass first (`-m '-h'` is a message, not help); `--trailer` values are never read, and `--trailer` in either form is refused on a checkpoint or merge (amend of a merge included) and when the message or merge state is unknown, with "Remove --trailer. Supply the complete message through literal -m text, a -F file, or a supported heredoc."; one quoted stdin heredoc serves every `-F -`/`--file -` form, plus a quoted `$(cat <<'X')` literal; `--amend` and `-C` read the full message; `SUBJECT` allows spaces in the parentheses; `merge --continue` reads `MERGE_MSG` and checks the staged tree; option values never read as flags; a scanner error is an unreadable command; a parser load or check error still refuses a possible commit, with the fix hint.
+- The natedev change-review list keeps C865, C866 and C870 from checkpoint merges; merge-only rows are not added.
 
-**Goal:** A unit cannot put a Change-Review or Covers line on a merge commit. The hook refuses it at commit time, by the same rule the merge gate reads, so no line is accepted that the gate ignores.
+**Files:**
+- `scripts/production/change_review.py`, `scripts/production/merge_checkpoint.py`, `scripts/production/merge_gate.py`, `scripts/direct/assertion_guard.py`.
+- `scripts/hooks/checkpoint_gate.py` — the shared command parser; `scripts/hooks/pre-tool-use-change-review-gate.py`, `scripts/hooks/pre-tool-use-checkpoint-doc-gate.py` — entry points.
+- Tests: `scripts/hooks/test_change_review_gate.py`, `scripts/hooks/test_checkpoint_doc_gate.py`, `scripts/production/test_change_review.py`, `scripts/production/test_merge_checkpoint_validation.py`, `scripts/production/test_merge_gate.py`.
+- `docs/as-built/showrunner-automation.md`, `docs/as-built/rustdoc-once-and-final-targets.md`.
 
-**Spec:**
-- Source: Phase 17 simplify review (F005, F006, F008), settled by the sdlc showrunner on 2026-11-03. sdlc: "Each phase now deletes more lines than it adds" (user: "everything is too complex").
-- One rule in `scripts/production/change_review.py` says that a merge commit carries no Change-Review or Covers lines. The hook (`scripts/hooks/pre-tool-use-change-review-gate.py`, `refusal`) and the merge gates read that one rule. Add no second check.
-- The hook knows a merge commit: a `git merge` command, or a `git commit` while `MERGE_HEAD` exists. Its refusal says: put the lines on a plain commit after the merge.
-- `change_review` owns the gate's next-step text (Phase 17's held message). `merge_checkpoint.py` and `scripts/production/merge_gate.py:1443` both import it; `merge_gate`'s refusal then names the next step.
-- Read-only check (F006): list the checkpoint merge commits on HEAD that carry a visible Change-Review line (31 found in review, for example `0d18aaa4c`, `d34684ce7`) and say for each one whether a plain commit also carries its lines. Send that list to sdlc before any row is added; the list is the user's. Add no row in this phase.
-- The phase deletes more lines than it adds.
+**Gotchas:** an early option scan must not refuse an unknown short option (`git commit -qJ`) outside Cargo; unreadable plain calls keep the old scope.
 
-**Files:** `scripts/production/change_review.py`, `scripts/hooks/pre-tool-use-change-review-gate.py`, `scripts/production/merge_checkpoint.py`, `scripts/production/merge_gate.py`, and their tests. The exact list is set at phase start.
-
-**State:** none (the check is read-only).
+**Ruled out:** reading `--trailer` values into the message (git's `=` form, amend and subject order made it unsafe); listing merge-only commits as change-review rows.

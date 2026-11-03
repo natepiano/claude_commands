@@ -14,7 +14,7 @@ import tempfile
 from pathlib import Path
 from typing import ClassVar, Literal, cast, override
 from unittest import mock
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Sequence, Mapping
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from types import SimpleNamespace
 
@@ -57,11 +57,6 @@ class FolderMoveBackend:
         self.fixture: FolderMoveFixture = fixture
         self.kind: Literal["claude", "codex"] = kind
         self.live: bool = live
-        self.startup_pending: bool = False
-        self.startup_delay_polls: int = 0
-        self.startup_observations: int = 0
-        self.startup_foreground_polls: list[list[dict[str, object]]] = []
-        self.foreground_before_start: list[dict[str, object]] = []
         self.pid: int = 998041
         self.shell_pid: int = 998040
         self.starts: list[tuple[str, list[str]]] = []
@@ -94,35 +89,15 @@ class FolderMoveBackend:
         return [herdr.HerdrProcess(self.pid, herdr.HerdrPlace(self.session, "w1:p1"),
             self.environment(self.pid), self.kind + " resume " + self.fixture.owner.current_session, str(self.cwd))]
 
-    def processes_inside(self, folder: Path) -> list[int]:
-        shell_folder = self.fixture.old_folder if self.fixture.old_folder.exists() else self.fixture.new_folder
-        pids = [self.shell_pid] if folder == shell_folder else []
-        if self.live and folder == self.cwd:
-            pids.append(self.pid)
-        return pids
-
     def pane_activity(self, pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:
-        self.fixture.assertEqual(pane, "w1:p1")
-        if self.startup_pending:
-            return herdr.PaneRunning(("python accounts.py",))
+        entry = pane_record.read(self.session)[pane]
+        self.fixture.assertIn(entry["session_id"], (self.fixture.owner.id, self.fixture.owner.current_session))
         return herdr.PaneRunning((self.kind,)) if self.live else herdr.PaneAtShell()
 
     def result(self, *arguments: str) -> dict[str, object]:
         self.fixture.assertEqual(arguments, ("pane", "process-info", "--pane", "w1:p1"))
-        if self.startup_pending:
-            self.startup_observations += 1
-            if self.startup_delay_polls > 0:
-                self.startup_delay_polls -= 1
-            else:
-                self.startup_pending = False
-                self.live = True
-                self.publish_process_state()
         argv = [self.kind] if self.live else [sys.executable, "/fixture/accounts.py", "exec", self.config.name]
         foreground: list[dict[str, object]] = [{"pid": self.pid, "argv": argv, "cwd": str(self.cwd)}]
-        if self.starts and self.startup_foreground_polls:
-            foreground = self.startup_foreground_polls.pop(0)
-        elif not self.starts and self.foreground_before_start:
-            foreground = self.foreground_before_start
         return {"process_info": {"shell_pid": self.shell_pid, "cwd": str(self.cwd),
                                  "foreground_processes": foreground}}
 
@@ -133,7 +108,7 @@ class FolderMoveBackend:
         self.cwd = Path(command[command.index("sh") + 4])
         self.fixture.assertTrue(self.cwd.is_dir())
         self.starts.append((pane, command.copy()))
-        self.startup_pending = True
+        self.live = True
         self.publish_process_state()
 
     def close_tab_confirmed(self, pane: str) -> None:
@@ -183,7 +158,6 @@ class FolderMoveFixture(StaffTestCase):
         _ = self.enterContext(mock.patch("pane_record.RECORD_DIR", self.records))
         _ = self.enterContext(mock.patch.object(progress_history, "SESSION_ROOTS", (self.run_dir.parent,)))
         _ = self.enterContext(mock.patch("progress_history.SESSION_ROOTS", (self.run_dir.parent,)))
-        _ = self.enterContext(mock.patch.object(unit_move, "processes_inside", return_value=[]))
         _ = self.folder_git(self.checkout, "init", "-b", "kept-branch")
         _ = self.folder_git(self.checkout, "config", "user.name", "Folder Move Test")
         _ = self.folder_git(self.checkout, "config", "user.email", "move@example.invalid")
@@ -225,7 +199,6 @@ class FolderMoveFixture(StaffTestCase):
         backend.publish_process_state()
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(
             os.environ, {"HERDR_PROC": str(self.root / "folder-processes")})))
-        _ = self.enterContext(mock.patch.object(unit_move, "processes_inside", side_effect=backend.processes_inside))
         account_key = "CLAUDE_CONFIG_DIR" if kind == "claude" else "CODEX_HOME"
         launch = pane_record.launch("w1:p1", self.owner.id, str(self.old_folder),
             {account_key: str(backend.config)}, [kind, "-n", "kept-name", "--model", "opus"], kind=kind)
@@ -491,7 +464,11 @@ def stop_at_staff_write(verb: Literal["rename", "move"], *, after: bool) -> Gene
         yield
 
 
-def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members: dict[str, tuple[str, ...]]) -> None:
+EMPTY_LOCATIONS: Mapping[tuple[str, str], Path] = {}
+
+
+def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members: dict[str, tuple[str, ...]],
+                       *, locations: Mapping[tuple[str, str], Path] = EMPTY_LOCATIONS) -> None:
     """Bind legacy source fixtures to the one staff fixture and seed their members."""
     case.staff_file = case.root / "state/staff/staff.json"
     environment.update(STAFF_FILE=str(case.staff_file), STAFF_TEST_OWNER_FILE=str(case.staff_file))
@@ -534,10 +511,9 @@ def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members
             for unit in units:
                 name = unit_names.name(unit)
                 cells = cells_by_name[name]
-                tree = Path(production_units.cell_value(cells["Worktree"])).expanduser()
+                tree = locations[(slug, unit)]
                 _ = fixture_member("unit", name=name, parent=row.id,
-                                   worktree=(staff.PresentWorktree(remote.local_machine(), tree)
-                                             if tree.is_dir() else staff.WorktreeUnfilled()))
+                                   worktree=staff.PresentWorktree(remote.local_machine(), tree))
                 if not tree.is_dir():
                     continue
                 plan = production_units.cell_value(cells["Plan"])
@@ -591,7 +567,8 @@ class ProductionRenameFixture(StaffTestCase):
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.bind_fixture(self.fixture_root)
         self.old_tip = self.fixture_tip
-        bind_staff_fixture(self, self.env, {OLD: UNITS})
+        bind_staff_fixture(self, self.env, {OLD: UNITS},
+                           locations={(OLD, unit): self.worktrees / unit for unit in UNITS})
         production = next(row for row in staff.find(kind="showrunner") if row.name == OLD)
         _ = fixture_member("showrunner", name="child", parent=production.id)
 

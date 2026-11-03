@@ -26,6 +26,8 @@ import units_table
 import style_units
 import style_ledger
 import unit_table_cells
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file, fixture_member
 
 # Importable once units_table has put scripts/direct on the path.
 import phase_table
@@ -61,6 +63,7 @@ class UnitsTableTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
 
     def run_file(self, *events: str) -> Path:
         path = self.root / "run.jsonl"
@@ -203,6 +206,12 @@ class UnitsTableTests(unittest.TestCase):
         _ = doc.write_text("# Production\n- **Kind:** style\n\n## Units\n\n"
                            + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
                            + f"| names-unit | docs/names.md | {self.root} | style-names |\n", encoding="utf-8")
+        _ = subprocess.run(["git", "init", "-q", str(self.root)], check=True, capture_output=True,
+                           timeout=10)
+        _ = doc.write_text(doc.read_text() + f"\n- **Showrunner checkout:** `{self.root}`\n")
+        owner = fixture_member("showrunner", name="style", doc=staff.LiveDoc("natedev", doc))
+        _ = fixture_member("unit", name="names", parent=owner.id,
+                           worktree=staff.PresentWorktree("natedev", self.root))
         units = [unit("names-unit", live("names"))]
         records: dict[str, object] = {"names-unit": {"plan": "/tmp/claude/names.md"}}
         output = io.StringIO()
@@ -241,6 +250,11 @@ class UnitsTableTests(unittest.TestCase):
                            + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
                            + f"| names-unit | retained/names-plan.md | {self.root} | style-names |\n"
                            + f"| types-unit | gone/types.md | {self.root / 'gone'} | style-types |\n")
+        _ = doc.write_text(doc.read_text() + f"\n- **Showrunner checkout:** `{self.root}`\n")
+        owner = fixture_member("showrunner", name="style", doc=staff.LiveDoc("natedev", doc))
+        for name, folder in (("names", self.root), ("types", self.root / "gone")):
+            _ = fixture_member("unit", name=name, parent=owner.id,
+                               worktree=staff.PresentWorktree("natedev", folder))
         self.assertFalse((self.root / "retained").exists())
         decision = self.root / "decision.md"
         _ = decision.write_text("---\nstatus: open\nunit: names-unit\nplan: approved\n---\n")
@@ -279,6 +293,31 @@ class UnitsTableTests(unittest.TestCase):
         self.assertEqual(showrunners.production_of("caller", self.root), doc)
         self.assertIsNone(showrunners.production_of("nobody", self.root))
         self.assertIsNone(showrunners.production_of("", self.root))
+
+
+
+
+from scripts.production.staff_test_support import StaffTestCase, without_worktree_column
+
+
+class BranchLedgerLocationTests(StaffTestCase):
+    def test_relative_plan_uses_the_staff_worktree_without_git(self) -> None:
+        fixture = self.separated_unit_folders()
+        from scripts.production import staff_sources, unit_lookup
+        from scripts.direct import phase_reservation
+        cells = {"Unit": "member-unit", "Plan": "docs/plan.md", "Worktree": "/stale/cell"}
+        row = staff.snapshot().by_id(fixture.unit.id)
+        assert row is not None
+        selected = staff_sources.MemberFound(row)
+        with patch.object(phase_reservation, "repository_root") as git_root:
+            self.assertEqual(unit_lookup.plan_worktree(cells, selected), self.source_root / "director")
+        git_root.assert_not_called()
+
+    def test_style_ledger_uses_the_plan_worktree_without_the_worktree_column(self) -> None:
+        fixture = self.separated_unit_folders()
+        without_worktree_column(fixture.doc)
+        paths = units_table.style_ledger_paths(fixture.doc, [live_units.LiveUnit("member-unit", None)])
+        self.assertEqual(paths, {"member-unit": style_ledger.ledger_location(fixture.worktree).database})
 
 
 if __name__ == "__main__":

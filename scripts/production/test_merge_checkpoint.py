@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import without_worktree_column, isolated_staff_file, unit_membership
+from scripts.production import staff
+
 import os
 import subprocess
 import sys
@@ -52,6 +55,41 @@ class ReviewNumbersTests(unittest.TestCase):
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    def test_checkpoint_ignores_unavailable_worktrees_of_other_units(self) -> None:
+        checkpoint = self.checkpoint()
+        rows = (
+            "| retired-unit | retired | /stale | retired-branch | — | — | src/retired.txt |\n"
+            "| standby-unit | standby | /stale | standby-branch | — | — | src/standby.txt |\n"
+            "| absent-unit | docs/absent.md | /stale | absent-branch | — | — | src/absent.txt |\n"
+        )
+        _ = self.doc.write_text(self.doc.read_text().replace("| `alpha-unit`", rows + "| `alpha-unit`"))
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            row = unit_membership("example", "retired-unit")
+            _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "removed"), expected=row.worktree)
+            _ = unit_membership("example", "standby-unit")
+        result = self.run_checkpoint(checkpoint)
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD^2"), checkpoint)
+
+    def test_checkpoint_uses_the_plan_worktree_when_the_director_runs_elsewhere(self) -> None:
+        plan = self.unit / "docs/plans/alpha.md"
+        plan.parent.mkdir(parents=True, exist_ok=True)
+        _ = plan.write_text("# Unit plan\n")
+        checkpoint = self.checkpoint("docs/plans/alpha.md", "# Approved unit plan\n")
+        _ = self.doc.write_text(self.doc.read_text().replace("`docs/plans/alpha.md`", f"`{plan}`"))
+        _ = self.doc.write_text(self.doc.read_text().replace("`src/alpha.txt`", "`src/alpha.txt`, `docs/plans/alpha.md`"))
+        without_worktree_column(self.doc)
+        director = self.root / "director-folder"
+        director.mkdir()
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            row = unit_membership("example", "alpha-unit")
+            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", director), expected=row.worktree)
+        result = self.run_checkpoint(checkpoint)
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD^2"), checkpoint)
+        self.assertTrue((self.checkout / "docs/plans/alpha.md").is_file())
+
+
     def test_record_passes_separate_simplify_fields_when_the_trial_contains_them(self) -> None:
         trial = TRIAL + ", simplify 0 findings, simplify minutes 2.5"
         result = self.run_checkpoint(self.checkpoint(), trial=trial)

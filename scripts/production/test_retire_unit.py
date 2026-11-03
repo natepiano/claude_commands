@@ -4,6 +4,8 @@ Shutdown, the Codex mesh and build_hold are recording stand-ins. Claude
 sessions are fixture records; nothing real stops."""
 from __future__ import annotations
 
+from scripts.production.staff_test_support import without_worktree_column
+
 from scripts.production.staff_test_support import fixture_member
 
 import io
@@ -84,6 +86,30 @@ def session(session_id: str, name: str, pid: int) -> SessionRecord:
 
 @final
 class RetireUnitTests(unittest.TestCase):
+    def test_retirement_uses_the_plan_worktree_without_a_worktree_column(self) -> None:
+        plan = self.worktree / "docs/plans/alpha.md"
+        plan.parent.mkdir(parents=True, exist_ok=True)
+        _ = plan.write_text("# Plan\n")
+        _ = git(self.worktree, "add", str(plan))
+        _ = git(self.worktree, "commit", "-m", "Retain the unit plan")
+        _ = git(self.worktree, "push", "origin", "alpha-branch")
+        _ = git(self.checkout, "merge", "--no-ff", "-m", "Merge the unit plan", "alpha-branch")
+        _ = self.doc.write_text(self.doc.read_text().replace("docs/plans/alpha.md", str(plan)))
+        director = self.root / "director-folder"
+        _ = git(self.checkout, "worktree", "add", "--detach", str(director), "HEAD")
+        _ = unit_config.write(director, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
+                                                             unit_config.AppPort(1), ("scripts",)))
+        _ = staff.set_worktree(self.unit_staff_id, staff.PresentWorktree("natedev", director), expected=staff.PresentWorktree("natedev", self.worktree))
+        without_worktree_column(self.doc)
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertFalse(self.worktree.exists())
+        row = staff.snapshot().by_id(self.unit_staff_id)
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertIsInstance(row.worktree, staff.RemovedWorktree)
+
+
     staff: StaffTestCase = StaffTestCase()
     root: Path = Path()
     checkout: Path = Path()
@@ -396,6 +422,7 @@ class RetireUnitTests(unittest.TestCase):
         _ = git(self.checkout, "commit", "-q", "-m", "production")
         _ = git(self.checkout, "push", "-q", "origin", "main")
         _ = git(self.checkout, "worktree", "add", "-q", "-b", "alpha-branch", str(self.worktree))
+        (self.worktree / "docs/plans").mkdir(parents=True, exist_ok=True)
         _ = (self.worktree / "work.txt").write_text("done\n", encoding="utf-8")
         _ = git(self.worktree, "add", "work.txt")
         _ = git(self.worktree, "commit", "-q", "-m", "checkpoint(alpha): the work")
