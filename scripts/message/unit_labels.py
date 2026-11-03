@@ -246,12 +246,13 @@ def showrunner_ids(
     return found
 
 
-def every_marked_unit(record: staff.StaffSnapshot | None = None) -> session_staff.MarkedProductions | OSError:
+def every_marked_unit(record: staff.StaffSnapshot | None = None, *,
+                      running: list[SessionRecord] | None = None) -> session_staff.MarkedProductions | OSError:
     """Every production's observed units, joined to one staff snapshot."""
     import unit_lookup as process_units
 
     try:
-        return process_units.every_marked_unit(record=record)
+        return process_units.every_marked_unit(record=record, running=running)
     except OSError as error:
         return error
 
@@ -276,7 +277,7 @@ def production_places(
     places: dict[str, ProductionPlace] = {}
     # One read of every production's marks serves every showrunner below.
     every = (marks if isinstance(marks, session_staff.MarkedProductions)
-             else every_marked_unit(record) if registered else session_staff.MarkedProductions({}, {}))
+             else every_marked_unit(record, running=records) if registered else session_staff.MarkedProductions({}, {}))
     # One process scan places every record; a scan per record took most of the roster's time.
     record_places: dict[int, herdr.HerdrPlace] | None = None
     for runner in registered:
