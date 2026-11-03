@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import redirect_stderr
+from decimal import Decimal
 import io
 import os
 from pathlib import Path
@@ -342,6 +343,46 @@ class ConfTests(unittest.TestCase):
                 redirect_stderr(io.StringIO()) as warning:
             override_guard.refuse_overrides(script, "lib/probe.py")
         self.assertIn("CONF_DIR", warning.getvalue())
+
+    def test_value_origin_distinguishes_live_permission_from_recovered_limits(self) -> None:
+        self.history()
+        self.commit("# range: 0..\namount=40\n")
+        self.write("# range: 0..\namount=20\n")
+        live = conf.value_origin("example", "amount", Decimal)
+        self.assertIsInstance(live, conf.UsableLiveValue)
+        if not isinstance(live, conf.UsableLiveValue):
+            self.fail("The valid live limit must identify live permission")
+        self.assertEqual(live.value, Decimal("20"))
+        for source in ("other=1\n", "# range: 0..\namount=broken\n",
+                       "# range: 0..\namount=-1\n"):
+            with self.subTest(source=source), redirect_stderr(io.StringIO()):
+                self.write(source)
+                recovered = conf.value_origin("example", "amount", Decimal)
+                self.assertIsInstance(recovered, conf.RecoveredValue)
+                if not isinstance(recovered, conf.RecoveredValue):
+                    self.fail("History must remain distinct from live spending permission")
+                self.assertEqual(recovered.value, Decimal("40"))
+                self.assertEqual(conf.number("example", "amount"), 40)
+
+    def test_value_origin_reports_unavailable_data_without_an_implicit_limit(self) -> None:
+        self.write("# range: 0..\namount=broken\n")
+        with redirect_stderr(io.StringIO()):
+            result = conf.value_origin("example", "amount", Decimal)
+        self.assertIsInstance(result, conf.UnavailableValue)
+
+    def test_value_origin_reads_changed_live_limits_after_history_recovery(self) -> None:
+        self.history()
+        self.commit("# range: 0..\namount=40\n")
+        self.write("amount=broken\n")
+        with redirect_stderr(io.StringIO()):
+            recovered = conf.value_origin(self.path, "amount", Decimal)
+        self.assertIsInstance(recovered, conf.RecoveredValue)
+        self.write("# range: 0..\namount=7.25\n")
+        live = conf.value_origin(self.path, "amount", Decimal)
+        self.assertIsInstance(live, conf.UsableLiveValue)
+        if not isinstance(live, conf.UsableLiveValue):
+            self.fail("A repaired live limit must replace the recovered state")
+        self.assertEqual(live.value, Decimal("7.25"))
 
 
 if __name__ == "__main__":

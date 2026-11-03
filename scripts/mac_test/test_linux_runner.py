@@ -859,7 +859,7 @@ class LinuxProcessTests(unittest.TestCase):
         with mock.patch.object(subprocess, "run", side_effect=cleanup), \
                 mock.patch.object(dispatch.controller, "stream_mac_run", side_effect=stream):
             completed, output, errors = dispatch.run_request(dispatch.request())
-            self.assertIsInstance(completed, offload.PassedOnMac)
+            self.assertIsInstance(completed, offload.PassedOnTarget)
             self.assertNotIn("Traceback", output + errors)
             self.assertIn(900, dispatch.fixture.claims("aws"))
             self.assertNotIn("release", dispatch.actions)
@@ -1399,7 +1399,7 @@ class LinuxDispatchTests(unittest.TestCase):
 
         result, output, _ = self.run_request(self.request())
 
-        self.assertIsInstance(result, offload.PassedOnMac)
+        self.assertIsInstance(result, offload.PassedOnTarget)
         self.assertIn("running on aws (Linux, host fake-linux)", output)
         self.assertNotIn("running on the Mac", output)
         self.assertIsInstance(offload.read_backoff(time.time(), "mac"), offload.ActiveBackoff)
@@ -1481,7 +1481,7 @@ class LinuxDispatchTests(unittest.TestCase):
 
         result, _, _ = self.run_request(self.request())
 
-        self.assertIsInstance(result, offload.PassedOnMac)
+        self.assertIsInstance(result, offload.PassedOnTarget)
         self.assertEqual(self.manifests, [
             ["scripts/mac_test/linux_runner.py", "config/aws_target.conf"],
         ])
@@ -1518,7 +1518,7 @@ class LinuxDispatchTests(unittest.TestCase):
         with mock.patch.object(os, "getpid", return_value=999):
             retry, _, _ = self.run_request(self.request())
 
-        self.assertIsInstance(retry, offload.PassedOnMac)
+        self.assertIsInstance(retry, offload.PassedOnTarget)
         self.assertEqual(self.actions[:4], ["claim:13", "cleanup", "release", "claim:0"])
         self.assertFalse(self.fixture.claims("aws"))
 
@@ -1553,7 +1553,7 @@ class LinuxDispatchTests(unittest.TestCase):
         with mock.patch.object(self.controller, "stream_mac_run", side_effect=stream_child_run):
             result, _, _ = self.run_request(self.request())
 
-        self.assertIsInstance(result, offload.PassedOnMac)
+        self.assertIsInstance(result, offload.PassedOnTarget)
         self.assertIn("cleanup", self.actions)
         self.assertNotIn("release", self.actions)
         self.assertIn(os.getpid(), self.fixture.claims("aws"))
@@ -1574,7 +1574,7 @@ class LinuxDispatchTests(unittest.TestCase):
         self.actions.clear()
         with mock.patch.object(os, "getpid", return_value=1000):
             fresh, _, _ = self.run_request(self.request())
-        self.assertIsInstance(fresh, offload.PassedOnMac)
+        self.assertIsInstance(fresh, offload.PassedOnTarget)
         self.assertEqual(self.actions[:4], ["claim:13", "cleanup", "release", "claim:0"])
         self.assertFalse(self.fixture.claims("aws"))
 
@@ -1590,7 +1590,7 @@ class LinuxDispatchTests(unittest.TestCase):
 
         result, _, _ = self.run_request(self.request())
 
-        self.assertIsInstance(result, offload.PassedOnMac)
+        self.assertIsInstance(result, offload.PassedOnTarget)
         self.assertEqual(self.actions[:4], ["claim:13", "cleanup", "release", "claim:0"])
         cleanup = next(argv for argv in self.commands if argv[0] == "ssh" and "select_leftovers" in argv[-1])
         identity = offload.repository_identity(self.source)
@@ -1648,7 +1648,7 @@ class LinuxDispatchTests(unittest.TestCase):
         with mock.patch.object(self.controller, "capture", side_effect=timed_capture):
             cold, _, _ = self.run_request(self.request())
 
-            self.assertIsInstance(cold, offload.PassedOnMac)
+            self.assertIsInstance(cold, offload.PassedOnTarget)
             self.assertTrue(shell_limits)
             self.assertTrue(all(limit >= cold_seconds for limit in shell_limits))
             self.assertIsInstance(offload.read_backoff(time.time(), "aws"), offload.NoBackoff)
@@ -1669,8 +1669,8 @@ class LinuxDispatchTests(unittest.TestCase):
 
         result, _, _ = self.run_request(self.request("check"))
 
-        self.assertIsInstance(result, offload.FailedOnMac)
-        if isinstance(result, offload.FailedOnMac):
+        self.assertIsInstance(result, offload.FailedOnTarget)
+        if isinstance(result, offload.FailedOnTarget):
             self.assertEqual(result.status, 101)
         self.assertFalse(self.fixture.claims("aws"))
 
@@ -1691,7 +1691,7 @@ class LinuxDispatchTests(unittest.TestCase):
         with mock.patch.object(offload, "read_tree_key", side_effect=tree_key):
             result, _, _ = self.run_request(request)
 
-        self.assertIsInstance(result, offload.PassedOnMac)
+        self.assertIsInstance(result, offload.PassedOnTarget)
         self.assertEqual(roots, [snapshot, snapshot])
         source_copy = next(argv for argv in self.commands if argv[0] == "rsync" and any(word.startswith("--exclude-from=") for word in argv))
         self.assertEqual(source_copy[-2], f"{snapshot}/")

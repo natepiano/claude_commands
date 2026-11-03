@@ -672,7 +672,7 @@ class UnitFolderMoveTests(FolderMoveFixture):
               mock.patch.object(client_type, "start_command", side_effect=start),
               mock.patch.object(client_type, "result", side_effect=backend.result),
               mock.patch("scripts.shutdown.launch_permission.claim_launch_pane")):
-            launched = herdr.launch_prepared_agent("agents", "production", "kept-name",
+            launched = herdr.launch_prepared_agent("agents", herdr.NewTab("production", "kept-name"),
                 herdr.PreparedAgentEnvironment(self.old_folder, {"CODEX_HOME": str(backend.config)}),
                 "codex", ["resume", self.owner.current_session], herdr.NoOpeningPrompt(), 1000,
                 agent="kept-name")

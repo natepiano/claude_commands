@@ -99,6 +99,8 @@ Rows from the same checkpoint share its selection within that request.
 It reads full checkpoint messages only when a merge contains changes from several known units.
 A row without a known staff unit stays with its source list.
 Empty lists and showrunners retain their zero-count tabs.
+Tabs with waiting changes precede empty tabs in alphabetical order and keep their positions until the next page load.
+The selected tab uses `outline-offset:-2px` to keep its full outline visible inside the scroll container.
 Builds rows can remain in the natedev list while the builds tab shows them.
 
 Each tab orders its prepared change rows with `urgency.queue_order`, the same order that `/next change` uses.
@@ -107,9 +109,11 @@ The existing urgency order, pin, dependencies, and moved rows determine its orde
 Rows from another list use qualified row IDs and qualified prerequisite IDs.
 Next selects the next prepared row in the browser without a server request.
 The URL fragment stores the showrunner and row key.
-A reload restores that place when the row still waits or needs message delivery.
+A reload restores that place when the row waits, awaits validation, has an open question, or needs message delivery.
 An empty tab shows **0 changes left** and hides Next.
-The page never advances without the user's action.
+Each successful save opens the next waiting change in the same tab.
+Next skips a change without saving an answer.
+The page keeps the current row if the user selects Next or another tab during the save.
 
 The record's `Kind` column remains the only source for the kind.
 Set it with `change_review.py set-kind --production DOC --row C27 --kind 'See in action'`.
@@ -122,21 +126,49 @@ The page shows every row with its recorded kind or the missing-kind notice.
 The short URL ends in `/changes.html`.
 The page retains the plain, narrow layout and fits a phone.
 Each row shows its kind, description once, proof, and answer controls.
-The user can select Works, Not works, Validate yourself, or Send feedback.
+The user can select Works, Not works, Validate yourself, Send feedback, or Ask a question.
 The feedback field accepts one line, which matches the verdict command's table-cell format.
 Works with text saves `works: <text>`.
 Not works with text saves `not works: <text>`.
 Send feedback saves the user's text without a prefix.
+Its saved verdict removes the row from the page count, including feedback that returns the change to its unit.
 The existing `change_review.lands` function decides whether the verdict lands or returns the row.
 
 **Validate yourself** sends the showrunner the row ID and **the user asks you to validate this**.
 The message includes any feedback from the form.
 This answer writes no verdict and runs no feature-log command.
-The row stays pending.
-The page calls `next_item.move_to_end` with the row key to move that row to the queue's end.
+The current page advances when the request saves.
+On a page load, the row leaves the waiting count and Next order only after the validation message sends.
+Pending and failed validation messages keep the row waiting, with a note and a resend control.
+The review list retains the row until the showrunner saves a verdict.
+A direct link shows **The showrunner will validate this** without answer buttons.
+The delivery record preserves this state across page loads and server restarts.
+The page calls `next_item.move_to_end` to move the row to the end of the showrunner's own queue.
 The CLI keeps its current form and still moves the pinned item.
 An unknown key raises `NextError` before the queue changes.
 Rows from an earlier list use their qualified keys.
+
+**Ask a question** uses the one-line feedback field.
+The server refuses empty questions.
+It refuses every line break in the feedback field for every outcome, including trailing Unicode separators.
+It saves no verdict and runs no feature-log command.
+The server stores the question before it sends one message to the tab's showrunner.
+The message names the row, list, production, change, and question.
+It includes a separate `Question id: <id>` line.
+The page advances after the save and removes the row from its count and Next order.
+Only an open question whose message was sent keeps the row outside those counts across page loads and server restarts.
+A failed save keeps the row waiting with its typed question and resend control.
+A pending or failed message keeps the row waiting after a page load, with its note and **Send question again** control.
+A direct link shows the open question without verdict buttons.
+
+The showrunner answers with `scripts/review_links/change_page.py answer-question --production <doc> --list <list> --row C<n> --question <id> --text "<answer>"`.
+The command refuses a row without an open question.
+The command refuses an old or unknown question ID.
+The same ID and answer text change nothing and exit 0 on a rerun.
+The same ID with different answer text is refused.
+The row returns to its tab's count and Next order after the answer saves.
+The page shows the question and answer below the change, with the usual answer buttons.
+The user can ask another question or save a verdict.
 
 Each answer uses a background `fetch` POST.
 The row shows **Saving**, **Saved: <answer>**, or a short failure reason.
@@ -144,7 +176,9 @@ Next stays available during a save.
 A failed save retains the feedback and selected outcome on that row.
 **Send answer again** retries that answer.
 A successful answer removes the row from its tab's waiting count.
-Validate yourself retains the row in the count and moves it to the tab's end.
+Validate yourself also removes the row from the current tab's waiting count.
+A page load counts the row again if its validation message remains pending or failed.
+A failed save keeps the row in that count and does not change the current row.
 
 The all-list publisher stores a private `.review-link-browser.json` beside a placeholder HTML file.
 This manifest contains a random page secret and an optional initial row key.
@@ -219,13 +253,28 @@ No agent polls for answers.
 A save shows **Saved: &lt;answer&gt;** from the review record.
 `DeliveryStatus` owns one private delivery record per review list and row under the configured review root.
 The record has separate validation and verdict slots, each with its latest attempt ID and state.
+Its question slot holds the latest question and its answer in the same record.
+`NoQuestion`, `OpenQuestion`, and `AnsweredQuestion` state who must act next.
+Each new question gets a `question_id` from `secrets.token_hex(4)`.
+An open question stores `question_id`, `text`, and `delivery`.
+The delivery contains its attempt ID and state or `null` after delivery.
+An answered question stores `question_id`, `text`, and `answer`.
+The command replaces the open question with the answered question under the delivery lock.
+Question retries send outcome `retry` with empty feedback and use the stored question and its ID.
+Only a pending or failed question whose delivery is not active can retry.
+The server refuses all other question retries without creating a question or message attempt.
+Repeated fresh question saves with the same text never write or send again while that question is open.
+A fresh question after an answer gets a new ID.
+Each server tracks its question messages during delivery, so a restart can recover a pending attempt.
 Only the validation slot stores feedback.
 Before the verdict write, the server stores a pending intent in the verdict slot with a new attempt ID.
 If this write fails, the server refuses the verdict write.
 The record contains no saved verdict, recipient, or error text.
 Validate yourself stores its feedback in the validation slot because the review record has no validation answer.
 A GET selects the verdict slot when the review record has a saved verdict.
-Otherwise, it selects the validation slot and keeps the answer form available.
+Otherwise, a `ValidationRequested` slot or an `OpenQuestion` with `awaiting_answer` removes the row from the page's waiting rows.
+The typed `awaiting_answer` property requires a sent question message.
+A pending or failed validation message retains its resend control and feedback.
 A failed verdict write preserves the validation slot, its feedback, and its resend control.
 A stop after the verdict write leaves the verdict slot available for a retry.
 A pending message shows **The message may not have sent** and a resend control.
@@ -237,8 +286,10 @@ A retry creates a new attempt ID.
 One stable `fcntl.flock` protects intent creation, conditional success deletion, and conditional failure updates.
 Message sends run outside the lock.
 An older attempt cannot clear or change a newer attempt's record.
-A successful current attempt removes only its slot and preserves the other slot.
-The server deletes the record only when both slots are empty.
+A successful verdict attempt removes its slot and preserves the validation slot.
+A successful validation attempt retains its slot with state `sent` and hides its resend control.
+The server ignores later results for a validation attempt with state `sent`.
+The server deletes a delivery record only when every slot is empty.
 After successful verdict delivery, retained validation feedback does not restore the resend control.
 Existing single-intent records, `failed\n` records, and validation feedback records remain retryable.
 

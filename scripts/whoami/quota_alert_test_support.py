@@ -85,6 +85,18 @@ def setUpModule() -> None:
     _ = unittest.enterModuleContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
 
 
+def stored_room(login: str, left: float, days: float) -> None:
+    """Store a fresh weekly reading for a Claude fixture account."""
+    from scripts.whoami import usage_store
+    saved = usage_store.load()
+    saved[usage_store.key("Claude", login)] = usage_store.StoredUsage(weekly=usage_store.StoredWindow(
+        left=left, at=datetime.now(timezone.utc).isoformat(),
+        resets=(datetime.now(timezone.utc) + timedelta(days=days)).isoformat()))
+    file = usage_store.store_file()
+    file.parent.mkdir(parents=True, exist_ok=True)
+    _ = file.write_text(json.dumps(saved))
+
+
 class QuotaReminderFixture(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -267,14 +279,7 @@ class QuotaReminderFixture(unittest.TestCase):
             return_value=account.Account("claude", identity.login, identity.label)))
 
     def stored_room(self, login: str, left: float, days: float) -> None:
-        from scripts.whoami import usage_store
-        saved = usage_store.load()
-        saved[usage_store.key("Claude", login)] = usage_store.StoredUsage(weekly=usage_store.StoredWindow(
-            left=left, at=datetime.now(timezone.utc).isoformat(),
-            resets=(datetime.now(timezone.utc) + timedelta(days=days)).isoformat()))
-        file = usage_store.store_file()
-        file.parent.mkdir(parents=True, exist_ok=True)
-        _ = file.write_text(json.dumps(saved))
+        stored_room(login, left, days)
 
     def configure_claude_roles(self) -> None:
         _ = (self.root / ".claude").mkdir(exist_ok=True)

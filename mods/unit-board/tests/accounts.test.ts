@@ -318,6 +318,56 @@ function hasSensitivePath(paths: readonly string[]) {
   return paths.some(path => /(?:\.claude\.json|auth\.json|id_token)/.test(path));
 }
 describe('accounts table', () => {
+  for (const columns of [140, 60, 30]) {
+    test(`${columns} cells: counts sum both machines and retain separate machine data`, async ($, on) => {
+      const fake = accountsHost(on);
+      const data = statusFixture();
+      data.accounts = [data.accounts[0]!, data.accounts[1]!];
+      data.accounts[0]!.role_counts_by_machine = {
+        natedev: { 'unit directors': { busy: 1, shell: 1, idle: 1, total: 3 },
+          showrunners: { busy: 1, shell: 0, idle: 1, total: 2 } },
+        mac: { 'unit directors': { busy: 2, shell: 1, idle: 0, total: 3 },
+          showrunners: { busy: 0, shell: 1, idle: 2, total: 3 } },
+      };
+      data.accounts[1]!.role_counts_by_machine = {
+        natedev: { workers: { busy: 2, shell: null, idle: 2, total: 4 } },
+        mac: { workers: { busy: 1, shell: null, idle: 0, total: 1 } },
+      };
+      const before = JSON.stringify(data);
+      fake.replace(data);
+      await $.command.run(command());
+      const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane',
+        surface: 'terminal', props: { ...props, bodyColumns: columns } });
+      const tree = await ui.drawn();
+      const row = normalized(accountLines(tree, 'Low'));
+      for (const values of ['3, 1', '2, 1', '1, 3', '6, 5']) expect(row).toContain(values);
+      expect(accountDisplay(data.accounts[1]!).roleCounts).toEqual([
+        { kind: 'available', value: { busy: 3, shell: null, idle: 2, total: 5 } },
+      ]);
+      const lines = rowLines(tree);
+      if (columns === 140) expect(lines.find(line => line.trim().startsWith('total'))!.trim().replace(/\s+/g, ' '))
+        .toBe('total 7 3 6 16');
+      else expect(normalized(lines.slice(lines.indexOf('total')))).toContain('total busy 7 · shell 3 · idle 6');
+      expect(JSON.stringify(data)).toBe(before);
+    });
+  }
+
+  test('unavailable peer counts show the local counts and one problem', async ($, on) => {
+    const fake = accountsHost(on);
+    const data = statusFixture();
+    data.accounts = [data.accounts[1]!];
+    data.accounts[0]!.role_counts_by_machine = { mac: { workers: { busy: 2, shell: null, idle: 2, total: 4 } } };
+    data.problems = ['natedev unavailable: counts are mac only'];
+    fake.replace(data);
+    await $.command.run(command());
+    const ui = await mount($);
+    const text = drawnText(await ui.drawn());
+    expect(text.split(data.problems[0]!).length - 1).toBe(1);
+    expect(accountDisplay(data.accounts[0]!).roleCounts).toEqual([
+      { kind: 'available', value: { busy: 2, shell: null, idle: 2, total: 4 } },
+    ]);
+  });
+
   for (const surface of ['terminal', 'desktop'] as const) {
     for (const columns of [140, 100, 60, 30]) {
       test(`${surface}: exact table form at ${columns} cells keeps every fact and problem`, async ($, on) => {
