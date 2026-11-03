@@ -1618,7 +1618,7 @@ def fetch_folder(
         landing = partial / folder.value
         landing.mkdir(parents=True)
         copied = controller.capture([
-            "rsync", "-rlp", "--safe-links", "-e", shlex.join(["ssh", *ssh_options(config)]),
+            "rsync", "-rlp", "--safe-links", "-e", shlex.join(["ssh", *ssh_options(config.connection)]),
             f"{config.host}:{remote_mirror(repository)}/{folder.value}/", f"{landing}/",
         ])
         if not isinstance(copied, CommandOutput) or copied.status != 0:
