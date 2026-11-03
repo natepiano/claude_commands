@@ -179,7 +179,7 @@ class UnitStatusFixture(unittest.TestCase):
                                        timeout=TEST_HANG_GUARD_SECS)
                 if unit not in retired_units:
                     member = unit_membership("example", unit)
-                    _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", worktree))
+                    _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", worktree), expected=member.worktree)
                     write_text_atomic(worktree / ".unit.toml", 'plan = "docs/plan.md"\nresponsibilities = []\n')
                 plan = "(retired by the user)" if unit in retired_units else "docs/plan.md"
                 rows.append(f"| {unit} | {plan} | {worktree} | {unit} | — | — |")

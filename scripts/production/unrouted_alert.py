@@ -52,7 +52,8 @@ def _notify(root: Path, listing: str, row: dict[str, str], reason: str, candidat
             saved = {}
         if saved.get("sent") is True:
             return
-        pause = conf.value_origin("review_links", "unrouted_alert_retry_seconds", float)
+        settings = conf.read("review_links")
+        pause = settings.origin("unrouted_alert_retry_seconds", float)
         if isinstance(pause, conf.UnavailableValue):
             raise conf.Unusable(pause.reason)
         now = time.time()
@@ -63,7 +64,7 @@ def _notify(root: Path, listing: str, row: dict[str, str], reason: str, candidat
         message = "\n".join(("Change review routing needs attention", f"List: {listing}", f"Row: {row['#']}",
                               f"Change: {row.get('Change', '')}", f"Reason: {reason}",
                               "Candidates: " + ", ".join(candidates)))
-        recipient = conf.value_origin("review_links", "unrouted_alert_recipient", str)
+        recipient = settings.origin("unrouted_alert_recipient", str)
         if isinstance(recipient, conf.UnavailableValue):
             raise conf.Unusable(recipient.reason)
         send_message(recipient.value, Path(__file__).stem, message)

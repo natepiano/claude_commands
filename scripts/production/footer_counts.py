@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -135,6 +136,9 @@ def sources(doc: Path, *, identities: QuestionStaff | None = None) -> list[Path]
                 found.append(questions.path)
             found.extend(record.path for record in question_records_for_document(doc, identities)
                          if record.status == "open")
+    except staff.StaffRefused as error:
+        print(f"questions: refused — {error}", file=sys.stderr)
+        raise SystemExit(2) from error
     except OSError:
         pass
     return found

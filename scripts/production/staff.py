@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -262,43 +263,63 @@ class CheckoutDocument:
 
 @dataclass(frozen=True)
 class OutsideGitCheckout:
-    """No readable checkout metadata identifies this document."""
+    """The document has no checkout metadata."""
 
 
-def _document_checkout(path: Path) -> CheckoutDocument | OutsideGitCheckout:
+@dataclass(frozen=True)
+class UnreadableGitCheckout:
+    """Checkout metadata cannot identify the document safely."""
+
+    path: Path
+    reason: str
+
+
+def _document_checkout(path: Path) -> CheckoutDocument | OutsideGitCheckout | UnreadableGitCheckout:
     """Read document identity from Git metadata without starting a process."""
+    metadata = path
     try:
         document = path.resolve()
         for folder in document.parents:
-            marker = folder / ".git"
-            if marker.is_dir():
-                git_directory = marker
-            elif marker.is_file():
-                directive = marker.read_text(encoding="utf-8").strip()
-                if not directive.startswith("gitdir:"):
-                    return OutsideGitCheckout()
-                location = directive.removeprefix("gitdir:").strip()
-                if not location:
-                    return OutsideGitCheckout()
-                git_directory = folder / location
-            else:
+            metadata = folder / ".git"
+            try:
+                mode = metadata.lstat().st_mode
+            except FileNotFoundError:
                 continue
-            git_directory = git_directory.resolve()
-            if not git_directory.is_dir():
-                return OutsideGitCheckout()
-            common_file = git_directory / "commondir"
-            if common_file.exists():
-                location = common_file.read_text(encoding="utf-8").strip()
-                if not location:
-                    return OutsideGitCheckout()
-                common_directory = (git_directory / location).resolve()
+            if stat.S_ISDIR(mode):
+                git_directory = metadata
+            elif stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+                if metadata.is_dir():
+                    git_directory = metadata
+                else:
+                    directive = metadata.read_text(encoding="utf-8").strip()
+                    if not directive.startswith("gitdir:"):
+                        raise ValueError("expected a gitdir: line")
+                    location = directive.removeprefix("gitdir:").strip()
+                    if not location:
+                        raise ValueError("empty gitdir path")
+                    git_directory = folder / location
             else:
+                raise ValueError("expected a Git metadata file or directory")
+            metadata = git_directory
+            git_directory = git_directory.resolve(strict=True)
+            if not stat.S_ISDIR(git_directory.stat().st_mode):
+                raise ValueError("Git directory is not a directory")
+            metadata = git_directory / "commondir"
+            try:
+                _ = metadata.lstat()
+            except FileNotFoundError:
                 common_directory = git_directory
-            if not common_directory.is_dir():
-                return OutsideGitCheckout()
+            else:
+                location = metadata.read_text(encoding="utf-8").strip()
+                if not location:
+                    raise ValueError("empty commondir path")
+                common_directory = (git_directory / location).resolve(strict=True)
+            metadata = common_directory
+            if not stat.S_ISDIR(common_directory.stat().st_mode):
+                raise ValueError("Git common directory is not a directory")
             return CheckoutDocument(common_directory, document.relative_to(folder))
-    except (OSError, UnicodeError, RuntimeError):
-        return OutsideGitCheckout()
+    except (OSError, UnicodeError, RuntimeError, ValueError) as error:
+        return UnreadableGitCheckout(metadata, str(error))
     return OutsideGitCheckout()
 
 
@@ -351,8 +372,17 @@ class StaffSnapshot:
         identity = _document_checkout(document)
         if isinstance(identity, OutsideGitCheckout):
             return None
-        matches = [row for row in candidates if isinstance(row.doc, (LiveDoc, WrappedDoc))
-                   and _document_checkout(row.doc.path) == identity]
+        if isinstance(identity, UnreadableGitCheckout):
+            raise StaffRefused(f"{document}: cannot read Git metadata {identity.path}: {identity.reason}")
+        matches: list[StaffRow] = []
+        for row in candidates:
+            if not isinstance(row.doc, (LiveDoc, WrappedDoc)):
+                continue
+            candidate = _document_checkout(row.doc.path)
+            if isinstance(candidate, UnreadableGitCheckout):
+                continue
+            if candidate == identity:
+                matches.append(row)
         if len(matches) > 1:
             names = ", ".join(str(row.id) for row in matches)
             raise StaffRefused(f"{document}: ambiguous production document; staff rows: {names}")
@@ -1058,16 +1088,24 @@ def move(staff_id: StaffId, new_parent: StaffId | None) -> StaffRow:
     return _transaction(edit)
 
 
-def set_worktree(unit: StaffId, worktree: PresentWorktree | RemovedWorktree) -> StaffRow:
+def set_worktree(unit: StaffId, worktree: PresentWorktree | RemovedWorktree, *,
+                 expected: PresentWorktree | RemovedWorktree | WorktreeUnfilled) -> StaffRow:
     """Set one unit's worktree through the existing owner transaction."""
     if not _is_owner():
+        previous = (["--expected-state", "unfilled"] if isinstance(expected, WorktreeUnfilled) else
+                    ["--expected-state", "present" if isinstance(expected, PresentWorktree) else "removed",
+                     "--expected-machine", expected.machine, "--expected-path", str(expected.path)])
         return _remote_row(["set-worktree", unit, "--machine", worktree.machine, "--path", str(worktree.path),
-                            "--state", "present" if isinstance(worktree, PresentWorktree) else "removed"])
+                            "--state", "present" if isinstance(worktree, PresentWorktree) else "removed", *previous])
 
     def edit(rows: list[StaffRow]) -> StaffRow:
         row = _required(rows, unit)
         if row.kind != "unit":
             raise StaffRefused("set-worktree requires a unit")
+        if row.worktree == worktree:
+            return row
+        if row.worktree != expected:
+            raise StaffRefused(f"{unit}: worktree differs from the expected value {expected!r}; found {row.worktree!r}")
         changed = replace(row, worktree=worktree)
         rows[rows.index(row)] = changed
         return changed
@@ -1305,6 +1343,9 @@ class _Arguments(argparse.Namespace):
     machine: str = ""
     path: str = ""
     state: str = ""
+    expected_state: str = ""
+    expected_machine: str = ""
+    expected_path: str = ""
     worktree: list[str] | None = None
     doc: list[str] | None = None
 
@@ -1365,6 +1406,10 @@ def _parser() -> argparse.ArgumentParser:
         _ = location_parser.add_argument("--machine", required=True)
         _ = location_parser.add_argument("--path", required=True)
         _ = location_parser.add_argument("--state", required=True, choices=states)
+        if command == "set-worktree":
+            _ = location_parser.add_argument("--expected-state", required=True, choices=("unfilled", "present", "removed"))
+            _ = location_parser.add_argument("--expected-machine", default="")
+            _ = location_parser.add_argument("--expected-path", default="")
         location_parsers.append(location_parser)
     for verb in (*location_parsers, show, get, add, restore_parser, rename_parser, move_parser, retire_parser, apply_parser, defer_parser, pending_parser):
         _ = verb.add_argument("--json", action="store_true")
@@ -1385,7 +1430,11 @@ def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | tuple[StaffId, 
     if arguments.verb == "set-worktree":
         worktree = (PresentWorktree(arguments.machine, Path(arguments.path)) if arguments.state == "present"
                     else RemovedWorktree(arguments.machine, Path(arguments.path)))
-        return set_worktree(StaffId(arguments.target), worktree)
+        expected = (WorktreeUnfilled() if arguments.expected_state == "unfilled" else
+                    PresentWorktree(arguments.expected_machine, Path(arguments.expected_path))
+                    if arguments.expected_state == "present" else
+                    RemovedWorktree(arguments.expected_machine, Path(arguments.expected_path)))
+        return set_worktree(StaffId(arguments.target), worktree, expected=expected)
     if arguments.verb == "set-doc":
         doc = (LiveDoc(arguments.machine, Path(arguments.path)) if arguments.state == "live"
                else WrappedDoc(arguments.machine, Path(arguments.path)))

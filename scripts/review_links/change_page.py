@@ -698,8 +698,9 @@ def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatu
     """Deliver each saved message and report exhausted attempts to its showrunner."""
     if isinstance(delivery, NoMessageDelivery):
         return
-    tries = conf.whole("review_links", "delivery_tries")
-    pause = conf.number("review_links", "delivery_pause_seconds")
+    settings = conf.read("review_links")
+    tries = settings.whole("delivery_tries")
+    pause = settings.number("delivery_pause_seconds")
     with status.locked():
         slots = status.slots(delivery.page, delivery.row)
         ownership = status.request_attempts.get(delivery.attempt)

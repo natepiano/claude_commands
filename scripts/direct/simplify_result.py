@@ -14,6 +14,7 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents.claude_result import claude_result
 from scripts.lib import conf
+from scripts.issue_score.selection import UseConfiguredValue
 from scripts.lib.atomic_file import write_text_atomic
 
 
@@ -51,15 +52,18 @@ def well_formed(report: str) -> bool:
                for line in report.strip().splitlines())
 
 
-def prepare(diff: Path, cwd: Path, source: Path, prompt: Path, files: ReviewFiles) -> Path:
+def prepare(diff: Path, cwd: Path, source: Path, prompt: Path, files: ReviewFiles, *,
+            settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Path:
     """Clear old evidence, check the diff, and write the prompt."""
+    if isinstance(settings, UseConfiguredValue):
+        settings = conf.read("direct")
     _ = files.findings.write_text("")
     _ = files.summary.write_text("")
     diff = (cwd / diff.expanduser()).resolve()
     with diff.open("rb") as stream:
         _ = stream.read(1)
     standing = Template((conf.directory() / "review/simplify.md").read_text()).substitute(
-        agents=",".join(conf.words("direct", "SIMPLIFY_AGENTS")))
+        agents=",".join(settings.words("SIMPLIFY_AGENTS")))
     if source.resolve() == prompt.resolve():
         prompt = prompt.with_name(f"{prompt.stem}.generated{prompt.suffix}")
     user_words = source.read_text()
@@ -116,20 +120,21 @@ def main() -> int:
     command_name = cast(str, args.command)
     files = ReviewFiles(cast(Path, args.findings_file), cast(Path, args.status_file), cast(Path, args.log_file),
                         cast(Path, args.summary_file))
+    if command_name == "finish":
+        print(finish(files, cast(str, args.reason), cast(int, args.exit_code)))
+        return 0
+    settings = conf.read("direct")
     if command_name == "prepare":
         try:
             print(prepare(cast(Path, args.diff), cast(Path, args.cwd), cast(Path, args.source),
-                          cast(Path, args.prompt_file), files))
+                          cast(Path, args.prompt_file), files, settings=settings))
             return 0
         except (OSError, KeyError, ValueError) as error:
             print(f"unable to prepare the simplify review: {error}", file=sys.stderr)
             return 1
-    if command_name == "finish":
-        print(finish(files, cast(str, args.reason), cast(int, args.exit_code)))
-        return 0
     report = files.findings.read_text() if files.findings.exists() else ""
     log = files.log.read_text(errors="replace") if files.log.exists() else ""
-    reason = validate(report, log, len(conf.words("direct", "SIMPLIFY_AGENTS")))
+    reason = validate(report, log, len(settings.words("SIMPLIFY_AGENTS")))
     if reason:
         if not report.strip() or well_formed(report):
             _ = files.findings.write_text(f"ERROR: {reason}")

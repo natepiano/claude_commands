@@ -558,14 +558,18 @@ def _merge(rename: UnitRename, _save: Callable[[], None]) -> None:
     rename.merged = unit_move.merge_into(worktree, f"origin/{rename.merge_branch}", message)
 
 
+def _relocate_staff_row(row: staff.StaffRow, worktree: Path) -> None:
+    if isinstance(row.worktree, staff.WorktreeUnfilled):
+        return
+    _ = staff.set_worktree(row.id, dataclasses.replace(row.worktree, path=worktree), expected=row.worktree)
+
+
 def relocate_staff_worktree(member_id: staff.StaffId, worktree: Path) -> None:
     """Change a recorded worktree path without changing its lifecycle state."""
     row = staff.by_id(member_id)
     if row is None or row.kind != "unit":
         raise RenameRefused(f"{member_id}: no matching unit staff row")
-    if isinstance(row.worktree, staff.WorktreeUnfilled):
-        return
-    _ = staff.set_worktree(member_id, dataclasses.replace(row.worktree, path=worktree))
+    _relocate_staff_row(row, worktree)
 
 
 def _move_git(rename: UnitRename, _save: Callable[[], None]) -> None:
@@ -584,7 +588,12 @@ def _move_git(rename: UnitRename, _save: Callable[[], None]) -> None:
         _ = git(Path(rename.new_worktree), "switch", rename.new_branch)
     worktree = Path(rename.new_worktree)
     git_exclude.ensure_excluded(worktree, "/.unit.toml")
-    relocate_staff_worktree(rename.staff_id, worktree)
+    row = staff.by_id(rename.staff_id)
+    if row is None or row.kind != "unit":
+        raise RenameRefused(f"{rename.staff_id}: no matching unit staff row")
+    if not isinstance(row.worktree, staff.WorktreeUnfilled) and row.worktree.path not in (source, worktree):
+        raise RenameRefused(f"{row.id}: staff worktree differs from the journal source and destination")
+    _relocate_staff_row(row, worktree)
 
 
 def _move_claude(rename: UnitRename, _save: Callable[[], None]) -> None:

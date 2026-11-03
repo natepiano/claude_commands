@@ -63,6 +63,8 @@ def install_cost_settings(path: Path, overrides: str = "") -> None:
         "observation_max_age_seconds": "86400", "cost_explorer_interval_seconds": "86400",
         "notification_timeout_s": "5", "notification_retry_s": "60",
     })
+    text_setting(path, "cost_explorer_tag_key", "Project")
+    text_setting(path, "cost_explorer_tag_value", "fixture-build")
     text_setting(path, "accounting_zone", "UTC")
     text_setting(path, "notification_recipient", "fixture-showrunner")
 

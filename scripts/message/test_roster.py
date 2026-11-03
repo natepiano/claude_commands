@@ -387,6 +387,28 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(found.problems, [])
         return {entry.name: entry for entry in found.entries}
 
+    def test_keyed_send_reuses_roster_registry_before_delivery(self) -> None:
+        state = self.root / "message"
+        state.mkdir()
+        identity = "abd1a227-f410-5c76-bc96-a0c77c0f3ef0"
+        registered = sessions.addressed(f"session:{identity}", sessions.live_sessions())
+        assert registered is not None
+        started = send.now()
+        targets = ("free-claude", f"session:{identity}", f"uds:{registered['messagingSocketPath']}")
+        for target in targets:
+            with self.subTest(target=target):
+                _ = (state / "keys.json").write_text(json.dumps({"notice": {"last": {target: started.isoformat()}}}))
+                options = send.parse(["--here", "--to", target, "--from", "fixture", "--text", "Notice",
+                                      "--key", "notice", "--repeat-minutes", "30"])
+                with (mock.patch.object(send, "STATE", state),
+                      mock.patch.object(send, "now", return_value=started),
+                      mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()),
+                      mock.patch.object(sessions, "read_registry", wraps=sessions.read_registry) as registry,
+                      mock.patch.object(send, "relay", return_value=send.Result("sent", "fixture")) as relay):
+                    self.assertEqual(send.send(options).outcome, "skipped")
+                registry.assert_called_once_with()
+                relay.assert_not_called()
+
     def test_fast_labels_agree_with_full_roster_for_live_claude_sessions(self) -> None:
         full = roster.unit_labels(list(self._entries().values()))
         wanted = ["17e44ec4-3e24-5ae1-b10d-5cf30de9455b", "acd50bad-5afa-5d3d-b155-3766b7d113e0", "abd1a227-f410-5c76-bc96-a0c77c0f3ef0"]
@@ -431,7 +453,7 @@ class RosterTests(unittest.TestCase):
         wanted = ["17e44ec4-3e24-5ae1-b10d-5cf30de9455b", "acd50bad-5afa-5d3d-b155-3766b7d113e0"]
         labels = roster.unit_labels_for(wanted, self.environment)
         old = unit_membership("alpha", "retired-unit")
-        _ = staff.set_worktree(old.id, staff.RemovedWorktree("natedev", self.root / "retired"))
+        _ = staff.set_worktree(old.id, staff.RemovedWorktree("natedev", self.root / "retired"), expected=old.worktree)
         historical = showrunner_relationship("wrapped")
         _ = staff.set_doc(historical.id, staff.WrappedDoc("natedev", self.root / "wrapped-production.md"))
         self.assertEqual(self._entries(), before)
@@ -1637,8 +1659,9 @@ class RosterTests(unittest.TestCase):
     def test_a_duplicate_mark_on_another_unit_keeps_this_units_director(self) -> None:
         read = unit_lookup.every_marked_unit
 
-        def with_duplicate(*, record: staff.StaffSnapshot | None = None) -> unit_lookup.MarkedProductions:
-            found = read(record=record)
+        def with_duplicate(*, record: staff.StaffSnapshot | None = None,
+                           running: list[sessions.SessionRecord] | None = None) -> unit_lookup.MarkedProductions:
+            found = read(record=record, running=running)
             return unit_lookup.MarkedProductions(
                 found.units, {"alpha": {"unit-two": "unit-two: its mark is on herdr sessions copy and first"}})
 
@@ -1783,7 +1806,7 @@ class RosterTests(unittest.TestCase):
 
     def test_unreadable_herdr_fallback_places_director_but_never_ledger_worker_by_cwd(self) -> None:
         owner = unit_membership("alpha", "unit-one")
-        _ = staff.set_worktree(owner.id, staff.PresentWorktree(roster.remote.local_machine(), self.home / "projects/unit-one"))
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree(roster.remote.local_machine(), self.home / "projects/unit-one"), expected=owner.worktree)
         _ = self.production_doc.write_text("# Production without a Units table\n")
         worker_path = self.sessions / "worker.json"
         worker = cast(dict[str, object], json.loads(worker_path.read_text(encoding="utf-8")))

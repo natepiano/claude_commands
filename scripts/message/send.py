@@ -288,6 +288,7 @@ KeyedMessage = TypedDict(
         "shown_sender": NotRequired[str],
         "sender_native_id": NotRequired[str],
         "socket_recovery": NotRequired[str],
+        "stable_recipient": NotRequired[str],
     },
 )
 UnkeyedMessage = TypedDict(
@@ -303,6 +304,7 @@ UnkeyedMessage = TypedDict(
         "shown_sender": NotRequired[str],
         "sender_native_id": NotRequired[str],
         "socket_recovery": NotRequired[str],
+        "stable_recipient": NotRequired[str],
     },
 )
 
@@ -552,6 +554,21 @@ class NoStaffRecipient:
     """The target keeps its transport resolution because no staff row matches."""
 
 
+@dataclass(frozen=True)
+class StableRecipient:
+    """Identify the recipient across changes to its transport address."""
+
+    value: str
+
+
+@dataclass(frozen=True)
+class TransportQueueOwner:
+    """Only the transport address identifies the queue owner."""
+
+
+TRANSPORT_QUEUE_OWNER = TransportQueueOwner()
+
+
 DeliveryRoute = SessionRecipient | UserDelivery | RemoteDelivery | RecipientLookupFailed
 
 
@@ -713,10 +730,10 @@ def session_key(session: sessions.SessionRecord) -> str:
 
 
 def queue_for(to: str) -> Path:
-    """Where a message that did not reach `to` is kept.
+    """Return the queue path for this address.
 
-    Under the Claude session id of the live session `to` means, so the session finds it whatever it
-    is called later. Under `to` itself when no live session answers to it: there is no id to look up.
+    Use the live session ID when available. Otherwise, use the original address.
+    Reject an unregistered socket address.
     """
     if to.startswith("session:") and len(to) > len("session:"):
         return queue_path(f"session-{to.removeprefix('session:')}")
@@ -733,6 +750,8 @@ def _queued_message(value: object) -> QueuedMessage | None:
         return None
     key = values.get("key")
     if "shown_sender" in values and not isinstance(values["shown_sender"], str):
+        return None
+    if "stable_recipient" in values and not isinstance(values["stable_recipient"], str):
         return None
     if "sender_native_id" in values:
         try:
@@ -755,8 +774,21 @@ def read_queue(path: Path) -> list[QueuedMessage]:
     return [message for message in messages if message is not None]
 
 
-def enqueue(message: Message, reason: str, at: datetime) -> None:
-    """Keep a message that did not arrive; a later one with the same key replaces it."""
+def _matches_queued_key(entry: QueuedMessage, key: str,
+                        recipient: StableRecipient | TransportQueueOwner, *, own_path: bool) -> bool:
+    if entry["key"] != key:
+        return False
+    if "stable_recipient" in entry:
+        return isinstance(recipient, StableRecipient) and entry["stable_recipient"] == recipient.value
+    return own_path
+
+
+def enqueue(message: Message, reason: str, at: datetime, *,
+            recipient: StableRecipient | TransportQueueOwner = TRANSPORT_QUEUE_OWNER) -> None:
+    """Keep an undelivered message under its transport address.
+
+    Retain its stable recipient when known. Replace the same recipient and key across queue files.
+    """
     path = queue_for(message.to)
     if message.key is None:
         entry: QueuedMessage = UnkeyedMessage(
@@ -782,10 +814,25 @@ def enqueue(message: Message, reason: str, at: datetime) -> None:
             sender_native_id=sender_native_id(message.stamp),
             **{"from": message.sender},
         )
+    if isinstance(recipient, StableRecipient):
+        entry["stable_recipient"] = recipient.value
     with locked():
         path.parent.mkdir(parents=True, exist_ok=True)
-        kept = [old for old in read_queue(path) if message.key is None or old["key"] != message.key]
+        kept = [old for old in read_queue(path) if message.key is None
+                or not _matches_queued_key(old, message.key, recipient, own_path=True)]
         write_atomic(path, "".join(json.dumps(item) + "\n" for item in [*kept, entry]))
+        if message.key is not None and isinstance(recipient, StableRecipient):
+            for previous in path.parent.glob("*.jsonl"):
+                if previous == path:
+                    continue
+                try:
+                    entries = read_queue(previous)
+                except UnicodeError:
+                    continue
+                remaining = [old for old in entries
+                             if not _matches_queued_key(old, message.key, recipient, own_path=False)]
+                if len(remaining) != len(entries):
+                    _rewrite_queue(previous, remaining)
 
 
 def _rewrite_queue(path: Path, kept: list[QueuedMessage]) -> None:
@@ -804,15 +851,25 @@ def _queue_paths_for_address(to: str) -> list[Path]:
     return list(dict.fromkeys((destination, queue_path(to))))
 
 
-def remove_queued_key(to: str, key: str) -> int:
-    """Remove a delivered keyed message's queued predecessor."""
+def remove_queued_key(to: str, key: str, *,
+                      recipient: StableRecipient | TransportQueueOwner = TRANSPORT_QUEUE_OWNER) -> int:
+    """Remove the queued copy of a delivered message with a key."""
     paths = _queue_paths_for_address(to)
     removed = 0
     with locked():
-        for path in paths:
-            entries = read_queue(path)
-            kept = [entry for entry in entries if entry["key"] != key]
-            _rewrite_queue(path, kept)
+        candidates = (list(dict.fromkeys([*paths, *(STATE / "queue").glob("*.jsonl")]))
+                      if isinstance(recipient, StableRecipient) else paths)
+        for path in candidates:
+            try:
+                entries = read_queue(path)
+            except UnicodeError:
+                if path in paths:
+                    raise
+                continue
+            kept = [entry for entry in entries
+                    if not _matches_queued_key(entry, key, recipient, own_path=path in paths)]
+            if len(kept) != len(entries):
+                _rewrite_queue(path, kept)
             removed += len(entries) - len(kept)
     return removed
 
@@ -1026,34 +1083,39 @@ def log(message: Message, result: Result, at: datetime, route: Route = NO_CLAUDE
 # ---------------------------------------------------------------------------
 
 
-def claim(message: Message, repeat: timedelta | None, at: datetime, *, live: bool = False,
+def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None, at: datetime, *,
+          legacy_aliases: tuple[str, ...] = (), live: bool = False,
           clears_when: str = "", posted_on: str = "") -> str | None:
-    """Why this send is skipped, or None after recording it as the key's latest attempt.
+    """Return the skip reason, or record this attempt under the stable recipient.
 
-    Recording before delivery, under the lock, keeps two overlapping runs with
-    one key from both sending. `live`: the window is an emergency push's lifetime.
+    The lock prevents overlapping sends with one key from both sending.
+    Known transport aliases contribute timestamps only to the window check.
+    With `live`, the window is the lifetime of an emergency push.
     """
     if message.key is None:
         return None
     with key_states() as states:
-        state = states.setdefault(message.key, {"last": {}})
+        state: KeyState = states.get(message.key, {"last": {}})
         if "acknowledged" in state:
             return acknowledged_skip_reason(message.key, state["acknowledged"])
-        last = state["last"].get(message.to)
+        timestamps = [state["last"][alias] for alias in (recipient.value, *legacy_aliases)
+                      if alias in state["last"]]
+        last = max(timestamps, key=datetime.fromisoformat) if timestamps else None
         if last is not None and message.key.startswith("github.keys_cold:"):
             return f"key {message.key!r}: GitHub keys still cold; this event already sent its push"
         if repeat is not None and last is not None and at - datetime.fromisoformat(last) < repeat:
             if live:
                 return still_live(message.key, message.sender, datetime.fromisoformat(last), repeat)
             minutes = repeat.total_seconds() / 60
-            return f"key {message.key!r} last sent to {message.to} at {last}, inside its {minutes:g}-minute window"
+            return f"key {message.key!r} last sent to {recipient.value} at {last}, inside its {minutes:g}-minute window"
         if clears_when:
             clear_record = Emergency(key=message.key, sender=message.sender, check=clears_when, machine=posted_on,
                                      sent=at.isoformat(), expires=(at + emergency_lifetime()).isoformat())
             # Persist recovery before the claim: a crash can leave an extra check, never an orphan claim.
             kept = [old for old in read_emergencies() if old["key"] != clear_record["key"]]
             write_emergencies([*kept, clear_record])
-        state["last"][message.to] = at.isoformat()
+        state["last"][recipient.value] = at.isoformat()
+        states[message.key] = state
     return None
 
 
@@ -1080,8 +1142,10 @@ def still_live(key: str, sender: str, sent: datetime, lifetime: timedelta) -> st
 
 
 def forget_sent(key: str, to: str, at: datetime | None = None) -> None:
-    """Forget the key's last send to `to`, so the next send goes out at once. With `at`, only when that
-    send is the one at `at`: a later run's record stays."""
+    """Remove this recipient's claim after a failed send.
+
+    With `at`, keep the claim when a later attempt owns it.
+    """
     with key_states() as states:
         state = states.get(key)
         if state is None or to not in state["last"] or (at is not None and state["last"][to] != at.isoformat()):
@@ -1309,10 +1373,10 @@ def recover_socket_queues(records: list[sessions.SessionRecord], at: datetime) -
 
 
 def pending(to: str | None) -> str:
-    """Print and clear what is kept for a session: the one `to` means, or the caller's own.
+    """Print and clear queued messages for the selected session.
 
-    It is found by session id. What was kept under a name is found too: the name `to`, the session's
-    name now, and each name it once had that no live session has now.
+    Current staff owners also receive their messages from queues for previous sessions.
+    Names from previous sessions remain eligible when no other live session uses them.
     """
     records = sessions.live_sessions()
     if to is None:
@@ -1328,10 +1392,49 @@ def pending(to: str | None) -> str:
         keys = [session_key(session), session["name"], f"uds:{session['messagingSocketPath']}",
                 *(name for name in session["formerNames"] if name not in taken), *keys]
     paths = list(dict.fromkeys(queue_path(key) for key in keys if key))
+    stable_values = set(keys)
+    if session is not None:
+        try:
+            member = staff.snapshot().by_current_session(session["sessionId"])
+        except staff.StaffUnreadable:
+            member = None
+        if member is not None:
+            stable_values.add(f"staff:{member.id}")
     with locked():
-        entries = sorted((entry for path in paths for entry in read_queue(path)), key=lambda entry: entry["time"])
-        for path in paths:
-            path.unlink(missing_ok=True)
+        entries: list[QueuedMessage] = []
+        rewrites: list[tuple[Path, list[QueuedMessage]]] = []
+        candidates = list(dict.fromkeys([*paths, *(STATE / "queue").glob("*.jsonl")]))
+        for path in candidates:
+            selected: list[QueuedMessage] = []
+            kept: list[QueuedMessage] = []
+            try:
+                queued = read_queue(path)
+            except UnicodeError:
+                if path in paths:
+                    raise
+                continue
+            for entry in queued:
+                owner = entry.get("stable_recipient", "")
+                if owner in stable_values or path in paths and not owner.startswith("staff:"):
+                    selected.append(entry)
+                else:
+                    kept.append(entry)
+            if selected or path in paths:
+                entries.extend(selected)
+                rewrites.append((path, kept))
+        for path, kept in rewrites:
+            _rewrite_queue(path, kept)
+        entries.sort(key=lambda entry: entry["time"])
+        newest: dict[tuple[str, str], QueuedMessage] = {}
+        unkeyed_or_legacy: list[QueuedMessage] = []
+        for entry in entries:
+            owner = entry.get("stable_recipient")
+            key = entry["key"]
+            if owner is not None and key is not None:
+                newest[owner, key] = entry
+            else:
+                unkeyed_or_legacy.append(entry)
+        entries = sorted([*unkeyed_or_legacy, *newest.values()], key=lambda entry: entry["time"])
     return "\n\n".join(stamped_text(
         f"Queued message {index} of {len(entries)}, from {entry['from']} at {entry['time']}:"
         + shown_sender_line(entry["from"], entry.get("shown_sender", entry["from"])),
@@ -1527,12 +1630,12 @@ def matching_recipients(
 
 def resolve_recipient(
     to: str, scope: RecipientResolutionScope, observed: roster.Roster, *,
-    membership: staff.StaffSnapshot | None = None,
+    membership: staff.StaffSnapshot | None = None, records: list[sessions.SessionRecord] | None = None,
 ) -> DeliveryRoute:
     """Resolve locally first; a remote row supplies the address sent to its machine."""
     membership = staff.snapshot() if membership is None else membership
     if to.startswith("uds:"):
-        return socket_recipient(to, sessions.live_sessions(), {}, membership=membership)
+        return socket_recipient(to, sessions.live_sessions() if records is None else records, {}, membership=membership)
     member = resolve_staff_recipient(to, membership, observed=observed.entries)
     if isinstance(member, RecipientLookupFailed):
         usage_error(member.reason)
@@ -2395,11 +2498,12 @@ def read_sender_stamp(value: object) -> SenderStamp:
 def morty_stamp(stamp: SenderStamp) -> bool:
     if isinstance(stamp, UnavailableSender):
         return False
+    config = conf.read("send")
     # A recovered configuration value cannot grant authority after a missing live key.
-    if not isinstance(conf.value_origin("send", "MORTY_NATIVE_ID", str), conf.UsableLiveValue):
+    if not isinstance(config.origin("MORTY_NATIVE_ID", str), conf.UsableLiveValue):
         return False
     try:
-        expected = conf.text("send", "MORTY_NATIVE_ID")
+        expected = config.text("MORTY_NATIVE_ID")
         kind, _, identity = expected.partition(":")
         if kind not in ("session", "codex"):
             return False
@@ -2465,8 +2569,11 @@ def send(options: Options) -> Result:
     needs_recipient_roster = (isinstance(options.selection, RosterLookup) and options.to != USER
                               and not options.to.startswith("uds:") and not isinstance(options.scope, NamedMachine))
     needs_sender_roster = options.to != USER and isinstance(options.shown_sender, SenderNotResolved)
-    observed = (roster.roster(os.environ, roster.ThisMachine(), membership=membership) if needs_recipient_roster or needs_sender_roster
+    running = (sessions.running_sessions() if needs_recipient_roster or needs_sender_roster
+               or (options.to != USER and isinstance(options.selection, RosterLookup)) else [])
+    observed = (roster.roster(os.environ, roster.ThisMachine(), membership=membership, records=running) if needs_recipient_roster or needs_sender_roster
                 else roster.Roster([], []))
+    records = [record for record in running if sessions.messaging_socket_exists(record)]
     if isinstance(options.selection, MeshWorker):
         route: DeliveryRoute = (
             RemoteDelivery(options.scope.host, options.to) if isinstance(options.scope, NamedMachine)
@@ -2476,8 +2583,18 @@ def send(options: Options) -> Result:
         route = (RemoteDelivery(options.scope.host, USER) if isinstance(options.scope, NamedMachine)
                  else UserDelivery())
     else:
-        route = resolve_recipient(options.to, options.scope, observed, membership=membership)
+        route = resolve_recipient(options.to, options.scope, observed, membership=membership, records=records)
     destination = route.address if isinstance(route, SessionRecipient | RemoteDelivery) else options.to
+    member = resolve_staff_recipient(options.to, membership, records=records, observed=observed.entries)
+    if isinstance(member, RecipientLookupFailed):
+        usage_error(member.reason)
+    if isinstance(member, NoStaffRecipient) and destination != options.to:
+        member = resolve_staff_recipient(destination, membership, records=records, observed=observed.entries)
+    stable = StableRecipient(f"staff:{member.id}" if isinstance(member, staff.StaffRow) else options.to)
+    registered = sessions.addressed(destination, records)
+    legacy_aliases = (destination,)
+    if registered is not None:
+        legacy_aliases += (f"session:{registered['sessionId']}", f"uds:{registered['messagingSocketPath']}")
     sender = options.sender or default_sender()
     if options.to == USER and options.sender is None and sender != "send.py":
         options = options._replace(answerable=True)
@@ -2502,13 +2619,13 @@ def send(options: Options) -> Result:
     held = None if refused else wrong_template(options, "\n".join((summary, text, action_text)))
     cold_check = options.clears_when if options.text_id == "github.keys_cold" else ""
     skip = None if refused or held is not None else claim(
-        message, window, started, live=live, clears_when=cold_check,
+        message, stable, window, started, legacy_aliases=legacy_aliases, live=live, clears_when=cold_check,
         posted_on=options.scope.host if isinstance(options.scope, NamedMachine) else machine())
     log_route: Route = NO_CLAUDE_ROUTE
     guarded = repeat_guard.Decision()
     if not refused and held is None and skip is None and not isinstance(route, (RecipientLookupFailed, CodexWorkerRecipient, RemoteDelivery)):
         guarded = repeat_guard.check(STATE / "repeats", repeat_guard.Attempt(
-            sender, repeat_guard.recipient_identity(destination, thread_id=route.thread_id if isinstance(route, CodexSessionRecipient) else ""),
+            sender, stable.value,
             text, machine(), started.timestamp(), options.human or sender.casefold() == USER or options.to == USER))
     if refused:
         result = Result("refused", NO_CLEAR_STEP)
@@ -2551,7 +2668,7 @@ def send(options: Options) -> Result:
                 if message.to.startswith("uds:") and recipient is None:
                     return Result("failed", f"{relayed_result.detail}; {dead_socket_reason(message.to)}")
                 queued = replace(message, to=f"session:{recipient['sessionId']}") if recipient is not None else message
-                enqueue(queued, relayed_result.detail, started)
+                enqueue(queued, relayed_result.detail, started, recipient=stable)
                 if recipient is None:
                     return Result("queued", f"{relayed_result.detail}; no live session answers to {message.to},"
                                   + " so it is kept under that name")
@@ -2563,7 +2680,7 @@ def send(options: Options) -> Result:
                 "queued",
                 f"no live session answers to {plan.address}, so it is kept under that name",
             )
-            enqueue(message, result.detail, started)
+            enqueue(message, result.detail, started, recipient=stable)
             log_route = ClaudeRoute("queue", "unresolved", time.monotonic() - claude_started)
         else:
             live = sessions.live_sessions()
@@ -2587,12 +2704,13 @@ def send(options: Options) -> Result:
                 result = relay_and_queue(plan.message, options.timeout)
                 log_route = ClaudeRoute("relay", "unresolved", time.monotonic() - claude_started)
     if result.outcome == "sent" and message.key is not None:
-        for recipient in dict.fromkeys((message.to, options.to)):
-            _ = remove_queued_key(recipient, message.key)
+        _ = remove_queued_key(message.to, message.key, recipient=stable)
+        if options.to != message.to:
+            _ = remove_queued_key(options.to, message.key, recipient=stable)
     # A failed send can retry. A queue or kept push owns its copy until delivery.
     if (key is not None and not refused and held is None and skip is None
             and result.outcome in {"failed", "refused", "held"}):
-        forget_sent(key, message.to, started)
+        forget_sent(key, stable.value, started)
     if emergency and options.clears_when and key is not None and not cold_check and result.outcome == "sent":
         posted_on = options.scope.host if isinstance(options.scope, NamedMachine) else machine()
         record_emergency(Emergency(key=key, sender=sender, check=options.clears_when, machine=posted_on,

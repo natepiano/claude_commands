@@ -1009,9 +1009,10 @@ def remote_path(path: PurePosixPath) -> str:
 
 
 def pull_mac_checkout(mac: PurePosixPath, source: Path) -> None:
+    settings_read = conf.read('merge_checkpoint')
     try:
-        tries = conf.whole("merge_checkpoint", "MAC_PULL_TRIES")
-        retry_seconds = conf.number("merge_checkpoint", "MAC_PULL_RETRY_SECONDS")
+        tries = settings_read.whole("MAC_PULL_TRIES")
+        retry_seconds = settings_read.number("MAC_PULL_RETRY_SECONDS")
     except ValueError as error:
         raise Stop("promote", "failed", str(error), "repair the Mac pull configuration and rerun this checkpoint") from error
     remote = (f"cd {remote_path(mac)} && git pull --ff-only "
