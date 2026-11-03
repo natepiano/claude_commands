@@ -13,7 +13,7 @@ Rustdoc runs once per phase, as the unit director's last command before a Rust c
 | `scripts/direct/verify.sh` | The `doc` verb and its staged-tree checkout, `doc_tree`, `doc_record`, `lint` without rustdoc, `final`, `UNTESTED_EXAMPLES_PY`, `TEST_TARGETS_PY`, and the header and usage text for each. |
 | `scripts/lint/invoke.sh` | `invoke_doc`: `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --jobs ${LINT_DOC_JOBS:-8}`. |
 | `scripts/hooks/pre-tool-use-checkpoint-doc-gate.py` | The checkpoint doc gate. |
-| `scripts/hooks/pre-tool-use-change-review-gate.py` | Supplies the `SUBJECT` and `ALL` patterns. The doc gate loads this file by path at run time, only after it finds a git commit or merge. |
+| `scripts/hooks/checkpoint_gate.py` | Supplies the command parser and the message and tree readers for both checkpoint hooks. |
 | `settings.json` | Registers the doc gate as a `Bash` PreToolUse hook, directly after the change-review gate. |
 | `config/lint.conf` | `doc=on` still exists. It controls only a standalone lint-CLI doc run; `verify.sh doc` ignores it. |
 | `commands/unit/checkpoint.md` (`<CheckpointCommit/>`) | The doc step, the own-call rule, and the rules the hook uses to recognize and refuse a commit. |
@@ -127,7 +127,7 @@ One example can get both refusals; the test refusal comes first. Offenders follo
 - The hook fails closed for Cargo checkpoints and opaque commands with git commit/merge words plus explicit checkpoint text in any cwd (or unreadable messages in a Cargo cwd). Modeled constructs never use quote-removed fallback evidence. Unrelated opaque calls and default merges pass. The first check stays cheap: every Bash call reaches it.
 - Only a `git` command word starts a commit or merge. Text in the argument of another program, a comment or a heredoc body is never a commit.
 - Every checkpoint in a Cargo repo needs a record for exactly the tree that its options write.
-- The hook loads `SUBJECT` and `ALL` from `pre-tool-use-change-review-gate.py`. A change to those patterns changes both hooks. The hook finds git commands with its own shell parser, not with the change-review `COMMIT` pattern.
+- Both hooks use the command parser in `checkpoint_gate.py`. The doc hook uses `SUBJECT` to check each message line.
 - `final` must not link examples, and the example scan must run before any build. Together they make sure no test is lost.
 - `final` must not pass `--lib`.
 - Tests that pin this: `test_verify_doc.py`, the `test_verify_lint_*.py` modules (shared fixture: `verify_lint_scope_test_support.py`), `test_checkpoint_doc_gate.py`, `test_verify_final_targets.py` and `test_verify_untested_examples.py`.
@@ -137,10 +137,11 @@ One example can get both refusals; the test refusal comes first. Offenders follo
 
 - In every repo, the checkpoint commit is the first command in its own Bash call. An earlier command can change the folder or the index. Put `cd`, `git add` and `verify.sh doc` in earlier calls. Commands after the commit, such as a push, are allowed. A line break also ends a command, so a command on an earlier line is an earlier command.
 - Only the commit's own message makes it a checkpoint. Checkpoint text in an `echo`, in another command's quoted argument, or in a heredoc that writes a file does not make a commit.
-- A shell expansion in a commit message, `$'…'` included, makes the message unreadable. In a Cargo repo an unreadable message counts as a checkpoint. Use literal `-m` text, a `-F` file, or the `"$(cat <<'EOF' … EOF)"` heredoc form. The hook cannot read the heredoc form, so it counts as a checkpoint.
-- A merge with no message option uses git's ordinary default subject, even with `--log` or a stale `MERGE_MSG`. Literal checkpoint merge messages follow the own-call rule in every repo. A Cargo checkpoint merge must finish with `--no-commit`; then run `doc` and commit the staged tree with the checkpoint subject.
+- A shell expansion in a commit message, `$'…'` included, makes the message unreadable. In a Cargo repo an unreadable message counts as a checkpoint. Use literal `-m` text, a `-F` file, or the `"$(cat <<'EOF' … EOF)"` heredoc form. The shared reader reads this form and one quoted stdin heredoc without shell execution.
+- A merge with no message option uses git's default subject, except `merge --continue`, which reads `MERGE_MSG`. Literal checkpoint merge messages follow the own-call rule in every repo. A Cargo checkpoint merge must finish with `--no-commit`; then run `doc` and commit the staged tree with the checkpoint subject.
 - Opaque explicit checkpoint commands are refused even from a non-Cargo cwd: `eval 'git -C <cargo repo> commit -m "checkpoint(x): p"'` cannot establish its target. Without checkpoint text, opaque git commit/merge words refuse only in a Cargo cwd. Modeled conditions, loops, groups, case arms and function bodies inspect command words, so quoted examples inside them pass.
-- The change-review hook refuses Bash text that holds example checkpoint commit text. Write such text with file tools.
+- Both hooks ignore example checkpoint text in other commands. Both hooks pass help requests before repository and message checks.
+- Both hooks refuse `--trailer` on checkpoints and merges, or when the message or merge state is unknown. Supply the complete message through literal `-m` text, a `-F` file, or a supported heredoc.
 - `doc` judges only the staged tree. A plain `git commit` also leaves out unstaged and untracked files, so they need no action. With `-a`, `--only`, `--include` or paths, the commit writes working changes that `doc` did not judge. The record then matches only if those changes were staged before `doc`.
 - `doc` always uses the original repo's target directory and a stable checkout below it. Later staged trees preserve unchanged source mtimes; the private checkout lock covers the whole doc run. Missing or damaged checkout metadata gets one fresh checkout, not a shared or temporary source tree.
 - The memory gate can hold a doc step for minutes. A one-file crate waited 15 min for a 2.6 s rustdoc run.

@@ -8,6 +8,7 @@ import io
 import json
 import multiprocessing
 import os
+import pwd
 import stat
 import subprocess
 import sys
@@ -337,6 +338,106 @@ class DocumentLookupTests(StaffTestCase):
 
 
 class StaffTests(StaffTestCase):
+    def test_gate_module_writes_keep_the_real_staff_and_launch_folders_unchanged(self) -> None:
+        from scripts.herdr import pane_launch
+        from scripts.production import merge_gate
+
+        real_state = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/state"
+        real_staff = real_state / "staff"
+        real_launches = real_state / "herdr-panes"
+
+        def folder_bytes(folder: Path) -> dict[Path, bytes]:
+            return {path.relative_to(folder): path.read_bytes()
+                    for path in folder.rglob("*") if path.is_file()}
+
+        before = folder_bytes(real_staff), folder_bytes(real_launches)
+        module_root = self.root / "gate-module"
+        module_root.mkdir()
+        environment = merge_gate.test_module_environment(module_root, {
+            **os.environ,
+            "STAFF_FILE": str(real_staff / "staff.json"),
+            "HERDR_PANE_RECORD_DIR": str(real_launches),
+        })
+        self.assertEqual(environment["STAFF_FILE"], str(module_root / "staff.json"))
+        self.assertEqual(environment["HERDR_PANE_RECORD_DIR"], str(module_root / "herdr-panes"))
+        with mock.patch.dict(os.environ, environment):
+            owner = fixture_member("showrunner", name="gate-private")
+            launch = pane_launch.launch("w1:p1", owner.id, str(module_root), {}, ["claude"])
+            path = pane_launch.record_directory() / "agents.json"
+            pane_launch.write(path, launch)
+            self.assertEqual(staff.snapshot().by_id(owner.id), owner)
+            self.assertEqual(pane_launch.read_strict(path)["w1:p1"]["session_id"], owner.id)
+        self.assertTrue((module_root / "staff.json").is_file())
+        self.assertEqual((folder_bytes(real_staff), folder_bytes(real_launches)), before)
+
+    def test_stopped_test_owner_removal_is_unchanged_on_a_second_run(self) -> None:
+        row = fixture_member("showrunner", name="fixture",
+            doc=staff.LiveDoc("natedev", self.root / "merge-gate-fixture/production.md"))
+        with mock.patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()):
+            self.assertEqual(staff._remove_test_fixture(row.id), staff.FixtureRemoved(row))  # pyright: ignore[reportPrivateUsage]
+            self.assertIsNone(staff.snapshot().by_id(row.id))
+            before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+            self.assertEqual(staff._remove_test_fixture(row.id), staff.FixtureAlreadyAbsent())  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_primary_staff_write_refuses_test_root_documents_and_worktrees(self) -> None:
+        runner, unit, _ = self.tree()
+        before = self.staff_file.read_bytes()
+        primary_home = self.root / "primary-home"
+        primary_file = primary_home / ".local/state/staff/staff.json"
+        primary_file.parent.mkdir(parents=True)
+        _ = primary_file.write_bytes(before)
+        for field in ("doc", "worktree"):
+            path = Path("/dev/shm/merge-gate-fixture") / field
+            with (self.subTest(field=field),
+                  mock.patch.dict(os.environ, {"STAFF_FILE": "", "HOME": str(primary_home)}),
+                  mock.patch.object(staff, "_file", return_value=primary_file)):
+                with self.assertRaises(staff.StaffRefused) as refusal:
+                    if field == "doc":
+                        _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", path))
+                    else:
+                        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path), expected=unit.worktree)
+                self.assertIn(str(path), str(refusal.exception))
+            self.assertEqual(primary_file.read_bytes(), before)
+
+    def test_primary_staff_write_refuses_generic_linux_and_mac_temporary_roots(self) -> None:
+        runner, unit, _ = self.tree()
+        before = self.staff_file.read_bytes()
+        primary_home = self.root / "primary-home"
+        primary_file = primary_home / ".local/state/staff/staff.json"
+        primary_file.parent.mkdir(parents=True)
+        _ = primary_file.write_bytes(before)
+        mac_temp = "/var/folders/fixture/T"
+        for root in (Path("/tmp/lint-scope-test-case/case"), Path(mac_temp) / "tmp-fixture"):
+            for field in ("doc", "worktree"):
+                path = root / field
+                with (self.subTest(path=path),
+                      mock.patch.dict(os.environ, {"STAFF_FILE": "", "HOME": str(primary_home)}),
+                      mock.patch.object(staff, "_file", return_value=primary_file),
+                      mock.patch("tempfile.gettempdir", return_value=mac_temp),
+                      self.assertRaises(staff.StaffRefused) as refusal):
+                    if field == "doc":
+                        _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", path))
+                    else:
+                        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path), expected=unit.worktree)
+                self.assertIn(str(path), str(refusal.exception))
+                self.assertEqual(primary_file.read_bytes(), before)
+
+    def test_primary_staff_update_keeps_unchanged_test_root_rows(self) -> None:
+        runner = fixture_member("showrunner", name="stray",
+            doc=staff.LiveDoc("natedev", Path("/dev/shm/merge-gate-existing/production.md")))
+        unrelated = fixture_member("showrunner", name="other")
+        primary_home = self.root / "primary-home"
+        primary_file = primary_home / ".local/state/staff/staff.json"
+        primary_file.parent.mkdir(parents=True)
+        _ = primary_file.write_bytes(self.staff_file.read_bytes())
+        with (mock.patch.dict(os.environ, {"STAFF_FILE": "", "HOME": str(primary_home)}),
+              mock.patch.object(staff, "_file", return_value=primary_file)):
+            changed = staff.rename(unrelated.id, "renamed")
+            self.assertEqual(changed.name, "renamed")
+            self.assertEqual(staff.snapshot().by_id(runner.id), runner)
+        self.assertIn("/dev/shm/merge-gate-existing/production.md", primary_file.read_text())
+
     def test_worktree_guard_changes_only_the_recorded_expected_location(self) -> None:
         _, unit, _ = self.tree()
         initial = staff.PresentWorktree("natedev", self.root / "initial")

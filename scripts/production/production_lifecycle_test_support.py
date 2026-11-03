@@ -27,6 +27,7 @@ from scripts.production.cli_fixture import invoke_cli
 SCRIPT = Path(__file__).with_name("production_lifecycle.py")
 STUB = '''#!__PYTHON__
 import os
+import shutil
 from pathlib import Path
 import sys
 
@@ -42,6 +43,11 @@ if name == "cargo-berth" and sys.argv[1:2] == ["board"]:
     print((state / "reservations.json").read_text() if (state / "reservations.json").exists() else
           '{"output_contract_version": 1, "verb": "board", "status": "unconfigured", "payload": {"kind": "no_facts"}}')
     raise SystemExit(int((state / "board-exit").read_text()) if (state / "board-exit").exists() else 4)
+if name == "notifier.sh" and sys.argv[1:2] == ["remove"]:
+    timer = state / "notifier" / sys.argv[2]
+    if timer.exists():
+        shutil.rmtree(timer)
+    raise SystemExit(0)
 if name in ("notifier.sh", "showrunners.py", "cargo-berth", "py"):
     raise SystemExit(0)
 raise SystemExit(99)
@@ -117,6 +123,13 @@ class LifecycleFixture(unittest.TestCase):
         self.env = self.fixture_env.copy()
         self.env["STAFF_FILE"] = str(self.staff.staff_file)
         self.env["HERDR_PANE_RECORD_DIR"] = str(self.staff.source_root / "panes")
+        self.staff.register_production("example", self.doc)
+        owner = fixture_member("showrunner", name="old-showrunner", doc=staff.LiveDoc("natedev", self.doc))
+        self.write(self.state / "notifier/showrunner-example/conf",
+                   f"TARGET=session:{owner.current_session}\nCHECK=production_check.sh {self.doc}\n")
+        for name, folder in (("alpha", self.alpha), ("beta", self.beta)):
+            _ = fixture_member("unit", name=name, parent=owner.id,
+                               worktree=staff.PresentWorktree("natedev", folder))
 
     def bind_fixture(self) -> None:
         self.origin = self.root / "origin.git"

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import without_worktree_column
+
 from scripts.production.staff_test_support import fixture_member
 
 import json
@@ -27,6 +29,15 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 @final
 class UnitRenameTests(UnitRenameFixture):
+    def test_unit_rename_uses_staff_without_a_worktree_column(self) -> None:
+        without_worktree_column(self.doc)
+        _ = self.git("add", str(self.doc), cwd=self.checkout)
+        _ = self.git("commit", "-m", "Remove the display column", cwd=self.checkout)
+        self.assert_ok(self.rename("apply"))
+        self.assertTrue((self.rust / "claude-demo-gamma").is_dir())
+        self.assertFalse((self.rust / "claude-demo-alpha").exists())
+
+
     def test_worktree_rename_updates_a_removed_location_without_reactivating_its_row(self) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         source, destination = self.rust / "claude-demo-alpha", self.rust / "claude-demo-gamma"

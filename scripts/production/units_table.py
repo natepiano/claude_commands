@@ -19,7 +19,7 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import live_units
-from scripts.production import showrunners
+from scripts.production import showrunners, staff, staff_sources, unit_lookup
 from production_units import Refusal, cell_value, production_field, unit_table
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
@@ -90,19 +90,30 @@ def style_ledger_paths(doc: Path, units: list[live_units.LiveUnit]) -> dict[str,
     """Resolve ledgers from the production rows, even when phase records fail."""
     import style_ledger
 
-    rows = {cell_value(row["Unit"]): row for row in unit_table(doc.read_text(encoding="utf-8").splitlines())}
     paths: dict[str, Path] = {}
+    try:
+        lines = doc.read_text(encoding="utf-8").splitlines()
+        rows = {cell_value(row["Unit"]): row for row in unit_table(lines)}
+        record = staff.snapshot()
+        sources = unit_lookup.member_sources()
+        slug = unit_lookup.production_slug_for_document(doc, record, sources)
+
+    except (OSError, UnicodeError, staff.StaffRefused, Refusal) as error:
+        print(f"units_table: {error}", file=sys.stderr)
+        return paths
     worktrees: dict[Path, Path] = {}
     for unit in units:
         if unit.unit not in rows:
             continue
         row = rows[unit.unit]
-        worktree = Path(cell_value(row["Worktree"])).expanduser()
         try:
+            worktree = unit_lookup.plan_worktree(row, sources.member(
+                staff_sources.UnitMember(slug, unit.unit), record))
             if worktree not in worktrees:
                 worktrees[worktree] = style_ledger.ledger_location(worktree).database
             paths[unit.unit] = worktrees[worktree]
-        except (OSError, ValueError):
+        except (OSError, ValueError, staff.StaffRefused) as error:
+            print(f"units_table: {unit.unit}: {error}", file=sys.stderr)
             continue
     return paths
 

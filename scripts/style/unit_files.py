@@ -12,8 +12,8 @@ sys.path.insert(0, str(SCRIPTS / "production"))
 from git_process import GitExitAnswers, run_git
 
 import style_ledger
-from production_units import read_production
-from production_units import cell_value, plan_cell_is_retired, production_field, unit_table
+from scripts.production import staff, staff_sources, unit_lookup, session_staff
+from production_units import cell_value, production_field, unit_table
 
 
 @dataclass(frozen=True)
@@ -33,20 +33,33 @@ def file_text(repo: Path, commit: str, path: str) -> str:
     return run_git(("git", "-C", str(repo), "cat-file", "blob", f"{commit}:{path}")).stdout.decode(errors="replace")
 
 
-def unit_worktrees(doc: Path) -> tuple[UnitWorktree, ...]:
-    production = read_production(doc)
-    rows = unit_table(doc.read_text().splitlines())
-    return tuple(
-        UnitWorktree(cell_value(row["Unit"]), cell_value(row["Branch"]),
-                     Path(cell_value(row["Worktree"])).expanduser(), production.merge_branch)
-        for row in rows if not plan_cell_is_retired(row.get("Plan", ""))
-    )
+def unit_worktrees(doc: Path, *,
+                   record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> tuple[UnitWorktree, ...]:
+    record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+    lines = doc.read_text().splitlines()
+    sources = unit_lookup.member_sources()
+    slug = unit_lookup.production_slug_for_document(doc, record, sources)
+    branch = production_field(lines, "Merge branch")
+    result: list[UnitWorktree] = []
+    for row in unit_table(lines):
+        unit = cell_value(row["Unit"])
+        try:
+            selected = sources.member(staff_sources.UnitMember(slug, unit), record)
+            location = unit_lookup.local_worktree(selected)
+            if isinstance(location, staff.RemovedWorktree):
+                continue
+            result.append(UnitWorktree(unit, cell_value(row["Branch"]),
+                                       unit_lookup.plan_worktree(row, selected), branch))
+        except (staff.StaffUnreadable, staff.StaffRefused) as error:
+            print(f"style: {unit}: {error}", file=sys.stderr)
+    return tuple(result)
 
 
 def unit_file_holders(repo: Path, doc: Path, ledger: style_ledger.Ledger, own_unit: str = "") -> dict[str, frozenset[str]]:
     lines = doc.read_text().splitlines()
     parent = Path(production_field(lines, "Parent production")).expanduser()
-    units = (*unit_worktrees(parent), *unit_worktrees(doc))
+    record = staff.snapshot()
+    units = (*unit_worktrees(parent, record=record), *unit_worktrees(doc, record=record))
     holders: dict[str, frozenset[str]] = {}
     for row in units:
         busy: set[str] = set()

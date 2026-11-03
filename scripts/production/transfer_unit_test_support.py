@@ -76,7 +76,10 @@ class UnitTransferFixture(StaffTestCase):
         _ = shutil.copytree(self.snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.bind_fixture(self.fixture_root)
-        bind_staff_fixture(self, self.env, {"demo": ("alpha-unit", "beta-unit"), "other": ("gamma-unit",)})
+        bind_staff_fixture(self, self.env, {"demo": ("alpha-unit", "beta-unit"), "other": ("gamma-unit",)},
+                           locations={("demo", "alpha-unit"): self.unit,
+                                      ("demo", "beta-unit"): self.rust / "claude-demo-beta",
+                                      ("other", "gamma-unit"): self.root / "absent-gamma"})
         row = unit_membership("demo", "alpha-unit")
         self.pane("w1:p1", session_id="5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", environment={
             "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit", "CLAUDE_CODE_SESSION_ID": row.id,

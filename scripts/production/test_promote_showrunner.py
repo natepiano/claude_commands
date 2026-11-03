@@ -3,6 +3,8 @@
 lookups and add_showrunner's start: nothing real stops or starts. Git runs in temporary repositories."""
 from __future__ import annotations
 
+from scripts.production.staff_test_support import without_worktree_column
+
 from scripts.production.staff_test_support import fixture_member
 
 import io
@@ -84,6 +86,23 @@ def commit_all(path: Path) -> None:
 
 @final
 class PromoteShowrunnerTests(unittest.TestCase):
+    def test_remote_director_location_refuses_before_the_unit_stops(self) -> None:
+        row = self.staff_unit()
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("mac", self.worktree), expected=row.worktree)
+        before = self.parent_doc.read_bytes(), self.child_doc.read_bytes()
+        code, output, errors = self.run_main()
+        self.assertNotEqual(code, 0, output + errors)
+        self.assertIn("mac", output + errors)
+        self.assert_nothing_stopped()
+        self.assertEqual((self.parent_doc.read_bytes(), self.child_doc.read_bytes()), before)
+
+    def test_promotion_uses_the_director_location_without_a_worktree_column(self) -> None:
+        without_worktree_column(self.parent_doc)
+        code, output, errors = self.run_main()
+        self.assertEqual(code, 0, output + errors)
+        self.assertTrue(any(event.startswith("start ") for event in self.events))
+
+
     staff: StaffTestCase = StaffTestCase()
     root: Path = Path()
     parent_doc: Path = Path()
@@ -132,7 +151,10 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.staff.register_production("parent", self.parent_doc)
         self.staff.register_production("child", self.child_doc)
         parent_row = fixture_member("showrunner", name="parent", doc=staff.LiveDoc("natedev", self.parent_doc))
-        _ = fixture_member("unit", name="demo", parent=parent_row.id, runtime_id=SESSION)
+        _ = fixture_member("unit", name="demo", parent=parent_row.id, runtime_id=SESSION,
+                           worktree=staff.PresentWorktree("natedev", self.worktree))
+        self.staff.pane("fixture:parent/demo-unit", session_id=SESSION, environment={
+            "SHOWRUNNER_UNIT": "parent", "SHOWRUNNER_UNIT_ID": "demo-unit"})
         session_records = self.root / "sessions"
         session_records.mkdir()
         _ = (session_records / f"{PID}.json").write_text(json.dumps({"pid": PID, "sessionId": SESSION, "name": "demo",
