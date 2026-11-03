@@ -274,8 +274,9 @@ sudo tailscale up --ssh --advertise-tags=tag:build-aws
 Use the [Tailscale SSH policy documentation](https://tailscale.com/docs/features/tailscale-ssh) when editing the tailnet policy.
 Give `tag:build-aws` no initiated connections to natedev or the Mac.
 Remove broader grants that would permit those connections.
-Permit natedev's user to reach `tag:build-aws`.
-Permit that user to enter the box's `natepiano` account through Tailscale SSH.
+Permit natedev's user and the Mac's user to reach `tag:build-aws`.
+Permit each user to enter the box's `natepiano` account through Tailscale SSH.
+The user asked for this access on 2026-11-03, to run `cargo tile` on the box by hand.
 Test the permitted and denied directions in the policy console.
 Do not store a Tailscale auth key on either branch.
 

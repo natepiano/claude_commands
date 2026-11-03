@@ -81,7 +81,7 @@ The target is built and disabled. `offload=off`, and `targets=mac,natedev` does 
 - An established day total can exceed a later bill or estimate. That is the cost of a total that never falls.
 - `limit_reserve_usd` covers one drain and one idle interval. The Budget action is the late backstop, not the cap.
 - A user stop disables the persistent Spot request until the next start. AWS restarts only a box it interrupted.
-- The compressed bootstrap must fit the 4096-byte CloudFormation parameter limit.
+- The compressed bootstrap must fit the 4096-byte CloudFormation parameter limit. On 2026-11-03 the encoded bootstrap measured 3908 bytes. `aws-build-base.nix` is copied into it, so put new host packages and services in `modules/linux/aws-build.nix`.
 - A pending notice that keeps failing delays each guard call by up to `notification_timeout_s`.
 - A verify module that hits the 1800 s test limit has so far been a route defect, not machine load.
 - Fake AWS tests do not prove real bootstrap or persistent-request behavior. The runbook's user checks prove them.
