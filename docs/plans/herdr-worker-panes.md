@@ -1234,7 +1234,7 @@ Make no unproved write and create no second row.
 
 ### Phase 4b — Owns and `production_tree.py` deleted  · status: todo
 
-**Depends on:** the readers and writers of each deleted thing (3s, 3t, 3u, 3v, 3w); 3h's native-id and location completeness proof. `production_tree.py` deletion alone waits for the handler unit's reader switch (Phase 3n item 6).
+**Depends on:** the readers and writers of each deleted thing (3s, 3t, 3u, 3v, 3w); 6b (the herdr suite passes on the Mac); 3h's native-id and location completeness proof. `production_tree.py` deletion alone waits for the handler unit's reader switch (Phase 3n item 6).
 
 #### Work Order
 
@@ -1702,23 +1702,82 @@ Test failed close and interrupted retirement, then rerun without another launch.
 
 ### Phase 6a — A darwin reader behind `startup_processes`  · status: done
 
-**Owner:** pane track rule: herdr-unit or models-unit, whichever is free first (sdlc, 2026-11-02).
+#### As-built
 
-**Depends on:** Phase 6. Land before Phase 15's Mac probe of Phases 6-7.
+- `Herdr.startup_processes` and `_startup_processes` read process facts through one reader from `_startup_process_reader(timeout)`: `_LinuxStartupProcesses` on Linux (`/proc`) and `_DarwinStartupProcesses` on darwin. The result type is the same on both platforms.
+- The darwin reader takes one `ps -axo pid=,ppid=,state=,lstart=` snapshot with `LC_ALL=C TZ=UTC` for start times and children. It reads the command with `ps -o command= -p <pid>` for a pid outside `_darwin_processes` (another user's process) and the foreground group with `ps -o tpgid= -p <pid>`. Every `ps` call takes the caller's timeout.
+- `_StartupProcessGone` marks a zombie or a pid absent from the snapshot; the walk skips it. Any other read error makes the walk unreadable. An agent entry sets `agent_present` even when its pid is gone or missing.
+- The Linux reader walks each thread's `task/<tid>/children` list in numeric thread order and keeps the children read before a later thread list goes missing.
+- The reader reads only pid, parent, state, command and start time; it prints no environment values.
+
+**Files:**
+
+- `scripts/herdr/herdr.py` — the two readers, `_StartupProcessGone`, `_darwin_start_time`, `_darwin_processes(complete=, timeout=)`.
+- `scripts/herdr/test_herdr.py` — darwin and Linux reader tests.
+
+**Gotchas:** On darwin, `AgentProcessIdentity.start_ticks` holds UTC epoch seconds from `ps lstart`, not clock ticks, so a pid reused in the same second keeps the same token. `ps lstart` is parsed with `%a %b %d %H:%M:%S %Y` and needs `LC_ALL=C`.
+
+**Ruled out:** a `ps` read for each pid in the walk — two reads race with process exit.
+
+### Phase 6b — The herdr suite passes on the Mac  · status: todo
+
+**Owner:** herdr-unit (natedev assignment, 2026-11-03).
+
+**Depends on:** Phase 6a. Land before Phase 4b.
 
 #### Work Order
 
-**Goal:** `Herdr.startup_processes` gives the correct result on the Mac. Today it reads `/proc`, which the Mac does not have (shutdown-unit Phase 6 probes).
+**Goal:** the herdr test suite (`scripts/herdr`) passes on the Mac with no failures or errors. Today ten tests fail there, and they also failed before Phase 6a.
 
 **Spec:**
-1. Add a darwin reader behind the same function, with the same result type. Linux behavior stays the same.
-2. Read only process facts (pid, parent, command, start time); print no environment values.
-3. Add a test that forces the darwin path.
+1. For each red test below, find the commit that made it red on the Mac. Bisect on a Mac copy of the tree.
+2. Fix each defect where it lives: in the source when the code is wrong on darwin, in the test when the test assumes Linux (for example a `/proc` path, a home folder, or `/tmp` against `/private/tmp`).
+3. Keep Linux behavior the same. A test that cannot pass on darwin gets a darwin path, not a skip.
+4. The red tests:
+   - `test_herdr.LaunchDestinationTests.test_cleanup_without_process_handles_signals_only_a_fresh_agent_identity` (cases `live`, `exited`, `reused`, `shell`, `exited_before_signal`): ERROR.
+   - `test_herdr.NativePaneSessionTests.test_native_pane_identity_uses_its_exact_claude_pid_registry_without_an_exported_id`: ERROR.
+   - `test_herdr.PromptSubmissionTests.test_promptless_codex_restart_needs_no_transcript_or_submit`: ERROR.
+   - `test_herdr.HerdrTests.test_moved_terminal_clears_its_conversation_when_the_agent_with_old_pane_marks_exits`: FAIL.
+   - `test_herdr.HerdrTests.test_session_of_keeps_the_terminal_but_clears_the_conversation_after_claude_exits`: FAIL.
+   - `test_herdr_sessions.HerdrSessionsTests.test_staff_marks_are_visible_without_a_claude_record`: FAIL.
+5. Record each red's cause commit and fix in the checkpoint notice.
+
+**Files:**
+- `scripts/herdr/herdr.py`, `scripts/herdr/herdr_sessions.py` — source repairs.
+- `scripts/herdr/test_herdr.py`, `scripts/herdr/test_herdr_sessions.py` — test and fixture repairs.
+
+A cause in a file outside these paths is fixed there through berth, and the notice names that file as also touched.
+
+**Workers:** `1 writer + 1 tester` — `impl`: source repairs; `test`: test and fixture repairs.
+
+**State:** none.
+
+**Acceptance gate:** the herdr suite on natedev and on the Mac with 0 failures and 0 errors (run on the Mac with `HERDR_BIN=/nonexistent/herdr` and the `scripts` and `config` folders copied); the shutdown suite on natedev; basedpyright 0/0/0 on each changed file and its caller modules.
+
+### Phase 6c — The startup reader keeps one deadline and a strong Mac process generation  · status: todo
+
+**Owner:** herdr-unit (follow-up of Phase 6a, 2026-11-03).
+
+**Depends on:** Phase 6a, Phase 6b. Land before Phase 7, which makes `herdr.py` read-only.
+
+#### Work Order
+
+**Goal:** a launch observes startup processes within its own deadline, and a darwin cleanup signals a process only when its identity proves the same process generation.
+
+**Spec:**
+1. **One deadline.** `start_command` (`herdr.py:1775`) passes its remaining deadline to `_startup_processes`. The darwin reader gives each `ps` call only the time that remains. A read that the deadline stops makes the walk unreadable, never gone.
+2. **Strong darwin generation.** On darwin, `AgentProcessIdentity` carries the process start time to the microsecond, from `proc_pidinfo(PROC_PIDTBSDINFO)` (`pbi_start_tvsec`, `pbi_start_tvusec`) through `ctypes`. Probe the struct layout on the Mac first and record it in the module comment.
+3. When the microsecond read fails, the identity is weak. `_terminate_startup_agents` (`herdr.py:4204`) sends no signal to a weak identity and keeps the pane.
+4. Linux behavior stays the same.
 
 **Files:**
 - `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py`
 
-**Acceptance gate:** the herdr suite on natedev and on the Mac; types for both files.
+**Workers:** `1 writer + 1 tester` — `impl`: `herdr.py`; `test`: `test_herdr.py`.
+
+**State:** `AgentProcessIdentity` on darwin holds microsecond start time, not `ps lstart` seconds.
+
+**Acceptance gate:** a test where a darwin pid is reused in the same second with a different microsecond start: the pane stays and no signal is sent; a test where the microsecond read fails: no signal; a test that the whole startup observation stays within the launch deadline when each `ps` call is slow; the herdr suite on natedev and on the Mac; the shutdown suite on natedev; basedpyright 0/0/0 on both files and their caller modules.
 
 ### Phase 7 — worker_panes.py: start-or-resume, close, observe  · status: todo
 
@@ -1726,7 +1785,7 @@ Test failed close and interrupted retirement, then rerun without another launch.
 
 **Pane track rule (sdlc, 2026-11-02):** each next pane-track phase goes to herdr-unit or models-unit, whichever is free first, by the dependencies. A phase owned by another unit (10 shutdown, 11 accounts) stays with that unit. Each checkpoint notice gives the through-Phase-12 date.
 
-**Depends on:** Phase 1, Phase 3, Phase 3n, Phase 4, Phase 6
+**Depends on:** Phase 1, Phase 3, Phase 3n, Phase 4, Phase 6, Phase 6c
 
 #### Work Order
 
