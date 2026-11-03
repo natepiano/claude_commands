@@ -125,7 +125,7 @@ class WorkerAdmissionTests(StaffTestCase):
                 self.assertEqual((allowed.name, allowed.parent, allowed.role), ("new-worker", unit.id, expected))
                 self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
 
-    def test_launch_permission_creates_no_row_and_publication_uses_the_returned_thread(self) -> None:
+    def test_start_permission_creates_no_row_and_publication_uses_the_returned_thread(self) -> None:
         _, unit, _ = self.tree()
         before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
         with mock.patch.object(staff, "runtime_id", return_value=unit.id):
