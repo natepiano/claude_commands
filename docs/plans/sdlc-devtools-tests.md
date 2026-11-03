@@ -627,7 +627,7 @@ Remaining gaps include shell command positions, executable Python aliases, and s
 
 **Ruled out:** refusing on any unreadable candidate row — one stale row would block every lookup.
 
-### Phase 4o — A unit folder moves at an open phase  · status: todo
+### Phase 4o — A unit folder moves at an open phase  · status: done
 
 Source: the user via morty and sdlc, 2026-11-02 18:4x. herdr-unit agreed 18:5x: devtools-unit owns `scripts/production/unit_move.py` and its tests for this phase; herdr-unit's 4g later extends `test_unit_move.py`.
 
@@ -674,6 +674,8 @@ Source: Phase 4o review (simplify lens), 2026-11-02. Each item removes a copy th
 6. `resume_message` exposes `resume_prompt_path(seat)` and `add_resume_note(seat, note)`. `unit_move`, `rename_unit.py:973`, `resume_message.py:87` and `inventory.py:818` use them, with one atomic write form.
 7. `herdr.child_environment` (`herdr.py:871`) owns one list of session identity variables, and `unit_move` uses it. The change to `herdr.py` goes through herdr-unit.
 8. `progress_history` exposes one call that returns the run states for a history file; `move_run` (`progress_history.py:499`) and `unit_move.folder_runs` use it.
+9. A worker process that exits between the liveness check and its argument read in `pause_folder_workers`, or just after `Popen` in the resume path, reads as exited; the move goes on. Add a regression test for each read.
+10. Each `codex_mesh` import in `unit_move` comes after the early exits, so a move whose runs have no mesh imports no `codex_mesh`.
 
 **Files:**
 - `scripts/production/unit_move.py`, `scripts/direct/workers.py`, `scripts/production/rename_unit.py`, `scripts/production/retire_unit.py`, `scripts/agents/codex_mesh.py`, `scripts/lib/resume_message.py`, `scripts/shutdown/inventory.py`, `scripts/direct/progress_history.py`, `scripts/herdr/herdr.py` — source.
@@ -688,6 +690,39 @@ Source: Phase 4o review (simplify lens), 2026-11-02. Each item removes a copy th
 **Constraints from prior phases:** Phase 4o: the folder move pauses and resumes workers on their same threads; keep every `test_unit_move.py` test green.
 
 **Acceptance gate:** `grep` shows one definition of each rule above; the existing suites of every changed module pass with no assertion change; `basedpyright` on the changed files and every caller module footer `0 errors, 0 warnings, 0 notes`; per-file `unittest discover`; full gate.
+
+### Phase 4r — One config read serves many settings  · status: todo
+
+**Depends on:** Phase 4o
+
+Source: the user via the sdlc showrunner, 2026-11-02: "i want only one way of doing things" (aws Phase 8 simplify item 27: `conf.py` parses the file again for each setting; one AWS tick does about 100 reads). Start after accounts-unit's Phase 101z is on main; it changes `conf.py`.
+
+#### Work Order
+
+**Goal:** a caller reads a config file once and takes many settings from that one read, through the one reader `conf.py` has.
+
+**Spec:**
+1. `conf.read(file) -> ConfigRead` (`scripts/lib/conf.py`) reads and parses the file once. `ConfigRead` has `text`, `number`, `whole`, `words` and `values`, with the same limits, host keys and messages as the module functions have now.
+2. A key with no usable value in the read still falls back to the newest valid committed value, read at use. Nothing is cached: no module state, and each `conf.read` reads the file again.
+3. The module functions `text`, `number`, `whole`, `words` and `values` go. `ConfigRead` is the one reader; there is no second reader beside it. `effective_line`, `editable_line` and `check` stay as they are.
+4. Every caller switches in this phase. A caller that takes several settings from one file in one pass (one tick, one command) holds one `ConfigRead` for that pass. A caller that takes one setting uses `conf.read(file).<kind>(key)`.
+5. At phase start, after the merge of origin/sdlc, grep again for callers (`conf.text(`, `conf.number(`, `conf.whole(`, `conf.words(`, `conf.values(` and imports of those names). Add each new caller file to Files.
+
+**Files:**
+- `scripts/lib/conf.py` — source.
+- `scripts/lint/memory_admit.py`, `scripts/lint/sweep.py`, `scripts/direct/findings.py`, `scripts/direct/assign.py`, `scripts/mac_test/mac_test.py`, `scripts/mac_test/offload.py`, `scripts/mac_test/loopback_proof.py`, `scripts/mac_test/linux_runner.py`, `scripts/mac_test/audit.py`, `scripts/production/fast_track.py`, `scripts/production/unit_move.py`, `scripts/production/merge_checkpoint.py`, `scripts/production/retire_unit.py`, `scripts/buildlog/memory.py`, `scripts/buildlog/sync.py`, `scripts/buildlog/report.py`, `scripts/buildlog/record.py`, `scripts/buildlog/disk.py`, `scripts/build_targets/target_config.py` — callers.
+- `scripts/lib/test_conf.py` — regressions.
+
+**Workers:** `2 writers + 1 tester`.
+- `impl` — `conf.py` and the `lint`, `direct` and `production` callers.
+- `impl2` — the `mac_test`, `buildlog` and `build_targets` callers.
+- `test` — `test_conf.py`.
+
+**State:** none; settings keep their values.
+
+**Constraints from prior phases:** Phase 8: `conf.py` is the one config reader, and a value change goes live at the next read without a release cycle. Phase 4o: keep every `test_unit_move.py` test green.
+
+**Acceptance gate:** a test counts file reads: one `conf.read` and five settings from it read the file once; a second `conf.read` reads it again after a change; a key with a bad live value in a `ConfigRead` falls back to its committed value; `grep` finds no `conf.text(`, `conf.number(`, `conf.whole(`, `conf.words(` or `conf.values(` call; the existing suites of every changed module pass with no assertion change; `basedpyright` on the changed files and every caller module footer `0 errors, 0 warnings, 0 notes`; per-file `unittest discover`; full gate.
 
 ### Phase 7m — Showrunners take Morty's words as the user's  · status: done
 
