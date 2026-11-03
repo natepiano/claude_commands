@@ -1,10 +1,5 @@
 #!/usr/bin/env bash
+# resume <name>: resume a unit or showrunner by its short name; see shutdown.py resume.
 set -euo pipefail
-exec "$HOME/.claude/scripts/lib/py" -B -c '
-import runpy
-import sys
-from pathlib import Path
-entry = Path(sys.argv.pop(1)).resolve().with_name("shutdown.py")
-sys.argv.insert(1, "resume")
-runpy.run_path(str(entry), run_name="__main__")
-' "$0" "$@"
+here="$(dirname "$(readlink -f "$0")")"
+exec "$HOME/.claude/scripts/lib/py" -B "$here/shutdown.py" resume "$@"
