@@ -58,9 +58,7 @@ event = {
 with (state / "events.jsonl").open("a", encoding="utf-8") as output:
     output.write(json.dumps(event) + "\n")
 
-if command == "systemd-run":
-    raise SystemExit(0)
-if command == "scp":
+if command in {"systemd-run", "scp", "curl"}:
     raise SystemExit(0)
 if command == "git":
     if "merge-base" in arguments and "--is-ancestor" in arguments:
@@ -69,8 +67,8 @@ if command == "git":
             0 if descendant and arguments[-2:] == [os.environ["MAC_RUN_SHA"], descendant]
             else 1
         )
-    if "rev-parse" in arguments and "--verify" in arguments:
-        status = int(os.environ.get("MAC_RUN_GIT_RESOLVE_STATUS", "0"))
+    if "rev-parse" in arguments:
+        status = int(os.environ.get("MAC_RUN_GIT_RESOLVE_STATUS", "0")) if "--verify" in arguments else 0
         if status == 0:
             print(os.environ["MAC_RUN_SHA"])
         raise SystemExit(status)
@@ -195,7 +193,7 @@ class MacRunTests(unittest.TestCase):
         _ = write_config_fixture(self.config_path, "ci_repo=\nconnect_timeout_s=6\n")
         stub = self.bin_directory / "command-stub"
         self.write_executable(stub, COMMAND_STUB)
-        for name in ("ssh", "scp", "git", "systemd-run", "gh", "rsync"):
+        for name in ("ssh", "scp", "git", "systemd-run", "gh", "rsync", "curl"):
             (self.bin_directory / name).symlink_to(stub)
         startup = self.root / "python-startup"
         startup.mkdir()
@@ -358,6 +356,39 @@ class MacRunTests(unittest.TestCase):
         self.assertIn(f"state unreadable: {block}", result.stdout)
         self.assert_no_build_started()
         self.assert_claim_released()
+
+    def test_smoke_uses_the_shared_refused_port_and_host(self) -> None:
+        _ = write_config_fixture(self.root / "config/hana_shot.conf",
+                                 "refused_port=17461\nhost=192.0.2.46\n")
+        script = SCRIPT.with_name("smoke_launch.sh")
+
+        def smoke(port: str) -> subprocess.CompletedProcess[str]:
+            self.clear_events()
+            return subprocess.run(
+                ["bash", str(script), str(self.repository), SHA, str(self.root / "smoke.log"), port],
+                cwd=self.root, env=self.environment, capture_output=True, text=True,
+                timeout=TEST_HANG_GUARD_SECS, check=False)
+
+        refused = smoke("17461")
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertIn("17461 is the user's live Hana", refused.stdout)
+        self.assertEqual(self.events(), [])
+
+        occupied = smoke("17462")
+        self.assertEqual(occupied.returncode, 1, occupied.stdout + occupied.stderr)
+        self.assertIn("port 17462 already answers BRP", occupied.stdout)
+        self.assertEqual([event["args"][-1] for event in self.events() if event["command"] == "curl"],
+                         ["http://192.0.2.46:17462/jsonrpc"])
+
+    def test_mac_connect_timeout_uses_the_shared_fraction_and_rounds_up(self) -> None:
+        _ = write_config_fixture(self.config_path, "connect_timeout_s=2.5\n")
+
+        result = self.mac_run(extra={"MAC_RUN_REACHABLE": "0"})
+
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        calls = self.events()
+        self.assertEqual([event["command"] for event in calls], ["ssh"])
+        self.assertIn("ConnectTimeout=3", calls[0]["args"])
 
     def test_unreachable_mac_keeps_exit_three(self) -> None:
         result = self.mac_run(extra={"MAC_RUN_REACHABLE": "0"})

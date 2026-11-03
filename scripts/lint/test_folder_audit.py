@@ -146,6 +146,29 @@ class FolderAuditTests(unittest.TestCase):
         self.assertEqual(self.judge_clones([young])[young], folder_audit.REMOVED)
         self.assertFalse(young.exists())
 
+    def test_candidates_keep_the_configured_visible_root_under_rust(self) -> None:
+        visible = folder(self.rust / "private-visible")
+        loose = folder(self.rust / "loose")
+        _ = write_config_fixture(self.root / "config/scratch.conf", f"visible_root={visible}\n")
+        with unittest.mock.patch.dict(os.environ):
+            del os.environ["SCRATCH_VISIBLE_ROOT"]
+            self.assertEqual(folder_audit.candidates(self.rust, [], frozenset()), [loose])
+
+    def test_folder_age_skips_the_names_from_scratch_config(self) -> None:
+        _ = write_config_fixture(self.root / "config/scratch.conf", "repo_skip=generated-private\n")
+        _ = write_config_fixture(self.root / "config/lint.conf", "folder_remove_after_seconds=604800\n")
+        idle = folder(self.temp / "idle/generated-private").parent
+        recent = folder(self.temp / "recent/included").parent
+        age(idle, 10)
+        age(recent, 10)
+        stamp(idle / "generated-private/file", time.time())
+        stamp(recent / "included/file", time.time())
+
+        outcomes = self.judge_clones([idle, recent], removing=False)
+
+        self.assertEqual(outcomes[idle], folder_audit.WOULD_REMOVE)
+        self.assertEqual(outcomes[recent], "idle less than 7 days")
+
     def test_judge_reads_scan_limits_once_for_multiple_due_folders(self) -> None:
         paths = [folder(self.temp / name, 10) for name in ("first", "second")]
         found = [(path, changed(path)) for path in paths]

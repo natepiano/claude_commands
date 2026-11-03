@@ -1298,7 +1298,7 @@ The Phase 26 checkpoint did not name two narrowed assertions; this phase's check
 
 **Ruled out:** value changes (none without the user); `conf.read` (devtools 4r not landed); edits to `memory_admit.py` (queue-unit's; it keeps its own `LINT_SWEEP_STATE_DIR` default).
 
-### Phase 46 — Each shared config key has a test that proves its reader uses it  · status: todo
+### Phase 46 — Each shared config key has a test that proves its reader uses it  · status: done
 
 **Approved:** the builds showrunner, 2026-11-02 23:55 EST: put the six regression tests in the next phase as a current follow-up. They are part of the configuration work the user released.
 

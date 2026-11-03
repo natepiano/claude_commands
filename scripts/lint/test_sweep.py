@@ -2998,6 +2998,16 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         self.assertIn("No earlier floor sweep", message)
         self.assertNotIn("fall beyond cache growth", message)
 
+    def test_holder_message_uses_the_first_configured_path_width(self) -> None:
+        _ = write_config_fixture(conf.path("lint"),
+                                 "sweep_message_path_widths=24 16\n")
+        holder = sweep.FloorHolder("/phase46/" + "a" * 70 + "/target", 2 * GIB, 46,
+                                   "maps build output", "phase46")
+
+        message = sweep.holder_message_text(holder, GIB, 3 * GIB)
+
+        self.assertIn("/phase46/aaaaaaa…/target (2.0 GiB)", message)
+
     def test_free_space_rise_uses_rising_wording(self) -> None:
         now = time.time()
         previous = sweep.FloorRecord(now - 60, 20 * GIB, 0, sweep.NoDeliveredAlert(), sweep.NoDeliveredAlert())

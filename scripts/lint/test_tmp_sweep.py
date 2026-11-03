@@ -34,7 +34,7 @@ else:
     import sessions
 
 from scripts.lib import copy_record
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 DAY = 86_400
 LIVE_SESSION = "11111111-2222-3333-4444-555555555555"
@@ -308,6 +308,16 @@ class CopyTests(TmpSweepCase):
 
 
 class IdleTests(TmpSweepCase):
+    def test_unrecorded_folder_uses_the_shared_removal_age(self) -> None:
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "lint.conf",
+                                 "folder_remove_after_seconds=86400\n")
+        output = write(self.tmp / "shots" / "image.png")
+
+        result = self.sweep()
+
+        self.assertFalse(output.parent.exists())
+        self.assertEqual([entry["path"] for entry in result.deleted], [str(output.parent)])
+
     def test_a_recent_entry_stops_the_scan_before_the_rest_is_loaded(self) -> None:
         folder = write(self.tmp / "large" / "recent").parent
         self.recent(folder / "recent")
