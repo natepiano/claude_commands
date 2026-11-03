@@ -3128,7 +3128,7 @@ natedev 2026-11-02: the hard-coded values proposal, phase 3 (user approved 2026-
 
 **As-built:** `scripts/lib/conf.py` resolves a value from the live file, then, for the default `~/.claude/config` only, the repository's `config/<stem>.conf` when the file or key is absent, then Git recovery. `CONF_DIR` stays authoritative: a missing value there still refuses. Invalid present values keep Git recovery. `value_origin`, the typed readers and `values` share `_resolve` and `_repository_path`. `scripts/lib/test_conf.py` covers each case. Full merge gate passed; merged to main 4da324700.
 
-### Phase 101y — A new settings key on one machine never blocks promotion  · status: todo
+### Phase 101y — A new settings key on one machine never blocks promotion  · status: done
 **Depends on:** Phase 101x (order only; both edit `scripts/settings/settings_local_keys.sh`).
 
 natedev 2026-11-02 accepted the general rule after 101x: a top-level key in the live `~/.claude/settings.json` that `HEAD`'s `settings.json` does not have is machine-local by default.

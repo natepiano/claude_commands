@@ -11,4 +11,16 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/settings_local_keys.sh"
 
-jq --argjson keys "$SETTINGS_LOCAL_KEYS_JSON" "$SETTINGS_LOCAL_KEYS_STRIP"
+input="$(mktemp)" || exit 1
+trap 'rm -f "$input"' EXIT
+cat >"$input" || exit 1
+
+# Keep snapshot errors even when Git discards filter stderr.
+log="$_SETTINGS_LOCAL_ROOT/settings.local-keys.errors.log"
+if ! errors="$(settings_local_keys_snapshot "$input" 2>&1)"; then
+    printf '%s\n' "$errors" >>"$log"
+    echo "settings: cannot preserve local settings values; see $log" >&2
+    exit 1
+fi
+baseline="$(settings_local_keys_baseline)" || exit 1
+jq --argjson baseline "$baseline" "$SETTINGS_LOCAL_KEYS_STRIP" "$input"
