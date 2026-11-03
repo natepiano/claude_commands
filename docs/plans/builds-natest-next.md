@@ -31,7 +31,7 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 - [ ] **Architecture proposal: the type-check job**
   - Target: `scripts/production/merge_gate.py` (owner sdlc devtools-unit)
   - Why needed: report-unit names `types/basedpyright` among the three highest-CPU gate jobs (2-4 min). One basedpyright job checks every listed folder in each gate.
-  - Completion condition: after Phase 2 records 5 or more gate runs, send the showrunner a proposal with the measured type-job share of gate wall time and CPU, and one design (for example, check only the folders whose files changed, or one job for each folder group).
+  - Completion condition: after 5 or more completed gate runs each record a measured `types/basedpyright` execution (not aborted, not a bootstrap failure with zero duration), send the showrunner a proposal with the measured type-job share of gate wall time and CPU, and one design (for example, check only the folders whose files changed, or one job for each folder group).
   - Revealed by: the builds showrunner's welcome, 2026-11-03.
 - [ ] **Architecture proposal: stale module keys in the gate state**
   - Target: `scripts/production/merge_gate.py` (owner sdlc devtools-unit)
