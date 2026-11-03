@@ -10,12 +10,14 @@ lines in its Efficiency ledger. Accepted plan-backlog lines are work in progress
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 import change_review
 import proposals_folder
 import proposals_table
+from scripts.production import staff
 from production_units import Refusal, production_field
 
 if TYPE_CHECKING:
@@ -119,6 +121,9 @@ def sources(doc: Path, *, identities: QuestionStaff | None = None) -> list[Path]
                 found.append(questions.path)
             found.extend(record.path for record in question_records_for_document(doc, identities)
                          if record.status == "open")
+    except staff.StaffRefused as error:
+        print(f"questions: refused — {error}", file=sys.stderr)
+        raise SystemExit(2) from error
     except OSError:
         pass
     return found

@@ -11,12 +11,90 @@ from typing import cast
 from unittest import mock
 
 from scripts.production import staff
+from scripts.production.cli_fixture import invoke_cli
+from scripts.production.staff_test_support import fixture_member
 from scripts.production.update_registration_test_support import RegistrationFixture, QuestionRegistration, registration, review
 
 from scripts.production.update_registration_test_support import setUpModule as setUpModule
 
 
 class RegistrationTests(RegistrationFixture):
+    def test_question_from_a_linked_checkout_uses_the_showrunner_relative_proposals_folder(self) -> None:
+        main = self.checkout
+        relative = self.doc.relative_to(main)
+        _ = self.doc.write_text("\n".join(
+            "- **Proposals:** `questions`" if line.startswith("- **Proposals:**") else line
+            for line in self.doc.read_text().splitlines()) + "\n")
+        _ = self.git("add", str(relative))
+        _ = self.git("commit", "-m", "Use a relative question folder")
+        owner = self.root / "question-owner-checkout"
+        unit = self.root / "question-unit-checkout"
+        _ = self.git("worktree", "add", "-b", "question-owner", str(owner))
+        _ = self.git("worktree", "add", "-b", "question-unit", str(unit))
+        owner_id = self.fixture_staff_id()
+        asker_id = self.fixture_staff_id("alpha-unit")
+        _ = staff.set_doc(owner_id, staff.LiveDoc("natedev", owner / relative))
+        self.checkout = unit
+        self.doc = unit / relative
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?")):
+            filed = self.run_command("ask", "--text", "Choose the shared layout", "--question", "Keep this layout?",
+                                     "--unit", str(asker_id))
+        self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
+        records = list((owner / "questions").glob("question-*.md"))
+        self.assertEqual(len(records), 1)
+        self.assertFalse((unit / "questions").exists())
+        self.assertIn(f"asked_by: {asker_id}", records[0].read_text().splitlines())
+        self.checkout = owner
+        self.doc = owner / relative
+        listed = self.run_command("questions-table")
+        self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
+        self.assertIn("Choose the shared layout", listed.stdout)
+        self.assertIn("waiting for your answer", listed.stdout)
+
+    def ambiguous_question_document(self) -> tuple[Path, staff.StaffId, staff.StaffId]:
+        relative = self.doc.relative_to(self.checkout)
+        other = self.root / "other-owner-checkout"
+        caller = self.root / "ambiguous-caller-checkout"
+        _ = self.git("worktree", "add", "-b", "other-question-owner", str(other))
+        _ = self.git("worktree", "add", "-b", "ambiguous-question-caller", str(caller))
+        second = fixture_member("showrunner", name="other-question-owner",
+                                doc=staff.LiveDoc("natedev", other / relative))
+        return caller / relative, self.fixture_staff_id(), second.id
+
+    def test_ask_refuses_ambiguous_document_ownership_without_writing_a_question(self) -> None:
+        document, first, second = self.ambiguous_question_document()
+        asker_id = self.fixture_staff_id("alpha-unit")
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                  for path in self.state.rglob("*") if path.is_file()}
+        self.checkout = document.parents[2]
+        self.doc = document
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?")):
+            result = self.run_command("ask", "--text", "Choose the layout", "--question", "Keep this layout?",
+                                      "--unit", str(asker_id))
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(str(first), result.stdout + result.stderr)
+        self.assertIn(str(second), result.stdout + result.stderr)
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns)
+                          for path in self.state.rglob("*") if path.is_file()}, before)
+        self.assertEqual(list((self.root / "issues").iterdir()), [])
+
+    def test_footer_sources_refuses_ambiguous_document_ownership_without_a_traceback(self) -> None:
+        import footer_counts
+
+        document, first, second = self.ambiguous_question_document()
+        staff_file = self.state / "staff/staff.json"
+        before = staff_file.read_bytes(), staff_file.stat().st_mtime_ns
+        def read_sources() -> int:
+            _ = footer_counts.sources(document)
+            return 0
+
+        result = invoke_cli(footer_counts, read_sources, [], self.env, self.checkout, production_state=True)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn(str(first), result.stderr)
+        self.assertIn(str(second), result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual((staff_file.read_bytes(), staff_file.stat().st_mtime_ns), before)
+
     def test_unit_files_and_lists_questions_from_linked_and_main_checkouts(self) -> None:
         main = self.checkout
         relative = self.doc.relative_to(main)

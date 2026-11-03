@@ -613,7 +613,7 @@ Remaining gaps include shell command positions, executable Python aliases, and s
 - Tests: `test_staff.DocumentLookupTests` (real repo with two linked worktrees and a subprocess guard) and `test_update_registration_questions.test_unit_files_and_lists_questions_from_linked_and_main_checkouts`.
 - Open in Phase 4p: a relative Proposals line resolves from the caller's copy; the consumers do not catch `StaffRefused`; unreadable `.git` metadata reads as outside git.
 
-### Phase 4p — Every checkout files a question in the showrunner's own folder  · status: todo
+### Phase 4p — Every checkout files a question in the showrunner's own folder  · status: done
 
 Source: Phase 4k phase review, 2026-11-02. A follow-up to the 4k fix.
 
@@ -667,6 +667,38 @@ Source: the user via morty and sdlc, 2026-11-02 18:4x. herdr-unit agreed 18:5x: 
 **Constraints from prior phases:** herdr-unit 4g builds its interruption tests on this phase's `test_unit_move.py`.
 
 **Acceptance gate:** one test each: a running unit resumes, a paused unit stays paused, a running worker resumes on its same thread, a paused worker stays paused (herdr-unit 4o Work Order, 2026-11-02); the existing `test_unit_move.py` tests pass; tests also show: a paused unit stays paused; paused workers stay paused; a process that is not the unit's own refuses; a rerun prints `unchanged` and exits 0. basedpyright 0/0/0 on changed files and every caller module; `test_unit_move.py` green in its own `discover` run; full merged-tree gate green.
+
+### Phase 4q — The folder move uses its owners' readers  · status: todo
+
+Source: Phase 4o review (simplify lens), 2026-11-02. Each item removes a copy that Phase 4o added; the owners' modules are outside the 4o file set.
+
+#### Work Order
+
+**Goal:** the folder move keeps no private copy of a rule that another module owns, and each owner's callers all use the one copy.
+
+**Spec:**
+1. `workers._moved_path` (`workers.py:1726`) becomes public. `unit_move.moved_folder_argument`, `rename_unit._moved` (`rename_unit.py:933`) and the inline rule at `progress_history.py:478` call it.
+2. `move_folder_worker_paths` calls `workers.repoint_unit_worktree`. Its `repoint_roster` (`workers.py:1870`) also moves `instructions_file` and `authorized_prompt`. Settle the `unit_ledger` difference in the merge.
+3. One shared step pauses runs, classifies run processes and stops them, in `unit_move`. `rename_unit._stop_runs` (`rename_unit.py:899`) and `retire_unit.run_processes` (`retire_unit.py:439`) use it. Keep the stronger proof: start time plus exact argv, and detached `mesh_runs` supervisors.
+4. `codex_mesh` exposes `recorded_run_servers(run)`, `is_run_server(pid, port, run)`, `is_worker_launcher(pid, run, name)` and `run_watcher(arguments)` beside their writers. `unit_move` and `retire_unit.py:460` call them.
+5. `unit_move` drops `PriorFolderWorker` and checks a status against `codex_mesh.ENDABLE_STATUSES`, with the classes of a public `_roster_thread` (`codex_mesh.py:636`). The exit code for an unknown status stays 1.
+6. `resume_message` exposes `resume_prompt_path(seat)` and `add_resume_note(seat, note)`. `unit_move`, `rename_unit.py:973`, `resume_message.py:87` and `inventory.py:818` use them, with one atomic write form.
+7. `herdr.child_environment` (`herdr.py:871`) owns one list of session identity variables, and `unit_move` uses it. The change to `herdr.py` goes through herdr-unit.
+8. `progress_history` exposes one call that returns the run states for a history file; `move_run` (`progress_history.py:499`) and `unit_move.folder_runs` use it.
+
+**Files:**
+- `scripts/production/unit_move.py`, `scripts/direct/workers.py`, `scripts/production/rename_unit.py`, `scripts/production/retire_unit.py`, `scripts/agents/codex_mesh.py`, `scripts/lib/resume_message.py`, `scripts/shutdown/inventory.py`, `scripts/direct/progress_history.py`, `scripts/herdr/herdr.py` — source.
+- `scripts/production/test_unit_move.py`, `scripts/production/test_rename_unit.py`, `scripts/production/test_retire_unit.py` — regressions.
+
+**Workers:** `1 writer + 1 tester`.
+- `impl` — the source files.
+- `test` — the test files.
+
+**State:** none; behavior stays the same.
+
+**Constraints from prior phases:** Phase 4o: the folder move pauses and resumes workers on their same threads; keep every `test_unit_move.py` test green.
+
+**Acceptance gate:** `grep` shows one definition of each rule above; the existing suites of every changed module pass with no assertion change; `basedpyright` on the changed files and every caller module footer `0 errors, 0 warnings, 0 notes`; per-file `unittest discover`; full gate.
 
 ### Phase 7m — Showrunners take Morty's words as the user's  · status: done
 

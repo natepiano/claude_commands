@@ -210,6 +210,53 @@ class DocumentLookupTests(StaffTestCase):
             self.assertEqual(record.by_doc("natedev", document), runner)
             self.assertIsNone(record.by_doc("natedev", copy))
 
+    def test_document_lookup_refuses_unreadable_git_metadata_after_no_exact_match(self) -> None:
+        document = self.root / "owner/example-production.md"
+        document.parent.mkdir()
+        _ = document.write_text("# Example production\n")
+        _ = fixture_member("showrunner", name="example", doc=staff.LiveDoc("natedev", document))
+        record = staff.snapshot()
+        before = self.staff_file.read_bytes()
+        for name, metadata, unreadable in (("missing-gitdir", b"gitdir: missing-folder\n", "missing-folder"),
+                                           ("invalid-encoding", b"gitdir: \xff\n", ".git")):
+            with self.subTest(metadata=name):
+                checkout = self.root / name
+                checkout.mkdir()
+                _ = (checkout / ".git").write_bytes(metadata)
+                copy = checkout / "example-production.md"
+                _ = copy.write_text(document.read_text())
+                with (mock.patch.object(subprocess, "run", side_effect=AssertionError("No external command expected")),
+                      self.assertRaises(staff.StaffRefused) as refusal):
+                    _ = record.by_doc("natedev", copy)
+                self.assertIn(str(copy), str(refusal.exception))
+                self.assertIn(str(checkout / unreadable), str(refusal.exception))
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_document_lookup_skips_an_unreadable_candidate_checkout(self) -> None:
+        stale = self.root / "stale-checkout"
+        stale.mkdir()
+        _ = (stale / ".git").write_text("gitdir: missing-folder\n")
+        relative = Path("docs/plans/example-production.md")
+        _ = fixture_member("showrunner", name="stale", doc=staff.LiveDoc("natedev", stale / relative))
+        _, owner, unit = self.checkouts()
+        runner = fixture_member("showrunner", name="example", doc=staff.LiveDoc("natedev", owner / relative))
+        record = staff.snapshot()
+        before = self.staff_file.read_bytes()
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("No external command expected")):
+            self.assertEqual(record.by_doc("natedev", unit / relative), runner)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_exact_document_match_does_not_require_readable_git_metadata(self) -> None:
+        checkout = self.root / "unreadable-checkout"
+        checkout.mkdir()
+        _ = (checkout / ".git").write_text("gitdir: missing-folder\n")
+        document = checkout / "example-production.md"
+        _ = document.write_text("# Example production\n")
+        runner = fixture_member("showrunner", name="example", doc=staff.LiveDoc("natedev", document))
+        record = staff.snapshot()
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("No external command expected")):
+            self.assertEqual(record.by_doc("natedev", document), runner)
+
     def test_document_lookup_refuses_multiple_repository_matches(self) -> None:
         main, owner, unit = self.checkouts()
         relative = Path("docs/plans/example-production.md")
