@@ -178,6 +178,7 @@ class VerifyDocFixture(unittest.TestCase):
             **memory_environment,
             "BUILD_HOLD_DIR": str(self.root / "build-hold"), "BUILD_TARGETS_SCRIPT": str(targets),
             "LINT_CONFIG_READER": str(SCRIPTS / "lint/lint_config.sh"),
+            "LINT_SKIP_SWEEP": "1",
             "LINT_CONFIG_FILE": str(self.config), **config_environment(self.root),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
         })
