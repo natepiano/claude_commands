@@ -427,191 +427,97 @@ Delivery failures, restarts, and failed ledger writes preserve the event and dup
 **Binds later work:** An interrupted slot prints one `aws_interrupted=` line after `mac_exit` and `mac_cleanup`, and exits with the child status.
 
 ### Phase 11 — Prepare guarded deployment and the NixOS branch  · status: done
-**Depends on:** Phase 10
+
+#### As-built
+
+- `deploy.py prepare` generates the CloudFormation parameters, priced inventory and preflight evidence locally, with no AWS command. `apply` and `setup_start` run only from the user's terminal. They create the monthly Budget (emails at 50, 80 and 100 percent, stop action at 100 percent) and its enforcement before any chargeable resource, and only inside `monthly_limit_usd=400` and `daily_limit_usd=20`.
+- `docs/plans/builds-aws/cloudformation.json` defines one persistent Spot instance on the official x86_64 NixOS AMI, with the root volume for NixOS and the store and a retained encrypted data volume at `/home`. Retention applies on stack deletion and replacement, and replacement never formats a retained volume. Every charged resource carries the configured `cost_explorer_tag_key`/`cost_explorer_tag_value` tags. Shutdown behavior is `stop`, IMDSv2 is required, inbound is UDP 41641 only, and the instance profile has `AmazonSSMManagedInstanceCore` with HTTPS egress. The scaler IAM policy allows start/stop on the one instance ARN, the required describe calls and `ce:GetCostAndUsage`; no scaler key is on the box.
+- The ledger records a `ComputeRequest(at, stack, region, spot_max_usd_per_hour)` before the compute deploy call. Until confirmed instance state or confirmed absence ends it, the request is charged as additional unconfirmed instance time at `max(fallback_usd_per_hour, submitted SpotMaxPrice)`, split at accounting-day boundaries. `prepare`, `setup_start` and `apply` reconcile open requests. Existing instance charges and their confirmed uptime stay unchanged.
+- `aws_target.py serve` (controller) and `remote.py serve` (box) run the service loops. Each reads its first interval before any action and exits non-zero when that read fails, so systemd restarts it. The controller tick runs with `controller_tick_timeout_s` and the private credential-file environment, reads `tick_interval_s` through `conf.read`, and uses `CostLedger.refresh_charges` for charge queries.
+- `docs/plans/builds-aws/nixos.patch` adds host `aws-build` (x86_64, data-volume mount, Tailscale SSH, SSM, remote lifecycle services, Python 3.13, Nix, Git, rsync, Rust, nextest, mend, configured `devshell` shells) and the natedev `aws-target` user unit, stopped by default (`wantedBy` empty). It is on `/etc/nixos` main as commit 78746da; no machine is rebuilt. First boot generates remote lifecycle settings, and execution stays refused until natedev publishes permission for that boot.
+- `docs/plans/builds-aws-runbook.md` holds the complete user go-live sequence (account, placement and price reads, config inputs, priced preflight, guarded deploy, Tailscale login through SSM, `aws configure --profile build-scaler` with `AWS_SHARED_CREDENTIALS_FILE=~/.config/aws-build/credentials` at mode 0600, rebuilds, parity, exchange, recorder, routing, warm reuse, recovery and rollback checks, and the `go-live.json` first running observation). It also holds volume reuse, recovery, manual stop and rollback. Rollback stops the instance and confirms the stopped state before it disables offload, the timer or the registry entry.
+
+**Files:**
+- `scripts/aws_target/deploy.py` — local preparation and guarded deployment.
+- `scripts/aws_target/ledger.py` — compute request accounting and reconciliation.
+- `scripts/aws_target/config.py` — deployment settings, `deployment_price`, `money` and the service loop.
+- `scripts/aws_target/test_deploy.py` — fake AWS executable tests of the deploy order, template contract and service loop.
+- `docs/plans/builds-aws/cloudformation.json` — infrastructure template.
+- `docs/plans/builds-aws/nixos.patch` — the NixOS `aws-build` host and natedev unit.
+- `docs/plans/builds-aws-runbook.md` — user go-live, recovery and rollback procedure.
+
+**Binds later work:** offload stays off and AWS stays out of `targets` until the user's go-live gate; no AWS resource exists before it. A NixOS change goes as a new commit on clone branch `aws-build` and then to the natedev showrunner. Compute request records stay internal: the guard refuses spend from them with the existing limit messages. The service first-interval failure is visible only through systemd status and the journal.
+
+**Gotchas:** `deployment.json` is saved before the instance observation, so a failed lookup keeps the identity. The compressed bootstrap must stay within the 4096-byte CloudFormation parameter limit. A user stop disables the persistent Spot request until the next start; AWS restarts only a box it interrupted, and a tick that finds such a box while the guard refuses spend stops it. `limit_reserve_usd` covers one bounded drain and one idle interval; fixed costs are charged daily from deploy, and the Budget action is the late backstop, not the ceiling. A fake AWS test does not prove real bootstrap or persistent-request behavior; the runbook's user checks prove them.
+
+**Ruled out:** replacing known instance charges with the fallback rate during an unconfirmed request — it under-counts; charging an unconfirmed request at a historical Spot price — it is not an upper bound.
+
+### Phase 12 — Exact spending caps, the midnight total and the NixOS regression tests  · status: todo
+**Depends on:** Phase 11
 
 #### Work Order
 
-**Goal:** The user receives a complete guarded go-live procedure after all code and configuration are ready.
+**Goal:** The spending guard refuses a cap a fraction above $400/month or $20/day, its daily total never drops across local midnight, and tests fail when a NixOS recovery step is removed.
+
+**Acceptance gate:** Complete Phase 12 before any user deployment or activation. Keep `offload=off` and keep AWS outside `targets`.
+
+**Constraints from prior phases:**
+
+- `config.py` `service_loop` already reads the first interval before any action. Keep the two service interval tests (first read fails; later read fails and the last usable interval stays). Spec 3 owns only the systemd restart settings.
+- Users see a first-interval failure through systemd status and the journal, correct the configuration, and restart the service. No more application state is required.
+- Compute request records stay internal: users act through spending decisions. `scripts/aws_target/measurement.py` (about lines 103 and 163) shows request costs in status and the daily report.
 
 **Spec:**
 
-1. Create a CloudFormation JSON template for the settled persistent Spot instance and retained data volume.
-   Parameterize type, region inputs, AMI, volume sizes, IOPS, throughput, timeouts, price inputs and budget settings from config.
-   Use the official x86_64 NixOS AMI selected for the region.
-   Keep the root volume for NixOS and the store; mount the retained encrypted data volume at `/home`.
-   Apply retention on stack deletion and replacement. Never format an existing retained volume during replacement.
-   Apply `cost_explorer_tag_key` and `cost_explorer_tag_value` to every charged resource, retained resources included. Generate these tags from validated configuration.
-   Test tag coverage in the template, and keep the tags during volume reuse.
-2. Require the spend guard before the first resource, not only before the first scaler start.
-   Provide `deploy.py prepare` to generate parameters, priced inventory and preflight evidence locally.
-   Have the user run guarded deployment from their terminal. Do not run deployment as an agent acceptance command.
-   Create the monthly Budget and enforcement dependencies before chargeable compute or storage.
-   Use the config's $400 monthly limit, with emails at configured 50, 80 and 100 percent thresholds.
-   Prepare the stop action at 100 percent; keep delayed billing outside the primary admission guard.
-3. Scope the scaler IAM policy to start/stop on the one instance ARN, required describe calls and `ce:GetCostAndUsage`.
-   Put no scaler key on the box. Give the box the SSM instance profile and public package access.
-   Open inbound UDP 41641 for direct Tailscale transport; open no inbound TCP port.
-   Make instance shutdown behavior `stop`. Require IMDSv2 for interruption checks.
-4. Prepare a dedicated NixOS branch with host `aws-build`, rather than importing natedev's desktop configuration.
-   Add x86_64 host output, data-volume mounting, Tailscale SSH, SSM and remote lifecycle services.
-   Install Python 3.13, Nix, Git, rsync, Rust, nextest and mend.
-   Select shells through configured `devshell` and `devshell.<repo>` settings.
-   Check `rustc -V`, `cargo nextest --version`, mend version and tracked script commit inside the configured shell.
-   Supply matching tools through the NixOS configuration before enabling AWS work.
-   Add a natedev user tick timer that reads its interval from config at use.
-   Keep the timer and AWS admission disabled before the user completes go-live inputs.
-   Hand the branch and commit to the natedev showrunner. Never push `/etc/nixos` main or rebuild either machine as an agent.
-   Generate valid remote lifecycle settings at first boot and enable their offload switch. Keep execution refused until natedev publishes valid permission for that boot.
-   Test the generated bootstrap configuration without published permission; require idle shutdown within `idle_stop_minutes`.
-   Run `scripts/aws_target/aws_target.py tick` from the natedev service with the private credential-file environment.
-   Read `tick_interval_s` through `conf.py` and new AWS switch checks through `config.offload_enabled`.
-   Reuse `CostLedger.refresh_charges` for UTC-day queries, saved-reply recovery and reconciliation; add no separate charge timer.
-5. Record the NixOS changes in `docs/plans/builds-aws/nixos.patch` for review.
-   The patch targets NixOS-relative `flake.nix`, `configuration.nix`, `hosts/aws-build.nix` and `modules/linux/aws-build.nix`.
-   Use a separate NixOS checkout to prepare the branch.
-   Read the existing NixOS entry points listed in Delegation Context; keep natedev's current jobs unchanged.
-6. Complete `docs/plans/builds-aws-runbook.md` with initial deploy, volume reuse, recovery, manual stop and rollback steps.
-   Include free region placement and current-price reads, required account inputs, notification email and selected AMI validation.
-   Read credentials through `AWS_SHARED_CREDENTIALS_FILE=~/.config/aws-build/credentials` and profile `build-scaler` on natedev.
-   Require mode 0600. Let only the user run `aws configure --profile build-scaler` with that credential-file setting.
-   Copy only tracked scripts and non-secret settings to the box.
-   Keep AWS outside `targets` until the user activation gate.
-   An AWS `SshTarget` entry enables record exchange even when `offload=off`.
-   Install tracked scripts and non-secret configuration before enabling the registry entry.
-   Keep `BUILDLOG_PEER` unset in the normal multi-peer service.
-   Include user checks for AWS exchange, recorder health, retained-capacity status, and rollback.
-   Include cold and cached test, check and staged doc runs through the configured shell.
-   Check warm reuse and budget trimming only in the selected slot.
-   Check retained-ownership recovery, including marker reconciliation after restart, without selecting or killing new work.
-   Give `tag:build-aws` no initiated connections to natedev or the Mac; permit natedev's user to reach it.
-   In the rollback procedure, stop the instance and confirm its stopped state before disabling offload, disabling the timer, or removing the registry entry.
-   Explain UTC charge periods, accounting-day costs and report-local comparison days.
-7. Build the deployment decisions below into the template, runbook and NixOS patch.
-   Keep all settled choices and both caps unchanged.
-   Do not present a fake AWS test as proof of a real bootstrap or persistent-request behavior; the runbook's user-run checks prove them at go-live.
-8. Test parameter generation and the full deployment command sequence through a fake AWS executable.
-   Cover first boot without observations, a live limit changed after preparation, and inventory kept across reruns.
-   Assert guard-before-resource order, disabled defaults, Budget amount, IAM scope, retention and secret exclusion.
-   Parse template JSON locally. Keep NixOS evaluation separate from system activation.
-   Test disabled configuration with the scheduled sync path.
-   Preserve target claims, affinity, warm mirrors, cost evidence, and peer status during restart and redeployment.
-   Test the generated service command with fake AWS replies across repeated ticks, a UTC boundary and saved-reply recovery.
-
-**Held changes:** Neither held branch modifies the new AWS deployment files or the NixOS patch paths.
-Keep the target activation edit to `config/build_targets.conf` separate from earlier routing changes.
-Preserve resources' Mac floor cleanup settings and verify's helper/token changes when reviewing the assembled checkout.
+1. Make the shared range check exact.
+   - Now: `scripts/lib/conf.py` `_limits` (about line 218) compares `# range:` values through `_number`, which returns `float`. `monthly_limit_usd=400.0000000000000001` and `daily_limit_usd=20.0000000000000001` round to the bound and pass.
+   - Compare `Decimal` values in the range path. Keep the finite-number check. Keep the value types that `conf.read` returns unchanged.
+   - Regression tests in `scripts/lib/test_conf.py`: a value a fraction above a decimal upper bound and a fraction below a lower bound are refused; the bound itself is accepted.
+   - Extend the cap test near `scripts/aws_target/test_deploy.py:875` (it covers one-cent increases): require refusal of `monthly_limit_usd=400.0000000000000001` and `daily_limit_usd=20.0000000000000001`. Both pass validation on the current tree.
+2. Pin the bootstrap retry with an existing watchdog.
+   - The bootstrap in `docs/plans/builds-aws/nixos.patch` (about line 57) checks the `aws-build-first-boot-stop.timer` load state before `systemd-run`.
+   - Render the bootstrap through the deploy bundle. Run its watchdog block twice with fake `systemctl` and `systemd-run` on `PATH`. The second run must not call `systemd-run` and must not extend the deadline.
+   - The test must fail if the load-state check is removed.
+3. Pin the controller restart settings.
+   - `aws-target.service` in `nixos.patch` (about line 283) has `Restart = "on-failure"` and `RestartSec`.
+   - Read the working-tree patch and require both settings on that unit. The test must fail if either is removed.
+4. Pin the volume check in both installation modes.
+   - The shared `aws-build-volume` script is in `hosts/aws-build-base.nix` in `nixos.patch` (about lines 128-144); `hosts/aws-build.nix` imports it (about line 256). Bootstrap formats with `mkfs.ext4 -L`; the full host refuses blank media.
+   - Render the Nix inputs into an isolated test copy. Fake the state paths, `udevadm`, `readlink`, the block-device check, `wipefs`, `lsblk`, `blkid` and `mkfs.ext4`. Keep the production serial and filesystem comparisons.
+   - Test bootstrap and full-host modes separately. Both modes refuse a wrong serial and keep an existing filesystem. Bootstrap formats matching blank media once. The full host refuses matching blank media.
+   - Require that `hosts/aws-build.nix` imports the base file. The tests must fail if the serial check or the import is removed.
+5. Test request costs at their user surfaces.
+   - In `scripts/build_targets/test_aws_status.py` and `scripts/buildlog/test_aws_report.py`, cover: pending request costs, a guard refusal, confirmed-instance reconciliation and confirmed-absence reconciliation.
+   - Confirmed uptime must not increase from a request in any case.
+6. Keep the daily total from dropping across local midnight.
+   - Now: `ledger.py` reconciliation (about line 489) spreads the Cost Explorer remainder over the period's accounting days. A higher estimate for an earlier day can lower a later day's share, so today's guard total can fall.
+   - Change the rule so a reconciliation never lowers an accounting day's established estimate. Monthly totals follow the same rule.
+   - Regression test: a Cost Explorer reconciliation whose period crosses local midnight, with a raised estimate for the earlier day. The daily and monthly guard totals for the later day do not fall.
+7. Do not run any AWS command. Do not rebuild any machine. Offload stays off.
+8. If a test can run a script only after a `nixos.patch` change, keep that change minimal. After any NixOS change, the director requires both host evaluations (natedev and aws-build), an exact match between the patch and the NixOS branch, a new commit on branch `aws-build` (clone `/home/natepiano/worktrees/nixos-aws-build`), and its hand-off to the natedev showrunner.
 
 **Files:**
 
-- `scripts/aws_target/deploy.py` — parameter preparation and guarded user deployment support.
-- `scripts/aws_target/test_deploy.py` — fake AWS deployment sequence and resource-contract tests.
-- `scripts/aws_target/config.py` — deployment config validation.
-- `scripts/aws_target/aws_target.py`, `scripts/aws_target/ledger.py`, `scripts/aws_target/remote.py` — existing controller, accounting and remote lifecycle contracts.
-- `config/aws_target.conf`, `config/build_targets.conf`, `config/README.md` — complete values, disabled defaults and activation procedure.
-- `docs/plans/builds-aws/cloudformation.json` — new infrastructure template.
-- `docs/plans/builds-aws/nixos.patch` — reviewable NixOS branch changes.
-- `docs/plans/builds-aws-runbook.md` — complete user procedure and branch handoff.
-- `pyrightconfig.json` — add only the AWS Python execution environment if required.
+- `scripts/lib/conf.py`, `scripts/lib/test_conf.py` — exact `Decimal` range check (also touches; owner of the shared conf module).
+- `scripts/aws_target/ledger.py` — reconciliation that never lowers a day's estimate.
+- `scripts/aws_target/test_deploy.py` — cap refusal, watchdog retry, restart settings, volume check and midnight tests.
+- `scripts/build_targets/test_aws_status.py`, `scripts/buildlog/test_aws_report.py` — request costs at status and report (the status test also touches; owner resources-unit).
+- `scripts/aws_target/deploy.py` — read only, unless the tests need a bundle accessor.
+- `docs/plans/builds-aws/nixos.patch` — read only, unless item 8 applies.
 
-**Workers:** 2 writers; deployment and NixOS preparation have independent files. The NixOS writer has no Python test lane.
-Both writers use the same controller command and activation sequence.
+**Workers:** 1 writer.
 
-- `impl` — deployment Python, fake integration tests, CloudFormation, config and `pyrightconfig.json`; hub: `config/aws_target.conf`, `config/build_targets.conf`.
-- `test` opens as impl — NixOS services, patch, separate NixOS branch and runbook; request config additions from `impl`.
+- `impl` — all files above.
 
-**State:** Before go-live, only local generated parameters and a separate NixOS branch exist.
-After the user gate, stack IDs, volume ID, instance ID, guard evidence and activation time persist.
-Make reruns reconcile existing resources and retained volume identity. Never reset cost evidence during redeployment.
-Preserve target claims, affinity, warm mirrors, cost evidence, and peer status during restart and redeployment.
+**Verification:**
 
-**Constraints from prior phases:** Phase 9 supplies reports. Phase 8 supplies tick, remote idle stop and interruption handling.
-Phase 6 supplies the deployment-purpose guard, the ledger and the priced-inventory requirement. Phases 1–4 supply target state, slots and Linux routing.
-This phase constructs `ResourceInventory`, implements `deploy.py prepare`, and calls the shared deployment guard before the first resource.
-The source design's Phase 3 go-live occurs only here, after implementation and the runbook are complete.
-An active AWS `SshTarget` enables record exchange even when `offload=off`.
-Keep AWS outside `targets` until tracked scripts and non-secret configuration are installed at the user gate.
-Phase 9 supplies AWS exchange status, recorder health and retained-capacity status for the runbook's user checks.
-Phase 3 checks parity inside the configured shell after script, public configuration and source copies.
-Its runner needs Python 3.13, Nix, Git, rsync, Rust, nextest and mend.
-Its LRU sweep trims selected-slot output; whole-folder removal occurs only for the disk floor.
-Phase 4 separates completion from cleanup state, unresolved count and evidence time in durable attempts.
-Startup refusal and remaining leftovers preserve ownership without backoff.
-Phase 6 permits spend only with usable live limits through `conf.py`; committed recovery values never permit spend.
-Phase 8 checks AWS permission before shell evaluation and `shellHook` in both runner entry points.
-Phase 8 reconciles retained markers and claims using boot identity after restart.
-Phase 8 keeps interruption generation in remote evidence and sender results. Durable `ssh_attempts` records keep the `lost` outcome without `interruption_generation`.
-Phase 10: `linux_runner.py` prints `aws_interrupted=` once, in the `interruption_signals` finally after `mac_exit` and `mac_cleanup`; the remote exit status is the child status, never 75. `interruptible_slot` is the one context for the run and probe paths.
-`Controller._action` in `aws_target.py` returns at once while `offload=off`, manual stop included; registry activation alone enables exchange but no control or charge read.
-Phase 9: `config.offload_enabled` is the one owner of the offload switch. `CostLedger.refresh_charges` queries whole UTC days and each accounting day prices the overlap of each UTC reconciliation.
-Phase 9: `measurement.record_go_live` keeps the first permitted running observation in `go-live.json`; it is the report's go-live boundary.
-Phase 9: AWS rows in build status and the `### AWS` report section appear only when an AWS `SshTarget` is configured.
-Read configuration through `conf.py`; tests use `CONF_DIR`, private `build_targets.conf` and numeric limit comments.
+- `python3 -m unittest discover -s scripts/aws_target -p 'test_*.py'`
+- `python3 -m unittest discover -s scripts/lib -p 'test_conf*.py'`
+- `python3 -m unittest discover -s scripts/build_targets -p 'test_*.py'`
+- `python3 -m unittest discover -s scripts/buildlog -p 'test_aws_report.py'`
+- `basedpyright` on each changed Python file; the footer must read 0 errors, 0 warnings, 0 notes.
 
-**Verification — impl:** `python3 -m json.tool docs/plans/builds-aws/cloudformation.json`
-
-**Verification — impl types:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/aws_target/deploy.py scripts/aws_target/config.py scripts/aws_target/test_deploy.py`
-
-**Verification — impl tests:** `python3 -m unittest discover -s scripts/aws_target -p 'test_deploy.py'`
-
-**Verification — NixOS writer:** In the prepared NixOS checkout, run `nix eval --raw .#nixosConfigurations.aws-build.config.system.build.toplevel.drvPath`.
-
-**Verification — NixOS writer:** In that checkout, run `nix eval --raw .#nixosConfigurations.natedev.config.system.build.toplevel.drvPath`.
-
-**Acceptance gate:** Local verification passes, the patch matches the prepared NixOS branch, and the runbook contains the complete guarded command sequence.
-The implementation checkpoint requires no AWS resource. Record go-live separately after the user gate.
-With AWS absent from targets, build status shows no AWS target and the report shows no AWS section. With AWS configured and `offload=off`, exchange runs but no controller work or charge query.
-This phase owns activation checks for the existing Phase 9 surfaces:
-- stopped, starting, running and draining states, spending decisions, occupied slots, retained capacity and recovery actions through build:status (`scripts/build_targets/test_aws_status.py`);
-- UTC charge reconciliation, query cost and reconciliation difference through the AWS report (`scripts/aws_target/test_measurement.py`, `scripts/buildlog/test_aws_report.py`);
-- estimated wait saved, cost ratios and unavailable comparisons through build:report (`scripts/buildlog/test_aws_report.py`);
-- each peer's last success, latest failure, never-synchronized state, pause and recovery, with the `buildlog sync` and `buildlog sync resume` actions, through the rendered report.
-Charge records stay implementation evidence; users see their consequences through the report.
-The runbook checks AWS exchange, recorder health, retained-capacity status and rollback after activation.
-The user-run gate checks parity inside the configured shell during cold and cached test, check and staged doc runs.
-The gate confirms warm reuse, selected-slot budget trimming and retained-ownership recovery across restart.
-Restart and redeployment preserve target claims, affinity, warm mirrors, cost evidence and peer status.
-
-**Go-live gate — user actions:** Finish the code, template, runbook and NixOS branch before these user steps.
-
-1. Create the AWS account and admin login in the console.
-2. Read placement scores and current prices through the runbook at the user's terminal.
-3. Fill the region, AMI, prices and required account inputs in configuration.
-4. Run the priced first-resource preflight from the runbook.
-5. Run the guarded `aws cloudformation deploy` procedure with the generated parameters.
-6. Run `sudo tailscale up --ssh --advertise-tags=tag:build-aws` through SSM Session Manager.
-7. Configure the Tailscale tag policy in the console.
-8. Run `aws configure --profile build-scaler` with `AWS_SHARED_CREDENTIALS_FILE` set to the private file named above.
-9. Rebuild natedev and the box from the prepared NixOS branch.
-10. Confirm tool parity inside the configured shell through the runbook.
-11. Confirm spending-guard readiness through the runbook.
-12. Confirm that tracked scripts and non-secret configuration are installed on the box.
-13. Keep `BUILDLOG_PEER` unset in the normal multi-peer service.
-14. Configure `kind.aws=ssh`, `platform.aws=linux` and `settings.aws=aws_target.conf`. Add aws to targets while offload stays off, then confirm record exchange. Set `offload=on` on natedev, enable the timer, and confirm fresh remote admission permission.
-15. Confirm AWS exchange through the runbook.
-16. Confirm AWS recorder health through the runbook.
-17. Confirm retained-capacity status through the runbook.
-18. Confirm cold and cached test, check and staged doc routing through the runbook's user-run proof.
-19. Confirm warm reuse and budget trimming in the selected slot.
-20. Confirm retained-ownership recovery after restart through the runbook.
-21. Confirm the rollback procedure through the runbook.
-22. Confirm that `go-live.json` records the controller's first permitted running observation. Keep that timestamp across restart and redeployment.
-
-Keep AWS lint disabled. Pass no password or key through a session.
-
-**Deployment decisions (aws-unit, 2026-11-01):**
-
-1. **Persistent Spot restart at a spending limit.** A user stop (the scaler's `StopInstances`, or the box's own shutdown) disables a persistent request until the next start, so AWS does not restart a stopped box.
-   AWS restarts only a box it interrupted. Phase 8 bounds that case: a tick that finds an unexpected restarted generation running while the guard refuses spend stops it at once, and the box's idle stop is the second bound. A controlled drain keeps its recorded deadline.
-   The runbook's go-live check confirms the request state after a manual stop.
-2. **First SSM connection.** Use the official NixOS AMI for the selected release and region (the runbook reads its ID from the NixOS AMI list and records it in config).
-   The NixOS Amazon image runs `amazon-ssm-agent`. The template gives the instance a profile with `AmazonSSMManagedInstanceCore` and open HTTPS egress.
-   User data carries the non-secret NixOS config that enables Tailscale and the idle stop, so the box stops itself from first boot.
-   The runbook checks `aws ssm describe-instance-information` before the Tailscale login; the EC2 serial console is the fallback.
-3. **Strict cost boundary during drain.** Phase 6's `limit_reserve_usd` covers one bounded drain (`drain_max_minutes`) and one idle interval.
-   Fixed costs (retained volume, IPv4) are charged to the ledger daily from deploy, so the daily limit already includes them.
-   Between deploy and natedev control, the box's idle stop bounds run time. The AWS Budget action is the late backstop, not the ceiling.
-
-**Also touches:** `config/build_targets.conf` (owner resources-unit); `pyrightconfig.json` (owner natedev showrunner); NixOS `flake.nix`, `configuration.nix`, `hosts/aws-build.nix`, `modules/linux/aws-build.nix` (owner natedev showrunner, separate branch only).
+**Also touches:** `scripts/lib/conf.py`, `scripts/lib/test_conf.py` (owner of the shared conf module); `scripts/build_targets/test_aws_status.py` (owner resources-unit). Name each owner in the checkpoint notice.
 
 ## Compilation record
 
