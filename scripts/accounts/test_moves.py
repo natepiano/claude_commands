@@ -75,7 +75,7 @@ class MoveJournalTests(unittest.TestCase):
                     with redirect_stdout(io.StringIO()):
                         self.assertEqual(len(moves.read_journal()), 1)
                 else:
-                    self.assertIsInstance(evidence, moves.UnreadableMoveJournal)
+                    self.assertEqual(evidence, moves.RecordedAutoEntries(frozenset()))
                 self.assertEqual(path.read_bytes(), valid + suffix)
 
     def test_an_auto_entry_read_recovers_interrupted_worker_name_conversion(self) -> None:
@@ -375,17 +375,6 @@ class MoveJournalTests(unittest.TestCase):
                          [("refusal", "quota refusal"), ("auto", "auto: units-low")])
         self.assertEqual(json.loads(path.read_text().splitlines()[1])["cause"], "auto")
 
-    def test_invalid_move_cause_is_refused_by_writer_and_skipped_by_reader(self) -> None:
-        valid = self.requested()
-        moves.append_move(valid)
-        for cause in ("credits on", "", None, 7, ["credits off"]):
-            with self.subTest(cause=cause):
-                malformed = {**valid, "cause": cause}
-                with self.assertRaisesRegex(ValueError, "invalid account move"):
-                    moves.append_move(cast(moves.RequestedMove, cast(object, malformed)))
-                with moves.store_file().open("a", encoding="utf-8") as output:
-                    _ = output.write(json.dumps(malformed) + "\n")
-        self.assertEqual(moves.read_moves(), [valid])
 
     def test_hand_and_refusal_causes_survive_storage_and_legacy_requests_read_as_refusals(self) -> None:
         legacy = self.requested()

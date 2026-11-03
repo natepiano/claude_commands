@@ -29,7 +29,6 @@ sys.path.insert(0, str(ROOT / "scripts" / "shutdown"))
 sys.path.insert(0, str(ROOT / "scripts" / "whoami"))
 from scripts.lib import conf
 from scripts.accounts import accounts, moves, next_moves, refusals, role_map
-from scripts.shutdown.stop_results import RunningOnAnotherAccount
 from scripts.whoami import account
 from scripts.whoami import agent_accounts
 from scripts.whoami.note_file import canonical_label
@@ -38,11 +37,8 @@ from quota_alert import (RefusedAt, _refusal_window, blocked_next_move_line, blo
                          BlockedHeadReason as BlockedHeadReason, NoTargetReading as NoTargetReading,
                          TargetReadingUnavailable as TargetReadingUnavailable,
                          TargetLoginRenewalFailed as TargetLoginRenewalFailed,
-                         TargetAccountUnavailable as TargetAccountUnavailable,
                          TargetAtOrBelowThreshold as TargetAtOrBelowThreshold,
-                         TargetUnresolvedRefusal as TargetUnresolvedRefusal,
-                         TargetPreparationRefused as TargetPreparationRefused,
-                         TargetIsCurrentAccount as TargetIsCurrentAccount)
+                         TargetUnresolvedRefusal as TargetUnresolvedRefusal)
 
 if TYPE_CHECKING:
     from scripts.shutdown import inventory as inventory_module
@@ -728,9 +724,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     state = _load_state()
     original_state = deepcopy(state)
     configured = read_auto_move_rules() if not proof_group else ()
-    # An unreadable queue cannot prove a group has nothing next.
-    pending_groups = (set(accounts.CLAUDE_GROUPS) if any(isinstance(rule, UnreadableNextMoveLog) for rule in configured)
-                      else {rule.group for rule in configured if isinstance(rule, AutoMoveRule)})
+    pending_groups = {rule.group for rule in configured if isinstance(rule, AutoMoveRule)}
     entries = moves.read_moves()
     ended = {entry["move_id"] for entry in entries if entry["kind"] == "wait ended"}
     for entry in entries:
@@ -758,7 +752,6 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
         refresh_usage()
         now = max(now, datetime.now(timezone.utc))
     waiting_groups: set[accounts.ClaudeGroup] = set()
-    blocked_groups: set[accounts.ClaudeGroup] = set()
     tick_logins = frozenset(identity.login.casefold() for session in owners
         if isinstance(detected[session["session_id"]], TranscriptRefusal)
         if isinstance(identity := accounts.account_identity(Path(session.get("config_dir", str(accounts.main_config_dir())))),
@@ -786,7 +779,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             if previous["state"] in ("retry", "no room") and not dry_run:
                 # Restore the saved wait before destination preparation can block its continuation.
                 _set_transition(state, session_id, refusal.entry_id, "waited", journaled_wait["move_id"])
-    # Preview preparation judges repairs without changing any account content.
+    # A short reset wait applies to the whole group.
     for session in owners:
         group_name = accounts.session_group(session)
         if group_name == "ungrouped" or group_name in pending_groups:
@@ -802,15 +795,13 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
         previous = state["sessions"].get(session["session_id"])
         if previous and previous["entry_id"] == refusal.entry_id and previous["state"] in ("requested", "cancelled", "continued", "group selected"):
             continue
-        identity = accounts.account_identity(Path(session.get("config_dir", str(accounts.main_config_dir()))))
-        if not isinstance(identity, agent_accounts.NumberedAccount):
-            continue
+        login = accounts.claude_login(Path(session.get("config_dir", str(accounts.main_config_dir()))))
         if previous and previous["entry_id"] == refusal.entry_id and "refusal" in previous:
             first = _first_refusal(previous["refusal"])
             window = first.window
             preflight_reset = first.reset
         else:
-            reading = refusals.stored_reading_with_age("claude", identity.login, now, stale_after)
+            reading = refusals.stored_reading_with_age("claude", login, now, stale_after)
             window = _refusal_window(refusal.window, reading, refusal.refused_at.at)
             preflight_reset: refusals.KnownReset | refusals.NoResetKnown = refusals.NoResetKnown()
             if isinstance(window, refusals.KnownWindow) and isinstance(reading, (refusals.FreshReading, refusals.StaleReading)):
@@ -825,14 +816,6 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
         if isinstance(window, refusals.KnownWindow) and window.name == "five_hour" and isinstance(preflight_reset, refusals.KnownReset) and timedelta(0) < preflight_reset.at - now < reset_wait:
             waiting_groups.add(group_name)
             continue
-        chosen = accounts.placement(group_name, now, exclude=tick_excluded, reading_age_minutes=stale_minutes)
-        if not isinstance(chosen.reason, accounts.GroupNoRoom):
-            assert isinstance(chosen.label, str)
-            prepared = (accounts.prepared_account_preview(chosen.label, resume=True) if dry_run
-                        else accounts.prepared_account(chosen.label, resume=True))
-            if isinstance(prepared, accounts.AccountRefused):
-                blocked_groups.add(group_name)
-                lines.append(f"{group_name}: move refused: {prepared.reason}")
     for session in owners:
         session_id = session["session_id"]
         refusal = detected[session_id]
@@ -841,17 +824,14 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
         previous = state["sessions"].get(session_id)
         if previous and previous["entry_id"] == refusal.entry_id and previous["state"] in ("requested", "cancelled", "continued", "group selected"):
             continue
-        if (accounts.session_group(session) in blocked_groups | unconfigured
+        if (accounts.session_group(session) in unconfigured
                 and not (previous and previous["entry_id"] == refusal.entry_id and previous["state"] == "waited")):
             continue
-        identity = accounts.account_identity(Path(session.get("config_dir", str(accounts.main_config_dir()))))
-        if not isinstance(identity, agent_accounts.NumberedAccount):
-            lines.append(f"{session['name']}: refused; account unreadable")
-            continue
+        login = accounts.claude_login(Path(session.get("config_dir", str(accounts.main_config_dir()))))
         if previous and previous["entry_id"] == refusal.entry_id and "refusal" in previous:
             account_refusal = _first_refusal(previous["refusal"])
         else:
-            reading = refusals.stored_reading_with_age("claude", identity.login, now, stale_after)
+            reading = refusals.stored_reading_with_age("claude", login, now, stale_after)
             window = _refusal_window(refusal.window, reading, refusal.refused_at.at)
             reset: refusals.KnownReset | refusals.NoResetKnown = refusals.NoResetKnown()
             if isinstance(window, refusals.KnownWindow) and isinstance(reading, (refusals.FreshReading, refusals.StaleReading)):
@@ -860,9 +840,9 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                     reset = value.reset
             if isinstance(refusal.reset, refusals.KnownReset):
                 reset = refusal.reset
-            account_refusal = refusals.AccountRefusal("claude", identity.login, window, reset, refusal.refused_at.at)
+            account_refusal = refusals.AccountRefusal("claude", login, window, reset, refusal.refused_at.at)
             if not dry_run:
-                observation = FirstRefusalObservation(login=identity.login,
+                observation = FirstRefusalObservation(login=login,
                     window=account_refusal.window.name if isinstance(account_refusal.window, refusals.KnownWindow) else "unknown",
                     at=account_refusal.at.isoformat())
                 if isinstance(account_refusal.reset, refusals.KnownReset):
@@ -891,7 +871,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                         lines.append(f"{session['name']}: continued on its current account")
                 continue
         if isinstance(refusal, TranscriptRefusal):
-            refusing_logins.add(identity.login.casefold())
+            refusing_logins.add(login.casefold())
         subject = session_id + ": " + session["name"]
         pending_head = accounts.session_group(session) in pending_groups
         if (isinstance(wait_reset, refusals.KnownReset) and (pending_head
@@ -910,7 +890,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             continue
         group_name = accounts.session_group(session)
         key = ("proof group" if proof_group else "proof:" + session_id if isinstance(refusal, ProofRefusal)
-               else identity.login.casefold()) if group_name == "ungrouped" else "group:" + group_name
+               else login.casefold()) if group_name == "ungrouped" else "group:" + group_name
         groups.setdefault(key, []).append((session, refusal, account_refusal))
     fingerprint = _reading_values_fingerprint()
     if dry_run:
@@ -922,14 +902,13 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     no_room_groups: set[accounts.ClaudeGroup] = set()
     for login, group in groups.items():
         group_name = cast(accounts.ClaudeGroup, login.removeprefix("group:")) if login.startswith("group:") else "ungrouped"
-        if group_name in waiting_groups or group_name in blocked_groups:
+        if group_name in waiting_groups:
             continue
-        source_identity = accounts.account_identity(Path(group[0][0].get("config_dir", str(accounts.main_config_dir()))))
-        if not isinstance(source_identity, agent_accounts.NumberedAccount):
-            continue
+        source_dir = Path(group[0][0].get("config_dir", str(accounts.main_config_dir())))
+        source_login = accounts.claude_login(source_dir)
         default_identity = accounts.account_identity(accounts.main_config_dir())
-        source = source_identity.label
-        excluded = {source, source_identity.label, *tick_excluded}
+        source = accounts.claude_config_label(source_dir)
+        excluded = {source, *tick_excluded}
         for member, _, _ in group:
             member_identity = accounts.account_identity(Path(member.get("config_dir", str(accounts.main_config_dir()))))
             if isinstance(member_identity, agent_accounts.NumberedAccount):
@@ -964,7 +943,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                             subject=session["session_id"] + ": " + session["name"], move_id=move_id,
                             earliest_reset=chosen.earliest_reset.at.isoformat() if isinstance(chosen.earliest_reset, accounts.EarliestReset) else ""))
                         _set_transition(state, session["session_id"], refusal.entry_id, "no room", move_id)
-                notice_key = login if isinstance(group[0][1], ProofRefusal) else source_identity.login.casefold()
+                notice_key = login if isinstance(group[0][1], ProofRefusal) else source_login.casefold()
                 if state["notices"].get(notice_key) != fingerprint:
                     _ = state["notices"].pop(notice_key, None)
                     if _notify_no_room(text, now):
@@ -991,10 +970,6 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
         move_origin = accounts.RefusalOrigin(window_name, first_refusal.reset)
         transition = accounts.GroupTransition(uuid4().hex, move_origin, accounts.RecordedTransitionReason(why))
         if group_name != "ungrouped":
-            prepared = accounts.prepared_account(chosen.label, resume=True)
-            if isinstance(prepared, accounts.AccountRefused):
-                lines.append(f"{group_name}: move refused: {prepared.reason}")
-                continue
             transition = accounts.set_group_account(group_name, chosen.label, why=why, now=now, origin=move_origin)
             selected_groups[group_name] = chosen.label
             moved_groups.add(group_name)
@@ -1013,7 +988,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             if outcome.session_id not in by_id:
                 continue
             refusal = by_id[outcome.session_id]
-            refused = isinstance(outcome, (accounts.SessionMoveRefused, RunningOnAnotherAccount))
+            refused = isinstance(outcome, accounts.SessionMoveRefused)
             _set_transition(state, outcome.session_id, refusal.entry_id,
                 "requested" if not refused else "group selected" if group_name != "ungrouped" else "retry",
                 transition.move_id if not refused else "")
@@ -1031,7 +1006,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     # A committed group choice is stable. Complete its off-target members without choosing again.
     if not proof_group and selected_groups:
         eligible: set[accounts.ClaudeGroup] = {group for group in accounts.CLAUDE_GROUPS
-                    if group not in moved_groups | waiting_groups | blocked_groups | no_room_groups
+                    if group not in moved_groups | waiting_groups | no_room_groups
                     and isinstance(accounts.group_label(selected_groups, group), str)}
         def completion_members(observed: dict[accounts.ClaudeGroup, list[inventory_module.ListedSession]],
                                group_name: accounts.ClaudeGroup, target: str) -> list[inventory_module.ListedSession]:
@@ -1063,18 +1038,10 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                     if not members:
                         continue
                     directory = accounts.claude_account_dir(target)
-                    identity = accounts.account_identity(directory)
-                    if not isinstance(identity, agent_accounts.NumberedAccount):
-                        lines.append(f"{group_name}: move refused: account unreadable")
-                        continue
-                    held = refusals.load().get(refusals.key("claude", identity.login))
-                    if held is not None and not refusals.resolved(held, refusals.stored_reading_with_age("claude", identity.login, now, stale_after), now):
+                    login = accounts.claude_login(directory)
+                    held = refusals.load().get(refusals.key("claude", login))
+                    if held is not None and not refusals.resolved(held, refusals.stored_reading_with_age("claude", login, now, stale_after), now):
                         lines.append(f"{group_name}: move refused: {target} holds an unresolved refusal")
-                        continue
-                    prepared = (accounts.prepared_account_preview(target, resume=True) if dry_run
-                                else accounts.prepared_account(target, resume=True))
-                    if isinstance(prepared, accounts.AccountRefused):
-                        lines.append(f"{group_name}: move refused: {prepared.reason}")
                         continue
                     if dry_run:
                         lines.extend(accounts.move_preview_line(session, target) for session in members)
@@ -1110,8 +1077,6 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
     configured = read_auto_move_rules()
     rules = [rule for rule in configured if isinstance(rule, AutoMoveRule)]
     lines = [rule.reason for rule in configured if isinstance(rule, UnreadableNextMoveLog)]
-    if lines:
-        return lines
     state = _load_state()
     original = deepcopy(state)
     holds = state.get("auto_move_holds", {})
@@ -1126,11 +1091,8 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         del notices[entry_id]
     recorded = role_map.repair_selected_auto_moves(tuple(role_map.AutoMoveTarget(rule.entry_id, rule.group, rule.to)
         for rule in rules), now, dry_run=dry_run)
-    if isinstance(recorded, UnreadableAutoMoveHistory):
-        if not dry_run and state != original:
-            _save_state(state)
-        return lines
-    consumed = recorded.entry_ids & {rule.entry_id for rule in rules}
+    consumed: frozenset[str] = (recorded.entry_ids & {rule.entry_id for rule in rules}
+                if isinstance(recorded, RecordedAutoMoves) else frozenset())
     if consumed:
         for entry_id in consumed:
             _ = holds.pop(entry_id, None)
@@ -1156,13 +1118,8 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         if (isinstance(selection.account, accounts.GroupNotConfigured)
                 or rule.group in moved):
             continue
-        try:
-            source_identity = accounts.account_identity(accounts.claude_account_dir(selection.account))
-        except accounts.AccountsError:
-            continue
-        if not isinstance(source_identity, agent_accounts.NumberedAccount):
-            continue
-        source = refusals.stored_reading_with_age("claude", source_identity.login, now, stale_after)
+        source_login = accounts.claude_login(accounts.claude_account_dir(selection.account))
+        source = refusals.stored_reading_with_age("claude", source_login, now, stale_after)
         if not isinstance(source, refusals.FreshReading):
             continue
         if source.weekly.left > rule.when.percent:
@@ -1183,21 +1140,22 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
                     and (now - started.at).total_seconds() / 60 < started.duration.minutes):
                 continue
         if selection.account == rule.to:
-            lines.append(_record_blocked_head(state, rule, TargetIsCurrentAccount(), now, dry_run))
+            lines.append(f"{rule.group}: unchanged")
+            if not dry_run:
+                next_moves.write_next_moves(tuple(entry for entry in next_moves.read_next_moves()
+                                                  if entry.id != rule.entry_id))
+                _ = holds.pop(rule.entry_id, None)
+                _ = notices.pop(rule.entry_id, None)
             continue
         try:
-            target_identity = accounts.account_identity(accounts.claude_account_dir(rule.to))
+            target_login = accounts.claude_login(accounts.claude_account_dir(rule.to))
         except accounts.AccountsError as error:
-            lines.append(_record_blocked_head(state, rule, TargetAccountUnavailable(str(error)), now, dry_run))
+            lines.append(str(error).splitlines()[0])
             continue
-        if not isinstance(target_identity, agent_accounts.NumberedAccount):
-            lines.append(_record_blocked_head(state, rule,
-                TargetAccountUnavailable("no readable login"), now, dry_run))
-            continue
-        target = refusals.stored_reading_with_age("claude", target_identity.login, now, stale_after)
+        target = refusals.stored_reading_with_age("claude", target_login, now, stale_after)
         last_read = (target.weekly.at if isinstance(target, (refusals.FreshReading, refusals.StaleReading))
                      and isinstance(target.weekly, refusals.ReadingWindow) else NoTargetReading())
-        target_usage = usage_store.load().get(usage_store.key("Claude", target_identity.login), {})
+        target_usage = usage_store.load().get(usage_store.key("Claude", target_login), {})
         if usage_store.latest_read_outcome(target_usage) in (agent_accounts.UsageReadOutcome.STALE_TOKEN,
                                                           agent_accounts.UsageReadOutcome.NO_LOGIN_TOKEN):
             attempt = accounts.login_renewal_attempts().get(rule.to)
@@ -1213,14 +1171,9 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
             lines.append(_record_blocked_head(state, rule,
                 TargetAtOrBelowThreshold(target.weekly.left, rule.when.percent), now, dry_run))
             continue
-        held = held_refusals.get(refusals.key("claude", target_identity.login))
+        held = held_refusals.get(refusals.key("claude", target_login))
         if held is not None and not refusals.resolved(held, target, now):
             lines.append(_record_blocked_head(state, rule, TargetUnresolvedRefusal(), now, dry_run))
-            continue
-        prepared = (accounts.prepared_account_preview(rule.to, resume=True) if dry_run
-                    else accounts.prepared_account(rule.to, resume=True))
-        if isinstance(prepared, accounts.AccountRefused):
-            lines.append(_record_blocked_head(state, rule, TargetPreparationRefused(prepared.reason), now, dry_run))
             continue
         _ = notices.pop(rule.entry_id, None)
         why = f"auto: {rule.entry_id}"

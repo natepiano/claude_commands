@@ -17,7 +17,6 @@ Ambiguous names return status 1 with up to five matching members.
 A remote member returns status 1 with its machine name.
 A session already running on the target account returns status 0 with an already-running line.
 A session running on another account returns status 1 without a stop.
-A retry accepts a session that started on the target account between attempts.
 The default reason is `resumed by name`.
 
 The shared resume path reads the saved account, environment, arguments, and folder.
@@ -25,17 +24,12 @@ It restores a closed tab through `restore_missing`.
 An explicit CLI resume can restore an intentionally stopped session.
 Automatic recovery preserves an intentional stop.
 A separate terminal starts the account command in the target pane.
+The action check confirms the session before signals or pane input.
 The command changes to the saved folder before the account launch.
 The pane receives one opening message after identity confirmation.
 
-An empty target pane cannot receive its own foreground command through pane typing.
-The own-pane path saves the resolved launch as an attempt before `exec`.
-It preserves the intentional-stop state and records no verified proof before the launch.
-An exec error uses the existing failure path and keeps the pane.
-It uses the same account command with the opening message as a Claude argument.
-It changes to the saved folder and replaces the foreground process.
-The SessionStart hook records the new process and clears the intentional-stop state.
-This path cannot perform the later pid confirmation or detached stay check.
+Resume from the target pane refuses without changing the launch.
+The refusal says: `the session is this pane; type /exit and run resume <name> from another pane`.
 
 `resume_message.py` builds every opening message.
 The restore paths use these causes:
@@ -50,7 +44,13 @@ The restore paths use these causes:
 The relaunch supervisor preserves explicit prompts.
 The pane path marks prompt delivery as `pane` to prevent a second automatic prompt.
 
-`ClaudeUp` means the registry reports a live Claude within 20 seconds. The command prints `ID: Claude is up on ACCOUNT in PANE (2.4 s)` and returns. The elapsed time includes that session's move stop. A detached check watches its pid and start generation for ten seconds. If it ends, the check tells the showrunner, sends the reviewed `shutdown.restart_failed` push, and enters the existing unit watchdog pass for a unit. Probe sessions skip the user push. The watchdog owns later recovery; the stay check does not retry. A Claude that never starts runs the same command in the same pane up to three times, then returns `ResumeFailed: never started`. A missing tab or unreadable identity returns a named failure. Batch stops and resumes run concurrently; all stops finish before any resume. Launch seeding reads process info only for selected panes; the seed CLI still reads all panes.
+`ClaudeUp` means the registry reports a live Claude within 20 seconds.
+Resume makes one attempt.
+A detached check watches its pid and start generation for ten seconds.
+The watchdog owns later recovery.
+A missing tab or unreadable liveness returns a named error.
+All batch stops finish before any resume.
+Launch seeding reads process information only for selected panes.
 
 The shared session registry reader skips a file that vanishes during the scan. It retries a transient unreadable file up to three times, 50 milliseconds apart. Other unreadable evidence remains visible.
 

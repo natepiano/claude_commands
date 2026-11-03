@@ -309,7 +309,11 @@ class UnitWatchdogTests(unittest.TestCase):
             return (sessions.LiveSessionProcess(pid) if any(entry["pid"] == pid for entry in self.fixture.live)
                     else sessions.SessionNotLive())
 
+        def runtime_identity(pid: int | None = None) -> str:
+            return next((owner["session_id"] for owner in self.units.values() if owner["pid"] == pid), "")
+
         with (patch.object(herdr, "shared_session", return_value="shared"),
+              patch.object(staff, "runtime_id", side_effect=runtime_identity),
               patch.object(pane_record, "seed", return_value=0),
               patch.object(stop_resume, "_tab_of", side_effect=tab),
               patch.object(sessions, "process_start", return_value="fixture-start"),

@@ -204,8 +204,8 @@ def _restart(label: str, identity: str, source: str) -> str:
         result = resume(identity, why="unit watchdog recovery", to=label, restore_missing=True)
         if isinstance(result, stop_results.ClaudeUp):
             return ""
-        return (stop_results.resume_failure_reason(result)
-                if isinstance(result, (stop_results.ResumeFailed, stop_results.RunningOnAnotherAccount))
+        return (result.reason
+                if isinstance(result, stop_results.ResumeFailed)
                 else f"{identity}: no pane launch")
     except (OSError, ValueError, herdr.HerdrFailure) as error:
         return str(error)

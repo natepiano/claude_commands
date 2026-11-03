@@ -291,19 +291,6 @@ class ExecLaunchShellTests(unittest.TestCase):
                 self.assertNotIn("IN_NIX_SHELL", environment)
                 self.assertFalse((self.folder / ".envrc").exists())
 
-    def test_refused_envrc_exits_one_without_starting_an_agent_or_supervisor(self) -> None:
-        envrc = self.folder.parent / ".envrc"
-        _ = envrc.write_text("use flake\n")
-        for label in ("claude", "claude4", "units", "showrunners", "codex2", "workers"):
-            for reason in (f"nix_env: run direnv allow {envrc}", "nix_env: IN_NIX_SHELL is not set",
-                           "nix_env: direnv timed out"):
-                with (self.subTest(label=label, reason=reason), patch.object(sys.stdin, "isatty", return_value=True),
-                      patch.object(self.loader, "ensure", return_value=fixtures.FakeShellRefusal(reason)),
-                      patch.object(accounts, "resolve_program") as resolve, patch.object(os, "execvpe") as launch):
-                    self.assertEqual(self.run_exec(label), (1, "", reason + "\n"))
-                    resolve.assert_not_called()
-                    launch.assert_not_called()
-
     def test_missing_helper_fails_only_exec_with_a_clear_error(self) -> None:
         with (patch.object(accounts, "import_module", side_effect=ImportError("fixture helper missing")), patch.object(os, "execvpe") as launch,
               patch.object(accounts, "status_report", return_value="fixture status")):

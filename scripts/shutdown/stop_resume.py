@@ -18,7 +18,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 from threading import Event
 from time import monotonic
-from typing import TYPE_CHECKING, Never, cast
+from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -30,7 +30,6 @@ import herdr
 import pane_record
 from scripts.shutdown.launch_names import LaunchNames
 import pane_launch
-from scripts.shutdown import folder_trust
 from scripts.lib.resume_message import (
     ResumeWorkers as ResumeWorkers,
     NO_WORKERS as NO_WORKERS,
@@ -41,8 +40,7 @@ from scripts.shutdown.stop_results import (
     Stopped as Stopped, NotRunning as NotRunning, StopFailed as StopFailed,
     ClaudeUp as ClaudeUp, ClaudeStartState, ResumePending as ResumePending, MoveHandedOff as MoveHandedOff, ResumeFailed as ResumeFailed,
     SessionNotFound as SessionNotFound, MoveResult as MoveResult, claude_up_line as claude_up_line,
-    RunningOnAnotherAccount as RunningOnAnotherAccount, ResumeResult as ResumeResult,
-    resume_failure_reason as resume_failure_reason,
+    ResumeResult as ResumeResult,
 )
 import sessions
 from launch_permission import shutdown_state_root
@@ -89,6 +87,28 @@ def _same_claude(pid: int, started: str) -> bool:
     return isinstance(identity, sessions.LiveSessionProcess)
 
 
+def _target_matches(identity: str, *, pid: int = 0, started: str = "", pane: str = "", empty: bool = False) -> bool:
+    """Confirm the target before a signal or pane input."""
+    if pid:
+        from scripts.production import staff
+
+        if not started:
+            raise OSError(f"process identity unreadable for pid {pid}")
+        if not _same_claude(pid, started):
+            return False
+        observed = staff.runtime_id(pid)
+    else:
+        client = herdr.Herdr(herdr.shared_session())
+        if empty:
+            if isinstance(client.pane_activity(pane), herdr.PaneAtShell):
+                return True
+            raise OSError(f"{identity}: target pane has live work")
+        observed = client.native_session(pane, "claude", START_SECONDS)
+    if observed != identity:
+        raise OSError(f"{identity}: target process identity is unreadable or differs: {observed}")
+    return True
+
+
 def _record_launches(selected: list[str]) -> None:
     """Seed only selected panes while their Claude still exposes its launch flags."""
     if not selected:
@@ -119,7 +139,7 @@ def stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
                 if entry["session_id"] == result.session_id:
                     pane_record.end(owner, pane, result.session_id)
         except (OSError, ValueError) as error:
-            return StopFailed(result.session_id, f"Claude stopped, but its intentional stop could not be saved: {error}")
+            print(f"{result.session_id}: anomaly: intentional stop was not saved: {error}", file=sys.stderr)
     return result
 
 
@@ -153,10 +173,8 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
             return NotRunning(identity)
         if isinstance(live, sessions.SessionLivenessUnknown):
             return StopFailed(identity, live.reason)
-        started = sessions.process_start(live.pid)
-        if not started:
-            return StopFailed(identity, f"process identity unreadable for pid {live.pid}")
-        if not _same_claude(live.pid, started):
+        started = sessions.process_start(live.pid) or ""
+        if not _target_matches(identity, pid=live.pid, started=started):
             return NotRunning(identity)
         os.kill(live.pid, signal.SIGTERM)
         deadline = monotonic() + STOP_GRACE_SECONDS
@@ -167,7 +185,7 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
             _ = Event().wait(min(0.1, remaining))
         else:
             return Stopped(identity, live.pid)
-        if _same_claude(live.pid, started):
+        if _target_matches(identity, pid=live.pid, started=started):
             os.kill(live.pid, signal.SIGKILL)
             deadline = monotonic() + KILL_GRACE_SECONDS
             while _same_claude(live.pid, started):
@@ -187,7 +205,7 @@ def resume_arguments(entry: pane_record.PaneLaunch) -> list[str]:
 
 
 def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account: str) -> list[str]:
-    """Build the account command for both terminal paths."""
+    """Build the account command for the target pane."""
     client = herdr.Herdr(herdr.shared_session())
     pane = next((pane for pane in client.panes() if pane["pane_id"] == tab.pane_id), None)
     if pane is None:
@@ -201,19 +219,12 @@ def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account:
             *pane_record.resume_arguments(entry)]
 
 
-def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
-                      account: str, message: str) -> Never:
-    """Replace the foreground command with the saved account launch."""
-    command = _pane_command(tab, entry, account)
-    os.chdir(entry["cwd"])
-    os.execvp(command[0], [*command, message])
-
-
 def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account: str, message: str) -> sessions.LiveSessionProcess:
     """Run the account command in the session's own pane, with one resume message."""
     client = herdr.Herdr(herdr.shared_session())
     command = _pane_command(tab, entry, account)
     launched_at = datetime.now(timezone.utc)
+    _ = _target_matches(entry["session_id"], pane=tab.pane_id, empty=True)
     client.run_in_pane(tab.pane_id, command)
     deadline = monotonic() + START_SECONDS
     live = sessions.session_liveness(entry["session_id"])
@@ -225,17 +236,16 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
         live = sessions.session_liveness(entry["session_id"])
     if isinstance(live, sessions.SessionLivenessUnknown):
         raise herdr.HerdrFailure(live.reason)
-    identity = client.native_session(tab.pane_id, "claude", START_SECONDS)
-    if identity != entry["session_id"]:
-        raise herdr.HerdrFailure(f"{entry['session_id']}: resumed registry identity differs: {identity}")
+    identity = entry["session_id"]
+    _ = _target_matches(identity, pane=tab.pane_id)
     opening = herdr.OpeningPrompt(message, herdr.SessionTranscript(Path(entry["config_dir"]), identity))
     outcome = client.submit_opening_prompt(tab.pane_id, opening, launched_at, int(START_SECONDS * 1000))
     if isinstance(outcome, herdr.PromptNotSubmitted):
-        raise herdr.HerdrFailure(f"{identity}: resume prompt not submitted: {outcome.reason}")
+        print(f"{identity}: anomaly: resume prompt not submitted: {outcome.reason}", file=sys.stderr)
     return live
 
 
-def _running_on_account(identity: str, pane_id: str, target: str | None) -> ClaudeUp | ResumeFailed | sessions.SessionNotLive | RunningOnAnotherAccount:
+def _running_on_account(identity: str, pane_id: str, target: str | None) -> ClaudeUp | ResumeFailed | sessions.SessionNotLive:
     """A rerun leaves a proven live destination alone; unreadable attribution cannot authorize a stop."""
     live = sessions.session_liveness(identity)
     if isinstance(live, sessions.SessionNotLive):
@@ -250,10 +260,7 @@ def _running_on_account(identity: str, pane_id: str, target: str | None) -> Clau
         return ResumeFailed(identity, "running Claude account is unreadable")
     label = accounts.claude_config_label(setting.path)
     if target is not None and setting.path != accounts.account_dir(target):
-        return RunningOnAnotherAccount(identity)
-    observed = herdr.Herdr(herdr.shared_session()).native_session(pane_id, "claude", START_SECONDS)
-    if observed != identity:
-        return ResumeFailed(identity, f"resumed registry identity differs: {observed}")
+        return ResumeFailed(identity, "Claude is still running on another account")
     return ClaudeUp(identity, pane_id, label, start_state=ClaudeStartState.ALREADY_RUNNING)
 
 
@@ -278,8 +285,7 @@ def _nearby_resume_names(reference: str, names: LaunchNames) -> list[str]:
 
 
 def resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "",
-           restore_missing: bool = False, resume_ended: bool = False) -> ResumeResult:
-    policy = sessions.retry_policy()
+           restore_missing: bool = False) -> ResumeResult:
     names = LaunchNames.read()
     record = names.tab_record
     member = record.by_member_reference(session)
@@ -295,27 +301,20 @@ def resume(session: str, *, why: str = "resumed by name", to: str | None = None,
         if machine and machine != remote.local_machine():
             return ResumeFailed(session, f"session is on {machine}")
         session = member.current_session
-    attempt = 0
-    while True:
-        result = _resume_once(session, why=why, to=to, requester=requester, restore_missing=restore_missing, resume_ended=resume_ended, names=names)
-        attempt += 1
-        if isinstance(result, SessionNotFound) and not matches:
-            nearby = _nearby_resume_names(session, names)
-            suffix = "; candidates: " + ", ".join(nearby) if nearby else ""
-            return ResumeFailed(session, "unknown name" + suffix)
-        if isinstance(result, RunningOnAnotherAccount):
-            return result
-        if not isinstance(result, ResumeFailed) or attempt >= policy.resume_attempts:
-            return result
-        time.sleep(policy.resume_delay_seconds)
+    result = _resume_once(session, why=why, to=to, requester=requester, restore_missing=restore_missing,
+                          names=names)
+    if isinstance(result, SessionNotFound) and not matches:
+        nearby = _nearby_resume_names(session, names)
+        suffix = "; candidates: " + ", ".join(nearby) if nearby else ""
+        return ResumeFailed(session, "unknown name" + suffix)
+    return result
 
 
 def _resume_once(session: str, *, why: str, to: str | None = None, requester: str = "",
-                 restore_missing: bool = False, resume_ended: bool = False, names: LaunchNames) -> ResumeResult:
+                 restore_missing: bool = False, names: LaunchNames) -> ResumeResult:
     began = monotonic()
     identity = session
     original: pane_launch.LaunchPublication | None = None
-    attempt_pane = ""
     try:
         member = names.tab_record.by_member_reference(session)
         if member is not None:
@@ -328,8 +327,6 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             original = pane_record.publication_for_session(session, record=names.tab_record)
             if original is None:
                 return tab
-            if original.path != pane_record.record_path(client.session):
-                return ResumeFailed(identity, "recovery across retained session files requires an explicit transfer")
             entry = original.entry
         else:
             if tab.session_id is None:
@@ -342,15 +339,16 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             entry = names.resume(entry)
         pane_id = entry["pane_id"] if isinstance(tab, SessionNotFound) and entry is not None else (
             tab.pane_id if isinstance(tab, herdr.TabSession) else "")
+        if pane_id and os.environ.get("HERDR_PANE_ID") == pane_id:
+            return ResumeFailed(identity, "the session is this pane; type /exit and run resume <name> from another pane")
         running = _running_on_account(identity, pane_id, to)
         if not isinstance(running, sessions.SessionNotLive):
             return running
-        if entry is None or entry["session_id"] != identity:
-            return ResumeFailed(identity, "pane launch entry does not match the session")
-        if restore_missing and not resume_ended and entry.get("ended", False):
-            return ResumeFailed(identity, "Claude was closed by hand")
-        if not entry.get("flags_read", False):
-            return ResumeFailed(identity, "pane launch flags are unknown")
+        if entry is None:
+            return SessionNotFound(session)
+        if entry["session_id"] != identity:
+            print(f"{identity}: anomaly: pane launch entry names {entry['session_id']}", file=sys.stderr)
+            entry["session_id"] = identity
         entry["environment"] = names.environment(entry)
         from inventory import codex_seats
         import unit_runs
@@ -364,78 +362,49 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                       Path(entry["environment"].get("CLAUDE_CONFIG_DIR", str(source))))
         label = to if to is not None else accounts.claude_config_label(target_dir)
         account_environment = named_account_environment(target_dir)
-        trust = folder_trust.heal(Path(entry["cwd"]), target_dir, source)
-        if isinstance(trust, (folder_trust.FolderNotTrusted, folder_trust.FolderTrustUnreadable)):
-            return ResumeFailed(identity, f"{trust.reason}. Run: {trust.command}")
-        if to is not None and original is not None and Path(original.entry["config_dir"]) != target_dir:
-            original = pane_launch.finish_restore(original.path, original.entry,
-                pane_launch.ResumeAttempt(original.entry["pane_id"], original.entry),
-                pane_launch.PreparedAccountMove(target_dir, account_environment), close=client.close_tab_confirmed)
         entry = entry.copy()
         entry["config_dir"] = str(target_dir)
         entry["environment"] = {**entry["environment"], **account_environment}
+        if to is not None and original is not None and Path(original.entry["config_dir"]) != target_dir:
+            try:
+                pane_record.write(client.session, entry)
+            except (OSError, ValueError) as error:
+                print(f"{identity}: anomaly: target account was not saved: {error}", file=sys.stderr)
         if isinstance(tab, SessionNotFound):
             with herdr.restore_staff(names.tab_record, labels=names.labels):
                 pane = client.open_tab(entry["environment"].get("SHOWRUNNER_UNIT", "agents"),
                     entry["name"] or identity, entry["cwd"], entry["environment"])
             entry = entry.copy()
             entry["pane_id"] = pane
-            attempt_pane = pane
             tab = next((item for item in client.tab_sessions() if item.pane_id == pane), None)
             if tab is None:
                 raise herdr.HerdrFailure("new recovery pane is unavailable")
             tab = replace(tab, session_id=identity)
         elif entry["name"]:
-            with herdr.restore_staff(names.tab_record, labels=names.labels):
-                _ = client.retitle(tab.pane_id, entry["name"])
-        copied_from = trust.source if isinstance(trust, herdr.TrustCopied) else ""
+            try:
+                with herdr.restore_staff(names.tab_record, labels=names.labels):
+                    _ = client.retitle(tab.pane_id, entry["name"])
+            except (OSError, ValueError, herdr.HerdrFailure) as error:
+                print(f"{identity}: anomaly: tab title was not set: {error}", file=sys.stderr)
         workers = ResumeWorkers(codex_seats([Path(run) for run in unit_runs.held(identity)]), entry["cwd"])
         message = resume_message(why, moved_from=source_label if to else None,
                                  moved_to=to, workers=workers)
-        if os.environ.get("HERDR_PANE_ID") == tab.pane_id:
-            if original is None:
-                raise ValueError("resume has no original publication")
-            with pane_record.locked(client.session):
-                entries = pane_record.read_strict(client.session)
-                if entries.get(tab.pane_id) != original.entry:
-                    raise ValueError("retained launch changed before the resume attempt")
-                pending = entry.copy()
-                pending["session_id"] = original.entry["session_id"]
-                entries[tab.pane_id] = pending
-                pane_record.save(client.session, entries)
-            attempt_pane = tab.pane_id
-            _exec_in_own_pane(tab, entry, label, message)
-        live = sessions.session_liveness(identity)
-        if isinstance(live, sessions.SessionLivenessUnknown):
-            raise herdr.HerdrFailure(live.reason)
-        if isinstance(live, sessions.SessionNotLive):
-            attempt_pane = tab.pane_id
-            live = _start_session(tab, entry, label, message)
-        else:
-            observed = client.native_session(tab.pane_id, "claude", START_SECONDS)
-            if observed != identity:
-                raise herdr.HerdrFailure(f"resumed registry identity differs: {observed}")
-        if original is None:
-            raise ValueError("resume has no original publication")
+        running = _running_on_account(identity, tab.pane_id, label)
+        if not isinstance(running, sessions.SessionNotLive):
+            return running
+        live = _start_session(tab, entry, label, message)
         generation = sessions.process_start(live.pid)
-        if not generation:
-            raise herdr.HerdrFailure(f"process identity unreadable for pid {live.pid}")
-        attempt = pane_launch.resume_attempt(original.path, tab.pane_id)
-        proof = names.resume_proof(original.entry, entry)
-        attempt_pane = ""
-        pane_launch.finish_restore(original.path, original.entry, attempt, proof, close=client.close_tab_confirmed)
-        _detach(["stay", "--session", identity, "--pane", tab.pane_id,
-                 "--account", label, "--pid", str(live.pid), "--generation", generation, "--why", why,
-                 *(["--requester", requester] if requester else [])], "stay")
-        return ClaudeUp(identity, tab.pane_id, label, monotonic() - began, copied_from)
-    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
-        if original is not None and attempt_pane:
+        if generation:
             try:
-                attempt = pane_launch.resume_attempt(original.path, attempt_pane)
-                pane_launch.finish_restore(original.path, original.entry, attempt, pane_launch.FailedResume(),
-                                           close=herdr.Herdr(original.path.stem).close_tab_confirmed)
-            except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as cleanup:
-                return ResumeFailed(identity, f"{error}; cleanup failed: {cleanup}")
+                _detach(["stay", "--session", identity, "--pane", tab.pane_id,
+                         "--account", label, "--pid", str(live.pid), "--generation", generation, "--why", why,
+                         *(["--requester", requester] if requester else [])], "stay")
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                print(f"{identity}: anomaly: stay check did not start: {error}", file=sys.stderr)
+        else:
+            print(f"{identity}: anomaly: process identity unreadable for pid {live.pid}", file=sys.stderr)
+        return ClaudeUp(identity, tab.pane_id, label, monotonic() - began)
+    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
         return ResumeFailed(identity, str(error))
 
 
@@ -591,27 +560,29 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                 stopped.append(result)
             except Exception as error:
                 stopped.append(StopFailed(session, str(error)))
-        def resume_moved(identity: str) -> ResumeResult:
-            result = (resume(identity, why=why, to=target, requester=requester) if requester else
-                      resume(identity, why=why, to=target))
+        def resume_moved(identity: str, missing: bool) -> ResumeResult:
+            result = (resume(identity, why=why, to=target, requester=requester, restore_missing=missing) if requester else
+                      resume(identity, why=why, to=target, restore_missing=missing))
             return replace(result, elapsed_seconds=monotonic() - began) if isinstance(result, ClaudeUp) else result
 
-        resumes = {index: pool.submit(resume_moved, result.session_id)
-                   for index, result in enumerate(stopped) if isinstance(result, (Stopped, NotRunning))}
+        resumes = {index: pool.submit(resume_moved, result.name if isinstance(result, SessionNotFound) else result.session_id,
+                                      isinstance(result, SessionNotFound))
+                   for index, result in enumerate(stopped) if isinstance(result, (Stopped, NotRunning, SessionNotFound))}
         outcomes: list[MoveResult] = []
         for index, result in enumerate(stopped):
-            if isinstance(result, (StopFailed, SessionNotFound, ClaudeUp)):
+            if isinstance(result, (StopFailed, ClaudeUp)):
                 outcomes.append(result)
                 continue
             try:
                 resumed = resumes[index].result()
-                if isinstance(resumed, (ClaudeUp, RunningOnAnotherAccount)):
+                if isinstance(resumed, (ClaudeUp, SessionNotFound)):
                     outcomes.append(resumed)
                 else:
-                    reason = "session has no tab after stop" if isinstance(resumed, SessionNotFound) else resumed.reason
-                    outcomes.append(ResumePending(result.session_id, target, reason))
+                    identity = result.name if isinstance(result, SessionNotFound) else result.session_id
+                    outcomes.append(ResumePending(identity, target, resumed.reason))
             except Exception as error:
-                outcomes.append(ResumePending(result.session_id, target, str(error)))
+                identity = result.name if isinstance(result, SessionNotFound) else result.session_id
+                outcomes.append(ResumePending(identity, target, str(error)))
         return outcomes
 
 
