@@ -19,7 +19,7 @@ port_lint.py writes its own call records through write_call() here.
       From invoke.sh's run(), before every step: print the tree key
       (treekey.py) of the worktree the step would be recorded under, or
       nothing.
-  record.py test-phase-context RESERVATION ARGV...
+  record.py test-phase-context SAMPLING_CONTEXT ARGV...
       Before release, print the reservation's repository and filter metadata
       with the actual post-share argv's test width. The sampler adds its window.
   record.py call OUTCOME STATUS CACHED WAIT WALL BUILD SAVED ELAPSED VERB [ARG...]
@@ -601,12 +601,16 @@ def pending_steps_root() -> Path:
     return store.root() / "pending-steps"
 
 
-def test_phase_context(reservation: Path, argv: list[str]) -> dict[str, object]:
+def test_phase_context(sampling_context: str, argv: list[str]) -> dict[str, object]:
     """Copy admission's selection, using the argv that actually runs for its width."""
-    loaded = cast(object, json.loads(reservation.read_text()))
+    loaded = cast(object, json.loads(sampling_context))
     if not isinstance(loaded, dict):
-        raise ValueError("test-phase reservation is not an object")
+        raise ValueError("test-phase sampling context is not an object")
     fields = cast(dict[str, object], loaded)
+    call = fields.get("call_id")
+    if isinstance(call, dict):
+        recorded_call = memory_admit.parse_snapshot_value(cast(dict[str, object], call), memory_admit.Call)
+        fields["call_id"] = recorded_call.call_id if isinstance(recorded_call, memory_admit.CallRecord) else None
     # Admission's parser returns the first width. Supplying nextest's environment
     # default last preserves an explicit flag, including a nonnumeric one.
     width_argv = argv
@@ -1285,7 +1289,7 @@ def main(argv: list[str]) -> int:
             if found:
                 print(found)
         elif command == "test-phase-context":
-            print(json.dumps(test_phase_context(Path(rest[0]), rest[1:]), separators=(",", ":")))
+            print(json.dumps(test_phase_context(rest[0], rest[1:]), separators=(",", ":")))
         elif command == "hold-event":
             hold_event(rest)
         elif command == "hold-build":

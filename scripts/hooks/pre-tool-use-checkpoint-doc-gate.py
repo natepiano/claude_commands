@@ -62,13 +62,14 @@ import re
 import shlex
 import shutil
 import subprocess
-import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Protocol, cast
 
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 class CheckpointParser(Protocol):
     SUBJECT: re.Pattern[str]
@@ -98,11 +99,14 @@ def git(directory: Path, *arguments: str, environment: Mapping[str, str] = os.en
 
 def commit_tree(directory: Path, every: bool) -> str:
     """Write a tree using a private index; -a adds only tracked working changes."""
-    with tempfile.TemporaryDirectory(prefix="checkpoint-doc-", dir="/tmp") as temporary:
+    from scripts.lib import build_folders
+
+    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
+            build_folders.FOLDER_PREFIXES["checkpoint-doc"], build_folders.SystemTemporaryParent())) as temporary:
         index = Path(git(directory, "rev-parse", "--git-path", "index"))
         if not index.is_absolute():
             index = directory / index
-        private_index = Path(temporary) / "index"
+        private_index = temporary / "index"
         if index.exists():
             _ = shutil.copyfile(index, private_index)
         environment = {**os.environ, "GIT_INDEX_FILE": str(private_index)}
@@ -113,8 +117,11 @@ def commit_tree(directory: Path, every: bool) -> str:
 
 def path_commit_tree(directory: Path, paths: tuple[str, ...], include_staged: bool) -> str:
     """Select working paths over HEAD (--only) or over the index (--include)."""
-    with tempfile.TemporaryDirectory(prefix="checkpoint-paths-", dir="/tmp") as temporary:
-        private_index = Path(temporary) / "index"
+    from scripts.lib import build_folders
+
+    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
+            build_folders.FOLDER_PREFIXES["checkpoint-paths"], build_folders.SystemTemporaryParent())) as temporary:
+        private_index = temporary / "index"
         environment = {**os.environ, "GIT_INDEX_FILE": str(private_index)}
         if include_staged:
             index = Path(git(directory, "rev-parse", "--git-path", "index"))

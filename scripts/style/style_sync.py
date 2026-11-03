@@ -12,13 +12,13 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import build_folders
 from types import FrameType, MappingProxyType
 from typing import Literal, cast
 
@@ -47,8 +47,8 @@ VERIFY = SCRIPTS / "direct/verify.sh"
 LEDGER = SCRIPTS / "style/style_ledger.py"
 TOOLS: tuple[style_ledger.LintTool, ...] = ("clippy", "mend", "rustfmt")
 # Each lint run owns one `style-sync-lint-*` dir here; a later run removes the dir of a run that was killed.
-LINT_TEMP_PARENT = Path(tempfile.gettempdir())
-LINT_PREFIX = "style-sync-lint-"
+LINT_TEMP_PARENT: Path | build_folders.InheritedTemporaryParent = build_folders.InheritedTemporaryParent()
+LINT_PREFIX = build_folders.FOLDER_PREFIXES["style-sync-lint"]
 OWNER_FILE = "owner.json"
 # Written by the verifier itself, so a SIGKILL of the owner right after Popen still leaves its group recorded.
 VERIFIER_FILE = "verifier.pgid"
@@ -101,6 +101,13 @@ def notify(repo_dir: Path, branch: str, tip: str) -> None:
     except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
         detail = " ".join(str(error).splitlines()).removeprefix("style_sync: ")
         print("style_sync: notify: " + detail)
+
+
+def lint_temp_parent() -> Path:
+    """Read the current temporary parent unless a test supplies its own parent."""
+    if isinstance(LINT_TEMP_PARENT, Path):
+        return LINT_TEMP_PARENT
+    return build_folders.inherited_temporary_parent()
 
 
 def lint_records(output: str, checkout: Path) -> tuple[ToolLintRecord, ...]:
@@ -330,7 +337,7 @@ def sweep_stale_lint_dirs() -> None:
     A dir without a readable owner record, or whose owner or verifier group runs, stays: a reused id
     keeps a dir, it never removes a running checkout. A failure prints one line and the run continues.
     """
-    for directory in sorted(LINT_TEMP_PARENT.glob(f"{LINT_PREFIX}*")):
+    for directory in sorted(lint_temp_parent().glob(f"{LINT_PREFIX}*")):
         try:
             remove_if_stale(directory)
         # Any failure of one dir's sweep; LintStopped and KeyboardInterrupt are not an Exception.
@@ -364,7 +371,8 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
     sweep_stale_lint_dirs()
     # Signals stay held outside the work, so the dir never exists without its record and its cleanup path.
     with stop_signals_raise(), locked_lint_target(Path(common_dir)) as target, signal_mask(signal.SIG_BLOCK):
-        directory = Path(tempfile.mkdtemp(prefix=LINT_PREFIX, dir=LINT_TEMP_PARENT))
+        directory = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
+            LINT_PREFIX, build_folders.ExplicitBuildParent(lint_temp_parent())))
         snapshot = directory / "checkout"
         try:
             OwnerRecord(os.getpid(), Path(common_dir)).write(directory)

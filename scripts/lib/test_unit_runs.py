@@ -26,6 +26,23 @@ class UnitRunsTest(unittest.TestCase):
         self.assertEqual(unit_runs.run_roots(), (Path("/tmp/claude/unit"), Path("/tmp/claude/delegate")))
         self.assertEqual(unit_runs.active_dirs(), (Path("/tmp/claude/unit/active"), Path("/tmp/claude/delegate/active")))
 
+    def test_activate_moves_only_its_marker_to_the_current_root(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            current, former = root / "unit", root / "delegate"
+            old = former / "active"
+            old.mkdir(parents=True)
+            _ = (old / "moving-session").write_text("old run\n")
+            _ = (old / "other-session").write_text("keep other run\n")
+            run = current / "private-run"
+            with patch.object(unit_runs, "RUN_ROOT", current), patch.object(unit_runs, "FORMER_RUN_ROOT", former):
+                unit_runs.activate(run, "moving-session")
+                self.assertEqual(unit_runs.marker("moving-session").read_text(), f"{run}\n")
+                unit_runs.activate(run, "moving-session")
+                self.assertEqual(unit_runs.marker("moving-session").read_text(), f"{run}\n")
+            self.assertFalse((old / "moving-session").exists())
+            self.assertEqual((old / "other-session").read_text(), "keep other run\n")
+
     def test_an_override_replaces_both_names(self) -> None:
         self.assertEqual(unit_runs.run_roots("/x/runs"), (Path("/x/runs"),))
         self.assertEqual(unit_runs.active_dirs("/x/active"), (Path("/x/active"),))
