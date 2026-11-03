@@ -264,11 +264,18 @@ def parse_record(text: str, schema: type[T]) -> T:
     return cast(T, gate.parse_snapshot_value(value, schema))
 
 
-def _encode(value: object, variants: dict[str, type]) -> str:
+def _encode(value: object, variants: dict[str, type], *, main_service: bool = False) -> str:
     name = next((name for name, schema in variants.items() if type(value) is schema), None)
     if name is None:
         raise ValueError("unknown admission message")
-    return encode_record({"v": VERSION, "type": name, "data": value}) + "\n"
+    data = gate.snapshot_value(value)
+    # Remove these main-service field omissions after the admission cut-over.
+    omitted: set[str] = {"run"} if isinstance(value, AdmitRequest) and isinstance(value.run, NoRun) else set()
+    if main_service and isinstance(value, CallerCode):
+        omitted.add("code_version")
+    for field_name in omitted:
+        del cast(dict[str, object], data)[field_name]
+    return encode_record({"v": VERSION, "type": name, "data": data}) + "\n"
 
 
 def _parse(line: str | bytes, variants: dict[str, type]) -> object:
@@ -304,9 +311,9 @@ def _validate_cleanup(request: Request) -> None:
         raise ValueError("cleanup status exceeds signed 64-bit range")
 
 
-def encode_request(request: Request) -> str:
+def encode_request(request: Request, *, main_service: bool = False) -> str:
     _validate_cleanup(request)
-    return _encode(request, _REQUESTS)
+    return _encode(request, _REQUESTS, main_service=main_service)
 
 
 def parse_request(line: str | bytes) -> Request:

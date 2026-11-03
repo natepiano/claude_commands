@@ -144,6 +144,8 @@ def pressure_text(pressure: gate.MemoryPressure, zone: ZoneInfo,
                 + head_facts.clock(pressure.next_start_at, zone))
     values = (f"memory pressure: full avg10 {pressure.full_avg10:.1f}%, "
               + f"some avg10 {pressure.some_avg10:.1f}%, swap used {pressure.swap_used_percent:.1f}%")
+    if isinstance(pressure.condition, gate.PressureConditionNotRecorded):
+        return values + "; condition not recorded by service"
     if pressure.condition == "swap":
         return (values + f"; starts when swap is at most {policy.pressure.swap_used_limit:g}% "
                 + f"or some avg10 is at most {policy.pressure.some_avg10_limit:.1f}%")

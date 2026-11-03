@@ -551,12 +551,17 @@ class NoPressureHold:
 
 
 @dataclass(frozen=True)
+class PressureConditionNotRecorded:
+    pass
+
+
+@dataclass(frozen=True)
 class MemoryPressure:
     full_avg10: float
     some_avg10: float = 0.0
     swap_used_percent: float = 0.0
     next_start_at: float = 0.0
-    condition: Literal["full", "swap"] = "full"
+    condition: Literal["full", "swap"] | PressureConditionNotRecorded = "full"
 
 
 @dataclass(frozen=True)
@@ -2696,6 +2701,9 @@ def pressure_with_recovery(recovery: RecoverySpacing, pressure: Pressure, now: f
 def pressure_text(pressure: MemoryPressure, policy: AdmissionPolicy) -> str:
     if pressure.next_start_at:
         return f"memory pressure recovery: starts at least {policy.timing.recovery_start_seconds:g} s apart"
+    if isinstance(pressure.condition, PressureConditionNotRecorded):
+        return (f"memory pressure: condition not recorded by service; full avg10 {pressure.full_avg10:.1f}; "
+                f"some avg10 {pressure.some_avg10:.1f}; swap {pressure.swap_used_percent:.1f}% used")
     if pressure.condition == "swap":
         return f"memory pressure: swap {pressure.swap_used_percent:.1f}% used; some avg10 {pressure.some_avg10:.1f}"
     return f"memory pressure: full avg10 {pressure.full_avg10:.1f}"
@@ -3556,8 +3564,28 @@ def parse_snapshot_value(value: object, schema: object) -> object:
             raise ValueError("missing snapshot row field")
         return {name: parse_snapshot_value(item, annotations[name]) for name, item in record.items()
                 if name in annotations}
+    if "diagnostics" in annotations and "fallbacks" in record and "diagnostics" not in record:
+        # Main records use the former field and tag for the same diagnostic text.
+        main_fallbacks = record["fallbacks"]
+        if not isinstance(main_fallbacks, list):
+            raise ValueError("invalid main-service diagnostics")
+        diagnostics: list[object] = []
+        for item in cast(list[object], main_fallbacks):
+            if not isinstance(item, dict):
+                raise ValueError("invalid main-service diagnostic")
+            main_diagnostic = cast(dict[str, object], item)
+            if main_diagnostic.get("kind") != "ConfigFallback":
+                raise ValueError("invalid main-service diagnostic")
+            diagnostics.append({**main_diagnostic, "kind": "ConfigurationDiagnostic"})
+        record = {name: item for name, item in record.items() if name != "fallbacks"}
+        record["diagnostics"] = diagnostics
     if schema is StepProfile and record.keys() == annotations.keys() - {"build_history_generation"} | {"kind"}:
         record = {**record, "build_history_generation": snapshot_value(NoBuildHistoryGeneration())}
+    if schema is MemoryPressure:
+        # Remove this main-service compatibility after the admission cut-over.
+        main_pressure_fields = annotations.keys() - {"condition"} | {"kind"}
+        if record.keys() == main_pressure_fields:
+            record = {**record, "condition": snapshot_value(PressureConditionNotRecorded())}
     if schema in (RunningStep, UnownedSliceMemory):
         # Older services omit display evidence that these fields add.
         for member in fields(schema):

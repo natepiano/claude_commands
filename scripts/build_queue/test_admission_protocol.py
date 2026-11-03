@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import unittest
-from typing import cast
+from typing import Literal, cast
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -43,6 +43,84 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.splitlines(), [before, before])
             self.assertNotEqual(wire.admission_code_version(scripts), before)
+
+    def test_main_service_running_steps_keep_their_identity_and_memory(self) -> None:
+        raw = (Path(__file__).with_name("fixtures") / "live_main_view.json").read_bytes()
+        reply = wire.parse_reply(raw, wire.ViewRequest())
+        assert isinstance(reply, wire.ViewReply)
+        running = reply.reading.view.running
+        recorded = cast(dict[str, object], json.loads(raw))
+        data = cast(dict[str, object], recorded["data"])
+        reading = cast(dict[str, object], data["reading"])
+        view = cast(dict[str, object], reading["view"])
+        source = cast(list[dict[str, object]], view["running"])
+        self.assertEqual(len(running), len(source))
+        self.assertTrue(running)
+        for step, original in zip(running, source, strict=True):
+            self.assertEqual((step.session_id, step.session_name, step.step, step.folder, step.promise),
+                             tuple(original[key] for key in ("session_id", "session_name", "step", "folder", "promise")))
+            measured = cast(dict[str, object], original["measured"])
+            self.assertEqual(cast(dict[str, object], gate.snapshot_value(step.measured))["bytes"], measured["bytes"])
+
+    def test_main_service_unowned_memory_keeps_its_charge_and_scope(self) -> None:
+        raw = (Path(__file__).with_name("fixtures") / "live_main_explain.json").read_bytes()
+        reply = wire.parse_reply(raw, wire.ExplainRequest())
+        assert isinstance(reply, wire.ExplainReply)
+        unowned = [row for row in reply.explanation.running if isinstance(row.step.measured, gate.UnownedSliceMemory)]
+        self.assertTrue(unowned)
+        for row in unowned:
+            memory = row.step.measured
+            assert isinstance(memory, gate.UnownedSliceMemory)
+            self.assertEqual(row.measured, memory.bytes)
+            self.assertGreaterEqual(row.charged, memory.bytes)
+            self.assertTrue(memory.cgroup.endswith(memory.owner))
+
+    def test_no_run_admission_uses_main_fields_but_run_identity_remains_explicit(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            encoded = cast(dict[str, object], json.loads(wire.encode_request(request)))
+            data = cast(dict[str, object], encoded["data"])
+            self.assertNotIn("run", data)
+            self.assertEqual(wire.parse_request(wire.encode_request(request)), request)
+            run = wire.RunIdentity(123, "456")
+            run_request = replace(request, run=run)
+            self.assertEqual(wire.parse_request(wire.encode_request(run_request)), run_request)
+            run_encoded = cast(dict[str, object], json.loads(wire.encode_request(run_request)))
+            self.assertEqual(cast(dict[str, object], run_encoded["data"])["run"], gate.snapshot_value(run))
+
+    def test_pressure_condition_variants_keep_their_meaning_through_the_codec(self) -> None:
+        conditions: tuple[gate.PressureConditionNotRecorded | Literal["full", "swap"], ...] = (
+            "full", "swap", gate.PressureConditionNotRecorded())
+        for condition in conditions:
+            with self.subTest(condition=condition):
+                pressure = gate.MemoryPressure(8, 15, 80, condition=condition)
+                reply = wait_reply(pressure)
+                reply = replace(reply, snapshot=replace(reply.snapshot,
+                    decision=replace(reply.snapshot.decision, pressure=pressure)))
+                self.assertEqual(wire.parse_reply(wire.encode_reply(reply)), reply)
+
+    def test_main_service_requests_omit_only_new_fields_and_preserve_every_main_field(self) -> None:
+        # Main's encoder produced these records before the admission cut-over.
+        lines = (Path(__file__).with_name("fixtures") / "main_request_records.jsonl").read_text().splitlines()
+        for line in lines:
+            with self.subTest(request=cast(dict[str, object], json.loads(line))["type"]):
+                original = wire.parse_request(line)
+                current = replace(original, code_version="current-caller-version")
+                self.assertEqual(wire.parse_request(wire.encode_request(current)), current)
+                compatible = wire.encode_request(current, main_service=True)
+                self.assertEqual(json.loads(compatible), json.loads(line))
+                self.assertEqual(wire.parse_request(compatible), original)
+
+    def test_main_service_configuration_diagnostic_keeps_the_recorded_text(self) -> None:
+        raw = cast(dict[str, object], json.loads(
+            (Path(__file__).with_name("fixtures") / "main_pressure_wait.json").read_text()))
+        data = cast(dict[str, object], raw["data"])
+        snapshot = cast(dict[str, object], data["snapshot"])
+        message = "main service recorded a configuration warning"
+        snapshot["fallbacks"] = [{"kind": "ConfigFallback", "diagnostic": message}]
+        reply = wire.parse_reply(json.dumps(raw))
+        assert isinstance(reply, wire.Wait)
+        self.assertEqual(reply.snapshot.diagnostics, (gate.ConfigurationDiagnostic(message),))
 
     def test_every_request_round_trips_with_profiles_width_and_call_states(self) -> None:
         with AdmissionFixture() as fixture:

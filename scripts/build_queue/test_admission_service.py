@@ -2882,7 +2882,7 @@ class RunPlaceTests(unittest.TestCase):
             request = fixture.request()
             envelope = wire.parse_record(wire.encode_request(request), dict[str, object])
             data = cast(dict[str, object], envelope["data"])
-            del data["run"]
+            _ = data.pop("run", None)
             legacy = wire.encode_record(envelope) + "\n"
             peer = fixture.connect(legacy)
             self.assertIsInstance(peer.replies()[0], wire.Wait)

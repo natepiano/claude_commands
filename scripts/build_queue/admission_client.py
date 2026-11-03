@@ -89,13 +89,16 @@ def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest) -
     request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
     deadline = CLOCK.monotonic() + QUERY_TIMEOUT_SECONDS
     try:
-        with _connect(QUERY_TIMEOUT_SECONDS) as connection:
-            connection.sendall(wire.encode_request(request).encode())
-            line = _line(connection, bytearray(), deadline)
-            reply = wire.parse_reply(line, request)
-            if isinstance(reply, wire.Refused):
-                raise wire.AdmissionUnavailable(reply.reason)
-            return reply
+        for main_service in (False, True):
+            with _connect(QUERY_TIMEOUT_SECONDS) as connection:
+                connection.sendall(wire.encode_request(request, main_service=main_service).encode())
+                line = _line(connection, bytearray(), deadline)
+                reply = wire.parse_reply(line, request)
+                if isinstance(reply, wire.Refused):
+                    if not main_service and reply.reason == "invalid snapshot record fields":
+                        continue
+                    raise wire.AdmissionUnavailable(reply.reason)
+                return reply
     except FileNotFoundError as error:
         raise wire.AdmissionUnavailable("no socket") from error
     except ConnectionRefusedError as error:
@@ -265,6 +268,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
              configuration: gate.MemoryConfig | wire.CleanupTiming
              ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue:
     first = request
+    main_service = False
     leave_interval = (configuration.running_pass_seconds if isinstance(configuration, gate.MemoryConfig)
                       else configuration.reconnect_seconds)
     generation_query = isinstance(first, wire.BuildHistoryRequest)
@@ -294,7 +298,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                 send_timeout = retry.bound(timeout)
                 if active_channel is not None or send_timeout < timeout:
                     connection.settimeout(send_timeout)
-                connection.sendall(wire.encode_request(request).encode())
+                connection.sendall(wire.encode_request(request, main_service=main_service).encode())
                 pending = active_channel.pending if active_channel is not None else bytearray()
                 while True:
                     deadline = max(last_valid, last_silence_notice) + configuration.silence_seconds
@@ -324,6 +328,9 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                     if CLOCK.monotonic() > retry.deadline:
                         return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
                     if isinstance(reply, wire.Refused):
+                        if not main_service and reply.reason == "invalid snapshot record fields":
+                            main_service = True
+                            break
                         if generation_query:
                             return reply
                         return _refused(reply.reason, checker=isinstance(first, (wire.AdmitRequest, wire.LaunchRequest)))

@@ -6,9 +6,11 @@ from contextlib import redirect_stderr
 from dataclasses import replace
 import io
 import os
+from pathlib import Path
 import sys
 import unittest
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 from scripts.lint import memory_admit as gate
 from typing import TYPE_CHECKING
@@ -17,6 +19,7 @@ if TYPE_CHECKING:
 else:
     import conf
 from scripts.build_queue import admission_client as client, admission_protocol as wire
+from scripts.build_queue import queue_evidence
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
 from scripts.build_queue.admission_test_support import (
     AdmissionFixture, Exchange, GIB, ScriptedTransport, TimedChunk, reply_bytes,
@@ -48,6 +51,93 @@ class ClientTests(unittest.TestCase):
             self.assertIn("head_seconds", errors.getvalue())
             self.assertEqual(len(errors.getvalue().splitlines()), 1)
             self.assertFalse(fixture.server.reservations)
+
+    def test_live_main_gate_grant_is_admitted_and_released(self) -> None:
+        # Capture: gate_reservation used the live main service on 2026-11-03.
+        grant_line, release_line = (Path(__file__).with_name("fixtures") / "live_main_gate.jsonl").read_bytes().splitlines(keepends=True)
+        with AdmissionFixture() as fixture:
+            request = replace(fixture.request(), profile=gate.ProgramProfile(
+                "merge-gate", "repo", str(fixture.root), gate.FixedCapSizing(1 << 20)))
+            transport = self.use_transport(fixture, Exchange(grant_line), Exchange(release_line))
+            waits: list[wire.Wait] = []
+            result = client.admit(request, waits.append, lambda: request)
+            self.assertIsInstance(result, wire.Admitted)
+            assert isinstance(result, wire.Admitted)
+            self.assertEqual((result.need, result.source), (1 << 20, "cap"))
+            self.assertEqual(waits, [])
+            self.assertIsInstance(client.release(result.reservation, 0, result.cleanup_timing), wire.Ok)
+            self.assertEqual(transport.requests[0], request)
+            release = transport.requests[1]
+            assert isinstance(release, wire.ReleaseRequest)
+            self.assertEqual((release.reservation, release.status), (result.reservation, 0))
+
+    def test_live_main_queue_replies_pass_the_client_query_paths(self) -> None:
+        directory = Path(__file__).with_name("fixtures")
+        view_reply = (directory / "live_main_view.json").read_bytes()
+        explain_reply = (directory / "live_main_explain.json").read_bytes()
+        with AdmissionFixture() as fixture:
+            transport = self.use_transport(fixture, Exchange(view_reply), Exchange(explain_reply))
+            reading = client.view()
+            explanation = client.explain()
+            self.assertTrue(reading.view.running)
+            self.assertTrue(explanation.running)
+            self.assertGreater(explanation.totals.measured, 0)
+            self.assertEqual(transport.requests, [wire.ViewRequest(code_version=client.LOADED_ADMISSION_CODE_VERSION),
+                                                  wire.ExplainRequest(code_version=client.LOADED_ADMISSION_CODE_VERSION)])
+
+    def test_main_service_pressure_snapshot_waits_then_admits_without_inventing_condition(self) -> None:
+        # Main aeb936809630c8a539613d4b0def9dce0db040c0 produced this reply through wire.encode_reply.
+        main_reply = (Path(__file__).with_name("fixtures") / "main_pressure_wait.json").read_bytes()
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            transport = self.use_transport(fixture, Exchange(main_reply, reply_bytes(GRANTED)))
+            waits: list[wire.Wait] = []
+            result = client.admit(request, waits.append, lambda: request)
+            self.assertEqual(result, GRANTED)
+            self.assertEqual(transport.requests, [request])
+            self.assertEqual(len(waits), 1)
+            pressure = waits[0].snapshot.decision.pressure
+            assert isinstance(pressure, gate.MemoryPressure)
+            self.assertIsInstance(pressure.condition, gate.PressureConditionNotRecorded)
+            self.assertEqual((pressure.full_avg10, pressure.some_avg10, pressure.swap_used_percent), (8, 15, 80))
+            self.assertEqual(waits[0].reason, pressure)
+            self.assertEqual([step.measured.bytes for step in waits[0].snapshot.running
+                              if isinstance(step.measured, gate.MeasuredMemory)], [4 * GIB, GIB])
+            self.assertEqual(gate.pressure_text(pressure, waits[0].snapshot.policy),
+                             "memory pressure: condition not recorded by service; full avg10 8.0; "
+                             + "some avg10 15.0; swap 80.0% used")
+            self.assertEqual(queue_evidence.pressure_text(pressure, ZoneInfo("UTC"), waits[0].snapshot.policy),
+                             "memory pressure: full avg10 8.0%, some avg10 15.0%, swap used 80.0%; "
+                             + "condition not recorded by service")
+
+    def test_main_schema_refusal_retries_admission_and_release_without_caller_version(self) -> None:
+        refused = reply_bytes(wire.Refused("invalid snapshot record fields"))
+        grant_line, release_line = (Path(__file__).with_name("fixtures") / "live_main_gate.jsonl").read_bytes().splitlines(keepends=True)
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            transport = self.use_transport(fixture, Exchange(refused), Exchange(grant_line),
+                                           Exchange(refused), Exchange(release_line))
+            result = client.admit(request, lambda _reply: None, lambda: request)
+            assert isinstance(result, wire.Admitted)
+            self.assertIsInstance(client.release(result.reservation, 0, result.cleanup_timing), wire.Ok)
+            first, compatible, release, compatible_release = transport.requests
+            self.assertEqual(first, request)
+            self.assertEqual(compatible, replace(request, code_version=""))
+            assert isinstance(release, wire.ReleaseRequest)
+            self.assertEqual(release.code_version, client.LOADED_ADMISSION_CODE_VERSION)
+            self.assertEqual(compatible_release, replace(release, code_version=""))
+            self.assertEqual((release.reservation, release.status), (result.reservation, 0))
+
+    def test_main_schema_refusal_retries_queries_without_caller_version(self) -> None:
+        directory = Path(__file__).with_name("fixtures")
+        refused = reply_bytes(wire.Refused("invalid snapshot record fields"))
+        with AdmissionFixture() as fixture:
+            transport = self.use_transport(fixture, Exchange(refused), Exchange((directory / "live_main_view.json").read_bytes()),
+                                           Exchange(refused), Exchange((directory / "live_main_explain.json").read_bytes()))
+            self.assertTrue(client.view().view.running)
+            self.assertTrue(client.explain().running)
+            self.assertEqual(transport.requests, [wire.ViewRequest(code_version=client.LOADED_ADMISSION_CODE_VERSION),
+                wire.ViewRequest(), wire.ExplainRequest(code_version=client.LOADED_ADMISSION_CODE_VERSION), wire.ExplainRequest()])
 
     def test_hold_after_grant_releases_before_waiting_and_uses_a_new_episode(self) -> None:
         with AdmissionFixture() as fixture:
