@@ -6,7 +6,9 @@ Posture **strengthen**: the workflow's behavior is fixed; the only question is b
 Subject at review time: **2385 lines / 18,811 words / 130,256 bytes**, loaded in
 full into the unit director's context on every `/plan:delegate` invocation.
 
-Five reviewers (`team_review.expert` = gpt-5.6-sol:xhigh, readonly), one lens each:
+The 2026-08-31 review used five external reviewers (`gpt-5.6-sol:xhigh`), one lens each.
+The current `/team_review` runs its lenses in the invoking session.
+The recorded lenses were:
 duplication and canonical home; rationale versus instruction; form and structure;
 instruction the scripts already enforce; dead text plus a counterweight pass naming
 what must not be cut. 63 findings. Literal before → after text for every finding is
