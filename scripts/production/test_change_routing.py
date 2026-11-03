@@ -241,6 +241,44 @@ class StaffRoutingTests(unittest.TestCase):
                     second = change_routing.StaffRouting(staff.snapshot(), {"top": doc}, change_review).owner(row, "top")
                 self.assertEqual(second, first)
 
+    def test_nested_ref_creation_update_and_removal_refresh_the_routing_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.dict(os.environ, {"STAFF_FILE": str(root / "staff.json"), "XDG_CACHE_HOME": str(root / "cache")}):
+                listing = root / "change-review - top.md"
+                _ = listing.write_text("## To review\n\n| # | Change |\n| --- | --- |\n| C1 | First |\n")
+                doc = root / "top-production.md"
+                checkpoint_rows(root, {"top": doc}, {listing: "top"})
+                repo = root / "routing-repo"
+
+                def git(*arguments: str) -> str:
+                    return subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True,
+                                          text=True, check=True).stdout.strip()
+
+                original = git("rev-parse", "HEAD")
+                _ = git("checkout", "-b", "hidden")
+                _ = git("commit", "--allow-empty", "-m", "checkpoint(unknown): hidden change")
+                hidden = git("rev-parse", "HEAD")
+                _ = git("checkout", "main")
+                _ = git("branch", "-D", "hidden")
+                record = staff.snapshot()
+                row = {"#": "C2", "Merged": hidden, "Change": "hidden change"}
+
+                def owner() -> change_routing.ChangeOwner:
+                    return change_routing.StaffRouting(record, {"top": doc}, change_review).owner(row, "top")
+
+                self.assertIsInstance(owner(), change_routing.ShowrunnerOwnChange)
+                reference = "refs/heads/review/nested/visible"
+                _ = git("update-ref", reference, hidden)
+                self.assertIn(repo / ".git" / reference, change_routing.history_sources(repo / ".git"))
+                self.assertIsInstance(owner(), change_routing.UnroutedChange)
+                _ = git("update-ref", reference, original)
+                self.assertIsInstance(owner(), change_routing.ShowrunnerOwnChange)
+                _ = git("update-ref", reference, hidden)
+                self.assertIsInstance(owner(), change_routing.UnroutedChange)
+                _ = git("update-ref", "-d", reference)
+                self.assertIsInstance(owner(), change_routing.ShowrunnerOwnChange)
+
     def test_delivered_marks_leave_the_count_but_failed_messages_keep_the_row(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -32,7 +32,7 @@ from urllib.parse import quote
 import store
 import parse
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 # Step and call fields under a former name, read as the current name.
 FORMER_FIELDS = (("seat", "worker"), ("delegate_session", "unit_session"))
 LOCK_NAME = "index.lock"
@@ -342,7 +342,26 @@ QUEUE_BUMP_COLUMNS: list[Column] = [
     ("old_position", "INTEGER", "waiting position before the move, starting at one"),
 ]
 
+SSH_ATTEMPT_COLUMNS: list[Column] = [
+    ("id", "TEXT PRIMARY KEY", "attempt identity"),
+    ("src", "TEXT", "source file"),
+    ("host", "TEXT", "recording host"),
+    ("at", "TEXT", "record time"),
+    ("call_id", "TEXT", "verify call identity"),
+    ("target", "TEXT", "selected SSH target"),
+    ("repo_identity", "TEXT", "normalized origin identity"),
+    ("queued_at", "REAL", "original queue timestamp"),
+    ("departed_at", "REAL", "SSH departure timestamp"),
+    ("slot", "INTEGER", "reserved repository slot"),
+    ("outcome", "TEXT", "passed, failed, lost, or declined"),
+    ("completion", "TEXT", "confirmed or missing completion evidence"),
+    ("cleanup", "TEXT", "confirmed or unconfirmed cleanup evidence"),
+    ("unresolved_count", "INTEGER", "remaining processes; NULL when unavailable"),
+    ("evidence_at", "REAL", "ownership evidence timestamp"),
+]
+
 TABLES: dict[str, tuple[list[Column], str, str]] = {
+    "ssh_attempts": (SSH_ATTEMPT_COLUMNS, "", "SSH attempts, including retained capacity after completion"),
     "queue_bumps": (QUEUE_BUMP_COLUMNS, "", "one row per user or session move to the head of the memory queue"),
     "mac_idle": (MAC_IDLE_COLUMNS, "", "one Mac idle case per cause per verify call; actions keep the call as the test owner"),
     "hold_builds": (HOLD_BUILD_COLUMNS, "", "one row per build, hold and action: audit or stopped"),
@@ -766,7 +785,11 @@ def add_queue_bump(connection: sqlite3.Connection, record: dict[str, object], sr
     insert(connection, "queue_bumps", pick({**record, "src": src}, QUEUE_BUMP_COLUMNS))
 
 
-ADDERS = {"queue_bump": add_queue_bump, "mac_idle": add_mac_idle, "hold_build": add_hold_build, "hold_event": add_hold_event, "step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample,
+def add_ssh_attempt(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
+    insert(connection, "ssh_attempts", pick({**record, "src": src}, SSH_ATTEMPT_COLUMNS))
+
+
+ADDERS = {"ssh_attempt": add_ssh_attempt, "queue_bump": add_queue_bump, "mac_idle": add_mac_idle, "hold_build": add_hold_build, "hold_event": add_hold_event, "step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample,
           "memory_snapshot": add_memory_snapshot}
 
 

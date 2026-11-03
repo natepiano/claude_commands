@@ -98,4 +98,5 @@ def open_proposals(doc: Path, names: frozenset[str] | None = None) -> list[Issue
     if folder is None or not folder.is_dir():
         return []
     names = owners(doc) if names is None else names
-    return [issue for issue in open_issues(folder, PROPOSAL_TAG) if proposer(issue) in names]
+    return [issue for issue in open_issues(folder, PROPOSAL_TAG)
+            if issue.value("record_type") != "question" and proposer(issue) in names]

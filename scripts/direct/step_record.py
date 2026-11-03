@@ -24,29 +24,79 @@ class NatedevOnly:
     reason: str
 
 
-RunsOn = MacAllowed | NatedevOnly
+@dataclass(frozen=True)
+class SshAllowed:
+    targets: tuple[str, ...]
+    mac_targets: tuple[str, ...] = ()
+
+
+RunsOn = MacAllowed | NatedevOnly | SshAllowed
+
+
+@dataclass(frozen=True)
+class WorkspacePackages:
+    """The command selects the workspace without a named package."""
+
+
+@dataclass(frozen=True)
+class NamedPackage:
+    name: str
+
+
+PackageSelection = WorkspacePackages | NamedPackage
+
+
+def package_selection(value: PackageSelection | str | None) -> PackageSelection:
+    return value if isinstance(value, (WorkspacePackages, NamedPackage)) else NamedPackage(value) if value else WorkspacePackages()
+
+
+def package_name(value: PackageSelection) -> str:
+    return value.name if isinstance(value, NamedPackage) else ""
+
+
+def mac_eligible(record: StepRecord) -> bool:
+    return isinstance(record.runs_on, MacAllowed) or (
+        isinstance(record.runs_on, SshAllowed) and bool(record.runs_on.mac_targets))
 
 
 class StepState(str, Enum):
     WAITING_HOLD = "waiting_hold"
     WAITING_MAC = "waiting_mac"
+    WAITING_SSH = "waiting_ssh"
+    ON_SSH = "on_ssh"
     ON_MAC = "on_mac"
     ON_NATEDEV = "on_natedev"
     LOCAL_NONCOMPILING = "local_noncompiling"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class StepRecord:
     call_id: str
     pid: int
     proc_start: str
     repo: Path
     kind: str
-    package: str | None
+    package: PackageSelection
     runs_on: RunsOn
     state: StepState
     updated: str
     v: int = 1
+    selected_target: str = ""
+
+    def __init__(self, call_id: str, pid: int, proc_start: str, repo: Path, kind: str,
+                 package: PackageSelection | str | None, runs_on: RunsOn, state: StepState,
+                 updated: str, v: int = 1, selected_target: str = "") -> None:
+        for name, value in (("call_id", call_id), ("pid", pid), ("proc_start", proc_start),
+                            ("repo", repo), ("kind", kind), ("package", package_selection(package)),
+                            ("runs_on", runs_on), ("state", state), ("updated", updated),
+                            ("v", v), ("selected_target", selected_target)):
+            object.__setattr__(self, name, value)
+
+    @property
+    def eligible_targets(self) -> tuple[str, ...]:
+        if isinstance(self.runs_on, SshAllowed):
+            return self.runs_on.targets
+        return ("mac", "natedev") if isinstance(self.runs_on, MacAllowed) else ("natedev",)
 
 
 @dataclass(frozen=True)
@@ -114,12 +164,24 @@ def _decode(value: object, call_id: str) -> StepRecord:
     location = cast(dict[str, object], target)
     if location.get("kind") == "mac_allowed":
         runs_on: RunsOn = MacAllowed()
+    elif location.get("kind") == "ssh_allowed":
+        targets = row.get("eligible_targets")
+        macs = location.get("mac_targets", [])
+        if (not isinstance(targets, list) or not isinstance(macs, list)
+                or not all(isinstance(item, str) and item for item in cast(list[object], targets))
+                or not all(isinstance(item, str) and item for item in cast(list[object], macs))):
+            raise ValueError("invalid eligible targets")
+        runs_on = SshAllowed(tuple(cast(list[str], targets)), tuple(cast(list[str], macs)))
     elif location.get("kind") == "natedev_only":
         runs_on = NatedevOnly(_text(location.get("reason")))
     else:
         raise ValueError("invalid run location")
+    selected = row.get("selected_target", "")
+    if not isinstance(selected, str):
+        raise ValueError("invalid selected target")
     return StepRecord(call_id, pid, _text(row.get("proc_start")), Path(_text(row.get("repo"))),
-                      kind, package, runs_on, StepState(_text(row.get("state"))), _text(row.get("updated")))
+                      kind, package, runs_on, StepState(_text(row.get("state"))), _text(row.get("updated")),
+                      selected_target=selected)
 
 
 def read(call_id: str) -> ReadResult:
@@ -152,9 +214,12 @@ def write(record: StepRecord) -> None:
     path = record_path(record.call_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     location = ({"kind": "mac_allowed"} if isinstance(record.runs_on, MacAllowed)
+                else {"kind": "ssh_allowed", "mac_targets": list(record.runs_on.mac_targets)}
+                if isinstance(record.runs_on, SshAllowed)
                 else {"kind": "natedev_only", "reason": record.runs_on.reason})
     row = dict(v=record.v, call_id=record.call_id, pid=record.pid, proc_start=record.proc_start,
-               repo=str(record.repo), kind=record.kind, package=record.package,
+               repo=str(record.repo), kind=record.kind, package=package_name(record.package) or None,
+               eligible_targets=list(record.eligible_targets), selected_target=record.selected_target,
                runs_on=location, state=record.state.value, updated=record.updated)
     with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=".step-", delete=False) as output:
         temporary = Path(output.name)
@@ -171,11 +236,13 @@ def write(record: StepRecord) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def state(call_id: str, next_state: StepState) -> None:
+def state(call_id: str, next_state: StepState, target: str = "") -> None:
     record = read(call_id)
     if not isinstance(record, StepRecord):
         raise ValueError(f"cannot update step record: {record}")
-    write(replace(record, state=next_state, updated=datetime.now(timezone.utc).isoformat()))
+    selected = target or ("mac" if next_state == StepState.ON_MAC else "natedev" if next_state == StepState.ON_NATEDEV else "")
+    write(replace(record, state=next_state, selected_target=selected,
+                  updated=datetime.now(timezone.utc).isoformat()))
 
 
 def remove(call_id: str) -> None:
@@ -223,8 +290,11 @@ def main() -> int:
     _ = create.add_argument("--repo", default=os.getcwd())
     _ = create.add_argument("--package")
     _ = create.add_argument("--reason", default="")
+    _ = create.add_argument("--eligible-targets", default="")
+    _ = create.add_argument("--mac-targets", default="")
     update = commands.add_parser("state")
     _ = update.add_argument("--call-id", required=True)
+    _ = update.add_argument("--target", default="")
     _ = update.add_argument("state", choices=[item.value for item in StepState])
     delete = commands.add_parser("remove")
     _ = delete.add_argument("--call-id", required=True)
@@ -240,18 +310,21 @@ def main() -> int:
         elif command == "stopped":
             return 0 if consume_stopped_build(call_id, Path(cast(str, args.consumed))) else 1
         elif command == "state":
-            state(call_id, StepState(cast(str, args.state)))
+            state(call_id, StepState(cast(str, args.state)), cast(str, args.target))
         else:
             pid = int(cast(str, args.pid))
             kind = cast(str, args.kind)
             location = cast(str, args.runs_on)
             reason = cast(str, args.reason)
-            if kind not in KINDS or location not in ("mac_allowed", "natedev_only"):
+            if kind not in KINDS or location not in ("mac_allowed", "natedev_only", "ssh_allowed"):
                 raise ValueError("invalid step kind or run location")
             if location == "natedev_only" and not reason:
                 raise ValueError("natedev-only step needs a reason")
             write(StepRecord(call_id, pid, process_start(pid), Path(cast(str, args.repo)).resolve(), kind,
-                             cast(str | None, args.package), MacAllowed() if location == "mac_allowed" else NatedevOnly(reason),
+                             cast(str | None, args.package), MacAllowed() if location == "mac_allowed" else
+                             SshAllowed(tuple(filter(None, cast(str, args.eligible_targets).split(","))),
+                                        tuple(filter(None, cast(str, args.mac_targets).split(","))))
+                             if location == "ssh_allowed" else NatedevOnly(reason),
                              StepState(cast(str, args.state)), datetime.now(timezone.utc).isoformat()))
     except (OSError, ValueError, IndexError) as error:
         parser.exit(2, f"step record: {error}; step refused\n")

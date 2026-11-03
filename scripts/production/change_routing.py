@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import cached_property
@@ -206,14 +206,8 @@ class StaffRouting:
         return self.repository_keys[repo]
 
     def history_key(self, repo: Path) -> str:
-        paths = history_sources(repo)
-        marks: list[tuple[str, int, int]] = []
-        for path in paths:
-            try:
-                status = path.stat()
-            except FileNotFoundError:
-                continue
-            marks.append((str(path.relative_to(repo)), status.st_mtime_ns, status.st_size))
+        marks = [(str(path.relative_to(repo)), status.st_mtime_ns, status.st_size)
+                 for path, status in _history_marks(repo)]
         return hashlib.sha256(json.dumps(sorted(marks)).encode()).hexdigest()
 
     def history_path(self, repo: Path) -> Path:
@@ -423,7 +417,36 @@ class StaffRouting:
 
 def history_sources(repo: Path) -> list[Path]:
     """Use these paths for the graph key and status count invalidation."""
-    return [repo / "HEAD", repo / "packed-refs", repo / "refs", *(repo / "refs").rglob("*")]
+    return [repo / "HEAD", repo / "packed-refs", repo / "refs",
+            *(path for path, _ in _ref_marks(repo / "refs"))]
+
+
+def _history_marks(repo: Path) -> Iterator[tuple[Path, os.stat_result]]:
+    """Read each ref's metadata once for the history key."""
+    for name in ("HEAD", "packed-refs", "refs"):
+        path = repo / name
+        try:
+            yield path, path.stat()
+        except FileNotFoundError:
+            continue
+    yield from _ref_marks(repo / "refs")
+
+
+def _ref_marks(directory: Path) -> Iterator[tuple[Path, os.stat_result]]:
+    """Read paths and metadata together during one directory scan."""
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                try:
+                    status = entry.stat()
+                except FileNotFoundError:
+                    continue
+                path = Path(entry.path)
+                yield path, status
+                if entry.is_dir(follow_symlinks=False):
+                    yield from _ref_marks(path)
+    except FileNotFoundError:
+        return
 
 
 def delivery_path(root: Path, review_list: Path, row: str) -> Path:

@@ -19,6 +19,7 @@ from unittest import mock
 import index
 from cgroup_test_support import CPU, GIB, slice_reading
 import parse
+import record as recorder
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
 else:
@@ -234,6 +235,68 @@ class IndexTests(unittest.TestCase):
 
     def ids(self) -> list[object]:
         return [row[0] for row in self.rows("SELECT id FROM steps ORDER BY id")]
+
+    def test_local_success_preserves_earlier_ssh_loss_and_original_queue_time(self) -> None:
+        recorder.ssh_attempt({
+            "call_id": "fallback", "target": "aws", "repo_identity": "github.com/team/hana",
+            "queued_at": 100.0, "departed_at": 140.0, "slot": 3, "outcome": "lost",
+            "completion": "missing", "cleanup": "unconfirmed", "unresolved_count": None,
+            "evidence_at": 145.0,
+        })
+        self.write(self.host_file, call("fallback", target="natedev", status=0),
+                   step("local-pass", call_id="fallback", target="natedev", caller="verify", status=0))
+
+        _ = index.update()
+
+        self.assertEqual(self.rows("SELECT target, status FROM calls WHERE id = 'fallback'"), [("natedev", 0)])
+        query = ("SELECT call_id, target, repo_identity, queued_at, departed_at, slot, outcome, "
+                 + "completion, cleanup, unresolved_count, evidence_at FROM ssh_attempts")
+        expected = [("fallback", "aws", "github.com/team/hana", 100.0, 140.0, 3, "lost",
+                     "missing", "unconfirmed", None, 145.0)]
+        self.assertEqual(self.rows(query), expected)
+        self.assertEqual(index.update(), 0)
+        _ = index.reindex()
+        self.assertEqual(self.rows(query), expected)
+
+    def test_confirmed_completion_does_not_imply_confirmed_cleanup(self) -> None:
+        for outcome, count in (("passed", None), ("failed", 2)):
+            recorder.ssh_attempt({
+                "call_id": outcome, "target": "aws", "repo_identity": "github.com/team/hana",
+                "queued_at": 100.0, "departed_at": 140.0, "slot": 2, "outcome": outcome,
+                "completion": "confirmed", "cleanup": "unconfirmed", "unresolved_count": count,
+                "evidence_at": 151.0,
+            })
+
+        _ = index.update()
+
+        self.assertEqual(self.rows(
+            "SELECT call_id, completion, cleanup, unresolved_count, typeof(unresolved_count), evidence_at "
+            + "FROM ssh_attempts ORDER BY call_id"),
+            [("failed", "confirmed", "unconfirmed", 2, "integer", 151.0),
+             ("passed", "confirmed", "unconfirmed", None, "null", 151.0)])
+
+    def test_each_ssh_attempt_keeps_its_target_slot_and_evidence(self) -> None:
+        for target, slot, outcome in (("mac", 1, "declined"), ("aws", 4, "passed")):
+            recorder.ssh_attempt({
+                "call_id": "one-call", "target": target, "repo_identity": "github.com/team/hana",
+                "queued_at": 100.0, "departed_at": 140.0 + slot, "slot": slot, "outcome": outcome,
+                "completion": "confirmed" if outcome == "passed" else "missing",
+                "cleanup": "confirmed", "unresolved_count": 0, "evidence_at": 150.0 + slot,
+            })
+
+        _ = index.update()
+
+        self.assertEqual(self.rows(
+            "SELECT target, queued_at, departed_at, slot, outcome, completion, cleanup, unresolved_count, evidence_at "
+            + "FROM ssh_attempts WHERE call_id = 'one-call' ORDER BY departed_at"),
+            [("mac", 100.0, 141.0, 1, "declined", "missing", "confirmed", 0, 151.0),
+             ("aws", 100.0, 144.0, 4, "passed", "confirmed", "confirmed", 0, 154.0)])
+
+    def test_legacy_calls_do_not_invent_ssh_attempt_evidence(self) -> None:
+        self.write(self.host_file, call("legacy", mac="passed_full", target="mac"))
+        _ = index.update()
+        self.assertEqual(self.rows("SELECT id, target, mac FROM calls"), [("legacy", "mac", "passed_full")])
+        self.assertEqual(self.rows("SELECT count(*) FROM ssh_attempts"), [(0,)])
 
     def cargo_build_rows(self, *commands: list[str]) -> list[tuple[object, ...]]:
         self.write(self.host_file, *(step(f"build-{number:03}", argv=argv) for number, argv in enumerate(commands)))
@@ -569,7 +632,7 @@ class IndexTests(unittest.TestCase):
             _ = connection.execute("PRAGMA user_version = 25")
             connection.commit()
         self.assertEqual(index.update(), 3)
-        self.assertEqual(self.rows("PRAGMA user_version"), [(27,)])
+        self.assertEqual(self.rows("PRAGMA user_version"), [(28,)])
         self.assertEqual(path.read_bytes(), original)
         self.assertEqual(json.loads(cast(str, self.rows("SELECT slices FROM samples ORDER BY at")[1][0])), slices)
 

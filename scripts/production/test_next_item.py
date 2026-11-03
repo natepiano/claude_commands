@@ -27,9 +27,10 @@ import proposals_folder
 from scripts.production import showrunners
 import showrunner_tree
 from scripts.production import staff
-from scripts.production.staff_test_support import isolated_staff_file, unit_membership
+from scripts.production.staff_test_support import (
+    fixture_member, isolated_source_readers, isolated_staff_file, source_environment, unit_membership,
+)
 from scripts.production.test_change_routing import checkpoint_rows
-from scripts.production.staff_test_support import fixture_member
 from change_review import Visible
 from next_item import NextError, Queue
 
@@ -84,6 +85,10 @@ class NextItemTests(unittest.TestCase):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.root = Path(folder.name)
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, source_environment(self.root / "sources"))))
+        _ = self.enterContext(isolated_source_readers())
+        _ = fixture_member("showrunner", name="fixture")
         with contextlib.ExitStack() as stack:
             _ = cast(object, stack.enter_context(mock.patch.dict(
                 os.environ, {"NEXT_STATE_DIR": str(self.root / "next"), "NIGHTLY_REVIEW_NOTE": str(self.root / "note.md")})))
@@ -243,6 +248,16 @@ class NextItemTests(unittest.TestCase):
         _ = path.write_text(path.read_text(encoding="utf-8").replace(" gone |", "  |"), encoding="utf-8")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         checkpoint_rows(self.root, docs, {path: "top", side_list: "side"})
+        for slug, doc in docs.items():
+            parent_name = {"kid": "top", "grand": "kid"}.get(slug)
+            parent = next((row.id for row in staff.find(kind="showrunner") if row.name == parent_name), None)
+            existing = staff.snapshot().by_path(slug)
+            if existing is not None:
+                _ = staff.move(existing.id, parent)
+            owner = fixture_member("showrunner", name=slug, parent=parent, doc=staff.LiveDoc("natedev", doc))
+            timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{slug}"
+            timer.mkdir(parents=True)
+            _ = (timer / "conf").write_text(f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {doc}\n")
         tree = {"top": ["top", "kid", "grand"], "kid": ["kid", "grand"], "grand": ["grand"], "side": ["side"]}
 
         def owner_docs(doc: Path) -> list[Path]:

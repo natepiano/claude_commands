@@ -4,13 +4,16 @@ from __future__ import annotations
 import re
 import os
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import change_review
 from scripts.production import change_routing, showrunners, staff
 import proposals_folder
 import proposals_table
 from production_units import Refusal, production_field
+
+if TYPE_CHECKING:
+    from update_registration import QuestionStaff
 
 EFFICIENCY_LEDGER_FIELD = "Efficiency ledger"
 COUNTS_HEAD = "For you: "
@@ -102,11 +105,10 @@ def routing_sources() -> list[Path]:
             *(Path(path) for path in record.inputs), root, *root.glob(".review-link-delivery-*")]
 
 
-def sources(doc: Path) -> list[Path]:
-    """The files the counts read, so a copy of them can tell when it is out of date.
+def sources(doc: Path, *, identities: QuestionStaff | None = None) -> list[Path]:
+    """Return the files that affect the counts and their containing folders.
 
-    A proposal closes in place, so each open one is named beside its folder, which a new one
-    changes.
+    Watch each open record because closing it changes the file.
     """
     try:
         listed = [item.path for item in change_review.scope_lists(change_review.scope_list(doc), doc)]
@@ -120,8 +122,22 @@ def sources(doc: Path) -> list[Path]:
         queue = None
         efficiency_queue = None
     found = [doc, *listed, *(path for path in (folder, queue, efficiency_queue) if path is not None)]
+    if folder is not None:
+        try:
+            found.extend(issue.path for issue in proposals_folder.open_proposals(doc))
+        except OSError:
+            pass
+    from update_registration import QuestionFolder, QuestionStaff, question_folder, question_records_for_document
+
     try:
-        found.extend(issue.path for issue in proposals_folder.open_proposals(doc))
+        if identities is None:
+            identities = QuestionStaff.read()
+        questions = question_folder(doc, identities)
+        if isinstance(questions, QuestionFolder):
+            if questions.path not in found:
+                found.append(questions.path)
+            found.extend(record.path for record in question_records_for_document(doc, identities)
+                         if record.status == "open")
     except OSError:
         pass
     return found
