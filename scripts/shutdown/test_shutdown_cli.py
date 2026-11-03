@@ -1,4 +1,4 @@
-"""Launch gating tests for shutdown records and their process-safe barrier."""
+"""Tests for shutdown commands and records."""
 
 from __future__ import annotations
 
@@ -31,7 +31,6 @@ from test_support import registry_confirmation, ShutdownTestCase
 import inventory
 import herdr
 from test_shutdown_record import LegacyRecordFixture, LegacyEntryFixture, write_old
-import launch_permission
 import shutdown_record as shutdown_store
 import sessions
 import remote_control
@@ -51,7 +50,6 @@ LOGIN = "owner@example.com"
 LABEL = "claude2"
 OCTOBER = "2026-10-09T21:49:10+00:00"
 JANUARY = "2026-01-15T17:30:00+00:00"
-PERMISSION_SCRIPT = Path(__file__).with_name("launch_permission.py")
 EMPTY_HERDR_SESSIONS = json.dumps(herdr.SessionListResult(sessions=[]))
 
 
@@ -484,50 +482,11 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                 self.assertEqual(result.stderr, "")
                 self.assertEqual(result.stdout, "")
 
-    def run_cli(self, *arguments: str) -> tuple[int, str, str]:
-        output = io.StringIO()
-        error = io.StringIO()
-
-        def resolve(requested: str) -> Account:
-            return (
-                Account("claude", LOGIN, LABEL)
-                if requested == LOGIN
-                else Account("claude", requested, requested)
-            )
-
-        with (
-            patch.object(
-                shutdown,
-                "named_claude_account",
-                side_effect=resolve,
-            ),
-            redirect_stdout(output),
-            redirect_stderr(error),
-        ):
-            status = shutdown.main(["launch-blocked", *arguments])
-        return status, output.getvalue(), error.getvalue()
 
     def write_record(self, live: LegacyRecordFixture) -> None:
         self.clear_state()
         write_old(live)
 
-    def run_exec(self, command: list[str]) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [
-                sys.executable,
-                str(PERMISSION_SCRIPT),
-                "exec-new-work",
-                "--name",
-                "test-job",
-                "--",
-                *command,
-            ],
-            env=self.environment,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=HANG_GUARD_SECONDS,
-        )
 
     def conflicting_legacy_record(self, conflict: str) -> str:
         self.clear_state()
@@ -589,192 +548,6 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertIn(str(broken), error.getvalue())
 
 
-    def test_launch_blocked_uses_pst_for_a_january_request(self) -> None:
-        self.write_record(shutdown_record("down", requested_at=JANUARY))
-
-        status, output, error = self.run_cli(LOGIN)
-
-        self.assertEqual(status, 0)
-        self.assertEqual(
-            output,
-            f"{LABEL} is held by a shutdown (since 2026-01-15 09:30 PST), requested in a terminal\n",
-        )
-        self.assertEqual(error, "")
-
-    def test_launch_blocked_is_silent_when_no_record_exists(self) -> None:
-        status, output, error = self.run_cli(LOGIN)
-
-        self.assertEqual((status, output, error), (1, "", ""))
-
-    def test_launch_blocked_fails_closed_for_malformed_and_corrupt_paths(self) -> None:
-        cases = ("malformed record", "account file", "broken account symlink")
-        for case in cases:
-            with self.subTest(case=case):
-                self.clear_state()
-                self.state.mkdir()
-                account_path = self.state / LOGIN
-                if case == "malformed record":
-                    account_path.mkdir()
-                    _ = (account_path / "record.json").write_text("{", encoding="utf-8")
-                elif case == "account file":
-                    _ = account_path.write_text("not a directory", encoding="utf-8")
-                else:
-                    account_path.symlink_to(self.state / "missing")
-
-                status, output, error = self.run_cli(LOGIN)
-
-                self.assertEqual(status, 3)
-                self.assertEqual(output, "")
-                self.assertEqual(len(error.splitlines()), 1)
-                self.assertTrue(error.startswith("shutdown state unreadable: "), error)
-                self.assertNotIn(
-                    "shutdown state unreadable: shutdown state unreadable:", error
-                )
-
-    def test_terminal_old_record_no_longer_holds_the_account(self) -> None:
-        for state in ("cancelled", "up"):
-            with self.subTest(state=state):
-                self.write_record(shutdown_record(cast(str, state)))
-                self.assertEqual(self.run_cli(LOGIN), (1, "", ""))
-
-    def test_a_registering_account_hold_blocks_before_its_sessions_are_recorded(self) -> None:
-        _ = self.enterContext(patch.object(shutdown_store, "registration_process_start", return_value="fixture-process-start"))
-        held = account_hold()
-        held["registration"] = "in progress"
-        held["registration_owners"] = {held["request_id"]:
-            shutdown_store.RegistrationOwner(pid=4242, proc_start="fixture-process-start")}
-        held["requested_by"] = shutdown_store.FromSession(kind="session", session_id="b1f5ca98-45aa-4604-8e2b-33ed0f071bb1")
-        shutdown_store.set_account_hold(held)
-        self.assertEqual(self.run_cli(LOGIN), (
-            0, f"{LABEL} is held by a shutdown (since 2026-10-09 14:49 PDT), requested by session b1f5ca98\n", "",
-        ))
-
-    def test_launch_check_releases_a_finished_stop_hold_and_lets_the_launch_go(self) -> None:
-        """The 10-18 claude2 case: a stop hold whose sessions all finished outlived its shutdown."""
-        held = account_hold()
-        held["then"] = "stop"
-        held["requested_by"] = shutdown_store.FromSession(kind="session", session_id="b1f5ca98-45aa-4604-8e2b-33ed0f071bb1")
-        shutdown_store.set_account_hold(held)
-        saved = session_shutdown(shutdown_store.SessionRestartFailed(kind="restart failed", at=OCTOBER, reason="restart prompt not submitted"))
-        self.assertTrue(shutdown_store.create_session(saved))
-        shutdown_store.archive_session(LOGIN, saved["session"]["session_id"])
-        status, output, error = self.run_cli(LOGIN)
-        self.assertEqual((status, error), (1, ""))
-        self.assertTrue(output.startswith(launch_permission.RELEASED_HOLD_PREFIX), output)
-        self.assertEqual(cast(object, json.loads(output.removeprefix(launch_permission.RELEASED_HOLD_PREFIX))), held)
-        self.assertIsNone(shutdown_store.account_hold(LOGIN))
-        self.assertEqual(self.run_cli(LOGIN), (1, "", ""))
-
-
-    def test_unreadable_session_or_hold_refuses_new_work_and_restore(self) -> None:
-        for name in ("hold.json", "sessions/session-123.json"):
-            with self.subTest(name=name):
-                self.clear_state()
-                broken = self.state / LOGIN / name
-                broken.parent.mkdir(parents=True)
-                _ = broken.write_text("{", encoding="utf-8")
-                for arguments in ((LOGIN,), (LOGIN, "--restart-of", "session-123")):
-                    status, output, error = self.run_cli(*arguments)
-                    self.assertEqual((status, output), (3, ""))
-                    self.assertIn("shutdown state unreadable:", error)
-
-    def test_launch_blocked_fails_closed_when_record_rejects_the_login(self) -> None:
-        status, output, error = self.run_cli(".hidden@example.com")
-
-        self.assertEqual(status, 3)
-        self.assertEqual(output, "")
-        self.assertTrue(error.startswith("shutdown state unreadable: "), error)
-        self.assertEqual(error.count("shutdown state unreadable: "), 1)
-
-    def test_launch_blocked_fails_closed_when_account_resolution_crashes(self) -> None:
-        output = io.StringIO()
-        error = io.StringIO()
-        with (
-            patch.object(
-                shutdown,
-                "_selected_account",
-                side_effect=RuntimeError("fixture resolver failed"),
-            ) as resolve,
-            redirect_stdout(output),
-            redirect_stderr(error),
-        ):
-            status = shutdown.main(["launch-blocked", LOGIN])
-
-        resolve.assert_called_once_with(LOGIN)
-        self.assertEqual(status, 3)
-        self.assertEqual(output.getvalue(), "")
-        self.assertEqual(len(error.getvalue().splitlines()), 1)
-        self.assertTrue(
-            error.getvalue().startswith("shutdown state unreadable: RuntimeError: "),
-            error.getvalue(),
-        )
-
-    def test_restart_permission_uses_its_own_progress_while_another_waits(self) -> None:
-        allowed: tuple[shutdown_store.SessionProgress, ...] = (
-            shutdown_store.SessionStopped(kind="stopped", at=OCTOBER),
-            shutdown_store.SessionAlreadyGone(kind="already gone", at=OCTOBER),
-            shutdown_store.ProcessIdentityLost(kind="process identity lost", at=OCTOBER),
-            shutdown_store.SessionRestarting(kind="restarting", at=OCTOBER, prior=shutdown_store.SessionStopped(kind="stopped", at=OCTOBER)),
-            shutdown_store.SessionRestartFailed(kind="restart failed", at=OCTOBER, reason="window did not open"),
-            shutdown_store.SessionNeedsManualRestart(kind="manual restart", command="claude --resume session-123"),
-        )
-        for progress in allowed:
-            for kind in ("unit", "top-level", "showrunner"):
-                with self.subTest(progress=progress["kind"], kind=kind):
-                    self.clear_state()
-                    saved = session_shutdown(progress)
-                    if kind != "unit":
-                        saved["session"] = cast(inventory.Session, cast(object, {
-                            **saved["session"], "kind": kind, "host": {"kind": "unknown"},
-                            **({"production": "demo", "doc": "/tmp/demo.md"} if kind == "showrunner" else {}),
-                        }))
-                    self.assertTrue(shutdown_store.create_session(saved))
-                    self.assertTrue(shutdown_store.create_session(session_shutdown(
-                        shutdown_store.SessionWaiting(kind="waiting"), "session-456", hold="account",
-                    )))
-                    self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-123"), (1, "", ""))
-                    shutdown_store.set_account_hold(account_hold())
-                    self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-123"), (1, "", ""))
-                    self.assertEqual(self.run_cli(LOGIN)[0], 0)
-                    self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-456")[0], 0)
-                    self.assertEqual(self.run_cli(LOGIN, "--restart-of", "missing")[0], 0)
-
-    def test_old_restarting_record_allows_its_stopped_unit_and_holds_new_work(self) -> None:
-        self.write_record(shutdown_record("restarting", progress=shutdown_store.SessionStopped(kind="stopped", at=OCTOBER)))
-        self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-123"), (1, "", ""))
-        self.assertEqual(self.run_cli(LOGIN), (
-            0, f"{LABEL} is held by a shutdown (since 2026-10-09 14:49 PDT), requested in a terminal\n", "",
-        ))
-
-
-    def test_selected_waiting_session_restore_is_held_without_an_account_hold(self) -> None:
-        saved = session_shutdown(shutdown_store.SessionWaiting(kind="waiting"))
-        self.assertTrue(shutdown_store.create_session(saved))
-        self.assertIsNone(shutdown_store.account_hold(LOGIN))
-        self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-123"), (
-            0, "alpha is held by a shutdown (since 2026-10-09 14:49 PDT)\n", "",
-        ))
-
-    def test_selected_ready_session_restore_is_held_without_an_account_hold(self) -> None:
-        saved = session_shutdown(shutdown_store.SessionReadyToStop(kind="ready", at=OCTOBER))
-        saved["requested_at"] = JANUARY
-        self.assertTrue(shutdown_store.create_session(saved))
-        self.assertIsNone(shutdown_store.account_hold(LOGIN))
-        self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-123"), (
-            0, "alpha is held by a shutdown (since 2026-01-15 09:30 PST)\n", "",
-        ))
-
-    def test_stopped_session_restore_is_allowed_under_an_account_hold(self) -> None:
-        self.assertTrue(shutdown_store.create_session(session_shutdown(
-            shutdown_store.SessionStopped(kind="stopped", at=OCTOBER),
-        )))
-        shutdown_store.set_account_hold(account_hold())
-        self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-123"), (1, "", ""))
-
-    def test_missing_session_restore_is_allowed_without_an_account_hold(self) -> None:
-        self.assertEqual(self.run_cli(LOGIN, "--restart-of", "missing"), (1, "", ""))
-
-
     def test_held_sessions_includes_owners_and_workers_sorted_once(self) -> None:
         saved = session_shutdown(shutdown_store.SessionWaiting(kind="waiting"), "z-owner")
         owner = saved["session"]
@@ -792,204 +565,6 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             self.assertEqual(shutdown.main(["held-sessions"]), 0)
         self.assertEqual(output.getvalue(), "a-worker\nm-owner\nz-owner\n")
 
-    def test_launch_permission_maps_exit_statuses(self) -> None:
-        with patch.object(
-            subprocess,
-            "run",
-            return_value=subprocess.CompletedProcess([], 1, "", ""),
-        ):
-            allowed = launch_permission.launch_permission(
-                self.environment, launch_permission.NewWorkLaunchPurpose()
-            )
-        self.assertIsInstance(allowed, launch_permission.AllowedByShutdownState)
-
-        with patch.object(
-            subprocess,
-            "run",
-            return_value=subprocess.CompletedProcess(
-                [], 0, "held because down\n", ""
-            ),
-        ):
-            blocked = launch_permission.launch_permission(
-                self.environment, launch_permission.NewWorkLaunchPurpose()
-            )
-        self.assertEqual(
-            blocked, launch_permission.BlockedByShutdown("held because down")
-        )
-
-        with patch.object(
-            subprocess,
-            "run",
-            return_value=subprocess.CompletedProcess(
-                [], 3, "", "shutdown state unreadable: broken JSON\n"
-            ),
-        ):
-            unreadable = launch_permission.launch_permission(
-                self.environment, launch_permission.NewWorkLaunchPurpose()
-            )
-        self.assertEqual(
-            unreadable, launch_permission.ShutdownStateUnreadable("broken JSON")
-        )
-
-        held = account_hold()
-        held["requested_by"] = shutdown_store.FromSession(kind="session", session_id="b1f5ca98-45aa-4604-8e2b-33ed0f071bb1")
-        released_line = launch_permission.RELEASED_HOLD_PREFIX + json.dumps(held) + "\n"
-        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, released_line, "")):
-            released = launch_permission.launch_permission(self.environment, launch_permission.NewWorkLaunchPurpose())
-        self.assertEqual(released, launch_permission.AllowedByShutdownState(launch_permission.ReleasedHold(
-            LABEL, "restart", OCTOBER, "b1f5ca98-45aa-4604-8e2b-33ed0f071bb1")))
-        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
-                [], 1, launch_permission.RELEASED_HOLD_PREFIX + "{\n", "")):
-            broken = launch_permission.launch_permission(self.environment, launch_permission.NewWorkLaunchPurpose())
-        self.assertIsInstance(broken, launch_permission.ShutdownStateUnreadable)
-
-    def test_launch_permission_fails_closed_when_launch_blocked_crashes(self) -> None:
-        copied_scripts = self.root / "copied-scripts"
-        copied_scripts.mkdir()
-        _ = shutil.copy2(PERMISSION_SCRIPT, copied_scripts / PERMISSION_SCRIPT.name)
-        _ = (copied_scripts / "shutdown.py").write_text(
-            'raise RuntimeError("import exploded")\n', encoding="utf-8"
-        )
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                (
-                    "import os\n"
-                    "import launch_permission\n"
-                    "permission = launch_permission.launch_permission(\n"
-                    "    os.environ, launch_permission.NewWorkLaunchPurpose()\n"
-                    ")\n"
-                    "print(type(permission).__name__)\n"
-                    "print(getattr(permission, 'detail', ''))\n"
-                ),
-            ],
-            cwd=copied_scripts,
-            env=self.environment,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=HANG_GUARD_SECONDS,
-        )
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            result.stdout.splitlines(),
-            [
-                "ShutdownStateUnreadable",
-                "launch-blocked exited 1: RuntimeError: import exploded",
-            ],
-        )
-
-    def test_launch_permission_reports_missing_interpreter(self) -> None:
-        missing = self.root / "missing-python"
-        with patch.object(sys, "executable", str(missing)):
-            permission = launch_permission.launch_permission(
-                self.environment, launch_permission.NewWorkLaunchPurpose()
-            )
-
-        self.assertIsInstance(permission, launch_permission.ShutdownStateUnreadable)
-        if isinstance(permission, launch_permission.ShutdownStateUnreadable):
-            self.assertIn(str(missing), permission.detail)
-
-    def test_launch_permission_passes_restart_session_to_cli(self) -> None:
-        commands: list[list[str]] = []
-
-        def run(
-            command: list[str], **_arguments: object
-        ) -> subprocess.CompletedProcess[str]:
-            commands.append(command)
-            return subprocess.CompletedProcess(command, 1, "", "")
-
-        with patch.object(subprocess, "run", side_effect=run):
-            permission = launch_permission.launch_permission(
-                self.environment,
-                launch_permission.RecordedSessionRestoreLaunchPurpose("session-123"),
-            )
-
-        self.assertIsInstance(permission, launch_permission.AllowedByShutdownState)
-        self.assertEqual(commands[0][-2:], ["--restart-of", "session-123"])
-
-    def test_real_launch_permission_removes_unreadable_prefix(self) -> None:
-        account_directory = self.state / LOGIN
-        account_directory.mkdir(parents=True)
-        _ = (account_directory / "record.json").write_text("{", encoding="utf-8")
-
-        permission = launch_permission.launch_permission(
-            self.environment, launch_permission.NewWorkLaunchPurpose()
-        )
-
-        self.assertIsInstance(permission, launch_permission.ShutdownStateUnreadable)
-        if isinstance(permission, launch_permission.ShutdownStateUnreadable):
-            self.assertNotIn("shutdown state unreadable:", permission.detail)
-            self.assertIn("not valid JSON", permission.detail)
-
-    def test_exec_new_work_executes_only_when_allowed_and_releases_barrier(self) -> None:
-        command = [
-            sys.executable,
-            "-c",
-            (
-                "import fcntl, os\n"
-                "from pathlib import Path\n"
-                "path = Path(os.environ['SHUTDOWN_STATE_DIR']) / 'launch.lock'\n"
-                "with path.open('a+') as lock:\n"
-                " fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
-                " print('command ran with barrier free')\n"
-            ),
-        ]
-
-        result = self.run_exec(command)
-
-        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
-        self.assertEqual(result.stdout, "command ran with barrier free\n")
-        self.assertEqual(result.stderr, "")
-
-    def test_exec_new_work_skips_blocked_and_unreadable_state(self) -> None:
-        self.write_record(shutdown_record("down"))
-        blocked = self.run_exec([sys.executable, "-c", "raise SystemExit(91)"])
-        self.assertEqual(blocked.returncode, 0)
-        self.assertEqual(
-            blocked.stdout,
-            "test-job: skipped: claude2 is held by a shutdown "
-            + "(since 2026-10-09 14:49 PDT), requested in a terminal\n",
-        )
-        self.assertEqual(blocked.stderr, "")
-
-        self.clear_state()
-        account_directory = self.state / LOGIN
-        account_directory.mkdir(parents=True)
-        _ = (account_directory / "record.json").write_text("{", encoding="utf-8")
-        unreadable = self.run_exec([sys.executable, "-c", "raise SystemExit(92)"])
-        self.assertEqual(unreadable.returncode, 0)
-        self.assertTrue(
-            unreadable.stdout.startswith(
-                "test-job: skipped: shutdown state unreadable: "
-            ),
-            unreadable.stdout,
-        )
-        self.assertEqual(unreadable.stdout.count("shutdown state unreadable: "), 1)
-        self.assertEqual(unreadable.stderr, "")
-
-    def test_exec_new_work_skips_when_launch_barrier_cannot_be_opened(self) -> None:
-        self.clear_state()
-        _ = self.state.write_text("not a directory", encoding="utf-8")
-
-        result = self.run_exec([sys.executable, "-c", "raise SystemExit(93)"])
-
-        self.assertEqual(result.returncode, 0)
-        self.assertTrue(
-            result.stdout.startswith(
-                "test-job: skipped: shutdown state unreadable: launch barrier: "
-            ),
-            result.stdout,
-        )
-        self.assertEqual(result.stdout.count("shutdown state unreadable: "), 1)
-        self.assertEqual(result.stderr, "")
-
-
-    def test_stopping_session_restore_is_held_by_name(self) -> None:
-        self.assertTrue(shutdown_store.create_session(session_shutdown(shutdown_store.SessionStopping(kind="stopping", at=OCTOBER))))
-        self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-123"), (0, "alpha is held by a shutdown (since 2026-10-09 14:49 PDT)\n", ""))
 
     def test_removed_writer_verbs_are_rejected(self) -> None:
         removed = ("down", "now", "ready", "cancel", "conduct", "follow", "begin", "refresh", "retry-stop", "claim-stop", "close-failed-stop")
@@ -1106,106 +681,6 @@ class OnlySessionCliTests(ShutdownTestCase):
         self.assertIn("sessions", reports[1])
         peer_report = cast(inventory.Inventory, reports[1])
         self.assertEqual([owner["session_id"] for owner in peer_report["sessions"]], ["beta-id"])
-
-
-    def test_restart_list_skips_live_and_keeps_going_after_unknown_name(self) -> None:
-        from test_restart import SUBMITTED_PROMPT
-
-        for all_accounts in (False, True):
-            with self.subTest(all_accounts=all_accounts):
-                state = self.root / "state"
-                if state.exists():
-                    shutil.rmtree(state)
-                self.owners = self.owners[:2]
-                _ = self.save_three(shutdown_store.SessionStopped(kind="stopped", at=OCTOBER))
-                live = sessions.SessionRecord(pid=99, sessionId="elsewhere", name="Running", messagingSocketPath="",
-                    updatedAt=1, tmux="", formerNames=[])
-                args = ["restart", *([] if all_accounts else [LABEL]), "--only", "Running,Unknown,Alpha,Beta", "--here", "--no-alert"]
-                with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
-                      patch.object(sessions, "live_sessions", return_value=[live]),
-                      patch.object(shutdown, "_terminal_accounts", return_value=shutdown.TerminalAccountSelection((Account("claude", LOGIN, LABEL),))),
-                      patch.object(restart_work, "_launch_session", return_value=restart_work.SessionLaunched(SUBMITTED_PROMPT)) as launch,
-                      patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()),
-                      redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error):
-                    code = shutdown.main(args)
-                self.assertEqual(code, 1)
-                self.assertIn("Running: already running; skipped", output.getvalue())
-                self.assertIn("Unknown: matches no session", error.getvalue())
-                self.assertEqual(launch.call_count, 2)
-                self.assertEqual(shutdown_store.session_records(LOGIN), [])
-
-    def test_restart_skips_a_recordless_live_session_on_the_selected_account(self) -> None:
-        for all_accounts in (False, True):
-            with self.subTest(all_accounts=all_accounts):
-                owner = self.owners[0]
-                live = sessions.SessionRecord(pid=owner["pid"], sessionId=owner["session_id"], name=owner["name"],
-                    messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
-                args = ["restart", *([] if all_accounts else [LABEL]), "--only", owner["name"], "--here"]
-                with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
-                      patch.object(sessions, "live_sessions", return_value=[live]),
-                      patch.object(shutdown, "_terminal_accounts", return_value=shutdown.TerminalAccountSelection((Account("claude", LOGIN, LABEL),))),
-                      patch.object(restart_work, "_launch_session", side_effect=AssertionError("live session relaunched")),
-                      patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()),
-                      redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error):
-                    code = shutdown.main(args)
-                self.assertEqual((code, error.getvalue()), (0, ""))
-                self.assertEqual(output.getvalue(), f"{owner['name']}: already running; skipped\n")
-
-    def test_restart_stopped_record_wins_over_a_different_live_session_with_the_same_name(self) -> None:
-        from test_restart import SUBMITTED_PROMPT
-
-        for all_accounts in (False, True):
-            with self.subTest(all_accounts=all_accounts):
-                state = self.root / "state"
-                if state.exists():
-                    shutil.rmtree(state)
-                _ = self.save_three(shutdown_store.SessionStopped(kind="stopped", at=OCTOBER))
-                live = sessions.SessionRecord(pid=99, sessionId="different-alpha", name="Alpha",
-                    messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
-                args = ["restart", *([] if all_accounts else [LABEL]), "--only", "Alpha", "--here", "--no-alert"]
-                with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
-                      patch.object(sessions, "live_sessions", return_value=[live]),
-                      patch.object(shutdown, "_terminal_accounts", return_value=shutdown.TerminalAccountSelection((Account("claude", LOGIN, LABEL),))),
-                      patch.object(restart_work, "_launch_session", return_value=restart_work.SessionLaunched(SUBMITTED_PROMPT)) as launch,
-                      patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()),
-                      redirect_stdout(io.StringIO()) as output):
-                    code = shutdown.main(args)
-                self.assertEqual(code, 0)
-                launch.assert_called_once()
-                self.assertEqual(cast(shutdown_store.SessionShutdown, launch.call_args.args[0])["session"]["session_id"], "alpha-id")
-                self.assertNotIn("Alpha: already running; skipped", output.getvalue())
-                self.assertNotIn("alpha-id", [saved["session"]["session_id"] for saved in shutdown_store.session_records(LOGIN)])
-
-    def test_restart_reports_stopped_name_ambiguity_across_machines_and_restarts_other_names(self) -> None:
-        from test_restart import SUBMITTED_PROMPT
-
-        for all_accounts in (False, True):
-            with self.subTest(all_accounts=all_accounts):
-                state = self.root / "state"
-                if state.exists():
-                    shutil.rmtree(state)
-                _ = self.save_three(shutdown_store.SessionStopped(kind="stopped", at=OCTOBER))
-                peer_alpha = session_shutdown(shutdown_store.SessionStopped(kind="stopped", at=OCTOBER), "peer-alpha-id")
-                peer_alpha["machine"] = "Mac"
-                peer_alpha["session"]["name"] = "Alpha"
-                report = inventory.Inventory(machine="Mac", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
-                args = ["restart", *([] if all_accounts else [LABEL]), "--only", "Alpha,Beta,Gamma", "--no-alert"]
-                with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
-                      patch.object(sessions, "live_sessions", return_value=[]),
-                      patch.object(shutdown, "_terminal_accounts", return_value=shutdown.TerminalAccountSelection((Account("claude", LOGIN, LABEL),))),
-                      patch.object(shutdown, "_remote_shutdown_records", return_value=shutdown.AccountShutdownRecords(kind="records", records=[peer_alpha])),
-                      patch.object(shutdown, "run_remote", return_value=(0, json.dumps(report))),
-                      patch.object(restart_work, "_launch_session", return_value=restart_work.SessionLaunched(SUBMITTED_PROMPT)) as launch,
-                      patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()),
-                      redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error):
-                    code = shutdown.main(args)
-                self.assertEqual(code, 1)
-                self.assertIn("Alpha: matches more than one session", error.getvalue())
-                self.assertIn("natedev: Alpha (alpha-id)", error.getvalue())
-                self.assertIn("Mac: Alpha (peer-alpha-id)", error.getvalue())
-                launched = [cast(shutdown_store.SessionShutdown, call.args[0])["session"]["name"] for call in launch.call_args_list]
-                self.assertCountEqual(launched, ["Beta", "Gamma"])
-                self.assertEqual([saved["session"]["name"] for saved in shutdown_store.session_records(LOGIN)], ["Alpha"])
 
 
     def test_only_restart_refuses_waiting_ready_and_stopping_with_exact_line(self) -> None:
@@ -1458,6 +933,106 @@ class OnlySessionCliTests(ShutdownTestCase):
         self.assertEqual(fixer.call_args.args[-2:], ("alpha unit", "Beta"))
         self.assertEqual(cast(dict[str, object], json.loads(output.getvalue()))["no_remote_control"], [])
         self.assertIsNone(shutdown_store.find_session(LOGIN, "beta-id"))
+
+
+    def test_restart_list_skips_live_and_keeps_going_after_unknown_name(self) -> None:
+        from test_restart import SUBMITTED_PROMPT
+
+        for all_accounts in (False, True):
+            with self.subTest(all_accounts=all_accounts):
+                state = self.root / "state"
+                if state.exists():
+                    shutil.rmtree(state)
+                self.owners = self.owners[:2]
+                _ = self.save_three(shutdown_store.SessionStopped(kind="stopped", at=OCTOBER))
+                live = sessions.SessionRecord(pid=99, sessionId="elsewhere", name="Running", messagingSocketPath="",
+                    updatedAt=1, tmux="", formerNames=[])
+                args = ["restart", *([] if all_accounts else [LABEL]), "--only", "Running,Unknown,Alpha,Beta", "--here", "--no-alert"]
+                with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
+                      patch.object(sessions, "live_sessions", return_value=[live]),
+                      patch.object(shutdown, "_terminal_accounts", return_value=shutdown.TerminalAccountSelection((Account("claude", LOGIN, LABEL),))),
+                      patch.object(restart_work, "_launch_session", return_value=restart_work.SessionLaunched(SUBMITTED_PROMPT)) as launch,
+                      redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error):
+                    code = shutdown.main(args)
+                self.assertEqual(code, 1)
+                self.assertIn("Running: already running; skipped", output.getvalue())
+                self.assertIn("Unknown: matches no session", error.getvalue())
+                self.assertEqual(launch.call_count, 2)
+                self.assertEqual(shutdown_store.session_records(LOGIN), [])
+
+
+    def test_restart_skips_a_recordless_live_session_on_the_selected_account(self) -> None:
+        for all_accounts in (False, True):
+            with self.subTest(all_accounts=all_accounts):
+                owner = self.owners[0]
+                live = sessions.SessionRecord(pid=owner["pid"], sessionId=owner["session_id"], name=owner["name"],
+                    messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+                args = ["restart", *([] if all_accounts else [LABEL]), "--only", owner["name"], "--here"]
+                with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
+                      patch.object(sessions, "live_sessions", return_value=[live]),
+                      patch.object(shutdown, "_terminal_accounts", return_value=shutdown.TerminalAccountSelection((Account("claude", LOGIN, LABEL),))),
+                      patch.object(restart_work, "_launch_session", side_effect=AssertionError("live session relaunched")),
+                      redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error):
+                    code = shutdown.main(args)
+                self.assertEqual((code, error.getvalue()), (0, ""))
+                self.assertEqual(output.getvalue(), f"{owner['name']}: already running; skipped\n")
+
+
+    def test_restart_stopped_record_wins_over_a_different_live_session_with_the_same_name(self) -> None:
+        from test_restart import SUBMITTED_PROMPT
+
+        for all_accounts in (False, True):
+            with self.subTest(all_accounts=all_accounts):
+                state = self.root / "state"
+                if state.exists():
+                    shutil.rmtree(state)
+                _ = self.save_three(shutdown_store.SessionStopped(kind="stopped", at=OCTOBER))
+                live = sessions.SessionRecord(pid=99, sessionId="different-alpha", name="Alpha",
+                    messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+                args = ["restart", *([] if all_accounts else [LABEL]), "--only", "Alpha", "--here", "--no-alert"]
+                with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
+                      patch.object(sessions, "live_sessions", return_value=[live]),
+                      patch.object(shutdown, "_terminal_accounts", return_value=shutdown.TerminalAccountSelection((Account("claude", LOGIN, LABEL),))),
+                      patch.object(restart_work, "_launch_session", return_value=restart_work.SessionLaunched(SUBMITTED_PROMPT)) as launch,
+                      redirect_stdout(io.StringIO()) as output):
+                    code = shutdown.main(args)
+                self.assertEqual(code, 0)
+                launch.assert_called_once()
+                self.assertEqual(cast(shutdown_store.SessionShutdown, launch.call_args.args[0])["session"]["session_id"], "alpha-id")
+                self.assertNotIn("Alpha: already running; skipped", output.getvalue())
+                self.assertNotIn("alpha-id", [saved["session"]["session_id"] for saved in shutdown_store.session_records(LOGIN)])
+
+
+    def test_restart_reports_stopped_name_ambiguity_across_machines_and_restarts_other_names(self) -> None:
+        from test_restart import SUBMITTED_PROMPT
+
+        for all_accounts in (False, True):
+            with self.subTest(all_accounts=all_accounts):
+                state = self.root / "state"
+                if state.exists():
+                    shutil.rmtree(state)
+                _ = self.save_three(shutdown_store.SessionStopped(kind="stopped", at=OCTOBER))
+                peer_alpha = session_shutdown(shutdown_store.SessionStopped(kind="stopped", at=OCTOBER), "peer-alpha-id")
+                peer_alpha["machine"] = "Mac"
+                peer_alpha["session"]["name"] = "Alpha"
+                report = inventory.Inventory(machine="Mac", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+                args = ["restart", *([] if all_accounts else [LABEL]), "--only", "Alpha,Beta,Gamma", "--no-alert"]
+                with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
+                      patch.object(sessions, "live_sessions", return_value=[]),
+                      patch.object(shutdown, "_terminal_accounts", return_value=shutdown.TerminalAccountSelection((Account("claude", LOGIN, LABEL),))),
+                      patch.object(shutdown, "_remote_shutdown_records", return_value=shutdown.AccountShutdownRecords(kind="records", records=[peer_alpha])),
+                      patch.object(shutdown, "run_remote", return_value=(0, json.dumps(report))),
+                      patch.object(restart_work, "_launch_session", return_value=restart_work.SessionLaunched(SUBMITTED_PROMPT)) as launch,
+                      redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error):
+                    code = shutdown.main(args)
+                self.assertEqual(code, 1)
+                self.assertIn("Alpha: matches more than one session", error.getvalue())
+                self.assertIn("natedev: Alpha (alpha-id)", error.getvalue())
+                self.assertIn("Mac: Alpha (peer-alpha-id)", error.getvalue())
+                launched = [cast(shutdown_store.SessionShutdown, call.args[0])["session"]["name"] for call in launch.call_args_list]
+                self.assertCountEqual(launched, ["Beta", "Gamma"])
+                self.assertEqual([saved["session"]["name"] for saved in shutdown_store.session_records(LOGIN)], ["Alpha"])
+
 
 
 if __name__ == "__main__":

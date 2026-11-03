@@ -29,7 +29,6 @@ sys.path.insert(0, str(ROOT / "scripts" / "shutdown"))
 sys.path.insert(0, str(ROOT / "scripts" / "whoami"))
 from scripts.lib import conf
 from scripts.accounts import accounts, moves, next_moves, refusals, role_map
-from scripts.shutdown.stop_results import RunningOnAnotherAccount
 from scripts.whoami import account
 from scripts.whoami import agent_accounts
 from scripts.whoami.note_file import canonical_label
@@ -1013,7 +1012,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             if outcome.session_id not in by_id:
                 continue
             refusal = by_id[outcome.session_id]
-            refused = isinstance(outcome, (accounts.SessionMoveRefused, RunningOnAnotherAccount))
+            refused = isinstance(outcome, accounts.SessionMoveRefused)
             _set_transition(state, outcome.session_id, refusal.entry_id,
                 "requested" if not refused else "group selected" if group_name != "ungrouped" else "retry",
                 transition.move_id if not refused else "")

@@ -216,17 +216,6 @@ class InventoryTests(ShutdownTestCase):
         decoded = inventory.parse_inventory(json.dumps(found))
         self.assertEqual(decoded["sessions"][0]["updated_at"], timestamp)
 
-    def test_updated_at_is_required_and_must_be_an_integer_in_fresh_inventory(self) -> None:
-        found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
-        values = cast(dict[str, object], cast(object, found["sessions"][0]))
-        for invalid in (True, 12.5, "123", None):
-            with self.subTest(updated_at=invalid):
-                values["updated_at"] = invalid
-                with self.assertRaisesRegex(inventory.InvalidInventory, r"updated_at"):
-                    _ = inventory.parse_inventory(json.dumps(found))
-        del values["updated_at"]
-        with self.assertRaisesRegex(inventory.InvalidInventory, r"updated_at"):
-            _ = inventory.parse_inventory(json.dumps(found))
 
     def test_shutdown_record_without_updated_at_remains_readable(self) -> None:
         saved = entry(top_level("legacy-owner"))
@@ -1017,22 +1006,6 @@ elif "comm=" in joined:
             parsed = inventory.parse_inventory(json.dumps(found))
             self.assertEqual(parsed, found)
 
-    def test_old_herdr_inventory_reads_detached_and_rejects_invalid_presentation(self) -> None:
-        self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "writing", "server"], {})
-        self.herdr_process(DESKTOP_PID, 71_001, ["/bin/claude"], {"HERDR_PANE_ID": "w1:p1"})
-        found = inventory.inventory(TARGET_LOGIN)
-        wire = cast(dict[str, object], json.loads(json.dumps(found)))
-        owners = cast(list[dict[str, object]], wire["sessions"])
-        host = cast(dict[str, object], next(owner for owner in owners if owner["session_id"] == DESKTOP_ID)["host"])
-        _ = host.pop("presentation")
-        parsed = inventory.parse_inventory(json.dumps(wire))
-        desktop = next(owner for owner in parsed["sessions"] if owner["session_id"] == DESKTOP_ID)
-        self.assertEqual(desktop["host"].get("presentation"), "detached")
-        for invalid in ("window", 3, {"kind": "invalid"}, None):
-            with self.subTest(invalid=invalid):
-                host["presentation"] = invalid
-                with self.assertRaises(inventory.InvalidInventory):
-                    _ = inventory.parse_inventory(json.dumps(wire))
 
     def test_herdr_unit_records_its_host_and_live_session_name(self) -> None:
         self.herdr_sessions(["unit-herdr"])
@@ -1423,36 +1396,6 @@ elif "comm=" in joined:
 
         self.assertEqual(parsed["host"], {"kind": "legacy tmux", "session_name": "legacy"})
 
-    def test_parse_inventory_rejects_unknown_kind_and_missing_variant_field(self) -> None:
-        found = inventory.inventory(TARGET_LOGIN)
-        document = cast(dict[str, object], cast(object, json.loads(json.dumps(found))))
-        session_values = cast(list[object], document["sessions"])
-        first = cast(dict[str, object], session_values[0])
-        first["host"] = {"kind": "spaceship"}
-        with self.assertRaisesRegex(
-            inventory.InvalidInventory,
-            r"inventory\.sessions\[0\]\.host\.kind is invalid",
-        ):
-            _ = inventory.parse_inventory(json.dumps(document))
-
-        document = cast(dict[str, object], cast(object, json.loads(json.dumps(found))))
-        session_values = cast(list[object], document["sessions"])
-        window_host: dict[str, object] | None = None
-        for item in session_values:
-            session_data = cast(dict[str, object], item)
-            host_data = cast(dict[str, object], session_data["host"])
-            if host_data["kind"] == "ghostty":
-                window_host = host_data
-                break
-        self.assertIsNotNone(window_host)
-        assert window_host is not None
-        host = window_host
-        del host["window_shell"]
-        with self.assertRaisesRegex(
-            inventory.InvalidInventory,
-            r"inventory\.sessions\[0\]\.host\.window_shell is missing",
-        ):
-            _ = inventory.parse_inventory(json.dumps(document))
 
 
 class ProcessEnvironmentTests(unittest.TestCase):

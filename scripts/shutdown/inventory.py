@@ -194,7 +194,7 @@ def parse_inventory(text: str) -> Inventory:
         raise InvalidInventory("inventory is not valid JSON") from None
     data = _wire_object(value, "inventory")
     parsed_sessions = [
-        parse_session(item, f"inventory.sessions[{index}]", require_updated_at=True)
+        parse_session(item, f"inventory.sessions[{index}]")
         for index, item in enumerate(
             _wire_list(
                 _wire_required(data, "sessions", "inventory"),
@@ -1292,7 +1292,7 @@ def _session_details(record: SessionFile, entry: ListedSession, *, directories: 
         common.update(production=entry.production, doc=entry.doc)
     elif entry.kind == "worker":
         common["owner"] = worker_owner
-    return parse_session(common, "observed session", require_updated_at=True)
+    return parse_session(common, "observed session")
 
 
 class MatchingSession(TypedDict):
