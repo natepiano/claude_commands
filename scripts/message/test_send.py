@@ -302,7 +302,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         for header, code, outcome in (("SENT", 0, "sent"), ("SKIPPED", 0, "skipped"),
                                       ("QUEUED", 1, "queued"), ("FAILED", 3, "failed"),
                                       ("REFUSED", 2, "refused"), ("HELD", 4, "held"),
-                                      ("REPLACED", 0, "replaced"), ("KEPT", 0, "kept")):
+                                      ("REPLACED", 0, "replaced"), ("KEPT", 0, "kept"), ("PENDING", 5, "pending")):
             with self.subTest(header=header):
                 result = send_result.send_outcome(code, header + ": fixture\nbody\n")
                 self.assertIsInstance(result, send_result.ConfirmedSendOutcome)
@@ -327,7 +327,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
     def test_send_outcome_requires_a_header_and_matching_exit(self) -> None:
         for code, output in ((0, ""), (1, ""), (0, "sent: lowercase"), (0, "finished"),
                              (0, "QUEUED: offline"), (1, "SENT: delivered"), (3, "SKIPPED: duplicate"),
-                             (0, "FAILED: unavailable"), (2, "HELD: review")):
+                             (0, "FAILED: unavailable"), (2, "HELD: review"), (0, "PENDING: active"), (1, "PENDING: active")):
             with self.subTest(code=code, output=output):
                 self.assertIsInstance(send_result.send_outcome(code, output), send_result.UnconfirmedSendOutcome)
 
@@ -1427,6 +1427,134 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                              "--repeat-minutes", "30", "--text", "Notice"])).outcome, "sent")
         self.assertEqual(self.claims("notice"), {**last, "staff:fixed": (started + timedelta(minutes=31)).isoformat()})
 
+    def test_pending_repeat_retains_a_settings_notice_until_a_retry_delivers(self) -> None:
+        from scripts.settings import local_key_notices as notices
+
+        self.session("recipient", "recipient")
+        _ = (self.root / "config/settings.conf").write_text("local_key_notice_to=recipient\n")
+        notices.record(self.root, "fixture", ["firstKey"])
+        outcomes: list[str] = []
+        ledger = self.root / notices.LEDGER
+        started = send.now()
+
+        def invoke(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            result = send.send(local_options(arguments[2:]))
+            outcomes.append(result.outcome)
+            return subprocess.CompletedProcess(arguments, send_result.EXIT[result.outcome],
+                                               result.outcome.upper() + ": " + result.detail, "")
+
+        def overlap(message: send.Message, timeout: float) -> send.Result:
+            del message, timeout
+            with mock.patch.object(send, "now", return_value=started + timedelta(seconds=1)):
+                notices.deliver(self.root, "fixture")
+            self.assertEqual(outcomes, ["pending"])
+            self.assertEqual(notices.read_history(ledger)["fixture"]["firstKey"], "pending")
+            self.assertEqual(self.relayed, [])
+            return send.Result("failed", "The first delivery failed.")
+
+        with (mock.patch.object(subprocess, "run", side_effect=invoke),
+              mock.patch.object(send, "now", return_value=started), redirect_stderr(io.StringIO())):
+            with mock.patch.object(send, "relay", overlap):
+                notices.deliver(self.root, "fixture")
+            self.assertEqual(outcomes, ["pending", "failed"])
+            self.assertEqual(notices.read_history(ledger)["fixture"]["firstKey"], "pending")
+            with mock.patch.object(send, "now", return_value=started + timedelta(seconds=2)):
+                notices.deliver(self.root, "fixture")
+            self.assertEqual(outcomes, ["pending", "failed", "sent"])
+            self.assertEqual(notices.read_history(ledger)["fixture"]["firstKey"], "accepted")
+            notices.deliver(self.root, "fixture")
+        self.assertEqual(len(self.relayed), 1)
+        key = self.relayed[0].key
+        assert key is not None
+        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=3)):
+            self.assertEqual(self.send("--to", "recipient", "--key", key, "--repeat-minutes", "30",
+                                       "--text", "The settings notice.").outcome, "skipped")
+        self.assertEqual(len(self.relayed), 1)
+
+    def test_pending_remote_result_releases_the_originating_claim(self) -> None:
+        options = send.parse(["--machine", "fixture", "--to", "session:recipient", "--from", "test",
+                              "--key", "pending-remote", "--repeat-minutes", "30", "--text", "Notice"])
+        with mock.patch.object(send, "run", return_value=(5, "PENDING: remote delivery is active", "")):
+            self.assertEqual(send.send(options).outcome, "pending")
+        self.assertEqual(self.claims("pending-remote"), {})
+
+    def test_pending_claim_blocks_only_until_the_delivery_timeout(self) -> None:
+        self.session("recipient", "Recipient")
+        started = send.now()
+        for key in ("notice", "github.keys_cold:fixture"):
+            with self.subTest(key=key):
+                delivered = len(self.relayed)
+                options = local_options(["--to", "recipient", "--key", key,
+                                         "--repeat-minutes", str(timedelta.max.days * 1440),
+                                         "--text", f"Notice for {key}"])
+                with (mock.patch.object(send, "now", return_value=started),
+                      mock.patch.object(send, "relay", side_effect=KeyboardInterrupt)):
+                    with self.assertRaises(KeyboardInterrupt):
+                        _ = send.send(options)
+                before = (self.root / "keys.json").read_bytes()
+                with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.TIMEOUT - 1)):
+                    self.assertEqual(send.send(options).outcome, "pending")
+                self.assertEqual((self.root / "keys.json").read_bytes(), before)
+                self.assertEqual(len(self.relayed), delivered)
+                with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.TIMEOUT + 1)):
+                    self.assertEqual(send.send(options).outcome, "sent")
+                self.assertEqual(self.claims(key), {"staff:recipient": (started + timedelta(seconds=send.TIMEOUT + 1)).isoformat()})
+                with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.TIMEOUT * 2 + 2)):
+                    self.assertEqual(send.send(options).outcome, "skipped")
+                self.assertEqual(len(self.relayed), delivered + 1)
+        self.assertEqual(len(self.relayed), 2)
+
+    def test_pending_claim_uses_the_first_senders_effective_delivery_limit(self) -> None:
+        self.session("recipient", "Recipient")
+        started = send.now()
+        for target, transport, limit in (("recipient", "relay", 120), ("user", "user", 205)):
+            with self.subTest(target=target):
+                options = local_options(["--to", target, "--key", f"limit-{target}", "--timeout", "120",
+                                         "--repeat-minutes", "30", "--text", f"Notice for {target}",
+                                         *(["--summary", "Delivery limit", "--no-action"] if target == "user" else [])])
+                retry = options._replace(timeout=1)
+
+                def overlap(*arguments: object, **keywords: object) -> send.Result:
+                    del arguments, keywords
+                    before = (self.root / "keys.json").read_bytes()
+                    with mock.patch.object(send, "now", return_value=started + timedelta(seconds=41)):
+                        self.assertEqual(send.send(retry).outcome, "pending")
+                    self.assertEqual((self.root / "keys.json").read_bytes(), before)
+                    with (mock.patch.object(send, "now", return_value=started + timedelta(seconds=limit - 1)),
+                          mock.patch.object(send, transport) as blocked):
+                        self.assertEqual(send.send(retry).outcome, "pending")
+                        blocked.assert_not_called()
+                    with (mock.patch.object(send, "now", return_value=started + timedelta(seconds=limit + 1)),
+                          mock.patch.object(send, transport, return_value=send.Result("sent", "fixture accepted")) as delivered):
+                        self.assertEqual(send.send(retry).outcome, "sent")
+                        delivered.assert_called_once()
+                    return send.Result("failed", "The first delivery failed.")
+
+                with (mock.patch.object(review, "user_send_seconds", return_value=205),
+                      mock.patch.object(send, "now", return_value=started),
+                      mock.patch.object(send, transport, side_effect=overlap) as first):
+                    self.assertEqual(send.send(options).outcome, "failed")
+                    first.assert_called_once()
+                with mock.patch.object(send, "now", return_value=started + timedelta(seconds=limit + 2)):
+                    self.assertEqual(send.send(options).outcome, "skipped")
+
+    def test_legacy_pending_timestamp_uses_the_default_delivery_limit(self) -> None:
+        self.session("recipient", "Recipient")
+        started = send.now()
+        path = self.root / "keys.json"
+        state = {"last": {"staff:recipient": started.isoformat()},
+                 "pending": {"staff:recipient": started.isoformat()}}
+        _ = path.write_text(json.dumps({"notice": state}))
+        before = path.read_bytes()
+        options = local_options(["--to", "recipient", "--key", "notice", "--repeat-minutes", "30", "--text", "Notice"])
+        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.TIMEOUT - 1)):
+            self.assertEqual(send.send(options).outcome, "pending")
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.relayed, [])
+        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.TIMEOUT + 1)):
+            self.assertEqual(send.send(options).outcome, "sent")
+        self.assertEqual(len(self.relayed), 1)
+
     def test_failed_stable_claim_does_not_clear_a_later_attempt(self) -> None:
         self.session("before", "resources")
         member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", None,
@@ -1459,7 +1587,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         def overlap(message: send.Message, timeout: float) -> send.Result:
             del message, timeout
             with mock.patch.object(send, "now", return_value=started + timedelta(seconds=1)):
-                self.assertEqual(send.send(options._replace(selection=send.RosterLookup(address))).outcome, "skipped")
+                self.assertEqual(send.send(options._replace(selection=send.RosterLookup(address))).outcome, "pending")
             self.assertEqual(self.claims("notice"), {"session:recipient": started.isoformat()})
             return send.Result("failed", "The first delivery failed.")
 
@@ -1512,7 +1640,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         def overlap(message: send.Message, timeout: float) -> send.Result:
             del message, timeout
             before = (self.root / "keys.json").read_bytes()
-            self.assertEqual(send.send(options).outcome, "skipped")
+            self.assertEqual(send.send(options).outcome, "pending")
             self.assertEqual((self.root / "keys.json").read_bytes(), before)
             return send.Result("failed", "The alias delivery failed.")
 
@@ -1764,7 +1892,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             with self.assertRaises(KeyboardInterrupt):
                 _ = send.send(options)
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as channel:
-            self.assertEqual(send.send(options).outcome, "skipped")
+            self.assertEqual(send.send(options).outcome, "pending")
             channel.assert_not_called()
             with mock.patch.object(send, "check_exit", return_value=0):
                 self.assertEqual(send.clear_check()[0], 0)

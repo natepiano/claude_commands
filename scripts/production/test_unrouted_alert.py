@@ -151,7 +151,7 @@ assert 'send' not in sys.modules
                 send.assert_called_once()
 
     def test_unaccepted_send_outcomes_keep_alerts_pending(self) -> None:
-        for code, header in ((0, "SKIPPED"), (0, "REPLACED"), (3, "FAILED"), (2, "REFUSED"), (4, "HELD")):
+        for code, header in ((0, "SKIPPED"), (0, "REPLACED"), (3, "FAILED"), (2, "REFUSED"), (4, "HELD"), (5, "PENDING")):
             with self.subTest(header=header):
                 error = StringIO()
                 with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, header + ": unaccepted", "")), redirect_stderr(error):

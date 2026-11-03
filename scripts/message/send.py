@@ -83,6 +83,7 @@ message text as one JSON line in STATE/log.jsonl:
   SENT: how                                                       exit 0
   SKIPPED: why   acknowledged, inside the repeat window, or       exit 0
                  an emergency push with the key is still live
+  PENDING: why   an earlier send has not confirmed acceptance     exit 5
   QUEUED: why    a Claude recipient not reached; kept in          exit 1
                  STATE/queue/, the latest per key, under the
                  recipient's Claude session id, so a rename loses
@@ -312,9 +313,15 @@ UnkeyedMessage = TypedDict(
 QueuedMessage = KeyedMessage | UnkeyedMessage
 
 
+class PendingDelivery(TypedDict):
+    started: str
+    limit_seconds: float
+
+
 class KeyState(TypedDict):
-    # Recipient -> UTC ISO time of the claimed send; a failed send releases its claim.
+    # Map each recipient to its claim time. A failed send releases its claim.
     last: dict[str, str]
+    pending: NotRequired[dict[str, str | PendingDelivery]]
     acknowledged: NotRequired[str]
 
 
@@ -1083,31 +1090,67 @@ def log(message: Message, result: Result, at: datetime, route: Route = NO_CLAUDE
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class ClaimGranted:
+    """This attempt can deliver the message."""
+
+
+@dataclass(frozen=True)
+class RepeatAccepted:
+    """An earlier attempt already accepted the message."""
+    reason: str
+
+
+@dataclass(frozen=True)
+class RepeatPending:
+    """An earlier attempt has not confirmed acceptance."""
+    reason: str
+
+
+def pending_deliveries(state: KeyState) -> dict[str, PendingDelivery]:
+    """Read legacy pending timestamps with the default delivery limit."""
+    return {recipient: PendingDelivery(started=mark, limit_seconds=TIMEOUT) if isinstance(mark, str) else mark
+            for recipient, mark in state.get("pending", {}).items()}
+
+
 def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None, at: datetime, *,
+          delivery_limit: float,
           legacy_aliases: tuple[str, ...] = (), live: bool = False,
-          clears_when: str = "", posted_on: str = "") -> str | None:
-    """Return the skip reason, or record this attempt under the stable recipient.
+          clears_when: str = "", posted_on: str = "") -> ClaimGranted | RepeatAccepted | RepeatPending:
+    """Check acceptance before recording an attempt under the stable recipient.
 
     The lock prevents overlapping sends with one key from both sending.
     Known transport aliases contribute timestamps only to the window check.
     With `live`, the window is the lifetime of an emergency push.
     """
     if message.key is None:
-        return None
+        return ClaimGranted()
     with key_states() as states:
         state: KeyState = states.get(message.key, {"last": {}})
         if "acknowledged" in state:
-            return acknowledged_skip_reason(message.key, state["acknowledged"])
+            return RepeatAccepted(acknowledged_skip_reason(message.key, state["acknowledged"]))
+        pending = pending_deliveries(state)
+        # An abandoned delivery must not block a window with no end.
         timestamps = [state["last"][alias] for alias in (recipient.value, *legacy_aliases)
-                      if alias in state["last"]]
+                      if alias in state["last"]
+                      and not (alias in pending and pending[alias]["started"] == state["last"][alias]
+                               and at - datetime.fromisoformat(state["last"][alias])
+                               >= timedelta(seconds=pending[alias]["limit_seconds"]))]
         last = max(timestamps, key=datetime.fromisoformat) if timestamps else None
+        unaccepted = any(alias in pending and pending[alias]["started"] == last
+                         for alias in (recipient.value, *legacy_aliases)) if last is not None else False
+        pending_reason = f"key {message.key!r}: an earlier send to {recipient.value} is pending; not yet accepted"
         if last is not None and message.key.startswith("github.keys_cold:"):
-            return f"key {message.key!r}: GitHub keys still cold; this event already sent its push"
+            if unaccepted:
+                return RepeatPending(pending_reason)
+            return RepeatAccepted(f"key {message.key!r}: GitHub keys still cold; this event already sent its push")
         if repeat is not None and last is not None and at - datetime.fromisoformat(last) < repeat:
+            if unaccepted:
+                return RepeatPending(pending_reason)
             if live:
-                return still_live(message.key, message.sender, datetime.fromisoformat(last), repeat)
+                return RepeatAccepted(still_live(message.key, message.sender, datetime.fromisoformat(last), repeat))
             minutes = repeat.total_seconds() / 60
-            return f"key {message.key!r} last sent to {recipient.value} at {last}, inside its {minutes:g}-minute window"
+            return RepeatAccepted(f"key {message.key!r} last sent to {recipient.value} at {last}, inside its {minutes:g}-minute window")
         if clears_when:
             clear_record = Emergency(key=message.key, sender=message.sender, check=clears_when, machine=posted_on,
                                      sent=at.isoformat(), expires=(at + emergency_lifetime()).isoformat())
@@ -1115,8 +1158,24 @@ def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None
             kept = [old for old in read_emergencies() if old["key"] != clear_record["key"]]
             write_emergencies([*kept, clear_record])
         state["last"][recipient.value] = at.isoformat()
+        state.setdefault("pending", {})[recipient.value] = PendingDelivery(started=at.isoformat(), limit_seconds=delivery_limit)
         states[message.key] = state
-    return None
+    return ClaimGranted()
+
+
+def accept_sent(key: str, to: str, at: datetime) -> None:
+    """Confirm only the claim owned by this accepted attempt."""
+    with key_states() as states:
+        state = states.get(key)
+        if state is None:
+            return
+        pending = state.get("pending", {})
+        owned = pending_deliveries(state).get(to)
+        if owned is None or owned["started"] != at.isoformat():
+            return
+        del pending[to]
+        if not pending:
+            del state["pending"]
 
 
 def user_emergency_key(sender: str, title: str) -> str:
@@ -1151,6 +1210,11 @@ def forget_sent(key: str, to: str, at: datetime | None = None) -> None:
         if state is None or to not in state["last"] or (at is not None and state["last"][to] != at.isoformat()):
             return
         del state["last"][to]
+        owned = pending_deliveries(state).get(to)
+        if "pending" in state and (at is None or (owned is not None and owned["started"] == at.isoformat())):
+            _ = state["pending"].pop(to, None)
+            if not state["pending"]:
+                del state["pending"]
         if not state["last"] and "acknowledged" not in state:
             del states[key]
 
@@ -2617,12 +2681,13 @@ def send(options: Options) -> Result:
     refused = emergency and not options.clears_when and not options.self_clearing
     held = None if refused else wrong_template(options, "\n".join((summary, text, action_text)))
     cold_check = options.clears_when if options.text_id == "github.keys_cold" else ""
-    skip = None if refused or held is not None else claim(
-        message, stable, window, started, legacy_aliases=legacy_aliases, live=live, clears_when=cold_check,
+    claim_result = ClaimGranted() if refused or held is not None else claim(
+        message, stable, window, started, delivery_limit=options.timeout,
+        legacy_aliases=legacy_aliases, live=live, clears_when=cold_check,
         posted_on=options.scope.host if isinstance(options.scope, NamedMachine) else machine())
     log_route: Route = NO_CLAUDE_ROUTE
     guarded = repeat_guard.Decision()
-    if not refused and held is None and skip is None and not isinstance(route, (RecipientLookupFailed, CodexWorkerRecipient, RemoteDelivery)):
+    if not refused and held is None and isinstance(claim_result, ClaimGranted) and not isinstance(route, (RecipientLookupFailed, CodexWorkerRecipient, RemoteDelivery)):
         guarded = repeat_guard.check(STATE / "repeats", repeat_guard.Attempt(
             sender, stable.value,
             text, machine(), started.timestamp(), options.human or sender.casefold() == USER or options.to == USER))
@@ -2630,8 +2695,10 @@ def send(options: Options) -> Result:
         result = Result("refused", NO_CLEAR_STEP)
     elif held is not None:
         result = Result("held", held)
-    elif skip is not None:
-        result = Result("skipped", skip)
+    elif isinstance(claim_result, RepeatAccepted):
+        result = Result("skipped", claim_result.reason)
+    elif isinstance(claim_result, RepeatPending):
+        result = Result("pending", claim_result.reason)
     elif guarded.held:
         result = Result("held", f"repeat guard: copy {guarded.copies} held; owner notice queued")
     elif isinstance(route, RecipientLookupFailed):
@@ -2707,9 +2774,12 @@ def send(options: Options) -> Result:
         if options.to != message.to:
             _ = remove_queued_key(options.to, message.key, recipient=stable)
     # A failed send can retry. A queue or kept push owns its copy until delivery.
-    if (key is not None and not refused and held is None and skip is None
-            and result.outcome in {"failed", "refused", "held"}):
+    if (key is not None and not refused and held is None and isinstance(claim_result, ClaimGranted)
+            and result.outcome in {"failed", "refused", "held", "pending"}):
         forget_sent(key, stable.value, started)
+    elif (key is not None and not refused and held is None and isinstance(claim_result, ClaimGranted)
+          and result.outcome in {"sent", "queued", "kept", "replaced", "skipped"}):
+        accept_sent(key, stable.value, started)
     if emergency and options.clears_when and key is not None and not cold_check and result.outcome == "sent":
         posted_on = options.scope.host if isinstance(options.scope, NamedMachine) else machine()
         record_emergency(Emergency(key=key, sender=sender, check=options.clears_when, machine=posted_on,
