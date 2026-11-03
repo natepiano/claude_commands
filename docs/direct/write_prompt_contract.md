@@ -53,7 +53,11 @@ opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
    detached: each verify.sh line as listed, which detaches itself, or any
    other command as
    `python3 ~/.claude/scripts/agents/mesh_runs.py start --label "<what>" -- <command>`.
-   Either returns at once with one line naming the run, its pid and its log.
+   A successful start returns at once with the run, its pid and its log.
+   A live twin takes priority over config/mesh_runs.conf LIVE_RUN_LIMIT.
+   Exit 4 refuses a new run at that limit and names the live runs.
+   Wait for a run's result, or put more files in one run. Never run attached after exit 4.
+   Exit 3 means the caller is not a mesh worker; run attached only for that exit.
    Keep working if you have other work; otherwise end your turn. The result
    (pass or fail, exit code, log path, last lines) arrives as your next
    message, also after an account move or a stop. Never poll, sleep, call

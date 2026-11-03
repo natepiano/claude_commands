@@ -13,11 +13,11 @@ Review links let a session on natedev or on the Mac show files to the user in a 
 | `/etc/nixos/modules/common/review-links.nix` | The shared job `nate.jobs.review-links` for both machines. |
 | `/etc/nixos/modules/linux/review-links.nix` | The natedev restart settings and the firewall line. |
 
-Run the tests from the repository root with `python3 -m unittest discover -s scripts/review_links -p 'test_*.py'`. They need Python 3.11 or later.
+Run the tests from the repository root with `python3 -m unittest discover -s scripts/review_links -p 'test_*.py'`. They need Python 3.12 or later.
 
 The flow:
 
-1. The skill runs `~/.claude/scripts/lib/py ~/.claude/scripts/review_links/review_link.py <file>... [--new]` on the machine that has the files. `scripts/lib/py` finds Python 3.11 or later.
+1. The skill runs `~/.claude/scripts/lib/py ~/.claude/scripts/review_links/review_link.py <file>... [--new]` on the machine that has the files. `scripts/lib/py` finds Python 3.12 or later.
 2. The publisher checks every input, gets the host, writes the snapshot under the index lock and prints one URL per file.
 3. The skill fetches each URL with `curl` on the same machine. It gives only the links that return `200`, as clickable Markdown links that show the file name.
 4. The browser on the Mac gets the file from the server on that machine, over the tailnet.
@@ -30,7 +30,13 @@ The flow:
 - Older callers still pass `--name`. The publisher accepts it and ignores it.
 - On success it prints one URL per input, in argument order, and exits 0. On an error it prints `review_link: <error>` to stderr and exits 2.
 
-The URL form is `http://<host>:8765/<id>/<file name>`, with the name percent-encoded, for example `http://100.103.14.30:8765/k3x9qa/herdr-issue-draft.html`. The URL of a `.md` input names its rendered `<stem>.html`. The host is the output of `tailscale ip -4` (10 s timeout), parsed as IPv4. Empty output, an IPv6 address, a host name or a nonzero exit refuses the run.
+The URL form is `http://<host>:<port>/<id>/<file name>`, with the name percent-encoded.
+The `server_port` setting starts at 8765.
+For example, a rendered link is `http://100.103.14.30:8765/k3x9qa/herdr-issue-draft.html`.
+The URL of a `.md` input names its rendered `<stem>.html`.
+The host comes from `tailscale ip -4`, parsed as IPv4.
+The `tailscale_timeout_seconds` setting starts at 10.
+Empty output, an IPv6 address, a host name, or a nonzero exit refuses the run.
 
 Two environment variables change the defaults. Neither changes the address the server binds.
 
@@ -77,7 +83,7 @@ Run this command without a row count or batch size:
 python3 scripts/review_links/change_page.py
 ```
 
-The page finds list paths through `change_review.LISTS` and the existing filename prefix.
+The page finds list paths through `change_review.lists_directory()` and the existing filename prefix.
 Each GET reads each list once through `change_review.review_snapshot`.
 The snapshot, pending-row reader, and saved-answer reader use one table reader.
 This reader checks each table row against its header's cell count.
@@ -90,25 +96,26 @@ The page never uses a review list as a production document.
 
 Tabs show each showrunner and its waiting count.
 `scripts/production/change_routing.py` owns the routing rule for the page, the status line, and `/next`.
-The router searches every staff repository for the merge checkpoint.
-The Production cell and list hints do not restrict this search.
-A unit checkpoint identifies a staff row, including a qualified path such as `builds/resources-unit`.
-The router follows its staff parent ids to its showrunner.
-A change without a unit checkpoint belongs to its list's showrunner.
-The router ignores unknown producer aliases when a known staff unit exists.
-For an unknown producer, the router first reads the saved unit rename journal.
-A renamed unit follows the journal's fixed staff ID or current unit name.
-A retired unit, plan alias, or production name without a staff unit belongs to its list's showrunner.
-Several known units under one showrunner belong to that showrunner; only the showrunner receives their messages.
-Units under different showrunners remain in `unrouted`.
-A known unit without a showrunner also remains in `unrouted`.
-The page shows the conflict note under the change.
-The router prints the conflict and change ID to stderr.
+Each row stores one fixed staff id in the `Producer` cell.
+The cell stores no name.
+The router reads the name and parent ids from the staff record at use.
+A unit producer belongs to its current staff showrunner.
+A showrunner producer belongs to that showrunner.
+An empty Producer cell belongs to the list's showrunner.
+A rename or a removed worktree does not change the producer id.
+An unknown id or a broken parent chain belongs to `unrouted`.
+The page shows its note under the change.
+The router prints the note and change id to stderr.
 A verdict on an unrouted row saves without sending a message or recording a delivery failure.
 An unrouted row offers no question control.
 The server refuses its question submissions without saving.
 The Production cell supplies no tab or message recipient.
-The router alerts the configured showrunner about each new unrouted row and reason.
+The router alerts the configured showrunner about each new unrouted row and reason only within the real change-review folder.
+The list's resolved parent must equal `change_routing.configured_lists_directory().resolve()`.
+The `lists_directory` setting names this folder.
+`CHANGE_REVIEW_DIR` is a test override for the reader folder.
+This override never makes a list real.
+Lists outside this folder print the routing note without sending an alert or writing an alert record.
 `unrouted_alert_recipient` starts at `natedev` in `config/review_links.conf`.
 `unrouted_alert_retry_seconds` starts at 60 and accepts 5 through 3600 seconds.
 The router reads both keys when it uses them.
@@ -121,15 +128,44 @@ A new reason permits one new alert.
 A crash between acceptance and the durable mark can repeat an alert.
 Routed rows and rows that need no user answer send no routing alert.
 
-The router caches commit history with a key from Git refs, HEAD, and packed-refs.
-The status count watches the same paths that form the graph cache key.
-New, changed, and deleted refs invalidate both caches.
-Concurrent graph writes use separate temporary files before atomic replacement.
-A failed write removes its temporary file.
-The router reads commit parents in one command for each repository that lacks a current cache.
-Production aliases share one document read per request.
-Rows from the same checkpoint share its selection within that request.
-The router reads full checkpoint messages when a merge contains several units.
+The status count watches the staff record, review lists, and delivery records.
+The owner's staff document supplies the production document when the file exists.
+The supplied production document for that showrunner is the fallback.
+A missing document reference in the source list does not block a row with an available owner document.
+An unrouted row retains verdict controls when its list's staff showrunner has an available document.
+Its owner remains unrouted and receives no message.
+
+`merge_checkpoint`, `merge_gate`, and `change_review.py append` store each checkpoint unit's Producer id.
+`merge_gate` reads the staff record before the merge.
+`merge_checkpoint` reads the staff record before the push.
+An unreadable staff record stops either run before anything is pushed.
+`merge_checkpoint` also undoes its unpushed local merge.
+One read supplies the rows for each run.
+Each writer matches the branch to its Units row and finds the staff unit by the Worktree path.
+An exact Branch name wins over a Plan, Unit, or worktree alias.
+The staff lookup prefers present worktrees, then the latest row within each worktree state.
+An unregistered unit writes an empty cell and one named note.
+`change_review.py add --repo <directory>` stores the unit id of that worktree.
+A showrunner directory or an unowned directory stores an empty cell.
+A verdict retains the Producer cell in Reviewed.
+
+Use `change_review.py backfill-producer [--list <path>]` to report older rows with no Producer id.
+Add `--write` to fill mapped rows in To review and Reviewed.
+The command copies each changed list to `<name>.backup-<timestamp>` before the locked write.
+It finds historical checkpoints in the production repositories.
+For a merge with several units, an exact Change-Review text selects the checkpoint.
+If no included checkpoint names the change, the command checks the merge commit's own checkpoint subject.
+It maps the old Branch, Plan, or Unit name through the Units Worktree path to the retained staff id.
+When that lookup fails, the command removes `build-followups-` from the checkpoint name.
+Exactly one staff unit with the remaining name supplies the id. Retired units count.
+Zero or several matches leave Producer empty. A valid Worktree result wins.
+It reports each unmapped row by list, row id, and old name.
+A failed list prints its name and error; the command continues and returns 1 after all lists.
+A rerun retries an unfinished commit.
+A completed list keeps its bytes and commit.
+After the lists are filled, remove `scripts/production/producer_backfill.py`, including its adapter.
+Remove the `backfill-producer` CLI case and argparse choice from `change_review.py`.
+Remove `scripts/production/test_producer_backfill.py`.
 Delivery records store fixed staff ids.
 Each send reads `staff.snapshot()` and sends to `session:<current_session>` from the saved staff row.
 An account move changes the next recipient address without changing the stored staff id.
@@ -276,10 +312,8 @@ Older selected-row pages use the same staff route.
 The saved verdict selects recipients when a new message attempt begins.
 An exact `works` verdict goes only to the showrunner, including text from Send feedback.
 When one staff unit owns the change, every other verdict also goes to that unit.
-The router resolves qualified staff paths before matching unit names or worktree names.
-An exact change trailer selects among checkpoints.
-A single unit also covers a reworded row.
-A change without a unit checkpoint belongs to its list's staff showrunner.
+The Producer cell identifies that unit through its fixed staff id.
+An empty Producer cell belongs to the list's staff showrunner.
 Retries retain stored staff recipient ids.
 Older records without recipient ids compute the same recipients as a fresh verdict send.
 No agent polls for answers.
@@ -364,10 +398,15 @@ No NixOS or service configuration change is necessary.
 
 ### Server
 
-`serve.py [--port PORT]`. The default port is 8765. `--port` is for tests.
+`serve.py [--port PORT]` reads its default port from `server_port`.
+The setting starts at 8765.
+`--port` overrides the setting for one server run.
+The times below describe the initial config values.
+The server reads the current settings when it needs them.
 
 - At start, the server runs `tailscale ip -4` (10 s timeout) and parses the output as IPv4. It creates the root if it is missing and runs the sweep. Then it binds a `ThreadingHTTPServer` to that address and port, and prints `review-links: serving <root> on <address>:<port>`. A failure at start, for example no address or a failed bind, prints one `review-links: <error>` line to stderr, and the server exits 1.
-- Every 60 s (monotonic clock), the server runs `tailscale ip -4` again. A failed lookup prints `tailscale address gone (was <address>)`. A different address prints `tailscale address changed (was <old>, now <new>)`. In both cases the server exits 1, and the service manager starts it again on the current address. If Tailscale stops but still reports the same address, the server keeps running, because its socket stays bound to that address.
+- The server repeats the address check after `tailscale_check_seconds`, which starts at 60 seconds.
+  The server uses the monotonic clock. A failed lookup prints `tailscale address gone (was <address>)`. A different address prints `tailscale address changed (was <old>, now <new>)`. In both cases the server exits 1, and the service manager starts it again on the current address. If Tailscale stops but still reports the same address, the server keeps running, because its socket stays bound to that address.
 - The server percent-decodes the path and removes the query. A path with a `..` segment gets 404. The server resolves the path under the root and follows symlinks. The result must be a regular file under the root. Folders and targets outside the root get 404. Index names, the `.review-link-` prefix, and atomic temporary names get 404. The server never lists a folder.
 - A published `changes.html` with a private manifest is rendered from the review record. Every other regular file gets 200 with `Content-Type`, `Content-Length`, `Last-Modified` and `X-Content-Type-Options: nosniff`. The server never sends 304.
 - Content types: `.html` and `.htm`, in any case, go out as `text/html; charset=utf-8`. A type that Python's `mimetypes` lists under `image/` keeps that type. All other files, `.md`, `.txt`, `.json` and `.pdf` included, go out as `text/plain; charset=utf-8`.
@@ -375,9 +414,14 @@ No NixOS or service configuration change is necessary.
 
 ### Sweep
 
-`sweep_snapshots(root: Path, now: float) -> int` deletes expired snapshot folders and returns how many it deleted. The server runs it at start, before the bind, and then once an hour.
+`sweep_snapshots(root: Path, now: float) -> int` deletes expired snapshot folders and returns the number deleted.
+The server runs it before the bind and after each `snapshot_sweep_seconds` interval.
+That interval starts at one hour.
 
-- A folder expires when its modification time is more than 7 days before `now`. Each publish resets that time, so a link expires 7 days after its last update. With the hourly sweep, a link lasts up to one hour more while the server runs. A stopped server sweeps at its next start.
+- `snapshot_retention_seconds` sets the expiration age and starts at seven days.
+  Each publish resets the folder modification time.
+  The sweep deletes expired folders at its next run.
+  A stopped server sweeps at its next start.
 - At the root, the sweep checks `is_symlink()` before `is_dir()`, so it never follows a symlink. It skips symlinks and entries that are not folders, for example `.index.json`, `.index.lock` and temporary files.
 - A root folder is a flat snapshot when its name is six lowercase letters or digits and it holds no subfolder and no symlink. The sweep deletes a flat snapshot as one folder.
 - Any other root folder is a session folder of the older `<session>/<UTC stamp>-<label>-<unique suffix>/` layout. The sweep checks each child folder on its own, skips child symlinks and never deletes the session folder.
@@ -403,12 +447,14 @@ Both machines import `/etc/nixos/modules/common/review-links.nix`. It defines th
 - The server binds only the IPv4 address from `tailscale ip -4`. `--port` changes only the port. The server exits 1 when that address is gone or changes, and it never serves on an old address.
 - The server serves regular files under the resolved root and the selected rows of published change pages, and never lists a folder. It never serves index files, page manifests or unfinished writes, including names in a different letter case.
 - One failed sweep entry never stops the bind, the server or the sweep of other entries. The sweep never follows a symlink.
-- Only the 7-day sweep deletes snapshots. A session end deletes nothing.
+- The configured sweep deletes expired snapshots.
+  A session end deletes nothing.
 - The skill gives a link only after `curl` on the same machine returns `200`, and only for the review-links service, never for a hand-run server.
 
 ## Gotchas
 
-- **Test port.** The publisher always prints port 8765, so a test server on another `--port` is not at the printed link.
+- **Test port.** The publisher uses `server_port`.
+  A server with another `--port` is not at the printed link.
 - **Mac case-insensitive filesystem.** The publisher compares output names after `str.casefold`, which is full Unicode case folding. `Report.txt` and `report.txt` collide. `Straße.txt` and `STRASSE.txt` collide. `Review.md`, with its `Review.html`, collides with `review.HTML`. This stops one output from overwriting another on the Mac.
 - **Private filenames.** `private_name` uses case folding before it checks names. It blocks index names, the `.review-link-` prefix, and atomic temporary names. The server checks names before and after it resolves symlinks. These checks hide page manifests and unfinished writes on both machines.
 - **Symlink aliases.** The key uses the resolved path and the published name. A symlink with a different name gets its own ID and its own copy, and the original link stays. A path through a symlinked folder to a file with the same name reuses the ID.
@@ -429,7 +475,7 @@ Both machines import `/etc/nixos/modules/common/review-links.nix`. It defines th
 - **A short URL.** The URL must not wrap in a terminal. The target is 60 characters. The IPv4 address of each machine has 13 characters, so a 20-character file name gives 53 characters, and a test checks the limit. The full name `natedev.tail21e383.ts.net` gives 65 characters. Percent-encoding makes names longer: a space becomes `%20`, and each non-ASCII letter becomes 6 or more characters.
 - **Plain HTTP on the tailnet, no `tailscale serve`.** The server binds only the Tailscale address, so only tailnet devices can reach it. One user service per machine needs no change to the Tailscale configuration. HTTPS, `tailscale serve` and access from outside the tailnet are out of scope.
 - **`marked` in the browser.** natedev has no `pandoc` and no Python `markdown` module, so the publisher does not render Markdown itself. The escaped `<pre>` keeps the page readable with no network.
-- **Snapshots and change pages.** Ordinary files are copied into the served root and stay after their publishing session ends. Change pages instead show only the review rows authorized by their private manifests. Both expire through the 7-day sweep.
+- **Snapshots and change pages.** Ordinary files are copied into the served root and stay after their publishing session ends. Change pages instead show only the review rows authorized by their private manifests. Both expire through the configured sweep.
 - **Refresh in place.** A second run on the same file set updates the same link, so the user refreshes the page that is already open to see an edit. `--new` keeps the old content when a separate link is necessary.
 - **Exit 1 on an address change.** A socket stays bound to one address, and only a new process can bind a new address. Exit 1 makes the service manager start the server again on the current address.
 - **`StartLimitIntervalSec=0` and `RestartSec=10s`.** When Tailscale is down at login, the server exits 1 at once. A user unit cannot order itself after the system's `tailscaled.service`, so the restart every 10 s is the wait. The systemd defaults, a 100 ms restart delay and a limit of five starts in ten seconds, would stop the unit for good before the tailnet returns.
@@ -464,3 +510,27 @@ curl -s -o /dev/null -w '%{http_code}' '<URL>'
 ```
 
 Give the link only if the result is `200`. To see the page title too, run `curl -s '<URL>' | grep -o '<title>[^<]*</title>'`. To check from the other machine, run the same `curl` there, for example from natedev: `ssh mac "curl -s -o /dev/null -w '%{http_code}' '<URL>'"`. If a link fails, compare the URL host with `tailscale ip -4`, and check that the service is active.
+
+
+## Configuration
+
+The scripts read `config/review_links.conf` through `scripts/lib/conf.py` when each operation starts.
+`server_port` selects the server port and the port in published URLs.
+`tailscale_timeout_seconds` limits address commands.
+`snapshot_retention_seconds` controls snapshot age.
+`snapshot_sweep_seconds` and `tailscale_check_seconds` control the server checks.
+`snapshot_allocation_tries` limits folder allocation attempts.
+`delivery_tries` and `delivery_pause_seconds` control message attempts.
+`unrouted_alert_recipient` selects the alert recipient.
+`unrouted_alert_retry_seconds` controls repeated alerts.
+
+The routing scripts read `config/change_review.conf` when they need a folder.
+`lists_directory` selects the default change review folder.
+`review_links_directory` selects the default delivery folder.
+`CHANGE_REVIEW_DIR` overrides the reader folder for tests.
+Each publication uses one delivery root for the HTML and its manifest.
+Each router resolves the configured alert folder once, when an unsaved unrouted row needs it.
+The status line watches `change_review.conf` so folder changes invalidate its counts.
+The alert guard uses only the configured folder.
+`REVIEW_LINKS_ROOT` overrides the delivery folder.
+The page, the footer and `/next` use these same folder readers.

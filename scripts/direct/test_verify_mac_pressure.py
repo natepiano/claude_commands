@@ -13,23 +13,14 @@ class VerifyMacPressureTests(VerifyMacOffloadFixture):
     def test_private_memory_pressure_blocks_local_work_until_its_release_event(self) -> None:
         pressure = Path(self.environment["BUILDLOG_MEMORY_PRESSURE"])
         _ = pressure.write_text("full avg10=20.00 avg60=0.00 avg300=0.00 total=0\n")
-        waiting = self.runner_state / "pressure-wait"
-        release = self.runner_state / "pressure-release"
-        self.write_executable(self.bin_directory / "sleep", '''#!/bin/sh
-: > "$TEST_PRESSURE_WAIT"
-exec "$TEST_REAL_PYTHON" "$TEST_WAIT_HELPER" "$TEST_PRESSURE_RELEASE"
-''')
-        process = self.start_verify("check", "sample", extra={
-            "TEST_PRESSURE_WAIT": str(waiting), "TEST_PRESSURE_RELEASE": str(release),
-        })
+        process = self.start_verify("check", "sample")
         try:
-            self.wait_for_path(waiting, (process,))
+            self.wait_for_memory_wait(process)
             self.assertEqual([event for event in self.cargo_events() if event["args"][:1] == ["check"]],
                              [], "pressure did not block local execution")
             ready = pressure.with_suffix(".ready")
             _ = ready.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
             _ = ready.replace(pressure)
-            release.touch()
             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(process.returncode, 0, output + errors)
             self.assertIn("memory pressure: full avg10 20.0", output + errors)

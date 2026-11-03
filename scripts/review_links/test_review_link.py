@@ -5,6 +5,7 @@ import html
 import fcntl
 import json
 import os
+import shutil
 import secrets
 import subprocess
 import sys
@@ -24,23 +25,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.review_links import review_link, serve
 
 
-from typing import TYPE_CHECKING, cast
+from typing import cast, override
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-
-
-if TYPE_CHECKING:
-    from typing import override
-else:
-    from typing import TypeVar
-
-    OverriddenMethod = TypeVar("OverriddenMethod")
-
-    def override(method: OverriddenMethod) -> OverriddenMethod:
-        return method
-
 
 SCRIPT = Path(__file__).with_name("review_link.py")
 TAILSCALE_IP = "100.103.14.30"
+
+
+def setUpModule() -> None:
+    configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    for stem in ("review_links", "change_review"):
+        _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf", configuration / f"{stem}.conf")
+    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
 
 class ReviewPage(HTMLParser):

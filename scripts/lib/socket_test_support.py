@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import socket
 import tempfile
+
+from scripts.lib import build_folders
 from pathlib import Path
 from typing import override
 
 
-def short_socket_directory() -> tempfile.TemporaryDirectory[str]:
+def short_socket_directory(prefix: str = "test-sock-") -> tempfile.TemporaryDirectory[str]:
     """Own a mode-0700 folder under /tmp; use its context or register cleanup."""
-    return tempfile.TemporaryDirectory(prefix="test-sock-", dir="/tmp")
+    return tempfile.TemporaryDirectory(prefix=prefix, dir=build_folders.SYSTEM_TEMPORARY_PARENT)
 
 
 class ShortUnixSocket(socket.socket):

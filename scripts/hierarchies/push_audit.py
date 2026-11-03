@@ -3,7 +3,7 @@
 
 This module defines the audit's failed-check rule. Date-time ends are excluded;
 a date-only --until includes that local day. Ownership comes from current
-production tables and cannot reconstruct historical ownership.
+staff rows and cannot reconstruct historical ownership.
 The report opens with a summary. Use --full to print the tables after it.
 """
 from __future__ import annotations
@@ -28,7 +28,7 @@ sys.path.insert(0, str(SCRIPTS / "production"))
 
 from scripts.hierarchies import log_records
 from scripts.notify.pushover import MESSAGE_MAX
-from scripts.production import production_units, showrunners
+from scripts.production import session_staff, showrunners, staff, unit_names
 
 STATE_DIR = Path.home() / ".local/state/notify"
 SESSION_CONFIG = SCRIPTS.parent / "config/hierarchies/sessions.toml"
@@ -319,28 +319,29 @@ def read_log[T](path: Path, parse: Callable[[log_records.JsonObject], T], proble
 
 
 def read_owners(problems: list[log_records.SourceProblem]) -> ProductionOwnership:
-    """Read current production tables without session lookup or roster traffic."""
+    """Read current staff rows without session lookup or roster traffic."""
     exact_names: dict[str, set[str]] = defaultdict(set)
     session_aliases: dict[str, set[str]] = defaultdict(set)
-    for instance in sorted(showrunners.NOTIFIER_STATE_DIR.glob("showrunner-*")):
-        checked = showrunners.checked_doc(instance)
-        if isinstance(checked, showrunners.NoCheckedDoc):
-            problems.append(log_records.SourceProblem(str(instance / "conf"), checked.reason, log_records.SourceNotApplicable.ATTRIBUTION))
-            continue
-        slug = instance.name.removeprefix("showrunner-")
-        exact_names[slug].add(slug)
-        try:
-            lines = checked.path.read_text(encoding="utf-8").splitlines()
-            for row in production_units.unit_table(lines):
-                if production_units.plan_cell_is_retired(row.get("Plan", "")):
+    try:
+        record = staff.snapshot()
+        resolver = session_staff.RowResolver(record)
+        for row in staff.active(record, "showrunner"):
+            timer = showrunners.timer_for(row, record)
+            slug = timer.slug if isinstance(timer, showrunners.Timer) else row.name
+            exact_names[row.name].add(slug)
+            exact_names[slug].add(slug)
+            for unit in staff.active(record, "unit"):
+                if unit.parent != row.id:
                     continue
-                name = production_units.cell_value(row.get("Unit", ""))
-                if name:
-                    exact_names[name].add(slug)
-                    if name.endswith("-unit"):
-                        session_aliases[name.removesuffix("-unit")].add(slug)
-        except (OSError, UnicodeError, production_units.Refusal) as error:
-            problems.append(log_records.SourceProblem(str(checked.path), f"unreadable ownership source: {error}", log_records.SourceNotApplicable.ATTRIBUTION))
+                state = resolver.unit_state(unit)
+                if not isinstance(state, session_staff.ActiveUnit):
+                    if isinstance(state, session_staff.LocationUnfilled):
+                        problems.append(log_records.SourceProblem(unit.name, state.reason, log_records.SourceNotApplicable.ATTRIBUTION))
+                    continue
+                exact_names[unit_names.unit_id(unit.name)].add(slug)
+                session_aliases[unit.name].add(slug)
+    except (OSError, ValueError) as error:
+        problems.append(log_records.SourceProblem("staff", str(error), log_records.SourceNotApplicable.ATTRIBUTION))
     return ProductionOwnership(
         {name: ShowrunnerOwner(next(iter(slugs))) for name, slugs in exact_names.items() if len(slugs) == 1},
         {name: ShowrunnerOwner(next(iter(slugs))) for name, slugs in session_aliases.items() if len(slugs) == 1})
@@ -537,7 +538,7 @@ def owner(sender: Sender, owners: ProductionOwnership, sessions: TopLevelSession
             return owners.session_aliases[sender.name]
     for session in sessions.entries:
         if sender.name == session.key:
-            return SessionWithoutProduction(session.key)
+            return owners.session_aliases.get(session.key, SessionWithoutProduction(session.key))
     if isinstance(sender, SessionSender):
         return SessionWithoutProduction(sender.name)
     return MachineService(sender.name)

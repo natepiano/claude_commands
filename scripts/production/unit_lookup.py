@@ -535,9 +535,10 @@ def observed_staff_marks(*, running: Sequence[SessionRecord] | None = None) -> t
 
 
 def every_marked_unit(*, record: staff.StaffSnapshot | None = None,
-                      sources: MemberSources | None = None) -> MarkedProductions:
+                      sources: MemberSources | None = None,
+                      running: Sequence[SessionRecord] | None = None) -> MarkedProductions:
     """Read all herdr units once. An unreadable host raises OSError."""
-    return group_marked_units(observed_staff_marks(), record=record, sources=sources)
+    return group_marked_units(observed_staff_marks(running=running), record=record, sources=sources)
 
 
 def marked_units(slug: str, *, record: staff.StaffSnapshot | None = None,

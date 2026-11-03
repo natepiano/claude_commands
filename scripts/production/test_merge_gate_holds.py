@@ -38,20 +38,18 @@ class MergeGateHoldTests(TemporaryHoldTest):
     @override
     def setUp(self) -> None:
         super().setUp()
+        hold_environment = {name: os.environ[name] for name in (
+            "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR", "MAC_TEST_STATE_DIR",
+            "NOTIFIER_SESSIONS_DIR", "CLAUDE_CODE_SESSION_ID", "UNIT_ACTIVE_DIR",
+            "UNIT_RUN_DIR", "UNIT_SESSION_DIR", "PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_SESSION_DIR",
+        )}
         self.addCleanup(self.gate.doCleanups)
         self.gate.setUp()
         self.gate.restore_fixture(suites_for_case(self))
         # Keep the hold helper's roots and owner, and the gate helper's tools and repos.
         _ = (Path(self.gate.environment["CONF_DIR"]) / "build_targets.conf").write_bytes(
             (self.root / "build_targets.conf").read_bytes())
-        self.environment = {**self.gate.environment, **{
-            name: os.environ[name] for name in (
-                "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR",
-                "MAC_TEST_STATE_DIR", "NOTIFIER_SESSIONS_DIR", "CLAUDE_CODE_SESSION_ID",
-                "UNIT_ACTIVE_DIR", "UNIT_RUN_DIR", "UNIT_SESSION_DIR",
-                "PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_SESSION_DIR",
-            )
-        }}
+        self.environment = {**self.gate.environment, **hold_environment}
         self.enterContext(mock.patch.dict(os.environ, self.environment))
 
     def record(self, event: str) -> None:

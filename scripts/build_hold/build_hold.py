@@ -21,7 +21,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, time as ClockTime, timezone
 from pathlib import Path
-from typing import Literal, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
@@ -34,6 +34,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import override_guard
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_targets"))
 from target_config import ConfigError, SshTarget, read_targets
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if TYPE_CHECKING:
+    from ..build_queue import admission_client, admission_protocol
+else:
+    from scripts.build_queue import admission_client, admission_protocol
 
 
 BUILD_COMMANDS = frozenset({"cargo", "rustc", "cargo-nextest"})
@@ -557,21 +563,11 @@ def audit_owner(process: AuditProcess, ancestors: Sequence[AuditProcess]) -> Own
     return NoOwningSession()
 
 
-def admitted_processes(buildlog_root: Path) -> frozenset[ProcessIdentity]:
-    """Read memory gate reservations without pruning or changing the ledger."""
-    admitted: set[ProcessIdentity] = set()
-    for path in (buildlog_root / "admission").glob("*.reservation"):
-        try:
-            value = cast(object, json.loads(path.read_text()))
-            if not isinstance(value, dict):
-                continue
-            row = cast(dict[str, object], value)
-            pid, start = row.get("pid"), row.get("start_time")
-            if isinstance(pid, int) and isinstance(start, str) and start.isdecimal():
-                admitted.add(ProcessIdentity(pid, start))
-        except (OSError, ValueError):
-            continue
-    return frozenset(admitted)
+def admitted_processes() -> frozenset[ProcessIdentity]:
+    """Read reservation owners from the bounded service view."""
+    reading = admission_client.view()
+    return frozenset(ProcessIdentity(row["pid"], row["start_time"])
+                     for row in reading.explanation.decided_from.reservations)
 
 
 def owner_is_sole_holder(owner: OwningSession | NoOwningSession, holders: Sequence[Holder]) -> bool:
@@ -592,9 +588,12 @@ def hold_enforcer() -> HoldEnforcer:
     return cast(HoldEnforcer, cast(object, importlib.import_module("hold_enforcer")))
 
 
-def audit_builds(proc_root: Path, holders: Sequence[Holder], buildlog_root: Path) -> tuple[AuditedBuild, ...]:
+def audit_builds(proc_root: Path, holders: Sequence[Holder]) -> tuple[AuditedBuild, ...]:
     processes = read_audit_processes(proc_root)
-    admitted = admitted_processes(buildlog_root)
+    try:
+        admitted = admitted_processes()
+    except admission_protocol.AdmissionUnavailable as error:
+        raise OSError(f"admission service unavailable: {error.reason}") from error
     builds: list[AuditedBuild] = []
     children: dict[int, list[ProcessIdentity]] = {}
     roots: list[AuditProcess] = []
@@ -650,8 +649,7 @@ def audit_hold(directory: Path, proc_root: Path) -> tuple[AuditedBuild, ...]:
     except ReleaseRecordReadError:
         state = read_holders(directory)
         holders = state.holders if isinstance(state, ActiveHolders) else ()
-    buildlog_root = Path(os.environ.get("BUILDLOG_DIR") or Path.home() / ".local/state/buildlog")
-    builds = audit_builds(proc_root, holders, buildlog_root)
+    builds = audit_builds(proc_root, holders)
     for build in builds:
         if build.classification in {"holder", "admitted"}:
             continue

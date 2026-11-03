@@ -20,7 +20,8 @@ from typing import Literal, Protocol, cast, final, get_args
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mac_test'))
 from scripts.aws_target import ledger, measurement, remote
-from scripts.aws_target.config import ControlSettings, money, offload_enabled, read_control_settings, read_settings
+from scripts.aws_target.config import ControlSettings, money, offload_enabled, read_control_settings, read_settings, service_loop
+from scripts.build_queue import queue_snapshot
 from scripts.build_targets.target_config import SshTarget, is_aws_target
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -61,35 +62,40 @@ class ControlResult:
 
 @final
 class AwsCli:
-    def __init__(self, settings: ControlSettings, execute: AwsExecutor = execute_command) -> None:
-        self.settings = settings
+    def __init__(self, profile: str, region: str, timeout_s: float,
+                 execute: AwsExecutor = execute_command) -> None:
+        self.profile = profile
+        self.region = region
+        self.timeout_s = timeout_s
         self.execute = execute
 
     def call(self, operation: str, *arguments: str, service: str = 'ec2') -> dict[str, object]:
-        result = self.execute(['aws', '--profile', self.settings.credentials_profile, '--region', self.settings.region,
+        result = self.execute(['aws', '--profile', self.profile, '--region', self.region,
                                service, operation, *arguments, '--output', 'json'], capture_output=True, text=True,
-                              timeout=self.settings.aws_timeout_s, check=False)
+                              timeout=self.timeout_s, check=False)
         if result.returncode:
             raise AwsUnavailable(result.stderr.strip() or f'{operation}: failed')
+        if service == 'cloudformation' and operation == 'deploy':
+            return {}
         raw = cast(object, json.loads(result.stdout))
         if not isinstance(raw, dict):
             raise AwsUnavailable(f'{operation}: invalid reply')
         return cast(dict[str, object], raw)
 
-    def observe(self, now: int) -> InstanceEvidence:
-        row = self.call('describe-instances', '--instance-ids', self.settings.instance_id)
+    def observe(self, instance_id: str, now: int) -> InstanceEvidence:
+        row = self.call('describe-instances', '--instance-ids', instance_id)
         try:
             reservations = cast(list[dict[str, object]], row['Reservations'])
             instances = [instance for reservation in reservations
                          for instance in cast(list[dict[str, object]], reservation['Instances'])]
-            if len(instances) != 1 or instances[0].get('InstanceId') != self.settings.instance_id:
+            if len(instances) != 1 or instances[0].get('InstanceId') != instance_id:
                 raise AwsUnavailable('instance identity does not match')
             instance = instances[0]
             state = cast(dict[str, object], instance['State']).get('Name')
             generation = instance.get('LaunchTime')
             if state not in get_args(ledger.InstanceState) or state == 'unknown' or not isinstance(generation, str) or not generation:
                 raise AwsUnavailable('instance lifecycle evidence is incomplete')
-            return InstanceEvidence(self.settings.instance_id, f'{self.settings.instance_id}:{generation}', cast(ledger.InstanceState, state), now)
+            return InstanceEvidence(instance_id, f'{instance_id}:{generation}', cast(ledger.InstanceState, state), now)
         except (KeyError, TypeError, AttributeError, IndexError) as error:
             raise AwsUnavailable('instance lifecycle reply is malformed') from error
 
@@ -154,8 +160,8 @@ class Controller:
         return result
 
     def _queued(self, settings: ControlSettings, now: int, configuration: conf.ConfigRead) -> int:
-        snapshot = memory_admit.read_queue_snapshot(self.queue_directory)
-        if (not isinstance(snapshot, memory_admit.QueueSnapshot)
+        snapshot = queue_snapshot.read_queue_snapshot(self.queue_directory)
+        if (not isinstance(snapshot, queue_snapshot.QueueSnapshot)
                 or not 0 <= now - snapshot.written_at <= settings.snapshot_max_age_s
                 or isinstance(snapshot.inputs.host, memory_admit.ReadingUnavailable)):
             return 0
@@ -212,7 +218,7 @@ class Controller:
         state['stop_generation'] = evidence.generation
         _ = self._save(state, ControlResult('stopping', reason, now, evidence.generation))
         _ = api.call('stop-instances', '--instance-ids', evidence.instance_id)
-        confirmed = api.observe(int(self.clock()))
+        confirmed = api.observe(evidence.instance_id, int(self.clock()))
         if confirmed.state in mac_test.RELEASE_STATES:
             self._release(confirmed)
         if confirmed.state in ('stopped', 'terminated'):
@@ -246,8 +252,8 @@ class Controller:
                 if not is_aws_target(configured):
                     raise ValueError('target is not an AWS target')
                 state = self._read()
-                api = AwsCli(settings, self.execute)
-                evidence = api.observe(now)
+                api = AwsCli(settings.credentials_profile, settings.region, settings.aws_timeout_s, self.execute)
+                evidence = api.observe(settings.instance_id, now)
                 previous_generation = state.get('permitted_generation')
                 state['instance_evidence'] = asdict(evidence)
                 if evidence.state in ('stopped', 'terminated'):
@@ -331,6 +337,16 @@ class Controller:
                 return self._save(state, ControlResult('refused', str(error), now, str(state.get('generation', ''))))
 
 
+def serve(settings_path: Path, directory: Path, *, execute: AwsExecutor = execute_command,
+          pause: Callable[[float], object] = time.sleep) -> None:
+    def tick() -> object:
+        return execute([sys.executable, str(Path(__file__)), 'tick',
+                        '--settings', str(settings_path), '--directory', str(directory)],
+                       capture_output=False, text=True, check=False,
+                       timeout=conf.read(settings_path).number('controller_tick_timeout_s'))
+    service_loop(settings_path, 'tick_interval_s', tick, pause=pause)
+
+
 class ControlArguments(argparse.Namespace):
     def __init__(self) -> None:
         super().__init__()
@@ -342,7 +358,7 @@ class ControlArguments(argparse.Namespace):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('tick', 'start', 'stop'))
+    _ = parser.add_argument('command', choices=('tick', 'start', 'stop', 'serve'))
     _ = parser.add_argument('--settings', type=Path)
     _ = parser.add_argument('--directory', type=Path)
     _ = parser.add_argument('--queue-directory', type=Path)
@@ -350,6 +366,9 @@ def main() -> int:
     directory = args.directory
     if directory == Path() and offload_enabled(conf.read(args.settings)):
         directory = offload.state_directory('aws')
+    if args.command == 'serve':
+        serve(args.settings, directory)
+        return 0
     controller = Controller(args.settings, directory, args.queue_directory)
     result = {'tick': controller.tick, 'start': controller.start, 'stop': controller.stop}[args.command]()
     print(json.dumps(asdict(result)))

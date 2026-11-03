@@ -16,7 +16,8 @@ from unittest.mock import patch
 import escalate
 import send
 import sessions
-from scripts.production import showrunners
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file
 if TYPE_CHECKING:
     from ..whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
 else:
@@ -48,6 +49,8 @@ class EscalateTests(unittest.TestCase):
             **os.environ, "ESCALATE_STATE_DIR": str(self.root / "state"), "LOG": str(self.root / "log"),
             "ESCALATE_SEND": str(self.root / "send.py"), "ESCALATE_NOTIFIER": str(self.root / "notifier.sh"),
         }
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        _ = (self.root / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
 
     def run_script(self, *arguments: str, **environment: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), *arguments], env={**self.environment, **environment},
@@ -307,7 +310,7 @@ class EscalateTests(unittest.TestCase):
 
     def test_due_after_swap_cancels_outgoing_account_without_waiting_for_updater(self) -> None:
         with (patch.dict(os.environ, {"HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root)}),
-              patch.object(escalate, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery()),
+              patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
               patch.object(escalate, "load_settings", return_value={"always": []}),
               patch.object(escalate, "STATE", self.root / "owned holds"),
               patch.object(escalate, "schedule"), patch.object(escalate, "deliver", return_value="") as deliver):
@@ -355,9 +358,7 @@ class EscalateTests(unittest.TestCase):
             b = self.select_codex(2)
             path = escalate.held_path("a-window")
             saved = path.read_bytes()
-            partial = showrunners.ShowrunnerDiscovery([], (
-                showrunners.ShowrunnerLookupFailure("missing", "fixture lookup failed"),))
-            with (patch.object(escalate, "registered_showrunners", return_value=partial),
+            with (patch.object(staff, "snapshot", side_effect=OSError("fixture lookup failed")),
                   patch.object(escalate, "load_settings", return_value={"always": ["offline"]}),
                   patch.object(escalate, "deliver", return_value="") as deliver,
                   patch.object(subprocess, "run") as send):
@@ -382,9 +383,7 @@ class EscalateTests(unittest.TestCase):
             path = escalate.held_path("five-hour-codex")
             saved = path.read_bytes()
             self.assertIsInstance(cast(escalate.HeldMessage, escalate.read(path)).owner, escalate.UnownedHold)
-            partial = showrunners.ShowrunnerDiscovery([], (
-                showrunners.ShowrunnerLookupFailure("missing", "fixture lookup failed"),))
-            with (patch.object(escalate, "registered_showrunners", return_value=partial),
+            with (patch.object(staff, "snapshot", side_effect=OSError("fixture lookup failed")),
                   patch.object(subprocess, "run") as retire):
                 for attempt in range(3):
                     escalate.reconcile_codex_holds(selected.home, selected.login)
@@ -392,7 +391,7 @@ class EscalateTests(unittest.TestCase):
                     self.assertEqual(path.read_bytes(), saved)
                 retire.assert_not_called()
             self.assertEqual([call.args[1] for call in deliver.call_args_list], ["other-tool"])
-            with (patch.object(escalate, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery()),
+            with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
                   patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as retire):
                 _ = escalate.due(10**12 + 4)
             self.assertFalse(path.exists())
@@ -420,7 +419,7 @@ class EscalateTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, "", "")
             with (patch.object(subprocess, "run", side_effect=retire),
                   patch.object(escalate, "load_settings", return_value={"always": ["offline"]}),
-                  patch.object(escalate, "registered_showrunners", return_value=[])):
+                  patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(()))):
                 _ = escalate.due(10**12)
             deliver.assert_not_called()
             self.assertEqual([item["key"] for item in send.read_queue(send.queue_path("offline"))], ["5-hour Claude"])

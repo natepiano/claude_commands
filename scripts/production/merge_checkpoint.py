@@ -65,6 +65,17 @@ class NotYetPushed(NamedTuple):
     pass
 
 
+class ChangesReadBeforePush(NamedTuple):
+    changes: list[change_review.PublicationChange]
+
+
+class ReadChangesWhenWriting(NamedTuple):
+    pass
+
+
+_READ_CHANGES_WHEN_WRITING = ReadChangesWhenWriting()
+
+
 class PromotionAlreadyAtTip(NamedTuple):
     tip: str
 
@@ -519,12 +530,14 @@ def checkpoint_step_record(checkout: Path, merge_head: str, step: str) -> Path:
     return checkout / path
 
 
-def record_changes(request: MergeRequest, commits: list[change_review.Commit], merge_head: str) -> None:
-    record_publication_changes(request.production, commits, merge_head)
+def record_changes(request: MergeRequest, commits: list[change_review.Commit], merge_head: str,
+                   changes: ChangesReadBeforePush | ReadChangesWhenWriting) -> None:
+    record_publication_changes(request.production, commits, merge_head, changes=changes)
 
 
 def record_publication_changes(production: Production, commits: list[change_review.Commit], merge_head: str,
-                               *, report_unchanged: bool = True) -> None:
+                               *, changes: ChangesReadBeforePush | ReadChangesWhenWriting = _READ_CHANGES_WHEN_WRITING,
+                               report_unchanged: bool = True) -> None:
     """Register each visible change and report merges with missing rows."""
     doc = change_review.list_path(production.doc)
     if doc is None:
@@ -539,14 +552,14 @@ def record_publication_changes(production: Production, commits: list[change_revi
     merged = good(git(production.checkout, "rev-parse", f"--short={change_review.SHORT}", merge_head), "push")
     try:
         # A stop after the list write but before the receipt must not add it twice.
-        changes = change_review.visible(commits)
+        publication = (changes.changes if isinstance(changes, ChangesReadBeforePush)
+                       else change_review.publication_changes(commits, production.doc))
         existing = change_review.pending(doc) if doc.exists() else []
         held = {row["Change"] for row in existing
                 if any(sha.startswith(merged) or merged.startswith(sha)
-                       for sha in cast(list[str], re.findall(r"\b[0-9a-f]{7,40}\b", row.get("Merged", ""))))}
-        rows = [] if changes and all(item.change in held for item in changes) else change_review.append_rows(
-            doc, changes, datetime.now(production.zone).date(), merged, production.doc,
-            owners=change_review.visible_owners(commits, production.doc))
+                       for sha in cast(list[str], change_review._HASH.findall(row.get("Merged", ""))))}  # pyright: ignore[reportPrivateUsage]
+        rows = [] if publication and all(change.item.change in held for change in publication) else change_review.append_rows(
+            doc, publication, datetime.now(production.zone).date(), merged, production.doc)
         done.parent.mkdir(parents=True, exist_ok=True)
         done.touch()
         drifted = change_review.drift(production.checkout, production.merge_branch,
@@ -1484,6 +1497,14 @@ def run(request: MergeRequest) -> int:
             for step in steps:
                 report(step, "ok", "checkpoint already merged; resuming promotion")
             paths = changed_paths(request, f"{merge_head}^1")
+        changes: ChangesReadBeforePush | ReadChangesWhenWriting = _READ_CHANGES_WHEN_WRITING
+        if isinstance(pushed, NotYetPushed) and change_review.list_path(request.production.doc) is not None:
+            try:
+                changes = ChangesReadBeforePush(change_review.publication_changes(commits, request.production.doc))
+            except (change_review.ChangeReviewError, OSError) as error:
+                undo_unpushed_merge(request.production, merge_head)
+                raise Stop("change review", "failed", f"{error}: the staff record is read before the push",
+                           "The staff record is unreadable; nothing was pushed; repair the staff record and send the checkpoint again.") from error
         if request.bump:
             report("test", "ok", "user bump: the gate runs on the pushed tip in the background")
         elif isinstance(pushed, NotYetPushed):
@@ -1533,7 +1554,7 @@ def run(request: MergeRequest) -> int:
             if tip:
                 record_pushed_merges(request.production, merge_head, request.commit, tip, phase_id=request.phase,
                                      issue=str(request.unit.plan))
-                record_changes(request, commits, merge_head)
+                record_changes(request, commits, merge_head, changes)
                 notify_published_style(request.production, merge_head, tip)
         promotion_done.parent.mkdir(parents=True, exist_ok=True)
         promotion_done.touch()

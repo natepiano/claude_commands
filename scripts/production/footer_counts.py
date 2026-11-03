@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 import change_review
-from scripts.production import change_routing, showrunners, staff
+from scripts.lib import conf
+from scripts.production import change_routing, staff
 import proposals_folder
 import proposals_table
 from production_units import Refusal, production_field
@@ -32,21 +33,24 @@ def total(each: list[FooterCounts]) -> FooterCounts:
     return FooterCounts(*(sum(column) for column in zip(FooterCounts(), *each)))
 
 
-def changes(doc: Path) -> int:
+def change_counts(doc: Path, record: staff.StaffSnapshot) -> tuple[int, int]:
+    """Count the production tab and the unrouted tab in one routed pass."""
     try:
-        return len(change_review.scoped_review_entries(change_review.scope_list(doc), doc))
+        scope = change_review.review_scope(doc, False, record)
+        routed = change_review.routed_review_entries(change_review.scope_list(doc), doc, record=record)
+        return (sum(owner.tab in scope for _, owner, _ in routed),
+                sum(isinstance(owner, change_routing.UnroutedChange) for _, owner, _ in routed))
     except (change_review.ChangeReviewError, OSError):
-        return 0
+        return 0, 0
+
+
+def changes(doc: Path) -> int:
+    return change_counts(doc, staff.snapshot())[0]
 
 
 def unrouted_changes(doc: Path) -> int:
     """Count the same global unrouted tab as the change page."""
-    try:
-        current = change_review.scope_list(doc)
-        return sum(isinstance(owner, change_routing.UnroutedChange)
-                   for _, owner, _ in change_review.routed_review_entries(current, doc))
-    except (change_review.ChangeReviewError, OSError):
-        return 0
+    return change_counts(doc, staff.snapshot())[1]
 
 
 def proposals(doc: Path) -> int:
@@ -83,21 +87,21 @@ def efficiency(doc: Path) -> int:
     return sum(open_efficiency(line) for line in lines)
 
 
-def read_counts(doc: Path, *, questions: int = 0) -> FooterCounts:
+def read_counts(doc: Path, *, questions: int = 0, record: staff.StaffSnapshot | None = None) -> FooterCounts:
     """Each count for one production doc; a source that cannot be read counts nothing."""
     try:
-        return FooterCounts(changes(doc), proposals(doc), questions, efficiency(doc), unrouted_changes(doc))
+        change_count, unrouted_count = change_counts(doc, record if record is not None else staff.snapshot())
+        return FooterCounts(change_count, proposals(doc), questions, efficiency(doc), unrouted_count)
     except OSError:
         return FooterCounts(questions=questions)
 
 
-def routing_sources() -> list[Path]:
+def routing_sources(record: staff.StaffSnapshot | None = None) -> list[Path]:
     """Watch staff, all review lists, and delivery records for tab count changes."""
     root = change_routing.review_root()
-    record = staff.snapshot()
-    routing = change_routing.StaffRouting(record, showrunners.timer_docs(), change_review.ReviewHistoryReader())
-    return [*(source for repo in routing.repository_choices({}, "") for source in change_routing.history_sources(repo)),
-            change_review.LISTS, *change_review.LISTS.glob(change_review.PREFIX + "*.md"),
+    record = record if record is not None else staff.snapshot()
+    lists = change_review.lists_directory()
+    return [conf.path("change_review"), lists, *lists.glob(change_review.PREFIX + "*.md"),
             *(Path(path) for path in record.inputs), root, *root.glob(".review-link-delivery-*")]
 
 

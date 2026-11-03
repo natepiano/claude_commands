@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.py_floor_test_support import cache_file_name
+
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 import unittest
@@ -187,7 +189,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         self.assertEqual(len(commands), 3)
         self.assertIn("sys.version_info", commands[0])
         self.assertEqual(commands[1:], ["print('ready')"] * 2)
-        self.assertEqual((self.root / "cold-cache" / "claude" / "python3-3.11").read_text().strip(), str(interpreter))
+        self.assertEqual((self.root / "cold-cache" / "claude" / cache_file_name()).read_text().strip(), str(interpreter))
 
     def test_interpreter_resolver_rejects_python310_and_its_old_cache(self) -> None:
         launcher = self.root / "scripts" / "lib" / "py"
@@ -215,6 +217,33 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual((result.returncode, result.stdout), (0, "UTC\n"), result.stderr)
+
+    def test_interpreter_resolver_rejects_python311_and_its_old_cache(self) -> None:
+        launcher = self.root / "scripts" / "lib" / "py"
+        binaries = self.root / "python311-bin"
+        binaries.mkdir()
+        interpreter = binaries / "python3"
+        _ = interpreter.write_text(
+            f"#!{sys.executable}\n"
+            + "import sys\n"
+            + "sys.version_info = (3, 11, 0, 'final', 0)\n"
+            + "exec(sys.argv[2])\n",
+            encoding="utf-8",
+        )
+        interpreter.chmod(0o755)
+        environment = self.environment()
+        cache_root = self.root / "python311-cache"
+        old_cache = cache_root / "claude" / "python3-3.11"
+        old_cache.parent.mkdir(parents=True)
+        _ = old_cache.write_text(str(interpreter) + "\n")
+        environment.update({"PATH": str(binaries) + os.pathsep + environment["PATH"],
+                            "XDG_CACHE_HOME": str(cache_root)})
+        result = subprocess.run(
+            ["bash", str(launcher), "-c", "import sys; print(sys.version_info[:2])"],
+            env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual((result.returncode, result.stdout), (0, f"{sys.version_info[:2]}\n"), result.stderr)
+        self.assertNotEqual((cache_root / "claude" / cache_file_name()).read_text().strip(), str(interpreter))
 
     def test_a_named_open_worker_receives_the_review_and_writes_findings(self) -> None:
         session_dir = self.start_implementation("assigned")

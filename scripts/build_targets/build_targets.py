@@ -61,10 +61,10 @@ import override_guard
 from user_zone import user_zone
 if TYPE_CHECKING:
     from ..message import roster
-    from ..aws_target import ledger as cost_ledger, measurement
+    from ..aws_target import config as aws_config, ledger as cost_ledger, measurement
 else:
     from scripts.message import roster
-    from scripts.aws_target import ledger as cost_ledger, measurement
+    from scripts.aws_target import config as aws_config, ledger as cost_ledger, measurement
 
 
 
@@ -308,7 +308,7 @@ def aws_spending_exclusion(target: SshTarget) -> str:
     """Check AWS spending before reading the execution settings."""
     if not is_aws_target(target):
         return ""
-    if conf.read(target.settings).text("offload") != "on":
+    if not aws_config.offload_enabled(conf.read(target.settings)):
         return "off"
     decision = cost_ledger.spending_guard(target.settings, mac_test.state_paths(target.name).directory)
     if isinstance(decision, cost_ledger.SpendingAllowed):

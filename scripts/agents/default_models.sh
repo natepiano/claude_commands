@@ -3,8 +3,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "$SCRIPT_DIR/agents_config.sh"
-# Every edit below publishes through agents_registry_store; no separate writer.
+source "$SCRIPT_DIR/models_config.sh"
+# Every edit below publishes through models_registry_store; no separate writer.
 
 # Unique skill names (the functions in [assignments]), sorted.
 list_skills() {
@@ -17,7 +17,7 @@ list_skills() {
         esac
         seen="$seen $key"
         echo "$key"
-    done < <(_agents_config_section_values assignments) | sort
+    done < <(_models_config_section_values assignments) | sort
 }
 
 # usage [function] — with a function, the examples use that function's real
@@ -32,25 +32,25 @@ usage() {
     if [[ -n "$fn" ]]; then
         # A caller function's example rows come from the family that would run
         # from here; from outside any session, codex stands in.
-        family="$(_agents_concrete_family "$(_agents_registry_get assignments "$fn")")"
-        [[ -z "$family" && "$(_agents_registry_get assignments "$fn")" == "$AGENTS_CALLER_ASSIGNMENT" ]] && family="codex"
+        family="$(_agents_concrete_family "$(_models_registry_get assignments "$fn")")"
+        [[ -z "$family" && "$(_models_registry_get assignments "$fn")" == "$AGENTS_CALLER_ASSIGNMENT" ]] && family="codex"
         if [[ -n "$family" ]]; then
             ex_fn="$fn"
             [[ "$family" == "codex" ]] && ex_other="claude" || ex_other="codex"
             # Take the first row without abandoning the producer mid-write --
             # a single `read` from a process substitution closes the pipe and
             # every later printf in it reports a broken pipe. See the note on
-            # _agents_registry_get in agents_config.sh.
-            row_line="$(_agents_config_section_values "$fn.$family")"
+            # _models_registry_get in models_config.sh.
+            row_line="$(_models_config_section_values "$fn.$family")"
             row_line="${row_line%%$'\n'*}"
             if [[ -n "$row_line" ]]; then
                 ex_row="$fn.${row_line%%=*}"
-                ex_pair="$(agents_config_trim "${row_line#*=}")"
+                ex_pair="$(models_config_trim "${row_line#*=}")"
             fi
         fi
     fi
     cat <<EOF
-Usage: agent_admin.sh [skills | <function> | <family> | <agent> | <tier>] | <function> <codex|claude|agent|tier> | <function>.<subtask> <agent>[:<effort>|tier]
+Usage: default_models.sh [skills | <function> | <family> | <agent> | <tier>] | <function> <codex|claude|agent|tier> | <function>.<subtask> <agent>[:<effort>|tier]
 
   (no args)                print every function, its family, and its resolved rows
                            (word=<family word>, agent=<current slug>)
@@ -83,17 +83,17 @@ Usage: agent_admin.sh [skills | <function> | <family> | <agent> | <tier>] | <fun
                            never take a tier: Claude fast mode bills extra usage
 
 Examples:
-  agent_admin.sh $ex_fn
-  agent_admin.sh $ex_other   # switch every function at once
-  agent_admin.sh ${ex_pair%%:*}   # every function on one agent, efforts kept
-  agent_admin.sh $ex_fn $ex_other
-  agent_admin.sh $ex_row $ex_pair
-  agent_admin.sh $ex_row ${ex_pair%%:*}   # keep the agent CLI default effort
-  agent_admin.sh $ex_fn fast   # codex speed tier for one function
-  agent_admin.sh $ex_row inherit   # the row follows its function's tier
+  default_models.sh $ex_fn
+  default_models.sh $ex_other   # switch every function at once
+  default_models.sh ${ex_pair%%:*}   # every function on one agent, efforts kept
+  default_models.sh $ex_fn $ex_other
+  default_models.sh $ex_row $ex_pair
+  default_models.sh $ex_row ${ex_pair%%:*}   # keep the agent CLI default effort
+  default_models.sh $ex_fn fast   # codex speed tier for one function
+  default_models.sh $ex_row inherit   # the row follows its function's tier
 
 Functions/subtasks come from [assignments] and [<function>.<family>] in
-config/agents.conf; model words from [<family>.families], slugs and efforts
+config/models.conf; model words from [<family>.families], slugs and efforts
 from [<family>.agents]. Codex words take the newest visible cached version
 with a known effort row; unresolved words show their reason in function status.
 Claude words stay CLI aliases that Claude resolves at launch.
@@ -124,14 +124,14 @@ tier_liveness() {
     if [[ -n "$subtask" ]]; then
         raw="$(_agents_active_family "$fn" "$subtask")"
     else
-        raw="$(_agents_registry_get assignments "$fn")"
+        raw="$(_models_registry_get assignments "$fn")"
     fi
     if [[ "$raw" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
         echo "live whenever a codex session runs $fn"
     elif [[ "$raw" == "codex" ]]; then
         echo "live"
     else
-        echo "dormant: ${fn}${subtask:+.$subtask} runs on $raw. Make it live with: agent_admin.sh $fn codex"
+        echo "dormant: ${fn}${subtask:+.$subtask} runs on $raw. Make it live with: default_models.sh $fn codex"
     fi
 }
 
@@ -141,7 +141,7 @@ set_tier() {
     agents_set_service_tier "$tier" "$scope"
     if [[ -z "$scope" ]]; then
         for fn in $AGENT_TIER_FUNCTIONS; do
-            [[ "$(_agents_registry_get assignments "$fn")" == "claude" ]] && dormant="$dormant, $fn"
+            [[ "$(_models_registry_get assignments "$fn")" == "claude" ]] && dormant="$dormant, $fn"
         done
         if [[ "$tier" == "inherit" ]]; then
             echo "# cleared every function's codex tier — codex rows follow $(codex_config_note)"
@@ -158,8 +158,8 @@ set_tier() {
         echo "# set [$fn.options] codex_service_tier${subtask:+.$subtask}=$tier — $(tier_liveness "$fn" "$subtask")"
     elif [[ -z "$subtask" ]]; then
         echo "# cleared $fn's codex tier — its codex rows follow $(codex_config_note)"
-    elif [[ -n "$(_agents_registry_get "$fn.options" codex_service_tier)" ]]; then
-        echo "# cleared $scope's own tier — it follows [$fn.options] codex_service_tier: $(_agents_registry_get "$fn.options" codex_service_tier)"
+    elif [[ -n "$(_models_registry_get "$fn.options" codex_service_tier)" ]]; then
+        echo "# cleared $scope's own tier — it follows [$fn.options] codex_service_tier: $(_models_registry_get "$fn.options" codex_service_tier)"
     else
         echo "# cleared $scope's own tier — it follows $(codex_config_note)"
     fi
@@ -186,7 +186,7 @@ elif [[ "$#" -eq 1 ]]; then
         exit 0
     fi
     # A bare family name switches everything; no function is ever named for one.
-    if _agents_config_has_section "$1.agents"; then
+    if _models_config_has_section "$1.agents"; then
         agents_set_all_assignments "$1"
         echo "# switched every function to $1"
         for fn in $AGENT_KEPT_FUNCTIONS; do
@@ -226,13 +226,13 @@ elif [[ "$#" -eq 2 ]]; then
         else
             echo "# updated [$fn.$AGENT_ROW_FAMILY] $1 — dormant:" \
                 "$1 runs on $AGENT_ROW_ACTIVE_FAMILY. Make it live with:" \
-                "agent_admin.sh $fn $AGENT_ROW_FAMILY"
+                "default_models.sh $fn $AGENT_ROW_FAMILY"
         fi
-    elif ! _agents_config_has_section "$2.agents" \
+    elif ! _models_config_has_section "$2.agents" \
         && [[ -n "$(_agents_agent_families_inline "$2")" ]]; then
         agents_set_model "$2" "$1"
         fn="$1"
-        if [[ "$(_agents_registry_get assignments "$fn")" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
+        if [[ "$(_models_registry_get assignments "$fn")" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
             echo "# set [$fn.$AGENT_SWEEP_FAMILY] to $2, efforts kept — live whenever a $AGENT_SWEEP_FAMILY session runs $fn"
         else
             echo "# switched $fn to $2 ($AGENT_SWEEP_FAMILY), efforts kept"

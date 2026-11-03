@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from scripts.build_queue.admission_test_support import caller_admission
+from scripts.lib.py_floor_test_support import cache_file_name
+
 from scripts.lint.memory_test_support import config_environment
 
 import json
@@ -233,6 +236,7 @@ esac
         return example
 
     def verify(self, *args: str) -> subprocess.CompletedProcess[str]:
+        _ = caller_admission(self, self.root, self.environment)
         self.environment["TEST_METADATA"] = json.dumps(workspace_metadata(self.root))
         return subprocess.run(
             ["bash", str(VERIFY), *args],
@@ -306,7 +310,7 @@ class SeededExampleWorkspaceFixture(ExampleWorkspaceFixture):
         # Host Nix discovery and Python version probing are separate contracts.
         cls.fixture_environment.update({"IN_NIX_SHELL": "pure", "BUILDLOG_BUILD_BUDGET_GIB": "64"})
         _ = cls.fixture_environment.pop("CLAUDE_PYTHON", None)
-        cache = builder.root / "cache/claude/python3-3.11"
+        cache = builder.root / "cache/claude" / cache_file_name()
         cache.parent.mkdir(parents=True)
         _ = cache.write_text(sys.executable + "\n")
         _ = shutil.copytree(builder.root, cls.fixture_seed, symlinks=True)
@@ -326,6 +330,7 @@ class SeededExampleWorkspaceFixture(ExampleWorkspaceFixture):
         self.calls = self.root / "cargo-calls"
         self.metadata_calls = self.root / "metadata-calls"
         self.environment = self.fixture_environment.copy()
+        _ = caller_admission(self, self.root, self.environment)
 
     @override
     def tearDown(self) -> None:

@@ -117,11 +117,11 @@ Go-live is the end of Phase 3, with test, check and doc: about 1,000 of last wee
 2. Run the runbook: `aws cloudformation deploy` of the template, with the region from the placement score and the $400 cap.
 3. In SSM Session Manager on the box: `sudo tailscale up --ssh --advertise-tags=tag:build-aws`, then add the tag rule to the tailnet policy.
 4. Create the scaler user's access key and write it with `aws configure --profile build-scaler` on natedev.
-5. Rebuild natedev and the box from the nixos branch.
+5. Rebuild the box from the nixos branch. natedev was rebuilt on `/etc/nixos` 10353a9 (2026-11-03), which holds the patch.
 
 ## Spending cap (user, 2026-11-01)
 
-`monthly_limit_usd=400` and `daily_limit_usd=20` (the monthly cap / 20). The AWS Budget uses the same $400. Phase 0 expects about $250 a month on Spot for test, check and doc, so the cap leaves room for Phase 4's lint (about $274).
+`monthly_limit_usd=400`: the user's words were "$400/month cap is fine to start". `daily_limit_usd=20` is derived (the monthly cap / 20); it waits for the user's approval at go-live. The AWS Budget uses the same $400. Phase 0 expects about $250 a month on Spot for test, check and doc, so the cap leaves room for Phase 4's lint (about $274).
 
 ## Review answers (user, 2026-11-02)
 

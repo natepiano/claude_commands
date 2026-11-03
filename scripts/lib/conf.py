@@ -2,7 +2,9 @@
 """Read live configuration, complete missing default values, and recover invalid values from Git."""
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 import math
 import os
@@ -11,7 +13,43 @@ import re
 import socket
 import subprocess
 import sys
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
+
+
+if TYPE_CHECKING:
+    from decimal import Decimal
+
+
+_warning_sink: ContextVar[Callable[[str], None] | None] = ContextVar("configuration_warning_sink", default=None)
+
+
+def _print_warning(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
+def _warning(message: str) -> None:
+    sink = _warning_sink.get()
+    if sink is None:
+        _print_warning(message)
+    else:
+        sink(message)
+
+
+@contextmanager
+def diagnostics(*, report: bool = True) -> Generator[list[str]]:
+    """Collect reader warnings for a reply, with optional local output."""
+    messages: list[str] = []
+
+    def collect(message: str) -> None:
+        messages.append(message)
+        if report:
+            _print_warning(message)
+
+    token = _warning_sink.set(collect)
+    try:
+        yield messages
+    finally:
+        _warning_sink.reset(token)
 
 
 class Unusable(ValueError):
@@ -91,10 +129,10 @@ class ConfigRead:
             except (ValueError, ArithmeticError):
                 continue
             if warn:
-                print(f"warning: {reason}", file=sys.stderr)
+                _warning(f"warning: {reason}")
             return RecoveredValue(value, reason)
         if warn:
-            print(f"warning: {reason}", file=sys.stderr)
+            _warning(f"warning: {reason}")
         return UnavailableValue(reason)
 
     def origin(self, key: str, convert: Callable[[str], Result]
@@ -146,9 +184,9 @@ class ConfigRead:
             except (OSError, UnicodeError):
                 pass
         for contents in _committed_files(self.source):
-            print(f"warning: {self.source}: keys: {fault.reason}", file=sys.stderr)
+            _warning(f"warning: {self.source}: keys: {fault.reason}")
             return _parse(contents)
-        print(f"warning: {self.source}: keys: {fault.reason}", file=sys.stderr)
+        _warning(f"warning: {self.source}: keys: {fault.reason}")
         raise Unusable(f"{self.source}: keys: {fault.reason}; no usable committed file")
 
 
@@ -215,18 +253,27 @@ def _limits(setting: Setting) -> None:
         bounds = limit.removeprefix(form).strip().split("..")
         if len(bounds) != 2:
             raise ValueError(f"invalid limit {limit}")
-        convert = _whole if form == "# whole:" else _number
+        convert = _whole if form == "# whole:" else decimal
         value = convert(setting.value)
         low, high = (bound.strip() for bound in bounds)
         if (low and value < convert(low)) or (high and value > convert(high)):
             raise ValueError(f"outside range {low}..{high}")
 
 
-def _number(value: str) -> float:
-    result = float(value)
-    if not math.isfinite(result):
+def decimal(value: str) -> Decimal:
+    from decimal import Decimal, InvalidOperation
+
+    try:
+        result = Decimal(value)
+    except InvalidOperation as error:
+        raise ValueError("expected a finite number") from error
+    if not result.is_finite() or not math.isfinite(float(result)):
         raise ValueError("expected a finite number")
     return result
+
+
+def _number(value: str) -> float:
+    return float(decimal(value))
 
 
 def _whole(value: str) -> int:

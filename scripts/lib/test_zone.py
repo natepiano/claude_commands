@@ -2,6 +2,7 @@
 """zone.py: resolve a place to a zone, write and push the setting, pull or queue the Mac, tell every session."""
 from __future__ import annotations
 
+import io
 import json
 import os
 import platform
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import override
@@ -84,6 +86,7 @@ class SetTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(redirect_stdout(io.StringIO()))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.checkout, origin, self.fakes = self.root / "checkout", self.root / "origin.git", self.root / "fakes"
         self.fakes.mkdir()

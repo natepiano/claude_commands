@@ -14,7 +14,7 @@ from typing import cast
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 from scripts.whoami import quota_alert_test_support as support
 import quota_alert
 import review
@@ -170,7 +170,7 @@ class RelayOutcomeTests(unittest.TestCase):
         cases = ((0, "SENT: fixture", True), (0, "SKIPPED: repeated", True),
                  (0, "KEPT: silence", True), (0, "REPLACED: revision", True),
                  (1, "QUEUED: offline", False), (3, "FAILED: unavailable", False),
-                 (2, "REFUSED: invalid", False), (4, "HELD: decision", False),
+                 (2, "REFUSED: invalid", False), (4, "HELD: decision", False), (5, "PENDING: active", False),
                  (0, "", False), (0, "QUEUED: inconsistent", False),
                  (1, "SENT: inconsistent", False), (0, "FAILED: inconsistent", False))
         for code, text, accepted in cases:
@@ -186,7 +186,8 @@ class RelayOutcomeTests(unittest.TestCase):
                                       (1, "QUEUED", "QUEUED: fixture detail"),
                                       (3, "FAILED", "stdout: FAILED: fixture detail"),
                                       (2, "REFUSED", "stdout: REFUSED: fixture detail"),
-                                      (4, "HELD", "stdout: HELD: fixture detail")):
+                                      (4, "HELD", "stdout: HELD: fixture detail"),
+                                      (5, "PENDING", "stdout: PENDING: fixture detail")):
             with self.subTest(header=header), mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, header + ": fixture detail", "")):
                 self.assertEqual(quota_alert.relay("fixture", "message", "fixture-key"), expected)
 

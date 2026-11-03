@@ -4,34 +4,49 @@ from __future__ import annotations
 import json
 import unittest
 from pathlib import Path
-from typing import cast
+from typing import cast, override
 
+from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct import test_verify_step_routes as routes
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, Record
 
 
 class VerifyTokenWaitTests(VerifyTokenWaitFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = caller_admission(self, self.root, self.environment)
+
     def test_token_wait_restores_the_original_place_and_runs_with_memory_and_token(self) -> None:
         observer = self.root / "observe-token.py"
         observations = self.root / "token-observations.json"
-        _ = observer.write_text('''import json
+        _ = observer.write_text('import sys\n' + f'sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})\n' + '''import json
 import os
 from pathlib import Path
 import sys
+
+from scripts.build_queue.admission_service import read_state, OrderNotStarted, TokenNotLeft
 
 phase = sys.argv[1]
 directory = Path(os.environ["BUILDLOG_DIR"]) / "admission"
 capture = Path(os.environ["TEST_TOKEN_OBSERVATIONS"])
 rows = json.loads(capture.read_text()) if capture.exists() else {}
-reservations = list(directory.glob("*.reservation"))
+state = read_state(directory)
+reservations = list(state.reservations.values())
 if phase == "reserved":
     assert len(reservations) == 1, reservations
-    rows[phase] = json.loads(reservations[0].read_text())["queue_waiter"]
+    rows[phase] = reservations[0].queue_waiter
 elif phase == "waiting":
     assert not reservations, reservations
-    waiting = [json.loads(path.read_text()) for path in directory.glob("*.waiting")]
+    waiting = list(state.places.values())
     assert len(waiting) == 1, waiting
-    row = waiting[0]
+    place = waiting[0]
+    row = {"pid": place.owner.pid, "start_time": place.owner.start_time,
+           "since": place.since}
+    if not isinstance(place.priority_since, OrderNotStarted):
+        row["priority_since"] = place.priority_since
+    if not isinstance(place.token_left_at, TokenNotLeft):
+        row["token_left_at"] = place.token_left_at
     for field in ("pid", "start_time", "since", "priority_since"):
         assert row.get(field) == rows["reserved"].get(field), (field, row, rows)
     assert "token_left_at" in row, row
@@ -39,7 +54,7 @@ elif phase == "waiting":
 else:
     assert len(reservations) == 1, reservations
     assert (Path(os.environ["UNIT_SESSION_DIR"]) / "locks/cargo.d").is_dir()
-    rows[phase] = json.loads(reservations[0].read_text())["queue_waiter"]
+    rows[phase] = reservations[0].queue_waiter
 capture.write_text(json.dumps(rows))
 ''')
         shell = self.root / "miss-once.sh"
