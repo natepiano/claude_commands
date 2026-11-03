@@ -37,6 +37,7 @@ from relay_identity import relay_session_name
 from relay_test_support import write_relay_record
 from scripts.lib import names
 from scripts.production import staff
+from scripts.message import send_result
 from scripts.message.recipient_test_support import staff_child_command
 from scripts.lib.test_names import fixture_names
 import rca
@@ -272,7 +273,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         acknowledged = send.acknowledged_skip_reason("shutdown-fixture", "2026-10-30T12:00:00+00:00")
         self.assertEqual(acknowledged, "key 'shutdown-fixture' acknowledged at 2026-10-30T12:00:00+00:00; `send.py reopen` to resume")
         window = "key 'shutdown-fixture' last sent to Unit at 2026-10-30T12:00:00+00:00, inside its 60-minute window"
-        cases: tuple[tuple[str, send.Outcome, str, str, bool], ...] = (
+        cases: tuple[tuple[str, send_result.Outcome, str, str, bool], ...] = (
             ("SENT: to the user\n", "sent", "to the user", "", False),
             ("SKIPPED: " + window + "\n", "skipped", window, "", False),
             ("SKIPPED: " + acknowledged + "\n", "skipped", acknowledged, "", True),
@@ -288,14 +289,52 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         )
         for output, outcome, detail, payload, is_acknowledged in cases:
             with self.subTest(output=output):
-                parsed = send.parse_outcome(output)
-                self.assertIsInstance(parsed, send.OutcomeHeader)
-                assert isinstance(parsed, send.OutcomeHeader)
+                parsed = send_result.parse_outcome(output)
+                self.assertIsInstance(parsed, send_result.OutcomeHeader)
+                assert isinstance(parsed, send_result.OutcomeHeader)
                 self.assertEqual((parsed.outcome, parsed.detail, parsed.payload), (outcome, detail, payload))
                 self.assertEqual(send.is_acknowledged_skip(parsed.detail), is_acknowledged)
         for output in ("", "reviewing draft\nunknown: still working\n", "sent: not a protocol header\n"):
             with self.subTest(output=output):
-                self.assertIsInstance(send.parse_outcome(output), send.NoOutcomeHeader)
+                self.assertIsInstance(send_result.parse_outcome(output), send_result.NoOutcomeHeader)
+
+    def test_send_outcome_confirms_each_header_with_its_documented_exit(self) -> None:
+        for header, code, outcome in (("SENT", 0, "sent"), ("SKIPPED", 0, "skipped"),
+                                      ("QUEUED", 1, "queued"), ("FAILED", 3, "failed"),
+                                      ("REFUSED", 2, "refused"), ("HELD", 4, "held"),
+                                      ("REPLACED", 0, "replaced"), ("KEPT", 0, "kept")):
+            with self.subTest(header=header):
+                result = send_result.send_outcome(code, header + ": fixture\nbody\n")
+                self.assertIsInstance(result, send_result.ConfirmedSendOutcome)
+                assert isinstance(result, send_result.ConfirmedSendOutcome)
+                self.assertEqual((result.header.outcome, result.header.detail, result.header.payload), (outcome, "fixture", "body"))
+
+    def test_send_outcome_uses_the_first_header_after_diagnostics(self) -> None:
+        result = send_result.send_outcome(1, "checking recipient\nQUEUED: offline\nsaved body\n")
+        self.assertIsInstance(result, send_result.ConfirmedSendOutcome)
+        assert isinstance(result, send_result.ConfirmedSendOutcome)
+        self.assertEqual((result.header.outcome, result.header.detail, result.header.payload), ("queued", "offline", "saved body"))
+
+    def test_send_outcome_does_not_replace_the_first_result_with_payload_text(self) -> None:
+        output = "FAILED: transport failed\nQUEUED: quoted earlier result\n"
+        result = send_result.send_outcome(3, output)
+        self.assertIsInstance(result, send_result.ConfirmedSendOutcome)
+        assert isinstance(result, send_result.ConfirmedSendOutcome)
+        self.assertEqual(result.header.outcome, "failed")
+        self.assertEqual(result.header.payload, "QUEUED: quoted earlier result")
+        self.assertIsInstance(send_result.send_outcome(1, output), send_result.UnconfirmedSendOutcome)
+
+    def test_send_outcome_requires_a_header_and_matching_exit(self) -> None:
+        for code, output in ((0, ""), (1, ""), (0, "sent: lowercase"), (0, "finished"),
+                             (0, "QUEUED: offline"), (1, "SENT: delivered"), (3, "SKIPPED: duplicate"),
+                             (0, "FAILED: unavailable"), (2, "HELD: review")):
+            with self.subTest(code=code, output=output):
+                self.assertIsInstance(send_result.send_outcome(code, output), send_result.UnconfirmedSendOutcome)
+
+    def test_send_outcome_does_not_confirm_an_interrupted_process(self) -> None:
+        for code in (None, -9, -15):
+            with self.subTest(code=code):
+                self.assertIsInstance(send_result.send_outcome(code, "SENT: apparent delivery"), send_result.UnconfirmedSendOutcome)
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -3517,11 +3556,42 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         message = send.Message("user", "script", "title", "body", None)
         with mock.patch.object(send, "run", return_value=(4, "SENT: earlier\nHELD: current\n1. Which build?\n", "")) as run:
             result = send.remote(message, "natedev", options)
-        self.assertEqual(result, send.Result("sent", "on natedev: earlier\nHELD: current\n1. Which build?"))
+        self.assertEqual(result, send.Result("failed", "ssh natedev: SENT: earlier HELD: current 1. Which build?"))
         self.assertNotIn("--answerable", cast(list[str], run.call_args.args[0])[-1])
         with mock.patch.dict(os.environ, {"CLAUDE_PID": ""}), mock.patch.object(send, "run", return_value=(1, "", "post failed")):
             _ = send.send(local_options(self.user_arguments("--from", "script")))
         self.assertFalse(self.failure_marker().exists())
+
+    def test_remote_preserves_each_confirmed_outcome_and_its_payload(self) -> None:
+        options = send.parse(self.user_arguments("--machine", "natedev"))
+        message = send.Message("user", "script", "title", "body", None)
+        cases: tuple[tuple[send_result.Outcome, int], ...] = (
+            ("sent", 0), ("skipped", 0), ("kept", 0), ("replaced", 0),
+            ("queued", 1), ("failed", 3), ("refused", 2), ("held", 4))
+        for outcome, code in cases:
+            with self.subTest(outcome=outcome), mock.patch.object(send, "run", return_value=(
+                    code, outcome.upper() + ": detail\nSENT: quoted payload\n", "SEND_RECIPIENT: session:fixture\n")):
+                result = send.remote(message, "natedev", options)
+            self.assertEqual(result, send.Result(outcome, "on natedev: detail\nSENT: quoted payload",
+                                                 send.NO_FAILED_PUSH, "session:fixture"))
+
+    def test_remote_requires_a_matching_exit_and_preserves_failure_metadata(self) -> None:
+        options = send.parse(self.user_arguments("--machine", "natedev"))
+        message = send.Message("user", "script", "title", "body", None)
+        record: send.FailedPushTransportRecord = {"reviewed": True, "need": "note", "title": "Choice",
+                                                 "action": "Choose retry.", "body": "The build stopped."}
+        for code, output in ((4, "SENT: earlier\nHELD: current\n1. Which build?\n"),
+                             (1, "SENT: apparent delivery"), (0, "QUEUED: offline"), (0, ""),
+                             (None, "SENT: interrupted")):
+            with self.subTest(code=code, output=output), mock.patch.object(send, "run", return_value=(
+                    code, output, "send.py: failed push JSON: " + json.dumps(record))):
+                result = send.remote(message, "natedev", options)
+            self.assertEqual(result.outcome, "failed")
+            self.assertIn("ssh natedev:", result.detail)
+            self.assertIsInstance(result.failure, send.FailedPush)
+            assert isinstance(result.failure, send.FailedPush)
+            self.assertEqual(result.failure.action, ActionRequired("Choose retry."))
+            self.assertEqual(result.failure.body, record["body"])
 
     def test_fallback_is_one_line_and_truncates_at_a_word_boundary(self) -> None:
         """F001: the built-in push has only a short message."""

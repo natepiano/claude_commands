@@ -265,6 +265,55 @@ class HealTests(NixFixture):
         self.assertIn("--only fixture --check", command[command.index("--clears-when") + 1])
         self.assertEqual([entry["action"] for entry in self.records()], ["refused", "refused"])
 
+    def test_retained_alert_marks_notified_without_another_send(self) -> None:
+        heal.STATE_DIR.mkdir()
+        for code, output in ((1, "checking delivery\nQUEUED: offline"), (0, "KEPT: until silence ends"),
+                             (0, "SKIPPED: acknowledged"), (0, "REPLACED: newer push")):
+            with self.subTest(output=output):
+                history = heal.new_history()
+                with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, output, "")) as run:
+                    heal.alert(self.session, history, "fixture refusal")
+                    heal.alert(self.session, history, "fixture refusal")
+                self.assertTrue(history["notified"])
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual(self.records(), [])
+
+    def test_failed_alert_with_queued_text_only_on_stderr_remains_unnotified(self) -> None:
+        heal.STATE_DIR.mkdir()
+        history = heal.new_history()
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "QUEUED: diagnostic")) as run:
+            heal.alert(self.session, history, "fixture refusal")
+            heal.alert(self.session, history, "fixture refusal")
+        self.assertFalse(history["notified"])
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual([(entry["action"], entry["reason"]) for entry in self.records()],
+                         [("push_failed", "QUEUED: diagnostic")] * 2)
+
+    def test_failed_alert_with_queued_text_in_the_payload_remains_unnotified(self) -> None:
+        heal.STATE_DIR.mkdir()
+        output = "FAILED: unavailable\nQUEUED: quoted result"
+        for code in (0, 1, 3):
+            with self.subTest(code=code):
+                history = heal.new_history()
+                with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, output, "")):
+                    heal.alert(self.session, history, "fixture refusal")
+                self.assertFalse(history["notified"])
+                self.assertEqual((self.records()[-1]["action"], self.records()[-1]["reason"]), ("push_failed", output))
+
+    def test_unconfirmed_alert_result_remains_retryable(self) -> None:
+        heal.STATE_DIR.mkdir()
+        for code, output in ((0, ""), (0, "unrelated output"), (0, "QUEUED: inconsistent exit"),
+                             (1, "SENT: inconsistent exit"), (2, "REFUSED: action required"), (4, "HELD: review")):
+            with self.subTest(code=code, output=output):
+                history = heal.new_history()
+                with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, output, "")) as run:
+                    heal.alert(self.session, history, "fixture refusal")
+                    heal.alert(self.session, history, "fixture refusal")
+                self.assertFalse(history["notified"])
+                self.assertEqual(run.call_count, 2)
+                self.assertEqual(self.records()[-1]["action"], "push_failed")
+                self.assertEqual(self.records()[-1]["reason"], output or f"exit {code}")
+
     def test_broken_replacement_hits_hour_guard_and_pushes_once(self) -> None:
         held, ensure, run = self.install_sweep([self.session])
         held.return_value = ""
