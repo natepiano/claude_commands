@@ -20,7 +20,7 @@ import sessions
 import restart
 from unit_staff_test_support import unit_host
 from scripts.production import staff
-from scripts.shutdown import shutdown_record, stop_resume
+from scripts.shutdown import shutdown_record, stop_resume, pane_record
 from test_support import ShutdownTestCase
 
 
@@ -140,6 +140,24 @@ def worker_session(
         host=inventory.UnknownHost(kind="unknown"),
         owner=worker_owner,
     )
+
+
+class SessionLaunchTests(ShutdownTestCase):
+    def test_restart_reads_plugin_directories_from_the_shutdown_pane_record(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        directories = [str(root / "postmaster"), str(root / "second plugin")]
+        entry = pane_record.launch("w1:p2", "saved", str(root), {},
+            ["claude", "--plugin-dir", directories[0], "--plugin-dir=" + directories[1]])
+        with (patch.object(pane_record, "RECORD_DIR", root / "panes"),
+              patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": "/account"})):
+            pane_record.write("agents", entry)
+            kind, environment, arguments = restart.session_launch("saved")
+        self.assertEqual(kind, "claude")
+        self.assertEqual(environment, {"CLAUDE_CONFIG_DIR": "/account"})
+        parsed = pane_record.parse_claude_arguments(["claude", *arguments])
+        self.assertEqual(parsed.plugin_directories, tuple(directories))
+        self.assertEqual(parsed.values["--resume"], "saved")
+        self.assertEqual(arguments.count("--plugin-dir"), 2)
 
 
 class RestartTests(ShutdownTestCase):
