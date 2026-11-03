@@ -30,7 +30,6 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 for directory in ("production", "shutdown", "herdr", "message", "whoami"):
     sys.path.insert(0, str(SCRIPTS / directory))
 
-from scripts.shutdown import shutdown_record
 
 if TYPE_CHECKING:
     from scripts.production import live_units, production_units, unit_lookup
@@ -155,9 +154,6 @@ def _write_state(state: dict[str, DownOutage]) -> None:
 def _sources(report_failure: Callable[[str], None] = lambda _message: None) -> dict[tuple[str, str], RecoverySource]:
     sources: dict[tuple[str, str], RecoverySource] = {}
     newest: dict[tuple[str, str], pane_record.PaneLaunch] = {}
-    # Records are ordered by their validated UTC request time; the latest stop wins.
-    stops = {record["session"]["session_id"]: record for record in shutdown_record.all_session_records()
-             if record["then"] == "stop"}
     for entry in sorted(pane_record.launches(), key=lambda item: item["written_at"]):
         marks = entry["environment"]
         unit, production = marks.get("SHOWRUNNER_UNIT_ID", ""), marks.get("SHOWRUNNER_UNIT", "")
@@ -168,9 +164,6 @@ def _sources(report_failure: Callable[[str], None] = lambda _message: None) -> d
         newest[key] = entry
     for key, entry in newest.items():
         if entry.get("ended", False):
-            continue
-        stopped = stops.get(entry["session_id"])
-        if stopped is not None and datetime.fromisoformat(stopped["requested_at"]) >= datetime.fromisoformat(entry["written_at"]):
             continue
         production, unit = key
         try:

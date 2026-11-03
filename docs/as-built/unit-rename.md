@@ -90,18 +90,9 @@ steps:
    field belongs to this production's owners; no plan field match is needed. This accepts the production slug or
    `unit (production)` form and leaves another production's issues in a shared folder untouched.
 8. **Retire.** A changed branch is deleted once origin holds the new tip.
-9. **Restart record.** The fields that move:
-   - `host.unit`;
-   - the cwd, plan path and worker cwds under the worktree;
-   - the Claude and herdr names, while they are still the defaults;
-   - `renamed`, which `restart.restart_note` puts first in the resumed prompt. With `kept` set it
-     also says the branch took no merge and the paused Codex workers now work in the new worktree.
-     `implement.sh` passes `--cwd <working dir>` on every follow-up, so a resumed worker's turns run
-     there and not in the path its thread started in.
+9. **Staff session.** Staff keeps the current session ID and worktree.
+   Restart reads those fields. It writes no name or worktree into the shutdown record.
 
-   `restart._unit_argv` still reads the plan from the Units row.
-   Old and new default herdr names use the shared prefix rule, so `names-unit` →
-   `cargo-liner-style-names-unit` keeps herdr session `cargo-liner-style-names`.
 10. **Relaunch.** `shutdown.py restart --only <session> --here` brings the unit back. apply then
     waits for the new id to carry a live Claude mark (`_await_live`, `LIVE_WAIT_SECONDS`,
     `RENAME_UNIT_LIVE_WAIT`, default 180), so verify does not run before the unit is up. The rename
@@ -122,7 +113,7 @@ A unit that was not running has no record, so steps 9 and 10 do nothing for it.
   - the branches and worktree;
   - the transcript folders, the stall stretch and the newest run;
   - proposals and phase notes;
-  - the shutdown record and the live session's mark;
+  - the staff row and the live session's mark;
   - held design roles (`design_roles.rename_failures`): no old holder, no old checkout in a live field or roster `cwd`, no stale `design_context.json`.
 - **Control.** The old id must still be in the merge-branch subjects. If the matcher finds nothing
   in history, it is broken.

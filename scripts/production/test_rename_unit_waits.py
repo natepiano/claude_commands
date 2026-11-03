@@ -71,16 +71,15 @@ class UnitRenameWaitsTests(UnitRenameFixture):
                       waited + stdout)
         # The fake restart starts nothing; every step before verify ran once the gate was done.
         self.assertIn("gamma-unit is not running", stderr)
-        self.assertEqual(self.journal()["step"], 10)
+        self.assertEqual(self.journal()["step"], 9)
 
     def test_a_running_unit_plans_and_apply_stops_it_through_the_shutdown_path(self) -> None:
         log = self.seed_record()
-        (self.home / ".local/state/shutdown/owner@example.com/sessions/5ad615f2-4e04-5121-a102-9d6b2e2a6eb3.json").unlink()
         _ = self.mark_live("alpha-unit", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
         self.record_live_launch()
         planned = self.rename("plan")
         self.assert_ok(planned)
-        self.assertIn("1. pause alpha-unit and its Codex workers through the shutdown path", planned.stdout)
+        self.assertIn("1. stop alpha-unit and pause its Codex workers; staff supplies the relaunch", planned.stdout)
         with patch.object(self, "stop_session", return_value=stop_resume.StopFailed("5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", "fixture stop refused")) as stop:
             applied = self.rename("apply")
         self.assert_refused(applied, "stop refused: fixture stop refused")

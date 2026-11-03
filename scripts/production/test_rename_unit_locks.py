@@ -71,7 +71,7 @@ class UnitRenameLockTests(UnitRenameFixture):
             self.assertEqual(process.returncode, 1, output + errors)
             self.assertIn("gamma-unit is not running", errors)
             self.assertNotIn("merge lock: waiting", output)
-            self.assertEqual(self.journal()["step"], 10)
+            self.assertEqual(self.journal()["step"], 9)
             self.assertEqual(len(log.read_text().splitlines()), len(before.splitlines()) + 1)
             _ = self.mark_live("gamma-unit", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
             process = self.start_apply()
