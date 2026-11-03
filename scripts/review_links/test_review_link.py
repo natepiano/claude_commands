@@ -5,6 +5,7 @@ import html
 import fcntl
 import json
 import os
+import shutil
 import secrets
 import subprocess
 import sys
@@ -41,6 +42,13 @@ else:
 
 SCRIPT = Path(__file__).with_name("review_link.py")
 TAILSCALE_IP = "100.103.14.30"
+
+
+def setUpModule() -> None:
+    configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    for stem in ("review_links", "change_review"):
+        _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf", configuration / f"{stem}.conf")
+    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
 
 class ReviewPage(HTMLParser):

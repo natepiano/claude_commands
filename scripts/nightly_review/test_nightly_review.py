@@ -28,6 +28,7 @@ from scripts.message import sessions
 from scripts.production.staff_test_support import (isolated_staff_file, isolated_source_readers,
                                                     source_environment, recorded_unit, fixture_member,
                                                     fixture_runtime_id)
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 # `messages` reads the message review from its own folder, as the timer does.
 
@@ -73,11 +74,16 @@ class NightlyReviewTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+        configuration = self.root / "config"
+        configuration.mkdir()
+        for stem in ("nightly_review", "accounts", "nix_env"):
+            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf", configuration / f"{stem}.conf")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         home = self.root / "home"
         (home / ".claude").mkdir(parents=True)
         environment_context: object = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(home)})))
         del environment_context
-        _ = self.enterContext(mock.patch.object(nightly_review, "ROOT", self.root / "nights"))
+        _ = self.enterContext(mock.patch.object(nightly_review, "state_root", return_value=self.root / "nights"))
         environment = source_environment(self.root / "sources")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", environment))
@@ -92,8 +98,8 @@ class NightlyReviewTests(unittest.TestCase):
         return row.current_session
 
     def test_timer_runs_messages_after_rust(self) -> None:
-        self.assertEqual(nightly_review.MODES, ("config", "rust", "messages"))
-        self.assertEqual(nightly_review.PROMPT, "/nightly_review config rust messages")
+        self.assertEqual(conf.read("nightly_review").words("review_modes"), ("config", "rust", "messages"))
+        self.assertEqual(nightly_review.job(NIGHT), "Nightly review for NIGHT=2026-09-29: follow ~/.claude/commands/nightly_review.md with the modes config rust messages, in that order.")
 
 
     def test_copied_nightly_library_import_needs_no_message_review_or_production_modules(self) -> None:
@@ -133,7 +139,7 @@ class NightlyReviewTests(unittest.TestCase):
             _ = (sessions / f"{index}.json").write_text(json.dumps(record))
         def production_of(sid: str) -> Path | None:
             return self.root if sid == "sid-0" else None
-        with (mock.patch.object(nightly_review, "SESSIONS_DIR", sessions),
+        with (mock.patch.object(nightly_review, "sessions_directory", return_value=sessions),
               mock.patch.object(showrunners, "registered_showrunners", return_value=[]),
               mock.patch.object(showrunners, "production_of", side_effect=production_of),
               mock.patch.object(account, "process_config_dir", side_effect=AssertionError("recorded account lost"))):
@@ -156,7 +162,7 @@ class NightlyReviewTests(unittest.TestCase):
         _ = unrelated.write_text(transcript.read_text())
         _ = (registry / "unrelated.json").write_text(json.dumps(nightly_review.TranscriptSessionRecord(
             sessionId=fixture_runtime_id("unrelated"), name="unrelated", transcript_path=str(unrelated))))
-        with mock.patch.object(nightly_review, "SESSIONS_DIR", registry):
+        with mock.patch.object(nightly_review, "sessions_directory", return_value=registry):
             found = nightly_review.showrunner_transcripts(since)
         self.assertEqual(found, [transcript])
 
@@ -170,7 +176,7 @@ class NightlyReviewTests(unittest.TestCase):
             type="assistant", timestamp=(since - timedelta(days=2)).isoformat())) + "\n")
         _ = (sessions / "1.json").write_text(json.dumps(nightly_review.TranscriptSessionRecord(
             name="natedev", sessionId=identity, transcriptPath=str(path))))
-        with (mock.patch.object(nightly_review, "SESSIONS_DIR", sessions),
+        with (mock.patch.object(nightly_review, "sessions_directory", return_value=sessions),
               mock.patch.object(showrunners, "registered_showrunners", return_value=[])):
             self.assertEqual(nightly_review.showrunner_transcripts(since), [])
 
@@ -186,7 +192,7 @@ class NightlyReviewTests(unittest.TestCase):
             type="assistant", timestamp=since.isoformat())) + "\n")
         _ = (sessions / "1.json").write_text(json.dumps(nightly_review.TranscriptSessionRecord(
             name="natedev", sessionId=identity, cwd="/work", pid=42)))
-        with (mock.patch.object(nightly_review, "SESSIONS_DIR", sessions),
+        with (mock.patch.object(nightly_review, "sessions_directory", return_value=sessions),
               mock.patch.object(showrunners, "registered_showrunners", return_value=[]),
               mock.patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(config)) as directory):
             self.assertEqual(nightly_review.showrunner_transcripts(since), [path])
@@ -247,7 +253,6 @@ class NightlyReviewTests(unittest.TestCase):
         self.assertIn("Edit(~/.claude/**)", denied)
         for label in ("claude1", "claude2", "claude3"):
             self.assertIn(f"Edit(~/{accounts.account_dir(label).name}/**)", denied)
-
 
 
 class TonightTests(NightlyReviewTests):

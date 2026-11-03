@@ -34,6 +34,8 @@ class UnroutedAlertTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.root), "STAFF_FILE": str(self.root / "staff.json"),
                                                "REVIEW_LINKS_ROOT": str(self.root / "links")}))
+        source_config = Path(__file__).resolve().parents[2] / "config/change_review.conf"
+        _ = (self.root / "change_review.conf").write_text(source_config.read_text())
         self.config = self.root / "review_links.conf"
         source = Path(__file__).resolve().parents[2] / "config/review_links.conf"
         _ = self.config.write_text(source.read_text().replace("unrouted_alert_recipient=natedev", "unrouted_alert_recipient=alert-owner"))
@@ -230,7 +232,7 @@ assert 'send' not in sys.modules
         self.assertFalse((self.root / "links").exists())
 
     def test_a_failed_alert_keeps_the_broken_producer_unrouted(self) -> None:
-        _ = self.enterContext(patch.object(change_routing, "LISTS", self.root))
+        _ = self.enterContext(patch.object(change_routing, "configured_lists_directory", return_value=self.root))
         router, _, unit = self.orphan_router()
         with (patch.object(unrouted_alert, "send_message", side_effect=RuntimeError("not reached")), redirect_stderr(StringIO())):
             owner = router.owner(self.row | {"Producer": str(unit.id)}, self.root / "change-review - top.md")
@@ -239,7 +241,7 @@ assert 'send' not in sys.modules
 
     def test_an_unrouted_list_in_the_real_folder_sends_once_through_the_fake_sender(self) -> None:
         router, _, unit = self.orphan_router()
-        with (patch.object(change_routing, "LISTS", self.root),
+        with (patch.object(change_routing, "configured_lists_directory", return_value=self.root),
               patch.object(unrouted_alert, "send_message") as send):
             for _ in range(2):
                 owner = router.owner(self.row | {"Producer": str(unit.id)}, self.root / "change-review - top.md")

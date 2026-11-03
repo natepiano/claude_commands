@@ -1724,6 +1724,138 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         for path in paths:
             self.assertEqual(send.read_queue(path), preserved[path])
 
+    def assert_older_send_preserves_newer_queue(self, older_result: send.Result, *, restart: bool) -> None:
+        self.session("recipient", "Recipient")
+        member = self.staff_rows["recipient"]
+        started = send.now()
+        other = send.StableRecipient("staff:other")
+        paths = [send.queue_path("session-recipient"), send.queue_path("session-previous")]
+        for address in ("session:recipient", "session:previous"):
+            for key, body in (("notice", "Other recipient"), ("unrelated", "Unrelated key"), (None, "Unkeyed body")):
+                send.enqueue(send.Message(address, "Sender", "", body, key), "unavailable", started, recipient=other)
+        preserved = {path: send.read_queue(path) for path in paths}
+        options = local_options(["--to", "recipient", "--from", "Sender", "--key", "notice",
+                                 "--repeat-minutes", "0", "--text", "Older body"])
+        destination = "session:after" if restart else "session:recipient"
+
+        def overlap(message: send.Message, timeout: float) -> send.Result:
+            del message, timeout
+            if restart:
+                self.session("after", "After")
+                self.staff_rows = {"recipient": replace(member, current_session=staff.StaffId("after"))}
+            with (mock.patch.object(send, "new_queue_order", return_value=send.QueueOrder(200)),
+                  mock.patch.object(send, "relay", return_value=send.Result("queued", "Newer delivery failed."))):
+                self.assertEqual(send.send(options._replace(text="Newer body")).outcome, "queued")
+            return older_result
+
+        with (mock.patch.object(send, "now", return_value=started),
+              mock.patch.object(send, "new_queue_order", return_value=send.QueueOrder(100)),
+              mock.patch.object(send, "relay", side_effect=overlap)):
+            self.assertEqual(send.send(options).outcome, older_result.outcome)
+        queued = [entry for path in (self.root / "queue").glob("*.jsonl") for entry in send.read_queue(path)
+                  if entry.get("stable_recipient") == "staff:recipient" and entry["key"] == "notice"]
+        self.assertEqual([entry["text"] for entry in queued], ["Newer body"])
+        self.assertEqual(queued[0].get("send_order"), 200)
+        for path in paths:
+            self.assertEqual([entry for entry in send.read_queue(path) if entry.get("stable_recipient") == other.value],
+                             preserved[path])
+        delivered = send.pending(destination)
+        self.assertEqual(delivered.count("Newer body"), 1)
+        self.assertNotIn("Older body", delivered)
+        self.assertEqual(send.pending(destination), "")
+        for path in paths:
+            self.assertEqual(send.read_queue(path), preserved[path])
+
+    def test_older_delivery_keeps_the_newer_sends_queued_body(self) -> None:
+        self.assert_older_send_preserves_newer_queue(send.Result("sent", "Older delivery finished."), restart=False)
+
+    def test_older_enqueue_keeps_the_newer_sends_queued_body_after_a_restart(self) -> None:
+        self.assert_older_send_preserves_newer_queue(send.Result("queued", "Older delivery failed."), restart=True)
+
+    def test_queue_order_keeps_the_second_send_when_the_clock_moves_back(self) -> None:
+        self.session("recipient", "Recipient")
+        self.outcome = send.Result("queued", "Delivery unavailable.")
+        started = send.now()
+        options = local_options(["--to", "recipient", "--from", "Sender", "--key", "notice",
+                                 "--text", "Older body"])
+        with (mock.patch.object(send, "now", return_value=started),
+              mock.patch.object(time, "time_ns", return_value=200)):
+            self.assertEqual(send.send(options).outcome, "queued")
+        first = send.read_queue(send.queue_path("session-recipient"))[0]
+        with (mock.patch.object(send, "now", return_value=started - timedelta(days=1)),
+              mock.patch.object(time, "time_ns", return_value=100)):
+            self.assertEqual(send.send(options._replace(text="Newer body")).outcome, "queued")
+        queued = send.read_queue(send.queue_path("session-recipient"))
+        self.assertEqual([entry["text"] for entry in queued], ["Newer body"])
+        self.assertGreater(queued[0].get("send_order", 0), first.get("send_order", 0))
+        self.assertEqual(send.pending("session:recipient").count("Newer body"), 1)
+
+    def test_queue_order_recovers_from_queued_entries_without_a_readable_counter(self) -> None:
+        message = send.Message("session:recipient", "Sender", "", "Queued body", "notice")
+        send.enqueue(message, "unavailable", send.now(), order=send.QueueOrder(90))
+        counter = self.root / "queue-order"
+        for content in (None, b"invalid", b"\xff", b"-1"):
+            with self.subTest(content=content):
+                counter.unlink(missing_ok=True)
+                if content is not None:
+                    _ = counter.write_bytes(content)
+                self.assertEqual(send.new_queue_order().value, 91)
+                self.assertEqual(send.new_queue_order().value, 92)
+                self.assertEqual(counter.read_text(), "92\n")
+
+    def test_queue_order_recovers_past_an_unrelated_queue_with_invalid_utf8(self) -> None:
+        message = send.Message("session:recipient", "Sender", "", "Queued body", "notice")
+        send.enqueue(message, "unavailable", send.now(), order=send.QueueOrder(7))
+        damaged = send.queue_path("session-unrelated")
+        _ = damaged.write_bytes(b"\xff")
+        self.assertEqual(send.new_queue_order().value, 8)
+        self.assertEqual((self.root / "queue-order").read_text(), "8\n")
+        self.assertEqual(damaged.read_bytes(), b"\xff")
+
+    def test_pending_prefers_an_ordered_copy_over_a_legacy_copy_in_both_file_orders(self) -> None:
+        self.session("recipient", "Recipient")
+        stable = send.StableRecipient("staff:recipient")
+        message = send.Message("session:recipient", "Sender", "", "Ordered body", "notice")
+        path = send.queue_path("session-recipient")
+        name_path = send.queue_path("Recipient")
+        for ordered_first in (True, False):
+            with self.subTest(ordered_first=ordered_first):
+                send.enqueue(message, "unavailable", send.now(), recipient=stable, order=send.QueueOrder(10))
+                ordered = send.read_queue(path)[0]
+                legacy = dict(ordered)
+                del legacy["send_order"]
+                legacy["text"] = "Legacy body"
+                first, second = (ordered, legacy) if ordered_first else (legacy, ordered)
+                send.write_atomic(path, json.dumps(first) + "\n")
+                send.write_atomic(name_path, json.dumps(second) + "\n")
+                delivered = send.pending("session:recipient")
+                self.assertEqual(delivered.count("Ordered body"), 1)
+                self.assertNotIn("Legacy body", delivered)
+                self.assertEqual(send.pending("session:recipient"), "")
+
+    def test_queue_order_resolves_tied_timestamps_and_interrupted_replacement(self) -> None:
+        self.session("recipient", "Recipient")
+        stable = send.StableRecipient("staff:recipient")
+        started = send.now()
+        older = send.new_queue_order()
+        newer = send.new_queue_order()
+        old_message = send.Message("session:previous", "Sender", "", "Older body", "notice")
+        new_message = replace(old_message, to="session:recipient", text="Newer body")
+        send.enqueue(old_message, "unavailable", started, recipient=stable, order=older)
+        with mock.patch.object(send, "_rewrite_queue", side_effect=OSError("Interrupted removal")):
+            with self.assertRaisesRegex(OSError, "Interrupted removal"):
+                send.enqueue(new_message, "unavailable", started, recipient=stable, order=newer)
+        before = {path: path.read_bytes() for path in (self.root / "queue").glob("*.jsonl")}
+        send.enqueue(old_message, "unavailable", started, recipient=stable, order=older)
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        delivered = send.pending("session:recipient")
+        self.assertEqual(delivered.count("Newer body"), 1)
+        self.assertNotIn("Older body", delivered)
+        self.assertEqual(send.pending("session:recipient"), "")
+        send.enqueue(new_message, "unavailable", started, recipient=stable, order=newer)
+        self.assertEqual(send.remove_queued_key(old_message.to, "notice", recipient=stable, order=older), 0)
+        self.assertEqual(send.queue_path("session-recipient").read_bytes(), before[send.queue_path("session-recipient")])
+
     def test_pending_returns_the_newest_copy_after_interrupted_queue_replacement(self) -> None:
         self.session("before", "resources")
         member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", None,
@@ -2334,10 +2466,11 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.outcome = send.Result("queued", "relay timed out")
         enqueue = send.enqueue
         def leave(message: send.Message, reason: str, at: datetime, *,
-                  recipient: send.StableRecipient | send.TransportQueueOwner = send.TRANSPORT_QUEUE_OWNER) -> None:
+                  recipient: send.StableRecipient | send.TransportQueueOwner = send.TRANSPORT_QUEUE_OWNER,
+                  order: send.QueueOrder | send.LegacyQueueOrder = send.LEGACY_QUEUE_ORDER) -> None:
             self.assertEqual(message.to, "session:recipient")
             (self.root / "sessions/recipient.json").unlink()
-            enqueue(message, reason, at, recipient=recipient)
+            enqueue(message, reason, at, recipient=recipient, order=order)
         with mock.patch.object(send, "enqueue", leave):
             result = send.send(local_options(["--to", address, "--from", "survey", "--text", "reply"]))
         self.assertEqual(result.outcome, "queued")
