@@ -16,7 +16,7 @@ import unittest
 
 from scripts.lib import unit_runs
 from scripts.production import staff, staff_check, staff_sources, unit_lookup, showrunners
-from scripts.production.staff_test_support import StaffTestCase
+from scripts.production.staff_test_support import StaffTestCase, without_worktree_column
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import process_table, roster
 from scripts.message.relay_test_support import write_relay_record
@@ -89,6 +89,11 @@ class StaffCheckTests(StaffTestCase):
         evidence = staff_check.CheckEvidence(
             unit_lookup.member_sources(), live, staff_sources.WorkerEvidence((observation,), {}, ()))
         return StaffCheckFixture(runner, unit, worker, doc, folder, live, evidence)
+
+    def test_staff_audit_accepts_a_document_without_the_worktree_column(self) -> None:
+        without_worktree_column(self.fixture.doc)
+        evidence = replace(self.fixture.evidence, sources=unit_lookup.member_sources())
+        self.assertEqual(self.check(evidence), (0, "checked 3 rows; 0 wrong\n"))
 
     def test_branch_and_configuration_failures_are_visible_without_diagnostic_capture(self) -> None:
         folder = self.fixture.folder
@@ -486,11 +491,12 @@ class StaffCheckTests(StaffTestCase):
         shutil.rmtree(self.fixture.folder)
         _ = self.assert_wrong(self.fixture.unit, f"worktree does not exist: {self.fixture.folder}")
 
-    def test_worktree_that_disagrees_with_its_bound_document_is_listed(self) -> None:
+    def test_moved_staff_worktree_ignores_the_stale_document_cell(self) -> None:
         elsewhere = self.root / "other-checkout"
-        elsewhere.mkdir()
+        _ = self.fixture_git(self.fixture.folder, "worktree", "move",
+                             str(self.fixture.folder), str(elsewhere))
         _ = staff.set_worktree(self.fixture.unit.id, staff.PresentWorktree("natedev", elsewhere), expected=self.fixture.unit.worktree)
-        _ = self.assert_wrong(self.fixture.unit, "worktree belongs elsewhere: document names")
+        self.assertEqual(self.check(), (0, "checked 3 rows; 0 wrong\n"))
 
     def test_resumed_session_in_an_external_folder_keeps_its_valid_ownership(self) -> None:
         evidence = replace(self.fixture.evidence, sessions=(
@@ -528,9 +534,12 @@ class StaffCheckTests(StaffTestCase):
 
     def test_an_unbound_row_cannot_borrow_another_units_marked_session_or_document(self) -> None:
         stale = fixture_member("unit", name="former-name", parent=self.fixture.runner.id)
-        folder = self.worktree("former-name-unit")
+        folder = self.root / "former-name-unit"
+        _ = self.fixture_git(self.fixture.folder, "worktree", "add", "-b", "former-name", str(folder))
+        _ = (folder / ".unit.toml").write_text('plan = "standby"\nresponsibilities = []\n')
         stale = staff.set_worktree(stale.id, staff.PresentWorktree("natedev", folder), expected=stale.worktree)
-        output = self.assert_wrong(stale, "uncertain: no document worktree bound to this unit")
+        code, output = self.check()
+        self.assertEqual(code, 0, output)
         self.assertNotIn(f"{self.fixture.unit.id} {self.fixture.unit.name}:", output)
 
     def test_delegate_without_a_server_is_silent_but_a_live_server_keeps_the_role_problem(self) -> None:

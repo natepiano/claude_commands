@@ -31,7 +31,7 @@ at `~/.claude/scripts/production/transfer_unit.py`:
    3. commit the Units row into the receiving doc, on the receiving merge branch;
    4. commit the Units row out of this doc, on this merge branch. The row moves; it is not marked retired;
    5. move the stall-watch stretch to the receiving production and forget its old pane;
-   6. point the unit's shutdown record at the receiving production and doc;
+   6. update the unit's staff parent;
    7. relaunch the same session. Its marks name the receiving production;
    8. verify.
 
@@ -39,8 +39,7 @@ at `~/.claude/scripts/production/transfer_unit.py`:
    takes the receiving merge branch at its own next merge.
    - **Exit 2** means the unit was still stopping after an hour. Find out why its stop holds, then rerun `apply`.
    - **Exit 1** names the step that refused. Fix the cause and rerun `apply`.
-3. Verify fails when a doc, the plan header, the stall-watch stretch, the shutdown record, the
+3. Verify fails when a doc, the plan header, the stall-watch stretch, the staff row, or the
    unit's marks still name this production. A failure leaves the journal open. Then run `verify` alone.
-4. When the transfer is done, the unit restarts. Its first prompt names its new production doc, merge
-   branch and showrunner. Send one message to the receiving showrunner: the unit, its worktree and
+4. When the transfer is done, the unit resumes its current session. Restart sends no work prompt. Send one message to the receiving showrunner: the unit, its worktree and
    branch, and that it now reports to it. Tell the user in one line.

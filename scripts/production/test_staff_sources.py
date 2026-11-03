@@ -39,6 +39,18 @@ from unit_lookup import ProductionMembers, live_unit_table, retired_units, unit_
 
 
 class StaffSourcesTests(StaffTestCase):
+    def test_existing_member_location_ignores_an_absent_worktree_column(self) -> None:
+        from scripts.production.staff_test_support import without_worktree_column
+        fixture = self.row_production()
+        without_worktree_column(fixture.doc)
+        before = self.staff_file.read_bytes()
+        selected = staff_sources.member(staff_sources.UnitMember(fixture.slug, "member-unit"), staff.snapshot())
+        self.assertIsInstance(selected, staff_sources.MemberFound)
+        assert isinstance(selected, staff_sources.MemberFound)
+        self.assertEqual(selected.row.worktree, staff.PresentWorktree("natedev", fixture.worktree))
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+
     @override
     def tree(self) -> tuple[staff.StaffRow, staff.StaffRow, staff.StaffRow]:
         owner, unit, worker = super().tree()
@@ -1251,11 +1263,6 @@ class StaffSourcesTests(StaffTestCase):
         run = self.worker_run("sdlc", "models-unit", "ec4e4c1d-6ca3-5651-9d48-74452fc51acc")
         self.write_json(run / "mesh_server.json", {"pid": 0, "codex_home": str(self.root / "codex")})
         roster = self.roster_worker(run, "test", "test", "71280e34-5ba9-5e39-b979-05acf27f3f6a", status="paused")
-        history = self.root / "shutdown/account/history/restart.json"
-        self.write_json(history, {"session": {
-            "session_id": "ec4e4c1d-6ca3-5651-9d48-74452fc51acc", "name": "models-unit", "run_dirs": [str(run)],
-            "host": {"kind": "unit", "unit": "models-unit", "session_name": "models-unit"},
-        }})
         with mock.patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / "shutdown")}):
             for director in ("ec4e4c1d-6ca3-5651-9d48-74452fc51acc", unit.id):
                 with self.subTest(director=director):
@@ -1274,8 +1281,6 @@ class StaffSourcesTests(StaffTestCase):
                     self.assertEqual(worker["identity"], {"codex": "71280e34-5ba9-5e39-b979-05acf27f3f6a"})
                     self.assertEqual(worker["role"], "test")
                     self.assertIn(str(roster), cast(list[str], value["inputs"]))
-                    if director == "ec4e4c1d-6ca3-5651-9d48-74452fc51acc":
-                        self.assertIn(str(history), cast(list[str], value["inputs"]))
 
     def test_legacy_claude_workers_join_board_slots_by_registered_mesh_name(self) -> None:
         _ = self.production("sdlc", "models-unit")

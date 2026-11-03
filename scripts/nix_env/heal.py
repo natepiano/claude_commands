@@ -27,11 +27,13 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS.parent))
 from scripts.lib import conf, nix_env
 from scripts.message import send_result, sessions
+from scripts.message import send_budget
 sys.path.insert(0, str(SCRIPTS / "notify"))
 if TYPE_CHECKING:
-    from scripts.notify import push_texts
+    from scripts.notify import push_texts, review
 else:
     import push_texts
+    import review
 
 
 def state_directory() -> Path:
@@ -318,7 +320,8 @@ def alert(directory: Path, limits: HealLimits, session: HealSession, history: He
                              machine=socket.gethostname(), cwd=str(session.cwd), cause=cause)
     command = push_texts.user_send_argv(push, key=f"nix-heal-{session.session_id}")
     command.extend(["--clears-when", check])
-    result = subprocess.run(command, capture_output=True, text=True, timeout=limits.alert_seconds, check=False)
+    timeout = max(limits.alert_seconds, send_budget.user_seconds(review.user_send_seconds()))
+    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
     outcome = send_result.send_outcome(result.returncode, result.stdout)
     if isinstance(outcome, send_result.ConfirmedSendOutcome) and outcome.header.outcome in {"sent", "skipped", "replaced", "queued", "kept"}:
         history["notified"] = True

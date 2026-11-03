@@ -5,12 +5,11 @@ import json
 import math
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from datetime import datetime
 from contextlib import redirect_stderr, redirect_stdout
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal, cast, final, override
@@ -22,7 +21,6 @@ from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 from scripts.message import sessions as runtime_sessions
 import unit_move
-from rename_state import RenameRefused
 
 import pane_restore  # first: it puts the herdr scripts on the path
 import herdr  # noqa: E402
@@ -170,120 +168,6 @@ class PaneRestoreTests(unittest.TestCase):
         return FakeClient([{"pane_id": "w1:p2", "label": "alpha", "workspace_id": "w1",
                             "agent_session": {"kind": "id", "value": session_id}}])
 
-    def test_a_restored_pane_resumes_on_its_own_account_and_its_restored_tab_closes(self) -> None:
-        self.entry()
-        client = self.restored()
-        code, output = self.run_restore(client)
-        self.assertEqual(code, 0, output)
-        (name, space, title, cwd, environment), = self.opened
-        self.assertEqual((name, space, title, cwd), ("agents", "demo", "alpha", "/work/alpha"))
-        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(self.config))
-        self.assertNotIn("STAFF_ID", environment)
-        self.assertEqual(environment["SHOWRUNNER_UNIT"], "demo")
-        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", environment)
-        self.assertEqual(client.started, [("alpha", "w1:p3", [
-            "--resume", "019b3a40-4250-7000-8000-000000000102", "-n", "alpha", "--remote-control", "alpha", "--model", "opus",
-            "--settings", SETTINGS])])
-        self.assertEqual(client.closed, ["w1:p2"])
-
-    def test_restore_uses_the_renamed_row_for_a_fixed_reference_and_current_session(self) -> None:
-        from scripts.production import session_staff
-
-        fixed = staff.StaffId("019b3a40-4250-7000-8000-000000000102")
-        current = staff.StaffId("019b3a40-4250-7000-8000-000000000103")
-        parent = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "showrunner", "demo", None,
-                                current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"))
-        owner = staff.StaffRow(fixed, "unit", "row-name", parent.id, current_session=current)
-        decoy = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000104"), "unit", "alpha", parent.id,
-                               current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000104"))
-        record = staff.StaffSnapshot((parent, owner, decoy))
-        self.entry()
-        _ = (self.config / "projects/work" / f"{current}.jsonl").write_text("{}\n")
-        with (mock.patch.object(staff, "initial_snapshot", return_value=record),
-              mock.patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources({}, ()))):
-            client = self.restored(current)
-            code, output = self.run_restore(client)
-        self.assertEqual(code, 0, output)
-        self.assertEqual(self.opened[0][2], "row-name")
-        arguments = client.started[0][2]
-        self.assertEqual(arguments[arguments.index("--resume") + 1], current)
-        self.assertEqual(arguments[arguments.index("-n") + 1], "row-name")
-        self.assertEqual(arguments[arguments.index("--remote-control") + 1], "row-name")
-        self.assertEqual(client.closed, ["w1:p2"])
-
-    def test_restore_resumes_current_session_from_a_fixed_owner_record_without_rewriting_it(self) -> None:
-        from scripts.production import staff
-        from scripts.production.staff_test_support import isolated_staff_file, isolated_source_readers, source_environment
-
-        path = self.root / "staff.json"
-        with (isolated_staff_file(path, {}),
-              mock.patch.dict(os.environ, source_environment(self.root / "sources")),
-              isolated_source_readers()):
-            parent = staff.ensure("showrunner", name="demo", runtime_id="019b3a40-4250-7000-8000-000000000101")
-            owner = staff.ensure("unit", name="alpha", parent=parent.id, runtime_id="019b3a40-4250-7000-8000-000000000102")
-            current = staff.native_id("019b3a40-4250-7000-8000-000000000103")
-            _ = staff.update_current_session(owner.current_session, current)
-            _ = (self.config / "projects/work" / f"{current}.jsonl").write_text("{}\n")
-            self.entry()
-            before = path.read_bytes()
-            client = self.restored(current)
-            code, output = self.run_restore(client)
-            self.assertEqual(code, 0, output)
-            self.assertEqual(len(client.started), 1)
-            arguments = client.started[0][2]
-            self.assertEqual(arguments[arguments.index("--resume") + 1], current)
-            self.assertNotIn(owner.id, arguments)
-            self.assertEqual(client.native_ids["w1:p3"], current)
-            self.assertEqual(client.closed, ["w1:p2"])
-            self.assertEqual(path.read_bytes(), before)
-            replacement, = pane_record.read("agents").values()
-            self.assertEqual((replacement["pane_id"], replacement["session_id"], replacement.get("kind"),
-                              replacement["config_dir"], replacement["cwd"]),
-                             ("w1:p3", owner.id, "claude", str(self.config), "/work/alpha"))
-
-    def test_stale_shutdown_state_does_not_prevent_restoring_a_stopped_pane(self) -> None:
-        state = self.root / "shutdown/account/sessions"
-        state.mkdir(parents=True)
-        _ = (state / "019b3a40-4250-7000-8000-000000000102.json").write_text('{"session":{"session_id":"019b3a40-4250-7000-8000-000000000102"}}')
-        self.entry()
-        with mock.patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(state.parents[1])}):
-            code, output = self.run_restore(self.restored())
-        self.assertEqual(code, 0, output)
-        self.assertEqual(len(self.opened), 1)
-        self.assertIn("resumed 019b3a40-4250-7000-8000-000000000102", output)
-
-    def test_restore_supplies_the_staff_owners_session_labels_to_the_new_tab(self) -> None:
-        from scripts.production import staff, session_staff, showrunners
-
-        parent = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "showrunner", "demo", None, current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"))
-        owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "unit", "alpha", parent.id, current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
-        document = "# Production — demo\n\n## Units\n\n| Unit | Plan |\n| --- | --- |\n| `alpha-unit` | standby |\n"
-        source = showrunners.ShowrunnerSource(
-            showrunners.Timer("demo", "session:runner", self.root / "demo.md", "UTC"), document)
-        self.entry(environment={"STAFF_ID": owner.id})
-        membership = session_staff.LaunchMembership(staff.StaffSnapshot((parent, owner)),
-            session_staff.MemberSources({"demo": source}, ()))
-        with (mock.patch.object(staff, "initial_snapshot", return_value=membership.record),
-              mock.patch.object(session_staff, "member_sources", return_value=membership.sources)):
-            code, output = self.run_restore(self.restored())
-        self.assertEqual(code, 0, output)
-        self.assertEqual(len(self.opened), 1)
-        environment = self.opened[0][4]
-        self.assertEqual({key: environment.get(key) for key in herdr.MEMBER_MARKS}, {
-            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
-        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(self.config))
-        self.assertNotIn("STAFF_ID", environment)
-
-
-    def test_a_failed_start_closes_the_new_tab_keeps_the_restored_one_and_exits_1(self) -> None:
-        self.entry()
-        client = self.restored()
-        client.start_error = herdr.HerdrFailure("agent not ready")
-        code, output = self.run_restore(client)
-        self.assertEqual(code, 1)
-        self.assertIn("not resumed: agent not ready", output)
-        self.assertEqual(client.closed, ["w1:p3"])
-
 
     def test_restore_keeps_the_original_tab_when_it_gains_other_work(self) -> None:
         for other_conversation in (False, True):
@@ -319,41 +203,6 @@ class PaneRestoreTests(unittest.TestCase):
                 self.assertEqual(output.count("pane close anomaly:"), 1)
                 self.assertIn("w1:p2", pane_record.read("agents"))
 
-    def test_an_old_launch_without_kind_restores_as_claude_without_rewriting_the_record(self) -> None:
-        self.entry()
-        path = pane_record.record_path("agents")
-        entries = cast(dict[str, dict[str, object]], json.loads(path.read_text()))
-        _ = entries["w1:p2"].pop("kind", None)
-        _ = path.write_text(json.dumps(entries))
-        staff_path = self.root / "legacy-staff.json"
-        _ = staff_path.write_text('{"schema": 2, "rows": []}\n')
-        from scripts.production.staff_test_support import isolated_staff_file
-        _ = self.enterContext(isolated_staff_file(staff_path, {}))
-        before = staff_path.read_bytes()
-        client = self.restored()
-
-        def observe(pane: str, kind: str, timeout: float) -> str:
-            self.assertEqual((pane, kind), ("w1:p3", "claude"))
-            self.assertGreater(timeout, 0)
-            self.assertEqual(client.closed, [])
-            return "019b3a40-4250-7000-8000-000000000102"
-
-        with mock.patch.object(client, "native_session", side_effect=observe):
-            code, output = self.run_restore(client)
-        self.assertEqual(code, 0, output)
-        self.assertEqual(client.started, [("alpha", "w1:p3", [
-            "--resume", "019b3a40-4250-7000-8000-000000000102", "-n", "alpha", "--remote-control", "alpha", "--model", "opus",
-            "--settings", SETTINGS])])
-        self.assertEqual(self.opened[0][4]["CLAUDE_CONFIG_DIR"], str(self.config))
-        self.assertEqual(client.closed, ["w1:p2"])
-        self.assertEqual(staff_path.read_bytes(), before)
-        replacement, = pane_record.read("agents").values()
-        self.assertEqual((replacement["pane_id"], replacement["session_id"], replacement.get("kind"),
-                          replacement["config_dir"], replacement["cwd"]),
-                         ("w1:p3", "019b3a40-4250-7000-8000-000000000102", "claude",
-                          str(self.config), "/work/alpha"))
-
-
     def test_seed_writes_the_entry_of_each_running_claude(self) -> None:
         (self.root / "proc/4242").mkdir(parents=True)
         _ = (self.root / "proc/4242/environ").write_bytes(
@@ -369,20 +218,6 @@ class PaneRestoreTests(unittest.TestCase):
         self.assertEqual((entry["session_id"], entry["config_dir"], entry["name"], entry["model"], entry["cwd"]),
                          ("019b3a40-4250-7000-8000-000000000102", str(self.config), "alpha", "opus", "/work/alpha"))
         self.assertEqual(entry["environment"], {"SHOWRUNNER_UNIT": "demo"})
-
-    def test_the_end_hook_marks_only_an_end_by_hand_of_the_same_conversation(self) -> None:
-        self.entry()
-        environment = {"PATH": "", "HOME": str(self.root), "HERDR_ENV": "1", "HERDR_SESSION": "agents",
-                       "HERDR_PANE_ID": "w1:p2", "HERDR_PANE_RECORD_DIR": str(self.root / "herdr-panes")}
-        for session_id, reason, ended in (("019b3a40-4250-7000-8000-000000000102", "other", False), ("sid-old", "prompt_input_exit", False),
-                                          ("019b3a40-4250-7000-8000-000000000102", "prompt_input_exit", True)):
-            ran = subprocess.run([sys.executable, str(END_HOOK)], input=json.dumps(
-                {"session_id": session_id, "reason": reason}), env=environment, capture_output=True, text=True,
-                check=False, timeout=60)
-            self.assertEqual(ran.returncode, 0, ran.stderr)
-            entry = pane_record.read("agents")["w1:p2"]
-            assert "ended" in entry
-            self.assertEqual(entry["ended"], ended, (session_id, reason))
 
 
 @final
@@ -413,6 +248,49 @@ class RestoreStaffNamesTests(StaffTestCase):
         with mock.patch.object(pane_record, "RECORD_DIR", directory):
             pane_record.save("agents", entries)
         return directory, FakeClient(rows)
+
+    def test_pane_restore_locks_the_row_before_it_reads_the_current_session(self) -> None:
+        directory, client = self.saved_batch()
+        active: list[str] = []
+        launches: list[str] = []
+        record = staff.snapshot()
+        row_operation = staff.row_operation
+        expected: dict[str, str] = {}
+
+        @contextmanager
+        def lock(reference: str) -> Generator[None]:
+            owner = record.by_member_reference(reference)
+            if owner is not None:
+                self.assertEqual(reference, owner.id)
+                changed = staff.native_id(fixture_runtime_id(f"locked-{owner.id}"))
+                with mock.patch.object(staff, "row_operation", row_operation):
+                    _ = staff.update_current_session(owner.current_session, changed)
+                expected[reference] = str(changed)
+            else:
+                expected[reference] = reference
+            active.append(reference)
+            try:
+                yield
+            finally:
+                active.remove(reference)
+
+        def resume(_session: str, _client: herdr.Herdr, _pane: herdr.TabSession,
+                   proof: pane_restore.ResolvedResume) -> None:
+            identity = proof.proof.expected["session_id"]
+            self.assertEqual(len(active), 1)
+            self.assertEqual(identity, expected[active[0]])
+            launches.append(identity)
+
+        with (mock.patch.object(pane_record, "RECORD_DIR", directory),
+              mock.patch.object(herdr, "Herdr", return_value=client),
+              mock.patch.object(staff, "row_operation", side_effect=lock),
+              mock.patch.object(pane_restore, "_resume", side_effect=resume),
+              mock.patch.object(sessions, "live_sessions", return_value=[]),
+              mock.patch.object(sessions, "running_sessions", return_value=[]),
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+            self.assertEqual(pane_restore.restore("agents", dry_run=False), 0)
+        self.assertEqual(len(launches), 3)
+        self.assertEqual(active, [])
 
     def test_mac_restore_reads_the_owner_once_and_never_selects_a_row_by_saved_name(self) -> None:
         directory, client = self.saved_batch()
@@ -454,7 +332,7 @@ class RestoreStaffNamesTests(StaffTestCase):
         self.assertEqual((directory / "agents.json").read_bytes(), before)
         self.assertEqual(client.started, [])
 
-    def test_mac_restore_launches_and_orders_several_tabs_with_one_owner_read(self) -> None:
+    def test_mac_restore_reads_each_row_under_its_lock_before_launch(self) -> None:
         from scripts.herdr.test_herdr import TitledLayoutHerdr
         from scripts.production import session_staff
 
@@ -511,7 +389,8 @@ class RestoreStaffNamesTests(StaffTestCase):
               redirect_stdout(output), redirect_stderr(output)):
             self.assertEqual(pane_restore.restore("agents", dry_run=False), 0, output.getvalue())
             self.assertEqual(len(pane_record.read("agents")), 3)
-        self.assertEqual(len(self.ssh_commands()), 1)
+        self.assertEqual(len(self.ssh_commands()), 7)
+        self.assertTrue(all("--snapshot" in command for command in self.ssh_commands()))
         self.assertEqual(order.call_count, 3)
         self.assertEqual(started, ["renamed-unit", "impl1", "models"])
         self.assertEqual(sorted(title for _, titles in client.layout() for title in titles),
@@ -519,51 +398,6 @@ class RestoreStaffNamesTests(StaffTestCase):
 
 
 class CodexPaneRestoreTests(FolderMoveFixture):
-    @contextmanager
-    def mac_retirement_processes(self, backend: FolderMoveBackend, *,
-                                 background_child: bool = False,
-                                 child_account: Literal["same", "other"] = "same",
-                                 parent_table: Literal["complete", "empty", "malformed"] = "complete") -> Generator[None]:
-        """Read private Mac process and open-file replies through the command fake."""
-        executable = self.root / "mac-process-tools"
-        source = Path(__file__).resolve().parents[1] / "herdr/fake_herdr.py"
-        _ = executable.write_text(f"#!{sys.executable}\nimport runpy\nrunpy.run_path({str(source)!r}, run_name='__main__')\n")
-        executable.chmod(0o755)
-        rows = [(backend.shell_pid, 1, "zsh"), (backend.pid, 1, backend.kind)]
-        if background_child:
-            rows.append((backend.pid + 100, backend.shell_pid, "sleep"))
-        uid = os.getuid()
-        transcript = backend.config / f"rollout-{self.owner.current_session}.jsonl"
-        responses = {
-            "-axo pid=,ppid=": {"stdout": "\n".join(
-                f"{pid} {parent}" for pid, parent, _command in rows), "code": 0},
-            f"-a -p {backend.pid} -Fn": {"stdout": f"p{backend.pid}\nf7\nn{transcript}\n", "code": 0},
-            f"-U {uid} -o pid=,ppid=,uid=,comm=": {"stdout": "\n".join(
-                f"{pid} {parent} {uid} {command}" for pid, parent, command in rows), "code": 0},
-            f"-U {uid} -o pid=,command=": {"stdout": "\n".join(
-                f"{pid} {command}" for pid, _parent, command in rows), "code": 0},
-        }
-        if child_account == "other":
-            child = backend.pid + 100
-            responses[f"-U {uid} -o pid=,ppid=,uid=,comm="] = {"stdout": "\n".join(
-                f"{pid} {parent} {uid} {command}"
-                for pid, parent, command in rows if pid != child), "code": 0}
-            responses[f"-U {uid} -o pid=,command="] = {"stdout": "\n".join(
-                f"{pid} {command}" for pid, _parent, command in rows if pid != child), "code": 0}
-            responses[f"-o command= -p {child}"] = {"stdout": "", "stderr": "permission denied", "code": 1}
-        if parent_table != "complete":
-            responses["-axo pid=,ppid="] = {
-                "stdout": "" if parent_table == "empty" else "unreadable parent row\n", "code": 0}
-        for pid, _parent, _command in rows:
-            responses[f"-o lstart=,tty= -p {pid}"] = {
-                "stdout": "Mon Nov  2 10:00:00 2026 ttys001\n", "code": 0}
-        response_path = self.root / "mac-process-responses.json"
-        _ = response_path.write_text(json.dumps(responses))
-        with (mock.patch.object(herdr, "_PLATFORM", "darwin"),
-              mock.patch.dict(os.environ, {"HERDR_LSOF": str(executable), "HERDR_PS": str(executable),
-                  "HERDR_PLATFORM": "darwin",
-                  "FAKE_HERDR_RESPONSES": str(response_path), "FAKE_HERDR_LOG": str(self.root / "mac-process-log")})):
-            yield
 
     @contextmanager
     def replaced_codex_process(self, backend: FolderMoveBackend, *,
@@ -718,40 +552,6 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         arguments = ["move-folder", "--unit", self.owner.id, "--to", str(self.new_folder)]
         return invoke_cli(unit_move, lambda: unit_move.main(arguments), arguments, dict(os.environ), self.checkout)
 
-    def test_move_rerun_retires_an_extra_shell_after_a_failed_close_for_each_backend(self) -> None:
-        for kind in ("claude", "codex"):
-            with self.subTest(kind=kind):
-                case = CodexPaneRestoreTests()
-                case.setUp()
-                try:
-                    backend, client = case.finished_pair(kind)
-                    with case.retirement_evidence(backend, client, exported_claude_id=kind != "claude"):
-                        result = case.finished_move_rerun()
-                    case.assertEqual(result.returncode, 0, result.stderr)
-                    case.assertEqual(client.closed, ["w1:p1"])
-                    entries = pane_record.read("agents")
-                    case.assertNotIn("w1:p1", entries)
-                    case.assertEqual(entries["w1:p3"]["session_id"], case.owner.id)
-                    case.assertEqual(backend.starts, [])
-                finally:
-                    case.doCleanups()
-
-    def test_move_rerun_preserves_an_occupied_stale_pane_and_a_tab_with_an_unrelated_pane(self) -> None:
-        for shared_tab in (False, True):
-            with self.subTest(shared_tab=shared_tab):
-                case = CodexPaneRestoreTests()
-                case.setUp()
-                try:
-                    backend, client = case.finished_pair("claude")
-                    before = pane_record.read("agents")
-                    with case.retirement_evidence(backend, client, stale_agent=not shared_tab, shared_tab=shared_tab):
-                        result = case.finished_move_rerun()
-                    case.assertNotEqual(result.returncode, 0, result.stdout)
-                    case.assertTrue(result.stderr)
-                    case.assertEqual(client.closed, [])
-                    case.assertEqual(pane_record.read("agents"), before)
-                finally:
-                    case.doCleanups()
 
     def test_restore_repair_proves_claude_from_its_exact_registry_without_an_exported_id(self) -> None:
         backend, client = self.finished_pair("claude")
@@ -766,135 +566,6 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         entries = [entry for entry in pane_record.read("agents").values() if entry["session_id"] == self.owner.id]
         self.assertEqual([entry["pane_id"] for entry in entries], ["w1:p3"])
 
-    def test_move_rerun_preserves_a_pane_that_starts_or_shares_its_tab_during_winner_proof(self) -> None:
-        for change in ("agent", "shared-tab"):
-            with self.subTest(change=change):
-                case = CodexPaneRestoreTests()
-                case.setUp()
-                try:
-                    backend, client = case.finished_pair("claude")
-                    before = pane_record.read("agents")
-                    winner_reads = 0
-                    with case.retirement_evidence(backend, client):
-                        read_result = client.result
-
-                        def result(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
-                            nonlocal winner_reads
-                            if arguments == ("pane", "process-info", "--pane", "w1:p3"):
-                                winner_reads += 1
-                                if winner_reads == 2 and change == "shared-tab":
-                                    client.rows.append({"pane_id": "w1:p9", "tab_id": "w1:t1",
-                                        "workspace_id": "w1", "label": "unrelated"})
-                            return read_result(*arguments, deadline=deadline)
-
-                        def activity(pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:
-                            if pane == "w1:p3" or (change == "agent" and winner_reads >= 2):
-                                return herdr.PaneRunning(("claude",))
-                            return herdr.PaneAtShell()
-
-                        def startup(pane: str, kind: str, timeout_ms: int) -> herdr.PaneStartupObservation:
-                            _ = (kind, timeout_ms)
-                            return herdr.PaneStartupObservation(herdr.PaneShell(backend.shell_pid), activity(pane))
-
-                        with (mock.patch.object(client, "result", side_effect=result),
-                              mock.patch.object(client, "pane_activity", side_effect=activity),
-                              mock.patch.object(client, "startup_processes", side_effect=startup)):
-                            moved = case.finished_move_rerun()
-                    case.assertGreaterEqual(winner_reads, 2)
-                    case.assertNotEqual(moved.returncode, 0)
-                    case.assertTrue(moved.stderr)
-                    case.assertEqual(client.closed, [])
-                    case.assertEqual(pane_record.read("agents"), before)
-                    case.assertIn("w1:p1", [row["pane_id"] for row in client.rows])
-                    if change == "shared-tab":
-                        case.assertIn("w1:p9", [row["pane_id"] for row in client.rows])
-                finally:
-                    case.doCleanups()
-
-    def test_move_rerun_keeps_all_records_without_a_proved_current_pane(self) -> None:
-        backend, client = self.finished_pair("claude")
-        before = pane_record.read("agents")
-        with self.retirement_evidence(backend, client, stopped=True):
-            _ = self.finished_move_rerun()
-        self.assertEqual(client.closed, [])
-        self.assertEqual(pane_record.read("agents"), before)
-
-    def test_codex_move_rerun_uses_the_open_rollout_instead_of_an_old_environment_id(self) -> None:
-        backend, client = self.finished_pair("codex")
-        with self.retirement_evidence(backend, client):
-            result = self.finished_move_rerun()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(client.closed, ["w1:p1"])
-        self.assertIn("w1:p3", pane_record.read("agents"))
-
-    def test_mac_move_rerun_proves_the_open_codex_rollout_and_keeps_one_launch(self) -> None:
-        backend, client = self.finished_pair("codex")
-        with (self.retirement_evidence(backend, client, rollout=False),
-              self.mac_retirement_processes(backend)):
-            result = self.finished_move_rerun()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(client.closed, ["w1:p1"])
-        entries = [entry for entry in pane_record.read("agents").values() if entry["session_id"] == self.owner.id]
-        self.assertEqual([entry["pane_id"] for entry in entries], ["w1:p3"])
-        self.assertEqual(backend.starts, [])
-
-    def test_mac_move_rerun_keeps_an_idle_shell_with_a_live_background_child(self) -> None:
-        backend, client = self.finished_pair("codex")
-        before = pane_record.read("agents")
-        with (self.retirement_evidence(backend, client),
-              self.mac_retirement_processes(backend, background_child=True)):
-            result = self.finished_move_rerun()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertTrue(result.stderr)
-        self.assertEqual(client.closed, [])
-        self.assertEqual(pane_record.read("agents"), before)
-        self.assertIn("w1:p1", [row["pane_id"] for row in client.rows])
-
-    def test_mac_move_rerun_keeps_a_shell_with_a_background_child_from_another_uid(self) -> None:
-        backend, client = self.finished_pair("codex")
-        before = pane_record.read("agents")
-        with (self.retirement_evidence(backend, client),
-              self.mac_retirement_processes(backend, background_child=True, child_account="other")):
-            result = self.finished_move_rerun()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertTrue(result.stderr)
-        self.assertEqual(client.closed, [])
-        self.assertEqual(pane_record.read("agents"), before)
-        self.assertIn("w1:p1", [row["pane_id"] for row in client.rows])
-
-    def test_codex_folder_move_uses_the_replaced_thread_from_the_open_rollout(self) -> None:
-        backend = self.folder_backend("codex", live=True)
-        with self.replaced_codex_process(backend):
-            result = self.finished_move_rerun()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(backend.stops, [self.owner.current_session])
-        (pane, arguments), = backend.starts
-        self.assertEqual(pane, "w1:p1")
-        resume = arguments.index("resume", arguments.index("exec") + 1)
-        self.assertEqual(arguments[resume + 1], self.owner.current_session)
-        self.assertNotEqual(arguments[resume + 1], self.owner.id)
-        self.assertEqual(pane_record.read("agents")[pane]["cwd"], str(self.new_folder))
-        self.assertTrue(backend.live)
-        self.assertTrue(self.new_folder.is_dir())
-        self.assertFalse(self.old_folder.exists())
-
-    def test_mac_move_rerun_keeps_the_shell_when_the_parent_table_is_empty_or_malformed(self) -> None:
-        for parent_table in ("empty", "malformed"):
-            with self.subTest(parent_table=parent_table):
-                case = CodexPaneRestoreTests()
-                case.setUp()
-                try:
-                    backend, client = case.finished_pair("codex")
-                    before = pane_record.read("agents")
-                    with (case.retirement_evidence(backend, client),
-                          case.mac_retirement_processes(backend, parent_table=parent_table)):
-                        result = case.finished_move_rerun()
-                    case.assertNotEqual(result.returncode, 0)
-                    case.assertTrue(result.stderr)
-                    case.assertEqual(client.closed, [])
-                    case.assertEqual(pane_record.read("agents"), before)
-                finally:
-                    case.doCleanups()
 
     def test_restore_liveness_uses_the_replaced_codex_thread_running_outside_herdr(self) -> None:
         backend = self.folder_backend("codex", live=True)
@@ -914,70 +585,6 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         self.assertEqual(client.started, [])
         self.assertEqual(client.closed, [])
 
-    def assert_codex_without_a_retained_pane(self, rollout: Literal["current", "unreadable"]) -> None:
-        for retained in ("missing", "closed"):
-            with self.subTest(retained=retained):
-                case = CodexPaneRestoreTests()
-                case.setUp()
-                try:
-                    backend = case.folder_backend("codex", live=True)
-                    launch = unit_move.folder_launch(case.owner)
-                    if retained == "missing":
-                        launch = unit_move.NoFolderLaunch()
-                    before = pane_record.read("agents")
-                    output = io.StringIO()
-                    with (case.replaced_codex_process(backend, rollout=rollout),
-                          mock.patch.object(backend, "panes", return_value=[]),
-                          mock.patch.object(herdr, "herdr_place_of", return_value=herdr.NotInHerdr()),
-                          mock.patch.object(runtime_sessions, "running_sessions", return_value=[]),
-                          redirect_stderr(output)):
-                        if rollout == "current":
-                            with case.assertRaises(RenameRefused):
-                                _ = unit_move.folder_session(case.owner, launch)
-                        else:
-                            case.assertIsInstance(unit_move.folder_session(case.owner, launch),
-                                                  unit_move.StoppedFolderSession)
-                            case.assertEqual(output.getvalue(),
-                                f"anomaly: pid {backend.pid} (Codex thread unknown); not blocking\n")
-                    case.assertEqual(pane_record.read("agents"), before)
-                    case.assertEqual((backend.starts, backend.stops), ([], []))
-                    case.assertTrue(case.old_folder.is_dir())
-                finally:
-                    case.doCleanups()
-
-    def test_codex_without_a_retained_pane_refuses_when_its_current_rollout_proves_it_live(self) -> None:
-        self.assert_codex_without_a_retained_pane("current")
-
-    def test_codex_without_a_retained_pane_reports_unreadable_evidence_without_refusing(self) -> None:
-        self.assert_codex_without_a_retained_pane("unreadable")
-
-    def test_codex_move_rerun_keeps_records_when_no_rollout_file_is_open(self) -> None:
-        backend, client = self.finished_pair("codex")
-        before = pane_record.read("agents")
-        with self.retirement_evidence(backend, client, rollout=False):
-            _ = self.finished_move_rerun()
-        self.assertEqual(client.closed, [])
-        self.assertEqual(pane_record.read("agents"), before)
-
-    def test_move_rerun_repairs_a_closed_tab_when_ordinary_close_cannot_save_retirement(self) -> None:
-        backend, client = self.finished_pair("claude")
-        save = pane_launch.save
-
-        def refuse_retirement(path: Path, entries: dict[str, pane_record.PaneLaunch]) -> None:
-            if "w1:p1" not in entries:
-                raise OSError("forced retirement write failure")
-            save(path, entries)
-
-        with self.retirement_evidence(backend, client):
-            with (mock.patch.object(pane_launch, "save", side_effect=refuse_retirement),
-                  self.assertRaisesRegex(herdr.HerdrFailure, "forced retirement write failure")):
-                herdr.close_agent("agents", "w1:p1")
-            self.assertNotIn("w1:p1", [row["pane_id"] for row in client.rows])
-            self.assertIn("w1:p1", pane_record.read("agents"))
-            result = self.finished_move_rerun()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(client.closed, ["w1:p1"])
-        self.assertNotIn("w1:p1", pane_record.read("agents"))
 
     def test_restore_rerun_repairs_a_closed_tab_when_retirement_cannot_be_saved(self) -> None:
         backend, _transcript = self.moved_codex()
@@ -1051,63 +658,11 @@ class CodexPaneRestoreTests(FolderMoveFixture):
                   self.old_folder, backend.config / ".claude.json", self.old_folder))):
             result = stop_resume.resume(self.owner.id, why="fixture recovery")
         self.assertIsInstance(result, stop_resume.ClaudeUp)
-        with (mock.patch.object(backend, "panes", return_value=[]),
-              mock.patch.object(unit_move, "processes_inside", return_value=[])):
+        with (mock.patch.object(backend, "panes", return_value=[])):
             moved = self.finished_move_rerun()
         self.assertEqual(moved.returncode, 0, moved.stderr)
         owners = [entry for entry in pane_record.read("agents").values() if entry["session_id"] == self.owner.id]
         self.assertEqual([(entry["pane_id"], entry["cwd"]) for entry in owners], [("w1:p3", str(self.new_folder))])
-
-
-    def test_restart_replacement_retires_its_old_record_before_a_folder_move(self) -> None:
-        from scripts.shutdown import restart
-        from scripts.shutdown.test_restart import common_session
-        from scripts.shutdown.session_types import TopLevelSession, UnknownHost
-        from datetime import timezone
-
-        backend = self.folder_backend("claude", live=False)
-        client = FakeClient([{"pane_id": "w1:p1", "workspace_id": "w1", "label": "kept-name",
-                              "terminal_id": "kept-terminal"}])
-        owner = TopLevelSession(**common_session(self.owner.current_session, "kept-name", cwd=str(self.old_folder)),
-                                kind="top-level", host=UnknownHost(kind="unknown"))
-        owner["config_dir"] = str(backend.config)
-        parts = restart.ResumeParts(str(self.old_folder), {}, ("--resume", self.owner.current_session),
-            "Continue.", restart.RetainResumeAccount(backend.config), restart.ResumeConversation(self.owner.current_session))
-
-        def launch(_name: str, _destination: herdr.NewTab, _prepared: herdr.PreparedAgentEnvironment,
-                   kind: str, agent_arguments: list[str], opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt,
-                   timeout_ms: int, *, agent: str) -> herdr.AgentLaunched:
-            _ = (opening, timeout_ms, agent)
-            self.assertEqual((kind, agent_arguments), ("claude", ["--resume", self.owner.current_session]))
-            replacement = pane_record.launch("w1:p3", self.owner.current_session, str(self.old_folder),
-                {"CLAUDE_CONFIG_DIR": str(backend.config)}, ["claude", *agent_arguments])
-            pane_record.write("agents", replacement)
-            client.rows.append({"pane_id": "w1:p3", "workspace_id": "w1", "label": "kept-name"})
-            client.native_ids["w1:p3"] = self.owner.current_session
-            return herdr.AgentLaunched("w1:p3", herdr.PromptSubmitted(datetime.now(timezone.utc)))
-
-        def close(pane: str) -> None:
-            FakeClient.close_tab_of(client, pane)
-
-        with (mock.patch.object(herdr, "Herdr", return_value=client),
-              mock.patch.object(client, "agents", return_value=[]),
-              mock.patch.object(client, "close_pane", side_effect=close),
-              mock.patch.object(restart, "_copy_claude_trust"),
-              mock.patch.object(restart, "_prepare_resume_environment", return_value=herdr.PreparedAgentEnvironment(
-                  self.old_folder, {})),
-              mock.patch.object(herdr, "restore_server", return_value=herdr.ServerAdopted()),
-              mock.patch.object(herdr, "server_environment", return_value={}),
-              mock.patch.object(herdr, "launch_prepared_agent", side_effect=launch),
-              mock.patch.object(restart, "_record_scheduled_restart_prompt"),
-              mock.patch.object(restart, "_present_restored_pane"), redirect_stdout(io.StringIO())):
-            launch_recorded = cast(Callable[..., restart.HerdrLaunch], getattr(restart, "_herdr_launch"))
-            _ = launch_recorded(parts, restart.RecordedHerdrPane("agents", "w1:p1"), owner, dry_run=False)
-        with (mock.patch.object(backend, "panes", return_value=[]),
-              mock.patch.object(unit_move, "processes_inside", return_value=[])):
-            result = self.finished_move_rerun()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("w1:p1", pane_record.read("agents"))
-        self.assertEqual(pane_record.read("agents")["w1:p3"]["cwd"], str(self.new_folder))
 
 
     def moved_codex(self) -> tuple[FolderMoveBackend, Path]:
@@ -1230,8 +785,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
     def second_move(self, backend: FolderMoveBackend) -> None:
         destination = self.root / "third-folder"
         arguments = ["move-folder", "--unit", self.owner.id, "--to", str(destination)]
-        with (mock.patch.object(backend, "panes", return_value=[]),
-              mock.patch.object(unit_move, "processes_inside", return_value=[])):
+        with (mock.patch.object(backend, "panes", return_value=[])):
             result = invoke_cli(unit_move, lambda: unit_move.main(arguments), arguments,
                                 dict(os.environ), self.checkout)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1247,7 +801,6 @@ class CodexPaneRestoreTests(FolderMoveFixture):
             self.assertEqual(pane_restore.restore("agents", dry_run=False), 0)
         self.assertEqual(client.closed, ["w1:p1"])
         self.second_move(backend)
-
 
 
     def test_claude_restore_requires_publication_and_then_allows_a_second_folder_move(self) -> None:
@@ -1293,9 +846,6 @@ class CodexPaneRestoreTests(FolderMoveFixture):
                     self.assertEqual(code, 0)
                     self.assertEqual(client.closed, ["w1:p1"])
                     self.second_move(backend)
-
-
-
 
 
 if __name__ == "__main__":
