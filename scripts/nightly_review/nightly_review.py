@@ -21,7 +21,7 @@ import json
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
@@ -37,7 +37,9 @@ from scripts.whoami import account  # noqa: E402
 
 if TYPE_CHECKING:
     from scripts.lib.conf import ConfigRead
-    from scripts.production.unit_lookup import LiveClaude
+    from scripts.production.session_staff import LiveClaude, RowResolver
+    from scripts.production.staff import StaffRow
+    from scripts.production.unit_config import UnitConfig
 
 SETTINGS = Path(__file__).with_name("settings.json")
 REVIEW_SCRIPT = SCRIPTS / "notify/review.py"
@@ -123,10 +125,13 @@ def sessions_directory() -> Path:
 
 def showrunner_transcripts(since: datetime) -> list[Path]:
     """Find dated replies in each showrunner's own account, including natedev."""
-    from scripts.production import showrunners
+    from scripts.production import staff
 
     primary = _settings().text("primary_showrunner_name")
-    names = {runner["session"] for runner in showrunners.require_complete(showrunners.registered_showrunners()) if runner["session"]}
+    membership = staff.snapshot()
+    owners = staff.active(membership, "showrunner")
+    identities = {identity for row in owners for identity in (row.id, row.current_session)}
+    names = {row.name for row in owners}
     found: set[Path] = set()
     for path in sorted(sessions_directory().glob("*.json")):
         try:
@@ -140,7 +145,7 @@ def showrunner_transcripts(since: datetime) -> list[Path]:
             session, name = record.get("sessionId", ""), record.get("name", "")
             if not session or Path(session).name != session:
                 continue
-            if name != primary and name not in names and showrunners.production_of(session) is None:
+            if name != primary and session not in identities and name not in names:
                 continue
             recorded = record.get("transcript_path", "") or record.get("transcriptPath", "")
             config = record.get("config_dir", "")
@@ -249,75 +254,125 @@ def job(day: date) -> str:
 
 
 @dataclass(frozen=True)
+class NightlyUnit:
+    unit: StaffRow
+    config: UnitConfig
+
+
+@dataclass(frozen=True)
+class NightlyUnitNotSelected:
+    """The production identity carries no launch selection."""
+
+
+@dataclass(frozen=True)
 class NightlyProduction:
     doc: Path
     slug: str
+    selection: NightlyUnit | NightlyUnitNotSelected = field(default_factory=NightlyUnitNotSelected, compare=False)
 
 
-def nightly_production() -> NightlyProduction | str:
-    """The one production whose Units table holds the permanent nightly review unit, or why there is none."""
-    from scripts.production import showrunners
+def nightly_production(*, resolver: RowResolver | None = None) -> NightlyProduction | str:
+    """Find the active unit whose configuration assigns the nightly review."""
+    from scripts.production import session_staff, showrunners, staff
 
-    if TYPE_CHECKING:
-        from scripts.production import production_units
-    else:
-        import production_units
-
-    settings = _settings()
-    unit_name = settings.text("unit_name")
-    session = settings.text("session_name")
-    found: list[NightlyProduction] = []
-    for runner in showrunners.require_complete(showrunners.registered_showrunners()):
-        try:
-            rows = production_units.unit_table(Path(runner["doc"]).read_text(encoding="utf-8").splitlines())
-        except (OSError, UnicodeError, production_units.Refusal):
-            continue
-        if any(production_units.cell_value(row.get("Unit", "")) == unit_name
-               and production_units.cell_value(row.get("Plan", "")) == "permanent" for row in rows):
-            found.append(NightlyProduction(Path(runner["doc"]), runner["slug"]))
+    try:
+        resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+        record = resolver.record
+        found: list[NightlyProduction] = []
+        unknown: list[str] = []
+        for row in staff.active(record, "unit"):
+            parent = record.by_id(row.parent) if row.parent is not None else None
+            if parent is not None and isinstance(parent.doc, staff.WrappedDoc):
+                continue
+            try:
+                config = resolver.unit_config(row)
+            except ValueError as error:
+                config = session_staff.ConfigMissing(str(error))
+            if not isinstance(config, session_staff.UnitConfig):
+                reason = f"{row.name}: {getattr(config, 'reason', 'unit configuration is unavailable')}"
+                print(f"nightly_review: {reason}", file=sys.stderr)
+                unknown.append(reason)
+                continue
+            if "nightly-review" not in config.responsibilities:
+                continue
+            doc = resolver.production_doc(row)
+            if not isinstance(doc, session_staff.ProductionDoc):
+                reason = f"{row.name}: {doc.reason}"
+                print(f"nightly_review: {reason}", file=sys.stderr)
+                unknown.append(reason)
+                continue
+            try:
+                timer = showrunners.timer_for(parent, record) if parent is not None else showrunners.NoTimer("staff parent is missing")
+            except (OSError, ValueError) as error:
+                reason = f"{row.name}: {error}"
+                print(f"nightly_review: {reason}", file=sys.stderr)
+                unknown.append(reason)
+                continue
+            slug = timer.slug if isinstance(timer, showrunners.Timer) else parent.name if parent is not None else row.name
+            found.append(NightlyProduction(doc.path, slug, NightlyUnit(row, config)))
+    except ValueError as error:
+        return f"nightly review membership is unavailable: {error}"
+    if unknown:
+        raise OSError("nightly review ownership is unknown: " + "; ".join(unknown))
     if not found:
-        return f"no running production has a permanent {unit_name} row; add it with add_unit.py {session} --permanent"
+        return "no running production has a unit configuration that assigns nightly-review"
     if len(found) > 1:
-        return f"{len(found)} productions hold {unit_name}: " + ", ".join(item.slug for item in found)
+        return f"{len(found)} productions hold nightly-review-unit: " + ", ".join(item.slug for item in found)
     return found[0]
 
 
-def live_unit(slug: str) -> LiveClaude | None:
-    if TYPE_CHECKING:
-        from scripts.production import unit_lookup
-    else:
-        import unit_lookup
+def live_unit(production: NightlyProduction, *, resolver: RowResolver) -> LiveClaude | None:
+    """Find the configured unit through its native session identity."""
+    from scripts.production import session_staff
+    from scripts.message import sessions
 
-    unit = unit_lookup.marked_unit(slug, _settings().text("unit_name"))
-    return unit.claude if unit is not None and isinstance(unit.claude, unit_lookup.LiveClaude) else None
+    if isinstance(production.selection, NightlyUnitNotSelected):
+        return None
+    row = resolver.record.by_id(production.selection.unit.id)
+    if row is None:
+        return None
+    for current in sessions.live_sessions():
+        if current["sessionId"] == row.current_session:
+            return session_staff.LiveClaude(current["name"], current["sessionId"],
+                                           current["messagingSocketPath"], current["pid"])
+    return None
 
 
 def tonight(day: date) -> list[str]:
     """Send the night's review to the live unit, starting it first through add_unit when it is gone."""
-    session = _settings().text("session_name")
-    production = nightly_production()
+    from scripts.production import session_staff, staff, unit_config
+
+    resolver = session_staff.RowResolver(staff.snapshot())
+    production = nightly_production(resolver=resolver)
     if isinstance(production, str):
         return [f"skipped: {production}"]
+    selection = production.selection
+    if isinstance(selection, NightlyUnitNotSelected):
+        return [f"skipped: {production.slug}: the nightly unit is not selected"]
     lines: list[str] = []
     try:
-        claude = live_unit(production.slug)
+        claude = live_unit(production, resolver=resolver)
         if claude is None:
-            # add_unit picks the account, checks shutdown holds and trust, and keeps the unit's launch flags.
+            plan = selection.config.plan
+            launch = (["--permanent"] if isinstance(plan, unit_config.PermanentPlan) else
+                      ["--standby"] if isinstance(plan, unit_config.StandbyPlan) else
+                      ["--plan", plan.path.as_posix()])
             started = subprocess.run([sys.executable, str(SCRIPTS / "production" / "add_unit.py"), "--production",
-                                      str(production.doc), session, "--permanent"], capture_output=True, text=True, check=False)
+                                      str(production.doc), selection.unit.name, *launch], capture_output=True, text=True, check=False)
             if started.returncode != 0:
-                return [f"{session}: not started: {failure_detail(started)}"]
-            lines.append(f"{session}: started")
-            claude = live_unit(production.slug)
+                return [f"{selection.unit.name}: not started: {failure_detail(started)}"]
+            lines.append(f"{selection.unit.name}: started")
+            resolver = session_staff.RowResolver(staff.snapshot())
+            claude = live_unit(production, resolver=resolver)
     except OSError as error:
         return [f"skipped: units unreadable: {error}"]
     if claude is None:
-        return [*lines, f"{session}: no live Claude carries the unit's mark"]
+        return [*lines, f"{selection.unit.name}: no live Claude has the unit's recorded identity"]
     sent = subprocess.run([sys.executable, str(SCRIPTS / "message" / "send.py"), "--to", f"uds:{claude.socket}",
                            "--from", "nightly-review timer", "--key", f"nightly-{day.isoformat()}", "--text", job(day)],
                           capture_output=True, text=True, check=False)
     outcome = "tonight's review sent" if sent.returncode == 0 else f"tonight's review not sent: {sent.stderr.strip()}"
-    return [*lines, f"{session}: {outcome}"]
+    return [*lines, f"{selection.unit.name}: {outcome}"]
 
 
 def launch(today: date) -> list[str]:

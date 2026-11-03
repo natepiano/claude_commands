@@ -887,6 +887,11 @@ def run(args: argparse.Namespace) -> int:
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     units = units_from_doc(lines, production.slug, record=staff_record)
     table_state = phase_tables(production.doc, production.zone)
+    if isinstance(table_state, PhaseTablesAvailable):
+        table_state = PhaseTablesAvailable(
+            {unit_names.name(unit): value for unit, value in table_state.units.items()},
+            {unit_names.name(unit): value for unit, value in table_state.could_start.items()},
+        )
     if isinstance(table_state, PhaseTablesUnavailable):
         report("phase tables", "unavailable", table_state.reason)
     instance = f"showrunner-{production.slug}"
@@ -904,7 +909,7 @@ def run(args: argparse.Namespace) -> int:
         report("status", "ok", f"left out, run finished and nothing waiting on the user: {', '.join(finished)}")
     if isinstance(table_state, PhaseTablesAvailable):
         for unit in units:
-            for phase in table_state.could_start.get(unit.name, ()):
+            for phase in table_state.could_start.get(unit_names.name(unit.name), ()):
                 print(f"parallel check: {unit.name}: Phase {phase} could start")
     for block in blocks:
         first: list[str] = []
@@ -961,7 +966,7 @@ def run(args: argparse.Namespace) -> int:
         held = fields.get("held")
         phase_state: UnitPhaseState = (
             table_state.units.get(
-                unit.name,
+                unit_names.name(unit.name),
                 NoNumberedOpenPlanPhase(UnitPhaseRecordUnavailable("unit missing from phase-table output")),
             )
             if isinstance(table_state, PhaseTablesAvailable)

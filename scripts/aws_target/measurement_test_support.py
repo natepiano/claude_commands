@@ -86,6 +86,21 @@ class MeasurementFixture(CostFixture):
         book.observe(ledger.InstanceObservation(NOW, "stopped", "fixture AWS state"))
         _ = book.guard(self.settings, "admission", NOW, lambda _event: True)
 
+    def pending_request(self) -> ledger.ComputeRequest:
+        request = ledger.ComputeRequest(NOW - 7200, 'fixture', 'us-east-1', Decimal(10))
+        self.book().record_compute_request(request)
+        decision = self.book().guard(self.settings, 'admission', NOW, lambda _event: True)
+        self.assertIsInstance(decision, ledger.SpendingRefused)
+        return request
+
+    def resolve_request(self, request: ledger.ComputeRequest,
+                        resolution: ledger.ComputeInstanceConfirmed | ledger.ComputeResourcesAbsent) -> int:
+        self.book().resolve_compute_request(request, resolution)
+        later = NOW + 3600
+        decision = self.book().guard(self.settings, 'admission', later, lambda _event: True)
+        self.assertIsInstance(decision, ledger.SpendingRefused)
+        return later
+
     def seed_previous_day(self, *, hours: int = 1) -> None:
         book = self.book()
         start = MIDNIGHT - 86400

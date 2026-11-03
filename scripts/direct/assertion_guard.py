@@ -1309,52 +1309,32 @@ class NoProductionBase:
     """No registered production provides a usable merge-branch base."""
 
 
-def worktree_path_matches(value: str, worktree: Path) -> bool:
-    """Compare absolute worktree paths, ignoring empty cells and retirement notes."""
-    if not value:
-        return False
-    try:
-        path = Path(value).expanduser()
-        return path.is_absolute() and path.resolve() == worktree
-    except (OSError, RuntimeError, ValueError):
-        return False
-
-
 def production_merge_branch(repo: Path) -> ProductionMergeBranch | NoProductionBase:
-    """Match a Units worktree first, then its branch, across registered docs."""
+    """Read the merge branch from the folder owner's row."""
     original_path = sys.path[:]
     try:
         repository_root = Path(__file__).resolve().parents[2]
         sys.path.insert(0, str(repository_root))
         sys.path.insert(0, str(repository_root / "scripts" / "production"))
-        from scripts.production import production_units, showrunners
+        from scripts.production import session_staff, staff
+        from scripts.shutdown import remote
     except ImportError:
         return NoProductionBase()
     finally:
         sys.path[:] = original_path
     worktree = Path(git(repo, "rev-parse", "--show-toplevel").strip()).resolve()
-    branch = git(repo, "branch", "--show-current").strip()
-    branch_match: ProductionMergeBranch | NoProductionBase = NoProductionBase()
-    for doc in dict.fromkeys(showrunners.timer_docs().values()):
-        try:
-            lines = doc.read_text(encoding="utf-8").splitlines()
-            rows = [row for row in production_units.unit_table(lines) if not any(
-                re.search(r"(?:^|[\s(`])(?:retired|removed)\b",
-                          row.get(column, ""), re.IGNORECASE)
-                for column in ("Status", "Worktree"))]
-            worktree_matches = any(worktree_path_matches(
-                production_units.cell_value(row.get("Worktree", "")), worktree) for row in rows)
-            branch_matches = bool(branch) and any(
-                production_units.cell_value(row.get("Branch", "")) == branch for row in rows)
-            if worktree_matches or branch_matches:
-                match = ProductionMergeBranch(production_units.production_field(lines, "Merge branch"))
-                if worktree_matches:
-                    return match
-                if isinstance(branch_match, NoProductionBase):
-                    branch_match = match
-        except (OSError, UnicodeError, production_units.Refusal):
-            continue
-    return branch_match
+    try:
+        resolver = session_staff.RowResolver(staff.snapshot())
+        member = resolver.member_by_folder(remote.local_machine(), worktree)
+        if isinstance(member, session_staff.NoSuchMember):
+            return NoProductionBase()
+        branch = resolver.merge_branch(member.row)
+        if isinstance(branch, session_staff.Branch):
+            return ProductionMergeBranch(branch.name)
+        print(f"assertion_guard: {member.row.name}: {branch.reason}", file=sys.stderr)
+    except (OSError, ValueError) as error:
+        print(f"assertion_guard: {worktree}: {error}", file=sys.stderr)
+    return NoProductionBase()
 
 
 def production_base(repo: Path) -> ProductionBase | NoProductionBase:

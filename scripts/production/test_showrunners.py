@@ -218,6 +218,30 @@ raise SystemExit(1)
 
 
 class RowTimerJoinTests(StaffTestCase):
+    def test_unreadable_timer_preserves_another_showrunners_document_match(self) -> None:
+        fixture = self.row_production()
+        bad_owner = fixture_member("showrunner", name="broken-owner")
+        bad_doc = self.root / "broken-production.md"
+        write_text_atomic(bad_doc, "# Broken production\n")
+        bad_owner = staff.set_doc(bad_owner.id, staff.LiveDoc("natedev", bad_doc))
+        bad_conf = Path(os.environ["NOTIFIER_STATE_DIR"]) / "showrunner-broken-alias" / "conf"
+        bad_conf.mkdir(parents=True)
+        record = staff.snapshot()
+        errors = io.StringIO()
+
+        with redirect_stderr(errors):
+            timer = showrunners.timer_for(fixture.runner, record)
+            with self.assertRaises(OSError) as raised:
+                _ = showrunners.timer_for(bad_owner, record)
+
+        self.assertIsInstance(timer, showrunners.Timer)
+        assert isinstance(timer, showrunners.Timer)
+        self.assertEqual((timer.slug, timer.doc), (fixture.slug, fixture.doc))
+        self.assertIn(bad_owner.name, str(raised.exception))
+        self.assertIn(str(bad_conf), str(raised.exception))
+        self.assertIn("Is a directory", str(raised.exception))
+        self.assertEqual(errors.getvalue(), "")
+
     def test_a_timer_target_cannot_replace_a_missing_document_join(self) -> None:
         from scripts.production import session_staff
 

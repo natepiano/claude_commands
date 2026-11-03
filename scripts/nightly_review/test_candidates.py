@@ -594,7 +594,7 @@ class NightlyReviewConfigTests(unittest.TestCase):
         from scripts.lib import conf
 
         settings = conf.read(Path(__file__).resolve().parents[2] / "config/nightly_review.conf")
-        for key, expected in {'state_directory': '~/.local/state', 'state_folder': 'nightly-review', 'sessions_directory': '~/.claude/sessions', 'review_modes': 'config rust messages', 'session_name': 'nightly-review', 'unit_name': 'nightly-review-unit', 'note_path': '~/rust/hanadocs/nightly improvement list.md', 'primary_showrunner_name': 'natedev', 'command_path': '~/.claude/commands/nightly_review.md'}.items():
+        for key, expected in {'state_directory': '~/.local/state', 'state_folder': 'nightly-review', 'sessions_directory': '~/.claude/sessions', 'review_modes': 'config rust messages', 'note_path': '~/rust/hanadocs/nightly improvement list.md', 'primary_showrunner_name': 'natedev', 'command_path': '~/.claude/commands/nightly_review.md'}.items():
             with self.subTest(key=key):
                 self.assertEqual(settings.text(key), expected)
         for key, expected in {'message_sample_rows': 20, 'title_characters': 90}.items():

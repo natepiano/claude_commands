@@ -9,6 +9,7 @@ from http.client import HTTPResponse
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -19,7 +20,8 @@ from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.aws_target import ledger
-from scripts.aws_target.config import read_control_settings
+from scripts.aws_target.config import read_control_settings, service_loop
+from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_group import send_process_group
 from scripts.mac_test import linux_runner, offload
@@ -139,21 +141,43 @@ class ImdsClient:
     def __init__(self, timeout_s: float) -> None:
         self.timeout_s = timeout_s
 
-    def __call__(self) -> bool:
+    def read(self, path: str) -> bytes:
         token_request = Request('http://169.254.169.254/latest/api/token', method='PUT',
                                 headers={'X-aws-ec2-metadata-token-ttl-seconds': '60'})
         with cast(HTTPResponse, urlopen(token_request, timeout=self.timeout_s)) as response:
             token = response.read().decode()
-        request = Request('http://169.254.169.254/latest/meta-data/spot/instance-action',
+        request = Request('http://169.254.169.254/latest/' + path,
                           headers={'X-aws-ec2-metadata-token': token})
+        with cast(HTTPResponse, urlopen(request, timeout=self.timeout_s)) as response:
+            return response.read()
+
+    def __call__(self) -> bool:
         try:
-            with cast(HTTPResponse, urlopen(request, timeout=self.timeout_s)) as response:
-                row = cast(dict[str, object], json.loads(response.read()))
-                return row.get('action') in ('stop', 'terminate', 'hibernate')
+            row = ledger.mapping(cast(object, json.loads(self.read('meta-data/spot/instance-action'))))
+            return row.get('action') in ('stop', 'terminate', 'hibernate')
         except HTTPError as error:
             if error.code == 404:
                 return False
             raise
+
+
+def write_bootstrap_settings(source: Path, destination: Path) -> None:
+    """Bind public lifecycle settings to this instance without granting admission."""
+    identity = ledger.mapping(cast(object, json.loads(
+        ImdsClient(conf.read(source).number('imds_timeout_s')).read('dynamic/instance-identity/document'))))
+    instance_id, region = ledger.text(identity, 'instanceId'), ledger.text(identity, 'region')
+    if not re.fullmatch(r'i-[0-9a-f]+', instance_id) or not re.fullmatch(r'[a-z0-9-]+', region):
+        raise ValueError('IMDS returned an invalid instance identity')
+    text = source.read_text()
+    for key, value in (('instance_id', instance_id), ('region', region)):
+        text, count = re.subn(rf'^{key}=.*$', f'{key}={value}', text, flags=re.MULTILINE)
+        if not count:
+            text = text.rstrip('\n') + f'\n{key}={value}\n'
+        elif count != 1:
+            raise ValueError(f'{key}: expected one bootstrap setting')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(destination, text)
+    destination.chmod(0o644)
 
 
 def active_process_groups() -> Sequence[int]:
@@ -281,16 +305,24 @@ class RemoteArguments(argparse.Namespace):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('publish', 'tick'))
-    _ = parser.add_argument('--directory', required=True, type=Path)
+    _ = parser.add_argument('command', choices=('publish', 'tick', 'serve'))
+    _ = parser.add_argument('--directory', type=Path)
     _ = parser.add_argument('--settings', type=Path)
     args = parser.parse_args(namespace=RemoteArguments())
     if args.command == 'publish':
+        if args.directory == Path():
+            parser.error('--directory is required for publish')
         return 0 if publish_admission(args.directory.expanduser(), sys.stdin.read(),
                                       now=int(time.time()), boot_id=linux_runner.boot_identity()) else 1
     if args.settings == Path():
-        parser.error('--settings is required for tick')
-    agent = RemoteAgent(args.settings, args.directory.expanduser())
+        parser.error('--settings is required for tick or serve')
+    if args.command == 'tick' and args.directory == Path():
+        parser.error('--directory is required for tick')
+    directory = args.directory.expanduser() if args.directory != Path() else Path.home() / read_control_settings(args.settings).remote_state_directory
+    agent = RemoteAgent(args.settings, directory)
+    if args.command == 'serve':
+        service_loop(args.settings, 'interruption_poll_s', agent.tick)
+        return 0
     print(agent.tick())
     return 0
 

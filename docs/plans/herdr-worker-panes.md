@@ -881,42 +881,26 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 
 **Acceptance gate (checker):** `test_staff_check.py` runs with no Units table and no timer doc metadata; rows, git and `.unit.toml` supply current facts. A remote read failure stays uncertain; confirmed absence remains a different diagnostic. This test must pass before 4c removes tables or 4d removes their parser.
 
-### Phase 3u — Other readers in this repository's shared trees read the row  · status: todo
+### Phase 3u — Other readers in this repository's shared trees read the row  · status: done
 
 **Depends on:** 3s. Lands alone.
 
-#### Work Order
+#### As-built
 
-**Goal:** the readers in `scripts/direct/`, `scripts/usage/`, `scripts/hierarchies/`, `scripts/message/`, `scripts/nightly_review/` and `scripts/statusline/` find a unit or showrunner from the row (by native runtime id or by folder), never from a worktree path, branch, plan header, doc field, Units cell or pane mark. This absorbs old Phases 3i and 17.
-
-**Spec:**
-1. **Readers.** `grep -rlE 'unit_table|units_table|## Units|production_units|unit_is_retired|SHOWRUNNER_UNIT|PRODUCTION_MARK|UNIT_MARK\b|Showrunner session|former_slugs|Parent production' scripts/direct scripts/usage scripts/hierarchies scripts/message scripts/nightly_review scripts/statusline`, non-test files. At ac680222: `assertion_guard.py`, `board_json.py`, `phase_table.py`, `outcomes.py`, `usage_report.py`, `waste_watch.py`, `measure.py`, `push_audit.py`, `escalate.py`, `rca.py`, `roster.py`, `unit_labels.py`, `nightly_review.py`, `statusline.sh`.
-2. A caller that knows its folder uses `session_staff.member_by_folder`; a pane uses its Claude session id or Codex thread id. Current owner reads the row; history keeps what the artifact recorded.
-3. **Status line.** `statusline.sh:105` finds the showrunner through `SHOWRUNNER_UNIT` and the timer folder today. It now reads the unit's parent from its native runtime id. On natedev that is one read of `staff.json`; on the Mac it is the staff snapshot. The read gets a time limit, `STAFF_READ_SECONDS` in `config/statusline.conf`, read at each run through the one `KEY=value` parse (`tunables`, Phase 3q); past it the line shows no showrunner part. The gate measures the line on both machines against its current budget.
-4. `nightly_review.py:258-264` finds the nightly unit as the active unit whose `.unit.toml` lists `nightly-review` (Phase 3q fills it).
-5. Text in the files this phase changes says "session labels", not "unit marks" (`test_roster.py:2247`).
-6. A timer is read only through `showrunners.timer_for` (decision 16); the fixtures keep a slug that differs from its row name.
+- The readers in `scripts/direct/`, `scripts/usage/`, `scripts/hierarchies/`, `scripts/message/` and `scripts/nightly_review/` take unit and showrunner ownership from the staff row: one `session_staff.RowResolver` per command run, `member_by_folder` for a caller that knows its folder, the native session or thread id for a pane. A run's recorded production and unit stay as history.
+- `showrunners.read_sources` takes an `on_failure` callback. `showrunners.timer_for` skips one unreadable timer and raises only when no timer is readable, so a bad timer removes only its own row and gives one problem line.
+- `nightly_review.py` selects its unit from config (`NightlyUnit`, `NightlyUnitNotSelected`) and launches `add_unit.py` with `--permanent`, `--standby` or `--plan`. Unknown ownership is an `OSError` refusal line.
+- `workers._run_unit` uses only the run's own evidence. `phase_table.read_production` validates the Merge branch, Showrunner checkout and Log fields. A unit name converts to its id once.
+- The status line is unchanged: it reads the unit's parent from the staff row in its `jq` join and matches a timer to its showrunner by the timer's native session target.
+- The item 1 search (`unit_table|units_table|## Units|production_units|unit_is_retired|SHOWRUNNER_UNIT|PRODUCTION_MARK|UNIT_MARK\b|Showrunner session|former_slugs|Parent production` and the `Production:` header) finds only helpers that read no membership: `unit_table.Refusal`, `unit_table.cell_value`, `unit_table_cells` (`open_step`, `run_events`), and `phase_table`'s `former_slugs` use for retained note ownership.
 
 **Files:**
-- `scripts/direct/{assertion_guard,board_json,phase_table}.py`, `scripts/usage/{outcomes,usage_report,waste_watch}.py`, `scripts/hierarchies/{measure,push_audit}.py`, `scripts/message/{escalate,rca,roster,unit_labels}.py`, `scripts/nightly_review/nightly_review.py`, `scripts/statusline/statusline.sh` — the readers item 1 lists (ac680222); a reader the search finds at dispatch joins them.
-- `config/statusline.conf` — `STAFF_READ_SECONDS`.
-- `scripts/direct/test_{assertion_guard,board_json,phase_table}.py`, `scripts/usage/test_{outcomes,usage_report,waste_watch}.py`, `scripts/hierarchies/test_{measure,push_audit}.py`, `scripts/message/test_{escalate,rca,roster,unit_labels}.py`, `scripts/nightly_review/test_nightly_review.py`, `scripts/statusline/test_statusline.py` — their tests.
-- `scripts/production/session_labels.py` — read only.
-- `scripts/direct/plan_history.py`, `scripts/direct/progress_history.py`, `scripts/direct/test_plan_history.py`, `scripts/direct/test_progress_history.py` — the `Production:` header readers (Phase 3h review).
+- `scripts/message/{roster,unit_labels,escalate,rca}.py`, `scripts/usage/{outcomes,usage_report,waste_watch}.py`, `scripts/hierarchies/{measure,push_audit}.py`, `scripts/direct/{assertion_guard,board_json,phase_table,plan_history,progress_history,workers}.py`, `scripts/production/{showrunners,dailies_input}.py`, `scripts/nightly_review/nightly_review.py` — the row readers.
+- Their tests, and the caller fixtures `scripts/direct/{assertion_guard_test_support,review_launcher_test_support}.py`, `scripts/direct/test_{workers,verify_lint_guard_key}.py`, `scripts/production/test_{dailies_input,showrunners,prune_phase_notes,rename_phase_notes}.py`, `scripts/hooks/test_direct_turn_wait_hooks.py`, `scripts/whoami/test_five_hour.py`.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — the non-test files and `config/statusline.conf`; hub: none (each reader calls the read-only resolver).
-- `test` — the test files.
+**Gotchas:** a strict staff-row reader needs a private staff row in each fixture in every tree, so run the merge gate early. A candidate unit's own folder row is not evidence of a run's owner. Do not apply the unit id suffix conversion twice.
 
-**State:** none.
-
-**Constraints from prior phases:** Phase 3s resolver. The messaging unit owns `scripts/message/`: agree the `roster.py`, `escalate.py`, `rca.py` and `unit_labels.py` changes with it. Delegation Context → Staff design (2026-10-31), No hard-coded config.
-- Phase 3h review (2026-11-01): the discovery search adds the `Production:` header pattern; `plan_history.py:52` and `progress_history.py:5031` read ownership from the staff row (unit → parent showrunner → doc). The status line's current-session join shipped in 3h; only its other reads remain here.
-- Phase 3s review (2026-11-02): a strict reader breaks fixtures in the whole repository. Grep every staff-row fixture before dispatch, list the affected test files in **Files**, and run the merge gate early. `staff_test_support.py` has one writer at a time.
-- Phase 3s review (2026-11-02): `member_by_folder` is `session_staff.RowResolver.member_by_folder` with the `FolderMember` selector, not a module-level function. Use one snapshot and one resolver per command run.
-- Phase 3s review (2026-11-02): keep incomplete output for `WorktreeUnfilled`, `DocUnfilled`, `LocationUnfilled` and `DocumentUnavailable`, with tests.
-
-**Acceptance gate:** the search in item 1 finds nothing; basedpyright 0/0 on changed files and every caller module; tests for a prefixed folder, a transferred unit, a retired unit's history and a changed `STAFF_READ_SECONDS`; the status line stays under its current budget on natedev and the Mac; a per-directory test run of each tree passes; full gate green. No rerun test: only reads change.
+**Ruled out:** a `STAFF_READ_SECONDS` limit for the status line (the staff read is a local file; a `conf.py` read costs 0.058 s against a 0.0165 s line).
 
 ### Phase 3v — Readers in other units' files read the row  · status: todo
 
@@ -1345,6 +1329,7 @@ Test unchanged reruns and refusal when the recorded old value differs.
 **State:** audit/removal handoff; the Units table leaves every production doc, one commit per merge branch.
 
 **Constraints from prior phases:** Phases 3t-3w switched every reader; Phase 4b removed Owns.
+- Phase 3u (2026-11-02): `board_json.py`, `phase_table.py` and `measure.py` still import `unit_table.Refusal`, `unit_table.cell_value` and `unit_table_cells.open_step` / `run_events`. They read no membership. Move them with `Refusal` before the table module goes.
 - Phase 3h review (2026-11-01): Port's home is `UnitConfig.port: AppPort | NoAppPort` in `.unit.toml` (`unit_config.py:42`), which `add_unit.configuration_for` and the fill already write and retire parks. Before the table goes, audit every Port cell into that field (a value that differs is listed for sdlc, never filled) and switch the remaining Port readers through 3s; test active and retired reads, rename and transfer with no table and no new store.
 - Phase 3h review (2026-11-01): keep the audited-source hashes, interrupted-commit recovery and the handoff to 4d; acceptance tells unproved retained-member facts from historical members that never had a row.
 - Phase 3s review (2026-11-02): `unit_lookup.py` and `live_units.py` still import table ordering from `production_units`. Remove that dependency here, with importer tests.

@@ -1461,7 +1461,7 @@ def require_configuration(settings_read: conf.ConfigRead) -> None:
             message = str(error)
             if "key is missing" in message:
                 message = f"{key} is not set: {message}"
-            elif "expected a whole number" in message or "could not convert string to float" in message:
+            elif "expected a whole number" in message or "expected a finite number" in message:
                 raw = conf.effective_line("direct", key)[1]
                 message = f"{key}={raw} is not a whole number: {message}"
             elif not conf.path("direct").is_file():
