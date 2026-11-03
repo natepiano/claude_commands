@@ -6,6 +6,7 @@ import fcntl
 import time
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -38,6 +39,17 @@ class UnroutedAlertTests(unittest.TestCase):
 
     def notify(self, reason: str = "conflict") -> None:
         unrouted_alert.notify(self.root / "links", "top", self.row, reason, ("one", "two"))
+
+    def test_importing_the_alert_does_not_load_the_sender(self) -> None:
+        command = """import sys
+sys.path.insert(0, sys.argv[1])
+from scripts.production import unrouted_alert
+assert 'scripts.message.send' not in sys.modules
+assert 'send' not in sys.modules
+"""
+        result = subprocess.run([sys.executable, "-I", "-c", command, str(Path(__file__).resolve().parents[2])],
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def assert_pending_alert_failure(self) -> None:
         error = StringIO()

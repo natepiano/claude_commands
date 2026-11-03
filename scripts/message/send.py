@@ -137,6 +137,12 @@ import process_group
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff, unit_names
 from scripts.lib import conf
+from scripts.message.send_result import (
+    Outcome as Outcome, EXIT as EXIT, OUTCOME_HEADERS as OUTCOME_HEADERS,
+    OutcomeHeader as OutcomeHeader, NoOutcomeHeader as NoOutcomeHeader, parse_outcome as parse_outcome,
+    ConfirmedSendOutcome as ConfirmedSendOutcome, UnconfirmedSendOutcome as UnconfirmedSendOutcome,
+    send_outcome as send_outcome,
+)
 import sessions  # noqa: E402
 from relay_identity import SavedRelaySender, read_relay_sender, relay_session_name
 import postmaster  # noqa: E402
@@ -242,54 +248,9 @@ NO_CLEAR_STEP = ("an emergency push (--need blocked) repeats on the phone until 
                  + ' way to clear. Add --clears-when "<command that exits 0 when fixed>", such as'
                  + " --clears-when github-warm-status: send.py then cancels the push when that command exits 0")
 
-Outcome = Literal["sent", "skipped", "queued", "failed", "refused", "held", "replaced", "kept"]
 Need = Literal["note", "decision", "blocked"]
 CHANNEL_PRIORITY: dict[Need, str] = {"note": "0", "decision": "1", "blocked": "2"}
-EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3, "refused": 2, "held": 4, "replaced": 0, "kept": 0}
-OUTCOME_HEADERS: dict[str, Outcome] = {outcome.upper(): outcome for outcome in EXIT}
 _ACKNOWLEDGED_AT = " acknowledged at "
-
-
-@dataclass(frozen=True)
-class OutcomeHeader:
-    """The first send result and the payload that follows it."""
-    outcome: Outcome
-    detail: str
-    payload: str
-
-
-@dataclass(frozen=True)
-class NoOutcomeHeader:
-    """The command output contains no send result."""
-
-
-def parse_outcome(stdout: str) -> OutcomeHeader | NoOutcomeHeader:
-    """Read the first outcome header; later headers are payload text."""
-    lines = stdout.removesuffix("\n").split("\n")
-    for index, line in enumerate(lines):
-        word, _, detail = line.partition(": ")
-        if word in OUTCOME_HEADERS:
-            return OutcomeHeader(OUTCOME_HEADERS[word], detail, "\n".join(lines[index + 1:]))
-    return NoOutcomeHeader()
-
-
-@dataclass(frozen=True)
-class ConfirmedSendOutcome:
-    """The first result header agrees with the command's exit code."""
-    header: OutcomeHeader
-
-
-@dataclass(frozen=True)
-class UnconfirmedSendOutcome:
-    """The command did not confirm a consistent send result."""
-
-
-def send_outcome(returncode: int | None, stdout: str) -> ConfirmedSendOutcome | UnconfirmedSendOutcome:
-    """Check the first result header against the command's exit code."""
-    header = parse_outcome(stdout)
-    if isinstance(header, OutcomeHeader) and returncode == EXIT[header.outcome]:
-        return ConfirmedSendOutcome(header)
-    return UnconfirmedSendOutcome()
 
 
 def acknowledged_skip_reason(key: str, at: str) -> str:
@@ -1998,10 +1959,11 @@ def remote(message: Message, host: str, options: Options) -> Result:
             raise AssertionError("a user message must state its action")
         failure = reviewed_failure(err, FailedPush(message.summary, options.action, message.text, need=options.need),
                                    prefix="send.py: failed push JSON: ", machine=host, remote_record=True)
-    parsed = parse_outcome(out)
-    if isinstance(parsed, NoOutcomeHeader):
+    outcome = send_outcome(code, out)
+    if isinstance(outcome, UnconfirmedSendOutcome):
         why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
         return Result("held" if isinstance(failure, FailedPush) and failure.held else "failed", f"ssh {host}: {why}", failure)
+    parsed = outcome.header
     detail = parsed.detail
     if parsed.payload:
         detail += "\n" + parsed.payload

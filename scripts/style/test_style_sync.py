@@ -459,6 +459,24 @@ class StyleSyncTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(output, "style_sync: notify: send.py: stdout: FAILED: unavailable\n")
 
+    def test_notify_requires_a_confirmed_success_outcome(self) -> None:
+        self.production()
+        cases = ((0, "SENT: fixture", True), (0, "SKIPPED: repeated", True),
+                 (0, "KEPT: silence", True), (0, "REPLACED: revision", True),
+                 (1, "QUEUED: offline", False), (3, "FAILED: unavailable", False),
+                 (2, "REFUSED: invalid", False), (4, "HELD: decision", False),
+                 (0, "", False), (0, "QUEUED: inconsistent", False),
+                 (1, "SENT: inconsistent", False), (0, "FAILED: inconsistent", False))
+        for code, text, accepted in cases:
+            with self.subTest(code=code, text=text):
+                _ = (self.root / "send.py").write_text(f"print({text!r})\nraise SystemExit({code})\n")
+                result, output = self.notice()
+                self.assertEqual(result, 0)
+                if accepted:
+                    self.assertEqual(output, "")
+                else:
+                    self.assertIn("style_sync: notify: send.py:", output)
+
     def test_notify_lookup_refusal_prints_one_prefix_and_keeps_the_merge_successful(self) -> None:
         with mock.patch.object(style_sync, "standing_style_production",
                                side_effect=ValueError("style_sync: invalid production")):

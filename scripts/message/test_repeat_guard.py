@@ -37,6 +37,7 @@ NOTICE_FIXTURE = r'''import sys,os,json,signal,io
 from pathlib import Path
 from unittest.mock import patch
 import send,repeat_guard as g,roster
+from scripts.message import send_result
 from scripts.production import staff
 staff.snapshot=lambda: staff.StaffSnapshot(())
 role,mode,root,sink=sys.argv[1:]
@@ -76,7 +77,7 @@ else:
         options=send.parse(command[2:])._replace(shown_sender=send.ShownSender(g.NOTICE_SENDER))
         with patch.object(roster,'roster',return_value=roster.Roster([],[])), patch.object(send,'resolve_recipient',return_value=send.CodexSessionRecipient('codex:owner','owner','owner',send.codex_daemon.CodexDaemon(Path(root),Path(root)/'unused.sock'))), patch.object(send,'codex_session',accept), patch.object(send,'user',accept), patch.object(send,'wrong_template',return_value=None):
             result=send.send(options)
-        return send.EXIT[result.outcome],result.outcome.upper()+': '+result.detail,''
+        return send_result.EXIT[result.outcome],result.outcome.upper()+': '+result.detail,''
     sys.stdin=io.StringIO(json.dumps(request))
     with patch.object(send,'repeat_notice_owner',owner), patch.object(send,'run',transport):
         send.main(['repeat-notice-attempt'])

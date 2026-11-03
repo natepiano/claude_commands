@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import cast
 
 from scripts.lib import atomic_file, conf, file_lock
-from scripts.message import send
+from scripts.message import send_result
 
 
 def send_message(recipient: str, sender: str, message: str) -> None:
@@ -18,8 +18,8 @@ def send_message(recipient: str, sender: str, message: str) -> None:
     result = subprocess.run([sys.executable, str(Path(__file__).resolve().parents[1] / "message/send.py"),
                              "--to", recipient, "--from", sender, "--text", message],
                             capture_output=True, text=True, check=False)
-    outcome = send.send_outcome(result.returncode, result.stdout)
-    if isinstance(outcome, send.ConfirmedSendOutcome):
+    outcome = send_result.send_outcome(result.returncode, result.stdout)
+    if isinstance(outcome, send_result.ConfirmedSendOutcome):
         match outcome.header.outcome:
             case "sent" | "queued" | "kept":
                 return
