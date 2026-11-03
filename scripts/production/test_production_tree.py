@@ -58,12 +58,12 @@ class ProductionTreeTests(StaffTestCase):
         notifier, state = self.source_root / "notifier", self.source_root / "showrunners"
         rows: dict[str, staff.StaffRow] = {}
         for slug, session_id in (("main", RUNNER), ("child", CHILD_RUNNER), ("gone", GONE_RUNNER)):
-            _ = self.production(slug, parent="main" if slug == "child" else "")
+            doc = self.production(slug, parent="main" if slug == "child" else "")
             conf = notifier / f"showrunner-{slug}" / "conf"
             target = showrunners.read_bound_source(conf.parent, self.source_root / f"{slug}-production.md").timer.target
             write_text_atomic(conf, conf.read_text().replace("TARGET=" + target, "TARGET=session:" + session_id))
             rows[slug] = fixture_member("showrunner", name=slug, parent=rows["main"].id if slug == "child" else None,
-                                        runtime_id=session_id)
+                                        runtime_id=session_id, doc=staff.LiveDoc("natedev", doc))
         _ = cast(object, self.enterContext(mock.patch.dict(
             os.environ, {"ASTRA_ROLES_STATE": str(self.root / "astra-roles"),
                          "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
@@ -118,8 +118,8 @@ class ProductionTreeTests(StaffTestCase):
 
     def test_transferred_live_unit_edge_uses_its_staff_parent_despite_the_old_launch_mark(self) -> None:
         for slug in ("natedev", "sdlc"):
-            _ = self.production(slug)
-            _ = fixture_member("showrunner", name=slug)
+            doc = self.production(slug)
+            _ = fixture_member("showrunner", name=slug, doc=staff.LiveDoc("natedev", doc))
         parent = staff_sources.member(staff_sources.ShowrunnerMember("sdlc"), staff.snapshot())
         assert isinstance(parent, staff_sources.MemberFound)
         row = fixture_member("unit", name="one", parent=parent.row.id, runtime_id=DIRECTOR)

@@ -5464,7 +5464,8 @@ def _local_session_counts() -> tuple[dict[tuple[Path, str], dict[str, str]], tup
             unit = launch["environment"].get("SHOWRUNNER_UNIT_ID", "")
             try:
                 # The live session id joins first; an older launch keeps its unit mark.
-                member = session_staff.unit_match(session_staff.ObservedUnit(unit), membership, identity)
+                member = session_staff.unit_match(session_staff.ObservedUnit(unit), membership,
+                                                 session_staff.LiveSession(identity))
                 if isinstance(member, session_staff.NoSuchMember) and unit:
                     member = session_staff.unit_match(session_staff.ObservedUnit(unit), membership)
             except (staff.StaffUnreadable, ValueError):

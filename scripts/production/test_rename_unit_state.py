@@ -12,6 +12,7 @@ from typing import cast, final
 from unittest import mock
 from scripts.astra import design_roles
 from scripts.direct import workers
+from scripts.production import staff
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -35,6 +36,8 @@ class UnitRenameStateTests(UnitRenameFixture):
         self.checkout = old.with_name("claude-demo-relocated")
         _ = old.rename(self.checkout)
         self.doc = self.checkout / "docs/plans/demo-production.md"
+        row = next(row for row in staff.find(kind="showrunner") if row.name == SLUG)
+        _ = staff.set_doc(row.id, staff.LiveDoc("natedev", self.doc))
         _ = self.git("worktree", "repair")
         self.write(self.doc, self.doc.read_text().replace(str(old), str(self.checkout)))
         _ = self.git("add", str(self.doc))

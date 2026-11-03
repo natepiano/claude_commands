@@ -84,7 +84,9 @@ class UnitRenameTests(UnitRenameFixture):
         row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
         worker = fixture_member("worker", name="impl1", parent=row.id)
         self.assert_ok(self.rename("apply"))
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "gamma", row.parent, current_session=row.id))
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(
+            row.id, "unit", "gamma", row.parent, current_session=row.id,
+            worktree=staff.PresentWorktree("natedev", self.rust / "claude-demo-gamma"), doc=row.doc))
         self.assertEqual(staff.snapshot().by_id(worker.id), worker)
         self.assertEqual(self.journal()["staff_id"], row.id)
 

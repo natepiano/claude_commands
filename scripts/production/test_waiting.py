@@ -24,6 +24,8 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.git_exclude import ensure_excluded
+from scripts.lib.atomic_file import write_text_atomic
 import add_unit
 import production_units
 import dailies_render
@@ -179,6 +181,9 @@ class WaitingTests(unittest.TestCase):
         _ = self.git("push", "-u", "origin", "production")
         _ = self.git("worktree", "add", "-b", "alpha-branch", str(self.alpha), "production")
         _ = self.git("worktree", "add", "-b", "beta-branch", str(self.beta), "production")
+        ensure_excluded(self.checkout, "/.unit.toml")
+        for folder, plan in ((self.alpha, "alpha"), (self.beta, "beta")):
+            write_text_atomic(folder / ".unit.toml", f'plan = "docs/{plan}.md"\nresponsibilities = []\n')
         self.write(self.log, "# Production log — example\n\n### STATE\n")
 
     def write(self, path: Path, content: str) -> None:
@@ -265,8 +270,11 @@ class WaitingTests(unittest.TestCase):
         owner = showrunner_relationship("showrunner-example")
         _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", self.doc))
         _ = write_timer(self.root / "notifier", "example", owner.id, "", self.doc)
-        for unit in (ALPHA, BETA):
-            _ = unit_membership("showrunner-example", unit)
+        for unit, folder, plan in ((ALPHA, self.alpha, "alpha"), (BETA, self.beta, "beta")):
+            row = unit_membership("showrunner-example", unit)
+            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", folder))
+            if folder.exists():
+                write_text_atomic(folder / ".unit.toml", f'plan = "docs/{plan}.md"\nresponsibilities = []\n')
 
     def add_gamma(self) -> None:
         _ = unit_membership("showrunner-example", GAMMA)

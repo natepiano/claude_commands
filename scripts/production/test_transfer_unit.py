@@ -11,7 +11,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-from typing import cast, final
+from typing import cast, final, override
 from unittest import mock
 from collections.abc import Callable
 from contextlib import ExitStack
@@ -40,6 +40,20 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 @final
 class UnitTransferTests(UnitTransferFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        for slug, checkout in (("demo", self.giving), ("other", self.receiving)):
+            owner = next(row for row in staff.find(kind="showrunner") if row.name == slug)
+            _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", checkout / f"docs/plans/{slug}-production.md"))
+
+    @override
+    def add_destination(self, slug: str) -> Path:
+        doc = super().add_destination(slug)
+        owner = next(row for row in staff.find(kind="showrunner") if row.name == slug)
+        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
+        return doc
+
     def test_transfer_changes_only_parent_and_preserves_locations_and_config_bytes(self) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.unit))
@@ -85,7 +99,8 @@ class UnitTransferTests(UnitTransferFixture):
         row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
         parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "other")
         self.assert_ok(self.transfer("apply"))
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", row.name, parent.id, current_session=row.id))
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", row.name, parent.id, current_session=row.id,
+                                worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled()))
         self.assertNotIn("alpha-unit", (self.giving / "docs/plans/demo-production.md").read_text())
         self.assertIn("alpha-unit", (self.receiving / "docs/plans/other-production.md").read_text())
         calls = fake_unit_host.calls(self.env)
@@ -126,7 +141,8 @@ class UnitTransferTests(UnitTransferFixture):
         self.assert_ok(planned)
         self.assertEqual(self.staff_file.read_bytes(), before)
         self.assert_ok(self.transfer("apply"))
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", row.name, parent.id, current_session=row.id))
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", row.name, parent.id, current_session=row.id,
+                                worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled()))
         self.assertNotIn("alpha-unit", (self.giving / "docs/plans/demo-production.md").read_text())
         self.assertIn("alpha-unit", (self.receiving / "docs/plans/other-production.md").read_text())
         self.assert_ok(self.transfer("verify"))
@@ -250,7 +266,8 @@ class UnitTransferTests(UnitTransferFixture):
         parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "other")
         worker = fixture_member("worker", name="impl1", parent=row.id)
         self.assert_ok(self.transfer("apply"))
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id, current_session=row.id))
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id, current_session=row.id,
+                                worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled()))
         self.assertEqual(staff.snapshot().by_id(worker.id), worker)
         saved = cast(dict[str, object], json.loads((self.root / "state/showrunner/demo/transfer_unit.json").read_text()))
         self.assertEqual(saved["staff_id"], row.id)
@@ -333,7 +350,8 @@ class UnitTransferTests(UnitTransferFixture):
             with mock.patch.object(self, "root", Path(directory)):
                 listener = contexts.enter_context(self.lock_notice(lock))
             def pause(transfer: transfer_unit.UnitTransfer, save: Callable[[], None]) -> None:
-                self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id, current_session=row.id))
+                self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id, current_session=row.id,
+                                worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled()))
                 process = self.start_script(SOURCES_SCRIPT, "seed")
                 pending.append(process)
                 self.assert_operation_blocks(process, listener)
@@ -345,7 +363,8 @@ class UnitTransferTests(UnitTransferFixture):
                 self.assert_ok(self.transfer("apply"))
             output, errors = pending[0].communicate(timeout=PROCESS_TIMEOUT)
         self.assertEqual(pending[0].returncode, 0, output + errors)
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id, current_session=row.id))
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id, current_session=row.id,
+                                worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled()))
 
     def test_rerun_finishes_each_uncommitted_document_write(self) -> None:
         snapshot = Path(self.enterContext(tempfile.TemporaryDirectory())) / "before"
