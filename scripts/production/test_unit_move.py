@@ -448,6 +448,9 @@ class UnitFolderMoveTests(FolderMoveFixture):
         self.assertEqual(command[resume + 1], self.owner.current_session)
         self.assertNotEqual(command[resume + 1], self.owner.id)
         self.assertEqual(command[command.index("exec") + 1], backend.config.name.removeprefix("."))
+        if kind == "claude":
+            self.assertIn("the session folder moved", command[-1])
+            self.assertNotIn("the herdr server restarted", command[-1])
         self.assertEqual(backend.cwd, self.new_folder)
         self.assertEqual(backend.startup_observations, startup_delay_polls + 1)
         self.assertFalse(backend.startup_pending)

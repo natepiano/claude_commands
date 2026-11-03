@@ -5,9 +5,9 @@ from __future__ import annotations
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 import unittest
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 from scripts.direct.implement_launcher_claims_test_support import CompletedWorkerFixture
-from scripts.direct.implement_launcher_test_support import AGENTS_REGISTRY as AGENTS_REGISTRY
+from scripts.direct.implement_launcher_test_support import MODELS_REGISTRY as MODELS_REGISTRY
 from typing import cast
 import json
 import subprocess
@@ -111,8 +111,8 @@ class ImplementLauncherWorkerTests(CompletedWorkerFixture):
         self.assertFalse((session_dir / "impl_status_test").exists())
         self.assertEqual(self.open_passes(session_dir), before)
 
-        registry = self.root / ".claude" / "config" / "agents.conf"
-        _ = write_registry(registry, {"direct.codex": {"impl": "gpt-blind:max"}}, base_text=AGENTS_REGISTRY)
+        registry = self.root / ".claude" / "config" / "models.conf"
+        _ = write_registry(registry, {"direct.codex": {"impl": "gpt-blind:max"}}, base_text=MODELS_REGISTRY)
         # The next turn follows the edited registry; the saved identity remains history.
         changed_model = self.mesh_launch(session_dir, to=name)
         self.assertEqual(changed_model.returncode, 0, changed_model.stderr)

@@ -268,10 +268,13 @@ function accountsPaneCalls($: EngineInterface): TablePaneCalls<AccountsReady, Ac
 async function queueRun($: EngineInterface, args: string[], isOpen = () => true) {
   const home = await $.env.get('HOME');
   if (!home || !isOpen()) throw new Error('Build queue could not be read.');
-  const result = await $.process.run([`${home}/.claude/scripts/lib/py`,
-    `${home}/.claude/scripts/${args[0] === "priority" ? "lint/memory_admit.py" : "build_queue/build_queue.py"}`, ...args]);
+  const argv = [`${home}/.claude/scripts/lib/py`,
+    `${home}/.claude/scripts/build_queue/build_queue.py`, ...args];
+  const result = args[0] === 'bump' || args[0] === 'clear' || args[0] === 'admit-head'
+    ? await $.process.run(argv, { env: { CLAUDE_CODE_SESSION_ID: await $.session.id() } })
+    : await $.process.run(argv);
   if (!isOpen()) throw new Error('Build queue could not be read.');
-  if (args[0] === 'priority' && result.exitCode === 3 && !result.isStdoutTruncated) {
+  if (args[0] === 'bump' && result.exitCode === 3 && !result.isStdoutTruncated) {
     const refusal = result.stdout.trim();
     if (/^build queue: [^\r\n]+$/.test(refusal)) return refusal;
   }
@@ -336,6 +339,7 @@ function queuePaneCalls($: EngineInterface, opening: QueueOpening = { kind: 'sav
       if (!isOpen()) return;
       const saved = normalizeQueueState(previous[QUEUE]);
       if (state.kind === 'loading' && saved.kind === 'loading') return;
+      if (state.kind === 'failed' && saved.kind === 'queue') return;
       const selected: QueuePaneState = state.kind === 'queue' ? state : { ...state, selection: saved.selection };
       await $.state.set(QUEUE_PANES, { ...previous, [QUEUE]: selected });
     },
@@ -427,10 +431,10 @@ export const register: Register = on => {
     }
     if (/^bump(?:\s|$)/.test(wanted)) {
       const words = wanted.split(/\s+/);
-      if (words.length !== 2) return { text: 'build queue: use /build:queue bump <unit>' };
+      if (words.length !== 2) return { text: 'build queue: use /build:queue bump <position|session|folder>' };
       let line: string;
       try {
-        const output = await queueRun($, ['priority', 'set', '--unit', words[1]!, '--why', "the user's bump"]);
+        const output = await queueRun($, ['bump', words[1]!]);
         line = output.trim();
         if (!line || /[\r\n]/.test(line)) throw new Error('Invalid bump result.');
       } catch { return { text: 'Build queue could not be read.' }; }

@@ -16,6 +16,9 @@ from typing import BinaryIO, Literal, cast
 from scripts.accounts.worker_names import journal_entry
 from scripts.usage.rollouts import parse_timestamp
 from scripts.whoami import run_out
+from scripts.production import session_staff, staff
+from scripts.shutdown import remote
+import sys
 
 
 @dataclass(frozen=True)
@@ -38,53 +41,38 @@ def git_text(repo: Path, *arguments: str) -> str | None:
     return result.stdout if result.returncode == 0 else None
 
 
-def cell_value(value: str) -> str:
-    quoted = re.search(r"`([^`]+)`", value)
-    return quoted.group(1) if quoted else value.split(" — ", 1)[0].strip()
-
-
-def production_paths(path: Path) -> tuple[Path, ...]:
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
+def production_paths(path: Path, *, resolver: session_staff.RowResolver | None = None) -> tuple[Path, ...]:
+    """Read the worktrees held by the document owner's staff rows."""
+    resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+    owner = resolver.record.by_doc(remote.local_machine(), path)
+    if owner is None:
+        print(f"outcomes: {path}: no staff owner binds the document", file=sys.stderr)
         return ()
     paths: list[Path] = []
-    for line in lines:
-        if line.startswith("- **Repository:** "):
-            value = cell_value(line.removeprefix("- **Repository:** "))
-            if value:
-                paths.append(Path(value).expanduser())
-    try:
-        units = lines.index("## Units")
-    except ValueError:
-        return tuple(paths)
-    headings: list[str] = []
-    for line in lines[units + 1:]:
-        if not line.startswith("|"):
-            if headings:
-                break
-            continue
-        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        if not headings:
-            headings = cells
-            continue
-        if all(set(cell) <= {"-", ":", " "} for cell in cells):
-            continue
-        if "Worktree" not in headings:
-            break
-        values = dict(zip(headings, cells, strict=False))
-        worktree = cell_value(values.get("Worktree", ""))
-        if worktree:
-            paths.append(Path(worktree).expanduser())
+    for row in resolver.record.find(kind="unit", parent=owner.id):
+        tree = resolver.unit_worktree(row)
+        if isinstance(tree, staff.WorktreeUnfilled):
+            print(f"outcomes: {row.name}: the worktree is not recorded", file=sys.stderr)
+        elif tree.machine == remote.local_machine():
+            worktrees = git_text(tree.path, "worktree", "list", "--porcelain")
+            if worktrees is not None:
+                first = worktrees.splitlines()[0] if worktrees else ""
+                if first.startswith("worktree "):
+                    main = Path(first.removeprefix("worktree "))
+                    if main not in paths:
+                        paths.append(main)
+            if tree.path not in paths:
+                paths.append(tree.path)
     return tuple(paths)
 
 
-def repositories(claude_repo: Path, production_docs: Path) -> tuple[Path, ...]:
+def repositories(claude_repo: Path, production_docs: Path, *, resolver: session_staff.RowResolver | None = None) -> tuple[Path, ...]:
+    resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
     candidates = [claude_repo]
     candidates.extend(
         path
         for document in sorted(production_docs.glob("*-production.md"))
-        for path in production_paths(document)
+        for path in production_paths(document, resolver=resolver)
     )
     unique: dict[str, Path] = {}
     for candidate in candidates:
@@ -347,14 +335,15 @@ def collect_checkpoints(db: sqlite3.Connection, claude_repo: Path, production_do
     state: LocalReadState = CompleteSourceRead()
     added = 0
     try:
+        resolver = session_staff.RowResolver(staff.snapshot())
         candidates = (claude_repo, *(path for document in sorted(production_docs.glob("*-production.md"))
-                                     for path in production_paths(document)))
+                                     for path in production_paths(document, resolver=resolver)))
         # Repository discovery omits failures; retain them in this source's state.
         # A worktree removed after its merge is no failure: its commits stay in the shared repository.
         for candidate in candidates:
             if candidate.exists() and git_text(candidate, "rev-parse", "--git-common-dir") is None:
                 state = PartialSourceRead()
-        repos = repositories(claude_repo, production_docs)
+        repos = repositories(claude_repo, production_docs, resolver=resolver)
         if not repos:
             state = PartialSourceRead()
         for repo in repos:

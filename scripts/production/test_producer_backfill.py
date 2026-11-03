@@ -220,7 +220,7 @@ class ProducerBackfillTests(ProducerFixture):
         _ = bad.write_text("# The review table is missing\n")
         from scripts.production import showrunners
         output, errors = io.StringIO(), io.StringIO()
-        with (mock.patch.object(change_review, "LISTS", self.root),
+        with (mock.patch.object(change_review, "lists_directory", return_value=self.root),
               mock.patch.object(showrunners, "timer_docs", return_value={"top": self.doc}),
               redirect_stdout(output), redirect_stderr(errors)):
             result = change_review.main(["backfill-producer", "--write"])
@@ -235,7 +235,7 @@ class ProducerBackfillTests(ProducerFixture):
         _ = bad.write_bytes(b"\xff")
         from scripts.production import showrunners
         output, errors = io.StringIO(), io.StringIO()
-        with (mock.patch.object(change_review, "LISTS", self.root),
+        with (mock.patch.object(change_review, "lists_directory", return_value=self.root),
               mock.patch.object(showrunners, "timer_docs", return_value={"top": self.doc}),
               redirect_stdout(output), redirect_stderr(errors)):
             result = change_review.main(["backfill-producer", "--write"])
@@ -250,7 +250,7 @@ class ProducerBackfillTests(ProducerFixture):
         _ = bad.write_text("## To review\n\n| # | Change |\n| --- | --- |\n|\n")
         from scripts.production import showrunners
         output, errors = io.StringIO(), io.StringIO()
-        with (mock.patch.object(change_review, "LISTS", self.root),
+        with (mock.patch.object(change_review, "lists_directory", return_value=self.root),
               mock.patch.object(showrunners, "timer_docs", return_value={"top": self.doc}),
               redirect_stdout(output), redirect_stderr(errors)):
             result = change_review.main(["backfill-producer", "--write"])
@@ -292,7 +292,7 @@ class ProducerBackfillTests(ProducerFixture):
         _ = other.write_bytes(self.listing.read_bytes())
         from scripts.production import showrunners
         output = io.StringIO()
-        with (mock.patch.object(change_review, "LISTS", self.root),
+        with (mock.patch.object(change_review, "lists_directory", return_value=self.root),
               mock.patch.object(showrunners, "timer_docs", return_value={"top": self.doc}), redirect_stdout(output)):
             result = change_review.main(["backfill-producer", "--write"])
         self.assertEqual(result, 0)

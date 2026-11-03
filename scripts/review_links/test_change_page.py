@@ -131,6 +131,38 @@ class ChangePageTests(unittest.TestCase):
         self.raw_messages = []
         self.unit = staff.StaffRow(staff.StaffId(""), "unit", "", None, current_session=staff.StaffId(""))
 
+    def test_publications_keep_the_html_and_manifest_under_one_configured_root(self) -> None:
+        from scripts.review_links import review_link
+
+        settings = Path(os.environ["CONF_DIR"]) / "change_review.conf"
+        original = settings.read_text()
+        real_write = atomic_file.write_bytes_atomic
+        publications: list[tuple[Callable[[], str], str]] = [
+            (change_page.publish_browser, change_page.BROWSER_MANIFEST),
+            (lambda: change_page.publish(self.production, self.review_list, ["C1"]), change_page.MANIFEST),
+        ]
+        for index, (publish, manifest) in enumerate(publications):
+            first = self.temporary / f"first-{index}"
+            second = self.temporary / f"second-{index}"
+            configured = original.replace("review_links_directory=~/.local/share/review-links",
+                                          f"review_links_directory={first}")
+            _ = settings.write_text(configured)
+
+            def write(path: Path, content: bytes, *, mode: int = 0o600) -> None:
+                real_write(path, content, mode=mode)
+                if path.name == change_page.PAGE_NAME:
+                    _ = settings.write_text(configured.replace(str(first), str(second)))
+
+            with (self.subTest(manifest=manifest), patch.dict(os.environ),
+                  patch.object(atomic_file, "write_bytes_atomic", side_effect=write)):
+                _ = os.environ.pop("REVIEW_LINKS_ROOT", None)
+                url = publish()
+                folder = first / urlsplit(url).path.split("/")[1]
+                self.assertTrue((folder / change_page.PAGE_NAME).is_file())
+                self.assertTrue((folder / manifest).is_file())
+                self.assertFalse(second.exists())
+                self.assertEqual(review_link.review_root(), second)
+
     def git(self, *arguments: str) -> str:
         return subprocess.run(["git", "-C", str(self.repo), *arguments],
                               capture_output=True, text=True, check=True).stdout.strip()
@@ -141,6 +173,9 @@ class ChangePageTests(unittest.TestCase):
         self.root = self.temporary / "snapshots"
         configuration = self.temporary / "config"
         configuration.mkdir()
+        for stem in ("change_review", "nix_env"):
+            source = Path(__file__).resolve().parents[2] / f"config/{stem}.conf"
+            _ = (configuration / f"{stem}.conf").write_text(source.read_text())
         self.write_delivery_config()
         _ = self.enterContext(patch.object(unrouted_alert, "send_message"))
         self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)}))
@@ -157,8 +192,8 @@ class ChangePageTests(unittest.TestCase):
             "STAFF_FILE": str(self.temporary / "staff.json"),
         }))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.temporary / "notifier"))
-        _ = self.enterContext(patch.object(change_review, "LISTS", self.temporary))
-        _ = self.enterContext(patch("change_review.LISTS", self.temporary))
+        _ = self.enterContext(patch.object(change_review, "lists_directory", return_value=self.temporary))
+        _ = self.enterContext(patch("change_review.lists_directory", return_value=self.temporary))
         _ = fixture_member("showrunner", name="demo")
         _ = self.git("init", "-b", "main")
         _ = self.git("config", "user.name", "Review test")
@@ -566,7 +601,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.messages, [])
 
     def test_an_unrouted_row_with_a_missing_alert_setting_still_renders(self) -> None:
-        _ = self.enterContext(patch.object(change_routing, "LISTS", self.temporary))
+        _ = self.enterContext(patch.object(change_routing, "configured_lists_directory", return_value=self.temporary))
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Conflict", "Read", "Proof")],
                                       date(2026, 11, 2), "abcdef12", self.production, producers=[staff.StaffId("missing-producer")])
         config = self.temporary / "config/review_links.conf"

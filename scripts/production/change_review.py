@@ -122,7 +122,7 @@ _CHECKPOINT = re.compile(r"^checkpoint\((?P<branch>[^)]+)\):")
 _HASH = re.compile(r"\b[0-9a-f]{7,40}\b")
 # The columns an older row keeps its merge hash in, in the order they are read.
 HASH_COLUMNS = ("Merged", "On the Mac build")
-LISTS = change_routing.LISTS
+lists_directory = change_routing.lists_directory
 PREFIX = "change-review - "
 FENCE = "---"
 PRODUCTIONS = "productions"
@@ -365,7 +365,7 @@ def read(path: Path) -> str:
 
 def list_file(showrunner: str) -> Path:
     """The list of the top-level showrunner called `showrunner`."""
-    return LISTS / f"{PREFIX}{showrunner}.md"
+    return lists_directory() / f"{PREFIX}{showrunner}.md"
 
 
 def _owner(path: Path) -> str:
@@ -712,7 +712,7 @@ def _routed_review_entries(path: Path, doc: Path, below: bool, record: staff.Sta
     from scripts.production import showrunners
 
     listed = {item.path.absolute(): item for item in scope_lists(path, doc, below)}
-    for source in LISTS.glob(PREFIX + "*.md"):
+    for source in lists_directory().glob(PREFIX + "*.md"):
         _ = listed.setdefault(source.absolute(), ProductionReviewList(source, _owner(source)))
     documents = {**showrunners.timer_docs(), slug_of(doc): doc}
     snapshots: dict[Path, ReviewListSnapshot] = {}
@@ -1497,7 +1497,7 @@ def _backfill_targets(options: CommandLine) -> tuple[list[Path], list[Path]]:
     from scripts.production import showrunners
 
     documents = list(showrunners.timer_docs().values())
-    lists = [Path(options.list).expanduser()] if options.list else sorted(LISTS.glob(f"{PREFIX}*.md"))
+    lists = [Path(options.list).expanduser()] if options.list else sorted(lists_directory().glob(f"{PREFIX}*.md"))
     return documents, lists
 
 

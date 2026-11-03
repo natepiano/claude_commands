@@ -3,6 +3,11 @@ from __future__ import annotations
 
 import re
 import unittest
+from unittest.mock import patch
+
+from scripts.direct import assertion_guard
+from scripts.production import staff, session_staff
+from scripts.production.staff_test_support import fixture_member, recorded_showrunner
 from typing import override
 
 from scripts.direct.assertion_guard_test_support import GitRepositoryFixture as GitRepositoryFixture, MergeInProgressFixture as MergeInProgressFixture, AssertionFindingFixture, TILE_OLD as TILE_OLD, TILE_NEW as TILE_NEW
@@ -42,6 +47,32 @@ class MergeBaseSelectionTests(SeededMergeInProgressFixture, AssertionFindingFixt
         for arguments in (("--base", self.base), ()):
             with self.subTest(arguments=arguments):
                 self.assert_clean(self.guard(*arguments, "--head", merge))
+
+class RowProductionBaseTests(GitRepositoryFixture):
+    def test_recorded_folder_uses_its_parent_after_a_transfer(self) -> None:
+        old_doc = self.root / "old-production.md"
+        new_doc = self.root / "new-production.md"
+        _ = old_doc.write_text("# Old production\n")
+        _ = new_doc.write_text("# New production\n")
+        old = recorded_showrunner("old-owner", old_doc)
+        destination = recorded_showrunner("new-owner", new_doc)
+        unit = fixture_member("unit", name="unrelated-name", parent=old.id,
+                              worktree=staff.PresentWorktree("natedev", self.repo))
+        branches = {old.id: "old-base", destination.id: "new-base"}
+
+        def merge_branch(resolver: session_staff.RowResolver, row: staff.StaffRow) -> session_staff.Branch:
+            parent = resolver.record.by_id(row.parent) if row.parent is not None else None
+            if parent is None:
+                self.fail("the fixture unit lost its parent")
+            return session_staff.Branch(branches[parent.id])
+
+        with patch.object(session_staff.RowResolver, "merge_branch", merge_branch):
+            self.assertEqual(assertion_guard.production_merge_branch(self.repo),
+                             assertion_guard.ProductionMergeBranch("old-base"))
+            _ = staff.move(unit.id, destination.id)
+            self.assertEqual(assertion_guard.production_merge_branch(self.repo),
+                             assertion_guard.ProductionMergeBranch("new-base"))
+
 
 class AssertionGuardTests(AssertionFindingFixture):
     def test_tile_weaker_assertion_is_found_among_six_thousand_other_changes(self) -> None:

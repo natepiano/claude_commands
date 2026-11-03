@@ -83,6 +83,12 @@ class ResourceInventory:
 
 
 @dataclass(frozen=True)
+class EstablishedDayCost:
+    day: str
+    usd: Decimal
+
+
+@dataclass(frozen=True)
 class CostReconciliation:
     at: int
     period_start: int
@@ -90,6 +96,7 @@ class CostReconciliation:
     usd: Decimal
     source: str
     query_usd: Decimal = Decimal(0)
+    established_days: tuple[EstablishedDayCost, ...] = field(default=(), compare=False)
 
 
 @dataclass(frozen=True)
@@ -137,6 +144,7 @@ class CostEstimate:
     intervals: tuple[ChargedInterval, ...]
     inventory_at: int
     observation_at: int
+    established_reconciliations: tuple[CostReconciliation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -281,7 +289,9 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
                                                  for p in rows(r, "resources")), text(r, "source"))
          for r in rows(row, "inventories")],
         [CostReconciliation(instant(r, "at"), instant(r, "period_start"), instant(r, "period_end"),
-                            money(text(r, "usd")), text(r, "source"), money(str(r.get("query_usd", "0"))))
+                            money(text(r, "usd")), text(r, "source"), money(str(r.get("query_usd", "0"))),
+                            tuple(EstablishedDayCost(date.fromisoformat(text(d, "day")).isoformat(), money(text(d, "usd")))
+                                  for d in rows(r, "established_days")) if "established_days" in r else ())
          for r in rows(row, "reconciliations")],
         [LimitEvent(text(r, "event_id"), instant(r, "at"), text(r, "period"), money(text(r, "estimate_usd")),
                     money(text(r, "limit_usd")), text(r, "recipient"), instant(r, "timeout_s"),
@@ -342,7 +352,8 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
                          "resources": [{"name": p.name, "usd_per_month": str(p.usd_per_month)} for p in r.resources]}
                         for r in state.inventories],
         "reconciliations": [{"at": r.at, "period_start": r.period_start, "period_end": r.period_end,
-                             "usd": str(r.usd), "source": r.source, "query_usd": str(r.query_usd)}
+                             "usd": str(r.usd), "source": r.source, "query_usd": str(r.query_usd),
+                             "established_days": [{"day": d.day, "usd": str(d.usd)} for d in r.established_days]}
                             for r in state.reconciliations],
         "events": [{"event_id": r.event_id, "at": r.at, "period": r.period, "estimate_usd": str(r.estimate_usd),
                     "limit_usd": str(r.limit_usd), "recipient": r.recipient, "timeout_s": r.timeout_s,
@@ -481,14 +492,22 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
         for reading in relevant_readings:
             intervals.append(ChargedInterval(reading.period_start, reading.period_start, reading.query_usd,
                                              "confirmed Cost Explorer read", "explorer"))
+    established_reconciliations: list[CostReconciliation] = []
     for reading in relevant_readings:
         if reading.period_end <= reading.period_start:
             raise LedgerUnavailable("invalid Cost Explorer period")
         estimated = period_cost((r for r in intervals if r.kind != "explorer"), reading.period_start, reading.period_end)
         extra = max(Decimal(0), reading.usd - estimated)
+        established_days: list[EstablishedDayCost] = []
+        previous = {d.day: d.usd for d in reading.established_days}
         for start, end in _days(reading.period_start, reading.period_end, settings.accounting_zone):
-            intervals.append(ChargedInterval(start, end, extra * Decimal(end - start)
-                                             / Decimal(reading.period_end - reading.period_start), reading.source, "reconciliation"))
+            day = datetime.fromtimestamp(start, settings.accounting_zone).date().isoformat()
+            base = period_cost((r for r in intervals if r.kind != "explorer"), start, end)
+            computed = base + extra * Decimal(end - start) / Decimal(reading.period_end - reading.period_start)
+            established = max(computed, previous.get(day, Decimal(0)))
+            established_days.append(EstablishedDayCost(day, established))
+            intervals.append(ChargedInterval(start, end, established - base, reading.source, "reconciliation"))
+        established_reconciliations.append(replace(reading, established_days=tuple(established_days)))
     if window is not None or pricing_end > now:
         intervals = [replace(r, start=max(r.start, requested_start), end=min(r.end, now),
                              usd=_overlap(r, requested_start, now),
@@ -499,7 +518,7 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
     daily = sum((r.usd for r in intervals if datetime.fromtimestamp(r.start, settings.accounting_zone).date().isoformat() == day), Decimal(0))
     monthly_total = sum((r.usd for r in intervals if datetime.fromtimestamp(r.start, settings.accounting_zone).strftime("%Y-%m") == month), Decimal(0))
     return CostEstimate(now, DailyTotal(day, daily), MonthlyTotal(month, monthly_total), tuple(intervals),
-                        inventories[-1].at, observations[-1].at if observations else 0)
+                        inventories[-1].at, observations[-1].at if observations else 0, tuple(established_reconciliations))
 
 
 def costs_from_evidence(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
@@ -704,13 +723,19 @@ class CostLedger:
         return True
 
     def _reconcile_charge(self, state: LedgerEvidence, reading: ChargeRead) -> None:
+        key = (reading.period_start, reading.period_end, 'Cost Explorer')
+        established: dict[str, Decimal] = {}
+        for saved in state.reconciliations:
+            if (saved.period_start, saved.period_end, saved.source) == key:
+                for day in saved.established_days:
+                    established[day.day] = max(established.get(day.day, Decimal(0)), day.usd)
         reconciliation = CostReconciliation(reading.at, reading.period_start, reading.period_end,
-                                             reading.actual_usd, 'Cost Explorer', reading.query_usd)
+                                             reading.actual_usd, 'Cost Explorer', reading.query_usd,
+                                             tuple(EstablishedDayCost(day, usd) for day, usd in sorted(established.items())))
         if reconciliation in state.reconciliations and state.charge_refresh_at >= reading.at:
             return
         state.reconciliations = [r for r in state.reconciliations
-                                 if (r.period_start, r.period_end, r.source)
-                                 != (reading.period_start, reading.period_end, 'Cost Explorer')]
+                                 if (r.period_start, r.period_end, r.source) != key]
         state.reconciliations.append(reconciliation)
         state.charge_refresh_at = max(state.charge_refresh_at, reading.at)
         self._save(state)
@@ -745,9 +770,16 @@ class CostLedger:
             self._reconcile_charge(state, reading)
             return reading
 
+    def _save_estimate(self, state: LedgerEvidence, costs: CostEstimate) -> None:
+        established = {r: r for r in costs.established_reconciliations}
+        state.reconciliations = [established.get(r, r) for r in state.reconciliations]
+        self._save(state)
+
     def estimate(self, settings: SpendingSettings, now: int) -> CostEstimate:
         with self._locked() as state:
-            return _charges(state, settings, now)
+            costs = _charges(state, settings, now)
+            self._save_estimate(state, costs)
+            return costs
 
     def decision_is_current(self, decision: SpendingDecision) -> bool:
         """Confirm that durable evidence contains this exact decision."""
@@ -842,7 +874,10 @@ class CostLedger:
                 decision = self._decide(state, settings_path, purpose, now)
                 evidence = decision.evidence
                 state.decision = decision_record(decision)
-                self._save(state)
+                if isinstance(evidence.costs, CostEstimate):
+                    self._save_estimate(state, evidence.costs)
+                else:
+                    self._save(state)
         except (OSError, ValueError, ArithmeticError) as error:
             return SpendingUnavailable(now, str(error), evidence)
         try:

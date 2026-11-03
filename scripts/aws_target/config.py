@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from pathlib import Path
 from typing import Literal, TypeVar
 from collections.abc import Callable
@@ -57,11 +57,8 @@ class SpendingSettings:
 
 
 def money(value: str) -> Decimal:
-    try:
-        amount = Decimal(value)
-    except InvalidOperation as error:
-        raise ValueError("expected finite nonnegative money") from error
-    if not amount.is_finite() or amount < 0:
+    amount = conf.decimal(value)
+    if amount < 0:
         raise ValueError("expected finite nonnegative money")
     return amount
 

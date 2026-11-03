@@ -121,11 +121,16 @@ def timer_for(row: staff.StaffRow, snapshot: staff.StaffSnapshot, *,
     owner = snapshot.by_doc(doc.machine, doc.path)
     if owner is None or owner.id != row.id or doc.machine != remote.local_machine():
         return NoTimer(f"{row.name}: no local timer for the recorded document")
-    sources = sources if sources is not None else read_sources(unreadable=UnreadableTimerPolicy.RAISE)
+    failures: list[ShowrunnerLookupFailure] = []
+    sources = sources if sources is not None else read_sources(
+        unreadable=UnreadableTimerPolicy.SKIP, on_failure=failures.append)
     matches = [source.timer for source in sources
                if source.timer.doc == doc.path]
     if len(matches) > 1:
         raise staff.StaffUnreadable(f"{row.name}: several timers name {doc.path}")
+    if not matches and failures:
+        reasons = "; ".join(f"showrunner-{failure.production}: {failure.reason}" for failure in failures)
+        raise OSError(f"{row.name}: no readable timer names {doc.path}; {reasons}")
     return matches[0] if matches else NoTimer(f"{row.name}: no timer names {doc.path}")
 
 
@@ -290,9 +295,15 @@ class UnreadableTimerPolicy(Enum):
     STRICT = "strict"  # Audit every source, including incomplete timer declarations.
 
 
+def _report_source_failure(failure: ShowrunnerLookupFailure) -> None:
+    print(failure.diagnostic, file=sys.stderr)
+
+
 def read_sources(state_dir: Path | None = None, *,
                  unreadable: UnreadableTimerPolicy,
-                 dependencies: Callable[[Path], None] | None = None) -> list[ShowrunnerSource]:
+                 dependencies: Callable[[Path], None] | None = None,
+                 on_failure: Callable[[ShowrunnerLookupFailure], None] = _report_source_failure,
+                 ) -> list[ShowrunnerSource]:
     """Read each timer/doc once, applying the caller's policy to unreadable timers."""
     found: list[ShowrunnerSource] = []
     for instance in sorted((state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*")):
@@ -305,7 +316,7 @@ def read_sources(state_dir: Path | None = None, *,
                 raise ValueError(f"{instance / 'conf'}: {error}") from error
             if isinstance(error, OSError) and unreadable is UnreadableTimerPolicy.RAISE:
                 raise
-            print(f"showrunners: skipping {instance.name}: {error}", file=sys.stderr)
+            on_failure(ShowrunnerLookupFailure(instance.name.removeprefix("showrunner-"), str(error)))
     return found
 
 

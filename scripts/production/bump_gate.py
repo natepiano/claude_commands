@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import os
-import tempfile
+import sys
 from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import build_folders
 
 from merge_checkpoint import (
     Stop, complete_gate, git, good, read_record, record_lock,
@@ -34,8 +37,9 @@ def run_gate(path: Path) -> int:
         record["proc_start"] = proc_start
         save_record(path, record)
     try:
-        with tempfile.TemporaryDirectory(prefix="bump-gate-", dir=path.parent) as temporary:
-            clone = Path(temporary) / "checkout"
+        with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
+                build_folders.FOLDER_PREFIXES["bump-gate"], build_folders.ExplicitBuildParent(path.parent))) as temporary:
+            clone = temporary / "checkout"
             _ = good(git(Path(record["checkout"]), "clone", "--shared", "--no-checkout",
                          record["checkout"], str(clone)), "clone")
             _ = good(git(clone, "checkout", "--detach", record["tip"]), "checkout pushed tip")

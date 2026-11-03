@@ -13,19 +13,13 @@ import unittest
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 
 import unittest.mock
 
-if TYPE_CHECKING:
-    from ..lib.socket_test_support import short_socket_directory
-else:
-    from scripts.lib.socket_test_support import short_socket_directory
-
-import folder_audit
-import scratch
-import tmp_sweep
-from scripts.lib import copy_record
+from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lint import tmp_sweep, folder_audit
+from scripts.lib import build_folders, copy_record, scratch
 
 DAY = 86_400
 
@@ -97,6 +91,21 @@ class FolderAuditTests(unittest.TestCase):
         state = self.root / "state"
         self.enterContext(unittest.mock.patch.dict(os.environ, {"FOLDER_SWEEP_STATE_DIR": str(state),
                                                                 "SCRATCH_HOLDS": str(state / "holds.json")}))
+
+    def test_common_build_names_keep_their_cleanup_classification(self) -> None:
+        for kind, template in build_folders.FOLDER_PREFIXES.items():
+            prefix = template.format(owner="123")
+            with self.subTest(kind=kind, prefix=prefix):
+                parent = self.temp / kind
+                parent.mkdir()
+                previous = parent / (prefix + "abc123")
+                previous.mkdir()
+                _ = (previous / "Cargo.toml").write_text("fixture")
+                current = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
+                    prefix, build_folders.ExplicitBuildParent(parent)))
+                _ = (current / "Cargo.toml").write_text("fixture")
+                self.assertEqual(folder_audit.kept_in_temp(current), folder_audit.kept_in_temp(previous),
+                                 f"{prefix} must retain its cleanup reader")
 
     def test_copies_root_keeps_an_old_open_phase_copy(self) -> None:
         import json
