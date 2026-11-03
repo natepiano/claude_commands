@@ -52,11 +52,14 @@ from concurrent.futures import ThreadPoolExecutor
 from time import monotonic, sleep
 from collections.abc import Generator
 from contextlib import contextmanager
+from enum import Enum
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import Literal, NamedTuple, NotRequired, TypedDict, cast
+
+from scripts.lib import conf
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
@@ -84,8 +87,6 @@ FIXED_TEXT = "permission.rca_fixed"
 # The reviewer's rewrite of a fixed text it refused twice: its title and body as the reviewer wrote them.
 REWRITTEN_TEXT = "permission.rca_fixed_rewritten"
 REMIND_AFTER = timedelta(minutes=30)
-# A user push waits for its review; a Claude recipient falls back to a relay.
-SEND_SECONDS = 300
 # The completed outcome of each owner message and reminder, after a line with its time and key.
 OWNER_LOG = "owner.log"
 # The first word of a command that changes a file: auto_mode.refused's "write …" and "edit …", and the
@@ -97,6 +98,11 @@ CHANNEL_PRIORITY = {"note": "0", "decision": "1", "blocked": "2"}
 
 Kind = Literal["prompt", "auto_mode"]
 Status = Literal["open", "started", "fixed"]
+
+
+def send_seconds() -> float:
+    """Owner delivery budget in seconds."""
+    return conf.read("rca").number("send_seconds")
 
 
 class Case(TypedDict):
@@ -294,8 +300,13 @@ def owner_message(case: Case, *, reminder: bool = False) -> str:
     return "\n".join(lines)
 
 
-def send(argv: list[str], *, seconds: float = SEND_SECONDS) -> tuple[bool, str]:
+class ConfiguredSendBudget(Enum):
+    CURRENT = "current"
+
+
+def send(argv: list[str], *, seconds: float | ConfiguredSendBudget = ConfiguredSendBudget.CURRENT) -> tuple[bool, str]:
     """Run send.py; whether it exited 0, and what it printed."""
+    seconds = send_seconds() if isinstance(seconds, ConfiguredSendBudget) else seconds
     if seconds <= 0:
         return False, "owner delivery budget exhausted; retained for the next pass"
     try:
@@ -316,7 +327,7 @@ def tell_owner(case: Case, *, reminder: bool = False, deadline: float = math.inf
         with open(STATE / OWNER_LOG, "a", encoding="utf-8") as log:
             _ = log.write(f"{now().isoformat()} {key}\n")
             log.flush()
-            sent, outcome = send(argv, seconds=min(SEND_SECONDS, max(0, deadline - monotonic())))
+            sent, outcome = send(argv, seconds=min(send_seconds(), max(0, deadline - monotonic())))
             _ = log.write(outcome + "\n")
         if sent:
             with locked(deadline=deadline):

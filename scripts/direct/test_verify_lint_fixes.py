@@ -1,4 +1,4 @@
-"""Check lint repairs converge before the first judgment."""
+"""Check lint repairs converge after a failed judgment."""
 
 from __future__ import annotations
 
@@ -8,7 +8,8 @@ import json
 
 
 class VerifyLintScopeTests(support.VerifyLintCacheFixture):
-    def test_fix_exposes_another_fix_before_the_first_judgment(self) -> None:
+
+    def test_fix_exposes_another_fix_before_the_final_judgment(self) -> None:
         original = "pub fn sum(a: f64, b: f64, c: f64) -> f64 { a * b + c }\n"
         first_fix = original.replace("a * b + c", "a.mul_add(b, c)")
         final_fix = first_fix.replace("pub fn", "pub const fn")

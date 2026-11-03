@@ -335,7 +335,7 @@ class BoardJsonTests(unittest.TestCase):
                 module = sys.modules.get(name)
                 if module is not None:
                     for field, value in (
-                        ("NOTIFIER_STATE_DIR", self.notifier), ("SESSIONS_DIR", self.sessions),
+                        ("NOTIFIER_STATE_DIR", self.notifier),
                         ("SESSIONS", self.session_script), ("SHOWRUNNER_STATE_DIR", self.showrunner_state),
                     ):
                         _ = scope.enter_context(patch.object(module, field, value))

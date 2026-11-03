@@ -1579,7 +1579,7 @@ class LocalReviewTests(unittest.TestCase):
             self.assertEqual(review.due(post=post, keys_file=keys), 0)
             self.assertEqual(review.due(post=post, keys_file=keys), 0)
         self.assertEqual(len(calls), 1)
-        self.assertIn(b"priority=1", calls[0])
+        self.assertIn(b"priority=0", calls[0])
         self.assertIsInstance(review.held_for(self.draft.source), review.NoHold)
         self.assertIn("sent after hold expired", pushover.LOG_FILE.read_text())
 

@@ -126,6 +126,14 @@ class StopResumeTests(unittest.TestCase):
         self.assertIn("title anomaly: fixture", output.getvalue())
         self.start.assert_called_once()
 
+    def test_enveloped_resume_launch_paths_need_no_source_record(self) -> None:
+        from scripts.lib import script_prompts
+
+        with patch.object(script_prompts, "record", side_effect=AssertionError("recorded resume")):
+            result = stop_resume.resume("alpha")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.assertTrue(self.client.prompts[0][1].text.startswith('<system-reminder source="script">'))
+
     def test_resume_names_share_one_snapshot_and_default_reason(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
         row = staff.StaffRow(staff.StaffId("accounts-unit"), "unit", "accounts", None,
@@ -139,6 +147,7 @@ class StopResumeTests(unittest.TestCase):
             read.assert_called_once()
             self.assertIn("resumed by name", self.client.prompts[0][1].text)
             self.assertNotIn("the herdr server restarted", self.client.prompts[0][1].text)
+            self.assertTrue(self.client.prompts[0][1].text.startswith('<system-reminder source="script">'))
 
     def test_unknown_ambiguous_and_remote_names_refuse(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])

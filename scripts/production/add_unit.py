@@ -1059,20 +1059,6 @@ def close_untyped_session(request: UnitLaunch, outcome: herdr.PromptNotSubmitted
     return "; its session is closed: run the same command again"
 
 
-def record_scheduled_restore_prompt(session_id: str, prompt: str) -> None:
-    # Imported here, not at the top: live_units.py and update_registration.py
-    # import this module for its table readers from trees without scripts/hooks.
-    import conversation_pause
-
-    try:
-        recorded = conversation_pause.read_scheduled_prompts(session_id)
-        conversation_pause.record_scheduled_prompts(session_id, (*recorded, prompt))
-    except (OSError, RuntimeError, ValueError) as error:
-        detail = str(error).strip()
-        reason = detail.splitlines()[0] if detail else type(error).__name__
-        raise RuntimeError(f"restart prompt not recorded: {reason}") from error
-
-
 class NoOpeningRecord(NamedTuple):
     """This unit has no saved opening to reconcile."""
 
@@ -1587,10 +1573,6 @@ def _main(argv: list[str]) -> int:
             autocompact.record(request.session.session_id, cast(str, args.autocompact))
         if isinstance(marked_unit, NoMarkedUnit):
             prompt = prompt_for(request)
-            if isinstance(request.launch_kind, UnitRestoreLaunch):
-                record_scheduled_restore_prompt(
-                    request.launch_kind.session_id, prompt
-                )
             outcome = launch_session(request, ready.director, prompt, unit_account, target=unit_account.label
                            if isinstance(request.session, ResumedSession) else "", model=resume_model,
                            autocompact_window=resume_autocompact)

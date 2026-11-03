@@ -83,7 +83,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
             self.assertIsInstance(REAL_TELL_USER(render("quota.claude_next_move", account="claude2", remaining="0%")), quota_alert.PushSent)
             command = cast(list[str], run.call_args.args[0])
             self.assertEqual(float(command[command.index("--timeout") + 1]), review.user_send_seconds())
-            self.assertEqual(run.call_args.kwargs["timeout"], review.user_send_seconds() + 15)
+            self.assertEqual(run.call_args.kwargs["timeout"], review.user_send_seconds() + 140)
             self.assertNotIn("input", run.call_args.kwargs)
         self.assertEqual(quota_alert.RELAY_TIMEOUT, 40)
 

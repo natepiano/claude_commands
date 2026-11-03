@@ -16,6 +16,9 @@ from importlib import import_module
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.session_paths import sessions_directory
+
 if __package__:
     from .process_identity import process_start as process_start
     from .relay_identity import RelayIdentity, live_relay_identity, relay_senders_directory
@@ -330,7 +333,7 @@ def live_session(record: SessionRecord) -> bool:
 
 
 def sessions_dir() -> Path:
-    return Path(os.environ.get("NOTIFIER_SESSIONS_DIR", str(Path.home() / ".claude/sessions")))
+    return sessions_directory()
 
 
 def _readable_records() -> Iterator[SessionRecord]:
