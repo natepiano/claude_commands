@@ -51,7 +51,7 @@ if [[ ! -f "${QUESTION_FILE}" ]]; then
   exit 2
 fi
 
-source "${AGENTS_DIR}/agents_config.sh"
+source "${AGENTS_DIR}/models_config.sh"
 if ! agents_resolve "${TASK}" 2>"${LOG_FILE}"; then
   echo "error" > "${STATUS_FILE}"
   cat "${LOG_FILE}" >&2

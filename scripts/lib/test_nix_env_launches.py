@@ -299,7 +299,7 @@ class ShellLaunchTests(NixFixture):
         _ = py.write_text('#!/bin/sh\nexec ' + sys.executable + ' "$@"\n')
         py.chmod(0o755)
         _ = (self.scripts / "agents/claude_account.sh").write_text('claude_launch_environment() { return 0; }\n')
-        _ = (self.scripts / "agents/agents_config.sh").write_text('''agents_resolve() { AGENT_FAMILY=claude; }
+        _ = (self.scripts / "agents/models_config.sh").write_text('''agents_resolve() { AGENT_FAMILY=claude; }
 agents_claude_args() { echo '--model fixture'; }
 ''')
         self.started = self.root / "started.jsonl"

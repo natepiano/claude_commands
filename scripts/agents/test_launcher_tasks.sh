@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
-export AGENTS_CONFIG_PUBLISH=0
+export MODELS_CONFIG_PUBLISH=0
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "$SCRIPT_DIR/../lib/test_agents_registry.sh"
+source "$SCRIPT_DIR/../lib/test_models_registry.sh"
 REPO="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEST_DIR"' EXIT
 export HOME="${TEST_DIR}/home"
-export AGENTS_CONFIG_FILE="${TEST_DIR}/agents.conf"
+export MODELS_CONFIG_FILE="${TEST_DIR}/models.conf"
 export CODEX_CONFIG_FILE="${TEST_DIR}/codex.toml"
 unset CLAUDE_CONFIG_DIR CLAUDE_CODE_OAUTH_TOKEN CODEX_HOME
 export PYTHONDONTWRITEBYTECODE=1 HERDR_BIN=/nonexistent/herdr
 mkdir -p "$HOME" "${TEST_DIR}/scripts/ask_a_friend" "${TEST_DIR}/scripts/agents" \
   "${TEST_DIR}/scripts/lib" "${TEST_DIR}/session"
 
-write_test_registry "$AGENTS_CONFIG_FILE"
+write_test_registry "$MODELS_CONFIG_FILE"
 
 # Run the real direct launchers with their fake mesh. Check start and follow.
 cd "$REPO"
@@ -27,7 +27,7 @@ python3 -m unittest \
 # Run the real friend launcher with a fake resolver and mesh.
 cp "${REPO}/scripts/ask_a_friend/launch_friend.sh" "${TEST_DIR}/scripts/ask_a_friend/"
 cp "${REPO}/scripts/lib/py" "${TEST_DIR}/scripts/lib/"
-cat > "${TEST_DIR}/scripts/agents/agents_config.sh" <<'SH'
+cat > "${TEST_DIR}/scripts/agents/models_config.sh" <<'SH'
 agents_resolve() {
   AGENT_FAMILY=codex AGENT_MODEL=gpt-fixture AGENT_EFFORT=high AGENT_SERVICE_TIER=default
 }

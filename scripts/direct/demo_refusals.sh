@@ -17,11 +17,11 @@ mkdir -p "$scratch/home" "$scratch/history" "$scratch/ledger" "$scratch/run"
 export HOME="$scratch/home"
 export XDG_CACHE_HOME="$scratch/cache"
 export UNIT_HISTORY_DIR="$scratch/history" PLAN_DELEGATE_HISTORY_DIR="$scratch/history"
-export AGENTS_CONFIG_FILE="$scratch/agents.conf"
-export AGENTS_CONFIG_PUBLISH=0
+export MODELS_CONFIG_FILE="$scratch/models.conf"
+export MODELS_CONFIG_PUBLISH=0
 export CONF_DIR="$scratch" PLAN_DELEGATE_CONFIG="$scratch/direct.conf"
 unset CLAUDE_CODE_SESSION_ID
-: > "$AGENTS_CONFIG_FILE"
+: > "$MODELS_CONFIG_FILE"
 # Fix the demo's thresholds so local tuning cannot change its examples.
 cat > "$CONF_DIR/direct.conf" <<'CONFIG'
 # whole: 1..

@@ -1626,7 +1626,7 @@ Require two equal reads one second apart; save both snapshots and named byte/tim
 Compare operation-owned staff fields and check for probe ids or scratch paths in live staff.
 Record live hashes; an unrelated hash change alone does not prove a probe write.
 
-### Phase 5 — Rename agents.conf to models.conf and /agent to /default_models  · status: todo
+### Phase 5 — Rename agents.conf to models.conf and /agent to /default_models  · status: done
 
 **Depends on:** none
 
@@ -1651,14 +1651,47 @@ Record live hashes; an unrelated hash change alone does not prove a probe write.
 - `scripts/whoami/codex_pacer.py`, `scripts/whoami/quota_alert.py`, `scripts/whoami/quota_alert_test_support.py`, `scripts/whoami/profile_notes_pass.py`, `scripts/whoami/test_profile_notes_pass.py`, `scripts/whoami/test_codex_alert_accounts.py`, `scripts/whoami/test_quota_alert_cancellation.py` — references and line parsers.
 - `scripts/hooks/context_usage.py`, `scripts/hooks/test_stop_direct_continue.py`, `scripts/notify/review.py`, `scripts/astra/design_roles.py`, `scripts/astra/test_design_roles.py`, `scripts/cli_agent/cli_agent.sh`, `scripts/history/history.py`, `scripts/ask_a_friend/launch_friend.sh`, `scripts/lib/test_nix_env_launches.py`, `scripts/style/test_add_style.py` — references.
 - `docs/direct/launch_implementation.md`, `docs/as-built/agent-registry.md`, `docs/as-built/director-model-study.md`, `docs/as-built/long-lived-workers.md`, `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/message-clarity.md`, `docs/as-built/showrunner-automation.md`, `docs/as-built/style-showrunner.md`, `docs/as-built/unit-progress-history.md` — references.
+- `scripts/agents/test_agents_conf_publish.py`, `scripts/agents/test_models_cache.py`, `scripts/lib/test_agents_registry_fixture.py`, `scripts/direct/test_simplify_lens.py`, `scripts/settings/git_filters_table.sh`, `scripts/settings/test_git_filters_retire.py` — references (main at 24e9b1b6c); the two `agents` test files move to `test_models_conf_publish.py` and `test_models_registry_fixture.py`.
+- `scripts/whoami/test_quota_alert_delivery.py`, `scripts/whoami/test_quota_alert_refusals.py`, `scripts/whoami/test_quota_alert_routing.py`, `scripts/whoami/test_quota_zero_episode.py`, `docs/direct/dual_review.md` — references (main at 24e9b1b6c).
+- `docs/as-built/director-model-study-results.json` — not changed: it records past runs. `test_no_old_model_names.py` exempts it and `docs/plans/` by path.
 
-**Workers:** `2 writers` — split by tree. `impl` — `config/`, `scripts/agents/` except `test_no_old_model_names.py`, `scripts/lib/`, `scripts/direct/`, `commands/`, `.gitignore`; hub: `scripts/lib/models_registry.py`. `test` (opens as impl) — `scripts/whoami/`, `scripts/hooks/`, `scripts/astra/`, `scripts/history/`, `scripts/production/`, `scripts/notify/`, `scripts/cli_agent/`, `scripts/ask_a_friend/`, docs, and `test_no_old_model_names.py`.
+**Workers:** `2 writers` — split by tree. `impl` — `config/`, `scripts/agents/` except `test_no_old_model_names.py`, `scripts/lib/`, `scripts/direct/`, `scripts/settings/`, `commands/`, `.gitignore`; hub: `scripts/lib/models_registry.py`. `test` (opens as impl) — `scripts/whoami/`, `scripts/hooks/`, `scripts/astra/`, `scripts/history/`, `scripts/production/`, `scripts/notify/`, `scripts/cli_agent/`, `scripts/ask_a_friend/`, docs, and `test_no_old_model_names.py`.
 
 **State:** `config/agents.conf` moves to `config/models.conf`.
 
 **Constraints from prior phases:** none from Phases 1-4.
+- sdlc, 2026-11-03: Phase 5 starts only after models 3n is on main, because 3n edits the registry callers. At start, merge main, then rerun `git grep -lE 'agents\.conf|AGENTS_CONFIG_FILE|agents_config\.sh|agents_registry|agent_admin\.sh|commands/agent\.md'` and add each new hit to Files. A `/agent` match inside `agent-notes` or `agent-detection` paths is not an old name.
+- The old-name check matches whole names only, so `agent-notes`, `agent_notes.py` and `subagents/agent-*.jsonl` stay legal.
+- models-unit, 2026-11-03: agrees to this Phase as written. 3n changes none of its files. Its next phases (7, 8, 9, 12) only read `agents_registry.py`, and it reads `models_registry.py` after it merges this Phase.
 
 **Acceptance gate:** `test_no_old_model_names.py` green; basedpyright 0/0 on changed files and callers; full gate green. No rerun test: the sweep is one commit, not a tool that changes shared state in steps (Invariants → Rerun-safe tools).
+
+**Assertion-Change rulings:** the test assertions that Phase 5 changes are rename-only: each old path, module or variable name becomes its new name, and the assertion checks the same behavior. The checkpoint commit carries one `Assertion-Change:` line per changed test file.
+
+### Phase 5a — Bash reads resolved registry values from one call  · status: todo
+
+**Depends on:** Phase 5
+
+The Phase 5 review found these after the hard landing (repair round 3). None is a regression: before Phase 5, bash parsed the rows itself and picked the path itself. They move here from Phase 5 (findings F002, F003, F004, F006, F008).
+
+#### Work Order
+
+**Goal:** bash parses no registry line and picks no registry path; one `models_registry.py` call per launch gives bash every value it reads.
+
+**Spec:**
+1. `models_registry.py shell` reads the file from `registry_path()` itself, not from stdin. `models_config.sh:22` and `sync_codex_catalog.sh:6` stop choosing the default path.
+2. `shell_assignments()` prints resolved section, key and value arrays from the parser, not raw row text. `_models_table_get` and `_models_table_has_key` compare keys only. The two awk parsers in `sync_codex_catalog.sh` (`:88`, `:332`) read the same arrays. A row `direct = codex` resolves in bash as it does in Python.
+3. One launch starts the parser once: `implement.sh:206` reads `codex_mesh` from the table that `agents_resolve` already loaded.
+4. `test_no_old_model_names.py` finds an old name that sentence punctuation follows (`Use /agent.`).
+5. `models_registry.py` commit subject and temporary file prefixes use `models`, not `agents`.
+
+**Files:** `scripts/lib/models_registry.py`, `scripts/lib/test_models_registry.py`, `scripts/agents/models_config.sh`, `scripts/agents/test_models_config.sh`, `scripts/agents/sync_codex_catalog.sh`, `scripts/agents/test_sync_codex_catalog.sh`, `scripts/direct/implement.sh`, `scripts/agents/test_no_old_model_names.py`.
+
+**Workers:** `1 writer + 1 tester` — `impl`: the source files; `test`: the test files.
+
+**State:** bash holds resolved registry values only.
+
+**Acceptance gate:** a bash test that `direct = codex` resolves; a test that one launch starts the parser once; a test that `MODELS_CONFIG_FILE` and the default path both reach bash through `registry_path()`; the old-name test finds `Use /agent.`; the changed test files and basedpyright 0/0/0 on changed files and callers; full gate green.
 
 ### Phase 6 — herdr primitives for worker panes, and probes  · status: done
 
