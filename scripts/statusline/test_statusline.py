@@ -514,7 +514,7 @@ class RoleTests(unittest.TestCase):
                                    ("s99999999999", "trunk")):
                 with self.subTest(identity=identity, name=name, duplicate=len(members) == 5):
                     environment = {"STAFF_ID": identity} if identity else {}
-                    resolved = reader.environment(environment, identity, name)
+                    resolved = reader.environment(environment, identity)
                     row = reader.record.by_id(staff.StaffId(resolved.get("CLAUDE_CODE_SESSION_ID", "")))
                     self.showrunner_record(os.getpid(), name, session_id="own-id")
                     role = ANSI.sub("", self.command_lines({"session_id": identity}, **environment)[0]).split(" | ")[0]
@@ -573,7 +573,7 @@ class RoleTests(unittest.TestCase):
                 # Exercise the schema emitted by staff's current writer.
                 _ = path.write_text(json.dumps({"schema": 2, "rows": [row.to_json() for row in rows]}))
                 reader = session_labels.StaffLabels(staff.StaffSnapshot(rows), sources, {source.timer.slug: runner})
-                resolved = reader.environment(environment, session_id, name, cwd)
+                resolved = reader.environment(environment, session_id)
                 row = reader.record.by_id(staff.StaffId(resolved.get("CLAUDE_CODE_SESSION_ID", "")))
                 self.assertEqual(row.id if row is not None else "", expected)
                 self.showrunner_record(os.getpid(), name, session_id=session_id)

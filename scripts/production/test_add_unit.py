@@ -203,7 +203,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
 
     def test_existing_unit_name_under_another_production_requires_an_explicit_move(self) -> None:
         old_doc = self.staff.production("old", "alpha-unit", workspace="original")
-        original = fixture_member("showrunner", name="original")
+        original = fixture_member("showrunner", name="original", doc=staff.LiveDoc("natedev", old_doc))
         old = fixture_member("unit", name="alpha", parent=original.id)
         before = self.staff.staff_file.read_bytes()
         document = old_doc.read_bytes()
@@ -726,7 +726,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         _ = self.git("add", "docs/hana/tool-based-ui-production.md")
         _ = self.git("commit", "-m", "production under another merge branch")
         (self.staff.source_root / "notifier/showrunner-build-followups/conf").unlink()
-        self.staff.register_production("tool-based-ui", self.doc)
+        _ = self.staff.record_production("tool-based-ui", self.doc)
         _ = self.successful("lfo", "--brief", "Add the LFO tool")
         worktree = self.root / "project-lfo"
         self.assertIn(self.unit_row("lfo", branch="tool-based-ui-lfo", worktree=worktree,
@@ -1124,7 +1124,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         _ = self.git("add", "docs/plans/build-followups-production.md")
         _ = self.git("commit", "-m", "move checkout")
         _ = self.git("push", "origin", "build-followups")
-        self.staff.register_production("build-followups", self.doc)
+        _ = self.staff.record_production("build-followups", self.doc)
         _ = self.successful("mul_add", "--plan", "docs/plans/given.md")
         self.assertIn(self.unit_row("mul_add", branch="build-followups-mul-add",
                                     worktree=self.root / "project-mul-add"), self.doc.read_text())

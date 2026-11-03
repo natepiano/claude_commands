@@ -45,12 +45,12 @@ class StaffMoveTests(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = self.production("sdlc", "models-unit", workspace="tools")
-        _ = self.production("target", workspace="new-tools")
+        source_doc = self.production("sdlc", "models-unit", workspace="tools")
+        destination_doc = self.production("target", workspace="new-tools")
         self.members = {}
         self.destination_panes = []
-        self.members["source"] = fixture_member("showrunner", name="tools")
-        self.members["destination"] = fixture_member("showrunner", name="new-tools")
+        self.members["source"] = fixture_member("showrunner", name="tools", doc=staff.LiveDoc("natedev", source_doc))
+        self.members["destination"] = fixture_member("showrunner", name="new-tools", doc=staff.LiveDoc("natedev", destination_doc))
         self.members["unit"] = fixture_member("unit", name="panes", parent=self.source.id)
         self.members["worker"] = fixture_member("worker", name="impl1", parent=self.unit.id)
         self.pane("w1:p1", session_id=self.unit.id, environment={
@@ -355,6 +355,9 @@ class StaffMoveTests(StaffTestCase):
         self.assertEqual(self.commands(), [])
 
     def test_mac_moves_owner_row_and_local_tab_without_a_local_staff_copy(self) -> None:
+        for key, slug in (("source", "sdlc"), ("destination", "target")):
+            self.members[key] = staff.set_doc(self.members[key].id, staff.LiveDoc(
+                "mac", self.root / "mac-sources" / f"{slug}-production.md"))
         with self.machine("mac"):
             _ = self.production("sdlc", "models-unit", workspace="tools")
             _ = self.production("target", workspace="new-tools")

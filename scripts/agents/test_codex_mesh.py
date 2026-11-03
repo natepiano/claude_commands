@@ -9342,7 +9342,8 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
 
     def test_relaunch_refuses_a_live_thread_without_starting_another(self) -> None:
         _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
-            "worker": {"thread_id": THREAD_ID, "turn_id": "peer-turn", "status": "running"}
+            "worker": {"thread_id": THREAD_ID, "turn_id": "peer-turn", "status": "running",
+                     "launcher_pid": os.getpid()}
         }), encoding="utf-8")
         self.live_turn = "peer-turn"
         code, errors = self.run_start()
@@ -9351,6 +9352,89 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         self.assertIn("end", errors)
         self.assertEqual(self.methods("thread/start"), [])
         self.assertEqual(self.methods("turn/steer"), [])
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(self.methods("thread/resume"), [])
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(errors, f"codex_mesh: worker: thread {THREAD_ID} has a live turn; "
+                         + "use codex_mesh.py end --to worker before relaunching\n")
+
+    def test_relaunch_interrupts_orphaned_turn_after_launcher_dies(self) -> None:
+        """The 13:01 restart leaves a turn without a launcher."""
+        old_thread = "old-orphaned-thread"
+        self.write_pool_roster({"worker": {
+            "thread_id": old_thread, "turn_id": "orphaned-turn", "status": "running",
+            "launcher_pid": 1_000_000_000,
+        }})
+        self.live_turn = "orphaned-turn"
+
+        code, errors = self.run_start()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(errors.splitlines(), [
+            f"codex_mesh: worker: thread {old_thread} has a stale turn with no live launcher; "
+            + "interrupt requested; continuing relaunch",
+        ])
+        interrupts = self.methods("turn/interrupt")
+        self.assertEqual([request["params"] for request in interrupts], [
+            {"threadId": old_thread, "turnId": "orphaned-turn"},
+        ])
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        started = self.methods("thread/start")
+        self.assertEqual(self.methods("thread/resume"), [])
+        self.assertLess(self.server.requests.index(interrupts[0]), self.server.requests.index(started[0]))
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(len(self.methods("turn/start")), 1)
+
+    def test_failed_worker_continues_after_orphan_interrupt_is_refused(self) -> None:
+        old_thread = "old-orphaned-thread"
+        self.write_pool_roster({"worker": {
+            "thread_id": old_thread, "turn_id": "orphaned-turn", "status": "failed",
+            "launcher_pid": 1_000_000_000,
+        }})
+        self.interrupt_error = "interrupt refused"
+        respond = self.server.respond
+
+        def old_thread_is_active(request: dict[str, object]) -> list[dict[str, object]] | None:
+            params = _as_test_dict(request.get("params"))
+            if request.get("method") == "thread/turns/list" and params.get("threadId") == old_thread:
+                return [_reply(request, {
+                    "data": [{"id": "orphaned-turn", "status": "inProgress"}], "nextCursor": None,
+                })]
+            if request.get("method") == "thread/read" and params.get("threadId") == old_thread:
+                return [_reply(request, {"thread": {
+                    "id": old_thread, "status": {"type": "active"},
+                    "turns": [{"id": "orphaned-turn", "status": "inProgress"}],
+                }})]
+            return respond(request)
+
+        self.server.respond = old_thread_is_active
+
+        code, errors = self.run_start()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(errors.splitlines(), [
+            f"codex_mesh: worker: thread {old_thread} has a stale turn with no live launcher; "
+            + "interrupt not confirmed; continuing relaunch",
+        ])
+        self.assertEqual(len(self.methods("turn/interrupt")), 1)
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertEqual(self.methods("thread/resume"), [])
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+
+    def test_relaunch_reports_orphaned_turn_without_a_recorded_launcher(self) -> None:
+        old_thread = "old-orphaned-thread"
+        self.write_pool_roster({"worker": {
+            "thread_id": old_thread, "turn_id": "orphaned-turn", "status": "running",
+        }})
+        self.live_turn = "orphaned-turn"
+
+        code, errors = self.run_start()
+
+        self.assertEqual(code, 0)
+        self.assertIn(f"worker: thread {old_thread} has a stale turn", errors)
+        self.assertEqual(len(errors.splitlines()), 1)
+        self.assertEqual(len(self.methods("turn/interrupt")), 1)
+        self.assertEqual(len(self.methods("thread/start")), 1)
         self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
 
     def test_relaunch_refuses_a_waiting_worker_with_a_live_launcher(self) -> None:
@@ -9469,7 +9553,8 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         old_thread = "old-failed-thread"
         old_turn = "old-live-turn"
         _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
-            "worker": {"thread_id": old_thread, "turn_id": old_turn, "status": "failed"}
+            "worker": {"thread_id": old_thread, "turn_id": old_turn, "status": "failed",
+                     "launcher_pid": os.getpid()}
         }), encoding="utf-8")
         self.live_turn = old_turn
         self.interrupt_error = "interrupt refused"
@@ -9508,7 +9593,8 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
     def test_failed_worker_refuses_relaunch_when_active_turn_has_no_id(self) -> None:
         old_thread = "old-failed-thread"
         _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
-            "worker": {"thread_id": old_thread, "turn_id": "", "status": "failed"}
+            "worker": {"thread_id": old_thread, "turn_id": "", "status": "failed",
+                     "launcher_pid": os.getpid()}
         }), encoding="utf-8")
         self.live_turn = "old-live-turn"
         self.hide_live_turn_id = True
@@ -9565,22 +9651,51 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         self.assertIn("replaced", (self.session_dir / "worker.log").read_text(encoding="utf-8"))
 
     def test_relaunch_refuses_when_thread_read_errors(self) -> None:
-        """An unreadable active thread is never assumed idle."""
+        """A live launcher retains an unreadable thread."""
+        old_thread = "old-unreadable-thread"
         _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
-            "worker": {"thread_id": THREAD_ID, "turn_id": "", "status": "running"}
+            "worker": {"thread_id": old_thread, "turn_id": "", "status": "running",
+                     "launcher_pid": os.getpid()}
         }), encoding="utf-8")
+        respond = self.server.respond
+
+        def old_thread_failure(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/start":
+                self.read_failure = ""
+            return respond(request)
+
+        self.server.respond = old_thread_failure
         self.read_failure = "error"
-        code, errors = self.run_start()
+        before = (self.session_dir / codex_mesh.ROSTER_FILE).read_bytes()
+        with patch.object(codex_mesh, "_end_unwatched_turn") as cleanup:
+            code, errors = self.run_start()
+        cleanup.assert_not_called()
+        self.assertEqual((self.session_dir / codex_mesh.ROSTER_FILE).read_bytes(), before)
         self.assertEqual(code, 2)
-        self.assertIn("could not be read", errors)
+        self.assertIn("recorded launcher is alive; use codex_mesh.py end --to worker before relaunching", errors)
+        self.assertIn("thread state unknown", errors)
         self.assertIn("read refused", errors)
+        self.assertEqual(len(errors.splitlines()), 1)
         self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(self.methods("thread/resume"), [])
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(self.worker_record()["thread_id"], old_thread)
 
     def test_relaunch_refuses_when_thread_read_times_out(self) -> None:
-        """A timed out read cannot authorize a relaunch."""
+        """A live launcher retains a thread after a read timeout."""
+        old_thread = "old-unreadable-thread"
         _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
-            "worker": {"thread_id": THREAD_ID, "turn_id": "", "status": "running"}
+            "worker": {"thread_id": old_thread, "turn_id": "", "status": "running",
+                     "launcher_pid": os.getpid()}
         }), encoding="utf-8")
+        respond = self.server.respond
+
+        def old_thread_failure(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/start":
+                self.read_failure = ""
+            return respond(request)
+
+        self.server.respond = old_thread_failure
         self.read_failure = "timeout"
         self.lifecycle_clock.freeze()
         original_call = codex_mesh.Client.call
@@ -9597,7 +9712,87 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         def timed_read(client: codex_mesh.Client, method: str,
                        params: dict[str, object], timeout: float = codex_mesh.CALL_TIMEOUT_SECS) -> codex_mesh.RpcMessage:
             nonlocal expiring_read
-            expiring_read = method == "thread/read"
+            expiring_read = method == "thread/read" and params.get("threadId") == old_thread
+            try:
+                return original_call(client, method, params, timeout=timeout)
+            finally:
+                expiring_read = False
+
+        before = (self.session_dir / codex_mesh.ROSTER_FILE).read_bytes()
+        with (patch.object(codex_mesh, "_end_unwatched_turn") as cleanup,
+              patch.object(codex_mesh.Client, "call", timed_read),
+              patch.object(codex_mesh.Client, "_read_until", expire_read)):
+            code, errors = self.run_start()
+        cleanup.assert_not_called()
+        self.assertEqual((self.session_dir / codex_mesh.ROSTER_FILE).read_bytes(), before)
+        self.assertEqual(code, 2)
+        self.assertIn("recorded launcher is alive; use codex_mesh.py end --to worker before relaunching", errors)
+        self.assertIn("timed out", errors)
+        self.assertEqual(len(errors.splitlines()), 1)
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(self.methods("thread/resume"), [])
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(self.worker_record()["thread_id"], old_thread)
+
+    def test_relaunch_continues_when_dead_launchers_thread_read_errors(self) -> None:
+        """An unreadable thread does not block a relaunch."""
+        old_thread = "old-unreadable-thread"
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "worker": {"thread_id": old_thread, "turn_id": "", "status": "running",
+                     "launcher_pid": 1_000_000_000}
+        }), encoding="utf-8")
+        respond = self.server.respond
+
+        def old_thread_failure(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/start":
+                self.read_failure = ""
+            return respond(request)
+
+        self.server.respond = old_thread_failure
+        self.read_failure = "error"
+        code, errors = self.run_start()
+        self.assertEqual(code, 0)
+        self.assertIn("thread state unknown", errors)
+        self.assertIn("read refused", errors)
+        self.assertEqual(len(errors.splitlines()), 1)
+        self.assertIn("cleanup attempted; interrupt not confirmed", errors)
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertEqual(self.methods("thread/resume"), [])
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+
+    def test_relaunch_continues_when_dead_launchers_thread_read_times_out(self) -> None:
+        """A read timeout does not block a relaunch."""
+        old_thread = "old-unreadable-thread"
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "worker": {"thread_id": old_thread, "turn_id": "", "status": "running",
+                     "launcher_pid": 1_000_000_000}
+        }), encoding="utf-8")
+        respond = self.server.respond
+
+        def old_thread_failure(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/start":
+                self.read_failure = ""
+            return respond(request)
+
+        self.server.respond = old_thread_failure
+        self.read_failure = "timeout"
+        self.lifecycle_clock.freeze()
+        original_call = codex_mesh.Client.call
+        original_read = codex_mesh.Client._read_until  # pyright: ignore[reportPrivateUsage]
+        expiring_read = False
+
+        def expire_read(client: codex_mesh.Client, deadline: codex_mesh.TransportDeadline,
+                        wake: codex_mesh.FollowEvents | codex_mesh.SocketOnlyWait = codex_mesh.SOCKET_ONLY_WAIT) -> codex_mesh.RpcMessage | None:
+            if expiring_read:
+                self.lifecycle_clock.advance(max(0.0, deadline.expires - self.lifecycle_clock.monotonic()) + 1)
+                return None
+            return original_read(client, deadline, wake)
+
+        def timed_read(client: codex_mesh.Client, method: str,
+                       params: dict[str, object], timeout: float = codex_mesh.CALL_TIMEOUT_SECS) -> codex_mesh.RpcMessage:
+            nonlocal expiring_read
+            expiring_read = method == "thread/read" and params.get("threadId") == old_thread
             try:
                 return original_call(client, method, params, timeout=timeout)
             finally:
@@ -9606,9 +9801,95 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         with (patch.object(codex_mesh.Client, "call", timed_read),
               patch.object(codex_mesh.Client, "_read_until", expire_read)):
             code, errors = self.run_start()
-        self.assertEqual(code, 2)
+        self.assertEqual(code, 0)
         self.assertIn("timed out", errors)
-        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(len(errors.splitlines()), 1)
+        self.assertIn("cleanup attempted; interrupt not confirmed", errors)
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertEqual(self.methods("thread/resume"), [])
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+
+    def test_relaunch_interrupts_when_unknown_thread_becomes_readable_during_cleanup(self) -> None:
+        old_thread = "old-unreadable-thread"
+        self.write_pool_roster({"worker": {
+            "thread_id": old_thread, "status": "running", "launcher_pid": 1_000_000_000,
+        }})
+        respond = self.server.respond
+        old_reads = 0
+
+        def recover_read(request: dict[str, object]) -> list[dict[str, object]] | None:
+            nonlocal old_reads
+            params = _as_test_dict(request.get("params"))
+            if request.get("method") == "thread/read" and params.get("threadId") == old_thread:
+                old_reads += 1
+                if old_reads == 1:
+                    return [{"id": request.get("id"), "error": {"message": "read refused"}}]
+                self.live_turn = "orphaned-turn"
+            return respond(request)
+
+        self.server.respond = recover_read
+        code, errors = self.run_start()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(errors.splitlines()), 1)
+        self.assertIn(f"worker: thread {old_thread}: thread state unknown (read refused)", errors)
+        self.assertIn("interrupt requested; continuing relaunch", errors)
+        self.assertNotIn("interrupt not confirmed", errors)
+        self.assertEqual(len(self.methods("turn/interrupt")), 1)
+        self.assertEqual(len(self.methods("thread/start")), 1)
+
+    def test_relaunch_continues_after_cleanup_connection_and_log_write_failures(self) -> None:
+        old_thread = "old-unreadable-thread"
+        self.write_pool_roster({"worker": {
+            "thread_id": old_thread, "status": "running", "launcher_pid": 1_000_000_000,
+        }})
+        respond = self.server.respond
+
+        def unreadable_old_thread(request: dict[str, object]) -> list[dict[str, object]] | None:
+            params = _as_test_dict(request.get("params"))
+            if request.get("method") == "thread/read" and params.get("threadId") == old_thread:
+                return [{"id": request.get("id"), "error": {"message": "read refused"}}]
+            return respond(request)
+
+        self.server.respond = unreadable_old_thread
+        with (patch.object(codex_mesh, "_drop_queued_messages", side_effect=ConnectionError("cleanup connection failed")),
+              patch.object(codex_mesh, "_log_uninterrupted_thread", side_effect=OSError("log write refused"))):
+            code, errors = self.run_start()
+
+        self.assertEqual(code, 0)
+        self.assertIn(f"thread {old_thread}: cleanup failed (cleanup connection failed)", errors)
+        self.assertIn("cleanup log failed (log write refused)", errors)
+        self.assertIn("cleanup attempted; interrupt not confirmed; continuing relaunch", errors)
+        self.assertNotIn("interrupt requested", errors)
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(len(self.methods("thread/start")), 1)
+
+    def test_relaunch_reports_no_interrupt_when_active_thread_becomes_idle_during_cleanup(self) -> None:
+        old_thread = "old-orphaned-thread"
+        self.write_pool_roster({"worker": {
+            "thread_id": old_thread, "status": "running", "launcher_pid": 1_000_000_000,
+        }})
+        respond = self.server.respond
+        old_reads = 0
+
+        def turn_ends(request: dict[str, object]) -> list[dict[str, object]] | None:
+            nonlocal old_reads
+            params = _as_test_dict(request.get("params"))
+            if request.get("method") == "thread/read" and params.get("threadId") == old_thread:
+                old_reads += 1
+                self.live_turn = "orphaned-turn" if old_reads == 1 else ""
+            return respond(request)
+
+        self.server.respond = turn_ends
+        code, errors = self.run_start()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(errors.splitlines()), 1)
+        self.assertIn("cleanup attempted; interrupt not confirmed; continuing relaunch", errors)
+        self.assertNotIn("interrupt requested", errors)
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(len(self.methods("thread/start")), 1)
 
     def test_stop_pause_interrupts_live_work_preserves_queued_messages_and_threads(self) -> None:
         entries: dict[str, object] = {
@@ -12300,9 +12581,9 @@ class FollowEventRegressionTests(MeshCommandFixture):
             if item.get("type") == "agentMessage" and not created.is_set():
                 self.assertFalse(stream.runs.last_observed.live)
                 self.assertGreater(stream.runs.next_check, self.lifecycle_clock.monotonic())
-                _ = run.write_text(json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
+                atomic_file.write_text_atomic(run, json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
                 pending = self.session_dir / "worker.pending.json"
-                _ = pending.write_text(pending.read_text() + "\n")
+                atomic_file.write_text_atomic(pending, pending.read_text() + "\n")
                 if resident:
                     record = self.worker_record()
                     record["status"] = "done"
@@ -12337,7 +12618,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
                     held = codex_mesh.hold_message(str(self.session_dir), "worker", "detached run result",
                                                    without_launcher=False)
                     self.assertIsInstance(held, codex_mesh.HeldForLauncher)
-                _ = run.write_text('{"worker":"worker","status":"finished"}')
+                atomic_file.write_text_atomic(run, '{"worker":"worker","status":"finished"}')
                 if resident:
                     _ = (self.session_dir / "worker.end").write_text("end")
             code, errors = LauncherHangGuard(self.id()).result(future)
@@ -12356,7 +12637,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
         self.outcomes = ["completed", "listed_before_notices"]
         run = self.session_dir / codex_mesh.DETACHED_RUNS_DIR / "last.json"
         run.parent.mkdir()
-        _ = run.write_text(json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
+        atomic_file.write_text_atomic(run, json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
         held_on_run = threading.Event()
         polled_result_turn = threading.Event()
         steps: list[codex_mesh.StreamStep | codex_mesh.FailedWithThread] = []
@@ -12394,7 +12675,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
                                                without_launcher=False)
                 # Match mesh_runs.command_supervise: hold the result while the
                 # run still owns the inbox, then publish its finished record.
-                _ = run.write_text(json.dumps({"worker": "worker", "status": "finished", "pid": os.getpid()}))
+                atomic_file.write_text_atomic(run, json.dumps({"worker": "worker", "status": "finished", "pid": os.getpid()}))
                 self.assertIsInstance(held, codex_mesh.HeldForLauncher)
                 LauncherHangGuard("the held result opened no turn").event(self.server.held_turn_ready)
                 LauncherHangGuard("no lifecycle check ran on the result turn").event(polled_result_turn)
@@ -17901,6 +18182,38 @@ class ServerRecordTests(unittest.TestCase):
         process = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)])
         self.spawned.append(process)
         return process.pid
+
+    def test_pid_alive_rejects_a_zombie_stat(self) -> None:
+        with (patch.object(codex_mesh, "_signal_process"),
+              patch.object(Path, "read_text", return_value="4242 (app-server (child)) Z 1 2 3")):
+            self.assertFalse(codex_mesh._pid_alive(4242))  # pyright: ignore[reportPrivateUsage]
+
+    def test_pid_alive_rejects_nonpositive_pids_without_an_os_probe(self) -> None:
+        with patch.object(codex_mesh, "_signal_process") as probe:
+            for pid in (0, -1, -4242):
+                with self.subTest(pid=pid):
+                    self.assertFalse(codex_mesh._pid_alive(pid))  # pyright: ignore[reportPrivateUsage]
+            probe.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "linux", "The zombie check uses Linux process evidence.")
+    def test_retired_child_app_server_is_reaped(self) -> None:
+        for retirement in ("retire", "replace", "stop"):
+            with self.subTest(retirement=retirement):
+                pid = self.sleeper()
+                self.write_server(4321, pid)
+                os.kill(pid, signal.SIGTERM)
+                # Observe the exit without reaping the child before retirement.
+                _ = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+                if retirement == "retire":
+                    self.assertTrue(codex_mesh._retire_server(  # pyright: ignore[reportPrivateUsage]
+                        str(self.session_dir), 4321))
+                elif retirement == "replace":
+                    codex_mesh._record_started_server(  # pyright: ignore[reportPrivateUsage]
+                        str(self.session_dir), {"pid": os.getpid(), "port": 9876})
+                else:
+                    _ = codex_mesh._reap(pid)  # pyright: ignore[reportPrivateUsage]
+                with self.assertRaises(ChildProcessError):
+                    _ = os.waitpid(pid, os.WNOHANG)
 
     def test_loaded_threads_reads_current_and_retired_pages_under_one_deadline(self) -> None:
         current = self.session_dir / codex_mesh.SERVER_FILE

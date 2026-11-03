@@ -265,7 +265,7 @@ DISCOVER_PRODUCTION_MARKS = DiscoverProductionMarks()
 
 
 def production_places(
-    records: list[SessionRecord], details: Mapping[str, ClaudeDetails],
+    records: list[SessionRecord],
     registered: list[showrunners.Showrunner],
     runner_ids: Mapping[str, showrunners.Showrunner], ledger_workers: set[str],
     problems: list[str],
@@ -322,9 +322,7 @@ def production_places(
             identity = session_record["sessionId"]
             if identity in ledger_workers:
                 continue
-            detail = details.get(identity)
-            cwd = detail.cwd if detail is not None else session_record.get("cwd", "")
-            values = labels.environment({}, identity, session_record["name"], cwd)
+            values = labels.environment({}, identity)
             if values.get("SHOWRUNNER_UNIT") == runner["slug"] and values.get("SHOWRUNNER_UNIT_ID"):
                 _ = places.setdefault(identity, ProductionPlace(showrunner, DirectsUnit(short_unit(values["SHOWRUNNER_UNIT_ID"]))))
     return places
@@ -344,7 +342,7 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
                                             membership=record)
         runners = showrunner_ids(records, registered)
         marks, directors = session_staff.session_staff_and_directors(records, environment, record=record)
-        places = production_places(records, {}, registered, runners, set(directors), problems, record=record, marks=marks)
+        places = production_places(records, registered, runners, set(directors), problems, record=record, marks=marks)
         names = {record["sessionId"]: record["name"] for record in records}
         labels: dict[str, UnitLabels] = {}
         for session_id in wanted & names.keys():

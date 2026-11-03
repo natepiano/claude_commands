@@ -177,7 +177,7 @@ class RecordedLabels:
                 values = {**{key: value for key, value in entry.get("environment", {}).items()
                              if key in MEMBER_MARKS}, **values}
         if not isinstance(self.membership, StaffLabelsRead):
-            values = self.membership.environment(values, record["sessionId"], record["name"], record.get("cwd", ""))
+            values = self.membership.environment(values, record["sessionId"])
         return values
 
 

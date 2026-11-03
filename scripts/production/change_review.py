@@ -88,6 +88,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import issues  # noqa: E402
 from production_units import Refusal, cell_value, production_field, unit_table  # noqa: E402
 from proposals_folder import owner_docs, scope_docs, slug_of  # noqa: E402
+from scripts.production import change_routing, staff
 
 TRAILER = "Change-Review"
 LIST_HEADER = "- **Change review:**"
@@ -189,6 +190,11 @@ def parse(value: str) -> Entry:
 
 def entries(message: str) -> list[Entry]:
     return [parse(found.group("value")) for found in _LINE.finditer(message)]
+
+
+def checkpoint_changes(message: str) -> tuple[str, ...]:
+    """The visible change names in a checkpoint message."""
+    return tuple(item.change for item in entries(message) if isinstance(item, Visible))
 
 
 def needs_trailer(subject: str, files: tuple[str, ...]) -> bool:
@@ -632,6 +638,13 @@ def scope_list(doc: Path) -> Path:
     from scripts.production import showrunners
     import showrunner_tree
 
+    if doc.is_file() and (value := _line_value(doc)):
+        return Path(value).expanduser()
+    if not doc.is_file():
+        for member in staff.snapshot().rows:
+            if (member.kind == "showrunner" and isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc))
+                    and member.doc.path == doc):
+                return list_file(member.name)
     slug = slug_of(doc)
     root = showrunner_tree.root_of(slug)
     try:
@@ -658,7 +671,8 @@ def scope_lists(path: Path, doc: Path, below: bool = False) -> tuple[ProductionR
     """The current list and each scoped production's own earlier list, once per path."""
     import showrunner_tree
 
-    lists = {path.absolute(): ProductionReviewList(path, showrunner_tree.root_of(slug_of(doc)))}
+    owner = _owner(path) if path.name.startswith(PREFIX) else showrunner_tree.root_of(slug_of(doc))
+    lists = {path.absolute(): ProductionReviewList(path, owner)}
     for production in scope_docs(doc, below):
         slug = slug_of(production)
         earlier = list_file(slug)
@@ -667,20 +681,68 @@ def scope_lists(path: Path, doc: Path, below: bool = False) -> tuple[ProductionR
     return tuple(lists.values())
 
 
-def scoped_review_entries(path: Path, doc: Path, below: bool = False) -> list[ScopedReviewEntry]:
-    """Read and rank each list independently; a bad list leaves the others in the queue."""
-    scope = {slug_of(each) for each in scope_docs(doc, below)}
-    entries: list[ScopedReviewEntry] = []
-    for review_list in scope_lists(path, doc, below):
+class ReviewHistoryReader:
+    """Supply the shared router with this module's Git readers."""
+
+    @staticmethod
+    def read_commit_parents(repo: Path, revisions: Iterable[str]) -> dict[str, tuple[str, ...]]:
+        return read_commit_parents(repo, revisions)
+
+    @staticmethod
+    def checkpoint_changes(message: str) -> tuple[str, ...]:
+        return checkpoint_changes(message)
+
+
+def routed_review_entries(path: Path, doc: Path, below: bool = False) -> list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]]:
+    """Read all source lists before the shared staff rule assigns their rows."""
+    return _routed_review_entries(path, doc, below, staff.snapshot())
+
+
+def _routed_review_entries(path: Path, doc: Path, below: bool, record: staff.StaffSnapshot) -> list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]]:
+    """Route all rows with one consistent staff snapshot."""
+    from scripts.production import showrunners
+
+    listed = {item.path.absolute(): item for item in scope_lists(path, doc, below)}
+    for source in LISTS.glob(PREFIX + "*.md"):
+        _ = listed.setdefault(source.absolute(), ProductionReviewList(source, _owner(source)))
+    documents = {**showrunners.timer_docs(), slug_of(doc): doc}
+    snapshots: dict[Path, ReviewListSnapshot] = {}
+    for source in listed:
         try:
-            rows = [row for row in pending(review_list.path)
-                    if (row.get(PRODUCTION) or review_list.default_production) in scope]
-            ranked = row_entries(rows)
+            snapshot = review_snapshot(source)
         except (ChangeReviewError, OSError, UnicodeError) as error:
-            print(f"change review: {review_list.path}: {error}", file=sys.stderr)
+            print(f"change review: {source}: {error}", file=sys.stderr)
             continue
-        entries.extend(ScopedReviewEntry(review_list, entry) for entry in ranked)
-    return entries
+        snapshots[source] = snapshot
+    documents = change_routing.production_documents(documents,
+        ((listed[source].default_production, snapshot.text) for source, snapshot in snapshots.items()))
+    routing = change_routing.StaffRouting(record, documents, ReviewHistoryReader())
+    routing.prepare((listed[source].default_production, snapshot.pending) for source, snapshot in snapshots.items())
+    return [(listed[source], routing.owner(row, listed[source].default_production), row)
+            for source, snapshot in snapshots.items()
+            for row in change_routing.waiting_rows(source, snapshot.pending)]
+
+
+def scoped_review_entries(path: Path, doc: Path, below: bool = False) -> list[ScopedReviewEntry]:
+    """Use the same staff tab as the change page."""
+    scope = {slug_of(each) for each in scope_docs(doc, below)}
+    record = staff.snapshot()
+    scope.update(member.name for member in record.rows
+                 if member.kind == "showrunner" and isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc))
+                 and slug_of(member.doc.path) in scope)
+    grouped: dict[Path, tuple[ProductionReviewList, list[dict[str, str]]]] = {}
+    for review_list, owner, row in _routed_review_entries(path, doc, below, record):
+        if owner.tab in scope:
+            if review_list.path not in grouped:
+                grouped[review_list.path] = (review_list, [])
+            grouped[review_list.path][1].append(row)
+    found: list[ScopedReviewEntry] = []
+    for review_list, rows in grouped.values():
+        try:
+            found.extend(ScopedReviewEntry(review_list, entry) for entry in row_entries(rows))
+        except ChangeReviewError as error:
+            print(f"change review: {review_list.path}: {error}", file=sys.stderr)
+    return found
 
 
 def scope_rows(path: Path, doc: Path, below: bool = False) -> list[dict[str, str]]:
@@ -721,7 +783,7 @@ class ChangeQueue:
 def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False) -> ChangeQueue:
     """The same change rows and pin for /next and change_review show."""
     if isinstance(scope, WholeReviewList):
-        return ChangeQueue(queue(path), row_entries(pending(path)))
+        return ChangeQueue(queue(path), row_entries(change_routing.waiting_rows(path, pending(path))))
     import showrunner_tree
 
     slug = slug_of(scope)
@@ -1074,6 +1136,9 @@ def record_verdict(path: Path, row: str, verdict: str, day: date,
                 return VerdictAlreadyRecorded(verdict, _plain(cells.get("Date", "")), row_merge(cells))
             return VerdictConflict(_plain(cells.get("Verdict", "")), _plain(cells.get("Date", "")))
         cells = dict(zip(columns, _cells(lines.pop(index))))
+        if not any(line.strip() == REVIEWED for line in lines):
+            reviewed_rows = list[str](("\n" + BODY[BODY.index(REVIEWED):]).splitlines(keepends=True))
+            _insert(lines, len(lines), reviewed_rows)
         _add_column(path, lines, REVIEWED, "Merged")
         # Page rows retain their description and proof in the same record after
         # answering. Older lists keep their existing Reviewed table shape.
@@ -1119,8 +1184,9 @@ class ReviewListSnapshot:
 def review_snapshot(path: Path) -> ReviewListSnapshot:
     text = read(path)
     lines = text.splitlines(keepends=True)
-
-    return ReviewListSnapshot(text, _review_table(path, lines, SECTION), _review_table(path, lines, REVIEWED))
+    pending = _review_table(path, lines, SECTION)
+    reviewed = _review_table(path, lines, REVIEWED) if any(line.strip() == REVIEWED for line in lines) else []
+    return ReviewListSnapshot(text, pending, reviewed)
 
 
 def set_row_kind(path: Path, row: str, kind: str, production: Path) -> str:

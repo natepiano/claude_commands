@@ -252,6 +252,56 @@ def _row_locations(kind: str, fields: dict[str, object]) -> tuple[PresentWorktre
 
 
 @dataclass(frozen=True)
+class CheckoutDocument:
+    """A document identified by its repository and path within a checkout."""
+
+    common_directory: Path
+    relative_path: Path
+
+
+@dataclass(frozen=True)
+class OutsideGitCheckout:
+    """No readable checkout metadata identifies this document."""
+
+
+def _document_checkout(path: Path) -> CheckoutDocument | OutsideGitCheckout:
+    """Read document identity from Git metadata without starting a process."""
+    try:
+        document = path.resolve()
+        for folder in document.parents:
+            marker = folder / ".git"
+            if marker.is_dir():
+                git_directory = marker
+            elif marker.is_file():
+                directive = marker.read_text(encoding="utf-8").strip()
+                if not directive.startswith("gitdir:"):
+                    return OutsideGitCheckout()
+                location = directive.removeprefix("gitdir:").strip()
+                if not location:
+                    return OutsideGitCheckout()
+                git_directory = folder / location
+            else:
+                continue
+            git_directory = git_directory.resolve()
+            if not git_directory.is_dir():
+                return OutsideGitCheckout()
+            common_file = git_directory / "commondir"
+            if common_file.exists():
+                location = common_file.read_text(encoding="utf-8").strip()
+                if not location:
+                    return OutsideGitCheckout()
+                common_directory = (git_directory / location).resolve()
+            else:
+                common_directory = git_directory
+            if not common_directory.is_dir():
+                return OutsideGitCheckout()
+            return CheckoutDocument(common_directory, document.relative_to(folder))
+    except (OSError, UnicodeError, RuntimeError):
+        return OutsideGitCheckout()
+    return OutsideGitCheckout()
+
+
+@dataclass(frozen=True)
 class StaffSnapshot:
     rows: tuple[StaffRow, ...]
     pending_retire: tuple[StaffId, ...] = ()
@@ -278,8 +328,22 @@ class StaffSnapshot:
         return max(matches, key=lambda row: len(cast(PresentWorktree, row.worktree).path.parts), default=None)
 
     def by_doc(self, machine: str, path: Path) -> StaffRow | None:
-        return next((row for row in self.rows if isinstance(row.doc, (LiveDoc, WrappedDoc))
-                     and row.doc.machine == machine and row.doc.path == path), None)
+        document = path.absolute()
+        candidates = [row for row in self.rows if isinstance(row.doc, (LiveDoc, WrappedDoc))
+                      and row.doc.machine == machine]
+        exact = next((row for row in candidates if isinstance(row.doc, (LiveDoc, WrappedDoc))
+                      and row.doc.path == document), None)
+        if exact is not None:
+            return exact
+        identity = _document_checkout(document)
+        if isinstance(identity, OutsideGitCheckout):
+            return None
+        matches = [row for row in candidates if isinstance(row.doc, (LiveDoc, WrappedDoc))
+                   and _document_checkout(row.doc.path) == identity]
+        if len(matches) > 1:
+            names = ", ".join(str(row.id) for row in matches)
+            raise StaffRefused(f"{document}: ambiguous production document; staff rows: {names}")
+        return next(iter(matches), None)
 
     def find(self, *, kind: Kind | None = None, parent: StaffId | None = None) -> list[StaffRow]:
         """An omitted kind or parent leaves that field unrestricted."""

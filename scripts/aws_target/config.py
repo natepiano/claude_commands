@@ -113,3 +113,43 @@ def read_settings(path: Path) -> SpendingSettings:
                             seconds("observation_max_age_seconds"), seconds("cost_explorer_interval_seconds"),
                             explorer, live_text("notification_recipient"), seconds("notification_timeout_s"),
                             seconds("notification_retry_s"), tuple(limits))
+
+
+@dataclass(frozen=True)
+class ControlSettings:
+    enabled: bool
+    instance_type: str
+    region: str
+    instance_id: str
+    credentials_profile: str
+    start_after_wait_s: float
+    start_min_waiting: int
+    capacity_backoff_s: float
+    drain_max_minutes: float
+    idle_stop_minutes: float
+    tick_interval_s: float
+    aws_timeout_s: float
+    snapshot_max_age_s: float
+    permission_ttl_s: float
+    interruption_poll_s: float
+    imds_timeout_s: float
+    remote_state_directory: str
+
+
+def read_control_settings(path: Path) -> ControlSettings:
+    values = conf.values(path)
+    enabled = conf.text(path, 'offload') == 'on'
+    def required(key: str) -> str:
+        value = conf.text(path, key)
+        if not value.strip():
+            raise ValueError(f'{key}: expected nonempty text')
+        return value
+    return ControlSettings(enabled, required('instance_type'), required('region') if enabled else values.get('region', ''),
+                           required('instance_id') if enabled else values.get('instance_id', ''),
+                           required('credentials_profile'), conf.number(path, 'start_after_wait_s'),
+                           conf.whole(path, 'start_min_waiting'), conf.number(path, 'capacity_backoff_s'),
+                           conf.number(path, 'drain_max_minutes'), conf.number(path, 'idle_stop_minutes'),
+                           conf.number(path, 'tick_interval_s'), conf.number(path, 'aws_timeout_s'),
+                           conf.number(path, 'snapshot_max_age_s'), conf.number(path, 'permission_ttl_s'),
+                           conf.number(path, 'interruption_poll_s'), conf.number(path, 'imds_timeout_s'),
+                           required('remote_state_directory'))
