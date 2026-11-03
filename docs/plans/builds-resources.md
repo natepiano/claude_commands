@@ -1311,16 +1311,13 @@ The Phase 26 checkpoint did not name two narrowed assertions; this phase's check
 
 ### Phase 47 — This unit's settings reads use conf.read  · status: done
 
-#### Work Order
+#### As-built
 
-Devtools 4r removed `conf.text`, `conf.number`, `conf.whole`, `conf.words`, `conf.values` and `conf.value_origin`. The Phase 45 and 46 reads use them, so the merge type check fails.
+- Hanas, Hana shots, scratch, the folder audit, the disk sweep and the tmp sweep call `conf.read(file)` once for each pass and give the `ConfigRead` to their helpers. Every key, value and reader kind is the same.
+- A helper that takes the read defaults to `UseConfiguredValue.CURRENT`. `sweep_workspace(target_dir, budget_config: conf.ConfigRead, dry_run, recent_minutes, *, lint_settings=UseConfiguredValue.CURRENT)`: the Linux runner passes its own budget file; other sweep settings still come from the repo `lint.conf`.
+- `UseConfiguredValue` has one definition, in `scripts/lib/conf.py` (devtools 4q item 13). No lib, lint or production module imports `scripts.issue_score`.
+- `smoke_launch.sh` checks the binary before its purpose check and reads config through `scripts/lib/py`.
 
-1. Merge origin/builds into this branch and resolve its conflicts. Keep the Phase 45 reads and their values.
-2. Change every removed-reader call in this unit's files to `conf.read(file)`. Call it once for each pass and use the returned `ConfigRead` (`text`, `number`, `whole`, `words`, `values`, `origin`).
-3. A helper that takes the read uses the default `UseConfiguredValue.CURRENT`, never `None`.
-4. Keep every value the same. A value change needs nate's approval.
-5. The contract is in `scripts/lib/conf.py` and `config/README.md`.
+**Files:** `scripts/hanas/hanas.py`, `scripts/hana_shot/hana_shot.py`, `scripts/lib/scratch.py`, `scripts/lib/conf.py`, `scripts/issue_score/selection.py`, `scripts/lint/folder_audit.py`, `scripts/lint/sweep.py`, `scripts/lint/tmp_sweep.py`, `scripts/mac_test/linux_runner.py`, `scripts/production/smoke_launch.sh`, the `UseConfiguredValue` importers (`scripts/issue_score/`, `scripts/accounts/next_moves.py`, `scripts/direct/simplify_result.py`, `scripts/production/retire_unit.py`), and their tests.
 
-**Files:** the Phase 45 and 46 readers and tests: `scripts/lint/hanas.py`, `scripts/lint/folder_audit.py`, `scripts/lint/sweep.py`, `scripts/lint/tmp_sweep.py`, `scripts/lint/scratch.py`, `scripts/hana_shot/`, `scripts/production/`, and their tests. The worker's list of remaining calls is the full set.
-
-**Acceptance:** `git grep` finds no removed-reader call in `scripts/`; the merge gate type check and the touched suites pass; the Phase 46 regression tests still pass.
+**Gotchas:** a lib module that imports a package outside `scripts/lib` fails in the merge gate's command copy, though the worktree suites pass. The tests `test_environment_budget_does_not_need_a_config_file` and `test_workspace_recovers_doc_budget_separately_from_a_private_budget_file` guard the two sweep budget reads.
