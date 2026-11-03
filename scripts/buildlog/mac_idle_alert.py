@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -12,10 +13,12 @@ from zoneinfo import ZoneInfo
 
 if TYPE_CHECKING:
     from . import store
-    from ..lint.config_values import config_values
 else:
     from scripts.buildlog import store
-    from scripts.lint.config_values import config_values
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import conf
 
 
 @dataclass(frozen=True)
@@ -29,45 +32,19 @@ class MacIdleConfig:
     send_timeout_s: float
 
 
-class MacIdleConfigError(ValueError):
-    """Selected and shipped settings cannot supply a valid idle policy."""
+# Keep the public error name for callers that report idle configuration failures.
+MacIdleConfigError = conf.Unusable
 
 
-def config_path() -> Path:
-    return Path(os.environ.get("MAC_TEST_CONFIG", "~/.claude/config/mac_test.conf")).expanduser()
-
-
-def idle_config(values: dict[str, str]) -> MacIdleConfig:
-    """Decode the idle policy using shipped values only when an override cannot supply it."""
-    shipped = Path(__file__).resolve().parents[2] / "config/mac_test.conf"
-    defaults: dict[str, str] = {}
-    defaults_read = False
-
-    def number(key: str) -> float:
-        nonlocal defaults, defaults_read
-        try:
-            value = float(values.get(key, ""))
-            if math.isfinite(value) and value > 0:
-                return value
-        except ValueError:
-            pass
-        if not defaults_read:
-            defaults = config_values(str(shipped))
-            defaults_read = True
-        try:
-            value = float(defaults[key])
-            if math.isfinite(value) and value > 0:
-                return value
-        except (KeyError, ValueError):
-            pass
-        raise MacIdleConfigError(f"Mac idle config needs a finite positive {key}; check {config_path()} and {shipped}")
-
-    return MacIdleConfig(number("alert_seconds"), number("push_seconds"), number("stale_seconds"),
-                         number("repeat_minutes"), number("send_timeout_s"))
+def idle_config(config: conf.ConfigRead) -> MacIdleConfig:
+    """Read the idle policy from one validated configuration file."""
+    return MacIdleConfig(config.number("alert_seconds"), config.number("push_seconds"),
+                         config.number("stale_seconds"), config.number("repeat_minutes"),
+                         config.number("send_timeout_s"))
 
 
 def read_idle_config() -> MacIdleConfig:
-    return idle_config(config_values(str(config_path())))
+    return idle_config(conf.read("mac_test"))
 
 
 def nonnegative_time(value: object) -> bool:

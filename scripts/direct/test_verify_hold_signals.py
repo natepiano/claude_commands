@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
+from scripts.lib.process_group import send_process_group
 from scripts.direct.shell_function_test_support import shell_functions
 from scripts.direct.verify_token_wait_test_support import VERIFY
 from scripts.direct.wait_for_test_state import wait_for_file
@@ -33,7 +34,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
                         "the step must have its own process group")
         before = self.owned_process_snapshot()
         started = time.monotonic()
-        os.killpg(process.pid, signum)
+        send_process_group(process.pid, signum)
         survivors = self.wait_for_owned_exit(5)
         code = process.poll()
         remaining = self.memory_queue_pids()
@@ -89,12 +90,12 @@ read -r command
                     readers = [int(pid) for pid in reader_pids.split()]
                     self.assertEqual(len(readers), 2)
                     wait_for_file(log)
-                    os.killpg(process.pid, signal.SIGHUP)
+                    send_process_group(process.pid, signal.SIGHUP)
                     self.assertEqual(process.wait(timeout=5), 129)
                     self.assertTrue(all(not Path(f"/proc/{pid}").exists() for pid in readers))
                 finally:
                     try:
-                        os.killpg(process.pid, signal.SIGKILL)
+                        send_process_group(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
                     _ = process.communicate(timeout=5)

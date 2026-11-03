@@ -6,6 +6,7 @@ import unittest
 from typing import override
 
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.direct.verify_lint_diagnostics_test_support import (
     CLIPPY_DENY_ATTRIBUTE,
     CLIPPY_DENY_WARNINGS,
@@ -200,8 +201,7 @@ Caused by:
         for limit in (1, 2, 4):
             with self.subTest(limit=limit):
                 self.write_config(clippy="on")
-                with self.config.open("a") as config:
-                    _ = config.write(f"clippy_fix_pass_limit = {limit} # repair budget\n")
+                _ = write_config_fixture(self.config, f"clippy=on\nclippy_fix_pass_limit={limit}\n")
                 result = self.invoke_verify("lint", "sample", cwd=self.root)
                 self.assertEqual(result.returncode, 101, result.stdout + result.stderr)
                 self.assert_fix_and_judgment_calls(fix_passes=limit)

@@ -7,10 +7,14 @@ import os
 import shlex
 import signal
 import time
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import offload
-from offload_test_support import HANA, OffloadCommandFixture, TEST_HANG_GUARD_SECS
+from offload_test_support import HANA, OffloadCommandFixture
+if TYPE_CHECKING:
+    from ..lib.test_hang_guard import TEST_HANG_GUARD_SECS
+else:
+    from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class OffloadForwardTests(OffloadCommandFixture):
@@ -144,7 +148,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assertFalse(self.claim_file.exists())
         self.assertIn("du -sk target/shots", events[-2]["args"][-1])
         pull = events[-1]["args"]
-        self.assertEqual(pull[:4], ["-rlp", "--safe-links", "-e", shlex.join(["ssh", *offload.ssh_options(offload.read_config(self.config_path))])])
+        self.assertEqual(pull[:4], ["-rlp", "--safe-links", "-e", shlex.join(["ssh", *offload.ssh_options(offload.read_connection_settings(self.config_path))])])
         self.assertEqual(pull[-2], "mac:.local/state/mac-test/mirror/hana/target/shots/")
         self.assertTrue(pull[-1].endswith("/fetched/call-forward.partial/target/shots/"))
 

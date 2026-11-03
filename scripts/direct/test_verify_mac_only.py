@@ -10,7 +10,9 @@ from pathlib import Path
 import unittest
 from typing import cast, final
 
-from scripts.direct.verify_mac_offload_test_support import HANG_GUARD_S, SLEEP_STUB, VerifyMacOffloadFixture
+from scripts.direct.verify_mac_offload_test_support import SLEEP_STUB, VerifyMacOffloadFixture
+
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
@@ -56,8 +58,10 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
 
     def test_busy_then_blocked_refuses_instead_of_polling(self) -> None:
         self.write_executable(self.bin_directory / "sleep", SLEEP_STUB)
+        # Let the retry reach the runner that reports the changed claim state.
         process = self.start_verify("test", "sample", "--mac", "why", extra={
             "TEST_RUNNER_BUSY_UNTIL": str(self.runner_state / "never-free"),
+            "TEST_FREE_NOW_FREE": "1",
             "TEST_STEP_ROUTING_SLEEP": "1"})
         self.addCleanup(self.stop_verify, process)
         self.wait_for_path(self.runner_state / "routing-sleep", (process,))
@@ -101,7 +105,7 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         self.wait_for_path(self.runner_state / "routing-sleep", (process,))
         _ = free.write_text("free\n")
         _ = (self.runner_state / "continue-sleep").write_text("continue\n")
-        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(self.local_runs(), [])
         self.assertGreaterEqual(len(self.runner_events()), 2)
@@ -230,7 +234,7 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         self.assertEqual(self.last_call()["mac_reason"], "unreachable")
 
     def test_local_first_target_is_skipped_for_mac_only(self) -> None:
-        config = Path(self.environment["BUILD_TARGETS_CONFIG"])
+        config = Path(self.environment["CONF_DIR"]) / "build_targets.conf"
         _ = config.write_text(config.read_text().replace("targets=mac,natedev", "targets=natedev,mac"))
         result = self.verify("test", "sample", "--mac", "why", extra={
             "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
@@ -287,7 +291,7 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         self.addCleanup(self.stop_verify, process)
         self.wait_for_path(self.runner_state / "routing-sleep", (process,))
         process.send_signal(signal.SIGTERM)
-        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 143, output + errors)
         self.assertEqual(self.last_call()["outcome"], "interrupted")
         self.assertEqual(self.last_call()["status"], 143)
@@ -298,10 +302,10 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         self.runner.unlink()
         result = self.verify("test", "sample", "--mac", "why")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("the Mac runner gave no usable result", result.stderr)
+        self.assertIn("the Mac claim state cannot be read", result.stderr)
         self.assertEqual(self.runner_events(), [])
         self.assertEqual(self.local_runs(), [])
-        self.assertEqual(self.last_call()["mac_reason"], "runner")
+        self.assertEqual(self.last_call()["mac_reason"], "")
 
 
 if __name__ == "__main__":

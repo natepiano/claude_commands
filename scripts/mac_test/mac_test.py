@@ -508,7 +508,7 @@ def read_config(target: str = "") -> MacTestConfig:
                  for key in ("ci_variable", "ci_workflow", "ci_job")}
 
     return MacTestConfig(
-        idle=idle_config(values),
+        idle=idle_config(config),
         ci_repo=ci_repo,
         ci_variable=ci_fields["ci_variable"],
         ci_workflow=ci_fields["ci_workflow"],

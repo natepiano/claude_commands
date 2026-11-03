@@ -13,7 +13,8 @@ import unittest
 from scripts.direct.shell_function_test_support import shell_functions
 from scripts.direct.tree_watch_test_support import TreeWatchFixture
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
-from scripts.direct.verify_lint_scope_test_support import VERIFY, TEST_HANG_GUARD_SECS
+from scripts.direct.verify_lint_scope_test_support import VERIFY
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyPythonStartsTests(VerifyLintCacheFixture):
@@ -39,8 +40,10 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         self.assertEqual(counts["tree_watch.py"], 8, rows)
         # Omitted fix: five step states, including memory admission's
         # waiting_hold/on_natedev. Omitted fmt: two more. Together with the
-        # two convergence keys, these remove nine starts from HEAD's 40.
-        self.assertEqual(len(rows), 31, counts)
+        # two convergence keys, these remove nine starts. SSH routing adds
+        # one target eligibility query to the previous total of 31.
+        self.assertEqual(counts["build-targets.py"], 2, rows)
+        self.assertEqual(len(rows), 32, counts)
 
     def test_lint_code_key_tracks_inputs_and_clears_unreadable_keys_with_both_hash_tools(self) -> None:
         home = self.root / "key-home"

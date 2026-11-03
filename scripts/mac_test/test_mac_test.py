@@ -1277,7 +1277,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
             result = self.command("claim-wait", "--pid", str(taker.pid),
                                   "--repo-root", str(hana), "--package", "hana",
                                   environment={**self.environment, "MAC_TEST_COPY_YIELD_S": "0.5"})
-            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual(result.returncode, 11, result.stdout + result.stderr)
             self.assertGreaterEqual(time.monotonic() - started, 0.5)
             self.assertIsNone(copy.poll())
             self.assertEqual(self.repository_claim("hana"), held)
@@ -3231,9 +3231,8 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 255, "active=0\nrc=0\n", "unreachable")):
             self.assertIsInstance(mac_test.check_mac_activity(config, "claim-host"), mac_test.ActivityCheckFailed)
 
-    def test_idle_alert_config_uses_shipped_values_and_rejects_invalid_overrides(self) -> None:
+    def test_idle_alert_config_reads_values_and_refuses_invalid_values_without_history(self) -> None:
         path = self.root / "mac_test.conf"
-        shipped = mac_test.read_config().idle
         _ = write_config_fixture(path, "alert_seconds=7\npush_seconds=11\nstale_seconds=13\n"
                                  + "repeat_minutes=17\nsend_timeout_s=19\n")
         configured = mac_test.read_config().idle
@@ -3241,7 +3240,9 @@ class ClaimWatchTests(NotificationGuardedTestCase):
                           configured.repeat_minutes, configured.send_timeout_s), (7, 11, 13, 17, 19))
         _ = write_config_fixture(path, "alert_seconds=nan\npush_seconds=0\nstale_seconds=-1\n"
                                  + "repeat_minutes=bad\nsend_timeout_s=inf\n")
-        self.assertEqual(mac_test.read_config().idle, shipped)
+        with mock.patch.object(conf, "_committed_files", return_value=iter(())), \
+             self.assertRaises(conf.Unusable):
+            _ = mac_test.read_config()
 
     def test_claim_idle_settings_read_configured_values(self) -> None:
         path = self.root / "mac_test.conf"

@@ -12,6 +12,7 @@ import tempfile
 import time
 import unittest
 from contextlib import closing, redirect_stderr
+from collections.abc import Callable
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -27,21 +28,23 @@ import mac_idle
 import memory
 import sample
 if TYPE_CHECKING:
-    from .mac_idle_test_support import NotificationGuardedTestCase, NotificationTransportBlocked, private_sender_acceptance
+    from .mac_idle_test_support import NotificationGuardedTestCase, NotificationTransportBlocked, private_sender_acceptance, write_idle_config
     from ..mac_test import mac_test
     from ..direct import step_record
     from ..lint.memory_test_support import fake_memory_readings
     from ..notify.push_texts import catalog, render_entry
     from ..notify.push_catalog import mac_idle_reservation
     from ..message import send
+    from ..message.test_send_delivery import stopped_sender
 else:
-    from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, NotificationTransportBlocked, private_sender_acceptance
+    from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, NotificationTransportBlocked, private_sender_acceptance, write_idle_config
     from scripts.mac_test import mac_test
     from scripts.direct import step_record
     from scripts.lint.memory_test_support import fake_memory_readings
     from scripts.notify.push_texts import catalog, render_entry
     from scripts.notify.push_catalog import mac_idle_reservation
     from scripts.message import send
+    from scripts.message.test_send_delivery import stopped_sender
 from test_index import use_test_log
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
@@ -76,15 +79,14 @@ class MacIdleTests(NotificationGuardedTestCase):
             "VERIFY_PROC_ROOT": str(self.paths.proc),
             "MAC_IDLE_STATE_DIR": str(self.paths.state),
             "MAC_TEST_STATE_DIR": str(self.paths.mac_state),
-            "MAC_TEST_CONFIG": str(self.root / "mac_test.conf"),
+            "CONF_DIR": str(self.root),
             "SESSION_TEMP_ROOT": str(self.paths.session_root),
             "NOTIFIER_SESSIONS_DIR": str(self.paths.sessions),
             "BUILD_HOLD_DIR": str(self.root / "holds"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "UNIT_RUN_DIR": str(self.root / "unit"),
         }))
-        _ = (self.root / "mac_test.conf").write_text(
-            (mac_idle.SCRIPTS.parent / "config/mac_test.conf").read_text())
+        _ = write_idle_config(self.root)
         self.paths.proc.mkdir()
         self.paths.mac_state.mkdir()
         self.paths.admission.mkdir(parents=True)
@@ -221,12 +223,6 @@ class MacIdleTests(NotificationGuardedTestCase):
         return subprocess.CompletedProcess(command, send.EXIT[result.outcome], result.outcome.upper(), result.detail)
 
     def check_interrupted_delivery(self, *, after_sender_record: bool) -> None:
-        class Stopped(BaseException):
-            pass
-
-        def stop(*_args: object, **_kwargs: object) -> None:
-            raise Stopped()
-
         self.block()
         settings = mac_idle.mac_idle_alert.read_idle_config()
         for stage, mark in (("notify_outage", "messaged"), ("push_outage", "pushed")):
@@ -238,8 +234,13 @@ class MacIdleTests(NotificationGuardedTestCase):
                      mock.patch.object(mac_idle, stage, side_effect=REAL_NOTIFY_OUTAGE if stage == "notify_outage" else REAL_PUSH_OUTAGE), \
                      mock.patch.object(subprocess, "run", side_effect=self.sender_command):
                     target = "log" if after_sender_record else "run"
-                    with mock.patch.object(send, target, side_effect=stop), self.assertRaises(Stopped):
-                        mac_idle.watch_once(self.paths, 1600, 100)
+                    def child(checkpoint: Callable[[], None]) -> None:
+                        def stop(*_args: object, **_kwargs: object) -> None:
+                            checkpoint()
+                        with mock.patch.object(send, target, side_effect=stop):
+                            mac_idle.watch_once(self.paths, 1600, 100)
+                    with stopped_sender(child):
+                        pass
                     self.assertEqual(fixture.count(), 1 if after_sender_record else 0)
                     self.assertIs(mac_idle.read_record(self.paths.state / "alert.json")[mark], False)
                     current = 1600 + settings.repeat_minutes * 120
@@ -327,15 +328,16 @@ class MacIdleTests(NotificationGuardedTestCase):
     def test_missing_or_bad_idle_configuration_produces_a_watch_diagnostic(self) -> None:
         self.block()
         mac_idle.watch_once(self.paths, 1180, 100)
-        for bad in ("", "alert_seconds=bad\n"):
-            with self.subTest(config=bad), mock.patch("builtins.open", cast(object, mock.mock_open(read_data=bad))):
+        for bad in ("", "# range: 0.001..\nalert_seconds=bad\n"):
+            _ = (self.root / "mac_test.conf").write_text(bad)
+            with self.subTest(config=bad):
                 line = mac_idle.mac_idle_alert.alert_line(self.paths.state / "alert.json", 1180, ZoneInfo("UTC"))
                 self.assertIn("MAC IDLE WATCH: config unreadable:", line or "")
                 with self.assertRaises(mac_idle.mac_idle_alert.MacIdleConfigError):
                     _ = mac_test.read_config()
 
     def test_repair_text_uses_configured_idle_threshold(self) -> None:
-        _ = (self.root / "mac_test.conf").write_text("alert_seconds=42\n")
+        _ = write_idle_config(self.root, "alert_seconds=42\n")
         message = mac_idle.repair_message(self.call, "idle_with_waiter")
         self.assertIn("at least 42 seconds", message)
         self.assertNotIn("3 minutes", message)
@@ -343,8 +345,8 @@ class MacIdleTests(NotificationGuardedTestCase):
     def test_config_changes_apply_to_live_outage_views_push_and_clear_check(self) -> None:
         _ = self.claim()
         config = self.root / "mac_test.conf"
-        _ = config.write_text("[mac_idle]\nalert_seconds=240\npush_seconds=300\n"
-                              + "stale_seconds=30\nrepeat_minutes=37\nsend_timeout_s=9\n")
+        _ = write_idle_config(self.root, "alert_seconds=240\npush_seconds=300\n"
+                                 + "stale_seconds=30\nrepeat_minutes=37\nsend_timeout_s=9\n")
         path = self.paths.state / "alert.json"
         with mock.patch.object(mac_idle, "notify_outage", return_value=True) as notify, \
              mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess[str]([], 0, "SENT", "")) as run:
@@ -584,7 +586,7 @@ class MacIdleTests(NotificationGuardedTestCase):
                     step_record.WorkspacePackages(), permission, state, "2026-11-02T10:00:00Z",
                     selected_target=selected))
                 self.assertIsInstance(step_record.read(self.call.call_id), step_record.StepRecord)
-                with mock.patch.object(mac_idle, "notify_director") as send:
+                with mock.patch.object(mac_idle, "notify_showrunner") as send:
                     self.two_passes()
                 send.assert_not_called()
                 self.assertEqual(mac_idle.waiting_calls(self.paths, mac_idle.processes(self.paths.proc)), ())

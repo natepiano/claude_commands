@@ -19,8 +19,10 @@ from typing import cast
 from scripts.direct import verify_lint_scope_test_support as lint_support
 from scripts.direct.shell_function_test_support import shell_functions
 from scripts.direct.verify_examples_test_support import rust_tool_path
-from scripts.direct.verify_token_wait_test_support import TEST_HANG_GUARD_SECS, VerifyTokenWaitFixture, BOARD, VERIFY
+from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, BOARD, VERIFY
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 SCRIPTS = VERIFY.parent.parent
 
@@ -644,8 +646,9 @@ class MacWaitClaimTests(unittest.TestCase):
             _ = subprocess.run(["git", "init", "-q", str(repo)], check=True, timeout=30)
             state = root / "state"
             settings = root / "mac.conf"
-            _ = settings.write_text("offload=on\nlinux_only.sample=\n")
-            environment = {**os.environ, "MAC_TEST_STATE_DIR": str(state), "BUILDLOG_OFF": "1",
+            _ = write_config_fixture(settings, "offload=on\nlinux_only.sample=\n", template="mac_test")
+            environment = {**os.environ, **config_environment(root),
+                           "MAC_TEST_STATE_DIR": str(state), "BUILDLOG_OFF": "1",
                            "MAC_TEST_CONFIG": str(settings), "BUILD_HOLD_DIR": str(root / "holds")}
             script = SCRIPTS / "mac_test" / "mac_test.py"
             command = [sys.executable, str(script), "claim-wait", "--pid", str(os.getpid()),
@@ -654,7 +657,7 @@ class MacWaitClaimTests(unittest.TestCase):
                 return subprocess.run(command, env=environment, capture_output=True, text=True, timeout=30)
             with ThreadPoolExecutor(max_workers=2) as executor:
                 attempts = list(executor.map(claim, range(2)))
-            self.assertEqual(sorted(answer.returncode for answer in attempts), [0, 1],
+            self.assertEqual(sorted(answer.returncode for answer in attempts), [0, 11],
                              [(answer.stdout, answer.stderr) for answer in attempts])
             claims = list((state / "claims").glob("*.json"))
             self.assertEqual(len(claims), 1)
@@ -678,7 +681,7 @@ class MacWaitClaimTests(unittest.TestCase):
                 after = cast(dict[str, object], json.loads(claims[0].read_text()))
                 self.assertEqual(after["pid"], runner.pid)
                 self.assertEqual(after["since"], before["since"])
-                self.assertEqual(claim().returncode, 1, "adoption opened the scope to another waiter")
+                self.assertEqual(claim().returncode, 11, "adoption opened the scope to another waiter")
                 _ = runner.communicate(timeout=30)
 
 
