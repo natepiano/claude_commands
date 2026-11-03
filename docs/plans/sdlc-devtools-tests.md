@@ -39,6 +39,9 @@ Known input for the inventory: `scripts/agents/test_codex_mesh.py` was killed at
   - Record publication even when promotion fails.
   - Mark a style notice complete only after successful delivery.
   - Preserve silent, idempotent completion of repeated handoffs.
+- **Config reads (Phase 4r).** A pass calls `conf.read(file)` once and gives the `ConfigRead` to its helpers. A helper default is `UseConfiguredValue.CURRENT`, never `None`. The module-level readers (`conf.text`, `conf.number`, `conf.whole`, `conf.words`, `conf.values`, `conf.value_origin`) are gone. A faulty setting prints the same stderr warning when the pass uses it. Keep the `scripts/lib/test_conf.py` tests for read counts, edits between reads, deferred recovery, unchanged warnings and refusal without usable history.
+- **Test runs.** A writer runs only the few test files its prompt names. The director runs the one merged-tree gate. A test double that replaces a function whose signature changed must take the new arguments: a rejected argument can fail silently inside a caught path.
+- **Ownership.** The staff row owns a unit's location. Git owns its branch. `.unit.toml` owns unit settings. Each command takes one identity snapshot and joins through it. An interrupted operation leaves state a rerun completes; a completed rerun changes nothing.
 
 ## Phases
 
@@ -654,20 +657,24 @@ Source: Phase 4o review (simplify lens), 2026-11-02. Each item removes a copy th
 **Spec:**
 1. `workers._moved_path` (`workers.py:1726`) becomes public. `unit_move.moved_folder_argument`, `rename_unit._moved` (`rename_unit.py:933`) and the inline rule at `progress_history.py:478` call it.
 2. `move_folder_worker_paths` calls `workers.repoint_unit_worktree`. Its `repoint_roster` (`workers.py:1870`) also moves `instructions_file` and `authorized_prompt`. Settle the `unit_ledger` difference in the merge.
-3. One shared step pauses runs, classifies run processes and stops them, in `unit_move`. `rename_unit._stop_runs` (`rename_unit.py:899`) and `retire_unit.run_processes` (`retire_unit.py:439`) use it. Keep the stronger proof: start time plus exact argv, and detached `mesh_runs` supervisors.
+3. One shared step pauses runs, classifies run processes and stops them, in `unit_move`. `rename_unit._stop_runs` (`rename_unit.py:899`) and `retire_unit.run_processes` (`retire_unit.py:439`) use it. Keep the stronger proof: start time plus exact argv, and detached `mesh_runs` supervisors. Classification is a read-only call; stopping is a separate call. `rename_unit.check_stoppable` (`rename_unit.py:364`) uses only the classification in preflight; keep `test_rename_unit_processes.py:188` (refusal with no signal).
 4. `codex_mesh` exposes `recorded_run_servers(run)`, `is_run_server(pid, port, run)`, `is_worker_launcher(pid, run, name)` and `run_watcher(arguments)` beside their writers. `unit_move` and `retire_unit.py:460` call them.
 5. `unit_move` drops `PriorFolderWorker` and checks a status against `codex_mesh.ENDABLE_STATUSES`, with the classes of a public `_roster_thread` (`codex_mesh.py:636`). The exit code for an unknown status stays 1.
 6. `resume_message` exposes `resume_prompt_path(seat)` and `add_resume_note(seat, note)`. `unit_move`, `rename_unit.py:973`, `resume_message.py:87` and `inventory.py:818` use them, with one atomic write form.
-7. `herdr.child_environment` (`herdr.py:871`) owns one list of session identity variables, and `unit_move` uses it. The change to `herdr.py` goes through herdr-unit.
+7. `herdr.child_environment` (`herdr.py:871`) owns one list of session identity variables, and `unit_move` uses it. The change to `herdr.py` goes through herdr-unit. First define the required launch environment for each caller and test the inherited identities: `herdr.child_environment` (`herdr.py:903`) removes fewer identity variables than either folder-resume path, the unit path removes `HERDR_TAB_ID` and the worker path removes `STAFF_OPERATION_FD`.
 8. `progress_history` exposes one call that returns the run states for a history file; `move_run` (`progress_history.py:499`) and `unit_move.folder_runs` use it.
 9. A worker process that exits between the liveness check and its argument read in `pause_folder_workers`, or just after `Popen` in the resume path, reads as exited; the move goes on. Add a regression test for each read.
 10. Each `codex_mesh` import in `unit_move` comes after the early exits, so a move whose runs have no mesh imports no `codex_mesh`.
 11. Copy removals from the Phase 4o review (sdlc showrunner ruling, 2026-11-02; where two copies differ, keep the owner's rule): the move starts workers through the unit's resume message, as `stop_resume.py:337` and `restart.py:2246` do, and starts no worker itself; one worker resume path keeps the `codex_seats` "was working" rule; one `codex_mesh.pause_run` serves `unit_move` and `rename_unit.py:909`, in place of the `Namespace` call and the subprocess call; `codex_mesh` owns "unpause an idle worker" for a run and its idle workers, and `unit_move` writes no roster status; `has_mesh` comes from the mesh files only; the move record always holds `sessions`, and the legacy branch goes.
 12. For each of these, first find why the code is as it is: two folder scans (`unit_move.py:736, 1237`) — is the second needed?; does `codex_mesh` lock the app-server start, so all workers can start before one wait loop?; does anything read `launcher_command` of a worker that is not running (else list Codex seats only for runs with a running worker)?; why the unlocked first roster read (can all runs be checked under the locks before any write)?; can a run state folder have another name, and who writes it (else read the run's own state file first)? The director settles each item under DecisionEconomy and states the call in one line (user via builds and the sdlc showrunner, 2026-11-02). Only an item that touches money, safety, behavior the user sees, or an act that cannot be undone goes to /unit:question, and its change waits for the user's answer.
+13. `UseConfiguredValue` moves from `scripts/issue_score/selection.py` to `scripts/lib/conf.py` beside `ConfigRead`, with one definition; every consumer (`apply_labels.py` and the 4r callers) imports it from `conf`. Tests: `scripts/lib/test_conf.py` and `scripts/production/test_rename_unit_processes.py` (keep its settings-sharing regression at line 207). Closes F009.
 
 **Files:**
 - `scripts/production/unit_move.py`, `scripts/direct/workers.py`, `scripts/production/rename_unit.py`, `scripts/production/retire_unit.py`, `scripts/agents/codex_mesh.py`, `scripts/lib/resume_message.py`, `scripts/shutdown/inventory.py`, `scripts/direct/progress_history.py`, `scripts/herdr/herdr.py` — source.
 - `scripts/production/test_unit_move.py`, `scripts/production/test_rename_unit.py`, `scripts/production/test_retire_unit.py` — regressions.
+- `scripts/lib/conf.py`
+- `scripts/issue_score/selection.py`
+- `scripts/issue_score/apply_labels.py`
 
 **Workers:** `1 writer + 1 tester`.
 - `impl` — the source files.
@@ -681,43 +688,24 @@ Source: Phase 4o review (simplify lens), 2026-11-02. Each item removes a copy th
 
 ### Phase 4r — One config read serves many settings  · status: done
 
-**Depends on:** Phase 4o
+#### As-built
 
-Source: the user via the sdlc showrunner, 2026-11-02: "i want only one way of doing things" (aws Phase 8 simplify item 27: `conf.py` parses the file again for each setting; one AWS tick does about 100 reads). Start after accounts-unit's Phase 101z is on main; it changes `conf.py`.
-
-#### Work Order
-
-**Goal:** a caller reads a config file once and takes many settings from that one read, through the one reader `conf.py` has.
-
-**Spec:**
-1. `conf.read(file) -> ConfigRead` (`scripts/lib/conf.py`) reads and parses the file once. `ConfigRead` has `text`, `number`, `whole`, `words` and `values`, with the same limits, host keys and messages as the module functions have now.
-2. A key with no usable value in the read still falls back to the newest valid committed value, read at use. Nothing is cached: no module state, and each `conf.read` reads the file again.
-3. The module functions `text`, `number`, `whole`, `words` and `values` go. `ConfigRead` is the one reader; there is no second reader beside it. `value_origin` becomes `ConfigRead.origin(key, convert)` with the same three results (director, 2026-11-02: a second module-level reader breaks item 3). `effective_line`, `editable_line` and `check` stay as they are.
-4. Every caller switches in this phase. A caller that takes several settings from one file in one pass (one tick, one command) holds one `ConfigRead` for that pass. A caller that takes one setting uses `conf.read(file).<kind>(key)`.
-5. At phase start, after the merge of origin/sdlc, grep again for callers (`conf.text(`, `conf.number(`, `conf.whole(`, `conf.words(`, `conf.values(` and imports of those names). Add each new caller file to Files. `scripts/hanas/hanas.py` and `scripts/lint/folder_audit.py` become callers in resources-unit's Phase 45 (branch builds-resources); switch them when that change is in the tree, else tell resources-unit when 4r is on origin/sdlc so its Phase 45 uses `conf.read`.
+- `conf.read(file) -> ConfigRead` (`scripts/lib/conf.py`) reads and parses a config file once. `ConfigRead.text`, `number`, `whole`, `words`, `values` and `origin(key, convert)` resolve each setting from that read, with the same limits, host keys and messages as before.
+- A key with no usable value in the read falls back to the newest valid committed value, read at use. Nothing is cached: each `conf.read` reads the file again. A fault warning prints when the setting is used, with the same text and stream as before.
+- The module-level readers (`conf.text`, `conf.number`, `conf.whole`, `conf.words`, `conf.values`, `conf.value_origin`) do not exist. `effective_line`, `editable_line` and `check` are unchanged.
+- Every caller holds one `ConfigRead` for each pass (one tick, one command) and gives it to its helpers. A helper that takes the read has the parameter type `conf.ConfigRead | UseConfiguredValue` with default `UseConfiguredValue.CURRENT`, never `None`.
 
 **Files:**
-- `scripts/lib/conf.py` — source. `config/README.md` — the reader's description (one read per `conf.read`; `ConfigRead.origin`).
-- `scripts/lint/memory_admit.py`, `scripts/lint/sweep.py`, `scripts/direct/findings.py`, `scripts/direct/assign.py`, `scripts/direct/simplify_result.py`, `scripts/production/fast_track.py`, `scripts/production/unit_move.py`, `scripts/production/merge_checkpoint.py`, `scripts/production/retire_unit.py`, `scripts/lib/tune.py` — callers (impl).
-- `scripts/mac_test/mac_test.py`, `scripts/mac_test/offload.py`, `scripts/mac_test/loopback_proof.py`, `scripts/mac_test/linux_runner.py`, `scripts/mac_test/audit.py`, `scripts/buildlog/memory.py`, `scripts/buildlog/sync.py`, `scripts/buildlog/report.py`, `scripts/buildlog/record.py`, `scripts/buildlog/disk.py`, `scripts/build_targets/target_config.py`, `scripts/build_targets/build_targets.py`, `scripts/build_queue/queue_place.py`, `scripts/message/send.py`, `scripts/whoami/note_file.py` — callers (impl2).
-- `scripts/accounts/accounts.py`, `scripts/accounts/new_account.py`, `scripts/accounts/next_moves.py`, `scripts/accounts/outage_alerts.py`, `scripts/accounts/refusals.py`, `scripts/accounts/refusal_watch.py`, `scripts/accounts/role_map.py`, `scripts/aws_target/aws_target.py`, `scripts/aws_target/config.py`, `scripts/issue_score/blind.py`, `scripts/issue_score/client.py`, `scripts/issue_score/evaluate.py`, `scripts/issue_score/questions.py`, `scripts/issue_score/records.py`, `scripts/issue_score/score_issues.py`, `scripts/issue_score/vault.py`, `scripts/astra/design_roles.py` — callers (fix), added by the Spec 5 re-grep after the merge of origin/sdlc d9c5e2569.
-- `scripts/lint/test_memory_admit.py`, `scripts/lint/test_sweep.py`, `scripts/lint/test_invoke_scope.py`, `scripts/production/test_fast_track.py`, `scripts/production/test_affected_modules.py` — caller tests (impl) that patch or wrap a removed function; each changes only its patch target, with no assertion change.
-- `scripts/mac_test/test_mac_test.py`, `scripts/mac_test/test_offload.py`, `scripts/mac_test/test_target_state.py`, `scripts/whoami/test_note_file.py` — caller tests (impl2), the same rule.
-- `scripts/accounts/test_accounts.py`, `scripts/accounts/test_refusal_watch.py`, `scripts/aws_target/test_remote.py`, `scripts/issue_score/test_config.py`, `scripts/agents/test_agents_conf_publish.py` — caller tests (fix), the same rule.
-- `scripts/lib/test_conf.py` — regressions.
-- `scripts/hanas/hanas.py`, `scripts/lint/folder_audit.py` — not in the tree at d9c5e2569; resources-unit is told when 4r is on origin/sdlc.
+- `scripts/lib/conf.py` — the one config reader (`read`, `ConfigRead`).
+- `scripts/issue_score/selection.py` — `UseConfiguredValue`.
+- `config/README.md` — the reader contract (one read per `conf.read`; `ConfigRead.origin`).
+- `scripts/lib/test_conf.py` — read-count, edit-between-reads, deferred-recovery and unchanged-warning tests.
 
-**Workers:** `3 writers + 1 tester` (director, 2026-11-02: the re-grep found 45 caller files, not 19).
-- `impl` — `conf.py` (hub), `config/README.md`, and the `lint`, `direct`, `production` and `lib/tune.py` callers with their tests.
-- `impl2` — the `mac_test`, `buildlog`, `build_targets`, `build_queue`, `message` and `whoami` callers with their tests.
-- `fix` (as a writer) — the `accounts`, `aws_target`, `issue_score` and `astra` callers with their tests, and `scripts/agents/test_agents_conf_publish.py`.
-- `test` — `test_conf.py`.
+**Binds later work:** `UseConfiguredValue` moves from `scripts/issue_score/selection.py` to `scripts/lib/conf.py` beside `ConfigRead`, with one definition. A new config setting is read through one `conf.read(file)` per pass.
 
-**State:** none; settings keep their values.
+**Gotchas:** a test double that replaces a function taking the read must accept the new argument; the renewal path catches a `TypeError` and prints nothing, so a wrong double fails silently.
 
-**Constraints from prior phases:** Phase 8: `conf.py` is the one config reader, and a value change goes live at the next read without a release cycle. Phase 4o: keep every `test_unit_move.py` test green.
-
-**Acceptance gate:** a test counts file reads: one `conf.read` and five settings from it read the file once; a second `conf.read` reads it again after a change; a key with a bad live value in a `ConfigRead` falls back to its committed value; `grep` finds no `conf.text(`, `conf.number(`, `conf.whole(`, `conf.words(` or `conf.values(` call; the existing suites of every changed module pass with no assertion change; `basedpyright` on the changed files and every caller module footer `0 errors, 0 warnings, 0 notes`; per-file `unittest discover`; full gate.
+**Ruled out:** a change to `simplify_result.py` for one read — its check and finish steps run in separate processes, and each reads `direct.conf` once.
 
 ### Phase 7m — Showrunners take Morty's words as the user's  · status: done
 
@@ -748,7 +736,7 @@ Source: herdr-unit plan Phase 3x, given to devtools-unit by sdlc 2026-11-02. Sta
 3. **Saved tab titles — dropped (user, 2026-11-01).** The saved layout keeps herdr names; `herdr.rename_saved_tab` (`herdr.py:2418`) replaces the title in the file at a rename, also for a stopped member (4g calls it).
 4. **Board cache** (`~/.local/state/unit-board/<slug>.json`, `board_json.py:424`; moved by `rename_outside.py:64`): `<showrunner staff id>.json`. The unit-board plugin's reader switches in the same step (the unit-board unit's file).
 5. **Proposal `unit:`** (`proposal_issue.py:261`; 4 readers): the issue field holds the staff id, and readers show the row's name. The proposals folder also holds question records, which Phase 4i already keyed by staff id. A production with no Proposals line keeps its question records in `<state>/<showrunner staff id>/questions` instead (Phase 4j, `update_registration.question_folder`); the migration does not touch that folder. The migration changes proposal records only; each question record keeps its contents, timestamps, `production_id` and `asked_by` byte for byte. A shared-folder regression holds both kinds of record and checks proposal ownership and the `/showrunner:questions` table after the migration, after a rename and after a transfer.
-6. **Stall stretch** (`stall_watch.py:412` `stretch_path`; 4 readers): stretch files, prompt files and notification keys by staff id. The migration cancels and re-sends a live alert under the new key, so elapsed time and cancellation survive (old Phase 3h). The moves in `rename_unit.py`, `rename.py` and `transfer_unit.py` go. `PROMPT_ALERT_SECONDS = 60` (`stall_watch.py:66`) moves to `config/production.conf`, read at use through `tunables`, with a changed-config test.
+6. **Stall stretch** (`stall_watch.py:412` `stretch_path`; 4 readers): stretch files, prompt files and notification keys by staff id. The migration cancels and re-sends a live alert under the new key, so elapsed time and cancellation survive (old Phase 3h). The moves in `rename_unit.py`, `rename.py` and `transfer_unit.py` go. `PROMPT_ALERT_SECONDS = 60` (`stall_watch.py:66`) moves to `config/production.conf`, read at use through `conf.read("production")`, one read for each pass, with a changed-config test. `stall_watch.py` belongs to messaging-unit: coordinate this item with it, outside the devtools store landings.
 
 **Files:**
 - `scripts/production/change_review.py`, `scripts/direct/phase_table.py`, `scripts/direct/board_json.py`, `scripts/production/proposal_issue.py`, `commands/change_review.md` — the four stores' writers and readers; every other reader that a store's inventory search finds joins its step.
@@ -761,7 +749,7 @@ Source: herdr-unit plan Phase 3x, given to devtools-unit by sdlc 2026-11-02. Sta
 
 **State:** each store moves to staff-id keys, once.
 
-**Constraints from prior phases:** Phase 3s resolver. Delegation Context → Staff design (2026-10-31), Rerun-safe tools.
+**Constraints from prior phases:** Phase 3s resolver. Delegation Context → Ownership. Phase 4p: `update_registration.question_folder` resolves a relative path from the staff owner's document; unreadable ownership is not confirmed absence; keep the linked-checkout, ambiguous-owner and shared-question tests. Before dispatch, check that 3t, 3u and 3v are on the branch; `RowResolver` comes from origin/sdlc.
 - Phase 3h review (2026-11-01): item 2 also removes `showrunner:` and `production_file:` from the phase note (read from staff). Item 5: `unit:`, `proposed_by:` and `approved_in:` hold fixed ids; `showrunner:` and `plan:` go. Each with all its readers and its own store proof.
 
 **Acceptance gate:** basedpyright 0/0 on changed files and every caller module; each store's suite passes, each test file in its own `discover` run; each store meets the rewriter order above; each store's own real proof (the rule above), one landing per store; a transferred unit's open change row shows under its new production, a production-owned row stays, and a reviewed row keeps its old production; a real `/change_review` shows a moved unit's open row under the new production with no rewrite; the shared-folder regression in item 5 passes; full merged-tree gate green before each store's checkpoint.
@@ -800,7 +788,7 @@ Source: herdr-unit plan Phase 3t, given to devtools-unit by sdlc 2026-11-02. Sta
 
 **State:** none.
 
-**Constraints from prior phases:** Phase 3s resolver; Phase 3r writers. Delegation Context → Staff design (2026-10-31), One identity join.
+**Constraints from prior phases:** Phase 3s resolver; Phase 3r writers. Delegation Context → Ownership. Phase 4p: `update_registration.question_folder` resolves a relative path from the staff owner's document; unreadable ownership is not confirmed absence; keep the linked-checkout, ambiguous-owner and shared-question tests. Phase 4s removes the Units Worktree column; do not repeat that work here.
 - Phase 3h review (2026-11-01): regression: `add_unit --resume --check` with a dead pending opening reports it and writes nothing; the test checks the pending file bytes unchanged. Keep the planned change of `recovery: UnitConfig | NoRetiredSession` to guaranteed retirement facts and `NoRecoveryRequired`.
 - Phase 3h review (2026-11-01): `proposals_folder.py:32` returns `ProposalsFolder(path) | ProposalsUnconfigured`, not `Path | None`.
 - Phase 4i review (2026-11-02): the `issues_folder` (`proposals_folder.py:41`) and `ledger` (`:32`) result change and every caller switch in one commit, with no `Path | None` adapter. Callers at 2f49beff4: `update_registration.py:32`, `tidy_wrapped.py:52,89`, `footer_counts`, `proposals_table`, `next_item`, `change_review`, `review_links/change_browser.py`, `review_links/change_page.py` and `rename_unit.py:1081`. `rename_unit.py` is herdr-unit's file: before dispatch, send the overlap to the showrunner and record its answer.
@@ -839,7 +827,7 @@ Source: herdr-unit plan Phase 4a, given to devtools-unit by sdlc 2026-11-02. Sta
 
 **State:** timer folders and the progress state move to staff-id keys, once.
 
-**Constraints from prior phases:** Phase 3x migration pattern; Phase 3t reads the doc from the showrunner row. Fast-track `3ac207239`: a worker may work in its own worktree; the staff row keeps only the unit's home worktree, and the worker's location stays in its run record. Derive active-run worktrees from run records, not from staff, and add a test that keeps an external worker's location and thread through the migration.
+**Constraints from prior phases:** Phase 3x migration pattern; Phase 3t reads the doc from the showrunner row. Fast-track `3ac207239`: a worker may work in its own worktree; the staff row keeps only the unit's home worktree, and the worker's location stays in its run record. Derive active-run worktrees from run records, not from staff, and add a test that keeps an external worker's location and thread through the migration. Phase 4p: `update_registration.question_folder` resolves a relative path from the staff owner's document; unreadable ownership is not confirmed absence; keep the linked-checkout, ambiguous-owner and shared-question tests.
 - Phase 3h review (2026-11-01): item 1 also covers the active run record and its worktree and branch consumers: the run points at the unit's fixed id, the worktree comes from the row and the branch from git; finished runs keep their paths as history. Run-folder paths stay the same across `/clear`. Keep the native-session and socket resolution that shipped.
 
 **Acceptance gate:** for each of the two stores, its own landing and real proof (Phase 3x rule); every running showrunner's timer fires once after the migration and the dailies and status line show it; a migration stopped after the first timer folder finishes on rerun; full gate green.
