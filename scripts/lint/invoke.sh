@@ -645,7 +645,16 @@ fmt_cargo() {
         lint_config_skip_notice fmt "cargo +nightly fmt $*"
         return 0
     fi
-    if ! cargo +nightly fmt --version >/dev/null 2>&1; then
+    local version_file="${VERIFY_LINT_RUSTFMT_VERSION_FILE:-}"
+    if [[ -n "$version_file" ]]; then
+        if [[ ! -f "$version_file" ]]; then
+            cargo +nightly fmt --version > "$version_file" 2>/dev/null || : > "$version_file"
+        fi
+        if [[ ! -s "$version_file" ]]; then
+            echo "cargo +nightly fmt is required" >&2
+            exit 2
+        fi
+    elif ! cargo +nightly fmt --version >/dev/null 2>&1; then
         echo "cargo +nightly fmt is required" >&2
         exit 2
     fi

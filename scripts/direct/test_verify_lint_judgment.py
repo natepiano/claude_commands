@@ -27,7 +27,7 @@ import sys
 
 arguments = sys.argv[1:]
 events = Path(os.environ["TEST_CARGO_EVENTS"])
-if arguments[:1] == ["clippy"] and "--fix" not in arguments:
+if arguments[:1] == ["clippy"] and "--fix" not in arguments and "--version" not in arguments:
     calls = [json.loads(line)["args"] for line in events.read_text().splitlines()] if events.exists() else []
     judgments = [args for args in calls if args[:1] == ["clippy"] and "--fix" not in args]
     if not judgments and "TEST_CLIPPY_FIRST_STATUS" in os.environ:

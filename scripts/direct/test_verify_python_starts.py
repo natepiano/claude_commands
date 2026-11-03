@@ -112,6 +112,10 @@ class PairedTreeKeyTests(TreeWatchFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        for name in ("cargo", "taplo"):
+            tool = self.root / "tools" / name
+            _ = tool.write_text("#!/bin/sh\nprintf '%s fixture\\n' \"$*\"\n")
+            tool.chmod(0o755)
         session = self.root / "session"
         session.mkdir(exist_ok=True)
         _ = (session / "lint.conf").write_text("# key input\n")

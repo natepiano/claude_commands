@@ -34,13 +34,13 @@ from pathlib import Path
 
 args = sys.argv[1:]
 root = Path(os.environ["TEST_CONTROL"])
+if "--version" in args:
+    print("cargo fixture 1.0")
+    raise SystemExit(0)
 with (root / "events.jsonl").open("a") as events:
     events.write(json.dumps(args) + "\n")
 if args[:1] == ["metadata"]:
     print(os.environ["TEST_METADATA"])
-    raise SystemExit(0)
-if "--version" in args:
-    print("cargo fixture 1.0")
     raise SystemExit(0)
 stage = ""
 if args[:2] == ["nextest", "run"]:
@@ -127,7 +127,7 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         (stubs / "git").unlink()
         (stubs / "git").symlink_to(git)
         self.write_tool(stubs / "cargo", CARGO)
-        self.write_shell_tool(stubs / "taplo", "exit 0\n")
+        self.write_shell_tool(stubs / "taplo", 'if [ "$1" = --version ]; then printf "taplo fixture 1.0\\n"; fi\n')
         self.write_shell_tool(stubs / "rustc", "printf 'rustc fixture\\n'\n")
         write_guard(stubs / "assertion-guard")
         # Keep real heartbeat/board sleeps; only controlled memory transitions

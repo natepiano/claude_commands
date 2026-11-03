@@ -30,6 +30,8 @@ class VerifyLintScopeTests(VerifyLintJudgmentFixture):
                 self.assertEqual(self.calls("doc"), [])
                 self.assertEqual([args for args in self.calls("+nightly") if "--version" not in args],
                                  [["fmt", "-p", "sample"]] * 4)
+                self.assertEqual([args for args in self.calls("+nightly") if "--version" in args],
+                                 [["fmt", "--version"]])
 
 
 if __name__ == "__main__":
