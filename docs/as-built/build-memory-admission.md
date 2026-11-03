@@ -196,6 +196,15 @@ A first checker failure or explicit refusal stops at once. A launch deadline app
 A zero launch limit refuses its first hold and accepts an immediate grant.
 The leave hook runs during held waits and returns `LeftQueue` when another machine can start the step.
 
+`mesh_runs.py start` checks for a live twin before it applies `config/mesh_runs.conf` `LIVE_RUN_LIMIT` to the worker.
+Orphan reaping uses the same runs-folder lock as start, including the `reap` verb and launcher reaping.
+The reaper cannot finish a record while start publishes its supervisor PID.
+Only running records with their matching supervisor hold a place.
+An exclusive `<runs>/.start.lock` covers the checks, record creation, supervisor creation, and PID publication.
+At the limit, exit 4 starts nothing and names each live run and label on stderr.
+Wait for a run's result as the next message, or put more files in one run.
+Exit 3 still means the caller is not a mesh worker; only that exit permits attached execution.
+
 `queue_place` uses the client in process. Its public call retains `before_check`.
 The hook runs before each attempt and after a grant. An exception after a grant returns the reservation before program startup.
 `popen` starts the program in its own scope, nested when the holder already runs in `builds.slice`.

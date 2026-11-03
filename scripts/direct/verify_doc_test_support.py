@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from scripts.build_queue.admission_test_support import caller_admission
+from scripts.lib.py_floor_test_support import cache_file_name
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
@@ -182,7 +183,7 @@ class VerifyDocFixture(unittest.TestCase):
         })
         # These are doc-policy tests, not interpreter-discovery tests. Exercise
         # the real shim's cache hit instead of revalidating Python every call.
-        cache = self.root / "cache/claude/python3-3.11"
+        cache = self.root / "cache/claude" / cache_file_name()
         cache.parent.mkdir()
         _ = cache.write_text(sys.executable + "\n", encoding="utf-8")
         _ = self.environment.pop("CLAUDE_PYTHON", None)

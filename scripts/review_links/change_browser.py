@@ -71,11 +71,10 @@ def row_token(browser: ReviewBrowser, key: str) -> str:
     return hmac.new(browser.token.encode(), key.encode(), hashlib.sha256).hexdigest()
 
 
-
 def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> PreparedReviews:
     delivery = status.read_view()
     snapshots = {path: change_review.review_snapshot(path)
-                 for path in sorted(change_review.LISTS.glob(change_review.PREFIX + "*.md"))}
+                 for path in sorted(change_review.lists_directory().glob(change_review.PREFIX + "*.md"))}
     routing = change_page.list_routing(snapshots)
     grouped: dict[str, list[WaitingChange]] = {path.stem.removeprefix(change_review.PREFIX): [] for path in snapshots}
     grouped.update({runner.name: [] for runner in routing.runners.values()})
@@ -183,7 +182,7 @@ def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus
         # A repeated save uses its original signed token.
         source, separator, row_id = key.partition("/")
         paths = {path.stem.removeprefix(change_review.PREFIX): path
-                 for path in change_review.LISTS.glob(change_review.PREFIX + "*.md")}
+                 for path in change_review.lists_directory().glob(change_review.PREFIX + "*.md")}
         if not separator or source not in paths or re.fullmatch(r"C\d+", row_id) is None:
             raise change_page.AnswerRefused("this change is not on the page")
         empty: dict[str, str] = {}

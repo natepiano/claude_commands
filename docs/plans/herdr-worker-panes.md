@@ -885,38 +885,22 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 
 **Depends on:** 3s. Lands alone.
 
-#### Work Order
+#### As-built
 
-**Goal:** the readers in `scripts/direct/`, `scripts/usage/`, `scripts/hierarchies/`, `scripts/message/`, `scripts/nightly_review/` and `scripts/statusline/` find a unit or showrunner from the row (by native runtime id or by folder), never from a worktree path, branch, plan header, doc field, Units cell or pane mark. This absorbs old Phases 3i and 17.
-
-**Spec:**
-1. **Readers.** `grep -rlE 'unit_table|units_table|## Units|production_units|unit_is_retired|SHOWRUNNER_UNIT|PRODUCTION_MARK|UNIT_MARK\b|Showrunner session|former_slugs|Parent production' scripts/direct scripts/usage scripts/hierarchies scripts/message scripts/nightly_review scripts/statusline`, non-test files. At ac680222: `assertion_guard.py`, `board_json.py`, `phase_table.py`, `outcomes.py`, `usage_report.py`, `waste_watch.py`, `measure.py`, `push_audit.py`, `escalate.py`, `rca.py`, `roster.py`, `unit_labels.py`, `nightly_review.py`, `statusline.sh`.
-2. A caller that knows its folder uses `session_staff.member_by_folder`; a pane uses its Claude session id or Codex thread id. Current owner reads the row; history keeps what the artifact recorded.
-3. **Status line.** The status line already reads the unit's parent from the staff row in its `jq` join (Phase 3h), and it matches a timer to its showrunner by the timer's session target, a native id. It stays as it is. It gets no `STAFF_READ_SECONDS` time limit: on both machines the staff read is a local file, and a `conf.py` read costs 0.058 s per render against a 0.0165 s line (unit director, 2026-11-02). The counts cache key moves to the staff id with the other showrunner stores.
-4. `nightly_review.py:258-264` finds the nightly unit as the active unit whose `.unit.toml` lists `nightly-review` (Phase 3q fills it).
-5. Text in the files this phase changes says "session labels", not "unit marks" (`test_roster.py:2247`).
-6. A timer is read only through `showrunners.timer_for` (decision 16); the fixtures keep a slug that differs from its row name.
+- The readers in `scripts/direct/`, `scripts/usage/`, `scripts/hierarchies/`, `scripts/message/` and `scripts/nightly_review/` take unit and showrunner ownership from the staff row: one `session_staff.RowResolver` per command run, `member_by_folder` for a caller that knows its folder, the native session or thread id for a pane. A run's recorded production and unit stay as history.
+- `showrunners.read_sources` takes an `on_failure` callback. `showrunners.timer_for` skips one unreadable timer and raises only when no timer is readable, so a bad timer removes only its own row and gives one problem line.
+- `nightly_review.py` selects its unit from config (`NightlyUnit`, `NightlyUnitNotSelected`) and launches `add_unit.py` with `--permanent`, `--standby` or `--plan`. Unknown ownership is an `OSError` refusal line.
+- `workers._run_unit` uses only the run's own evidence. `phase_table.read_production` validates the Merge branch, Showrunner checkout and Log fields. A unit name converts to its id once.
+- The status line is unchanged: it reads the unit's parent from the staff row in its `jq` join and matches a timer to its showrunner by the timer's native session target.
+- The item 1 search (`unit_table|units_table|## Units|production_units|unit_is_retired|SHOWRUNNER_UNIT|PRODUCTION_MARK|UNIT_MARK\b|Showrunner session|former_slugs|Parent production` and the `Production:` header) finds only helpers that read no membership: `unit_table.Refusal`, `unit_table.cell_value`, `unit_table_cells` (`open_step`, `run_events`), and `phase_table`'s `former_slugs` use for retained note ownership.
 
 **Files:**
-- `scripts/direct/{assertion_guard,board_json,phase_table}.py`, `scripts/usage/{outcomes,usage_report,waste_watch}.py`, `scripts/hierarchies/{measure,push_audit}.py`, `scripts/message/{escalate,rca,roster,unit_labels}.py`, `scripts/nightly_review/nightly_review.py`, `scripts/statusline/statusline.sh` — the readers item 1 lists (ac680222); a reader the search finds at dispatch joins them.
-- `scripts/direct/test_{assertion_guard,board_json,phase_table}.py`, `scripts/usage/test_{outcomes,usage_report,waste_watch}.py`, `scripts/hierarchies/test_{measure,push_audit}.py`, `scripts/message/test_{escalate,rca,roster,unit_labels}.py`, `scripts/nightly_review/test_nightly_review.py`, `scripts/statusline/test_statusline.py` — their tests.
-- `scripts/production/session_labels.py` — read only.
-- `scripts/direct/plan_history.py`, `scripts/direct/progress_history.py`, `scripts/direct/test_plan_history.py`, `scripts/direct/test_progress_history.py` — the `Production:` header readers (Phase 3h review).
-- Joined in repair: `scripts/direct/workers.py`, `scripts/production/{dailies_input,showrunners}.py` (a bad timer skips only its own row), and the caller fixtures `scripts/direct/{assertion_guard_test_support,review_launcher_test_support}.py`, `scripts/direct/test_{workers,verify_lint_guard_key}.py`, `scripts/production/test_{dailies_input,showrunners,prune_phase_notes,rename_phase_notes}.py`, `scripts/hooks/test_direct_turn_wait_hooks.py`, `scripts/whoami/test_five_hour.py`.
+- `scripts/message/{roster,unit_labels,escalate,rca}.py`, `scripts/usage/{outcomes,usage_report,waste_watch}.py`, `scripts/hierarchies/{measure,push_audit}.py`, `scripts/direct/{assertion_guard,board_json,phase_table,plan_history,progress_history,workers}.py`, `scripts/production/{showrunners,dailies_input}.py`, `scripts/nightly_review/nightly_review.py` — the row readers.
+- Their tests, and the caller fixtures `scripts/direct/{assertion_guard_test_support,review_launcher_test_support}.py`, `scripts/direct/test_{workers,verify_lint_guard_key}.py`, `scripts/production/test_{dailies_input,showrunners,prune_phase_notes,rename_phase_notes}.py`, `scripts/hooks/test_direct_turn_wait_hooks.py`, `scripts/whoami/test_five_hour.py`.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — the non-test files; hub: none (each reader calls the read-only resolver).
-- `test` — the test files.
+**Gotchas:** a strict staff-row reader needs a private staff row in each fixture in every tree, so run the merge gate early. A candidate unit's own folder row is not evidence of a run's owner. Do not apply the unit id suffix conversion twice.
 
-**State:** none.
-
-**Constraints from prior phases:** Phase 3s resolver. The messaging unit owns `scripts/message/`: agree the `roster.py`, `escalate.py`, `rca.py` and `unit_labels.py` changes with it. Delegation Context → Staff design (2026-10-31), No hard-coded config.
-- Phase 3h review (2026-11-01): the discovery search adds the `Production:` header pattern; `plan_history.py:52` and `progress_history.py:5031` read ownership from the staff row (unit → parent showrunner → doc). The status line's current-session join shipped in 3h; only its other reads remain here.
-- Phase 3s review (2026-11-02): a strict reader breaks fixtures in the whole repository. Grep every staff-row fixture before dispatch, list the affected test files in **Files**, and run the merge gate early. `staff_test_support.py` has one writer at a time.
-- Phase 3s review (2026-11-02): `member_by_folder` is `session_staff.RowResolver.member_by_folder` with the `FolderMember` selector, not a module-level function. Use one snapshot and one resolver per command run.
-- Phase 3s review (2026-11-02): keep incomplete output for `WorktreeUnfilled`, `DocUnfilled`, `LocationUnfilled` and `DocumentUnavailable`, with tests.
-
-**Acceptance gate:** the search in item 1 finds only helpers that read no membership: the `unit_table.Refusal`, `unit_table.cell_value` and `unit_table_cells` (`open_step`, `run_events`) imports, and `phase_table`'s `former_slugs` use for retained note ownership (unit director, 2026-11-02); basedpyright 0/0 on changed files and every caller module; tests for a prefixed folder, a transferred unit and a retired unit's history; the status line is unchanged; a per-directory test run of each tree passes; full gate green. No rerun test: only reads change.
+**Ruled out:** a `STAFF_READ_SECONDS` limit for the status line (the staff read is a local file; a `conf.py` read costs 0.058 s against a 0.0165 s line).
 
 ### Phase 3v — Readers in other units' files read the row  · status: todo
 
@@ -1250,7 +1234,7 @@ Make no unproved write and create no second row.
 
 ### Phase 4b — Owns and `production_tree.py` deleted  · status: todo
 
-**Depends on:** the readers and writers of each deleted thing (3s, 3t, 3u, 3v, 3w); 3h's native-id and location completeness proof. `production_tree.py` deletion alone waits for the handler unit's reader switch (Phase 3n item 6).
+**Depends on:** the readers and writers of each deleted thing (3s, 3t, 3u, 3v, 3w); 6b (the herdr suite passes on the Mac); 3h's native-id and location completeness proof. `production_tree.py` deletion alone waits for the handler unit's reader switch (Phase 3n item 6).
 
 #### Work Order
 
@@ -1716,25 +1700,65 @@ Phases 7 and 10-12 consume this operation instead of adding close logic.
 Each test preserves the director and sibling panes and leaves one retained replacement launch.
 Test failed close and interrupted retirement, then rerun without another launch.
 
-### Phase 6a — A darwin reader behind `startup_processes`  · status: todo
+### Phase 6a — A darwin reader behind `startup_processes`  · status: done
 
-**Owner:** pane track rule: herdr-unit or models-unit, whichever is free first (sdlc, 2026-11-02).
+#### As-built
 
-**Depends on:** Phase 6. Land before Phase 15's Mac probe of Phases 6-7.
-
-#### Work Order
-
-**Goal:** `Herdr.startup_processes` gives the correct result on the Mac. Today it reads `/proc`, which the Mac does not have (shutdown-unit Phase 6 probes).
-
-**Spec:**
-1. Add a darwin reader behind the same function, with the same result type. Linux behavior stays the same.
-2. Read only process facts (pid, parent, command, start time); print no environment values.
-3. Add a test that forces the darwin path.
+- `Herdr.startup_processes` and `_startup_processes` read process facts through one reader from `_startup_process_reader(timeout)`: `_LinuxStartupProcesses` on Linux (`/proc`) and `_DarwinStartupProcesses` on darwin. The result type is the same on both platforms.
+- The darwin reader takes one `ps -axo pid=,ppid=,state=,lstart=` snapshot with `LC_ALL=C TZ=UTC` for start times and children. It reads the command with `ps -o command= -p <pid>` for a pid outside `_darwin_processes` (another user's process) and the foreground group with `ps -o tpgid= -p <pid>`. Every `ps` call takes the caller's timeout.
+- `_StartupProcessGone` marks a zombie or a pid absent from the snapshot; the walk skips it. Any other read error makes the walk unreadable. An agent entry sets `agent_present` even when its pid is gone or missing.
+- The Linux reader walks each thread's `task/<tid>/children` list in numeric thread order and keeps the children read before a later thread list goes missing.
+- The reader reads only pid, parent, state, command and start time; it prints no environment values.
 
 **Files:**
-- `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py`
 
-**Acceptance gate:** the herdr suite on natedev and on the Mac; types for both files.
+- `scripts/herdr/herdr.py` — the two readers, `_StartupProcessGone`, `_darwin_start_time`, `_darwin_processes(complete=, timeout=)`.
+- `scripts/herdr/test_herdr.py` — darwin and Linux reader tests.
+
+**Gotchas:** On darwin, `AgentProcessIdentity.start_ticks` holds UTC epoch seconds from `ps lstart`, not clock ticks, so a pid reused in the same second keeps the same token. `ps lstart` is parsed with `%a %b %d %H:%M:%S %Y` and needs `LC_ALL=C`.
+
+**Ruled out:** a `ps` read for each pid in the walk — two reads race with process exit.
+
+### Phase 6b — The herdr suite passes on the Mac  · status: done
+
+#### As-built
+
+- The herdr suite (`scripts/herdr`) passes on the Mac and on natedev: 381 tests, 0 failures, 0 errors. The source is unchanged; each of the ten Mac reds was a test or fixture that assumed Linux.
+- `native_process_commands(pid)` in `test_herdr.py` is the one fixture for darwin process facts. It answers `ps -o lstart=,tty= -p <pid>` and `lsof -a -p <pid> -Fn` and patches `sessions.process_start` for that one pid. Any other pid raises `AssertionError`.
+- The fresh-identity cleanup test replaces `herdr.os` with a namespace that has only `kill`, so the test takes the signal path without pidfd on every host.
+- `fake_herdr.py` reads the fixture process tree from `HERDR_PROC` on every host, so it sees a fixture agent exit on darwin too.
+- The staff-marks test in `test_herdr_sessions.py` patches `process_start` for its Codex fixture.
+
+**Files:**
+- `scripts/herdr/test_herdr.py` — `native_process_commands`, the darwin-safe cleanup test.
+- `scripts/herdr/test_herdr_sessions.py` — the staff-marks fixture start time.
+- `scripts/herdr/fake_herdr.py` — the fixture process tree on every host.
+
+**Binds later work:** a change to the darwin process identity read changes `native_process_commands` in the same place and keeps its one-pid guard.
+
+**Gotchas:** run the Mac suite from `scripts/herdr` on a copy of `scripts` and `config`, with `PYTHONPATH` at the copy root and `HERDR_BIN=/nonexistent/herdr`. Judge a Mac run only by its `Ran`/`OK`/`FAILED` lines; a relayed exit code can read 0 for a failed run.
+
+**Ruled out:** a regression test for the fixture's own pid guard — it would test a mock it configures.
+
+### Phase 6c — The startup reader keeps one deadline and a strong Mac process generation  · status: done
+
+#### As-built
+
+- `start_command` passes one launch deadline, a `_ProcessReadDeadline`, to `_startup_processes`. Each darwin `ps` call gets only the time that remains, and a read the deadline stops makes the walk unreadable, never gone. Callers outside startup pass a float and keep their per-call timeout; for them `_darwin_processes` skips a pid whose read times out.
+- On darwin, `AgentProcessIdentity.start_ticks: int | ProcessGenerationUnavailable` holds the libproc start time in microseconds, read with `proc_pidinfo(PROC_PIDTBSDINFO)` through `ctypes` into `_DarwinProcessBSDInfo`. A failed read is `ProcessGenerationUnavailable`. Linux keeps its start ticks.
+- Cleanup sends no signal on weak generation evidence: `_require_startup_generations` raises `failed agent generation is unavailable; pane left open`, and the pane stays.
+- A pid that reads a different strong generation leaves the tracked set and must prove its agent command again before it is signalled.
+- `_track_startup_identity` keeps the strong identity when a later read of the same pid is weak, so a reparented agent stays tracked.
+
+**Files:**
+- `scripts/herdr/herdr.py` — the startup reader, the darwin libproc identity and the cleanup guard.
+- `scripts/herdr/test_herdr.py` — deadline, pid-reuse, weak-read, reparent and fallback-timeout tests; `native_process_commands` answers the libproc read for its one pid.
+
+**Binds later work:** a failed start with weak generation evidence keeps its pane, maybe with the agent still running; a rerun reaches it only through `ExistingPane`, which refuses unless the pane reads `PaneAtShell`. Compare darwin identities only by equality.
+
+**Gotchas:** `proc_bsdinfo` is 136 bytes on the Mac: `pbi_pid` at offset 12, `pbi_start_tvsec` at 120, `pbi_start_tvusec` at 128. Only a `_ProcessReadDeadline` caller re-raises a per-pid `TimeoutExpired`. On darwin, `start_ticks` holds microseconds, not ticks.
+
+**Ruled out:** `ps lstart` seconds as the darwin generation — a pid reused in the same second reads the same.
 
 ### Phase 7 — worker_panes.py: start-or-resume, close, observe  · status: todo
 
@@ -1742,7 +1766,7 @@ Test failed close and interrupted retirement, then rerun without another launch.
 
 **Pane track rule (sdlc, 2026-11-02):** each next pane-track phase goes to herdr-unit or models-unit, whichever is free first, by the dependencies. A phase owned by another unit (10 shutdown, 11 accounts) stays with that unit. Each checkpoint notice gives the through-Phase-12 date.
 
-**Depends on:** Phase 1, Phase 3, Phase 3n, Phase 4, Phase 6
+**Depends on:** Phase 1, Phase 3, Phase 3n, Phase 4, Phase 6, Phase 6c
 
 #### Work Order
 
@@ -1848,6 +1872,7 @@ Test failed close and interrupted retirement, then rerun without another launch.
 - Phase 3s review (2026-11-02): a Codex worker's `OpenWorker` matches the Codex conversation id (thread id); a Claude worker's matches the Claude session id. `herdr.native_process` falls back to `CODEX_THREAD_ID` when no rollout is open, and that value can name the launch thread after `/new`. It is not proof of the current thread: give unknown evidence, and add an idle-thread-change test that opens no other backend.
 - Phase 3s review (2026-11-02): publish complete result unions in this phase, `AdmissionRefused` and `UnpublishedWorker` included, in the signatures. Phases 8-13 handle each one with tests: failed publication, unknown process evidence, and no unproved delivery.
 - Phase 3s review (2026-11-02): the pane-location fields send a notice to cargo-liner (an outside `staff.json` reader) with a representative stored-record fixture.
+- Phase 6c (2026-11-03): a failed start whose agent generation cannot be proved raises `failed agent generation is unavailable; pane left open`, sends no signal and keeps the pane, possibly with the agent still running. A rerun of `start-or-resume` that finds that pane by its label goes through `ExistingPane`, which refuses unless the pane reads `PaneAtShell`; report that refusal with its reason and never close the pane. On darwin, `AgentProcessIdentity.start_ticks` holds libproc start microseconds or `ProcessGenerationUnavailable`; compare identities only by equality.
 
 **Acceptance gate:**
 - basedpyright 0/0 on the new files and every caller module.
@@ -2327,7 +2352,25 @@ Config: `config/agents.conf`, `config/README.md:7, 14, 15, 20`, `.gitignore:23-2
 
 ### Probe results (Phase 6 writes them)
 
-none yet.
+Measured 2026-11-02 on natedev, herdr 0.9.5 (protocol 22), in probe workspaces of `agents` and in a private herdr server. The probes did not restart the shared `agents` server and did not replace a live credential. Each probe workspace was closed after use.
+
+| Probe | Result | Who uses it |
+| --- | --- | --- |
+| Which side `--ratio` measures | The original pane: the left side of a `right` split, the top of a `down` split. `pane split --direction right --ratio 0.3` gave the original pane 27 of 91 columns. | Phase 7 split sizes |
+| `split_ratio` on a nested split | It changes the nearest split that holds the pane. The root split kept its ratio 0.3. | Phase 7 |
+| A close rebalances the rest | No. The closed branch collapses into its sibling. The other split ratios stay. | Phase 7, Phase 10 |
+| Label after the agent exits | Kept. After `/exit`, Codex and Claude panes kept their `label_pane` label and their `terminal_id`. | Phase 7 finds a stopped worker's shell by its label |
+| Label after a cross-workspace move | Kept, with the same `terminal_id`. The pane id changes (`w1P:p2` became `w1Q:p1`). | Phase 7 |
+| A message typed mid-turn | Both CLIs processed a second prompt sent right after the first. That the second arrived during an active turn is not proved. herdr's state read `idle` right after the prompt, so state reads can lag a turn. | Decision 4: only a `DONE <dispatch id>` line ends a pass |
+| herdr's Codex state over a 10-minute turn | `working` at the start, `done` at the end: 605 s, `Worked for 10m 5s`. The probe read the start and the end only. | Phase 7 |
+| Prompt by path, and an image named in a prompt file | Both CLIs read `/tmp/.../prompt.txt` and opened the image it named (Claude about 9 s, Codex about 22 s). This is the interactive prompt-file workflow, not a CLI flag. | Phase 7 |
+| The Codex input that names a session | `/rename <name>` typed in the session. `codex --help` shows no `--name`. Claude takes `--name <name>` at start. | Phase 7 |
+| `native_session` for a Codex pane | Fails before the first turn ("Codex launch identity is unavailable"). After the first turn it returns the thread id, from the rollout file Codex opens. | Phase 7 must handle the interval before the first turn |
+| Confirmed pane close | It closes only the target pane. The sibling in the same tab stays with its record. A rerun changes nothing. | Phases 7, 10-12 |
+| `resume_agents_on_restore` keeps each pane's `--env` | **Negative.** With `resume_agents_on_restore = true`, a private server stop and start brought back the shell only: `agent get` gave `agent_not_found`, and the pane-only `--env` marker was absent from the restored shell. | Phase 10: our split-tab restore stays; questions list item 1(e) applies |
+| Interactive Codex picks up a new `auth.json` by itself | Not proved. After a private `auth.json` was replaced with an invalid key, the running Codex still answered. That shows it kept its old credentials, not that it read new ones. | Reference job 8: the sign-in restart stays |
+
+Probe logs: `/tmp/claude/unit/32b26811-c966-489a-8843-ba1bd158abce/mesh_runs/` runs `20261102T111252-3094000-c5b2` (start and prompt probes), `20261102T112920-297660-034d` (confirmed close) and `20261102T120803-3311603-53df` (10-minute turn, restore, `auth.json`). They are kept only while that run folder exists.
 
 ### Risks
 
