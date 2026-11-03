@@ -5899,13 +5899,13 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             quotas=[agent_accounts.Quota("Weekly", 25, old + timedelta(days=1))])], old)
         self.codex_reads.return_value = agent_accounts.Report("Codex", problem="Startup request timed out",
             source=agent_accounts.CodexHomeSource(target),
-            codex_startup=agent_accounts.CodexStartupFailure(target, "/showrunner:accounts setup codex1"))
+            codex_startup=agent_accounts.CodexStartupFailure(target, "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup codex1"))
         code, output, error = self.run_cli("status")
         self.assertEqual((code, error), (0, ""))
         row = next(line for line in output.splitlines() if "| codex1 " in line)
         self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
-        self.assertIn("* codex1: usage unavailable; Codex did not start at ~/.codex1; this shows the reading from 01-02 05:29; run /showrunner:accounts setup codex1 and try again; no usage read has been attempted", output)
-        self.assertIn("/showrunner:accounts setup codex1", row)
+        self.assertIn("* codex1: usage unavailable; Codex did not start at ~/.codex1; this shows the reading from 01-02 05:29; run ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup codex1 and try again; no usage read has been attempted", output)
+        self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup codex1", row)
 
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_after_weekly_reset_explains_a_stale_login_without_reading_it_again(self) -> None:
@@ -6747,18 +6747,18 @@ _ = sys.stdin.read()
     def test_numbered_home_start_failure_row_names_setup(self) -> None:
         _, target = self.workers_fixture()
         self.login_directory("claude2", "main@example.invalid", default=True)
-        problem = 'Codex did not start at ~/.codex1; run /showrunner:accounts setup "codex1" and try again'
-        startup = agent_accounts.CodexStartupFailure(target, '/showrunner:accounts setup "codex1"')
+        problem = 'Codex did not start at ~/.codex1; run ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup "codex1" and try again'
+        startup = agent_accounts.CodexStartupFailure(target, '~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup "codex1"')
         self.codex_reads.return_value = agent_accounts.Report("Codex", problem=problem,
             source=agent_accounts.CodexHomeSource(target), codex_startup=startup)
         rows = self.status_rows()[1:]
         target_row = next(row for row in rows if row[0] == "~/.codex1")
-        self.assertIn('/showrunner:accounts setup "codex1"', " ".join(target_row))
+        self.assertIn('~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup "codex1"', " ".join(target_row))
 
     def test_table_uses_the_startup_result_command_independently_of_problem_text(self) -> None:
         _, target = self.workers_fixture()
         self.login_directory("claude2", "main@example.invalid", default=True)
-        command = '/showrunner:accounts setup "codex1"'
+        command = '~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup "codex1"'
         self.codex_reads.return_value = agent_accounts.Report("Codex", problem="Startup request timed out",
             codex_startup=agent_accounts.CodexStartupFailure(target, command))
         row = next(row for row in self.status_rows() if row[0] == "~/.codex1")

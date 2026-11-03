@@ -169,7 +169,7 @@ def codex_steps(account: NewAccount) -> list[Step]:
     if problems:
         return [Step(False, "\n    ".join(problems))]
     return [Step(True, f"~/.{account.name} is set up and signed in; it is a spare until "
-                 + f"/showrunner:accounts swap workers {account.label}"), alias_step(account)]
+                 + f"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py swap workers {account.label}"), alias_step(account)]
 
 
 def settings_entries(account: NewAccount) -> list[tuple[str, str]]:
