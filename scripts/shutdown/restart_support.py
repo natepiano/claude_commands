@@ -218,7 +218,7 @@ def _deliver_message(
                 return MessageReplaced(kind="replaced", reason=detail)
             case "queued":
                 return MessageQueued(kind="queued", reason=detail)
-            case "failed" | "refused" | "held":
+            case "failed" | "refused" | "held" | "pending":
                 pass
     if isinstance(outcome, send_result.UnconfirmedSendOutcome):
         return MessageUnconfirmed(kind="unconfirmed", reason="send returned no confirmed outcome")
