@@ -341,11 +341,13 @@ class AdmissionFixture(ExitStack):
         stopped = threading.Event()
         failures: list[BaseException] = []
 
+        real_monotonic = time.monotonic
+
         def serve() -> None:
-            previous = time.monotonic()
+            previous = real_monotonic()
             try:
                 while not stopped.is_set():
-                    current = time.monotonic()
+                    current = real_monotonic()
                     self.clock.advance(current - previous)
                     previous = current
                     with self.loop_turn():
@@ -623,10 +625,21 @@ def admitted_reply(reservation: str = "stem", need: int = GIB, source: str = "ne
                          {"reservation_id": reservation, "need": need})
 
 
+_caller_services: dict[str, AdmissionFixture] = {}
+
+
 def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str, str]) -> AdmissionFixture:
     """Use the one server for existing caller fixtures and their child processes."""
+    existing = _caller_services.get(environment.get("ADMISSION_SOCKET", ""))
+    if existing is not None and existing.root == root and not existing.server.closed:
+        return existing
     _ = test.enterContext(LauncherHangGuard(test.id()).protect())
     fixture = test.enterContext(AdmissionFixture(root=root, log_dir=Path(environment["BUILDLOG_DIR"])))
+    _caller_services[str(fixture.socket_path)] = fixture
+    test.addCleanup(_caller_services.pop, str(fixture.socket_path))
+    fixture.enter_context(mock.patch.dict(os.environ, {
+        "BUILDLOG_BUILD_BUDGET_GIB": environment.get("BUILDLOG_BUILD_BUDGET_GIB", "21"),
+    }))
     fixture.clock.epoch = time.time()
     launcher = Path.home() / ".claude/scripts/lib/py"
     launcher.parent.mkdir(parents=True, exist_ok=True)

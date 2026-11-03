@@ -144,7 +144,11 @@ buildlog_memory_refuse() {
     build_check_stop 2 "memory admission check failed ($1)"
 }
 
+buildlog_memory_event() { :; }
+
 buildlog_wait_for_memory() {
+    local -
+    set -o pipefail
     BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=MeminfoUnavailable BUILDLOG_MEM_RESERVATION=""
     if [[ "${OSTYPE:-}" == darwin* && -z "${BUILDLOG_MEMINFO+x}" ]]; then
         BUILDLOG_MEM_OUTCOME=Granted
@@ -161,7 +165,8 @@ buildlog_wait_for_memory() {
     BUILDLOG_MAC_IDLE_HOOK="${BUILDLOG_MAC_IDLE_HOOK:-}" \
     buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" "$action" --pid "$owner" \
         --since "$BUILDLOG_MEM_WAIT_FROM" --sidecar "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" \
-        --shell-state "$grant" -- "$@" >/dev/null || status=$?
+        --shell-state "$grant" --wait-events -- "$@" |
+        while IFS= read -r event; do buildlog_memory_event "$event"; done || status=$?
     source "$grant"
     if (( status == 75 )); then
         BUILDLOG_MEM_OUTCOME=LeftQueue

@@ -473,6 +473,7 @@ class WaitOutput:
     last_reasons: tuple[str, ...] = ()
     last_need: int = 0
     last_position: int = 0
+    on_event: Callable[[str], None] = field(default=lambda _event: None)
 
     def __call__(self, reply: wire.Wait) -> None:
         now = CLOCK.monotonic()
@@ -482,6 +483,7 @@ class WaitOutput:
                    or reply.position != self.last_position)
         if first:
             self.next_notice, self.held = now + gate.read_memory_config().wait_reply_seconds, True
+            self.on_event("first")
         elif now < self.next_notice and not changed:
             return
         elif now >= self.next_notice:
@@ -603,6 +605,7 @@ def main(argv: list[str] | None = None) -> int:
         _ = admission.add_argument("--since", type=float, default=0.0)
         _ = admission.add_argument("--sidecar", default="")
         _ = admission.add_argument("--shell-state", type=Path)
+        _ = admission.add_argument("--wait-events", action="store_true")
         _ = admission.add_argument("argv", nargs=argparse.REMAINDER)
     mine_parser = subcommands.add_parser("mine")
     _ = mine_parser.add_argument("session_id")
@@ -627,9 +630,11 @@ def main(argv: list[str] | None = None) -> int:
         since: float = 0.0
         sidecar: str = ""
         shell_state: Path | None = None
+        wait_events: bool = False
         argv: list[str] = []
     args = parser.parse_args(argv, namespace=Arguments())
-    output = WaitOutput()
+    output = WaitOutput(on_event=(lambda event: print(event, flush=True))
+                        if args.wait_events else lambda _event: None)
     launch_limit = _whole_seconds("BUILDLOG_MEM_WAIT_LIMIT_S", 900)
     deadline = output.started + launch_limit if args.command == "launch" and launch_limit > 0 else float("inf")
     retry_token = _ACQUISITION_RETRY.set(AcquisitionRetry(deadline,
@@ -673,7 +678,8 @@ def main(argv: list[str] | None = None) -> int:
                     raise
             outcome = "Granted"
             output.finished()
-            print(wire.encode_reply(grant), end="")
+            if not args.wait_events:
+                print(wire.encode_reply(grant), end="")
             return 0
         result = (view() if args.command == "view" else explain() if args.command == "explain" else
                   mine(args.session_id) if args.command == "mine" else release(args.reservation, args.value)
@@ -704,6 +710,8 @@ def main(argv: list[str] | None = None) -> int:
         _ = _refused(str(error) or "checker returned an error", checker=args.command in ("admit", "launch"))
         return 2
     finally:
+        if output.held:
+            output.on_event("done")
         _ACQUISITION_RETRY.reset(retry_token)
         if args.command in ("admit", "launch") and args.shell_state is not None:
             try:

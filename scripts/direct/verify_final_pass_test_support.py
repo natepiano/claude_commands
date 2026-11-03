@@ -9,6 +9,7 @@ import sys
 import tempfile
 from typing import ClassVar, override
 
+from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.test_verify_untested_examples import ExampleWorkspaceFixture, VERIFY, workspace_metadata
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -41,6 +42,7 @@ class FinalPassFixture(ExampleWorkspaceFixture):
         self.calls: Path = self.fixture_root / "cargo-calls"
         self.metadata_calls: Path = self.fixture_root / "metadata-calls"
         self.environment: dict[str, str] = self.fixture_environment.copy()
+        _ = caller_admission(self, self.fixture_root, self.environment)
 
     @override
     def tearDown(self) -> None:

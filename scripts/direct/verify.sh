@@ -1045,14 +1045,12 @@ phase_wait_finish_all() {
     done
 }
 
-# The memory gate announces only blocked admission. A granted first check
-# emits no line and therefore creates no zero-length wait.
-buildlog_memory_line() {
+# Record only blocked admission. An immediate grant creates no wait.
+buildlog_memory_event() {
     case "$1" in
         first) phase_wait_start memory "memory admission" ;;
         done|left) phase_wait_finish memory ;;
     esac
-    buildlog_memory_line_inner "$@"
 }
 
 collect_routing_wait() {
@@ -3260,12 +3258,12 @@ case "$CMD" in
         if ! lint_config_enabled doc; then
             echo 'verify.sh: the phase rustdoc check cannot be switched off; ignoring doc=off.'
         fi
-        (
-            cd "$DOC_CHECKOUT/tree"
-            # Keep repository identity at the caller and copy only the judged tree.
-            MAC_SOURCE_ROOT="$DOC_CHECKOUT/tree"
-            LINT_CONFIG_FORCE=1 invoke_doc --workspace "${DOC_FEATURE_FLAGS[@]}"
-        )
+        DOC_CALLER_DIR=$PWD
+        cd "$DOC_CHECKOUT/tree"
+        # Keep the signal handlers and the active step PID in the caller shell.
+        MAC_SOURCE_ROOT="$DOC_CHECKOUT/tree"
+        LINT_CONFIG_FORCE=1 invoke_doc --workspace "${DOC_FEATURE_FLAGS[@]}"
+        cd "$DOC_CALLER_DIR"
         doc_record
         ;;
     example)

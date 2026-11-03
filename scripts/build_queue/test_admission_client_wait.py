@@ -66,6 +66,7 @@ class AdmissionClientWaitTests(unittest.TestCase):
     admission: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
     root: Path = Path()
     grants: list[wire.Admitted] = []
+    grant_charges: list[tuple[tuple[str, int], ...]] = []
     environment: dict[str, str] = {}
 
     @override
@@ -76,6 +77,7 @@ class AdmissionClientWaitTests(unittest.TestCase):
         self.admission.free(60 * gate.GIB)
         _ = (self.root / "pressure").write_text("full avg10=10 total=0\n")
         self.grants = []
+        self.grant_charges = []
         self.environment = {**os.environ,
             "TEST_WAIT_ROOT": str(self.root), "BUILDLOG_MEM_CHECK_RETRY_S": "2",
             "BUILDLOG_MEM_WAIT_SINCE": str(int(time.time()) - 1200),
@@ -95,6 +97,8 @@ class AdmissionClientWaitTests(unittest.TestCase):
                 _ = calls.write_text("".join(json.dumps(row) + "\n" for row in observations))
             if isinstance(reply, wire.Admitted):
                 self.grants.append(reply)
+                self.grant_charges.append(tuple((record.reservation_id, record.need)
+                    for record in self.admission.server.reservations.values()))
             if isinstance(reply, wire.Wait):
                 return replace(reply, reason=gate.EstimateExpired(self.admission.clock.now()))
             return reply
@@ -160,7 +164,11 @@ class AdmissionClientWaitTests(unittest.TestCase):
         self.assertEqual(places[0], places[1])
         self.assertEqual(places[1], places[2])
         self.assertEqual(calls[-1]["rows"], {})
-        self.assertEqual(len(self.grants), 1)
+        # A reconnect can replay a grant while the client refreshes its estimate.
+        self.assertEqual(len({grant.reservation for grant in self.grants}), 1)
+        for grant, charges in zip(self.grants, self.grant_charges, strict=True):
+            self.assertEqual(grant, self.grants[0])
+            self.assertEqual(charges, ((grant.reservation, grant.need),))
 
     def test_continuous_failed_polls_eventually_refuse_with_status_two(self) -> None:
         result = self.run_wait("hold,fail")

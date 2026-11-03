@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from scripts.build_queue.admission_test_support import caller_admission
+from scripts.build_queue import admission_protocol as wire
+
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 import json
@@ -679,6 +682,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
             self.build_fixture()
         self.addCleanup(self.assert_nothing_outlives)
+        _ = caller_admission(self, self.root, self.environment)
 
     def fixture_paths(self) -> None:
         self.home = self.root / "home"
@@ -1132,6 +1136,13 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         finally:
             for descriptor in descriptors:
                 os.close(descriptor)
+
+    def wait_for_memory_wait(self, process: subprocess.Popen[str]) -> None:
+        """Wait for a held reply from this fixture's service."""
+        admission = caller_admission(self, self.root, self.environment)
+        self.wait_until(lambda: any(isinstance(waiting.last_reply, wire.Wait)
+                                   for waiting in admission.server.waiters.values()),
+                        "the admission wait", (process,))
 
     def hold_memory(self) -> Path:
         """Keep natedev's memory gate holding until the returned meminfo is rewritten."""
