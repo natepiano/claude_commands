@@ -1480,7 +1480,8 @@ def main() -> int:
     class Arguments(argparse.Namespace):
         command: str = ""
         service: bool = False
-        state_dir: Path = Path()
+        # argparse skips a default when the namespace already has the attribute.
+        state_dir: Path = default_state_dir
     args = parser.parse_args(namespace=Arguments())
     if args.command == "drain-check":
         return drain_check(args.state_dir, service=args.service,
