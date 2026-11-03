@@ -13,6 +13,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ## Delegation Context
 
 - **Project:** `~/.claude` — the scripts, commands and config that run the user's productions. This plan records test times and makes the slowest test modules faster.
+- **Project started:** 2026-11-03T14:50:07.684+00:00
 - **Stack:** Python 3.13, standard library only (`unittest`, `sqlite3`, `json`); Markdown commands; `.conf` files read through `scripts/lib/conf.py`.
 - **Layout:**
   - `scripts/test_times/` — new, natest-unit owns it: the module runner, the gate record writer, the `test_times` query tool and their tests
@@ -67,7 +68,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 ## Phases
 
-### Phase 1 — The module runner writes each test's time  · status: todo
+### Phase 1 — The module runner writes each test's time  · status: done
 **Depends on:** none
 
 #### Work Order
