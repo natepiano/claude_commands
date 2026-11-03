@@ -72,40 +72,25 @@
 
 **Depends on:** herdr-unit's 4h shrink, which writes this Work Order.
 
-#### Work Order
+#### As-built
 
-Copied from herdr-worker-panes.md Phase 4m at phase start (2026-11-02).
-
-**Goal:** before 4c deletes the Units table, every live and retired unit has its port in its `.unit.toml`, from a recorded source, never from a likely value.
-
-**Spec:**
-1. List each staff unit row with its configuration port and the Port cell from its bound production document.
-2. Read active configuration from the worktree and retired configuration from its parked file; use `cleanup=False` for every audit read.
-3. Read remote configuration on its recorded machine; record the source path and bound-document evidence.
-4. Report `AppPort`, valid `NoAppPort`, `ConfigMissing`, or `unavailable: <cause>`; never treat missing configuration as `NoAppPort`.
-5. List a missing or different port for sdlc; the audit writes nothing and guesses no value.
-6. Add one guarded port repair in `unit_config`, taking the recorded old value and sdlc's settled value.
-7. Require the recorded old value before publication; accept an already settled value as `unchanged`, and refuse any third value.
-8. Use this repair for active and parked configuration; preserve retirement facts, responsibilities, and repository formatting.
-9. Publish through the shared atomic writer; a rerun after interruption finishes once.
-10. After repair, a rerun of the audit prints no gap and exits 0.
+- `scripts/production/audit_unit_ports.py` is a read-only audit. For each staff unit row it prints the configuration port, its source path, and the Port cell from the Units row with that document's path. It reads active configuration from the worktree and retired configuration from the parked file, with `cleanup=False`, and remote configuration on the recorded machine. Each result is `AppPort`, `NoAppPort`, `ConfigMissing` or `unavailable: <cause>`; missing configuration never counts as `NoAppPort`. It prints each gap and a `note:` line, supports `--json`, writes nothing, and exits 0 with gaps (tools report anomalies and never block).
+- `unit_config` holds the one Port cell parser: `N (note)` is port `N`, and `—` or an empty cell is `NoAppPort`. `production_units.lookup_unit` is the one Units row lookup: it reads the parent's document first, then each showrunner's bound document, with one file cache per run. Its results are `UnitRowFound`, `UnitRowMissing` and `UnitSearchIncomplete`, which keeps each unavailable source. The audit, `staff_sources.py fill` and `add_unit` use both; a new unit never takes another production's port.
+- `unit_config.repair_port(target, recorded_old, settled)` is the guarded port repair for `InWorktree` and `Parked` targets. It requires the recorded old value, returns `AlreadyCurrent` for the settled value, refuses any third value and `ConfigMissing`, and publishes through the shared atomic writer under `writer_lock()`. `unit_config.decode` and `unit_config.parked_path(unit, *, home=None)` are public.
+- `staff.set_worktree(..., expected=...)` requires the expected old location and compares the full location inside the staff transaction; the settled value returns unchanged. `staff.py set-worktree` takes `--expected-state` with `--expected-machine` and `--expected-path`, and the remote form carries them. Every caller passes the location it observed.
+- `staff_sources.py fill` refuses a row on any `UnitSearchIncomplete` result or an unavailable parent document, and names each unread document. Session recovery stays only for `UnitRowMissing`. A refusal is a per-row report; later rows continue.
 
 **Files:**
-- `scripts/production/audit_unit_ports.py` — new: the read-only audit command.
-- `scripts/production/unit_config.py` — the guarded port repair.
-- `scripts/production/test_audit_unit_ports.py`, `scripts/production/test_unit_config.py` — tests and fixtures.
-- `scripts/production/staff.py`, `scripts/production/production_doc.py`, `scripts/shutdown/remote.py` — read only.
+- `scripts/production/audit_unit_ports.py` — the audit command.
+- `scripts/production/unit_config.py` — Port cell parser, `repair_port`, `parked_path`, `decode`.
+- `scripts/production/production_units.py` — `lookup_unit` and its result types.
+- `scripts/production/staff.py` — the guarded `set_worktree` and its CLI.
+- `scripts/production/staff_sources.py`, `add_unit.py` — the shared parser and lookup; the incomplete-search refusal.
+- `scripts/production/retire_unit.py`, `unit_move.py`, `production_lifecycle.py`, `rename_unit.py` — pass the observed location to `set_worktree`.
+- Tests: `test_audit_unit_ports.py`, `test_unit_config.py`, `test_production_units.py`, `test_staff.py`, `test_staff_sources.py`, `test_add_unit.py`, and the shared test-support helpers.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — the audit command and guarded repair; hub: `scripts/production/unit_config.py`.
-- `test` — their tests and fixtures.
+**Binds later work:** every `staff.set_worktree` caller passes `expected=`; `staff.py set-worktree` without the expected flags refuses. Port cells parse only through `unit_config`, and Units rows resolve only through `production_units.lookup_unit`. Readers read `~/.local/state/staff/staff.json` directly; a format change bumps its version and tells cargo-liner.
 
-**Acceptance gate:** the audit prints no gap on natedev and the Mac; a rerun changes nothing and exits 0; full gate green.
+**Gotchas:** an incomplete search with one match is not proof of one row. The recovery reader must keep the native timer owner when a document load fails, or the refusal loses the document path. A hand-run `staff.py set-worktree` once wrote a phase worktree into a unit row; the expected-old guard now refuses that form.
 
-**Acceptance gate (port evidence):** test valid `NoAppPort`, missing configuration, bound-document evidence, parked files, and unavailable remote reads.
-Interrupt the guarded repair before and after publication; reruns preserve retirement facts and responsibilities.
-Test unchanged reruns and refusal when the recorded old value differs.
-
-**Note (sdlc, 2026-11-02, user rule):** readers read the staff page `~/.local/state/staff/staff.json` directly, not `staff.py show --json --live`. A change to the staff.json format bumps its version and tells cargo-liner.
-
-**Note for the Work Order (sdlc, 2026-11-02, from herdr's architect review):** `unit_config.write_parked` refuses a changed port. This phase adds one guarded port repair in `unit_config` that takes the old value and the settled value, with interrupt and rerun tests. Phase 4 lands first.
+**Ruled out:** recovering a unit from a live session when the Units search is incomplete; a second Port parser or Units lookup in any caller; an audit that exits 1 on a gap.
