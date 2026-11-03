@@ -57,9 +57,10 @@ The settings.json entry, one more SessionStart item:
   config sets `[session] resume_agents_on_restore = false`. Else herdr resumes each pane itself
   on the server's account, so `_clear_restored_workspaces` clears the layout, as for every other
   session.
-- `agents restart` selects sessions from shutdown records and saved pane launches. It
-  starts or adopts the shared herdr server and restores each selected session in its
-  own tab on its own account. It does not call `pane_restore.restore` for other panes.
+- `shutdown.py restart --all` stops and starts the local live Claude staff rows.
+- `shutdown.py restart` starts the missing rows from the saved row ID list.
+- Staff supplies the current session and worktree. Herdr saves tab order by staff row ID.
+- Restart sends no work prompt and does not restore unrelated panes.
 - A restore takes focus only when that launch created a window
   (`WindowServerCreated`). After focusing that window, it closes untouched startup
   workspaces. Restoring into an existing server leaves focus and startup workspaces alone.

@@ -44,6 +44,7 @@ from typing import NotRequired, Protocol, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone, zone_label  # noqa: E402
+import push_reference
 
 PY = Path.home() / ".claude/scripts/lib/py"
 SILENCE = Path.home() / ".claude/scripts/notify/silence.py"
@@ -68,6 +69,7 @@ class SilenceRecord(TypedDict):
 
 
 class KeptPush(TypedDict):
+    reference: NotRequired[push_reference.PushReference]
     due: NotRequired[str]
     need: NotRequired[str]
     source: str
@@ -154,14 +156,21 @@ def parse_push(text: str) -> KeptPush | None:
         return None
     record = cast(dict[str, object], value)
     # A line kept before pushes had a key or a text id reads as key "" and text id "" (free text).
-    found = {name: record.get(name) for name in KeptPush.__annotations__ if name not in {"due", "need"}} | {
+    found = {name: record.get(name) for name in KeptPush.__annotations__ if name not in {"due", "need", "reference"}} | {
         "key": record.get("key", ""), "text_id": record.get("text_id", "")}
     for name in ("due", "need"):
         if name in record:
             found[name] = record[name]
     if not all(isinstance(item, str) for item in found.values()):
         return None
-    return cast(KeptPush, cast(object, found))
+    try:
+        reference = push_reference.read_reference(record.get("reference"))
+    except ValueError:
+        return None
+    result = cast(KeptPush, cast(object, found))
+    if "reference" in record:
+        result["reference"] = reference
+    return result
 
 
 def shown(moment: datetime) -> str:
@@ -327,14 +336,13 @@ def claim(when: Callable[[SilenceRecord], bool] | None = None, *,
 
 def release(record: SilenceRecord | None, kept: list[KeptPush], runner: Run, deliver: Deliver, opening: str) -> int:
     _ = stop_timer(record["timer"] if record else None, runner)
-    failed = attempted = 0
+    failed = delivered = dropped = 0
     with locked():
         pending = read_kept()
         for push in kept:
             # Another release may already have posted this push since claim read it.
             if push not in pending:
                 continue
-            attempted += 1
             try:
                 code = deliver(push)
             except Exception:
@@ -344,6 +352,10 @@ def release(record: SilenceRecord | None, kept: list[KeptPush], runner: Run, del
             if code != 0:
                 failed += 1
                 continue
+            if isinstance(code, push_reference.KeptPushDropped):
+                dropped += 1
+            else:
+                delivered += 1
             pending.remove(push)
             temporary = kept_file().with_suffix(".tmp")
             _ = temporary.write_text("".join(json.dumps(left) + "\n" for left in pending), encoding="utf-8")
@@ -356,9 +368,10 @@ def release(record: SilenceRecord | None, kept: list[KeptPush], runner: Run, del
             except OSError as error:
                 print(f"silence: release event append failed: {error}", file=sys.stderr)
                 failed += 1
-    plural = "" if attempted == 1 else "es"
+    plural = "" if delivered == 1 else "es"
     note = f"; {failed} failed, see ~/.local/state/notify/pushover.jsonl" if failed else ""
-    print(f"{opening}; {attempted} kept push{plural} delivered{note}", file=sys.stdout if opening == "silence off" else sys.stderr)
+    dropped_note = f"; {dropped} dropped" if dropped else ""
+    print(f"{opening}; {delivered} kept push{plural} delivered{dropped_note}{note}", file=sys.stdout if opening == "silence off" else sys.stderr)
     return 1 if failed else 0
 
 
