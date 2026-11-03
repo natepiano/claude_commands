@@ -808,44 +808,35 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 
 ### Phase 3s — The one join answers from the row  · status: done
 
-**Overlap (devtools-unit, via sdlc, 2026-11-02):** devtools 3x waits on 3s. devtools 3t switches every `issues_folder` caller in one commit, `rename_unit.py:1081` included, and sends the overlap at 3t start.
+#### As-built
 
-**Depends on:** 3a (order); 3q, 3r for data. First reader phase on the rename track; lands before 3t/3u/3v.
-
-#### Work Order
-
-**Goal:** `session_staff` gives each member's worktree, branch, `.unit.toml`, production doc, merge branch and active or retired state from the row and git, and the membership readers use it, not the Units table or the timer doc.
-
-**Spec:**
-0. **Module boundary.** `session_staff.py` owns membership joins; `session_labels.py` already owns display labels. No file move or shim is needed. Put the row/config/git resolver beside the membership join and use it from label readers. Keep the single grouping core shared by current membership and `retained_unit_marks`. Current lists omit removed units and children of wrapped showrunners; stop and check retain live, unknown and duplicate pane evidence. Text uses "session labels". Keep mark-reader names until 4e changes them.
-1. **One resolver (Invariants → One identity join).** `session_staff.py` gains, each over one `StaffSnapshot`: `unit_worktree(row) -> PresentWorktree | RemovedWorktree | WorktreeUnfilled`; `unit_branch(row) -> Branch(name) | BranchUnreadable(reason)` from `git -C <path> rev-parse --abbrev-ref HEAD` (on the other machine one ssh call per command run for all its units); `unit_config(row) -> UnitConfig | ConfigMissing`; `production_doc(row) -> ProductionDoc` for a showrunner, and for a unit through its parent; `merge_branch(row) -> Branch | BranchUnreadable` from git at the doc's folder; `unit_state(row) -> ActiveUnit | RetiredUnit` (`RetiredUnit` is `RemovedWorktree`; it uses Phase 3r's `staff.active`); `showrunners.timer_for(row, snapshot) -> Timer | NoTimer`, the one timer join until Phase 4a: the timer whose doc is the row's doc (`by_doc`), never a name or slug match (decision 16); `member_by_folder(machine, path) -> MemberFound | NoSuchMember` through `by_worktree`, for a caller that knows only its folder (a worktree or branch finds its row here, never from a name). No other module runs these git reads.
-2. **Membership readers switch:** `unit_lookup.py`, `live_units.py`, `unit_lookup.live_unit_table` callers in `dailies_input.py` and `roster.py` SessionMarks, and `staff_sources.member` / `live()`: a production's units are the active unit rows under its showrunner row, with the worktree, plan and port from the row and `.unit.toml`. A retired unit is listed only where the reader lists retired units today, from `RetiredUnit`.
-3. **Transitional outcomes.** Unfilled worktree or doc gives `LocationUnfilled(reason)` and one member problem line, never an empty list. A present worktree's branch comes only from git. A removed worktree's branch and configuration come only from its parked `RetiredSession`; missing or malformed parked facts give `RetiredFactsUnavailable(reason)`, never a git read of the removed folder. `production_doc` gives `ProductionDoc | DocumentUnavailable(reason)`; unreadable and remote-unavailable evidence stays distinct from confirmed absence. `unit_config` keeps `ConfigMissing(reason)` for absence and its typed refusal for malformed content. Each reader maps every outcome to its own visible incomplete state. No transitional state is removed before 4d's completeness gate.
-4. Readers that fail to read git or the file show one problem line that names the unit and the cause, never an empty list (as Phase 3g's `StaffUnreadable` rule).
+- `session_staff.RowResolver` holds one `StaffSnapshot` per command run and resolves each row's facts: `unit_worktree(row) -> PresentWorktree | RemovedWorktree | WorktreeUnfilled`, `unit_branch(row) -> Branch | BranchUnreadable | LocationUnfilled | RetiredFactsUnavailable` (git; one ssh call per remote machine for all its units), `unit_config(row) -> UnitConfig | ConfigMissing | NoUnitConfig | LocationUnfilled | RetiredFactsUnavailable`, `production_doc(row) -> ProductionDoc | DocumentUnavailable | LocationUnfilled`, `merge_branch(row) -> Branch | BranchUnreadable`, `unit_state(row) -> ActiveUnit | RetiredUnit | LocationUnfilled` and `member_by_folder(machine, path) -> MemberFound | NoSuchMember` (selector `FolderMember`). No other module runs these git reads.
+- `showrunners.timer_for(row, snapshot) -> Timer | NoTimer` joins a timer to a row by doc (`by_doc`), never by name or slug.
+- The membership readers `unit_lookup`, `live_units`, `production_units`, `staff_sources.member` / `live()`, `dailies_input` and the `roster` SessionMarks read the unit's worktree, plan and port from the row and `.unit.toml`. The Units table keeps only how a unit name is shown (`unit_table.unit_spellings`). Plan paths are absolute, the board's contract.
+- A removed worktree's branch and configuration come only from its parked `RetiredSession`. A row with an unfilled, unreadable or unavailable fact gives one problem line that names the unit and the cause, and the reader goes on; it never gives an empty list. Unreadable and remote-unavailable evidence stays distinct from confirmed absence.
+- `unit_match` takes a reference selector (`StoredReference(id) | LiveSession(id) | ByName`) and a parent selector (`RequiredParent(row) | AnyParent`). `ObservedUnit.staff_id` is `LiveSession(id) | NoSession`. `unit_match` and `staff_check` take the owner by doc first (`by_doc`, then `by_member_reference`). `staff_check` gets typed problems from `unit_metadata`, not captured stderr.
+- `accounts.py` calls `unit_match` with `RequiredParent`; its by-mark fallback stays.
 
 **Files:**
-- `scripts/production/session_staff.py` — the existing membership join and new row/config/git resolver.
-- `scripts/production/session_labels.py` — calls the shared resolver for display labels.
-- `scripts/production/stall_watch.py`, `scripts/message/unit_labels.py`, `scripts/production/unit_status_test_support.py`, `scripts/production/session_pane.py`, `scripts/herdr/test_herdr.py`, `scripts/message/test_unit_labels.py`, `scripts/production/test_stall_watch.py` — the import and the text.
-- `docs/as-built/herdr-adoption.md`, `docs/as-built/session-roster.md`, `docs/as-built/showrunner-automation.md`, `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/build-memory-admission.md` — "session labels".
-- `scripts/production/showrunners.py`, `scripts/production/test_showrunners.py` — `timer_for`.
-- `scripts/production/unit_lookup.py`, `scripts/production/live_units.py`, `scripts/production/production_units.py`, `scripts/production/staff_sources.py`, `scripts/production/dailies_input.py`, `scripts/message/roster.py` — membership from rows.
-- `scripts/production/test_session_labels.py`, `scripts/production/test_unit_lookup.py`, `scripts/production/test_live_units.py`, `scripts/production/test_production_units.py`, `scripts/production/test_staff_sources.py`, `scripts/production/test_dailies_input.py`, `scripts/message/test_roster.py`, `scripts/production/staff_test_support.py` — fixtures and regressions.
+- `scripts/production/session_staff.py` — the one membership join, `RowResolver` and the `unit_match` selectors.
+- `scripts/production/staff.py` — the worktree and doc states (`PresentWorktree`, `RemovedWorktree`, `WorktreeUnfilled`, `DocUnfilled`).
+- `scripts/production/session_labels.py` — display labels through the resolver.
+- `scripts/production/showrunners.py` — `timer_for`.
+- `scripts/production/unit_table.py` — `unit_spellings`, the shown spelling of each unit name.
+- `scripts/production/unit_lookup.py`, `live_units.py`, `production_units.py`, `staff_sources.py`, `dailies_input.py`, `staff_check.py`, `unit_config.py`, `scripts/message/roster.py` — membership from rows.
+- `scripts/production/staff_test_support.py` — fixture rows that record the worktree and doc.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — the non-test files; hub: `scripts/production/session_staff.py` (the one join every later reader calls).
-- `test` — the test files and the shared fixture.
+**Binds later work:**
+- Every reader takes one `RowResolver` per command run, never one per unit, so the remote branch read stays one ssh call per machine.
+- The transitional outcomes (`WorktreeUnfilled`, `DocUnfilled`, `LocationUnfilled`, `RetiredFactsUnavailable`) stay until the completeness gate removes the unfilled variants. Runtime read failures (`BranchUnreadable`, `DocumentUnavailable`) stay after it.
+- The phases that make production tools read the row and `.unit.toml` land one at a time.
+- `staff.json` has an outside reader (cargo-liner). A change to its shape needs a notice to that reader.
 
-**State:** none.
+**Gotchas:**
+- A strict staff reader breaks staff-row fixtures in the whole repository, not only in `scripts/production`. Search every fixture that writes staff rows before dispatch, and run the merge gate early.
+- After this phase, `grep -rnE 'unit_marks|unit marks|marked unit'` finds only `production_tree.py`, `test_production_tree.py` and the mark-reader names.
 
-**Constraints from prior phases:** Phase 3q fields and `unit_config`; Phase 3r keeps them current. Phase 3g `unit_lookup.unit_parent` is the one row-parent resolver; `session_staff.member_sources(dependencies=...)` is the one join. Delegation Context → Staff design (2026-10-31).
-- Phase 3h review (2026-11-01): Phase 3h's last repair resolves a stored launch reference by fixed id, then current session, and keeps `unit_match` for live sessions only; keep that split, and test recording a launch, changing `current_session`, then resolving membership and parent with no name fallback.
-- Phase 3h review (2026-11-01): one signature each: `production_doc(row) -> ProductionDoc | DocumentUnavailable(reason)` (item 3 wins over item 1). A worker's configuration is its holder unit's (worker → unit); a showrunner-held worker gives `NoUnitConfig`. The parked-only branch/configuration and remote-uncertainty gates stay until 4d.
-- Phase 3h review (2026-11-01): no `None` or empty string as a state: `unit_match`'s `staff_id: str = ""` and `parent: StaffRow | None` become a selector (`StoredReference(id) | LiveSession(id) | ByName`) and `RequiredParent(row) | AnyParent`; `ObservedUnit.staff_id` becomes `LiveSession(id) | NoSession`; `unit_parent(sources: MemberSources | None)` takes `MemberSources`.
-
-**Acceptance gate:** `grep -rnE 'unit_marks|unit marks|marked unit' scripts commands docs/as-built docs/direct` finds only `production_tree.py`, `test_production_tree.py` and the mark-reader names that Phase 4e replaces (a rerun of the search after the landing finds the same, so no old module is introduced); the suite of each importer passes; basedpyright 0/0 on changed files and every caller module; the named suites pass; tests for a unit whose Units row disagrees with its row (the row wins), a timer joined by doc with a slug that differs from the row name, a retired unit, a Mac unit (one ssh call for its branches), and an unreadable worktree (a problem line); a real `live_units.py` and roster run on natedev list the same units as before the change; full gate green. No rerun test: these readers write nothing.
-
-**Acceptance gate (transitions):** cover unfilled unit and showrunner locations, parked-only branch/config, missing and malformed parked files, unavailable docs and remote uncertainty. Preserve the real retained-row tests: id and legacy-name marks omit retired membership while keeping live siblings; cleanup still finds live, unknown and duplicate evidence; an active row with an invalid parent refuses.
+**Ruled out:** a problem line only where a reader lists units — the row is the authority, so each reader prints the line.
 
 ### Phase 3t — Production tools read the row and `.unit.toml`  · status: todo
 
