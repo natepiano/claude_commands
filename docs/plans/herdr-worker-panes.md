@@ -1719,7 +1719,7 @@ Test failed close and interrupted retirement, then rerun without another launch.
 
 **Ruled out:** a `ps` read for each pid in the walk — two reads race with process exit.
 
-### Phase 6b — The herdr suite passes on the Mac  · status: todo
+### Phase 6b — The herdr suite passes on the Mac  · status: done
 
 **Owner:** herdr-unit (natedev assignment, 2026-11-03).
 
@@ -1744,7 +1744,7 @@ Test failed close and interrupted retirement, then rerun without another launch.
 
 **Files:**
 - `scripts/herdr/herdr.py`, `scripts/herdr/herdr_sessions.py` — source repairs.
-- `scripts/herdr/test_herdr.py`, `scripts/herdr/test_herdr_sessions.py` — test and fixture repairs.
+- `scripts/herdr/test_herdr.py`, `scripts/herdr/test_herdr_sessions.py`, `scripts/herdr/fake_herdr.py` — test and fixture repairs.
 
 A cause in a file outside these paths is fixed there through berth, and the notice names that file as also touched.
 
