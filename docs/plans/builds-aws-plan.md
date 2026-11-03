@@ -384,130 +384,29 @@ Delivery failures, restarts, and failed ledger writes preserve the event and dup
 ### Phase 9 — Report AWS use, cost and estimated wait saved  · status: done
 **Depends on:** Phase 8
 
-#### Work Order
+#### As-built
 
-**Goal:** Build status and reports show AWS capacity and the cost of its estimated benefit.
-
-**Spec:**
-
-1. Add a local AWS status reader to `build_targets.py`; ordinary status must not call AWS.
-   Show the controller's recorded state, evidence time and month's dollars against the configured cap.
-   Support `stopped`, `starting since HH:MM`, per-repository slot counts, interruption drain and limit refusal.
-   Show allowed, refused, unavailable and disabled spending states, with decision times, invalid settings, reasons, and notice delivery or recovery actions.
-   Show occupied slots per repository, including slots retained pending cleanup.
-   Show confirmed test results separately from retained capacity, including confirmed completion with unconfirmed cleanup.
-   Render completion, confirmed or unconfirmed cleanup, unresolved count and evidence time from the attempt result.
-   Show Phase 8's recovery action for retained capacity; keep numeric selector status internal.
-   Do not interpret `slots=2` as a global target capacity.
-   Preserve read-only status without probes or writes.
-   Test active work, dead owners, `cleanup_pending`, malformed claims, and recovery.
-   Extend `test_aws_status.py` with confirmed results, unconfirmed cleanup, unresolved counts and retained-capacity recovery output.
-   Preserve the user's time zone and existing unreadable-state behavior.
-2. Keep `host=aws-build` on remote steps. Preserve each attempt's target when fallback changes the final call target to natedev.
-   Consume Phase 4's SSH attempt evidence for estimation.
-   Use each attempt's repository identity, original queue timestamp, departure timestamp, slot, and outcome.
-   Preserve confirmed failure, loss and admission refusal as distinct outcomes.
-   Add only absent AWS measurement fields at the record and index boundaries.
-   Preserve old records with absent AWS fields.
-3. Read actual charges through Cost Explorer once per configured accounting day.
-   Record the query cost and reconciliation difference. Do not add the actual charge to the estimate as a second charge.
-   Keep reports local; the controller performs scheduled reads.
-4. For departure after `t` seconds, select that day's natedev steps with the same kind and repository and wait greater than `t`.
-   Estimate saved wait as `median(wait - t)` for those rows.
-   Add the same command's median natedev run time minus the AWS run time. Preserve negative differences.
-   Mark missing comparison data as unavailable; never manufacture a saving.
-5. Add an `### AWS` section with this lead-line shape:
-   `AWS: up <h>, <n> steps, about <h> of queue wait saved for $<d> ($<d> per saved hour, estimated).`
-   Show missing or zero saved-hour ratios without division errors.
-   Compare daily summed natedev queue wait before and after go-live; label the comparison as unmatched for load.
-6. Keep Mac reports restricted to Mac work and existing natedev predicates restricted to natedev work.
-   Reuse Phase 3's Linux sent-tree keys and target-specific evidence classification.
-   Keep `verify-linux` success out of natedev pass evidence.
-   Test mixed-host data, negative estimates, missing comparisons, daily reconciliation and all status states.
-7. Show each active peer's last successful exchange and latest failure.
-   Show never-synchronized and globally paused states.
-   Label AWS report data with its synchronization time.
-   Provide the relevant `buildlog sync` or `buildlog sync resume` action.
-   Preserve the legacy Mac status reader.
-   Test isolated AWS failure, isolated Mac failure, first failure, pause, and recovery through rendered report output.
-
-**Held changes:** Resources replaces eager `memory_admit` imports with `admission_metadata` in `record.py`.
-It also adds the `start` boundary to `queue_priority` for append deduplication.
-Keep both function contracts unchanged; add AWS metadata at the record boundary.
-Neither held branch changes `report.py` or `build_targets.py` source for these AWS sections at the inspected tips.
+- `targets.read_aws_status` builds an `AwsStatusRow` from `controller.json`, slot records, attempt results and `measurement.read_status_measurement`; `build_targets.format_aws_status` renders state, spending decision, month dollars against the cap, occupied and retained slots per repository, cleanup state and recovery action. Status makes no AWS call, probe or write.
+- `measurement.py` reads ledger snapshots, uptime and daily usage without calling `guard` or `estimate`; missing evidence decodes to `MeasurementUnavailable`. `record_go_live` keeps the first permitted running observation in `go-live.json`.
+- `CostLedger.refresh_charges` reads Cost Explorer once per day for whole UTC days with date-only bounds, records the query cost and the reconciliation difference, and never adds the actual charge as a second charge. Each accounting day prices only the overlap of each UTC reconciliation (`period_cost`).
+- `aws_report.estimate_wait_saved` selects the same day's natedev steps of the same kind and repository with wait greater than the departure time, takes `median(wait - t)`, and adds the median natedev run time minus the AWS run time; negative differences stay. Missing comparison data is unavailable.
+- `report.py` renders `### AWS` with `AWS: up <h>, <n> steps, about <h> of queue wait saved for $<d> (...)`, and one `peer_sync_lines` line for each peer (last success, latest failure, never-synchronized, pause, `buildlog sync` / `buildlog sync resume`). The summary reads in one grouped query.
+- `config.offload_enabled(path)` is the one owner of the offload switch. `record.is_local_step` is the one local-step rule; `mac_outcome.natedev_step_predicate` is the target rule and `natedev_host_predicate` the host rule. `verify-linux` success stays out of natedev pass evidence.
 
 **Files:**
 
-- `scripts/aws_target/measurement.py` — new local measurement reader and reconciliation support.
-- `scripts/aws_target/aws_target.py`, `scripts/aws_target/ledger.py` — scheduled charge reads and reconciliation records.
-- `scripts/build_targets/build_targets.py`, `scripts/build_targets/targets.py` — AWS status row and repository slot state types.
-- `scripts/buildlog/record.py`, `scripts/buildlog/index.py`, `scripts/buildlog/report.py` — absent measurement fields and AWS report output.
-- `scripts/buildlog/mac_report.py` — read and preserve target-specific tree-key evidence.
-- `scripts/buildlog/sync.py` — active peer status access and legacy Mac reader compatibility.
-- `scripts/buildlog/store.py` — read the existing persistence contract.
+- `scripts/aws_target/measurement.py` — local measurement reader, go-live record and daily usage.
+- `scripts/aws_target/ledger.py`, `scripts/aws_target/aws_target.py`, `scripts/aws_target/config.py` — charge reads, reconciliation, permission status and the offload owner.
+- `scripts/buildlog/aws_report.py`, `scripts/buildlog/report.py` — wait-saved estimate, AWS section and peer sync lines.
+- `scripts/buildlog/record.py`, `scripts/buildlog/mac_outcome.py`, `scripts/buildlog/mac_report.py` — local-step and natedev rules.
+- `scripts/build_targets/targets.py`, `scripts/build_targets/build_targets.py` — AWS status row.
 - `config/aws_target.conf`, `config/README.md` — reporting and charge-read settings.
-- `scripts/aws_target/test_measurement.py`, `scripts/buildlog/test_aws_report.py`, `scripts/build_targets/test_aws_status.py` — isolated regressions.
-- `scripts/buildlog/test_record.py`, `scripts/buildlog/test_mac_report.py` — Linux tree-key and natedev evidence regression gate.
 
-**Workers:** 1 writer + 1 tester; report and index changes share one metadata owner.
+**Binds later work:** AWS rows in build status and the `### AWS` report section appear only when an AWS `SshTarget` is configured. The controller tick runs `refresh_charges`; no separate charge timer exists. New offload reads use `config.offload_enabled`.
 
-- `impl` — source and config files; hub: `scripts/buildlog/index.py`, `scripts/buildlog/record.py`, `config/aws_target.conf`.
-- `test` — the three new tests and existing evidence regressions; use temporary records, SQLite fixtures, fixed clocks and fake charge replies.
+**Gotchas:** Cost Explorer `DateInterval` takes `YYYY-MM-DD`, and DAILY granularity reports UTC days. A NULL remote duration in an attempt row decodes to unavailable. The cost caps are strict: no admission past either cap.
 
-**State:** Daily charge-read marks, actual-charge records and the go-live timestamp persist beside the ledger.
-Reuse the existing schema and classification contracts. Migrate only absent measurement fields while preserving existing records.
-A retry must not repeat a successful daily charge read or duplicate a reconciliation.
-Read retained slot evidence and peer exchange status without probes or writes.
-
-**Constraints from prior phases:** Phase 8 records controller state, drain reason and slot-release evidence.
-Phase 8 controller state lives in `controller.json` (states off, refused, stopped, starting, running, draining, stopping); read its generation with `aws_target.instance_generation`. `permitted_generation`, not `generation`, is restart protection.
-Phase 8 binds AWS remote claims with `instance_generation`; `mac_test.RELEASE_STATES` names release states; release proofs go to `release-evidence/`.
-Phase 8 `ControlSettings` has no `host` or `connect_timeout_s`; SSH uses `offload.read_connection_settings` and `offload.ssh_options`.
-Replace each `# range: 5e-324..` comment in `config/aws_target.conf` with a readable positive-number form that `conf.py` accepts, and fix the matching `config/README.md` line.
-Phase 6 owns cost totals and `CostLedger.reconcile`. Phase 4 records each SSH attempt independently of the call's final target.
-Read ledger snapshots without calling `guard` or `estimate`, which can create coordination files; decode missing evidence into named unavailable states.
-Published current-day intervals are not complete history. Reuse the existing reconciliation arithmetic.
-Keep `value_origin` internal; guard evidence carries its consequences.
-Phase 4 persists completion, cleanup state, unresolved count and evidence time through `write_result`.
-Confirmed completion can coexist with retained capacity; Phase 8 owns recovery of markers and claims using boot identity.
-Phase 8 records generation-bound interruption loss separately from startup refusal and confirmed completion.
-Phase 3 preserves `verify-linux` sent-tree keys and excludes their success from natedev pass evidence.
-Reuse those guarantees; add only missing measurement fields.
-Read configuration through `conf.py`; tests use `CONF_DIR`, private `build_targets.conf` and numeric limit comments.
-Phase 2 added `steps.target` in schema version 27.
-Phase 4 added the `ssh_attempts` table in schema version 28; `offload.persist_attempt` writes one row per attempt (outcome `no_tests` when no test ran).
-Reuse `record.recorded_target`, configured host mappings, and the existing Mac classification predicates.
-Add only absent AWS measurement fields.
-Preserve legacy records with missing target values and explicit target precedence over host aliases.
-Preserve AWS recorder health for active AWS configuration.
-Phase 2 keeps per-peer exchange status and the legacy Mac status reader.
-Phase 8 owns retained-claim recovery. This phase exposes retained capacity and its recovery action.
-
-**Verification — impl:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/aws_target/measurement.py scripts/aws_target/aws_target.py scripts/aws_target/ledger.py scripts/build_targets/build_targets.py scripts/build_targets/targets.py scripts/buildlog/record.py scripts/buildlog/index.py scripts/buildlog/report.py scripts/buildlog/sync.py`
-
-**Verification — test:** `python3 -m unittest discover -s scripts/aws_target -p 'test_measurement.py'`
-
-**Verification — test:** `python3 -m unittest discover -s scripts/buildlog -p 'test_aws_report.py'`
-
-**Verification — test:** `python3 -m unittest discover -s scripts/build_targets -p 'test_aws_status.py'`
-
-**Verification — test:** `python3 -m unittest discover -s scripts/buildlog -p 'test_record.py'`
-
-**Verification — test:** `python3 -m unittest discover -s scripts/buildlog -p 'test_mac_report.py'`
-
-**Verification — test:** `python3 -m unittest discover -s scripts/direct -p 'test_verify_ssh_targets.py'`
-
-**Verification — test types:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/aws_target/test_measurement.py scripts/buildlog/test_aws_report.py scripts/build_targets/test_aws_status.py scripts/buildlog/test_record.py scripts/buildlog/test_mac_report.py`
-
-**Acceptance gate:** The commands pass. Fixed mixed-host data produces the specified AWS line without changing Mac totals or double-counting charges.
-Status distinguishes active execution from retained slots per repository without probes or writes.
-`test_aws_status.py` renders confirmed results separately from retained capacity with cleanup state, unresolved count, evidence time and recovery action.
-The record and Mac report tests preserve Linux tree keys without treating Linux success as natedev pass evidence.
-Rendered reports show each active peer's success, failure, never-synchronized, paused and recovered states with the relevant action.
-AWS report data carries its synchronization time. Legacy Mac records and explicit target precedence remain correct.
-An excluded Linux target records no Mac decline; `test_excluded_linux_target_does_not_record_a_mac_decline` stays green.
-
-**Also touches:** `scripts/build_targets/build_targets.py`, `scripts/build_targets/targets.py` (owner resources-unit); `scripts/buildlog/` (owner report-unit).
+**Ruled out:** Querying charges by local accounting-day bounds — Cost Explorer reports UTC days.
 
 ### Phase 10 — Print the interruption marker once  · status: todo
 **Depends on:** Phase 9
@@ -519,12 +418,13 @@ An excluded Linux target records no Mac decline; `test_excluded_linux_target_doe
 **Spec:**
 
 1. In `scripts/mac_test/linux_runner.py`, delete the `if print_interruption(values): return 75` call in `execute_slot`.
-   The signal handler and the `finally` in `interruption_signals` already print the marker.
+   The signal handler and the `finally` in `interruption_signals` both print the marker today; a simulated SIGTERM gives two `print_interruption` calls without the `execute_slot` call.
    After the change, an interrupted slot prints `mac_exit` and `mac_cleanup` once, and its remote exit status is the child status, not 75.
 2. Add a regression test that runs an interrupted AWS slot through the real sender path.
    Assert that the sender still reports `InterruptedTargetRun` with the same generation and attempt outcome as before.
    Assert that the remote output holds exactly one `aws_interrupted=` line and the remote exit status is the child status.
-3. Keep the probe path, `print_interruption` and `interruption_signals` unchanged.
+3. Give the run path one marker owner across signal handling and finalization. Preserve the probe contract and the child exit status.
+   Test SIGTERM through the runner and the real sender parser; assert one marker and the existing interruption outcome.
 
 **Files:**
 
@@ -568,6 +468,8 @@ The user chose this change on 2026-11-02 (Phase 8 simplify item 25, answer "a").
    Use the official x86_64 NixOS AMI selected for the region.
    Keep the root volume for NixOS and the store; mount the retained encrypted data volume at `/home`.
    Apply retention on stack deletion and replacement. Never format an existing retained volume during replacement.
+   Apply `cost_explorer_tag_key` and `cost_explorer_tag_value` to every charged resource, retained resources included. Generate these tags from validated configuration.
+   Test tag coverage in the template, and keep the tags during volume reuse.
 2. Require the spend guard before the first resource, not only before the first scaler start.
    Provide `deploy.py prepare` to generate parameters, priced inventory and preflight evidence locally.
    Have the user run guarded deployment from their terminal. Do not run deployment as an agent acceptance command.
@@ -587,6 +489,11 @@ The user chose this change on 2026-11-02 (Phase 8 simplify item 25, answer "a").
    Add a natedev user tick timer that reads its interval from config at use.
    Keep the timer and AWS admission disabled before the user completes go-live inputs.
    Hand the branch and commit to the natedev showrunner. Never push `/etc/nixos` main or rebuild either machine as an agent.
+   Generate valid remote lifecycle settings at first boot and enable their offload switch. Keep execution refused until natedev publishes valid permission for that boot.
+   Test the generated bootstrap configuration without published permission; require idle shutdown within `idle_stop_minutes`.
+   Run `scripts/aws_target/aws_target.py tick` from the natedev service with the private credential-file environment.
+   Read `tick_interval_s` through `conf.py` and new AWS switch checks through `config.offload_enabled`.
+   Reuse `CostLedger.refresh_charges` for UTC-day queries, saved-reply recovery and reconciliation; add no separate charge timer.
 5. Record the NixOS changes in `docs/plans/builds-aws/nixos.patch` for review.
    The patch targets NixOS-relative `flake.nix`, `configuration.nix`, `hosts/aws-build.nix` and `modules/linux/aws-build.nix`.
    Use a separate NixOS checkout to prepare the branch.
@@ -605,6 +512,8 @@ The user chose this change on 2026-11-02 (Phase 8 simplify item 25, answer "a").
    Check warm reuse and budget trimming only in the selected slot.
    Check retained-ownership recovery, including marker reconciliation after restart, without selecting or killing new work.
    Give `tag:build-aws` no initiated connections to natedev or the Mac; permit natedev's user to reach it.
+   In the rollback procedure, stop the instance and confirm its stopped state before disabling offload, disabling the timer, or removing the registry entry.
+   Explain UTC charge periods, accounting-day costs and report-local comparison days.
 7. Build the deployment decisions below into the template, runbook and NixOS patch.
    Keep all settled choices and both caps unchanged.
    Do not present a fake AWS test as proof of a real bootstrap or persistent-request behavior; the runbook's user-run checks prove them at go-live.
@@ -614,6 +523,7 @@ The user chose this change on 2026-11-02 (Phase 8 simplify item 25, answer "a").
    Parse template JSON locally. Keep NixOS evaluation separate from system activation.
    Test disabled configuration with the scheduled sync path.
    Preserve target claims, affinity, warm mirrors, cost evidence, and peer status during restart and redeployment.
+   Test the generated service command with fake AWS replies across repeated ticks, a UTC boundary and saved-reply recovery.
 
 **Held changes:** Neither held branch modifies the new AWS deployment files or the NixOS patch paths.
 Keep the target activation edit to `config/build_targets.conf` separate from earlier routing changes.
@@ -624,6 +534,7 @@ Preserve resources' Mac floor cleanup settings and verify's helper/token changes
 - `scripts/aws_target/deploy.py` — parameter preparation and guarded user deployment support.
 - `scripts/aws_target/test_deploy.py` — fake AWS deployment sequence and resource-contract tests.
 - `scripts/aws_target/config.py` — deployment config validation.
+- `scripts/aws_target/aws_target.py`, `scripts/aws_target/ledger.py`, `scripts/aws_target/remote.py` — existing controller, accounting and remote lifecycle contracts.
 - `config/aws_target.conf`, `config/build_targets.conf`, `config/README.md` — complete values, disabled defaults and activation procedure.
 - `docs/plans/builds-aws/cloudformation.json` — new infrastructure template.
 - `docs/plans/builds-aws/nixos.patch` — reviewable NixOS branch changes.
@@ -631,9 +542,10 @@ Preserve resources' Mac floor cleanup settings and verify's helper/token changes
 - `pyrightconfig.json` — add only the AWS Python execution environment if required.
 
 **Workers:** 2 writers; deployment and NixOS preparation have independent files. The NixOS writer has no Python test lane.
+Both writers use the same controller command and activation sequence.
 
-- `impl` — deployment Python, its tests, CloudFormation, config and `pyrightconfig.json`; hub: `config/aws_target.conf`, `config/build_targets.conf`.
-- `test` opens as impl — NixOS patch, separate NixOS branch and runbook; request config additions from `impl`.
+- `impl` — deployment Python, fake integration tests, CloudFormation, config and `pyrightconfig.json`; hub: `config/aws_target.conf`, `config/build_targets.conf`.
+- `test` opens as impl — NixOS services, patch, separate NixOS branch and runbook; request config additions from `impl`.
 
 **State:** Before go-live, only local generated parameters and a separate NixOS branch exist.
 After the user gate, stack IDs, volume ID, instance ID, guard evidence and activation time persist.
@@ -655,7 +567,11 @@ Startup refusal and remaining leftovers preserve ownership without backoff.
 Phase 6 permits spend only with usable live limits through `conf.py`; committed recovery values never permit spend.
 Phase 8 checks AWS permission before shell evaluation and `shellHook` in both runner entry points.
 Phase 8 reconciles retained markers and claims using boot identity after restart.
-Phase 8 carries generation-bound interruption evidence into the stream parser and durable attempt record.
+Phase 8 keeps interruption generation in remote evidence and sender results. Durable `ssh_attempts` records keep the `lost` outcome without `interruption_generation`.
+`Controller._action` in `aws_target.py` returns at once while `offload=off`, manual stop included; registry activation alone enables exchange but no control or charge read.
+Phase 9: `config.offload_enabled` is the one owner of the offload switch. `CostLedger.refresh_charges` queries whole UTC days and each accounting day prices the overlap of each UTC reconciliation.
+Phase 9: `measurement.record_go_live` keeps the first permitted running observation in `go-live.json`; it is the report's go-live boundary.
+Phase 9: AWS rows in build status and the `### AWS` report section appear only when an AWS `SshTarget` is configured.
 Read configuration through `conf.py`; tests use `CONF_DIR`, private `build_targets.conf` and numeric limit comments.
 
 **Verification — impl:** `python3 -m json.tool docs/plans/builds-aws/cloudformation.json`
@@ -670,7 +586,13 @@ Read configuration through `conf.py`; tests use `CONF_DIR`, private `build_targe
 
 **Acceptance gate:** Local verification passes, the patch matches the prepared NixOS branch, and the runbook contains the complete guarded command sequence.
 The implementation checkpoint requires no AWS resource. Record go-live separately after the user gate.
-The fake scheduled sync path leaves disabled AWS configuration inert.
+With AWS absent from targets, build status shows no AWS target and the report shows no AWS section. With AWS configured and `offload=off`, exchange runs but no controller work or charge query.
+This phase owns activation checks for the existing Phase 9 surfaces:
+- stopped, starting, running and draining states, spending decisions, occupied slots, retained capacity and recovery actions through build:status (`scripts/build_targets/test_aws_status.py`);
+- UTC charge reconciliation, query cost and reconciliation difference through the AWS report (`scripts/aws_target/test_measurement.py`, `scripts/buildlog/test_aws_report.py`);
+- estimated wait saved, cost ratios and unavailable comparisons through build:report (`scripts/buildlog/test_aws_report.py`);
+- each peer's last success, latest failure, never-synchronized state, pause and recovery, with the `buildlog sync` and `buildlog sync resume` actions, through the rendered report.
+Charge records stay implementation evidence; users see their consequences through the report.
 The runbook checks AWS exchange, recorder health, retained-capacity status and rollback after activation.
 The user-run gate checks parity inside the configured shell during cold and cached test, check and staged doc runs.
 The gate confirms warm reuse, selected-slot budget trimming and retained-ownership recovery across restart.
@@ -691,7 +613,7 @@ Restart and redeployment preserve target claims, affinity, warm mirrors, cost ev
 11. Confirm spending-guard readiness through the runbook.
 12. Confirm that tracked scripts and non-secret configuration are installed on the box.
 13. Keep `BUILDLOG_PEER` unset in the normal multi-peer service.
-14. Enable `targets=mac,natedev,aws` and the tick timer.
+14. Configure `kind.aws=ssh`, `platform.aws=linux` and `settings.aws=aws_target.conf`. Add aws to targets while offload stays off, then confirm record exchange. Set `offload=on` on natedev, enable the timer, and confirm fresh remote admission permission.
 15. Confirm AWS exchange through the runbook.
 16. Confirm AWS recorder health through the runbook.
 17. Confirm retained-capacity status through the runbook.
@@ -699,7 +621,7 @@ Restart and redeployment preserve target claims, affinity, warm mirrors, cost ev
 19. Confirm warm reuse and budget trimming in the selected slot.
 20. Confirm retained-ownership recovery after restart through the runbook.
 21. Confirm the rollback procedure through the runbook.
-22. Record the activation time for the report.
+22. Confirm that `go-live.json` records the controller's first permitted running observation. Keep that timestamp across restart and redeployment.
 
 Keep AWS lint disabled. Pass no password or key through a session.
 
