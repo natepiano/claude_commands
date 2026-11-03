@@ -59,10 +59,10 @@ Design Phase 0 is done at `bc636f47`. Its queue replay selected `m7a.4xlarge` Sp
   - `scripts/production/cli_fixture.py` — synchronous CLI tests with isolated process state.
   - `pyrightconfig.json` — Python execution environments.
   - NixOS repository context: `flake.nix`, `configuration.nix`, `modules/linux/buildlog.nix`, `modules/linux/tailscale.nix`, `modules/common/agents.nix`.
-    These paths are relative to the NixOS repository. Phase 10 prepares a separate branch for the natedev showrunner.
+    These paths are relative to the NixOS repository. Phase 11 prepares a separate branch for the natedev showrunner.
 - **Test lanes:** Python uses adjacent `test_*.py` files, rather than Rust `tests/` directories.
   New tests use these same lanes in `scripts/mac_test/`, `scripts/build_targets/`, `scripts/build_hold/`, `scripts/direct/`, `scripts/buildlog/` and `scripts/aws_target/`.
-- **Build:** none for Python and shell. Phase 10 names the NixOS branch checks separately.
+- **Build:** none for Python and shell. Phase 11 names the NixOS branch checks separately.
 - **Test:** use each Work Order's exact `python3 -m unittest discover` commands from the repository root.
 - **Lint:** use each slot's exact basedpyright command. Each slot requires `0 errors, 0 warnings, 0 notes`.
   Shell changes require the listed `bash -n` command. No file-level ignores apply. Avoid `Any`; use `TypedDict` for known-key dictionaries.
@@ -110,7 +110,7 @@ Design Phase 0 is done at `bc636f47`. Its queue replay selected `m7a.4xlarge` Sp
   6. Keep `monthly_limit_usd=400` and `daily_limit_usd=20` in `config/aws_target.conf`, per the user, 2026-11-01.
   7. Derive the AWS Budget amount from `monthly_limit_usd`. Do not duplicate spending limits in code or raise either limit.
   8. Enforce the spending guard before the first AWS resource, including deployment and the first boot.
-  9. Create or start no AWS resource before the final go-live gate in Phase 10, which completes design Phase 3.
+  9. Create or start no AWS resource before the final go-live gate in Phase 11, which completes design Phase 3.
   10. Let the user run console operations, CloudFormation deployment, Tailscale login and AWS credential configuration at their terminal.
   11. Pass no password, AWS key or Tailscale auth key through a session. Do not read credential files into output.
   12. Fake all AWS CLI/API calls in tests. Fake SSH, clocks, process state and machine memory in automated tests.
@@ -140,7 +140,7 @@ Keep these changes independent until the showrunner integrates them. Do not merg
 
 ## Phases
 
-Design Phase 1 maps to Phases 1–2. Design Phase 2 maps to Phases 3–5. Design Phase 3 maps to Phases 6–10.
+Design Phase 1 maps to Phases 1–2. Design Phase 2 maps to Phases 3–5. Design Phase 3 maps to Phases 6–11.
 The divisions separate state, execution, routing, cost accounting, control, reporting and deployment.
 
 ### Phase 1 — Isolate target state and holds  · status: done
@@ -381,7 +381,7 @@ Delivery failures, restarts, and failed ledger writes preserve the event and dup
 
 **Gotchas:** `permitted_generation`, not `generation`, is restart protection. `offload.py` puts its own directory on `sys.path` for callers outside `scripts/mac_test`. The tick timer stays disabled until go-live.
 
-### Phase 9 — Report AWS use, cost and estimated wait saved  · status: todo
+### Phase 9 — Report AWS use, cost and estimated wait saved  · status: done
 **Depends on:** Phase 8
 
 #### Work Order
@@ -509,8 +509,53 @@ An excluded Linux target records no Mac decline; `test_excluded_linux_target_doe
 
 **Also touches:** `scripts/build_targets/build_targets.py`, `scripts/build_targets/targets.py` (owner resources-unit); `scripts/buildlog/` (owner report-unit).
 
-### Phase 10 — Prepare guarded deployment and the NixOS branch  · status: todo
+### Phase 10 — Print the interruption marker once  · status: todo
 **Depends on:** Phase 9
+
+#### Work Order
+
+**Goal:** An interrupted AWS slot prints its interruption marker once and exits with the child status, and the sender result stays the same.
+
+**Spec:**
+
+1. In `scripts/mac_test/linux_runner.py`, delete the `if print_interruption(values): return 75` call in `execute_slot`.
+   The signal handler and the `finally` in `interruption_signals` already print the marker.
+   After the change, an interrupted slot prints `mac_exit` and `mac_cleanup` once, and its remote exit status is the child status, not 75.
+2. Add a regression test that runs an interrupted AWS slot through the real sender path.
+   Assert that the sender still reports `InterruptedTargetRun` with the same generation and attempt outcome as before.
+   Assert that the remote output holds exactly one `aws_interrupted=` line and the remote exit status is the child status.
+3. Keep the probe path, `print_interruption` and `interruption_signals` unchanged.
+
+**Files:**
+
+- `scripts/mac_test/linux_runner.py` — remove the extra marker print in `execute_slot`.
+- `scripts/mac_test/test_linux_runner.py` — remote marker count and exit status.
+- `scripts/direct/test_verify_ssh_targets.py` — the sender's reported result for an interrupted AWS slot.
+
+**Workers:** 1 writer + 1 tester.
+
+- `impl` — `scripts/mac_test/linux_runner.py`.
+- `test` — the two test files; use the existing fixture generation and fake remote output.
+
+**State:** None. No record, schema or config changes.
+
+**Constraints from prior phases:** Phase 8 owns generation-bound interruption evidence; `offload.py` reads `aws_interrupted=` lines at lines 739 and 1246.
+The user chose this change on 2026-11-02 (Phase 8 simplify item 25, answer "a"). Keep it out of other phases.
+
+**Verification — impl:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/mac_test/linux_runner.py`
+
+**Verification — test:** `python3 -m unittest discover -s scripts/mac_test -p 'test_*.py'`
+
+**Verification — test:** `python3 -m unittest discover -s scripts/direct -p 'test_verify_ssh_targets.py'`
+
+**Verification — test types:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/mac_test/test_linux_runner.py scripts/direct/test_verify_ssh_targets.py`
+
+**Acceptance gate:** The commands pass. An interrupted AWS slot prints one marker, exits with the child status, and the sender reports the same `InterruptedTargetRun` result as before.
+
+**Also touches:** `scripts/mac_test/linux_runner.py`, `scripts/mac_test/test_linux_runner.py`, `scripts/direct/test_verify_ssh_targets.py` (owner verify-unit).
+
+### Phase 11 — Prepare guarded deployment and the NixOS branch  · status: todo
+**Depends on:** Phase 10
 
 #### Work Order
 

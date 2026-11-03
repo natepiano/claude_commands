@@ -121,6 +121,30 @@ Stale latest evidence refuses admission.
 `cost_explorer_interval_seconds=86400` schedules reconciliation reads.
 `cost_explorer_read_usd=0.01` reserves each scheduled read's cost.
 
+The controller reads the previous UTC day's actual charges when the daily read is due.
+Cost Explorer receives date-only UTC bounds. The ledger reconciles the reply against those same bounds.
+Accounting days can overlap these UTC periods.
+`cost_explorer_tag_key=BuildTarget` and `cost_explorer_tag_value=aws-build` select the AWS resource charges.
+The resource deployment must apply this tag to every charged resource.
+Reports and target status read local evidence. They make no AWS call and create no coordination file.
+The controller saves each successful reply in `charges/<day>.json` before reconciliation.
+A retry reads the saved reply and does not repeat the successful query.
+The ledger adds only the reconciliation difference through its existing accounting rule.
+The report shows the actual charge and query cost separately.
+The scheduled query cost already belongs to the estimate. Reconciliation does not add it again.
+`go-live.json` records the first permitted running observation for the wait comparison.
+
+`### AWS` reports uptime, steps, estimated queue wait saved, cost, and cost per saved hour.
+Missing comparisons remain unavailable. Run time differences can remain negative.
+The daily wait comparison remains unmatched for load.
+Each active peer report shows its last successful exchange and latest failure.
+The report gives `buildlog sync` and `buildlog sync resume` actions when needed.
+Target status separates confirmed results from slots retained for cleanup.
+Slot counts apply to each repository. They do not describe one global capacity.
+
+Positive numeric settings use the readable lower bound `# range: 0.001..`.
+Zero-permitted settings retain `# range: 0..`. Whole-number settings retain their existing limits.
+
 `fixed_usd_per_month` includes retained storage, root storage, IPv4 and provisioned gp3 performance.
 The corresponding component keys state each monthly estimate.
 The guard uses the greater of the total and the component sum.
