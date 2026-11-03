@@ -29,7 +29,7 @@ if sys.argv[1] == "stop":
 Path(os.environ["FIXTURE_REGISTRY_PATH"]).write_text(os.environ["FIXTURE_REGISTRY_RECORD"])
 if os.environ.get("FIXTURE_REFUSE_PUBLICATION"):
     staff.set_worktree(staff.StaffId(os.environ["CODEX_THREAD_ID"]),
-                       staff.RemovedWorktree("natedev", Path(os.getcwd())))
+                       staff.RemovedWorktree("natedev", Path(os.getcwd())), expected=staff.WorktreeUnfilled())
 print("backgrounded · " + os.environ["FIXTURE_NATIVE_ID"][:8] + " · fresh-impl")
 '''
 
@@ -126,7 +126,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
         self.assertEqual(calls[0]["STAFF_ID"], "")
 
     def test_refused_claude_permission_starts_nothing_and_writes_no_worker_row(self) -> None:
-        _ = staff.set_worktree(self.fixture.unit.id, staff.RemovedWorktree("natedev", self.fixture.work))
+        _ = staff.set_worktree(self.fixture.unit.id, staff.RemovedWorktree("natedev", self.fixture.work), expected=self.fixture.unit.worktree)
         before = self.staff_file.read_bytes()
         result = self.launch()
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)

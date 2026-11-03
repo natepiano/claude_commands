@@ -183,7 +183,7 @@ class BuildBudgetTests(unittest.TestCase):
     def test_positive_environment_budget_wins_without_reading_config(self) -> None:
         _ = write_config_fault(self.config, "[memory]\nbuild_budget_gib=7.25\n")
         with patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": "31.5"}), \
-             patch.object(conf, "number", side_effect=AssertionError("environment wins")):
+             patch.object(conf.ConfigRead, "number", side_effect=AssertionError("environment wins")):
             self.assertEqual(gate.build_budget_bytes(), int(31.5 * GIB))
 
     def test_config_budget_is_read_again_after_each_change(self) -> None:
@@ -4868,7 +4868,7 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
     def test_one_config_read_supplies_policy_margin_budget_and_service_intervals(self) -> None:
         self.write_config(head_seconds="321", test_phase_margin="1.7", build_budget_gib="9.5",
                           running_pass_seconds="3")
-        with patch.object(conf, "values", wraps=conf.values) as reader:
+        with patch.object(conf, "read", wraps=conf.read) as reader:
             config = gate.read_memory_config()
         reader.assert_called_once_with("lint")
         self.assertEqual(config.policy.timing.head_seconds, 321)

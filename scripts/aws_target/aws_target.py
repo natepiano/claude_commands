@@ -132,8 +132,8 @@ class Controller:
         self.target = target
         self.path = directory / 'controller.json'
 
-    def _publish(self, envelope: remote.AdmissionEnvelope, settings: ControlSettings) -> bool:
-        connection = offload.read_connection_settings(self.settings_path)
+    def _publish(self, envelope: remote.AdmissionEnvelope, settings: ControlSettings, configuration: conf.ConfigRead) -> bool:
+        connection = offload.connection_settings(configuration)
         command = shlex.join(['python3', '.claude/scripts/aws_target/remote.py', 'publish',
                               '--directory', settings.remote_state_directory])
         result = subprocess.run(['ssh', *offload.ssh_options(connection), connection.host, command], input=json.dumps(remote.envelope_record(envelope)),
@@ -154,13 +154,13 @@ class Controller:
         write_text_atomic(self.path, json.dumps(state, sort_keys=True))
         return result
 
-    def _queued(self, settings: ControlSettings, now: int) -> int:
+    def _queued(self, settings: ControlSettings, now: int, configuration: conf.ConfigRead) -> int:
         snapshot = queue_snapshot.read_queue_snapshot(self.queue_directory)
         if (not isinstance(snapshot, queue_snapshot.QueueSnapshot)
                 or not 0 <= now - snapshot.written_at <= settings.snapshot_max_age_s
                 or isinstance(snapshot.inputs.host, memory_admit.ReadingUnavailable)):
             return 0
-        values = conf.values(self.settings_path)
+        values = configuration.values()
         return sum(1 for _, row in snapshot.inputs.ordered
                    if offload.linux_kind_permitted(values, str(row.get('step', ''))) and row.get('repo_identity')
                    and row.get('repository_name') and 'token_left_at' not in row
@@ -236,12 +236,13 @@ class Controller:
 
     def _action(self, action: Literal['tick', 'start', 'stop']) -> ControlResult:
         now = int(self.clock())
-        if not offload_enabled(self.settings_path):
+        configuration = conf.read(self.settings_path)
+        if not offload_enabled(configuration):
             return ControlResult('off', 'disabled', now)
         state: dict[str, object] = {}
         with control_lock(self.directory):
             try:
-                settings = read_control_settings(self.settings_path)
+                settings = read_control_settings(configuration)
                 configured = SshTarget(self.target, 'linux', self.settings_path)
                 if not is_aws_target(configured):
                     raise ValueError('target is not an AWS target')
@@ -290,7 +291,7 @@ class Controller:
                 published = False
                 if evidence.state == 'running':
                     try:
-                        published = self.publish(envelope) if self.publish is not None else self._publish(envelope, settings)
+                        published = self.publish(envelope) if self.publish is not None else self._publish(envelope, settings, configuration)
                     except (OSError, ValueError, subprocess.SubprocessError) as error:
                         state['publication_error'] = {'at': int(self.clock()), 'reason': str(error)}
                 state['permission_published'] = published
@@ -313,7 +314,7 @@ class Controller:
                 if evidence.state != 'stopped':
                     return self._save(state, ControlResult('starting' if evidence.state == 'pending' else evidence.state,
                                                            '' if published else 'permission_unpublished', now, evidence.generation))
-                if action == 'tick' and self._queued(settings, now) < settings.start_min_waiting:
+                if action == 'tick' and self._queued(settings, now, configuration) < settings.start_min_waiting:
                     return self._save(state, ControlResult('stopped', 'no_eligible_work', now, evidence.generation))
                 backoff = state.get('capacity_retry_after', 0)
                 if type(backoff) is not int or backoff > now:
@@ -348,7 +349,7 @@ def main() -> int:
     _ = parser.add_argument('--queue-directory', type=Path)
     args = parser.parse_args(namespace=ControlArguments())
     directory = args.directory
-    if directory == Path() and offload_enabled(args.settings):
+    if directory == Path() and offload_enabled(conf.read(args.settings)):
         directory = offload.state_directory('aws')
     controller = Controller(args.settings, directory, args.queue_directory)
     result = {'tick': controller.tick, 'start': controller.start, 'stop': controller.stop}[args.command]()

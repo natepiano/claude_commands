@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import staff, staff_sources, unit_config
+from scripts.production import staff, staff_sources, unit_config, production_units
 from scripts.shutdown import remote
 from scripts.lib import git_exclude
 
@@ -925,6 +925,7 @@ def launch_session(
     """Start Claude in a tab of the shared herdr session, carrying its session labels."""
     import herdr
     from scripts.accounts import accounts
+    from scripts.shutdown.launch_names import LaunchNames
     from scripts.whoami.account import named_account_environment
 
     environment = {unit_lookup.PRODUCTION_MARK: request.production.slug,
@@ -950,8 +951,9 @@ def launch_session(
         session_id = ""
     if autocompact_window:
         arguments.extend(["--autocompact", autocompact_window])
-    session_name = (request.launch_kind.session_name if isinstance(request.launch_kind, UnitRestoreLaunch)
-                    else request.identity.session)
+    saved_name = (request.launch_kind.session_name if isinstance(request.launch_kind, UnitRestoreLaunch)
+                  else request.identity.session)
+    session_name = LaunchNames.read().name(session_id, saved_name)
     profile = request.profile
     flags = profile.flags if isinstance(profile, ProfiledLaunch) else ("--settings", '{"disableAgentView": true}')
     if isinstance(request.launch_kind, UnitRestoreLaunch) and request.launch_kind.probe:
@@ -1322,15 +1324,42 @@ def configuration_for(request: UnitLaunch) -> unit_config.UnitConfig:
         return existing
     plan = (unit_config.PlanFile(request.plan_path) if not isinstance(request.plan, Standby) else
             unit_config.PermanentPlan() if request.plan.permanent else unit_config.StandbyPlan())
-    no_cells: dict[str, str] = {}
-    cells = next((cells for cells in unit_table(request.production.doc.read_text(encoding="utf-8").splitlines())
-                  if cell_value(cells.get("Unit", "")) == request.unit_id), no_cells)
-    port_text = request.port.value if isinstance(request.port, SuppliedCell) else cell_value(cells.get("Port", ""))
-    port: unit_config.AppPort | unit_config.NoAppPort = unit_config.NoAppPort()
-    if port_text and port_text not in ("—", "-", "none"):
-        if not port_text.isdigit() or not 1 <= int(port_text) <= 65535:
-            raise Refusal(f"unit {request.unit_id}: invalid Port cell {port_text!r}")
-        port = unit_config.AppPort(int(port_text))
+    record = staff.initial_snapshot()
+    selected = checked_unit_member(request.production, request.unit_id, record)
+    established = isinstance(selected, staff_sources.MemberFound)
+    parent = production_units.DocumentSource(remote.local_machine(), request.production.doc)
+    documents = tuple(production_units.DocumentSource(row.doc.machine, row.doc.path)
+                      for row in record.find(kind="showrunner") if not isinstance(row.doc, staff.DocUnfilled))
+    cache: dict[production_units.DocumentSource, str | production_units.DocumentUnavailable] = {}
+
+    def load(source: production_units.DocumentSource) -> str | production_units.DocumentUnavailable:
+        if source not in cache:
+            try:
+                if source.machine != remote.local_machine():
+                    raise ValueError("remote production document is unavailable for admission")
+                cache[source] = source.path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError, ValueError) as error:
+                cache[source] = production_units.DocumentUnavailable(str(error))
+        return cache[source]
+
+    found = production_units.lookup_unit(request.unit_id, parent, documents, load, established=established)
+    cells: dict[str, str] = {}
+    if isinstance(found, production_units.UnitRowFound):
+        cells = found.cells
+    elif not isinstance(found, production_units.UnitRowMissing):
+        raise Refusal(found.reason)
+    if isinstance(request.port, SuppliedCell):
+        raw_port = request.port.value
+    elif cells:
+        if "Port" not in cells:
+            raise Refusal(f"unit {request.unit_id}: Units row has no Port column")
+        raw_port = cells["Port"]
+    else:
+        raw_port = ""
+    try:
+        port = unit_config.parse_port_cell(raw_port)
+    except unit_config.ConfigRefused as error:
+        raise Refusal(f"unit {request.unit_id}: {error}") from error
     config = unit_config.UnitConfig(plan, port, request.responsibilities)
     if isinstance(existing, unit_config.UnitConfig):
         comparable = existing
@@ -1449,7 +1478,7 @@ def ensure_staff_unit(production: Production, unit: str, *,
             raise Refusal(f"{unit}: native session conflicts with retained staff identity")
         if isinstance(worktree, staff.WorktreeUnfilled) or worktree == found.row.worktree:
             return found.row
-        return staff.ensure("unit", name=found.row.name, parent=found.row.parent, worktree=worktree)
+        return staff.set_worktree(found.row.id, worktree, expected=found.row.worktree)
     if isinstance(worktree, staff.WorktreeUnfilled):
         raise Refusal(f"unit {unit}: no filled worktree for admission")
     runner = ensure_staff_showrunner(production)

@@ -344,7 +344,7 @@ class AffectedModulesTests(unittest.TestCase):
 
     def test_named_configuration_selects_its_callers_without_a_full_suite(self) -> None:
         self.write("config/limits.conf", "amount=1\n")
-        self.write("scripts/component/reader.py", 'import conf\nVALUE = conf.whole("limits", "amount")\n')
+        self.write("scripts/component/reader.py", 'import conf\nVALUE = conf.read("limits").whole("amount")\n')
         self.add_test("checks/test_limits.py", "import reader\n")
         self.certify()
         self.write("config/limits.conf", "amount=2\n")

@@ -100,7 +100,7 @@ class DailiesInputTests(DailiesInputFixture):
         for label, name in ((ALPHA, "alpha"), (BETA, "beta")) if beta else ((ALPHA, "alpha"),):
             row = unit_membership(fixture_showrunner_name("example", self.doc), label)
             folder = self.root / name
-            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", folder))
+            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", folder), expected=row.worktree)
             assert row.parent is not None
             _ = staff.set_doc(row.parent, staff.LiveDoc("natedev", self.doc))
             write_text_atomic(folder / ".unit.toml", f'plan = "docs/{name}.md"\nresponsibilities = []\n')
@@ -659,7 +659,7 @@ class DailiesInputTests(DailiesInputFixture):
     def test_a_dailies_leaves_a_retired_units_note_for_the_timer_to_prune(self) -> None:
         _ = staff.set_worktree(
             unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).id,
-            staff.RemovedWorktree(local_machine(), self.root / "alpha"))
+            staff.RemovedWorktree(local_machine(), self.root / "alpha"), expected=unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).worktree)
         note = self.root / "vault/old-showrunner/alpha-unit.md"
         note.parent.mkdir(parents=True)
         _ = note.write_text(
@@ -745,7 +745,7 @@ class DailiesInputTests(DailiesInputFixture):
     def test_all_retired_units_report_no_live_units(self) -> None:
         _ = staff.set_worktree(
             unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).id,
-            staff.RemovedWorktree(local_machine(), self.root / "alpha"))
+            staff.RemovedWorktree(local_machine(), self.root / "alpha"), expected=unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).worktree)
         content = self.doc.read_text(encoding="utf-8")
         _ = self.doc.write_text(content.replace("`docs/alpha.md`", "retired after completion", 1),
                                 encoding="utf-8")

@@ -9,6 +9,7 @@ import sys
 import time
 import unittest
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import replace
 from pathlib import Path
 from typing import Literal, cast, final
@@ -17,7 +18,7 @@ from unittest import mock
 from scripts.agents import worker_lifecycle
 from scripts.accounts import accounts
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
-from scripts.lib import relaunch
+from scripts.lib import relaunch, conf
 from scripts.message import sessions
 from scripts.production import staff
 from scripts.production.cli_fixture import invoke_cli
@@ -29,9 +30,98 @@ from scripts.shutdown import pane_record
 import herdr
 
 
+def folder_move_config(stop: float, resume: float, poll: float) -> str:
+    return (f"# range: 5e-324..\nFOLDER_MOVE_STOP_SECONDS={stop}\n"
+            + f"# range: 5e-324..\nFOLDER_MOVE_RESUME_SECONDS={resume}\n"
+            + f"# range: 5e-324..\nFOLDER_MOVE_POLL_SECONDS={poll}\n")
+
+
 UNREADABLE_ARGUMENTS: tuple[dict[str, object], ...] = (
     {}, {"argv": None}, {"argv": "starting"}, {"argv": ["starting", 17]},
 )
+
+
+@final
+class WorkerMoveRuntime:
+    """Private launchers expose worker progress and process death separately."""
+
+    def __init__(self, case: UnitFolderMoveTests, backend: FolderMoveBackend) -> None:
+        from scripts.agents import codex_mesh
+        from scripts.shutdown import inventory
+
+        self.case: UnitFolderMoveTests = case
+        self.backend: FolderMoveBackend = backend
+        self.starts: list[tuple[list[str], Path]] = []
+        self.live: dict[int, bool] = {}
+        self.launch_status: Literal["starting", "running"] = "running"
+        self.vanish_pid: int = 0
+        self.vanished: list[int] = []
+        self.pauses: list[str] = []
+        self.original_popen: Callable[..., subprocess.Popen[str]] = subprocess.Popen
+        self.original_liveness: Callable[[int, str], sessions.LiveSessionProcess | sessions.SessionNotLive
+                                        | sessions.SessionLivenessUnknown] = sessions.process_liveness
+        self.original_arguments: Callable[[int], list[str]] = pane_record.process_arguments
+        self.original_start: Callable[[int], str | None] = sessions.process_start
+        for context in (
+            mock.patch.object(codex_mesh, "command_stop", side_effect=self.pause),
+            mock.patch.object(codex_mesh, "open_unit_worker",
+                              side_effect=AssertionError("A move must reuse the worker thread")),
+            mock.patch.object(inventory, "codex_seats", return_value=[]),
+            mock.patch.object(pane_record, "PROC", case.root / "folder-processes"),
+            mock.patch("pane_record.PROC", case.root / "folder-processes"),
+            mock.patch.object(pane_record, "process_arguments", side_effect=self.arguments),
+            mock.patch("pane_record.process_arguments", side_effect=self.arguments),
+            mock.patch.object(sessions, "process_liveness", side_effect=self.liveness),
+            mock.patch.object(sessions, "process_start", side_effect=self.process_start),
+            mock.patch.object(subprocess, "Popen", side_effect=self.launch),
+        ):
+            _ = case.enterContext(context)
+
+    def publish_process(self, pid: int, arguments: list[str]) -> None:
+        process = self.case.root / "folder-processes" / str(pid)
+        write_bytes_atomic(process / "cmdline", b"\0".join(os.fsencode(word) for word in arguments) + b"\0")
+        write_text_atomic(process / "stat", f"{pid} (fixture) S 1 " + "0 " * 18 + "1\n")
+        write_bytes_atomic(process / "environ", b"")
+        self.live[pid] = True
+
+    def pause(self, arguments: argparse.Namespace) -> int:
+        self.case.assertTrue(cast(bool, arguments.pause))
+        self.pauses.append(cast(str, arguments.session_dir))
+        rows = self.case.read_rows()
+        rows["impl1"]["status"] = "paused"
+        self.case.write_json(self.case.run_dir / "mesh_roster.json", rows)
+        for pid in self.live:
+            self.live[pid] = False
+        return 0
+
+    def launch(self, command: list[str], **options: object) -> subprocess.Popen[str]:
+        if not any(Path(word).name in ("implement.sh", "review.sh") for word in command):
+            return self.original_popen(command, **options)
+        self.starts.append((command.copy(), Path(cast(str | Path, options["cwd"]))))
+        pid = 998050 + len(self.starts)
+        self.publish_process(pid, command)
+        rows = self.case.read_rows()
+        rows["impl1"].update(status=self.launch_status, launcher_pid=pid, launcher_start="fixture-start")
+        self.case.write_json(self.case.run_dir / "mesh_roster.json", rows)
+        return cast(subprocess.Popen[str], mock.Mock(pid=pid))
+
+    def liveness(self, pid: int, started: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive | sessions.SessionLivenessUnknown:
+        if pid in self.live:
+            return sessions.LiveSessionProcess(pid) if self.live[pid] else sessions.SessionNotLive()
+        return self.original_liveness(pid, started)
+
+    def process_start(self, pid: int) -> str | None:
+        if pid in self.live:
+            return "fixture-start" if self.live[pid] else None
+        return self.original_start(pid)
+
+    def arguments(self, pid: int) -> list[str]:
+        if pid == self.vanish_pid:
+            self.vanish_pid = 0
+            self.live[pid] = False
+            self.vanished.append(pid)
+            raise FileNotFoundError(f"/private-proc/{pid}/cmdline")
+        return self.original_arguments(pid)
 
 
 @final
@@ -112,15 +202,48 @@ class UnitFolderMoveTests(FolderMoveFixture):
         self.assertEqual(tuple((pane["pane_id"], pane.get("terminal_id")) for pane in backend.panes()),
                          (("w1:p1", "kept-terminal"), ("w1:p2", "neighbour-terminal")))
 
+    def move_files(self, *extra: Path) -> tuple[Path, ...]:
+        return (self.staff_file, self.records / "agents.json", self.history,
+                self.run_dir / "progress_history_state.json", *extra)
+
+    def read_rows(self) -> dict[str, dict[str, object]]:
+        return cast(dict[str, dict[str, object]], json.loads((self.run_dir / "mesh_roster.json").read_text()))
+
     def assert_finished_rerun(self, backend: FolderMoveBackend) -> None:
-        paths = (self.staff_file, self.records / "agents.json", self.history,
-                 self.run_dir / "progress_history_state.json", staff.folder_move_path(self.owner.id))
+        paths = self.move_files(staff.folder_move_path(self.owner.id))
         before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
         starts, stops = backend.starts.copy(), backend.stops.copy()
         result = self.move_folder()
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "unchanged\n", ""))
         self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
         self.assertEqual((backend.starts, backend.stops), (starts, stops))
+
+    def test_one_folder_move_shares_settings_through_stop_and_resume(self) -> None:
+        backend = self.folder_backend(live=True)
+        configuration = self.root / "move-config"
+        configuration.mkdir()
+        path = configuration / "production.conf"
+        _ = path.write_text(folder_move_config(3, 3, 0.01))
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(configuration), "PRODUCTION_CONFIG": str(path)}),
+              mock.patch.object(conf, "read", wraps=conf.read) as reads):
+            result = self.move_folder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([call.args[0] for call in reads.call_args_list if call.args[0] == path], [path])
+        self.assert_moved(backend)
+        self.assertTrue(backend.starts)
+        self.assertTrue(backend.stops)
+
+    def test_worker_wait_restart_uses_the_same_settings_as_its_first_deadline(self) -> None:
+        path = self.root / "production.conf"
+        _ = path.write_text(folder_move_config(3, 4, 0.01))
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(self.root), "PRODUCTION_CONFIG": str(path)}),
+              mock.patch.object(conf, "read", wraps=conf.read) as reads,
+              mock.patch.object(time, "monotonic", return_value=0.0)):
+            wait = unit_move.FolderMoveWait("FOLDER_MOVE_RESUME_SECONDS", settings=conf.read(Path(os.environ["PRODUCTION_CONFIG"])))
+            _ = path.write_text(folder_move_config(3, 9, 0.01))
+            wait.restart()
+        self.assertEqual(reads.call_count, 1)
+        self.assertEqual(wait.deadline, 4.0)
 
     def test_stopped_move_updates_every_path_without_starting_or_renaming(self) -> None:
         backend = self.folder_backend()
@@ -150,8 +273,7 @@ class UnitFolderMoveTests(FolderMoveFixture):
         self.assertEqual(backend.observed_processes(), [])
 
     def assert_idle_move_refused(self, backend: FolderMoveBackend) -> None:
-        paths = (self.staff_file, self.records / "agents.json", self.history,
-                 self.run_dir / "progress_history_state.json", self.run_dir / "working_dir")
+        paths = self.move_files(self.run_dir / "working_dir")
         before = [path.read_bytes() for path in paths]
         result = self.move_folder()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -190,8 +312,7 @@ class UnitFolderMoveTests(FolderMoveFixture):
         self.assertIs(move.steps["resume"], unit_move.FolderStepState.PENDING)
         self.assertEqual((backend.starts, backend.stops), ([], [self.owner.current_session]))
         self.outside_codex_evidence(backend)
-        paths = (self.staff_file, self.records / "agents.json", self.history,
-                 self.run_dir / "progress_history_state.json", progress)
+        paths = self.move_files(progress)
         before = [path.read_bytes() for path in paths]
         result = self.move_folder()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -261,8 +382,7 @@ class UnitFolderMoveTests(FolderMoveFixture):
                     elif kind == "codex":
                         _ = case.enterContext(mock.patch.object(sessions, "session_liveness",
                             return_value=sessions.SessionLivenessUnknown("Claude registry is unavailable")))
-                    paths = (case.staff_file, case.records / "agents.json", case.history,
-                             case.run_dir / "progress_history_state.json", case.run_dir / "working_dir")
+                    paths = case.move_files(case.run_dir / "working_dir")
                     if pending_resume:
                         paths += (progress,)
                     before = [path.read_bytes() for path in paths]
@@ -543,8 +663,7 @@ class UnitFolderMoveTests(FolderMoveFixture):
                             {"pid": backend.pid, "argv": [kind], "cwd": str(case.old_folder)},
                             {"pid": backend.pid + 1, "cwd": str(case.old_folder), **arguments},
                         ]
-                        paths = (case.staff_file, case.records / "agents.json", case.history,
-                                 case.run_dir / "progress_history_state.json")
+                        paths = case.move_files()
                         before = [path.read_bytes() for path in paths]
                         with mock.patch.object(time, "sleep") as sleep:
                             result = case.move_folder()
@@ -805,13 +924,10 @@ class UnitFolderMoveTests(FolderMoveFixture):
               mock.patch.object(worker_lifecycle, "effective_deadline", return_value=1.0)):
             for configured, expected in ((0.35, 0.35), (0.65, 0.65), (2.0, 1.0)):
                 with self.subTest(configured=configured):
-                    _ = configuration.write_text(
-                        f"# range: 5e-324..\nFOLDER_MOVE_STOP_SECONDS={configured}\n"
-                        + "# range: 5e-324..\nFOLDER_MOVE_RESUME_SECONDS=3\n"
-                        + "# range: 5e-324..\nFOLDER_MOVE_POLL_SECONDS=0.1\n")
+                    _ = configuration.write_text(folder_move_config(configured, 3, 0.1))
                     clock[0] = 0.0
                     with self.assertRaisesRegex(ValueError, "session did not leave"):
-                        unit_move.stop_folder_session(self.owner, launch)
+                        unit_move.stop_folder_session(self.owner, launch, settings=conf.read(Path(os.environ["PRODUCTION_CONFIG"])))
                     self.assertAlmostEqual(clock[0], expected)
         self.assertEqual(signals, [backend.pid] * 3)
         self.assertEqual(backend.starts, [])
@@ -855,29 +971,317 @@ class UnitFolderMoveTests(FolderMoveFixture):
     def test_rerun_finishes_after_each_saved_step(self) -> None:
         self.assert_interrupted_steps(after=True)
 
-    def test_open_phase_refuses_before_any_move_record_or_file_change(self) -> None:
-        backend = self.folder_backend(live=True)
+    def open_move_phase(self) -> None:
+        configuration = self.root / "config"
+        configuration.mkdir()
+        write_text_atomic(configuration / "production.conf", folder_move_config(3, 3, 0.01))
+        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
+            "CONF_DIR": str(configuration), "PRODUCTION_CONFIG": str(configuration / "production.conf"),
+        })))
         with self.history.open("a") as history:
-            _ = history.write(json.dumps({"event_type": "phase_started", "phase_instance_id": "phase-one", "phase_id": "1"}) + "\n")
-        before = self.staff_file.read_bytes(), (self.records / "agents.json").read_bytes()
+            _ = history.write(json.dumps({"event_type": "phase_started",
+                "phase_instance_id": "phase-one", "phase_id": "1"}) + "\n")
+
+    def test_open_phase_running_unit_resumes_in_the_moved_folder(self) -> None:
+        self.open_move_phase()
+        backend = self.folder_backend(live=True)
         result = self.move_folder()
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("phase 1 is open", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_moved(backend)
+        self.assertTrue(backend.live)
+        self.assertEqual(backend.cwd, self.new_folder)
+        self.assertEqual(backend.stops, [self.owner.current_session])
+        (pane, command), = backend.starts
+        self.assertEqual(pane, "w1:p1")
+        self.assertEqual(command[command.index("--resume") + 1], self.owner.current_session)
+        self.assertIn(str(self.new_folder), command)
+        self.assert_finished_rerun(backend)
+
+    def test_open_phase_paused_unit_stays_paused_after_the_move(self) -> None:
+        self.open_move_phase()
+        backend = self.folder_backend()
+        result = self.move_folder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_moved(backend)
+        self.assertEqual((backend.starts, backend.stops, backend.live), ([], [], False))
+        self.assertIs(pane_record.read("agents")["w1:p1"].get("ended"), True)
+
+    def assert_open_phase_worker_move(self, prior: Literal["running", "paused"]) -> None:
+        from scripts.agents import codex_mesh
+
+        self.open_move_phase()
+        backend = self.folder_backend(live=True)
+        thread = fixture_runtime_id("open-phase-worker")
+        roster = self.run_dir / "mesh_roster.json"
+        self.write_json(roster, {"impl1": {
+            "thread_id": thread, "role": "impl", "status": prior,
+            "cwd": str(self.old_folder), "codex_home": str(self.root / "home/.codex2"),
+        }})
+        pauses: list[str] = []
+        starts: list[list[str]] = []
+        launch_process = cast(Callable[..., subprocess.Popen[str]], subprocess.Popen)
+        process_liveness = sessions.process_liveness
+
+        def liveness(pid: int, started: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive | sessions.SessionLivenessUnknown:
+            if pid == 998043:
+                self.assertEqual(started, "fixture-start")
+                return sessions.LiveSessionProcess(pid) if starts else sessions.SessionNotLive()
+            return process_liveness(pid, started)
+
+        def pause(arguments: argparse.Namespace) -> int:
+            self.assertTrue(cast(bool, arguments.pause))
+            self.assertEqual(cast(str, arguments.session_dir), str(self.run_dir))
+            self.assertTrue(self.old_folder.exists())
+            pauses.append(cast(str, arguments.session_dir))
+            rows = self.read_rows()
+            rows["impl1"]["status"] = "paused"
+            self.write_json(roster, rows)
+            return 0
+
+        def launch(command: list[str], **options: object) -> subprocess.Popen[str]:
+            if not any(Path(argument).name in ("implement.sh", "review.sh") for argument in command):
+                return launch_process(command, **options)
+            self.assertFalse(self.old_folder.exists())
+            self.assertTrue(self.new_folder.is_dir())
+            self.assertEqual(command[command.index("--to") + 1], "impl1")
+            self.assertIn(str(self.new_folder), command)
+            rows = self.read_rows()
+            self.assertEqual(rows["impl1"]["thread_id"], thread)
+            self.assertEqual(rows["impl1"]["status"], "paused")
+            starts.append(command.copy())
+            write_bytes_atomic(self.root / "folder-processes/998043/cmdline",
+                               b"\0".join(os.fsencode(word) for word in command) + b"\0")
+            rows["impl1"]["status"] = "running"
+            self.write_json(roster, rows)
+            return cast(subprocess.Popen[str], mock.Mock(pid=998043))
+
+        with (mock.patch.object(codex_mesh, "command_stop", side_effect=pause),
+              mock.patch.object(pane_record, "PROC", self.root / "folder-processes"),
+              mock.patch("pane_record.PROC", self.root / "folder-processes"),
+              mock.patch.object(codex_mesh, "open_unit_worker",
+                                side_effect=AssertionError("A move must reuse the worker thread")),
+              mock.patch.object(sessions, "process_liveness", side_effect=liveness),
+              mock.patch.object(subprocess, "Popen", side_effect=launch)):
+            result = self.move_folder()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assert_moved(backend)
+            self.assertEqual(pauses, [str(self.run_dir)])
+            self.assertEqual(len(starts), 1 if prior == "running" else 0)
+            row = self.read_rows()["impl1"]
+            self.assertEqual((row["thread_id"], row["status"]), (thread, prior))
+            self.assert_finished_rerun(backend)
+            self.assertEqual(pauses, [str(self.run_dir)])
+            self.assertEqual(len(starts), 1 if prior == "running" else 0)
+
+    def test_open_phase_running_worker_resumes_on_its_same_thread(self) -> None:
+        self.assert_open_phase_worker_move("running")
+
+    def test_open_phase_paused_worker_stays_paused(self) -> None:
+        self.assert_open_phase_worker_move("paused")
+
+    def prepare_worker_resume(self, cwd: Path) -> tuple[WorkerMoveRuntime, str]:
+        self.open_move_phase()
+        write_text_atomic(self.root / "config/production.conf", folder_move_config(3, 0.03, 0.001))
+        backend = self.folder_backend(live=True)
+        thread = fixture_runtime_id("recovering-folder-worker")
+        cwd.mkdir(parents=True, exist_ok=True)
+        self.write_json(self.run_dir / "mesh_roster.json", {"impl1": {
+            "thread_id": thread, "role": "impl", "status": "running", "cwd": str(cwd),
+            "codex_home": str(self.root / "home/.codex2"),
+        }})
+        return WorkerMoveRuntime(self, backend), thread
+
+    def test_worker_without_a_saved_launcher_resumes_in_its_own_outside_folder(self) -> None:
+        cwd = self.root / "worker-checkout"
+        runtime, thread = self.prepare_worker_resume(cwd)
+        moved = self.move_folder()
+        self.assertEqual(moved.returncode, 0, moved.stdout + moved.stderr)
+        self.assert_moved(runtime.backend)
+        (command, launch_cwd), = runtime.starts
+        self.assertEqual(launch_cwd, cwd)
+        self.assertIn(str(cwd), command)
+        self.assertEqual(command[command.index("--to") + 1], "impl1")
+        row = self.read_rows()["impl1"]
+        self.assertEqual((row["thread_id"], row["cwd"], row["status"]), (thread, str(cwd), "running"))
+        self.assert_finished_rerun(runtime.backend)
+        self.assertEqual(len(runtime.starts), 1)
+
+    def test_rerun_relaunches_a_worker_whose_starting_launcher_died(self) -> None:
+        runtime, thread = self.prepare_worker_resume(self.old_folder)
+        runtime.launch_status = "starting"
+        failed = self.move_folder()
+        self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+        self.assertEqual(self.read_rows()["impl1"]["status"], "starting")
+        self.assertEqual(len(runtime.starts), 1)
+        runtime.live[998051] = False
+        runtime.launch_status = "running"
+        resumed = self.move_folder()
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertEqual(len(runtime.starts), 2)
+        self.assertEqual((self.read_rows()["impl1"]["thread_id"], self.read_rows()["impl1"]["status"]),
+                         (thread, "running"))
+        self.assert_moved(runtime.backend)
+        self.assert_finished_rerun(runtime.backend)
+        self.assertEqual(len(runtime.starts), 2)
+
+    def test_resumed_worker_that_finishes_before_process_capture_counts_as_restored(self) -> None:
+        runtime, thread = self.prepare_worker_resume(self.old_folder)
+
+        def finish(command: list[str], **options: object) -> subprocess.Popen[str]:
+            process = runtime.launch(command, **options)
+            if process.pid in runtime.live:
+                rows = self.read_rows()
+                rows["impl1"]["status"] = "done"
+                self.write_json(self.run_dir / "mesh_roster.json", rows)
+                runtime.live[process.pid] = False
+            return process
+
+        with mock.patch.object(subprocess, "Popen", side_effect=finish):
+            moved = self.move_folder()
+        self.assertEqual(moved.returncode, 0, moved.stdout + moved.stderr)
+        self.assert_moved(runtime.backend)
+        self.assertEqual((self.read_rows()["impl1"]["thread_id"], self.read_rows()["impl1"]["status"]),
+                         (thread, "done"))
+        move = unit_move.read_folder_move(staff.folder_move_path(self.owner.id))
+        self.assertTrue(move.steps["resume"])
+        self.assertIsInstance(move.sessions, unit_move.FolderSessions)
+        assert isinstance(move.sessions, unit_move.FolderSessions)
+        worker, = move.sessions.workers
+        self.assertTrue(worker.restored)
+        self.assertIsInstance(worker.resume_process, unit_move.UnstartedWorkerResume)
+        self.assert_finished_rerun(runtime.backend)
+        self.assertEqual(len(runtime.starts), 1)
+
+    def test_rerun_relaunches_a_dead_worker_even_when_its_roster_says_running(self) -> None:
+        runtime, thread = self.prepare_worker_resume(self.old_folder)
+        save = unit_move.save_folder_move
+
+        def interrupt(path: Path, move: unit_move.FolderMove) -> None:
+            if (isinstance(move.sessions, unit_move.FolderSessions)
+                    and any(worker.restored for worker in move.sessions.workers)):
+                raise OSError("interrupted before worker restore was saved")
+            save(path, move)
+
+        with mock.patch.object(unit_move, "save_folder_move", side_effect=interrupt):
+            failed = self.move_folder()
+        self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+        self.assertIn("interrupted before worker restore was saved", failed.stderr)
+        self.assertEqual(self.read_rows()["impl1"]["status"], "running")
+        self.assertEqual(len(runtime.starts), 1)
+        runtime.live[998051] = False
+        resumed = self.move_folder()
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertEqual(len(runtime.starts), 2)
+        self.assertEqual(self.read_rows()["impl1"]["thread_id"], thread)
+        self.assert_moved(runtime.backend)
+        self.assert_finished_rerun(runtime.backend)
+        self.assertEqual(len(runtime.starts), 2)
+
+    def test_worker_launcher_with_a_parent_path_component_is_owned_by_the_move(self) -> None:
+        from scripts.agents import codex_mesh
+
+        runtime, thread = self.prepare_worker_resume(self.old_folder)
+        pid = 998045
+        mesh = Path(codex_mesh.__file__).resolve().parents[1] / "direct/../agents/codex_mesh.py"
+        runtime.publish_process(pid, [sys.executable, str(mesh), "send", "--session-dir", str(self.run_dir),
+                                      "--to", "impl1"])
+        rows = self.read_rows()
+        rows["impl1"].update(launcher_pid=pid, launcher_start="fixture-start")
+        self.write_json(self.run_dir / "mesh_roster.json", rows)
+
+        def inside(folder: Path) -> list[int]:
+            return runtime.backend.processes_inside(folder) + ([pid] if runtime.live[pid] else [])
+
+        with mock.patch.object(unit_move, "processes_inside", side_effect=inside):
+            moved = self.move_folder()
+        self.assertEqual(moved.returncode, 0, moved.stdout + moved.stderr)
+        self.assert_moved(runtime.backend)
+        self.assertEqual(runtime.pauses, [str(self.run_dir)])
+        self.assertEqual(len(runtime.starts), 1)
+        self.assertEqual(self.read_rows()["impl1"]["thread_id"], thread)
+
+    def assert_process_exit_during_pause(self) -> None:
+        from scripts.agents import codex_mesh
+
+        pid = 998045
+        self.write_json(self.run_dir / "mesh_roster.json", {})
+        selected = unit_move.read_folder_sessions({"unit": self.owner.current_session, "prior": "paused",
+            "runs": [str(self.run_dir)], "workers": [],
+            "processes": [{"pid": pid, "started": "fixture-start", "arguments": ["worker-launcher"]}]})
+        self.open_move_phase()
+        observations: list[int] = []
+
+        def liveness(candidate: int, started: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
+            self.assertEqual((candidate, started), (pid, "fixture-start"))
+            observations.append(candidate)
+            return sessions.LiveSessionProcess(pid) if len(observations) == 1 else sessions.SessionNotLive()
+
+        with (mock.patch.object(codex_mesh, "command_stop", return_value=0),
+              mock.patch.object(sessions, "process_liveness", side_effect=liveness),
+              mock.patch.object(pane_record, "PROC", self.root / "folder-processes"),
+              mock.patch("pane_record.PROC", self.root / "folder-processes"),
+              mock.patch.object(os, "kill") as kill):
+            unit_move.pause_folder_workers(selected, settings=conf.read(Path(os.environ["PRODUCTION_CONFIG"])))
+        self.assertGreaterEqual(len(observations), 2)
+        kill.assert_not_called()
+
+    def assert_process_exit_during_resume(self) -> None:
+        runtime, thread = self.prepare_worker_resume(self.old_folder)
+        runtime.launch_status = "starting"
+        failed = self.move_folder()
+        self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+        self.assertEqual(len(runtime.starts), 1)
+        rows = self.read_rows()
+        rows["impl1"]["status"] = "paused"
+        self.write_json(self.run_dir / "mesh_roster.json", rows)
+        runtime.live[998051] = True
+        runtime.vanish_pid = 998051
+        runtime.launch_status = "running"
+        resumed = self.move_folder()
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertEqual(runtime.vanished, [998051])
+        self.assertEqual(len(runtime.starts), 2)
+        self.assertEqual(self.read_rows()["impl1"]["thread_id"], thread)
+        self.assert_moved(runtime.backend)
+
+    def test_worker_process_exit_during_argument_read_does_not_stop_pause_or_resume(self) -> None:
+        for stage in ("pause", "resume"):
+            with self.subTest(stage=stage):
+                case = UnitFolderMoveTests()
+                case.setUp()
+                try:
+                    if stage == "pause":
+                        case.assert_process_exit_during_pause()
+                    else:
+                        case.assert_process_exit_during_resume()
+                finally:
+                    case.doCleanups()
+
+    def assert_foreign_process_refused(self, *, open_phase: bool) -> None:
+        if open_phase:
+            self.open_move_phase()
+        backend = self.folder_backend(live=True)
+        paths = self.move_files()
+        before = [path.read_bytes() for path in paths]
+        with mock.patch.object(unit_move, "processes_inside", return_value=[backend.pid, 998042]):
+            result = self.move_folder()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("998042", result.stderr)
+        self.assertEqual([path.read_bytes() for path in paths], before)
         self.assertTrue(self.old_folder.exists())
         self.assertFalse(self.new_folder.exists())
         self.assertFalse(staff.folder_move_path(self.owner.id).exists())
-        self.assertEqual((self.staff_file.read_bytes(), (self.records / "agents.json").read_bytes()), before)
         self.assertEqual((backend.starts, backend.stops), ([], []))
 
-    def test_other_process_in_folder_refuses_without_stopping_the_unit(self) -> None:
-        backend = self.folder_backend(live=True)
-        with mock.patch.object(unit_move, "processes_inside", return_value=[backend.pid, 998042]):
-            result = self.move_folder()
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("998042", result.stderr)
-        self.assertTrue(self.old_folder.exists())
-        self.assertFalse(staff.folder_move_path(self.owner.id).exists())
-        self.assertEqual((backend.starts, backend.stops), ([], []))
+    def test_foreign_process_refuses_before_any_session_stops_with_or_without_an_open_phase(self) -> None:
+        for open_phase in (False, True):
+            with self.subTest(open_phase=open_phase):
+                case = UnitFolderMoveTests()
+                case.setUp()
+                try:
+                    case.assert_foreign_process_refused(open_phase=open_phase)
+                finally:
+                    case.doCleanups()
 
     def test_next_worker_dispatch_uses_the_moved_run_folder(self) -> None:
         from scripts.agents import codex_mesh

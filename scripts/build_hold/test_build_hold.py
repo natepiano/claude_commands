@@ -2241,8 +2241,9 @@ class BuildAuditTests(IsolatedBuildHoldTest):
 
     def admission(self, pid: int, start: str) -> None:
         fixture = self.admission_fixture
-        owner = fixture.fixture_owner(pid, start)
-        _ = only_admitted(fixture.server.handle_request(fixture.request(owner=owner)))
+        with fixture.loop_turn():
+            owner = fixture.fixture_owner(pid, start)
+            _ = only_admitted(fixture.server.handle_request(fixture.request(owner=owner)))
 
     def builds(self) -> tuple[build_hold.AuditedBuild, ...]:
         return build_hold.audit_builds(self.proc, build_hold.natedev_holds(self.holders).in_force)

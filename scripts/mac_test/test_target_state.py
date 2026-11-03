@@ -252,7 +252,7 @@ class TargetStateTests(IsolatedTargetState):
                 _ = targets.target_state(target)
 
     def test_aws_drain_reserve_covers_its_configured_maximum_duration(self) -> None:
-        values = conf.values(SCRIPTS.parent / "config/aws_target.conf")
+        values = conf.read(SCRIPTS.parent / "config/aws_target.conf").values()
         reserve = float(values["limit_reserve_usd"])
         minutes = float(values["drain_max_minutes"])
         self.assertGreater(minutes, 0)
@@ -261,7 +261,7 @@ class TargetStateTests(IsolatedTargetState):
         self.assertLess(reserve, float(values["daily_limit_usd"]))
 
     def test_aws_repository_budgets_fit_the_build_budget(self) -> None:
-        values = conf.values(SCRIPTS.parent / "config/aws_target.conf")
+        values = conf.read(SCRIPTS.parent / "config/aws_target.conf").values()
         ceiling = float(values["build_budget_gib"])
         for key, value in values.items():
             if key == "target_budget_gib" or key.startswith("target_budget_gib."):

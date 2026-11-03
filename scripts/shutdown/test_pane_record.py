@@ -212,6 +212,18 @@ class PaneRecordTests(unittest.TestCase):
                 self.assertEqual(pane_record.resume_launch(unknown), unknown)
                 self.assertEqual((path.read_bytes(), record_path.read_bytes(), record_path.stat().st_mtime_ns), before)
 
+    def test_writers_remove_a_legacy_staff_id_and_keep_account_evidence(self) -> None:
+        entry = pane_record.launch("w1:p2", "saved-session", "/work", {}, ["claude", "-n", "saved"])
+        entry["environment"] = {"STAFF_ID": "parent", "ENABLE_TOOL_SEARCH": "true"}
+        with (mock.patch.object(pane_record, "RECORD_DIR", self.records),
+              mock.patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(()))):
+            pane_record.write("agents", entry)
+            self.assertEqual(pane_record.read("agents")["w1:p2"]["environment"], {"ENABLE_TOOL_SEARCH": "true"})
+            pane_record.save("agents", {"w1:p2": entry})
+            self.assertEqual(pane_record.read("agents")["w1:p2"]["environment"], {"ENABLE_TOOL_SEARCH": "true"})
+            self.assertEqual(pane_record.read("agents")["w1:p2"]["config_dir"], entry["config_dir"])
+        self.assertEqual(entry["environment"]["STAFF_ID"], "parent")
+
     def current_owner(self) -> tuple[staff.StaffRow, staff.StaffId, Path]:
         from scripts.production.staff_test_support import isolated_staff_file, isolated_source_readers, source_environment
 

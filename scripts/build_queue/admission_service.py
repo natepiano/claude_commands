@@ -1376,7 +1376,7 @@ ADMISSION_CALLERS = ("verify.sh", "invoke.sh", "pre-tool-use-brp-launch-gate.sh"
 def read_state(directory: Path) -> ServiceState:
     record = wire.parse_record((directory / "state.json").read_text(), dict[str, object])
     if record.keys() == {"kind", "reservations", "places", "ledger", "recovery", "override"}:
-        # Phase 5 stores neither a queue priority nor pending import cleanup.
+        # The first state form stores neither a queue priority nor pending import cleanup.
         record["priority"] = gate.snapshot_value(gate.NO_QUEUE_PRIORITY)
         record["legacy_cleanup"] = gate.snapshot_value(())
     old_fields = gate.snapshot_fields(ServiceState).keys() - {"build_history_generation"} | {"kind"}

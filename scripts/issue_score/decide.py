@@ -5,6 +5,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
+from scripts.lib import conf
+
 from .client import Answer, ChoiceAnswer, ScoreAnswer, TypeSafeError
 from . import questions
 from .selection import UseConfiguredValue
@@ -34,16 +36,20 @@ class RiskPoint:
     error_rate: float
 
 
-def select_threshold(field_name: str, points: Sequence[RiskPoint], *, complete: bool = True) -> ThresholdOutcome:
-    if field_name not in questions.thresholds():
+def select_threshold(field_name: str, points: Sequence[RiskPoint], *, complete: bool = True,
+                     scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> ThresholdOutcome:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    thresholds = questions.thresholds(scoring_config=scoring_config)
+    error_targets = questions.error_targets(scoring_config=scoring_config)
+    if field_name not in thresholds:
         raise ValueError(f"Unknown threshold field: {field_name}")
-    if isinstance(questions.thresholds()[field_name], ReportOnly):
+    if isinstance(thresholds[field_name], ReportOnly):
         return ReportOnly()
     if not complete:
         return Unsupported("incomplete or non-tuning cohort; excluded from threshold selection")
     for point in sorted(points, key=lambda item: item.threshold):
-        if point.coverage > 0 and point.error_rate <= questions.error_targets()[field_name] + 1e-12:
-            return MinimumGap(point.threshold) if isinstance(questions.thresholds()[field_name], MinimumGap) else Supported(point.threshold)
+        if point.coverage > 0 and point.error_rate <= error_targets[field_name] + 1e-12:
+            return MinimumGap(point.threshold) if isinstance(thresholds[field_name], MinimumGap) else Supported(point.threshold)
     return Unsupported()
 
 

@@ -83,7 +83,7 @@ class LiveUnitsTests(unittest.TestCase):
         before = self.run_script()
         self.assertEqual(before.returncode, 0, before.stderr)
         retired = unit_membership("show", "retired-unit")
-        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"))
+        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"), expected=retired.worktree)
         after = self.run_script()
         self.assertEqual(after.returncode, 0, after.stderr)
         self.assertEqual(after.stdout, before.stdout)

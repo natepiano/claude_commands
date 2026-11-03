@@ -74,7 +74,7 @@ def deliver(root: Path, machine: str) -> None:
         pending = [key for key, status in notices.items() if status == "pending"]
     if not pending:
         return
-    destination = conf.text("settings", "local_key_notice_to")
+    destination = conf.read("settings").text("local_key_notice_to")
     for key in pending:
         identity = hashlib.sha256(json.dumps([machine, key]).encode()).hexdigest()
         command = [str(root / "scripts/lib/py"), str(root / "scripts/message/send.py"),
