@@ -22,7 +22,8 @@ from scripts.message.repeat_guard_test_support import install_guard_test_budget
 
 from scripts.lib.test_agents_registry import write_registry
 
-from scripts.lib import names
+from scripts.lib import names, process_start as process_reader
+from scripts.lib.process_start_test_support import write_stat, stored_start_probe, process_start_probe
 from scripts.lib.test_names import fixture_names
 
 from scripts.whoami.note_file import note_name
@@ -6879,7 +6880,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
               patch.object(codex_mesh, "_pid_alive", side_effect=alive),
               patch.object(process_table, "snapshot", return_value=table) as snapshot,
               patch.object(sessions, "running_sessions", return_value=[director]),
-              patch.object(sessions, "process_start", return_value="fixture-start"),
+              patch.object(process_reader, "process_start", return_value=process_reader.ProcessStartDate("fixture-start")),
               self.quota_reports(report)):
             code, errors = self.run_start()
         self.assertEqual(code, 1, errors)
@@ -9050,6 +9051,116 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         self.assertEqual(self.worker_record()["status"], "running")
         self.assertEqual(len(self.methods("turn/start")), 1)
 
+    def test_unreadable_launcher_keeps_the_active_roster_claim(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        record = {**self.worker_record(), "status": "running", "turn_id": "live",
+                  "launcher_pid": 41, "launcher_start_time": 123}
+        self.write_pool_roster({"worker": record})
+        with patch.object(process_reader, "process_start", side_effect=process_reader.ProcessReadError("denied")):
+            state = codex_mesh._roster_thread(record)  # pyright: ignore[reportPrivateUsage]
+            self.assertFalse(codex_mesh._launcher_died(state))  # pyright: ignore[reportPrivateUsage]
+            codex_mesh._restore_follow_claim(str(self.session_dir), "worker", 41)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.worker_record(), record)
+
+    def test_replaced_and_gone_launchers_release_the_claim_without_a_signal(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+            root = Path(folder)
+            read_start = process_start_probe(root)
+
+            for replaced in (True, False):
+                if replaced:
+                    _ = write_stat(root, 41, start_ticks=456)
+                else:
+                    (root / "41/stat").unlink()
+                record = {**self.worker_record(), "status": "running", "turn_id": "old",
+                          "launcher_pid": 41, "launcher_start_time": 123}
+                self.write_pool_roster({"worker": record})
+                with (self.subTest(replaced=replaced),
+                      patch.object(process_reader, "process_start", side_effect=read_start),
+                      patch.object(os, "kill") as signal):
+                    codex_mesh._restore_follow_claim(str(self.session_dir), "worker", 41)  # pyright: ignore[reportPrivateUsage]
+                self.assertNotIn("launcher_pid", self.worker_record())
+                signal.assert_not_called()
+
+    def test_reused_launcher_pid_is_dead_but_legacy_and_live_launchers_stay_busy(self) -> None:
+        for status in ("starting", "running", "waiting_capacity"):
+            with self.subTest(status=status):
+                record: dict[str, object] = {"thread_id": THREAD_ID, "status": status,
+                    "turn_id": "interrupted-turn", "launcher_pid": os.getpid(),
+                    "launcher_start_time": 0}
+                state = codex_mesh._roster_thread(record)  # pyright: ignore[reportPrivateUsage]
+                self.assertTrue(codex_mesh._launcher_died(state))  # pyright: ignore[reportPrivateUsage]
+                _ = record.pop("launcher_start_time")
+                state = codex_mesh._roster_thread(record)  # pyright: ignore[reportPrivateUsage]
+                self.assertFalse(codex_mesh._launcher_died(state))  # pyright: ignore[reportPrivateUsage]
+
+    def test_follow_claim_records_identity_and_release_keeps_a_live_active_launcher(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        args = self.start_args()
+        args.to = "worker"
+        args.claim_pid = os.getpid()
+        self.assertEqual(codex_mesh.command_can_follow(args), 0)
+        claimed = self.worker_record()
+        self.assertIn("launcher_start_time", claimed)
+        for status in ("running", "waiting_capacity"):
+            with self.subTest(status=status):
+                active = {**claimed, "status": status, "turn_id": "live-turn"}
+                self.write_pool_roster({"worker": active})
+                state = codex_mesh._roster_thread(active)  # pyright: ignore[reportPrivateUsage]
+                self.assertFalse(codex_mesh._launcher_died(state))  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(codex_mesh.command_release_follow(args), 0)
+                self.assertEqual(self.worker_record(), active)
+                self.assertEqual(codex_mesh.command_can_follow(args), 2)
+                active["launcher_start_time"] = 0
+                self.write_pool_roster({"worker": active})
+                self.assertEqual(codex_mesh.command_release_follow(args), 0)
+                self.assertEqual(self.worker_record()["status"], "done")
+                self.assertNotIn("launcher_start_time", self.worker_record())
+
+    def test_stale_release_identity_cannot_remove_a_newer_starting_claim(self) -> None:
+        self.assertEqual(self.run_start()[0], 0)
+        args = self.start_args()
+        args.to = "worker"
+        args.claim_pid = os.getpid()
+        self.assertEqual(codex_mesh.command_can_follow(args), 0)
+        claimed = self.worker_record()
+        # A retry from the older process still carries its original start time.
+        args.claim_start_time = "0"
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                self.assertEqual(codex_mesh.command_release_follow(args), 0)
+                self.assertEqual(self.worker_record(), claimed)
+        args.claim_start_time = str(claimed["launcher_start_time"])
+        self.assertEqual(codex_mesh.command_release_follow(args), 0)
+        self.assertEqual(self.worker_record()["status"], "done")
+
+    def test_roster_status_updates_keep_the_original_launcher_start_time(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "starting",
+            "launcher_pid": os.getpid(), "launcher_start_time": 0}})
+        _ = codex_mesh._update_roster(str(self.session_dir), "worker", {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": THREAD_ID, "status": "running", "turn_id": "interrupted-turn",
+        })
+        self.assertEqual(self.worker_record()["launcher_start_time"], 0)
+        state = codex_mesh._roster_thread(self.worker_record())  # pyright: ignore[reportPrivateUsage]
+        self.assertTrue(codex_mesh._launcher_died(state))  # pyright: ignore[reportPrivateUsage]
+        _ = codex_mesh._update_roster(str(self.session_dir), "worker", {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": THREAD_ID, "status": "waiting_capacity", "launcher_pid": os.getpid(),
+        })
+        self.assertEqual(self.worker_record()["launcher_start_time"], 0)
+        state = codex_mesh._roster_thread(self.worker_record())  # pyright: ignore[reportPrivateUsage]
+        self.assertTrue(codex_mesh._launcher_died(state))  # pyright: ignore[reportPrivateUsage]
+
+    def test_thread_replacement_keeps_the_attached_launcher_identity(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "starting",
+            "launcher_pid": os.getpid(), "launcher_start_time": 0}})
+        _ = codex_mesh._update_roster(str(self.session_dir), "worker", {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": "replacement-thread", "status": "starting",
+        })
+        self.assertEqual(self.worker_record()["launcher_start_time"], 0)
+        state = codex_mesh._roster_thread(self.worker_record())  # pyright: ignore[reportPrivateUsage]
+        self.assertTrue(codex_mesh._launcher_died(state))  # pyright: ignore[reportPrivateUsage]
+
     def test_follow_recovers_dead_launcher_only_after_thread_is_idle(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
         _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
@@ -11015,6 +11126,24 @@ class CompactionRecoveryTests(MeshCommandFixture):
 
 @final
 class FollowEventRegressionTests(MeshCommandFixture):
+    def test_a_settled_resident_keeps_its_live_detached_run_until_the_result_arrives(self) -> None:
+        self.assertEqual(self.run_start(), (0, ""))
+        record = self.worker_record()
+        self.assertEqual(record["status"], "done")
+        run = self.session_dir / codex_mesh.DETACHED_RUNS_DIR / "late-result.json"
+        run.parent.mkdir(exist_ok=True)
+        atomic_file.write_text_atomic(run, json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
+        client = codex_mesh.Client(self.server.port, "resident")
+        self.addCleanup(client.close)
+        stream = self.stream_for(client, resident=True)
+        released = cast(Callable[[codex_mesh.TurnStream], bool], vars(codex_mesh)["_stream_was_released"])
+        self.assertFalse(released(stream))
+        self.assertEqual(self.worker_record(), record)
+        atomic_file.write_text_atomic(run, json.dumps({"worker": "worker", "status": "finished", "pid": os.getpid()}))
+        stream.runs.refresh(force=True)
+        self.assertTrue(released(stream))
+
+
     """Real socket/file waits: no next_frame substitution or fabricated quiet wakes."""
 
     guard_frame_reads: bool = False
@@ -13046,8 +13175,10 @@ class DirectorLifetimeTests(MeshCommandFixture):
         self.addCleanup(endpoint.close)
         address = root / "director.sock"
         endpoint.bind(str(address))
+        director_start = process_reader.process_start(os.getpid())
+        assert not isinstance(director_start, process_reader.ProcessGone)
         _ = (registry / "director.json").write_text(json.dumps({
-            "pid": os.getpid(), "procStart": sessions.process_start(os.getpid()),
+            "pid": os.getpid(), "procStart": director_start.text,
             "sessionId": current_session, "name": "demo · builders · director",
             "messagingSocketPath": str(address), "updatedAt": 2, "tmux": "", "formerNames": [],
             "entrypoint": "cli"}))
@@ -13078,6 +13209,16 @@ class DirectorLifetimeTests(MeshCommandFixture):
             "FIXTURE_SERVER_PID": str(os.getpid()), "SCRATCH_ROOT": str(root / "scratch"),
             "SCRATCH_VISIBLE_ROOT": str(root / "visible"), "SCRATCH_HOLDS": str(root / "holds.json")}
         self.patches.enter_context(patch.dict(os.environ, environment))
+        from scripts.production import fake_unit_host
+        from scripts.production.staff_test_support import isolated_staff_file, production_membership
+        # tearDown closes this stack before unittest cleanups; environment scopes must unwind together.
+        _ = self.patches.enter_context(isolated_staff_file(root / "staff.json", environment))
+        production_membership("demo", "builders")
+        host = fake_unit_host.environment(root)
+        fake_unit_host.write(host, [fake_unit_host.HostedUnit("agents", "w1:p1", {
+            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "builders"})])
+        fake_unit_host.place_process(host, os.getpid(), "w1:p1", session="agents", exec_shell=True)
+        self.patches.enter_context(patch.dict(os.environ, host))
         roster = {"project-impl": {"thread_id": THREAD_ID, "status": "done", "role": "impl", "launcher_pid": 0},
                   "project-test": {"thread_id": "thread-test", "status": "paused", "role": "test", "launcher_pid": 0}}
         roster_entries: dict[str, object] = dict(roster)
@@ -13127,7 +13268,7 @@ if script.endswith('remove_workers.py'):
             pathlib.Path(os.environ['FIXTURE_REAPS']).write_text('implicit sweep')
             return remove_workers.subprocess.CompletedProcess(command, 1)
         return invoke(command, *args, **kwargs)
-    with patch.object(remove_workers.subprocess, 'run', no_implicit_sweep), patch.object(remove_workers, 'DEFAULT_ROOTS', (pathlib.Path(os.environ['FIXTURE_RUN']).parent,)), patch.object(remove_workers, 'list_sessions', return_value=[]), patch.object(remove_workers, 'shutdown_held_sessions', return_value={'kind': 'held sessions', 'session_ids': set()}):
+    with patch.object(remove_workers.subprocess, 'run', no_implicit_sweep), patch.object(remove_workers, 'DEFAULT_ROOTS', (pathlib.Path(os.environ['FIXTURE_RUN']).parent,)), patch.object(remove_workers, 'list_sessions', return_value=[]):
         raise SystemExit(remove_workers.main())
 if script.endswith('codex_mesh.py'):
     def reap(pid, *, deadline):
@@ -13470,7 +13611,7 @@ class WorkerPauseTests(MeshCommandFixture):
         fake_unit_host.write(host, [])
         self.patches.enter_context(patch.dict(os.environ, host))
         from scripts.production.staff_test_support import isolated_staff_file, production_membership
-        _ = self.enterContext(isolated_staff_file(self.session_dir / "staff.json", {}))
+        _ = self.patches.enter_context(isolated_staff_file(self.session_dir / "staff.json", {}))
         production_membership("demo", "builders")
         respond = self.server.respond
         @bounded_fixture
@@ -14697,7 +14838,7 @@ class MacCleanupTests(unittest.TestCase):
         _ = self.enterContext(patch.object(codex_mesh, "user_zone", return_value=ZoneInfo("UTC")))
         _ = self.enterContext(patch.object(account, "mac_process_record", side_effect=AssertionError("no native process record")))
         _ = self.enterContext(patch.object(account, "process_codex_home", side_effect=AssertionError("no native environment")))
-        _ = self.enterContext(patch.object(sessions, "process_start", side_effect=AssertionError("no native process start")))
+        _ = self.enterContext(patch.object(process_reader, "process_start", side_effect=AssertionError("no native process start")))
         _ = self.enterContext(patch.object(os, "kill", side_effect=AssertionError("no real signal")))
 
     def test_mac_server_listing_parses_all_elapsed_forms_and_excludes_non_websocket_targets(self) -> None:
@@ -14727,7 +14868,7 @@ class MacCleanupTests(unittest.TestCase):
                       ("codex", "app-server", "daemon"), account.ProcessWithoutCodexHome(), executable)),
                   patch.object(Path, "read_bytes", return_value=b"codex\0app-server\0daemon\0"),
                   patch.object(os, "readlink", return_value=str(executable)),
-                  patch.object(sessions, "process_start", return_value="start-101")):
+                  patch.object(process_reader, "process_start", return_value=process_reader.ProcessStartDate("start-101"))):
                 self.assertEqual(codex_mesh._running_servers(), [])  # pyright: ignore[reportPrivateUsage]
                 target = codex_mesh._daemon_record(101)  # pyright: ignore[reportPrivateUsage]
             self.assertIsInstance(target, codex_mesh.UnclassifiedCodexProcess)
@@ -14987,11 +15128,11 @@ class CodexDaemonCleanupTests(unittest.TestCase):
         _ = self.enterContext(patch.object(account, "process_codex_home", side_effect=AssertionError("no native environment")))
         def process_start(pid: int) -> str:
             return f"start-{pid}"
-        _ = self.enterContext(patch.object(sessions, "process_start", side_effect=process_start))
+        _ = self.enterContext(patch.object(process_reader, "process_start", side_effect=stored_start_probe(process_start)))
         _ = self.enterContext(patch.object(codex_mesh, "_daemon_process_tree", return_value={}))
         _ = self.enterContext(patch.object(codex_mesh, "_list_family_processes", return_value=""))
         _ = self.enterContext(patch.object(codex_mesh, "_process_session", return_value=codex_mesh.ProcessSession(1)))
-        _ = self.enterContext(patch.object(codex_mesh, "_daemon_process_state", return_value=codex_mesh.ProcessRunState.RUNNING))
+        _ = self.enterContext(patch.object(process_reader, "process_state", return_value=codex_mesh.ProcessRunState.RUNNING))
         _ = self.enterContext(patch.object(codex_mesh, "_process_terminal", return_value=codex_mesh.ProcessTerminal("??")))
 
     def test_sweep_lists_and_stops_only_signed_out_shared_home_daemons_and_their_descendants(self) -> None:
@@ -15052,7 +15193,7 @@ class CodexDaemonCleanupTests(unittest.TestCase):
                   patch.object(account, "process_codex_home", side_effect=selected),
                   patch.object(codex_mesh, "_daemon_process_tree", return_value=table),
                   patch.object(codex_mesh, "_process_identity", side_effect=identity),
-                  patch.object(codex_mesh, "_daemon_process_state", side_effect=state),
+                  patch.object(process_reader, "process_state", side_effect=state),
                   patch.object(os, "kill", side_effect=signal_process),
                   contextlib.redirect_stdout(io.StringIO()) as output):
                 self.assertEqual(codex_mesh.command_sweep(argparse.Namespace(root=str(self.home), stop=stop)), 0)
@@ -15138,7 +15279,7 @@ class CodexDaemonCleanupTests(unittest.TestCase):
               patch.object(account, "mac_process_record", return_value=account.MacProcessRecord(
                   arguments, account.ProcessWithoutCodexHome(), Path("/opt/bin/codex"))),
               patch.object(account, "process_codex_home", return_value=account.ProcessWithoutCodexHome()),
-              patch.object(codex_mesh, "_daemon_process_state", side_effect=state),
+              patch.object(process_reader, "process_state", side_effect=state),
               patch.object(os, "kill", side_effect=send_signal),
               contextlib.redirect_stdout(io.StringIO()) as output,
               contextlib.redirect_stderr(io.StringIO()) as errors):
@@ -15219,28 +15360,35 @@ class DaemonProcessStateTests(unittest.TestCase):
                  ("S\n", 0, codex_mesh.ProcessRunState.RUNNING),
                  ("Z\n", 0, codex_mesh.ProcessRunState.GONE),
                  ("", 1, codex_mesh.ProcessRunState.GONE))
+        native_stat = Path.stat
+        def no_proc(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+            if path == process_reader.PROC_ROOT:
+                raise FileNotFoundError("no proc on this host")
+            return native_stat(path, follow_symlinks=follow_symlinks)
         for output, exit_code, expected in cases:
-            with (self.subTest(output=output), patch.object(sys, "platform", "darwin"),
+            with (self.subTest(output=output), patch.object(Path, "stat", no_proc),
                   patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], exit_code, output, "")) as command):
-                self.assertEqual(codex_mesh._daemon_process_state(101), expected)  # pyright: ignore[reportPrivateUsage]
-            self.assertEqual(cast(tuple[str, ...], command.call_args.args[0]), ("ps", "-p", "101", "-o", "stat="))
+                self.assertEqual(process_reader.process_state(101), expected)
+            self.assertEqual(command.call_args.args[0], ["ps", "-o", "stat=", "-p", "101"])
 
     def test_linux_process_state_reads_state_after_the_complete_parenthesized_command(self) -> None:
-        for state, expected in (("T", codex_mesh.ProcessRunState.STOPPED),
-                                ("S", codex_mesh.ProcessRunState.RUNNING),
-                                ("Z", codex_mesh.ProcessRunState.GONE)):
-            with (self.subTest(state=state), patch.object(sys, "platform", "linux"),
-                  patch.object(Path, "read_text", return_value=f"101 (codex with ) in name) {state} 1 0 0"),
-                  patch.object(subprocess, "run", side_effect=AssertionError("Linux reads only fake stat"))):
-                self.assertEqual(codex_mesh._daemon_process_state(101), expected)  # pyright: ignore[reportPrivateUsage]
+        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+            root = Path(folder)
+            for state, expected in (("T", codex_mesh.ProcessRunState.STOPPED),
+                                    ("S", codex_mesh.ProcessRunState.RUNNING),
+                                    ("Z", codex_mesh.ProcessRunState.GONE)):
+                _ = write_stat(root, 101, command="codex with ) in name", state=state)
+                with self.subTest(state=state), patch.object(subprocess, "run", side_effect=AssertionError("Linux reads only fake stat")):
+                    self.assertEqual(process_reader.process_state(101, root), expected)
 
     def test_denied_process_state_refuses_instead_of_claiming_a_process_is_gone(self) -> None:
-        for platform in ("linux", "darwin"):
-            with (self.subTest(platform=platform), patch.object(sys, "platform", platform),
-                  patch.object(Path, "read_text", side_effect=PermissionError("denied")),
-                  patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 2, "", "denied"))):
-                with self.assertRaises(OSError):
-                    _ = codex_mesh._daemon_process_state(101)  # pyright: ignore[reportPrivateUsage]
+        with patch.object(Path, "read_bytes", side_effect=PermissionError("denied")):
+            with self.assertRaises(OSError):
+                _ = process_reader.process_state(101)
+        with (patch.object(Path, "stat", side_effect=FileNotFoundError("no proc")),
+              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 2, "", "denied"))):
+            with self.assertRaises(OSError):
+                _ = process_reader.process_state(101)
 
 
 @final
@@ -15275,14 +15423,17 @@ class DaemonFamilySafetyTests(unittest.TestCase):
         _ = self.enterContext(patch.object(codex_mesh, "_process_session", side_effect=self.process_session))
         _ = self.enterContext(patch.object(codex_mesh, "_process_terminal", return_value=codex_mesh.ProcessTerminal("??")))
         _ = self.enterContext(patch.object(codex_mesh, "_list_family_processes", side_effect=self.listing))
-        _ = self.enterContext(patch.object(sessions, "process_start", side_effect=self.starts.__getitem__))
+        def start_text(pid: int) -> str:
+            identity = self.identities.get(pid)
+            return identity.started if isinstance(identity, codex_mesh.ProcessIdentity) else self.starts.get(pid, "")
+        _ = self.enterContext(patch.object(process_reader, "process_start", side_effect=stored_start_probe(start_text)))
         self.stopped = set()
         self.signals = []
         _ = self.enterContext(patch.object(account, "process_codex_home", return_value=account.ProcessWithoutCodexHome()))
         _ = self.enterContext(patch.object(codex_mesh, "_process_identity", side_effect=self.identity))
         _ = self.enterContext(patch.object(codex_mesh, "_daemon_process_tree", side_effect=self.tree))
         _ = self.enterContext(patch.object(os, "kill", side_effect=self.signal_process))
-        _ = self.enterContext(patch.object(codex_mesh, "_daemon_process_state", side_effect=self.state))
+        _ = self.enterContext(patch.object(process_reader, "process_state", side_effect=self.state))
         _ = self.enterContext(patch.object(time, "sleep", side_effect=AssertionError("no real sleep")))
 
     def identity(self, pid: int) -> codex_mesh.ProcessIdentity | codex_mesh.UnreadCodexProcess:
@@ -15358,7 +15509,7 @@ class DaemonFamilySafetyTests(unittest.TestCase):
                 with (patch.object(codex_mesh, "time", clock),
                       patch.object(clock, "sleep", backoff),
                       patch.object(os, "kill", signal_process),
-                      patch.object(codex_mesh, "_daemon_process_state", process_state)):
+                      patch.object(process_reader, "process_state", process_state)):
                     self.assertTrue(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
                 self.assertEqual(delays, [codex_mesh.REAP_POLL_SECS])
                 self.assertEqual(self.parents, {})
@@ -15604,7 +15755,7 @@ class DaemonFamilySafetyTests(unittest.TestCase):
             if sig == signal.SIGKILL:
                 self.assertEqual(confirmed, {101, 201})
             self.signal_process(pid, sig)
-        with (patch.object(codex_mesh, "_daemon_process_state", side_effect=state),
+        with (patch.object(process_reader, "process_state", side_effect=state),
               patch.object(os, "kill", side_effect=signal_process),
               patch.object(time, "sleep", new=bounded_fixture(fixture_skip_sleep))):
             self.assertTrue(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
@@ -15809,13 +15960,13 @@ class DaemonFamilySafetyTests(unittest.TestCase):
                 if (pid, sig) == (201, signal.SIGSTOP):
                     self.identities[201] = codex_mesh.UnreadCodexProcess(201, "argv and executable unavailable")
             def process_start(pid: int) -> str:
-                if pid == 201:
+                if pid == 201 and pid in self.stopped:
                     if isinstance(start, OSError):
                         raise start
                     return start
                 return self.starts[pid]
             with (self.subTest(start=start), patch.object(os, "kill", side_effect=signal_process),
-                  patch.object(sessions, "process_start", side_effect=process_start),
+                  patch.object(process_reader, "process_start", side_effect=stored_start_probe(process_start)),
                   contextlib.redirect_stderr(io.StringIO()) as errors):
                 self.assertFalse(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
             self.assertIn("pid 201", errors.getvalue())
@@ -17180,7 +17331,7 @@ class LauncherSessionSwapTests(unittest.TestCase):
                       patch.object(codex_mesh, "SWEEP_ROOTS", (run.parent,)),
                       patch.object(codex_mesh, "_pid_alive", side_effect=alive),
                       patch.object(process_table, "snapshot", return_value=table),
-                      patch.object(sessions, "process_start", side_effect=started_at),
+                      patch.object(process_reader, "process_start", side_effect=stored_start_probe(started_at)),
                       # A record without a process start runs while its socket exists.
                       patch.object(sessions, "messaging_socket_exists", return_value=True),
                       patch.object(os, "kill"),

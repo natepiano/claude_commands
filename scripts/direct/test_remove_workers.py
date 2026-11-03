@@ -157,6 +157,25 @@ class RemoveWorkersTest(unittest.TestCase):
         result, removed = self.run_remove_workers(session_dir, caller)
         return result.returncode, sorted(removed)
 
+    def test_cleanup_reports_only_the_run_with_a_failed_worker_without_repeating_removal(self) -> None:
+        first = self.run_dir("first", ["failed"])
+        second = self.run_dir("second", ["removed"])
+        report = self.root / "failed-runs"
+        rows = [row("failed", "first-worker"), row("removed", "second-worker")]
+        with patch.object(sys, "argv", [str(SCRIPT), "--run-root", str(self.root),
+                "--session-dir", str(first), "--session-dir", str(second), "--failed-runs", str(report)]), \
+             patch.object(remove_workers, "list_sessions", return_value=rows), \
+             patch.object(remove_workers, "removal_targets", return_value={"failed": "finished", "removed": "finished"}), \
+             patch.object(subprocess, "run", side_effect=[
+                 subprocess.CompletedProcess([], 7, "", "fixture refusal"),
+                 subprocess.CompletedProcess([], 0, "", ""),
+             ]) as remove:
+            status = remove_workers.main()
+        removals = [call.args[0][-1] for call in remove.call_args_list]
+        self.assertEqual(status, 1)
+        self.assertEqual(report.read_text().splitlines(), [str(first)])
+        self.assertEqual(removals, ["failed", "removed"])
+
     def test_phase_cleanup_keeps_a_claude_session_owned_by_the_unit_ledger(self) -> None:
         own = self.run_dir("own", ["held", "ephemeral"], orchestrator=ORCHESTRATOR)
         self.list_rows([row("held", "persistent writer"), row("ephemeral", "temporary writer")])

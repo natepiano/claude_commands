@@ -143,6 +143,19 @@ opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
    We believe in three gods, Simple, Fast and Beautiful, with correctness as the
    floor beneath them.
    ```
+10. `## Build rules`, always inline in every implementation, test and repair
+    prompt (user, 2026-10-31: builds always wait, so workers submit fewer):
+
+    ```
+    ## Build rules
+
+    1. Fix every visible failure before you rerun. Finish the edit round. Then run once.
+    2. After a pass, do not run again until your edits are done.
+    3. While editing, use `verify.sh check`. Lint runs once, at the phase gate.
+    ```
+
+    The phase gate and the merge gate run in full.
+    Each worker's listed tests must pass before its checkpoint.
 
 The Verification section carries the applicable command lines and every
 worker-facing rule from <VerificationContract/>, with nothing added around

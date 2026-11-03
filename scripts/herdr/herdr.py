@@ -54,6 +54,7 @@ from pane_launch import MEMBER_MARKS as MEMBER_MARKS, UNIT_MARKS as UNIT_MARKS, 
 
 if TYPE_CHECKING:
     from scripts.production.session_labels import StaffLabels
+from scripts.lib import process_start
 
 # Herdr requires agent-start timeouts strictly above this boundary.
 _AGENT_START_TIMEOUT_MINIMUM_MS = 3000
@@ -779,7 +780,7 @@ class PaneRunning:
 @dataclass(frozen=True)
 class AgentProcessIdentity:
     pid: int
-    start_ticks: int
+    started: process_start.ProcessStart
 
 
 @dataclass(frozen=True)
@@ -1818,9 +1819,9 @@ class Herdr:
                 pid = process.get("pid")
                 if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
                     try:
-                        stat = (_proc_root() / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
-                        if stat[0] != "Z":
-                            identities.append(AgentProcessIdentity(pid, int(stat[19])))
+                        started = process_start.process_start(pid)
+                        if not isinstance(started, process_start.ProcessGone):
+                            identities.append(AgentProcessIdentity(pid, started))
                     except (OSError, ValueError, IndexError):
                         pass
         activity = AgentProcessPresent(tuple(identities)) if agent_present else PaneAtShell() if foreground == shell else PaneRunning(tuple(commands))
@@ -2841,11 +2842,10 @@ class NoOpenCodexRollout(ValueError):
 
 
 def _process_birth(pid: int) -> str:
-    started = (darwin_process_identity(pid).started if _platform() == "darwin"
-               else runtime_sessions.process_start(pid))
-    if not started:
+    started = process_start.process_start(pid)
+    if isinstance(started, process_start.ProcessGone):
         raise ValueError(f"pid {pid}: process start is unavailable")
-    return started
+    return started.text
 
 
 def _open_codex_rollouts(pid: int) -> dict[Path, str]:
@@ -3019,16 +3019,13 @@ def _startup_processes(shell: PaneShell, kind: str, tracked: set[AgentProcessIde
     live: set[AgentProcessIdentity] = set()
     unreadable = False
     for identity in tuple(tracked):
-        try:
-            stat = (root / str(identity.pid) / "stat").read_text().rsplit(")", 1)[1].split()
-            if stat[0] == "Z" or int(stat[19]) != identity.start_ticks:
-                tracked.remove(identity)
-            else:
-                live.add(identity)
-                pending.append((identity.pid, True))
-        except FileNotFoundError:
+        owner = process_start.check_owner(identity.pid, identity.started, root)
+        if owner.stale:
             tracked.remove(identity)
-        except (OSError, ValueError, IndexError):
+        elif owner is process_start.OwnerCheck.ALIVE:
+            live.add(identity)
+            pending.append((identity.pid, True))
+        else:
             unreadable = True
     visited: set[int] = set()
     while pending:
@@ -3039,8 +3036,8 @@ def _startup_processes(shell: PaneShell, kind: str, tracked: set[AgentProcessIde
         try:
             process = root / str(pid)
             if pid != shell.pid:
-                stat = (process / "stat").read_text().rsplit(")", 1)[1].split()
-                if stat[0] == "Z":
+                started = process_start.process_start(pid, root)
+                if isinstance(started, process_start.ProcessGone):
                     continue
                 if not belongs_to_agent:
                     arguments = _process_arguments(process)
@@ -3048,7 +3045,7 @@ def _startup_processes(shell: PaneShell, kind: str, tracked: set[AgentProcessIde
                     if not belongs_to_agent:
                         commands.append(arguments[0] if arguments else str(pid))
                 if belongs_to_agent:
-                    identity = AgentProcessIdentity(pid, int(stat[19]))
+                    identity = AgentProcessIdentity(pid, started)
                     tracked.add(identity)
                     live.add(identity)
             # children is per-thread, not the entire process's child list.
@@ -3063,8 +3060,10 @@ def _startup_processes(shell: PaneShell, kind: str, tracked: set[AgentProcessIde
         return PaneProcessesUnreadable()
     try:
         # Read foreground ownership after walking the tree, not before launch.
-        shell_stat = (root / str(shell.pid) / "stat").read_text().rsplit(")", 1)[1].split()
-        foreground = int(shell_stat[5])
+        shell_stat = process_start.read_stat(shell.pid, root)
+        if isinstance(shell_stat, process_start.ProcessGone):
+            return PaneProcessesUnreadable()
+        foreground = shell_stat.tpgid
     except (OSError, ValueError, IndexError):
         return PaneProcessesUnreadable()
     if not commands and foreground == shell.pid:
@@ -3130,24 +3129,6 @@ def _session_socket(name: str) -> Path:
     config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "herdr"
     session_directory = config if name == "default" else config / "sessions" / name
     return session_directory / "herdr.sock"
-
-
-class DarwinProcessIdentity(NamedTuple):
-    """Registry-compatible birth time and controlling-terminal presence (0 or 1)."""
-
-    started: str
-    terminal: int
-
-
-def darwin_process_identity(pid: int) -> DarwinProcessIdentity:
-    result = run_program([os.environ.get("HERDR_PS", "ps"), "-o", "lstart=,tty=", "-p", str(pid)],
-                         timeout=5, environment={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
-    require_success(result, f"process {pid} identity")
-    fields = result.stdout.strip().rsplit(maxsplit=1)
-    if len(fields) != 2 or not re.fullmatch(
-            r"[A-Z][a-z]{2} [A-Z][a-z]{2} +[0-9]{1,2} [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}", fields[0]):
-        raise HerdrFailure(f"process {pid}: cannot read start time and controlling terminal")
-    return DarwinProcessIdentity(fields[0], 0 if fields[1] in {"??", "?", "-"} else 1)
 
 
 def darwin_open_files(pid: int) -> list[Path]:
@@ -3350,8 +3331,8 @@ def pane_snapshot() -> Generator[Callable[[str], list[PaneIdentity]]]:
 
 
 def _process_parent(pid: int) -> int:
-    stat = (_proc_root() / str(pid) / "stat").read_text()
-    return int(stat[stat.rindex(")") + 1:].split()[1])
+    stat = process_start.read_stat(pid, _proc_root())
+    return 0 if isinstance(stat, process_start.ProcessGone) else stat.ppid
 
 
 @pane_snapshot()

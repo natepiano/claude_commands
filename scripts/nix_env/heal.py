@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Restart idle Claude sessions that missed their worktree's nix environment.
 
-Registry decoding and process identity belong to message/sessions.py. Build
+Registry decoding belongs to message/sessions.py; process identity belongs to lib/process_start.py. Build
 holds belong to the build-target state readers. A locked journal reserves each
 restart before invoking shutdown, including failed attempts, for one hour.
 A five-minute notifier timer runs the sweep.
@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Literal, TypedDict, cast
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS.parent))
 from scripts.lib import nix_env
+from scripts.lib import process_start as process_identity
 from scripts.message import send_result, sessions
 sys.path.insert(0, str(SCRIPTS / "notify"))
 if TYPE_CHECKING:
@@ -158,14 +159,18 @@ def registry_sessions() -> list[HealSession]:
 
 def list_sessions() -> list[HealSession]:
     """List confirmed live processes, including those without messaging sockets."""
-    return [item for item in registry_sessions() if sessions.process_start(item.pid) == item.proc_start]
+    return [item for item in registry_sessions() if process_identity.check_owner(item.pid, process_identity.parse_start(item.proc_start)) is process_identity.OwnerCheck.ALIVE]
 
 
-def find_session(session_id: str) -> HealSession | Gone:
-    for item in registry_sessions():
-        if item.session_id == session_id and sessions.process_start(item.pid) == item.proc_start:
-            return item
-    return Gone()
+def _owner_failure(session: HealSession) -> Gone | Unavailable | None:
+    if not session.proc_start:
+        return Unavailable("recorded process start is missing")
+    owner = process_identity.check_owner(session.pid, process_identity.parse_start(session.proc_start))
+    if owner.stale:
+        return Gone()
+    if owner is process_identity.OwnerCheck.UNKNOWN:
+        return Unavailable("process identity is unknown")
+    return None
 
 
 def inspect(session: HealSession) -> Healthy | Broken | Unavailable | Gone:
@@ -173,8 +178,9 @@ def inspect(session: HealSession) -> Healthy | Broken | Unavailable | Gone:
     try:
         if nix_env.nearest_envrc(session.cwd) is None:
             return Healthy()
-        if not session.proc_start or sessions.process_start(session.pid) != session.proc_start:
-            return Gone()
+        failure = _owner_failure(session)
+        if failure is not None:
+            return failure
         if sys.platform == "darwin":
             from scripts.whoami import account
 
@@ -186,8 +192,9 @@ def inspect(session: HealSession) -> Healthy | Broken | Unavailable | Gone:
                 return Unavailable("process belongs to another user")
             environment = (process / "environ").read_bytes().split(b"\0")
             loaded = any(value.startswith(b"IN_NIX_SHELL=") and value != b"IN_NIX_SHELL=" for value in environment)
-        if sessions.process_start(session.pid) != session.proc_start:
-            return Gone()
+        failure = _owner_failure(session)
+        if failure is not None:
+            return failure
         return Healthy() if loaded else Broken()
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return Unavailable(str(error))
@@ -371,11 +378,15 @@ def resume_pending(session: HealSession, pending: PendingRestart, history: HealH
     completion = stop_completion(session, pending["login"])
     if isinstance(completion, StopPending):
         if not pending["stop_request_sent"]:
-            if sessions.process_start(session.pid) != session.proc_start:
+            owner = process_identity.check_owner(session.pid, process_identity.parse_start(session.proc_start))
+            if owner.stale:
                 history["pending"] = NoPendingRestart(kind="none")
                 reason = "unsent shutdown request lost its original session process; restart cancelled"
                 log(session, history, "refused", reason)
                 alert(session, history, reason)
+                return
+            if owner is not process_identity.OwnerCheck.ALIVE:
+                log(session, history, "pending", "waiting for readable process identity")
                 return
             if not request_stop(session, pending, history, histories):
                 return

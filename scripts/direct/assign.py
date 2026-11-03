@@ -364,7 +364,11 @@ class Dispatch:
                     identity["worker_id"] = record["thread_id"]
                     worker_lifecycle.WorkerStateFile(self.claim.identity_path).publish(json.dumps(identity))
         workers.release_allocation(self.run, self.worker, self.reservation)
-        self.capture_style(1)  # An interrupted dispatch never settles an assigned style pass.
+        self.capture_style(1)  # An interrupted dispatch does not settle the style pass.
+
+
+def launcher_claim_is_live(pid: int, claim: dict[str, object]) -> bool:
+    return codex_mesh.launcher_is_live(pid, codex_mesh.recorded_launcher_start(claim.get("start_time")))
 
 
 def claim_worker(dispatch: Dispatch) -> WorkerClaim:
@@ -389,22 +393,25 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
         pid = previous_claim.get("pid")
         stale_claim = False
         if isinstance(pid, int) and pid > 0:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                stale_claim = True
-                claim_path.unlink(missing_ok=True)
-            else:
+            if launcher_claim_is_live(pid, previous_claim):
                 refuse(f"{dispatch.worker} is claimed by launcher {pid}")
+            stale_claim = True
+            # Release the stale mesh claim before removing its identity evidence.
+            release_options = ["--claim-pid", str(pid)]
+            saved_start = previous_claim.get("start_time")
+            if isinstance(saved_start, (int, str)):
+                release_options += ["--claim-start-time", str(saved_start)]
+            _ = dispatch.mesh_call("release-follow", *release_options, capture=True)
+            record = read_roster(dispatch.run, dispatch.worker)
+            if record.get("launcher_pid") == pid and record.get("status") in {
+                    "starting", "running", "waiting_capacity"}:
+                refuse(f"{dispatch.worker}: mesh did not release stale launcher {pid}; claim retained")
+            claim_path.unlink(missing_ok=True)
         status_path = dispatch.run / f"impl_status_{slot}"
         if stale_claim or (status_path.exists() and status_path.read_text().strip() == "implementing"):
             launcher = record.get("launcher_pid")
-            if isinstance(launcher, int) and launcher > 0:
-                try:
-                    os.kill(launcher, 0)
-                except ProcessLookupError:
-                    pass
-                else:
+            if isinstance(launcher, int) and launcher > 0 and not (stale_claim and launcher == pid):
+                if codex_mesh.launcher_is_live(launcher, codex_mesh.recorded_launcher_start(record.get("launcher_start_time"))):
                     refuse(f"{dispatch.worker} is already implementing")
             _ = status_path.write_text("error\n")
         if record.get("transferring_role") or record.get("role_redirect") or design_roles.transfer_route(
@@ -434,8 +441,10 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
                 dispatch.board(slot, "status", f"launcher: {compact.stdout.strip() or f'compacted {dispatch.worker}'}")
         if record.get("status") == "ended":
             _ = dispatch.mesh_call("reopen", capture=True)
+        claim_record: dict[str, object] = {"pid": os.getpid(), "worker": dispatch.worker, "turn_id": ""}
+        claim_record["start_time"] = codex_mesh.launcher_start_text(os.getpid())
         dispatch.claim_follow()
-        worker_lifecycle.WorkerStateFile(claim_path).publish(json.dumps({"pid": os.getpid(), "worker": dispatch.worker, "turn_id": ""}))
+        worker_lifecycle.WorkerStateFile(claim_path).publish(json.dumps(claim_record))
         # Each turn runs at the caller's model:effort (agents.conf default or explicit override).
         return WorkerClaim(identity_path, slot, dispatch.model, dispatch.effort)
 

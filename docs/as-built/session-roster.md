@@ -406,7 +406,7 @@ Senders:
 
 - `process_table` imports none of `roster`, `broadcast` or `codex_winddown`, so `broadcast.py` imports `roster.py` without a cycle.
 
-- `running_sessions()` and `live_sessions()` select per record through their own predicate; a change to `running_session` keeps that. `sessions.process_start` is the one process-start reader. A record with a `procStart` is running only while it matches its process, socket or not, so a phantom is never a roster row, a broadcast line, an unreachable line or a cause of name ambiguity. A headless run (`sessions.headless`) is never running either, so a relay is never a roster row and no name lookup finds it.
+- `running_sessions()` and `live_sessions()` select each record through separate predicates. Changes to `running_session` preserve this rule. `scripts.lib.process_start` is the shared process-start reader. `sessions` uses that reader. A record with `procStart` runs only while its process identity matches. This rule applies with or without a socket. An unmatched record appears in no roster, broadcast, unreachable-session report, or ambiguous-name result. A headless run (`sessions.headless`) never counts as running. A relay appears in no roster or name lookup.
 
 - A role-key or signature change in `broadcast.broadcast` carries `codex_winddown.py` and `test_codex_winddown.py`.
 

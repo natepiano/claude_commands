@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if __name__ == "__main__":
     # Lazy runtime readers share these exact row and exception classes in the CLI.
     sys.modules["scripts.production.staff"] = sys.modules[__name__]
+from scripts.lib import process_start
 from scripts.lib import atomic_file  # noqa: E402
 from scripts.shutdown import remote  # noqa: E402
 
@@ -61,17 +62,21 @@ def runtime_id(pid: int | None = None) -> str:
         except StaffRefused:
             return ""
     current = os.getpid() if pid is None else pid
-    for depth in range(32):
-        del depth
-        started = sessions.process_start(current)
-        if not started:
+    remaining = 32
+    while remaining:
+        remaining -= 1
+        try:
+            started = process_start.process_start(current)
+        except process_start.ProcessReadError:
+            return ""
+        if isinstance(started, process_start.ProcessGone):
             return ""
         path = sessions.sessions_dir() / f"{current}.json"
         if path.exists():
             record = sessions.read_session(path)
             if (not isinstance(record, sessions.UnreadableSessionRecord)
                     and record["pid"] == current and sessions.running_session(record)
-                    and sessions.process_start(current) == started):
+                    and process_start.check_owner(current, started) is process_start.OwnerCheck.ALIVE):
                 return str(native_id(record["sessionId"]))
         if pid is not None or current <= 1:
             return ""
@@ -81,8 +86,10 @@ def runtime_id(pid: int | None = None) -> str:
                                         text=True, check=True, timeout=2)
                 current = int(result.stdout.strip())
             else:
-                stat = (Path(os.environ.get("HERDR_PROC", "/proc")) / str(current) / "stat").read_text()
-                current = int(stat.rsplit(")", 1)[1].split()[1])
+                stat = process_start.read_stat(current, Path(os.environ.get("HERDR_PROC", "/proc")))
+                if isinstance(stat, process_start.ProcessGone):
+                    return ""
+                current = stat.ppid
         except (OSError, ValueError, IndexError, subprocess.SubprocessError):
             return ""
     return ""

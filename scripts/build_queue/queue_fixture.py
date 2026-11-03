@@ -16,6 +16,7 @@ from typing import cast, override
 from zoneinfo import ZoneInfo
 
 from scripts.buildlog import store
+from scripts.lib.process_start_test_support import write_stat
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import fake_memory_readings
 from scripts.message.unit_labels import UnitLabels
@@ -104,9 +105,7 @@ def write_process(proc: Path, pid: int, used: int = 0) -> None:
     """Write the process identity and resident memory consumed by admission."""
     directory = proc / str(pid)
     directory.mkdir(exist_ok=True)
-    fields = ["S", "1", *(["0"] * 17), str(pid)]
-    if (directory / "stat").write_text(f"{pid} (verify) {' '.join(fields)}\n") <= 0:
-        raise OSError("empty fixture process")
+    _ = write_stat(proc, pid, command="verify", start_ticks=pid)
     if (directory / "status").write_text(f"VmRSS: {used // 1024} kB\nVmSwap: 0 kB\n") <= 0:
         raise OSError("empty fixture memory")
 

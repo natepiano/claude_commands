@@ -44,11 +44,12 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast
+from types import MappingProxyType
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -64,6 +65,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 from atomic_file import write_text_atomic  # noqa: E402
+from scripts.lib import process_start
 import add_unit  # noqa: E402
 import berth_board  # noqa: E402
 import production_units  # noqa: E402
@@ -368,15 +370,6 @@ def _alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
-
-
-def proc_start(pid: int) -> str:
-    """The process's start time in clock ticks, as /proc/<pid>/stat field 22 gives it."""
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except OSError:
-        return ""
-    return stat.rsplit(")", 1)[-1].split()[19]
 
 
 def claude_sessions(_worktree: Path, ids: frozenset[str]) -> tuple[SessionRecord, ...]:
@@ -708,7 +701,10 @@ def stop_sessions(unit: Unit, found: Found, wait_minutes: float, known_ids: froz
     return failures
 
 
-def terminate(pids: list[int], what: dict[int, str], wait: float | None = None, *, settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[str]:
+NO_RECORDED_PROCESSES: Mapping[int, process_start.ProcessStart] = MappingProxyType({})
+
+
+def terminate(pids: list[int], what: dict[int, str], wait: float | None = None, *, recorded: Mapping[int, process_start.ProcessStart] = NO_RECORDED_PROCESSES, settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[str]:
     """SIGTERM each pid, observing the configured wait and poll limits."""
     if not pids:
         return []
@@ -723,16 +719,33 @@ def terminate(pids: list[int], what: dict[int, str], wait: float | None = None, 
     if wait is not None:
         duration = min(duration, max(0, wait))
     deadline = min(started + duration, operation_limit)
-    signalled: set[int] = set()
+    identities = dict(recorded)
+    refused: list[str] = []
+    signalled: list[int] = []
     for pid in pids:
+        if pid not in identities:
+            try:
+                started = process_start.process_start(pid)
+            except process_start.ProcessReadError:
+                refused.append(f"{what[pid]}: owner cannot be confirmed; kept")
+                continue
+            if isinstance(started, process_start.ProcessGone):
+                continue
+            identities[pid] = started
+        owner = process_start.check_owner(pid, identities[pid])
+        if owner is process_start.OwnerCheck.UNKNOWN:
+            refused.append(f"{what[pid]}: owner cannot be confirmed; kept")
+            continue
+        if owner is not process_start.OwnerCheck.ALIVE:
+            continue
         try:
             os.kill(pid, signal.SIGTERM)
-            signalled.add(pid)
+            signalled.append(pid)
         except ProcessLookupError:
             continue
         except PermissionError as error:
-            what[pid] += f": {error}"
-    while any(_alive(pid) for pid in pids):
+            refused.append(f"{what[pid]}: {error}")
+    while any(process_start.check_owner(pid, identities[pid]) is process_start.OwnerCheck.ALIVE for pid in signalled):
         now = time.monotonic()
         if now >= operation_limit:
             raise worker_lifecycle.OperationDeadlineExpired("retirement operation deadline expired")
@@ -740,23 +753,29 @@ def terminate(pids: list[int], what: dict[int, str], wait: float | None = None, 
         if remaining <= 0:
             break
         time.sleep(min(poll, remaining))
-    left: list[str] = []
-    for pid in pids:
-        if _alive(pid):
+    left = refused
+    for pid in signalled:
+        if process_start.check_owner(pid, identities[pid]) in (
+                process_start.OwnerCheck.ALIVE, process_start.OwnerCheck.UNKNOWN):
             left.append(f"{what[pid]}: still runs after SIGTERM")
-        elif pid in signalled:
+        else:
             print(f"stopped: {what[pid]}")
     return left
 
 
+
 def process_description(pid: int, *, settings: conf.ConfigRead) -> str:
     try:
-        fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
-        parent = fields[1]
-    except (OSError, IndexError):
+        stat = process_start.read_stat(pid)
+        parent = "unknown" if isinstance(stat, process_start.ProcessGone) else str(stat.ppid)
+    except process_start.ProcessReadError:
         parent = "unknown"
+    try:
+        started = process_start.start_text(pid) or "unknown"
+    except process_start.ProcessReadError:
+        started = "unknown"
     return (f"unowned process {pid}, parent {parent}, command {' '.join(command_line(pid, settings=settings)).strip() or 'unknown'}, "
-            f"start {proc_start(pid) or 'unknown'}")
+            f"start {started}")
 
 
 def process_session(pid: int) -> str:
@@ -777,7 +796,7 @@ def stop_orphan(unit: Unit, pid: int, recorded_session_id: str = "", *, settings
     poll = settings.number("RETIRE_POLL_SECONDS")
     description = process_description(pid, settings=settings)
     try:
-        started = proc_start(pid)
+        started = process_start.start_text(pid)
         session_id = recorded_session_id or last_session(unit)
         if not started or not session_id or process_session(pid) != session_id:
             raise Refused("no recorded session ownership")
@@ -800,7 +819,7 @@ def stop_orphan(unit: Unit, pid: int, recorded_session_id: str = "", *, settings
                 cwd = (entry / "cwd").resolve(strict=True)
                 if not cwd.is_relative_to(unit.worktree.resolve()) or process_session(member) != session_id:
                     raise Refused(f"group member {member} has no worktree/session ownership")
-                birth = proc_start(member)
+                birth = process_start.start_text(member)
                 if not birth:
                     raise Refused(f"group member {member} has no start time")
                 members.append((member, birth))
@@ -811,10 +830,10 @@ def stop_orphan(unit: Unit, pid: int, recorded_session_id: str = "", *, settings
         observed = sessions.session_processes(session_id)
         if isinstance(observed, sessions.SessionLivenessUnknown) or observed.pids:
             raise Refused("the recorded session became live or unreadable")
-        if any(proc_start(member) != birth or os.getpgid(member) != pid
+        if any(process_start.check_owner(member, process_start.parse_start(birth)) is not process_start.OwnerCheck.ALIVE or os.getpgid(member) != pid
                or process_session(member) != session_id
                or not Path(f"/proc/{member}/cwd").resolve(strict=True).is_relative_to(unit.worktree.resolve())
-               for member, birth in members) or proc_start(pid) != started:
+               for member, birth in members) or process_start.check_owner(pid, process_start.parse_start(started)) is not process_start.OwnerCheck.ALIVE:
             raise Refused("process identity changed before signal")
         if operation_limit != worker_lifecycle.NO_LOCK_DEADLINE and time.monotonic() >= operation_limit:
             raise worker_lifecycle.OperationDeadlineExpired("retirement operation deadline expired")
@@ -827,11 +846,7 @@ def stop_orphan(unit: Unit, pid: int, recorded_session_id: str = "", *, settings
         return [f"{description} works inside {unit.worktree}; stop it first: {error}"]
     deadline = min(time.monotonic() + duration, operation_limit)
     def still_running() -> bool:
-        try:
-            state = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()[0]
-        except (OSError, IndexError):
-            return False
-        return state != "Z" and proc_start(pid) == started and _alive(pid)
+        return process_start.check_owner(pid, process_start.parse_start(started)) is process_start.OwnerCheck.ALIVE
     while still_running():
         now = time.monotonic()
         if now >= operation_limit:
@@ -847,7 +862,7 @@ def stop_orphan(unit: Unit, pid: int, recorded_session_id: str = "", *, settings
 
 
 def live_claims(claims: tuple[MacClaim, ...]) -> tuple[MacClaim, ...]:
-    return tuple(claim for claim in claims if _alive(claim.pid) and proc_start(claim.pid) == claim.proc_start)
+    return tuple(claim for claim in claims if claim.proc_start and process_start.check_owner(claim.pid, process_start.parse_start(claim.proc_start)) is process_start.OwnerCheck.ALIVE)
 
 
 def stop_rest(unit: Unit, found: Found, recorded_session_id: str = "", *, settings: conf.ConfigRead) -> list[str]:
@@ -874,9 +889,12 @@ def stop_rest(unit: Unit, found: Found, recorded_session_id: str = "", *, settin
             left.append(f"berth reservation {key}: {failure(result)}")
         elif result.returncode == 0:
             print(f"released: berth reservation {key}")
+    for claim in found.claims:
+        if not claim.proc_start or process_start.check_owner(claim.pid, process_start.parse_start(claim.proc_start)) is process_start.OwnerCheck.UNKNOWN:
+            left.append(f"Mac claim {claim.what} (pid {claim.pid}): owner cannot be confirmed; kept")
     claims = live_claims(found.claims)
     what = {claim.pid: f"Mac claim {claim.what} (pid {claim.pid})" for claim in claims}
-    left += terminate([claim.pid for claim in claims], what, settings=settings) if claims else terminate([], {})
+    left += terminate([claim.pid for claim in claims], what, recorded={claim.pid: process_start.parse_start(claim.proc_start) for claim in claims}, settings=settings) if claims else terminate([], {})
     # Cwd alone never gives signal authority; the session and identity must agree.
     inside: set[int] = set(unit_move.processes_inside(unit.worktree)) if unit_move.exists(unit.worktree) else set()
     for pid in found.processes:

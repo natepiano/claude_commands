@@ -16,11 +16,14 @@ from importlib import import_module
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import process_start as process_identity
+process_start = process_identity.start_text
+
 if __package__:
-    from .process_identity import process_start as process_start
     from .relay_identity import RelayIdentity, live_relay_identity, relay_senders_directory
 else:
-    from process_identity import process_start as process_start
     from relay_identity import RelayIdentity, live_relay_identity, relay_senders_directory
 
 
@@ -260,7 +263,7 @@ def running_session(record: SessionRecord) -> bool:
         return False
     recorded_start = record.get("procStart", "")
     if recorded_start:
-        return recorded_start == process_start(record["pid"])
+        return process_identity.check_owner(record["pid"], process_identity.parse_start(recorded_start)) is process_identity.OwnerCheck.ALIVE
     return messaging_socket_exists(record)
 
 
@@ -268,19 +271,10 @@ def process_liveness(pid: int, recorded_start: str) -> LiveSessionProcess | Sess
     """Check the saved process identity without treating unreadable evidence as absence."""
     if not recorded_start:
         return SessionNotLive()
-    current = process_start(pid)
-    if current is not None and current != recorded_start:
+    state = process_identity.check_owner(pid, process_identity.parse_start(recorded_start))
+    if state.stale:
         return SessionNotLive()
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return SessionNotLive()
-    except PermissionError:
-        if current == recorded_start:
-            return LiveSessionProcess(pid)
-    except (OSError, OverflowError) as error:
-        return SessionLivenessUnknown(f"process identity unreadable: {error}")
-    if current is None:
+    if state is process_identity.OwnerCheck.UNKNOWN:
         return SessionLivenessUnknown(f"process identity unreadable for pid {pid}")
     return LiveSessionProcess(pid)
 

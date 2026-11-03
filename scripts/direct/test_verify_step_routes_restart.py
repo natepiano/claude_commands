@@ -31,6 +31,7 @@ if arguments[:1] == ["check"]:
         holders = Path(self.fixture.environment["BUILD_HOLD_DIR"])
         (holders / "other").unlink()
         cargo = self.fixture.bin_directory / "cargo"
+        self.fixture.environment["TEST_PROCESS_REPOSITORY"] = str(Path(__file__).resolve().parents[2])
         source = cargo.read_text().replace('arguments = sys.argv[1:]', '''arguments = sys.argv[1:]
 if arguments[:1] == ["check"]:
     import socket
@@ -38,7 +39,12 @@ if arguments[:1] == ["check"]:
     if not first.exists():
         first.write_text("stopped")
         proc = Path("/proc")
-        start = (proc / str(os.getpid()) / "stat").read_text().rsplit(")", 1)[1].split()[19]
+        sys.path.insert(0, os.environ["TEST_PROCESS_REPOSITORY"])
+        from scripts.lib import process_start
+        stat = process_start.read_stat(os.getpid())
+        if isinstance(stat, process_start.ProcessGone):
+            raise SystemExit("the test process ended before its stop record")
+        start = stat.start.text
         log = Path(os.environ["BUILDLOG_DIR"]) / socket.gethostname().split(".")[0]
         log.mkdir(parents=True, exist_ok=True)
         (log / "hold-builds-test.jsonl").write_text(json.dumps(dict(

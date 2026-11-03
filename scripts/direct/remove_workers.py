@@ -196,16 +196,26 @@ def main() -> int:
         "--session-dir", action="append", default=[], help="a run of the caller's; all its workers go (repeatable)"
     )
     _ = parser.add_argument("--run-root", help="one run root in place of both run-folder names")
+    _ = parser.add_argument("--failed-runs", type=Path)
     args = parser.parse_args()
     session_dirs = cast("list[str]", args.session_dir)
     given = cast("str | None", args.run_root)
     roots = (Path(given),) if given else DEFAULT_ROOTS
     own_runs = {Path(session_dir).resolve() for session_dir in session_dirs if session_dir}
 
+    failure_path = cast(Path | None, args.failed_runs)
+    failures: set[Path] = set()
+
+    def report() -> None:
+        if failure_path is not None:
+            _ = failure_path.write_text("".join(str(run) + "\n" for run in sorted(failures)))
+
     claude = claude_bin()
     rows = list_sessions(claude)
     if rows is None:
         print("remove_workers: could not list sessions with `claude agents --json`; nothing removed.", file=sys.stderr)
+        failures.update(own_runs)
+        report()
         return 1
 
     listed_sessions = {row.get("sessionId", "") for row in rows}
@@ -214,6 +224,11 @@ def main() -> int:
     caller = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     removed = 0
     failed = 0
+    ownership = {worker_id: {run for run in own_runs if worker_id in ledger_ids(run)} for worker_id in targets}
+    for row in rows:
+        match = LEGACY_NAME.match(row.get("name", ""))
+        if match:
+            ownership.setdefault(row.get("id", ""), set()).update(run for run in own_runs if run.name == match.group(1))
     for row in rows:
         worker_id = row.get("id", "")
         if row.get("kind") != "background" or worker_id not in targets:
@@ -231,6 +246,7 @@ def main() -> int:
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             failed += 1
+            failures.update(ownership.get(worker_id, set()))
             print(f"remove_workers: could not remove {name} ({worker_id}): {error}", file=sys.stderr)
             continue
         if result.returncode == 0:
@@ -238,11 +254,13 @@ def main() -> int:
             print(f"removed worker {name} ({worker_id}): {targets[worker_id]}")
         else:
             failed += 1
+            failures.update(ownership.get(worker_id, set()))
             detail = (result.stderr or result.stdout).strip()
             print(f"remove_workers: could not remove {name} ({worker_id}): {detail}", file=sys.stderr)
 
     if removed == 0 and failed == 0:
         print("remove_workers: no workers to remove.")
+    report()
     return 1 if failed else 0
 
 

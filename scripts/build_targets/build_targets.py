@@ -22,6 +22,12 @@ import time
 from types import FrameType
 from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast, final
 
+if TYPE_CHECKING:
+    from ..lib import process_start
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib import process_start
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
@@ -333,7 +339,7 @@ def ssh_target_config(target: SshTarget) -> offload.OffloadConfig | ExcludedTarg
 
 def owns_wait_claim(paths: mac_test.StatePaths, repo_root: str, pid: int) -> bool:
     """Find the same process's reservation, including retained cleanup ownership."""
-    start = mac_test.process_start_time(pid)
+    start = process_start.start_text(pid)
     if start is None:
         return False
     scope = mac_test.target_claim_scope(paths, repo_root)
@@ -350,7 +356,7 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments) -> None:
     scope = mac_test.target_claim_scope(paths, args.repo_root)
     if not isinstance(scope, mac_test.RepositoryScope):
         return
-    start = mac_test.process_start_time(args.pid)
+    start = process_start.start_text(args.pid)
     if start is None:
         return
     with mac_test.locked(paths.lock):
@@ -459,7 +465,7 @@ def command_reserve(args: CliArguments) -> int:
 
 def command_release_wait(pid: int) -> int:
     """Release only process-bound reservations; remote claims retain ownership."""
-    start = mac_test.process_start_time(pid)
+    start = process_start.start_text(pid)
     if start is None:
         return 0
     for target in read_targets():
@@ -645,8 +651,11 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
         for signum in (signal.SIGINT, signal.SIGTERM):
             previous_handlers[signum] = signal.signal(signum, interrupted)
         if waiter_file:
+            owner_start = process_start.process_start(os.getpid())
+            if isinstance(owner_start, process_start.ProcessGone):
+                raise RuntimeError("hold waiter process ended before registration")
             waiter: ActiveWaitProcess = {"call_id": call_id, "pid": os.getpid(),
-                                         "proc_start": build_hold.process_start_time(os.getpid())}
+                                         "proc_start": owner_start.text}
             temporary = Path(waiter_file).with_suffix(".tmp")
             _ = temporary.write_text(json.dumps(waiter))
             os.replace(temporary, waiter_file)
@@ -722,7 +731,7 @@ def command_interrupt_local(call_id: str, signal_name: str) -> int:
         identity = waiter.get("proc_start")
         if (waiter.get("call_id") != call_id or not isinstance(pid, int) or pid <= 0
             or not isinstance(identity, str) or not identity
-            or build_hold.process_start_time(pid) != identity):
+            or process_start.check_owner(pid, process_start.parse_start(identity)) is not process_start.OwnerCheck.ALIVE):
             return 0
         os.kill(pid, signal.SIGINT if signal_name == "INT" else signal.SIGTERM)
         deadline = time.monotonic() + 2

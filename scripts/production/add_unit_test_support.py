@@ -22,6 +22,8 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
+
+from scripts.lib.process_start_test_support import write_stat
 from typing import ClassVar, cast, override
 from types import ModuleType
 from collections.abc import Callable, Iterator
@@ -448,7 +450,7 @@ class AddUnitTestCase(ShutdownTestCase):
                 for path, parent, command in ((process, int(server.name), ["zsh"]), (server, 1, ["herdr", "--session", name, "server"])):
                     path.mkdir(parents=True, exist_ok=True)
                     _ = (path / "cmdline").write_bytes("\0".join(command).encode() + b"\0")
-                    _ = (path / "stat").write_text(f"{path.name} (fixture) S {parent} 0")
+                    _ = write_stat(path.parent, int(path.name), ppid=parent)
                     _ = (path / "status").write_text(f"Uid:\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\n")
                 (process / "cwd").unlink(missing_ok=True)
                 (process / "cwd").symlink_to(request.session_cwd)
@@ -872,7 +874,7 @@ class AddUnitTestCase(ShutdownTestCase):
         for pid, parent, arguments in ((201, 1, ["herdr", "--session", name, "server"]), (202, 201, ["zsh"])):
             process = self.root / "proc" / str(pid)
             process.mkdir(parents=True)
-            _ = (process / "stat").write_text(f"{pid} (fixture) S {parent} 0")
+            _ = write_stat(process.parent, int(process.name), ppid=parent)
             _ = (process / "cmdline").write_bytes("\0".join(arguments).encode())
             _ = (process / "environ").write_text("HERDR_PANE_ID=w2:p1\0SHOWRUNNER_UNIT=build-followups\0SHOWRUNNER_UNIT_ID=alpha-unit" if pid == 202 else "")
             (process / "cwd").symlink_to(cwd)

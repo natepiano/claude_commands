@@ -23,12 +23,18 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 for directory in ("mac_test", "build_targets", "build_hold", "buildlog"):
     sys.path.insert(0, str(SCRIPTS / directory))
 
+
 if TYPE_CHECKING:
+    from ..lib import process_start
+    from ..lib.process_start_test_support import stored_start_probe
     from . import mac_test, offload
     from ..build_hold import build_hold
     from ..build_targets import targets
     from ..lint.memory_test_support import config_environment, write_config_fixture
 else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib import process_start
+    from scripts.lib.process_start_test_support import stored_start_probe
     import mac_test
     import offload
     import build_hold
@@ -74,7 +80,7 @@ class RepositorySlotTests(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
         })))
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
-        _ = self.enterContext(mock.patch.object(mac_test, "process_start_time", side_effect=self.process_start))
+        _ = self.enterContext(mock.patch.object(process_start, "process_start", side_effect=stored_start_probe(lambda pid: (self.process_start)(pid) or "")))
         _ = self.enterContext(mock.patch.object(mac_test, "utc_now", return_value=datetime(2026, 11, 1, tzinfo=timezone.utc)))
         _ = self.enterContext(mock.patch.object(time, "monotonic", return_value=100.0))
         _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=build_hold.NoOwningSession()))

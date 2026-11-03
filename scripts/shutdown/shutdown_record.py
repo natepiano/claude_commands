@@ -33,6 +33,7 @@ from launch_permission import launch_barrier, shutdown_state_root
 for dependency in ("lib", "whoami"):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / dependency))
 from user_zone import user_zone  # noqa: E402
+from scripts.lib import process_start
 from scripts.whoami.note_file import canonical_label, parse_account_label, NumberedAccountLabel
 from scripts.whoami.account import ResolvedHistoryLabel, HistoricalAccountUnresolved
 
@@ -1873,16 +1874,10 @@ def registration_process_start(pid: int) -> str:
         seconds = int.from_bytes(buffer.raw[120:128], sys.byteorder)
         micros = int.from_bytes(buffer.raw[128:136], sys.byteorder)
         return f"darwin:{seconds}:{micros}"
-    _, separator, fields = Path(f"/proc/{pid}/stat").read_bytes().rpartition(b")")
-    if not separator:
+    stat = process_start.read_stat(pid)
+    if isinstance(stat, process_start.ProcessGone):
         raise OSError("cannot identify the shutdown registration process")
-    try:
-        started = fields.split()[19].decode("ascii")
-    except (IndexError, UnicodeDecodeError) as error:
-        raise OSError("cannot identify the shutdown registration process") from error
-    if not started.isdigit():
-        raise OSError("cannot identify the shutdown registration process")
-    return started
+    return stat.start.text
 
 
 def register_account_hold_request(hold: AccountHold, *, account_wide: bool, expires_at: str = "") -> None:

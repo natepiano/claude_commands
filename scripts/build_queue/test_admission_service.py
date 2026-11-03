@@ -20,12 +20,138 @@ from unittest import mock
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lint import memory_admit as gate
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib import process_start
 from scripts.build_queue import admission_protocol as wire, admission_service as service
 from scripts.build_queue import queue_view
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, only_admitted
 
 
 class ServiceTests(unittest.TestCase):
+    def test_unreadable_table_keeps_the_promise_after_an_alive_owner_check(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request(need=8 * GIB)
+            grant = only_admitted(fixture.server.handle_request(request))
+            write_text_atomic(Path(grant.reservation), wire.encode_record(
+                service.reservation_row(fixture.server.reservations[request.episode])))
+            fixture.scoped_peak(grant, GIB)
+            fixture.clock.advance(gate.DEFAULT_ADMISSION_POLICY.timing.ramp_seconds + 1)
+            readable = fixture.proc.processes()
+
+            def unreadable_after_owner_check() -> gate.ProcessTable:
+                self.assertEqual(fixture.proc.owner_check(request.owner), process_start.OwnerCheck.ALIVE)
+                return {request.owner.pid: gate.UnreadableProcessIdentity("process table read failed")}
+
+            with mock.patch.object(fixture.proc, "processes", side_effect=unreadable_after_owner_check):
+                _ = fixture.server.run_pass()
+            inputs = fixture.server.last_inputs
+            self.assertIsInstance(inputs, gate.QueueInputs)
+            if not isinstance(inputs, gate.QueueInputs):
+                self.fail("the service did not retain its memory inputs")
+            self.assertEqual(inputs.running[0].measured, gate.PromisedMemory(8 * GIB))
+            self.assertIn(request.episode, fixture.server.reservations)
+            self.assertTrue(Path(grant.reservation).exists())
+
+            with mock.patch.object(fixture.proc, "processes", return_value=readable):
+                _ = fixture.server.run_pass()
+            inputs = fixture.server.last_inputs
+            self.assertIsInstance(inputs, gate.QueueInputs)
+            if not isinstance(inputs, gate.QueueInputs):
+                self.fail("the service did not retain its memory inputs")
+            measured = inputs.running[0].measured
+            self.assertIsInstance(measured, gate.MeasuredMemory)
+            if not isinstance(measured, gate.MeasuredMemory):
+                self.fail("the service did not resume measured charging")
+            self.assertEqual(measured.bytes, GIB)
+            self.assertEqual(gate.charge_basis(measured).bytes, GIB)
+            self.assertTrue(Path(grant.reservation).exists())
+
+    def test_an_unreadable_owner_keeps_the_service_running_and_its_scope_reserved(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            request = replace(request, sidecar=str(fixture.scope(request.owner)))
+            _ = only_admitted(fixture.server.handle_request(request))
+            fixture.clock.advance(gate.DEFAULT_ADMISSION_POLICY.timing.ramp_seconds)
+            with mock.patch.object(fixture.proc, "owner_check", side_effect=service.SystemProc().owner_check), \
+                 mock.patch.object(process_start, "process_start", side_effect=process_start.ProcessReadError("denied")):
+                fixture.server.run_once(0)
+                reply = fixture.server.handle_request(wire.ViewRequest())[0]
+            self.assertFalse(fixture.server.stopped)
+            self.assertIn(request.episode, fixture.server.reservations)
+            self.assertIsInstance(reply, wire.ViewReply)
+            if not isinstance(reply, wire.ViewReply):
+                self.fail("the service did not answer after the owner read failed")
+            self.assertEqual(len(reply.reading.explanation.running), 1)
+
+    def test_unknown_owners_keep_empty_sidecars_and_memory_until_confirmed_loss(self) -> None:
+        for final_state in (process_start.OwnerCheck.GONE, process_start.OwnerCheck.REPLACED):
+            for full_table in (False, True):
+                with self.subTest(final_state=final_state, full_table=full_table), AdmissionFixture() as fixture:
+                    request = fixture.request()
+                    sidecar = fixture.root / "empty.cgroup"
+                    _ = sidecar.write_text("")
+                    request = replace(request, sidecar=str(sidecar))
+                    grant = only_admitted(fixture.server.handle_request(request))
+                    fixture.scoped_peak(grant, GIB)
+                    write_text_atomic(Path(grant.reservation), wire.encode_record(
+                        service.reservation_row(fixture.server.reservations[request.episode])))
+                    if full_table:
+                        other = fixture.request(need=GIB)
+                        _ = only_admitted(fixture.server.handle_request(other))
+                    original = fixture.proc.owner_check
+                    state = process_start.OwnerCheck.UNKNOWN
+
+                    def owner_check(owner: wire.Owner) -> process_start.OwnerCheck:
+                        return state if owner == request.owner else original(owner)
+
+                    with mock.patch.object(fixture.proc, "owner_check", side_effect=owner_check):
+                        fixture.restart()
+                        for refresh_seconds in (1, 2):
+                            fixture.clock.advance(refresh_seconds)
+                            fixture.server.run_once(0)
+                            self.assertIn(request.episode, fixture.server.reservations)
+                            self.assertTrue(Path(grant.reservation).exists())
+                            inputs = fixture.server.last_inputs
+                            self.assertIsInstance(inputs, gate.QueueInputs)
+                            if not isinstance(inputs, gate.QueueInputs):
+                                self.fail("the service did not retain its memory inputs")
+                            saved = next(step for step in inputs.running if step.session_id == request.identity.session_id)
+                            self.assertEqual(saved.measured, gate.PromisedMemory(request.profile.peak.bytes))
+                            self.assertFalse(fixture.history())
+                        state = final_state
+                        fixture.server.run_once(0)
+                        _ = fixture.server.run_pass()
+                        self.assertNotIn(request.episode, fixture.server.reservations)
+                        self.assertEqual(len(fixture.history()), 1)
+                        fixture.restart()
+                        _ = fixture.server.run_pass()
+                        self.assertEqual(len(fixture.history()), 1)
+
+    def test_unknown_waiters_keep_their_places_during_unrelated_owner_events_without_a_grant(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            request = fixture.request()
+            _ = fixture.server.handle_request(request)
+            unrelated = fixture.request()
+            _ = fixture.server.handle_request(unrelated)
+            places = dict(fixture.server.places)
+            original = fixture.proc.owner_check
+
+            def owner_check(owner: wire.Owner) -> process_start.OwnerCheck:
+                return process_start.OwnerCheck.UNKNOWN if owner == request.owner else original(owner)
+
+            with mock.patch.object(fixture.proc, "owner_check", side_effect=owner_check):
+                fixture.proc.kill(unrelated.owner)
+                fixture.free(60 * GIB)
+                fixture.server.run_once(0)
+                self.assertIn(request.episode, fixture.server.waiters)
+                self.assertTrue(any(place == value for place in fixture.server.places.values()
+                                    for value in places.values() if value.owner == request.owner))
+                self.assertNotIn(request.episode, fixture.server.reservations)
+                self.assertNotIn(request.episode, fixture.server.ledger)
+                fixture.restart()
+                self.assertTrue(any(place.owner == request.owner for place in fixture.server.places.values()))
+                self.assertFalse(fixture.history())
+
     def test_socket_fixture_works_with_a_long_tmpdir(self) -> None:
         with tempfile.TemporaryDirectory(prefix="admit-long-", dir="/tmp") as root:
             long_tmpdir = Path(root) / ("nested-" * 24)
@@ -51,13 +177,13 @@ class ServiceTests(unittest.TestCase):
                     override = fixture.server.override
                     self.assertNotIsInstance(override, gate.NoHeadAdmissionOverride)
                     fixture.server.close()
-                    owner_start = fixture.proc.owner_start
+                    owner_check = fixture.proc.owner_check
 
-                    def slow_restore(pid: int) -> str | None:
+                    def slow_restore(owner: wire.Owner) -> process_start.OwnerCheck:
                         fixture.clock.advance(10)
-                        return owner_start(pid)
+                        return owner_check(owner)
 
-                    with mock.patch.object(fixture.proc, "owner_start", side_effect=slow_restore):
+                    with mock.patch.object(fixture.proc, "owner_check", side_effect=slow_restore):
                         fixture.server = fixture.new_server(start=False)
                     self.assertGreater(fixture.clock.monotonic(), 4)
                     self.assertEqual(fixture.server.override, override)
@@ -817,7 +943,7 @@ class ServiceTests(unittest.TestCase):
             def supplied_scope_memory(_path: Path, row: gate.Reservation, _now: object,
                                       _processes: object, _proc: Path, policy: gate.AdmissionPolicy) -> gate.StepMemory:
                 _ = policy
-                lifetime = fixture.proc.lifetime(row, fixture.proc.owner_start(owner.pid) == owner.start_time)
+                lifetime = fixture.proc.lifetime(row, not fixture.proc.owner_check(owner).stale)
                 return gate.GoneMemory() if isinstance(lifetime, gate.EndedStep) else gate.MeasuredMemory(GIB)
             with mock.patch.object(gate, "check_memory_reading", side_effect=membership_only), \
                  mock.patch.object(fixture.readings, "reservation", side_effect=supplied_scope_memory):

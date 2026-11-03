@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 import io
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -19,6 +20,7 @@ from typing import TYPE_CHECKING, BinaryIO, TypedDict, Unpack
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lint import memory_admit
+from scripts.lib import process_start
 
 if TYPE_CHECKING:
     from scripts.lib import conf
@@ -36,6 +38,15 @@ CONFIGURED_FIRST_PEAK = ConfiguredFirstPeak()
 
 class QueuePlaceRefused(Exception):
     """The program cannot acquire or keep its queue place."""
+
+
+class CleanupIncomplete(QueuePlaceRefused):
+    """The deadline ended before cleanup confirmed every child exit."""
+
+    def __init__(self, unresolved_pids: set[int]) -> None:
+        self.unresolved_pids: frozenset[int] = frozenset(unresolved_pids)
+        super().__init__("program cleanup incomplete; unresolved pids: "
+                         + ", ".join(str(pid) for pid in sorted(unresolved_pids)))
 
 
 def no_hold_wait() -> None:
@@ -155,28 +166,90 @@ class ProgramNotStarted:
 class ProgramTree:
     group: int
     observed: dict[int, str] = field(default_factory=dict[int, str])
-    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    unconfirmed_members: frozenset[int] = field(default_factory=frozenset[int])
+    replaced_members: set[int] = field(default_factory=set[int])
 
     def live_members(self, scope_members: set[int]) -> dict[int, str]:
         """Retain observed descendants after a session change or reparenting."""
-        with self.lock:
-            processes = memory_admit.process_table(Path("/proc"))
-            members = memory_admit.process_tree(self.observed, processes)
-            members.update(scope_members)
+        processes = memory_admit.process_table(Path("/proc"))
+        fresh_members = memory_admit.process_tree(self.observed, processes) | scope_members
+        if self.group:
             for pid in processes:
                 try:
                     if os.getpgid(pid) == self.group:
-                        members.add(pid)
-                except ProcessLookupError:
+                        fresh_members.add(pid)
+                except OSError:
                     continue
-            live = {pid: processes[pid].start for pid in members if pid in processes}
-            self.observed = live
-            return live
+        candidates = fresh_members | self.observed.keys() | self.unconfirmed_members
+        live: dict[int, str] = {}
+        unknown: set[int] = set()
+        retained: dict[int, str] = {}
+        for pid in candidates - self.replaced_members:
+            identity = processes.get(pid)
+            if isinstance(identity, memory_admit.ProcessIdentity):
+                known = self.observed.get(pid)
+                if known is not None and known != identity.start:
+                    self.replaced_members.add(pid)
+                elif known is not None or pid in fresh_members:
+                    live[pid] = identity.start
+            elif isinstance(identity, memory_admit.UnreadableProcessIdentity) or pid in scope_members:
+                unknown.add(pid)
+                if pid in self.observed:
+                    retained[pid] = self.observed[pid]
+            elif pid in self.observed:
+                self.replaced_members.add(pid)
+        self.unconfirmed_members = frozenset(unknown)
+        self.observed = {**retained, **live}
+        return live
+
+    def has_pending_members(self) -> bool:
+        """Keep unreadable children pending until an exit is confirmed."""
+        pending = set(self.unconfirmed_members)
+        for pid in self.unconfirmed_members:
+            try:
+                if process_start.process_state(pid) is process_start.ProcessRunState.GONE:
+                    pending.remove(pid)
+                    if pid in self.observed:
+                        self.replaced_members.add(pid)
+                        del self.observed[pid]
+            except process_start.ProcessReadError:
+                pass
+        self.unconfirmed_members = frozenset(pending)
+        return bool(pending)
 
 
 @dataclass
 class ScopedProgram:
     """The published scope contains every program descendant."""
+
+
+@dataclass(frozen=True)
+class CleanupRequest:
+    terminate_at: float
+    finish_at: float
+    failed: bool
+
+
+@dataclass(frozen=True)
+class CleanupPending:
+    unresolved_pids: frozenset[int]
+
+
+@dataclass(frozen=True)
+class CleanupComplete:
+    status: int
+
+
+@dataclass(frozen=True)
+class CleanupNotRequested:
+    pass
+
+
+@dataclass
+class CleanupControl:
+    request: CleanupRequest | CleanupNotRequested = field(default_factory=CleanupNotRequested)
+    result: CleanupPending | CleanupComplete = field(default_factory=lambda: CleanupPending(frozenset()))
+    completed: threading.Event = field(default_factory=threading.Event)
 
 
 @dataclass
@@ -185,17 +258,18 @@ class StartedProgram:
     stopped: threading.Event
     sampler: threading.Thread
     tracking: ScopedProgram | ProgramTree
+    cleanup: CleanupControl = field(default_factory=CleanupControl)
 
 
 def scope_start(sidecar: Path, holder_pid: int, holder_start: str, argv: Sequence[str]) -> None:
     """Publish the scope and confirm its holder before the program starts."""
-    if memory_admit.process_start_time(holder_pid) != holder_start:
+    if process_start.start_text(holder_pid) != holder_start:
         raise QueuePlaceRefused("the queue place holder exited before scope startup")
     for line in Path("/proc/self/cgroup").read_text().splitlines():
         if line.startswith("0::") and "/builds.slice/" in line:
             scope = Path("/sys/fs/cgroup") / line[3:].lstrip("/")
             atomic_sample(sidecar, str(scope) + "\n")
-            if memory_admit.process_start_time(holder_pid) != holder_start:
+            if process_start.start_text(holder_pid) != holder_start:
                 raise QueuePlaceRefused("the queue place holder exited during scope publication")
             os.execvp(argv[0], list(argv))
     raise QueuePlaceRefused("the program did not enter its memory scope")
@@ -210,27 +284,6 @@ def scope_members(scope: Path) -> set[int]:
         except FileNotFoundError:
             continue
     return members
-
-
-def stop_scope(scope: Path, deadline: float, sample_seconds: float) -> None:
-    """Stop scope members until the scope is empty."""
-    while members := scope_members(scope):
-        number = signal.SIGKILL if time.monotonic() >= deadline else signal.SIGTERM
-        killed_scope = False
-        if number == signal.SIGKILL:
-            try:
-                _ = (scope / "cgroup.kill").write_text("1\n")
-                killed_scope = True
-            except FileNotFoundError:
-                pass
-        if not killed_scope:
-            for pid in members:
-                try:
-                    os.kill(pid, number)
-                except ProcessLookupError:
-                    pass
-        time.sleep(min(sample_seconds, max(0, deadline - time.monotonic()))
-                   if number == signal.SIGTERM else sample_seconds)
 
 
 def program_members(tree: ProgramTree, sidecar: Path) -> dict[int, str]:
@@ -283,7 +336,7 @@ class QueuePlace:
                 raise QueuePlaceRefused(
                     "the queued program requires a memory scope; set BUILDLOG_SCOPE=0 only for tests")
         holder_pid = os.getpid()
-        holder_start = memory_admit.process_start_time(holder_pid)
+        holder_start = process_start.start_text(holder_pid)
         if holder_start is None:
             raise QueuePlaceRefused("the queue place holder has no live process identity")
         command = ([*prefix, sys.executable, str(Path(__file__).resolve()), "--scope-start", str(self.sidecar),
@@ -295,11 +348,9 @@ class QueuePlace:
             tracking: ScopedProgram | ProgramTree = ScopedProgram()
             if not prefix:
                 tracking = ProgramTree(process.pid)
-                start = memory_admit.process_start_time(process.pid)
-                if start is not None:
-                    tracking.observed[process.pid] = start
-            sampler = threading.Thread(target=self._sample, args=(tracking, stopped), daemon=True)
+            sampler = threading.Thread(target=self._run_program, daemon=True)
             self.program = StartedProgram(process, stopped, sampler, tracking)
+            self.program.cleanup.result = CleanupPending(frozenset({process.pid}))
             sampler.start()
             if prefix:
                 while not self.sidecar.read_text().strip():
@@ -321,12 +372,16 @@ class QueuePlace:
                     self.observe(anon, anon)
                 elif isinstance(tracking, ProgramTree):
                     members = program_members(tracking, self.sidecar)
+                    if isinstance(self.program, StartedProgram):
+                        self.program.cleanup.result = CleanupPending(frozenset(
+                            set(members) | tracking.unconfirmed_members | {self.program.process.pid}))
                     proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
                     matching = set(members)
                     if proc != Path("/proc"):
                         processes = memory_admit.process_table(proc)
                         matching = {pid for pid, start in members.items()
-                                    if pid in processes and processes[pid].start == start}
+                                    if isinstance(identity := processes.get(pid), memory_admit.ProcessIdentity)
+                                    and identity.start == start}
                     reading = memory_admit.process_memory(matching, proc)
                     self.observe(reading.bytes, reading.bytes)
             except (OSError, ValueError, StopIteration):
@@ -334,38 +389,104 @@ class QueuePlace:
             if stopped.wait(memory_admit.read_memory_config().program_sample_seconds):
                 return
 
+    def _run_program(self) -> None:
+        program = self.program
+        if not isinstance(program, StartedProgram):
+            return
+        try:
+            if isinstance(program.tracking, ProgramTree) and program.process.pid not in program.tracking.observed:
+                if program.process.poll() is None:
+                    start = process_start.start_text(program.process.pid)
+                    if start is not None and program.process.poll() is None:
+                        program.tracking.observed[program.process.pid] = start
+            self._sample(program.tracking, program.stopped)
+            _ = program.stopped.wait()
+            self._complete_cleanup(program)
+        except Exception:
+            program.cleanup.completed.set()
+
+    def _complete_cleanup(self, program: StartedProgram) -> None:
+        request = program.cleanup.request
+        if not isinstance(request, CleanupRequest):
+            return
+        try:
+            self._cleanup(program, request)
+        except (CleanupIncomplete, OSError, ValueError):
+            pass
+        finally:
+            program.cleanup.completed.set()
+
+    def _cleanup(self, program: StartedProgram, request: CleanupRequest) -> None:
+        process = program.process
+        tree = program.tracking if isinstance(program.tracking, ProgramTree) else ProgramTree(0)
+        config = memory_admit.read_memory_config()
+        completed = process.poll()
+
+        def check_deadline() -> None:
+            if time.monotonic() > request.finish_at:
+                raise CleanupIncomplete(set(program.cleanup.result.unresolved_pids)
+                    if isinstance(program.cleanup.result, CleanupPending) else {process.pid})
+
+        check_deadline()
+        while True:
+            members = program_members(tree, self.sidecar)
+            program.cleanup.result = CleanupPending(frozenset(set(members) | tree.unconfirmed_members or {process.pid}))
+            check_deadline()
+            pending = tree.has_pending_members()
+            check_deadline()
+            unresolved = set(members) | tree.unconfirmed_members
+            program.cleanup.result = CleanupPending(frozenset(unresolved or {process.pid}))
+            if not members and not pending:
+                scope = self.sidecar.read_text().strip()
+                check_deadline()
+                if scope:
+                    unresolved.update(scope_members(Path(scope)))
+                    check_deadline()
+                if not unresolved:
+                    break
+            for pid, start in members.items():
+                owner = process_start.check_owner(pid, process_start.parse_start(start))
+                check_deadline()
+                if owner is process_start.OwnerCheck.ALIVE and time.monotonic() < request.finish_at:
+                    number = signal.SIGKILL if time.monotonic() >= request.terminate_at else signal.SIGTERM
+                    try:
+                        os.kill(pid, number)
+                    except ProcessLookupError:
+                        pass
+            _ = process.poll()
+            check_deadline()
+            now = time.monotonic()
+            if now >= request.finish_at:
+                raise CleanupIncomplete(unresolved)
+            next_read = (request.terminate_at - now if now < request.terminate_at
+                         else (request.finish_at - now) / 2)
+            time.sleep(min(config.program_sample_seconds, next_read))
+        try:
+            _ = process.wait(timeout=max(0, request.finish_at - time.monotonic()))
+        except subprocess.TimeoutExpired as error:
+            raise CleanupIncomplete({process.pid}) from error
+        check_deadline()
+        program.cleanup.result = CleanupComplete(completed if completed is not None and not request.failed else self.status)
+
     def finish(self, *, failed: bool = False) -> None:
         if not isinstance(self.program, StartedProgram):
             return
         program = self.program
-        process = program.process
-        try:
-            completed = process.poll()
-            config = memory_admit.read_memory_config()
-            deadline = time.monotonic() + config.program_stop_seconds
-            if isinstance(program.tracking, ScopedProgram):
-                stop_scope(Path(self.sidecar.read_text().strip()), deadline, config.program_sample_seconds)
-            else:
-                members = program_members(program.tracking, self.sidecar)
-                while members:
-                    number = signal.SIGKILL if time.monotonic() >= deadline else signal.SIGTERM
-                    for pid, start in members.items():
-                        try:
-                            if memory_admit.process_start_time(pid) == start:
-                                os.kill(pid, number)
-                        except ProcessLookupError:
-                            pass
-                    _ = process.poll()
-                    time.sleep(min(config.program_sample_seconds,
-                                   max(0, deadline - time.monotonic())) if number == signal.SIGTERM
-                               else config.program_sample_seconds)
-                    members = program_members(program.tracking, self.sidecar)
-            _ = process.wait()
-            if completed is not None and not failed:
-                self.status = completed
-        finally:
-            program.stopped.set()
-            program.sampler.join()
+        config = memory_admit.read_memory_config()
+        request = program.cleanup.request
+        if not isinstance(request, CleanupRequest):
+            terminate_at = time.monotonic() + config.program_stop_seconds
+            request = CleanupRequest(terminate_at, terminate_at + config.program_stop_seconds, failed)
+            program.cleanup.request = request
+        finish_at = request.finish_at
+        program.stopped.set()
+        done = program.cleanup.completed.wait(timeout=max(0, finish_at - time.monotonic()))
+        program.sampler.join(timeout=max(0, finish_at - time.monotonic()))
+        result = program.cleanup.result
+        if not done or program.sampler.is_alive() or not isinstance(result, CleanupComplete):
+            raise CleanupIncomplete(set(result.unresolved_pids) or {program.process.pid}
+                                    if isinstance(result, CleanupPending) else {program.process.pid})
+        self.status = result.status
 
 
 def _stop_holder(number: int, _frame: object) -> None:
@@ -392,8 +513,10 @@ def queue_place(program: str, repo: Path, *,
     previous_need = 0
     previous_reasons: tuple[str, ...] = ()
     reported_at = 0.0
-    with tempfile.TemporaryDirectory(prefix="queue-place-") as temporary:
-        sidecar = Path(temporary) / "program.cgroup"
+    temporary = Path(tempfile.mkdtemp(prefix="queue-place-"))
+    cleanup_incomplete = False
+    try:
+        sidecar = temporary / "program.cgroup"
         _ = sidecar.write_text("")
         handlers = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT)}
         for number, handler in handlers.items():
@@ -425,7 +548,11 @@ def queue_place(program: str, repo: Path, *,
                         raise
                     finally:
                         with defer_cleanup_signals():
-                            place.finish(failed=failed)
+                            try:
+                                place.finish(failed=failed)
+                            except CleanupIncomplete:
+                                cleanup_incomplete = True
+                                raise
                             memory_admit.release(place.path, place.status, root=root)
                     return
                 now = time.monotonic()
@@ -439,12 +566,17 @@ def queue_place(program: str, repo: Path, *,
             with defer_cleanup_signals():
                 try:
                     memory_admit.cancel_waiter(pid, root=root)
-                    for path, row in memory_admit.live_reservations(memory_admit.admission_dir(root)):
-                        if row["pid"] == pid and row["sidecar"] == str(sidecar):
-                            memory_admit.release(path, 1, root=root)
+                    if not cleanup_incomplete:
+                        for path, row in memory_admit.live_reservations(memory_admit.admission_dir(root)):
+                            if row["pid"] == pid and row["sidecar"] == str(sidecar):
+                                memory_admit.release(path, 1, root=root)
                 finally:
                     for number, handler in handlers.items():
                         _ = signal.signal(number, handler)
+
+    finally:
+        if not cleanup_incomplete:
+            shutil.rmtree(temporary)
 
 
 if __name__ == "__main__":

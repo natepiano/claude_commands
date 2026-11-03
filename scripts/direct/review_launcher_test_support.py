@@ -271,7 +271,7 @@ class ReviewLauncherFixture(LauncherFixture):
             _ = shutil.copy2(DIRECT_DIR.parent / "lint" / name, lint / name)
         message = self.root / "scripts/message"
         message.mkdir()
-        for name in ("sessions.py", "process_identity.py", "relay_identity.py"):
+        for name in ("sessions.py", "relay_identity.py"):
             _ = shutil.copy2(DIRECT_DIR.parent / "message" / name, message / name)
         review_config = self.root / "config/review"
         review_config.mkdir(parents=True)

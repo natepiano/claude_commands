@@ -7,10 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-if __package__:
-    from .process_identity import process_start
-else:
-    from process_identity import process_start
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.process_start import start_text as process_start
 
 RELAY_PREFIX = "relay/"
 
@@ -54,7 +52,10 @@ class ProcessLifetimeUnknown:
 
 
 def _process_lifetime(pid: int) -> ProcessLifetime | ProcessLifetimeUnknown:
-    started = process_start(pid)
+    try:
+        started = process_start(pid)
+    except OSError:
+        return ProcessLifetimeUnknown()
     if not started:
         return ProcessLifetimeUnknown()
     try:

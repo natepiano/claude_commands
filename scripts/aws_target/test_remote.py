@@ -19,7 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mac_test"))
 
 from scripts.aws_target import config as settings_config, ledger, remote
 from scripts.aws_target.control_test_support import ControlFixture
-from scripts.lib import conf
+from scripts.lib.process_start_test_support import stored_start_probe
+from scripts.lib import process_start, conf
 from scripts.mac_test import linux_runner, mac_test
 
 
@@ -449,7 +450,7 @@ class RunnerPermissionTests(ControlFixture):
         arguments.pid, arguments.what, arguments.remote = 700, "check hana", "aws-build"
         scope = mac_test.RepositoryScope("hana", "https://example.invalid/team/hana", 1)
         with mock.patch.object(mac_test, "target_claim_scope", return_value=scope), \
-             mock.patch.object(mac_test, "process_start_time", return_value="fixture-process"), \
+             mock.patch.object(process_start, "process_start", side_effect=stored_start_probe(lambda pid: "fixture-process" or "")), \
              redirect_stdout(io.StringIO()):
             self.assertEqual(mac_test.command_claim(arguments, paths, watch_claim=False), 0)
         claim = mac_test.claim_path(paths, scope)

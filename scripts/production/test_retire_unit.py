@@ -17,7 +17,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from collections.abc import Generator
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,6 +26,8 @@ from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scripts.lib import process_start
+from scripts.lib.process_start_test_support import write_stat
 from scripts.astra import design_roles
 from scripts.astra.test_design_roles import damage_binding_repository
 from scripts.astra.design_role_test_support import write_empty_binding_record
@@ -80,6 +83,16 @@ def git(where: Path, *arguments: str) -> str:
 def session(session_id: str, name: str, pid: int) -> SessionRecord:
     return SessionRecord(pid=pid, sessionId=session_id, name=name, messagingSocketPath="/nonexistent.sock",
                          updatedAt=0, tmux="", formerNames=[])
+
+
+@contextmanager
+def termination_process(*, running: bool) -> Generator[None]:
+    """Supply a confirmed process that exits or remains after SIGTERM."""
+    owner = process_start.OwnerCheck
+    with (mock.patch.object(process_start, "process_start", return_value=process_start.ProcessStartTime(123)),
+          mock.patch.object(process_start, "check_owner", return_value=owner.ALIVE,
+                            side_effect=None if running else [owner.ALIVE, owner.GONE, owner.GONE])):
+        yield
 
 
 @final
@@ -255,7 +268,7 @@ class RetireUnitTests(unittest.TestCase):
     def test_external_termination_reads_current_settings_for_the_named_request(self) -> None:
         with (mock.patch.object(conf, "read", wraps=conf.read) as reads,
               mock.patch.object(os, "kill") as send,
-              mock.patch.object(retire_unit, "_alive", return_value=False)):
+              termination_process(running=False)):
             left = retire_unit.terminate([1234], {1234: "fixture"}, settings=UseConfiguredValue.CURRENT)
         self.assertEqual(left, [])
         send.assert_called_once_with(1234, signal.SIGTERM)
@@ -264,7 +277,7 @@ class RetireUnitTests(unittest.TestCase):
     def test_sigterm_wait_reads_the_retirement_settings_once(self) -> None:
         with (mock.patch.object(conf, "read", wraps=conf.read) as reads,
               mock.patch.object(os, "kill") as send,
-              mock.patch.object(retire_unit, "_alive", return_value=False)):
+              termination_process(running=False)):
             self.assertEqual(retire_unit.terminate([1234], {1234: "fixture"}), [])
         send.assert_called_once_with(1234, signal.SIGTERM)
         reads.assert_called_once_with("production")
@@ -299,7 +312,7 @@ class RetireUnitTests(unittest.TestCase):
               mock.patch.object(time, "monotonic", side_effect=lambda: now),
               mock.patch.object(time, "sleep", side_effect=sleep),
               mock.patch.object(os, "kill") as send,
-              mock.patch.object(retire_unit, "_alive", return_value=True),
+              termination_process(running=True),
               worker_lifecycle.operation_deadline(deadline=100.25)):
             with self.assertRaises(worker_lifecycle.OperationDeadlineExpired):
                 _ = retire_unit.terminate([1234], {1234: "fixture"})
@@ -323,7 +336,7 @@ class RetireUnitTests(unittest.TestCase):
                 with self.subTest(poll=poll, wait=wait):
                     _ = self.limits(poll=str(poll), wait=str(wait))
                     with (mock.patch.object(os, "kill") as send_signal,
-                          mock.patch.object(retire_unit, "_alive", return_value=True),
+                          termination_process(running=True),
                           mock.patch.object(time, "monotonic", side_effect=[0, 0, wait - 0.1, wait]),
                           mock.patch.object(time, "sleep") as sleep):
                         left = retire_unit.terminate([1234], {1234: "fixture"})
@@ -337,7 +350,7 @@ class RetireUnitTests(unittest.TestCase):
         path = self.limits(poll="1", wait="10")
         with (mock.patch.dict(os.environ, {"CONF_DIR": str(Path(path).parent)}),
               mock.patch.object(os, "kill"),
-              mock.patch.object(retire_unit, "_alive", return_value=True),
+              termination_process(running=True),
               mock.patch.object(time, "monotonic", side_effect=[0, 0, 0.1]),
               mock.patch.object(time, "sleep") as sleep):
             _ = retire_unit.terminate([1234], {1234: "fixture"}, wait=0.1)
@@ -1004,8 +1017,11 @@ class RetireUnitTests(unittest.TestCase):
         child = self.orphan_child(DIRECTOR)
         self.claude = []
         unit = retire_unit.find_unit("alpha", "alpha")
+        check_owner = process_start.check_owner
+        def owner_after_signal(pid: int, started: process_start.ProcessStart) -> process_start.OwnerCheck:
+            return process_start.OwnerCheck.GONE if send.called else check_owner(pid, started)
         with (mock.patch.object(process_group, "send_process_group") as send,
-              mock.patch.object(retire_unit, "_alive", return_value=False)):
+              mock.patch.object(process_start, "check_owner", side_effect=owner_after_signal)):
             self.assertEqual(retire_unit.stop_orphan(unit, child.pid, DIRECTOR, settings=conf.read("production")), [])
         send.assert_called_once_with(child.pid, signal.SIGTERM)
         self.assertIsNone(child.poll(), "the test patches the signal; the child still runs")
@@ -1027,8 +1043,10 @@ class RetireUnitTests(unittest.TestCase):
         child = self.orphan_child(DIRECTOR)
         self.claude = []
         unit = retire_unit.find_unit("alpha", "alpha")
-        birth = retire_unit.proc_start(child.pid)
-        with (mock.patch.object(retire_unit, "proc_start", side_effect=[birth, birth, birth, "reused"]),
+        birth = process_start.start_text(child.pid)
+        with (mock.patch.object(process_start, "process_start", side_effect=[
+                process_start.parse_start(birth or ""), process_start.parse_start(birth or ""),
+                process_start.parse_start(birth or ""), process_start.ProcessStartTime(0)]),
               mock.patch.object(process_group, "send_process_group") as send):
             left = retire_unit.stop_orphan(unit, child.pid, DIRECTOR, settings=conf.read("production"))
         send.assert_not_called()
@@ -1076,6 +1094,28 @@ class RetireUnitTests(unittest.TestCase):
               mock.patch.object(retire_unit, "terminate", return_value=[]) as signals):
             self.assertEqual(retire_unit.stop_rest(unit, found, settings=conf.read("production")), [])
         self.assertFalse(any(991551 in call.args[0] for call in signals.call_args_list))
+
+    def test_claim_cleanup_keeps_unknown_and_never_signals_a_reused_or_gone_pid(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+            root = Path(folder)
+            stat = write_stat(root, 41, start_ticks=456)
+            native_check = process_start.check_owner
+
+            def check_owner(pid: int, start: process_start.ProcessStart) -> process_start.OwnerCheck:
+                return native_check(pid, start, root)
+
+            with mock.patch.object(os, "kill") as signal:
+                for mode in ("reused", "gone", "unknown"):
+                    if mode == "gone":
+                        stat.unlink()
+                    elif mode == "unknown":
+                        stat.parent.mkdir(exist_ok=True)
+                        _ = stat.write_bytes(b"broken")
+                    with mock.patch.object(process_start, "check_owner", side_effect=check_owner):
+                        remaining = retire_unit.terminate([41], {41: "claim"}, wait=0,
+                                                         recorded={41: process_start.ProcessStartTime(123)})
+                    self.assertEqual(bool(remaining), mode == "unknown")
+                signal.assert_not_called()
 
     def test_refuses_uncommitted_work_and_an_unmerged_checkpoint_and_changes_nothing(self) -> None:
         _ = (self.worktree / "late.txt").write_text("late\n", encoding="utf-8")

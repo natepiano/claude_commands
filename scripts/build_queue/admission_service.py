@@ -17,6 +17,7 @@ import uuid
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.lib import process_start
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.queue_view import reason_phrase
 from scripts.lint import memory_admit as gate
@@ -45,7 +46,7 @@ class Readings(Protocol):
     def pressure(self, host: gate.HostMemory, policy: gate.AdmissionPolicy) -> gate.Pressure: ...
     def compilers(self) -> list[gate.StepMemory]: ...
     def reservation(self, path: Path, row: gate.Reservation, now: datetime,
-                    processes: dict[int, gate.ProcessIdentity], proc: Path, policy: gate.AdmissionPolicy) -> gate.StepMemory: ...
+                    processes: gate.ProcessTable, proc: Path, policy: gate.AdmissionPolicy) -> gate.StepMemory: ...
 
 
 class SystemReadings:
@@ -62,15 +63,15 @@ class SystemReadings:
         return gate.sccache_memory()
 
     def reservation(self, path: Path, row: gate.Reservation, now: datetime,
-                    processes: dict[int, gate.ProcessIdentity], proc: Path, policy: gate.AdmissionPolicy) -> gate.StepMemory:
+                    processes: gate.ProcessTable, proc: Path, policy: gate.AdmissionPolicy) -> gate.StepMemory:
         return gate.reservation_memory(path, row, now, processes, proc, policy)
 
 
 class Proc(Protocol):
     @property
     def path(self) -> Path: ...
-    def processes(self) -> dict[int, gate.ProcessIdentity]: ...
-    def owner_start(self, pid: int) -> str | None: ...
+    def processes(self) -> gate.ProcessTable: ...
+    def owner_check(self, owner: wire.Owner) -> process_start.OwnerCheck: ...
     def pidfd(self, pid: int) -> int: ...
     def lifetime(self, row: gate.Reservation, owner_live: bool
                  ) -> gate.PopulatedStepScope | gate.LiveOwnerProcess | gate.EndedStep: ...
@@ -81,11 +82,11 @@ class SystemProc:
     def path(self) -> Path:
         return Path(os.environ.get("BUILDLOG_PROC", "/proc"))
 
-    def processes(self) -> dict[int, gate.ProcessIdentity]:
+    def processes(self) -> gate.ProcessTable:
         return gate.process_table(self.path)
 
-    def owner_start(self, pid: int) -> str | None:
-        return gate.process_start_time(pid)
+    def owner_check(self, owner: wire.Owner) -> process_start.OwnerCheck:
+        return process_start.check_owner(owner.pid, process_start.parse_start(owner.start_time))
 
     def pidfd(self, pid: int) -> int:
         return os.pidfd_open(pid)
@@ -359,7 +360,7 @@ class AdmissionServer:
         for episode, record in list(self.reservations.items()):
             path = Path(record.path)
             row = gate.read_reservation(path) if path.exists() else reservation_row(record)
-            live = self.proc.owner_start(record.owner.pid) == record.owner.start_time
+            live = not self.proc.owner_check(record.owner).stale
             lifetime = self.proc.lifetime(row, live)
             if "finalization" in row or not isinstance(record.ending, NotEnding) or isinstance(lifetime, gate.EndedStep):
                 self._end(episode, record.ending if not isinstance(record.ending, NotEnding) else OwnerExited())
@@ -454,7 +455,7 @@ class AdmissionServer:
 
     def _prune_places(self) -> None:
         self.places = {key: place for key, place in self.places.items()
-                       if self.proc.owner_start(place.owner.pid) == place.owner.start_time}
+                       if not self.proc.owner_check(place.owner).stale}
 
     def _row(self, request: wire.AdmitRequest | wire.LaunchRequest, place: WaiterPlace) -> gate.Waiter:
         profile, identity = request.profile, request.identity
@@ -488,12 +489,22 @@ class AdmissionServer:
         now = self.clock.now()
         running: list[gate.RunningStep] = []
         rows: list[gate.Reservation] = []
-        owners = {record.owner.pid: self.proc.owner_start(record.owner.pid) for record in self.reservations.values()}
-        lifetimes = {episode: self.proc.lifetime(reservation_row(record), owners[record.owner.pid] == record.owner.start_time)
+        owners = {episode: self.proc.owner_check(record.owner) for episode, record in self.reservations.items()}
+        lifetimes = {episode: self.proc.lifetime(reservation_row(record), not owners[episode].stale)
                      for episode, record in self.reservations.items()}
-        processes = (self.proc.processes() if any(isinstance(lifetime, gate.LiveOwnerProcess)
-                     for lifetime in lifetimes.values()) else
-                     {pid: gate.ProcessIdentity(0, start) for pid, start in owners.items() if start is not None})
+        processes: dict[int, gate.ProcessIdentity | gate.UnreadableProcessIdentity] = (dict(self.proc.processes()) if any(
+            isinstance(lifetime, gate.LiveOwnerProcess) and owners[episode] is process_start.OwnerCheck.ALIVE
+            for episode, lifetime in lifetimes.items()) else {})
+        for episode, record in self.reservations.items():
+            owner = owners[episode]
+            if (owner is process_start.OwnerCheck.ALIVE
+                    and not isinstance(processes.get(record.owner.pid), gate.UnreadableProcessIdentity)):
+                processes[record.owner.pid] = gate.ProcessIdentity(0, record.owner.start_time)
+            elif owner.stale:
+                _ = processes.pop(record.owner.pid, None)
+        for episode, record in self.reservations.items():
+            if owners[episode] is process_start.OwnerCheck.UNKNOWN:
+                processes[record.owner.pid] = gate.UnreadableProcessIdentity("owner identity is unknown")
         for episode, record in list(self.reservations.items()):
             row = reservation_row(record)
             memory = self.readings.reservation(Path(record.path), row, datetime.fromtimestamp(now, UTC),
@@ -550,11 +561,15 @@ class AdmissionServer:
         for decision in starts:
             episode = by_owner[decision.owner]
             waiting = self.waiters[episode]
+            if self.proc.owner_check(waiting.request.owner) is not process_start.OwnerCheck.ALIVE:
+                continue
             proposed = cast(gate.ProposedAdmission, decision.admission)
             self._effects(proposed.recovery, proposed.override, decision.decision, preserve_override)
             self._admit(waiting, config)
         for episode, waiting in list(self.launches.items()):
             request = waiting.request
+            if self.proc.owner_check(request.owner) is not process_start.OwnerCheck.ALIVE:
+                continue
             if not isinstance(inputs.host, gate.HostMemory):
                 reply_launch: wire.Reply = wire.Wait(gate.ReadingUnavailable(), 0, "", "memory reading unavailable")
             else:
@@ -692,7 +707,7 @@ class AdmissionServer:
         if replay is not None:
             return [replay.reply]
         if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)):
-            if self.proc.owner_start(request.owner.pid) != request.owner.start_time:
+            if self.proc.owner_check(request.owner) is not process_start.OwnerCheck.ALIVE:
                 return [wire.Refused("owner no longer exists")]
             if any(record.owner == request.owner for record in self.reservations.values()):
                 return [wire.Refused("owner already has a reservation")]
@@ -950,10 +965,10 @@ class AdmissionServer:
                 else:
                     self._unwatch(descriptor)
                 for episode, waiting in list(self.waiters.items()):
-                    if self.proc.owner_start(waiting.request.owner.pid) != waiting.request.owner.start_time:
+                    if self.proc.owner_check(waiting.request.owner).stale:
                         del self.waiters[episode]
                 for episode, waiting in list(self.launches.items()):
-                    if self.proc.owner_start(waiting.request.owner.pid) != waiting.request.owner.start_time:
+                    if self.proc.owner_check(waiting.request.owner).stale:
                         del self.launches[episode]
                 self._prune_places()
                 self._prune_watches()

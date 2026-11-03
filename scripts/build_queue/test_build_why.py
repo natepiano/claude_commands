@@ -17,6 +17,8 @@ import unittest
 from typing import TypedDict, Unpack, cast, override
 from unittest import mock
 
+from scripts.lib.process_start_test_support import stored_start_probe
+from scripts.lib import process_start
 from scripts.build_queue import build_why, head_facts
 from scripts.build_queue.queue_fixture import write_process
 from scripts.build_queue.test_head_facts import bump_line, queue_time_line, token_gap_line, write_bumps, write_token_gaps
@@ -220,9 +222,10 @@ class BuildWhyTests(unittest.TestCase):
     def test_override_free_memory_terms_add_up_to_its_printed_threshold(self) -> None:
         self.reset_running(available=23, need=12)
         _ = self.running(800, "growing", "clippy", 20, 1, 30)
-        starts = {pid: identity.start for pid, identity in gate.process_table(self.proc).items()}
+        starts = {pid: identity.start for pid, identity in gate.process_table(self.proc).items()
+                  if isinstance(identity, gate.ProcessIdentity)}
         with mock.patch.object(gate, "showrunner_is_registered", return_value=True), \
-                mock.patch.object(gate, "process_start_time", side_effect=starts.get), \
+                mock.patch.object(process_start, "process_start", side_effect=stored_start_probe(lambda pid: (starts.get)(pid) or "")), \
                 mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "showrunner-id", "CODEX_THREAD_ID": ""}):
             _ = gate.admit_head("arithmetic regression")
         output = self.output()
@@ -677,7 +680,7 @@ class BuildWhyTests(unittest.TestCase):
         waiter = gate.read_waiter(self.head_path)
         waiter["token_left_at"] = token_times["token_left_at"]
         _ = self.head_path.write_text(json.dumps(waiter))
-        with mock.patch.object(gate, "process_start_time", side_effect=str), \
+        with mock.patch.object(process_start, "process_start", side_effect=stored_start_probe(lambda pid: (str)(pid) or "")), \
              mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "id-inspectors-fix", "CLAUDE_SESSION_NAME": "inspectors-fix",
                                           "BUILDLOG_MEM_TOKEN_BACK_AT": str(token_times["token_back_at"])}):
             return gate.check(self.root / "meminfo", 500, "", ["cargo", "nextest"], NOW - 122 * 60,

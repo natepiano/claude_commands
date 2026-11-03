@@ -39,7 +39,8 @@
 # changed during the run records nothing.
 # Records outlive worker sessions and are pruned after 14 days on each write.
 #
-# The lint stages — mend, fmt, clippy fix, fmt, clippy judgment — use
+# The lint stages — mend, fmt, taplo, clippy judgment, then fixes and fmt
+# only after a failed judgment, followed by another judgment — use
 # config/lint.conf (edit it with /lint_config). Taplo fmt --check always runs
 # at the workspace root. A gated-off check prints a SKIPPED line and exits 0.
 # Scope is never configurable. cargo check, cargo nextest and the checkpoint
@@ -67,9 +68,9 @@
 # unchanged tree fails the same way (one worker ran 12 in a row on 2026-10-01).
 # A failed `test` is never recorded (tests flake), nor a run cut short by a
 # usage error, the sandbox or a kill. A lint failure is not recorded when the
-# third clippy fix and format pass still changed the tree. The judged tree is
-# the tree when the run starts, or for `lint` the tree invoke_clippy_fix and formatting leave
-# for clippy judgment. A run that ends on any other tree (for `test`,
+# third clippy fix and format pass still changed the tree. Each clippy judgment
+# reads the tree left by mend and formatting, or by the repair loop when the
+# first judgment fails. A run that ends on any other tree (for `test`,
 # any other part of it the package is built from) records nothing: an edit
 # landed while it ran, and its verdict belongs to neither tree.
 # A test or lint run outside a worker session is never cached.
@@ -111,9 +112,10 @@
 #   verify.sh lint <package>               mend --fix, nightly fmt of the package
 #                                          and the members that differ from HEAD,
 #                                          workspace taplo fmt --check,
-#                                          workspace clippy fix, fmt, then clippy
-#                                          judgment on all targets with all features
-#                                          (warnings denied)
+#                                          workspace clippy judgment on all targets
+#                                          with all features (warnings denied);
+#                                          only on failure: clippy fix, fmt, then
+#                                          judgment again
 #                                          — cargo stages gated by config/lint.conf;
 #                                          taplo always checks TOML formatting
 #   verify.sh lint --workspace [--check]   the same gate with fmt over all members;
@@ -213,6 +215,7 @@ UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
 # repo needs >= 3.11.
 PY="${HOME}/.claude/scripts/lib/py"
+PROCESS_REPOSITORY="$(cd "${BASH_SOURCE[0]%/*}/../.." && pwd -P)"
 
 # The single bottom layer: run(), lint.conf gating, fmt_cargo, run_nextest,
 # invoke_clippy_fix, invoke_clippy, and sandbox-failure detection come from here.
@@ -1004,13 +1007,22 @@ ROUTING_WAIT_STARTED=""
 # step subshells to the parent cleanup, which also ends interrupted waits.
 PHASE_WAIT_SESSION="${UNIT_RUN_DIR:-${UNIT_SESSION_DIR:-}}"
 PHASE_WAIT_RECORDER="$(cd "${BASH_SOURCE[0]%/*}" && pwd)/progress_history.py"
+PHASE_WAIT_RETRY_ROOT=""
+PHASE_WAIT_PUBLISHED=0
+# Publish the folder only after its owner is recorded. A missing process or
+# a changed start time makes it recoverable, even if cleanup never ran.
+PHASE_WAIT_FOLDERS="${PHASE_WAIT_RECORDER%/*}/wait_folders.py"
 phase_wait_start() {
-    local key=$1 reason=$2 id file
+    local key=$1 reason=$2 file
     [[ "${CLAUDE_PROBE_SESSION:-}" != 1 && -n "$PHASE_WAIT_SESSION" \
-        && -f "$PHASE_WAIT_SESSION/progress_history_state.json" && -n "$HOLD_WAIT_DIR" ]] || return 0
+        && -f "$PHASE_WAIT_SESSION/progress_history_state.json" && "$PHASE_WAIT_PUBLISHED" -eq 1 ]] || return 0
     file="$HOLD_WAIT_DIR/phase-wait.${BASHPID:-$$}.$key"
     [[ ! -s "$file" ]] || return 0
-    local args=(start-wait --session-dir "$PHASE_WAIT_SESSION"
+    if ! phase_wait_retry_pending; then
+        printf 'verify.sh: wait history NotRecorded: an earlier wait still needs to close\n' >&2
+        return 0
+    fi
+    local args=(start-wait --session-dir "$PHASE_WAIT_SESSION" --wait-file "$file"
         --kind WaitingForMemoryOrSlot --reason "$reason")
     local owner="${CODEX_THREAD_ID:-}"
     if [[ -n "$owner" ]]; then
@@ -1018,31 +1030,35 @@ phase_wait_start() {
     else
         args+=(--director --owner-session "${CLAUDE_CODE_SESSION_ID:-}")
     fi
-    if id="$("$PY" "$PHASE_WAIT_RECORDER" "${args[@]}")" && [[ -n "$id" ]]; then
-        printf '%s\n' "$id" > "$file"
-    else
+    if ! "$PY" "$PHASE_WAIT_RECORDER" "${args[@]}" >/dev/null; then
         printf 'verify.sh: wait history NotRecorded: %s\n' "$reason" >&2
     fi
 }
 phase_wait_finish() {
-    local file="$HOLD_WAIT_DIR/phase-wait.${BASHPID:-$$}.$1" id
-    [[ -s "$file" ]] || return 0
-    read -r id < "$file"
-    if "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id"; then
-        rm -f "$file"
-    else
-        printf 'verify.sh: wait history NotRecorded: cannot close %s\n' "$id" >&2
+    phase_wait_finish_file "$HOLD_WAIT_DIR/phase-wait.${BASHPID:-$$}.$1" || true
+}
+phase_wait_finish_file() {
+    [[ -s "$1" ]] || return 0
+    if ! "$PY" "$PHASE_WAIT_FOLDERS" close-marker --session-dir "$PHASE_WAIT_SESSION" --directory "$1"; then
+        printf 'verify.sh: cannot close wait marker %s\n' "$1" >&2
+        return 1
     fi
 }
-phase_wait_finish_all() {
-    local file id
-    [[ -n "$HOLD_WAIT_DIR" ]] || return 0
-    for file in "$HOLD_WAIT_DIR"/phase-wait.*; do
-        [[ -s "$file" ]] || continue
-        read -r id < "$file"
-        "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id" \
-            || printf 'verify.sh: wait history NotRecorded: cannot close %s\n' "$id" >&2
-    done
+phase_wait_recover_folder() {
+    "$PY" "$PHASE_WAIT_FOLDERS" recover-wait-folder --session-dir "$PHASE_WAIT_SESSION" --directory "$1"
+}
+phase_wait_retry_pending() {
+    [[ -n "$PHASE_WAIT_RETRY_ROOT" ]] || return 0
+    "$PY" "$PHASE_WAIT_FOLDERS" sweep-wait-folders --session-dir "$PHASE_WAIT_SESSION" \
+        --worktree "$PWD" --current "$HOLD_WAIT_DIR"
+}
+phase_wait_create_directory() {
+    if [[ -n "$PHASE_WAIT_RETRY_ROOT" ]] && HOLD_WAIT_DIR="$("$PY" "$PHASE_WAIT_FOLDERS" \
+        create-wait-folder --session-dir "$PHASE_WAIT_SESSION" --worktree "$PWD" --pid "$$")"; then
+        PHASE_WAIT_PUBLISHED=1
+        return 0
+    fi
+    HOLD_WAIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-hold.$$.XXXXXX")"
 }
 
 # The memory gate announces only blocked admission. A granted first check
@@ -1081,14 +1097,18 @@ interrupt_hold_wait() {
 }
 
 finish_hold_wait() {
-    phase_wait_finish_all
     collect_hold_wait
     if [[ -n "${TOKEN_WAIT_ENTRY:-}" ]]; then rm -f -- "$TOKEN_WAIT_ENTRY"; fi
     if [[ -n "$MAC_IDLE_MARKER" && -f "${MAC_IDLE_SCRIPT:-/nonexistent}" ]]; then
         "$PY" "$MAC_IDLE_SCRIPT" remove "$BUILDLOG_CALL_ID" || true
     fi
     if [[ -n "$HOLD_WAIT_DIR" ]]; then
-        rm -rf "$HOLD_WAIT_DIR"
+        if [[ "$PHASE_WAIT_PUBLISHED" -eq 1 ]]; then
+            phase_wait_recover_folder "$HOLD_WAIT_DIR" || true
+        else
+            # This admission-only folder has no recorded owner or wait ids.
+            rm -rf -- "$HOLD_WAIT_DIR"
+        fi
         HOLD_WAIT_DIR=""
     fi
 }
@@ -1240,6 +1260,14 @@ finish_tree_watch() {
     cancel_tree_run
     [[ -z "$TREE_WATCH_DIR" ]] || rm -rf "$TREE_WATCH_DIR"
     TREE_WATCH_DIR=""
+}
+
+# Both lint judgments record the tree they read and preserve the tool status.
+judge_lint_clippy() {
+    start_tree_watch
+    clippy_status=0
+    invoke_clippy --workspace --all-targets --all-features --keep-going || clippy_status=$?
+    finish_tree_watch
 }
 
 # Git's staged tree identity. A private copy avoids updating the real index's
@@ -2251,8 +2279,10 @@ cache_record() {
             printf 'host=mac\n'
         fi
     } > "${CACHE_DIR}/${key}.${kind}.tmp"
-    mv -f "${CACHE_DIR}/${key}.${kind}.tmp" "${CACHE_DIR}/${key}.${kind}"
+    # Remove the old verdict first: a stop before publication must make the
+    # next call run again, not reuse an answer this run has disproved.
     rm -f "${CACHE_DIR}/${key}.${other}"
+    mv -f "${CACHE_DIR}/${key}.${kind}.tmp" "${CACHE_DIR}/${key}.${kind}"
 }
 
 # Records a Mac pass, whose output is in the file $1, as this call's pass
@@ -2332,7 +2362,13 @@ if [[ "$CMD" == test && -z "${GATE_METADATA}" ]]; then
     GATE_METADATA="$(cargo metadata --no-deps --format-version 1 2>/dev/null)" || GATE_METADATA=""
 fi
 
-HOLD_WAIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-hold.$$.XXXXXX")"
+if [[ "${CLAUDE_PROBE_SESSION:-}" != 1 && -n "$PHASE_WAIT_SESSION" \
+    && -f "$PHASE_WAIT_SESSION/progress_history_state.json" ]]; then
+    # Scope retries to this run and physical working tree. Owner identity
+    # lets a later call recover a stopped call without taking a live wait.
+    PHASE_WAIT_RETRY_ROOT=enabled
+fi
+phase_wait_create_directory
 export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds"
 export BUILDLOG_HOLD_WAITER_FILE="$HOLD_WAIT_DIR/waiter"
 export BUILDLOG_CHECK_FAILED_FILE="$HOLD_WAIT_DIR/check-failed"
@@ -2351,6 +2387,7 @@ hold_interrupted() {
 trap 'hold_interrupted INT 130' INT
 trap 'hold_interrupted TERM 143' TERM
 trap 'hold_interrupted HUP 129' HUP
+phase_wait_retry_pending || true
 initialize_step_record
 if cache_lookup; then
     exit "${LOOKUP_STATUS}"
@@ -2713,26 +2750,25 @@ import signal
 import subprocess
 import sys
 
-lock = Path(sys.argv[1])
-holder = sys.argv[2]
-command = sys.argv[3:]
+sys.path.insert(0, sys.argv[1])
+from scripts.lib import process_start
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.process_group import send_process_group
+
+proc_root = Path(os.environ.get("VERIFY_PROC_ROOT", "/proc"))
+lock = Path(sys.argv[2])
+holder = sys.argv[3]
+command = sys.argv[4:]
 
 def shell_status(status: int) -> int:
     return status if status >= 0 else 128 - status
 
-def identity(pid):
-    try:
-        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
-        return fields[19]
-    except (OSError, IndexError):
-        return subprocess.check_output(["ps", "-p", str(pid), "-o", "lstart="],
-                                       text=True, stderr=subprocess.DEVNULL).strip()
 
 child = os.fork()
 if child:
     def forward(signum, _frame):
         try:
-            if (sent := subprocess.run([str(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]) / "py"), str(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]) / "process_group.py"), str(child), str(signum)], capture_output=True, text=True)).returncode: raise ProcessLookupError if sent.returncode == 3 else SystemExit("verify.sh: process group helper failed: " + " ".join(sent.stderr.splitlines()))
+            send_process_group(child, signum)
         except ProcessLookupError:
             # The child has not created its new group yet, or has exited.
             try:
@@ -2758,9 +2794,10 @@ with (lock.parent / "cargo.guard").open("a+") as guard:
         print("verify.sh: this run lost the cargo token before its step started; run it again.",
               file=sys.stderr)
         sys.exit(125)
-    record = lock / f"owned.{os.getpid()}.tmp"
-    record.write_text(json.dumps({"group": os.getpid(), "start": identity(os.getpid())}))
-    os.replace(record, lock / "owned")
+    start = process_start.process_start(os.getpid(), proc_root)
+    if isinstance(start, process_start.ProcessGone):
+        sys.exit("verify.sh: step owner has ended; step refused")
+    write_text_atomic(lock / "owned", json.dumps({"group": os.getpid(), "start": start.text}), create_parent=False)
     fcntl.flock(guard, fcntl.LOCK_UN)
 
 sys.exit(shell_status(subprocess.call(command)))
@@ -2771,8 +2808,8 @@ sys.exit(shell_status(subprocess.call(command)))
 eval "$(declare -f buildlog_exec | sed '1s/buildlog_exec/buildlog_exec_unowned/')"
 buildlog_exec() {
     if [[ "${TOKEN_HELD}" -eq 1 ]]; then
-        buildlog_exec_unowned env VERIFY_PROCESS_GROUP_LIB="$(dirname -- "${STEP_RECORD_SCRIPT:-$BOARD_HELPER}")/../lib" python3 -c "$STEP_OWNER_PY" \
-            "${BOARD_DIR}/locks/cargo.d" "$$" "$@"
+        buildlog_exec_unowned env VERIFY_PROCESS_GROUP_LIB="$(dirname -- "${STEP_RECORD_SCRIPT:-$BOARD_HELPER}")/../lib" "$PY" -c "$STEP_OWNER_PY" \
+            "$PROCESS_REPOSITORY" "${BOARD_DIR}/locks/cargo.d" "$$" "$@"
     else
         buildlog_exec_unowned "$@"
     fi
@@ -2828,16 +2865,27 @@ remember_tree_reservation() {
 }
 
 buildlog_wait_for_memory() {
-    local memory_wait stat fields=()
+    local memory_wait admission_start
     if [[ ! -s "$BUILDLOG_MEM_WAIT_FIRST_FILE" ]]; then
         printf '%s\n' "${BUILDLOG_MEM_WAIT_SINCE:-${EPOCHSECONDS:-$(date +%s)}}" > "$BUILDLOG_MEM_WAIT_FIRST_FILE"
     fi
     export BUILDLOG_MEM_WAIT_SINCE="$(< "$BUILDLOG_MEM_WAIT_FIRST_FILE")"
-    if [[ -n "${TREE_WATCH_DIR:-}" && -r "/proc/${BASHPID:-$$}/stat" ]]; then
-        stat="$(< "/proc/${BASHPID:-$$}/stat")"
-        read -r -a fields <<< "${stat##*) }"
+    if [[ -n "${TREE_WATCH_DIR:-}" ]] && admission_start="$("$PY" -c "
+import os
+from pathlib import Path
+import sys
+sys.path.insert(0, sys.argv[1])
+from scripts.lib import process_start
+try:
+    start = process_start.process_start(int(sys.argv[2]), Path(os.environ.get(\"VERIFY_PROC_ROOT\", \"/proc\")))
+except process_start.ProcessReadError:
+    sys.exit(2)
+if not isinstance(start, process_start.ProcessStartTime):
+    sys.exit(1)
+print(start.text)
+" "$PROCESS_REPOSITORY" "${BASHPID:-$$}")"; then
         printf '%s/admission/%s-%s.waiting\n' "${BUILDLOG_DIR:-$HOME/.local/state/buildlog}" \
-            "${BASHPID:-$$}" "${fields[19]}" >> "$TREE_WATCH_DIR/waiters"
+            "${BASHPID:-$$}" "$admission_start" >> "$TREE_WATCH_DIR/waiters"
     fi
     step_state waiting_hold
     if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
@@ -3153,7 +3201,7 @@ case "$CMD" in
             fi
             exit "$lint_status"
         fi
-        # Order: mend, fmt, taplo, clippy fix, fmt, clippy judgment.
+        # Order: mend, fmt, taplo, clippy judgment; repair and judge again only on failure.
         # Cargo stages are gated by lint.conf; the Taplo check always runs.
         # mend passes --all-targets because it needs the test and example
         # targets to see every import and visibility site. It covers the
@@ -3235,24 +3283,24 @@ case "$CMD" in
         fi
         if lint_config_enabled clippy; then
             [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy start'
-            clippy_tree_before="$(tree_key)"
-            for ((clippy_fix_pass=1; HOLD_LINT == 0 && clippy_fix_pass<=3; clippy_fix_pass++)); do
-                invoke_clippy_fix --workspace --all-targets --all-features --keep-going || true
-                fmt_cargo "${FMT_SCOPE[@]}"
-                clippy_tree_after="$(tree_key)"
-                if [[ -n "$clippy_tree_before" && "$clippy_tree_before" == "$clippy_tree_after" ]]; then
-                    break
-                fi
-                # An empty key cannot prove that the tree stopped changing.
-                if (( clippy_fix_pass == 3 )); then
-                    CLIPPY_FIX_LIMIT_REACHED=1
-                fi
-                clippy_tree_before="$clippy_tree_after"
-            done
-            start_tree_watch
-            clippy_status=0
-            invoke_clippy --workspace --all-targets --all-features --keep-going || clippy_status=$?
-            finish_tree_watch
+            judge_lint_clippy
+            if (( clippy_status != 0 )); then
+                clippy_tree_before="$(tree_key)"
+                for ((clippy_fix_pass=1; HOLD_LINT == 0 && clippy_fix_pass<=3; clippy_fix_pass++)); do
+                    invoke_clippy_fix --workspace --all-targets --all-features --keep-going || true
+                    fmt_cargo "${FMT_SCOPE[@]}"
+                    clippy_tree_after="$(tree_key)"
+                    if [[ -n "$clippy_tree_before" && "$clippy_tree_before" == "$clippy_tree_after" ]]; then
+                        break
+                    fi
+                    # An empty key cannot prove that the tree stopped changing.
+                    if (( clippy_fix_pass == 3 )); then
+                        CLIPPY_FIX_LIMIT_REACHED=1
+                    fi
+                    clippy_tree_before="$clippy_tree_after"
+                done
+                judge_lint_clippy
+            fi
             (( clippy_status == 0 )) || exit "$clippy_status"
             [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy passed'
         else

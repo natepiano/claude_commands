@@ -31,6 +31,17 @@ import time
 from types import FrameType
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if TYPE_CHECKING:
+    from ..lib import process_start
+else:
+    from scripts.lib import process_start
+
+if TYPE_CHECKING:
+    from ..lib.atomic_file import write_text_atomic
+else:
+    from scripts.lib.atomic_file import write_text_atomic
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
@@ -200,9 +211,13 @@ class StepProgress:
 
     def __init__(self, info: StepInfo | NoStepInfo) -> None:
         self.info: StepInfo | NoStepInfo = info
-        self.leader_start: str | None = (
-            mac_test.process_start_time(info.pgid) if isinstance(info, StepInfo) else None
-        )
+        self.leader_start: process_start.ProcessStart | None = None
+        if isinstance(info, StepInfo):
+            try:
+                stat = process_start.read_stat(info.pgid)
+                self.leader_start = None if isinstance(stat, process_start.ProcessGone) else stat.start
+            except process_start.ProcessReadError:
+                pass
         self.offset: int = 0
         self.pending: bytes = b""
         self.cargo_started: float | None = None
@@ -232,31 +247,15 @@ class StepProgress:
                 self.cargo_started = time.monotonic()
 
     def leader_alive(self) -> bool:
-        """The step's group leader still runs: not reaped, not a zombie, not a reused pid."""
+        """Only a matching group leader permits stopping this step's group."""
         if isinstance(self.info, NoStepInfo) or self.leader_start is None:
             return False
-        pgid = self.info.pgid
-        try:
-            stat = Path(f"/proc/{pgid}/stat").read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return False
-        fields = stat[stat.rfind(")") + 1 :].split()
-        if not fields or fields[0] == "Z" or mac_test.process_start_time(pgid) != self.leader_start:
+        if process_start.check_group_leader(self.info.pgid, self.leader_start) is not process_start.OwnerCheck.ALIVE:
             return False
         try:
-            return os.getpgid(pgid) == pgid
+            return os.getpgid(self.info.pgid) == self.info.pgid
         except OSError:
             return False
-
-
-def write_text_atomic(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False
-    ) as output:
-        temporary = Path(output.name)
-        _ = output.write(text)
-    os.replace(temporary, path)
 
 
 def read_candidate(path: Path) -> CandidateRecord | None:
@@ -280,16 +279,17 @@ def read_candidate(path: Path) -> CandidateRecord | None:
 
 
 def newest_candidate(directory: Path) -> str | None:
-    """The call id of the newest live candidate (latest start, then call id).
+    """The newest candidate whose owner is not proven stale (start, then call id).
 
-    A record whose watcher no longer runs is removed.
+    Remove proven stale records. Keep records with no start identity.
     """
     newest: CandidateRecord | None = None
     for path in sorted(directory.glob("*.json")):
         record = read_candidate(path)
         if record is None:
             continue
-        if mac_test.process_start_time(record["pid"]) != record["proc_start"]:
+        owner = mac_test.check_recorded_owner(record["pid"], record["proc_start"])
+        if isinstance(owner, process_start.OwnerCheck) and owner.stale:
             path.unlink(missing_ok=True)
             continue
         if newest is None or (record["call_started"], record["call_id"]) > (
@@ -522,12 +522,21 @@ class Watch:
         if not wanted:
             self.candidate.unlink(missing_ok=True)
         elif not self.candidate.exists():
+            try:
+                watcher_start = process_start.process_start(os.getpid())
+            except process_start.ProcessReadError:
+                return False
+            if isinstance(watcher_start, process_start.ProcessGone):
+                return False
             record: CandidateRecord = {
                 "pid": os.getpid(),
-                "proc_start": mac_test.process_start_time(os.getpid()) or "",
+                "proc_start": watcher_start.text,
                 "call_started": self.request.call_started,
                 "call_id": self.request.call_id,
             }
+            # Candidate state is ours to create; the result folder belongs to
+            # verify.sh and must never be recreated after it has been retired.
+            self.candidate.parent.mkdir(parents=True, exist_ok=True)
             write_text_atomic(self.candidate, json.dumps(record) + "\n")
         return wanted
 
@@ -640,7 +649,11 @@ def main() -> int:
                 report = watch.run(wakeup)
             finally:
                 watch.close()
-        write_text_atomic(request.result, result_text(report))
+        try:
+            write_text_atomic(request.result, result_text(report), create_parent=False)
+        except OSError as error:
+            print(f"copy_watch.py: cannot publish result {request.result}: {error}", file=sys.stderr)
+            return 1
     return 0
 
 
