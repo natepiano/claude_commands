@@ -603,3 +603,22 @@ Retries retain the transition id and read only the saved log tail.
 The service imports old files once.
 A failed cleanup logs its path and retains its record.
 Each later finalization attempt uses the same guard, so other admissions continue.
+
+### Mac disk floor
+
+`sweep.py --floor-only --host mac` uses the existing floor scan and deletion order.
+It reads `mac_test.conf` once for `sweep_floor_gib` and `sweep_floor_roots`.
+The floor is 150 GiB. A missing floor or a floor below `free_floor_gib` refuses the pass.
+The roots are `/tmp`, `~/rust`, and `~/.local/state/mac-test/mirror`.
+Only targets with our use stamp, mirror mark, or a registered copy ancestor are eligible.
+Resolved paths must stay inside these roots. The scan does not follow directory symlinks.
+
+The sweep reads the local and natedev Mac claims under their existing admission locks.
+It keeps these locks until deletion ends. A live or kept claim protects its mirror.
+An unreadable claim reply or a lost lock process protects every target.
+The Mac uses `lsof` for other process use. Unreadable process use protects every target.
+The sweep checks protection again before each target deletion.
+It takes only the shortfall, in the existing least recently used order.
+The result line reports removed bytes, free bytes before and after, and skipped busy targets.
+`--dry-run` lists proposed takes and removes nothing. It does not run the general tmp sweep.
+The nix-darwin job is a separate deployment step.

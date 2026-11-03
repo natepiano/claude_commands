@@ -155,6 +155,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import io
 import json
 import math
 import os
@@ -168,7 +169,7 @@ import time
 import tomllib
 from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, redirect_stdout
 from contextvars import ContextVar
 from copy import copy
 from dataclasses import asdict, dataclass, field, replace
@@ -199,6 +200,8 @@ else:
     import store
 
 from scripts.lib.conf import UseConfiguredValue
+from scripts.lib import copy_record
+from scripts.mac_test import floor_claims
 
 GIB = 1 << 30
 MIB = 1 << 20
@@ -2113,6 +2116,7 @@ def shrink_floor(
     planned_at: float, owners: TargetOwnerIndex,
 *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    policy: MacFloor | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> tuple[int, int, list[tuple[FloorTake, int]]]:
     """Plan unlocked; lock just one target for its deletions, then release it."""
     if isinstance(lint_settings, UseConfiguredValue):
@@ -2143,8 +2147,9 @@ def shrink_floor(
         if root in busy:
             continue
         # Uses can start while the unlocked scan is running.
-        current_holds = build_hold_targets([root], trees, lint_settings=lint_settings)
-        current_uses = process_use(root, owners)
+        current_holds = (build_hold_targets([root], trees, lint_settings=lint_settings)
+                         if not isinstance(policy, MacFloor) else {})
+        current_uses = policy.uses([root]) if isinstance(policy, MacFloor) else process_use(root, owners)
         if root in current_holds:
             busy[root] = current_holds[root]
             continue
@@ -2818,20 +2823,105 @@ def floor_scan_targets(scan: Scan, idle: Sequence[str], target_uses: dict[str, f
     return rows
 
 
+@dataclass(frozen=True)
+class MacFloor:
+    """Only marked output inside the three approved Mac roots can be removed."""
+
+    roots: tuple[str, ...]
+    claims: floor_claims.LockedClaims
+    mirror: Path
+
+    def allows(self, target: str) -> bool:
+        path = Path(target)
+        real = path.resolve()
+        if path.is_symlink() or not any(real.is_relative_to(Path(root).expanduser().resolve()) for root in self.roots):
+            return False
+        if (path / USE_STAMP).is_file():
+            return True
+        for parent in (path, *path.parents):
+            if not any(parent.resolve().is_relative_to(Path(root).expanduser().resolve()) for root in self.roots):
+                break
+            if (parent / floor_claims.MIRROR_MARK).is_file():
+                return True
+            if isinstance(copy_record.read_record(parent / copy_record.RECORD), copy_record.Registered):
+                return True
+        return False
+
+    def uses(self, targets: Sequence[str]) -> dict[str, TargetUse | LockHeld]:
+        result: dict[str, TargetUse | LockHeld] = {}
+        paths = tmp_sweep.lsof_paths(tuple(str(Path(root).expanduser().resolve()) for root in self.roots))
+        for root in targets:
+            if not self.allows(root) or self.claims.holds(root, self.mirror) or isinstance(paths, tmp_sweep.ProcessUsesUnavailable):
+                result[root] = LockHeld("Mac claim or process use is busy or unreadable")
+            else:
+                for path, pid, how in paths.paths:
+                    if Path(path).is_relative_to(root):
+                        result[root] = TargetUse(pid, how)
+                        break
+        return result
+
+
+class NatedevFloor(Enum):
+    """Use the existing Linux process and build hold checks."""
+
+    CURRENT = "natedev"
+
+
+@dataclass(frozen=True)
+class FloorOutcome:
+    status: int
+    removed: int
+    before: int
+    after: int
+    busy: int
+
+
+def mac_floor_settings(settings: conf.ConfigRead) -> tuple[int, tuple[str, ...]]:
+    """Refuse a missing live floor or a floor below the admission minimum."""
+    if "sweep_floor_gib" not in settings.values():
+        raise conf.Unusable("mac_test.conf: sweep_floor_gib is missing")
+    floor = settings.number("sweep_floor_gib")
+    if floor < settings.number("free_floor_gib"):
+        raise conf.Unusable("mac_test.conf: sweep_floor_gib must be at least free_floor_gib")
+    roots = settings.words("sweep_floor_roots")
+    approved = (Path("/tmp").resolve(), Path.home() / "rust", Path.home() / ".local/state/mac-test/mirror")
+    if len(roots) != 3 or {Path(root).expanduser().resolve() for root in roots} != {root.resolve() for root in approved}:
+        raise conf.Unusable("mac_test.conf: sweep_floor_roots must name /tmp, ~/rust and ~/.local/state/mac-test/mirror")
+    return int(floor * GIB), roots
+
+
 def hold_floor(floor: int, dry_run: bool, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    policy: MacFloor | NatedevFloor = NatedevFloor.CURRENT,
 ) -> int:
-    """Below the floor, take the shortfall from the least used idle targets."""
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
-    roots = lint_settings.words("sweep_floor_roots")
+    if isinstance(policy, NatedevFloor):
+        return _hold_floor(floor, dry_run, lint_settings=lint_settings, policy=policy).status
+    output = io.StringIO()
+    with redirect_stdout(output):
+        result = _hold_floor(floor, dry_run, lint_settings=lint_settings, policy=policy)
+    if dry_run:
+        for line in output.getvalue().splitlines():
+            if "the floor would take" in line:
+                print(line)
+    print(f"lint sweep: removed_bytes={result.removed} free_before_bytes={result.before} "
+          + f"free_after_bytes={result.after} busy_targets_skipped={result.busy} dry_run={str(dry_run).lower()}")
+    return result.status
+
+
+def _hold_floor(floor: int, dry_run: bool, *,
+    lint_settings: conf.ConfigRead, policy: MacFloor | NatedevFloor,
+) -> FloorOutcome:
+    """Below the floor, take the shortfall from the least used idle targets."""
+    roots = policy.roots if isinstance(policy, MacFloor) else lint_settings.words("sweep_floor_roots")
     lock = tmp_sweep.state_dir() / "floor.lock"
-    if not dry_run:
+    if not dry_run and isinstance(policy, NatedevFloor):
         recover_pending_trims(lint_settings=lint_settings)
     home = os.path.expanduser("~")
     free = free_bytes(home)
     if free >= floor:
-        return 0
+        return FloorOutcome(0, 0, free, free, 0)
     guard = None
     if not dry_run:
         lock_path = str(lock)
@@ -2839,8 +2929,9 @@ def hold_floor(floor: int, dry_run: bool, *,
         guard = try_lock(lock_path)
         if guard is None:
             print(f"lint sweep: {gib(free)} free, under the {gib(floor)} floor; another sweep is holding it")
-            alert_floor_lock(lock_path, free, floor, lint_settings=lint_settings)
-            return 0
+            if isinstance(policy, NatedevFloor):
+                alert_floor_lock(lock_path, free, floor, lint_settings=lint_settings)
+            return FloorOutcome(0, 0, free, free, 0)
     try:
         planned_at = time.time()
         if guard is not None:
@@ -2850,10 +2941,13 @@ def hold_floor(floor: int, dry_run: bool, *,
         tree_targets: dict[str, str] = {}
         busy: dict[str, TargetUse | LockHeld | BuildHoldTarget] = {}
         targets = target_dirs(roots, lint_settings=lint_settings)
+        if isinstance(policy, MacFloor):
+            targets = [target for target in targets if policy.allows(target)]
         owners = TargetOwnerIndex(targets)
         known_trees: dict[str, list[str]] = {}
-        hold_targets = build_hold_targets(targets, known_trees, lint_settings=lint_settings)
-        uses = process_uses(owners)
+        hold_targets = (build_hold_targets(targets, known_trees, lint_settings=lint_settings)
+                        if isinstance(policy, NatedevFloor) else {})
+        uses = policy.uses(targets) if isinstance(policy, MacFloor) else process_uses(owners)
         locked_files = held_cargo_lock_files(lint_settings=lint_settings)
         tree_depth = lint_settings.whole("sweep_max_tree_depth")
         for root in targets:
@@ -2871,8 +2965,12 @@ def hold_floor(floor: int, dry_run: bool, *,
                 busy[root] = reason
                 continue
             if root in uses:
-                print(f"lint sweep: pid {uses[root].pid} {uses[root].how}; {root} left alone")
-                busy[root] = uses[root]
+                use = uses[root]
+                if isinstance(use, TargetUse):
+                    print(f"lint sweep: pid {use.pid} {use.how}; {root} left alone")
+                else:
+                    print(f"lint sweep: {use.lock}; {root} left alone")
+                busy[root] = use
                 continue
             root_trees = known_trees[root] if root in known_trees else _build_trees(root, tree_depth, lint_settings=lint_settings)
             known_trees[root] = root_trees
@@ -2890,7 +2988,7 @@ def hold_floor(floor: int, dry_run: bool, *,
         target_uses = {root: target_last_use(root, groups, targets) for root, groups in target_groups.items()}
         total = sum(scan.blocks.values())
         # A held target is not walked even for accounting; its bytes stay unmeasured this pass.
-        busy_bytes = {path: 0 if isinstance(use, BuildHoldTarget) else (
+        busy_bytes = {path: 0 if isinstance(policy, MacFloor) or isinstance(use, BuildHoldTarget) else (
                           directory_blocks(path, excluded=targets) if any(
                               other != path and other.startswith(path + os.sep) for other in targets)
                           else directory_blocks(path))
@@ -2924,7 +3022,7 @@ def hold_floor(floor: int, dry_run: bool, *,
                     *unit_age(group, planned_at),
                 ),
                 planned_at, owners,
-             lint_settings=lint_settings)
+             lint_settings=lint_settings, policy=policy if isinstance(policy, MacFloor) else UseConfiguredValue.CURRENT)
         else:
             print(f"lint sweep: {gib(scanned_free)} free after the scan, not under the {gib(floor)} floor;"
                   + " nothing taken")
@@ -2939,7 +3037,7 @@ def hold_floor(floor: int, dry_run: bool, *,
                       + f" last used {when(target_uses[root])}")
         after_free = free_bytes(home)
         print(f"lint sweep: {gib(after_free)} free")
-        if not dry_run:
+        if not dry_run and isinstance(policy, NatedevFloor):
             now = time.time()
             # The record's free is read before its caches and the next sweep's free after its scan,
             # so a deletion during either walk can only make the computed fall smaller.
@@ -2999,7 +3097,8 @@ def hold_floor(floor: int, dry_run: bool, *,
                                                            KnownHeldRoots(frozenset(hold_targets)),
                                                            previous.lock_alert if isinstance(previous, FloorRecord)
                                                            else NoFloorLockAlert()))
-        return 1 if failures else 0
+        return FloorOutcome(0 if isinstance(policy, MacFloor) else (1 if failures else 0),
+                            0 if dry_run else max(0, total - left), free, after_free, len(busy))
     finally:
         if guard is not None:
             os.close(guard)
@@ -3417,6 +3516,7 @@ def main(argv: list[str]) -> int:
         return rebuilds_main(argv[1:])
     dry_run = False
     floor_only = False
+    host = ""
     target_dir: str | None = None
     args = iter(argv)
     for arg in args:
@@ -3424,6 +3524,11 @@ def main(argv: list[str]) -> int:
             dry_run = True
         elif arg == FLOOR_ONLY_FLAG:
             floor_only = True
+        elif arg == "--host":
+            host = next(args, "")
+            if host not in ("mac", "natedev"):
+                print("lint sweep: --host must be mac or natedev", file=sys.stderr)
+                return 2
         elif arg == TARGET_DIR_FLAG:
             target_dir = next(args, None)
             if target_dir is None:
@@ -3431,6 +3536,22 @@ def main(argv: list[str]) -> int:
                 return 2
         else:
             print(f"lint sweep: unknown argument {arg}", file=sys.stderr)
+            return 2
+    if host == "mac":
+        if not floor_only:
+            print("lint sweep: --host mac requires --floor-only", file=sys.stderr)
+            return 2
+        try:
+            with conf.diagnostics(report=False):
+                mac_settings = conf.read("mac_test")
+                mac_floor, mac_roots = mac_floor_settings(mac_settings)
+                lint_settings = conf.read("lint")
+                timeout = mac_settings.number("probe_timeout_s")
+            with floor_claims.locked_claims(timeout) as claims:
+                return hold_floor(mac_floor, dry_run, lint_settings=lint_settings,
+                                  policy=MacFloor(mac_roots, claims, Path.home() / ".local/state/mac-test/mirror"))
+        except conf.Unusable as error:
+            print(f"lint sweep: {error}", file=sys.stderr)
             return 2
     config = str(conf.path("lint"))
     try:

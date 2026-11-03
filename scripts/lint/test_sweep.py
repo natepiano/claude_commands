@@ -17,7 +17,7 @@ import time
 import unittest
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import sweep
 import conf
+from scripts.mac_test import floor_claims
 from test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
 from memory_test_support import config_environment, write_config_fixture
 if TYPE_CHECKING:
@@ -4076,6 +4077,144 @@ GIT_ENVIRONMENT = {
 
 def git(*args: str, cwd: Path) -> None:
     _ = subprocess.run(["git", *args], cwd=cwd, env=GIT_ENVIRONMENT, capture_output=True, check=True)
+
+
+NO_MAC_CLAIMS: frozenset[str] = frozenset()
+
+
+class MacFloorTests(SweepCase):
+    def policy(self, base: Path, claims: frozenset[str] = NO_MAC_CLAIMS) -> sweep.MacFloor:
+        return sweep.MacFloor((str(base),), floor_claims.LockedClaims(claims), base / "mirror")
+
+    def mac_hold(self, policy: sweep.MacFloor, shortfall: int, *, dry_run: bool = False) -> str:
+        output = io.StringIO()
+        with (mock.patch.object(sweep, "free_bytes", return_value=GIB - shortfall),
+              mock.patch.object(sweep.tmp_sweep, "lsof_paths", return_value=sweep.tmp_sweep.ProcessUsesKnown([])),
+              redirect_stdout(output)):
+            self.assertEqual(sweep.hold_floor(GIB, dry_run, policy=policy), 0)
+        return output.getvalue()
+
+    def test_live_mac_claim_keeps_the_mirror_target(self) -> None:
+        base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        tree, payload = cargo_target(base / "mirror", "held", APP, time.time() - DAY)
+        _ = (tree.parent / sweep.USE_STAMP).write_text("")
+        text = self.mac_hold(self.policy(base, frozenset({"held"})), 1)
+        self.assertTrue(payload.exists())
+        self.assertIn("busy_targets_skipped=1", text)
+        self.assertIn("removed_bytes=0", text)
+        self.assertEqual(len(text.splitlines()), 1)
+
+    def test_live_mac_claim_keeps_a_symlinked_target_in_another_root(self) -> None:
+        mirror = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        other = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        tree, payload = cargo_target(other, "held", APP, time.time() - DAY)
+        _ = (tree.parent / sweep.USE_STAMP).write_text("")
+        (mirror / "hana").symlink_to(tree.parent, target_is_directory=True)
+        policy = sweep.MacFloor((str(mirror), str(other)),
+                                floor_claims.LockedClaims(frozenset({"hana"})), mirror)
+        self.assertTrue(policy.claims.holds(str(tree.parent), mirror))
+        text = self.mac_hold(policy, 1)
+        self.assertTrue(payload.exists())
+        self.assertIn("busy_targets_skipped=1", text)
+        self.assertIn("removed_bytes=0", text)
+
+    def test_unreadable_mac_claims_keep_every_target(self) -> None:
+        base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        tree, payload = cargo_target(base, "idle", APP, time.time() - DAY)
+        _ = (tree.parent / sweep.USE_STAMP).write_text("")
+        with mock.patch("scripts.mac_test.floor_claims.subprocess.Popen", side_effect=OSError("unreadable")):
+            with floor_claims.locked_claims(1) as claims:
+                text = self.mac_hold(sweep.MacFloor((str(base),), claims, base / "mirror"), 1)
+        self.assertTrue(payload.exists())
+        self.assertIn("busy_targets_skipped=1", text)
+
+    def test_mac_claim_decoder_rejects_a_corrupt_private_record(self) -> None:
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        claims = state / "claims"
+        claims.mkdir()
+        _ = (claims / "broken.json").write_text("not JSON")
+        result = subprocess.run([sys.executable, str(Path(floor_claims.__file__))],
+                                input="", text=True, capture_output=True, check=False,
+                                env={**os.environ, "MAC_TEST_STATE_DIR": str(state)}, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("ClaimStateUnreadable", result.stderr)
+
+    def test_no_proc_mac_sweep_takes_only_the_oldest_shortfall(self) -> None:
+        base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        old_tree, old = cargo_target(base, "old", APP, time.time() - 3 * DAY)
+        new_tree, newer = cargo_target(base, "new", DEMO, time.time() - DAY)
+        for tree, age in ((old_tree, 3 * DAY), (new_tree, DAY)):
+            stamp = tree.parent / sweep.USE_STAMP
+            _ = stamp.write_text("")
+            os.utime(stamp, (time.time() - age, time.time() - age))
+        with mock.patch.object(sweep, "process_uses", side_effect=AssertionError("Mac must use claims and lsof")):
+            text = self.mac_hold(self.policy(base), 1)
+        self.assertFalse(old.exists())
+        self.assertTrue(newer.exists())
+        self.assertIn("busy_targets_skipped=0", text)
+
+    def test_mac_dry_run_lists_targets_and_deletes_nothing(self) -> None:
+        base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        tree, payload = cargo_target(base, "idle", APP, time.time() - DAY)
+        _ = (tree.parent / sweep.USE_STAMP).write_text("")
+        before = {path: path.read_bytes() for path in base.rglob("*") if path.is_file()}
+        text = self.mac_hold(self.policy(base), 1, dry_run=True)
+        self.assertEqual({path: path.read_bytes() for path in base.rglob("*") if path.is_file()}, before)
+        self.assertTrue(payload.exists())
+        self.assertIn("the floor would take", text)
+        self.assertIn("removed_bytes=0", text)
+
+    def test_mac_rejects_unmarked_outside_symlink_and_dotdot_targets(self) -> None:
+        base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        outside = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        tree, payload = cargo_target(base, "unmarked", APP, time.time() - DAY)
+        other_tree, other = cargo_target(outside, "other", DEMO, time.time() - DAY)
+        _ = (other_tree.parent / sweep.USE_STAMP).write_text("")
+        policy = self.policy(base)
+        self.assertFalse(policy.allows(str(tree.parent)))
+        self.assertFalse(policy.allows(str(other_tree.parent)))
+        link = base / "link"
+        link.symlink_to(other_tree.parent, target_is_directory=True)
+        self.assertFalse(policy.allows(str(link)))
+        self.assertFalse(policy.allows(str(base / ".." / outside.name / "other" / "target")))
+        _ = self.mac_hold(policy, 1)
+        self.assertTrue(payload.exists())
+        self.assertTrue(other.exists())
+
+    def test_mac_missing_or_lower_floor_refuses_with_one_line(self) -> None:
+        config = Path(os.environ["CONF_DIR"]) / "mac_test.conf"
+        original = config.read_text()
+        for changed in (original.replace("sweep_floor_gib=150", "sweep_floor_gib=99"),
+                        original.replace("sweep_floor_gib=150", "")):
+            with self.subTest(changed=changed):
+                _ = config.write_text(changed)
+                output = io.StringIO()
+                with redirect_stderr(output), mock.patch.object(sweep, "hold_floor") as take:
+                    self.assertEqual(sweep.main(["--floor-only", "--host", "mac"]), 2)
+                take.assert_not_called()
+                self.assertEqual(len(output.getvalue().splitlines()), 1)
+        _ = config.write_text(original)
+
+    def test_mac_entry_uses_mac_floor_and_skips_the_tmp_sweep(self) -> None:
+        config = Path(os.environ["CONF_DIR"]) / "mac_test.conf"
+        _ = write_config_fixture(config, "sweep_floor_gib=101")
+        claims = floor_claims.LockedClaims(frozenset())
+        with (mock.patch.object(floor_claims, "locked_claims", return_value=nullcontext(claims)),
+              mock.patch.object(sweep, "hold_floor", return_value=0) as take,
+              mock.patch.object(sweep.tmp_sweep, "run_if_due") as tmp):
+            self.assertEqual(sweep.main(["--floor-only", "--host", "mac", "--dry-run"]), 0)
+        self.assertEqual(take.call_args.args, (101 * GIB, True))
+        self.assertIsInstance(cast(object, take.call_args.kwargs["policy"]), sweep.MacFloor)
+        tmp.assert_not_called()
+
+    def test_lost_claim_lock_or_unreadable_process_use_keeps_output(self) -> None:
+        base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        tree, payload = cargo_target(base, "idle", APP, time.time() - DAY)
+        _ = (tree.parent / sweep.USE_STAMP).write_text("")
+        with mock.patch.object(sweep.tmp_sweep, "lsof_paths", return_value=sweep.tmp_sweep.ProcessUsesUnavailable()):
+            self.assertIn(str(tree.parent), self.policy(base).uses([str(tree.parent)]))
+        self.assertTrue(payload.exists())
 
 
 class LockHolderTests(unittest.TestCase):

@@ -1357,7 +1357,7 @@ The user's rule stays: during a hold, no test of another session runs, and the e
 
 **Acceptance:** the build-hold and merge-gate hold suites pass after the cut-over hold ends; basedpyright is clean on the changed files. A gate run that a hold interrupts shows "stopped during a natedev hold; queued again" for each stopped module and no red from the hold.
 
-### Phase 50 — The Mac runs the floor sweep, and it never deletes a mirror target that a Mac test claim holds  · status: in progress
+### Phase 50 — The Mac runs the floor sweep, and it never deletes a mirror target that a Mac test claim holds  · status: done
 
 Owner: builds-resources. Asked by verify-unit; builds approved 2026-11-03 14:05 EST as its own phase, merged first.
 
@@ -1387,17 +1387,36 @@ Owner: builds-resources. Asked by verify-unit; builds approved 2026-11-03 14:05 
 
 ### Phase 51 — Build output moves to the /build drive, and every tool that reads build folders follows it  · status: in progress
 
-Owner: builds-resources. Asked by natedev (#35); builds approved. Code waits for the user's go.
+Owner: builds-resources. Asked by natedev (#35). builds started it 2026-11-03 16:00 EST: the user wants the drive in, and Morty authorized natedev to lead #35. Purchase, install, rebuild and reboot stay with the user.
 
-**Nix side (natedev, nixos branch build-drive 2b91f2c, not merged):** /build mount (LUKS 'build', nofail); ~/.cargo/config.toml build.build-dir = /build/cargo/{workspace-path-hash} (final binaries stay in target/); SCCACHE_DIR=/build/sccache; CI caches /build/hana-ci; tmpfiles make /build/cargo, /build/claude, /build/sccache.
+**Nix side (natedev, nixos branch build-drive 2b91f2c, not merged):** /build mount (LUKS 'build', nofail); ~/.cargo/config.toml `build.build-dir = /build/cargo/{workspace-path-hash}` (final binaries stay in target/); SCCACHE_DIR=/build/sccache; CI caches /build/hana-ci.
 
-**Step 1 (now, read only):** the list of our tools that break or go blind after the switch.
+**Rules (builds, 2026-11-03).**
+1. The code works before the switch (no /build, no build.build-dir) and after it (/build mounted), with no step between. It merges before the user runs natedev's switch script.
+2. One shared per-workspace mapping: workspace_root, target_directory, build_directory, read from Cargo itself (cargo metadata, which reflects `build.build-dir`). No hard-coded /build anywhere.
+3. The floor watches each filesystem that holds build output. Each floor comes from config, read at use.
+4. Scope (builds, 2026-11-03 16:05): the inventory (S/phases/51/inventory.md) rows that break or go blind. The /build/claude scratch move is dropped (nothing breaks there). This phase takes the floor and the build records (rows 1-8). Phase 53 takes the cleanup paths and the reports (rows 11-13, 16-24).
 
-**Spec (after the user's go):**
-1. Path keys move /tmp/claude/{scratch,copies} and the gate/test clones to /build/claude. Config read at use.
-2. A /build sweeper root with a 20% floor. / keeps 300 GiB.
-3. Every ~/.claude script that reads target/ intermediates (deps/, build/, .fingerprint/, incremental/) reads cargo metadata build_directory.
-4. One fallback rule for all paths when /build is not mounted. No hard-coded paths. Nothing moves under a running session.
+**Spec (inventory rows 1-5).**
+1. **Disk floor per filesystem** (`scripts/lint/sweep.py:2913`, `:3004`, `:3038`; `config/lint.conf:92`). Group build output by filesystem (st_dev). Check each filesystem against its floor and take the shortfall only from candidates on that filesystem, LRU first. The root filesystem keeps `sweep_free_floor_gib.natedev` (300 GiB), unchanged. A new key gives the floor for another filesystem that holds build output, as a percent of its size: 20. A missing or bad key refuses with one line. When all build output is on one filesystem, behavior is the same as today.
+2. **Floor discovery and CI totals** (`config/lint.conf:252`, `:255`). Discovery finds intermediate roots through the mapping (each workspace's build_directory), not a fixed path. The CI cache paths come from config and hold both the old and the new path during the drain; a missing path is skipped. The CI exclusion from deletion stays.
+3. **Floor records and alerts** (`scripts/lint/sweep.py:2263`, `:2939`, `:3049`; `scripts/buildlog/record.py:1169`). Key the floor record, lock, growth check and alert state by filesystem, and put the filesystem in each scan row. Old records stay readable. One filesystem means one record, as today.
+4. **Unit deletion and copied binaries** (`scripts/lint/sweep.py:1302`, `:1919`, `:1980`). Pair the artifact tree (target/) with its intermediate tree (build_directory) through the mapping, so a unit and its copied binary are removed together. Keep deletion records for each physical root.
+5. **Build hold protection** (`scripts/lint/sweep.py:2741`, `:2774`). Resolve each held checkout to both Cargo output roots through the mapping, so an intermediate tree outside the checkout keeps its protection. Keep the existing process and lock checks.
+
+6. **Cold rebuild report** (`scripts/lint/sweep.py:3409`, `:3447`). Join removal paths to their checkout through the saved mapping, so a removed `/build/cargo/<hash>` keeps its cause.
+7. **Build folder records** (`scripts/buildlog/record.py:928`; `scripts/buildlog/index.py:664`). Record the resolved intermediate root beside the artifact root. Keep checkout identity and old records readable.
+8. **Warm test admission** (`scripts/direct/tree_watch.py:110`, `:229`; `scripts/lint/memory_admit.py:2380`, `:2396`). Save both output roots in the build identity. A deletion of either root ends the warm promise. memory_admit.py is queue-unit's file: the change waits for queue's ok.
+
+**The mapping is one module** (`scripts/lib/cargo_roots.py`), written first. Every other row and Phase 53 read it.
+
+**Out of scope.** Inventory rows 9-10, 14-15 (the scratch/copy/clone move). Phase 53's rows. The Mac and AWS layout.
+
+**Checks.**
+- Tests (scripts/lint/test_sweep.py and the record tests): (a) one filesystem: same choices as today; (b) two filesystems: each floor is checked, and the shortfall on one never takes a candidate on the other; (c) a percent floor from config, and a missing key refuses; (d) build_directory outside the checkout: the pair is removed together and a held checkout protects both roots; (e) records and alerts keyed by filesystem, old records readable; (f) no /build path in code.
+- basedpyright 0/0/0 on the changed files and their callers.
+- Tests for rows 6-8: a removed build_directory keeps its cold-rebuild cause; records carry both roots; a deleted build_directory ends the warm promise.
+- A natedev dry run: `sweep.py --floor-only --dry-run` prints the same choice as before the change (one filesystem today).
 
 ### Phase 52 — The build hold audit classifies a reused pid and an admitted step correctly under load  · status: done
 
@@ -1408,3 +1427,20 @@ Owner: builds-resources. Asked by builds 2026-11-03 15:00 EST; it held natest's 
 **Spec.** Find the cause in the code (pid identity and admission classification), and fix it there. Do not change the test's timing, add sleeps or retries, or widen a timeout. A pid match needs the same start time as the admission record. A step whose admission record matches it is 'admitted' even when the system is slow.
 
 **Checks.** A test that reproduces the fault without load (for example, a forced slow read or a stale /proc start time). test_build_hold.py and test_hold_enforcer.py pass. basedpyright 0/0/0 on the changed files and their callers.
+
+### Phase 53 — After the /build switch, cleanup removes a checkout's outside build cache, and the disk reports show each drive  · status: in progress
+
+Owner: builds-resources. Asked by natedev (#35); builds started it 2026-11-03 16:05 EST with Phase 51. Phase 51 rules 1-3 apply here too: it works before and after the switch with no step between; it reads the one mapping in `scripts/lib/cargo_roots.py` (Phase 51), never a hard-coded /build; free-space reads use the filesystem that holds the output.
+
+**Why.** After the switch, Cargo puts intermediates in `/build/cargo/<workspace-path-hash>/`, outside the checkout. Cleanup that deletes a checkout leaves that cache behind, and the disk reports read the wrong drive.
+
+**Spec (inventory rows).**
+1. **Cleanup paths** (rows 11-13, 16, 18): `scripts/lib/scratch.py:906`, `:921`; `scripts/lint/tmp_sweep.py:1038`; `scripts/lint/folder_audit.py:402`; `scripts/direct/remove_run_scratch.py:55`, `:112`; `scripts/worktree_delete/perform_deletion.sh:40`, `:68`; `scripts/style/style_sync.py:348`-`:381`; `scripts/buildlog/rust_release.py:308`, `:398`, `:406`. Save a checkout's output roots before it is removed. Remove its idle, exclusive intermediate cache through one shared guarded cleanup path. Never remove a cache that another checkout or a live process uses.
+2. **Free-space and size reads** (rows 17, 19-23): `scripts/buildlog/rust_release.py:147`, `:463`; `scripts/buildlog/disk.py:70`, `:224`; `scripts/buildlog/report.py:2269`, `:1527`; `scripts/buildlog/sample.py:152`; `scripts/buildlog/memory.py:89`, `:95`; `scripts/mac_test/linux_runner.py:173`, `:567`, `:618`, `:646`. Read the filesystem that holds the output. Report each filesystem once (no double count of one device). Match build processes by the resolved output roots, not by `/target/` in the path.
+3. **Operator text** (row 24): `commands/showrunner/produce.md:1229`; `commands/change_review.md:160`; `docs/direct/write_prompt_contract.md:270`. Check both filesystems; name both Cargo output places.
+
+**Out of scope.** The scratch/copy/clone move to /build/claude. Phase 51's rows. The Mac and AWS layout.
+
+**Checks.**
+- Tests beside each changed module: with build_directory inside target/ (today) behavior is the same; with build_directory outside, cleanup removes the exclusive idle cache and keeps a shared or live one; reports name each filesystem once.
+- basedpyright 0/0/0 on the changed files and their callers.

@@ -1044,6 +1044,7 @@ def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1
     return "\n".join(
         (
             f'mkdir -p "$HOME"/{mirror} || exit 1',
+            f'printf "mac-test mirror\\n" > "$HOME"/{mirror}/.mac-test-mirror || exit 1',
             "free_gib=$(df -g \"$HOME\" | awk 'NR == 2 {print $4}')",
             "printf 'free_gib=%s\\nhost=%s\\nrc=0\\n' "
             + '"$free_gib" "$(hostname -s)"',
@@ -1335,7 +1336,7 @@ def copy_tree(
         ) as exclude_file:
             exclude_path = Path(exclude_file.name)
             try:
-                _ = exclude_file.write("/.git\n/target/\n")
+                _ = exclude_file.write("/.git\n/target/\n/.mac-test-mirror\n")
                 for path in ignored:
                     _ = exclude_file.write(f"/{escape_rsync_filter_path(path)}\n")
                 exclude_file.flush()

@@ -220,6 +220,12 @@ Linux-only packages, and Mac nextest exclusions. A repository needs a
 `linux_only.<repo>` key, even when its value is empty, before tests can run on
 the Mac. An empty `ci_repo` disables CI calls. `CONF_DIR` selects the fixture folder in tests.
 
+The Mac floor sweep reads `sweep_floor_gib=150` from this file.
+The value must meet `free_floor_gib`. A missing or lower floor refuses the pass.
+`sweep_floor_roots` names `/tmp`, `~/rust`, and `~/.local/state/mac-test/mirror`.
+Only marked build output and mirrors inside these roots are eligible.
+The on-demand command and the future timer use `sweep.py --floor-only --host mac`.
+
 ## aws_target.conf
 
 This file defines the disabled AWS SSH target. `offload=off` prevents work.

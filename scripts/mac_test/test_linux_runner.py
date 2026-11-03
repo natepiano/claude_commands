@@ -1527,7 +1527,7 @@ class LinuxDispatchTests(unittest.TestCase):
         ])
         source_copy = next(argv for argv in self.commands if argv[0] == "rsync" and any(word.startswith("--exclude-from=") for word in argv))
         self.assertIn("--delete", source_copy)
-        self.assertEqual(self.filters, ["/.git\n/target/\n/private/\n/.env\n"])
+        self.assertEqual(self.filters, ["/.git\n/target/\n/.mac-test-mirror\n/private/\n/.env\n"])
         self.assertNotIn("--copy-links", source_copy)
         identity = offload.repository_identity(self.source)
         if not isinstance(identity, offload.KnownRepository):
