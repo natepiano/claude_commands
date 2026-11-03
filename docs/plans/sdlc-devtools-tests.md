@@ -602,6 +602,62 @@ Remaining gaps include shell command positions, executable Python aliases, and s
 
 **Gotchas:** `store_questions` writes the outstanding JSON only when reminders exist; with questions only, the file stays absent. `tidy_wrapped` deletes `<state>/<slug>/`; question folders sit under `<state>/<staff id>/`, so a move of a production's state folder to its staff id must keep `questions/` out of that delete.
 
+### Phase 4k — A unit files a question with any copy of its production doc  · status: done
+
+Source: sdlc 2026-11-02 18:4x: phases-unit's `update_registration.py ask --production docs/plans/sdlc-production.md --unit phases-unit` exits 2 with "no showrunner staff row", from the unit's worktree copy and from `~/.claude` main's copy. `QuestionStaff.owner` (`update_registration.py:292`) and `question_folder` (`:810`) call `StaffSnapshot.by_doc` (`staff.py:280`), which matches only the exact path of the showrunner's checkout copy.
+
+#### Work Order
+
+**Goal:** a unit files a question with any checkout's copy of its production doc (its own worktree, `~/.claude` main, or the showrunner checkout), and the item reaches the showrunner's list.
+
+**Spec:**
+1. `StaffSnapshot.by_doc(machine, path)` stays the one doc lookup. It matches a row when `path` is the row's doc or the same file in another checkout of the same git repository: the same git common directory and the same path relative to the checkout top. Add no second path list and no alias records.
+2. An exact path match still wins. A path outside any git checkout matches only exactly. When two rows match the same document by repository identity, the lookup refuses and picks neither.
+3. Read the checkout facts without a subprocess where a `.git` file or folder answers it (`gitdir:` and `commondir`), so the lookup stays fast.
+4. Every `by_doc` caller (`update_registration.py:295`, `:810`) gets the new match with no change at the call.
+
+**Files:**
+- `scripts/production/staff.py` — `by_doc` and its checkout-identity helper.
+- `scripts/production/test_staff.py`, `scripts/production/test_update_registration_questions.py` — regressions.
+
+**Workers:** `1 writer + 1 tester`.
+- `impl` — `scripts/production/staff.py`.
+- `test` — the two test files.
+
+**State:** none; only the lookup changes.
+
+**Constraints from prior phases:** Phase 4j: `question_folder` takes its owner from `by_doc`; a match from another checkout gives the same showrunner row and so the same question folder.
+
+**Acceptance gate:** a test with a showrunner row whose doc is in one checkout files a question with `ask` from a second worktree's copy and from the main checkout's copy, and `questions-table` lists it; a doc outside git matches only exactly; two matching rows refuse; basedpyright 0/0/0 on changed files and on `update_registration.py`, `footer_counts.py`, `tidy_wrapped.py`; each changed test file green in its own `discover` run; full merged-tree gate green.
+
+### Phase 4o — A unit folder moves at an open phase  · status: todo
+
+Source: the user via morty and sdlc, 2026-11-02 18:4x. herdr-unit agreed 18:5x: devtools-unit owns `scripts/production/unit_move.py` and its tests for this phase; herdr-unit's 4g later extends `test_unit_move.py`.
+
+#### Work Order
+
+**Goal:** `unit_move.py move-folder` moves a unit's folder while a run phase is open, and every session returns to the state it had before the move.
+
+**Spec:**
+1. `_folder_boundary` (`unit_move.py:693`) no longer refuses an open phase. At an open phase, `move-folder` stops the unit session and pauses the run's Codex workers through the shutdown path (`scripts/agents/codex_mesh.py` pause, `scripts/shutdown/`). It then moves the folder and updates the staff row, the launch folder and the run record.
+2. Before the stop, record each session's prior state: running or paused. After the move, resume only the sessions that were running. A paused unit and paused workers stay paused. Each worker keeps its thread.
+3. The unit's own processes (its session, its run's Codex host and watch shell, its workers) are allowed. Any other process inside the folder still refuses, as now.
+4. A rerun after a full move prints `unchanged` and exits 0. A rerun after an interrupted move finishes the remaining steps.
+
+**Files:**
+- `scripts/production/unit_move.py` — the open-phase move and the prior-state restore.
+- `scripts/production/test_unit_move.py` — one test for each case in items 1-4.
+
+**Workers:** `1 writer + 1 tester`.
+- `impl2` — `scripts/production/unit_move.py`.
+- `test` — `scripts/production/test_unit_move.py` (after 4k's tests are done).
+
+**State:** each session's prior state, kept in the folder-move record until the move ends.
+
+**Constraints from prior phases:** herdr-unit 4g builds its interruption tests on this phase's `test_unit_move.py`.
+
+**Acceptance gate:** one test each: a running unit resumes, a paused unit stays paused, a running worker resumes on its same thread, a paused worker stays paused (herdr-unit 4o Work Order, 2026-11-02); the existing `test_unit_move.py` tests pass; tests also show: a paused unit stays paused; paused workers stay paused; a process that is not the unit's own refuses; a rerun prints `unchanged` and exits 0. basedpyright 0/0/0 on changed files and every caller module; `test_unit_move.py` green in its own `discover` run; full merged-tree gate green.
+
 ### Phase 7m — Showrunners take Morty's words as the user's  · status: done
 
 #### As-built
