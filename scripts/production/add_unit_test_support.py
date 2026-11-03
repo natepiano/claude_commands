@@ -771,10 +771,10 @@ class AddUnitTestCase(ShutdownTestCase):
         def launch(_request: add_unit.UnitLaunch, prompt: str) -> herdr.PromptSubmitOutcome:
             if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
                 recorded = self.recorded_prompts(launch_kind.session_id)
-                self.assertEqual(recorded[-1], prompt)
+                self.assertEqual(recorded, ())
                 self.assertIs(
                     conversation_pause.prompt_source(
-                        prompt, frozenset, lambda: recorded
+                        script_prompt(prompt), frozenset, lambda: recorded
                     ),
                     conversation_pause.PromptSource.SCHEDULED,
                 )

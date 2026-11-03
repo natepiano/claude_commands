@@ -168,7 +168,7 @@ Before starting the agent, add_unit saves its exact opening, conversation id, ac
 - A plain `--resume` of an existing Units row, active or retired, continues its transcript without requiring a Production header in the row’s own plan document, so a condensed as-built remains usable; new units and attaches still require the header, and a resume with a different plan still refuses.
 - A plain `--resume` of a retired Units row may use `--cwd` outside its worktree: the raw Plan cell supplies the retired state, the row keeps its worktree and branch, and the launch creates neither and leaves the row for resume_unit to unmark; other cwd mismatches retain their refusal.
 - On a resume of a unit with session labels, `ClaudeUnknown` refuses, and `ClaudeNotRunning` closes that place's tab with `close_agent` before the relaunch.
-- A restore records its prompt as scheduled (`record_scheduled_restore_prompt`). The resumed model is the transcript's last real assistant model unless `--model` is given.
+- A restore's prompt carries the script envelope, which marks it as a script prompt; it writes no scheduled-prompt record. The resumed model is the transcript's last real assistant model unless `--model` is given.
 - A new unit waits until `read_place` shows `/remote-control is active`.
 - It prints `<unit> started: <attach_hint>` or `<unit> restore launched: <attach_hint>`, the unit's tab in its production's workspace.
 - Exit 1 on `AgentNotReady` (prints the screen), 2 on a refusal, 1 on other failures.
