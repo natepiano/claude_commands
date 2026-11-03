@@ -14,9 +14,6 @@ from typing import TYPE_CHECKING, cast, override
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
-
 ROOT = Path(__file__).resolve().parents[2]
 for dependency in ("lib", "herdr", "production", "message", "shutdown", "notify", "whoami", "direct"):
     sys.path.insert(0, str(ROOT / "scripts" / dependency))
@@ -40,9 +37,13 @@ else:
     from user_action import NoActionRequired
 from scripts.accounts import accounts
 from scripts.lib import nix_env
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file, unit_membership
+from scripts.shutdown.remote import local_machine
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.whoami import account
 from scripts.shutdown import launch_permission
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class HerdrLaunchTests(NixFixture):
@@ -150,8 +151,11 @@ class HerdrLaunchTests(NixFixture):
             branch="fixture", worktree=self.root / "unused-checkout", plan=add_unit.Standby(),
             port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(), session=add_unit.ResumedSession("sid", self.work),
             launch_kind=add_unit.NewWorkLaunch(), timeout=1)
-        self.refusal(lambda: add_unit.launch_session(request, add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
-            "resume", accounts.NamedAccount("claude3", self.home / ".claude3")))
+        with isolated_staff_file(self.root / "staff.json", self.env):
+            member = unit_membership("child", "unit")
+            member = staff.set_worktree(member.id, staff.PresentWorktree(local_machine(), request.worktree), expected=member.worktree)
+            self.refusal(lambda: add_unit.launch_session(request, add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
+                "resume", accounts.NamedAccount("claude3", self.home / ".claude3")))
 
     def test_add_showrunner_uses_requested_cwd_before_opening(self) -> None:
         self.refusal(lambda: add_showrunner.launch(self.production(), "opus", "high", None, self.work,
@@ -159,9 +163,10 @@ class HerdrLaunchTests(NixFixture):
 
     def test_restart_uses_resume_cwd_before_opening(self) -> None:
         config = self.home / ".claude3"
-        parts = restart.ResumeParts(str(self.work), {"CLAUDE_CONFIG_DIR": str(config)}, ("--resume", "sid"),
-                                    "resume", restart.RetainResumeAccount(config), restart.ResumeConversation())
-        session = {"session_id": "sid", "name": "worker", "kind": "standalone", "cwd": str(self.work)}
+        identity = fixture_runtime_id("nix-restart-recorded-session")
+        parts = restart.ResumeParts(str(self.work), {"CLAUDE_CONFIG_DIR": str(config)}, ("--resume", identity),
+                                    "resume", restart.RetainResumeAccount(config), restart.ResumeConversation(identity))
+        session = {"session_id": identity, "name": "worker", "kind": "standalone", "cwd": str(self.work)}
         invoke = cast(Callable[..., object], getattr(restart, "_herdr_launch"))
         with (patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": str(config)}),
               patch.object(restart, "_heal_folder_trust"), patch.object(restart, "_holds_live_agent", return_value=False),
@@ -173,11 +178,12 @@ class HerdrLaunchTests(NixFixture):
     def test_restart_uses_the_healers_prepared_environment_without_another_load(self) -> None:
         _ = self.envrc(self.work)
         config = self.home / ".claude3"
-        parts = restart.ResumeParts(str(self.work), {"CLAUDE_CONFIG_DIR": str(config)}, ("--resume", "sid"),
-                                    "resume", restart.RetainResumeAccount(config), restart.ResumeConversation())
-        session = {"session_id": "sid", "name": "worker", "kind": "standalone", "cwd": str(self.work)}
+        identity = fixture_runtime_id("nix-restart-recorded-session")
+        parts = restart.ResumeParts(str(self.work), {"CLAUDE_CONFIG_DIR": str(config)}, ("--resume", identity),
+                                    "resume", restart.RetainResumeAccount(config), restart.ResumeConversation(identity))
+        session = {"session_id": identity, "name": "worker", "kind": "standalone", "cwd": str(self.work)}
         invoke = cast(Callable[..., object], getattr(restart, "_herdr_launch"))
-        handoff = {nix_env.HEAL_SESSION_ENV: "sid", nix_env.HEAL_DIRECTORY_ENV: str(self.work.resolve()),
+        handoff = {nix_env.HEAL_SESSION_ENV: identity, nix_env.HEAL_DIRECTORY_ENV: str(self.work.resolve()),
                    "IN_NIX_SHELL": "impure", "NIX_LDFLAGS": "-Lprepared"}
         with (patch.dict("os.environ", handoff),
               patch.object(nix_env, "ensure", side_effect=AssertionError("no load may follow the healer's final hold check")) as ensure,
@@ -203,14 +209,15 @@ class HerdrLaunchTests(NixFixture):
     def test_prepared_restart_proof_cannot_be_used_for_another_session_or_without_a_nix_shell(self) -> None:
         _ = self.envrc(self.work)
         config = self.home / ".claude3"
-        parts = restart.ResumeParts(str(self.work), {"CLAUDE_CONFIG_DIR": str(config)}, ("--resume", "sid"),
-                                    "resume", restart.RetainResumeAccount(config), restart.ResumeConversation())
-        session = {"session_id": "sid", "name": "worker", "kind": "standalone", "cwd": str(self.work)}
+        identity = fixture_runtime_id("nix-restart-recorded-session")
+        parts = restart.ResumeParts(str(self.work), {"CLAUDE_CONFIG_DIR": str(config)}, ("--resume", identity),
+                                    "resume", restart.RetainResumeAccount(config), restart.ResumeConversation(identity))
+        session = {"session_id": identity, "name": "worker", "kind": "standalone", "cwd": str(self.work)}
         invoke = cast(Callable[..., object], getattr(restart, "_herdr_launch"))
-        for identity, directory, shell in (("another-session", str(self.work), "impure"),
-                                            ("sid", str(self.root), "impure"), ("sid", str(self.work), "")):
-            with (self.subTest(identity=identity, directory=directory, shell=shell),
-                  patch.dict("os.environ", {nix_env.HEAL_SESSION_ENV: identity, nix_env.HEAL_DIRECTORY_ENV: directory,
+        for handoff_identity, directory, shell in (("another-session", str(self.work), "impure"),
+                                            (identity, str(self.root), "impure"), (identity, str(self.work), "")):
+            with (self.subTest(identity=handoff_identity, directory=directory, shell=shell),
+                  patch.dict("os.environ", {nix_env.HEAL_SESSION_ENV: handoff_identity, nix_env.HEAL_DIRECTORY_ENV: directory,
                                              "IN_NIX_SHELL": shell}),
                   patch.object(nix_env, "ensure", side_effect=AssertionError("a bad handoff must fail closed")),
                   patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": str(config)}),
@@ -251,7 +258,7 @@ class HerdrLaunchTests(NixFixture):
                                    ["claude", "-n", "worker"])
         invoke = cast(Callable[..., object], getattr(pane_restore, "_resume"))
         with patch.object(pane_restore, "named_account_environment", return_value={}):
-            self.refusal(lambda: invoke("host", client, pane_restore.RestoredPane("pane", "worker", "space", "sid"), entry))
+            self.refusal(lambda: invoke("host", client, herdr.TabSession("pane", "worker", "space", "sid"), entry))
         cast(Mock, client.close_tab_of).assert_not_called()
 
     def test_herdr_sessions_refusal_prints_one_line_and_opens_nothing(self) -> None:
@@ -284,7 +291,7 @@ class ShellLaunchTests(NixFixture):
     def setUp(self) -> None:
         super().setUp()
         self.scripts = self.home / ".claude/scripts"
-        for relative in ("agents/agent_exec.sh", "agents/agent_bg.sh", "cli_agent/cli_agent.sh", "berth_fix/launch.sh", "make_a_worktree/direnv_allow.sh", "lib/nix_env.py"):
+        for relative in ("agents/agent_exec.sh", "agents/agent_bg.sh", "cli_agent/cli_agent.sh", "berth_fix/launch.sh", "make_a_worktree/direnv_allow.sh", "lib/nix_env.py", "lib/conf.py"):
             destination = self.scripts / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = shutil.copyfile(ROOT / "scripts" / relative, destination)
@@ -340,8 +347,13 @@ print('{"type":"result","result":"fixture completed"}')
         self.launch_contract("cli_agent/cli_agent.sh", [], self.work)
 
     def test_agent_bg(self) -> None:
-        self.launch_contract("agents/agent_bg.sh", ["fixture", str(self.work), str(self.root / "prompt"),
-            str(self.root / "result"), str(self.root / "launch.log"), str(self.root / "id")], self.work)
+        (self.scripts / "production").symlink_to(ROOT / "scripts/production", target_is_directory=True)
+        with isolated_staff_file(self.root / "staff.json", self.env):
+            owner = unit_membership("child", "unit")
+            self.env["CODEX_THREAD_ID"] = owner.id
+            self.env["AGENT_BG_ROLE"] = "impl"
+            self.launch_contract("agents/agent_bg.sh", ["fixture", str(self.work), str(self.root / "prompt"),
+                str(self.root / "result"), str(self.root / "launch.log"), str(self.root / "id")], self.work)
         rows = [cast(dict[str, object], json.loads(line)) for line in self.started.read_text().splitlines()]
         arguments = cast(list[str], rows[0]["args"])
         settings = cast(dict[str, dict[str, str]], json.loads(arguments[arguments.index("--settings") + 1]))

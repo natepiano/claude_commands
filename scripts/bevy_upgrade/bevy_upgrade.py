@@ -8,6 +8,8 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
@@ -15,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 from production_units import Production, read_production
 import production_units
 import pins
-import showrunners
+from scripts.production import showrunners
 import upstream
 import upgrade_check
 import upgrade_record

@@ -16,12 +16,19 @@ from pathlib import Path
 from typing import Self, cast, override
 from unittest.mock import Mock, patch
 
-from scripts.accounts import accounts, role_map
+from scripts.lib.signal_test_support import install_signal_pid_guard
+from scripts.accounts.home_test_support import scratch_account_home
+from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader
 from scripts.agents import codex_mesh
 from scripts.whoami import agent_accounts
 
 send_role_map_command = role_map.ssh_role_map
+
+
+def setUpModule() -> None:
+    install_signal_pid_guard()
+    _ = unittest.enterModuleContext(patch.object(accounts, "_start_session_counts_fetch", return_value=True))
 
 
 class RoleMapReadTime(datetime):
@@ -47,8 +54,8 @@ class RoleMapTests(unittest.TestCase):
             for label in ("claude1", "claude2", "claude3", "codex1", "codex3"):
                 _ = (home / "notes" / f"{label}.md").write_text(
                     f"---\nlogin: {label}@example.invalid\n---\n")
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home / "notes"),
+        _ = cast(object, self.enterContext(scratch_account_home(self.home, {
+            "AGENT_NOTES_DIR": str(self.home / "notes"),
             "USER_ZONE": "America/New_York", "PATH": os.defpath,
         }, clear=True)))
         _ = self.enterContext(patch.object(role_map, "ROLE_MAP_HOST", "natedev"))
@@ -178,8 +185,8 @@ class RoleMapTests(unittest.TestCase):
 
     def remote(self, arguments: tuple[str, ...]) -> str:
         """Run the real remote CLI against a second scratch home, never a shell or ssh."""
-        with (patch.dict(os.environ, {"HOME": str(self.server_home),
-                                     "AGENT_NOTES_DIR": str(self.server_home / "notes")}),
+        with (scratch_account_home(self.server_home, {
+                  "AGENT_NOTES_DIR": str(self.server_home / "notes")}, clear=False),
               patch.object(socket, "gethostname", return_value="natedev")):
             code, output, error = self.cli(*arguments)
         self.assertEqual((code, error), (0, ""))
@@ -216,7 +223,7 @@ class RoleMapTests(unittest.TestCase):
         alias.symlink_to(self.home, target_is_directory=True)
         for process_home, login_home in ((alias, self.home), (self.home, alias)):
             with (self.subTest(process_home=process_home, login_home=login_home),
-                  patch.dict(os.environ, {"HOME": str(process_home)}),
+                  scratch_account_home(process_home, {}, clear=False),
                   patch.object(role_map, "_login_home", return_value=role_map.LoginHome(login_home)),
                   patch.object(role_map, "ssh_role_map", side_effect=self.remote) as ssh):
                 selected = role_map.read_role_map()
@@ -256,6 +263,64 @@ class RoleMapTests(unittest.TestCase):
         self.assertEqual(history.read_text(), complete)
         self.assertFalse(recovery.exists())
         self.assertGreaterEqual(sum(call.args[1] == fcntl.LOCK_EX for call in flock.call_args_list), 2)
+
+    def test_auto_move_rerun_repairs_selection_history_once_and_advances_the_queue(self) -> None:
+        class Killed(BaseException):
+            pass
+
+        self.seed(self.home, groups={"units": "claude1"})
+        repair_at = RoleMapReadTime.now(timezone.utc)
+        original_at = repair_at - timedelta(minutes=3)
+        reset = (repair_at + timedelta(days=1)).isoformat()
+        first = next_moves.ClaudeGroupMove("selected-before-stop", "units", 1, 0, "claude3", original_at)
+        second = next_moves.ClaudeGroupMove("successor", "units", 1, 0, "claude2", original_at)
+        with patch.object(socket, "gethostname", return_value="natedev"), next_moves.next_moves_lock():
+            next_moves.write_next_moves((first, second))
+        change = role_map.RoleMapChange("units", "claude3", "auto: " + first.id, original_at.isoformat(),
+                                        "interrupted-group-move", "auto", "weekly", reset)
+        history = accounts.roles_history_file()
+        mkdir = Path.mkdir
+
+        def stop_after_selection(path: Path, mode: int = 0o777, parents: bool = False,
+                                 exist_ok: bool = False) -> None:
+            if path == history.parent and json.loads(accounts.groups_file().read_text())["units"] != "claude1":
+                raise Killed
+            mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+
+        def identity(path: Path) -> agent_accounts.NumberedAccount:
+            label = accounts.claude_config_label(path)
+            return agent_accounts.NumberedAccount(label, path, label + "@example.invalid")
+
+        reading = refusals.FreshReading(refusals.ReadingWindow(0,
+            refusals.KnownReset(repair_at + timedelta(days=1)), repair_at), refusals.NoWindow(), "")
+        with (patch.object(role_map, "is_role_map_host", return_value=True),
+              patch.object(socket, "gethostname", return_value="natedev"),
+              patch.object(role_map, "datetime", RoleMapReadTime),
+              patch.object(accounts, "account_identity", side_effect=identity),
+              patch.object(refusals, "stored_reading_with_age", return_value=reading),
+              patch("shutdown_record.all_session_records", return_value=[]),
+              patch.object(refusal_watch, "_notify_blocked_head", return_value=False),
+              patch.object(accounts, "prepared_account", side_effect=AssertionError("blocked target was prepared"))):
+            with patch.object(Path, "mkdir", new=stop_after_selection):
+                with self.assertRaises(Killed):
+                    role_map.write_role_map(change)
+            self.assertEqual(json.loads(accounts.groups_file().read_text())["units"], {
+                "label": "claude3", "move_id": "interrupted-group-move", "cause": "auto",
+                "window": "weekly", "why": "auto: " + first.id, "reset": reset,
+            })
+
+            _ = refusal_watch.run_auto_moves(repair_at)
+
+            self.assertEqual(next_moves.read_next_moves(), (second,))
+            lines = refusal_watch.run_auto_moves(repair_at + timedelta(seconds=1))
+            self.assertTrue(any("claude2" in line and "at or below" in line for line in lines), lines)
+            self.assertEqual(next_moves.read_next_moves(), (second,))
+        rows = [json.loads(line) for line in history.read_text().splitlines()]
+        self.assertEqual(rows, [{
+            "at": repair_at.isoformat(), "group": "units", "label": "claude3",
+            "why": "auto: " + first.id, "move_id": "interrupted-group-move", "cause": "auto",
+            "window": "weekly", "reset": reset,
+        }])
 
     def test_scratch_home_writes_its_groups_workers_and_history_without_remote_changes(self) -> None:
         self.seed(self.home, groups={"units": "claude3", "showrunners": "claude1"})

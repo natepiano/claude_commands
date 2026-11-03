@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 import io
 import json
@@ -22,6 +23,7 @@ import broadcast
 import codex_daemon
 import process_table
 import roster
+from scripts.production import staff
 
 NO_SHOWRUNNER = roster.NoShowrunner()
 NO_DIRECTOR = roster.NoDirector()
@@ -30,18 +32,19 @@ NO_CODEX_THREAD = roster.NoCodexThread()
 # Every send must start before any can finish, proving deliveries run together.
 SEND_STUB = """import hashlib, json, os, sys, time, uuid
 from pathlib import Path
+TEST_HANG_GUARD_SECS = __TEST_HANG_GUARD_SECS__
 root = Path(os.environ["LOG"])
 args = sys.argv[1:]
 to = args[args.index("--to") + 1]
 (root / ("started-" + hashlib.sha256(to.encode()).hexdigest())).touch()
-deadline = time.monotonic() + 3
+deadline = time.monotonic() + TEST_HANG_GUARD_SECS
 while len(list(root.glob("started-*"))) < int(os.environ["TOGETHER"]) and time.monotonic() < deadline:
     time.sleep(0.01)
 (root / ("send-" + uuid.uuid4().hex + ".json")).write_text(json.dumps(args))
 if to == os.environ.get("REFUSED") or len(list(root.glob("started-*"))) < int(os.environ["TOGETHER"]):
     print("QUEUED: relay timed out after 40 s")
     raise SystemExit(1)
-"""
+""".replace("__TEST_HANG_GUARD_SECS__", str(TEST_HANG_GUARD_SECS))
 
 
 def entry(
@@ -159,6 +162,8 @@ class BroadcastTests(unittest.TestCase):
         output, errors = io.StringIO(), io.StringIO()
         os.environ["SSH_SNAPSHOT"] = roster.RosterSnapshot(roster.Roster(self.peer_rows, self.peer_problems)).encode()
         with (patch.dict(os.environ, environment),
+              patch.object(staff, "runtime_id", return_value=environment.get(
+                  "CLAUDE_CODE_SESSION_ID", self.environment["CLAUDE_CODE_SESSION_ID"])),
               patch.object(roster, "roster", side_effect=self.fixture_roster) as read_roster,
               patch.object(roster, "sender_identity", wraps=roster.sender_identity) as read_identity,
               redirect_stdout(output), redirect_stderr(errors)):

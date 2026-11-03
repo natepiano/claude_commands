@@ -24,11 +24,10 @@ import unittest
 from unittest import mock
 import zlib
 
+from scripts.buildlog import store
 from scripts.hana_shot import hana_shot
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("hana_shot.py")
 CAMERA_ENTITY = 5
@@ -228,7 +227,7 @@ class Fake:
         if method == "brp_extras/screenshot":
             self.screenshot_started.set()
             if self.screenshot in ("hang", "hold"):
-                _ = self.release.wait(15)
+                _ = self.release.wait(TEST_HANG_GUARD_SECS)
                 return {"result": None}
             if self.screenshot == "busy-always" or (self.screenshot == "busy-once" and screenshots == 1):
                 return {"error": {"code": -32603, "message": "Screenshot already in progress"}}
@@ -323,15 +322,26 @@ def handler_for(fake: Fake) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
-class HanaShotTest(unittest.TestCase):
-    fake_listeners: list[ThreadingHTTPServer] = []
+class BuildLogIsolatedTest(unittest.TestCase):
     scratch: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "BUILDLOG_DIR": str(self.scratch / "buildlog"),
+        })))
+
+
+class HanaShotTest(BuildLogIsolatedTest):
+    fake_listeners: list[ThreadingHTTPServer] = []
     fake: Fake = Fake()
     port: int = 0
 
     @override
     def setUp(self) -> None:
-        self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        super().setUp()
         self.fake = Fake()
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(self.fake))
         self.fake_listeners = [server]
@@ -368,7 +378,7 @@ class HanaShotTest(unittest.TestCase):
         return subprocess.run(
             [sys.executable, str(program), *args],
             cwd=self.scratch, env=self.script_environment(session_variables), capture_output=True, text=True,
-            timeout=60, check=False,
+            timeout=TEST_HANG_GUARD_SECS, check=False,
         )
 
     def run_script(self, *args: str, session_variables: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -412,7 +422,7 @@ def face_transforms() -> dict[str, list[float]]:
     }
 
 
-class FaceAngleTests(unittest.TestCase):
+class FaceAngleTests(BuildLogIsolatedTest):
     def test_all_local_axes_round_trip_through_hana_camera_offset(self) -> None:
         for label, matrix in face_transforms().items():
             for column, axis in enumerate(("x", "y", "z")):
@@ -730,14 +740,15 @@ class FaceShotTests(HanaShotTest):
         self.assertEqual(len(self.fake.methods("brp_extras/screenshot")), 2)
 
 
-class LaunchBuildWarningTests(unittest.TestCase):
+class LaunchBuildWarningTests(BuildLogIsolatedTest):
     root: Path = Path()
     executable: Path = Path()
     source: Path = Path()
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        super().setUp()
+        self.root = self.scratch
         self.source = self.root / "crates" / "hana" / "main.rs"
         self.source.parent.mkdir(parents=True)
         _ = self.source.write_text("committed source\n")
@@ -947,6 +958,42 @@ class LaunchRecordRecoveryTests(HanaShotTest):
             for number, handler in handlers.items():
                 _ = signal.signal(number, handler)
         return exit_code, diagnostics.getvalue()
+
+    def test_launch_and_cleanup_keep_real_buildlog_unchanged(self) -> None:
+        isolated_root = store.root()
+        self.assertTrue(isolated_root.is_relative_to(self.scratch))
+        with mock.patch.dict(os.environ):
+            _ = os.environ.pop("BUILDLOG_DIR", None)
+            real_root = store.root()
+        real_paths = (real_root / store.ERRORS_NAME, real_root / store.host_name())
+
+        def real_log_metadata() -> dict[Path, tuple[int, int]]:
+            metadata: dict[Path, tuple[int, int]] = {}
+            for base in real_paths:
+                for path in (base, *base.rglob("*")):
+                    try:
+                        reading = path.stat()
+                    except FileNotFoundError:
+                        continue
+                    metadata[path] = (reading.st_size, reading.st_mtime_ns)
+            return metadata
+
+        before = real_log_metadata()
+        self.stop_fake_listener()
+        state = self.launch_without_starting_hana()
+        self.restart_fake_listener()
+        with mock.patch.object(hana_shot, "process_alive", return_value=False):
+            exit_code, diagnostics = self.shutdown_command()
+
+        self.assertEqual(real_log_metadata(), before)
+        self.assertEqual(exit_code, 0, diagnostics)
+        self.assertFalse(self.state_path.exists())
+        self.assertFalse(Path(state["scratch"]).exists())
+        rows = list((isolated_root / store.host_name()).glob("*.jsonl"))
+        if rows:
+            self.assertIn(str(self.executable), "".join(path.read_text() for path in rows))
+        else:
+            self.assertIn(f"launch {self.state_path}", (isolated_root / store.ERRORS_NAME).read_text())
 
     def assert_unreadable_shutdown_then_relaunch(self, reason: str) -> None:
         with (
@@ -1471,7 +1518,7 @@ class ViewsTests(HanaShotTest):
         self.addCleanup(self.stop_script, process)
         self.assertTrue(self.fake.screenshot_started.wait(TEST_HANG_GUARD_SECS), "the second view never reached capture")
         process.send_signal(signal.SIGTERM)
-        _, stderr = process.communicate(timeout=60)
+        _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
         self.assertEqual(process.returncode, 128 + signal.SIGTERM, stderr)
         [line] = self.timing_lines()
@@ -1938,7 +1985,7 @@ class RemoteTests(HanaShotTest):
         self.addCleanup(self.stop_script, process)
         self.assertTrue(self.fake.screenshot_started.wait(TEST_HANG_GUARD_SECS), "the screenshot call never reached the fake")
         process.send_signal(signal_number)
-        _, stderr = process.communicate(timeout=60)
+        _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         return cast(int, process.returncode), stderr
 
     def test_remote_shot_copies_the_png_back_and_removes_it_there(self) -> None:

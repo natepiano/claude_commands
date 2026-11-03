@@ -247,10 +247,13 @@ class ProductionRenamePhaseNoteTests(unittest.TestCase):
         self.assertEqual(json.loads(note_fields(note)["production_file"]), NEW_LINK)
         held = fake_showrunner.write_session(fixture.root / "state/sessions", "runner-now", "test-showrunner")
         self.addCleanup(held.close)
+        worktree = fixture.worktrees / "alpha-unit"
+        plan = worktree / "docs/plans/alpha-unit.md"
+        fixture.write(plan, fixture.plan_path("alpha-unit").read_text())
         session = fixture.root / "phase-session"
         fixture.write(session / "progress_history_state.json", json.dumps({
-            "working_dir": str(fixture.checkout),
-            "project_plan_doc": str(fixture.plan_path("alpha-unit")),
+            "working_dir": str(worktree),
+            "project_plan_doc": str(plan),
             "status": "active", "phase": None,
         }))
         result = subprocess.run(
@@ -325,7 +328,7 @@ class ProductionRenamePhaseNoteTests(unittest.TestCase):
         # These are all the apply steps before phase-note repair was added.
         journal["completed"] = [
             "_rename_doc", "_rewrite_plans", "_rename_timer", "_rename_showrunner_state",
-            "_rename_stall_watch", "_rename_review_pool", "_rename_unit_workers", "_rename_branch",
+            "_rename_stall_watch", "_rename_unit_workers", "_rename_branch",
         ]
         fixture.write(fixture.state / "new/rename.json", json.dumps(journal))
         note = write_note(self.vault, "runner", "alpha-unit", f'production_file: "{OLD_LINK}"')

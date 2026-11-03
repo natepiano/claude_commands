@@ -1,6 +1,10 @@
 """Judge real Git trees with fake Cargo, without changing the caller's index."""
 from __future__ import annotations
 
+from scripts.lib.py_floor_test_support import cache_file_name
+
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+
 import json
 import os
 from pathlib import Path
@@ -12,11 +16,10 @@ from typing import ClassVar, TypedDict, cast, override
 import unittest
 
 from scripts.lint.memory_test_support import fake_memory_readings
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 VERIFY = Path(__file__).with_name("verify.sh")
 SCRIPTS = VERIFY.parent.parent
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 
 class DocPassRecord(TypedDict):
@@ -122,7 +125,7 @@ class VerifyDocFixture(unittest.TestCase):
         self.records = home / ".local/state/verify/doc_pass"
         self.events = self.root / "cargo-events.jsonl"
         self.config = self.root / "lint.conf"
-        _ = self.config.write_text("doc=on\nsweep=off\n", encoding="utf-8")
+        _ = write_config_fixture(self.config, "doc=on\nsweep=off\n")
         tools = self.root / "bin"
         tools.mkdir()
         self.executable(tools / "cargo", CARGO_STUB)
@@ -172,12 +175,12 @@ class VerifyDocFixture(unittest.TestCase):
             **memory_environment,
             "BUILD_HOLD_DIR": str(self.root / "build-hold"), "BUILD_TARGETS_SCRIPT": str(targets),
             "LINT_CONFIG_READER": str(SCRIPTS / "lint/lint_config.sh"),
-            "LINT_CONFIG_FILE": str(self.config),
+            "LINT_CONFIG_FILE": str(self.config), **config_environment(self.root),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
         })
         # These are doc-policy tests, not interpreter-discovery tests. Exercise
         # the real shim's cache hit instead of revalidating Python every call.
-        cache = self.root / "cache/claude/python3-3.11"
+        cache = self.root / "cache/claude" / cache_file_name()
         cache.parent.mkdir()
         _ = cache.write_text(sys.executable + "\n", encoding="utf-8")
         _ = self.environment.pop("CLAUDE_PYTHON", None)
@@ -213,6 +216,7 @@ class VerifyDocFixture(unittest.TestCase):
         settings = self.root / "mac.conf"
         _ = settings.write_text("offload=on\n")
         self.environment["MAC_TEST_CONFIG"] = str(settings)
+        self.environment["CONF_DIR"] = str(Path(settings).parent)
         self.environment["MAC_IDLE_STATE_DIR"] = str(self.root / "mac-idle")
         self.environment["MAC_TEST_STATE_DIR"] = str(self.root / "mac-state")
         targets = Path(self.environment["BUILD_TARGETS_SCRIPT"])

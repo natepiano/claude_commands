@@ -13,22 +13,28 @@ import tempfile
 import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import change_review
-import showrunners
+from scripts.lib import copy_record
+from scripts.production import showrunners, staff, change_routing, merge_checkpoint
+from scripts.shutdown import remote
+from scripts.production.production_units import Production
+from zoneinfo import ZoneInfo
+from scripts.production.staff_test_support import fixture_member
+import showrunner_tree
 from change_review import Invisible, Malformed, Visible
 
 # Importable once change_review has put scripts/lib on the path.
 import scratch
 import urgency
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 LIST = """# Change review list
 
@@ -62,9 +68,235 @@ def setUpModule() -> None:
     folder = tempfile.TemporaryDirectory()
     unittest.addModuleCleanup(folder.cleanup)
     unittest.enterModuleContext(mock.patch.dict(os.environ, {
-        "NEXT_STATE_DIR": folder.name, scratch.ROOT_ENV: f"{folder.name}/scratch",
+        "STAFF_FILE": str(Path(folder.name) / "staff.json"), "NEXT_STATE_DIR": folder.name, copy_record.ROOT_ENV: f"{folder.name}/scratch",
         scratch.VISIBLE_ROOT_ENV: f"{folder.name}/repro"}))
+    _ = fixture_member("showrunner", name="fixture")
     _ = unittest.enterModuleContext(mock.patch.object(showrunners, "timer_docs", return_value={}))
+
+
+def producer_rows(root: Path, documents: dict[str, Path], lists: dict[Path, str],
+                    *, selected_rows: dict[Path, set[str]] | None = None) -> None:
+    """Give the selected fixture rows Producer ids and staff records."""
+    runners: dict[str, staff.StaffRow] = {}
+    for name, doc in documents.items():
+        runners[name] = fixture_member("showrunner", name=name, doc=staff.LiveDoc("natedev", doc))
+        text = doc.read_text() if doc.exists() else f"# {name}\n"
+        if "**Showrunner checkout:**" not in text:
+            text += f"\n- **Showrunner checkout:** `{root}`\n"
+        if "**Change review:**" not in text:
+            text += f"- **Change review:** `{next(iter(lists))}`\n"
+        _ = doc.write_text(text)
+    for path, default in lists.items():
+        rows = change_review.pending(path)
+        text = path.read_text()
+        for row in rows:
+            if selected_rows is not None and row["#"] not in selected_rows.get(path, set[str]()):
+                continue
+            owner = row.get("Production") or default
+            if owner not in runners:
+                continue
+            name = "fixture-" + owner + "-" + path.stem.replace(" ", "-") + "-" + row["#"]
+            member = fixture_member("unit", name=name, parent=runners[owner].id,
+                                    worktree=staff.PresentWorktree("natedev", root / name))
+            if "| Producer |" not in text:
+                lines = text.splitlines()
+                header = next(i for i, line in enumerate(lines) if line.startswith("| # |"))
+                lines[header] += " Producer |"
+                lines[header + 1] += " --- |"
+                for i in range(header + 2, len(lines)):
+                    if lines[i].startswith("| C"):
+                        lines[i] += " |"
+                text = "\n".join(lines) + "\n"
+            columns = next(line for line in text.splitlines() if line.startswith("| # |")).strip("|").split("|")
+            index = [column.strip() for column in columns].index("Producer")
+            lines = text.splitlines()
+            for i, line in enumerate(lines):
+                if line.startswith(f"| {row['#']} |"):
+                    cells = line.strip("|").split("|")
+                    cells[index] = " " + str(member.id) + " "
+                    lines[i] = "|" + "|".join(cells) + "|"
+                    break
+            text = "\n".join(lines) + "\n"
+        if not text.startswith("---\n"):
+            docs = "".join(f"  - {doc}\n" for doc in documents.values())
+            text = f"---\nshowrunner: {default}\nproductions:\n{docs}---\n" + text
+        _ = path.write_text(text)
+
+
+class ProducerFixture(unittest.TestCase):
+    root: Path = Path()
+    repo: Path = Path()
+    doc: Path = Path()
+    listing: Path = Path()
+    unit: staff.StaffRow
+
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.unit = staff.StaffRow(staff.StaffId(""), "unit", "", None, current_session=staff.StaffId(""))
+
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.doc = self.root / "top.md"
+        self.listing = self.root / "change-review - top.md"
+        self.enterContext(mock.patch.dict(os.environ, {"STAFF_FILE": str(self.root / "staff.json"),
+            "CHANGE_REVIEW_DIR": str(self.root), "REVIEW_LINKS_ROOT": str(self.root / "links"),
+            "NEXT_STATE_DIR": str(self.root / "next")}))
+        _ = self.enterContext(mock.patch.object(remote, "local_machine", return_value="natedev"))
+        _ = self.git("init", "-b", "main")
+        _ = self.git("config", "user.name", "Producer fixture")
+        _ = self.git("config", "user.email", "producer@example.invalid")
+        _ = self.git("commit", "--allow-empty", "-m", "Initial")
+        runner = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", self.doc))
+        self.unit = fixture_member("unit", name="new-unit", parent=runner.id,
+            worktree=staff.PresentWorktree("natedev", self.root / "unit"))
+        _ = self.doc.write_text(f"# Top\n- **Repository:** `{self.repo}`\n"
+            + f"- **Showrunner checkout:** `{self.repo}`\n- **Change review:** `{self.listing}`\n"
+            + "## Units\n| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
+            + f"| new-unit | old-plan.md | {self.root / 'unit'} | old-branch |\n")
+
+    def git(self, *arguments: str) -> str:
+        return subprocess.run(["git", "-C", str(self.repo), *arguments], capture_output=True,
+                              text=True, check=True).stdout.strip()
+
+    def merge(self, name: str = "old-branch", change: str = "A visible change") -> str:
+        _ = self.git("checkout", "-b", name)
+        _ = self.git("commit", "--allow-empty", "-m",
+            f"checkpoint({name}): change\n\nChange-Review: {change} | Read | Proof")
+        _ = self.git("checkout", "main")
+        _ = self.git("merge", "--no-ff", name, "-m", f"Merge {name}")
+        return self.git("rev-parse", "HEAD")
+
+    def old_row(self, merge: str, change: str = "A visible change", *, reviewed: bool = False) -> None:
+        _ = change_review.append_rows(self.listing, [change_review.Visible(change, "Read", "Proof")],
+                                     date(2026, 11, 2), merge, self.doc)
+        if reviewed:
+            _ = change_review.record_verdict(self.listing, "C1", "not works", date(2026, 11, 2), self.doc)
+
+
+class ProducerWriterTests(ProducerFixture):
+    def colliding_units(self) -> staff.StaffRow:
+        runner = staff.snapshot().by_path("top")
+        assert runner is not None
+        second = fixture_member("unit", name="second-unit", parent=runner.id,
+                                worktree=staff.PresentWorktree("natedev", self.root / "second"))
+        _ = self.doc.write_text(f"- **Repository:** `{self.repo}`\n- **Change review:** `{self.listing}`\n"
+            + "## Units\n| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
+            + f"| branch-b | first.md | {self.root / 'unit'} | branch-a |\n"
+            + f"| second-unit | second.md | {self.root / 'second'} | branch-b |\n")
+        return second
+
+    def test_an_exact_branch_wins_over_an_earlier_unit_alias(self) -> None:
+        second = self.colliding_units()
+        source = change_review.unit_branches([self.doc])["branch-b"]
+        self.assertEqual(source.worktree, self.root / "second")
+        self.assertEqual(source.name, second.name)
+
+    def test_merge_publication_uses_the_exact_branch_producer_before_an_alias(self) -> None:
+        second = self.colliding_units()
+        merged = self.merge("branch-b")
+        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"))
+        with mock.patch.object(change_review, "drift", return_value=[]):
+            merge_checkpoint.record_publication_changes(production, change_review.merge_commits(self.repo, merged), merged)
+        self.assertEqual(change_review.pending(self.listing)[0]["Producer"], second.id)
+
+    def test_a_checkpoint_with_an_unmatched_branch_pattern_keeps_the_row_values_aligned(self) -> None:
+        _ = self.git("checkout", "-b", "old-branch")
+        for name, change in (("old-branch", "First"), ("a (b)", "Unmatched"), ("old-branch", "Last")):
+            _ = self.git("commit", "--allow-empty", "-m",
+                         f"checkpoint({name}): change\n\nChange-Review: {change} | Read | Proof")
+        _ = self.git("checkout", "main")
+        _ = self.git("merge", "--no-ff", "old-branch", "-m", "Merge all")
+        merged = self.git("rev-parse", "HEAD")
+        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"))
+        with mock.patch.object(change_review, "drift", return_value=[]):
+            merge_checkpoint.record_publication_changes(production, change_review.merge_commits(self.repo, merged), merged)
+        rows = change_review.pending(self.listing)
+        self.assertEqual([row["Change"] for row in rows], ["First", "Unmatched", "Last"])
+        self.assertEqual([row["Producer"] for row in rows], [self.unit.id, "", self.unit.id])
+        self.assertEqual([row["Production"] for row in rows], ["top"] * 3)
+
+    def test_append_writes_a_known_producer_and_notes_an_unknown_unit_once(self) -> None:
+        _ = self.doc.write_text(self.doc.read_text()
+            + f"| unregistered-unit | unknown-plan.md | {self.root / 'unknown'} | unknown |\n")
+        previous = self.git("rev-parse", "HEAD")
+        _ = self.git("update-ref", "refs/remotes/origin/main", previous)
+        _ = self.git("checkout", "-b", "old-branch")
+        for name, change in (("old-branch", "Known"), ("unknown", "Unknown one"), ("unknown-plan", "Unknown two")):
+            _ = self.git("commit", "--allow-empty", "-m",
+                         f"checkpoint({name}): change\n\nChange-Review: {change} | Read | Proof")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = change_review.main(["append", "--repo", str(self.repo), "--checkpoint", "HEAD",
+                "--previous", previous, "--merge-branch", "main", "--production", str(self.doc),
+                "--list", str(self.listing), "--merged", self.git("rev-parse", "HEAD")])
+        self.assertEqual(code, 0)
+        self.assertEqual([row["Producer"] for row in change_review.pending(self.listing)], [self.unit.id, "", ""])
+        notes = [line for line in output.getvalue().splitlines() if line.startswith("change review: no staff row")]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("unregistered-unit", notes[0])
+
+    def test_a_verdict_preserves_the_producer_for_a_returning_row(self) -> None:
+        _ = change_review.append_rows(self.listing, [change_review.Visible("Return", "Read", "Proof")],
+            date(2026, 11, 2), "", self.doc, producers=[self.unit.id])
+        _ = change_review.record_verdict(self.listing, "C1", "not works", date(2026, 11, 2), self.doc)
+        row = change_review.review_snapshot(self.listing).reviewed[0]
+        self.assertEqual(row["Producer"], self.unit.id)
+        self.assertEqual(change_routing.StaffRouting(staff.snapshot(), {}).owner(row, self.root / "change-review - other.md").tab, "top")
+
+    def test_merge_publication_writes_the_units_staff_id(self) -> None:
+        merge = self.merge()
+        commits = change_review.merge_commits(self.repo, merge)
+        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"))
+        with mock.patch.object(change_review, "drift", return_value=[]):
+            merge_checkpoint.record_publication_changes(production, commits, merge)
+        self.assertEqual(change_review.pending(self.listing)[0]["Producer"], self.unit.id)
+        self.assertNotIn(self.unit.name, change_review.pending(self.listing)[0]["Producer"])
+
+    def test_an_unregistered_unit_writes_an_empty_producer_and_one_named_note(self) -> None:
+        merge = self.merge()
+        commits = change_review.merge_commits(self.repo, merge)
+        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"))
+        output = io.StringIO()
+        with (mock.patch.object(change_review, "drift", return_value=[]),
+              mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())), redirect_stdout(output)):
+            merge_checkpoint.record_publication_changes(production, commits, merge)
+        notes = [line for line in output.getvalue().splitlines() if line.startswith("change review: no staff row")]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("new-unit", notes[0])
+        self.assertEqual(change_review.pending(self.listing)[0]["Producer"], "")
+
+    def test_add_in_a_unit_worktree_saves_its_id_and_a_showrunner_saves_no_id(self) -> None:
+        for directory, expected in ((self.root / "unit", self.unit.id),
+                                    (self.root / "unit" / "src", self.unit.id), (self.repo, ""), (self.root, "")):
+            with self.subTest(directory=directory), redirect_stdout(io.StringIO()):
+                result = change_review.main(["add", "--repo", str(directory), "--production", str(self.doc),
+                    "--list", str(self.listing), "--change", str(directory), "--check", "Read", "--see", "Proof"])
+                self.assertEqual(result, 0)
+                self.assertEqual(change_review.pending(self.listing)[-1]["Producer"], expected)
+
+
+class ReviewKindTest(unittest.TestCase):
+    def test_set_kind_is_recorded_once_and_survives_the_verdict_with_its_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "change-review - sample.md"
+            _ = change_review.append_rows(path, [GRID], date(2026, 11, 1), "abc12345", PRODUCTION)
+            self.assertEqual(run("set-kind", "--production", DOC, "--list", str(path), "--row", "C1",
+                                 "--kind", "Read only")[0], 0)
+            row = change_review.review_rows(path)[0]
+            self.assertEqual(row["Kind"], "Read only")
+            before = path.read_bytes()
+            self.assertEqual(run("set-kind", "--production", DOC, "--list", str(path), "--row", "C1",
+                                 "--kind", "hidden")[0], 1)
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(run("verdict", "--production", DOC, "--list", str(path), "--row", "C1",
+                                 "--verdict", "works")[0], 0)
+            saved = change_review.review_rows(path)[0]
+            self.assertEqual((saved["Kind"], saved[change_review.CHECK], saved["Verdict"]),
+                             ("Read only", GRID.how(), "works"))
 
 
 class ParseTest(unittest.TestCase):
@@ -111,16 +343,41 @@ class ListTest(unittest.TestCase):
     def test_rows_take_the_next_number_in_the_whole_file_and_end_the_table(self) -> None:
         rows = change_review.append_rows(self.path, [Visible("A | B", "Look", "It"), Visible("C", "D.", "E")],
                                          date(2026, 10, 14), "61b65bbf", PRODUCTION)
-        self.assertEqual(rows, ["| C81 | A \\| B | 2026-10-14 · 61b65bbf | not yet | Look. You see: It | demo |",
-                                "| C82 | C | 2026-10-14 · 61b65bbf | not yet | D. You see: E | demo |"])
+        self.assertEqual(rows, ["| C81 | A \\| B | 2026-10-14 · 61b65bbf | not yet | Look. You see: It | demo |  |",
+                                "| C82 | C | 2026-10-14 · 61b65bbf | not yet | D. You see: E | demo |  |"])
         lines = self.path.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(lines[lines.index("| C77 | Fonts redraw | 2026-10-14 | not yet | Change a font | |") + 1], rows[0])
+        self.assertEqual(lines[lines.index("| C77 | Fonts redraw | 2026-10-14 | not yet | Change a font | | |") + 1], rows[0])
 
     def test_a_list_without_the_section_is_refused_and_left_alone(self) -> None:
         _ = self.path.write_text("# list\n", encoding="utf-8")
         self.assertRaises(change_review.ChangeReviewError, change_review.append_rows, self.path,
                           [Visible("A", "B", "C")], date(2026, 10, 14), "abc", PRODUCTION)
         self.assertEqual(self.path.read_text(encoding="utf-8"), "# list\n")
+
+    def test_a_row_with_only_a_separator_raises_a_named_review_error(self) -> None:
+        _ = self.path.write_text(LIST.replace("| C76 | Panels keep shields | 2026-10-14 | not yet | Launch Hana |", "|"))
+        with self.assertRaises(change_review.ChangeReviewError) as raised:
+            _ = change_review.review_snapshot(self.path)
+        self.assertEqual(str(raised.exception), f"{self.path}: | has the wrong number of cells")
+
+    def test_one_routed_pass_lists_delivery_records_once_for_three_lists(self) -> None:
+        root = self.path.parent
+        doc = root / "top.md"
+        _ = doc.write_text("# Top")
+        listings = [root / f"change-review - {name}.md" for name in ("top", "child", "other")]
+        for listing in listings:
+            _ = listing.write_text("## To review\n\n| # | Change |\n| --- | --- |\n| C1 | First |\n| C2 | Second |\n")
+        links = root / "links"
+        record = staff.StaffSnapshot(())
+        scans = mock.Mock(wraps=links.glob)
+        folder = mock.Mock(glob=scans)
+        with (mock.patch.object(change_review, "lists_directory", return_value=root),
+              mock.patch.object(change_routing, "review_root", return_value=folder)):
+            routed = change_review.routed_review_entries(listings[0], doc, record=record)
+        self.assertEqual(sorted((source.path.name, owner.tab, row["#"]) for source, owner, row in routed),
+                         sorted((listing.name, name, row) for listing, name in zip(listings, ("top", "child", "other"))
+                                for row in ("C1", "C2")))
+        scans.assert_called_once_with(".review-link-delivery-*")
 
     def test_a_production_doc_names_its_list_or_none(self) -> None:
         doc = self.path.with_name("production.md")
@@ -147,7 +404,7 @@ class ListTest(unittest.TestCase):
             self.assertEqual(change_review.list_path(doc), stale)
 
     def test_a_child_production_takes_its_root_showrunners_name(self) -> None:
-        import showrunners
+        from scripts.production import showrunners
 
         names = {"build-followups": "natedev"}
 
@@ -155,13 +412,16 @@ class ListTest(unittest.TestCase):
             return names.get(slug, "")
 
         with (mock.patch.object(showrunners, "canonical_slug", side_effect=str),
-              mock.patch.object(showrunners, "root_of", return_value="build-followups") as root,
+              mock.patch.object(showrunner_tree, "root_of", return_value="build-followups") as root,
               mock.patch.object(showrunners, "current_name", side_effect=name_of)):
             self.assertEqual(change_review.showrunner_of(Path("/p/child-production.md")), "natedev")
             root.assert_called_once_with("child")
             names.clear()
             self.assertRaises(change_review.ChangeReviewError, change_review.showrunner_of,
                               Path("/p/child-production.md"))
+
+
+from scripts.production.staff_test_support import isolated_staff_file
 
 
 class AttachedListTest(unittest.TestCase):
@@ -172,8 +432,6 @@ class AttachedListTest(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        import showrunners
-
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
@@ -189,8 +447,12 @@ class AttachedListTest(unittest.TestCase):
             "| --- | --- | --- | --- | --- |\n" +
             "| C9 | Earlier child | Check earlier | 2026-10-02 | |\n" +
             "| C11 | Dependent child | Check dependent | 2026-10-03 | blocks, after C9 |\n")
-        _ = self.enterContext(mock.patch.object(change_review, "LISTS", self.root))
-        _ = self.enterContext(mock.patch.object(showrunners, "root_of", return_value="parent"))
+        _ = self.enterContext(mock.patch.object(change_review, "lists_directory", return_value=self.root))
+        _ = self.enterContext(mock.patch.object(showrunner_tree, "root_of", return_value="parent"))
+
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        producer_rows(self.root, {"parent": self.root / "parent-production.md", "child": self.doc},
+                        {self.current: "parent", self.earlier: "child"})
 
     def test_columnless_earlier_rows_belong_to_the_attached_production_without_list_edits(self) -> None:
         before = {path: path.read_bytes() for path in (self.current, self.earlier)}
@@ -236,6 +498,8 @@ class AttachedListTest(unittest.TestCase):
             "| --- | --- | --- | --- | --- | --- |\n" +
             "| C9 | Current child | child | Check current | 2026-10-20 | after C12 |\n" +
             "| C12 | Current prerequisite | child | Check prerequisite | 2026-10-21 | |\n")
+        producer_rows(self.root, {"parent": self.root / "parent-production.md", "child": self.doc},
+                        {self.current: "parent"})
         entries = change_review.scope_entries(self.current, self.doc)
         self.assertEqual({entry.key: entry.after for entry in entries},
                          {"C9": "C12", "C12": "", "child/C9": "", "child/C11": "child/C9"})
@@ -261,6 +525,46 @@ class StampTest(unittest.TestCase):
     def frontmatter(self) -> list[str]:
         lines = self.path.read_text(encoding="utf-8").splitlines()
         return lines[:lines.index("---", 1) + 1]
+
+    def test_every_row_writer_preserves_pipes_through_sorting_and_the_saved_verdict(self) -> None:
+        item = Visible("Use A | B", "Print A | B", "A | B appears")
+        _ = change_review.append_rows(self.path, [item], date(2026, 11, 2), "abc12345", PRODUCTION)
+        _ = change_review.set_row_kind(self.path, "C1", "See in action", PRODUCTION)
+        edited = Visible("Use C | D", r"grep 'C\|D'", "C | D appears")
+        _ = change_review.edit_row(self.path, "C1", edited, date(2026, 11, 2), PRODUCTION)
+        _ = change_review.mark_row(self.path, "C1", datetime(2026, 11, 2, 12), PRODUCTION)
+        _ = change_review.append_rows(self.path, [item], date(2026, 11, 2), "def12345", PRODUCTION)
+        before = change_review.review_snapshot(self.path)
+        self.assertEqual(before.pending[0]["Change"], edited.change)
+        self.assertEqual(before.pending[0][change_review.CHECK], edited.how())
+        _ = change_review.record_verdict(self.path, "C1", "works: C | D", date(2026, 11, 2), PRODUCTION)
+        after = change_review.review_snapshot(self.path)
+        self.assertEqual(after.reviewed[0]["Verdict"], "works: C | D")
+        self.assertEqual(after.reviewed[0][change_review.CHECK], edited.how())
+        self.assertEqual(after.pending[0]["Change"], item.change)
+
+    def test_a_malformed_cell_count_is_refused_before_a_snapshot_can_misroute_a_row(self) -> None:
+        _ = change_review.append_rows(self.path, [Visible("A", "B", "C")], date(2026, 11, 2), "", PRODUCTION)
+        text = self.path.read_text().replace("| A |", "| A | extra |")
+        _ = self.path.write_text(text)
+        with self.assertRaisesRegex(change_review.ChangeReviewError, "C1 has the wrong number of cells"):
+            _ = change_review.review_snapshot(self.path)
+
+    def test_page_and_save_readers_refuse_the_same_malformed_review_rows(self) -> None:
+        _ = change_review.append_rows(self.path, [Visible("A", "B", "C")], date(2026, 11, 2), "", PRODUCTION)
+        for reviewed in (False, True):
+            with self.subTest(reviewed=reviewed):
+                if reviewed:
+                    _ = change_review.record_verdict(self.path, "C1", "works", date(2026, 11, 2), PRODUCTION)
+                original = self.path.read_text()
+                _ = self.path.write_text(original.replace("| A |", "| A | extra |"))
+                for reader in (change_review.review_rows, change_review.review_snapshot):
+                    with self.assertRaisesRegex(change_review.ChangeReviewError, "C1 has the wrong number of cells"):
+                        _ = reader(self.path)
+                if not reviewed:
+                    with self.assertRaisesRegex(change_review.ChangeReviewError, "C1 has the wrong number of cells"):
+                        _ = change_review.pending(self.path)
+                _ = self.path.write_text(original)
 
     def test_a_write_moves_date_modified_and_keeps_a_listed_production_in_either_form(self) -> None:
         _ = change_review.append_rows(self.path, [Visible("A", "B", "C")], date(2026, 10, 15), "",
@@ -309,20 +613,20 @@ class ActionTest(unittest.TestCase):
 
     def test_the_first_row_creates_a_missing_list_from_the_skeleton(self) -> None:
         rows = change_review.append_rows(self.fresh, [Visible("A", "B", "C")], date(2026, 10, 15), "", PRODUCTION)
-        self.assertEqual(rows, ["| C1 | A | 2026-10-15 | B. You see: C | demo |"])
+        self.assertEqual(rows, ["| C1 | A | 2026-10-15 | B. You see: C | demo |  |"])
         self.assertEqual(self.fresh.read_text(encoding="utf-8").split("\n\n## To review")[0], "\n".join([
             "---", 'date_created: "[[2026-10-15]]"', 'date_modified: "[[2026-10-15]]"', "productions:",
             '  - "~/worktrees/demo-trunk/docs/plans/demo-production.md"', "showrunner: natedev", "---", "",
             "# natedev showrunner: changes to review", "",
             'Ask for "change review" any time to walk it one change at a time. A reviewed row moves to Reviewed '
             + "with your verdict."]))
-        self.assertIn("| --- | --- | --- | --- | --- |\n| C1 | A | 2026-10-15 | B. You see: C | demo |\n\n## Reviewed", self.fresh.read_text(encoding="utf-8"))
+        self.assertIn("| --- | --- | --- | --- | --- | --- |\n| C1 | A | 2026-10-15 | B. You see: C | demo |  |\n\n## Reviewed", self.fresh.read_text(encoding="utf-8"))
 
     def test_add_takes_the_next_number_and_fills_the_mac_build_column_only_where_the_table_has_one(self) -> None:
         self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "Tabs | spaces", "--check", "Look", "--see", "It",
                              "--merged", "216c4e1d"), (0, "C81\n", ""))
         day = change_review.today().isoformat()
-        self.assertIn(f"| C81 | Tabs \\| spaces | {day} · 216c4e1d | not yet | Look. You see: It | demo |\n\n## Questions",
+        self.assertIn(f"| C81 | Tabs \\| spaces | {day} · 216c4e1d | not yet | Look. You see: It | demo |  |\n\n## Questions",
                       self.path.read_text(encoding="utf-8"))
         self.assertEqual(run("add", "--production", DOC, "--list", str(self.fresh), "--change", "A", "--check", "B", "--see", "C")[1], "C1\n")
         self.assertIn(f"| C1 | A | {day} | B. You see: C |", self.fresh.read_text(encoding="utf-8"))
@@ -351,9 +655,11 @@ class ActionTest(unittest.TestCase):
         self.assertEqual(change_review.credited(parent), parent)
         rows = change_review.append_rows(self.path, [Visible("A", "B", "C")], date(2026, 10, 27), "216c4e1d", style,
                                          owners=[style])
-        self.assertTrue(rows[0].endswith("| parent |"), rows)
+        self.assertEqual(next(row for row in change_review.pending(self.path)
+                              if row["#"] == rows[0].split()[1])["Production"], "parent")
         rows = change_review.append_rows(self.path, [Visible("D", "B", "C")], date(2026, 10, 27), "", style)
-        self.assertTrue(rows[0].endswith("| parent |"), rows)
+        self.assertEqual(next(row for row in change_review.pending(self.path)
+                              if row["#"] == rows[0].split()[1])["Production"], "parent")
 
     def test_add_holds_each_folder_by_the_new_row(self) -> None:
         held = self.path.parent / "shown-repo"
@@ -469,7 +775,7 @@ class ActionTest(unittest.TestCase):
         text = self.path.read_text(encoding="utf-8")
         self.assertLess(text.index("| C77 |"), text.index("| C81 |"))
         self.assertLess(text.index("| C81 |"), text.index("| C76 |"))
-        self.assertIn("| Urgency | Production |\n| --- | --- | --- | --- | --- | --- | --- |", text)
+        self.assertIn("| Urgency | Production | Producer |\n| --- | --- | --- | --- | --- | --- | --- | --- |", text)
         self.assertIn("| C76 | Panels keep shields | 2026-10-14 | not yet | Launch Hana | |", text)
         self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B",
                              "--see", "C", "--urgency", "soon")[0], 1)
@@ -512,7 +818,7 @@ class ActionTest(unittest.TestCase):
     def test_verdict_rerun_finishes_scratch_and_replays_merged_result(self) -> None:
         for verdict in ("works", "still missing the shield"):
             with self.subTest(verdict=verdict), mock.patch.dict(os.environ, {
-                scratch.ROOT_ENV: str(self.path.parent / "scratch"),
+                copy_record.ROOT_ENV: str(self.path.parent / "scratch"),
                 scratch.HOLDS_ENV: str(self.path.parent / "holds.json"),
             }):
                 _ = self.path.write_text(LIST, encoding="utf-8")
@@ -539,7 +845,7 @@ class ActionTest(unittest.TestCase):
                 self.assertEqual(self.path.read_text().split("## Reviewed")[1].count("| C76 |"), 1)
 
     def test_conflicting_verdict_keeps_reviewed_row_and_finishes_scratch(self) -> None:
-        with mock.patch.dict(os.environ, {scratch.ROOT_ENV: str(self.path.parent / "scratch"),
+        with mock.patch.dict(os.environ, {copy_record.ROOT_ENV: str(self.path.parent / "scratch"),
                                           scratch.HOLDS_ENV: str(self.path.parent / "holds.json")}):
             folder = scratch.new(f"row:{self.path.stem}-C76", "conflict")
             _ = change_review.hold_for_row(self.path, "C76", [str(folder)])
@@ -582,10 +888,24 @@ class ActionTest(unittest.TestCase):
         self.assertIn("| C77 | Fonts redraw | still the old font \\| x |", self.path.read_text(encoding="utf-8"))
         self.assertTrue(change_review.lands("Works: it does"))
         self.assertFalse(change_review.lands("not fine"))
-        for verdict in ("okay c17 works", "ok fine", "yes works", "Works: it does"):
+        for verdict in ("okay c17 works", "ok fine", "Works: it does", "OK C17 FINE: still checked"):
             self.assertTrue(change_review.lands(verdict), verdict)
-        for verdict in ("still pushes", "it works but still pushes", "no, broken", "doesn't work"):
+        for verdict in ("still pushes", "it works but still pushes", "no, broken", "doesn't work", "yes works",
+                        "worksheets", "finely", "c17 okay works"):
             self.assertFalse(change_review.lands(verdict), verdict)
+
+    def test_verdict_start_sets_the_printed_outcome_and_keeps_the_users_words(self) -> None:
+        for verdict, outcome in (("okay c17 works", "C76 landed"),
+                                 ("works: checked, no empty cwd", "C76 landed"),
+                                 ("not works", "C76 returns to its unit (merged 2026-10-14)")):
+            with self.subTest(verdict=verdict):
+                _ = self.path.write_text(LIST, encoding="utf-8")
+                self.assertEqual(run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76",
+                                     "--verdict", verdict), (0, outcome + "\n", ""))
+                text = self.path.read_text(encoding="utf-8")
+                self.assertNotIn("| C76 |", text.split("## Reviewed")[0])
+                self.assertIn(f"| C76 | Panels keep shields | {verdict} | {change_review.today().isoformat()} "
+                              + "| 2026-10-14 |\n| C70 |", text)
 
     def test_a_verdict_removes_the_rows_scratch_folders_either_way(self) -> None:
         demo = scratch.new("row:natedev-C1", "demo", visible=True)
@@ -612,7 +932,7 @@ class ActionTest(unittest.TestCase):
         _ = self.path.write_text(LIST.replace("C76", "C9"), encoding="utf-8")
         _ = earlier.write_text(LIST.replace("C76", "C9").replace("Panels keep shields", "Earlier change"),
                                encoding="utf-8")
-        _ = self.enterContext(mock.patch.object(change_review, "LISTS", self.path.parent))
+        _ = self.enterContext(mock.patch.object(change_review, "lists_directory", return_value=self.path.parent))
         _ = self.enterContext(mock.patch.object(change_review, "production_list", return_value=self.path))
         return earlier
 
@@ -1014,6 +1334,31 @@ class RepositoryTest(unittest.TestCase):
         self.assertEqual(change_review.missing(commits), [])
         self.assertEqual(change_review.visible(commits), [GRID])
 
+    def test_a_merge_reads_its_parents_with_one_git_command_and_refuses_unknown_commits(self) -> None:
+        checkpoint = self.commit("a.py", f"checkpoint(u): grid\n\n{SEE}")
+        merged = self.merged("unit", "Merge u")
+        with mock.patch.object(subprocess, "run", wraps=subprocess.run) as commands:
+            commits = change_review.merge_commits(self.repo, merged)
+        invocations = [cast(list[str], call.args[0]) for call in commands.call_args_list]
+        self.assertEqual(sum("--parents" in command for command in invocations), 1)
+        self.assertEqual([commit.sha for commit in commits], [checkpoint])
+        self.assertEqual(change_review.merge_commits(self.repo, checkpoint), [])
+        with self.assertRaises(change_review.ChangeReviewError):
+            _ = change_review.merge_commits(self.repo, "f" * 40)
+
+    def test_a_tree_reads_a_branch_first_parent_line_once(self) -> None:
+        checkpoint = self.commit("a.py", f"checkpoint(u): grid\n\n{SEE}")
+        merged = self.merged("unit", "Merge u")
+        doc = self.repo / "production.md"
+        _ = doc.write_text(f"- **Repository:** {self.repo}\n- **Merge branch:** merge\n\n## Units\n\n")
+        tree = change_review.Tree([doc])
+        with mock.patch.object(subprocess, "run", wraps=subprocess.run) as commands:
+            self.assertEqual(tree.landed_on(self.repo, merged), doc)
+            self.assertIsNone(tree.landed_on(self.repo, checkpoint))
+            self.assertEqual(tree.landed_on(self.repo, merged), doc)
+        invocations = [cast(list[str], call.args[0]) for call in commands.call_args_list]
+        self.assertEqual(sum("--first-parent" in command for command in invocations), 1)
+
     def test_a_markdown_only_checkpoint_needs_no_line_but_its_line_is_read(self) -> None:
         _ = self.commit("a.md", "checkpoint(u): doc without a line")
         checkpoint = self.commit("b.md", f"checkpoint(u): doc with a line\n\n{SEE}")
@@ -1134,7 +1479,8 @@ class RepositoryTest(unittest.TestCase):
         commits = [change_review.Commit("1", "checkpoint(u-plan): grid", f"checkpoint(u-plan): grid\n\n{SEE}", ()),
                    change_review.Commit("2", "checkpoint(own): grid", f"checkpoint(own): grid\n\n{SEE}", ())]
         with mock.patch.object(change_review, "owner_docs", return_value=[top, kid]):
-            self.assertEqual(change_review.visible_owners(commits, top), [top, kid])
+            self.assertEqual([change.source.production if change.source is not None else top
+                              for change in change_review.publication_changes(commits, top)], [top, kid])
 
 
 if __name__ == "__main__":

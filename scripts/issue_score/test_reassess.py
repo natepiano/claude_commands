@@ -8,16 +8,16 @@ from dataclasses import asdict
 from pathlib import Path
 import tempfile
 from typing import cast, override
-import unittest
 from unittest import mock
 
+from scripts.issue_score.test_config import ConfiguredTestCase
 from scripts.issue_score import client, decide, evaluate, questions, records, score_issues, vault
 from scripts.issue_score.test_decide import choice_answer, score_answer
 
 FIXTURES = Path(__file__).with_name("fixtures")
 
 
-class ReassessmentFixture(unittest.TestCase):
+class ReassessmentFixture(ConfiguredTestCase):
     root: Path = Path()
     issues: Path = Path()
     state: Path = Path()
@@ -27,6 +27,7 @@ class ReassessmentFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.issues = self.root / "vault" / "issues"
         self.issues.mkdir(parents=True)
@@ -76,11 +77,11 @@ class ReassessmentFixture(unittest.TestCase):
         area = client.parse_response(area, area_questions)
         return {
             "issue_path": str(path), "content_hash": score_issues.content_hash(issue, areas, self.definitions),
-            "question_set_version": questions.QUESTION_SET_VERSION, "model": questions.MODEL,
+            "question_set_version": questions.QUESTION_SET_VERSION, "model": questions.model(),
             "answers": {"main": main, "area": area},
             "payloads": {
-                "main": {"model": questions.MODEL, "state": state, "questions": questions.main_questions()},
-                "area": {"model": questions.MODEL, "state": {**state, "areas": areas}, "questions": area_questions},
+                "main": {"model": questions.model(), "state": state, "questions": questions.main_questions()},
+                "area": {"model": questions.model(), "state": {**state, "areas": areas}, "questions": area_questions},
             },
             "decided_fields": {name: asdict(decision) for name, decision in
                                decide.decide_answers(main["answers"], area["answers"]).items()},
@@ -127,7 +128,8 @@ class ReassessTests(ReassessmentFixture):
         self.assertIn("Issues: 1", high_group)
         self.assertIn("| backlog_impact | 1 | 0 |", high_group)
         for path in (unrated, default):
-            self.assertTrue({"category", "area", "backlog_urgency", "backlog_effort"}.issubset(by_path[str(path)]["user"]))
+            self.assertTrue({"category", "backlog_urgency", "backlog_effort"}.issubset(by_path[str(path)]["user"]))
+            self.assertIn("area", by_path[str(path)]["taken"])
         self.assertEqual(by_path[str(default)]["missing_rules"], ["global:rust/names.md"])
         self.assertIn("MissingStyleRule: global:rust/names.md", markdown)
         self.assertEqual({path: path.read_bytes() for path in before}, before)
@@ -141,9 +143,11 @@ class ReassessTests(ReassessmentFixture):
         run_id = self.run_file("agent-values", [self.judgment(path) for path in (unrated, default)])
         before = {path: path.read_bytes() for path in (unrated, default)}
         markdown, pending = self.reassess(run_id)
-        required = {"category", "area", "backlog_urgency", "backlog_effort"}
+        required = {"category", "backlog_urgency", "backlog_effort"}
         for row in pending["rows"]:
             self.assertEqual(row["agent_proposed"], {})
+            self.assertIn("area", row["taken"])
+            self.assertNotIn("area", row["user"])
             routing = row["routing"]
             self.assertEqual(routing["status"], "awaiting-agent-proposals")
             assert routing["status"] == "awaiting-agent-proposals"
@@ -157,7 +161,7 @@ class ReassessTests(ReassessmentFixture):
         self.assertEqual({entry["issue_path"] for entry in form["issues"]}, {str(path) for path in before})
         for entry in form["issues"]:
             self.assertEqual(entry["fields"], dict.fromkeys(required, ""))
-            entry["fields"].update({"category": "research", "area": "unfiled", "backlog_urgency": "⭐⭐⭐⭐"})
+            entry["fields"].update({"category": "research", "backlog_urgency": "⭐⭐⭐⭐"})
         _ = form_path.write_text(json.dumps(form, ensure_ascii=False))
         _, incomplete = self.reassess(run_id)
         for row in incomplete["rows"]:
@@ -170,7 +174,7 @@ class ReassessTests(ReassessmentFixture):
         _ = form_path.write_text(json.dumps(form, ensure_ascii=False))
         markdown, completed = self.reassess(run_id)
         for row in completed["rows"]:
-            self.assertEqual(row["agent_proposed"], {"category": "research", "area": "unfiled",
+            self.assertEqual(row["agent_proposed"], {"category": "research",
                                                    "backlog_urgency": "⭐⭐⭐⭐", "backlog_effort": "⭐⭐⭐⭐⭐"})
             self.assertEqual(row["routing"], {"status": "ready", "score": 40., "band": "Score >= 20"})
             self.assertTrue(required.issubset(row["user"]))
@@ -197,7 +201,8 @@ class ReassessTests(ReassessmentFixture):
         self.assertIn(str(missing), unscored_section)
         self.assertNotIn(str(failed), unscored_section)
 
-    def test_interrupted_agent_form_replacement_preserves_filled_choices_for_rerun(self) -> None:
+    @mock.patch.object(questions, "JEV_FIELDS", questions.JEV_FIELDS - {"area"})
+    def test_interrupted_agent_form_replacement_preserves_filled_choices_under_historical_area_agent_policy(self) -> None:
         target = self.issue("Preserve completed agent choices")
         _ = target.write_text(target.read_text().replace('backlog_impact: "⭐"', 'backlog_impact:'))
         run_id = self.run_file("atomic-agent-form", [self.judgment(target)])
@@ -283,7 +288,8 @@ class ReassessTests(ReassessmentFixture):
         self.assertEqual(evaluate.load_run(run_path, allow_partial_last_line=True).scored,
                          {str(scored): completed, str(stopped): interrupted})
 
-    def test_agent_can_propose_a_defined_area_that_no_issue_uses(self) -> None:
+    @mock.patch.object(questions, "JEV_FIELDS", questions.JEV_FIELDS - {"area"})
+    def test_historical_area_agent_policy_accepts_a_defined_area_that_no_issue_uses(self) -> None:
         unused_area = "documentation"
         self.definitions[unused_area] = "Writing user and contributor documentation."
         _ = self.definitions_path.write_text(self.definitions_path.read_text()
@@ -315,8 +321,10 @@ class ReassessTests(ReassessmentFixture):
                 row["answers"]["main"]["answers"][name] = choice_answer({
                     "ship_hana": .4, "find_collaborators": .3, "seek_investors": .2, "business_viability": .1})
             row["answers"]["main"]["answers"]["alignment_ship_hana"] = score_answer({"0": 0., "1": 0., "2": .05, "3": .95, "4": 0.})
+            for name in ("area", "area_reverse"):
+                row["answers"]["area"]["answers"][name] = choice_answer({"rendering": .95, "tooling": .05})
             row["decided_fields"] = {field: {"value": "stale", "certainty": "sure", "confidence": 1.}
-                                      for field in questions.THRESHOLDS}
+                                      for field in questions.thresholds()}
         raw[1]["answers"]["main"]["answers"]["goal_reverse"] = choice_answer({
             "ship_hana": .3, "find_collaborators": .4, "seek_investors": .2, "business_viability": .1})
         raw[2]["answers"]["main"]["answers"]["impact"] = score_answer({"0": .3, "1": 0., "2": 0., "3": 0., "4": .7})
@@ -332,7 +340,27 @@ class ReassessTests(ReassessmentFixture):
             self.assertIn("backlog_alignment", rows[str(path)]["user"])
         self.assertIn("backlog_impact", rows[str(split)]["user"])
         for row in rows.values():
-            self.assertTrue({"category", "area", "backlog_urgency", "backlog_effort"}.issubset(row["user"]))
+            self.assertTrue({"category", "backlog_urgency", "backlog_effort"}.issubset(row["user"]))
+            self.assertIn("area", row["taken"])
+            self.assertNotIn("area", row["user"])
+
+    def test_area_gap_routing_rebuilds_saved_certainty_at_and_below_the_boundary(self) -> None:
+        equal, below = self.issue("Area gap equality"), self.issue("Area gap below")
+        records = [self.judgment(path) for path in (equal, below)]
+        for record, confidence in zip(records, (.65, .649)):
+            for name in ("area", "area_reverse"):
+                record["answers"]["area"]["answers"][name] = choice_answer({
+                    "rendering": confidence, "tooling": 1 - confidence})
+            record["decided_fields"]["area"] = {"value": "tooling", "certainty": "sure", "confidence": 1.}
+        markdown, review = self.reassess(self.run_file("area-gap-routing", records))
+        rows = {row["issue_path"]: row for row in review["rows"]}
+        self.assertIn("area", rows[str(equal)]["taken"])
+        self.assertNotIn("area", rows[str(equal)]["user"])
+        self.assertIn("area", rows[str(below)]["user"])
+        self.assertNotIn("area", rows[str(below)]["taken"])
+        for row in rows.values():
+            self.assertEqual(row["proposed"]["area"], "rendering")
+        self.assertIn("area rendering / tooling (unsure)", markdown)
 
     def test_review_preserves_both_goal_alignments_and_distinguishes_unfiled_origins(self) -> None:
         unsure = self.issue("Unsure goal")

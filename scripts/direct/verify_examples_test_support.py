@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from scripts.lib.py_floor_test_support import cache_file_name
+
+from scripts.lint.memory_test_support import config_environment
+
 import json
 import os
 import subprocess
@@ -14,12 +18,10 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 
 from scripts.direct.verify_mac_offload_test_support import stub_build_tool_path
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
-HANG_SECONDS = TEST_HANG_GUARD_SECS
 FIXED_RUSTC = "rustc 1.90.0 (1159e78c4 2025-09-14)"
 
 
@@ -204,7 +206,7 @@ esac
             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
             "VERIFY_MAC_RUNNER": str(self.root / "no-mac-runner"),
             "LINT_CONFIG_READER": str(reader),
-            "LINT_CONFIG_FILE": str(reader),
+            "LINT_CONFIG_FILE": str(reader), **config_environment(self.root),
             "UNIT_SESSION_DIR": str(self.root / "session"),
         }
 
@@ -241,7 +243,7 @@ esac
             capture_output=True,
             text=True,
             check=False,
-            timeout=HANG_SECONDS,
+            timeout=TEST_HANG_GUARD_SECS,
         )
 
     def calls_made(self) -> list[str]:
@@ -306,7 +308,7 @@ class SeededExampleWorkspaceFixture(ExampleWorkspaceFixture):
         # Host Nix discovery and Python version probing are separate contracts.
         cls.fixture_environment.update({"IN_NIX_SHELL": "pure", "BUILDLOG_BUILD_BUDGET_GIB": "64"})
         _ = cls.fixture_environment.pop("CLAUDE_PYTHON", None)
-        cache = builder.root / "cache/claude/python3-3.11"
+        cache = builder.root / "cache/claude" / cache_file_name()
         cache.parent.mkdir(parents=True)
         _ = cache.write_text(sys.executable + "\n")
         _ = shutil.copytree(builder.root, cls.fixture_seed, symlinks=True)

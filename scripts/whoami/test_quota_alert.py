@@ -2,27 +2,30 @@
 
 from __future__ import annotations
 
+import sys
 import fcntl
 import json
 import os
 import subprocess
 import unittest
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from datetime import datetime, timedelta
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami import quota_alert_test_support as support
 import quota_alert
+from scripts.production import showrunners
 from scripts.whoami import agent_accounts
-from agent_accounts import Quota, Report
-import usage_store
+from scripts.whoami.agent_accounts import Quota, Report
+from scripts.whoami import usage_store
 from agent_notes import local_reset
 from scripts.accounts import accounts, moves, next_moves, role_map
 from user_action import ActionRequired
 from scripts.whoami.quota_alert_test_support import Notes, REAL_RECIPIENTS, REAL_TELL_USER, REGISTRY as REGISTRY, running
-
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 setUpModule = support.setUpModule
 
@@ -225,6 +228,12 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         self.assertEqual(self.sent, [])
         self.assertEqual(self.noted[-1].values["account"], "codex2")
 
+    def test_partial_discovery_uses_the_unknown_inventory_fallback(self) -> None:
+        partial = showrunners.ShowrunnerDiscovery(running("healthy"), (
+            showrunners.ShowrunnerLookupFailure("missing", "fixture lookup failed"),))
+        with mock.patch.object(quota_alert, "registered_showrunners", return_value=partial):
+            self.assertEqual(quota_alert.showrunners_now(), [])
+
     def test_retained_notice_recipients_include_configured_sessions_and_showrunners_once(self) -> None:
         with (mock.patch.object(quota_alert, "recipients", REAL_RECIPIENTS),
               mock.patch.object(quota_alert, "registered_showrunners",
@@ -294,14 +303,14 @@ class QuotaAlertRerunTests(support.CodexRerunFixture):
             _ = quota_alert.blocked([self.note(1)], owner, self.now, codex_readings=self.readings(self.now))
 
         def fail_one(editor: str, *arguments: str) -> str | None:
-            if arguments == ("module_review", "codex"):
+            if arguments == ("design_roles", "codex"):
                 return "fixture registry locked"
             return self.edit_assignments(editor, *arguments)
 
         with mock.patch.object(quota_alert, "edit_registry", side_effect=fail_one):
             _ = self.alert(self.now + timedelta(minutes=1), left=90)
         self.assertEqual(self.read_assignments()["direct"], "codex")
-        self.assertEqual(self.read_assignments()["module_review"], "claude")
+        self.assertEqual(self.read_assignments()["design_roles"], "claude")
 
     def test_queued_claude_switch_keeps_failed_restore_keys_until_the_next_recovery(self) -> None:
         class Killed(BaseException):
@@ -317,9 +326,9 @@ class QuotaAlertRerunTests(support.CodexRerunFixture):
         with quota_alert.state_file() as state:
             fallback = state["fallback"]
             assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
-            self.assertEqual(set(fallback.moved), {"direct", "module_review"})
+            self.assertEqual(set(fallback.moved), {"direct", "design_roles"})
         _ = self.alert(self.now + timedelta(days=4), left=90)
-        self.assertEqual({self.read_assignments()[key] for key in ("direct", "module_review")}, {"codex"})
+        self.assertEqual({self.read_assignments()[key] for key in ("direct", "design_roles")}, {"codex"})
         with quota_alert.state_file() as state:
             self.assertIsInstance(state["fallback"], quota_alert.NoCodexQuotaFallback)
 
@@ -340,9 +349,9 @@ class QuotaAlertRerunTests(support.CodexRerunFixture):
         with quota_alert.state_file() as state:
             fallback = state["fallback"]
             assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
-            self.assertEqual(set(fallback.moved), {"direct", "module_review"})
+            self.assertEqual(set(fallback.moved), {"direct", "design_roles"})
         _ = self.alert(later + timedelta(minutes=1), left=90)
-        self.assertEqual({self.read_assignments()[key] for key in ("direct", "module_review")}, {"codex"})
+        self.assertEqual({self.read_assignments()[key] for key in ("direct", "design_roles")}, {"codex"})
 
     def test_restoration_reports_survive_a_stop_or_failed_journal_append(self) -> None:
         class Killed(BaseException):
@@ -369,7 +378,7 @@ class QuotaAlertRerunTests(support.CodexRerunFixture):
                 shown = quota_alert.notice(lambda: quota_alert.OWNER)
                 assert shown is not None
                 self.assertIn("Codex recovered", shown)
-                self.assertIn("direct, module_review", shown)
+                self.assertIn("direct, design_roles", shown)
                 _ = self.alert(later + timedelta(seconds=2), left=90)
                 self.assertEqual(len([row for row in moves.read_journal() if row["kind"] == "routed back"]), before + 1)
                 self.assertIsNone(quota_alert.notice(lambda: quota_alert.OWNER))
@@ -435,7 +444,7 @@ class QuotaAlertRerunTests(support.CodexRerunFixture):
         _ = self.alert(self.now + timedelta(seconds=1), left=0)
         shown = quota_alert.notice(lambda: quota_alert.OWNER)
         assert shown is not None
-        self.assertIn("direct, module_review moved to Claude", shown)
+        self.assertIn("direct, design_roles moved to Claude", shown)
         _ = self.alert(self.now + timedelta(seconds=2), left=0)
         self.assertIsNone(quota_alert.notice(lambda: quota_alert.OWNER))
         self.assertEqual(len([row for row in moves.read_journal() if row["kind"] == "routed to claude"]), 1)
@@ -487,14 +496,14 @@ class QuotaAlertRerunTests(support.CodexRerunFixture):
             self.assertIsInstance(fallback, quota_alert.AccountCodexQuotaFallback)
             assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
             self.assertEqual((fallback.owner, fallback.at, fallback.moved, fallback.hold),
-                             (owner, stamp, ("direct", "module_review"), hold))
+                             (owner, stamp, ("direct", "design_roles"), hold))
             self.assertEqual(fallback.claude_account, destination)
             _ = quota_alert.switch_to_claude(state, note, stamp, owner, hold=hold,
                 why="auto: rerun-entry", claude_account=destination)
         routing = [row for row in moves.read_journal() if row["kind"] == "routed to claude"]
         self.assertEqual(len(routing), 1)
         self.assertEqual((routing[0]["fallback_at"], routing[0]["moved"], routing[0]["why"]),
-                         (stamp, ["direct", "module_review"], "auto: rerun-entry"))
+                         (stamp, ["direct", "design_roles"], "auto: rerun-entry"))
         self.assertEqual(routing[0].get("claude_account"), "claude4")
         self.assertEqual(self.read_assignments()["ask_a_friend"], "caller")
 
@@ -511,7 +520,7 @@ class QuotaAlertRerunTests(support.CodexRerunFixture):
         readings = self.readings(later, left=100)
 
         def fail_one(editor: str, *arguments: str) -> str | None:
-            if arguments == ("module_review", "codex"):
+            if arguments == ("design_roles", "codex"):
                 return "fixture registry locked"
             return self.edit_assignments(editor, *arguments)
 
@@ -522,19 +531,19 @@ class QuotaAlertRerunTests(support.CodexRerunFixture):
             fallback = state["fallback"]
             self.assertIsInstance(fallback, quota_alert.AccountCodexQuotaFallback)
             assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
-            self.assertEqual((fallback.at, fallback.moved), (stamp, ("module_review",)))
+            self.assertEqual((fallback.at, fallback.moved), (stamp, ("design_roles",)))
         self.assertEqual(self.read_assignments()["direct"], "codex")
-        self.assertEqual(self.read_assignments()["module_review"], "claude")
+        self.assertEqual(self.read_assignments()["design_roles"], "claude")
         with mock.patch.object(quota_alert, "registry_assignments", side_effect=Killed()):
             with self.assertRaises(Killed), quota_alert.state_file() as state:
                 _ = quota_alert.switch_back(state, later + timedelta(seconds=1), readings)
         with mock.patch.object(quota_alert, "edit_registry", side_effect=self.edit_assignments) as edit:
             with quota_alert.state_file() as state:
                 _ = quota_alert.switch_back(state, later + timedelta(minutes=1), readings)
-        edit.assert_called_once_with("agents_set_assignment", "module_review", "codex")
+        edit.assert_called_once_with("agents_set_assignment", "design_roles", "codex")
         with quota_alert.state_file() as state:
             self.assertIsInstance(state["fallback"], quota_alert.NoCodexQuotaFallback)
-        self.assertEqual(self.read_assignments()["module_review"], "codex")
+        self.assertEqual(self.read_assignments()["design_roles"], "codex")
         routing = [row for row in moves.read_journal()
                    if row["kind"] == "routing not restored" or row["kind"] == "routed back"]
         self.assertEqual([row["kind"] for row in routing], ["routing not restored", "routed back"])

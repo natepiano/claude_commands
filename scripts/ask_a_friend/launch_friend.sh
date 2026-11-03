@@ -35,7 +35,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
-# repo needs >= 3.11.
+# repo needs >= 3.12.
 PY="${SCRIPT_DIR}/../lib/py"
 AGENTS_DIR="${SCRIPT_DIR}/../agents"
 QUESTION_FILE="${SESSION_DIR}/question.md"
@@ -62,7 +62,7 @@ printf 'task=%s\nfamily=%s\nagent=%s\neffort=%s\n' \
 
 case "${AGENT_FAMILY}" in
   claude)
-    if ! AGENT_BG_DETACH=1 AGENT_BG_EFFORT="${AGENT_EFFORT}" \
+    if ! AGENT_BG_ROLE=review AGENT_BG_DETACH=1 AGENT_BG_EFFORT="${AGENT_EFFORT}" \
          bash "${AGENTS_DIR}/agent_bg.sh" "${FRIEND}" "${WORKING_DIR}" \
            "${QUESTION_FILE}" "${ANSWER_FILE}" "${LOG_FILE}" \
            "${SESSION_DIR}/friend_id" "${AGENT_MODEL}" >/dev/null; then

@@ -1,5 +1,5 @@
 ---
-description: Run a /unit:direct run's periodic CI point now, or one the run skipped.
+description: Run a unit's periodic CI checks.
 ---
 
 # Direct — periodic CI

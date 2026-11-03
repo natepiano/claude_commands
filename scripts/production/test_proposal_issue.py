@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import final, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import proposal_issue
@@ -675,7 +677,7 @@ class ProposalIssueTests(unittest.TestCase):
         before = self.text()
         with mock.patch.object(proposal_issue, "calling_showrunner", self.real_calling_showrunner), \
                 mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "no-such-session"}), \
-                mock.patch("showrunners.production_of", return_value=None):
+                mock.patch("scripts.production.showrunners.production_of", return_value=None):
             for verb in (["approve", "--by", "user", "--showrunner", "hana", "--unit", "u", "--plan", "p"], ["unapprove"]):
                 with self.subTest(verb=verb[0]):
                     code, _, error = self.run_cli(verb[0], str(self.issue), *verb[1:])

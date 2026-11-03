@@ -29,6 +29,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.process_failure import failure_detail
+
 STATE_ENV = "MAIN_SYNC_STATE_DIR"
 DEFAULT_STATE_DIR = os.path.join("~", ".local", "state", "main-sync")
 SYNC_LOG = "sync.jsonl"
@@ -62,7 +65,7 @@ def _git(checkout: Path, *arguments: str, timeout: float = 30) -> subprocess.Com
 
 
 def _first_line(result: subprocess.CompletedProcess[str]) -> str:
-    return (result.stderr.strip() or result.stdout.strip() or "no message").splitlines()[0]
+    return failure_detail(result, lines=1).replace("\n", "; ")
 
 
 def sync(checkout: Path) -> Outcome:

@@ -71,11 +71,13 @@ class ApplyLabelsTests(ReassessmentFixture):
         self.assertIn("## Awaiting agent proposals", markdown)
         target_row = next(row for row in pending["rows"] if row["issue_path"] == str(target))
         self.assertEqual(target_row["routing"]["status"], "awaiting-agent-proposals")
+        self.assertIn("area", target_row["taken"])
+        self.assertNotIn("area", target_row["user"])
         reports = self.state / "reports"
         agent_path = reports / f"{run_id}-agent-proposals.json"
         review_path = reports / f"{run_id}-reassess.json"
         form = cast(records.AgentProposals, json.loads(agent_path.read_text()))
-        choices = {"category": "research", "area": "tooling", "backlog_urgency": "⭐⭐", "backlog_effort": "⭐⭐⭐"}
+        choices = {"category": "research", "backlog_urgency": "⭐⭐", "backlog_effort": "⭐⭐⭐"}
         self.assertEqual(len(form["issues"]), 1)
         self.assertEqual(form["issues"][0]["issue_path"], str(target))
         self.assertEqual(form["issues"][0]["fields"], dict.fromkeys(choices, ""))
@@ -90,7 +92,8 @@ class ApplyLabelsTests(ReassessmentFixture):
         self.assertEqual(json.loads(agent_path.read_text()), form)
         self.assertEqual({path: path.read_bytes() for path in before}, before)
         review_bytes, agent_bytes = review_path.read_bytes(), agent_path.read_bytes()
-        confirmed = {**{field: target_row["proposed"][field] for field in target_row["taken"]}, **choices}
+        confirmed = {**{field: target_row["proposed"][field] for field in target_row["taken"]},
+                     **choices, "area": "tooling"}
         approvals = self.root / "guide-approvals.json"
         _ = approvals.write_text(json.dumps({"review_path": str(review_path), "approvals": [
             {"issue_path": str(target), "fields": confirmed}]}, ensure_ascii=False))

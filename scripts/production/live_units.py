@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""List a showrunner's units: the live rows of its production doc, each with its session now."""
+"""List a showrunner's recorded units, each with its session now."""
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 from typing import NamedTuple
 
-import showrunners
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.production import showrunners, staff
+from scripts.shutdown import remote
 import unit_lookup
-from production_units import Refusal, cell_value, live_unit_table
+from production_units import order_unit_names
 
 
 class LiveUnit(NamedTuple):
@@ -23,33 +26,43 @@ class LiveUnit(NamedTuple):
         return claude.name if isinstance(claude, unit_lookup.LiveClaude) else ""
 
 
-def production_units(doc: Path) -> list[LiveUnit]:
-    """Every unit the doc's Units table lists and has not retired, found by its mark.
+def _production_slug(doc: Path, record: staff.StaffSnapshot,
+                     sources: unit_lookup.MemberSources) -> str:
+    owner = record.by_doc(remote.local_machine(), doc)
+    slugs = [slug for slug, row in sources.showrunner_members(record).items() if row == owner]
+    return (slugs[0] if len(slugs) == 1 else owner.name if owner is not None
+            else showrunners.production_slug(str(doc)))
 
-    Raises OSError when the doc cannot be read or herdr cannot say which sessions exist.
-    """
-    slug, units = _listed(doc)
-    return _joined(slug, units, unit_lookup.every_marked_unit())
+
+def production_units(doc: Path) -> list[LiveUnit]:
+    """List recorded unit children with their current panes."""
+    record = staff.snapshot()
+    sources = unit_lookup.member_sources()
+    slug = _production_slug(doc, record, sources)
+    metadata = unit_lookup.unit_metadata(record, sources, slug=slug)
+    for problem in metadata.problems:
+        print(f"live_units: {problem.name}: unavailable: {problem.reason}", file=sys.stderr)
+    every = unit_lookup.every_marked_unit(record=record, sources=sources)
+    return _units_in(doc, every, slug)
 
 
 def units_in(doc: Path, every: unit_lookup.MarkedProductions) -> list[LiveUnit]:
-    """The doc's units, as `production_units` finds them, from one read of every production's marks.
-
-    Raises OSError when the doc cannot be read or its production's marks are at fault.
-    """
-    slug, units = _listed(doc)
-    return _joined(slug, units, every)
+    """Join a production through its recorded document and the caller's pane snapshot."""
+    record = staff.snapshot()
+    sources = unit_lookup.member_sources()
+    return _units_in(doc, every, _production_slug(doc, record, sources))
 
 
-def _listed(doc: Path) -> tuple[str, list[str]]:
-    """The doc's production slug and the units its Units table lists and has not retired."""
-    slug = showrunners.production_slug(str(doc))
+def _units_in(doc: Path, every: unit_lookup.MarkedProductions, slug: str) -> list[LiveUnit]:
+    members = every.members.get(slug, ())
+    offline = set(members) - every.units.get(slug, {}).keys()
     try:
-        rows = live_unit_table(doc.read_text(encoding="utf-8").splitlines(), slug)
-    except (UnicodeError, Refusal) as error:
-        raise OSError(f"{doc}: {error}") from error
-    units = [cell_value(cells.get("Unit", "")) for cells in rows]
-    return slug, [unit for unit in units if unit]
+        lines = doc.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        print(f"live_units: {slug}: {error}", file=sys.stderr)
+        lines = []
+    names = order_unit_names(lines, members, offline=offline)
+    return _joined(slug, names, every)
 
 
 def _joined(slug: str, units: list[str], every: unit_lookup.MarkedProductions) -> list[LiveUnit]:

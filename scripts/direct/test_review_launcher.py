@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.py_floor_test_support import cache_file_name
+
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 import unittest
@@ -12,15 +14,137 @@ from pathlib import Path
 from typing import cast
 import json
 import os
+import hashlib
 from unittest.mock import patch
 import subprocess
 import sys
 import tempfile
+from typing import override
 from scripts.direct import wait_for_test_state
 from scripts.direct.wait_for_test_state import wait_until
 
 
 class ReviewLauncherPassTests(support.ReviewLauncherFixture):
+    def test_own_claim_refusal_removes_a_stale_review_slot(self) -> None:
+        session = self.start_implementation("stale-review-slot")
+        self.finish_implementation(session)
+        slot = session / "review_slot_contract"
+        _ = slot.write_text("review2\n", encoding="utf-8")
+        _ = self.open_worker(session, name="fixture-review", role="review", status="running")
+        result = subprocess.run(self.unit_review_command(session), env=self.environment(), capture_output=True,
+                                text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(slot.exists())
+
+    @override
+    def environment(self) -> dict[str, str]:
+        environment = super().environment()
+        environment["FAST_TRACK_REVIEW_PROMPT"] = str(self.root / "received-fast-track-prompt.md")
+        return environment
+
+    def prepare_fast_track_review(self, name: str) -> tuple[Path, dict[str, str], str]:
+        session = self.start_implementation(name)
+        self.finish_implementation(session)
+        state_path = session / "progress_history_state.json"
+        state = cast(dict[str, object], json.loads(state_path.read_text()))
+        state["unit"] = "alpha-unit"
+        _ = state_path.write_text(json.dumps(state))
+        _ = (self.working_dir / "fast-fix.txt").write_text(f"already pushed fast fix {name}\n")
+        for arguments in (["add", "fast-fix.txt"],
+                          ["-c", "user.name=Review Test", "-c", "user.email=review@example.invalid",
+                           "commit", "-m", "fast-track(alpha-unit): repair the sample"]):
+            _ = subprocess.run(["git", *arguments], cwd=self.working_dir, check=True, capture_output=True,
+                               timeout=TEST_HANG_GUARD_SECS)
+        tip = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.working_dir,
+                             check=True, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
+        environment = self.environment()
+        directory = Path(environment["FAST_TRACK_STATE_DIR"])
+        directory.mkdir(exist_ok=True)
+        row = {"unit": "alpha-unit", "commit": tip, "why": "repair the sample",
+               "patch_sha256": hashlib.sha256(b"sample fix").hexdigest(),
+               "time": "2026-10-31T12:00:00+00:00", "review": "pending"}
+        _ = (directory / "records.jsonl").write_text(json.dumps(row) + "\n")
+        # Keep the real command and its imports; only its fixture entry path changes.
+        command = self.root / "scripts/production/fast_track.py"
+        real_command = Path(__file__).resolve().parents[1] / "production/fast_track.py"
+        _ = command.write_text("import os, sys\nos.execv(sys.executable, [sys.executable, "
+                               + repr(str(real_command)) + ", *sys.argv[1:]])\n")
+        agent = self.root / "scripts/agents/agent_exec.sh"
+        with agent.open("a") as output:
+            _ = output.write('cp "$4" "$FAST_TRACK_REVIEW_PROMPT"\n')
+        return session, environment, tip
+
+    def fast_track_review_rows(self) -> list[dict[str, object]]:
+        return [cast(dict[str, object], json.loads(line)) for line in
+                (self.root / "fast-track-state/records.jsonl").read_text().splitlines()]
+
+    def test_each_broad_review_receives_pending_fast_fix_diffs_and_marks_the_snapshot(self) -> None:
+        for lens in ("contract", "adversary"):
+            with self.subTest(lens=lens):
+                session, environment, tip = self.prepare_fast_track_review("fast-track-" + lens)
+                result = subprocess.run(self.review_command(session, lens, ""), env=environment,
+                                        capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                prompt = Path(environment["FAST_TRACK_REVIEW_PROMPT"]).read_text()
+                self.assertIn(tip, prompt)
+                self.assertIn("diff --git a/fast-fix.txt b/fast-fix.txt", prompt)
+                self.assertIn("+already pushed fast fix", prompt)
+                row, = self.fast_track_review_rows()
+                self.assertEqual(row["review"], "reviewed")
+                self.assertIn(lens, str(row["review_pass"]))
+                self.assertIn("1", str(row["review_pass"]))
+
+    def test_broad_lenses_and_retry_keep_the_same_fast_fix_snapshot(self) -> None:
+        session, environment, tip = self.prepare_fast_track_review("shared-fast-track-pass")
+        command = self.review_command(session, "contract", "")
+        first = subprocess.run(command, env=environment, capture_output=True, text=True,
+                               timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        later = {**self.fast_track_review_rows()[0], "commit": "1" * 40,
+                 "patch_sha256": hashlib.sha256(b"next pass fix").hexdigest(), "review": "pending"}
+        records = self.root / "fast-track-state/records.jsonl"
+        with records.open("a") as output:
+            _ = output.write(json.dumps(later) + "\n")
+        for lens in ("adversary", "contract"):
+            with self.subTest(lens=lens):
+                result = subprocess.run(self.review_command(session, lens, ""), env=environment,
+                                        capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                prompt = Path(environment["FAST_TRACK_REVIEW_PROMPT"]).read_text()
+                self.assertIn(tip, prompt)
+                self.assertIn("+already pushed fast fix", prompt)
+                self.assertNotIn(str(later["commit"]), prompt)
+        reviewed, pending = self.fast_track_review_rows()
+        self.assertEqual(reviewed["review"], "reviewed")
+        self.assertEqual(pending["review"], "pending")
+
+    def test_failed_review_keeps_fast_fix_pending(self) -> None:
+        session, environment, _ = self.prepare_fast_track_review("fast-track-red")
+        with (self.root / "scripts/agents/agent_exec.sh").open("a") as output:
+            _ = output.write("exit 9\n")
+        result = subprocess.run(self.review_command(session, "contract", ""), env=environment,
+                                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        row, = self.fast_track_review_rows()
+        self.assertEqual(row["review"], "pending")
+
+    def test_successful_review_does_not_mark_a_fast_fix_added_after_dispatch(self) -> None:
+        session, environment, tip = self.prepare_fast_track_review("fast-track-snapshot")
+        later = {**self.fast_track_review_rows()[0], "commit": "1" * 40,
+                 "patch_sha256": hashlib.sha256(b"later fix").hexdigest()}
+        late_path = self.root / "late-fast-fix.jsonl"
+        _ = late_path.write_text(json.dumps(later) + "\n")
+        environment["FAST_TRACK_LATE_RECORD"] = str(late_path)
+        environment["FAST_TRACK_RECORDS"] = str(self.root / "fast-track-state/records.jsonl")
+        with (self.root / "scripts/agents/agent_exec.sh").open("a") as output:
+            _ = output.write('cat "$FAST_TRACK_LATE_RECORD" >> "$FAST_TRACK_RECORDS"\n')
+        result = subprocess.run(self.review_command(session, "contract", ""), env=environment,
+                                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        first, second = self.fast_track_review_rows()
+        self.assertEqual((first["commit"], first["review"]), (tip, "reviewed"))
+        self.assertEqual(second["review"], "pending")
+
     def test_rerun_lens_uses_review_slot_and_its_own_findings_file(self) -> None:
         session = self.start_implementation("rerun-slot")
         self.finish_implementation(session)
@@ -65,7 +189,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         self.assertEqual(len(commands), 3)
         self.assertIn("sys.version_info", commands[0])
         self.assertEqual(commands[1:], ["print('ready')"] * 2)
-        self.assertEqual((self.root / "cold-cache" / "claude" / "python3-3.11").read_text().strip(), str(interpreter))
+        self.assertEqual((self.root / "cold-cache" / "claude" / cache_file_name()).read_text().strip(), str(interpreter))
 
     def test_interpreter_resolver_rejects_python310_and_its_old_cache(self) -> None:
         launcher = self.root / "scripts" / "lib" / "py"
@@ -93,6 +217,33 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual((result.returncode, result.stdout), (0, "UTC\n"), result.stderr)
+
+    def test_interpreter_resolver_rejects_python311_and_its_old_cache(self) -> None:
+        launcher = self.root / "scripts" / "lib" / "py"
+        binaries = self.root / "python311-bin"
+        binaries.mkdir()
+        interpreter = binaries / "python3"
+        _ = interpreter.write_text(
+            f"#!{sys.executable}\n"
+            + "import sys\n"
+            + "sys.version_info = (3, 11, 0, 'final', 0)\n"
+            + "exec(sys.argv[2])\n",
+            encoding="utf-8",
+        )
+        interpreter.chmod(0o755)
+        environment = self.environment()
+        cache_root = self.root / "python311-cache"
+        old_cache = cache_root / "claude" / "python3-3.11"
+        old_cache.parent.mkdir(parents=True)
+        _ = old_cache.write_text(str(interpreter) + "\n")
+        environment.update({"PATH": str(binaries) + os.pathsep + environment["PATH"],
+                            "XDG_CACHE_HOME": str(cache_root)})
+        result = subprocess.run(
+            ["bash", str(launcher), "-c", "import sys; print(sys.version_info[:2])"],
+            env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual((result.returncode, result.stdout), (0, f"{sys.version_info[:2]}\n"), result.stderr)
+        self.assertNotEqual((cache_root / "claude" / cache_file_name()).read_text().strip(), str(interpreter))
 
     def test_a_named_open_worker_receives_the_review_and_writes_findings(self) -> None:
         session_dir = self.start_implementation("assigned")
@@ -266,13 +417,12 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             (session_dir / "review_status").read_text(encoding="utf-8"), "reviewed\n"
         )
 
-    def test_without_a_named_worker_the_unit_reviewer_runs_and_keeps_its_thread(self) -> None:
+    def test_unit_reviewer_runs_and_keeps_its_thread(self) -> None:
         session_dir = self.start_implementation("fresh")
         self.finish_implementation(session_dir)
 
         result = subprocess.run(
-            ["bash", str(self.review_script), "--pool", "code", "--lease", "builders:3:broad:1",
-             *self.review_command(session_dir, "", "")[2:]],
+            self.unit_review_command(session_dir, ""),
             check=False,
             capture_output=True,
             text=True,
@@ -294,6 +444,20 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         self.assertEqual(
             (session_dir / "review_status").read_text(encoding="utf-8"), "reviewed\n"
         )
+
+    def test_removed_review_options_refuse_before_any_review_starts(self) -> None:
+        for flag in ("--pool", "--lease"):
+            with self.subTest(flag=flag):
+                session = self.start_implementation("removed-option-" + flag[2:])
+                self.finish_implementation(session)
+                command = self.review_command(session, "contract", "")
+                command[2:2] = [flag, "unused"]
+                result = subprocess.run(command, capture_output=True, text=True, check=False,
+                                        env=self.environment(), timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stderr.splitlines(), ["ERROR: unknown review option '" + flag + "'."])
+                self.assertFalse((session / "mesh_roster.json").exists())
+                self.assertEqual(self.turn_records(session), [])
 
     def test_paused_reviewer_receives_followup_on_its_recorded_thread(self) -> None:
         session_dir = self.start_implementation("paused-review")
@@ -333,6 +497,40 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         )
         board = (session_dir / "board.log").read_text(encoding="utf-8")
         self.assertIn(f"compacted {worker}: 100001 -> 12000 tokens", board)
+
+    def test_review_compaction_uses_the_first_private_config_value(self) -> None:
+        session = self.start_implementation("first-compact-value")
+        self.finish_implementation(session)
+        with self.config_file.open("a", encoding="utf-8") as output:
+            _ = output.write("\n# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=300000\n")
+        worker = self.open_worker(session, context_tokens=100001)
+
+        result = self.run_assigned_review(session, worker)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((session / "mesh_events.txt").read_text().splitlines(),
+                         ["compact", "can-follow", "follow"])
+
+    def test_a_compaction_roster_conflict_stops_review_before_claim_or_follow(self) -> None:
+        session_dir = self.start_implementation("compact-roster-changed")
+        self.finish_implementation(session_dir)
+        worker = self.open_worker(session_dir, context_tokens=100001)
+        original = (session_dir / "mesh_roster.json").read_bytes()
+        (session_dir / "compact_roster_changed").touch()
+
+        result = self.run_assigned_review(session_dir, worker)
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("roster changed during compaction", result.stderr)
+        self.assertIn("reopen", result.stderr)
+        self.assertEqual((session_dir / "mesh_events.txt").read_text().splitlines(), ["compact"])
+        self.assertEqual((session_dir / "mesh_roster.json").read_bytes(), original)
+        self.assertFalse((session_dir / "follow_message.txt").exists())
+        self.assertFalse((session_dir / "review_status").exists())
+        self.assertFalse((session_dir / "review_findings_1.txt").exists())
+        board = (session_dir / "board.log").read_text(encoding="utf-8")
+        self.assertIn("follow-up not sent", board)
+        self.assertNotIn("continuing follow-up", board)
 
     def test_review_of_an_unmeasured_worker_does_not_compact_again(self) -> None:
         session_dir = self.start_implementation("unmeasured-review")

@@ -5,9 +5,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
+from scripts.lib import conf
+
 from .client import Answer, ChoiceAnswer, ScoreAnswer, TypeSafeError
-from .questions import ERROR_TARGETS, EVIDENCE_ABSENT, EVIDENCE_PRESENT, GOAL_LABELS, SPLIT_PROBABILITY, THRESHOLDS, URGENCY_EVIDENCE
-from .questions import ReportOnly as ReportOnly, Supported as Supported, ThresholdOutcome as ThresholdOutcome, Unsupported as Unsupported
+from . import questions
+from .selection import UseConfiguredValue
+from .questions import GOAL_LABELS, URGENCY_EVIDENCE
+from .questions import MinimumGap as MinimumGap, ReportOnly as ReportOnly, Supported as Supported, ThresholdOutcome as ThresholdOutcome, Unsupported as Unsupported
 
 
 @dataclass(frozen=True)
@@ -32,28 +36,47 @@ class RiskPoint:
     error_rate: float
 
 
-def select_threshold(field_name: str, points: Sequence[RiskPoint], *, complete: bool = True) -> ThresholdOutcome:
-    if field_name not in THRESHOLDS:
+def select_threshold(field_name: str, points: Sequence[RiskPoint], *, complete: bool = True,
+                     scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> ThresholdOutcome:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    thresholds = questions.thresholds(scoring_config=scoring_config)
+    error_targets = questions.error_targets(scoring_config=scoring_config)
+    if field_name not in thresholds:
         raise ValueError(f"Unknown threshold field: {field_name}")
-    if isinstance(THRESHOLDS[field_name], ReportOnly):
+    if isinstance(thresholds[field_name], ReportOnly):
         return ReportOnly()
     if not complete:
         return Unsupported("incomplete or non-tuning cohort; excluded from threshold selection")
     for point in sorted(points, key=lambda item: item.threshold):
-        if point.coverage > 0 and point.error_rate <= ERROR_TARGETS[field_name] + 1e-12:
-            return Supported(point.threshold)
+        if point.coverage > 0 and point.error_rate <= error_targets[field_name] + 1e-12:
+            return MinimumGap(point.threshold) if isinstance(thresholds[field_name], MinimumGap) else Supported(point.threshold)
     return Unsupported()
 
 
-def is_sure(field_name: str, decision: FieldDecision, thresholds: Mapping[str, ThresholdOutcome] = THRESHOLDS) -> bool:
-    """Only supported fields and supported dependencies can be sure."""
+def is_sure(field_name: str, decision: FieldDecision, thresholds: Mapping[str, ThresholdOutcome] | UseConfiguredValue = UseConfiguredValue.CURRENT) -> bool:
+    """Apply the configured probability or gap gate after structural guards."""
+    thresholds = questions.thresholds() if isinstance(thresholds, UseConfiguredValue) else thresholds
     policy = thresholds[field_name]
-    if not isinstance(policy, Supported):
+    if not decision.structurally_eligible or decision.split:
         return False
-    if not decision.structurally_eligible or decision.split or decision.confidence < policy.threshold:
+    if isinstance(policy, Supported):
+        if decision.confidence < policy.threshold:
+            return False
+    elif isinstance(policy, MinimumGap):
+        if decision.origin == "area_fallback":
+            gap = decision.confidence - (1 - decision.confidence)
+        else:
+            probabilities = sorted(decision.probabilities.values(), reverse=True)
+            if not probabilities:
+                return False
+            gap = probabilities[0] - (probabilities[1] if len(probabilities) > 1 else 0.0)
+        if gap + 1e-12 < policy.gap:
+            return False
+    else:
         return False
     for name, confidence in decision.threshold_dependencies.items():
         dependency = thresholds[name]
+        # Dependencies carry confidence only, so a gap dependency cannot be certified.
         if not isinstance(dependency, Supported) or confidence < dependency.threshold:
             return False
     return True
@@ -76,7 +99,7 @@ def median_level(probabilities: Mapping[str, float]) -> int:
 
 
 def is_split(probabilities: Mapping[str, float]) -> bool:
-    levels = sorted(int(level) for level, probability in probabilities.items() if probability >= SPLIT_PROBABILITY)
+    levels = sorted(int(level) for level, probability in probabilities.items() if probability >= questions.split_probability())
     return bool(levels and levels[-1] - levels[0] > 1)
 
 
@@ -113,8 +136,8 @@ def decide_score(answer: ScoreAnswer, field_name: str) -> FieldDecision:
 def decide_urgency(evidence: Mapping[str, float], pressure: ScoreAnswer) -> FieldDecision:
     if set(evidence) != set(URGENCY_EVIDENCE):
         raise TypeSafeError("Urgency evidence questions are missing or unexpected")
-    ambiguous = any(EVIDENCE_ABSENT <= value <= EVIDENCE_PRESENT for value in evidence.values())
-    present = any(value > EVIDENCE_PRESENT for value in evidence.values())
+    ambiguous = any(questions.evidence_absent() <= value <= questions.evidence_present() for value in evidence.values())
+    present = any(value > questions.evidence_present() for value in evidence.values())
     pressure_decision = decide_score(pressure, "backlog_urgency")
     if present:
         confidence = max(evidence.values())
@@ -158,10 +181,10 @@ def decide_answers(main: Mapping[str, Answer], area: Mapping[str, Answer]) -> di
         threshold_dependencies={"backlog_goal": goal.confidence}))
     area_decision = decide_choice(_choice(area, "area"), _choice(area, "area_reverse"), "area")
     fits = _noul(area, "area_fits")
-    if fits < EVIDENCE_ABSENT:
+    if fits < questions.evidence_absent():
         area_decision = _certify("area", replace(area_decision, value="unfiled", hint=str(area_decision.value),
                                 confidence=1 - fits, structurally_eligible=True, origin="area_fallback"))
-    elif fits <= EVIDENCE_PRESENT:
+    elif fits <= questions.evidence_present():
         area_decision = replace(area_decision, certainty="unsure", structurally_eligible=False)
     return {
         "backlog_goal": replace(goal, value=GOAL_LABELS[goal_name]),

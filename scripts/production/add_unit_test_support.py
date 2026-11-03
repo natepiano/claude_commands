@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.lib.test_agents_registry import write_registry
 
 from scripts.lib import names
@@ -13,12 +18,10 @@ import json
 import os
 import shlex
 import subprocess
-import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import ClassVar, cast, override
 from types import ModuleType
 from collections.abc import Callable, Iterator
@@ -28,12 +31,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import add_unit
 import production_units
+from scripts.production import staff, unit_config
 from cli_fixture import ImmutableGitSeed, invoke_cli
 import conversation_pause
 import unit_lookup
 import sessions
 import inventory
-import shutdown_record as shutdown_store
 import restart
 from herdr import HerdrPlace
 from production_units import Refusal, cell_value
@@ -41,8 +44,9 @@ from scripts.accounts import accounts
 from scripts.whoami.note_file import NumberedAccountLabel, note_name, parse_account_label
 import herdr
 from scripts.herdr.fake_herdr import CommandResponse
-import usage_store
-from test_support import ShutdownTestCase
+from scripts.production.fake_unit_host import confirm_tab_close, native_claude
+from scripts.whoami.account_test_support import stored_room
+from test_support import registry_confirmation, ShutdownTestCase
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -93,7 +97,34 @@ def configure_test_zone() -> None:
     unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
-from scripts.production.staff_test_support import StaffTestCase
+from scripts.production.staff_test_support import (
+    StaffTestCase, fixture_runtime_id, fixture_showrunner_name, unit_membership,
+)
+
+
+class ObservedUnitLaunch:
+    """Validate launch identity before a test observes the spawn boundary."""
+
+    def __init__(self, case: unittest.TestCase,
+                 observe: Callable[[add_unit.UnitLaunch, str], herdr.PromptSubmitOutcome]) -> None:
+        self.case: unittest.TestCase = case
+        self.observe: Callable[[add_unit.UnitLaunch, str], herdr.PromptSubmitOutcome] = observe
+
+    def __call__(self, request: add_unit.UnitLaunch, _director: add_unit.DirectorAgent,
+                 prompt: str, _selected: accounts.ClaudeLaunchAccount, *, target: str = "",
+                 model: str = "", autocompact_window: str = "") -> herdr.PromptSubmitOutcome:
+        self.case.assertEqual(target, "claude2" if isinstance(request.session, add_unit.ResumedSession) else "")
+        self.case.assertEqual((model, autocompact_window), ("", ""))
+        owners = [row for row in staff.find(kind="showrunner")
+                  if row.name == fixture_showrunner_name(request.production.slug, request.production.doc)]
+        self.case.assertEqual(len(owners), 1)
+        rows = [row for row in staff.find(kind="unit", parent=owners[0].id)
+                if row.name == request.identity.session]
+        self.case.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.case.assertIsNotNone(row)
+        self.case.assertEqual((row.kind, row.name), ("unit", request.identity.session))
+        return self.observe(request, prompt)
 
 class AddUnitTestCase(ShutdownTestCase):
     staff: StaffTestCase = StaffTestCase()
@@ -133,10 +164,10 @@ class AddUnitTestCase(ShutdownTestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.staff = StaffTestCase()
         self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
-        super().setUp()
         _ = self.enterContext(patch.object(names, "load_names", return_value=fixture_names()))
         # These CLI fixtures prove launcher plumbing; transcript proof is exercised
         # through the real submit method in PromptSubmissionTests.
@@ -208,6 +239,7 @@ class AddUnitTestCase(ShutdownTestCase):
                     "CODEX_CATALOG_SYNC_STATE_FILE": str(sync_state)}
         self.env["STAFF_FILE"] = str(self.staff.staff_file)
         self.env["HERDR_PANE_RECORD_DIR"] = str(self.staff.source_root / "panes")
+        _ = self.staff.record_production("build-followups", self.doc)
         self.herdr_overrides = {}
         fake_path = self.bin / "fake-herdr"
         source = (SCRIPT.parents[1] / "herdr/fake_herdr.py").read_text()
@@ -217,12 +249,16 @@ class AddUnitTestCase(ShutdownTestCase):
         source = source.replace("raise SystemExit(main(sys.argv[1:]))", "raise SystemExit(submitting_main(sys.argv[1:]))")
         hook = r'''def submitting_main(argv):
     result = main(argv)
+    if result == 0 and argv[2:4] == ["agent", "start"]:
+        sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
+        from scripts.production.staff_test_support import record_fixture_claude_start
+        record_fixture_claude_start(argv)
     if result == 0 and argv[2:4] == ["agent", "prompt"]:
         from datetime import datetime, timezone
         calls = [json.loads(line) for line in Path(os.environ["FAKE_HERDR_LOG"]).read_text().splitlines()]
         start = next(row for row in reversed(calls) if row[:2] == argv[:2] and row[2:4] == ["agent", "start"])
-        flag = "--resume" if "--resume" in start else "--session-id"
-        session_id = start[start.index(flag) + 1]
+        registry = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / (os.environ["FAKE_CLAUDE_PID"] + ".json")
+        session_id = json.loads(registry.read_text())["sessionId"]
         config = next((value.split("=", 1)[1] for row in reversed(calls) for value in row
                        if row[:2] == argv[:2] and value.startswith("CLAUDE_CONFIG_DIR=")),
                       str(Path.home() / ".claude"))
@@ -233,6 +269,7 @@ class AddUnitTestCase(ShutdownTestCase):
     return result
 
 '''
+        hook = hook.replace('os.environ["FIXTURE_CHECKOUT"]', repr(str(SCRIPT.resolve().parents[2])))
         source = source.replace('if __name__ == "__main__":', hook + 'if __name__ == "__main__":')
         _ = fake_path.write_text(source)
         fake_path.chmod(0o755)
@@ -275,13 +312,8 @@ class AddUnitTestCase(ShutdownTestCase):
         self.prepare_herdr_launch("alpha", "--plan", "docs/plans/given.md")
 
     def quota_reading(self, login: str, left: float, reset_days: float) -> None:
-        file = Path(self.env["HOME"]) / ".local/state/agent-notes/usage.json"
-        saved = cast(dict[str, usage_store.StoredUsage], json.loads(file.read_text())) if file.exists() else {}
-        now = datetime.now(timezone.utc)
-        saved[login] = {"weekly": {"left": left, "at": now.isoformat(),
-                                  "resets": (now + timedelta(days=reset_days)).isoformat()}}
-        file.parent.mkdir(parents=True, exist_ok=True)
-        _ = file.write_text(json.dumps(saved))
+        with patch.dict(os.environ, self.env):
+            stored_room(login, left, datetime.now(timezone.utc) + timedelta(days=reset_days))
 
     def select_unit_account(self, label: str) -> Path:
         with patch.dict(os.environ, self.env):
@@ -316,7 +348,12 @@ class AddUnitTestCase(ShutdownTestCase):
         self.persist_herdr_unit(session, self.root)
         environment = self.root / "proc/202/environ"
         _ = environment.write_text(environment.read_text() + f"\0CLAUDE_CONFIG_DIR={directory}")
-        transcript = Path(self.env["HOME"]) / ".claude/projects/project/session-123.jsonl"
+        import pane_record
+        with patch.object(pane_record, "RECORD_DIR", Path(self.env["HERDR_PANE_RECORD_DIR"])):
+            pane_record.write(session, pane_record.launch("w1:p1", "62ccbd64-f22e-5647-b20e-7899aa39d766", str(self.root),
+                {"CLAUDE_CONFIG_DIR": str(directory), "SHOWRUNNER_UNIT_ID": "alpha-unit"},
+                ["claude", "-n", "alpha", "--model", model]))
+        transcript = Path(self.env["HOME"]) / ".claude/projects/project/62ccbd64-f22e-5647-b20e-7899aa39d766.jsonl"
         transcript.parent.mkdir(parents=True, exist_ok=True)
         _ = transcript.write_text(json.dumps({"type": "assistant", "message": {"model": model}}) + "\n")
 
@@ -378,10 +415,18 @@ class AddUnitTestCase(ShutdownTestCase):
         responses["--session default session list --json"] = CommandResponse(
             code=0, stdout=json.dumps(herdr.SessionListResult(sessions=sessions)))
         if isinstance(request, add_unit.UnitLaunch):
+            self.env["FIXTURE_CHECKOUT"] = str(SCRIPT.parents[2])
+            self.env["FAKE_CLAUDE_PID"] = str(os.getpid())
+            native_claude(self.env, int(self.env["FAKE_CLAUDE_PID"]))
+            parent = fixture_runtime_id("showrunner::" + fixture_showrunner_name(request.production.slug, request.production.doc))
+            self.env["FAKE_CLAUDE_SESSION_ID"] = fixture_runtime_id("unit:" + parent + ":" + request.identity.session)
             name = SHARED
             title = (request.launch_kind.session_name if isinstance(request.launch_kind, add_unit.UnitRestoreLaunch)
                      else request.identity.session)
             responses[f"--session {name} agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({"result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
+            responses[f"--session {name} pane process-info --pane w1:p1"] = CommandResponse(code=0, stdout=json.dumps({
+                "result": {"process_info": {"foreground_processes": [
+                    {"pid": os.getpid(), "name": "claude", "argv": ["claude"]}]}}}))
             responses[f"--session {name} status server"] = [
                 CommandResponse(code=0, stdout="status: stopped\n"),
                 CommandResponse(code=0, stdout="status: running\n")]
@@ -420,6 +465,8 @@ class AddUnitTestCase(ShutdownTestCase):
                     str(self.state / f"herdr-live-{name}"): "",
                     self.env["FAKE_HERDR_RESPONSES"]: json.dumps(after)})
         responses.update(self.herdr_overrides)
+        if isinstance(request, add_unit.UnitLaunch):
+            confirm_tab_close(responses, SHARED, "w1:t1", Path(self.env["FAKE_HERDR_RESPONSES"]))
         if isinstance(request, add_unit.UnitLaunch) and (self.root / "proc/202").exists():
             after_stop = {**responses, "--session default session list --json": CommandResponse(code=0, stdout='{"sessions": []}')}
             stopped_name = (self.root / "proc/201/cmdline").read_text().split("\0")[2]
@@ -435,6 +482,7 @@ class AddUnitTestCase(ShutdownTestCase):
             _ = parser.add_argument("--" + flag, type=int if flag == "port" else str)
         _ = parser.add_argument("--standby", action="store_true")
         _ = parser.add_argument("--permanent", action="store_true")
+        _ = parser.add_argument("--responsibility", action="append", default=[])
         _ = parser.add_argument("--check", action="store_true")
         _ = parser.add_argument("--probe", action="store_true")
         _ = parser.add_argument("--source-fallback", action="store_true")
@@ -510,7 +558,7 @@ class AddUnitTestCase(ShutdownTestCase):
         self,
         state: str,
         *,
-        session_id: str = "session-123",
+        session_id: str = "62ccbd64-f22e-5647-b20e-7899aa39d766",
         progress: dict[str, object] | None = None,
     ) -> dict[str, object]:
         return {
@@ -595,6 +643,9 @@ class AddUnitTestCase(ShutdownTestCase):
         _ = self.git("add", "docs/plans/build-followups-production.md")
         _ = self.git("commit", "-m", "prepare unit rows")
         _ = self.git("push", "origin", "build-followups")
+        cells = production_units.unit_table(self.doc.read_text().splitlines())[0]
+        if not production_units.plan_cell_is_retired(cells["Plan"]):
+            _ = unit_membership(fixture_showrunner_name("build-followups", self.doc), cell_value(cells["Unit"]))
 
     def assert_no_launch_change(self, document: str, head: str) -> None:
         self.assertEqual(self.doc.read_text(), document)
@@ -607,7 +658,7 @@ class AddUnitTestCase(ShutdownTestCase):
     def restore(self, name: str, cwd: Path) -> subprocess.CompletedProcess[str]:
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
-        return self.cli(name, "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(cwd),
+        return self.cli(name, "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(cwd),
                         "--restart-note", str(note), "--session-name", "recorded-name",
                         "--host-session", "recorded-herdr", "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
@@ -621,7 +672,25 @@ class AddUnitTestCase(ShutdownTestCase):
         worktree = self.root / "tool-based-ui-trunk"
         _ = self.git("worktree", "add", str(worktree), "-b", "init/catalyst-trunk")
         self.commit_prepared_row(self.unit_row("trunk", branch="init/catalyst-trunk", worktree=worktree))
+        _ = self.prepare_restored_worktree("trunk", worktree)
         return worktree
+
+    def prepare_restored_worktree(self, name: str, worktree: Path, *,
+                                  branch: str = "build-followups-alpha",
+                                  plan: str = "docs/plans/given.md") -> staff.StaffRow:
+        """Record the existing location and file a scheduled restore must keep."""
+        if not worktree.exists():
+            _ = self.git("worktree", "add", str(worktree), "-b", branch)
+        with patch.dict(os.environ, self.env):
+            row = unit_membership(fixture_showrunner_name("build-followups", self.doc), name)
+            identity = self.env.get("FAKE_RESTORED_SESSION_ID", "62ccbd64-f22e-5647-b20e-7899aa39d766")
+            if row.current_session != identity:
+                row = staff.update_current_session(row.current_session, staff.native_id(identity))
+            row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", worktree), expected=row.worktree)
+            config_plan = (unit_config.StandbyPlan() if plan == "standby"
+                           else unit_config.PlanFile(Path(plan)))
+            _ = unit_config.write(worktree, unit_config.UnitConfig(config_plan, unit_config.NoAppPort(), ()))
+        return row
 
     def run_with_marked_unit(
         self,
@@ -640,7 +709,7 @@ class AddUnitTestCase(ShutdownTestCase):
             plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
             port=add_unit.OmittedCell(),
             owns=add_unit.OmittedCell(),
-            session=(add_unit.ResumedSession("session-123", self.root / "prior-session")
+            session=(add_unit.ResumedSession("62ccbd64-f22e-5647-b20e-7899aa39d766", self.root / "prior-session")
                      if isinstance(launch_kind, add_unit.UnitRestoreLaunch) else add_unit.NewSession()),
             launch_kind=launch_kind,
             timeout=1.0,
@@ -655,13 +724,27 @@ class AddUnitTestCase(ShutdownTestCase):
             if already_marked or isinstance(launch_kind, add_unit.UnitRestoreLaunch) else add_unit.NoUnitRow(),
             add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
         )
+        # These launcher tests replace worktree creation and preflight. Supply
+        # their real admission inputs before intercepting launcher commands.
+        if not request.worktree.exists():
+            _ = self.git("worktree", "add", "-b", request.branch, str(request.worktree), "build-followups")
+        with patch.dict(os.environ, self.env):
+            row = unit_membership(fixture_showrunner_name("build-followups", self.doc), request.unit_id)
+            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", request.worktree), expected=row.worktree)
+            _ = unit_config.write(request.worktree, unit_config.UnitConfig(
+                unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.NoAppPort(), ()))
+        git_run = subprocess.run
         commands: list[list[str]] = []
         launches: list[str] = []
 
         if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
             _ = launch_kind.note.write_text("Resume this unit.", encoding="utf-8")
 
-        def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            if command[0] == "git":
+                cwd = kwargs.get("cwd")
+                assert cwd is None or isinstance(cwd, (str, Path))
+                return git_run(command, cwd=cwd, capture_output=True, text=True, check=False)
             if "show-options" in command:
                 return subprocess.CompletedProcess(command, 0, "", "")
             if "launch-blocked" in command:
@@ -684,15 +767,7 @@ class AddUnitTestCase(ShutdownTestCase):
             commands.append(command)
             return subprocess.CompletedProcess(command, 0, "", "")
 
-        def launch(
-            _request: add_unit.UnitLaunch,
-            _director: add_unit.DirectorAgent,
-            prompt: str,
-            _selected: accounts.ClaudeLaunchAccount,
-            *, target: str = "", model: str = "", autocompact_window: str = "",
-        ) -> herdr.PromptSubmitOutcome:
-            self.assertEqual(target, "claude2" if isinstance(_request.session, add_unit.ResumedSession) else "")
-            self.assertEqual((model, autocompact_window), ("", ""))
+        def launch(_request: add_unit.UnitLaunch, prompt: str) -> herdr.PromptSubmitOutcome:
             if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
                 recorded = self.recorded_prompts(launch_kind.session_id)
                 self.assertEqual(recorded[-1], prompt)
@@ -719,7 +794,7 @@ class AddUnitTestCase(ShutdownTestCase):
             patch.object(add_unit, "append_row"),
             patch.object(add_unit, "commit_unit"),
             patch.object(add_unit, "ensure_worktree"),
-            patch.object(add_unit, "launch_session", side_effect=launch),
+            patch.object(add_unit, "launch_session", side_effect=ObservedUnitLaunch(self, launch)),
             patch.object(add_unit, "wait_for_remote_control", return_value=launched) as wait,
             patch.object(add_unit, "record"),
             patch.object(subprocess, "run", side_effect=run),
@@ -740,18 +815,18 @@ class AddUnitTestCase(ShutdownTestCase):
     def write_resume_registry_record(self, proc_start: str) -> None:
         registry = Path(self.env["NOTIFIER_SESSIONS_DIR"])
         _ = (registry / f"{os.getpid()}.json").write_text(json.dumps({
-            "pid": os.getpid(), "sessionId": "session-123", "name": "postmaster",
+            "pid": os.getpid(), "sessionId": "62ccbd64-f22e-5647-b20e-7899aa39d766", "name": "postmaster",
             "messagingSocketPath": "", "updatedAt": 1, "procStart": proc_start,
         }))
 
     def prepare_attach(self, *, after_stop: tuple[int, ...] = (), after_launch: tuple[int, ...] = (202,),
-                       stop_progress: str = "stopped", timeout: bool = False) -> tuple[Path, list[str]]:
+                       timeout: bool = False) -> tuple[Path, list[str]]:
         prior = self.root / "prior-session"
         prior.mkdir()
         started = sessions.process_start(os.getpid())
         assert started is not None
         self.write_resume_registry_record(started)
-        source = inventory.ListedSession("session-123", os.getpid(), started, "postmaster", "top-level",
+        source = inventory.ListedSession("62ccbd64-f22e-5647-b20e-7899aa39d766", os.getpid(), started, "postmaster", "top-level",
                                          self.root / "home/.claude", "owner@example.com", "", "")
         _ = self.enterContext(patch.object(inventory, "listing", return_value=[source]))
         document, head = self.doc.read_text(), self.git("rev-parse", "HEAD")
@@ -769,46 +844,31 @@ class AddUnitTestCase(ShutdownTestCase):
             return launch_session(request, director, prompt, selected, target=target, model=model,
                                   autocompact_window=autocompact_window)
 
-        def shutdown(arguments: list[str], within: float) -> subprocess.CompletedProcess[str]:
+        from scripts.shutdown import stop_resume
+        def stop(identity: str) -> stop_resume.Stopped | stop_resume.StopFailed:
             nonlocal stopped
-            self.assertGreater(within, 0)
+            self.assertEqual(identity, "62ccbd64-f22e-5647-b20e-7899aa39d766")
             self.assert_no_launch_change(document, head)
             self.assertEqual([row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]], [])
-            trace.append(arguments[0])
-            if arguments[0] == "down":
-                self.assertEqual(arguments[:6], ["down", "owner@example.com", "--here", "--only", "session-123", "--request-id"])
-                self.write_shutdown_record(self.shutdown_record("down", progress={"kind": stop_progress,
-                                                                                 "at": "2026-10-28T20:00:00+00:00"}))
-                _ = shutdown_store.migrate("owner@example.com")
-                def select_request(saved: shutdown_store.SessionShutdown) -> None:
-                    saved["request_id"] = arguments[6]
-                    saved["hold"] = "session"
-                _ = shutdown_store.update_session("owner@example.com", "session-123", select_request)
-                (Path(self.env["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json").unlink()
-                stopped = True
-            else:
-                self.assertEqual(arguments[:3], ["follow", "owner@example.com", "--request"])
-                if timeout:
-                    raise subprocess.TimeoutExpired(arguments, within)
-            return subprocess.CompletedProcess(arguments, 0, "", "")
+            trace.append("stop")
+            if timeout:
+                return stop_resume.StopFailed(identity, "fixture stop failed")
+            (Path(self.env["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json").unlink()
+            stopped = True
+            return stop_resume.Stopped(identity, os.getpid())
 
         def processes(_identity: str) -> sessions.SessionProcesses:
             return sessions.SessionProcesses(after_launch if launched else after_stop if stopped else (os.getpid(),))
 
-        def finish(records: list[shutdown_store.SessionShutdown]) -> restart.TargetCheck:
-            trace.append("finish")
-            self.assertTrue(launched)
-            return restart.TargetCheck([], records)
-
-        _ = self.enterContext(patch.object(add_unit, "run_attach_shutdown", side_effect=shutdown))
+        _ = self.enterContext(patch.object(stop_resume, "stop", side_effect=stop))
         _ = self.enterContext(patch.object(add_unit, "launch_session", side_effect=launch))
         _ = self.enterContext(patch.object(sessions, "session_processes", side_effect=processes))
         _ = self.enterContext(patch.object(sessions, "process_liveness", return_value=sessions.SessionNotLive()))
-        _ = self.enterContext(patch.object(restart, "wait_for_confirmation", return_value=restart.RegistryConfirmation()))
-        _ = self.enterContext(patch.object(restart, "clear_running_on_target", side_effect=finish))
+        _ = self.enterContext(patch.object(restart, "wait_for_confirmation", return_value=registry_confirmation(frozenset({"62ccbd64-f22e-5647-b20e-7899aa39d766"}))))
         return prior, trace
 
     def persist_herdr_unit(self, name: str, cwd: Path) -> None:
+        _ = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
         for pid, parent, arguments in ((201, 1, ["herdr", "--session", name, "server"]), (202, 201, ["zsh"])):
             process = self.root / "proc" / str(pid)
             process.mkdir(parents=True)
@@ -820,13 +880,15 @@ class AddUnitTestCase(ShutdownTestCase):
         (Path(self.env["HOME"]) / ".claude/sessions").mkdir(exist_ok=True)
         self.herdr_overrides["--session default session list --json"] = CommandResponse(code=0, stdout=json.dumps(herdr.SessionListResult(sessions=[
                 herdr.SessionEntry(name=name, running=True, default=False, session_dir="/fixture", socket_path="/fixture/socket")])))
+        self.herdr_overrides[f"--session {name} pane list"] = CommandResponse(code=0, stdout=json.dumps({
+            "result": {"panes": [{"pane_id": "w2:p1", "workspace_id": "w2", "label": "alpha"}]}}))
         self.herdr_overrides[f"--session {name} server stop"] = CommandResponse(code=0, stdout="", remove_paths=[str(self.root / "proc/202")])
 
     def set_unit_autocompact(self, value: str, *flags: str) -> subprocess.CompletedProcess[str]:
         """A running unit's window, set as live: its row off the naming pattern and its plan since changed."""
         prior = self.root / "prior-session"
         prior.mkdir(exist_ok=True)
-        return self.successful("trunk", "--plan", "docs/plans/other.md", "--resume", "session-trunk",
+        return self.successful("trunk", "--plan", "docs/plans/other.md", "--resume", "3001165e-ca76-59c2-9490-878224585fad",
                                "--cwd", str(prior), "--autocompact", value, *flags)
 
     def assert_named_unit_launch_and_restart(self, unit: str) -> None:
@@ -837,6 +899,7 @@ class AddUnitTestCase(ShutdownTestCase):
         _ = self.git("add", str(self.doc.relative_to(self.checkout)))
         _ = self.git("commit", "-m", "Add sample fixture production")
         _ = self.git("push", "origin", "build-followups")
+        _ = self.staff.record_production("sample", self.doc)
 
         result = self.successful(unit, "--plan", "docs/plans/given.md")
         self.assertIn(f"{unit} started", result.stdout)

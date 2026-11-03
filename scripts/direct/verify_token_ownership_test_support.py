@@ -9,10 +9,9 @@ import time
 from typing import override
 
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 
 class VerifyTokenOwnershipFixture(VerifyTokenWaitFixture):

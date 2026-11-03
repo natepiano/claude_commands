@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 from typing import cast
 
+from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import LauncherHangGuard
 
 HEARTBEAT = Path(__file__).resolve().parent / "heartbeat.sh"
@@ -100,7 +101,7 @@ class HeartbeatWatcherTests(unittest.TestCase):
                     # On a regression, kill only this disposable process group,
                     # including a child that still owns the output pipes.
                     try:
-                        os.killpg(watcher.pid, signal.SIGKILL)
+                        send_process_group(watcher.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
                     _ = watcher.communicate(timeout=guard.remaining())

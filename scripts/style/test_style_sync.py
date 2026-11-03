@@ -21,6 +21,8 @@ import unittest
 from collections.abc import Callable
 from contextlib import closing, redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import TypedDict, cast, final, override
 from unittest import mock
 
@@ -28,12 +30,11 @@ import style_sync
 import scratch
 import style_ledger
 import style_rules
-import showrunners
+from scripts.lib.process_group import send_process_group
+from scripts.production import showrunners
 from scripts.direct import test_verify_lint_scope as verify_fixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 class RecordedCall(TypedDict):
     arguments: list[str]
@@ -89,7 +90,7 @@ def wait_until(condition: Callable[[], bool], seconds: float) -> bool:
 
 def group_running(group: int) -> bool:
     try:
-        os.killpg(group, 0)
+        send_process_group(group, 0)
     except ProcessLookupError:
         return False
     return True
@@ -97,7 +98,7 @@ def group_running(group: int) -> bool:
 
 def kill_group(group: int) -> None:
     with suppress(ProcessLookupError):
-        os.killpg(group, signal.SIGKILL)
+        send_process_group(group, signal.SIGKILL)
 
 
 def ended_pid() -> int:
@@ -139,13 +140,16 @@ class StyleSyncTests(unittest.TestCase):
             "STYLE_HISTORY_NATE_STYLE_DIR": str(rule_root),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
             "SCRATCH_HOLDS": str(self.root / "scratch-holds.json"),
+            "SCRATCH_ROOT": str(self.root / "scratch"),
+            "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
+            "SCRATCH_VISIBLE_ROOT": str(self.root / "repro"),
         })))
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", rule_root))
         sender = self.root / "send.py"
         _ = sender.write_text(
             "import json,sys\nfrom pathlib import Path\n"
             + f"Path({str(self.root / 'sent.json')!r}).write_text(json.dumps({{'arguments':sys.argv[1:]}}))\n"
-            + "raise SystemExit(0)\n",
+            + "print('SENT: fixture')\nraise SystemExit(0)\n",
         )
         address = self.root / "address.py"
         _ = address.write_text("print('session:fake-style')\n")
@@ -350,7 +354,7 @@ class StyleSyncTests(unittest.TestCase):
         self.checkpoint_for_wake()
         self.waiting_units("names-unit", "types-unit")
         self.wake_sender("names-unit")
-        self.assertEqual(self.merge_for_wake(), (0, "style_ledger: wake names-unit: FAILED: unavailable\n", ""))
+        self.assertEqual(self.merge_for_wake(), (0, "style_ledger: wake names-unit: send.py: stdout: FAILED: unavailable\n", ""))
         self.assertEqual(self.remaining_waiters(), ["names-unit"])
         with style_ledger.open_ledger(self.repo) as ledger, closing(sqlite3.connect(ledger.database)) as connection:
             self.assertEqual(connection.execute("SELECT state FROM tickets WHERE id='modules-unit-1'").fetchone(), ("merged",))
@@ -453,7 +457,25 @@ class StyleSyncTests(unittest.TestCase):
         _ = (self.root / "send.py").write_text("print('FAILED: unavailable')\nraise SystemExit(3)\n")
         code, output = self.notice()
         self.assertEqual(code, 0)
-        self.assertEqual(output, "style_sync: notify: FAILED: unavailable\n")
+        self.assertEqual(output, "style_sync: notify: send.py: stdout: FAILED: unavailable\n")
+
+    def test_notify_requires_a_confirmed_success_outcome(self) -> None:
+        self.production()
+        cases = ((0, "SENT: fixture", True), (0, "SKIPPED: repeated", True),
+                 (0, "KEPT: silence", True), (0, "REPLACED: revision", True),
+                 (1, "QUEUED: offline", False), (3, "FAILED: unavailable", False),
+                 (2, "REFUSED: invalid", False), (4, "HELD: decision", False), (5, "PENDING: active", False),
+                 (0, "", False), (0, "QUEUED: inconsistent", False),
+                 (1, "SENT: inconsistent", False), (0, "FAILED: inconsistent", False))
+        for code, text, accepted in cases:
+            with self.subTest(code=code, text=text):
+                _ = (self.root / "send.py").write_text(f"print({text!r})\nraise SystemExit({code})\n")
+                result, output = self.notice()
+                self.assertEqual(result, 0)
+                if accepted:
+                    self.assertEqual(output, "")
+                else:
+                    self.assertIn("style_sync: notify: send.py:", output)
 
     def test_notify_lookup_refusal_prints_one_prefix_and_keeps_the_merge_successful(self) -> None:
         with mock.patch.object(style_sync, "standing_style_production",
@@ -605,13 +627,25 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
             _ = self.git("worktree", "add", "--detach", str(directory / "checkout"), self.tip)
         return directory
 
+    def test_shared_target_survives_task_end_and_reuses_artifacts(self) -> None:
+        common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
+        target = style_sync.lint_target(common)
+        code, output = self.run_lint('printf previous > target/artifact\n')
+        self.assertEqual(code, 0, output)
+        self.assertEqual(scratch.end("run:sample-style"), [])
+        self.assertTrue(target.is_dir())
+        self.assertEqual((target / "artifact").read_text(), "previous")
+        code, output = self.run_lint('[[ $(cat target/artifact) == previous ]] || exit 2\n')
+        self.assertEqual(code, 0, output)
+        self.assertEqual(list(self.lint_temp.iterdir()), [])
+
     def test_lint_links_a_warm_target_and_cleanup_keeps_it_until_the_production_ends(self) -> None:
-        target = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir")) / "style-sync-target"
+        target = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir")) / scratch.STYLE_TARGET_NAME
         code, output = self.run_lint('[[ -L target ]] || exit 2\nprintf warm > target/artifact\n')
         self.assertEqual(code, 0, output)
         self.assertEqual((target / "artifact").read_text(), "warm")
         self.assertEqual(list(self.lint_temp.iterdir()), [])
-        self.assertEqual(scratch.holds()[str(target)]["task"], "run:sample-style")
+        self.assertNotIn(str(target), scratch.holds())
         # A later checkout uses the same artifacts. No Cargo environment variable is overridden.
         with mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": "inherited-value"}):
             code, output = self.run_lint(
@@ -619,12 +653,12 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
             )
         self.assertEqual(code, 0, output)
         self.assertEqual(list(self.lint_temp.iterdir()), [])
-        self.assertEqual(scratch.end("run:sample-style"), [target])
-        self.assertFalse(target.exists())
+        self.assertEqual(scratch.end("run:sample-style"), [])
+        self.assertTrue(target.exists())
         self.assertEqual(scratch.holds(), {})
 
     def test_a_missing_or_swept_target_runs_cold(self) -> None:
-        target = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir")) / "style-sync-target"
+        target = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir")) / scratch.STYLE_TARGET_NAME
         for state in ("missing", "swept"):
             with self.subTest(state=state):
                 self.assertFalse(target.exists())
@@ -643,10 +677,10 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         real_flock = fcntl.flock
 
         def first_sync() -> None:
-            with (target / "sync.lock").open("a") as lock:
+            with (target / scratch.STYLE_LOCK_NAME).open("a") as lock:
                 real_flock(lock, fcntl.LOCK_EX)
                 locked.set()
-                _ = attempted.wait(30)
+                _ = attempted.wait(TEST_HANG_GUARD_SECS)
 
         holder = threading.Thread(target=first_sync)
         holder.start()
@@ -669,7 +703,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         real_cleanup = style_sync.remove_lint_dir
 
         def assert_locked() -> None:
-            with (target / "sync.lock").open("a") as lock, self.assertRaises(BlockingIOError):
+            with (target / scratch.STYLE_LOCK_NAME).open("a") as lock, self.assertRaises(BlockingIOError):
                 real_flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
         def git(repo: Path, *arguments: str) -> str:
@@ -691,7 +725,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         self.assertTrue(attempted.is_set())
         self.assertEqual(list(self.lint_temp.iterdir()), [])
         # Cleanup has completed and the next sync can acquire the same lock.
-        with (target / "sync.lock").open("a") as lock:
+        with (target / scratch.STYLE_LOCK_NAME).open("a") as lock:
             real_flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_replacing_the_target_link_cannot_grant_successful_lint_coverage(self) -> None:
@@ -725,7 +759,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 )
                 try:
-                    self.assertTrue(wait_until(lambda: pids.exists() or process.poll() is not None, 30))
+                    self.assertTrue(wait_until(lambda: pids.exists() or process.poll() is not None, TEST_HANG_GUARD_SECS))
                     self.addCleanup(kill_group, int(pids.read_text().split()[0]))
                     process.send_signal(signum)
                     _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
@@ -738,7 +772,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
                 self.assertEqual(list(self.lint_temp.iterdir()), [])
                 self.assertEqual(self.git("worktree", "list", "--porcelain"), original_worktrees)
                 child, grandchild = (int(pid) for pid in pids.read_text().split())
-                self.assertTrue(wait_until(lambda: not running(child) and not running(grandchild), 5))
+                self.assertTrue(wait_until(lambda: not running(child) and not running(grandchild), TEST_HANG_GUARD_SECS))
 
     def test_a_stop_signal_during_cleanup_raises_after_the_cleanup_ends_and_handlers_are_restored(self) -> None:
         previous = signal.getsignal(signal.SIGTERM)
@@ -883,7 +917,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
                 verifiers.append(child.pid)
                 self.addCleanup(kill_group, child.pid)
                 # verify.sh is running, so only a stop removes its group.
-                self.assertTrue(wait_until(started.exists, 30))
+                self.assertTrue(wait_until(started.exists, TEST_HANG_GUARD_SECS))
                 os.kill(os.getpid(), signal.SIGTERM)
             return child
 
@@ -894,7 +928,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
             code = style_sync.main(["lint", "--repo", str(self.repo), "--checkout", str(self.repo), "--tip", self.tip])
         self.assertEqual(code, 128 + signal.SIGTERM, output.getvalue())
         self.assertEqual(len(verifiers), 1)
-        self.assertTrue(wait_until(lambda: not group_running(verifiers[0]), 5))
+        self.assertTrue(wait_until(lambda: not group_running(verifiers[0]), TEST_HANG_GUARD_SECS))
         self.assertEqual(list(self.lint_temp.iterdir()), [])
 
     def test_after_a_sigkill_of_the_owner_the_sweep_keeps_the_dir_until_its_verifier_ends(self) -> None:
@@ -909,7 +943,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         try:
-            self.assertTrue(wait_until(lambda: verifier.exists() or process.poll() is not None, 30))
+            self.assertTrue(wait_until(lambda: verifier.exists() or process.poll() is not None, TEST_HANG_GUARD_SECS))
         finally:
             process.kill()
             _ = process.wait()
@@ -920,7 +954,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
             style_sync.sweep_stale_lint_dirs()
         self.assertTrue((directory / "checkout").exists())
         kill_group(group)
-        self.assertTrue(wait_until(lambda: not group_running(group), 5))
+        self.assertTrue(wait_until(lambda: not group_running(group), TEST_HANG_GUARD_SECS))
         with redirect_stdout(io.StringIO()):
             style_sync.sweep_stale_lint_dirs()
         self.assertEqual(list(self.lint_temp.iterdir()), [])
@@ -987,7 +1021,8 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         _ = (self.root / "send.py").write_text(
             "import json,sys\nfrom pathlib import Path\n"
             + f"with Path({str(self.root / 'notices.jsonl')!r}).open('a') as out:\n"
-            + " out.write(json.dumps(sys.argv[1:]) + '\\n')\n",
+            + " out.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            + "print('SENT: fixture')\n",
         )
         return checkpoint
 
@@ -1151,17 +1186,44 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
     def test_queued_send_handoff_is_sent_to_the_parent(self) -> None:
         """send.py queued a hand-off and the row stayed pending, so its merge was refused (cargo-liner, 2026-10-27)."""
         checkpoint = self.handoff_checkpoint()
-        self.handoff_sender("QUEUED: relay timed out", 1)
+        self.handoff_sender("checking recipient\nQUEUED: relay timed out", 1)
         self.assertEqual(self.send_handoff(checkpoint), (0, f"hand-off {checkpoint[:7]}: queued for parent\n"))
         self.assertEqual(self.handoff_rows()[0][:3], (checkpoint, "sent", "parent"))
         self.assertEqual(len(self.handoff_notices()), 1)
+
+    def test_kept_handoff_notice_records_acceptance_and_reports_queued(self) -> None:
+        checkpoint = self.handoff_checkpoint()
+        self.handoff_sender("KEPT: until silence ends", 0)
+        self.assertEqual(self.send_handoff(checkpoint), (0, f"hand-off {checkpoint[:7]}: queued for parent\n"))
+        self.assertEqual(self.handoff_rows()[0][:3], (checkpoint, "sent", "parent"))
+        self.assertEqual(len(self.handoff_notices()), 1)
+
+    def test_handoff_without_a_confirmed_send_result_stays_pending(self) -> None:
+        checkpoint = self.handoff_checkpoint()
+        for output, code in (("", 0), ("unrelated output", 0), ("QUEUED: offline", 0),
+                             ("SENT: apparent delivery", 1), ("FAILED: unavailable\nQUEUED: quoted result", 1),
+                             ("REFUSED: action required", 2), ("HELD: review", 4), ("PENDING: active", 5)):
+            with self.subTest(output=output, code=code):
+                self.handoff_sender(output, code)
+                result, diagnostic = self.send_handoff(checkpoint)
+                self.assertEqual(result, 1)
+                self.assertIn("style_sync: hand-off: send.py:", diagnostic)
+                self.assertEqual(self.handoff_rows()[0][:3], (checkpoint, "pending", ""))
+
+    def test_skipped_and_replaced_handoff_notices_record_parent_acceptance(self) -> None:
+        checkpoint = self.handoff_checkpoint()
+        for output in ("SKIPPED: acknowledged", "REPLACED: newer notice"):
+            with self.subTest(output=output):
+                self.handoff_sender(output, 0)
+                self.assertEqual(self.send_handoff(checkpoint), (0, ""))
+                self.assertEqual(self.handoff_rows()[0][:3], (checkpoint, "sent", "parent"))
 
     def test_undelivered_send_handoff_stays_pending(self) -> None:
         checkpoint = self.handoff_checkpoint()
         for outcome, code in (("FAILED: unavailable", 3), ("relay error", 1)):
             with self.subTest(outcome=outcome):
                 self.handoff_sender(outcome, code)
-                self.assertEqual(self.send_handoff(checkpoint), (1, f"style_sync: hand-off: {outcome}\n"))
+                self.assertEqual(self.send_handoff(checkpoint), (1, f"style_sync: hand-off: send.py: stdout: {outcome}\n"))
                 self.assertEqual(self.handoff_rows()[0][:3], (checkpoint, "pending", ""))
 
     def test_resume_records_a_queued_notice_as_sent(self) -> None:

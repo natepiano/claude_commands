@@ -22,16 +22,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
-if __package__:
-    from .note_file import canonical_label
-else:
-    from note_file import canonical_label
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-# Timer and package callers share credit observation types and the log location.
-if __name__ == "run_out":
-    _ = sys.modules.setdefault("scripts.whoami.run_out", sys.modules[__name__])
-elif __name__ == "scripts.whoami.run_out":
-    _ = sys.modules.setdefault("run_out", sys.modules[__name__])
+from scripts.whoami.note_file import canonical_label
 
 STATE = Path.home() / ".local/state/agent-notes"
 READINGS_LOG = STATE / "readings.jsonl"

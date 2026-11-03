@@ -5,10 +5,18 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, NotRequired, TypedDict
 
+from scripts.lib import conf
+from .selection import UseConfiguredValue
+
 
 @dataclass(frozen=True)
 class Supported:
     threshold: float
+
+
+@dataclass(frozen=True)
+class MinimumGap:
+    gap: float
 
 
 @dataclass(frozen=True)
@@ -21,35 +29,75 @@ class ReportOnly:
     pass
 
 
-ThresholdOutcome = Supported | Unsupported | ReportOnly
+ThresholdOutcome = Supported | MinimumGap | Unsupported | ReportOnly
 
 QUESTION_SET_VERSION = "5"
-MODEL = "jev-1.14.0"
-BUDGET_USD = 20.0
-INPUT_USD_PER_MILLION = 0.042
-# Complete version-3 tuning run: 20261027T104743.153330Z-3b227095 (N=317).
-THRESHOLDS: dict[str, ThresholdOutcome] = {
-    "backlog_goal": Supported(0.40),
-    "backlog_alignment": Supported(0.40),
-    "backlog_impact": Supported(0.40),
-    "backlog_urgency": ReportOnly(),
-    "backlog_effort": ReportOnly(),
-    "category": Supported(0.90),
-    # Defined-area options: tune error .083 with .38 taken (2026-10-29).
-    "area": Supported(0.90),
-}
-# The user's per-field verdict after the blind preference test (2026-10-29):
-# Jev proposes these fields; the agent proposes every other field.
-JEV_FIELDS: frozenset[str] = frozenset({"backlog_goal", "backlog_impact", "backlog_alignment"})
 
-ERROR_TARGETS = {field: 0.1 for field in (
-    "backlog_goal", "category", "area", "backlog_impact", "backlog_alignment",
-)}
+
+def model(scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> str:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    return scoring_config.text("model")
+
+
+def budget_usd(scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> float:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    return scoring_config.number("budget_usd")
+
+
+def input_usd_per_million(scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> float:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    return scoring_config.number("input_usd_per_million")
+
+
+def thresholds(scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> dict[str, ThresholdOutcome]:
+    # Policy kinds stay in code; the configured numbers can change at use.
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    return {
+        "backlog_goal": Supported(scoring_config.number("threshold.backlog_goal")),
+        "backlog_alignment": Supported(scoring_config.number("threshold.backlog_alignment")),
+        "backlog_impact": Supported(scoring_config.number("threshold.backlog_impact")),
+        "backlog_urgency": ReportOnly(),
+        "backlog_effort": ReportOnly(),
+        "category": Supported(scoring_config.number("threshold.category")),
+        "area": MinimumGap(scoring_config.number("threshold.area")),
+    }
+
+
+# The user's per-field verdict, including the area decision (2026-10-30):
+# Jev proposes these fields; the agent proposes every other field.
+JEV_FIELDS: frozenset[str] = frozenset({"backlog_goal", "backlog_impact", "backlog_alignment", "area"})
+
+
+def error_targets(scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> dict[str, float]:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    return {field: scoring_config.number(f"error_target.{field}") for field in (
+        "backlog_goal", "category", "area", "backlog_impact", "backlog_alignment",
+    )}
+
+
 RISK_THRESHOLDS = tuple(percent / 100 for percent in range(40, 100, 5))
-EVIDENCE_PRESENT = 0.7
-EVIDENCE_ABSENT = 0.3
-SPLIT_PROBABILITY = 0.25
-BODY_CHARACTER_LIMIT = 24_000
+RISK_GAPS = tuple(percent / 100 for percent in range(0, 100, 5))
+
+
+def evidence_present(scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> float:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    return scoring_config.number("evidence_present")
+
+
+def evidence_absent(scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> float:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    return scoring_config.number("evidence_absent")
+
+
+def split_probability(scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> float:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    return scoring_config.number("split_probability")
+
+
+def body_character_limit(scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> int:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    return scoring_config.whole("body_character_limit")
+
 
 # README summaries; legacy project names remain the vault's identifiers.
 PROJECT_ABOUT = {

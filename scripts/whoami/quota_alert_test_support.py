@@ -2,10 +2,6 @@
 
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import ExactRows, registry_text, write_registry
-
-from scripts.whoami.note_file import note_name
-
 import io
 import base64
 import json
@@ -22,19 +18,23 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.test_agents_registry import ExactRows, registry_text, write_registry
+from scripts.whoami.account_test_support import create_claude_account
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import quota_alert
 from push_texts import RenderedPush
 from scripts.whoami import agent_accounts
-from agent_accounts import ClaudeAccountsInUse, CodexHomeSource, Quota, Report
+from scripts.whoami.agent_accounts import ClaudeAccountsInUse, CodexHomeSource, Quota, Report
 import agent_notes
-import session_table
-import note_file
-import account
-import usage_store
+from scripts.whoami import session_table
+from scripts.whoami import note_file
+from scripts.whoami import account
+from scripts.whoami import usage_store
 from agent_notes import local_reset
-from note_file import read_note
+from scripts.whoami.note_file import read_note
 from scripts.accounts import accounts, moves, next_moves, role_map
 from scripts.production import showrunners
 
@@ -47,13 +47,13 @@ Notes = list[quota_alert.AgentNote]
 
 REGISTRY = registry_text({
     'assignments': ExactRows({'direct': 'codex', 'cli': 'claude',
-                              'module_review': 'codex   # a trailing comment', 'ask_a_friend': 'caller'}),
+                              'design_roles': 'codex   # a trailing comment', 'ask_a_friend': 'caller'}),
     'direct.codex': ExactRows({'impl': 'gpt-6-sol:high'}),
     'direct.claude': ExactRows({'impl': 'opus:high'}),
     'cli.codex': ExactRows({'commit_prep': 'gpt-6-sol:high'}),
     'cli.claude': ExactRows({'commit_prep': 'sonnet:high'}),
-    'module_review.codex': ExactRows({'review': 'gpt-6-sol:xhigh'}),
-    'module_review.claude': ExactRows({'review': 'opus:max'}),
+    'design_roles.codex': ExactRows({'reviewer': 'gpt-6-sol:xhigh'}),
+    'design_roles.claude': ExactRows({'reviewer': 'opus:max'}),
     'ask_a_friend.codex': ExactRows({'consultation': 'gpt-6-sol:max'}),
     'ask_a_friend.claude': ExactRows({'consultation': 'opus:max'}),
     'codex.agents': ExactRows({'gpt-6-sol': 'low,medium,high,xhigh,max'}),
@@ -266,28 +266,13 @@ class QuotaReminderFixture(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(account, "account_of",
             return_value=account.Account("claude", identity.login, identity.label)))
 
-    def stored_room(self, login: str, left: float, days: float) -> None:
-        import usage_store
-        saved = usage_store.load()
-        saved[usage_store.key("Claude", login)] = usage_store.StoredUsage(weekly=usage_store.StoredWindow(
-            left=left, at=datetime.now(timezone.utc).isoformat(),
-            resets=(datetime.now(timezone.utc) + timedelta(days=days)).isoformat()))
-        file = usage_store.store_file()
-        file.parent.mkdir(parents=True, exist_ok=True)
-        _ = file.write_text(json.dumps(saved))
-
     def configure_claude_roles(self) -> None:
         _ = (self.root / ".claude").mkdir(exist_ok=True)
         _ = (self.root / ".claude.json").write_text(
             json.dumps({"oauthAccount": {"emailAddress": "showrunner@example.invalid"}}), encoding="utf-8",
         )
-        _ = (self.root / "claude2.md").write_text("---\nlogin: showrunner@example.invalid\n---\n")
         for label, login in (("claude1", "spare@example.invalid"), ("claude2", "showrunner@example.invalid"), ("claude3", "unit@example.invalid")):
-            self.assertEqual(accounts.setup(label), [])
-            _ = (self.root / note_name(label)).write_text(f"---\nlogin: {login}\n---\n")
-            _ = (accounts.account_dir(label) / ".claude.json").write_text(
-                json.dumps({"oauthAccount": {"emailAddress": login}}), encoding="utf-8",
-            )
+            create_claude_account(label, login)
         self.set_claude_activity("claude3")
 
     def assignments(self) -> dict[str, str]:
@@ -490,7 +475,7 @@ class CodexRerunFixture(CodexZeroEpisodeFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = (self.root / "rerun-assignments.json").write_text(json.dumps({
-            "direct": "codex", "module_review": "codex", "cli": "claude", "ask_a_friend": "caller"}))
+            "direct": "codex", "design_roles": "codex", "cli": "claude", "ask_a_friend": "caller"}))
         _ = self.enterContext(mock.patch.object(quota_alert, "registry_assignments", side_effect=self.read_assignments))
         _ = self.enterContext(mock.patch.object(quota_alert, "edit_registry", side_effect=self.edit_assignments))
         _ = self.enterContext(mock.patch.object(accounts, "check_codex_target", return_value=

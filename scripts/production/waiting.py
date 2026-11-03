@@ -16,12 +16,14 @@ from typing import Callable, NamedTuple, TypeVar, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.process_failure import failure_detail
 
 import unit_lookup
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
 from production_units import Production, read_production
-from production_units import Refusal, cell_value, live_unit_table, retired_units
+from production_units import Refusal, cell_value
+from unit_lookup import live_unit_table, retired_units
 from merge_checkpoint import MergeEntry, NoMerge, Stop, git, merge_branch_history, report as merge_report
 
 JsonMap = dict[str, object]
@@ -184,7 +186,7 @@ def run_command(step: str, argv: list[str], cwd: Path | None = None) -> subproce
 
 
 def detail(result: subprocess.CompletedProcess[str]) -> str:
-    return result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+    return failure_detail(result)
 
 
 def read_state(path: Path) -> JsonMap:

@@ -13,8 +13,13 @@ from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
+
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import live_units
-import showrunners
+from scripts.production import showrunners
 import unit_lookup
 from herdr import HerdrPlace
 import units_table

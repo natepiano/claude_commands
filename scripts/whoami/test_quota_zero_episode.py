@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import write_registry
-
+import sys
 import io
 import json
 import os
@@ -14,12 +13,15 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.test_agents_registry import write_registry
+
 from scripts.whoami import quota_alert_test_support as support
 import quota_alert
 from push_texts import RenderedPush, render
 from scripts.whoami import agent_accounts
-from agent_accounts import ClaudeAccountsInUse, Quota
-import usage_store
+from scripts.whoami.agent_accounts import ClaudeAccountsInUse, Quota
+from scripts.whoami import usage_store
 from scripts.accounts import accounts, moves, next_moves, refusals, role_map
 from user_action import ActionRequired
 
@@ -686,7 +688,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
             _ = self.alert(spare_left=0)
             fallback.assert_called_once()
             self.assertEqual(quota_alert.registry_assignments()["direct"], "claude")
-            self.assertEqual(quota_alert.registry_assignments()["module_review"], "claude")
+            self.assertEqual(quota_alert.registry_assignments()["design_roles"], "claude")
             for minute in (2, 30):
                 _ = self.alert(self.now + timedelta(minutes=minute), spare_left=0)
             fallback.assert_called_once()
@@ -695,7 +697,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         routed = [entry for entry in moves.read_journal() if entry["kind"] == "routed to claude"]
         self.assertEqual(len(routed), 1)
         self.assertEqual(routed[0]["cause"], "credits off")
-        self.assertEqual(set(routed[0]["moved"]), {"direct", "module_review"})
+        self.assertEqual(set(routed[0]["moved"]), {"direct", "design_roles"})
         push = self.zero_pushes()[-1]
         self.assertIn("Claude", push.body)
         self.assertIn("codex1", push.body)

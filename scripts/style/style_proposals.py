@@ -39,6 +39,7 @@ from proposal_issue import (GOAL, INHERITED_FIELDS, STAR, ApprovedDecision, Decl
                             UnansweredDecision, approve_unanswered, decision_answer, fill_ranking, refresh_decision, require_generated_body)
 from unit_files import file_text, git, unit_file_holders
 from unit_plans import PilotScope, crate_in_scope, family_pilot_scopes
+from process_failure import failure_detail
 from user_zone import user_zone
 
 
@@ -48,14 +49,14 @@ def proposal_command(*arguments: str) -> None:
         capture_output=True, text=True, check=False,
     )
     if result.returncode:
-        raise style_ledger.LedgerError(result.stderr.strip() or result.stdout.strip())
+        raise style_ledger.LedgerError(failure_detail(result))
 
 
 def renumber() -> None:
     result = subprocess.run([sys.executable, str(SCRIPTS / "prioritize/renumber.py"), "--apply"],
                             capture_output=True, text=True, check=False)
     if result.returncode:
-        raise style_ledger.LedgerError(result.stderr.strip() or result.stdout.strip())
+        raise style_ledger.LedgerError(failure_detail(result))
 
 
 def is_decision(issue: Issue) -> bool:
@@ -162,6 +163,8 @@ def issue_project(repo: Path, crate: str, vault: Path) -> IssueProject:
 class DecisionKey:
     rule: str
     crate: str
+    # Decisions retain their historical text. A new blob gets a new decision and fresh rule-policy approval;
+    # a human answer to the older text never silently approves the replacement.
     blob: str
 
 
@@ -569,8 +572,9 @@ _DEFAULT_PROPOSAL_READS = DefaultProposalReads()
 
 
 def judged_at_current_file(ledger: style_ledger.Ledger, finding: style_ledger.HeldFinding, tip: str) -> bool:
-    """Whether the shared declaration evidence retains this finding's source site."""
-    return isinstance(ledger.finding_site(finding, tip), style_ledger.UnchangedSite)
+    """Whether the shared evidence permits filing, including existing untracked findings."""
+    return isinstance(ledger.finding_site(finding, tip),
+                      (style_ledger.UnchangedSite, style_ledger.FilingEligibleWithoutHistory))
 
 
 def print_finding_waits(issue: Path, waits: Mapping[tuple[str, str], int]) -> None:
@@ -613,7 +617,8 @@ def ranked_work(ledger: style_ledger.Ledger, cells: Iterable[style_ledger.Cell],
             family = families.get(finding.rule.removesuffix("#uncovered"))
             if family is not None and counts(family, crate_for(directories, finding.path)) and (
                     isinstance(finding.state, style_ledger.Filed)
-                    or isinstance(evidence[finding.finding_id], style_ledger.UnchangedSite)):
+                    or isinstance(evidence[finding.finding_id],
+                                  (style_ledger.UnchangedSite, style_ledger.FilingEligibleWithoutHistory))):
                 work[finding.path].add(family)
     return RankedWork({path: frozenset(present) for path, present in work.items()})
 
@@ -829,12 +834,12 @@ class MovedSites:
             text = finding.text.strip()
             if len(text.splitlines()) != 1 or any(text in line for line in self.lines_at(self.tip, finding.path)):
                 continue
-            judged = self.ledger.judged_commit(finding)
-            if isinstance(judged, style_ledger.NoJudgedCommit):
+            anchor = self.ledger.finding_anchor(finding)
+            if isinstance(anchor, style_ledger.NeedsJudgment):
                 continue
-            gained = [path for path in self.changed_since(judged.commit)
+            gained = [path for path in self.changed_since(anchor.commit)
                       if path != finding.path and text in self.lines_at(self.tip, path)
-                      and text not in self.lines_at(judged.commit, path)]
+                      and text not in self.lines_at(anchor.commit, path)]
             if len(gained) == 1:
                 moved[finding.finding_id] = gained[0]
         return moved
@@ -876,7 +881,7 @@ def close_finished_decision(ledger: style_ledger.Ledger, issue: Path) -> bool:
     if not findings or left_to_build(findings):
         return False
     tickets = sorted(ticket["id"] for ticket in ledger.proposal_tickets()
-                     if ticket["state"] == "merged" and Path(ticket["proposal"]) == issue)
+                     if ticket["state"] == "merged" and issue in ledger.ticket_proposals(ticket["id"]))
     if tickets:
         reason = BUILT_REASON + ", ".join(tickets)
     else:
@@ -1032,7 +1037,7 @@ def plan_moves(ledger: style_ledger.Ledger, proposals: Path, issues: list[Issue]
     all_findings = {finding.finding_id: finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
     open_tickets = tuple(ticket for ticket in ledger.proposal_tickets()
                          if ticket["state"] not in style_ledger.FINAL_TICKET_STATES)
-    holding = {Path(ticket["proposal"]): ticket for ticket in open_tickets}
+    holding = {issue: ticket for ticket in open_tickets for issue in ledger.ticket_proposals(ticket["id"])}
     open_ids = {ticket["id"] for ticket in open_tickets}
     refile: Mapping[str, style_ledger.PersonReading] = scope.refilings if isinstance(scope, FileBuiltAgain) else {}
     directories = workspace_directories(ledger)
@@ -1328,7 +1333,8 @@ def file_unapplied_again(ledger: style_ledger.Ledger, issue: Path, parent: str, 
     Every refusal comes before the first write.
     """
     building = [ticket["id"] for ticket in ledger.proposal_tickets()
-                if Path(ticket["proposal"]) == issue and ticket["state"] not in style_ledger.FINAL_TICKET_STATES]
+                if ticket["state"] not in style_ledger.FINAL_TICKET_STATES
+                and issue in ledger.ticket_proposals(ticket["id"])]
     if building:
         raise style_ledger.LedgerError(f"{issue}: open ticket {building[0]} builds it")
     commit = ledger.synced_commit()
@@ -1472,7 +1478,7 @@ def plan_withdrawal(ledger: style_ledger.Ledger, pending: Mapping[str, tuple[Pat
     issues = {issue for issue, _ in pending.values()}
     issues.update(finding.state.proposal for finding in ledger.held_findings(style_ledger.HeldFindingsInState("withdrawn"))
                   if isinstance(finding.state, style_ledger.Withdrawn) and isinstance(finding.state.proposal, Path)
-                  and isinstance(finding.state.by, (style_ledger.ExceptionVerdict, style_ledger.DeclarationGone)))
+                  and isinstance(finding.state.by, (style_ledger.ExceptionVerdict, style_ledger.DeclarationGone, style_ledger.RuleBodyChanged)))
     closes: list[EmptiedDecisionClose] = []
     refreshes: list[Path] = []
     for issue in sorted(issues):
@@ -1548,14 +1554,15 @@ def drop_duplicates(ledger: style_ledger.Ledger, *, dry_run: bool) -> tuple[Path
     return tuple(skipped)
 
 
-def superseded_line(finding: style_ledger.HeldFinding, verdict: style_ledger.SupersedingJudgment) -> str:
+def superseded_line(finding: style_ledger.HeldFinding, verdict: style_ledger.SupersedingJudgment | style_ledger.RuleBodyChanged) -> str:
+    if isinstance(verdict, style_ledger.RuleBodyChanged):
+        return f"{finding.finding_id} {finding.rule} {finding.path}:{finding.line}: {style_ledger.withdrawn_line(verdict)}"
     return (f"{finding.finding_id} {finding.rule} {finding.path}:{finding.line}: "
             + f"judgment {verdict.judgment_id} {verdict.verdict} under {verdict.rule_blob[:8]}")
 
 
 def run_withdrawal(writer: DecisionWriter, *, dry_run: bool) -> tuple[Path, ...]:
-    """Withdraw each filed finding that an exception under its rule's newer text supersedes, and each unfiled
-    finding whose cell that text judged again, then close or refresh the decisions of the filed ones.
+    """Apply the ledger's rule-body and newer-judgment withdrawal policy, then close or refresh filed decisions.
 
     Print one line per withdrawn and kept finding and per closed decision, then the totals. A dry run prints the
     same lines and writes nothing. A refresh keeps the parent that the decision names. A decision that cannot
@@ -1564,7 +1571,9 @@ def run_withdrawal(writer: DecisionWriter, *, dry_run: bool) -> tuple[Path, ...]
     ledger = writer.ledger
     withdrawal = (ledger.superseded_findings(writer.definitions) if dry_run
                   else ledger.withdraw_superseded(writer.definitions))
-    plan = plan_withdrawal(ledger, {item.finding.finding_id: (item.finding.state.proposal, style_ledger.ExceptionVerdict(item.verdict.judgment_id))
+    plan = plan_withdrawal(ledger, {item.finding.finding_id: (item.finding.state.proposal,
+                   item.verdict if isinstance(item.verdict, style_ledger.RuleBodyChanged)
+                   else style_ledger.ExceptionVerdict(item.verdict.judgment_id))
                                     for item in withdrawal.withdrawn if isinstance(item.finding.state, style_ledger.Filed)})
     for item in withdrawal.withdrawn:
         print(f"withdraw {superseded_line(item.finding, item.verdict)}")
@@ -1634,6 +1643,8 @@ def follow_line(outcome: DeclarationChange, tip: str) -> str:
                 return f"follow {site} -> {path}:{line}: unchanged source site"
             case style_ledger.NeedsJudgment(reason):
                 return f"left {site}: needs judgment: {reason}"
+            case style_ledger.FilingEligibleWithoutHistory():
+                return f"left {site}: eligible for filing without source history"
     suffix = (style_ledger.outside_evidence_suffix(outcome.evidence)
               if isinstance(outcome, (style_ledger.DeclarationRemoved, style_ledger.DeclarationGoneFromFile,
                                       style_ledger.DeclaredInSeveralFiles, style_ledger.DeclaredInAnotherCrate))
@@ -1697,7 +1708,7 @@ def run_follow(writer: DecisionWriter, findings: Iterable[style_ledger.HeldFindi
     skipped: list[Path] = []
     for issue in sorted({outcome.finding.state.proposal for outcome in planned.outcomes
                          if (isinstance(outcome, (style_ledger.DeclarationMoved, style_ledger.DeclarationRemoved))
-                             or isinstance(outcome, style_ledger.FindingSite) and not isinstance(outcome.evidence, style_ledger.NeedsJudgment))
+                             or isinstance(outcome, style_ledger.FindingSite) and isinstance(outcome.evidence, style_ledger.UnchangedSite))
                          and isinstance(outcome.finding.state, style_ledger.Filed)}):
         if not open_decision(issue):
             continue

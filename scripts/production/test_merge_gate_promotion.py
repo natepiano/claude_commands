@@ -15,32 +15,65 @@ from typing import final
 from contextlib import redirect_stdout
 from unittest import mock
 from scripts.production import merge_gate
-from scripts.production.merge_gate_test_support import MergeGateFixture, TEST_HANG_GUARD_SECS, wait_for_file
+from scripts.production.merge_gate_test_support import MergeGateFixture, wait_for_file
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
 class MergeGatePromotionTests(MergeGateFixture):
     def test_mac_timeout_or_interruption_reports_that_main_was_already_promoted(self) -> None:
-        args = merge_gate.GateArguments(main_repo=str(self.main), merge_branch="integration", settings_blob=self.settings_blob,
+        args = merge_gate.GateArguments(main_repo=str(self.main), merge_branch="integration",
                                        ssh="fake-ssh", mac_repo="~/fixture", mac_host="fixture")
         for failure in (subprocess.TimeoutExpired("fake-ssh", 25), merge_gate.GateRefused("interrupted by SIGTERM"), KeyboardInterrupt()):
             with self.subTest(failure=type(failure).__name__), mock.patch.dict(os.environ, self.environment), mock.patch.object(merge_gate, "wait_for_release_lock"), mock.patch.object(
-                    merge_gate, "checked_git", side_effect=["main", "", self.base, self.base, self.settings_blob, "", "", self.base]) as checked, mock.patch.object(
+                    merge_gate, "checked_git", side_effect=["main", "", self.base, self.base, self.base, "", "", self.base]) as checked, mock.patch.object(
                     merge_gate, "git", return_value=subprocess.CompletedProcess([], 0, "", "")), mock.patch.object(
                     subprocess, "run", side_effect=failure):
                 with self.assertRaisesRegex(merge_gate.GateRefused, f"main promoted to {self.base}; Mac fast-forward failed"):
                     merge_gate.promote(args)
             self.assertIn(mock.call(self.main, "push", "origin", "main"), checked.call_args_list)
 
-    def test_settings_filter_rejects_changed_blob(self) -> None:
-        self.write(self.unit / "settings.json", '{"unexpected": true}\n')
-        self.checkpoint = self.commit(self.unit, "unapproved settings")
-        _ = self.git(self.unit, "push", "origin", "unit-phase")
-        result = self.run_gate()
+    def test_promotion_retries_its_recorded_fast_forward_after_push_failure(self) -> None:
+        args = self.publish_for_promotion()
+        checked = merge_gate.checked_git
+
+        def stop_at_push(repo: Path, *arguments: str) -> str:
+            if arguments == ("push", "origin", "main"):
+                raise merge_gate.GateRefused("injected push failure")
+            return checked(repo, *arguments)
+
+        with mock.patch.dict(os.environ, self.environment), mock.patch.object(
+                merge_gate, "checked_git", side_effect=stop_at_push):
+            with self.assertRaisesRegex(merge_gate.GateRefused, "injected push failure"):
+                merge_gate.promote(args)
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.checkpoint)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+        result = self.run_promote_only()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
+        self.assertEqual(len([call for call in self.calls() if call["tool"] == "ssh"]), 1)
+
+    def test_promotion_rejects_an_unrecorded_commit_with_the_same_tree(self) -> None:
+        args = self.publish_for_promotion()
+        checked = merge_gate.checked_git
+
+        def stop_at_push(repo: Path, *arguments: str) -> str:
+            if arguments == ("push", "origin", "main"):
+                raise KeyboardInterrupt()
+            return checked(repo, *arguments)
+
+        with mock.patch.dict(os.environ, self.environment), mock.patch.object(
+                merge_gate, "checked_git", side_effect=stop_at_push):
+            with self.assertRaises(KeyboardInterrupt):
+                merge_gate.promote(args)
+        _ = self.git(self.main, "commit", "--allow-empty", "-m", "unrelated local commit")
+        local = self.git(self.main, "rev-parse", "HEAD")
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD^{tree}"),
+                         self.git(self.main, "rev-parse", self.checkpoint + "^{tree}"))
+        result = self.run_promote_only()
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("settings", (result.stdout + result.stderr).lower())
-        self.assert_not_pushed()
-        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), local)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
 
     def test_promote_fast_forwards_scratch_main_and_checks_mac_result(self) -> None:
         result = self.run_gate("--promote")

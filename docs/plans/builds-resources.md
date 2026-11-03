@@ -22,7 +22,7 @@ Own what a build may use and when it starts: memory admission and the memory que
   - `scripts/hooks/test_brp_launch_gate.py` — `setUp` :53 takes `BUILDLOG_MEMINFO`, `BUILDLOG_MEMORY_PRESSURE` and `BUILDLOG_LIVE_MEMORY_TRIPWIRE` from `fake_memory_readings(self.root)` (:74). `test_low_memory_wait_leaves_old_release_record_unchanged` :159 writes its low value to the returned `meminfo` file.
   - `scripts/production/merge_gate.py` — `test_module_environment` :514 gives each test module a private `BUILDLOG_DIR` and the build-tool tripwires (`cargo`, `rustc`, `rustdoc`, `rustup`, `cargo-nextest` first on `PATH`, each appends its argv to `<root>/build-tool-calls.jsonl` and exits 99). `finish_gate_job` reads that file, appends `a test started real <tool>: <args>` to the output, and sets status 1 and `GateJobResult.tripwire_tripped`. The gate never reruns a tripped module alone. Not in any unit's Owns cell: natedev showrunner's file.
   - `scripts/production/affected_modules.py` — affected-only module selection follows import edges (natedev c495a0b2): a change to a test helper selects every module that imports it. There is no `SHARED_TEST_HELPERS` list. natedev showrunner's file.
-  - `scripts/production/test_merge_gate_suites.py` — tests of the gate's build-tool tripwire: `test_module_tool_calls_fail_even_when_its_tests_pass` :132 (asserts `a test started real <tool>: <args>` and no `Rerun alone:`), `test_module_can_put_its_own_build_tool_stub_first` :145. natedev 367da4f1 split `test_merge_gate.py` by subject into this module, `test_merge_gate_holds.py` and `test_merge_gate_ledger.py`. natedev showrunner's file.
+  - `scripts/production/test_merge_gate_suites_tripwires.py` — tests of the gate's build-tool tripwire: `test_module_tool_calls_fail_even_when_its_tests_pass` :22 (asserts `a test started real <tool>: <args>` and no `Rerun alone:`), `test_module_can_put_its_own_build_tool_stub_first` :35. Resource, admission, signal and `types` coverage live in `test_merge_gate_suites_resources.py`, `_admission.py`, `_signals.py` and `_types.py`. natedev 367da4f1 split `test_merge_gate.py` by subject into this module, `test_merge_gate_holds.py` and `test_merge_gate_ledger.py`. natedev showrunner's file.
   - Import idiom for a test helper: `from scripts.lib.nix_env_test_support import NixFixture` (`scripts/direct/test_verify_nix_shell.py` :13); the gate runs each module with the repo root as working directory.
 - **Survey (2026-10-29, `grep -c` per test module that names the gate, `invoke.sh`, `verify.sh` or the launch hook):**
   - Fake both readings: `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_build_queue.py`, `scripts/hooks/test_brp_launch_gate.py`, `scripts/build_hold/test_build_hold.py` (this unit, through `fake_memory_readings`); `scripts/direct/test_verify_mac_offload.py` and `test_verify_checks_fail_closed.py` (through `verify_mac_offload_test_support.py` :682), `test_verify_lint_scope.py` (`verify_lint_scope_test_support.py` :244), `test_verify_token_wait.py` (`verify_token_wait_test_support.py` :156), `test_verify_untested_examples.py` (:190) (verify-unit).
@@ -33,7 +33,7 @@ Own what a build may use and when it starts: memory admission and the memory que
 - **Test lanes:** `test_*.py` beside each module.
 - **Build:** none (Python, shell and markdown).
 - **Test:** each changed module with `python3 -m unittest discover -s <dir> -p '<module>'` from the worktree root. Then the merge gate: `env HERDR_BIN=/nonexistent/herdr python3 ~/.claude/scripts/production/merge_gate.py --checkout <worktree> --tests-only`, run from `~/.claude` main after a merge of `origin/builds` (memory: merge origin before every gate). Check `build_hold.py status` first; no tests during a natedev build hold that this unit does not hold.
-- **Lint:** `basedpyright scripts/lint scripts/hooks scripts/build_hold scripts/production` from the worktree root, plus the directory of every other changed module; pass is its `0 errors, 0 warnings, 0 notes` line (exit status says nothing). `bash -n scripts/lint/memory_gate.sh`.
+- **Lint:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python <files>` from the worktree root. `<files>` is what the acceptance gate names; with no list, `scripts/lint scripts/hooks scripts/build_hold scripts/production` plus the directory of every other changed module. The interpreter is the merge gate's type-check venv (`merge_gate.py` `typecheck_python()` :574, pinned pillow and fake-bpy-module), so `bpy` and `PIL` resolve; a bare `basedpyright` reports false import errors. If the venv is absent, a merge gate run builds it. Every `basedpyright` line in an acceptance gate below means this form. Pass is its `0 errors, 0 warnings, 0 notes` line (exit status says nothing). `bash -n scripts/lint/memory_gate.sh`.
 - **Invariants:**
   - Admission and hold check errors stop the step; only an explicit admission answer starts it (`docs/as-built/build-memory-admission.md` → Invariants).
   - Outside a test the tripwire does nothing: it acts only when `BUILDLOG_LIVE_MEMORY_TRIPWIRE` is set, and no installed caller sets it. A live session's gate behaves as before, byte for byte in its output.
@@ -121,75 +121,38 @@ Own what a build may use and when it starts: memory admission and the memory que
 
 **Ruled out:** a first-builds column in `rebuilds`; the shared-folder sweep extension computes first builds from build-log records.
 
-### Phase 4 — Short-lived clones share one build folder per repository  · status: todo
-**Depends on:** Phase 3, Phase 9 (the sweep change this phase extends), and the case D numbers from verify-unit's Phase 1 trial (the user approved verify-unit's copy plan on 2026-10-29; case D runs under verify's build hold after 00:00 EDT). The adopt rule picks this phase or drops it.
+### Phase 4 — Short-lived clones share one build folder per repository  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** a new temp clone of a Rust repository reuses the build output of earlier clones of the same repository, if a measured trial shows that this saves work without making builds wait. Approved by the showrunner 2026-10-29 (W2). Measurement: mktemp folders (91.2 compile-h in 7 days, 4.6 steps per clone, 61.6 cold-h on first builds) and style-sync folders (10.9 h) rebuild everything on their first build.
-
-**Spec:**
-
-1. **Trial first.** (Showrunner, 2026-10-29: if the user approves verify-unit's copies plan, this trial runs as case D of verify's Phase 1, in the same build-hold session, so its numbers compare with the seeding cases. The build work in items 3-5 waits on the pick that plan's rule makes from those numbers.) On hana, make two clones at one commit with `scratch.py new`. Build the first, then the second with a shared `CARGO_BUILD_BUILD_DIR` per repository. Record crates compiled and wall time for each. Then run two builds at once on the shared build folder and record the lock wait. Use `verify.sh build` for every build. `verify.sh` serializes calls that share a unit board, so start the two parallel builds from two separate session folders, and record each Cargo start and end time: the phase report shows that the two Cargo runs overlap. Report the build-folder lock wait (Cargo's `Blocking waiting for file lock` time) apart from the admission wait and the board wait.
-2. **Adopt rule.** Adopt only when the second build compiles under half the crates of the first, and the parallel lock wait is under 10% of build time. Otherwise the phase records the numbers in the plan, changes no code, and stops.
-3. **If adopted:**
-   - `scripts/lib/scratch.py`: `new()` (:182) makes a task-owned folder today; it does not clone and takes no repository. Add an explicit clone operation (repository, commit, destination) that sets the shared build folder for that repository. Name the exact command in the as-built.
-   - `scripts/hooks/pre-tool-use-scratch-guard.py` steers a hand clone of a Rust repository into `/tmp` or a scratchpad to that clone operation.
-   - `scripts/style/style_sync.py` already shares one `style-sync-target` per repository (:332) and serializes checkout creation through cleanup. Change only what the shared-folder lifetime needs, and keep its lock.
-   - **Shared-target identity.** One mapping from repository to its shared folder. The folder has one use stamp for all its clones, a lifetime that does not end with one scratch task, and Cargo's build-folder lock. `rebuild_causes()` today finds a workspace by the target's parent path; give it the mapping, so a removal of the shared folder names the repository.
-   - The disk sweeps treat the shared build folder as one target with its own last use. `lock_trees()` (sweep.py :491) returns `TargetLocksAcquired | TargetLockBusy`, not `tuple[list[int], str | None]`.
-   - Deletions of the shared folder go through `reclaim()` and count only `ConfirmedDeletion` bytes (Phase 9). Artifacts that Cargo hard-links into a clone's own target folder free nothing while that clone is present; a test in `test_sweep.py` covers a shared folder whose artifacts are still linked from a clone.
-4. **Tests** for each changed module, in `scripts/lib/test_scratch.py`, `scripts/hooks/test_scratch_guard.py`, `scripts/style/test_style_sync.py` and `scripts/lint/test_sweep.py`: two clones on one target, a busy shared target, and rebuild attribution after its removal. The existing busy-skip and exhaustion tests stay as gates.
-5. **Docs.** The scratch as-built names the shared build folder and the guard's steer.
+- The per-repository shared Cargo build folder (`scratch.shared_build_folder`) was built here and removed by Phase 34: the builds showrunner reversed its 02:42 word on 2026-10-30, because the verify-copies measurement (case D) spent 68.7 of 69.0 s on the shared folder's build lock, so `copies.py` seeds each copy's own build folder. A copy record no longer writes `shared_target`; old records still load.
+- `scratch.mark_cargo_cache(target)` writes `CACHEDIR.TAG` and refreshes the one use stamp. `scratch.USE_STAMP`, `CACHE_TAG`, `STYLE_TARGET_NAME` and `STYLE_LOCK_NAME` are the only spellings of these names.
+- `style_sync.py` keeps its one `style-sync-target` per repository past task end and keeps its `sync.lock`.
+- The sweeps treat each target as one unit with its own last use. `sweep.lock_trees(trees) -> TargetLocksAcquired(held) | TargetLockBusy(path)` takes Cargo's locks and, for a style target, `sync.lock`, without a wait. The busy check expands Cargo `build.build-dir` templates (`{workspace-root}`, `{cargo-cache-home}`, `{workspace-path-hash}`); an unknown template keeps the whole Cargo cache busy.
+- `record.sweep_trim(folder: str, bytes_freed: int, extent: Literal["whole", "partial"], cause: Literal["budget take", "floor take"], at: float) -> None` appends one `kind` `"sweep_trim"` build-log row (`host`, `at`, `folder`, `bytes_freed`, `extent`, `cause`). `sweep.record_sweep_removal` is its one call site; the budget take and the floor take call it once per target take. `bytes_freed` counts only `ConfirmedDeletion` bytes. `extent` is `whole` when the take leaves no build unit or incremental dir of the target. A dry run writes no row. A failed write prints to stderr and the sweep goes on.
+- Each take is write-ahead: a `TrimTake` intent under the floor record's `trims/` folder lasts until its row is in the build log, and `recover_pending_trims` publishes a stopped take on the next run.
+- `rebuilds` reads trims from `sweep_trim` rows through the same build-log read as its steps, and merges them with the journal and legacy `removals.jsonl` rows. Nothing writes `removals.jsonl`.
+- Rebuild attribution still keys steps by workspace. The shared-folder attribution through the build step row's `target_dir` and `repo_identity`, and `repo_identity` on the trim row, do not exist yet.
 
 **Files:**
-- `scripts/lib/scratch.py` — item 3.
-- `scripts/lib/test_scratch.py` — item 4.
-- `scripts/hooks/pre-tool-use-scratch-guard.py` — item 3.
-- `scripts/hooks/test_scratch_guard.py` — item 4.
-- `scripts/style/style_sync.py` — item 3 (owner natedev style-unit; trial-merge against `origin/natedev`).
-- `scripts/lint/sweep.py` — item 3, the shared folder as one target.
-- `scripts/lint/test_sweep.py`, `scripts/style/test_style_sync.py` — item 4.
+- `scripts/lib/scratch.py` — `mark_cargo_cache` and the shared cache names (the shared folder mapping was removed by Phase 34).
+- `scripts/style/style_sync.py` — the retained shared style target.
+- `scripts/lint/sweep.py` — one-target sweep, `lock_trees`, Cargo build-dir templates, `TrimTake`, `recover_pending_trims`, `record_sweep_removal`, the `rebuilds` trim reader.
+- `scripts/buildlog/record.py` — `sweep_trim`.
+- `docs/as-built/build-targets.md` — the trim row (the shared folder text was removed by Phase 34).
+- `scripts/lib/test_scratch.py`, `scripts/style/test_style_sync.py`, `scripts/lint/test_sweep.py` — tests.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — the trial (item 1), the adopt decision record, items 3 and 5.
-- `test` — item 4, after the adopt decision: `test_scratch.py`, `test_scratch_guard.py`, `test_style_sync.py`, `test_sweep.py`.
+**Binds later work:** the `sweep_trim` row has no `repo_identity` until the step-row attribution reader lands. Trim recovery accounting extends `TrimTake.log_offset`, `recover_pending_trims` and `store.read_last_whole_row_end` / `store.last_whole_row_end`; a stop between `reclaim` and the row append, and a cut-short row, are not yet covered.
 
-**Acceptance gate:**
-- The trial numbers (crates compiled, wall time, lock wait) are in the phase report with the adopt decision.
-- If adopted: the tests of each changed module pass; `basedpyright` over each changed file reports `0 errors, 0 warnings, 0 notes`. Post-merge check, 24 h after the merge reaches main (as in Phase 12's ruling): the first-build cold-h of mktemp and scratch.py folders, next to the 7-day figures. `rebuilds` does not separate first builds (a workspace's first step has cause `none`), so compute it from the build-log records: the first recorded step of each new workspace folder. The removal records in `rebuilds` name the shared folder's repository. The phase report records when the check is due; the result goes in a follow-up notice.
-- The notice has an `also touches scripts/style/style_sync.py (owner natedev style-unit)` line, tested against `origin/natedev`.
-- Change-Review line: a new temp clone of hana builds only the crates that changed | in any Claude session on natedev, make two clones of hana at one commit with the scratch.py clone command that Spec 3 adds (its exact form is in the scratch as-built) and build each with `verify.sh build` | the second clone's build log step compiles under half the crates of the first.
+**Gotchas:**
+- `ConfirmedDeletion.removed` counts removals apart from bytes: a delete of a hard-linked file frees 0 bytes but is still a trim.
+- `{workspace-path-hash}` follows Cargo's own hash; a golden test pins it.
+- `target_dirs` must include the retained style target under `.git`, and the floor must not take it while `sync.lock` is held.
 
-### Phase 5 — Clone builds turn incremental mode off, and mend uses the compile cache  · status: todo
-**Depends on:** Phase 3; Phase 12 (`invoke.sh`).
+**Ruled out:** a second build-log appender for trims; a journal change for failed groups.
 
-#### Work Order
-
-**Goal:** builds in temp clones store their workspace crates in sccache, and mend uses sccache, if a measured trial shows hits. Approved by the showrunner 2026-10-29 (W3). Measurement: workspace crates build with `-C incremental`, so sccache never caches them; mend runs with `RUSTC_WRAPPER=` (`scripts/lint/invoke.sh:582`), 31.6 cold-h in `/tmp` this week; sccache is full at 64 of 64 GiB.
-
-**Spec:**
-
-1. **Trial first.** Two hana clones at one commit. Build both with `CARGO_INCREMENTAL=0` and record sccache hits for workspace crates on the second (stats before and after). invoke.sh :578-579 says a cache hit suppresses the rustc diagnostics that mend reads. Test that claim: run mend twice with sccache in a clone, and compare the findings of the cached second run with a run that has `RUSTC_WRAPPER=`.
-2. **Adopt rule.** Adopt each change only on a measured gain: workspace-crate hits on the second clone, or a shorter mend run with the same mend findings. The baseline is dated after Phase 3 (`e3b8e391`), so a sweep gain is not counted as a cache gain. The trial is case E in verify-unit's build hold (showrunner, 2026-10-29).
-3. **If adopted:** `scripts/direct/verify.sh` sets `CARGO_INCREMENTAL=0` for builds in a temp clone (not in `~/rust` worktrees, where incremental helps); `scripts/lint/invoke.sh` runs mend with sccache.
-4. **sccache size and disk room.** Report the full cache and the disk numbers to natedev, which decides the cache size and the disk room as root.
-5. **Tests** in the new `scripts/direct/test_verify_clone_incremental.py` for the `verify.sh` lines, and in `scripts/lint/test_invoke_scope.py` (owner verify-unit) for the `invoke.sh` lines.
-
-**Files:**
-- `scripts/direct/verify.sh` — item 3 (owner verify-unit; trial-merge against `origin/natedev-verify` and `origin/natedev`).
-- `scripts/lint/invoke.sh` — item 3 (owner verify-unit; same trial merges).
-- `scripts/direct/test_verify_clone_incremental.py` — new — item 5, the tests for the changed `verify.sh` lines (a new module, so verify-unit's own test modules stay untouched).
-- `scripts/lint/test_invoke_scope.py` — item 5, the tests for the changed `invoke.sh` lines (owner verify-unit).
-
-**Workers:** `1 writer + 1 tester`
-- `impl` — the trial, the adopt decision record, item 3, the item 4 message text for the director.
-- `test` — item 5, after the adopt decision.
-
-**Acceptance gate:**
-- The trial numbers are in the phase report with each adopt decision.
-- If adopted: the changed modules' tests pass; `basedpyright` over every changed Python file reports `0 errors, 0 warnings, 0 notes`; the notice has `also touches` lines for verify.sh and invoke.sh (owner verify-unit), tested against `origin/natedev-verify` and `origin/natedev`.
-- Change-Review line: temp-clone builds and mend runs reuse the compile cache | in a terminal on natedev, `sccache --show-stats` before and after a second clone's build | the Rust hit count rises by the workspace crates of the second build.
+### Phase 5 — Clone builds turn incremental mode off, and mend uses the compile cache  · status: dropped
+**Dropped:** builds showrunner 2026-10-30, on case E of verify-unit's copies trial (hana `c421a1a6`, verify's build hold 2026-10-30). Clone builds with `CARGO_INCREMENTAL=0` got 0 sccache hits on workspace crates, so incremental off buys nothing. mend with sccache ran 132.4 s against 115.4 s without, so mend keeps `RUSTC_WRAPPER=`. Neither adopt rule held; `verify.sh` and `invoke.sh` keep their current lines. Log: `/tmp/claude/unit/bf5b8d4c-77ff-4f7b-9318-afb6114ad8f2/copies/results/case_e.log`.
 
 ### Phase 6 — The BRP launch gate keeps waiting for every launch; the bypass moves to Phase 13  · status: done
 
@@ -210,7 +173,7 @@ Own what a build may use and when it starts: memory admission and the memory que
 
 - `scripts/build_targets/working_set.py` prints memory by category from `/proc`: cargo/rustc, Claude sessions, Codex, Python helpers and other. The Python row breaks down by script path and names the owning unit. Each row gives PSS, swap and its top three processes. The machine totals are total, available and swap used. The script writes nothing. A process that is unreadable or that exited is counted on its own line.
 - Owner rules come from `scripts/build_targets/working_set_owners.json`, generated from the production docs' Owns cells (73 rules, 13 units at checkpoint; 69 rules, 12 units since the retired enh-showrunner rows dropped out). `load_owners` validates the file; a bad file exits 1 and names the file. The rules are not in the script, because the push-text gate read an owner tuple that named `pushover.py` as a phone send.
-- Argv parsing finds the entry point past interpreter options, Node runtime options included. `node --redirect-warnings` is a known gap (follow-up add-on).
+- Argv parsing finds the entry point past interpreter options, Node runtime options included. Phase 28 closed the `node --redirect-warnings` gap: space-form value options skip their value.
 - `scripts/lint/tmp_sweep.py` streams its scan. The process-use boundary returns `ProcessUsesKnown | ProcessUsesUnavailable`. `scripts/lint/folder_audit.py` uses the same types.
 - Measured on natedev 2026-10-29: `working_set.py` ran in 1.25 s, and its available and swap totals matched `free -m`. `tmp_sweep.py --dry-run` over the live `/tmp` peaked at 36 MB (was 1.3–3.9 GB).
 - The `working-set` PATH wrapper is natedev's change in `/etc/nixos/modules/common/agents.nix`, after this reaches main.
@@ -227,7 +190,7 @@ Own what a build may use and when it starts: memory admission and the memory que
 **Binds later work:** A new script whose owner must show in the table needs an Owns entry in its production doc. Regenerate `working_set_owners.json` from the production docs after an Owns cell changes.
 
 ### Phase 8 — Shared build state is written only by the installed copy  · status: todo
-**Depends on:** Phase 2; Phase 5 (`verify.sh`, `invoke.sh`); Phases 10, 12 and 11 (`memory_admit.py`, its tests and doc); report-unit's bare-step writer in `waiter_identity` (merged at HEAD 64a94048)
+**Depends on:** Phase 2; Phases 10, 12 and 11 (`memory_admit.py`, its tests and doc); report-unit's bare-step writer in `waiter_identity` (merged at HEAD 64a94048)
 
 **Approved:** showrunner 2026-10-29, after Phase 2. report-unit keeps its bare-step writer (it fixes the cause in main) and drops only its read-side strip; this phase builds the repository field on report-unit's merge. The edit to `builds-production.md:14` is approved.
 
@@ -243,20 +206,31 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 
 **Spec:**
 
-1. **The writers refuse a checkout copy.** `memory_admit.py` and `build_hold.py` refuse to write the real state directories (`~/.local/state/buildlog/admission`, the real hold dir) when their own file is not the installed copy under `~/.claude/scripts/`. With a fake `BUILDLOG_DIR` / `BUILD_HOLD_DIR` (every test), they write as now. The refusal names the installed path to run instead. This one guard is the fix at the cause; items 2–4 make every caller pass it.
-2. **Queue rows carry separate fields.** report-unit's merged writer already gives `.waiting` rows a bare `step`; this phase adds the `repository` field beside it, as `.reservation` rows carry `repo`. The queue view's reader takes the fields; no prefix strip exists anywhere. `build_queue.py` shows the repository beside the step for waiting and running rows alike (report-unit's file; its one display change only).
+1. **The writers refuse a checkout copy.** `memory_admit.py` and `build_hold.py` refuse to write the real state directories (`~/.local/state/buildlog/admission`, the real hold dir `~/.local/state/build-hold`, the real release dir `~/.local/state/build-hold-release`) when their own file is not the installed copy under `~/.claude/scripts/`. With a fake `BUILDLOG_DIR` / `BUILD_HOLD_DIR` / `BUILD_HOLD_RELEASE_DIR` (every test), they write as now. The refusal names the installed path to run instead. This one guard is the fix at the cause; items 2–4 make every caller pass it.
+   - **One place.** Extend the existing guard, `scripts/build_hold/override_guard.py` (`refusal()` :63, `refuse_overrides()` :89, the account-database home `user_home()` :28, and Phase 36's `is_installed_file()` :42, which the new function reuses for its installed-copy test). Add one function there that takes the calling script, its installed relative path and the directory about to change, and returns allowed or a refusal line. Write no second home lookup or installed-path check anywhere.
+   - **Refuse before any change, imported calls included.** A CLI-only check misses two boundaries: Phase 16's merge gate calls `memory_admit.check` in its own process, and `recorded_releases()` (`build_hold.py` :1184) changes state during a lookup, before `release_cycle` runs. So call the guard where every change passes: `memory_admit.admission_dir()` (:2323; `check`, `admit_head`, `priority_set`, `priority_clear`, `token_wait`, `release`, `set_width` and `cancel_waiter` all get their directory from it), and `build_hold.release_lock()` (:939; every holder-file write, release-record write and receipt move runs under it, `write_hold` and `release_hold` included), which checks the holder dir and the release dir. Read-only paths (`queue_view`, which reads `store.root() / "admission"` directly, and `status`) change nothing and stay allowed. The guard raises one typed error; the CLIs turn it into exit 2 with the named reason, and an imported caller gets the error (the merge gate stops on it, Phase 16 Spec 4).
+   - **Imported recovery goes through the lock.** `recorded_releases()` (:1184) only calls `release_records_for_change()` (:1188), and that function does not take `release_lock()` itself. It moves old receipts (`complete_release_record` :1112) and sets damaged pending intents aside (`set_aside_damaged_record` :1027). Today its callers hold the lock (`recorded_release_holder` :1220, `release_cycle` :1496), but an imported call does not have to, so a lock-only guard misses it. Make the lock the one mutation boundary: `release_lock()` runs the guard, then yields a typed `ReleaseLockHeld` value. Every helper that changes release state takes that value as a parameter: `release_records_for_change`, `complete_release_record`, `set_aside_damaged_record`, `read_cycle_for_change` (:1039), `save_cycle` (:1057) and `finish_recorded_notices` (:1274). `recorded_releases()` takes it too, or goes, because its callers already hold the lock. No helper takes the flock again: a second `flock` on `release.lock` from the same process blocks.
+   - **The admission lock binds the directory it changes.** `release` (:3709) takes its lock directory from `root` but reads and finalizes the given `path`, and `finalize_reservation` (:3656) writes history under `path.parent`, so a guard on `root` alone does not prove the write is private. One guarded admission-lock context validates the actual mutation directory and yields an `AdmissionLockHeld` value bound to it. Reservation updates, finalization, recovery, override, queue priority, token-wait and queue-event writers require that value and validate their paths against it; they never take the lock again.
+   - Each directory is judged on its own: a fake `BUILD_HOLD_DIR` with the real release dir refuses at the release dir, and a real `BUILD_HOLD_DIR` with a fake release dir refuses at the holder dir.
+2. **Queue rows carry separate fields.** Waiters already carry `repository_name` (`Waiter` :440, written by `check` :2855) beside `repo_identity` and a bare `step`. Reuse the waiter's existing `repository_name` and bare `step`, and expose the reservation's existing `repo` through the same queue-reader model. Do not add a parallel `repository` field to a row or reconstruct a combined label; no prefix strip exists anywhere.
+   - **The model.** The queue-reader steps carry `step` and `folder` but no repository: `WaitingStep` (`memory_admit.py` :957, built in `queue_read_from` :3246) and `RunningStep` (:969, built in `gather_queue_inputs` :3175). Add `repository_name` to both, from the waiter's `repository_name` and the reservation's `repo`. A waiter row from before that field shows `—`, as the view shows other missing names.
+   - **The display.** `/build:queue` renders through `scripts/build_queue/queue_view.py` and `scripts/build_queue/queue_card.py` (queue-unit's files); `build_queue.py` only parses arguments and calls them, and does not change. `queue_view.render_view` (:225) shows a Repository cell beside its Step cell, in the header and in each waiting row. `queue_card.render_card` (:33) names the repository and the step apart in a waiting card's title line (:44-45), and `render_selection` (:95) does the same in a running step's line (:107). This is the one display change.
 3. **Callers run the installed copy.**
    - `memory_gate.sh`: `BUILDLOG_MEM_ADMIT_SCRIPT="${BUILDLOG_MEM_ADMIT_SCRIPT:-$HOME/.claude/scripts/lint/memory_admit.py}"`. `invoke.sh:89` sources `$HOME/.claude/scripts/lint/memory_gate.sh`.
    - `verify.sh`: one root, `SCRIPTS="$HOME/.claude/scripts"`, for `override_guard.sh`, `local_release_wait.py`, `mesh_runs.py`, `mac_idle.py` and the `build_targets` fallback. Tests fake `HOME` with a copied tree already; the `VERIFY_*_SCRIPT` overrides stay.
    - `merge_gate.py` reads holds only and already runs from `~/.claude` main (Delegation Context, Test). No change. The notice records this.
    - `top_level.py`, `retire_unit.py`: the `build_hold.py` path from `Path.home() / ".claude"`.
 4. **The plan lines that teach a checkout run** (`docs/plans/builds-production.md:14`, `docs/plans/build-followups-worker-seats.md:48`) name `~/.claude/scripts/lib/py ~/.claude/scripts/production/merge_gate.py --checkout <tree>`.
-5. **Tests:** `scripts/build_hold/override_guard.py` already finds the real home through the account database and refuses fake state variables when the installed script runs. Keep that refusal. Routing tests copy scripts under a fake home; the checkout-write refusal is tested against an injected canonical-home and state fixture, never real coordination state. A checkout-copy `memory_admit.py` against the real-dir path refuses (exit 2, named reason) and against a fake dir writes; same for `build_hold.py`; a `.waiting` row has `repository` and a bare `step`; the queue view shows both; `verify.sh` and `memory_gate.sh` resolve to `$HOME/.claude/scripts` under a fake `HOME`. Fake memory readings throughout (Phase 1 helper).
+5. **Tests:** `scripts/build_hold/override_guard.py` already finds the real home through the account database and refuses fake state variables when the installed script runs. Keep that refusal. Routing tests copy scripts under a fake home; the checkout-write refusal is tested against an injected canonical-home and state fixture, never real coordination state. A checkout-copy `memory_admit.py` against the real-dir path refuses (exit 2, named reason) and against a fake dir writes; same for `build_hold.py`; a `.waiting` row has `repository_name` and a bare `step`, and no `repository` field; in `scripts/build_queue/test_queue_view.py` and `test_queue_card.py`, the view's waiting rows, a waiting card and a running step's line show the repository and the step in separate cells, and the `scripts/build_queue/golden/` view and card files change to match; a private root paired with a real-state reservation path, and direct imported mutation calls, refuse before any write; `verify.sh` and `memory_gate.sh` resolve to `$HOME/.claude/scripts` under a fake `HOME`. Guard tests in `scripts/build_hold/test_override_guard.py`: fake holder dir with the real release dir, and the real holder dir with a fake release dir, each refuse and leave every file in the real dir unchanged; an imported `memory_admit.check` call from a checkout copy against the real admission dir raises before it writes a file; from a checkout copy with a real release dir, the recovery read refuses before it moves an old receipt and before it sets a damaged pending intent aside (every file in the release dir unchanged); the installed copy still migrates the receipt and sets the damaged intent aside; `status` stays read-only and prints the same lines with and without the change; the installed script's existing override refusal tests in that module pass unchanged. Fake memory readings throughout (Phase 1 helper).
+
+**Constraints from prior phases:** Phase 22 added hold release state under `BUILD_HOLD_RELEASE_DIR`: `pending-release.json`, `releases/<id>/` and `receipts/<holder-key>/completed-release.json` (`docs/as-built/build-memory-admission.md`, Build hold). It is shared build state, so the installed copy is its only writer, as for the holder files and the cycle. Phase 16 makes the merge gate call `memory_admit.check` and `release` in its own process; the guard covers that call through `admission_dir()`. Phase 23's `status` reader of pending release records is read-only and takes no `release_lock()`, so the guard does not refuse it. Phase 23 also made release set damaged pending records aside and rebuild a damaged or missing cycle from the intent; those writes are the recovery that item 1 routes through `ReleaseLockHeld`. Phase 32 added `admit_head` (:742), which writes `admit-head.json` under `admission_dir()`. Phases 24, 26 and 20 add admission writers (the reservation finalizer; Phase 26's `queue_priority.json` from `priority_set` :559 and `priority_clear` :580, the `.token-wait` intent that `token_wait` (:2742) writes and `finish_token_wait` (:2725) ends, and `queue_times.jsonl` through `append_queue_time` (:2702); Phase 20's lifecycle events); each gets its directory from `admission_dir()`, and Phase 18's estimate cache (`admission/build_marks.json`, written while `check` estimates, before it reaches `admission_dir()`) is one more guarded write: an imported checkout refuses before the cache changes, and git work stays outside the admission lock. So the one guard covers them.
 
 **Files:**
 - `scripts/lint/memory_admit.py`, `scripts/lint/memory_gate.sh`, `scripts/lint/test_memory_admit.py` — items 1–2, 3, 5.
 - `scripts/build_hold/build_hold.py`, `scripts/build_hold/test_build_hold.py` — items 1, 5.
-- `scripts/build_queue/build_queue.py`, `scripts/build_queue/test_build_queue.py` — item 2 (owner report-unit).
+- `scripts/build_hold/override_guard.py`, `scripts/build_hold/test_override_guard.py` — item 1, the one guard function; item 5, the guard tests.
+- `scripts/build_queue/queue_view.py`, `scripts/build_queue/queue_card.py` — item 2, the display (owner queue-unit; trial-merge against `origin/builds-queue`). `build_queue.py` does not change.
+- `scripts/build_queue/test_queue_view.py`, `scripts/build_queue/test_queue_card.py`, `scripts/build_queue/golden/view_*.txt`, `scripts/build_queue/golden/card_*.txt` — item 5, the display tests and goldens (owner queue-unit).
 - `scripts/direct/verify.sh`, `scripts/lint/invoke.sh` — item 3 (owner verify-unit). The tester owns routing coverage in `scripts/direct/test_verify_checks_fail_closed.py`, `scripts/direct/test_verify_nix_shell.py`, `scripts/lint/test_invoke_scope.py`, `scripts/message/test_top_level.py` and `scripts/production/test_retire_unit.py`, plus the admission, hold and queue tests named above. Cover the installed paths and retained overrides under a fake HOME and private coordination state.
 - `scripts/production/merge_gate.py` — no change (item 3); the notice records why.
 - `scripts/message/top_level.py`, `scripts/production/retire_unit.py` — item 3 (owners per natedev's Owners table, named in the notice).
@@ -264,13 +238,14 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 - `docs/as-built/build-memory-admission.md` — the one-copy rule and the row fields.
 
 **Workers:** `1 writer + 1 tester`
-- `impl` — items 1–4 and the doc.
-- `test` — item 5.
+- `impl` — items 1–4 (`override_guard.py`, the guarded admission-lock context, and the queue model with `queue_view.py` and `queue_card.py` included) and the doc.
+- `test` — item 5 (`test_override_guard.py`, `test_queue_view.py`, `test_queue_card.py` and the goldens included).
 
 **Acceptance gate:**
 - The changed modules' tests pass; `basedpyright` over every changed Python file reports `0 errors, 0 warnings, 0 notes`.
-- Live, after install: every `.waiting` row in `~/.local/state/buildlog/admission` has `repository` and a bare `step` within one held poll; a run of a checkout copy's `memory_admit.py` against the real dir exits 2 with the named refusal.
-- The notice has `also touches` lines for verify.sh and invoke.sh (verify-unit, against `origin/natedev-verify` and `origin/natedev`), the hold callers (their owners, against `origin/natedev`), and build_queue.py (report-unit, against `origin/builds-report`); it confirms no read-side prefix strip remains in `memory_admit.py` or `build_queue.py`.
+- These existing tests stay green unchanged, because each one guards an outcome a user sees: `test_full_queue_holds_gate_until_the_running_charge_is_released` (:155) and `test_admission_error_refuses_before_any_module_starts` (:224) in `scripts/production/test_merge_gate_suites_admission.py`; in `scripts/build_hold/test_build_hold.py`, `test_status_reports_recovery_without_changing_damaged_record` (:941), `test_status_names_unsent_release_after_last_holder_is_gone` (:1479), `test_release_sets_aside_malformed_current_intent_with_no_holder` (:1537), `test_release_recovers_recipient_notices_from_a_damaged_referenced_cycle` (:1575) and `test_status_names_unreadable_pending_records_and_cycles_without_hiding_them` (:1656).
+- Live, after install: every `.waiting` row in `~/.local/state/buildlog/admission` has `repository_name` and a bare `step` within one held poll; a run of a checkout copy's `memory_admit.py` against the real dir exits 2 with the named refusal.
+- The notice has `also touches` lines for verify.sh and invoke.sh (verify-unit, against `origin/natedev-verify` and `origin/natedev`), the hold callers (their owners, against `origin/natedev`), and `queue_view.py`, `queue_card.py` with their tests and goldens (queue-unit, against `origin/builds-queue`); it confirms no read-side prefix strip remains in `memory_admit.py`, `queue_view.py` or `queue_card.py`.
 - Change-Review line: `/build:queue` shows the repository and the step in separate columns | in a Claude session on natedev while a build waits, type `/build:queue` | each row shows e.g. `hana` and `clippy` apart, and no row reads "hana clippy".
 
 ### Phase 9 — The floor sweep counts what a deletion really frees  · status: done
@@ -308,7 +283,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 **Gotchas:** Releasing a measured reservation frees only its resident bytes. Its swap bytes stay part of the build charge but do not count as freed RAM.
 
 ### Phase 11 — Memory admission promises what each repository's steps really use  · status: todo
-**Depends on:** Phase 10 and Phase 12 (same file, `memory_admit.py`); verify-unit's Phase 4 (branch `natedev-verify-memory`). Start after that merge reaches `origin/builds`, and merge `origin/builds` first.
+**Depends on:** Phase 10 and Phase 12 (same file, `memory_admit.py`); verify-unit's Phase 4 (branch `natedev-verify-memory`). Start after that merge reaches `origin/builds`, and merge `origin/builds` first. Global order: Phases 21, 16, 25, 30, 28, 4, 24 and 32 are checkpointed; serial memory chain 31 → 33 → 26 → 15/27 (queue-unit) → 39 → 20 → **11** → 17 → 18 → 19 → 8; 29 runs beside the chain, checkpoints after 33 (same file, `sweep.py`) and joins before 11. Phases 15 and 27 moved to queue-unit: start after queue-unit's checkpoints for them reach `origin/builds`, and merge it first. Phase 27's gate cap source and the removal of `gate_estimate` come from those checkpoints.
 
 **Approved:** showrunner 2026-10-29 (ETA 22:00 EDT, after Phase 12), from the widget wait study (07:09–11:43 EDT): a measured floor per repository for filtered test runs, and the promises that are 3x or more too high.
 
@@ -325,22 +300,29 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 
 1. Replay first: for every step in the 14-day history, compute the promise that today's `expected_peak` gives from the history before that step, and compare it to the step's measured anon peak. Report, per repository and step, the count of promises under half the measured peak and over 3x the measured peak. Fresh runs and compile runs (Spec 4's rule) are separate rows. Save the table in the as-built doc. The replay runs again on the result: neither count rises for any repository, and each count falls in total.
 2. `expected_peak` (`scripts/lint/memory_admit.py`): when a repository has 5 or more keyed rows, use only keyed rows; old unkeyed rows count only when keyed rows are fewer than 5.
-3. A repository with 1 to 4 own runs does not take the all-repository pool p90. Use the largest of its own runs, or the pool when that is lower. A repository with no own runs keeps today's rule.
-4. A promise does not mix compile runs and no-compile runs (showrunner 2026-10-29 17:11 EDT, from the user's rule). Spec 4 applies to every step. A history row is a compile run when its index step (anon rows: joined by `call_id` and step name to `steps.call_id` and `steps.step`; index rows: their own column) has `crates_compiled > 0`. A row with no match counts as neither. The step being admitted is a compile run unless verify Phase 4's `is_fresh_test` proves it fresh. A compile run's promise comes only from earlier compile runs; for a filtered run the order is the same as `filtered_peak` today: the exact filter set, then the package's filtered runs, then the check/build peaks. The 1 GiB floor stays only for fresh runs and for a repository with no compile history; do not raise the fresh floor. Fresh runs keep verify Phase 4's `fresh_test_peak` unchanged. `expected_peak()` returns `min(filtered, full)` today, so a compile-run promise above the full-run estimate would not hold: the compile-run promise wins over that minimum, and a test covers a promise above the full estimate; the replay includes that case (Phase 3 architect review, F11). Comment each new constant with the measurement that set it, as the current constants are.
-5. Tests in `scripts/lint/test_memory_admit.py`: keyed rows win over unkeyed rows; 1–4 own runs do not take the pool; a compile run's promise uses only compile runs; an anon row with no `call_id` and step match counts as neither; a fresh run keeps the `fresh_test_peak` promise; each test fakes both memory readings.
+3. A repository with 1 to 4 own runs does not take the all-repository pool p90. Use the largest of its own runs, or the pool when that is lower. A repository with no own runs keeps today's rule. This rule does not apply to `build` steps: Phase 24 Spec 3 owns their promise.
+4. A promise does not mix compile runs and no-compile runs (showrunner 2026-10-29 17:11 EDT, from the user's rule). Spec 4 applies to every step. A history row is a compile run when its index step has `crates_compiled > 0` (index rows: their own column). Anon rows get it through the one index join in `scripts/lint/build_shape.py`: `index_shapes(index_path, host, step, cutoff, before)` (:89, Phase 24) joins anon rows to `steps` by host, `call_id` and step name, with no repository argument, because `steps.repo` is the checkout folder; it drops rows without usable argv, which fits a shape lookup only. Widen the existing host/call-id/step join into one frozen step-evidence value whose shape and compile count have independent known/unknown states, and rename it to say what it returns. Missing argv must not erase a recorded compile count, and a stored shape must not bypass compile classification; keep the no-repository-argument contract and repository filtering at the history-row boundary. Open no second `steps` join and parse no argv outside `build_shape` (:59). A row with no match counts as neither. The step being admitted is a compile run unless verify Phase 4's `is_fresh_test` proves it fresh. A compile run's promise comes only from earlier compile runs; for a filtered run the order is the same as `filtered_peak` today: the exact filter set, then the package's filtered runs, then the check/build peaks. The 1 GiB floor stays only for fresh runs and for a repository with no compile history; do not raise the fresh floor. Fresh runs keep verify Phase 4's `fresh_test_peak` unchanged. `expected_peak()` returns `min(filtered, full)` today, so a compile-run promise above the full-run estimate would not hold: the compile-run promise wins over that minimum, and a test covers a promise above the full estimate; the replay includes that case (Phase 3 architect review, F11). Comment each new constant with the measurement that set it, as the current constants are.
+5. Tests in `scripts/lint/test_memory_admit.py`: keyed rows win over unkeyed rows; 1–4 own runs do not take the pool; a `build` step with 1–4 same-shape rows keeps Phase 24's same-shape promise, not Spec 3's lower pool; a compile run's promise uses only compile runs; an anon row with no `call_id` and step match counts as neither; a fresh run keeps the `fresh_test_peak` promise; a `merge-gate` row with no index match stays in `anon_peaks.jsonl` and goes into no Cargo step's compile or no-compile history; each test fakes both memory readings. In `scripts/lint/test_build_shape.py`: the widened join returns known shape with known count, known count with unknown shape (no usable argv), known shape with unknown count, and the unmatched-row state. The existing `BuildShapePromiseTests` (same-shape promise and failed-peak floor) and the `need_basis` codec and rendering tests pass unchanged.
 6. Docs: `docs/as-built/build-memory-admission.md` gets the replay table before and after, and the new rules. The replay script lives in the session folder and is not committed.
 
-**Constraints from prior phases:** Phase 11 changes estimates (`need`) only. It keeps the running charge as Phase 12 built it: current memory, the ramp and unknown-peak promises, the observed peak with its `.wave` decay after 1500 s, the missing-`.wave` fallback to the `.max` mtime, the recovery start spacing, and the estimate-expiry checks after the lock.
+**Constraints from prior phases:**
+- Phase 33 (`5c9b01fd`): history rows are read only through `store.whole_rows(handle, start)` (`scripts/buildlog/store.py`); `anonymous_history_rows` (`memory_admit.py`) delegates its decoding to it. A row counts only when it ends in a newline; a cut-short, non-UTF-8 or non-object row is skipped. Add no second decode loop; keep the unfinished-JSON and split-UTF-8 consumer tests after any classification change.
+- Phase 12: Phase 11 changes estimates (`need`) only. It keeps the running charge as Phase 12 built it: current memory, the ramp and unknown-peak promises, the observed peak with its `.wave` decay after 1500 s, the missing-`.wave` fallback to the `.max` mtime, the recovery start spacing, and the estimate-expiry checks after the lock.
+- Phase 16: merge gates write `anon_peaks.jsonl` rows under step `merge-gate`, and those rows have no Cargo index step to join. Spec 4's "every step" classifier does not drop them as "neither": `merge-gate` rows stay a class of their own, and report-unit's merge-gate history rows stay written. Phase 27 sizes the gate row by its cap and removes `gate_estimate`, so no admission estimate reads `merge-gate` rows. The compile and no-compile split applies to Cargo steps only (Spec 5 tests it).
+- Phase 24: `scripts/lint/build_shape.py` holds the one argv parser (`build_shape`) and the one anon-to-index join (`index_shapes`); Spec 4 widens that join and adds no other. For `build` steps, `build_expected_peak` (`memory_admit.py` :1612) keeps Phase 24's same-shape tiers (p90 with 10 or more rows, the largest with 1 to 9), failed-peak floor, release factor 1.314 (`RELEASE_HEADROOM` :102), the dev rule Phase 39 adopted (it replaced `DEV_HEADROOM`'s single 4.2034275337646125 factor; keep the adopted rule, never restore the factor) and the cap at the configured build budget. The cap is `build_budget_bytes()` (:1364: `BUILDLOG_BUILD_BUDGET_GIB`, then `[memory] build_budget_gib` in `config/lint.conf`, then `FALLBACK_BUILD_BUDGET_BYTES`), read when the estimate runs; write no fixed cap anywhere, tests included. A replay caps each promise at the budget in force when its step ran and names that budget, so a budget change does not read as this phase's effect. `ShapeFallback` (the profile fallback) has neither floor nor factor; feature-side filtering is already satisfied inside same-shape build tiers and remains necessary for profile fallback and other step histories. Determine release profile through `BuildShape.profile`, including `--profile release`, and test both release spellings. Specs 2 and 4 split rows inside each shape; they change none of those tiers, and Spec 3's lower pool never replaces a same-shape `build` promise.
 
 **Files:**
 - `scripts/lint/memory_admit.py` — items 2–4.
-- `scripts/lint/test_memory_admit.py` — item 5.
+- `scripts/lint/build_shape.py` — item 4, the widened join.
+- `scripts/lint/test_memory_admit.py`, `scripts/lint/test_build_shape.py` — item 5.
 - `docs/as-built/build-memory-admission.md` — items 1 and 6.
 
-**Workers:** `1 writer`
+**Workers:** `1 writer + 1 tester`
+- `impl` — `memory_admit.py`, `build_shape.py`, the as-built doc and the replay (run folder).
+- `test` — `test_memory_admit.py` and `test_build_shape.py` (Spec 5).
 
 **Acceptance gate:**
-- The memory admission tests pass; `basedpyright` over both Python files reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
+- The memory admission and build-shape tests pass; `basedpyright` over `scripts/lint/memory_admit.py`, `scripts/lint/build_shape.py`, `scripts/lint/test_memory_admit.py` and `scripts/lint/test_build_shape.py` reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
 - The replay after the change: neither count rises for any repository, and each count falls in total. The before and after table goes in the checkpoint notice.
 - Change-Review line: memory promises match each repository's real use | on natedev run `cargo clippy` in `~/rust/cargo-liner` and read its reservation in `~/.local/state/buildlog/admission` | its `need` is near the compile-only keyed p90 that the replay measures (the phase report gives the figure), not 3.0 GiB.
 
@@ -370,40 +352,959 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 ### Phase 13 — A session can launch an app that is already built without waiting at the BRP launch gate  · status: dropped
 **Dropped:** showrunner 2026-10-29. There is no bevy_brp prebuilt option and no hook bypass, so every launch keeps waiting, as Phase 6 ruled. The user doubted its value. report-unit first restores the brp-launch rows in the build log (none since 2026-10-15); after that, launch waits get measured, and a new phase starts only if they show a cost.
 
-### Phase 14 — Memory admission, the sweeps and the merge gate finish when they run again after a stop  · status: todo
-**Depends on:** Phase 12 (same file, `memory_admit.py`). Runs after Phase 4. Merge `origin/builds` first.
+### Phase 14 — Memory admission, the sweeps and the merge gate finish when they run again after a stop  · status: done
 
-**Approved:** showrunner 2026-10-29 (ETA 02:30 EDT 2026-10-30), from the rerun sweep on `~/.claude` main (`docs/plans/sdlc-rerun-sweep.md`, sdlc tip `097b1a0d`, checked 19:59 EDT): the 2 rows under builds-resources-unit and the 5 rows under resources-unit.
+#### As-built
+
+- `merge_gate.py` `promote` records the commit it promotes, with its tested merge, before the local fast-forward of main. A rerun pushes local main only when local main is that recorded commit and origin/main is its ancestor; any other difference refuses.
+- The merge gate records each checkpoint merge (checkpoint commit, merge commit, base) before the push, in a record apart from the pass ledger. `check_local_doc_commits` accepts a local commit only when it is that recorded merge, and the rerun pushes it.
+- `memory_admit.py` applies one liveness rule, `reservation_lifetime` (`PopulatedStepScope | LiveOwnerProcess | EndedStep`), in `live_reservations`, `step_memory`, `check` cleanup and `queue_rows`. A scoped step's reservation stays live while its step cgroup holds a process: it is charged that cgroup's memory and keeps `.max` and `.wave`. An unscoped step keeps the pid-and-start-time rule. `set_width` writes through a temporary file and rename.
+- `sweep.py` retention writes the kept rows to a temporary file and renames it over the removal log. Append, retention and readers take a separate stable lock file before they open the log.
+- `tmp_sweep.py` writes the plan to a temporary file and links it into place; it never replaces an existing plan. `--plan` over an incomplete leftover names the file and how to clear it.
+- `folder_audit.py` `remove` records the worktree sources next to the removal log before the delete, prunes them, then removes the record. A rerun prunes every source still in a record.
+
+**Files:**
+- `scripts/production/merge_gate.py` — promote and checkpoint-push recovery records.
+- `scripts/lint/memory_admit.py` — step-cgroup liveness, atomic `set_width`.
+- `scripts/lint/sweep.py` — removal-log lock file, atomic retention.
+- `scripts/lint/tmp_sweep.py`, `scripts/lint/folder_audit.py` — atomic plan link and leftover message; worktree-prune record.
+- `docs/as-built/build-memory-admission.md`, `docs/as-built/build-targets.md`, `docs/as-built/merge-gate-and-test-speed.md` — the rerun rule for each command.
+
+**Binds later work:** a new reservation sidecar must be removed on every delete path, the cgroup-liveness paths included. Any writer or reader of the `sweep.py` removal log takes its separate stable lock file first.
+
+**Gotchas:** a reused pid can lend its `/proc` identity to an orphaned scope row. Origin can be rewound below the recorded base, so a checkpoint retry must refuse it. A scope can vanish between the `memory.current` read and the swap read. The push-recovery records are never pruned.
+
+**Ruled out:** tree equality as proof for a promote rerun (it does not show the commit is the gate's own).
+
+### Phase 15 — A nextest step's charge falls to its test-phase need when its tests start  · status: moved
+**Moved:** to queue-unit (builds showrunner 2026-10-31): one owner for queue Phase 5's hub file and a shorter path to the cutover. No new work on it here.
+**Depends on:** Phase 33 (its one anonymous-history reader feeds Spec 2, and its finalizer retry carries Spec 4's saved evidence; the reader moved from this phase to Phase 33) and Phase 26 (same file, `memory_admit.py`; 33 → 26 → 15 land one after another); report-unit's Phase 4c (the test-phase file `$BUILDLOG_PEAK.test-phase.json`, `test_phase_peak_bytes`, `record.read_test_phase`), merged on `origin/builds` (`f88d8012`) and in this branch at `31c3ee3e`. Merge `origin/builds` first. Global order: Phases 21, 16, 25, 30, 28, 4, 24 and 32 are checkpointed; serial memory chain 31 → 33 → 26 → **15**/27 (queue-unit) → 39 → 20 → 11 → 17 → 18 → 19 → 8; 29 runs beside the chain, checkpoints after 33 (same file, `sweep.py`) and joins before 11.
+
+**Approved:** builds showrunner 2026-10-30, option A: the narrow key (repository + scope + package + filters), margin × 1.2, a test for each case, acceptance at most 2.3 % of test phases above their charge per repository on 4c data, and a 24 h check after the merge (steps above their charge, `mem_wait_s` against the 24 h before, earlyoom kills).
 
 #### Work Order
 
-**Goal:** each command below finishes when it runs again after a stop or a failure at the named line, and a stop never loses a charge or a record that a rerun needs.
+**Goal:** when a nextest step's tests start, its charge falls from its compile peak to `max(test-phase peak so far, N) × 1.2`, where N is the p90 test-phase peak of earlier runs of the same family. A step with no N keeps today's charge.
 
-**Rows (sweep line numbers are at sdlc `097b1a0d`; find each by its function):**
-1. `scripts/production/merge_gate.py` `promote` (sweep :1000, the "main HEAD differs from origin/main" refusal): promotion stops after its local fast-forward of main and before the push, or the push fails. A rerun refuses because main differs from origin/main. Fix: the gate records the exact commit it promotes, with its tested merge, before the local fast-forward. A rerun pushes local main only when local main is that recorded commit and origin/main is its ancestor. Tree equality is not proof. Any other difference still refuses.
-2. `scripts/production/merge_gate.py` checkpoint push (sweep :1124) and `check_local_doc_commits` (sweep :1089): the checkpoint push fails after the merge and the tests pass, or stops just before the push. A rerun rejects its own local merge commit. Fix: the gate records each checkpoint merge it makes (checkpoint commit, merge commit, base) before it pushes; the pass ledger certifies tests, not this step, so it is a separate record. `check_local_doc_commits` accepts a local commit only when it is that recorded merge for that checkpoint, and the rerun pushes it. A local commit that is not the gate's own still refuses.
-3. `scripts/lint/memory_admit.py` `live_reservations`, `step_memory`, `check` cleanup and `queue_rows` (sweep :811, Q2): a reservation is live only while its owning shell's pid and start time match. If the shell dies while a child in its own process group keeps running, `step_memory` returns `GoneMemory`, `check` deletes the reservation with `.max` and `.wave`, and `queue_rows` hides it, so the child's memory is no longer charged. Fix, across all four paths with one liveness rule: a scoped step's reservation stays live while its step cgroup (the scope `invoke.sh` starts) holds a process; it is charged that cgroup's memory, keeps `.max` and `.wave` until the step ends, and stays visible to the queue and the blocker lookup. Read the cgroup with the same faked-reading support as the other readings. An unscoped step has no cgroup and keeps today's pid rule. When neither the pid nor the cgroup is live, cleanup is as today. Tests cover admission, queue visibility and blocker agreement for an orphaned child.
-4. `scripts/lint/memory_admit.py` `set_width` (sweep :1427, Q3): a stop during `path.write_text` leaves incomplete JSON. Its caller starts the step anyway, and the next check deletes the unreadable reservation, so the live step has no charge. Fix: write the row to a temporary file in the same folder and rename it over the reservation, as `.max` is written.
-5. `scripts/lint/sweep.py` removal-log retention (sweep :2142, the `seek(0)` / `truncate()` / `writelines` block): a stop after the truncate loses every kept row. Fix: write the kept rows to a temporary file and rename it over the log. The log is also the lock today, and a writer that opened the old inode would append to the replaced file, so append, retention and readers first take one separate stable lock file and open the log only after they hold it. A test runs an append beside a retention and checks that no record is lost.
-6. `scripts/lint/tmp_sweep.py` plan write (sweep :1106, `plan.open("x")`): a stop after the exclusive create and before the JSON is complete leaves a plan that `--plan` refuses and `--apply` cannot read. Fix: write the plan to a temporary file and link it into place without replacing an existing plan (keep "an existing plan is never replaced"). A rerun of `--plan` over an incomplete leftover from a stopped run names the file and how to clear it; it does not apply it.
-7. `scripts/lint/folder_audit.py` `remove` (sweep :256): a stop after `tmp_sweep.delete_tree` and before `git worktree prune` leaves a stale worktree entry, and a rerun no longer finds the folder or its source. Fix: record the worktree sources before the delete in a small record next to the removal log, prune them, then remove the record; a rerun prunes every source still in a record.
+**Measured (code at `bc36e49f`; Phases 24 and 26 move the line numbers, so find each by its name):**
+- Need: `check` (`memory_admit.py` :1582) stores the p90 whole-step anon peak from `expected_peak` (:845) or `filtered_peak` (:943) as the reservation's `need`.
+- Running charge: `charge_basis` (:797) takes the largest of `UsingNow`, `RampPromise`, `PeakSoFar` and `PeakFileUnreadable`, and `decide` (:771) sums it. `reservation_memory` (:1155) reads `.max` and `.wave` (`"<peak> <epoch>"`), which the sampler `buildlog_sample_anon` (`invoke.sh` :172) writes. The peak decays `PEAK_DECAY_SECONDS` (:78, 1500 s) after the last sample at or above half the peak. So a nextest step keeps its compile peak far into its test phase. Live, 2026-10-30 07:51 EDT: a widget nextest step had a charge of 11.2 GiB while its test binary used 0.38 GiB.
+- Admission has no compile-end signal. Report-unit's Phase 4c adds one. The same sampler writes `$BUILDLOG_PEAK.test-phase.json`: `test_phase_started_at` (the first tick a test binary in a `deps` folder runs in the step's scope), the live `test_phase_peak_bytes` (scope anon, all parallel tests together), and the context (`repo_identity`, `test_scope`, `package`, `filters`, `call_id`, `test_threads`). Its path is the reservation's `sidecar` (`$BUILDLOG_PEAK.cgroup`) with `.cgroup` replaced by `.test-phase.json`. Its one parser is `record.read_test_phase` (`scripts/buildlog/record.py` :603 at `f88d8012`). It returns `TestPhaseRecord` (window `ObservedTestPhase(peak_bytes, started_at)` or `UnobservedTestPhase`), `NoTestPhaseRecord` or `UnreadableTestPhaseRecord`. `buildlog_finish_memory` releases the reservation before `buildlog_end` runs `record.py`, and `record.py` deletes the file after it reads it, so the file still exists at release. The build-log row gets `test_phase_peak_bytes`, and `test_phase_charge` stays null (admission records no charge yet). On 2026-10-30 08:00 EDT, 0 natedev build-log rows had `test_phase_peak_bytes`.
+- Replay (helper, 2026-10-30, data to 08:00 EDT; `/tmp/claude/unit/abea5ffb-4b99-499e-ae41-7ebb04630f9f/nextest_charge/report.md`). Rule at the mark: charge = max(test peak so far, N) × m, no decay. N stand-in: the p90 of the family's no-compile nextest runs. At m = 1.2 it frees 795 GiB·min on 10-29 and 320 GiB·min on 10-30, at most 11.6–11.7 GiB at one time. The queue model fails its check (it gives 90 of 592 waited admissions on 10-29 and 97 of 146 on 10-30), so the wait minutes saved (0–140 and 31–199) show sensitivity only.
+- Risk, no-compile runs from 2026-10-16 to 10-30 against N from earlier runs: on the narrow key (repository + scope + package + filters), 20 of 869 runs (2.3 %) went above N × 1.2. With rows widened to the package or the repository, 60 of 1,399 (4.3 %). Worst at 1.2: a hana filtered run at width 16, 6.04 GiB against 1.65 GiB. A margin of 1.314 removes only 2–13 more and frees 15 % less.
+- The parked arms (same-width history max, max + 10 %) failed: test phases went above that lower charge more often than above today's charge.
 
 **Spec:**
-- Each fix has a test that stops the command at the named line (a fault injected at that point, never a sleep), then runs it again and checks that it finishes with the right state. Tests never read the live cgroup tree, `/proc/meminfo` or `/proc/pressure/memory`.
-- Keep every refusal that protects against a wrong state; a rerun repairs only its own stopped work.
-- Docs: each as-built doc in Files gets one sentence per row on the rerun rule.
+
+1. **Read the mark.** One helper, `test_phase_path(row) -> Path | NoTestPhaseFile`, gives the file path from the reservation's `sidecar`. An empty `sidecar`, or one that does not end in `.cgroup`, gives `NoTestPhaseFile`. Read the file only with `record.read_test_phase`, through the `record` module that `memory_admit.py` already loads (`record` :72); add the function to that module's Protocol (`GitIdentityReader` :49). Do not write a second parser. Call it at run time only: `record.py` imports `memory_admit` when it loads, so `memory_admit` must not use `record` attributes while it loads. Admission never writes or deletes the file; `record.py` owns it.
+   - In `reservation_memory` (:1847), an `ObservedTestPhase` window and a stored `TestPhaseNeed` (Spec 2) give a new `PeakHistory` variant, `TestPhaseStarted(started_at, peak_so_far, need)`, with `peak_so_far` = the window's `peak_bytes`. Every other case keeps today's history (`PeakSoFar`, `PeakDecayed`): no file, no window yet, an unreadable file, or no stored need. The `.max` read stays first, so an unreadable `.max` keeps today's `PeakFileUnreadable`.
+2. **N, the test-phase need.**
+   - **Rows.** This host's `anon_peaks.jsonl` rows over `HISTORY_DAYS` with `step` `nextest`, an integer `test_phase_peak_bytes` above 0, and the same `repo_identity`, `test_scope`, `package` and sorted `filters` as the step. Use no rows of other filters, other packages or other repositories (no widening: 4.3 % against 2.3 % in the replay).
+   - **Width.** The run's width is the reservation's `test_threads` (the share after `set_width`); it is not part of the key. The form is a closed set, picked in this order: `same_width`: rows at the run's width, their p90; `wider_unscaled`: rows only at wider widths, the p90 of the nearest wider width, no scale-down; `scaled_up`: rows only at narrower widths, the p90 of the widest narrower width × width / recorded width, rounded up. No `fitted` form (the replay ran without it). The p90 is `percentile` (:1128). The floor is `FILTERED_FLOOR` (:80, the existing single-test floor, 1 GiB): N = max(form value, `FILTERED_FLOOR`). No second floor rule.
+   - **Types.** `TestPhaseNeed(bytes, runs, width, recorded_width, form)`, or `NoTestPhaseNeed(reason)` with a closed reason: `no_width`, `no_history`, or `not_recorded` (a reservation from before this phase).
+   - **One rule, one reader.** Split N into a pure function over rows (the rule) and the reader that feeds it, so the replay and the 24 h check call the same rule. The reader is Phase 33's one anonymous-history reader (Phase 33 Spec 3), which feeds `gate_estimate`, `expected_peak`, `build_peaks`, `filtered_peak`, `fresh_test_peak` and the finalizer's reservation-id lookup from store's whole-row boundary. This phase consumes that reader and adds no parser.
+   - **When.** Outside the admission lock (Phase 12), once for each admitted nextest step, never on each poll. After `check` admits a nextest step and leaves the lock, it computes N from the row's key and `test_threads` and writes it into the reservation. `set_width` (:3030) computes N for the new width before it takes the lock, and writes it with the width. One locked update helper writes reservation fields by atomic replace (today's read, change and `os.replace` in `set_width`); both callers use it, and it skips a reservation that is gone. The field `test_phase_need` is tagged JSON through one codec: generalize and rename the existing tagged estimate codec, `need_basis_record` (:1352) and `read_need_basis` (:1370), so it has explicit typed entry points for admission need bases (`NeedBasis`) and test-phase needs (`TestPhaseNeed | NoTestPhaseNeed`), while those stay separate domain types. Both entry points use one codec implementation and the existing atomic reservation writer; each field's reader returns that field's named unknown state (`BasisNotRecorded` for `need_basis`, `NoTestPhaseNeed(not_recorded)` for `test_phase_need`). No second encoder. A row with no field reads as `NoTestPhaseNeed(not_recorded)`.
+3. **The charge after the mark.** In `charge_basis` (:1100), for `TestPhaseStarted` the observed-peak term becomes `TestPhaseCharge(bytes, peak_so_far, need)`, with `bytes = ceil(max(peak_so_far, need.bytes) × TEST_PHASE_MARGIN)` and `TEST_PHASE_MARGIN = 1.2`. Comment the constant with the replay: 2.3 % of 869 no-compile runs above N × 1.2 on the narrow key; 1.314 removed only 2–13 more and freed 15 % less. The other terms stay: `UsingNow`, the promise (a nextest step keeps `RampPromise` for 120 s, then `NoPromise`, as Phase 24 left it) and `PeakFileUnreadable`. After the mark, the compile `.max` peak and its `.wave` decay no longer count, and the test-phase charge does not decay. The sampler still writes `.max` for the history row. `growth_headroom` (:1119) does not change: the test-phase charge is a budget charge, as the observed peak is today. With no mark or no N, the step keeps today's charge and its 1500 s decay.
+   - **Where the types sit.** `TestPhaseCharge` is one more `ChargeBasis` variant, beside `RampPromise` and Phase 24's `LifetimePromise`. It is not a promise: Phase 24's `RampPromise | LifetimePromise | NoPromise` on `MeasuredMemory` does not change. `TestPhaseNeed` is not a `NeedBasis` variant: `NeedBasis` explains the admission `need`, and this phase does not change `need`. So the charge after the mark has one type, and N has one type.
+4. **The history row.** Phase 24's one finalizer, `finalize_reservation` (`memory_admit.py` :2953), adds three fields to the `anon_peaks.jsonl` row, from the same `test_phase_path` read: `test_phase_peak_bytes` and `test_phase_started_at` when the window is observed, and `test_phase_need` (tagged JSON) when the reservation has one. With no file or no window, the row has no window fields. N's history starts at this merge: coverage grows over about a day, and until then a family has no N and keeps today's charge.
+   - **Saved before the first append.** `record.py` deletes the test-phase file after it reads it (`_delete_step_sources`, `scripts/buildlog/record.py` :729), so a retry cannot read it again. Snapshot the observed test-phase fields and the stored test-phase need into the existing `FinalizationIntent` (`memory_admit.py` :241, Phase 24) before the first history append. Every retry publishes that saved evidence through the same finalizer, also after `record.py` has removed the file.
+5. **Build-why words.** `build_why.charge_text` (:51) ends in `assert_never`, so the new variant needs its text: `tests since <HH:MM>: peak so far <GiB>, need <GiB> (<form>, p90 of <runs> runs at width <width>), × 1.2`.
+6. **Tests.** In `scripts/lint/test_memory_admit.py`, on `MemoryQueueFixture` (:1286) with `fake_memory_readings`. Extend `MemoryQueueFixture.running` (:1315) to take a sidecar, a `.max` peak and a test-phase file; write no second reservation writer. Write history rows through one module-level row writer, and move the three writers that the classes have today (`HistoryTests.add_measured` :158, `FilteredPromiseTests.samples` :263, `RepositoryHistoryTests.samples` :934) onto it. One test for each case:
+   - `test_nextest_charge_falls_to_test_phase_need_at_mark`: `.max` 11 GiB, a mark with peak 0.4 GiB, N 2 GiB: the charge is 2.4 GiB, and a held 12 GiB waiter is admitted.
+   - `test_test_phase_charge_follows_peak_so_far`: peak so far 5 GiB, N 2 GiB: the charge is 6 GiB.
+   - `test_test_phase_charge_does_not_decay`: 1500 s after the last near-peak time, the charge stays.
+   - `test_no_history_keeps_compile_peak`: a mark and no N: today's `PeakSoFar`, with its 1500 s decay.
+   - `test_no_mark_keeps_today`: no file, a file with no window, and an unreadable file each keep today's charge.
+   - The need: `same_width`, `wider_unscaled` (no scale-down) and `scaled_up` (rounded up); the `FILTERED_FLOOR` floor; rows of other filters, another package or another repository give `no_history`; no width gives `no_width`; a reservation with no field gives `not_recorded`.
+   - `test_need_stored_outside_lock_and_on_width_change`: N is computed while the lock is free and stored in the reservation; `set_width` computes it again for the new width.
+   - The history row: the finalizer row carries `test_phase_peak_bytes`, `test_phase_started_at` and `test_phase_need`; with no test-phase file (a step that started with the old sampler) and a stored need, the row keeps `test_phase_need` (Spec 4) and has no window fields (`test_phase_peak_bytes`, `test_phase_started_at`); admission leaves the test-phase file in place.
+   - The one reader: N's rows come through Phase 33's reader; the existing estimate-consumer tests pass unchanged.
+   - The saved evidence (Spec 4): a failed append and an interrupted append, each followed by the removal of the test-phase file and then a retry, and owner-gone cleanup after the file is gone: each ends with exactly one history row that carries the saved `test_phase_peak_bytes`, `test_phase_started_at` and `test_phase_need`.
+   - The codec (Spec 2): every `NeedBasis` variant, `TestPhaseNeed` and each `NoTestPhaseNeed` reason round-trip through the one codec; a missing field reads as its field's named unknown state.
+   - In `scripts/build_queue/test_build_why.py`: `charge_text` for `TestPhaseCharge`.
+
+   Every test fakes both memory readings.
+7. **Docs.** `docs/as-built/build-memory-admission.md`: the mark read, N with its key, width forms and floor, the charge after the mark and its margin, the history row fields, and the replay table.
+
+**State:** the reservation's `test_phase_need` field (written after admission and by `set_width`, under the lock, by atomic replace) and three new fields on the finalizer's `anon_peaks.jsonl` row. No new files; the test-phase file stays `record.py`'s.
+
+**Constraints from prior phases:**
+- Phase 12: estimates run outside the admission lock. A step keeps the sampler it started with, so a step that started before 4c's sampler (no test-phase file) keeps today's charge and decay.
+- Phase 10: the blocker lookup reuses `decide` and `reservation_memory`, so it follows the new charge with no copy of the rule.
+- Phase 24: one finalizer writes every history row and ends every reservation; `ChargeBasis` has `LifetimePromise`; `MeasuredMemory` carries `RampPromise | LifetimePromise | NoPromise`; a nextest step keeps `RampPromise` for 120 s; `need_basis` is tagged JSON.
+- Phase 33: one anonymous-history reader feeds every estimate consumer and the finalizer from store's whole-row boundary; a retry of a failed or interrupted append ends with exactly one row with its original outcome. Spec 4 extends that saved intent; it adds no second retry path.
+- Phase 26: same file; it changes the ordered snapshot, removes `bump_waiter` and changes the waiter row, and this phase does not.
+- Phases 1–2: tests never read live `/proc/meminfo`, `/proc/pressure/memory` or the cgroup tree; the merge gate trips a module that does.
 
 **Files:**
-- `scripts/production/merge_gate.py`, `scripts/production/test_merge_gate.py`, `scripts/production/test_merge_gate_promotion.py`, `scripts/production/test_merge_gate_ledger.py` (only if ledger coverage is needed), `docs/as-built/merge-gate-and-test-speed.md` — rows 1–2.
-- `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py` (and `scripts/lint/memory_test_support.py` only for the cgroup fake) — rows 3–4.
-- `scripts/lint/sweep.py`, `scripts/lint/tmp_sweep.py`, `scripts/lint/folder_audit.py`, `scripts/lint/test_sweep.py`, `scripts/lint/test_tmp_sweep.py`, `scripts/lint/test_folder_audit.py` — rows 5–7.
-- `docs/as-built/build-memory-admission.md` (rows 3, 4 and 6) and `docs/as-built/build-targets.md` (rows 5 and 7).
+- `scripts/lint/memory_admit.py` — Specs 1–4.
+- `scripts/lint/test_memory_admit.py` — Spec 6.
+- `scripts/build_queue/build_why.py` — Spec 5 (owner queue-unit; trial-merge against `origin/builds-queue`).
+- `scripts/build_queue/test_build_why.py` — Spec 6, the charge text test (owner queue-unit).
+- `docs/as-built/build-memory-admission.md` — Spec 7.
 
-**Workers:** `2 writers`
-- `impl` — rows 3–7: the `scripts/lint/` modules and tests above, `build-memory-admission.md` and `build-targets.md`.
-- `ws-impl` — rows 1–2: `merge_gate.py`, its three test modules above and `merge-gate-and-test-speed.md`.
+The replay and 24 h check scripts live in the run folder (`phases/15/`), not in the repository; both call Spec 2's rule.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — `memory_admit.py` (including the finalization-intent extension, Spec 4, and the one codec, Spec 2), `build_why.py`, docs, the replay and the follow-up measurement (the 24 h check).
+- `test` — `test_memory_admit.py` with its shared fixture (`MemoryQueueFixture`) and the one module-level history row writer (Spec 6), the retry regressions (failed and interrupted appends, owner-gone cleanup), and `test_build_why.py`.
 
 **Acceptance gate:**
-- Every changed test module passes; `basedpyright` over every changed Python file reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
-- For each row, the notice names the test that stops at its line and reruns.
-- Change-Review line: a stopped sweep plan finishes on a rerun | in a terminal on natedev, run `~/.claude/scripts/lib/py ~/.claude/scripts/lint/tmp_sweep.py --plan <file>` twice, stopping the first with Ctrl-C | the second run names the leftover and how to clear it, and a clean rerun writes the plan.
+- The memory admission and build-why tests pass; `basedpyright` over `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`, `scripts/build_queue/build_why.py` and `scripts/build_queue/test_build_why.py` reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
+- The finalization retry tests (Spec 6) pass: a failed or interrupted append, the removal of the test-phase file, then a retry or owner-gone cleanup, leaves exactly one history row with the saved test-phase evidence (Phase 33's one-row guarantee, extended by Spec 4).
+- A test phase is above its charge when its `test_phase_peak_bytes` is above N × 1.2, its charge at the mark. The replay on 4c data uses natedev build-log rows with `test_phase_peak_bytes`, each with N from earlier rows by Spec 2's rule. For every repository, at most 2.3 % of test phases with an N are above their charge. The table (per repository: test phases, test phases with an N, test phases above the charge, worst excess in GiB) goes in the checkpoint notice. If a repository is above 2.3 %, the numbers go to the builds showrunner before the checkpoint.
+- The notice has an `also touches scripts/build_queue/build_why.py, test_build_why.py (owner queue-unit)` line, tested against `origin/builds-queue`.
+- The 24 h check, 24 h after the merge reaches main: from `anon_peaks.jsonl` rows with `test_phase_peak_bytes` and `test_phase_need`, per repository, the nextest steps that got a `TestPhaseCharge` and the test phases above their charge; the `steps.mem_wait_s` total against the 24 h before the merge; earlyoom kills (journal) and `calls.mem_kills` in both windows. The phase report records when the check is due; the result goes in a follow-up notice.
+- Change-Review line: a nextest step's charge falls to its test-phase need once its tests start | on natedev in `~/rust/hana`, run `~/.claude/scripts/direct/verify.sh test hana_diegetic` two times; during the second run, after its compile, run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_why.py` | the step's charge reads `tests since …` with its need and width form, below its compile peak.
+
+### Phase 16 — Python test gates take a place in the shared admission queue  · status: done
+
+#### As-built
+
+- `merge_gate.py` `gate_reservation` takes one memory reservation through `memory_admit.check` after `BuildHoldWait` and before the first module. The gate waits in the shared queue, inside `scratch.copy_lock`, as a cargo step waits; `/build:queue` shows it as step `merge-gate` with its checkout as the folder. It releases on every exit path, and `cancel_waiter` removes its queue place when a wait stops. An admission error stops the gate with the checker's last line.
+- `check` takes `profile: InferFromArgv | StepProfile | GateProfile`. `GateProfile` (repository `~/.claude`, step `merge-gate`, the checkout, the cap) carries `GateEstimate = MeasuredGatePeak(bytes, runs) | NoGateHistory(cap_bytes)`. `gate_estimate` gives the p90 of this host's `merge-gate` rows in `anon_peaks.jsonl` over `HISTORY_DAYS`, else the cap (`--memory-cap-mib`, default 4096). At the 600 s refresh a `GateProfile` keeps its identity and gets a new estimate, never an argv one.
+- `GateReservation.observe` writes `<reservation>.max` and `.wave` atomically when the tree peak goes up, so the charge and its decay work as for cargo. The sidecar is an empty `gate.scope` in the private run folder; release adds the gate's one history row to `anon_peaks.jsonl`. Records go to the caller's `BUILDLOG_DIR/admission`.
+- Each module, `types` included, takes one slot from `/dev/steve` (or `BUILDLOG_JOBSERVER_FIFO`) and writes it back on every exit path. `shared_cpu_pool` accepts a FIFO or a character device and reads after a zero-timeout `select`; with no token the launch loop goes on reaping, sampling and handling stops. With no pool file the gate takes no slots.
+- Each launch and its cleanup registration run in one `defer_cleanup_signals` block, and the child unblocks `SIGTERM`, `SIGHUP` and `SIGINT` before `exec`, so a stop never gives back capacity under a live module.
+- `Gate memory wait: <GiB> needed; <reasons>` (`gate_wait_reasons`) prints on a change, else once a minute.
+
+**Files:**
+- `scripts/production/merge_gate.py` — reservation, CPU pool, launch, wait line.
+- `scripts/lint/memory_admit.py` — profile union, `GateProfile`, `gate_estimate`, `cancel_waiter`; `queue_rows` keeps every reservation row with an int pid (readers skip `GoneMemory`).
+- `scripts/production/merge_gate_test_support.py` — `MergeGateFixture`: private `BUILDLOG_DIR`, fake memory readings, fake jobserver FIFO.
+- `scripts/production/test_merge_gate_suites_{admission,resources,signals,types}.py`, `scripts/lint/test_memory_admit.py` — tests.
+- `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/build-memory-admission.md` — the `merge-gate` step and slots.
+
+**Binds later work:** the gate calls `check`, `release` and `cancel_waiter` in its own process, so a write guard in `admission_dir()` covers it (Shared build state is written only by the installed copy). `merge-gate` rows have no Cargo index step: they stay their own class, and `gate_estimate` is their one reader (Memory admission promises what each repository's steps really use; A build's promise comes from builds of the same shape and holds until the build ends). Gates are queue steps: `gate_wait_reasons` reads their `CheckResult` (The memory queue starts steps in queue order and records when a step became first), and the replay counts them only from rebuilt queue intervals (Replay a looser head rule, and adopt it only on the replay).
+
+**Gotchas:** natedev's `/dev/steve` is a CUSE character device, not a FIFO, and need not honor `O_NONBLOCK`; `select` comes before every read. A launch outside `defer_cleanup_signals` can give back capacity under a live module. `Waiter.need_source` is report-unit's typed `NeedSource`; add no second field.
+
+**Ruled out:** a split of cargo waits by gate presence from old logs (no gate recorded its start); the 24 h check after `queue_times.jsonl` reaches main makes it.
+
+### Phase 17 — The nextest promise splits by compile size  · status: todo
+**Depends on:** Phase 11 (same `expected_peak`; Phase 11 splits compile runs from no-compile runs). Merge `origin/builds` first. Global order: Phases 21, 16, 25, 30, 28, 4, 24 and 32 are checkpointed; serial memory chain 31 → 33 → 26 → 15/27 (queue-unit) → 39 → 20 → 11 → **17** → 18 → 19 → 8; 29 runs beside the chain, checkpoints after 33 (same file, `sweep.py`) and joins before 11. Phases 15 and 27 moved to queue-unit: start after queue-unit's checkpoints for them reach `origin/builds`, and merge it first. `TestPhaseCharge` (Phase 15) comes from those checkpoints.
+
+**Approved:** showrunner 2026-10-29 (no ETA given).
+
+#### Work Order
+
+**Goal:** a nextest step's promise comes from earlier runs that compiled about as much as this run will, so a one-test run on a warm tree is not promised a full compile, and a full compile is not promised a one-test run.
+
+**Measured:**
+- The showrunner's figures: the p90 over the "nextest" class mixes 0.5 GiB one-test runs with 29 GiB full compiles (not checked against the log in this Work Order).
+- `steps.crates_compiled` counts `Compiling/Checking/Documenting` lines (`scripts/buildlog/index.py` :100); anon rows join to steps by host, `call_id` and step name in Phase 11's one step-evidence reader (the widened `index_shapes` join, `scripts/lint/build_shape.py` :89; Phase 11 Spec 4). That join returns no worktree or step start time today, and a new copy seeds its own build folder from a source tree's cache (the copies rule picks seed; builds reversed the shared build folder on 2026-10-30 and Phase 34 removes `scratch.shared_build_folder`), so a worktree with no earlier step is not a cold cache, and the history it inherited from its seed is not recorded. `width_trial.py` `anon_by_call` (:171) and `anon_by_step` (:197) pair anon rows with steps. The size of a step's compile is known only after it runs.
+
+**Spec:**
+
+1. **Measure first.** Over 14 days of natedev nextest steps, per repository: the distribution of `crates_compiled` and the anon peak by `crates_compiled`. Choose size bands where the peak changes (the edges come from the data; show the table). Then measure predictors of the band at admission time, using only data present before the step: (a) the last recorded `crates_compiled` of the same worktree and step; (b) whether the `tree_key` changed since the last step in that worktree; (c) the build history of the actual Cargo cache folder the step builds into, including reuse across copies. Predictors read the one step-evidence reader (Phase 11 Spec 4), extended with worktree, start time and `tree_key`; add no second index join. Predictor (c) reads lasting attribution to the actual cache folder; an unknown folder history is a named unknown predictor state (`CacheHistoryUnknown`), never proof of a cold cache. Report for each predictor how often it picks the right band, and choose the best. Replay the promise per band against today's (after Phase 11): per repository, promises under half and over 3x the measured peak, wait minutes saved, and how often a step went above its promise.
+2. **Adopt rule.** Adopt only when the replay shows fewer promises under half the peak in total and none rises for any repository. Otherwise record the table and stop.
+3. **If adopted:** `expected_peak` and `filtered_peak` (`memory_admit.py`) take the predicted band and use only history rows of that band, in each tier. Phase 11's compile/no-compile split stays the first split; bands split compile runs only. With fewer than 5 rows in the band, use the next larger band, never a smaller one. Comment each band edge with the measurement that set it. Predictors (a) and (b) read `crates_compiled`, worktree, start time and `tree_key` from the one step-evidence reader (Phase 11 Spec 4; add worktree, start time and `tree_key` to its value), not from a second join. Predictor (c) reads cache-folder attribution as Spec 1 says.
+   - **The band in the need's basis.** Add one variant, `CompileBand(low, high, runs, predictor)`, to Phase 24's `NeedBasis` union (`memory_admit.py` :206); write no second basis type. Its source is one new closed `NeedSource` (:145) value, `"band"`. Producer: `expected_peak`/`filtered_peak`. It travels as Phase 24 Spec 3 sets out: the waiter row's `need_basis` and `need_source` fields, read into `RecordedNeed` (:1030) by the queue pass, through the one basis codec (`need_basis_record` :1653, `read_need_basis` :1671), and the source field of the check's output line, which the shell reads. Readers: `build_why.need_text` (`scripts/build_queue/build_why.py` :76) names the band and its predictor and no longer calls the need a plain p90; `memory_gate.sh` names the band in the first and periodic wait lines (`buildlog_memory_line_inner` :158, a `band)` arm in its `case`).
+   - **One basis-to-source map.** Two places turn a basis into a source today: `build_expected_peak` (:1612) writes `"shape"` itself (:1650), and the cached CLI reader in `run_action` (:3781-3803) rebuilds `ExpectedPeak` with `basis if isinstance(basis, str) else "shape"` (:3800). The shell passes its cached need and source back to `check` on every poll after the first, so with only the codec change a cached nextest poll reports source `shape`, prints a same-shape wait line and writes `need_source` `shape` to the waiter row. Add one function, `need_source_for(basis: NeedBasis) -> NeedSource`, closed with `assert_never`. `build_expected_peak`, the band producer and the cached reader call it; no other code maps a basis to a source.
+   - **The shell does not fail closed on an unknown source.** Its `case` sends any unknown source to `no history, so the fallback` (the `*)` arm, `memory_gate.sh` :171), so a source with no arm reads as a fallback. The `band)` arm and the producer land in one change.
+4. **Tests** in `scripts/lint/test_memory_admit.py`: each predictor input; band selection; a thin band takes the next larger band; a no-compile run keeps Phase 11's rule; the waiter row carries `CompileBand`, which round-trips through the basis codec; `need_source_for` gives a source for every `NeedBasis` variant; the shell's first wait line (an uncached poll) and its periodic wait line after a cached poll both name the band (`ShellTests` :5015), and after the cached poll the waiter row still has `need_source` `band`; an unknown cache-folder history gives `CacheHistoryUnknown` in every reader, not a cold-cache band; two worktrees that share one cache folder, and a copy whose record has ended, read that folder's history; fake both memory readings. In `scripts/lint/test_build_shape.py`: the step-evidence reader returns worktree, start time and `tree_key` with the existing shape and compile-count states. In `scripts/build_queue/test_build_why.py`: `need_text` for `CompileBand`.
+5. **Docs.** `docs/as-built/build-memory-admission.md`: the bands, the predictor and the replay table.
+
+**Decided (builds showrunner 2026-10-30 18:1x EDT):** predictor (c) stays unavailable until step records keep the actual Cargo cache folder each build used (the next item `Record the Cargo cache folder each build used so trims can be matched to affected builds`); a wrong prediction is worse than none. A seeded copy whose inherited history is not recorded reads as `CacheHistoryUnknown`.
+
+**Constraints from prior phases:**
+- Phase 33 (`5c9b01fd`): history rows are read only through `store.whole_rows(handle, start)` (`scripts/buildlog/store.py`); `anonymous_history_rows` (`memory_admit.py`) delegates its decoding to it. A row counts only when it ends in a newline; a cut-short, non-UTF-8 or non-object row is skipped. Add no second decode loop; keep the unfinished-JSON and split-UTF-8 consumer tests after any classification change.
+- Phase 11: keyed rows win over unkeyed rows; 1–4 own runs do not take the pool; the compile-run promise wins over `min(filtered, full)`; fresh runs keep `fresh_test_peak`.
+- Running charge: the band changes `need` and so the ramp promise only; it leaves the running charge as built (`build_charge` :1096, `charge_basis` :1100, `growth_headroom` :1119, `reservation_memory` :1847 at `31c3ee3e`; `docs/as-built/build-memory-admission.md`): a running step charges the largest of its current resident and swap bytes, its observed `.max` peak, its promise during `RAMP_SECONDS` (120 s), and its promise when the peak is unknown. After Phase 24, a release-profile `build` step holds its promise for its whole life (`LifetimePromise`, in the budget charge and the free-memory growth term); nextest steps keep the ramp. The `.max` peak expires `PEAK_DECAY_SECONDS` (1500 s) after the last near-peak time in `.wave`, or after the `.max` mtime when `.wave` is absent. Phase 15 lands before this phase: after report 4c's test-phase mark the running charge is `TestPhaseCharge`, and the band leaves that charge unchanged too.
+- Phase 24: `NeedBasis` and its path to the waiter row, build-why and the shell are Phase 24's; this phase adds one variant and one source value on that path, and the existing `need_basis` codec and rendering tests and the `LifetimePromise` tests stay gates. `build` steps keep Phase 24's same-shape rule; bands apply to nextest steps only.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — Spec 3.
+- `scripts/lint/build_shape.py` — Spec 3, worktree, start time and `tree_key` in the one step-evidence reader's value.
+- `scripts/lint/test_build_shape.py` — Spec 4, the reader's new fields.
+- `scripts/lint/memory_gate.sh` — Spec 3, the band in the wait line.
+- `scripts/lint/test_memory_admit.py` — Spec 4.
+- `scripts/build_queue/build_why.py`, `scripts/build_queue/test_build_why.py` — Specs 3–4, the band text (owner queue-unit; trial-merge against `origin/builds-queue`).
+- `docs/as-built/build-memory-admission.md` — Specs 1 and 5.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — admission (`memory_admit.py`, with `need_source_for` and the cached reader), the step-evidence reader (`build_shape.py`), the shell text (`memory_gate.sh`), `build_why.py` and docs.
+- `test` — `test_memory_admit.py`, `test_build_shape.py` and `test_build_why.py`; the predictor replay (Spec 1).
+
+**Acceptance gate:**
+- The memory admission and build-why tests pass; `basedpyright` over every changed Python file reports `0 errors, 0 warnings, 0 notes`; `bash -n scripts/lint/memory_gate.sh`; the merge gate is green. If Spec 2 stops the phase, no code changes and this item does not apply.
+- The notice has an `also touches scripts/build_queue/build_why.py, test_build_why.py (owner queue-unit)` line, tested against `origin/builds-queue`.
+- The `need_basis` codec and rendering tests (Phase 24's, plus `CompileBand`) and the `LifetimePromise` tests pass; an unknown cache-folder history reads as `CacheHistoryUnknown` in admission, build-why and the shell; the first and the cached wait lines both name the band.
+- The band table, predictor accuracy and before/after replay are in the checkpoint notice, with wait minutes saved and steps above their promise.
+- Post-merge check, 24 h after the merge reaches main: per band, steps above their promise and wait minutes against the 24 h before.
+- Change-Review line: a small-compile test run on a warm tree gets a small promise | on natedev in `~/rust/hana`, run `~/.claude/scripts/direct/verify.sh test hana_diegetic --filter <one test>` once, then add a comment line to one source file of that crate (a small compile that is not zero; an unchanged tree takes the freshness path instead), run it again and read that run's memory wait line | its need is near the small band's p90 that the replay gives, and its basis names the compile band it picked.
+
+### Phase 18 — History splits on the dylib feature and each step's commit, not on a time  · status: todo
+**Depends on:** Phase 17 (same `expected_peak`). Merge `origin/builds` first. Global order: Phases 21, 16, 25, 30, 28, 4, 24 and 32 are checkpointed; serial memory chain 31 → 33 → 26 → 15/27 (queue-unit) → 39 → 20 → 11 → 17 → **18** → 19 → 8; 29 runs beside the chain, checkpoints after 33 (same file, `sweep.py`) and joins before 11.
+
+**Approved:** showrunner 2026-10-29 (no ETA given).
+
+#### Work Order
+
+**Goal:** a promise uses only history built the same way as the step it admits. The 14-day window crosses two hana build changes that cut memory, and a time cutoff mixes steps from both sides.
+
+**Measured:**
+- Bevy dylib: hana `11c5edbd6f` (2026-10-29 05:33 EDT); `9b60fcd76e` is only its merge. Every dylib step's argv carries `--features` with `hana/dynamic_linking` in a comma list, for example `"--features", "hana/dynamic_linking,hana/hotpatching"`. Index read 2026-10-29 22:59 EDT: 68 step rows carry it; 42 of them are `verify-mac` rows with no repo and no sha. The showrunner's count: a time or sha-ancestry cutoff misses 13 of 17 dylib runs.
+- opt-level 1: hana `ad25f045ff` (2026-10-28 23:54 EDT), merged by `2bbd4c1fba` (2026-10-29 00:59 EDT), changes only `Cargo.toml` `[profile.dev.package.<crate>]` for dev and test builds. Argv does not show it, and the build log has no profile or `Cargo.toml` field. Steps record `sha` (short commit) and `tree_key`, so a step's side is whether `ad25f045ff` is an ancestor of its own `sha`.
+- Anon rows carry no sha; they join to `steps` by `call_id` and step name (Phase 11 Spec 4).
+
+**Spec:**
+
+1. **Measure first.** Over 14 days of natedev hana steps: the count on each side of each change, by step; the anon peak p90 on each side; how many rows have no sha or no `call_id` match (they count on neither side). Confirm that the opt-level side from sha ancestry separates the peaks; if it does not, record that and leave the opt-level split out. Replay today's promise against the split promise: per step, promises under half and over 3x the measured peak, wait minutes saved, steps above their promise.
+2. **One list of build changes.** A new `config/build_changes.json` holds each change: repository identity, kind (`argv_feature` with the feature name, or `commit` with the full sha), and a note. The two entries above are its first rows.
+3. **The split.** `expected_peak` and `filtered_peak` keep only history rows on the same side of every listed change as the admitted step. `argv_feature`: the feature set of the step's own argv and of the row's argv, both from `build_shape(argv).features` (`scripts/lint/build_shape.py` :59), which already reads comma lists, `--features=`, `-F` and repeated flags; write no second parser. `commit`: whether the change is an ancestor of the step's `HEAD` and of the row's `sha`. An anon row's argv and `sha` come from the one index join (Phase 11 Spec 4); add `sha` to its value and open no second join. Run git once per distinct sha and keep the answers in `admission/build_marks.json`; measure the added check time and report it. A release build (`BuildShape.profile` is `release`: `--release` or `--profile release`) ignores the opt-level entry (dev and test only).
+4. **Fallback.** With fewer than 5 rows on the step's side, the tiers below apply as today, still on that side. Rows of the other side never fill a tier.
+5. **Tests** in `scripts/lint/test_memory_admit.py`: a step with the dylib feature in a comma list, and one with `--features=`, lands on the dylib side; a sha after and before a commit change; a row with no sha counts on neither side; the cache file; a release `build` step keeps Phase 24's tiers, floor, factor and cap on its side; fake both memory readings. In `scripts/lint/test_build_shape.py`: the join's value carries `sha`. The existing `BuildShapePromiseTests` (same-shape promise and failed-peak floor) and the `need_basis` codec and rendering tests pass unchanged.
+6. **Docs.** `docs/as-built/build-memory-admission.md`: the list, the split rule and the replay table.
+
+**Constraints from prior phases:**
+- Phase 33 (`5c9b01fd`): history rows are read only through `store.whole_rows(handle, start)` (`scripts/buildlog/store.py`); `anonymous_history_rows` (`memory_admit.py`) delegates its decoding to it. A row counts only when it ends in a newline; a cut-short, non-UTF-8 or non-object row is skipped. Add no second decode loop; keep the unfinished-JSON and split-UTF-8 consumer tests after any classification change.
+- Phase 17's bands and Phase 11's compile split apply inside each side.
+- Build history inside each side: `build_expected_peak` (`memory_admit.py` :1612) keeps Phase 24's same-shape tiers (p90 with 10 or more rows, the largest with 1 to 9), failed-peak floor, release factor 1.314 (`RELEASE_HEADROOM` :102), the dev rule Phase 39 adopted (it replaced `DEV_HEADROOM`'s single 4.2034275337646125 factor; keep the adopted rule, never restore the factor) and the cap at the configured build budget. The cap is `build_budget_bytes()` (:1364: `BUILDLOG_BUILD_BUDGET_GIB`, then `[memory] build_budget_gib` in `config/lint.conf`, then `FALLBACK_BUILD_BUDGET_BYTES`), read when the estimate runs; write no fixed cap anywhere, tests included. A replay caps each promise at the budget in force when its step ran and names that budget, so a budget change does not read as this phase's effect. `ShapeFallback` (the profile fallback) has neither floor nor factor; feature-side filtering is already satisfied inside same-shape build tiers and remains necessary for profile fallback and other step histories. Determine release profile through `BuildShape.profile`, including `--profile release`, and test both release spellings. The split removes rows; it changes none of those values, and Phase 11's lower pool never replaces a same-shape `build` promise.
+- `scripts/lint/build_shape.py` holds the one argv parser and the one anon-to-index join (Phase 24 Part A; Phase 11 widens the join).
+- The estimate runs outside the admission lock (`check`), so git calls never run under the lock.
+
+**Files:**
+- `config/build_changes.json` — new — Spec 2.
+- `scripts/lint/memory_admit.py` — Spec 3–4.
+- `scripts/lint/build_shape.py` — Spec 3, `sha` in the join's value.
+- `scripts/lint/test_memory_admit.py`, `scripts/lint/test_build_shape.py` — Spec 5.
+- `docs/as-built/build-memory-admission.md` — Specs 1 and 6.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — `config/build_changes.json`, `memory_admit.py` (history filtering), `build_shape.py` (step evidence), the as-built doc and the side-split replay.
+- `test` — `test_memory_admit.py` and `test_build_shape.py` (Spec 5).
+
+**Acceptance gate:**
+- The memory admission and build-shape tests pass; `basedpyright` over `scripts/lint/memory_admit.py`, `scripts/lint/build_shape.py`, `scripts/lint/test_memory_admit.py` and `scripts/lint/test_build_shape.py` reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
+- The side counts, the peak per side, the added check time and the before/after replay are in the checkpoint notice.
+- Post-merge check, 24 h after the merge reaches main: hana steps above their promise and wait minutes against the 24 h before.
+- Change-Review line: a dylib hana test is promised only from dylib history | on natedev in `~/rust/hana`, run `~/.claude/scripts/direct/verify.sh test hana_diegetic` and read its first memory wait line | the need and its source match the dylib-side p90 that the replay gives.
+
+### Phase 19 — Measure where admission estimates come from, then make the 0.65 fallback rare  · status: todo
+**Depends on:** Phase 18 (same `expected_peak`); Phase 20 Spec 0 (the `admitted` events and their one reader, Spec 1). Runs before Phase 8. Merge `origin/builds` first. Global order: Phases 21, 16, 25, 30, 28, 4, 24 and 32 are checkpointed; serial memory chain 31 → 33 → 26 → 15/27 (queue-unit) → 39 → 20 → 11 → 17 → 18 → **19** → 8; 29 runs beside the chain, checkpoints after 33 (same file, `sweep.py`) and joins before 11. Phases 15 and 27 moved to queue-unit: start after queue-unit's checkpoints for them reach `origin/builds`, and merge it first. Phase 27's gate cap source and the removal of `gate_estimate` come from those checkpoints.
+
+**Approved:** showrunner 2026-10-29, rescoped (no ETA given).
+
+#### Work Order
+
+**Goal:** most admissions use measured anon peaks. The build-log peak times `ANON_SHARE` is a fallback that few admissions take.
+
+**Measured (code, at `a650d945`):**
+- `ANON_SHARE = 0.65` (`memory_admit.py` :71) scales a build-log `peak_mem_bytes` (page cache included) to process memory: in `expected_peak` (:597) when a repository has fewer than 5 measured anon peaks, and in `filtered_peak` (:703, :708) for the index tiers. `ExpectedPeak.source` (:141) is `measured`, `buildlog`, `pooled` or `fallback`.
+- Before Phase 20 Spec 0, no record keeps the source of an admitted step's estimate: reservations have no source field, and waiter rows (report Phase 3 adds `need_source`) are deleted at admission. From Spec 0's merge, each `admitted` event in `admission/queue_times.jsonl` records the need source, and Phase 20's one interval reader in `memory_admit.py` rebuilds each step from those events.
+
+**Spec:**
+
+1. **Measure first.** For every admitted natedev step in the last 7 days (steps that pass the memory gate: `width_trial.py` `_uses_memory_gate` :355), find its tier. For a step in the period that Phase 20 Spec 0 covers, read the recorded source of its `admitted` event through Phase 20's one interval reader; write no second parser of `queue_times.jsonl`. For an earlier step, replay `expected_peak` with the history before the step. Keep the two apart: recorded sources and reconstructed historical estimates are separate columns, never one sum. Phase 27's `cap` source (the gate row sized by its cap) is its own row; it is a chosen size, not a history fallback, and it counts in neither the `fallback` share nor the `× ANON_SHARE` share. Recorded source tables include `shape` and `cap` as distinct sources. `expected_peak` (:1152) routes a build to `build_expected_peak` with the default shape `NO_BUILD_SHAPE`, so a replay through the old call signature silently gives fallback estimates: reconstruct earlier build estimates with their recorded argv through `build_shape` and the shared step-evidence reader (Phase 11), preserving the historical shape and profile rules; report missing shape evidence separately, never as an ordinary fallback admission. Report the share of admissions per tier, by step kind (nextest full, nextest filtered, clippy, check, build, doc, other). Report the share that took a `× ANON_SHARE` tier, and for those steps, the estimate against the measured anon peak.
+2. **Stop rule.** If the `× ANON_SHARE` share is already small, the phase is only this measurement: the table goes in the as-built doc and no code changes. The showrunner sets "small" from the table.
+3. **Otherwise, widen anon matching.** When the exact filter set has no anon history, use the same repository + step anon rows (same scope and Phase 11/17/18 splits) before any `× ANON_SHARE` tier. Replay again: the `× ANON_SHARE` share, promises under half and over 3x the measured peak, wait minutes, steps above their promise.
+4. **Drop 0.65 once rare.** When the replay shows the `× ANON_SHARE` share below the showrunner's bound, remove the `ANON_SHARE` tiers; a step with no anon history goes to the pooled tier, then the fallback. Keep `ANON_SHARE` if the replay shows more promises under half the peak without it. Only the producer stops: old records stay readable. `NeedSource` (`memory_admit.py` :130) keeps `buildlog` as a value that only old rows carry; `build_why.need_text` (:81) and the shell's `buildlog)` description (`memory_gate.sh` :163) still render it; the cached-profile read in `run_action` still accepts it.
+5. **Tests** in `scripts/lint/test_memory_admit.py`: repo + step anon rows win over the index tier when the exact filter has none; with no anon history the next tier applies; a `build` step keeps Phase 24's same-shape rule when the widened match has rows of another shape; fake both memory readings. If Spec 4 removes the tier: an old waiter row with `need_source` `buildlog` still renders in build-why (`scripts/build_queue/test_build_why.py`) and in the shell's wait line.
+6. **Docs.** `docs/as-built/build-memory-admission.md`: the tier share table; if changed, the `need` paragraph.
+
+**Constraints from prior phases:**
+- Phase 33 (`5c9b01fd`): history rows are read only through `store.whole_rows(handle, start)` (`scripts/buildlog/store.py`); `anonymous_history_rows` (`memory_admit.py`) delegates its decoding to it. A row counts only when it ends in a newline; a cut-short, non-UTF-8 or non-object row is skipped. Add no second decode loop; keep the unfinished-JSON and split-UTF-8 consumer tests after any classification change.
+- Phases 11, 17 and 18 set which rows match; the widened match keeps every split, and reads rows through the one index join in `scripts/lint/build_shape.py` (no second join or argv parser).
+- Phase 24 owns the `build` promise: `build_expected_peak` (`memory_admit.py` :1612) keeps Phase 24's same-shape tiers (p90 with 10 or more rows, the largest with 1 to 9), failed-peak floor, release factor 1.314 (`RELEASE_HEADROOM` :102), the dev rule Phase 39 adopted (it replaced `DEV_HEADROOM`'s single 4.2034275337646125 factor; keep the adopted rule, never restore the factor) and the cap at the configured build budget. The cap is `build_budget_bytes()` (:1364: `BUILDLOG_BUILD_BUDGET_GIB`, then `[memory] build_budget_gib` in `config/lint.conf`, then `FALLBACK_BUILD_BUDGET_BYTES`), read when the estimate runs; write no fixed cap anywhere, tests included. A replay caps each promise at the budget in force when its step ran and names that budget, so a budget change does not read as this phase's effect. `ShapeFallback` (the profile fallback) has neither floor nor factor; feature-side filtering is already satisfied inside same-shape build tiers and remains necessary for profile fallback and other step histories. Determine release profile through `BuildShape.profile`, including `--profile release`, and test both release spellings. The widened match and the drop of 0.65 change other steps' tiers only.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — Specs 3–4 (none if Spec 2 stops the phase).
+- `scripts/lint/test_memory_admit.py` — Spec 5.
+- `scripts/build_queue/test_build_why.py` — Spec 5, the old `buildlog` row test, only if Spec 4 removes the tier (owner queue-unit; trial-merge against `origin/builds-queue`).
+- `docs/as-built/build-memory-admission.md` — Specs 1 and 6.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — the measurement, any adopted tier change in `memory_admit.py`, and the as-built doc.
+- `test` — `test_memory_admit.py` and the old-source rendering tests (Spec 5).
+
+**Acceptance gate:**
+- The tier share table is in the phase report and the checkpoint notice, with the stop decision.
+- If code changed: the memory admission tests pass; `basedpyright` over both Python files reports `0 errors, 0 warnings, 0 notes`; the merge gate is green; the before/after replay is in the notice. Post-merge check, 24 h after the merge reaches main: steps above their promise and wait minutes against the 24 h before.
+- Change-Review line: few admissions use the 0.65 fallback | on natedev while builds wait, run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_why.py` | the waiting rows name source `measured` and few name `buildlog`. If Spec 2 stops the phase: Change-Review: none — measurement only.
+
+### Phase 20 — Replay a looser head rule, and adopt it only on the replay  · status: todo
+**Depends on:** Phases 31 (Rule A; the head-admission override in the one snapshot), 33 (the finalizer's retry guarantees, Spec 0) and 26 (`queue_times.jsonl`, the priority-aware ordered snapshot, the token-wait transaction with its `token_gap` events, and the total queue wait from the waiter's original `since`), all on the same file `memory_admit.py`; checkpointed Phases 16, 24, 30 and 32 (gate rows, the one reservation finalizer, the ordered walk, the override); report-unit's build-why change on `origin/builds` (`explain_queue`, Spec 2). Merge `origin/builds` first. Global order: Phases 21, 16, 25, 30, 28, 4, 24 and 32 are checkpointed; serial memory chain 31 → 33 → 26 → 15/27 (queue-unit) → 39 → **20** → 11 → 17 → 18 → 19 → 8; 29 runs beside the chain, checkpoints after 33 (same file, `sweep.py`) and joins before 11. Phases 15 and 27 moved to queue-unit: start after queue-unit's checkpoints for them reach `origin/builds`, and merge it first. Phase 39 (the dev need rule) lands first: its deployment time is a calibration boundary for Spec 1, like each other deployed rule change.
+
+**Approved:** showrunner 2026-10-29 (ETA 08:30 EDT 2026-10-30). The showrunner decides adoption from the replay table. Spec 0 (every step's queue life in the shared record): builds showrunner 2026-10-30.
+
+#### Work Order
+
+**Goal:** when the head of the memory queue cannot fit by its own measure, younger steps that fit start, if the replay shows the head is not held back by more than the showrunner's bound.
+
+**Measured:**
+- Today's rule (`memory_admit.py` at `a650d945`): `HEAD_SECONDS` 600 (:90), `STRICT_SECONDS` 600 (:91), `BACKFILL_SECONDS` 120 (:92). `head_window` (:307): before 600 s younger steps backfill; after that, 600 s strict then 120 s backfill, in a cycle. `head_priority` (:1025) gives the head priority when it fits now or `MemAvailable + measured >= head need + reserve`. `queue_decision` (:1040) holds every younger step in a strict window (`replace(decision, state="hold")`, :1047-1048), even one that fits.
+- At `31c3ee3e`: `queue_decision` (:2181) returns its row's entry from `admission_walk` (:2151; Phase 30) and takes `ordered`, `recovery` and `now`; `check` applies the Phase 32 head-admission override after the walk (:2460-2469).
+- The hana showrunner saw 25 steps wait behind one 11.8 GiB head while many 3 GiB clippy steps fit (reported 2026-10-29; not checked against the log in this Work Order).
+
+**Spec:**
+
+0. **Record every step's queue life first.** Phase 16 deferred its comparison of cargo waits with and without a gate running, and no record can make it: `release` (:3017) keeps an end time and a positive peak, but no arrival, admission time, wait or need, and a gate has no Cargo `steps` row. `memory_admit.py` appends lifecycle events to Phase 26's `admission/queue_times.jsonl` through Phase 26's one append function (`at`, lock, 8 MiB / 14-day trim), with Phase 26's identity fields (one record holds every queue time; no second gate history): `admitted` from `check` (arrival = the waiter's original `since`, `admitted_at`, wait seconds = `admitted_at - since`, `need`, the need source, whether the step was the head and the head's window state, and the build budget in force from `build_budget_bytes()`), `left` from `cancel_waiter` (:3647, reason `cancelled`) and from `live_waiters` (:2389, reason `owner_gone`, when it removes a dead owner's row; it runs only under the admission lock), and `ended` from Phase 24's finalizer, `finalize_reservation` (:3656) (`ended_at`, `outcome`, the end kind below, and `PeakSampled` or `NoPositiveSample` for an exit before the first positive sample). Every step writes them, `merge-gate` included. One reader in `memory_admit.py` rebuilds each step's interval from these events. Nothing claims the Phase 16 comparison or the replay's gate coverage until that reader rebuilds overlapping gate intervals, a cancelled gate and a gate that exits before a positive sample. The Phase 16 comparison runs 24 h after Spec 0 reaches main, not 24 h after Phase 16. Lifecycle publication preserves Phase 33's retry guarantees and reservation identity: the `ended` event comes from the saved finalization intent, once per reservation id, also on a retry. Spec 0 lands in every case, also when Spec 1 stops the phase.
+   - **A reservation is an interval, not a step.** A token wait ends one reservation, and a later admission opens another for the same step. `token_wait` (:2742) writes a `.token-wait` intent; `finish_token_wait` (:2725) finalizes the reservation as `Completed` with status 0 and restores the waiter row with its original `since` and `priority_since`; the next `check` admits the step under a new `reservation_id`. An interrupted intent is finished by the next `check` (:2814) or by a rerun of `token-wait`. So the events carry two keys: the reservation interval (`reservation_id`, on `admitted` and `ended`) and the logical step (`pid`, `start_time` and the original `since`, from the reservation's `queue_waiter`, on every event).
+   - **The end kind is closed.** `finalize_reservation` takes `StepEnd | TokenReturn`. `finish_token_wait` passes `TokenReturn`; every other caller passes `StepEnd`. The finalization intent (`FinalizationIntent` :256) saves the kind, so a retry publishes the same kind, once per reservation id. A `TokenReturn` `ended` event ends the interval, never the step. The `anon_peaks.jsonl` row does not change.
+   - **The reader joins intervals to one step.** The one interval reader groups events by the logical step key, in time order: the arrival (the original `since`), each reservation interval, the token gaps between them (Phase 26's `token_gap` events: `token_left_at`, `token_back_at`), and one end, the last `StepEnd` `ended` or a `left`. A step whose last interval ended with `TokenReturn` and that has no later event has no end yet. The step's memory wait is (first `admitted_at` - `since`) plus, for each later admission, (`admitted_at` - the `token_back_at` of the gap before it).
+1. **Calibrate the queue model first.** Calibrate on one cohort whose real policy is known: one span with one rule in force, bounded by the time every admission-policy checkpoint reached main (`git log origin/main`): Phases 24, 30, 31, 32, 26, 15 and 27. Each changes the policy: 24 the build promise and its lifetime charge, 30 the ordered walk, its recovery slot and the bump stop, 31 Rule A, 32 the head-admission override, 26 queue priority, 15 the test-phase charge, 27 the gate's cap. A build budget change is a boundary too: the budget comes from `build_budget_bytes()` (:1364: `BUILDLOG_BUILD_BUDGET_GIB`, then `[memory] build_budget_gib` in `config/lint.conf`, then `FALLBACK_BUILD_BUDGET_BYTES`), so each change of that key on main starts a new span. The replay uses the cohort's actual charge and override rules and its budget, and the report names that budget. Use the newest span that holds 7 days, and say which. Then Spec 3 compares the deployed rule with the capacity rule on that model, so a change from any of those phases does not read as model error. The Phase 15 replay (`/tmp/claude/unit/abea5ffb-4b99-499e-ae41-7ebb04630f9f/phases/15/replay.py`; report `replay_report.md` in the same folder) is the failed baseline: its replay of today's rule gave 113,965,165.46 wait minutes against 178,192.68 recorded `mem_wait_s` minutes, 639.56 times the recorded wait. Its report names the admission inputs it lacks: `MemAvailable` and host totals at each admission poll, PSI avg10, exact sccache anon, request retries, queue bumps, and `.max`/`.wave` growth. Over the cohort's 7 days of the natedev build log, the replay of its rule must give total wait minutes within 25% of the recorded `mem_wait_s` sum (all steps, and hana alone). Inputs: step arrival = the step's original `since`. From Spec 0's merge it is the interval reader's arrival. In an earlier cohort, `steps.started_at - mem_wait_s` is short by the token gap: `mem_wait_s` adds only the two memory waits around a token wait (`scripts/direct/verify.sh` :2645-2648), and the step kept its place through the gap. So arrival = `started_at - mem_wait_s -` the token gap, with the gap from Phase 26's `token_gap` events where the cohort has them, and `steps.token_wait_s` as a named stand-in before them. `need` from `expected_peak` with the history before the step, run time `duration_s`, charge from `anon_peaks.jsonl`, `MemAvailable` from `samples.mem_used_bytes`, bumps from `queue_bumps` only before Phase 30 (after it no bump moves a step), queue priority from Phase 26's `queue_priority` build-log rows (`record.queue_priority`, `scripts/buildlog/record.py` :986): set, replace (a second set) and clear only, with no expiry; the user's typed bump is a set with why `the user's bump`, and override admissions from `head_admission` rows. Print both totals and the ratio, and name each missing input the replay uses a stand-in for. If the replay cannot reach the bound, the phase records the totals, the ratio and the missing inputs in the as-built doc and the phase report, names the record that each missing input needs as a follow-up item, and stops the comparative replay and any behavior change (Specs 3–6). Spec 0 lands in every case; whether Spec 2 lands is the pending decision below.
+2. **One head policy, before the comparison.** Since Phase 31 (`04e4cee2`) each row's admission decision, its `BehindHead`/`BehindOlderFit` reason and `check`'s head fields already come from the one walk through `admission_for_waiter`, `queue_wait_reason` and the shared override decision (`HeadRoom | NoHeadRoom`). What still recomputes the window on its own is `head_wait_reason` (:906, through `head_window` :911) and the window state in `queue_read_from` (:3246, the snapshot consumer; `read_queue_pass` :3327 only gathers its inputs and calls it). Keep that admission decision path and the `window_clause` writer; add no second implementation of Rule A. Make one function return the head's policy for a queue snapshot, with a closed window state and a closed rule argument: rule (a) the deployed rule of Spec 3, rule (b) the capacity rule of Spec 3. It takes the walk and its recovery slot, Phase 31's head room and Phase 26's priority-aware order, and keeps the head-admission override that Phase 31 puts in the one snapshot (never transferred to another waiter). Production passes rule (a). Admission, the blocker lookup, `read_queue`, `explain_queue` (in the pass it shares with `read_queue`), `head_wait_text` (:938) and `check`'s head fields all read that result; none recomputes the window. The release search reads it too: `head_after_steps_end` (`memory_admit.py` :3546) rebuilds the head waiter from the frozen `QueueExplanation` and calls `head_priority` and `queue_decision`, and `smallest_head_release` (:3589) calls it for each set of endings. Both call the one policy function on the snapshot with those rows ended. They stay frozen and read-only (no file read, no lock, no state change), and they return the closed `HeadRelease = HeadAdmitsAfterEnd | HeadStartsAt` (:1191) or `HeadStillHeld`, with no new variant. The release line text stays only in `build_why.release_text` (:152). This step changes no admission behavior: the existing tests pass unchanged. The replay imports this function from the checkout; it holds no copy of the rule. It lands whether or not Spec 5 adopts rule (b).
+3. **Comparative replay.** On the calibrated model of Spec 1, replay the queue through the Spec 2 function under two rules: (a) the deployed ordered walk after Phases 30, 31 and 26: Rule A, recovery spacing and the recovery slot, queue priority (a user bump stays until the user moves it; no expiry), the token wait (a step keeps its original `since` through each gap), the total queue wait, the Phase 32 override and the lifetime promise of release builds; (b) the same walk with only the stated capacity condition changed: in a strict window, when `decide` for the head alone returns hold, a younger step is checked as in a backfill window, on its own budget and memory checks, with no head-room check (Rule A's check (2)). Both rules keep the cohort's own build budget, test-phase charge and gate-cap rules: a nextest step gets Phase 15's `TestPhaseCharge` after its mark only in a cohort after Phase 15 landed; in a cohort after Phase 27 landed, each gate row holds its own cap, read from its `admitted` event's `need`, so a gate run with a nondefault `--memory-cap-mib` keeps that cap, not the default; in an earlier cohort, a gate row holds the estimate it had. Report per day and per repository: wait minutes under each rule, minutes saved, and for each head, how much later it starts under (b) (count, p50, p90, max). Find the hana showrunner's case in the log and show it as one row.
+4. **Risk.** For rule (b), count how often an admitted step went above its charge, and the replayed `full avg10` holds, against rule (a).
+5. **Adopt rule.** The showrunner sets the bound on the head's added delay from the replay table. Rule (b) lands only if the head's added delay stays under that bound. Otherwise the phase records the table in the as-built doc and lands only the Spec 2 function.
+6. **If adopted:** production passes rule (b). The window state adds `CapacityBackfill` (the head cannot fit, so younger steps that fit start) apart from today's timed backfill. `verify.sh`'s wait lines and `/build:queue` share the text: the window text keeps one writer, `head_facts.order_text` (`scripts/build_queue/head_facts.py` :418) through Phase 31's one clause function (`window_clause`, `memory_admit.py` :928). `CapacityBackfill` has no deadline, and two readers read `deadline` from every recorded window other than `WindowNotStarted`: `order_text` (:424) and `queue_view.head_status` (`scripts/build_queue/queue_view.py` :183, the countdown at :194-196). Both match on the closed window state and end in `assert_never`. `head_status` shows `CapacityBackfill` as the ` ↑` mark in `success` tone with no countdown span; `order_text` gives `head cannot fit: younger steps that fit may start` with no time left. Extend the window union where it is declared (`HeadExplanation.order`, `memory_admit.py` :1061; `HeadFacts.order`, `head_facts.py` :106). Queue priority (Phase 26) keeps its meaning: the priority unit's steps walk first under both rules, and the Phase 32 override admits only its own head.
+7. **Tests** in `scripts/lint/test_memory_admit.py`: for one snapshot under rule (a), admission, `blocker`, the queue view's Reason, `explain_queue` and the shell wait text show the same window state (Spec 2); `BehindOlderFit`, the recovery-slot reservation and an override head read the same in every reader, and the Phase 30 and 31 cross-reader tests, `AdmitHeadTests`, `test_fitting_strict_head_keeps_its_place_when_younger_polls_first` and `test_build_why.py` `test_override_free_memory_terms_add_up_to_its_printed_threshold` pass unchanged. During recovery spacing, with a head behind running charge that only endings free: `smallest_head_release` returns `HeadStartsAt(next_start_at)` with the required steps in `ended`, from the same window state that admission reads, and reads no file (rule (a), and rule (b) if adopted). If adopted: a younger step that fits starts while a head that cannot fit is strict; while a head that fits is strict, a younger step that fits beside the marked head still admits (the test sets the budget to 21 GiB through `BUILDLOG_BUILD_BUDGET_GIB`; running charge 10, head 8, younger 2), and a younger step the marked head's room leaves no space for holds with `BehindOlderFit` (same snapshot, younger 4); queue priority still walks the priority unit first, and an override head still admits only itself; the same five readers show `CapacityBackfill`. Spec 0's identity contract: (token return) a step that gives its reservation back for the token and is admitted again reads as one logical step with two reservation intervals, one arrival at its original `since`, one token gap, a memory wait without the gap, and one end, and its `TokenReturn` `ended` event is no completion; (cancellation) a step that leaves during its token wait through `cancel_waiter`, and one whose owner is gone when `live_waiters` removes its row, each end as `left` with no completed run; (interrupted recovery) a stop after the `.token-wait` intent is written and before `finish_token_wait` ends, followed by the next `check` or by a rerun of `token-wait`, publishes exactly one `TokenReturn` `ended` event for that reservation id, and the step still reads as one logical step. In `scripts/build_queue/test_build_why.py` (owner queue-unit), only if `build_why.py` changes: its head text for each window state. If adopted, in `scripts/build_queue/test_queue_view.py`: a `CapacityBackfill` head shows ` ↑` with no countdown, and the goldens (`scripts/build_queue/golden/view_*.txt`) pass unchanged under rule (a); in `scripts/build_queue/test_head_facts.py`: `order_text` for `CapacityBackfill`. Fake both memory readings.
+8. **Docs.** `docs/as-built/build-memory-admission.md`: the calibration totals, the replay table and, if adopted, the new head rule (Rule and Waiters paragraphs).
+
+**Decided (builds showrunner 2026-10-30 18:1x EDT):** the one head-policy function (Spec 2) lands even when calibration (Spec 1) fails; it changes no behavior and removes four copies of the window rule.
+
+**Constraints from prior phases:**
+- Phase 10: the blocker lookup reuses `decide` and `queue_decision`; no second rule.
+- Running charge: the replay uses the running charge as built after Phase 24 (`build_charge` :1096, `growth_headroom` :1119, `reservation_memory` :1847 at `31c3ee3e`; `docs/as-built/build-memory-admission.md`): a running step charges the largest of its current resident and swap bytes, its observed `.max` peak, its promise during `RAMP_SECONDS` (120 s), and its promise when the peak is unknown; a release-profile `build` step holds its promise for its whole life, in the budget charge and the free-memory growth term (`LifetimePromise`). The `.max` peak expires `PEAK_DECAY_SECONDS` (1500 s) after the last near-peak time in `.wave`, or after the `.max` mtime when `.wave` is absent. Phase 15 lands before this phase: in a cohort after Phase 15 landed, the replay charges a nextest step `TestPhaseCharge` after report 4c's test-phase mark, as Phase 15 builds it (Spec 3 keeps the cohort's rule).
+- Phase 16: merge gates are queue steps; the replay counts them only from Spec 0's rebuilt intervals. Phase 27: after it lands, a gate row holds its own `--memory-cap-mib` from start to end, with need source `cap`.
+- Phase 26: one priority-aware ordered snapshot (`resolve_queue_order` :643), resolved once at the snapshot boundary, feeds admission, `admit_head`, the queue readers, the blocker lookup and the release search; the walk does not sort it again. Its current consumer is `queue_read_from` (:3246); `read_queue_pass` (:3327) only gathers inputs for it. No head time exists: a waiter keeps its original `since` across token waits (`check` :2837-2839 takes the earlier of the shell's `BUILDLOG_MEM_WAIT_SINCE` and the stored row; `token_wait` restores the row from the reservation's `queue_waiter`), and the views show the total wait from it. Spec 2's one function takes that order as it is.
+- Phase 31: Rule A runs inside the walk and keeps its recovery slot; the head-admission override (`HeadAdmissionOverride | NoHeadAdmissionOverride`) is part of the one admission snapshot, so check, the queue view, build-why and the release search agree when a head is let in. This phase keeps it: the one policy function reads the override from the snapshot.
+- Phase 32: `admit-head` admits the waiting head once; its `head_admission` set, admitted and lapsed rows stay readable (`AdmitHeadTests`, `test_memory_admit.py` :2790).
+- Phase 25: `head_after_steps_end` and `smallest_head_release` return `HeadStartsAt` for a recovery spacing hold, with the endings the timer needs first; `build_why.release_text` is the one writer of the release line.
+- report-unit's build-why change (on `origin/builds` since `228b45ae`): `explain_queue() -> QueueExplanation` in `memory_admit.py`, `ChargeBasis` and the waiter `need_source` as closed unions, and `scripts/build_queue/build_why.py`. `read_queue` and `explain_queue` share one internal pass: `read_queue_pass` (:3327) gathers inputs (`gather_queue_inputs` :3175) and `queue_read_from` (:3246) consumes them; the policy result goes in `queue_read_from`. Keep its reader contract: `queue_rows` (:3060) keeps every reservation row, readers skip `GoneMemory` rows (:3137, :3190), and `Waiter.need_source` is the typed `NeedSource` (:461; `NeedSource` :145).
+
+**Files:**
+- `scripts/lint/memory_admit.py` — Specs 0, 2 and 6.
+- `scripts/lint/test_memory_admit.py` — Spec 7, and Spec 0's events and interval reader (overlapping gates, a cancelled gate, an exit before a positive sample, a token return, a cancellation during a token wait, an interrupted token-wait recovery).
+- `docs/as-built/build-memory-admission.md` — Specs 0, 1, 3 and 8.
+- `scripts/build_queue/build_queue.py` — only if its head Reason text must change (owner queue-unit; trial-merge against `origin/builds-queue`).
+- `scripts/build_queue/head_facts.py`, `scripts/build_queue/test_head_facts.py` — only if adopted: the `CapacityBackfill` window text in `order_text`, the one window-text writer (owner queue-unit; trial-merge against `origin/builds-queue`).
+- `scripts/build_queue/build_why.py`, `scripts/build_queue/test_build_why.py` — only if the head text in build-why must change (owner queue-unit; trial-merge against `origin/builds-queue`).
+- `scripts/build_queue/queue_view.py` — only if adopted: `head_status` shows `CapacityBackfill` with no countdown (owner queue-unit; trial-merge against `origin/builds-queue`).
+- `scripts/build_queue/test_queue_view.py`, `scripts/build_queue/golden/view_*.txt` — only if adopted: the `CapacityBackfill` row test; the goldens stay unchanged under rule (a) (owner queue-unit).
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — the lifecycle writer and reader (Spec 0) and the head policy function (Specs 2 and 6) in `memory_admit.py`, any queue text change (`head_facts.py`, `queue_view.py`, `build_why.py`), and docs.
+- `test` — lifecycle tests (token return, cancellation and interrupted recovery included), frozen-policy and explanation tests (Spec 7), `test_head_facts.py`, `test_queue_view.py` and the view goldens if adopted, and the comparative replay (Specs 1, 3 and 4).
+
+**Acceptance gate:**
+- Spec 0: its tests pass, including a retried `ended` event published once per reservation id and the token return, cancellation and interrupted-recovery cases (one logical step, no completion before its last interval); post-merge check, 24 h after Spec 0 reaches main: the Phase 16 comparison (cargo-step wait minutes and pressure holds with and without a gate running) from the rebuilt intervals; the phase report records when it is due; the result goes in a follow-up notice.
+- The calibration totals (replayed and recorded wait minutes, the ratio, the missing inputs, the cohort and its build budget) are in the phase report and the checkpoint notice. If Spec 1 stops the phase: Change-Review line: each step's queue life is recorded | on natedev after a merge gate runs, read the last lines of `~/.local/state/buildlog/admission/queue_times.jsonl` | the gate has `admitted` and `ended` lines with its arrival, admission and end times.
+- The replay table is in the phase report and the checkpoint notice with the showrunner's bound and the adopt decision.
+- The Spec 2 function: the memory admission tests pass unchanged and with the new same-state test; the Phase 30 and 31 cross-reader tests (`BehindOlderFit`, the recovery-slot reservation, an override head) and `AdmitHeadTests` pass unchanged; `basedpyright` over the changed Python files reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
+- If adopted: the memory admission tests and `test_queue_view.py` (the untimed `CapacityBackfill` mark) pass; `basedpyright` over the changed Python files reports `0 errors, 0 warnings, 0 notes`; the merge gate is green. Post-merge check, 24 h after the merge reaches main: wait minutes and the heads' start delay against the 24 h before, and how often a step went above its charge. The phase report records when the check is due.
+- Change-Review line: small steps start while a large head cannot fit | on natedev while a large hana nextest head waits, type `/build:queue` in a Claude session | younger clippy rows that fit are running, and the head's Reason names the new window state (text in the as-built).
+
+### Phase 21 — Copies get a root, a busy mark and a lifetime that ends when their work ends  · status: done
+
+#### As-built
+
+- `/tmp/claude/copies/<pair>/<copy>` is a kept root in `tmp_sweep.py`, in `folder_audit.py` `KEPT_NAMES` and in the scratch guard hook. `copy_record.copies_root()` resolves it once with `realpath` (`SCRATCH_COPIES_ROOT` sets it in tests). Each copy is one entry; an empty `<pair>/` goes.
+- Each copy has one `.scratch.json` record: source path and commit, copy commit, target mode, seed source, `borrows_from`, owner unit, task, land target and copy identity; a `phase:` record adds its run dir and phase id. `scratch.register_copy` writes it. Only the record and `.claude-busy` go in the copy's `.git/info/exclude`.
+- One record writer: `update_record` under `copy_record_lock`; task fields come only from `fields_for_task`. `directory_record_lock(path, *, wait)` checks after the `flock` that the locked fd still names the path (`st_dev`, `st_ino`), tries at most three times, then raises `ScratchError`.
+- Closed results: `read_record` returns `Registered | NotRegistered | UnreadableRecord(reason)`; `lifetime` returns `Live(why) | Ended(evidence) | Unknown(reason)`. A sweep removes only `Ended`; the dry run names each `Unknown` with its repair reason.
+- Lifetime rules: an open phase keeps a copy at any age; the recorder's completed, stopped and error states end it. `landed:<unit>/<branch>` ends when `origin/<branch>` is an ancestor of the land target in the refs of the record's `source_path` (no fetch) and the copy has no unsaved work; the 7-day no-change rule then applies. A parent stays while a live record borrows from it.
+- Busy mark: holders take a shared `flock` on `.claude-busy` while they run; `tmp_sweep.py`, scratch end and the `sweep.py` floor sweep try a non-blocking exclusive `flock` and skip the copy when it fails. `removal_lock` creates the mark; `judgment_lock` (dry runs, scans) does not. `merge_gate.py --checkout <copy>` holds the shared lock through `scratch.copy_lock`.
+- Removal writes a certificate `.scratch-removing-<copy>.json` in the pair folder with the copy identity, so a stopped removal finishes on a rerun and never removes a new copy at the same path. It is the same removal mark `scratch.remove_marked` writes beside every scratch folder (one name, one writer, one reader `pending_removal`); only a copy's mark carries and checks the identity.
+- `scratch.py hand-over PATH --to UNIT --task TASK [--run-dir RUN_DIR] [--land-target LAND_TARGET]` replaces owner and task fields in one record write and keeps the path. A phase record handed to a `landed:` task drops its phase fields.
+
+**Files:**
+- `scripts/lib/scratch.py` — copies root, record, lifetime, locks, removal certificates, `hand-over`.
+- `scripts/lint/tmp_sweep.py`, `scripts/lint/folder_audit.py` — kept root and a judgment per copy.
+- `scripts/lint/sweep.py` — busy lock in the floor sweep.
+- `scripts/hooks/pre-tool-use-scratch-guard.py` — copies root allowed.
+- `scripts/production/merge_gate.py` — `--checkout` shared busy lock.
+- `docs/as-built/build-targets.md` — copies root, record and lifetime.
+
+**Binds later work:** every clone under the copies root registers with `scratch.register_copy`, and every record change goes through `update_record`. The busy mark is per copy: a lock on a shared build folder does not take `.claude-busy` from inside a copy. Admission and token waits stay inside the copy lock (Python test gates take a place in the shared admission queue).
+
+**Gotchas:** a `flock` on a directory fd does not prove the path still names that directory; every record lock rechecks dev/ino. A second record writer reopens the record races.
+
+**Ruled out:** a rename on hand-over (it breaks child `objects/info/alternates` and the merge gate's path-keyed push-recovery records); trust in a locked fd without a path identity check.
+
+### Phase 22 — A stopped hold release finishes when it runs again  · status: done
+
+#### As-built
+
+- `release_cycle` saves the last holder's release intent atomically in `BUILD_HOLD_RELEASE_DIR/pending-release.json` (`save_release_intent`) before it removes the holder file. When a later release saves its intent, `retain_release_record` first moves an earlier pending record to `releases/<release-id>/`, so its notices stay.
+- `release` and `release --resume` with no hold in force drain each pending record on its own under `release.lock` (`finish_release_intent`). A record whose notice or broadcast fails stays pending, and the drain goes on to the next.
+- A notice outcome is saved after its sender returns, so a stopped send is retried: notices are at-least-once. A release without a usable cycle keeps its broadcast pending until the broadcast returns.
+- A drained record becomes the one completed receipt for its holder key, `receipts/<holder-key>/completed-release.json`, replaced in place (`complete_release_record`). `recorded_releases()` moves older receipts there as it reads.
+- Live holder files take precedence over receipts. A finished release prints `hold is already released.` even after a new cycle opens, then the details of any record it drained, `Not reached, tell them yourself` lines included.
+
+**Files:**
+- `scripts/build_hold/build_hold.py` — release intent, drain, receipts.
+- `scripts/build_hold/test_build_hold.py` — fault-injection rerun tests.
+- `docs/as-built/build-memory-admission.md` — the release intent paragraph and notice outcome timing in its build-hold part.
+
+**Binds later work:** `BUILD_HOLD_RELEASE_DIR` (`pending-release.json`, `releases/`, `receipts/`) is shared build state that only the installed copy writes (Shared build state is written only by the installed copy); receipt migration in `recorded_releases()` is a write. `status` does not show a pending release record yet; Hold status names unsent release notices adds it.
+
+**Gotchas:** a session can receive a release notice twice. `recorded_releases()` migrates receipts as it reads, so a read-only reader must not call it.
+
+**Ruled out:** at-most-once notices (a lost notice is worse than a repeated one); one receipt per release (the count grows without bound).
+
+### Phase 23 — Hold status names unsent release notices  · status: done
+
+#### As-built
+
+- `build_hold.py status` prints one line per pending release record, after the holder lines or `no build hold`: `release pending: <holder name>, released <HH:MM zone> - unsent: <name>, <name>; run /build:hold release to finish it` (`every session (broadcast)` for a broadcast). An unreadable record or cycle prints `release pending: <path> could not be read: <error>; /build:hold release sets it aside`.
+- Status and release share `pending_release_paths()` and `read_release_intent()`. Status takes no `release_lock()`, never calls `recorded_releases()`, and changes no file.
+- `release_notices(intent)` is the one unsent reader: `CycleNoticesToSend(cycle, entries)` or the broadcast notice. The first cycle entry per session counts; a recipient is unsent when its entry is missing, `NotAttempted` or `DeliveryFailed`. A cycle id that is not the record's `cycle_id` raises `ReleaseNoticeReadError(path, reason)`.
+- Release sets a damaged pending record or cycle aside (`set_aside_damaged_record`, `<name>.damaged-<UTC time>[-n]`) and goes on. It rebuilds a damaged or missing cycle from the intent's recipients, so the printed command works.
+
+**Files:**
+- `scripts/build_hold/build_hold.py` — path list, unsent reader, status lines, set-aside and cycle rebuild.
+- `scripts/build_hold/test_build_hold.py` — status and release agreement, damaged and duplicate cases, status writes nothing.
+- `docs/as-built/build-memory-admission.md` — Build hold: `status` row, release intent paragraph.
+
+**Binds later work:** the status reader takes no lock, so a write guard at `release_lock()` does not refuse it. The set-aside and cycle rebuild are writes: recovery that the guard routes through `ReleaseLockHeld`, with no second `flock` (Shared build state is written only by the installed copy).
+
+**Gotchas:** a rebuilt cycle has no delivery evidence, so a session can get a notice twice (at-least-once).
+
+### Phase 24 — A build's promise comes from builds of the same shape and holds until the build ends  · status: done
+
+#### As-built
+
+- **Shape.** `build_shape(argv) -> BuildShape` is a frozen value (profile, sorted features, targets) with a stable JSON `key`; `--all-features` and `--no-default-features` are their own feature values. `recorded_build_shape(raw) -> BuildShape | NoBuildShape` decodes a stored key and never infers `dev`. `index_shapes(index_path, host, step, cutoff, before) -> dict[(call_id, step), BuildShape]` reads `steps.argv` read-only; an old history row takes its shape from this join, and a row with no match has no shape.
+- **Promise.** `build_expected_peak(repository, shape, host, now, root) -> ExpectedPeak` counts only same-repository, same-shape rows: p90 with 10 or more rows (`ShapeP90`), the largest with 1 to 9 (`ShapeLargest`). With no same-shape rows, `ShapeFallback` is `max(FALLBACK, heaviest same-profile build)`, with no floor and no factor.
+- **Failed-build floor.** On the two tiers, the newest same-shape row with outcome `killed` or `owner_gone`, or with a peak above its `need`, sets `FailedPeakFloor(peak, ended_at)`; the base is `max(tier, floor)`. A later success below the floor does not end it; a newer failed row replaces it; it ends when its row leaves `HISTORY_DAYS`. A row with `OutcomeNotRecorded` never sets a floor.
+- **Factor and cap.** The tiers multiply by `RELEASE_HEADROOM` (1.314) for release shapes and `DEV_HEADROOM` (about 4.203) for dev shapes; other profiles get `NoHeadroom`. Every promise caps at `BUILD_BUDGET_BYTES` (21 GiB) as `CappedAtBudget(uncapped)` or `UnderBudget`.
+- **Need basis.** `NeedBasis = LegacyNeedSource | ShapeP90 | ShapeLargest | ShapeFallback`, each shape tier with its floor, factor and cap. `need_basis_record` writes it to the waiter row's `need_basis` beside the `shape` source token; `read_need_basis` reads it back (`BasisNotRecorded` for an old row). `read_queue_pass`, `build_why.need_text` and `memory_gate.sh` read it; the wait line says "a same-shape promise", never a p90. An unknown token fails closed in the shell.
+- **Lifetime promise.** `MeasuredMemory.promise` is `RampPromise | LifetimePromise | NoPromise`, set in `step_memory`. A release `build` step holds `LifetimePromise(need)` until it ends: `charge_basis` charges `max(need, current memory, observed peak)` and `growth_headroom` keeps `need − current` as growth in the free-memory check. `build_why.charge_text` says the promise holds until the step ends. Dev builds and all other steps keep the 120 s `RampPromise`.
+- **One finalizer.** `finalize_reservation(path, row, outcome, now, status) -> HistoryRecorded | NoHistoryRecorded` runs under the caller's lock, from `release` and from `check` for each ended row. It stores a `finalization` intent with a stable `reservation_id` in the reservation, appends one `anon_peaks.jsonl` row with `need`, `shape` and `outcome` (`completed` status 0, `failed` 1–127, `killed` 128+, `owner_gone`) unless that id is already there, then removes the sidecars and the reservation last. `check` uses the evidence it records in the same admission.
+
+**Files:**
+- `scripts/lint/build_shape.py` — shape value, stored-key decoder, index join.
+- `scripts/lint/memory_admit.py` — same-shape promise, floor, need basis codec, lifetime promise, `finalize_reservation`.
+- `scripts/lint/memory_gate.sh` — the `shape` source token and its wait line.
+- `scripts/build_queue/build_why.py` — need and charge texts (report-unit).
+- `docs/as-built/build-memory-admission.md` — the rule and the replay table (126 natedev builds, 14 days to 2026-10-30).
+- Tests: `scripts/lint/test_build_shape.py`, `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_build_why.py`, `scripts/buildlog/test_test_phase_peak.py`.
+
+**Binds later work:** `finalize_reservation` is the only path that ends a reservation and writes history; the anonymous-history reader and the test-phase charge build on it. `need_basis_record`/`read_need_basis` is the one codec for need bases; new bases (a band, a gate cap) join the `NeedBasis` union through it. `LifetimePromise` is the state to reuse for any promise held for a step's life. `index_shapes` takes no repository.
+
+**Gotchas:**
+- The index join cannot match on repository: `steps.repo` is the checkout folder, not the origin name.
+- `live_reservations` deletes nothing: `merge_gate.py` calls it outside the lock. Neither caller of the finalizer takes the lock twice.
+- A `.max` read error keeps every file for the next cleanup.
+- `DEV_HEADROOM` is set by one small cargo-berth build (0.336 GiB history, 1.413 GiB peak); the constant's comment holds the measurement.
+- All rows written before this change lack `outcome`, so no floor exists until a new failed row lands.
+
+**Ruled out:**
+- A headroom factor on the fallback — it gave dev builds 21 GiB.
+- The largest same-shape row × 4.20 for every build — +146.7 GiB-hours, 77 promises above 21 GiB before the cap.
+- A p90 with no floor — nine 10 GiB rows and one 15.76 GiB killed row give 13.14 GiB, not 20.7.
+
+### Phase 25 — Build-why names when a recovery spacing hold ends  · status: done
+
+#### As-built
+
+- `memory_admit.py` has `HeadStartsAt(at, ended, charge_drop, freed, growth_drop)` and the alias `HeadRelease = HeadAdmitsAfterEnd | HeadStartsAt`; `HeadAfterEnd = HeadRelease | HeadStillHeld | NoWaiter | ReadingUnavailable`.
+- `head_after_steps_end` returns `HeadStartsAt` with `at = next_start_at` when the decision holds only for a `MemoryPressure` with `next_start_at` (recovery spacing: one start per 30 s for 120 s after a pressure hold). A pressure hold with no `next_start_at` (`full avg10` or swap) stays `HeadStillHeld` with `pressure` in its causes, and so does recovery spacing with a failed budget or free check. It reads no files and uses admission's own `queue_decision`.
+- `smallest_head_release` takes `HeadStartsAt` as a release found, as it takes `HeadAdmitsAfterEnd`. It returns `HeadStartsAt` with empty `ended` only when the snapshot with no endings gives it; otherwise the result keeps the endings the timer needs first.
+- `build_why.release_text` writes the whole release line. For `HeadStartsAt` it prints `no running step needs to end; recovery spacing starts it at <HH:MM:SS zone>`, or `<steps> end (<drops>); then recovery spacing starts it at <HH:MM:SS zone>` when steps must end first. It adds `; the pressure hold or recovery spacing must also clear` for every other result under pressure, not for `HeadStartsAt`.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — `HeadStartsAt`, `HeadRelease`, the release search.
+- `scripts/build_queue/build_why.py` — `release_text` (owner report-unit).
+- `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_build_why.py` — recovery spacing, mixed and pressure cases.
+- `docs/as-built/build-memory-admission.md` — build-why paragraph: the `HeadStartsAt` text.
+
+**Binds later work:** a new head result joins `HeadRelease` or `HeadAfterEnd`, and release-line text goes only in `build_why.release_text` (The memory queue starts steps in queue order and records when a step became first; Replay a looser head rule, and adopt it only on the replay). `HeadStartsAt` is per snapshot and not saved; build-why and `/build:queue`'s head explanation show it from the same `QueueRead`.
+
+**Gotchas:** the type check that counts is the merge gate's form, `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python`; a bare run reports bpy and PIL errors. The merge gate's type job can go above its 4.000 GiB sampled cap; it passes when it runs alone.
+
+### Phase 26 — The memory queue starts steps in queue order, and the user's bump puts one unit first  · status: done
+
+#### As-built
+
+- One resolved queue snapshot exists. `resolve_queue_order` gives each waiter a derived `priority_rank`. Admission (`check`), `admit-head`, the queue view and card, `build_why`, the blocker lookup and the release search all read that one snapshot; none reads the roster or `queue_priority.json` on its own. The snapshot keeps the head-admission override as it was.
+- Queue priority is the user's bump. `memory_admit.py priority set --unit <unit> --why <why>` and `priority clear` work only for a showrunner session. State is `admission/queue_priority.json`. It has no expiry: a second `set` replaces the live record, and `clear` restores plain `(since, pid)` order. Scope is the unit's roster `unit_labels` (its Codex workers and scratch-copy steps), read at each pass. Each set, replace and clear writes one build-log row with a transition id, deduped by `record.append_row_once`.
+- `/build:queue bump <unit>` (unit-board pane and `build_queue.py bump`) runs `priority set --why "the user's bump"`. It prints `queue priority set for <unit>: first step now #N` or `…: no waiting step yet`. A session that is not a showrunner gets exit 3 and `build queue: type /build:queue bump <unit> in a showrunner pane`. A wrong word count gets `build queue: use /build:queue bump <unit>`.
+- Token wait: when `try_token_now` fails, `memory_admit.py token-wait <reservation>` (shell `buildlog_token_wait` in `memory_gate.sh`, called from `verify.sh`) ends the reservation through the finalizer and, under the same lock, puts back the waiter row with its original `since` and `priority_since` plus `token_left_at`. The row is an ordinary waiter for every reader. When `acquire_token` returns, the next `check` of that pid and start time (with `BUILDLOG_MEM_TOKEN_BACK_AT`) appends one `token_gap` line to `queue_times.jsonl` through the one locked append, drops `token_left_at`, and admits under the usual rules. A step runs only when it holds both memory and the token.
+- No `head_since` exists. Views show total wait from the first queue time. The row-1 mark is the head window mark only (`↑ ≤N`, `⊘`, `↑` backfill). An active priority shows on its own line, `queue priority: <unit> (the user's bump)`, in the view and the card. `HEAD_SECONDS`, `STRICT_SECONDS`, `BACKFILL_SECONDS` and the strict/backfill cycle are unchanged.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — resolved snapshot, `priority set|clear`, `token-wait`, the exit-3 pane refusal.
+- `scripts/lint/memory_gate.sh`, `scripts/direct/verify.sh` — the `buildlog_token_wait` route.
+- `scripts/build_queue/queue_view.py`, `queue_card.py`, `build_why.py`, `head_facts.py`, `build_queue.py` — snapshot readers, the priority line (written once in `head_facts`), the bump route.
+- `scripts/buildlog/record.py` — priority transition rows, `append_row_once`.
+- `mods/unit-board/hooks/register.tsx` — the pane bump route.
+- `commands/build/queue.md`, `commands/showrunner/bump.md`, `docs/as-built/build-memory-admission.md` — priority and token-wait rules.
+
+**Binds later work:** Queue priority rows are set, replace and clear only; the single head policy work and its lifecycle events read them so. `head_facts.read_head_facts` gets no `head_since`; `_token_gap` reads `token_left_at` and `token_back_at` by those names. Old `queue_bump` rows stay readable as history; nothing writes new ones. Approved follow-up: a typed `/build:queue bump` from any pane, with no session check on the plugin route.
+
+**Gotchas:**
+- `priority_rank` is derived: strip it before any durable write (waiter rows, reservation copies).
+- The row-1 mark is never a priority mark; a test that expects an up arrow for a priority is wrong.
+- An agent session cannot set a priority; only a showrunner session or the user's typed bump in a showrunner pane can.
+- A stop between the finalizer and the row write in `token-wait` is finished by the next `token-wait` or the dead-owner sweep; there is no second path.
+
+**Ruled out:**
+- Priority expiry (`--until`) — the user: a priority lasts until replaced or cleared.
+- `head_since` as a separate measure — the user: total wait is what matters.
+- A give-back that sends a token-waiting step behind others — it keeps its place under the normal windows.
+- Holding the reservation through a token wait — it promises memory no build uses.
+- A moved mark on row 1 — priority has its own line.
+- `bump_order`, `bump_waiter`, `BumpOff`, `priority refuse` — removed.
+
+### Phase 27 — The merge gate holds its whole memory cap in the admission queue  · status: moved
+**Moved:** to queue-unit (builds showrunner 2026-10-31): one owner for queue Phase 5's hub file and a shorter path to the cutover. No new work on it here.
+**Depends on:** devtools-unit's merge-gate checkpoint that raises the gate memory cap to 6 GiB (`a70f99e6`), which is on `main`, `origin/builds` and this branch: `merge_gate.py` :72 has `DEFAULT_MEMORY_CAP_MIB = 6144`. Phase 15 (same files, `memory_admit.py` and `build_why.py`; 26 → 15 → 27 land one after another). Merge `origin/builds` first. Global order: Phases 21, 16, 25, 30, 28, 4, 24 and 32 are checkpointed; serial memory chain 31 → 33 → 26 → 15/**27** (queue-unit) → 39 → 20 → 11 → 17 → 18 → 19 → 8; 29 runs beside the chain, checkpoints after 33 (same file, `sweep.py`) and joins before 11.
+
+**Approved:** builds showrunner 2026-10-30 (natedev item: after devtools' 6 GiB cap lands on `main`, each gate holds its cap as one queue row from start to end, with a test).
+
+#### Work Order
+
+**Goal:** a merge gate reserves its whole memory cap as one row in the admission queue from its start to its end, so a build that starts beside it never counts on room the gate can still use.
+
+**Measured (2026-10-30, `builds-resources` `01441cc0`):**
+- `merge_gate.py` `gate_reservation` (:359-372) opens one `GateProfile` row with `NoGateHistory(cap)`. `memory_admit.py` `check` (:2336-2337 at `31c3ee3e`) replaces that estimate every `HEAD_SECONDS` with `gate_estimate` (:989): the p90 of the host's `merge-gate` rows in `admission/anon_peaks.jsonl` over 14 days, else the cap. So the row promises the p90 peak, not the cap.
+- Inside the gate, its own admission lets its modules use up to the cap. The Phase 25 gate on 2026-10-30 sampled 4.050 GiB against its 4.000 GiB cap. The gate can use its whole cap; its queue row promises less.
+- `build_why.py` `need_text` (:79-92) prints `fallback: fewer than 5 runs` for a `fallback` source, which is the gate row's source with no history today. That text is not true for a row sized by the cap.
+- The running charge: `step_memory` (:1812) sets the promise only during `RAMP_SECONDS` (120 s). After that, `charge_basis` charges current memory or the decaying `.max` peak, and `growth_headroom` holds no unused cap. So a 6 GiB gate that uses 1 GiB lets a 20 GiB request start under the 21 GiB budget.
+
+**Spec:**
+
+1. **The row holds the cap.** `GateProfile.peak` is `ExpectedPeak(cap_bytes, "cap", 0)` for every check, from start to end. `"cap"` is a new closed value of the need source (`NeedSource` :130), used only by the gate. Define a semantic gate-cap basis and carry it through `ExpectedPeak` (:282), the waiter record, the existing basis codec (`need_basis_record` :1352, `read_need_basis` :1370; today it accepts only the four legacy sources) and `RecordedNeed` (:791); add no second codec. Remove `gate_estimate`, `MeasuredGatePeak`, `NoGateHistory`, `GateEstimate`, the `estimate` and `estimated_at` fields and their refresh in `check`, after a grep of the tree shows no other reader. The `merge-gate` rows in `anon_peaks.jsonl` are still written for report-unit; only the read for the estimate goes.
+   - **The cap stays charged until the gate ends.** A gate row gets Phase 24's `LifetimePromise(need)`: Phase 24's one promise decision in `step_memory` (from the reservation row's shape) gains one case, a row with step `merge-gate`. Reuse `LifetimePromise` (:321) for charging; write no second promise rule. Both checks read it: `charge_basis` for the budget charge (`max(cap, current memory, observed peak)`) and `growth_headroom` for the free-memory `promised` term (cap − current memory). The 120 s ramp and the `.wave` peak decay no longer lower a gate's charge.
+2. **One cap value.** `gate_reservation` sizes the row from the gate's own cap (`--memory-cap-mib`, default `DEFAULT_MEMORY_CAP_MIB`, 6 GiB after devtools' change) and nothing else.
+3. **Text.** `need_text` prints `the merge gate's memory cap` for the `"cap"` source; every other source keeps its text. `build_why.charge_text` renders `LifetimePromise` as `release build promise: holds until the step ends`; make that one rendering name the step's kind (a release build or the merge gate) from the row it already reads, with no second promise type or charging rule, and test both texts in `scripts/build_queue/test_build_why.py`.
+4. **Tests.** In `scripts/lint/test_memory_admit.py`: a gate row holds `cap_bytes` with ten `merge-gate` history rows at 2 GiB; the row keeps the cap on a check after `HEAD_SECONDS`. A 6 GiB gate that uses 1 GiB, past `RAMP_SECONDS`: its charge is `LifetimePromise` 6 GiB and its growth term 5 GiB, a 20 GiB waiter under a 21 GiB budget is held, and admission (`check`), the queue view (`read_queue`, `explain_queue`) and the `blocker` line agree that the full cap stays reserved. The same after a peak falls: `.max` at 5 GiB with its last near-peak time older than `PEAK_DECAY_SECONDS`, the charge stays 6 GiB in all three. In `scripts/production/test_merge_gate_suites_admission.py`: the gate's reservation equals `--memory-cap-mib` from start to its last module. In `scripts/build_queue/test_build_why.py`: a gate row's need line reads `the merge gate's memory cap`. The gate-cap basis round-trips through the basis codec, and its queue and build-why text is the same before and after the former `HEAD_SECONDS` refresh interval. This Work Order approves replacing the tests that assert `MeasuredGatePeak` or `NoGateHistory` (`test_memory_admit.py` `GateProfileTests` :2027-2120, `test_merge_gate_suites_admission.py` :176-209); put one `Assertion-Change:` line per replaced test in the summary. Fake both memory readings.
+5. **Docs.** `docs/as-built/build-memory-admission.md`: the gate paragraph says the row holds the cap, and its charge holds it until the gate ends in both checks. `docs/as-built/merge-gate-and-test-speed.md`, the Shared admission bullet (:66): replace the estimate text (`With no gate history it asks for --memory-cap-mib; otherwise it uses the gate peaks' p90 ...` and `A wait that reaches 600 seconds refreshes that estimate ...`) with the cap contract: the reservation asks for the gate's `--memory-cap-mib` (default `DEFAULT_MEMORY_CAP_MIB`) and holds it, in the budget and free-memory checks, from start to end, with no history estimate and no refresh; a wait keeps its gate identity and queue place; release still writes the gate's `merge-gate` history row, which admission no longer reads.
+
+**Constraints from prior phases:**
+- Phase 16: a gate holds one queue row from start to end through `gate_reservation`; keep that one row.
+- Phase 14: a gate run again after a stop finishes, and its row is released on every exit path.
+- Phase 24: `MeasuredMemory` carries `RampPromise | LifetimePromise | NoPromise`, set in `step_memory` from the reservation row; `LifetimePromise` counts in `charge_basis` and `growth_headroom`; `build_why.charge_text` says the promise holds until the step ends.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — Spec 1.
+- `scripts/lint/test_memory_admit.py` — Spec 4.
+- `scripts/production/merge_gate.py` — Spec 2 (owner natedev showrunner; trial-merge against `origin/natedev`).
+- `scripts/production/test_merge_gate_suites_admission.py` — Spec 4 (owner natedev showrunner).
+- `scripts/build_queue/build_why.py` — Spec 3 (owner queue-unit; trial-merge against `origin/builds-queue`).
+- `scripts/build_queue/test_build_why.py` — Spec 4 (owner queue-unit).
+- `docs/as-built/build-memory-admission.md` — Spec 5.
+- `docs/as-built/merge-gate-and-test-speed.md` — Spec 5, the Shared admission bullet (owner natedev showrunner; trial-merge against `origin/natedev`).
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — gate sizing (`merge_gate.py`), the admission charge and the gate-cap basis (`memory_admit.py`), the explanation (`build_why.py`) and both docs.
+- `test` — `test_memory_admit.py`, `test_merge_gate_suites_admission.py` and `test_build_why.py`.
+
+**Acceptance gate:**
+- The memory admission, gate admission and build-why tests pass; `basedpyright` over the six Python files reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
+- The `need_basis` codec and rendering tests pass with the gate-cap basis, and the existing `LifetimePromise` tests pass unchanged; the gate extends that one rule.
+- The notice has `also touches` lines for `merge_gate.py`, its test and `merge-gate-and-test-speed.md` (natedev showrunner, against `origin/natedev`) and for `build_why.py` and its test (queue-unit, against `origin/builds-queue`).
+- Change-Review line: a merge gate holds its whole memory cap in the queue | on natedev, while a merge gate runs, type `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_why.py` | the gate's row shows a 6.0 GiB need from `the merge gate's memory cap`, and its charge stays 6.0 GiB after its first 2 min while it uses less, from its start to its end.
+
+### Phase 28 — The working-set command files a Node helper under its own script  · status: done
+
+#### As-built
+
+- `NODE_VALUE_OPTIONS` (`working_set.py`) is the one list of space-form value options, read from Node v24.19.0 `--help`. `node_entry(arguments) -> str` skips a second argument only for an option in that list; an equals form skips nothing. `node --redirect-warnings <file> <script>` names `<script>`.
+- `--eval`, `--print`, `-e`, `-p`, `--run` and `--run=` return `NO_NODE_ENTRY` (`""`), so a `node --run <task>` process has no entry script and shows as `other`.
+- `classify_process(arguments) -> ProcessClassification` (frozen: `category`, `node_script`) feeds both classification and report grouping; `classify` returns its `category`. A Node helper gets script and owner detail rows like a Python helper; detail groups key on category and script.
+
+**Files:**
+- `scripts/build_targets/working_set.py` — option list, `node_entry`, `classify_process`, report grouping.
+- `scripts/build_targets/test_working_set.py` — one table-driven case per value option, `--run` cases, rendered Node rows.
+
+**Gotchas:**
+- The option list is a snapshot of Node v24.19.0; a newer Node can add value options and misfile its helpers.
+- A parsed entry script is not proof it reaches the table; only a rendered-output test shows the Node rows.
+
+**Ruled out:**
+- Skip one argument per option: it files `--redirect-warnings <file>` under the file.
+
+### Phase 29 — The floor sweep keeps targets used in the last hours  · status: done
+
+#### As-built
+
+- `hold_floor` (`scripts/lint/sweep.py`) takes idle targets least recently used first: the sort key is (target last use, then `unit_age`). The floor has no recency window and no `floor_recent_hours` key.
+- Each real scan under the floor writes one `floor_scan` build-log row through `record.floor_scan`: the free space after the scan, the floor, the shortfall, and the idle targets oldest first (folder, last use, bytes). A `--dry-run` writes no row.
+- `recent_minutes` in `[sweep]` orders only the units inside one target at its budget.
+
+**Files:**
+- `scripts/lint/sweep.py` — the floor order and the `floor_scan` write.
+- `scripts/lint/test_sweep.py` — floor order, `floor_scan` and dry-run tests.
+- `config/lint.conf` — the `[sweep]` comment: `recent_minutes` is the budget's unit order only.
+- `scripts/buildlog/record.py`, `scripts/buildlog/test_record.py` — the `floor_scan` writer beside `sweep_trim`, and its test.
+- `docs/as-built/build-targets.md` — Build output retained by the sweep holds the floor rule; `docs/as-built/build-memory-admission.md` points there.
+
+**Gotchas:** a dry run during a live sweep is refused by the floor lock; run it after the live sweep ends.
+
+**Ruled out:** a floor recency window (`floor_recent_hours`) — a target used inside any window is always newer than every target outside it, so the window never changes least-recently-used order.
+
+### Phase 30 — Waiting steps start in queue order  · status: done
+
+#### As-built
+
+- `admission_walk(available, total, ordered, running, head, pressure, *, recovery, now, room_used=0, override=..., limits=...) -> list[WaiterAdmission]` (`memory_admit.py`) sorts the waiting snapshot by `waiter_order` and walks it once, in every window. It marks a row when the row fits after the running charge plus the needs of the rows marked before it (memory budget, free-memory check, pressure, run-alone rule). Only a marked row admits, so a younger row that polls first cannot take an older fitting row's room.
+- A row that fits alone but loses its room to an older marked row holds with `BehindOlderFit(older_name, older_since, older_session_id)`, beside `BehindHead`. In a strict window a row behind the head still holds with `BehindHead`; the head's drained start and the user's admit-head override do not change.
+- While a recovery start slot is open (`RecoveryStarts`, `now < ends_at`), the walk marks only the first fitting row.
+- `queue_decision` takes the walk's arguments plus `row` (after `total`) and returns that row's entry; it adds the row to the snapshot when the row is not in it. `read_queue_pass` walks once for all rows. `head_after_steps_end` and `smallest_head_release` pass the snapshot order and stay read-only.
+- Every reader shows the one reason as `behind older step <label>` (`older_fit_text`): `check`/`CheckResult`, `reservation_blocker`, `blocker_snapshot`, `read_queue_pass` (`WaitReason`), `explain_queue`, `build_queue.reason_text`, `merge_gate.gate_wait_reasons` and the shell summary, which puts the text first so the field count stays.
+- `bump_waiter(_selector, _actor) -> NoReturn` raises `BumpOff(ValueError)` with `only the user can bump; bump is off until /showrunner:bump sets queue priority`. It takes no lock, reads nothing and writes nothing. `build_queue.py bump <selector>` calls it before any queue or roster read, prints `build queue: <text>` as one stdout line and exits 3. `bump_order` in existing rows still orders them.
+- `WaiterRowSelector`, `UnmatchedWaiter`, `bump_selector`, `refusal_text` and `record.queue_bump` are gone; the index still loads old `queue_bump` rows.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — `admission_walk`, `queue_decision`, `BehindOlderFit`, `BumpOff`, `bump_waiter`.
+- `scripts/build_queue/build_queue.py` — older-fit text in `reason_text(…, facts)`; bump refusal before any read.
+- `scripts/production/merge_gate.py` — `gate_wait_reasons` names the older step.
+- `scripts/buildlog/record.py` — no `queue_bump` writer.
+- `docs/as-built/build-memory-admission.md`, `commands/build/queue.md` — the walk and the bump refusal.
+- Tests: `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_build_queue.py`, `scripts/build_queue/test_build_why.py`, `scripts/production/test_merge_gate_suites_admission.py`, `scripts/buildlog/test_record.py`.
+
+**Binds later work:** Rule A's room check is one more check inside `admission_walk` and keeps the recovery slot. The one head policy function takes `admission_walk` with its `recovery` argument. Queue priority reaches the walk through one priority-aware order; the walk keeps no second order. No bump writes `priority_since` until queue priority lands; queue priority deletes `bump_waiter`, `BumpOff`, the bump subcommand, the unit-board pane's bump dispatch and the `commands/build/queue.md` bump text together, and its writer goes beside `head_admission` in `record.py`.
+
+**Gotchas:**
+- Every `queue_decision` caller passes the ordered snapshot plus `recovery` and `now`; a caller that passes one row alone loses the queue order.
+- The unit-board pane (`mods/unit-board/hooks/register.tsx`) reads a bump refusal only as exit 3 with one stdout line.
+
+**Ruled out:**
+- Bump refusal on stderr with exit 2 — it breaks the unit-board pane protocol.
+- A second `BehindHead` text in the shell summary.
+
+### Phase 31 — The strict window lets younger steps use the budget minus the head's need  · status: done
+
+#### As-built
+
+- Rule A: in a strict window, a row behind the head admits when (1) it fits now with no head term (budget or run-alone rule, free memory, pressure) and (2) the steps admitted since the head took priority, plus marked older rows, plus its own need total at most budget − head need. The head passes the budget check when the steps running at its priority time end.
+- "Admitted since priority" is a live reservation with `admitted_at` (ms) at or after `priority_since`, so a step admitted in the same `check` that set it counts, as does a backfill-slot step; each counts at the larger of its `need` and `build_charge`. No new head time or row field.
+- `decide` reports a strict head's room as one closed result, `HeadRoom(head_need, used, room, passes) | NoHeadRoom`, carried on `AdmissionDecision`; `check`, `queue_view`, `explain_queue`, the blocker lookup and the shell wait line read it. `CheckResult.head_need` is set only when the head's room alone holds the step.
+- `admission_walk` checks an admitting later row against running memory plus every marked older promise, so a fitting strict head keeps its room when a younger step polls first (the younger holds with `BehindOlderFit`). Younger rows that fail check (1) get `NeedsBuildBudget`, `NeedsMemory` or `MemoryPressure`, not `BehindHead`.
+- The head-admission override is captured in the one queue snapshot (`snapshot_head_override`) and applied through the shared decision path; its free-memory check sets `promised=0`, so build-why's printed terms add up to its threshold. The override never passes to another waiter, and pressure still holds it.
+- One function in `memory_admit.py` writes the window clause: backfill `younger steps may start until HH:MM`; strict `younger steps may use <budget − head need> GiB of the budget until HH:MM`; strict with head need at or above budget `younger steps wait until HH:MM`. `head_wait_text` and `head_facts.order_text` call it.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — `decide`, `admission_walk`, `queue_decision`, `snapshot_head_override`, `head_after_steps_end`, the window clause.
+- `scripts/build_queue/build_queue.py`, `head_facts.py`, `build_why.py` — readers of `HeadRoom`, the override terms and the window clause.
+- `docs/as-built/build-memory-admission.md` — Rule and Waiters paragraphs.
+- `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_build_why.py` — Rule A, room sum, override and cross-reader tests.
+
+**Binds later work:** Admission results are the closed `HeadRoom | NoHeadRoom`. `admission_walk` counts every marked older promise; a waiting head is never running memory. The override lives in the one snapshot with `promised=0`. `head_after_steps_end` keeps captured queue order fields and rebuilds legacy head fields only when no ordered snapshot exists. The head rule replay and queue order work keep `test_fitting_strict_head_keeps_its_place_when_younger_polls_first`, `test_override_free_memory_terms_add_up_to_its_printed_threshold`, the recovery-slot test and the override cross-reader tests as gates.
+
+**Gotchas:** A waiting head's room counts once, as a marked older promise; dropping it from later rows' reservations lets a younger step take its place.
+
+### Phase 32 — The user can admit the waiting head  · status: done
+
+#### As-built
+
+- `memory_admit.py admit-head [--why "<text>"]` runs `admit_head(why) -> str`. `require_showrunner() -> str` is the one caller check: it refuses with `AdmitHeadRefused` unless `CLAUDE_CODE_SESSION_ID` is a registered showrunner and `CODEX_THREAD_ID` is unset.
+- It replaces one `admission/admit-head.json` record that names the first waiter by file name, pid and start time. Nothing waiting gives a refusal and no record.
+- The next locked `check` admits that same head above the build budget when `MemAvailable >= need + reserve`. Pressure, recovery spacing and estimate expiry still hold it. The record stays while memory is short, and is deleted when the head starts or on the next locked check after it leaves. It never admits another step or changes order.
+- `record.head_admission(action, unit, step, need, free, reserve, why, set_by, at)` writes `set`, `admitted` or `lapsed` rows.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — caller check, record, override in `admission_for_waiter`.
+- `scripts/buildlog/record.py` — `head_admission`.
+- `scripts/lint/test_memory_admit.py` — `AdmitHeadTests`.
+- `docs/as-built/build-memory-admission.md` — "Admit the waiting head".
+
+**Binds later work:** queue priority (`priority set`) reuses `require_showrunner`; new build-log writers follow `head_admission`. The override is part of the one admission snapshot that check, queue view, build-why, blocker lookup and release search share; `AdmitHeadTests` gates admission changes.
+
+**Gotchas:** `check` reads the override once per pass; `snapshot_head_override` matches it to the head and passes it on as a value, so no reader in the pass reopens the file.
+
+**Ruled out:** a unit label rule in `admit_head` apart from the queue view's `waiter_unit_name`.
+
+### Phase 33 — A history row counts only when it is whole  · status: done
+
+#### As-built
+
+- `store.whole_rows(handle, start)` is the one reader of whole JSONL rows from an offset: it starts at the next row boundary, skips cut-short, non-UTF-8 and non-object rows, and yields objects. A row counts as recorded only when it ends in a newline.
+- `anonymous_history_rows` (all estimate reads of `anon_peaks.jsonl`), the reservation-id check in `finalize_reservation` and the sweep's trim recovery all read through `whole_rows`.
+- The finalizer repairs a cut-short tail under the store lock before it checks for its reservation id, and appends through that locked handle when the id is absent.
+- A sweep trim keeps a write-ahead intent until its `sweep_trim` row is in the build log. An intent whose time cannot be published is set aside as `DamagedTrimIntentSetAside(path)` (names the kept `.damaged-` file), and a later take of the target proceeds. Recovery counts deleted bytes by the same rule as a live take.
+- Admission records are written with `write_text_atomic`; `write_admission_record` no longer exists.
+
+**Files:**
+- `scripts/buildlog/store.py`, `scripts/buildlog/test_store.py` — `whole_rows` (report-unit files).
+- `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py` — trim intent, recovery, `DamagedTrimIntentSetAside`.
+- `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py` — history reads and finalizer through `whole_rows`; `write_text_atomic`.
+
+**Binds later work:** history rows are read only through `store.whole_rows(handle, start)`; no second decode loop; the unfinished-JSON and split-UTF-8 tests stay. The trim write-ahead intent and `DamagedTrimIntentSetAside(path)` stay, with `test_damaged_trim_outcome_names_the_preserved_intent` as a gate.
+
+**Gotchas:** an intent time is checked with `store.utc_iso` at read time; a millisecond epoch passes a range check and fails only at publication.
+
+### Phase 34 — The unused shared build folder goes  · status: done
+
+#### As-built
+
+- No code, test or as-built text names a shared Cargo build folder per repository. The verify-copies measurement spent 68.7 of 69.0 s waiting on the shared folder's build lock, so the copies rule picks seed and `copies.py` has no shared mode.
+- `scratch.py` has no `shared_build_folder`, `SharedBuildFolder`, `NoSharedBuildFolder` or `SCRATCH_SHARED_BUILD_ROOT`. `scratch.register_copy` takes no `shared_target` and new copy records carry no such field.
+- Readers load old copy records that still carry `shared_target` and ignore the field.
+- `style_sync.py`'s own `style-sync-target` and the sweep's general Cargo `build.build-dir` template reading are unchanged.
+
+**Files:**
+- `scripts/lib/scratch.py` — copy records and cache markers; no shared folder.
+- `scripts/lib/test_scratch.py` — `test_copy_record_with_a_legacy_shared_target_still_loads` pins the legacy-field read.
+- `scripts/lint/test_sweep.py` — no shared-folder discovery test.
+- `docs/as-built/build-targets.md` — "Copy records and lifetime" says each copy has its own build folder.
+
+**Gotchas:** a grep for `shared_target` in `scripts` also finds unrelated account-link (`test_accounts.py`) and style-sync names; only the legacy-record test in `test_scratch.py` refers to copy records.
+
+**Ruled out:** a shared per-repository build folder for verify copies — its build lock serializes the copies.
+
+### Phase 35 — The hold wait line names the hold the session waits on  · status: done
+
+#### As-built
+
+- `build_targets.hold_waited_on` picks the hold a session waits on: the oldest hold in force whose key is not the caller's own. It returns `NoBlockingHold` when no hold blocks the caller. A caller with no owning session gets the oldest hold in force.
+- The wait line, the check and launch lines and the 2 h line name the holder and reason of that hold. The words of each line stay the same.
+- `holds_only_own` and `caller_holds_only_own` use the same choice over one `natedev_holds` read, so the wait decision and the named hold cannot disagree.
+- When the caller owns the older of two holds, the line names the other session and its reason. The caller's own hold alone gives no wait.
+
+**Files:**
+- `scripts/build_targets/build_targets.py` — `hold_waited_on`, `NoBlockingHold`, and the wait, check and launch lines.
+- `scripts/build_targets/test_build_targets.py` — scratch-hold cases for owner, peer and later sessions and for callers, among them `test_wait_and_launch_lines_name_the_oldest_hold_the_caller_does_not_own`.
+- `docs/as-built/build-targets.md` — the named-hold bullet.
+
+**Gotchas:** `scripts/direct/verify.sh` prints no `is held by` line of its own; the line comes only from `build_targets.py`.
+
+**Ruled out:** a change in `verify.sh` — it has no held-by line to fix.
+
+### Phase 36 — The floor's dry-run lines show the takes in take order, and a suite run from the installed copy stops with one line  · status: done
+
+#### As-built
+
+- `hold_floor` (`scripts/lint/sweep.py`) prints one line per target in the order of the first take from that target (`taken` insertion order, built from `chosen`), on a dry run and a real run. `shrink_floor` takes orphan batches of every target before unit batches, so a target with orphans prints before an older target with units only.
+- `override_guard.is_installed_file(script, relative, home) -> bool` is the one installed-file test (same file, links followed). `refusal()` and `require_checkout(script: Path) -> None` both use it, with the home from `user_home()`.
+- `require_checkout` raises one `RuntimeError` at import when the file is under `<home>/.claude/scripts`: `<suite file>: this suite runs from a checkout, not from the installed scripts under <home>/.claude/scripts; run it from a worktree.` A checkout path passes with no file read beyond the path check. It never skips: a skipped suite reads as passed in a gate.
+- Eight modules call `require_checkout(Path(__file__))` at import, after their own path setup: `memory_test_support.py`, `build_hold_test_support.py`, `test_hold_applies.py`, `test_cargo_wrapper.py`, `test_hold_enforcer.py`, `test_targets.py`, `test_nextest_budget.py`, `test_nextest_width.py`.
+
+**Files:**
+- `scripts/lint/sweep.py` — the floor line order.
+- `scripts/lint/test_sweep.py` — `test_floor_report_lists_targets_in_take_order_in_both_modes`.
+- `scripts/build_hold/override_guard.py` — `is_installed_file`, `require_checkout`.
+- `scripts/build_hold/test_override_guard.py` — `test_installed_suite_stops_with_one_checkout_instruction`, `test_checkout_suite_passes_without_reading_file_contents`, `test_wired_modules_keep_their_checkout_import_forms` (19 start forms across the eight modules).
+- `scripts/lint/memory_test_support.py`, `scripts/build_hold/build_hold_test_support.py`, `scripts/build_hold/test_hold_applies.py`, `scripts/build_hold/test_cargo_wrapper.py`, `scripts/build_hold/test_hold_enforcer.py`, `scripts/build_targets/test_targets.py`, `scripts/lint/test_nextest_budget.py`, `scripts/lint/test_nextest_width.py` — the import-time call.
+- `docs/as-built/build-targets.md` — the Tests bullet names the check and its line; `docs/as-built/build-memory-admission.md` — floor lines in take order, oldest use first.
+
+**Binds later work:** "The floor takes an idle target that holds no build unit whole, in last-use order" keeps the first-take line order for whole takes. "Shared build state is written only by the installed copy" reuses `user_home` and `is_installed_file` for its writer guard, keeps `require_checkout`, and keeps the installed-stop, checkout-path and wired-import-form tests green; `require_checkout` guards test entry points only, not production writers.
+
+**Gotchas:**
+- A module that calls `require_checkout` at import must set its import path first. Package import (`scripts.<dir>.<file>`), `unittest discover` and a direct `python3 <file>` run must all load; only a subprocess run from the checkout with no `PYTHONPATH` shows a break.
+- The installed copy is main's: a run from `~/.claude` shows the new line only after this reaches main.
+- `scripts/lint/test_invoke_scope.py` and the suites under `scripts/direct/`, `scripts/production/`, `scripts/mac_test/` and `scripts/hooks/` do not call the check; their owners add the same import.
+
+**Ruled out:** removing or loosening the installed-script guard (builds 2026-10-31: the guard stays); a skip in place of the error; wiring `test_invoke_scope.py` here (verify-unit owns it).
+
+### Phase 37 — The floor takes an idle target that holds no build unit whole, in last-use order  · status: done
+
+#### As-built
+
+- `shrink_floor` (`scripts/lint/sweep.py`) takes `FloorTake = Group | WholeTargetTake`. An idle target with no build-unit group is one `WholeTargetTake`: the target root and the walk's observed entries, inodes, output versions and retained paths. Orphan batches of every target go first. Then unit batches and whole takes go together in `target_last_use` order, least recently used first. A target with no unit and no use stamp uses the newest mtime of its top-level entries as its last use. The floor takes only the shortfall and never a held target.
+- A whole take uses the one deletion path: `recoverable_trim` (write-ahead intent, `sweep_trim` row) → `reclaim` → `remove`. It runs under the same target lock and rechecks as a group batch (busy, build hold, process use, cargo lock, a newer use stamp). `record_target_deletes(paths, *, known_targets=())` writes the target root to `target-deletes.json` before the markers go, so `memory_admit.py` refuses a warm promise for that target.
+- A whole take keeps the target folder and its lock files: `.claude-busy`, `LOCK_NAMES` in each build tree, and `doc/.lock`. It takes `doc/.lock` with `try_lock`. When rustdoc holds it, the target is busy for this pass.
+- A cargo target inside another target's folder, outside that target's build trees, is its own target with its own last use, busy check and batches. `TargetOwnerIndex` maps each path to its deepest target once per pass (prefix check first; `/proc` paths skip `realpath`). `build_trees`, `process_uses` and `walk` use that one owner. `busy_bytes` and `after_caches` count a nested target's bytes once.
+- `unit_hash(name) -> UnitHash | NoUnitHash` gives a linker temp `.<name>-<hash>.<pid>` in `deps/` to its unit. `copied_name`, `copied_up` and `group_roots` keep their result for every other name.
+- A floor dry run takes no `floor.lock`, so a real pass does not stop beside a dry run.
+- The report line stays `lint sweep: the floor took <gib> from <target>, last used <when>` (`would take` on a dry run), in take order.
+
+**Files:**
+- `scripts/lint/sweep.py` — floor candidates, `WholeTargetTake`, `TargetOwnerIndex`, `unit_hash` states, the dry-run lock rule.
+- `scripts/lint/test_sweep.py` — whole-take order, nested targets, locks, recovery, byte totals, linker temps, a dry run beside a held `floor.lock`.
+- `docs/as-built/build-targets.md` — Build output retained by the sweep: "a target folder is disposable; keep nothing you need in it", the whole take, nested targets, linker temps.
+- `docs/as-built/build-memory-admission.md` — Disk floor: one pointer line to `build-targets.md`.
+
+**Binds later work:** "The floor_scan row shows takeable bytes and the reason for the rest" computes a whole take's `takeable_bytes` from that target's candidate inodes, fixes the nested-mtime last use, adds a cheap one-target recheck that keeps the nextest and deepest-owner checks, and adds the `floor.lock` hold alert. `TargetOwnerIndex` stays the one path-to-target map.
+
+**Gotchas:**
+- One process recheck costs about 0.21 s with 1830 pids. The natedev dry run makes 221 takes, most of them small whole takes (0.0 GiB lines), and runs 292 s (44 s with 4 takes before).
+- Unit tests at 20-40 targets do not show a square term: an owner check per (pid, target) is O(P×T²). A floor change needs a real-scale dry run (floor 400, the same config) in its acceptance.
+- Never run a real floor on natedev's roots from a test or by hand; tests use scratch roots. Run `test_sweep.py` from the worktree, never from `~/.claude`.
+
+**Ruled out:** pruning `doc/` or `mend-wrapper/` inside a target that still has units; a path rule for session scratchpad clones (the order is by last use only); whole takes ahead of orphans (orphans also cost no rebuild).
+
+### Phase 38 — The floor_scan row shows takeable bytes and the reason for the rest  · status: done
+
+#### As-built
+
+- `IdleFloorTarget` retains `folder`, `last_use` and total `bytes` (`scan.target_bytes`), with optional `takeable_bytes` and `reason` when they differ; `record.floor_scan` persists them. `floor_scan_targets` uses `freed_by` with target-local candidate inode links and no shortfall limit, independently of take order; cross-target shared inodes free nothing from either target alone, and reasons distinguish `links outside the target`, `links outside the take candidates` within the target, and `output outside take candidates`. Busy and held targets are omitted.
+- `record_before_delete` saves `target-deletes.json` before normal or doc-budget deletion; a failed write keeps the folder, prints its cause, counts a failure and continues to later targets.
+- `DiscoveredTargetRoots` and `Scan` share one discovery inventory, including nested roots, without rediscovery in `walk`; `target_last_use` excludes entries containing a nested target from its no-stamp fallback.
+- `process_use` rechecks one target per take through `TargetOwnerIndex`, comparing `exe`/`cwd` prefixes and filtering raw `maps` bytes before decoding matching processes; `nextest_targets` and deepest-owner attribution protect nextest runs and nested targets. The initial full `process_uses` scan remains the inventory source.
+- Real `floor.lock` holders record pid and `started_at`; `floor_lock_holder` returns `KnownFloorLockHolder`, `UnreadableFloorLockHolder` or `NoFloorLockHolder`. A real sweep unable to acquire the lock alerts natedev only for a known overdue hold below the floor with pid, command and free space, using `[sweep]` `floor_lock_alert_minutes` from `config/lint.conf` at use (configured as 15); invalid configuration prints its cause and sends nothing.
+- `FloorRecord` represents receipts with `DeliveredFloorLockAlert(pid, started_at)` and `NoFloorLockAlert`; `locked_floor_record` holds the separate stable `floor-alert.lock` across receipt read/check/send/save and every measurement write, rereading inside the lock. Receipts persist only after `send_floor_alert` succeeds, so concurrent waiters deliver once per hold, failed sends retry, and another hold by the same pid can alert again.
+
+**Files:** `scripts/lint/sweep.py` — estimates, discovery, deletion, ownership and alert state; `scripts/lint/test_sweep.py` — filesystem, process and concurrency contracts; `scripts/buildlog/record.py` and `scripts/buildlog/test_record.py` — optional row fields and persistence; `config/lint.conf` — alert delay; `docs/as-built/build-targets.md` — behavior contracts.
+
+**Gotchas:** Target-local observed link counts distinguish internal links outside candidates from external links; the alert lock keeps a stable inode separate from the atomically replaced record, and both receipt and measurement writers reread under it to preserve newer state.
+
+**Ruled out:** Treating all scanned bytes as independently takeable; copying all `scan.links` entries per target; using mtime or pid alone as hold identity; recording invalidation after deletion; saving delivery before a successful send.
+
+### Phase 39 — A build's memory promise fits the build's size, so a big build does not wait for a promise it never uses  · status: todo
+**Depends on:** Phase 26 (`scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`). Runs before Phase 20 (same file; director's order 2026-10-31, a one-line revert), so Phase 20's replay calibrates against the adopted dev rule.
+
+**Approved:** builds showrunner GO 2026-10-31, after the head-memory-wait answer; the director's measurement is quoted below.
+
+#### Work Order
+
+**Goal:** A dev build with few earlier runs gets a promise near its real peak. On 2026-10-31 the S2 hana build (`verify.sh build hana`) waited 63 min at the head of the queue with 26 to 44 steps behind it. It was promised 21.0 GiB and peaked at 7.8 GiB.
+
+**Cause (measured by the director, 2026-10-31):** the `shape_largest` basis multiplies the largest earlier same-shape peak by `DEV_HEADROOM` (4.2). That one factor was fit so that the smallest dev build in the 126-build replay was covered: a cargo-berth build that used 1.41 GiB after a 0.34 GiB same-shape peak. Applied to a 6.3 GiB hana peak, it gives 26.4 GiB, which the build budget in force then (21 GiB) caps. A need equal to the whole budget fits only when no build runs. A cap on the result would only hide this; the cause is a multiplier fit to small builds and applied to large ones. In the 3 days to 2026-10-31 02:05, the 50 hana `build` steps on natedev peaked at p50 10.8, p90 13.4 and at most 15.3 GiB. Phase 31 does not cover this case: it changes only what younger steps may do while the head has priority.
+
+**Spec:**
+
+1. **The headroom fits the build's size.** Replace the single dev multiplier with a headroom rule that covers small builds without scaling their ratio onto large ones (for example a fixed margin plus a smaller factor, or a factor that falls with the peak). Fit the rule by replay on the same 126-build cohort that fit `DEV_HEADROOM`, plus every build in the last 3 days. Each replayed promise caps at the build budget in force when its build ran (`[memory] build_budget_gib` in `config/lint.conf` on main at that time, else `FALLBACK_BUILD_BUDGET_BYTES`); the fit and the report name the budget of each cohort, so a budget change does not read as the new rule's effect. Keep `RELEASE_HEADROOM` unless the replay shows the same defect for release builds; say so in the summary either way.
+2. **One source.** The rule and its fitted numbers live in one place in `memory_admit.py`, with a comment that names the replay (cohort, date, the build that limits each number). The need basis row records the rule so `need_basis` still reads back (`read_need_basis` (written by `need_basis_record`); a basis saved before this phase still reads back). No second copy of the shape logic anywhere, tests included: tests import the constants.
+   - **The basis keeps the cap it applied.** `CappedAtBudget` (:180) holds only `uncapped`. `need_basis_record` (:1653) writes only that, `read_need_basis` (:1671) refuses a row whose `uncapped` is at or below today's `build_budget_bytes()` (:1686), and `build_why.need_text` prints today's budget as the cap (`scripts/build_queue/build_why.py` :102). So a basis saved under one budget does not read back under another: uncapped 22 GiB under a 21 GiB budget becomes `BasisNotRecorded` under a 24 GiB budget. Make it `CappedAtBudget(uncapped, cap)` with `cap: int | CapNotRecorded`. `build_expected_peak` (:1612) stores the budget it applied. The codec writes `cap` and checks `uncapped > cap`, never today's budget. A saved row with no `cap` decodes to `CapNotRecorded()` and checks only `uncapped > 0`. `need_text` prints the saved cap, and for `CapNotRecorded` prints `capped at the build budget of that time (uncapped <GiB>)`.
+   - **Old factors read back.** The factor decode compares a saved factor with today's constant (`RELEASE_HEADROOM` :1707, `DEV_HEADROOM` :1709), so a dev basis saved with the old factor decodes to a named old-rule state after the rule changes, never to `BasisNotRecorded`.
+3. **The kill retry stays.** The existing retry after a memory kill stays the safety for a build that goes over its promise. Do not change it.
+4. **Replay report.** The phase ships a replay over the last 3 days of natedev step rows: for each build, the old promise, the new promise and the measured peak. The report gives how many builds would have gone over their new promise, and by how much (each one, and the largest).
+5. **Docs.** `docs/as-built/build-memory-admission.md` states the new rule and its source.
+
+Tests: `scripts/lint/test_memory_admit.py`: a large dev build with 1 to 9 earlier runs gets a need within the fitted margin of its earlier peak (the S2 case: a 6.3 GiB earlier peak gives an `UnderBudget` need under the budget the test sets through `BUILDLOG_BUILD_BUDGET_GIB`); a small build (0.34 GiB earlier peak) is still covered at 1.41 GiB; the basis row round-trips; a release build keeps its current need unless Spec 1 changes it; a basis capped under a test budget of 21 GiB (uncapped 22 GiB) decodes and renders the same cap after the test budget changes to 24 GiB; a saved row with no `cap` decodes to `CapNotRecorded` and renders its text under either budget; a dev basis saved with the old factor still decodes. In `scripts/build_queue/test_build_why.py`: `need_text` for the new rule's basis, a saved cap and `CapNotRecorded`.
+
+**Acceptance:** the tests, the budget-change decode and render cases included; the replay report (Spec 4), with the budget of each cohort, in the checkpoint notice; `test_memory_admit.py`, the build queue tests and `basedpyright` on the changed Python files pass from the worktree. After the phase lands on main, the director sends builds the count of memory kills on natedev for one day, against the rate before the phase.
+
+**Files:**
+- `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`, `docs/as-built/build-memory-admission.md` — items 1-5.
+- `scripts/build_queue/build_why.py`, `scripts/build_queue/test_build_why.py` — `need_text` renders `DevHeadroom`'s multiplier today; the new rule is a named basis variant with its own text, and an old saved basis keeps its text. `need_text` prints the saved cap, not today's budget (:102).
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — `memory_admit.py`, `build_why.py`, the replay and the doc.
+- `test` — `test_memory_admit.py` and `test_build_why.py`, the budget-change decode and render cases included.
+
+### Phase 40 — A scratch folder's task always has an end, and only a running worker keeps a folder  · status: done
+
+#### As-built
+
+`scratch.registered_plan(unit)` is the single resolver, using `unit_lookup.unit_parent` with `staff.snapshot`, `phase_table.show_production` and `proposals_table.unit_plan_paths` to locate the registered plan.
+`target` and `hand_over` validate new phase tasks through `plan_history.plan_phases` before creation, adoption or record replacement; missing phases and unreadable plans raise cause-bearing refusals naming a real phase, `gate:<id>` or `--until <when>`.
+`checked_task` stays shape-only for legacy updates, holds and end, so existing invalid phase tasks remain cleanable.
+`tmp_sweep.worker_use` keeps a mesh record's cwd only while its status is `running`; other keeps and the 7-day fallback still apply.
+
+**Files:**
+- `scripts/lib/scratch.py`, `scripts/lib/test_scratch.py` — resolver, assignment guard and private-plan assignment/legacy-cleanup cases.
+- `scripts/lint/tmp_sweep.py`, `scripts/lint/test_tmp_sweep.py` — running-only cwd retention and lifecycle cases.
+- `scripts/production/test_merge_checkpoint.py` — private `registered_plan` fixture for phase-end cleanup.
+- `docs/as-built/build-memory-admission.md` — scratch task and retention rules.
+
+**Binds later work:** “Test Hana clones go through scratch, and the Mac keeps no idle clone below its floor” uses the single resolver, real registered phase or gate/deadline tasks, shape-only legacy cleanup, private-plan tests and running-only mesh cwd keeps.
+
+**Gotchas:** Staff records carry no plan; resolution uses the registered production rather than the caller's checkout. Tests patch `registered_plan` and keep scratch/copy roots private. A paused roster worker or active unit run does not make a finished mesh record's cwd live.
+
+**Ruled out:** A second unit-plan registry; semantic validation on legacy update/end paths.
+
+### Phase 41 — A queue priority change reads only the new end of the build log, and a step waiting for the cargo token holds no place at the head  · status: todo
+**Depends on:** Phase 38 (`scripts/buildlog/record.py` is in Phase 38's files until its checkpoint); queue-unit Phase 4 (`origin/builds-queue` d309bbed, its one decision pass holds the head rule): merge it before any edit.
+
+**Approved:** item 7 of the production rules: defects in Phase 26's own change, found by its cold review after the merge. Builds showrunner 2026-10-31: land defects 1 and 2 first, as their own small checkpoint, not behind the smaller fixes (Phase 42); build defect 2 on queue's Phase 4 and tell queue-unit what changes there.
+
+#### Work Order
+
+**Goal:** Fix the two Phase 26 defects that stop builds on natedev today (director's read-only review of `ec3f2f0b..58391add`, 2026-10-31):
+
+- every `priority set`, replace or clear scans the whole natedev month log (496 MB on 2026-10-31, about 14 s) while it holds the admission lock and the build-log lock, so no step is admitted and no step row is written for those 14 s;
+- a step that waits for the cargo token keeps its queue row as a head candidate, so it can take the strict window and hold its memory while the step that holds the token waits behind it, up to `STRICT_SECONDS`.
+
+**Spec:**
+
+1. **The priority row write reads only the new end of the log.** `record.queue_priority` (`scripts/buildlog/record.py:986`) takes the start offset and passes it to `append_row_once` (`:685`). `memory_admit.py` saves the log's end offset in the priority transition when it writes the transition (as `PendingStep.month_row_end` does) and passes it on every finish, the one in `check()` too. A rerun after a stop still finds the row by its fixed id, because the row can only be after the saved offset.
+2. **A step in token wait is no head.** A waiter row with `token_left_at` keeps its order place but is skipped as a head candidate and as a holder of room in the head rule (queue Phase 4's one decision pass) and the admission walk, until its token returns. Model the state as a named type, not as key presence (Type Design Contract): for example `QueuedWaiter | TokenWaitingWaiter`.
+
+Tests: `scripts/buildlog/test_record.py`: a `queue_priority` write with a start offset does not read rows before it, and a rerun after a stop adds the row once. `scripts/lint/test_memory_admit.py`: a priority set on a log whose part before the saved offset is not JSON finishes and adds its row once; the token-wait case from the review (X 12 GiB older, Y 11.5 GiB in token wait holding the token: Y is not held behind X, and X holds no room while it waits).
+
+**Acceptance:** the tests; `test_memory_admit.py`, `test_record.py`, the `scripts/build_queue` suites and `basedpyright` on the changed Python files pass from the worktree. Live: one `priority set` on natedev's real month log answers in under 1 s (time it).
+
+**Files:**
+- `scripts/lint/memory_admit.py`, `scripts/buildlog/record.py` — items 1-2.
+- `docs/as-built/build-memory-admission.md` — the token-wait rule.
+- `scripts/lint/test_memory_admit.py`, `scripts/buildlog/test_record.py` — tests.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — the source and doc files.
+- `test` — the test files.
+
+### Phase 42 — Bump and token-wait edges: one bad intent, the pane's session, unit names, card text and type shapes  · status: todo
+**Depends on:** Phase 41
+
+**Approved:** item 7 of the production rules (Phase 26 cold review, 2026-10-31). Builds showrunner 2026-10-31: card text as recommended.
+
+#### Work Order
+
+**Goal:** Fix the smaller defects the Phase 26 cold review found.
+
+**Spec:**
+
+1. **One bad token-wait intent stops nothing else.** `check()` finishes each `*.token-wait` intent in its own guard (`memory_admit.py:2796`): an error is logged with the intent's path and the intent stays for the next poll; the other intents and the admission go on.
+2. **The pane's bump names the session itself.** `mods/unit-board/hooks/register.tsx:420` passes the session id from `$.session.id()` to the process explicitly (as `--you` does at :309), not by inheriting `CLAUDE_CODE_SESSION_ID`. Its test asserts the id reaches the process.
+3. **A unit name is checked.** `priority set <unit>` refuses a unit that is not in the roster's unit labels (one line naming the unit; the old priority stays), and the unit goes to argparse as `--unit=<unit>`, so a word that starts with `-` is a unit, not a flag.
+4. **Card text** (builds showrunner 2026-10-31, as recommended): the card names a unit-priority step as `N of <unit> (queue priority)`, not `moved up`, and shows no legacy per-row bump rows as its reason; the priority line shows once per card and renders the stored `why`, not a fixed "(the user's bump)".
+5. **Corrupt priority file.** `priority_clear` on an unreadable `queue_priority.json` removes it and says so; it does not print "cleared" and leave it.
+6. **Type design.** `Waiter.priority_rank` leaves the durable row type: the resolved order is its own type (for example `RankedWaiter` with `PriorityUnit | NormalOrder`). `QueuePriority.transition` becomes `SettledPriority | PendingPriorityTransition`. `resolve_queue_order` and `token_wait` take named types, not bare `None`. `priority_set` reports "no waiting step" as a named case, not `place = 0`. `BehindHead.head_since` gets a name that is not `head_since`.
+
+Tests: `scripts/lint/test_memory_admit.py`: one intent whose finish raises does not stop `check` for the others; an unknown unit is refused and the old priority stays; `--unit=-x` is a unit; a corrupt priority file is removed on clear. `mods/unit-board/tests/queue.test.ts`: the session id reaches the process. `scripts/build_queue/test_queue_card.py`, `test_head_facts.py` and the goldens: the item 4 text.
+
+The Phase 26 checkpoint did not name two narrowed assertions; this phase's checkpoint carries their lines: `Assertion-Change: scripts/lint/test_memory_admit.py::test_cleanup_added_floor_expires_the_old_estimate_without_losing_queue_place — bump_order and holds_younger left the waiter row in Phase 26` and the same for `test_estimate_expiry_after_lock_keeps_queue_and_recovery_for_next_poll`.
+
+**Acceptance:** the tests; `test_memory_admit.py`, the `scripts/build_queue` suites, `claude plugin test mods/unit-board` and `basedpyright` on the changed Python files pass from the worktree.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — items 1, 3, 5, 6.
+- `mods/unit-board/hooks/register.tsx` — item 2.
+- `scripts/build_queue/queue_card.py`, `scripts/build_queue/head_facts.py`, `scripts/build_queue/build_queue.py`, `scripts/build_queue/golden/card_*.txt` — items 3, 4.
+- `docs/as-built/build-memory-admission.md`, `commands/build/queue.md`, `commands/showrunner/bump.md` — where they state the changed rules.
+- `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_queue_card.py`, `scripts/build_queue/test_head_facts.py`, `scripts/build_queue/test_build_queue.py`, `mods/unit-board/tests/queue.test.ts` — tests.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — the source, doc and command files.
+- `test` — the test files and goldens.
+
+### Phase 43 — Every agent Hana carries its owner and purpose, and `hanas` lists, stops and sweeps test Hanas on both machines  · status: todo
+**Depends on:** none (runs beside Phase 41; no shared files).
+
+**Approved:** builds showrunner 2026-10-31, relaying a user request through hana: design `/home/natepiano/.local/state/showrunner/tool-based-ui/session/hana-test-window-design.md`, its phase 1. Outside paths approved under `--also`: `scripts/production/mac_run.sh`, `scripts/production/smoke_launch.sh`, `scripts/hana_shot/hana_shot.py`, `config/mac_test.conf`. `/etc/nixos` changes go to natedev as branch + hash. bevy_brp needs no change: its launch tool already takes `env` (`~/rust/bevy_brp/mcp/src/app_tools/launch_params.rs:49-52`). Trunk Phase 174 (the Hana side: refusal, title, idle exit) lands only after this phase is installed.
+
+#### Work Order
+
+**Goal:** The user wants each test Hana window to name the unit director and the feature under test, on the Mac and on natedev, and wants every test Hana to stop reliably, with no dependence on memories or announcements. This phase gives every agent launch path the two labels, refuses an agent Hana launch with no purpose, and adds one tool, `hanas`, that finds test Hanas from the process table on both machines, also when their owner session is gone, and stops the ones over their limits.
+
+**Spec:**
+
+1. **Config.** A new `config/hanas.conf` (documented in `config/README.md`) holds every limit, read at run time through `config_values`: `exempt_ports=15702,15761` (the user's own Hana and the demo), `test_max_hours=4`, `unlabelled_max_minutes=30`, `stop_grace_seconds`. Nothing hard-codes a limit or a port.
+2. **The labels.** Every agent launch path passes `HANA_TEST_PURPOSE` (the feature under test, required) and `HANA_TEST_OWNER` (the unit director's name; default `SHOWRUNNER_UNIT_ID` from the caller's env) in Hana's env:
+   - `scripts/hana_shot/hana_shot.py`: `launch()` (:2090, env built at :2113-2116) and every caller of it (`command_launch` :2747, `instance()` :2293) take a purpose; a launch without one refuses with one line naming the flag.
+   - `scripts/production/mac_run.sh`: the generated `.command` (:117-122) sets both; a run without a purpose refuses before any ssh.
+   - `scripts/production/smoke_launch.sh` (:73-74): the same.
+3. **The launch gate.** `scripts/hooks/pre-tool-use-brp-launch-gate.sh` reads `tool_input` and denies an `mcp__brp__brp_launch` of the Hana app whose `env` has no non-empty `HANA_TEST_PURPOSE`, with a reason that names the `env` key to add. Other apps pass as today. The deny uses the hook's existing deny form (:20-26) and runs before the memory wait.
+4. **`hanas`.** New `scripts/hanas/hanas.py` with `list`, `stop <machine>:<pid|port>` and `sweep [--dry-run]`. It reads the process table on natedev (`/proc`, the env through `shutdown/inventory.py` `_process_environment`) and on the Mac over ssh (`ps eww -axww`, ssh options from `mac_test/offload.py` `ssh_prefix`, host from `mac_test.conf`). A Hana is a process whose executable is a `target/<profile>/hana`. Each row: machine, pid, port (`BRP_EXTRAS_PORT`), owner, purpose, age, checkout. An unreachable Mac is one line, and natedev rows still print. A test Hana is a labelled Hana, or any Hana on a port outside `exempt_ports`, or a Hana on an exempt port whose env carries `CLAUDECODE`, `SSH_CONNECTION` or `SHOWRUNNER_UNIT_ID`. `sweep` stops a test Hana older than `test_max_hours` and an unlabelled test Hana older than `unlabelled_max_minutes`: TERM, then KILL after `stop_grace_seconds`. It never stops a user Hana (exempt port, no agent env). Every stop prints one line, and a rerun with nothing left to stop exits 0.
+5. **Install and timer (director, after the checkpoint).** A `/etc/nixos` branch adds a `hanas` wrapper beside `agents.nix:19-30` and a both-machine `nate.jobs` entry that runs `hanas sweep` (template `modules/common/folder-audit.nix`). Its interval is the only value set in nix. Sent to natedev as branch + hash.
+
+Tests: `scripts/hooks/test_brp_launch_gate.py`: a Hana launch with no purpose is denied with the named key; with a purpose it reaches the memory wait; another app is not checked. `scripts/hanas/test_hanas.py`: rows from a fake `/proc` and from fake `ps eww` output; the test-Hana rule for each exempt-port case; sweep picks only rows over their limit, from config values; a stop of a pid that is gone exits 0; an unreachable Mac still lists natedev. `scripts/hana_shot/test_hana_shot.py`: a launch without a purpose refuses; the started env carries both labels.
+
+**Acceptance:** the tests; `test_brp_launch_gate.py`, `test_hanas.py`, `test_hana_shot.py` and `basedpyright` on the changed Python files pass from the worktree. Live on natedev: `hanas list` shows each running Hana on both machines with owner and purpose, or `unlabelled`; `hanas sweep --dry-run` names exactly the ones over their limits.
+
+**Files:**
+- `config/hanas.conf`, `config/README.md` — item 1.
+- `scripts/hana_shot/hana_shot.py`, `scripts/production/mac_run.sh`, `scripts/production/smoke_launch.sh` — item 2 (approved outside paths).
+- `scripts/hooks/pre-tool-use-brp-launch-gate.sh` — item 3.
+- `scripts/hanas/hanas.py` — item 4.
+- `docs/as-built/hana-test-windows.md` — new: the labels, the gate, `hanas` and its config.
+- `scripts/hooks/test_brp_launch_gate.py`, `scripts/hanas/test_hanas.py`, `scripts/hana_shot/test_hana_shot.py` — tests.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — the source, config and doc files.
+- `test` — the test files.
+
+### Phase 44 — Test Hana clones go through scratch, and the Mac keeps no idle clone below its floor  · status: todo
+**Depends on:** Phase 43
+
+**Approved:** builds showrunner 2026-10-31, the same design, its phase 3.
+
+#### Work Order
+
+**Goal:** No large copies stay on the Mac or natedev after tests (user request, 2026-10-31).
+
+**Spec:**
+
+1. **Clones through scratch.** Every test-Hana clone on both machines is made through `scripts/lib/scratch.py` with a task, so its end removes it; `mac_run.sh` and the Mac clone guidance use it.
+2. **Audit age.** `scripts/lint/folder_audit.py` (:68, `REMOVE_AFTER_SECONDS`) removes an idle clone after `clone_max_hours` (config, 4) instead of 7 days; other folders keep their limits.
+3. **Below the Mac floor.** When the Mac's free space is under `free_floor_gib` (`config/mac_test.conf:17`), the sweep removes idle clones, oldest first; a clone with unsaved work (a dirty git tree) loses only its `target`.
+
+Tests: `scripts/lint/test_folder_audit.py` and the Mac sweep's tests: a clone over the age is removed and a younger one stays; below the floor an idle clone goes, a dirty one keeps its source and loses `target`; a busy clone stays.
+
+**Acceptance:** the tests and `basedpyright` on the changed Python files pass from the worktree.
+
+**Files:**
+- `scripts/lib/scratch.py`, `scripts/lint/folder_audit.py`, `scripts/production/mac_run.sh`, `config/mac_test.conf`, `config/hanas.conf` — items 1-3.
+- `scripts/lib/test_scratch.py`, `scripts/lint/test_folder_audit.py` — tests.
+
+**Constraints from prior phases:** Phase 40 validates a new `phase:<unit>/<id>` assignment in `scratch.target` and `scratch.hand_over` through `scratch.registered_plan(unit) -> Path` and `plan_history.plan_phases`. The registered plan comes from the staff parent and production Units record, never the caller's checkout. Clone flows outside a real phase use `gate:<id>` or `--until <when>`. Keep `checked_task` as a shape check so old tasks can still update and end. Tests patch only `registered_plan` with a private plan and use private scratch and copy roots; keep `test_unknown_phase_is_refused_before_creation_or_hand_over` and `test_an_existing_unknown_phase_task_can_update_and_end` in `test_scratch.py`. A `mesh_runs` cwd keeps a folder only while its record says `running`; finished records do not remove the other keeps or the 7-day fallback.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — the source and config files.
+- `test` — the test files.

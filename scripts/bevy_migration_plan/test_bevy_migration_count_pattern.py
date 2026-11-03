@@ -6,16 +6,11 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast, final
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
-
+from typing import TYPE_CHECKING, Literal, cast, final, override
 if TYPE_CHECKING:
-    from typing import override
+    from ..lib import test_hang_guard
 else:
-    def override(method: object) -> object:
-        return method
+    from scripts.lib import test_hang_guard
 
 
 CountMode = Literal["single", "multiple", "verify"]
@@ -61,7 +56,7 @@ class MigrationPatternCountTests(unittest.TestCase):
                          *patterns, "--", str(codebase), file_type]
         return subprocess.run(
             ["bash", str(COUNTER), *arguments], cwd=self.root,
-            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+            capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
     def report(self, result: subprocess.CompletedProcess[str]) -> dict[str, object]:

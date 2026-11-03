@@ -11,7 +11,7 @@ import dailies_input
 import fake_unit_host
 import fake_herdr
 import dailies_render
-from cli_fixture import ImmutableGitSeed, invoke_cli
+from cli_fixture import ImmutableGitSeed, invoke_cli, production_paths
 import os
 import subprocess
 import sys
@@ -24,10 +24,13 @@ from unittest import mock
 from dailies_input import (Activity, Block, ClaudeNotRunning, Decision, FormWaiting, Running, SessionGone,
                            StillWaiting, TicksFailing, UnitRow, status_blocks)
 from unit_lookup import UnitState
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff, unit_names
+from scripts.production.staff_test_support import (
+    fixture_showrunner_name, isolated_staff_file, showrunner_launch, showrunner_relationship,
+    unit_membership,
+)
 
-
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("dailies_input.py")
 RENDERER = SCRIPT.with_name("dailies_render.py")
@@ -151,7 +154,10 @@ class DailiesInputFixture(unittest.TestCase):
         builder = cls()
         builder.root = cls.fixture_root
         builder.root.mkdir()
-        builder.build_fixture()
+        try:
+            builder.build_fixture()
+        finally:
+            builder.doCleanups()
         cls.fixture_attributes = {name: cast(Path, getattr(builder, name)) for name in (
             "root", "home", "origin", "checkout", "doc", "status", "judgment", "state", "holders",
             "output", "notifier", "events", "notifier_failure", "phase_table", "phase_table_json",
@@ -190,6 +196,8 @@ class DailiesInputFixture(unittest.TestCase):
         for name, value in self.fixture_attributes.items():
             setattr(self, name, value)
         self.env = self.fixture_env.copy()
+        _ = self.enterContext(isolated_staff_file(self.root / "staff/staff.json", self.env))
+        _ = self.enterContext(production_paths(self.env))
         self.patch_commands()
 
     def build_fixture(self) -> None:
@@ -237,9 +245,12 @@ class DailiesInputFixture(unittest.TestCase):
                     "STYLE_LEDGER_STATE_DIR": str(self.root / "style-state"),
                     "STYLE_HISTORY_NATE_STYLE_DIR": str(self.root / "nate_style"),
                     **fake_unit_host.environment(self.root),
-                    "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")}
+                    "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
+                    "HERDR_PANE_RECORD_DIR": str(self.root / "pane-records"), "HERDR_SESSION": "agents"}
+        _ = self.enterContext(isolated_staff_file(self.root / "staff/staff.json", self.env))
         (self.root / "sessions").mkdir()
         self.production_doc()
+        _ = showrunner_relationship(fixture_showrunner_name("example", self.doc))
         self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 23:40")
         self.judgment_file()
 
@@ -272,8 +283,9 @@ class DailiesInputFixture(unittest.TestCase):
                         self.root / "bin/review_regime.py", self.root / "race-review.py",
                         self.home / ".claude/scripts/message/send.py"}
             production_commands = {CI_POINTS, WAITING, SCRIPT.with_name("review_regime.py"),
-                                   SCRIPT.parent.parent / "direct/phase_table.py",
-                                   SCRIPT.parent.parent / "style/style_ledger.py"}
+                                   SCRIPT.parent.parent / "direct/phase_table.py"}
+            # The ledger's imported catalog freezes environment paths; it needs
+            # a real child interpreter, even if another test imported it first.
             if script.exists() and (script in fixtures or script in production_commands):
                 module = ModuleType("dailies_fixture_command")
                 module.__file__ = str(script)
@@ -322,6 +334,9 @@ class DailiesInputFixture(unittest.TestCase):
             rows.append(f"| `{BETA}` | `docs/beta.md` | `{self.root / 'beta'}` | `beta` | — | — |")
         rows.extend(["", "## Gates", ""])
         _ = self.doc.write_text("\n".join(rows), encoding="utf-8")
+        self.timer("example")
+        for unit in (ALPHA, BETA) if beta else (ALPHA,):
+            _ = unit_membership(fixture_showrunner_name("example", self.doc), unit)
 
     def status_lines(self, *lines: str) -> None:
         _ = self.status.write_text("\n".join((STAMP, *lines)) + "\n", encoding="utf-8")
@@ -474,6 +489,8 @@ class DailiesInputFixture(unittest.TestCase):
                               capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def rename_unit(self, name: str) -> None:
+        row = unit_membership(fixture_showrunner_name("example", self.doc), ALPHA)
+        _ = staff.rename(row.id, unit_names.name(name))
         for path in (self.doc, self.status, self.judgment):
             _ = path.write_text(path.read_text(encoding="utf-8").replace(ALPHA, name), encoding="utf-8")
 
@@ -515,17 +532,17 @@ class DailiesInputFixture(unittest.TestCase):
     def timer(self, slug: str) -> None:
         """A production with a complete update timer, so the tree counts it."""
         instance = self.root / "notifier-state" / f"showrunner-{slug}"
-        instance.mkdir(parents=True)
+        instance.mkdir(parents=True, exist_ok=True)
+        row = showrunner_relationship(fixture_showrunner_name(slug, self.doc))
         _ = (instance / "conf").write_text(
-            f"TARGET=session:{slug}-session\nCHECK=zsh /x/production_check.sh {self.doc}\n", encoding="utf-8")
+            f"TARGET=session:{row.id}\nCHECK=zsh /x/production_check.sh {self.doc}\n", encoding="utf-8")
+        showrunner_launch(row, row.id, self.env)
 
     def attach(self, child: str, parent: str) -> None:
         for slug in (child, parent):
             if not (self.root / "notifier-state" / f"showrunner-{slug}").exists():
                 self.timer(slug)
-        edge = self.showrunner_state / child / "parent"
-        edge.parent.mkdir(parents=True, exist_ok=True)
-        _ = edge.write_text(parent + "\n", encoding="utf-8")
+        _ = showrunner_relationship(fixture_showrunner_name(child, self.doc), fixture_showrunner_name(parent, self.doc))
 
     def saved_report(self, slug: str) -> Path:
         return self.showrunner_state / slug / "dailies_last.json"

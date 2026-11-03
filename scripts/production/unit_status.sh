@@ -29,10 +29,10 @@ for line in $units; do
   names+=($fields[1] $fields[4])
 done
 PY=$REPO/scripts/lib/py
-slug=$("$PY" - "$REPO/scripts/production" "${production[@]}" <<'PYTHON'
+slug=$("$PY" - "$REPO" "${production[@]}" <<'PYTHON'
 import sys
 sys.path.insert(0, sys.argv[1])
-from showrunners import named, production_slug
+from scripts.production.showrunners import named, production_slug
 arguments = sys.argv[2:]
 print(production_slug(arguments[1]) if arguments[0] == "--production" else named(arguments[0])["slug"])
 PYTHON

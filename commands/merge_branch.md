@@ -1,5 +1,5 @@
 ---
-description: Discover branches and merge them with linear history — rebase the current branch, integrate another, or fall back to a --no-ff merge.
+description: Find and merge branches.
 ---
 
 I'll discover available branches and help you safely merge changes.

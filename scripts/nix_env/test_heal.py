@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -10,13 +11,14 @@ import socket
 import subprocess
 import sys
 import time
-from typing import TYPE_CHECKING, cast, override
+from typing import TYPE_CHECKING, TextIO, cast, override
 from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import nix_env
+from scripts.lib import conf, nix_env
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.nix_env import heal
+from scripts.shutdown import stop_resume
 if TYPE_CHECKING:
     from scripts.notify import push_texts
 else:
@@ -33,11 +35,64 @@ class HealTests(NixFixture):
         super().setUp()
         _ = self.envrc(self.work)
         self.session = heal.HealSession("fixture", 811, "start-811", "worker", self.work, "idle", self.home / ".claude3")
-        _ = self.enterContext(patch.object(heal, "STATE_DIR", self.root / "journal"))
+        _ = self.enterContext(patch.object(heal, "state_directory", return_value=self.root / "journal"))
 
     def records(self) -> list[dict[str, object]]:
-        path = heal.STATE_DIR / "log.jsonl"
+        path = heal.state_directory() / "log.jsonl"
         return [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_a_sweep_keeps_its_state_log_and_lock_in_the_selected_folder(self) -> None:
+        settings = Path(self.env["CONF_DIR"]) / "nix_env.conf"
+        original = settings.read_text()
+        first, second = self.root / "first", self.root / "second"
+        second.mkdir()
+        configured = original.replace("heal_state_directory=~/.local/state/nix-heal", f"heal_state_directory={first}")
+        _ = settings.write_text(configured)
+        real_lock = fcntl.flock
+        locked_paths: list[Path] = []
+
+        def lock(stream: TextIO, operation: int) -> None:
+            real_lock(stream, operation)
+            locked_paths.append(Path(cast(str, stream.name)))
+            _ = settings.write_text(configured.replace(str(first), str(second)))
+
+        def configured_directory() -> Path:
+            return Path(conf.read("nix_env").text("heal_state_directory"))
+
+        with (patch.object(heal, "state_directory", side_effect=configured_directory),
+              patch.object(fcntl, "flock", side_effect=lock),
+              patch.object(heal, "list_sessions", return_value=[self.session]),
+              patch.object(heal, "inspect", return_value=heal.Unavailable("fixture metadata"))):
+            self.assertEqual(heal.sweep(), 0)
+            self.assertEqual(locked_paths, [first / "state.lock"])
+            self.assertIn(self.session.session_id, heal.read_history(first))
+            self.assertIn("fixture metadata", (first / "log.jsonl").read_text())
+            self.assertTrue((first / "state.lock").is_file())
+            self.assertEqual(list(second.iterdir()), [])
+            self.assertEqual(heal.sweep(), 0)
+            self.assertEqual(locked_paths, [first / "state.lock", second / "state.lock"])
+            self.assertIn(self.session.session_id, heal.read_history(second))
+            self.assertTrue((second / "log.jsonl").is_file())
+
+    def test_the_command_timeout_changes_the_pending_relaunch_budget(self) -> None:
+        directory = heal.state_directory()
+        directory.mkdir()
+        history = heal.new_history()
+        history["restart_at"] = 100.0
+        history["pending"] = heal.PendingRestart(kind="launching", login="fixture", name=self.session.name,
+            cwd=str(self.session.cwd), config_dir=str(self.session.config_dir), pid=self.session.pid,
+            proc_start=self.session.proc_start, stop_request_sent=True)
+        heal.save_history(directory, {self.session.session_id: history})
+        settings = Path(self.env["CONF_DIR"]) / "nix_env.conf"
+        original = settings.read_text()
+        with (patch.object(heal, "list_sessions", return_value=[]),
+              patch.object(time, "time", return_value=1100.0), patch.object(heal, "alert") as alert):
+            self.assertEqual(heal.sweep(), 0)
+            alert.assert_not_called()
+            _ = settings.write_text(original.replace("command_timeout_seconds=600", "command_timeout_seconds=1"))
+            self.assertEqual(heal.sweep(), 0)
+            alert.assert_called_once()
+            self.assertIn("waiting for a live replacement", cast(str, alert.call_args.args[-1]))
 
     def test_later_envrc_approval_does_not_repair_the_live_process(self) -> None:
         # The session began before approval. Only a restart changes its own env.
@@ -113,7 +168,7 @@ class HealTests(NixFixture):
 
         def command_result(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
             del kwargs
-            if command[2] == "restart":
+            if command[2] == "resume":
                 session_id = command[command.index("--only") + 1]
                 original = next(item for item in selected if item.session_id == session_id)
                 replacement = replace(original, pid=original.pid + 10000, proc_start="restarted-" + original.proc_start)
@@ -122,6 +177,15 @@ class HealTests(NixFixture):
             return subprocess.CompletedProcess(command, 0, "SENT: fixture", "")
 
         run = cast(Mock, self.enterContext(patch.object(subprocess, "run", side_effect=command_result)))
+        def stop(identity: str) -> stop_resume.Stopped | stop_resume.StopFailed:
+            result = cast(subprocess.CompletedProcess[str], run(["shared-api", "stop_resume", "stop", "test-account", "--here", "--only", identity]))
+            return stop_resume.Stopped(identity, self.session.pid) if result.returncode == 0 else stop_resume.StopFailed(identity, result.stderr)
+        def resume(identity: str, *, why: str) -> stop_resume.ClaudeUp | stop_resume.ResumeFailed:
+            self.assertEqual(why, "nix shell heal")
+            result = cast(subprocess.CompletedProcess[str], run(["shared-api", "stop_resume", "resume", "test-account", "--only", identity, "--here"]))
+            return stop_resume.ClaudeUp(identity, "fixture-pane", "claude3") if result.returncode == 0 else stop_resume.ResumeFailed(identity, result.stderr)
+        _ = self.enterContext(patch.object(stop_resume, "stop", side_effect=stop))
+        _ = self.enterContext(patch.object(stop_resume, "resume", side_effect=resume))
         return held, ensure, run
 
     def test_idle_session_restarts_once_and_logs_the_restart(self) -> None:
@@ -130,10 +194,10 @@ class HealTests(NixFixture):
         self.assertEqual(ensure.call_args_list, [call(self.work), call(self.work)])
         self.assertGreaterEqual(held.call_count, 2)
         command = cast(list[str], run.call_args.args[0])
-        self.assertEqual(command[2:], ["restart", "test-account", "--only", self.session.session_id, "--here"])
+        self.assertEqual(command[2:], ["resume", "test-account", "--only", self.session.session_id, "--here"])
         stop = cast(list[str], run.call_args_list[0].args[0])
-        self.assertEqual(stop[2:], ["down", "test-account", "--here", "--only", self.session.session_id])
-        self.assertTrue(command[1].endswith("/shutdown/shutdown.py"))
+        self.assertEqual(stop[2:], ["stop", "test-account", "--here", "--only", self.session.session_id])
+        self.assertEqual(command[1], "stop_resume")
         entries = self.records()
         self.assertEqual([entry["action"] for entry in entries], ["restart"])
         self.assertEqual(entries[0]["session_id"], self.session.session_id)
@@ -146,12 +210,12 @@ class HealTests(NixFixture):
         held, ensure, run = self.install_sweep([self.session])
         held.return_value = ""
         complete = cast(Callable[..., subprocess.CompletedProcess[str]], run.side_effect)
-        with (patch.object(heal, "stop_completion", return_value=heal.StopPending(record_missing=True)) as completion,
+        with (patch.object(heal, "stop_completion", return_value=heal.StopPending()) as completion,
               patch.object(sessions, "process_start", return_value=self.session.proc_start)):
             run.side_effect = KeyboardInterrupt("fixture stopped before down ran")
             with self.assertRaises(KeyboardInterrupt):
                 _ = heal.sweep()
-            pending = heal.read_history()[self.session.session_id]["pending"]
+            pending = heal.read_history(heal.state_directory())[self.session.session_id]["pending"]
             self.assertEqual(pending["kind"], "stopping")
             if pending["kind"] == "none":
                 self.fail("interrupted stop must keep its reservation")
@@ -161,7 +225,7 @@ class HealTests(NixFixture):
             run.side_effect = complete
             self.assertEqual(heal.sweep(), 0)
             run.assert_called_once_with(*interrupted_call.args, **interrupted_call.kwargs)
-            pending = heal.read_history()[self.session.session_id]["pending"]
+            pending = heal.read_history(heal.state_directory())[self.session.session_id]["pending"]
             if pending["kind"] == "none":
                 self.fail("accepted stop must wait for the conductor")
             self.assertTrue(pending["stop_request_sent"])
@@ -169,14 +233,14 @@ class HealTests(NixFixture):
             self.assertEqual(run.call_count, 1)
             completion.return_value = heal.StopComplete()
             self.assertEqual(heal.sweep(), 0)
-        self.assertEqual(heal.read_history()[self.session.session_id]["pending"]["kind"], "none")
+        self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"]["kind"], "none")
         self.assertEqual(ensure.call_count, 2)
         commands = [cast(list[str], item.args[0]) for item in run.call_args_list]
-        self.assertEqual([command[2] for command in commands], ["down", "restart"])
+        self.assertEqual([command[2] for command in commands], ["stop", "resume"])
 
     def test_rerun_clears_unsent_stop_and_alerts_if_the_saved_process_is_gone(self) -> None:
         for identity in (None, "reused-pid-start"):
-            with self.subTest(identity=identity), patch.object(heal, "STATE_DIR", self.root / str(identity)):
+            with self.subTest(identity=identity), patch.object(heal, "state_directory", return_value=self.root / str(identity)):
                 held, ensure, run = self.install_sweep([self.session])
                 held.return_value = ""
                 complete = cast(Callable[..., subprocess.CompletedProcess[str]], run.side_effect)
@@ -186,27 +250,27 @@ class HealTests(NixFixture):
                 run.reset_mock()
                 run.side_effect = complete
                 with (patch.object(heal, "list_sessions", return_value=[]),
-                      patch.object(heal, "stop_completion", return_value=heal.StopPending(record_missing=True)),
+                      patch.object(heal, "stop_completion", return_value=heal.StopPending()),
                       patch.object(sessions, "process_start", return_value=identity)):
                     self.assertEqual(heal.sweep(), 0)
                     self.assertEqual(heal.sweep(), 0)
-                self.assertEqual(heal.read_history()[self.session.session_id]["pending"], heal.NoPendingRestart(kind="none"))
+                self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"], heal.NoPendingRestart(kind="none"))
                 run.assert_called_once()
                 command = cast(list[str], run.call_args.args[0])
                 self.assertIn("--need", command)
                 self.assertIn("nix-heal-fixture", command)
-                self.assertNotIn("down", command)
-                self.assertNotIn("restart", command)
+                self.assertNotIn("stop", command)
+                self.assertNotIn("resume", command)
                 self.assertEqual(ensure.call_count, 1)
                 self.assertIn("unsent shutdown request lost its original session process", cast(str, self.records()[-1]["reason"]))
 
     def test_sent_stop_with_no_record_keeps_waiting_and_legacy_records_are_sent(self) -> None:
         held, ensure, run = self.install_sweep([self.session])
         held.return_value = ""
-        with (patch.object(heal, "stop_completion", return_value=heal.StopPending(record_missing=True)),
+        with (patch.object(heal, "stop_completion", return_value=heal.StopPending()),
               patch.object(sessions, "process_start", side_effect=AssertionError("a sent stop must not be retried"))):
             self.assertEqual(heal.sweep(), 0)
-            pending = heal.read_history()[self.session.session_id]["pending"]
+            pending = heal.read_history(heal.state_directory())[self.session.session_id]["pending"]
             if pending["kind"] == "none":
                 self.fail("accepted stop must remain pending")
             self.assertTrue(pending["stop_request_sent"])
@@ -214,9 +278,9 @@ class HealTests(NixFixture):
             # Existing journals predate the sent mark and must retain their wait.
             legacy = dict(pending)
             del legacy["stop_request_sent"]
-            histories = heal.read_history()
+            histories = heal.read_history(heal.state_directory())
             histories[self.session.session_id]["pending"] = heal.read_pending(legacy)
-            heal.save_history(histories)
+            heal.save_history(heal.state_directory(), histories)
             self.assertEqual(heal.sweep(), 0)
             self.assertEqual(run.call_count, 1)
             self.assertEqual(ensure.call_count, 1)
@@ -224,18 +288,6 @@ class HealTests(NixFixture):
         for invalid in invalid_marks:
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 _ = heal.read_pending({**pending, "stop_request_sent": invalid})
-
-    def test_missing_shutdown_record_is_distinct_from_an_in_progress_record(self) -> None:
-        sys.path.insert(0, str(heal.SCRIPTS / "shutdown"))
-        from scripts.shutdown import shutdown_record
-
-        with patch.object(shutdown_record, "find_session", return_value=None):
-            completion = heal.stop_completion(self.session, "test-account")
-        self.assertIsInstance(completion, heal.StopPending)
-        if not isinstance(completion, heal.StopPending):
-            self.fail("missing shutdown record must remain pending")
-        self.assertTrue(completion.record_missing)
-        self.assertFalse(heal.StopPending().record_missing)
 
     def test_hold_and_busy_sessions_do_not_load_or_restart_and_log_reason_changes(self) -> None:
         held, ensure, run = self.install_sweep([self.session])
@@ -267,6 +319,56 @@ class HealTests(NixFixture):
         self.assertIn("--only fixture --check", command[command.index("--clears-when") + 1])
         self.assertEqual([entry["action"] for entry in self.records()], ["refused", "refused"])
 
+    def test_retained_alert_marks_notified_without_another_send(self) -> None:
+        heal.state_directory().mkdir()
+        for code, output in ((1, "checking delivery\nQUEUED: offline"), (0, "KEPT: until silence ends"),
+                             (0, "SKIPPED: acknowledged"), (0, "REPLACED: newer push")):
+            with self.subTest(output=output):
+                history = heal.new_history()
+                with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, output, "")) as run:
+                    heal.alert(heal.state_directory(), heal.HealLimits.read(), self.session, history, "fixture refusal")
+                    heal.alert(heal.state_directory(), heal.HealLimits.read(), self.session, history, "fixture refusal")
+                self.assertTrue(history["notified"])
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual(self.records(), [])
+
+    def test_failed_alert_with_queued_text_only_on_stderr_remains_unnotified(self) -> None:
+        heal.state_directory().mkdir()
+        history = heal.new_history()
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "QUEUED: diagnostic")) as run:
+            heal.alert(heal.state_directory(), heal.HealLimits.read(), self.session, history, "fixture refusal")
+            heal.alert(heal.state_directory(), heal.HealLimits.read(), self.session, history, "fixture refusal")
+        self.assertFalse(history["notified"])
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual([(entry["action"], entry["reason"]) for entry in self.records()],
+                         [("push_failed", "QUEUED: diagnostic")] * 2)
+
+    def test_failed_alert_with_queued_text_in_the_payload_remains_unnotified(self) -> None:
+        heal.state_directory().mkdir()
+        output = "FAILED: unavailable\nQUEUED: quoted result"
+        for code in (0, 1, 3):
+            with self.subTest(code=code):
+                history = heal.new_history()
+                with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, output, "")):
+                    heal.alert(heal.state_directory(), heal.HealLimits.read(), self.session, history, "fixture refusal")
+                self.assertFalse(history["notified"])
+                self.assertEqual((self.records()[-1]["action"], self.records()[-1]["reason"]), ("push_failed", output))
+
+    def test_unconfirmed_alert_result_remains_retryable(self) -> None:
+        heal.state_directory().mkdir()
+        for code, output in ((0, ""), (0, "unrelated output"), (0, "QUEUED: inconsistent exit"),
+                             (1, "SENT: inconsistent exit"), (2, "REFUSED: action required"), (4, "HELD: review"),
+                             (5, "PENDING: active")):
+            with self.subTest(code=code, output=output):
+                history = heal.new_history()
+                with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, output, "")) as run:
+                    heal.alert(heal.state_directory(), heal.HealLimits.read(), self.session, history, "fixture refusal")
+                    heal.alert(heal.state_directory(), heal.HealLimits.read(), self.session, history, "fixture refusal")
+                self.assertFalse(history["notified"])
+                self.assertEqual(run.call_count, 2)
+                self.assertEqual(self.records()[-1]["action"], "push_failed")
+                self.assertEqual(self.records()[-1]["reason"], output or f"exit {code}")
+
     def test_broken_replacement_hits_hour_guard_and_pushes_once(self) -> None:
         held, ensure, run = self.install_sweep([self.session])
         held.return_value = ""
@@ -286,10 +388,10 @@ class HealTests(NixFixture):
         self.assertEqual(ensure.call_args_list, [call(self.work), call(self.work)])
         self.assertEqual(run.call_count, 3)
         commands = [cast(list[str], call.args[0]) for call in run.call_args_list]
-        self.assertEqual(sum(command[2] == "restart" for command in commands), 1)
+        self.assertEqual(sum(command[2] == "resume" for command in commands), 1)
         self.assertEqual(sum("--need" in command for command in commands), 1)
         self.assertFalse(any(entry["action"] == "restart" for entry in self.records()))
-        self.assertEqual(heal.read_history()[self.session.session_id]["pending"]["kind"], "launching")
+        self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"]["kind"], "launching")
         push = commands[-1]
         values = dict(push[index + 1].split("=", 1) for index, word in enumerate(push) if word == "--value")
         self.assertIn("An automatic restart did not fix it.",
@@ -308,16 +410,16 @@ class HealTests(NixFixture):
              "The automatic restart could not fix it. The nix shell setup refused to load."),
         )
         for outcome, raw, cause in cases:
-            with self.subTest(outcome=outcome), patch.object(heal, "STATE_DIR", self.root / outcome):
+            with self.subTest(outcome=outcome), patch.object(heal, "state_directory", return_value=self.root / outcome):
                 held, ensure, run = self.install_sweep([self.session])
                 held.return_value = ""
                 if outcome == "still_broken":
-                    heal.STATE_DIR.mkdir(parents=True)
+                    heal.state_directory().mkdir(parents=True)
                     history = heal.new_history()
                     history["restart_at"] = time.time()
                     history["restart_pid"] = self.session.pid - 1
                     history["restart_proc_start"] = "before-restart"
-                    heal.save_history({self.session.session_id: history})
+                    heal.save_history(heal.state_directory(), {self.session.session_id: history})
                 else:
                     ensure.return_value = nix_env.Refused(raw)
                 self.assertEqual(heal.sweep(), 0)
@@ -351,7 +453,7 @@ class HealTests(NixFixture):
         complete = cast(Callable[..., subprocess.CompletedProcess[str]], run.side_effect)
 
         def stop_or_launch(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-            if "down" in command:
+            if "stop" in command:
                 held.return_value = "build hold: acquired after stop"
             return complete(command, **kwargs)
 
@@ -368,7 +470,7 @@ class HealTests(NixFixture):
             registry.return_value = [replace(self.session, pid=10811, proc_start="restarted-start-811")]
             self.assertEqual(heal.sweep(), 0)
         commands = [cast(list[str], call.args[0]) for call in run.call_args_list]
-        self.assertEqual([command[2] for command in commands], ["down", "restart"])
+        self.assertEqual([command[2] for command in commands], ["stop", "resume"])
         self.assertEqual(commands[1][3:], ["test-account", "--only", self.session.session_id, "--here"])
         self.assertEqual(self.records()[-1]["action"], "restart")
         self.assertEqual(ensure.call_count, 2)
@@ -383,7 +485,7 @@ class HealTests(NixFixture):
             self.assertEqual(self.records()[-1]["reason"], "waiting for shutdown stop completion")
             completion.return_value = heal.StopComplete()
             self.assertEqual(heal.sweep(), 0)
-        self.assertEqual([cast(list[str], item.args[0])[2] for item in run.call_args_list], ["down", "restart"])
+        self.assertEqual([cast(list[str], item.args[0])[2] for item in run.call_args_list], ["stop", "resume"])
         self.assertEqual(ensure.call_count, 2)
 
     def test_pending_restart_refusal_alerts_once_and_never_relaunches(self) -> None:
@@ -394,8 +496,8 @@ class HealTests(NixFixture):
         self.assertEqual(heal.sweep(), 0)
         self.assertEqual(heal.sweep(), 0)
         commands = [cast(list[str], item.args[0]) for item in run.call_args_list]
-        self.assertEqual(sum(command[2] == "down" for command in commands), 1)
-        self.assertEqual(sum(command[2] == "restart" for command in commands), 0)
+        self.assertEqual(sum(command[2] == "stop" for command in commands), 1)
+        self.assertEqual(sum(command[2] == "resume" for command in commands), 0)
         self.assertEqual(sum("--need" in command for command in commands), 1)
 
     def test_hold_during_pending_environment_load_prevents_the_relaunch(self) -> None:
@@ -412,30 +514,27 @@ class HealTests(NixFixture):
         self.assertEqual(heal.sweep(), 0)
         self.assertEqual(ensure.call_count, 2)
         commands = [cast(list[str], item.args[0]) for item in run.call_args_list]
-        self.assertEqual([command[2] for command in commands], ["down"])
-        self.assertEqual(heal.read_history()[self.session.session_id]["pending"]["kind"], "stopping")
+        self.assertEqual([command[2] for command in commands], ["stop"])
+        self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"]["kind"], "stopping")
         held.return_value = ""
-        self.assertEqual(heal.sweep(), 0)
-        environment = cast(dict[str, str], run.call_args.kwargs["env"])
-        self.assertEqual(environment["NIX_LDFLAGS"], "-Lfixture")
-        self.assertEqual(environment[nix_env.HEAL_SESSION_ENV], self.session.session_id)
-        self.assertEqual(environment[nix_env.HEAL_DIRECTORY_ENV], str(self.work.resolve()))
-        self.assertEqual(heal.read_history()[self.session.session_id]["pending"]["kind"], "none")
+        with patch.object(stop_resume, "resume", wraps=stop_resume.resume) as resume:
+            self.assertEqual(heal.sweep(), 0)
+        resume.assert_called_once_with(self.session.session_id, why="nix shell heal")
+        self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"]["kind"], "none")
 
     def test_relaunch_failure_keeps_pending_and_pushes_once_without_a_duplicate_launch(self) -> None:
         for failure in ("timeout", "nonzero", "oserror"):
-            with self.subTest(failure=failure), patch.object(heal, "STATE_DIR", self.root / failure):
+            with self.subTest(failure=failure), patch.object(heal, "state_directory", return_value=self.root / failure):
                 held, ensure, run = self.install_sweep([self.session])
                 held.return_value = ""
 
                 def fail_launch(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-                    if command[2] == "restart":
-                        self.assertEqual(command[3], "test-account")
-                        timeout = cast(int, kwargs["timeout"])
-                        self.assertGreaterEqual(timeout, nix_env.TIMEOUT_SECONDS + 90)
-                        self.assertEqual(heal.read_history()[self.session.session_id]["pending"]["kind"], "launching")
+                    del kwargs
+                    if command[2] == "resume":
+                        self.assertIn(self.session.session_id, command)
+                        self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"]["kind"], "launching")
                         if failure == "timeout":
-                            raise subprocess.TimeoutExpired(command, timeout)
+                            raise subprocess.TimeoutExpired(command, 30)
                         if failure == "oserror":
                             raise OSError("fixture cannot start restart")
                         return subprocess.CompletedProcess(command, 1, "", "fixture launch refused")
@@ -443,10 +542,10 @@ class HealTests(NixFixture):
 
                 run.side_effect = fail_launch
                 self.assertEqual(heal.sweep(), 0)
-                self.assertEqual(heal.read_history()[self.session.session_id]["pending"]["kind"], "launching")
+                self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"]["kind"], "launching")
                 self.assertEqual(heal.sweep(), 0)
                 commands = [cast(list[str], item.args[0]) for item in run.call_args_list]
-                self.assertEqual(sum(command[2] == "restart" for command in commands), 1)
+                self.assertEqual(sum(command[2] == "resume" for command in commands), 1)
                 self.assertEqual(sum("--need" in command for command in commands), 1)
                 self.assertEqual(ensure.call_count, 2)
                 # Delayed success after a timeout must clear the reservation,
@@ -455,8 +554,8 @@ class HealTests(NixFixture):
                 with (patch.object(heal, "list_sessions", return_value=[replacement]),
                       patch.object(heal, "inspect", return_value=heal.Healthy())):
                     self.assertEqual(heal.sweep(), 0)
-                self.assertEqual(heal.read_history()[self.session.session_id]["pending"]["kind"], "none")
-                self.assertEqual(sum(cast(list[str], item.args[0])[2] == "restart" for item in run.call_args_list), 1)
+                self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"]["kind"], "none")
+                self.assertEqual(sum(cast(list[str], item.args[0])[2] == "resume" for item in run.call_args_list), 1)
 
     def test_successful_restart_command_retains_pending_until_the_replacement_is_healthy(self) -> None:
         held, ensure, run = self.install_sweep([self.session])
@@ -468,15 +567,15 @@ class HealTests(NixFixture):
 
         run.side_effect = success_without_registry
         self.assertEqual(heal.sweep(), 0)
-        self.assertEqual(heal.read_history()[self.session.session_id]["pending"]["kind"], "launching")
+        self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"]["kind"], "launching")
         replacement = replace(self.session, pid=913, proc_start="confirmed-replacement")
         with (patch.object(heal, "list_sessions", return_value=[replace(replacement, config_dir=self.home / ".claude-wrong")]) as registry,
               patch.object(heal, "inspect", return_value=heal.Healthy())):
             self.assertEqual(heal.sweep(), 0)
-            self.assertEqual(heal.read_history()[self.session.session_id]["pending"]["kind"], "launching")
+            self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"]["kind"], "launching")
             registry.return_value = [replacement]
             self.assertEqual(heal.sweep(), 0)
-        self.assertEqual(heal.read_history()[self.session.session_id]["pending"]["kind"], "none")
+        self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"]["kind"], "none")
         self.assertEqual(run.call_count, 2)
         self.assertEqual(ensure.call_count, 2)
         self.assertEqual(self.records()[-1]["action"], "restart")

@@ -1,5 +1,5 @@
 ---
-description: Discover worktrees and safely delete one and its branch, locally and on origin, checking for uncommitted and unpushed work first.
+description: Delete a worktree and its branch.
 ---
 
 PROTECTED_BRANCHES = main

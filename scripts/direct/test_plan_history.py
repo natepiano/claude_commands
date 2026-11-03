@@ -5,11 +5,18 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from typing import override
+from scripts.production.staff_test_support import isolated_staff_file, recorded_unit
 
 from scripts.direct import plan_history
 
 
 class PlanDependencyTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(isolated_staff_file(root / "staff.json", {}))
+
     def read_dependencies(self, body: str) -> list[str] | None:
         with tempfile.TemporaryDirectory() as directory:
             plan = Path(directory) / "plan.md"
@@ -92,6 +99,10 @@ class PlanDependencyTests(unittest.TestCase):
                 + "**Depends on:** " + depends + "\n",
                 encoding="utf-8",
             )
+            if header:
+                document = plan.parent / "production.md"
+                _ = document.write_text("# Production\n")
+                _ = recorded_unit("sdlc-owner", "phases", plan.parent, document, plan=plan.name)
             phases = plan_history.plan_phases(plan)
         self.assertEqual(len(phases), 1)
         return phases[0]["depends_on"]

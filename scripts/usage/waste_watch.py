@@ -28,6 +28,8 @@ if __package__ in (None, ""):
 from scripts.usage import collect, outcomes, usage_report, weights
 from scripts.usage.agents_log import state_dir
 from scripts.usage.usage_report import UnitWorktree
+from scripts.production import session_staff, staff
+from scripts.shutdown import remote
 
 
 WINDOW = timedelta(hours=2)
@@ -173,24 +175,35 @@ class ShowrunnerLookupFailed:
 ShowrunnerLookup = ShowrunnersFound | ShowrunnerLookupFailed
 
 
-def registered_showrunners() -> ShowrunnerLookup:
+def registered_showrunners(*, resolver: session_staff.RowResolver | None = None) -> ShowrunnerLookup:
     """Every registered showrunner with its production doc's units, as the production tooling finds them."""
-    from scripts.production import showrunners
+    from scripts.message import unit_labels
 
     try:
-        runners = showrunners.registered_showrunners()
-    except OSError as error:
+        resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+        record = resolver.record
+        problems: list[str] = []
+        runners = unit_labels.registered_showrunners(problems, membership=record, resolver=resolver)
+        found = tuple(Showrunner(runner["slug"], f"uds:{runner['socket']}" if runner["socket"] else "",
+                                usage_report.document_units(Path(runner["doc"]), resolver=resolver))
+                      for runner in runners)
+        if problems:
+            return ShowrunnerLookupFailed("; ".join(problems))
+        return ShowrunnersFound(found)
+    except (OSError, ValueError) as error:
         return ShowrunnerLookupFailed(f"showrunner lookup failed: {' '.join(str(error).split())}")
-    return ShowrunnersFound(tuple(
-        Showrunner(runner["slug"], f"uds:{runner['socket']}" if runner["socket"] else "",
-                   usage_report.document_units(Path(runner["doc"]))) for runner in runners))
 
 
-def folder_unit(folder: str | None, worktrees: tuple[UnitWorktree, ...]) -> str:
+def folder_unit(folder: str | None, worktrees: tuple[UnitWorktree, ...],
+                *, resolver: session_staff.RowResolver | None = None) -> str:
     if folder is None:
         return "unknown"
+    resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
     path = Path(folder)
-    return next((row.unit for row in worktrees if path.is_relative_to(row.worktree)), path.name or "unknown")
+    member = resolver.member_by_folder(remote.local_machine(), path)
+    if isinstance(member, session_staff.MemberFound):
+        return member.row.name
+    return next((row.unit for row in worktrees if path.is_relative_to(row.worktree)), "unknown")
 
 
 @dataclass
@@ -335,13 +348,14 @@ def watch(db: Path, production_docs: Path, *, now: datetime | None = None, dry_r
             <= WAIT_SHARE_LIMIT * MINIMUM_WEIGHTED
             and not any(thread.context_flagged() for thread in threads)):
         return
-    lookup = registered_showrunners()
+    resolver = session_staff.RowResolver(staff.snapshot())
+    lookup = registered_showrunners(resolver=resolver)
     runners = lookup.showrunners if isinstance(lookup, ShowrunnersFound) else ()
     worktrees = usage_report.longest_first([
-        *(row for runner in runners for row in runner.units), *usage_report.unit_worktrees(production_docs)])
+        *(row for runner in runners for row in runner.units), *usage_report.unit_worktrees(production_docs, resolver=resolver)])
     units: dict[str, UnitUsage] = {}
     for thread in threads:
-        unit = folder_unit(thread.folder, worktrees)
+        unit = folder_unit(thread.folder, worktrees, resolver=resolver)
         units.setdefault(unit, UnitUsage(unit)).threads.append(thread)
     path = state_file()
     alerts = read_state(path)

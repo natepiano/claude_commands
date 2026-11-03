@@ -1,6 +1,10 @@
 """Independent tools, state and process cleanup for verify token tests."""
 from __future__ import annotations
 
+from scripts.lib.py_floor_test_support import cache_file_name
+
+from scripts.lint.memory_test_support import config_environment
+
 import json
 import os
 import signal
@@ -13,10 +17,12 @@ import time
 import unittest
 from pathlib import Path
 from typing import ClassVar, cast, override
+from scripts.lib.process_group import send_process_group
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
 from scripts.direct.verify_mac_offload_test_support import RUSTC_STUB, stub_build_tool_path
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -24,8 +30,6 @@ VERIFY = Path(__file__).with_name("verify.sh")
 
 BOARD = VERIFY.with_name("board.sh")
 
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 
 Record = dict[str, object]
@@ -85,6 +89,9 @@ if [ "$1" = metadata ]; then
 fi
 printf "%s\n" "$*" >> "$CARGO_CALLS"
 if [ "$1" = check ]; then
+    if [ -n "${TEST_TOKEN_OBSERVER:-}" ]; then
+        python3 "$TEST_TOKEN_OBSERVER" run || exit 96
+    fi
     if [ "${TEST_REQUIRE_OWNED:-0}" = 1 ]; then
         python3 - "$TEST_OWNED_RECORD" "$$" "$TEST_CALLER_GROUP" <<'PY'
 import json
@@ -159,7 +166,7 @@ esac
         _ = pressure.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
         # Interpreter selection is independent of token ownership. Seed the
         # shim's normal cache once rather than rediscovering Python per test.
-        interpreter = self.root / "cache" / "claude" / "python3-3.11"
+        interpreter = self.root / "cache" / "claude" / cache_file_name()
         interpreter.parent.mkdir()
         _ = interpreter.write_text(sys.executable + "\n")
         memory_event = self.root / "memory-event.py"
@@ -226,7 +233,7 @@ esac
             "MAC_IDLE_STATE_DIR": str(self.root / "mac-idle"),
             "VERIFY_MAC_RUNNER": str(self.root / "no-mac-runner"),
             "LINT_CONFIG_READER": str(reader),
-            "LINT_CONFIG_FILE": str(reader),
+            "LINT_CONFIG_FILE": str(reader), **config_environment(self.root),
             "UNIT_SESSION_DIR": str(self.root / "session"),
             "TEST_RUNNING": str(self.root / "running"),
             "TEST_RELEASE": str(self.root / "release"),
@@ -269,7 +276,7 @@ esac
 
     def end_group(self, group: int) -> None:
         try:
-            os.killpg(group, signal.SIGKILL)
+            send_process_group(group, signal.SIGKILL)
         except ProcessLookupError:
             pass
         deadline = time.monotonic() + TEST_HANG_GUARD_SECS
@@ -472,7 +479,7 @@ if sys.argv[1] == "wait-local":
             step_group = cast(int, step_record["group"])
             self.started_groups.add(step_group)
 
-            os.killpg(first.pid, interruption)
+            send_process_group(first.pid, interruption)
             _ = first.wait(timeout=TEST_HANG_GUARD_SECS)
             self.assertNotEqual(first.returncode, 0)
             self.assertFalse(lock.exists(), "interrupted verify kept its token")

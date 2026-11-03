@@ -13,10 +13,9 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.lint.memory_test_support import fake_memory_readings
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file, source_environment
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("dailies_render.py")
 HOLD_SCRIPT = SCRIPT.parent.parent / "build_hold" / "build_hold.py"
@@ -49,6 +48,9 @@ class DailiesHoldTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(isolated_staff_file(self.scratch / "staff.json", {}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, source_environment(self.scratch / "sources"))))
+        _ = fixture_member("showrunner", name="fixture")
         self.enterContext(mock.patch.dict(os.environ, fake_memory_readings(self.scratch)))
         # HOME puts the renderer's AGENTS_DIR and READINGS_LOG under this test directory.
         (self.scratch / "rust/hanadocs/agents").mkdir(parents=True)
@@ -119,6 +121,7 @@ class DailiesHoldTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
+            timeout=TEST_HANG_GUARD_SECS,
             env={
                 **os.environ,
                 "HOME": str(self.scratch),

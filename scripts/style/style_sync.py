@@ -17,17 +17,22 @@ from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from types import FrameType, MappingProxyType
 from typing import Literal, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "production"))
 sys.path.insert(0, str(SCRIPTS / "lib"))
+import process_group
 
 from add_style import NoStyleProduction, standing_style_production
 from production_units import Refusal
-import showrunners
+from scripts.message import send_result
+from scripts.production import showrunners
 import style_ledger
+from process_failure import failure_detail
 import scratch
 
 PYTHON = SCRIPTS / "lib/py"
@@ -85,8 +90,14 @@ def notify(repo_dir: Path, branch: str, tip: str) -> None:
             "--key", f"style-sync:{standing.slug}",
             "--timeout", str(SEND_SECONDS),
         ], capture_output=True, text=True, check=False, timeout=SEND_RUN_SECONDS)
-        if sent.returncode:
-            raise Refusal(sent.stderr.strip() or sent.stdout.strip() or f"send.py exited {sent.returncode}")
+        outcome = send_result.send_outcome(sent.returncode, sent.stdout)
+        if isinstance(outcome, send_result.ConfirmedSendOutcome):
+            match outcome.header.outcome:
+                case "sent" | "skipped" | "kept" | "replaced":
+                    return
+                case "queued" | "failed" | "refused" | "held" | "pending":
+                    pass
+        raise Refusal(f"send.py: {failure_detail(sent)}")
     except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
         detail = " ".join(str(error).splitlines()).removeprefix("style_sync: ")
         print("style_sync: notify: " + detail)
@@ -220,17 +231,17 @@ def lint_run_running(directory: Path, owner_record: OwnerRecord) -> bool:
     group = int(verifier_file.read_text())
     if group <= 0:
         raise ValueError(f"{VERIFIER_FILE} names no process group")
-    return probe(os.killpg, group)
+    return probe(process_group.send_process_group, group)
 
 
 def stop_lint_child(child: subprocess.Popen[str]) -> None:
     """Stop verify.sh and every process it started, so no cargo build writes into a removed checkout."""
     with suppress(ProcessLookupError):
-        os.killpg(child.pid, signal.SIGTERM)
+        process_group.send_process_group(child.pid, signal.SIGTERM)
     with suppress(subprocess.TimeoutExpired):
         _ = child.wait(CHILD_STOP_SECONDS)
     with suppress(ProcessLookupError):
-        os.killpg(child.pid, signal.SIGKILL)
+        process_group.send_process_group(child.pid, signal.SIGKILL)
     _ = child.wait()
 
 
@@ -328,10 +339,10 @@ def sweep_stale_lint_dirs() -> None:
 
 
 def lint_target(common_dir: Path) -> Path:
-    """One Cargo target per main repo, held until its standing style production wraps."""
-    target = common_dir / "style-sync-target"
-    target.mkdir(exist_ok=True)
-    _ = scratch.hold(target, f"run:{common_dir.parent.name}-style", "standing style production sync lint target")
+    """One Cargo target per main repo, retained across style production tasks."""
+    target = common_dir / scratch.STYLE_TARGET_NAME
+    scratch.mark_cargo_cache(target)
+    _ = scratch.release(target)
     return target
 
 
@@ -339,7 +350,7 @@ def lint_target(common_dir: Path) -> Path:
 def locked_lint_target(common_dir: Path) -> Generator[Path]:
     """Serialize checkout creation through cleanup, so source times postdate prior fingerprints."""
     target = lint_target(common_dir)
-    with (target / "sync.lock").open("a") as lock:
+    with (target / scratch.STYLE_LOCK_NAME).open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         yield target
 
@@ -405,11 +416,13 @@ def handoff_notice(slug: str, parent: str, checkpoint: str) -> HandoffDelivery:
         "--text", f"From the showrunner of {slug}: hand-off {checkpoint}",
         "--timeout", str(SEND_SECONDS),
     ], capture_output=True, text=True, check=False, timeout=SEND_RUN_SECONDS)
-    if result.returncode == 1 and result.stdout.startswith("QUEUED:"):
-        return "queued"
-    if result.returncode:
-        raise Refusal(result.stderr.strip() or result.stdout.strip() or f"send.py exited {result.returncode}")
-    return "sent"
+    outcome = send_result.send_outcome(result.returncode, result.stdout)
+    if isinstance(outcome, send_result.ConfirmedSendOutcome):
+        if outcome.header.outcome in {"queued", "kept"}:
+            return "queued"
+        if outcome.header.outcome in {"sent", "skipped", "replaced"}:
+            return "sent"
+    raise Refusal(f"send.py: {failure_detail(result)}")
 
 
 @dataclass(frozen=True)
@@ -482,7 +495,7 @@ def wake_waiters(repo: Path, ticket_id: str) -> None:
                     "--timeout", str(SEND_SECONDS),
                 ], capture_output=True, text=True, check=False, timeout=SEND_RUN_SECONDS)
                 if result.returncode:
-                    raise Refusal(result.stderr.strip() or result.stdout.strip() or f"send.py exited {result.returncode}")
+                    raise Refusal(f"send.py: {failure_detail(result)}")
             except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
                 print(f"style_ledger: wake {wait.unit}: " + " ".join(str(error).splitlines()))
                 continue

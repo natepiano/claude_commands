@@ -17,10 +17,23 @@ import time
 import unittest
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, override
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import write_config_fixture, config_environment
+else:
+    from memory_test_support import write_config_fixture, config_environment
+
 import offload
 import mac_test
 import treekey
 from offload_test_commands import COMMAND_STUB, write_shell
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+    from ..lib.process_group import send_process_group
+else:
+    from scripts.lib import test_hang_guard
+    from scripts.lib.process_group import send_process_group
 
 if TYPE_CHECKING:
     from ..production.cli_fixture import invoke_cli
@@ -35,9 +48,6 @@ STATE_SCRIPT = Path(__file__).with_name("mac_test.py")
 FILTER = "package(hana) & (test(a) | test(b))"
 
 WORKING_TREE_SOURCE = offload.RepositoryWorkingTree()
-
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 
 class RemoteLine(TypedDict):
@@ -276,10 +286,11 @@ class OffloadCommandFixture(unittest.TestCase):
         self.sync_fixture()
         self.environment = {
             **os.environ,
+            **config_environment(self.root),
             "HOME": str(self.root / "home"),
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "MAC_TEST_STATE_DIR": str(self.state_directory),
-            "MAC_TEST_CONFIG": str(self.config_path),
+            "MAC_TEST_CONFIG": str(self.config_path), "CONF_DIR": str(Path(self.config_path).parent),
             "MAC_TEST_STUB_DIR": str(self.stub_directory),
             "MAC_TEST_REAL_STATE": str(STATE_SCRIPT),
             "BUILD_HOLD_DIR": str(self.root / "holders"),
@@ -297,13 +308,13 @@ class OffloadCommandFixture(unittest.TestCase):
         path.chmod(0o755)
 
     def sync_config(self) -> None:
-        _ = self.config_path.write_text(
-            "".join(f"{name}={value}\n" for name, value in self.config.items()),
-            encoding="utf-8",
-        )
+        _ = write_config_fixture(self.config_path, "".join(f"{name}={value}\n" for name, value in self.config.items()), template="mac_test")
+        lines = self.config_path.read_text().splitlines()
+        _ = self.config_path.write_text("\n".join(line for line in lines
+            if not line.startswith("linux_only.") or line.partition("=")[0] in self.config) + "\n")
 
     def sync_fixture(self) -> None:
-        assignments = [f"TEST_HANG_GUARD_SECS={TEST_HANG_GUARD_SECS}"]
+        assignments = [f"TEST_HANG_GUARD_SECS={test_hang_guard.TEST_HANG_GUARD_SECS}"]
         for name, value in self.fixture.items():
             if name == "run_lines":
                 continue
@@ -322,7 +333,7 @@ class OffloadCommandFixture(unittest.TestCase):
         *nextest_arguments: str,
         repository: Path | None = None,
         filter_run: bool = False,
-        timeout: float = TEST_HANG_GUARD_SECS,
+        timeout: float = test_hang_guard.TEST_HANG_GUARD_SECS,
         subprocess_cli: bool = False,
         settings: Path | offload.DefaultMacSettings = offload.DEFAULT_MAC_SETTINGS,
         last_decline: str = "",
@@ -421,7 +432,7 @@ raise SystemExit(offload.main())
              "--call-id", "call-17", "--result", str(self.result_path), "--"],
             cwd=self.root, env=self.environment, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
-            text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+            text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
     def start_command(
@@ -491,7 +502,7 @@ raise SystemExit(offload.main())
             capture_output=True,
             text=True,
             check=False,
-            timeout=TEST_HANG_GUARD_SECS,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
     def events(self) -> list[CommandEvent]:
@@ -618,7 +629,7 @@ raise SystemExit(offload.main())
                 self.assertIn("connection refused by host", output)
 
     def wait_for_path(self, path: Path) -> None:
-        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+        deadline = time.monotonic() + test_hang_guard.TEST_HANG_GUARD_SECS
         while time.monotonic() < deadline:
             if path.exists():
                 return
@@ -633,7 +644,7 @@ raise SystemExit(offload.main())
             self.fail("runner output is unavailable")
         received = b""
         expected_bytes = expected.encode()
-        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+        deadline = time.monotonic() + test_hang_guard.TEST_HANG_GUARD_SECS
         while expected_bytes not in received:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -662,17 +673,17 @@ raise SystemExit(offload.main())
         try:
             self.wait_for_path(self.stub_directory / "claim-started")
             if signal_group:
-                os.killpg(process.pid, signal_number)
+                send_process_group(process.pid, signal_number)
             else:
                 process.send_signal(signal_number)
             self.wait_for_ignored_signals(process)
             _ = (self.stub_directory / "finish-claim").write_text("continue\n")
-            output, _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            output, _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         finally:
             _ = (self.stub_directory / "finish-claim").write_text("continue\n")
             if process.poll() is None:
                 process.kill()
-                _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 128 + signal_number, output)
         self.assertFalse(self.result_path.exists())
         self.assertFalse((self.state_directory / "unreachable_until").exists())
@@ -680,7 +691,7 @@ raise SystemExit(offload.main())
 
     def wait_for_ignored_signals(self, process: subprocess.Popen[str]) -> None:
         expected = sum(1 << (number - 1) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP))
-        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+        deadline = time.monotonic() + test_hang_guard.TEST_HANG_GUARD_SECS
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 return
@@ -748,13 +759,13 @@ raise SystemExit(offload.main())
             self.wait_for_path(self.stub_directory / "copy-started")
             change()
             _ = (self.stub_directory / "continue-copy").write_text("continue\n")
-            output, _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            output, _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
             self.assertEqual(process.returncode, 0, output)
             self.assert_wire("passed", "")
         finally:
             if process.poll() is None:
                 process.kill()
-                _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
 
     def sent_command_words(self) -> list[str]:
         self.assertEqual(len(self.events_for("rsync")), 1)

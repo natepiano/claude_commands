@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import io
 import os
+import sqlite3
 import sys
+import traceback
 import unittest
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from pathlib import Path
 from typing import final
 from unittest import mock
@@ -14,6 +16,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import style_plan
+import rules
 import style_proposals
 
 import berth_board
@@ -25,6 +28,74 @@ from style_plan_test_support import StylePlanFixture
 
 @final
 class StylePlanTests(StylePlanFixture):
+    def test_restored_rule_body_returns_the_unchanged_held_cell_to_refill(self) -> None:
+        rule = self.rule("read")
+        self.sync()
+        _ = self.held_proposal(rule, self.sources[0])
+        rule_file = self.rule_dir / "read.md"
+        original = rule_file.read_text()
+        with self.ledger() as ledger:
+            _ = rule_file.write_text(original + "Changed body.\n")
+            _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+        _ = rule_file.write_text(original)
+        for path in self.sources[1:]:
+            self.record(rule, path, self.tip)
+        self.assertEqual(self.candidates(), (style_plan.TicketSelection("read", "names", "crates/alpha",
+                                                                       (self.sources[0],), (rule,)),))
+
+    def test_refill_uses_the_planners_catalog_snapshot(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        load = rules.load_rules
+
+        def shared_catalog(repo: Path | None) -> tuple[rules.Rule, ...]:
+            self.assertNotIn("_refill_cells", [frame.name for frame in traceback.extract_stack()])
+            return load(repo)
+
+        with mock.patch.object(rules, "load_rules", side_effect=shared_catalog):
+            result, output, errors = self.run_next()
+        self.assertEqual(result, 0, output + errors)
+
+    def test_rule_body_change_refills_unchanged_held_files_before_resuming(self) -> None:
+        read = self.rule("read")
+        self.sync()
+        _ = self.held_proposal(read, self.sources[0])
+        ledger = self.ledger()
+        ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha", [self.sources[0]], [read])
+        ledger.ticket_assign("names-unit-1", "demo-style-names")
+        rule_file = self.rule_dir / "read.md"
+        _ = rule_file.write_text(rule_file.read_text() + "Changed body.\n")
+        # No source edit: the old open-proposal shortcut must not hide this cell.
+        for path in self.sources[1:]:
+            self.record(read, path, self.tip)
+        candidates = self.candidates()
+        self.assertEqual(candidates, (style_plan.TicketSelection("read", "names", "crates/alpha",
+                                                               (self.sources[0],), (read,)),))
+        result, output, errors = self.run_next()
+        self.assertEqual(result, 0, output + errors)
+        self.assertNotIn("resumed names-unit-1", output)
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT state FROM tickets WHERE id='names-unit-1'").fetchone(), ("dropped",))
+        self.assertIsInstance(ledger.held_findings(style_ledger.AllHeldFindings())[0].state, style_ledger.Withdrawn)
+        self.assertEqual(ledger.ticket_open("names-unit")[0]["files"], [self.sources[0]])
+
+    def test_old_held_judgment_does_not_hide_a_current_body_finding(self) -> None:
+        read = self.rule("read")
+        self.sync()
+        issue = self.held_proposal(read, self.sources[0])
+        rule_file = self.rule_dir / "read.md"
+        _ = rule_file.write_text(rule_file.read_text() + "Changed body.\n")
+        ledger = self.ledger()
+        definitions = {rule.rule_id: rule for rule in rules.load_rules(self.repo)}
+        _ = ledger.withdraw_superseded(definitions)
+        finding = ledger.hold(read, self.sources[0], 2, "current-body finding", "rename", "old", "new",
+                              definitions[read].blob, "outside")
+        ledger.file_held(finding.finding_id, issue)
+        for path in self.sources[1:]:
+            self.record(read, path, self.tip)
+        self.assertEqual(self.candidates(), (style_plan.TicketSelection("read", "names", "crates/alpha",
+                                                                       (self.sources[0],), (read,)),))
+
     def test_repair_first_does_not_read_the_board_or_change_the_plan(self) -> None:
         text = self.plan.read_text() + "\n### Phase 3 — repair round 1 · status: todo\nFix a review finding.\n"
         _ = self.plan.write_text(text)

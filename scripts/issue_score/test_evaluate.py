@@ -14,7 +14,10 @@ from typing import Literal, cast, override
 import unittest
 from unittest import mock
 
+from scripts.issue_score.test_config import ConfiguredTestCase, patch_thresholds
 from scripts.issue_score import client, decide, evaluate, questions, records, score_issues, vault
+from scripts.issue_score.test_decide import choice_answer
+from scripts.lib import conf
 from scripts.prioritize import renumber
 
 FIXTURES = Path(__file__).with_name("fixtures")
@@ -44,7 +47,19 @@ def table(report: str, first_header: str) -> list[dict[str, str]]:
     return rows
 
 
-class MetricTests(unittest.TestCase):
+class MetricTests(ConfiguredTestCase):
+    def test_routing_counts_use_the_displayed_threshold_after_the_live_file_changes(self) -> None:
+        path = self.configuration(**{"threshold.backlog_goal": ".8"})
+        scoring_config = conf.read("issue_score")
+        self.change_configuration(path, **{"threshold.backlog_goal": ".2"})
+        issue = vault.Issue(Path("fixture.md"), "Fixture", "hana", "", {})
+        observation = evaluate.FieldObservation(issue, "ship_hana", "ship_hana",
+            decide.FieldDecision("ship_hana", .5, "unsure"), {"ship_hana": .5})
+        report = evaluate._routing_summary("backlog_goal", [observation], scoring_config=scoring_config)  # pyright: ignore[reportPrivateUsage]
+        self.assertIn("configured threshold 0.80", report)
+        self.assertIn("taken (sure): 0.0000", report)
+        self.assertIn("routed to the user (unsure): 1.0000", report)
+
     def test_split_hashes_the_filename_including_extension_and_ignores_parent(self) -> None:
         # SHA1 residues modulo ten are 1, 8, 9, and 7 respectively.
         for filename, expected in (("Target A.md", "tune"), ("Target G.md", "holdout"),
@@ -94,7 +109,7 @@ class MetricTests(unittest.TestCase):
                     self.assertTrue(result.reason)
 
 
-class CompareTests(unittest.TestCase):
+class CompareTests(ConfiguredTestCase):
     root: Path = Path()
     issues: Path = Path()
     state: Path = Path()
@@ -102,6 +117,7 @@ class CompareTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.issues = self.root / "vault" / "issues"
         self.issues.mkdir(parents=True)
@@ -111,7 +127,7 @@ class CompareTests(unittest.TestCase):
         _ = self.goals.write_text("## Current goals\n" + "".join(
             f"{number}. `{label}`\n" for number, label in enumerate(questions.GOAL_LABELS.values(), 1)))
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
-        _ = self.enterContext(mock.patch.object(client, "SPEND_LEDGER", self.state / "spend.jsonl"))
+        _ = self.enterContext(mock.patch.object(client, "spend_ledger", return_value=self.state / "spend.jsonl"))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": "fixture-key"})))
         _ = self.enterContext(mock.patch.object(client, "urlopen", side_effect=AssertionError("Live HTTP forbidden")))
 
@@ -137,9 +153,9 @@ class CompareTests(unittest.TestCase):
         area = client.parse_response(cast(object, json.loads((FIXTURES / "area_response.json").read_text())), area_questions)
         return {
             "issue_path": str(path), "content_hash": score_issues.content_hash(issue, area_state["areas"], {}),
-            "question_set_version": questions.QUESTION_SET_VERSION, "model": questions.MODEL,
-            "payloads": {"main": {"model": questions.MODEL, "state": state, "questions": main_questions},
-                         "area": {"model": questions.MODEL, "state": area_state, "questions": area_questions}},
+            "question_set_version": questions.QUESTION_SET_VERSION, "model": questions.model(),
+            "payloads": {"main": {"model": questions.model(), "state": state, "questions": main_questions},
+                         "area": {"model": questions.model(), "state": area_state, "questions": area_questions}},
             "answers": {"main": main, "area": area},
             "decided_fields": {name: asdict(value) for name, value in decide.decide_answers(main["answers"], area["answers"]).items()},
         }
@@ -179,11 +195,11 @@ class CompareTests(unittest.TestCase):
         _ = self.run_file("unequal-thresholds", [record])
         decision = decide.decide_answers(answers, record["answers"]["area"]["answers"])["backlog_alignment"]
         for goal_threshold in (.4, .6, .7):
-            with self.subTest(goal_threshold=goal_threshold), mock.patch.dict(questions.THRESHOLDS, backlog_goal=decide.Supported(goal_threshold)):
+            with self.subTest(goal_threshold=goal_threshold), patch_thresholds(backlog_goal=decide.Supported(goal_threshold)):
                 report = self.compare("unequal-thresholds", split="tune")
                 rows = table(section(section(report, "## Risk-coverage"), "### backlog_alignment"), "Threshold")
                 for row in rows:
-                    thresholds = dict(questions.THRESHOLDS)
+                    thresholds = dict(questions.thresholds())
                     thresholds["backlog_alignment"] = decide.Supported(float(row["Threshold"]))
                     expected = int(decide.is_sure("backlog_alignment", decision, thresholds))
                     self.assertEqual(int(row["Sure N"]), expected, row)
@@ -223,7 +239,8 @@ class CompareTests(unittest.TestCase):
             with self.subTest(split=split):
                 risk = section(self.compare("threshold-complete", split=split), "## Risk-coverage")
                 for field in ("backlog_goal", "backlog_alignment", "backlog_impact", "category", "area"):
-                    self.assertIn("Threshold outcome: " + outcome, section(risk, "### " + field))
+                    expected = "supported_gap(0.00)" if field == "area" and split == "tune" else outcome
+                    self.assertIn("Threshold outcome: " + expected, section(risk, "### " + field))
                 for field in ("backlog_urgency", "backlog_effort"):
                     self.assertIn("Threshold outcome: report-only", section(risk, "### " + field))
         missing_title = next(f"Missing tune {number}" for number in range(50)
@@ -232,6 +249,7 @@ class CompareTests(unittest.TestCase):
         partial = self.compare("threshold-complete", split="tune")
         self.assertIn("partial", partial.splitlines()[0])
         self.assertIn("Threshold outcome: unsupported", section(section(partial, "## Risk-coverage"), "### backlog_impact"))
+        self.assertIn("Threshold outcome: unsupported", section(section(partial, "## Risk-coverage"), "### area"))
 
     def test_heldout_validates_the_configured_threshold_without_selecting_and_marks_incomplete_results_partial(self) -> None:
         paths: list[Path] = []
@@ -256,7 +274,7 @@ class CompareTests(unittest.TestCase):
         _ = self.run_file("heldout-validation", entries)
         # .73 is between sweep points. Ten answers qualify; the eleventh,
         # wrong answer is below this configured threshold and must be excluded.
-        with mock.patch.dict(questions.THRESHOLDS, backlog_goal=decide.Supported(.73)), \
+        with patch_thresholds(backlog_goal=decide.Supported(.73)), \
                 mock.patch.object(decide, "select_threshold", side_effect=AssertionError("Held-out data must not select thresholds")):
             passed = self.compare("heldout-validation", split="holdout")
             goal = section(section(passed, "## Risk-coverage"), "### backlog_goal")
@@ -278,7 +296,7 @@ class CompareTests(unittest.TestCase):
             self.assertIn("exact error: 0.2000", goal)
             self.assertIn("agent-only", goal)
 
-            with mock.patch.dict(questions.THRESHOLDS, backlog_goal=decide.Supported(.9)):
+            with patch_thresholds(backlog_goal=decide.Supported(.9)):
                 uncovered = self.compare("heldout-validation", split="holdout")
             goal = section(section(uncovered, "## Risk-coverage"), "### backlog_goal")
             self.assertIn("Held-out validation: fail at configured threshold 0.90", goal)
@@ -318,7 +336,7 @@ class CompareTests(unittest.TestCase):
             record["answers"]["area"]["answers"]["area_fits"] = {"type": "noul", "noul": 1.}
             self.refresh_decisions(record)
         _ = self.run_file("tuned-heldout", entries)
-        with mock.patch.dict(questions.THRESHOLDS, area=decide.Unsupported()), \
+        with patch_thresholds(area=decide.Unsupported()), \
                 mock.patch.object(decide, "select_threshold", side_effect=AssertionError("Held-out data must not select thresholds")):
             report = self.compare("tuned-heldout", split="holdout")
         risk = section(report, "## Risk-coverage")
@@ -341,23 +359,29 @@ class CompareTests(unittest.TestCase):
         area_recommendation = next(row["Recommendation"] for row in recommendations if row["Field"] == "area")
         self.assertIn("agent-only", area_recommendation)
 
-    def test_routing_reports_taken_and_user_shares_at_the_configured_area_threshold(self) -> None:
-        entries = [self.record(self.issue(f"Routing {number}")) for number in range(4)]
-        for record, confidence, fits, agrees in zip(
-                entries, (.9, .89, .99, .99), (.95, .95, .5, .95), (True, True, True, False)):
-            answers = record["answers"]["area"]["answers"]
-            answers["area"] = {
-                "type": "choice", "choice": "rendering", "confidence": confidence,
-                "probabilities": {"rendering": confidence, "tooling": 1 - confidence},
-            }
-            answers["area_reverse"] = copy.deepcopy(answers["area"]) if agrees else {
-                "type": "choice", "choice": "tooling", "confidence": .51,
-                "probabilities": {"rendering": .49, "tooling": .51},
-            }
-            answers["area_fits"] = {"type": "noul", "noul": fits}
-            self.refresh_decisions(record)
-        _ = self.run_file("routing", entries)
-        risk = section(self.compare("routing"), "## Risk-coverage")
+    def historical_area_routing_run(self) -> Path:
+        with patch_thresholds(area=decide.Supported(.90)):
+            entries = [self.record(self.issue(f"Routing {number}")) for number in range(4)]
+            for record, confidence, fits, agrees in zip(
+                    entries, (.9, .89, .99, .99), (.95, .95, .5, .95), (True, True, True, False)):
+                record["question_set_version"] = "4"
+                answers = record["answers"]["area"]["answers"]
+                answers["area"] = {
+                    "type": "choice", "choice": "rendering", "confidence": confidence,
+                    "probabilities": {"rendering": confidence, "tooling": 1 - confidence},
+                }
+                answers["area_reverse"] = copy.deepcopy(answers["area"]) if agrees else {
+                    "type": "choice", "choice": "tooling", "confidence": .51,
+                    "probabilities": {"rendering": .49, "tooling": .51},
+                }
+                answers["area_fits"] = {"type": "noul", "noul": fits}
+                self.refresh_decisions(record)
+        return self.run_file("historical-routing", entries)
+
+    def test_historical_area_policy_reports_taken_and_user_shares_at_point_nine(self) -> None:
+        run_path = self.historical_area_routing_run()
+        with patch_thresholds(area=decide.Supported(.90)):
+            risk = section(self.compare(run_path.stem), "## Risk-coverage")
         area = section(risk, "### area")
         self.assertIn("Routing at configured threshold 0.90: taken (sure): 0.2500; "
                       + "routed to the user (unsure): 0.7500", area)
@@ -372,6 +396,55 @@ class CompareTests(unittest.TestCase):
             with self.subTest(field=field):
                 self.assertIn("taken (sure): 0.0000; routed to the user (unsure): 1.0000",
                               section(risk, "### " + field))
+
+    def test_current_area_gap_routing_rechecks_readable_historical_answers(self) -> None:
+        run_path = self.historical_area_routing_run()
+        before = run_path.read_bytes()
+        saved = evaluate.load_run(run_path)
+        self.assertEqual(len(saved.scored), 4)
+        first = saved.scored[str(self.issues / "Routing 0.md")]
+        self.assertEqual(first["question_set_version"], "4")
+        saved_area = cast(dict[str, object], first["decided_fields"]["area"])
+        self.assertEqual(saved_area["certainty"], "sure")
+        self.assertEqual(saved_area["confidence"], .90)
+        area = section(section(self.compare(run_path.stem), "## Risk-coverage"), "### area")
+        self.assertIn("Routing at configured gap 0.30: taken (sure): 0.5000; "
+                      + "routed to the user (unsure): 0.5000; taken-wrong: 0.0000", area)
+        by_gap = {row["Gap"]: row for row in table(area, "Gap")}
+        self.assertEqual(by_gap["0.30"]["Coverage"], "0.5000")
+        self.assertEqual(by_gap["0.80"]["Coverage"], "0.2500")
+        self.assertEqual(by_gap["0.85"]["Coverage"], "0.0000")
+        self.assertEqual(by_gap["0.85"]["Routed to user"], "1.0000")
+        self.assertEqual(run_path.read_bytes(), before)
+
+    def test_area_gap_risk_sweep_matches_production_and_reports_taken_wrong_and_heldout_validation(self) -> None:
+        titles = [f"Area gap {number}" for number in range(100)
+                  if evaluate.split_for(f"Area gap {number}.md") == "holdout"][:3]
+        entries = [self.record(self.issue(title)) for title in titles]
+        for record, confidence in zip(entries, (.65, .8, .649)):
+            answers = record["answers"]["area"]["answers"]
+            for name in ("area", "area_reverse"):
+                answers[name] = choice_answer({"rendering": confidence, "tooling": 1 - confidence})
+            self.refresh_decisions(record)
+        wrong = Path(entries[1]["issue_path"])
+        _ = wrong.write_text(wrong.read_text().replace('area: "[[rendering]]"', 'area: "[[tooling]]"'))
+        _ = self.run_file("gap-risk", entries)
+        decisions = [decide.decide_answers(record["answers"]["main"]["answers"],
+                                          record["answers"]["area"]["answers"])["area"] for record in entries]
+        area = section(section(self.compare("gap-risk", split="holdout"), "## Risk-coverage"), "### area")
+        self.assertIn("Held-out validation: fail at configured gap 0.30; Sure N: 2; coverage: 0.6667; exact error: 0.5000", area)
+        self.assertIn("taken (sure): 0.6667; routed to the user (unsure): 0.3333; taken-wrong: 0.5000", area)
+        rows = table(area, "Gap")
+        self.assertEqual([row["Gap"] for row in rows], [f"{percent / 100:.2f}" for percent in range(0, 100, 5)])
+        for row in rows:
+            policies = dict(questions.thresholds(), area=decide.MinimumGap(float(row["Gap"])))
+            expected = sum(decide.is_sure("area", decision, policies) for decision in decisions)
+            self.assertEqual(int(row["Sure N"]), expected, row)
+        by_gap = {row["Gap"]: row for row in rows}
+        self.assertEqual(by_gap["0.25"]["Sure N"], "3")
+        self.assertEqual(by_gap["0.30"]["Sure N"], "2")
+        self.assertEqual(by_gap["0.35"]["Taken-wrong"], "1.0000")
+        self.assertEqual(by_gap["0.65"]["Sure N"], "0")
 
     def test_partial_report_counts_success_failure_and_unattempted_rated_issues(self) -> None:
         scored = self.issue("Target A")
@@ -419,6 +492,25 @@ class CompareTests(unittest.TestCase):
             self.assertEqual(values["Exact"], "0.5000")
             self.assertEqual(values["Within one"], "0.5000")
             self.assertEqual(values["MAE"], "1.0000")
+
+    def test_reliability_bucket_boundaries_and_caption_follow_the_current_config(self) -> None:
+        issue = self.issue("Target A")
+        _ = self.run_file("bucket-fixture", [self.record(issue)])
+        config = self.configuration()
+        before = section(section(self.compare("bucket-fixture"), "## Group: all (N=1)"), "#### category")
+        self.assertIn("Reliability (5 confidence buckets):", before)
+        self.assertEqual(len(table(before, "Confidence")), 5)
+        self.change_configuration(config, reliability_bucket_count="2")
+        after = section(section(self.compare("bucket-fixture"), "## Group: all (N=1)"), "#### category")
+        self.assertIn("Reliability (2 confidence buckets):", after)
+        buckets = table(after, "Confidence")
+        self.assertEqual([row["Confidence"] for row in buckets], ["0.00–0.50", "0.50–1.00 (inclusive)"])
+        self.assertEqual([row["N"] for row in buckets], ["0", "1"])
+        self.assertEqual(buckets[-1]["Mean confidence"], "0.8000")
+        self.change_configuration(config, reliability_bucket_count="1")
+        single = section(section(self.compare("bucket-fixture"), "## Group: all (N=1)"), "#### category")
+        self.assertEqual(table(single, "Confidence")[0]["Confidence"], "0.00–1.00 (inclusive)")
+        self.assertIn("Reliability (1 confidence buckets):", single)
 
     def test_probability_metrics_read_raw_answers_instead_of_synthetic_decision_probabilities(self) -> None:
         paths = [self.issue("Target A"), self.issue("Target B"), self.issue("Target C")]
@@ -519,8 +611,8 @@ class CompareTests(unittest.TestCase):
         buckets = table(area, "Confidence")
         self.assertEqual([row["N"] for row in buckets], ["0", "0", "0", "1", "0"])
         self.assertEqual((buckets[3]["Mean confidence"], buckets[3]["Accuracy"]), ("0.7400", "1.0000"))
-        risk = table(section(section(report, "## Risk-coverage"), "### area"), "Threshold")
-        self.assertEqual([row["Sure N"] for row in risk], ["0"] * 12)
+        risk = table(section(section(report, "## Risk-coverage"), "### area"), "Gap")
+        self.assertEqual([row["Sure N"] for row in risk], ["0"] * 20)
 
     def test_unfiled_is_exact_match_only_strictly_below_the_absent_evidence_bound(self) -> None:
         path = self.issue("Target A")
@@ -543,13 +635,13 @@ class CompareTests(unittest.TestCase):
                 metrics = table(area, "N")[0]
                 self.assertEqual((metrics["Accuracy"], metrics["Probability N"]), ("1.0000", probability_n))
                 self.assertEqual(sum(int(row["N"]) for row in table(area, "Confidence")), int(probability_n))
-                risk = table(section(section(report, "## Risk-coverage"), "### area"), "Threshold")
+                risk = table(section(section(report, "## Risk-coverage"), "### area"), "Gap")
                 if fits == .1:
                     self.assertTrue(metrics["Brier"].startswith("N/A"))
-                    self.assertEqual([row["Sure N"] for row in risk], ["1"] * 11 + ["0"])
+                    self.assertEqual([row["Sure N"] for row in risk], ["1"] * 17 + ["0"] * 3)
                 else:
                     self.assertEqual(metrics["Brier"], "0.0800")
-                    self.assertEqual([row["Sure N"] for row in risk], ["0"] * 12)
+                    self.assertEqual([row["Sure N"] for row in risk], ["0"] * 20)
 
     def test_unknown_saved_goal_raises_a_value_error_naming_the_field_and_value(self) -> None:
         path = self.issue("Target A")
@@ -701,6 +793,12 @@ class CompareTests(unittest.TestCase):
         self.assertEqual([row["Issue"] for row in rows[:2]], ["Disagreement 24", "Disagreement 23"])
         self.assertEqual([row["Gap"] for row in rows[:2]], ["4.0000", "3.0000"])
         self.assertEqual({row["Issue"] for row in rows[2:]}, {f"Disagreement {number:02}" for number in range(18)})
+        _ = self.configuration(disagreement_count="2", title_only_character_limit="0")
+        report = self.compare("disagreements")
+        changed = section(report, "## Largest disagreements (up to 2 per field)")
+        self.assertEqual([row["Issue"] for row in table(section(changed, "### backlog_impact"), "Issue")],
+                         ["Disagreement 24", "Disagreement 23"])
+        self.assertIn("## Group: title-only (N=0)", report)
 
     def test_compare_cli_passes_split_and_repeat_to_a_report_built_from_saved_answers(self) -> None:
         tune = self.issue("Target A")

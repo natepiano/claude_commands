@@ -13,9 +13,12 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.accounts.home_test_support import clear_notes_directory_cache, scratch_account_home, scratch_accounts_config
 from scripts.accounts import accounts, new_account
-import agent_accounts
-import note_file
+from scripts.whoami import agent_accounts
+from scripts.whoami import note_file
 
 
 def shipped_color_expectations(text: str) -> tuple[str, str, bytes]:
@@ -62,8 +65,8 @@ class NewAccountTests(unittest.TestCase):
         self.notes.mkdir()
         self.nixos.parent.mkdir()
         _ = self.nixos.write_text("claude1 = \"...\";\n", encoding="utf-8")
-        environment: object = cast(object, self.enterContext(patch.dict(os.environ, {
-            "AGENT_NOTES_DIR": str(self.notes), "HOME": str(self.home), "PATH": os.defpath,
+        environment: object = cast(object, self.enterContext(scratch_account_home(self.home, {
+            "AGENT_NOTES_DIR": str(self.notes), "PATH": os.defpath,
         }, clear=True)))
         del environment
         _ = (self.home / ".claude.json").write_text("{}", encoding="utf-8")
@@ -450,6 +453,37 @@ class NewAccountTests(unittest.TestCase):
 
 
 class ShellModuleTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        _ = self.enterContext(scratch_accounts_config())
+
+    def test_path_roots_use_config_and_expand_the_scratch_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            config = Path(os.environ["CONF_DIR"]) / "accounts.conf"
+            original = config.read_text()
+            with patch.dict(os.environ, {"HOME": str(home)}):
+                _ = os.environ.pop("AGENT_NOTES_DIR", None)
+                self.assertEqual(new_account.notes_directory(), home / "rust/hanadocs/agents")
+                _ = config.write_text(original.replace("notes_directory=~/rust/hanadocs/agents",
+                    "notes_directory=~/custom-notes").replace("home_nixos_repository_root=~/nixos",
+                    "home_nixos_repository_root=~/custom-nixos").replace("nixos_repository_root=/etc/nixos",
+                    f"nixos_repository_root={home / 'missing-system'}"))
+                clear_notes_directory_cache()
+                self.assertEqual(new_account.notes_directory(), home / "custom-notes")
+                self.assertEqual(note_file.notes_dir(), home / "custom-notes")
+                account = new_account.parse_account("claude", "claude4")
+                self.assertTrue(new_account.note_step(account, new_account.HomeLogin("fixture")).done)
+                self.assertEqual(note_file.note_path(account.label), new_account.note_path(account))
+                self.assertEqual([note.label for note in note_file.read_notes()], [account.label])
+                folder = "darwin" if sys.platform == "darwin" else "linux"
+                module = home / "custom-nixos" / "modules" / folder / "shell.nix"
+                module.parent.mkdir(parents=True)
+                _ = module.write_text("# fixture\n")
+                self.assertEqual(new_account.nixos_shell_module(), module)
+                os.environ["AGENT_NOTES_DIR"] = str(home / "override-notes")
+                self.assertEqual(new_account.notes_directory(), home / "override-notes")
+
     def test_platform_module_lookup_prefers_etc_then_home_repository(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -465,7 +499,7 @@ class ShellModuleTests(unittest.TestCase):
                     _ = module.write_text("# fixture\n")
             for platform, folder in (("darwin", "darwin"), ("linux", "linux"), ("freebsd", "linux")):
                 with (self.subTest(platform=platform), patch.object(sys, "platform", platform),
-                      patch.object(accounts, "accounts_home", return_value=home),
+                      patch.dict(os.environ, {"HOME": str(home)}),
                       patch.object(new_account, "Path", side_effect=repository_path)):
                     expected = system_repository / f"modules/{folder}/shell.nix"
                     if not expected.exists():

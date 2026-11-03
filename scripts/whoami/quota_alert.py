@@ -25,23 +25,28 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import note_file
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import agents_registry  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import process_group
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.process_failure import failure_detail
+from scripts.message import send_result
+from scripts.whoami import note_file
+
+from scripts.lib import agents_registry  # noqa: E402
+
 from scripts.lib.user_zone import user_zone
 from scripts.whoami import agent_accounts
 from scripts.accounts import moves, next_moves, refusals, role_map
-import usage_store
+from scripts.whoami import usage_store
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
 import review
 
-from note_file import reset_time
-from agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, Report,
+from scripts.whoami.note_file import reset_time
+from scripts.whoami.agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, Report,
                             codex_can_work, CodexWorkAvailable, codex_email_on_disk,
                             codex_homes, codex_live, observe_workers_home, NoWorkersHome)
 
@@ -89,14 +94,15 @@ def codex_alert_pass(home: Path | NoWorkersHome, reports: list[Report], observed
     )
 
 
-def resolve_codex_readings(value: CodexAlertPassReadings | ReadCurrentCodexReadings) -> CodexAlertPassReadings:
+def resolve_codex_readings(value: CodexAlertPassReadings | ReadCurrentCodexReadings, *,
+                           now: datetime) -> CodexAlertPassReadings:
     if isinstance(value, CodexAlertPassReadings):
         return value
     home = observe_workers_home()
     async def collect() -> list[Report]:
         return list(await asyncio.gather(*(codex_live(folder) for folder in codex_homes(home)
                                           if folder.is_dir() and codex_email_on_disk(folder))))
-    return codex_alert_pass(home, asyncio.run(collect()), datetime.now(timezone.utc))
+    return codex_alert_pass(home, asyncio.run(collect()), now)
 
 
 def selected_codex_report(readings: CodexAlertPassReadings, now: datetime) -> Report:
@@ -234,6 +240,7 @@ from scripts.production.showrunners import (
     ShowrunnerSettings as ShowrunnerSettings,
     load_settings_from as load_settings_from,
     registered_showrunners as registered_showrunners,
+    require_complete,
     socket_for as socket_for,
 )
 
@@ -601,7 +608,7 @@ def load_config() -> Config:
 def showrunners_now() -> list[Showrunner]:
     """Every showrunner with an update timer. None when the session records cannot say who runs."""
     try:
-        return registered_showrunners()
+        return require_complete(registered_showrunners())
     except OSError as error:
         print(f"quota-alert: showrunners unknown: {error}", file=sys.stderr)
         return []
@@ -685,10 +692,10 @@ def state_file() -> Generator[State]:
 
 
 
-def ahead(resets: str | None) -> bool:
+def ahead(resets: str | None, *, now: datetime) -> bool:
     """Whether a note's reset is still to come."""
     reset = reset_time(resets)
-    return isinstance(reset, note_file.KnownReset) and reset.value > datetime.now(timezone.utc)
+    return isinstance(reset, note_file.KnownReset) and reset.value > now
 
 
 def remaining(note: AgentNote) -> float | None:
@@ -703,10 +710,10 @@ def percent(note: AgentNote) -> str:
     return "unknown" if value is None else f"{value:g}%"
 
 
-def low(notes: list[AgentNote], threshold: float) -> list[AgentNote]:
+def low(notes: list[AgentNote], threshold: float, *, now: datetime) -> list[AgentNote]:
     """Notes in use at or under the threshold in a window that has not reset."""
     return [note for note in notes
-            if note_file.in_use(note) and ahead(note.get("resets"))
+            if note_file.in_use(note) and ahead(note.get("resets"), now=now)
             and (value := remaining(note)) is not None and value <= threshold]
 
 
@@ -810,7 +817,7 @@ def edit_registry(editor: str, *args: str) -> str | None:
         try:
             out, err = process.communicate(timeout=EDIT_TIMEOUT)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
+            process_group.send_process_group(process.pid, signal.SIGKILL)
             _ = process.communicate()
             return f"{editor} took longer than {EDIT_TIMEOUT} s and was stopped"
     if process.returncode == 0:
@@ -1507,9 +1514,17 @@ def relay(recipient: str, text: str, key: str | None) -> str | None:
                               check=False)
     except (subprocess.TimeoutExpired, OSError) as error:
         return str(error)
-    if done.returncode == 0:
-        return None
-    return " ".join((done.stdout.strip() or done.stderr.strip() or f"exit {done.returncode}").split())
+    outcome = send_result.send_outcome(done.returncode, done.stdout)
+    if isinstance(outcome, send_result.ConfirmedSendOutcome):
+        match outcome.header.outcome:
+            case "sent" | "skipped" | "replaced" | "kept":
+                return None
+            case "queued":
+                # refusal_watch accepts a queued copy through this header.
+                return " ".join(f"QUEUED: {outcome.header.detail}".split())
+            case "failed" | "refused" | "held" | "pending":
+                pass
+    return " ".join(failure_detail(done).split())
 
 
 @dataclass(frozen=True)
@@ -1538,9 +1553,14 @@ def tell_user(push: RenderedPush) -> PushDelivery:
                               check=False)
     except (subprocess.TimeoutExpired, OSError) as error:
         return PushFailed(str(error))
-    if done.returncode == 0:
-        return PushSent()
-    return PushFailed(" ".join((done.stdout.strip() or done.stderr.strip() or f"exit {done.returncode}").split()))
+    outcome = send_result.send_outcome(done.returncode, done.stdout)
+    if isinstance(outcome, send_result.ConfirmedSendOutcome):
+        match outcome.header.outcome:
+            case "sent" | "skipped" | "kept" | "replaced":
+                return PushSent()
+            case "queued" | "failed" | "refused" | "held" | "pending":
+                pass
+    return PushFailed(" ".join(failure_detail(done).split()))
 
 
 def deliver(jobs: list[Job]) -> list[str | None]:
@@ -1582,8 +1602,8 @@ def alert(notes: list[AgentNote], now: datetime | None = None, *,
           codex_readings: CodexAlertPassReadings | ReadCurrentCodexReadings = READ_CURRENT_CODEX_READINGS) -> list[str]:
     """Send what is due, record it, and return one log line per attempt."""
     selection = _selection(selection)
-    codex_readings = resolve_codex_readings(codex_readings)
     now = now or datetime.now(timezone.utc)
+    codex_readings = resolve_codex_readings(codex_readings, now=now)
     _save_codex_readings(codex_readings, now)
     return _alert_for_saved_readings(notes, now, selection, codex_readings)
 
@@ -1932,7 +1952,7 @@ def _alert_for_saved_readings(notes: list[AgentNote], now: datetime, selection: 
         _ = close_recovered(state, notes, threshold, selection, now, codex_readings)
         back = switch_back(state, now, codex_readings)
         codex_readings = _readings_after_restoration(codex_readings, back)
-        for note in [*low([note for note in notes if note.tool != "codex"], threshold),
+        for note in [*low([note for note in notes if note.tool != "codex"], threshold, now=now),
                      *_low_codex_notes(notes, threshold, codex_readings, now)]:
             name = note.label
             if name not in episodes:
@@ -2067,8 +2087,8 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
     """A provider refusal waits briefly, moves workers, or opens the Claude fallback."""
     from scripts.accounts import accounts
     del selection
-    readings = resolve_codex_readings(codex_readings)
     now = now or datetime.now(timezone.utc)
+    readings = resolve_codex_readings(codex_readings, now=now)
     refusal_time = refused_at.at if isinstance(refused_at, RefusedAt) else now
     _save_codex_readings(readings, now)
     _finish_workers_transitions(now)
@@ -2233,8 +2253,8 @@ def refresh(notes: list[AgentNote], here: str | None, now: datetime | None = Non
     """Refresh readings and restore routing without messaging sessions."""
     del here
     selection = _selection(selection)
-    codex_readings = resolve_codex_readings(codex_readings)
     now = now or datetime.now(timezone.utc)
+    codex_readings = resolve_codex_readings(codex_readings, now=now)
     _save_codex_readings(codex_readings, now)
     threshold = load_config()["threshold_percent"]
     with state_file() as state:

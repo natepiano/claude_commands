@@ -1,5 +1,5 @@
 ---
-description: Send the user a targeted update from a named template, now or after a delay; the agent fills in the details. `silence` keeps pushes until it ends; `show` prints a phone push template.
+description: Send or defer a user update.
 argument-hint: "adhoc|silence [delay] <instructions> | show <template>"
 ---
 

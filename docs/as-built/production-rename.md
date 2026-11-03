@@ -27,7 +27,6 @@ name. Each unit keeps its old branch until its replacement has been pushed.
 | `scripts/production/showrunners.py` | Reads timer CHECK paths and resolves Formerly names. |
 | `scripts/production/unit_lookup.py` | Groups marked sessions by current slug and reports Claude state. |
 | `scripts/production/stall_watch.py` | Supplies hashed state paths and matches inherited process marks by current slug. |
-| `scripts/direct/review_pool.py` | `_production` resolves the production argument to its current pool. |
 | `commands/showrunner/rename.md` | Showrunner workflow and recovery instructions. |
 | `docs/production_format.md` | Production Context's Formerly field. |
 
@@ -50,7 +49,6 @@ class RenamePlan:
     timer: PathMove                # showrunner-<old> -> showrunner-<new>
     state: tuple[PathMove, ...]    # owned_paths(old) -> owned_paths(new)
     stall: tuple[PathMove, ...]    # one per unit
-    review_pool: PathMove
     # properties: journal = state[-1].destination / "rename.json"; message = commit subject;
     # renames_branch = merge_branch == old; branch = new if renames_branch else merge_branch
 ```
@@ -78,8 +76,7 @@ duplicate detection. A slug with an existing `showrunner-<slug>` notifier
 directory is current and needs no timer-doc read; any other slug resolves
 through `canonical_slug` once per distinct discovered slug. Stall-watch
 likewise resolves each distinct inherited process slug once per call, so
-detached work with old marks still counts as running. Review-pool arguments use
-the same resolver.
+detached work with old marks still counts as running.
 
 ## Production changes
 
@@ -102,10 +99,9 @@ branch is renamed, and no unfinished prior rename journal for the old slug.
 | 3 | Rename `showrunner-<old>` to `showrunner-<new>` and keep the updated CHECK. |
 | 4 | Move `footers-off/<slug>`, `review-paused/<slug>.json`, `outstanding/<slug>.json`, `counts/<slug>`, `reports/<slug>.json`, then each entry of `<slug>/` into the new directory; rewrite matching `*/parent` contents; each held design the showrunner holds takes `ShowrunnerHolder(<new>)` (`design_roles.move_holder`). Then `rename_outside.apply`: move the `next-`, `proposal-` and `question-<slug>` pins (and their `-all-below` forms) and rename their `<old>: ` item keys; rewrite Production cells naming `<old>` on the change-review list; point each child doc's Parent production line at the new doc; move the bevy upgrade record and notifier job (`RUN` names the new doc, `FROM` the new instance) and drop its lock; remove the derived `unit-board/<old>.json`; a Log line naming `<old>-log.md` takes `<new>-log.md`, the log and its `-recovered` copy move, and an info/exclude line naming an old one gains one for the new. The production's own log and its `-recovered` copy, by either name, may stand untracked: every clean-checkout check (`_dirty`, `_check_edits`) skips them, since a log is never committed. Every part repeats safely. |
 | 5 | Move each Units row's stall-watch file from `sha256(old\0unit).json` to `sha256(new\0unit).json`. |
-| 6 | Move the production's review-pool directory, including leases. |
-| 7 | Move the units' worker ledgers from the old production to the new one. |
-| 8 | Renamed merge branch: create and switch to `<new>` at the saved tip and update Merge branch. Kept merge branch: stay on it. Then commit documents and push with upstream. |
-| 9 | Retarget phase notes from the old production to the current new doc. |
+| 6 | Move the units' worker ledgers from the old production to the new one. |
+| 7 | Renamed merge branch: create and switch to `<new>` at the saved tip and update Merge branch. Kept merge branch: stay on it. Then commit documents and push with upstream. |
+| 8 | Retarget phase notes from the old production to the current new doc. |
 
 The journal sits in `<new>/` from step 0, so step 4 merges the old directory's
 entries into it: a prior journal goes to `rename-history/<old>.json`, the old
@@ -203,36 +199,22 @@ showrunner's own checkout, a linked worktree, to a new path. The default path
 is the checkout's basename with a Formerly name replaced by the slug
 (`claude-build-followups-trunk` becomes `claude-natedev-trunk`); a basename
 with no Formerly name in it needs the path argument. The showrunner cannot
-move the folder it runs in, so the move happens in the shutdown conductor
-between its stop and its launch:
-
-1. The first run refuses an existing destination, a main worktree, and a
-   showrunner that already has a shutdown record. It then runs
-   `shutdown.py down --only <session> --restart --here --checkout-move OLD NEW`
-   for the session the update timer's `TARGET` names, and refuses when the
-   record it made does not carry `checkout_move`.
-2. The conductor's launch (`restart.move_checkout`) calls
-   `rename_checkout.move(old, new)`: `git worktree move` and `git worktree
-   repair`, the Claude project folder and each account's folder trust, every
-   timer's `CHECK` and `RUN` line, each child doc's Parent production line,
-   herdr pane `cwd` keys, and a commit on the merge branch of the doc's
-   Showrunner checkout line. The git move refuses processes still inside the
-   folder before it moves anything; every later part repeats safely.
-3. A run after the restart finds the doc naming the new path. It commits the
-   Showrunner checkout line if the callback could not, then pushes the merge
-   branch when its tip is that commit.
-
-When the callback fails part way, the showrunner still launches: in the new
-folder when the git move happened, else in the old one (see
-`shutdown-and-restart.md`). Only the doc line states where the checkout is;
-logs and design docs that name the old path are history and keep it.
+move the folder it runs in. `rename_checkout.checkout` calls `stop_resume.stop`,
+moves the checkout with `rename_checkout.move`, then calls `stop_resume.resume`.
+An existing destination, a main worktree, or a pre-existing shutdown record refuses.
+The move runs `git worktree move` and `git worktree repair`. It updates the
+Claude project folder, folder trust, timer commands, child doc parent lines,
+herdr pane cwd keys, and the Showrunner checkout line. Processes still inside
+the folder block the git move. A failed step reports its error; a rerun finishes
+idempotent updates. A later run pushes the doc commit. Only the doc line states
+where the checkout is; logs and design docs keep historical paths.
 
 ## Journal and recovery
 
 `SHOWRUNNER_STATE_DIR/<new>/rename.json` stores `version: 1`, the old and
 new slugs, original branch and tip, unit identities, checkout-relative plan
 names, completed apply step names and `done`. It does not store the current
-checkout, production doc paths, timer, state, stall-watch or review-pool paths.
+checkout, production doc paths, timer, state or stall-watch paths.
 On resume these are resolved from the current update timer and configured
 state roots. Until `_rename_timer` is recorded complete, the old slug's timer
 is required, except while that step is pending and its source instance has
@@ -313,7 +295,7 @@ and 2 for invalid arguments.
 - `_lookup_slug`'s current-name fast path keeps the shutdown inventory within
   its timer-read budget: membership and missing-target checks share one read.
 - A `**Formerly:**` line outside `## Production Context` is ignored.
-- `test_unit_lookup` and `test_review_pool` use productions with no update
+- `test_unit_lookup` uses productions with no update
   timer; a strict lookup at those callers breaks them.
 - Every path honors the state-dir environment variables; never run the verbs
   against live state when testing.

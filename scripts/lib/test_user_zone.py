@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import override
 
 from scripts.lib.code_kind import is_test_code
+from scripts.lib import user_zone
 
 SCRIPT = Path(__file__).with_name("user_zone.py")
 PROBE = ("import sys; sys.path.insert(0, sys.argv[1]); import user_zone; from datetime import datetime, timezone; "
@@ -22,6 +23,7 @@ PROBE = ("import sys; sys.path.insert(0, sys.argv[1]); import user_zone; from da
 HARDCODED = re.compile(r"""ZoneInfo\(\s*["'](?!UTC)|TZ=["']?[A-Z][a-z]+/|%[HMS] ?[PE][DS]T\b""")
 # The scripts that may name a zone, each because the zone there is a fact and never the user's setting.
 NAMES_A_ZONE = {
+    "build_queue/queue_fixture.py": "one fixed zone, so a golden render is the same in every user zone",
     "model_study/turns.py": "the zone the roster's stored times were recorded in",
     "prioritize/renumber.py": "one fixed zone, so a date is the same on both machines",
     "whoami/agent_accounts.py": "the offset a stored reset time is written with",
@@ -36,7 +38,6 @@ USES_THE_MACHINE_ZONE = {
     "notify/review.py": "a log stamp written with its offset",
     "production/dailies_render.py": "reads reset times stored with no offset, in the machine's zone",
     "production/review_regime.py": "a stamp written with its offset",
-    "shutdown/inventory.py": "Codex names its session folders by the machine's date",
     "whoami/agent_notes.py": "reset times written with their offset, and the note's date as the vault's linter writes it",
     "whoami/codex_pacer.py": "Codex names its session folders by the machine's date",
     "whoami/note_file.py": "reads a reset time stored before the offset was, in the machine's zone",
@@ -62,6 +63,28 @@ class UserZoneTests(unittest.TestCase):
         _ = self.conf.write_text("# a comment\nzone=Europe/Paris\n", encoding="utf-8")
         result = self.run_script()
         self.assertEqual((result.returncode, result.stdout), (0, "Europe/Paris\n"), result.stderr)
+
+    def test_stored_zone_reads_the_first_zone_line_and_reloads_edits(self) -> None:
+        self.assertEqual(user_zone.stored_zone(str(self.conf)), "")
+        _ = self.conf.write_text("# zone=ignored\nother=value\n", encoding="utf-8")
+        self.assertEqual(user_zone.stored_zone(str(self.conf)), "")
+        _ = self.conf.write_text("# comment\nzone= Europe/Paris \nzone=UTC\n", encoding="utf-8")
+        self.assertEqual(user_zone.stored_zone(str(self.conf)), "Europe/Paris")
+        _ = self.conf.write_text("zone=UTC\n", encoding="utf-8")
+        self.assertEqual(user_zone.stored_zone(str(self.conf)), "UTC")
+
+    def test_cli_import_budget_without_site(self) -> None:
+        _ = self.conf.write_text("zone=Europe/Paris\n", encoding="utf-8")
+        environment = {key: value for key, value in os.environ.items() if key != "USER_ZONE"}
+        environment["USER_ZONE_CONF"] = str(self.conf)
+        result = subprocess.run([sys.executable, "-S", "-X", "importtime", str(SCRIPT)],
+                                env=environment, capture_output=True, text=True, check=False, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "Europe/Paris\n")
+        imports = {line.rpartition("|")[2].strip() for line in result.stderr.splitlines()
+                   if line.startswith("import time:")}
+        self.assertTrue(imports, result.stderr)
+        self.assertNotIn("pathlib", imports)
 
     def test_no_file_and_no_zone_line_both_give_the_default(self) -> None:
         self.assertEqual(self.run_script().stdout, "America/New_York\n")

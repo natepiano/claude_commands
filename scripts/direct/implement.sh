@@ -166,13 +166,8 @@ fi
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
-# repo needs >= 3.11.
+# repo needs >= 3.12.
 PY="${SCRIPT_DIR}/../lib/py"
-"$PY" "${SCRIPT_DIR}/worker_state.py" "${SESSION_DIR}"
-mkdir -p "${ARTIFACT_DIR}"
-# Every dispatch names the run's director in the run folder (unit_runs.py), which the
-# production tree reads: a marker names one run per director, and a director runs phases side by side.
-"$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" record-director "${SESSION_DIR}" || true
 SUMMARY_FILE="${ARTIFACT_DIR}/impl_summary${SLOT}.txt"
 # Truncate at launch: the "done" post below names this path unconditionally, so a
 # worker that reports on the board without writing a summary would otherwise leave
@@ -181,7 +176,18 @@ REPLY_FILE="${ARTIFACT_DIR}/impl_reply${SLOT}.txt"
 STATUS_FILE="${ARTIFACT_DIR}/impl_status${SLOT}"
 LOG_FILE="${ARTIFACT_DIR}/impl_agent${SLOT}.log"
 AGENT_FILE="${ARTIFACT_DIR}/impl_agent${SLOT}"
-BG_ID_FILE="${ARTIFACT_DIR}/impl_bg_id${SLOT}"
+# Backend observations follow the durable worker address, including a repair
+# worker dispatched through the original implementation slot.
+BG_ID_KEY="$("$PY" - "${SCRIPT_DIR}" "${SESSION_DIR}" "${MESH_NAME}" "${TEAM_ROLE}" "${PASS_KIND}" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from worker_state import worker_record_path
+record = worker_record_path(Path(sys.argv[2]), sys.argv[3], sys.argv[4], role=sys.argv[5])
+print(record.stem.removeprefix("impl_worker_"))
+PY
+)"
+BG_ID_FILE="${ARTIFACT_DIR}/impl_bg_id_${BG_ID_KEY}"
 BOARD_HELPER="${SCRIPT_DIR}/board.sh"
 HEARTBEAT_HELPER="${SCRIPT_DIR}/../agents/heartbeat.sh"
 HEARTBEAT_FILE="${SESSION_DIR}/heartbeat.log"
@@ -190,20 +196,11 @@ PROGRESS_STATE="${SESSION_DIR}/progress_history_state.json"
 FINDINGS_HELPER="${SCRIPT_DIR}/findings.py"
 FINDINGS_STATE="${SESSION_DIR}/findings_state.json"
 HEARTBEAT_INTERVAL_SECS=60
-DIRECT_CONFIG="${UNIT_CONFIG:-${HOME}/.claude/config/direct.conf}"
-COMPACT_ABOVE_TOKENS=""
-if [[ -r "${DIRECT_CONFIG}" ]]; then
-  COMPACT_ABOVE_TOKENS="$(sed -n \
-    's/^UNIT_COMPACT_ABOVE_TOKENS=\([0-9][0-9]*\).*$/\1/p' \
-    "${DIRECT_CONFIG}" | tail -n 1)"
-fi
-if [[ ! "${COMPACT_ABOVE_TOKENS}" =~ ^[0-9]+$ ]] || (( COMPACT_ABOVE_TOKENS <= 0 )); then
-  echo "ERROR: UNIT_COMPACT_ABOVE_TOKENS in ${DIRECT_CONFIG} must be a positive integer." >&2
-  exit 2
-fi
+source "${SCRIPT_DIR}/../lib/conf.sh"
+COMPACT_ABOVE_TOKENS="$(conf_value direct UNIT_COMPACT_ABOVE_TOKENS)"
 
 source "${SCRIPT_DIR}/../agents/agents_config.sh"
-if ! agents_resolve "${TASK}" 2>"${LOG_FILE}"; then
+if ! agents_resolve "${TASK}"; then
   exit 1
 fi
 CODEX_MESH="${UNIT_CODEX_MESH:-$(_agents_registry_get direct.options codex_mesh)}"
@@ -352,6 +349,10 @@ with worker_claim_lock(root):
                              "follow-up not sent")
                         fail(f"{name} still has a live turn after compaction; end the worker "
                              f"(codex_mesh.py end --to {name}) and start a fresh one")
+                    if compact.returncode == 4:
+                        post(f"launcher: {detail}; follow-up not sent")
+                        fail(f"{name}: roster changed during compaction; follow-up not sent; "
+                             f"inspect the worker and use codex_mesh.py reopen --to {name} if idle")
                     post(f"launcher: compaction failed for {name}: {detail}; continuing follow-up")
             check = subprocess.run(
                 [sys.executable, mesh_script, "can-follow", "--session-dir", root_text,
@@ -398,6 +399,16 @@ with worker_claim_lock(root):
             print(turn_id)
 PY
 }
+
+# Admission precedes claims, reservations and pass/artifact publication, including attach.
+if [[ "${AGENT_FAMILY}" == "claude" ]]; then
+  PYTHONPATH="${SCRIPT_DIR}/../..${PYTHONPATH:+:${PYTHONPATH}}" "$PY" -m scripts.production.worker_fill admit --name "${MESH_NAME}" --run "${SESSION_DIR}" --role "${PASS_KIND}" || exit 2
+fi
+
+"$PY" "${SCRIPT_DIR}/worker_state.py" "${SESSION_DIR}"
+mkdir -p "${ARTIFACT_DIR}"
+# A director marker names one run, including phases running beside each other.
+"$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" record-director "${SESSION_DIR}" || true
 
 if [[ -n "${FOLLOW_TO}" ]]; then
   export FOLLOW_LAUNCHER_PID="$$"
@@ -517,7 +528,7 @@ if [[ -n "${FOLLOW_TO}" ]]; then
   cat "${PROMPT_FILE}" > "${FOLLOW_MESSAGE}"
   printf '\n\nAs your last act, write impl_summary%s.txt, then post done on the board.\n' "${SLOT}" >> "${FOLLOW_MESSAGE}"
   if [[ "${AGENT_FAMILY}" == "claude" ]]; then
-    bash "${SCRIPT_DIR}/../agents/agent_bg.sh" --attach \
+    AGENT_BG_ROLE="${PASS_KIND}" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" --attach \
       "${MESH_NAME}" "${WORKING_DIR}" "${FOLLOW_MESSAGE}" "${SUMMARY_FILE}" \
       "${LOG_FILE}" "${BG_ID_FILE}" "${AGENT_MODEL}" &
   elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
@@ -532,7 +543,7 @@ if [[ -n "${FOLLOW_TO}" ]]; then
     exit 2
   fi
 elif [[ "${AGENT_FAMILY}" == "claude" ]]; then
-  AGENT_BG_WORKERS=1 AGENT_BG_EFFORT="${AGENT_EFFORT:-}" AGENT_BG_LEDGER="${SESSION_DIR}/workers" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" \
+  AGENT_BG_ROLE="${PASS_KIND}" AGENT_BG_WORKERS=1 AGENT_BG_EFFORT="${AGENT_EFFORT:-}" AGENT_BG_LEDGER="${SESSION_DIR}/workers" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" \
     "${MESH_NAME}" "${WORKING_DIR}" "${PROMPT_FILE}" "${SUMMARY_FILE}" \
     "${LOG_FILE}" "${BG_ID_FILE}" "${AGENT_MODEL}" &
 elif [[ "${USE_CODEX_MESH}" == "1" ]]; then

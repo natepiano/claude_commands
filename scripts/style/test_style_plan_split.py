@@ -6,6 +6,7 @@ import io
 import signal
 import sqlite3
 import subprocess
+from subprocess import run as run_git
 import sys
 import tempfile
 import time
@@ -13,7 +14,9 @@ import unittest
 from contextlib import chdir, closing, nullcontext, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast, final
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from typing import cast, final, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -21,11 +24,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import approved_renames
 import declarations
 import style_plan
-import showrunners
+from scripts.production import showrunners
+from scripts.production.staff_test_support import isolated_staff_file, production_membership, recorded_unit
 from scripts.build_hold import build_hold
+from scripts.build_queue import queue_place
 import live_units
 import unit_lookup
-import merge_gate
 import unit_plans
 import style_proposals
 
@@ -39,6 +43,12 @@ from style_plan_test_support import StylePlanFixture
 
 @final
 class StylePlanTests(StylePlanFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        production_membership("sample-style", "names-unit")
+
     def test_split_partitions_the_table_left_total_including_ticketed_and_unselected_findings(self) -> None:
         rule = self.rule("split-population")
         names = ("free", "ticketed", "judged", "unsynced", "structure", "exempt", "busy", "gone",
@@ -91,6 +101,7 @@ class StylePlanTests(StylePlanFixture):
         def exempt(finding: style_ledger.HeldFinding, _family: rules.Family) -> bool:
             return finding.path == paths["exempt"]
 
+        self.finish_judging()
         definitions = {definition.rule_id: definition for definition in rules.load_rules(self.repo)}
         measured_at = "2026-10-28T12:00:00+00:00"
         with (mock.patch.object(style_ledger.Ledger, "declaration_reading", return_value=style_ledger.DeclarationReading(self.tip, outcomes)),
@@ -178,11 +189,12 @@ class StylePlanTests(StylePlanFixture):
         ledger.ticket_add("types-unit-1", "types-unit", "read", "types", "crates/alpha", [self.sources[1]], [type_rule])
         ledger.ticket_assign("types-unit-1", "style/main")
         _ = ledger.ticket_base("types-unit-1")
-        ledger.ticket_drop("types-unit-1")
         for index, path in enumerate(self.sources[:2]):
             _ = ledger.hold(type_rule, path, 1, "type work", "type", "before", "after", definition.blob,
                             "outside" if index == 0 else "types-unit-1")
+        ledger.ticket_drop("types-unit-1")
         self.commit_files({self.sources[1]: "pub fn value() { changed(); }\n"})
+        self.finish_judging()
         scopes: dict[rules.Family, unit_plans.PilotScope] = {"names": unit_plans.AllCrates(), "types": unit_plans.AllCrates()}
         cache = style_ledger.GitReadCache(self.repo)
         expected = {self.sources[0]: style_proposals.RankWait("names", self.sources[0], "types")}
@@ -399,7 +411,14 @@ class UnsyncedChangeTests(unittest.TestCase):
 
 
 class AllStyleProductionsTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(isolated_staff_file(root / "staff.json", {}))
+        production_membership("fixture")
+
     def runner(self, root: Path, slug: str, kind: str = "style", *, running: bool = True) -> showrunners.Showrunner:
+        production_membership(slug)
         doc = root / f"{slug}-production.md"
         _ = doc.write_text(f"# Production — {slug}\n\n- **Kind:** {kind}\n")
         return {"slug": slug, "session": slug if running else "", "socket": "test" if running else "",
@@ -470,6 +489,18 @@ class AllStyleProductionsTests(unittest.TestCase):
             self.assertEqual((code, output.getvalue(), errors.getvalue()),
                              (0, "split-all: natedev build hold in force; skipped\n", ""))
 
+    def test_all_splits_healthy_productions_but_reports_incomplete_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            runner = self.runner(Path(folder), "healthy")
+            partial = showrunners.ShowrunnerDiscovery([runner], (
+                showrunners.ShowrunnerLookupFailure("missing", "fixture lookup failed"),))
+            with (mock.patch.object(showrunners, "registered_showrunners", return_value=partial),
+                  mock.patch.object(build_hold, "natedev_holds", return_value=build_hold.NatedevHolds(())),
+                  mock.patch.object(style_plan, "split_all", return_value=0) as split,
+                  redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+                self.assertEqual(style_plan.main(["split-all", "--all"]), 1)
+            split.assert_called_once_with(Path(runner["doc"]))
+
     def test_all_reports_a_discovery_failure_as_a_command_failure(self) -> None:
         output, errors = io.StringIO(), io.StringIO()
         with (mock.patch.object(showrunners, "registered_showrunners", side_effect=OSError("no timers")),
@@ -482,16 +513,32 @@ class AllStyleProductionsTests(unittest.TestCase):
 
 
 class RefillRecordingTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(isolated_staff_file(root / "staff.json", {}))
+        production_membership("production")
+
     def test_split_all_without_live_style_units_prints_no_style_units_and_succeeds(self) -> None:
+        production_membership("production", "feature-unit")
         with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
             production = Path(folder) / "production.md"
             _ = production.write_text("# Production\n\n## Units\n\n"
                                       + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
                                       + "| feature-unit | feature.md | /tmp/claude/feature | feature |\n"
                                       + "| retired-names-unit | retired | /tmp/claude/retired | retired |\n")
+            worktree = Path(folder) / "feature"
+            _ = subprocess.run(["git", "init", "-b", "feature", str(worktree)], check=True, capture_output=True)
+            _ = recorded_unit("production", "feature-unit", worktree, production, plan="feature.md")
+            def no_child(command: list[str], *, capture_output: bool, text: bool,
+                         check: bool) -> subprocess.CompletedProcess[str]:
+                if command[0] == "git":
+                    return run_git(command, capture_output=capture_output, text=text, check=check)
+                raise AssertionError("no child for an empty production")
+
             output, errors = io.StringIO(), io.StringIO()
             with (mock.patch.object(unit_lookup, "marked_units", return_value={}),
-                  mock.patch.object(subprocess, "run", side_effect=AssertionError("no child for an empty production")),
+                  mock.patch.object(subprocess, "run", side_effect=no_child),
                   redirect_stdout(output), redirect_stderr(errors)):
                 code = style_plan.main(["split-all", "--production", str(production)])
             self.assertEqual((code, output.getvalue(), errors.getvalue()), (0, "no style units\n", ""))
@@ -505,7 +552,7 @@ class RefillRecordingTests(unittest.TestCase):
                                       + f"| names-unit | docs/names.md | {root / 'gone'} | style-names |\n")
             output, errors = io.StringIO(), io.StringIO()
             with (mock.patch.object(unit_lookup, "marked_units", return_value={}),
-                  mock.patch.object(merge_gate, "suite_scope_prefix", side_effect=AssertionError("no child for a retired unit")),
+                  mock.patch.object(queue_place, "suite_scope_prefix", side_effect=AssertionError("no child for a retired unit")),
                   redirect_stdout(output), redirect_stderr(errors)):
                 code = style_plan.main(["split-all", "--production", str(production)])
             self.assertEqual((code, output.getvalue(), errors.getvalue()), (0, "no style units\n", ""))
@@ -519,15 +566,19 @@ class RefillRecordingTests(unittest.TestCase):
                 worktree = root / unit
                 plan = worktree / "docs/retained-plan.md"
                 plan.parent.mkdir(parents=True)
-                _ = (worktree / ".git").write_text("gitdir: unused-child-fixture\n")
+                _ = subprocess.run(["git", "init", "-b", unit, str(worktree)], check=True, capture_output=True)
                 _ = plan.write_text("# Standing unit\n")
                 rows.append(f"| {unit} | docs/retained-plan.md | {worktree} | {unit} |")
             _ = production.write_text("# Production\n\n## Units\n\n"
                                       + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
                                       + "\n".join(rows) + "\n")
             completed: list[str] = []
+            for unit in ("names-unit", "types-unit", "values-unit"):
+                _ = recorded_unit("production", unit, root / unit, production, plan="docs/retained-plan.md")
 
             def child(command: list[str], *, capture_output: bool, text: bool, check: bool) -> subprocess.CompletedProcess[str]:
+                if command[0] == "git":
+                    return run_git(command, capture_output=capture_output, text=text, check=check)
                 self.assertEqual(command[:8], ["systemd-run", "--user", "--scope", "--slice=builds.slice", "nice", "-n", "19", sys.executable])
                 self.assertTrue(capture_output and text)
                 self.assertFalse(check)
@@ -541,14 +592,14 @@ class RefillRecordingTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, f"{unit}: 1/2/3/4 in 0.25 min\n", "")
 
             output = io.StringIO()
-            with (mock.patch.object(merge_gate, "suite_scope_prefix", return_value=[
+            with (mock.patch.object(queue_place, "suite_scope_prefix", return_value=[
                     "systemd-run", "--user", "--scope", "--slice=builds.slice"]),
                   mock.patch.object(subprocess, "run", side_effect=child), redirect_stdout(output)):
                 code = style_plan.main(["split-all", "--production", str(production)])
             self.assertEqual(code, 1)
             self.assertEqual(completed, ["names-unit", "types-unit", "values-unit"])
             self.assertEqual(output.getvalue(), "names-unit: 1/2/3/4 in 0.25 min\n"
-                             + "types-unit: failed: cannot read tree\nvalues-unit: 1/2/3/4 in 0.25 min\n")
+                             + "types-unit: failed: stderr: split types-unit: cannot read tree\nvalues-unit: 1/2/3/4 in 0.25 min\n")
 
     def test_main_records_every_outcome_after_next_phase_returns(self) -> None:
         cases: tuple[tuple[object, str, int, str], ...] = (

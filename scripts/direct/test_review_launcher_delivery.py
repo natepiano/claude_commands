@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 import unittest
 from scripts.direct import review_launcher_test_support as support
-from scripts.direct.test_review_launcher_pool import own_review_with_legacy_flags
-from typing import override
 from pathlib import Path
 from scripts.direct.review_launcher_test_support import ProgressState as ProgressState
 from typing import cast
@@ -22,11 +21,6 @@ from scripts.direct.wait_for_test_state import wait_until
 
 
 class ReviewLauncherPassTests(support.ReviewLauncherFixture):
-    @override
-    def pool_command(self, session_dir: Path, *, lens: str = "contract", phase: str = "3",
-                     early: str = "", reviewer_type: str = "code", pass_index: int = 1) -> list[str]:
-        return own_review_with_legacy_flags(self, session_dir, lens=lens, phase=phase, early=early,
-                                           reviewer_type=reviewer_type, pass_index=pass_index)
 
     def test_ux_launch_checks_identity_before_the_worker_and_records_valid_checks(self) -> None:
         stale = self.start_implementation("ux-stale-identity")
@@ -156,6 +150,37 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             output, errors = self.finish_early_launcher(process, ready, finish)
         self.assertEqual(process.returncode, 0, output + errors)
 
+    def test_canceling_a_fresh_codex_launcher_group_stops_its_child(self) -> None:
+        session = self.start_implementation("fresh-codex-cancellation")
+        self.finish_implementation(session)
+        child_ready = session / "codex-child-pid"
+        environment = self.environment()
+        environment.update({"TEST_PYTHON": sys.executable, "TEST_CODEX_CHILD_PID": str(child_ready)})
+        with (self.root / "scripts/agents/agent_exec.sh").open("a") as agent:
+            _ = agent.write(
+                'exec "$TEST_PYTHON" -c \'import os, signal; from pathlib import Path; '
+                + 'Path(os.environ["TEST_CODEX_CHILD_PID"]).write_text(str(os.getpid())); signal.pause()\'\n'
+            )
+        with (session / "cancellation-output").open("w") as output:
+            process = subprocess.Popen(self.review_command(session, "", ""), env=environment,
+                                       stdout=output, stderr=output, text=True, start_new_session=True)
+            try:
+                descriptor = os.pidfd_open(wait_for_pid(child_ready, processes=(process,)))
+                try:
+                    send_process_group(process.pid, signal.SIGTERM)
+                    _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)[0], [descriptor])
+                finally:
+                    if not select.select([descriptor], [], [], 0)[0]:
+                        signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                    os.close(descriptor)
+            finally:
+                try:
+                    send_process_group(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+
     def test_early_launcher_timeout_reaps_its_group_before_fixture_cleanup(self) -> None:
         child_ready = self.root / "blocked-review-child"
         child_code = ("import os, signal, sys; from pathlib import Path; "
@@ -181,7 +206,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
                 os.close(descriptor)
         finally:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                send_process_group(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             _ = process.communicate()
@@ -310,25 +335,19 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         self.assertIn("finished before delivery", heartbeat)
 
     def test_early_verdict_without_delivery_records_void_and_findings_without_a_pass(self) -> None:
-        for arm in ("pool", "own"):
-            with self.subTest(arm=arm):
-                session = self.start_implementation(f"void-{arm}")
-                ready = session / "ready"
-                if arm == "pool":
-                    environment = self.pool_fixture()
-                    command = self.pool_command(session, early=str(ready))
-                else:
-                    environment = self.environment()
-                    command = self.review_command(session, "contract", str(ready), self.open_worker(session))
-                environment["STUB_FINDINGS"] = "1. A void finding\n"
-                result = subprocess.run(command, env=environment, capture_output=True,
-                                        text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual((session / "review_status_contract").read_text().strip(), "reviewed")
-                record, = self.turn_records(session)
-                self.assertEqual(record["status"], "void")
-                self.assertEqual(record["raised"], 1)
-                self.assertFalse(any(event.get("pass_kind") == "review" for event in self.pass_events(session.name)))
+        session = self.start_implementation("void-unit-review")
+        ready = session / "ready"
+        environment = self.environment()
+        command = self.review_command(session, "contract", str(ready), self.open_worker(session))
+        environment["STUB_FINDINGS"] = "1. A void finding\n"
+        result = subprocess.run(command, env=environment, capture_output=True,
+                                text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((session / "review_status_contract").read_text().strip(), "reviewed")
+        record, = self.turn_records(session)
+        self.assertEqual(record["status"], "void")
+        self.assertEqual(record["raised"], 1)
+        self.assertFalse(any(event.get("pass_kind") == "review" for event in self.pass_events(session.name)))
 
     def test_own_term_records_canceled_instead_of_successful_exit_trap(self) -> None:
         session = self.start_implementation("own-signal")
@@ -379,7 +398,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("unknown review lens 'style' (adversary, contract, craft, ux, rerun)", result.stderr)
+        self.assertIn("unknown review lens 'style' (adversary, contract, craft, ux, rerun, simplify)", result.stderr)
         self.assertFalse((session_dir / "review_status_style").exists())
         self.assertEqual(
             [event["event_type"] for event in self.pass_events("unknown-lens")],

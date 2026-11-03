@@ -5,14 +5,11 @@
 exits 0. A manager and a showrunner, unit director or Claude worker member are Claude Code session
 ids; a Codex worker member is its thread id, since a Codex worker has no Claude session. The edges:
 
-- a showrunner to each child showrunner, role `showrunner`, from the showrunner parent files;
-- a showrunner to each unit director marked with its production, role `unit`;
+- a showrunner to each child showrunner, role `showrunner`, from the staff record;
+- a showrunner to each live unit director, role `unit`, with its parent from the staff record;
 - a unit director to each Codex worker of its run, with the worker's role from `mesh_roster.json`;
 - a unit director to each Claude worker of its run, its member that worker's Claude session id and
   its role the one `board.sh roles` reports for its slot;
-- a unit director to each pool reviewer it leases, role `review`, its member the reviewer's thread
-  id, from the review pool's `pool.json`. It also carries `unit` (the lease's unit), `thread_id`,
-  `state` (`busy` while its `busy_pid` runs, else `idle`) and `type`. Templates are left out.
 - a Claude manager to each local Astra thread it holds, role `astra-designer` or
   `astra-reviewer`, from the Astra role records. Each adds `codex_home` and `state`
   (`busy` while its mesh worker runs or waits for capacity, or its exec pid runs; else `idle`).
@@ -22,7 +19,8 @@ Runs are found by scanning both run roots, not through the session markers: a di
 independent phases side by side, each in its own run folder, and its one marker names only one of
 them. A run's director is the one `unit_runs.director` reads from the run folder.
 
-Only local records are read, nothing over ssh. An edge is printed while its member runs on this
+Staff membership is read once from its owner; session and worker records are local.
+An edge is printed while its member runs on this
 machine; its manager may run on another one, since cargo-handler joins session ids across machines,
 so a showrunner is named by its production's update timer wherever it runs. cargo-handler polls this every 30
 seconds, so it never prompts and answers well under a second. A source that cannot be read
@@ -38,11 +36,14 @@ import sys
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_roles  # noqa: E402
-import showrunners  # noqa: E402
+from scripts.production import staff, staff_sources, session_staff
+from scripts.production import showrunners  # noqa: E402
+import showrunner_tree
 import unit_lookup  # noqa: E402
 import unit_runs  # noqa: E402
 from sessions import running_sessions  # noqa: E402
@@ -65,20 +66,9 @@ class Edge(TypedDict):
     role: Role
 
 
-class ReviewerEdge(Edge):
-    unit: str
-    thread_id: str
-    state: Literal["busy", "idle"]
-    type: str
-
-
 class AstraEdge(Edge):
     codex_home: str
     state: Literal["busy", "idle"]
-
-
-def pool_root() -> Path:
-    return Path(os.environ.get("REVIEW_POOL_STATE", "~/.local/state/review-pool")).expanduser()
 
 
 def _warn(text: str) -> None:
@@ -93,9 +83,12 @@ def _json_object(path: Path) -> dict[str, object]:
     return cast(dict[str, object], raw) if isinstance(raw, dict) else {}
 
 
-def showrunner_sessions() -> dict[str, str]:
+def showrunner_sessions(*,
+                        membership: staff.StaffSnapshot | showrunners.DiscoverMembership = showrunners.DISCOVER_MEMBERSHIP,
+                        ) -> dict[str, str]:
     """Each production slug to its showrunner's session id, from its update timer, wherever it runs."""
     found: dict[str, str] = {}
+    record = staff.initial_snapshot() if isinstance(membership, showrunners.DiscoverMembership) else membership
     for instance in sorted(showrunners.NOTIFIER_STATE_DIR.glob("showrunner-*")):
         try:
             lines = (instance / "conf").read_text(encoding="utf-8").splitlines()
@@ -104,33 +97,46 @@ def showrunner_sessions() -> dict[str, str]:
         target = next((line.removeprefix("TARGET=") for line in lines if line.startswith("TARGET=")), "")
         session_id = target.removeprefix("session:") if target.startswith("session:") else ""
         if session_id:
-            found[instance.name.removeprefix("showrunner-")] = session_id
+            owner = record.by_id(staff.StaffId(session_id))
+            found[instance.name.removeprefix("showrunner-")] = owner.current_session if owner is not None else session_id
     return found
 
 
-def showrunner_edges(sessions: dict[str, str], running: set[str]) -> list[Edge]:
+def showrunner_edges(sessions: dict[str, str], running: set[str], record: staff.StaffSnapshot) -> list[Edge]:
     return [
         Edge(manager=sessions[parent], member=sessions[child], role="showrunner")
-        for child, parent in sorted(showrunners.edges(set(sessions)).items())
+        for child, parent in sorted(showrunner_tree.edges(set(sessions), record=record).items())
         if sessions[child] in running
     ]
 
 
-def marked_units() -> unit_lookup.MarkedProductions | None:
+def marked_units(*, record: staff.StaffSnapshot | None = None) -> unit_lookup.MarkedProductions | None:
     try:
-        return unit_lookup.every_marked_unit()
+        return unit_lookup.every_marked_unit(record=record)
     except OSError as error:
         _warn(f"unit marks unreadable: {error}")
         return None
 
 
-def unit_edges(sessions: dict[str, str], running: set[str], marked: unit_lookup.MarkedProductions) -> list[Edge]:
+def unit_edges(sessions: dict[str, str], running: set[str], marked: unit_lookup.MarkedProductions,
+               record: staff.StaffSnapshot) -> list[Edge]:
+    managers: dict[staff.StaffId, str] = {}
+    for slug, row in staff_sources.showrunner_members(record).items():
+        if slug in sessions:
+            managers[row.id] = sessions[slug]
     edges: list[Edge] = []
     for slug, units in sorted(marked.units.items()):
-        manager = sessions.get(slug, "")
         for unit in sorted(units):
             claude = units[unit].claude
-            if manager and isinstance(claude, unit_lookup.LiveClaude) and claude.session_id in running:
+            if not isinstance(claude, unit_lookup.LiveClaude) or claude.session_id not in running:
+                continue
+            identity = units[unit].staff_id
+            reference = session_staff.LiveSession(identity) if identity else session_staff.NO_SESSION
+            found = staff_sources.member(staff_sources.ObservedUnit(unit, reference), record)
+            if isinstance(found, staff_sources.NoSuchMember) or found.row.parent is None:
+                continue
+            manager = managers.get(found.row.parent, "")
+            if manager:
                 edges.append(Edge(manager=manager, member=claude.session_id, role="unit"))
     return edges
 
@@ -216,43 +222,6 @@ def _claude_edges(director: str, run: Path, workers: dict[str, str]) -> list[Edg
     return edges
 
 
-def _pid_running(pid: object) -> bool:
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
-
-
-def reviewer_edges(running: set[str], marked: unit_lookup.MarkedProductions) -> list[ReviewerEdge]:
-    """Each leased pool reviewer under the running unit director that holds its lease."""
-    edges: list[ReviewerEdge] = []
-    for slug, units in sorted(marked.units.items()):
-        reviewers = _json_object(pool_root() / slug / "pool.json").get("reviewers")
-        if not isinstance(reviewers, dict):
-            continue
-        for _name, raw in sorted(cast(dict[str, object], reviewers).items()):
-            if not isinstance(raw, dict):
-                continue
-            reviewer = cast(dict[str, object], raw)
-            lease = reviewer.get("lease")
-            leased = cast(dict[str, object], lease).get("unit") if isinstance(lease, dict) else None
-            thread, kind = reviewer.get("thread_id"), reviewer.get("type")
-            director = units.get(leased) if isinstance(leased, str) else None
-            claude = director.claude if director is not None else None
-            if (isinstance(leased, str) and isinstance(thread, str) and thread and isinstance(kind, str)
-                    and isinstance(claude, unit_lookup.LiveClaude) and claude.session_id in running):
-                edges.append(ReviewerEdge(manager=claude.session_id, member=thread, role="review", unit=leased,
-                                          thread_id=thread,
-                                          state="busy" if _pid_running(reviewer.get("busy_pid")) else "idle",
-                                          type=kind))
-    return edges
-
-
 def astra_edges() -> list[AstraEdge]:
     """Each live Astra thread under its Claude manager, wherever that manager runs."""
     return [AstraEdge(manager=record["manager"], member=record["thread_id"],
@@ -286,11 +255,19 @@ def worker_edges(running: set[str], astra_threads: set[str] | None = None) -> li
 
 def tree() -> list[Edge]:
     running = {record["sessionId"] for record in running_sessions()}
-    sessions = showrunner_sessions()
-    marked = marked_units()
     astra = astra_edges()
-    managed: list[Edge] = [*unit_edges(sessions, running, marked), *reviewer_edges(running, marked)] if marked is not None else []
-    return [*showrunner_edges(sessions, running), *managed,
+    showrunner: list[Edge] = []
+    directors: list[Edge] = []
+    try:
+        record = staff.snapshot()
+        sessions = showrunner_sessions(membership=record)
+        marked = marked_units(record=record)
+        showrunner = showrunner_edges(sessions, running, record)
+        if marked is not None:
+            directors = unit_edges(sessions, running, marked, record)
+    except staff.StaffUnreadable as error:
+        _warn(f"staff unreadable: {error}")
+    return [*showrunner, *directors,
             *worker_edges(running, {edge["member"] for edge in astra}), *astra]
 
 

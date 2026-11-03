@@ -16,20 +16,54 @@ from contextlib import closing
 from dataclasses import FrozenInstanceError, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TypedDict, cast, override
+from typing import TYPE_CHECKING, TypedDict, cast, override
 from unittest import mock
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import config_environment
+else:
+    from scripts.lint.memory_test_support import config_environment
 
 import disk
 import ci
 import index
 import mac_outcome
+import moments
 import report
 import holds
+import health
+from cgroup_test_support import GIB, slice_reading
 from user_zone import user_zone
 import rust_release
 import sync
+import store
+from record import TARGET_DIR_UNSET
 from test_holds import timed_hold_events, write_holder, write_mac_block
 from test_index import COORDINATION_VARIABLES, STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
+from test_record_rerun import refresh_machine_health
+from test_memory_window import isolated_journal
+
+HISTORY_STAMP = "2026-09-30T12:00:00Z"
+
+
+def table_cells(heading: str, rows: list[str]) -> list[dict[str, str]]:
+    headers = [cell.strip() for cell in heading.strip("|").split("|")]
+    return [dict(zip(headers, [cell.strip() for cell in line.strip("|").split("|")], strict=True))
+            for line in rows]
+
+
+def cargo_build(record_id: str, **fields: object) -> Record:
+    return step(record_id, **{
+        "step": "nextest",
+        "argv": ["cargo", "nextest", "run", "--workspace", "--bin", "hana"],
+        "duration_s": 20.0,
+        "finished_s": 10.0,
+        "crates_compiled": 1,
+        **fields,
+    })
 
 
 class CliWork(TypedDict):
@@ -92,7 +126,7 @@ def measure_cli_work(command: str, environment: dict[str, str], row_count: int) 
         [sys.executable, "-c", "import os; environment = dict(os.environ); from test_report import probe_cli; os.environ.update(environment); probe_cli()", command],
         cwd=Path(__file__).resolve().parents[2],
         env={**environment, "PYTHONPATH": str(Path(__file__).resolve().parent), "BUILDLOG_TEST_INSTRUCTION_LIMIT": str(row_count * 500)},
-        capture_output=True, text=True, check=False, timeout=120,
+        capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
     )
     if result.returncode != 0:
         raise AssertionError(f"CLI failed: {result.stderr}\n{result.stdout}")
@@ -110,6 +144,7 @@ def setUpModule() -> None:
 class ReportSpeedTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
+        _ = isolated_journal(self)
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {name: str(temporary / name) for name in COORDINATION_VARIABLES})))
 
@@ -236,10 +271,37 @@ class ReportTests(unittest.TestCase):
         temporary = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(temporary) / "buildlog"
         point_root_at(self, self.root)
-        self.enterContext(mock.patch.dict(os.environ, {"HOME": temporary}))
+        for host in ("natedev", "Mac"):
+            _ = refresh_machine_health(self, host, self.root, self.root)
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": temporary, **config_environment(Path(temporary))}))
         _ = self.enterContext(mock.patch.object(subprocess, "run"))
         _ = self.enterContext(mock.patch.object(ci, "gh_get"))
         self.records = []
+
+    def test_recorder_health_action_matches_unfinished_records_errors_or_both(self) -> None:
+        day = "2026-10-02"
+        at = datetime(2026, 10, 2, 16, tzinfo=UTC).timestamp()
+        for machine, location in ((health.Machine.NATEDEV, "natedev"), (health.Machine.MAC, "the Mac")):
+            for unfinished, errors in ((2, 0), (0, 3), (2, 3)):
+                with self.subTest(machine=machine, unfinished=unfinished, errors=errors):
+                    snapshot = health.FreshRecorderHealth(health.RecorderHealthSnapshot(
+                        machine, at, unfinished, (at,) * errors))
+                    with mock.patch.object(health, "read_snapshots", return_value=[snapshot]):
+                        lines = report.recorder_health_lines(day)
+                    self.assertEqual(len(lines), 1)
+                    line = lines[0]
+                    self.assertIn(f"{unfinished} records the recorder has not finished", line)
+                    self.assertIn(f"{errors} recorder errors", line)
+                    if unfinished:
+                        self.assertIn(f"run buildlog launches on {location}", line)
+                    else:
+                        self.assertNotIn("run buildlog launches", line)
+                    if errors:
+                        self.assertIn("see ", line)
+                        self.assertIn(f"errors.log on {location}", line)
+                    else:
+                        self.assertNotIn("see ", line)
+                        self.assertNotIn("errors.log", line)
 
     def write(self, path: Path, *records: Record) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -310,7 +372,7 @@ class ReportTests(unittest.TestCase):
         lines = self.render().splitlines()
         start = lines.index("### Test builds (temporary)")
         next_section = next(line for line in lines[start + 1:] if line.startswith("### "))
-        self.assertEqual(next_section, "### Power profile")
+        self.assertEqual(next_section, "### Before and after")
 
     def test_mac_rows_leave_natedev_sections_and_failed_steps_unchanged(self) -> None:
         self.write(
@@ -446,10 +508,7 @@ class ReportTests(unittest.TestCase):
         lines = self.mac_tests_lines(day)
         heading = next(line for line in lines if line.startswith("| Package |"))
         row = next(line for line in lines if line.startswith(f"| {package} |"))
-        return dict(zip(
-            [cell.strip() for cell in heading.strip("|").split("|")],
-            [cell.strip() for cell in row.strip("|").split("|")], strict=True,
-        ))
+        return self.table_cells(heading, [row])[0]
 
     def test_held_target_waits_keep_fractional_seconds_and_unknown_rows(self) -> None:
         self.write(
@@ -922,12 +981,231 @@ class ReportTests(unittest.TestCase):
         self.assertIn("| cold (50+ crates) | 1 | 40.0 s | 50.0 s | 1.5 min | 40% | 43% |", section)
         self.assertFalse(any(line.startswith("nextest:") for line in section))
         self.assertNotIn("Edited-crate rebuilds by package (nextest):", section)
-        self.assertIn(
-            "Source: steps with a known crate count; compile is cargo's own \"Finished … in\" time, other is the rest of the step.",
-            section,
+        source = next(line for line in section if line.startswith("Source:"))
+        self.assertIn("steps with a known crate count", source)
+        self.assertIn("compile is cargo's own \"Finished … in\" time, other is the rest of the step", source)
+        for requirement in ("folder", "same target", "same features", "before"):
+            self.assertIn(requirement, source)
+
+    def test_first_build_row_includes_one_to_forty_nine_crates_but_zero_and_cold_keep_their_bins(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            *(cargo_build(f"first-{crates}", target_dir=f"/fresh/{crates}", crates_compiled=crates)
+              for crates in (0, 1, 3, 4, 49, 50)),
         )
+        section = self.rebuilds_lines()
+        for expected in (
+            "| none | 1 |", "| first build here (1–49 crates) | 4 |", "| cold (50+ crates) | 1 |",
+            "| edited crate (1–3 crates) | 0 |", "| cascade (4–49 crates) | 0 |",
+        ):
+            self.assertTrue(any(line.startswith(expected) for line in section), section)
+        self.assertNotIn("Edited-crate rebuilds by package (nextest):", section)
+
+    def test_finished_history_in_an_earlier_month_warms_the_same_target_folder_across_worktrees(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-09.jsonl",
+            cargo_build("previous", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP,
+                        target_dir="/shared/target", worktree="/old/checkout", finished_s=0.0, status=1,
+                        argv=["cargo", "test", "--workspace", "--bin", "hana", "--features", "trace,hana/dynamic_linking"]),
+        )
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            cargo_build("warm", target_dir="/shared/target", worktree="/new/checkout", branch="new", sha="newsha",
+                        argv=["cargo", "nextest", "run", "--all", "--bin=hana", "-F", "hana/dynamic_linking trace"]),
+        )
+        section = self.rebuilds_lines()
+        self.assertIn("| edited crate (1–3 crates) | 1 | 10.0 s | 10.0 s | 20.0 s | 100% | 100% |", section)
+        self.assertIn("| first build here (1–49 crates) | 0 | — | — | — | — | — |", section)
+
+    def test_other_folder_host_features_profile_or_unfinished_history_cannot_make_a_build_warm(self) -> None:
+        command = ["cargo", "nextest", "run", "--workspace", "--bin", "hana"]
+        cases: tuple[tuple[str, Record], ...] = (
+            ("other folder", {"target_dir": "/different/target"}),
+            ("other host", {"host": "Mac"}),
+            ("other features", {"argv": [*command, "--features", "hana/dynamic_linking"]}),
+            ("other profile", {"argv": [*command, "--release"]}),
+            ("other target", {"argv": [*command, "--target", "aarch64-unknown-linux-gnu"]}),
+            ("other package scope", {"argv": ["cargo", "nextest", "run", "-p", "hana", "--bin", "hana"]}),
+            ("other command", {"argv": ["cargo", "check", "--workspace", "--bin", "hana"]}),
+            ("unfinished", {"finished_s": None}),
+            ("same timestamp", {"started_at": STAMP, "ended_at": STAMP}),
+            ("future", {"started_at": "2026-10-03T12:00:00Z", "ended_at": "2026-10-03T12:00:00Z"}),
+            ("non cargo", {"argv": ["python3", "checker.py", "--workspace", "--bin", "hana"]}),
+        )
+        for name, changes in cases:
+            with self.subTest(history=name):
+                previous = cargo_build("previous", **{
+                    "started_at": HISTORY_STAMP, "ended_at": HISTORY_STAMP,
+                    "target_dir": "/shared/target", **changes,
+                })
+                for host in ("natedev", "Mac"):
+                    self.write(self.root / host / "history.jsonl", *([previous] if previous["host"] == host else []))
+                self.write(self.root / "natedev" / "2026-10.jsonl", cargo_build("current", target_dir="/shared/target"))
+                section = self.rebuilds_lines()
+                expected_count = 2 if name == "same timestamp" else 1
+                self.assertTrue(any(line.startswith(f"| first build here (1–49 crates) | {expected_count} |") for line in section), section)
+                self.assertIn("| edited crate (1–3 crates) | 0 | — | — | — | — | — |", section)
+
+    def test_target_coverage_combines_finished_history_and_group_selectors(self) -> None:
+        prefix = ["cargo", "nextest", "run", "--workspace"]
+        cases: tuple[tuple[str, list[list[str]], list[str], bool], ...] = (
+            ("union", [["--lib", "--test", "a"], ["--test", "b"]], ["--lib", "--test", "a", "--test", "b"], True),
+            ("uncovered", [["--lib", "--test", "a"]], ["--lib", "--test", "a", "--test", "b"], False),
+            ("default", [[]], [], True),
+            ("explicit does not cover default", [["--bin", "hana"]], [], False),
+            ("default does not cover explicit", [[]], ["--bin", "hana"], False),
+            ("bins covers named binary", [["--bins"]], ["--bin", "hana"], True),
+            ("tests covers named test", [["--tests"]], ["--test", "a"], True),
+            ("examples covers named example", [["--examples"]], ["--example", "demo"], True),
+            ("benches covers named bench", [["--benches"]], ["--bench", "speed"], True),
+            ("bins does not cover tests", [["--bins"]], ["--test", "a"], False),
+            ("named binary does not cover bins", [["--bin", "hana"]], ["--bins"], False),
+            ("named test does not cover tests", [["--test", "a"]], ["--tests"], False),
+            ("named example does not cover examples", [["--example", "demo"]], ["--examples"], False),
+            ("named bench does not cover benches", [["--bench", "speed"]], ["--benches"], False),
+            ("all targets covers default", [["--all-targets"]], [], True),
+            ("all targets covers every non-doc item", [["--all-targets"]],
+             ["--lib", "--bin", "hana", "--bins", "--test", "a", "--tests", "--example", "demo",
+              "--examples", "--bench", "speed", "--benches", "--all-targets"], True),
+            ("all targets does not cover docs", [["--all-targets"]], ["--doc"], False),
+            ("all targets plus docs covers docs", [["--all-targets"], ["--doc"]], ["--bin", "hana", "--doc"], True),
+        )
+        for name, prior_items, requested, warm in cases:
+            with self.subTest(coverage=name):
+                history = [cargo_build(f"previous-{number}", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP,
+                                       argv=[*prefix, *items]) for number, items in enumerate(prior_items)]
+                self.write(self.root / "natedev" / "2026-09.jsonl", *history)
+                self.write(self.root / "natedev" / "2026-10.jsonl", cargo_build("current", argv=[*prefix, *requested]))
+                section = self.rebuilds_lines()
+                label = "edited crate (1–3 crates)" if warm else "first build here (1–49 crates)"
+                self.assertTrue(any(line.startswith(f"| {label} | 1 |") for line in section), section)
+
+    def test_multi_target_history_warms_only_the_same_complete_target_set(self) -> None:
+        prefix = ["cargo", "nextest", "run", "--workspace", "--bin", "hana"]
+        cases: tuple[tuple[str, list[str], bool], ...] = (
+            ("same order", ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"], True),
+            ("reordered with duplicate", ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
+                                           "x86_64-unknown-linux-gnu"], True),
+            ("last target alone", ["x86_64-unknown-linux-gnu"], False),
+            ("different pair with same last target", ["wasm32-unknown-unknown", "x86_64-unknown-linux-gnu"], False),
+            ("default target", [], False),
+        )
+        for name, targets, warm in cases:
+            with self.subTest(targets=name):
+                self.write(
+                    self.root / "natedev" / "2026-09.jsonl",
+                    cargo_build("previous", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP,
+                                argv=[*prefix, "--target", "aarch64-unknown-linux-gnu",
+                                      "--target", "x86_64-unknown-linux-gnu"]),
+                )
+                self.write(
+                    self.root / "natedev" / "2026-10.jsonl",
+                    cargo_build("current", argv=[*prefix, *(f"--target={target}" for target in targets)]),
+                )
+                section = self.rebuilds_lines()
+                warm_count, first_count = (1, 0) if warm else (0, 1)
+                self.assertTrue(any(line.startswith(f"| edited crate (1–3 crates) | {warm_count} |") for line in section), section)
+                self.assertTrue(any(line.startswith(f"| first build here (1–49 crates) | {first_count} |") for line in section), section)
+
+    def test_warm_history_compares_instants_instead_of_fractional_timestamp_spelling(self) -> None:
+        prefix = "2026-10-02T12:08:45"
+        cases = (
+            ("earlier whole second", "Z", ".123Z", True),
+            ("later fractional second", ".123Z", "Z", False),
+            ("equal instant fractional history", ".000Z", "Z", False),
+            ("equal instant whole-second history", "Z", ".000Z", False),
+            ("equal instant longer history fraction", ".123000Z", ".123Z", False),
+            ("equal instant shorter history fraction", ".123Z", ".123000Z", False),
+            ("earlier microsecond", ".123000Z", ".123001Z", True),
+            ("later microsecond", ".123001Z", ".123000Z", False),
+        )
+        for name, previous_suffix, current_suffix, warm in cases:
+            with self.subTest(history=name):
+                previous_at, current_at = prefix + previous_suffix, prefix + current_suffix
+                self.write(
+                    self.root / "natedev" / "2026-10.jsonl",
+                    cargo_build("previous", started_at=previous_at, ended_at=previous_at, crates_compiled=None),
+                    cargo_build("current", started_at=current_at, ended_at=current_at, caller="verify"),
+                )
+                section = self.rebuilds_lines(local_day(current_at))
+                label = "edited crate (1–3 crates)" if warm else "first build here (1–49 crates)"
+                other_label = "first build here (1–49 crates)" if warm else "edited crate (1–3 crates)"
+                self.assertTrue(any(line.startswith(f"| {label} | 1 |") for line in section), section)
+                self.assertTrue(any(line.startswith(f"| {other_label} | 0 |") for line in section), section)
+                with closing(index.read_only()) as connection:
+                    groups = report.profile_step_durations(connection, datetime(2026, 10, 2, tzinfo=UTC), datetime(2026, 10, 3, tzinfo=UTC))
+                self.assertEqual(groups[("nextest", "verify", label)], [20.0])
+                self.assertNotIn(("nextest", "verify", other_label), groups)
+
+    def test_hana_group_history_warms_filtered_binary_in_all_rebuild_callers(self) -> None:
+        prefix = ["cargo", "nextest", "run", "--workspace"]
+        self.write(
+            self.root / "natedev" / "2026-09.jsonl",
+            cargo_build("previous", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP,
+                        target_dir=TARGET_DIR_UNSET, worktree="/worktrees/hana", cwd="/worktrees/hana",
+                        argv=[*prefix, "--lib", "--bins", "--tests", "--features", "hana/dynamic_linking"]),
+        )
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            cargo_build("current", caller="verify", target_dir=TARGET_DIR_UNSET, worktree="/worktrees/hana", cwd="/worktrees/hana",
+                        argv=[*prefix, "--bin", "hana", "-E", "package(hana)", "--features", "hana/dynamic_linking"]),
+        )
+        section = self.rebuilds_lines()
+        self.assertIn("| edited crate (1–3 crates) | 1 | 10.0 s | 10.0 s | 20.0 s | 100% | 100% |", section)
+        self.assertIn("| first build here (1–49 crates) | 0 | — | — | — | — | — |", section)
+        self.assertIn("| hana | 1 | 10.0 s | 10.0 s | 10.0 s |", section)
+        with closing(index.read_only()) as connection:
+            groups = report.profile_step_durations(connection, datetime(2026, 10, 2, tzinfo=UTC), datetime(2026, 10, 3, tzinfo=UTC))
+        self.assertEqual(groups[("nextest", "verify", "edited crate (1–3 crates)")], [20.0])
+        self.assertNotIn(("nextest", "verify", "first build here (1–49 crates)"), groups)
+
+    def test_rebuild_package_and_profile_callers_use_the_same_warm_classification(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-09.jsonl",
+            cargo_build("previous-bin", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP),
+            cargo_build("previous-tests", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP,
+                        argv=["cargo", "nextest", "run", "--workspace", "--tests"]),
+        )
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            cargo_build("warm-edited", caller="verify", argv=["cargo", "nextest", "run", "--workspace", "--bin", "hana", "-E", "package(warm)"]),
+            cargo_build("warm-cascade", caller="verify", crates_compiled=4, duration_s=40.0, finished_s=20.0,
+                        argv=["cargo", "nextest", "run", "--workspace", "--tests"]),
+            cargo_build("first-edited", caller="verify", target_dir="/fresh/one", duration_s=338.0, finished_s=300.0,
+                        argv=["cargo", "nextest", "run", "--workspace", "--bin", "hana", "-E", "package(first)"]),
+            cargo_build("first-cascade", caller="verify", target_dir="/fresh/two", crates_compiled=4, duration_s=711.0, finished_s=700.0),
+        )
+        section = self.rebuilds_lines()
+        for prefix in ("| edited crate (1–3 crates) | 1 |", "| cascade (4–49 crates) | 1 |", "| first build here (1–49 crates) | 2 |"):
+            self.assertTrue(any(line.startswith(prefix) for line in section), section)
+        title = section.index("Edited-crate rebuilds by package (nextest):")
+        packages = [line for line in section[title + 1:] if line.startswith("|")]
+        self.assertEqual(packages[2:], ["| warm | 1 | 10.0 s | 10.0 s | 10.0 s |"])
+        with closing(index.read_only()) as connection:
+            groups = report.profile_step_durations(connection, datetime(2026, 10, 2, tzinfo=UTC), datetime(2026, 10, 3, tzinfo=UTC))
+        self.assertEqual(groups[("nextest", "verify", "edited crate (1–3 crates)")], [20.0])
+        self.assertEqual(groups[("nextest", "verify", "cascade (4–49 crates)")], [40.0])
+        self.assertCountEqual(groups[("nextest", "verify", "first build here (1–49 crates)")], [338.0, 711.0])
+
+    def test_unfinished_and_future_items_cannot_complete_the_historical_union(self) -> None:
+        prefix = ["cargo", "nextest", "run", "--workspace"]
+        self.write(
+            self.root / "natedev" / "history.jsonl",
+            cargo_build("finished-a", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP, argv=[*prefix, "--test", "a"]),
+            cargo_build("unfinished-b", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP, finished_s=None,
+                        argv=[*prefix, "--test", "b"]),
+            cargo_build("future-b", started_at="2026-10-03T12:00:00Z", ended_at="2026-10-03T12:00:00Z",
+                        argv=[*prefix, "--test", "b"]),
+        )
+        self.write(self.root / "natedev" / "2026-10.jsonl", cargo_build("current", argv=[*prefix, "--test", "a", "--test", "b"]))
+        section = self.rebuilds_lines()
+        self.assertTrue(any(line.startswith("| first build here (1–49 crates) | 1 |") for line in section), section)
+        self.assertIn("| edited crate (1–3 crates) | 0 | — | — | — | — | — |", section)
 
     def test_nextest_rebuilds_show_packages_top_five_and_empty_cold_bin(self) -> None:
+        self.write(self.root / "natedev" / "2026-09.jsonl", cargo_build(
+            "previous", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP, argv=["cargo", "nextest", "run"],
+        ))
         package_steps = [
             ("hana-short", "package(hana)", 10.0, 1),
             ("hana-complex", "package(hana) & (test(a) | test(b))", 30.0, 3),
@@ -967,6 +1245,8 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(section[3], "")
         self.assertEqual(section[4], "| Rebuild | Steps | Compile | Other | Total | Share of compile | Share of time |")
         title = section.index("Edited-crate rebuilds by package (nextest):")
+        package_source = next(line for line in section[title + 1:] if line.startswith("Source:"))
+        self.assertTrue(package_source.startswith("Source: warm nextest steps"), package_source)
         package_table = [line for line in section[title + 1:] if line.startswith("|")]
         self.assertEqual(package_table[0], "| Package | Steps | p50 | p95 | Compile |")
         self.assertEqual(package_table[2:], [
@@ -979,9 +1259,12 @@ class ReportTests(unittest.TestCase):
         self.assertFalse(any("delta" in line or "epsilon" in line or "zeta" in line for line in package_table))
 
     def test_each_rebuild_table_is_followed_immediately_by_its_source_and_a_blank_line(self) -> None:
+        self.write(self.root / "natedev" / "2026-09.jsonl", cargo_build(
+            "previous", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP, argv=["cargo", "nextest", "run"],
+        ))
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
-            step("edited", step="nextest", argv=["package(hana)"], duration_s=20.0, finished_s=10.0, crates_compiled=1),
+            step("edited", step="nextest", argv=["cargo", "nextest", "run", "-E", "package(hana)"], duration_s=20.0, finished_s=10.0, crates_compiled=1),
         )
 
         section = self.rebuilds_lines()
@@ -1742,6 +2025,9 @@ class ReportTests(unittest.TestCase):
         )
 
     def test_offloaded_steps_stay_out_of_every_natedev_query(self) -> None:
+        self.write(self.root / "natedev" / "2026-09.jsonl", cargo_build(
+            "previous", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP, argv=["cargo", "nextest", "run"],
+        ))
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call(
@@ -2146,6 +2432,215 @@ class ReportTests(unittest.TestCase):
         self.assertIn("| scratch (temp folders) | clippy | 30.0 s | 2 |", section)
         self.assertIn("| verify.sh (agents) | clippy | 5.0 s | 2 |", section)
 
+    def usage_sample(self, at: str, held: int, *, cpu: int = 0, identity: int = 42,
+                     boot: str = "boot-a", free: int = 30 * GIB, tokens: int = 17) -> Record:
+        return sample(at, boot_id=boot,
+                      slices={"builds": slice_reading(held, cpu=cpu, identity=identity),
+                              "ci": slice_reading(40 * GIB, cpu=cpu * 100, identity=99)},
+                      filesystem={"state": "measured", "total": 100 * GIB, "used": 60 * GIB,
+                                  "free": free, "device": "254:0", "device_name": "dm-0"},
+                      jobserver={"builds": {"state": "measured", "free_pool_tokens": tokens},
+                                 "ci": {"state": "unavailable"}})
+
+    def write_usage(self, *records: Record) -> None:
+        self.write(self.root / "natedev/samples-2026-10.jsonl", *records)
+
+    def usage_cells(self, text: str) -> list[dict[str, str]]:
+        table = [line for line in text.splitlines() if line.startswith("|")]
+        self.assertGreaterEqual(len(table), 3)
+        return self.table_cells(table[0], table[2:])
+
+    def table_cells(self, heading: str, rows: list[str]) -> list[dict[str, str]]:
+        return table_cells(heading, rows)
+
+    def usage_text(self, day: str) -> str:
+        _ = index.update()
+        with closing(index.read_only()) as connection, mock.patch.object(store, "host_name", return_value="natedev"):
+            return report.usage_hours(connection, day)
+
+    def test_pressure_interval_counts_only_in_the_day_it_ends(self) -> None:
+        self.write_usage(
+            sample("2026-10-01T23:59:00Z", stall_some_us=10_000_000, stall_full_us=2_000_000,
+                   cpu_stall_some_us=10_000_000),
+            sample("2026-10-02T00:01:00Z", stall_some_us=12_000_000, stall_full_us=3_000_000,
+                   cpu_stall_some_us=40_000_000))
+        _ = index.update()
+        with closing(index.read_only()) as connection, mock.patch.dict(os.environ, {"USER_ZONE": "UTC", "TZ": "UTC"}):
+            time.tzset()
+            try:
+                before = report.memory_pressure_section(connection, "2026-10-01", 0)
+                after = report.memory_pressure_section(connection, "2026-10-02", 0)
+                cpu_before = report.cpu_disk_pressure_section(connection, "2026-10-01")
+                cpu_after = report.cpu_disk_pressure_section(connection, "2026-10-02")
+            finally:
+                self.addCleanup(time.tzset)
+        self.assertTrue(any("some unavailable" in line and "full unavailable" in line for line in before))
+        self.assertTrue(any("some 2.0 s" in line and "full 1.0 s" in line for line in after))
+        self.assertIn("CPU and IO samples: none.", cpu_before)
+        self.assertTrue(any("CPU some 25.0%" in line for line in cpu_after))
+
+    def test_held_components_average_their_own_readings_without_current(self) -> None:
+        first = self.usage_sample("2026-10-02T12:00:00Z", 8 * GIB)
+        second = self.usage_sample("2026-10-02T13:00:00Z", 24 * GIB)
+        cast(Record, cast(Record, second["slices"])["builds"])["current_bytes"] = "unavailable"
+        self.write_usage(first, second)
+        _ = index.update()
+        with closing(index.read_only()) as connection, mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+            line = report.memory_held_line(connection, "2026-10-02")
+        self.assertIn("average 8.0 GiB", line)
+        self.assertIn("`anon` 4.0 GiB", line)
+        self.assertIn("`file` 8.0 GiB", line)
+        self.assertIn("`inactive_file` 4.0 GiB", line)
+
+    def test_usage_on_mac_selects_natedev_samples_and_counters(self) -> None:
+        self.write_usage(self.usage_sample("2026-10-02T12:00:00Z", 12 * GIB),
+                         self.usage_sample("2026-10-02T12:01:00Z", 20 * GIB, cpu=120_000_000))
+        self.write(self.root / "mac/samples-2026-10.jsonl",
+                   sample("2026-10-02T12:00:00Z", host="mac", slices={"builds": slice_reading(40 * GIB)}))
+        _ = index.update()
+        with closing(index.read_only()) as connection, mock.patch.object(store, "host_name", return_value="mac"), \
+             mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+            row = next(row for row in self.usage_cells(report.usage_hours(connection, "2026-10-02"))
+                       if "12:00" in row["Hour"])
+        self.assertEqual(row["Average GiB held"], "16.0 (2)")
+        self.assertEqual(row["Builds CPU cores"], "2.00 (1)")
+
+    def test_sample_without_snapshot_keeps_memory_disk_tokens_and_counters(self) -> None:
+        self.write_usage(self.usage_sample("2026-10-02T12:00:00Z", 12 * GIB),
+                         self.usage_sample("2026-10-02T12:01:00Z", 20 * GIB, cpu=120_000_000,
+                                           free=25 * GIB, tokens=9))
+        _ = index.update()
+        with closing(index.read_only()) as connection, mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM memory_snapshots").fetchone(), (0,))
+            line = report.memory_held_line(connection, "2026-10-02")
+            rows = self.usage_cells(report.usage_hours(connection, "2026-10-02"))
+        row = next(row for row in rows if "12:00" in row["Hour"])
+        self.assertIn("average 16.0 GiB", line)
+        self.assertEqual(row["Average GiB held"], "16.0 (2)")
+        self.assertEqual(row["Builds CPU cores"], "2.00 (1)")
+        self.assertEqual(row["Lowest free disk GiB"], "25.0 (2)")
+        self.assertEqual(row["Builds free pool tokens"], "13.0 (2)")
+
+    def test_usage_window_edges_filter_and_bucket_the_same_instant(self) -> None:
+        self.write_usage(self.usage_sample("2026-10-01T23:59:59.999999Z", 40 * GIB),
+                         self.usage_sample("2026-10-02T00:00:00Z", 8 * GIB),
+                         self.usage_sample("2026-10-02T23:59:59.999999Z", 12 * GIB),
+                         self.usage_sample("2026-10-03T00:00:00Z", 40 * GIB))
+        with mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+            rows = self.usage_cells(self.usage_text("2026-10-02"))
+        measured = [row for row in rows if row["Samples"] != "0"]
+        self.assertEqual([(row["Hour"], row["Average GiB held"]) for row in measured],
+                         [("2026-10-02 00:00 +0000", "8.0 (1)"), ("2026-10-02 23:00 +0000", "12.0 (1)")])
+
+    def test_memory_held_averages_current_charge_without_peaks_children_or_swap(self) -> None:
+        self.write_usage(
+                   self.usage_sample("2026-10-02T12:00:00Z", 12 * GIB),
+                   self.usage_sample("2026-10-02T12:01:00Z", 20 * GIB),
+                   sample("2026-10-02T12:02:00Z", builds_anon_bytes=100 * GIB))
+        self.write(self.root / "natedev/2026-10.jsonl", step("peak", peak_mem_bytes=1000 * GIB))
+        with mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}), \
+             mock.patch.object(store, "host_name", return_value="natedev"):
+            lines = self.render("2026-10-02").splitlines()
+        line = next(line for line in lines if line.startswith("Build memory held ("))
+        self.assertEqual(line, "Build memory held (60 s samples, last 24 h): average 16.0 GiB "
+                         + "(`anon` 4.0 GiB, `file` 8.0 GiB, of which `inactive_file` 4.0 GiB) "
+                         + "of the 44.0 GiB cap; busiest hour 12:00 at 16.0 GiB.")
+
+    def test_memory_held_weights_samples_instead_of_hour_means(self) -> None:
+        self.write_usage(self.usage_sample("2026-10-02T12:00:00Z", 12 * GIB),
+                         self.usage_sample("2026-10-02T12:01:00Z", 20 * GIB),
+                         self.usage_sample("2026-10-02T13:00:00Z", 4 * GIB))
+        _ = index.update()
+        with closing(index.read_only()) as connection, mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}), \
+             mock.patch.object(store, "host_name", return_value="natedev"):
+            line = report.memory_held_line(connection, "2026-10-02")
+        self.assertIn("average 12.0 GiB", line)
+        self.assertIn("busiest hour 12:00 at 16.0 GiB", line)
+
+    def test_memory_held_old_rows_and_missing_current_are_not_zero_readings(self) -> None:
+        self.write_usage(
+                   sample(STAMP, builds_anon_bytes=8 * GIB),
+                   sample("2026-10-02T12:01:00Z", slices={"builds": {"state": "present", "peak_bytes": 44 * GIB}}))
+        self.assertIn("Build memory held: no readings yet.", self.render("2026-10-02"))
+
+    def test_usage_hours_counts_missing_components_separately_and_keeps_cap(self) -> None:
+        first = self.usage_sample("2026-10-02T12:00:00Z", 12 * GIB, tokens=10)
+        second = self.usage_sample("2026-10-02T12:01:00Z", 20 * GIB, tokens=20)
+        builds = cast(Record, cast(Record, second["slices"])["builds"])
+        del cast(Record, builds["stat"])["anon"]
+        second["jobserver"] = {"builds": {"state": "unavailable"}, "ci": {"state": "unavailable"}}
+        self.write_usage(first, second)
+        with mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+            text = self.usage_text("2026-10-02")
+        row = next(row for row in self.usage_cells(text) if "2026-10-02 12:00" in row["Hour"])
+        self.assertEqual(row["Average GiB held"], "16.0 (2)")
+        self.assertEqual(row["Processes GiB"], "3.0 (1)")
+        self.assertEqual(row["File cache GiB"], "8.0 (2)")
+        self.assertEqual(row["Builds free pool tokens"], "10.0 (1)")
+        self.assertEqual(row["Samples"], "2")
+
+    def test_usage_hours_separates_repeated_local_hours_by_utc_offset(self) -> None:
+        self.write_usage(
+                   self.usage_sample("2026-11-01T05:30:00Z", 12 * GIB),
+                   self.usage_sample("2026-11-01T06:30:00Z", 20 * GIB))
+        with mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
+            text = self.usage_text("2026-11-01")
+        rows = [line for line in text.splitlines() if "2026-11-01 01:00" in line]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(any("-04:00" in row or "-0400" in row for row in rows))
+        self.assertTrue(any("-05:00" in row or "-0500" in row for row in rows))
+        self.assertTrue(any("12.0" in row for row in rows))
+        self.assertTrue(any("20.0" in row for row in rows))
+
+    def test_usage_hours_splits_cpu_and_top_device_traffic_at_hour_edge(self) -> None:
+        self.write_usage(
+                   self.usage_sample("2026-10-02T12:59:30Z", 12 * GIB, cpu=0),
+                   self.usage_sample("2026-10-02T13:00:30Z", 12 * GIB, cpu=120_000_000,
+                                     free=25 * GIB, tokens=9))
+        with mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+            text = self.usage_text("2026-10-02")
+        rows = [row for row in self.usage_cells(text) if "2026-10-02 12:00" in row["Hour"] or "2026-10-02 13:00" in row["Hour"]]
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(row["Builds CPU cores"], "2.00 (1)")
+            self.assertEqual(row["Builds read bytes"], "60000000.00 (1)")
+            self.assertEqual(row["Builds written bytes"], "120000000.00 (1)")
+        self.assertEqual(rows[1]["Lowest free disk GiB"], "25.0 (1)")
+
+    def test_usage_hours_unknown_intervals_never_become_zero_cpu(self) -> None:
+        cases = (("same instant", 0, "boot-a", 42, 200), ("reset", 60, "boot-a", 42, 50), ("boot", 60, "boot-b", 42, 200),
+                 ("cgroup", 60, "boot-a", 43, 200),
+                 ("gap", report.MAX_SAMPLE_GAP_S + 1, "boot-a", 42, 200))
+        for name, elapsed, boot, identity, counter in cases:
+            with self.subTest(case=name):
+                start = datetime(2026, 10, 2, 12, tzinfo=UTC)
+                self.write_usage(
+                           self.usage_sample(start.isoformat(), 12 * GIB, cpu=100),
+                           self.usage_sample((start + timedelta(seconds=elapsed)).isoformat(), 12 * GIB,
+                                             cpu=counter, identity=identity, boot=boot))
+                with mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+                    text = self.usage_text("2026-10-02")
+                row = next(row for row in self.usage_cells(text) if "2026-10-02 12:00" in row["Hour"])
+                self.assertEqual(row["Builds CPU cores"], "— (0)")
+                self.assertEqual(row["Builds read bytes"], "— (0)")
+                self.assertEqual(row["Builds written bytes"], "— (0)")
+
+    def test_memory_held_rolling_window_ends_now_and_dated_window_ends_local_day(self) -> None:
+        self.write_usage(
+                   self.usage_sample("2026-10-01T11:59:59Z", 40 * GIB),
+                   self.usage_sample("2026-10-01T12:00:01Z", 8 * GIB),
+                   self.usage_sample("2026-10-02T11:59:59Z", 12 * GIB),
+                   self.usage_sample("2026-10-02T12:00:01Z", 40 * GIB))
+        _ = index.update()
+        with closing(index.read_only()) as connection, mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}), \
+             mock.patch.object(store, "host_name", return_value="natedev"):
+            with mock.patch.object(report, "datetime", wraps=datetime,
+                                   now=mock.Mock(return_value=datetime(2026, 10, 2, 12, tzinfo=UTC))):
+                line = report.memory_held_line(connection)
+            dated = report.memory_held_line(connection, "2026-10-02")
+        self.assertIn("average 10.0 GiB", line)
+        self.assertIn("average 26.0 GiB", dated)
+
     def test_cpu_disk_pressure_follows_memory_and_reports_two_hosts(self) -> None:
         self.write(self.root / "natedev" / "samples-2026-10.jsonl",
                    sample(STAMP, cpu_stall_some_us=10_000_000, io_stall_some_us=1_000_000,
@@ -2168,14 +2663,14 @@ class ReportTests(unittest.TestCase):
         self.assertIn("natedev: CPU some 41.2%, full —; IO some 3.1%, full 1.0%; CPU idle 52.0%, iowait 0.4% (of 1.0 min sampled)", section)
         self.assertIn("mac: CPU some 10.0%, full 5.0%; IO some 0.0%, full 0.0%; CPU idle 80.0%, iowait 10.0% (of 2.0 min sampled)", section)
 
-    def test_cpu_disk_pressure_counts_reboot_counters_from_zero(self) -> None:
+    def test_cpu_disk_pressure_does_not_count_across_a_reboot(self) -> None:
         self.write(self.root / "natedev" / "samples-2026-10.jsonl",
                    sample(STAMP, cpu_stall_some_us=99_000_000, io_stall_some_us=9_000_000,
                           cpu_idle_ticks=9000, cpu_iowait_ticks=900, cpu_total_ticks=10000),
                    sample("2026-10-02T12:01:00.000Z", boot_id="new-boot", cpu_stall_some_us=30_000_000,
                           io_stall_some_us=6_000_000, cpu_idle_ticks=200, cpu_iowait_ticks=20, cpu_total_ticks=1000))
         section = self.section_lines(self.render(), "### CPU and disk pressure")
-        self.assertIn("natedev: CPU some 50.0%, full —; IO some 10.0%, full —; CPU idle 20.0%, iowait 2.0% (of 1.0 min sampled)", section)
+        self.assertIn("CPU and IO samples: none.", section)
 
     def test_cpu_disk_pressure_long_gap_is_not_sampled_time(self) -> None:
         start = datetime.fromisoformat(STAMP)
@@ -2243,7 +2738,7 @@ class ReportTests(unittest.TestCase):
         section = self.memory_section()
         self.assertTrue(any("Source:" in line and "60 s" in line and "step" in line and "stall" in line for line in section))
         self.assertTrue(any("8.0 GiB" in line and "7.0 GiB" in line for line in section))
-        self.assertTrue(any("3.5 s" in line and "1.5 s" in line for line in section))
+        self.assertTrue(any("3.0 s" in line and "1.4 s" in line for line in section))
         self.assertTrue(any("peak builds 4.0 GiB, peak CI 5.0 GiB (process memory)" in line for line in section))
         self.assertIn("memory waits: none", section)
 
@@ -2257,7 +2752,7 @@ class ReportTests(unittest.TestCase):
         section = self.memory_section()
         self.assertFalse(any(line.startswith("|") for line in section))
         self.assertTrue(any("4.0 GiB" in line and "2.0 GiB" in line for line in section))
-        self.assertTrue(any("some 0.0 s" in line and "full 0.0 s" in line for line in section))
+        self.assertTrue(any("some unavailable" in line and "full unavailable" in line for line in section))
 
     def test_memory_pressure_compares_adjacent_samples_per_host(self) -> None:
         self.write(
@@ -2280,7 +2775,7 @@ class ReportTests(unittest.TestCase):
             sample(STAMP, stall_some_us=12_000_000, stall_full_us=3_000_000),
         )
         section = self.memory_section()
-        self.assertTrue(any("some 0.0 s" in line and "full 0.0 s" in line for line in section))
+        self.assertTrue(any("some unavailable" in line and "full unavailable" in line for line in section))
 
     def test_memory_pressure_counts_counter_rise_across_midnight_when_samples_are_close(self) -> None:
         self.addCleanup(time.tzset)
@@ -2676,9 +3171,11 @@ class ReportTests(unittest.TestCase):
         _ = (self.root / "sync_paused.json").write_text(json.dumps({
             "since": "2026-10-06T11:00:00Z", "why": "Mac hold",
         }))
-        note = report.mac_note()
-        self.assertTrue(note.startswith("Mac: sync paused since "))
-        self.assertIn("(Mac hold). Mac rows as of the ", note)
+        lines = report.peer_sync_lines()
+        mac = [line for line in lines if line.startswith("mac (")]
+        self.assertEqual(len(mac), 1)
+        self.assertIn("sync globally paused (Mac hold); run buildlog sync resume", mac[0])
+        self.assertIn("last successful exchange", mac[0])
 
     def test_every_step_kind_and_summary_places_p95_after_average(self) -> None:
         kinds = ("check", "clippy", "doc", "nextest", "mend", "fmt")
@@ -2741,6 +3238,10 @@ class PowerProfileTests(unittest.TestCase):
         point_root_at(self, self.root)
         self.addCleanup(time.tzset)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"TZ": "UTC", "USER_ZONE": "UTC"})))
+        # These fixtures exercise build/profile comparisons. Memory moments
+        # have independent fixtures and must not change the profile assertions.
+        _ = cast(object, self.enterContext(mock.patch.object(moments, "MOMENTS", tuple(
+            event for event in moments.MOMENTS if isinstance(event, moments.BuildMoment)))))
         time.tzset()
 
     def write(self, *records: Record) -> None:
@@ -2760,7 +3261,8 @@ class PowerProfileTests(unittest.TestCase):
 
     def rows(self, lines: list[str]) -> list[list[str]]:
         return [[cell.strip() for cell in line.strip("|").split("|")]
-                for line in lines if line.startswith("| ") and not line.startswith("| Kind |")]
+                for line in lines if line.startswith("| ") and not line.startswith("| Kind |")
+                and len(line.strip("|").split("|")) == 8]
 
     def profiled(self, at: str, profile: str = "performance", since: str | None = None) -> Record:
         return sample(at, power_profile=profile, power_profile_since=since)
@@ -2803,7 +3305,8 @@ class PowerProfileTests(unittest.TestCase):
     def test_rows_match_kind_caller_and_rebuild_class_with_counts_and_busiest_first(self) -> None:
         before = "2026-10-12T12:00:00.000Z"
         after = "2026-10-13T12:00:00.000Z"
-        records = [self.profiled(after)]
+        records = [self.profiled(after), cargo_build("previous", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP,
+                                                  argv=["cargo", "clippy", "--workspace"])]
         groups = (
             ("nextest", "verify", 1, 10, 12),
             ("nextest", "verify", 4, 2, 3),
@@ -2857,12 +3360,15 @@ class PowerProfileTests(unittest.TestCase):
                  caller="verify", crates_compiled=1),
         )
         lines = self.section()
-        self.assertEqual([line for line in lines if line], [
-            "### Power profile",
+        self.assertEqual([line for line in lines if line and (
+            line.startswith(("### ", "Profile now:", "Before ", "No step ran")))], [
+            "### Before and after",
             "Profile now: performance, since 2026-10-13 12:00:00 UTC.",
             "Before 2026-10-13 12:00:00 UTC (profile not recorded) vs after (performance):",
             "No step ran with the same kind, caller and rebuild class on both sides.",
         ])
+        self.assertEqual(self.rows(lines), [])
+        self.assertFalse(any(line.startswith("Source: natedev steps that passed") for line in lines))
 
     def test_p50_uses_nearest_rank_rather_than_interpolated_median(self) -> None:
         records = [self.profiled("2026-10-13T12:00:00.000Z")]
@@ -2875,7 +3381,9 @@ class PowerProfileTests(unittest.TestCase):
         self.assertEqual(self.rows(self.section())[0][3:], ["4", "20.0 s", "4", "50.0 s", "—"])
 
     def test_mac_failed_and_sweep_steps_do_not_enter_comparisons(self) -> None:
-        records = [self.profiled("2026-10-13T12:00:00.000Z")]
+        records = [self.profiled("2026-10-13T12:00:00.000Z"),
+                   cargo_build("previous", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP,
+                               argv=["cargo", "clippy", "--workspace"])]
         for side, at in (("before", "2026-10-12T12:00:00.000Z"), ("after", "2026-10-13T12:00:00.000Z")):
             records.extend(self.runs(side, at, 1, 20))
             records.extend((step(f"mac-{side}", started_at=at, host="macbook", step="nextest",
@@ -2928,9 +3436,10 @@ class PowerProfileTests(unittest.TestCase):
         self.write(self.profiled("2026-10-06T00:01:00.000Z", since=since),
                    self.profiled("2026-10-13T12:00:00.000Z", since="2026-10-13T11:00:00.000Z"))
         lines = self.section()
-        self.assertEqual([line for line in lines if line], [
-            "### Power profile", "Profile now: performance, since 2026-10-06 00:00:00 UTC.",
+        self.assertEqual([line for line in lines if line and line.startswith(("### ", "Profile now:", "Before "))], [
+            "### Before and after", "Profile now: performance, since 2026-10-06 00:00:00 UTC.",
         ])
+        self.assertEqual(self.rows(lines), [])
 
     def test_no_profiled_natedev_sample_omits_section(self) -> None:
         self.write(sample(STAMP), sample("2026-10-13T12:00:00.000Z", host="macbook", power_profile="balanced"))

@@ -26,6 +26,7 @@ import proposal_issue
 
 import berth_board
 import fake_fmt
+from style_child_test_support import style_cli_command, unqueued_style_children
 import mechanical_classes
 import rules
 import style_ledger
@@ -52,6 +53,8 @@ class StylePlanFixture(unittest.TestCase):
     rule_dir: Path = Path()
 
     tip: str = ""
+
+    pending_judge_tickets: frozenset[str] = frozenset()
 
     sources: tuple[str, ...] = tuple(f"crates/{crate}/src/{name}.rs" for crate in ("alpha", "beta") for name in ("lib", "other"))
 
@@ -98,14 +101,14 @@ class StylePlanFixture(unittest.TestCase):
         _ = shutil.copytree(self.snapshot, self.fixture_root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.configure_fixture()
-        # Keep one gate case on the executable path; the others retain the real parser and handlers in-process.
-        if self._testMethodName != "test_structure_file_cells_gate_and_checkpoint_require_the_last_file_verdict":
-            _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=self.run_command))
+        _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=self.run_command))
 
     def configure_fixture(self) -> None:
+        _ = self.enterContext(unqueued_style_children())
         listed = mechanical_classes.classes()
         _ = self.enterContext(mock.patch.object(mechanical_classes, "classes", return_value=listed))
         self.root = self.fixture_root
+        self.pending_judge_tickets = frozenset()
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         self.repo = self.root / "sample"
         self.style = self.root / "sample-style"
@@ -137,6 +140,10 @@ class StylePlanFixture(unittest.TestCase):
         if command[0] == sys.executable and len(command) > 1:
             module = next((item for item in (style_plan, style_ledger, style_footprint, proposal_issue)
                            if Path(command[1]) == Path(item.__file__ or "")), None)
+        # Keep one gate case in a child interpreter with the shared queue fake.
+        if module is style_plan and self._testMethodName == "test_structure_file_cells_gate_and_checkpoint_require_the_last_file_verdict":
+            command = style_cli_command(Path(command[1]), *arguments)
+            module = None
         executable = Path(shutil.which(command[0], path=environment.get("PATH")) or command[0])
         if executable.parent == self.root / "bin" and executable.name in fake_fmt.NAMES:
             module = ModuleType("style_plan_formatter_fixture")
@@ -243,6 +250,7 @@ class StylePlanFixture(unittest.TestCase):
             ledger.set_tip(self.tip, "style/main")
 
     def candidates(self, family: rules.Family = "names", blocked: tuple[str, ...] = ()) -> tuple[style_plan.TicketSelection, ...]:
+        self.finish_judging()
         ledger = self.ledger()
         board = self.board(*blocked)
         busy = style_plan.busy_files(self.repo, self.doc, ledger, family + "-unit", board)
@@ -266,6 +274,7 @@ class StylePlanFixture(unittest.TestCase):
         _ = self.git("merge", "-q", "--ff-only", "style/main", cwd=self.unit)
 
     def run_next(self) -> tuple[int, str, str]:
+        self.finish_judging()
         output, errors = io.StringIO(), io.StringIO()
         with redirect_stdout(output), redirect_stderr(errors):
             code = style_plan.main(["next-phase", "--unit", "names-unit", "--plan", str(self.plan), "--repo", str(self.repo)])
@@ -389,10 +398,11 @@ class StylePlanFixture(unittest.TestCase):
             _ = connection.execute("INSERT OR IGNORE INTO sync_waits (unit,since,token) VALUES ('names-unit','2026-01-01T00:00:00+00:00','seed-wait')")
             connection.commit()
 
-    def approved_decision(self, rule: str, files: tuple[str, ...], kind: style_ledger.FindingKind) -> Path:
+    def approved_decision(self, rule: str, files: tuple[str, ...], kind: style_ledger.FindingKind,
+                          *, name: str = "decision") -> Path:
         folder = self.root / "issues"
         folder.mkdir(exist_ok=True)
-        issue = folder / "decision.md"
+        issue = folder / (name + ".md")
         with style_ledger.open_ledger(self.repo) as ledger:
             blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
             for path in files:
@@ -400,7 +410,8 @@ class StylePlanFixture(unittest.TestCase):
                 ledger.file_held(finding.finding_id, issue)
         _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
                              + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
-        _ = self.doc.write_text(self.doc.read_text().replace("## Units", f"- **Proposals:** {folder}\n\n## Units"))
+        if "**Proposals:**" not in self.doc.read_text():
+            _ = self.doc.write_text(self.doc.read_text().replace("## Units", f"- **Proposals:** {folder}\n\n## Units"))
         return issue
 
     def commit_to_every_checkout(self) -> None:
@@ -409,9 +420,76 @@ class StylePlanFixture(unittest.TestCase):
             _ = self.git("merge", "--ff-only", "main", cwd=checkout)
         self.sync()
 
+    def buildable_decisions(self, issues: tuple[Path, ...]) -> tuple[style_plan.BuildableDecision, ...]:
+        """Read approved fixture decisions for focused tests of the shared batch admission."""
+        definitions = {item.rule_id: item for item in rules.load_rules(self.repo)}
+        with self.ledger() as ledger:
+            findings = tuple((issue, ledger.proposal_findings(issue)) for issue in issues)
+        return tuple(style_plan.BuildableDecision(issue, definitions[members[0].rule], "crates/alpha", members)
+                     for issue, members in findings)
+
+    def verification_ticket(self) -> str:
+        """An assigned crate-alpha ticket with its base saved for package verification."""
+        rule = self.rule("read")
+        self.sync()
+        ticket_id = "names-unit-1"
+        with self.ledger() as ledger:
+            ledger.ticket_add(ticket_id, "names-unit", "read", "names", "crates/alpha", [self.sources[0]], [rule])
+            ledger.ticket_assign(ticket_id, "demo-style-names")
+            _ = ledger.ticket_base(ticket_id)
+        return ticket_id
+
+    def combined_decision_ticket(self) -> tuple[tuple[Path, Path], str]:
+        """An assigned ticket holding one type finding from each of two approved decisions in crate alpha."""
+        rule = self.rule("combined-decisions")
+        self.sync()
+        issues = (self.approved_decision(rule, (self.sources[0],), "type", name="a-primary"),
+                  self.approved_decision(rule, (self.sources[1],), "type", name="b-secondary"))
+        ticket_id = "names-unit-1"
+        with self.ledger() as ledger:
+            findings = tuple(finding for issue in issues for finding in ledger.proposal_findings(issue))
+            for issue in issues:
+                identities = ", ".join(finding.finding_id for finding in ledger.proposal_findings(issue))
+                _ = issue.write_text(issue.read_text().replace("\n---\n", f"\nstyle_findings: [{identities}]\n---\n", 1))
+            ledger.ticket_add(ticket_id, "names-unit", "proposal", "names", "crates/alpha", list(self.sources[:2]),
+                              [rule], proposal=str(issues[0]), proposals=issues,
+                              finding_ids=tuple(finding.finding_id for finding in findings))
+            ledger.ticket_assign(ticket_id, "demo-style-names")
+        return issues, ticket_id
+
+    def finish_judging(self) -> None:
+        """Drop fixture judge tickets after their final writes and before selecting work."""
+        if not self.pending_judge_tickets:
+            return
+        ledger = self.ledger()
+        for ticket in sorted(self.pending_judge_tickets):
+            ledger.ticket_drop(ticket)
+            self.pending_judge_tickets -= {ticket}
+
+    def borrowing_decision(self, rule: str, family: rules.Family, path: str, count: int = 1) -> Path:
+        folder = self.root / "borrow-issues"
+        folder.mkdir(exist_ok=True)
+        issue = folder / (family + ".md")
+        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        ledger = self.ledger()
+        judge = f"judge-{family}-1"
+        ledger.ticket_add(judge, f"judge-{family}", "read", family, "crates/alpha", [path], [rule])
+        ledger.ticket_assign(judge, "style/main")
+        _ = ledger.ticket_base(judge)
+        for index in range(count):
+            finding = ledger.hold(rule, path, 1, f"change {index}", "type", "u32", "u64", blob, judge)
+            ledger.file_held(finding.finding_id, issue)
+        self.pending_judge_tickets |= {judge}
+        _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nplan: approved\n"
+                             + f"unit: {family}-unit\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
+        if "**Proposals:**" not in self.doc.read_text():
+            _ = self.doc.write_text(self.doc.read_text().replace("## Units", f"- **Proposals:** {folder}\n\n## Units"))
+        return issue
+
     def judged_findings(self, rule: str, sites: tuple[tuple[str, int, str], ...], *, kind: style_ledger.FindingKind = "type",
-                        before: str = "before", after: str = "after") -> tuple[Path, tuple[style_ledger.HeldFinding, ...]]:
-        """Files findings at sites in an approved decision, judged by a dropped ticket that started at the tip.
+                        before: str = "before", after: str = "after",
+                        clean_before_holding: bool = False) -> tuple[Path, tuple[style_ledger.HeldFinding, ...]]:
+        """Files findings at sites in an approved decision, leaving its judge open for further writes.
 
         They are type findings unless named.
         """
@@ -420,12 +498,15 @@ class StylePlanFixture(unittest.TestCase):
         ledger.ticket_add("modules-unit-1", "modules-unit", "read", "names", "crates/alpha", sorted({site[0] for site in sites}), [rule])
         ledger.ticket_assign("modules-unit-1", "style/main")
         _ = ledger.ticket_base("modules-unit-1")
-        ledger.ticket_drop("modules-unit-1")
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        if clean_before_holding:
+            for path in sorted({site[0] for site in sites}):
+                self.record(rule, path, self.tip, "modules-unit-1")
         findings = tuple(ledger.hold(rule, path, line, text, kind, before, after, blob, "modules-unit-1")
                          for path, line, text in sites)
         for finding in findings:
             ledger.file_held(finding.finding_id, issue)
+        self.pending_judge_tickets |= {"modules-unit-1"}
         return issue, findings
 
     def commit_files(self, files: dict[str, str | bytes]) -> None:
@@ -484,8 +565,7 @@ class StylePlanFixture(unittest.TestCase):
         rule = self.rule("read")
         site = self.sources[0]
         self.commit_files({site: "pub struct Parent {\n    old: u32,\n}\n"})
-        issue, (finding,) = self.judged_findings(rule, ((site, 2, "old: u32,"),))
-        self.record(rule, site, self.tip, "modules-unit-1")
+        issue, (finding,) = self.judged_findings(rule, ((site, 2, "old: u32,"),), clean_before_holding=True)
         self.commit_files({site: "pub struct Parent {\n    old: u32,\n}\n\npub struct Typed;\n"})
         output = self.refill_decisions()
         # The merge made the finding's cell stale, so the refill gives its file to a ticket that judges it again.
@@ -581,12 +661,17 @@ class StylePlanFixture(unittest.TestCase):
         issue = self.root / "reference-approval.md"
         with style_ledger.open_ledger(self.repo) as ledger:
             blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+            judging = ledger.next_ticket_id("judging")
+            ledger.ticket_add(judging, "judging", "read", "names", ".", [self.sources[0]], [rule])
+            ledger.ticket_assign(judging, "main")
+            _ = ledger.ticket_base(judging)
             ids: list[str] = []
             for index, (before, after) in enumerate(pairs):
                 finding = ledger.hold(rule, self.sources[0], index + 1, "rename", kinds[index % len(kinds)],
-                                      before, after, blob, "outside")
+                                      before, after, blob, judging)
                 ledger.file_held(finding.finding_id, issue)
                 ids.append(finding.finding_id)
+            ledger.ticket_drop(judging)
             _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
                                  + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
             ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "crates/alpha",
@@ -610,12 +695,17 @@ class StylePlanFixture(unittest.TestCase):
         issue = self.root / "binding-approval.md"
         ledger = self.ledger()
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        judging = ledger.next_ticket_id("judging")
+        ledger.ticket_add(judging, "judging", "read", "names", ".", [self.sources[0]], [rule])
+        ledger.ticket_assign(judging, "main")
+        _ = ledger.ticket_base(judging)
         ids: list[str] = []
         for line, old, new in pairs:
             finding = ledger.hold(rule, self.sources[0], line, source.splitlines()[line - 1], "rename",
-                                  old, new, blob, "outside")
+                                  old, new, blob, judging)
             ledger.file_held(finding.finding_id, issue)
             ids.append(finding.finding_id)
+        ledger.ticket_drop(judging)
         _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
                              + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
         ticket = "names-unit-1"

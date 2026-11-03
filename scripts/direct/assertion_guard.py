@@ -8,6 +8,7 @@ from bisect import bisect_right
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -23,7 +24,7 @@ ASSERTION_MACROS = (
     "assert_matches", "prop_assert", "prop_assert_eq", "prop_assert_ne")
 TRUSTED_MACROS = frozenset(ASSERTION_MACROS + (
     "matches", "print", "println", "eprint", "eprintln", "panic", "unreachable", "todo",
-    "unimplemented", "write", "writeln", "dbg"))
+    "unimplemented", "write", "writeln", "dbg", "vec"))
 MACRO_INVOCATION = re.compile(r"(?<!\w)(?P<name>(?:::\s*)?[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*)\s*!\s*[(\[{]")
 ASSERTION = re.compile(
     r"\b(?P<macro>" + "|".join(ASSERTION_MACROS) + r")!\s*\("
@@ -45,8 +46,8 @@ NUMERIC_LITERAL = re.compile(
 NUMERIC_TYPES = frozenset(("i8", "i16", "i32", "i64", "i128", "isize",
                            "u8", "u16", "u32", "u64", "u128", "usize", "f32", "f64"))
 RUST_LITERAL = re.compile(
-    r'''(?:br(?<!\wbr)|r(?<!\wr))(?P<hashes>\#*)"(?s:.*?)"(?P=hashes)'''
-    + r'''|b?"(?:\\.|[^"\\])*"|b?'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\])'|//[^\n]*|/\*'''
+    r'''(?<!\w)(?:br|cr|r)(?P<hashes>\#*)"(?s:.*?)"(?P=hashes)'''
+    + r'''|[bc]?"(?:\\.|[^"\\])*"|b?'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\])'|//[^\n]*|/\*'''
     + r"|(?<!\w)(?:" + NUMERIC_LITERAL.pattern + r")(?!\w)", re.DOTALL)
 BLOCK_COMMENT = re.compile(r"/\*|\*/")
 IDENTIFIER = re.compile(r"\b[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*\b")
@@ -59,7 +60,8 @@ WEAKER = re.compile(
 TURNED_OFF = re.compile(
     r"#\[ignore\b|@unittest\.(?:skip|skipIf|skipUnless|expectedFailure)\b"
     + r"|@pytest\.mark\.(?:skip|skipif|xfail)\b|\bself\.skipTest\s*\(|\bpytest\.skip\s*\(")
-TEST_MARK = re.compile(r"#\[(?:test|tokio::test|rstest)\b")
+TEST_MARK = re.compile(r"#\s*\[\s*(?:test|(?:tokio|async_std)\s*::\s*test"
+                       + r"|rstest(?:\s*::\s*rstest)?|test_case(?:\s*::\s*test_case)?)\s*(?=[\](])")
 PYTHON_TEST = re.compile(r"\bdef\s+(test_\w*)\s*\(")
 RULING = re.compile(r"(?:^|(?:-[a-zA-Z]*m|--message)[= \t]*[\"']?)Assertion-Change:"
                     + r"[ \t]*(.+?)::([^\s]+)[ \t]+[—-][ \t]*(\S[^\n]*)$", re.MULTILINE)
@@ -74,7 +76,7 @@ class DiffLine(NamedTuple):
 
     @property
     def key(self) -> str:
-        return normalized(self.text)
+        return normalized(self.text, self.path.endswith(".rs"))
 
 
 @dataclass(frozen=True)
@@ -137,12 +139,22 @@ class TouchedAssertion(NamedTuple):
     numeric_constants: tuple[NumericOccurrence, ...] = ()
 
 
-def normalized(text: str) -> str:
+def rust_string_key(literal: str) -> str:
+    """Drop string continuations; keep every other escape as written."""
+    # Consume escape pairs in order so an escaped backslash stays literal.
+    return re.sub(r"\\(?:\r?\n[ \t\n\r]*|.)",
+                  lambda escape: "" if escape[0].startswith(("\\\n", "\\\r\n")) else escape[0], literal)
+
+
+def normalized(text: str, rust: bool) -> str:
     parts: list[str] = []
     cursor = 0
     for token in lexical_spans(text, True):
         if token.kind == "literal":
-            parts.extend(("".join(text[cursor:token.first].split()), text[token.first:token.last]))
+            literal = text[token.first:token.last]
+            if rust and literal.startswith(('"', 'b"', 'c"')):
+                literal = rust_string_key(literal)
+            parts.extend(("".join(text[cursor:token.first].split()), literal))
             cursor = token.last
     parts.append("".join(text[cursor:].split()))
     return "".join(parts)
@@ -259,6 +271,15 @@ class ScopeBlock:
     children: list[ScopeBlock] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class ScopedLocalBinding:
+    """A plain declaration and the block interval where its reads are visible."""
+
+    declaration: int
+    first_read: int
+    block: ScopeBlock
+
+
 @dataclass
 class ConstantTable:
     block: ScopeBlock
@@ -269,10 +290,17 @@ class ConstantTable:
     inline_modules: set[tuple[str, ...]] = field(default_factory=set)
     refused_names: set[str] = field(default_factory=set)
     refuse_all: bool = False
+    local_declarations: dict[str, ScopedLocalBinding] = field(default_factory=dict)
+    function_bodies: list[ScopeBlock] = field(default_factory=list)
+    local_renames_refused: bool = False
 
     def bind(self, name: str, block: ScopeBlock,
              value: LiteralExpression | NumericConstant | UnresolvedConstant = UNRESOLVED_CONSTANT) -> None:
         self.bindings.setdefault(name, []).append(NameBinding(block.module, value))
+
+    def refuse_environment(self) -> None:
+        self.refuse_all = True
+        self.local_renames_refused = True
 
     def assertion_scope(self, code: list[str], line: int) -> ScopeBlock:
         match = ASSERTION.search(code[line - 1])
@@ -331,9 +359,16 @@ class SourceRevision:
 class RevisionSourceCache:
     """Read each changed file and build its census once per revision."""
     sources: dict[tuple[SourceRevision, str], list[str]] = field(default_factory=dict)
+    code: dict[tuple[SourceRevision, str], list[str]] = field(default_factory=dict)
     tables: dict[tuple[SourceRevision, str], ConstantTable] = field(default_factory=dict)
     files: dict[SourceRevision, set[str]] = field(default_factory=dict)
     unreadable: set[tuple[SourceRevision, str]] = field(default_factory=set)
+
+    def code_rows(self, revision: SourceRevision, path: str, rows: list[str]) -> list[str]:
+        key = revision, path
+        if key not in self.code:
+            self.code[key] = code_lines(rows, path.endswith(".rs"))
+        return self.code[key]
 
 
 def source_revision(base: str, head: str, staged: bool, side: Side) -> SourceRevision:
@@ -361,21 +396,22 @@ def use_bindings(text: str, prefix: tuple[str, ...] = ()) -> Iterable[UseBinding
                 yield UseBinding(alias.strip() or parts[-1], parts)
 
 
-def declaration_end(text: str, start: int, stops: str) -> int:
+def declaration_end(text: str, start: int, stops: str, *, angles: bool = False) -> int:
     """Find a delimiter outside nested groups in already masked code."""
     depth = 0
     for index in range(start, len(text)):
         char = text[index]
         if depth == 0 and char in stops:
             return index
-        if char in "([{":
+        if char in ("([{<" if angles else "([{"):
             depth += 1
-        elif char in ")]}":
+        elif char in (")]}>" if angles else ")]}") and not (angles and char == ">" and text[index - 1] == "-"):
             depth -= 1
     return len(text)
 
 
-def pairing_code_is_certain(code: str) -> bool:
+def pairing_code_is_certain(code: str, function_bodies: tuple[ScopeBlock, ...] = (), *,
+                            binding_rename: bool = False) -> bool:
     """Require fully read code and known statement/item macro environments."""
     if not code.isascii() or re.search(r"\br#|\bextern\s+crate\s+\w+\s+as\b", code):
         return False
@@ -391,7 +427,9 @@ def pairing_code_is_certain(code: str) -> bool:
                 boundary = cursor
         elif token["name"]:
             prefix = code[boundary:token.start()].rstrip()
-            if prefix.endswith(":") or (token["name"] not in TRUSTED_MACROS and not prefix):
+            unrelated_function = any(body.first < token.start() < body.last for body in function_bodies)
+            field_value = prefix.endswith(":") and not (binding_rename and token["name"] == "vec")
+            if not unrelated_function and (field_value or (token["name"] not in TRUSTED_MACROS and not prefix)):
                 return False
         else:
             boundary = cursor
@@ -488,9 +526,7 @@ def constant_table(lines: list[str], code: list[str]) -> ConstantTable:
     text, masked = "\n".join(lines), "\n".join(code)
     root = ScopeBlock(0, len(text), (), module_items=True)
     table = ConstantTable(root, [0] + [match.end() for match in re.finditer("\n", text)])
-    if not pairing_code_is_certain(masked):
-        table.refuse_all = True
-        return table
+    table.refuse_all = not pairing_code_is_certain(masked)
     blocks = [root]
     tokens = re.compile(r"\b(?:const|static|use|mod|let|for|fn|type|struct|enum|union|trait|impl|extern|macro_rules)\b|[{};|]")
     # Unknown keywords may introduce bindings: refuse their following name.
@@ -519,6 +555,12 @@ def constant_table(lines: list[str], code: list[str]) -> ConstantTable:
                                 or bool(re.search(r"!\s*(?:\w+\s*)?$|=>|\||\b(?:for|mod|impl|trait|enum|struct)\b", header)))
             block.children.append(nested)
             blocks.append(nested)
+            loop = re.fullmatch(r"\s*for\s+(?:mut\s+)?([A-Za-z_]\w*)\s+in\s+[^{}]+", header)
+            if loop:
+                table.local_declarations[loop[1]] = ScopedLocalBinding(
+                    boundary + loop.start(1), cursor, nested)
+            if function:
+                table.function_bodies.append(nested)
             boundary = cursor
         elif value == "}":
             if len(blocks) > 1:
@@ -536,6 +578,11 @@ def constant_table(lines: list[str], code: list[str]) -> ConstantTable:
                     end = cursor + in_keyword.start()
             for name in pattern_names(masked[cursor:end]):
                 table.bind(name, block)
+            plain = re.fullmatch(r"\s*(?:mut\s+)?([A-Za-z_]\w*)\s*(?::[^=;]+)?", masked[cursor:end])
+            if (value == "let" and plain and end < len(masked) and masked[end] == "="
+                    and not masked[boundary:token.start()].strip()):
+                table.local_declarations[plain[1]] = ScopedLocalBinding(
+                    cursor + plain.start(1), declaration_end(masked, end + 1, ";") + 1, block)
         elif value == "|":
             end = masked.find("|", cursor)
             if end >= 0 and not re.search(r"[;{}]", masked[cursor:end]):
@@ -545,6 +592,7 @@ def constant_table(lines: list[str], code: list[str]) -> ConstantTable:
                 cursor = end + 1
         elif value == "macro_rules":
             table.refuse_all = True
+            table.local_renames_refused = True
         elif value == "extern":
             imported_crate = re.match(r"\s+crate\s+(\w+)(?:\s+as\s+(\w+))?", masked[cursor:])
             if imported_crate:
@@ -597,6 +645,7 @@ def constant_table(lines: list[str], code: list[str]) -> ConstantTable:
                 for imported in use_bindings(masked[cursor:end].strip()):
                     if imported.name in TRUSTED_MACROS:
                         table.refuse_all = True
+                        table.local_renames_refused = True
                     if imported.name == "*":
                         table.globs.append(GlobImport(block.module, imported.parts[:-1]))
                     else:
@@ -618,6 +667,8 @@ def constant_table(lines: list[str], code: list[str]) -> ConstantTable:
                     table.bind(binding[1], block)
     if len(blocks) != 1:
         root.uncertain = True
+    # Local proofs check their own function; unrelated function-local macros cannot bind there.
+    table.local_renames_refused |= root.uncertain or not pairing_code_is_certain(masked, tuple(table.function_bodies))
     for typed_name in re.finditer(r"\b([A-Za-z_]\w*)\s*:(?!:)", masked):
         if typed_name.start(1) not in literal_definitions:
             table.refused_names.add(typed_name[1])
@@ -673,7 +724,7 @@ def inspect_globs(repo: Path, base: str, head: str, staged: bool, path: str, sid
         owner, parts = glob.module, glob.parts
         if parts and parts[0] == "crate":
             if source.name not in ("lib.rs", "main.rs"):
-                table.refuse_all = True
+                table.refuse_environment()
                 continue
             owner, parts = (), parts[1:]
         elif parts and parts[0] == "self":
@@ -682,38 +733,40 @@ def inspect_globs(repo: Path, base: str, head: str, staged: bool, path: str, sid
             owner, parts = owner[:-1], parts[1:]
         target = owner + parts
         if not parts or any(len(table.bindings.get(name, [])) != 1 for name in target):
-            table.refuse_all = True
+            table.refuse_environment()
             continue
         if target in table.inline_modules:
             table.refused_names.update(name for name, bindings in table.bindings.items()
                                        if any(binding.module == target for binding in bindings))
             continue
         if target not in table.external_modules:
-            table.refuse_all = True
+            table.refuse_environment()
             continue
         module = directory.joinpath(*target)
         candidates = [candidate.as_posix() for candidate in (module.with_suffix(".rs"), module / "mod.rs")
                       if candidate.as_posix() in cache.files[revision]]
         if len(candidates) != 1:
-            table.refuse_all = True
+            table.refuse_environment()
             continue
         key = revision, candidates[0]
         try:
             if key in cache.unreadable:
-                table.refuse_all = True
+                table.refuse_environment()
                 continue
             if key not in cache.tables:
                 rows = read_sources(repo, base, head, staged, [], cache,
                                     (SourceFile(candidates[0], side),))[candidates[0], side]
-                cache.tables[key] = constant_table(rows, code_lines(rows, True))
+                cache.tables[key] = constant_table(rows, cache.code_rows(revision, candidates[0], rows))
             imported = cache.tables[key]
             if imported.refuse_all or imported.globs or imported.block.uncertain:
                 table.refuse_all = True
+            if imported.local_renames_refused or imported.globs or imported.block.uncertain:
+                table.local_renames_refused = True
             table.refused_names.update(imported.bindings)
             table.refused_names.update(imported.refused_names)
         except (GuardError, OSError, UnicodeError):
             cache.unreadable.add(key)
-            table.refuse_all = True
+            table.refuse_environment()
 
 
 def diff_path(text: str) -> str:
@@ -791,7 +844,7 @@ def argument_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def comparison_operands(text: str) -> tuple[tuple[str, ...], bool]:
+def comparison_operands(text: str, rust: bool) -> tuple[tuple[str, ...], bool]:
     """Read a top-level comparison, including one followed by another condition."""
     text = text.strip()
     openings: list[int] = []
@@ -828,13 +881,14 @@ def comparison_operands(text: str) -> tuple[tuple[str, ...], bool]:
             end -= 1
     for level, index, right, operator in comparisons:
         if level == depth:
-            return ((normalized(text[start:index]), normalized(text[right:end])),
+            return ((normalized(text[start:index], rust), normalized(text[right:end], rust)),
                     operator in ("==", "!=", "is"))
-    return (normalized(text[start:end]),), False
+    return (normalized(text[start:end], rust),), False
 
 
 def parse_assertion(line: DiffLine, hunks: tuple[int, ...], comparison: str) -> Assertion:
-    match = ASSERTION.search(code_lines([comparison], line.path.endswith(".rs"))[0])
+    rust = line.path.endswith(".rs")
+    match = ASSERTION.search(code_lines([comparison], rust)[0])
     if match is None:
         raise GuardError("cannot read assertion")
     name = match.group("macro") or match.group("method") or match.group("bare") or match.group("raises")
@@ -843,10 +897,10 @@ def parse_assertion(line: DiffLine, hunks: tuple[int, ...], comparison: str) -> 
                      if arguments[start:end].strip())
     exact = name in EXACT_CALLS
     if name in ("assert", "debug_assert", "prop_assert") and operands:
-        operands, exact = comparison_operands(operands[0])
+        operands, exact = comparison_operands(operands[0], rust)
     else:
-        operands = tuple(normalized(operand) for operand in operands)
-    subject_text = normalized(arguments) if match.group("bare") else normalized(comparison)
+        operands = tuple(normalized(operand, rust) for operand in operands)
+    subject_text = normalized(arguments if match.group("bare") else comparison, rust)
     return Assertion(line, name, operands, exact, not exact and is_weaker(comparison), hunks, subject_text)
 
 
@@ -897,6 +951,7 @@ def touched_assertions(lines: list[DiffLine], sources: dict[tuple[str, Side], li
     for line in lines:
         groups[line.path, line.side].append(line)
     assertions: list[TouchedAssertion] = []
+    renames = binding_renames(sources, code, constants)
     for (path, side), changes in groups.items():
         cursor = 0
         for span in assertion_spans(sources[path, side], code[path, side], path.endswith(".rs"), changes):
@@ -912,6 +967,11 @@ def touched_assertions(lines: list[DiffLine], sources: dict[tuple[str, Side], li
                 if path.endswith(".rs"):
                     table = constants[path, side]
                     expansion = table.expand(expansion.text, table.assertion_scope(code[path, side], span.first))
+                if side == "new":
+                    for proof in renames.get(path, ()):
+                        if proof.scope.first <= span.first <= span.last <= proof.scope.last:
+                            expansion = proof.rewrite(expansion)
+                            break
                 assertions.append(TouchedAssertion(source, tuple(hunks), expansion.text, expansion.numeric_constants))
             if cursor == len(changes):
                 break
@@ -997,16 +1057,16 @@ def test_lines(lines: list[DiffLine], code: dict[tuple[str, Side], list[str]]) -
     for line in lines:
         key = line.path, line.side
         text = code[key][line.number - 1]
-        if "#[" not in text and "def" not in text and "fn" not in text:
+        if "#" not in text and "def" not in text and "fn" not in text:
             continue
-        if "#[" in text and TEST_MARK.search(text):
+        if TEST_MARK.search(text):
             markers[key] = line.number
         match = PYTHON_TEST.search(text) if "def" in text else None
         if match:
             tests.append((line, match[1]))
-        elif "fn" in text and line.path.endswith(".rs") and 0 < line.number - markers.get(key, -4) <= 3:
+        elif "fn" in text and line.path.endswith(".rs"):
             function = FUNCTION.search(text)
-            if function:
+            if function and 0 < line.number - markers.pop(key, -4) <= 3:
                 tests.append((line, function[1]))
     return tests
 
@@ -1047,6 +1107,7 @@ class NumericAssertionBucket:
 def numeric_comparison(assertion: TouchedAssertion) -> NumericComparison:
     """Keep the whole assertion and every digit exact, with numeric types separate."""
     text = assertion.comparison
+    rust = assertion.source.path.endswith(".rs")
     occurrences = list(assertion.numeric_constants)
     for span in lexical_spans(text, True):
         if span.kind == "literal" and not text[:span.first].rstrip().endswith("-"):
@@ -1059,12 +1120,12 @@ def numeric_comparison(assertion: TouchedAssertion) -> NumericComparison:
     values: list[NumericLiteral | NumericConstant] = []
     cursor = 0
     for occurrence in occurrences:
-        fragments.append(normalized(text[cursor:occurrence.first]))
+        fragments.append(normalized(text[cursor:occurrence.first], rust))
         value = occurrence.value
         digits.append(value.literal.digits if isinstance(value, NumericConstant) else value.digits)
         values.append(value)
         cursor = occurrence.last
-    fragments.append(normalized(text[cursor:]))
+    fragments.append(normalized(text[cursor:], rust))
     return NumericComparison(NumericAssertionKey(assertion.source.path, tuple(fragments), tuple(digits)), tuple(values))
 
 
@@ -1248,52 +1309,32 @@ class NoProductionBase:
     """No registered production provides a usable merge-branch base."""
 
 
-def worktree_path_matches(value: str, worktree: Path) -> bool:
-    """Compare absolute worktree paths, ignoring empty cells and retirement notes."""
-    if not value:
-        return False
-    try:
-        path = Path(value).expanduser()
-        return path.is_absolute() and path.resolve() == worktree
-    except (OSError, RuntimeError, ValueError):
-        return False
-
-
 def production_merge_branch(repo: Path) -> ProductionMergeBranch | NoProductionBase:
-    """Match a Units worktree first, then its branch, across registered docs."""
+    """Read the merge branch from the folder owner's row."""
     original_path = sys.path[:]
     try:
         repository_root = Path(__file__).resolve().parents[2]
         sys.path.insert(0, str(repository_root))
         sys.path.insert(0, str(repository_root / "scripts" / "production"))
-        from scripts.production import production_units, showrunners
+        from scripts.production import session_staff, staff
+        from scripts.shutdown import remote
     except ImportError:
         return NoProductionBase()
     finally:
         sys.path[:] = original_path
     worktree = Path(git(repo, "rev-parse", "--show-toplevel").strip()).resolve()
-    branch = git(repo, "branch", "--show-current").strip()
-    branch_match: ProductionMergeBranch | NoProductionBase = NoProductionBase()
-    for doc in dict.fromkeys(showrunners.timer_docs().values()):
-        try:
-            lines = doc.read_text(encoding="utf-8").splitlines()
-            rows = [row for row in production_units.unit_table(lines) if not any(
-                re.search(r"(?:^|[\s(`])(?:retired|removed)\b",
-                          row.get(column, ""), re.IGNORECASE)
-                for column in ("Status", "Worktree"))]
-            worktree_matches = any(worktree_path_matches(
-                production_units.cell_value(row.get("Worktree", "")), worktree) for row in rows)
-            branch_matches = bool(branch) and any(
-                production_units.cell_value(row.get("Branch", "")) == branch for row in rows)
-            if worktree_matches or branch_matches:
-                match = ProductionMergeBranch(production_units.production_field(lines, "Merge branch"))
-                if worktree_matches:
-                    return match
-                if isinstance(branch_match, NoProductionBase):
-                    branch_match = match
-        except (OSError, UnicodeError, production_units.Refusal):
-            continue
-    return branch_match
+    try:
+        resolver = session_staff.RowResolver(staff.snapshot())
+        member = resolver.member_by_folder(remote.local_machine(), worktree)
+        if isinstance(member, session_staff.NoSuchMember):
+            return NoProductionBase()
+        branch = resolver.merge_branch(member.row)
+        if isinstance(branch, session_staff.Branch):
+            return ProductionMergeBranch(branch.name)
+        print(f"assertion_guard: {member.row.name}: {branch.reason}", file=sys.stderr)
+    except (OSError, ValueError) as error:
+        print(f"assertion_guard: {worktree}: {error}", file=sys.stderr)
+    return NoProductionBase()
 
 
 def production_base(repo: Path) -> ProductionBase | NoProductionBase:
@@ -1306,32 +1347,18 @@ def production_base(repo: Path) -> ProductionBase | NoProductionBase:
     return NoProductionBase()
 
 
-def default_base(repo: Path, explicit_base: str = "") -> str:
-    """Take the newer upstream/production base, or the nearest remote base."""
-    if explicit_base:
-        return git(repo, "rev-parse", "--verify", f"{explicit_base}^{{commit}}").strip()
-    production = production_base(repo)
-    try:
-        upstream = git(repo, "merge-base", "HEAD", "@{upstream}").strip()
-    except GuardError:
-        pass
-    else:
-        if isinstance(production, ProductionBase) and production.commit != upstream:
-            # A descendant always has fewer base..HEAD commits. For diverged bases,
-            # the same count selects the nearer one; ties keep the upstream base.
-            upstream_count = int(git(repo, "rev-list", "--count", f"{upstream}..HEAD").strip())
-            production_count = int(git(repo, "rev-list", "--count", f"{production.commit}..HEAD").strip())
-            if production_count < upstream_count:
-                return production.commit
-        return upstream
+def _explicit_base(repo: Path, revision: str) -> str:
+    return git(repo, "rev-parse", "--verify", f"{revision}^{{commit}}").strip()
+
+
+def _nearest_remote_base(repo: Path) -> str:
+    """Require a unique nearest remote base when no configured base is usable."""
     default_remote = ""
     try:
         default_remote = git(repo, "symbolic-ref", "refs/remotes/origin/HEAD").strip()
     except GuardError:
         pass
     nearest: dict[str, int] = {}
-    if isinstance(production, ProductionBase):
-        nearest[production.commit] = int(git(repo, "rev-list", "--count", f"{production.commit}..HEAD").strip())
     for reference in git(repo, "for-each-ref", "--format=%(refname)", "refs/remotes/").splitlines():
         if reference.endswith("/HEAD") or reference == default_remote:
             continue
@@ -1348,37 +1375,322 @@ def default_base(repo: Path, explicit_base: str = "") -> str:
     raise GuardError("cannot determine branch base; set VERIFY_ASSERTION_BASE (or --base)")
 
 
-def commit_bases(repo: Path) -> tuple[str, ...]:
-    """The parents of the commit being made, including all pending merge heads."""
-    bases = [git(repo, "rev-parse", "--verify", "HEAD^{commit}").strip()]
+def _pending_merge_bases(repo: Path) -> tuple[str, ...]:
     merge_head = repo / git(repo, "rev-parse", "--git-path", "MERGE_HEAD").strip()
     try:
         merging = merge_head.read_text(encoding="ascii").splitlines()
     except FileNotFoundError:
-        merging = []
-    for revision in merging:
-        bases.append(git(repo, "rev-parse", "--verify", f"{revision}^{{commit}}").strip())
-    return tuple(dict.fromkeys(bases))
+        return ()
+    return tuple(_explicit_base(repo, revision) for revision in merging)
 
 
-def name_tests(findings: list[Finding], sources: dict[tuple[str, Side], list[str]]) -> list[Finding]:
+def commit_bases(repo: Path, selected_bases: tuple[str, ...] = ("HEAD",), *,
+                 head: str = "", staged: bool = True) -> tuple[str, ...]:
+    """Keep selected bases, adding independent merged-in parents of the judged side.
+
+    No arguments retains the commit hook's HEAD/index comparison. An empty
+    selection covers upstream and production history; an explicit selection
+    keeps its order. Only automatic selection prunes covered starting bases.
+    """
+    bases = list(dict.fromkeys(_explicit_base(repo, base) for base in selected_bases))
+    if not bases:
+        try:
+            bases.append(git(repo, "merge-base", "HEAD", "@{upstream}").strip())
+        except GuardError:
+            pass
+        production = production_base(repo)
+        if isinstance(production, ProductionBase) and production.commit not in bases:
+            bases.append(production.commit)
+        if not bases:
+            bases.append(_nearest_remote_base(repo))
+    parents: dict[str, None] = {}
+    for base in bases:
+        for merge in git(repo, "rev-list", "--min-parents=2", "--parents",
+                         f"{base}..{head or 'HEAD'}").splitlines():
+            parents.update(dict.fromkeys(merge.split()[2:]))
+    if staged:
+        parents.update(dict.fromkeys(_pending_merge_bases(repo)))
+    candidates = list(dict.fromkeys([*bases, *parents]))
+    independent = set(git(repo, "merge-base", "--independent", *candidates).split())
+    if selected_bases:
+        bases.extend(parent for parent in parents if parent in independent and parent not in bases)
+    else:
+        bases = [base for base in candidates if base in independent]
+    return tuple(bases)
+
+
+@dataclass(frozen=True)
+class TestScope:
+    first: int
+    last: int
+    name: str
+
+
+def enclosing_tests(rows: list[str], rust: bool) -> Iterable[TestScope]:
+    """Bound test bodies by Python syntax or Rust's masked braces."""
+    text = "\n".join(rows)
+    if not rust:
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+                yield TestScope(node.lineno, node.end_lineno or node.lineno, node.name)
+        return
+    offsets = [0] + [match.end() for match in re.finditer("\n", text)]
+    tokens = re.compile(r"#\s*\[|" + FUNCTION.pattern + r"|[{};]")
+    cursor = depth = 0
+    marked = False
+    pending_name = ""
+    pending_first = 0
+    bodies: dict[int, TestScope] = {}
+    scopes: list[TestScope] = []
+    while token := tokens.search(text, cursor):
+        cursor = token.end()
+        if token[0].startswith("#"):
+            end = declaration_end(text, cursor, "]")
+            if end == len(text):
+                return
+            cursor = end + 1
+            marked = marked or bool(TEST_MARK.search(text[token.start():cursor]))
+        elif function := FUNCTION.fullmatch(token[0]):
+            cursor = declaration_end(text, token.end() - 1, "{;", angles=True)
+            if cursor == len(text):
+                return
+            if marked:
+                pending_name = function[1]
+                pending_first = bisect_right(offsets, token.start())
+            marked = False
+        else:
+            if token[0] == "{":
+                depth += 1
+                if pending_name:
+                    bodies[depth] = TestScope(pending_first, len(rows), pending_name)
+            elif token[0] == "}":
+                if depth in bodies:
+                    scopes.append(replace(bodies.pop(depth), last=bisect_right(offsets, token.start())))
+                depth -= 1
+                if depth < 0:
+                    return
+            marked = False
+            pending_name = ""
+    if depth == 0:
+        yield from scopes
+
+
+
+class RustToken(NamedTuple):
+    text: str
+    first: int
+    last: int
+
+
+RUST_CODE_TOKEN = re.compile(
+    r"[A-Za-z_]\w*|::|->|=>|\.\.=|\.\.\.|\.\.|<<=|>>=|==|!=|<=|>=|&&|\|\||"
+    + r"<<|>>|[+*/%&|^!-]=|[^\s]")
+
+
+def rust_tokens(text: str) -> Iterable[RustToken]:
+    """Use the shared lexer for exact literals/comments; retain code token boundaries."""
+    cursor = 0
+    for span in lexical_spans(text, True):
+        for token in RUST_CODE_TOKEN.finditer(text, cursor, span.first):
+            yield RustToken(token[0], token.start(), token.end())
+        if span.kind == "literal":
+            yield RustToken(text[span.first:span.last], span.first, span.last)
+        cursor = span.last
+    for token in RUST_CODE_TOKEN.finditer(text, cursor):
+        yield RustToken(token[0], token.start(), token.end())
+
+
+@dataclass(frozen=True)
+class NoBindingRename:
+    """The test's token changes do not prove a local binding rename."""
+
+
+@dataclass(frozen=True)
+class BindingRename:
+    scope: TestScope
+    names: dict[str, str]  # Head names back to their base names.
+
+    def rewrite(self, expansion: AssertionExpansion) -> AssertionExpansion:
+        text = expansion.text
+        tokens = [token for token in rust_tokens(text) if token.text in self.names]
+        parts: list[str] = []
+        cursor = 0
+        for token in tokens:
+            parts.extend((text[cursor:token.first], self.names[token.text]))
+            cursor = token.last
+        parts.append(text[cursor:])
+
+        def renamed_offset(offset: int) -> int:
+            return offset + sum(len(self.names[token.text]) - len(token.text)
+                                for token in tokens if token.last <= offset)
+
+        numbers = tuple(replace(number, first=renamed_offset(number.first), last=renamed_offset(number.last))
+                        for number in expansion.numeric_constants)
+        return AssertionExpansion("".join(parts), numbers)
+
+
+def rename_references_are_plain(text: str, tokens: list[RustToken],
+                                census: ConstantTable, names: set[str]) -> bool:
+    """Require visible local reads outside fields, types and token-observing macro arguments."""
+    masked = "\n".join(code_lines(text.split("\n"), True))
+    for macro in MACRO_INVOCATION.finditer(masked):
+        end = declaration_end(masked, macro.end(), ")]}")
+        if macro["name"] == "matches":
+            # Only the subject is an expression; patterns and guards cannot prove renamed reads.
+            arguments = argument_spans(masked[macro.end():end])
+            if not arguments:
+                return False
+            start = macro.end() + arguments[0][1]
+        elif macro["name"] in (*ASSERTION_MACROS, "vec"):
+            continue
+        else:
+            start = macro.end()
+        if any(identifier[0] in names for identifier in IDENTIFIER.finditer(masked, start, end)):
+            return False
+    # A local value cannot prove a type-namespace change, even with the same spelling.
+    for type_site in re.finditer(r"::\s*<|\bas\b|(?<!:):(?!:)", masked):
+        stops = ">" if type_site[0].endswith("<") else "=;,)}"
+        end = declaration_end(masked, type_site.end(), stops, angles=True)
+        if any(identifier[0] in names for identifier in IDENTIFIER.finditer(masked, type_site.end(), end)):
+            return False
+    groups: list[str] = []
+    for index, token in enumerate(tokens):
+        if token.text in ("(", "[", "{"):
+            groups.append(token.text)
+        elif token.text in (")", "]", "}"):
+            if not groups or groups.pop() != {")": "(", "]": "[", "}": "{"}[token.text]:
+                return False
+        if token.text not in names:
+            continue
+        binding = census.local_declarations[token.text]
+        declaration = token.first == binding.declaration
+        if not declaration and not binding.first_read <= token.first < binding.block.last - 1:
+            return False
+        before = tokens[index - 1].text if index else ""
+        after = tokens[index + 1].text if index + 1 < len(tokens) else ""
+        if (before in (".", "::", "'") or after in ("::", "!") or (after == ":" and not declaration)
+                or (groups and groups[-1] == "{" and before in ("{", ",") and after in (",", "}"))):
+            return False
+    return not groups
+
+
+def prove_binding_rename(old_rows: list[str], new_rows: list[str], scope: TestScope) -> BindingRename | NoBindingRename:
+    """Require the complete test, including every RHS, to be equal under one bijection."""
+    old_text, new_text = "\n".join(old_rows), "\n".join(new_rows)
+    old_code, new_code = code_lines(old_rows, True), code_lines(new_rows, True)
+    # Nested functions, attributed/generic signatures and unfamiliar test headers are a refusal class.
+    for rows in (old_code, new_code):
+        masked = "\n".join(rows)
+        if (not re.match(r"\s*(?:async\s+)?fn\s+\w+\s*\(", masked)
+                or len(list(FUNCTION.finditer(masked))) != 1 or "#" in masked):
+            return NoBindingRename()
+    old_tokens, new_tokens = list(rust_tokens(old_text)), list(rust_tokens(new_text))
+    if len(old_tokens) != len(new_tokens):
+        return NoBindingRename()
+    old_census, new_census = constant_table(old_rows, old_code), constant_table(new_rows, new_code)
+    if any(table.block.uncertain or not pairing_code_is_certain("\n".join(rows), binding_rename=True)
+           for table, rows in ((old_census, old_code), (new_census, new_code))):
+        return NoBindingRename()
+    names: dict[str, str] = {}
+    old_names: set[str] = set()
+    old_present = {token.text for token in old_tokens}
+    new_present = {token.text for token in new_tokens}
+    for old, new in zip(old_tokens, new_tokens):
+        if old.text == new.text:
+            continue
+        if (old.text not in old_census.local_declarations or new.text not in new_census.local_declarations
+                or len(old_census.bindings.get(old.text, ())) != 1
+                or len(new_census.bindings.get(new.text, ())) != 1
+                or new.text in old_present or old.text in new_present):
+            return NoBindingRename()
+        if new.text in names:
+            if names[new.text] != old.text:
+                return NoBindingRename()
+        elif old.text in old_names:
+            return NoBindingRename()
+        names[new.text] = old.text
+        old_names.add(old.text)
+    if not names:
+        return NoBindingRename()
+    capture = re.compile(r"\{(?:" + "|".join(re.escape(name) for name in old_names | set(names)) + r")\b")
+    for text in (old_text, new_text):
+        if any(span.kind == "literal" and capture.search(text[span.first:span.last])
+               for span in lexical_spans(text, True)):
+            return NoBindingRename()
+    if (not rename_references_are_plain(old_text, old_tokens, old_census, old_names)
+            or not rename_references_are_plain(new_text, new_tokens, new_census, set(names))):
+        return NoBindingRename()
+    return BindingRename(scope, names)
+
+
+def binding_renames(sources: dict[tuple[str, Side], list[str]],
+                    code: dict[tuple[str, Side], list[str]],
+                    constants: dict[tuple[str, Side], ConstantTable]) -> dict[str, list[BindingRename]]:
+    """Prove renames once per enclosing test, using the existing revision reads and census."""
+    result: dict[str, list[BindingRename]] = {}
+    for path, side in sources:
+        if side != "old" or not path.endswith(".rs") or (path, "new") not in sources:
+            continue
+        if any(constants[path, side].local_renames_refused for side in ("old", "new")):
+            continue
+        old_tests: dict[str, list[TestScope]] = defaultdict(list)
+        new_tests: dict[str, list[TestScope]] = defaultdict(list)
+        for scope in enclosing_tests(code[path, "old"], True):
+            old_tests[scope.name].append(scope)
+        for scope in enclosing_tests(code[path, "new"], True):
+            new_tests[scope.name].append(scope)
+        for name, old in old_tests.items():
+            new = new_tests.get(name, [])
+            if len(old) != 1 or len(new) != 1:
+                continue
+            before, after = old[0], new[0]
+            proof = prove_binding_rename(sources[path, "old"][before.first - 1:before.last],
+                                         sources[path, "new"][after.first - 1:after.last], after)
+            if isinstance(proof, BindingRename):
+                result.setdefault(path, []).append(proof)
+    return result
+
+def name_tests(findings: list[Finding], sources: dict[tuple[str, Side], list[str]],
+               code: dict[tuple[str, Side], list[str]]) -> list[Finding]:
     groups: dict[tuple[str, Side], list[Finding]] = defaultdict(list)
     for finding in findings:
         groups[finding.source.path, finding.source.side].append(finding)
     named: list[Finding] = []
     for (path, side), group in groups.items():
-        functions = [(number, match[1]) for number, text in enumerate(sources[path, side], 1)
+        rust = path.endswith(".rs")
+        rows = sources[path, side]
+        code_rows = code[path, side]
+        tests = deque(sorted(enclosing_tests(code_rows if rust else rows, rust), key=lambda test: test.first))
+        active: list[TestScope] = []
+        functions = [(number, match[1]) for number, text in enumerate(code_rows, 1)
                      if "fn" in text or "def" in text
                      if (match := FUNCTION.search(text))]
         positions = [number for number, _ in functions]
-        for finding in group:
+        for finding in sorted(group, key=lambda finding: finding.source.number):
+            while tests and tests[0].first <= finding.source.number:
+                test = tests.popleft()
+                while active and active[-1].last < test.first:
+                    _ = active.pop()
+                active.append(test)
+            while active and active[-1].last < finding.source.number:
+                _ = active.pop()
             index = bisect_right(positions, finding.source.number) - 1
-            named.append(replace(finding, test=functions[index][1] if index >= 0 else "?"))
-    removed_tests = {(finding.source.path, finding.test) for finding in named if finding.kind == "test removed"}
-    counts = Counter((finding.source.path, finding.test) for finding in named if finding.kind == "removed")
+            owner = active[-1].name if active else functions[index][1] if index >= 0 else "?"
+            named.append(replace(finding, test=owner))
+    return sorted(named, key=lambda finding: (finding.source.path, finding.source.number))
+
+
+def aggregate_test_removals(findings: list[Finding]) -> list[Finding]:
+    """Combine only removals that survived comparison against every base."""
+    removed_tests = {(finding.source.path, finding.test) for finding in findings if finding.kind == "test removed"}
+    counts = Counter((finding.source.path, finding.test) for finding in findings if finding.kind == "removed")
     combined = [replace(finding, removed_assertions=counts[finding.source.path, finding.test])
                 if finding.kind == "test removed" else finding
-                for finding in named if finding.kind != "removed"
+                for finding in findings if finding.kind != "removed"
                 or (finding.source.path, finding.test) not in removed_tests]
     return sorted(combined, key=lambda finding: (finding.source.path, finding.source.number))
 
@@ -1410,7 +1722,9 @@ def findings_against_base(repo: Path, base: str, head: str, staged: bool,
     diff = git(repo, *diff_args)
     lines = parse_diff(diff)
     sources = read_sources(repo, base, head, staged, lines, cache)
-    code = {key: code_lines(rows, key[0].endswith(".rs")) for key, rows in sources.items()}
+    code: dict[tuple[str, Side], list[str]] = {
+        (path, side): cache.code_rows(source_revision(base, head, staged, side), path, rows)
+        for (path, side), rows in sources.items()}
     constants: dict[tuple[str, Side], ConstantTable] = {}
     for (path, side), rows in sources.items():
         if path.endswith(".rs"):
@@ -1420,12 +1734,27 @@ def findings_against_base(repo: Path, base: str, head: str, staged: bool,
             inspect_globs(repo, base, head, staged, path, side, cache.tables[key], cache)
             constants[path, side] = cache.tables[key]
     assertions = touched_assertions(lines, sources, code, constants)
-    return name_tests(find_changes(lines, assertions, code), code)
+    return name_tests(find_changes(lines, assertions, code), sources, code)
 
 
-def finding_identity(finding: Finding) -> tuple[str, str, Kind, str, str]:
-    """Match the same change across parents even when source line numbers differ."""
-    return (finding.source.path, finding.test, finding.kind, normalized(finding.old), normalized(finding.new))
+def finding_identity(finding: Finding) -> tuple[str, Kind, str, str]:
+    """Intersect changes independently of owner; run keeps the first base's name."""
+    rust = finding.source.path.endswith(".rs")
+    return (finding.source.path, finding.kind, normalized(finding.old, rust), normalized(finding.new, rust))
+
+
+def intersect_findings(comparisons: list[list[Finding]]) -> list[Finding]:
+    """Keep the first base's occurrences that every comparison reports."""
+    common = Counter(finding_identity(finding) for finding in comparisons[0])
+    for findings in comparisons[1:]:
+        common &= Counter(finding_identity(finding) for finding in findings)
+    shared: list[Finding] = []
+    for finding in comparisons[0]:
+        identity = finding_identity(finding)
+        if common[identity]:
+            shared.append(finding)
+            common[identity] -= 1
+    return shared
 
 
 def run(arguments: list[str]) -> int:
@@ -1440,29 +1769,17 @@ def run(arguments: list[str]) -> int:
     _ = parser.parse_args(arguments, namespace=args)
     repo = Path(args.repo).expanduser().resolve()
     repo = Path(git(repo, "rev-parse", "--show-toplevel").strip())
-    if args.bases:
-        bases = [default_base(repo, base) for base in args.bases]
-    else:
-        bases = [default_base(repo)]
-        bases.extend(git(repo, "rev-list", "--parents", "-n", "1", "HEAD").split()[2:])
-    bases = list(dict.fromkeys(bases))
+    explicit = os.environ.get("VERIFY_ASSERTION_BASE", "")
+    selected = tuple(args.bases) or ((explicit,) if explicit else ())
+    bases = commit_bases(repo, selected, head=args.head, staged=args.staged)
     cache = RevisionSourceCache()
-    findings = findings_against_base(repo, bases[0], args.head, args.staged, cache)
-    common = Counter(finding_identity(finding) for finding in findings)
-    for base in bases[1:]:
-        common &= Counter(finding_identity(finding)
-                          for finding in findings_against_base(repo, base, args.head, args.staged, cache))
-    shared: list[Finding] = []
-    for finding in findings:
-        identity = finding_identity(finding)
-        if common[identity]:
-            shared.append(finding)
-            common[identity] -= 1
+    shared = intersect_findings([findings_against_base(repo, base, args.head, args.staged, cache)
+                                 for base in bases])
     messages = "\n".join(git(repo, "log", "--format=%B", f"{base}..{args.head or 'HEAD'}", "--")
                          for base in bases)
     rulings = read_rulings(args.rulings, messages)
     blocking = 0
-    for finding in shared:
+    for finding in aggregate_test_removals(shared):
         why = rulings.get((finding.source.path, finding.test), "")
         prefix = "note: " if finding.kind == "changed" else ""
         suffix = f" — ruled: {why}" if why else ""

@@ -14,16 +14,16 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import fake_unit_host
 import production_lifecycle
-import showrunners
+from scripts.production import showrunners, staff, unit_config
 import unit_lookup
 import tidy_wrapped
 from scripts.production.cli_fixture import invoke_cli
 
 
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 SCRIPT = Path(__file__).with_name("production_lifecycle.py")
 STUB = '''#!__PYTHON__
 import os
@@ -62,7 +62,9 @@ with open(os.environ["TEST_SENT"], "a") as handle:
 '''
 
 
-from scripts.production.staff_test_support import StaffTestCase
+from scripts.production.staff_test_support import fixture_member, StaffTestCase
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import config_environment
 
 class LifecycleFixture(unittest.TestCase):
     staff: StaffTestCase = StaffTestCase()
@@ -151,6 +153,7 @@ class LifecycleFixture(unittest.TestCase):
                     "SHOWRUNNERS_SESSIONS": str(self.root / "sessions.py"),
                     "SHOWRUNNERS_SEND": str(self.root / "send.py"), "TEST_SENT": str(self.state / "sent.jsonl")}
         self.env.update(fake_unit_host.environment(self.root))
+        self.env.update(config_environment(self.root / "config"))
         self.write(self.root / "sessions.py", SESSIONS)
         self.write(self.root / "send.py", SEND)
         self.checkout.mkdir()
@@ -219,10 +222,27 @@ class LifecycleFixture(unittest.TestCase):
         _ = self.git("worktree", "add", "-b", "alpha-branch", str(self.alpha), "production")
         _ = self.git("worktree", "add", "-b", "beta-branch", str(self.beta), "production")
         _ = self.git("push", "origin", "alpha-branch", "beta-branch")
+        runner = fixture_member("showrunner", name="old-showrunner",
+                              doc=staff.LiveDoc("natedev", self.doc))
+        for name, worktree in (("alpha", self.alpha), ("beta", self.beta)):
+            row = fixture_member("unit", name=name, parent=runner.id,
+                               worktree=staff.PresentWorktree("natedev", worktree))
+            _ = unit_config.write(worktree, unit_config.UnitConfig(
+                unit_config.PlanFile(Path(f"docs/plans/{name}.md")), unit_config.NoAppPort(), ()))
+            self.staff.pane(f"fixture:{name}", session_id=row.id, environment={
+                "SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": f"{name}-unit",
+            })
+            _ = self.staff.session_transcript(row.id, worktree, home=self.home)
         common_dir = Path(self.git("rev-parse", "--git-common-dir"))
         with (self.checkout / common_dir / "info/exclude").open("a", encoding="utf-8") as output:
             _ = output.write("production.log\n")
         self.write(self.log, "# Production log — example\n\n### STATE\nold state\n")
+
+    def park_fixture_unit(self, name: str, worktree: Path, branch: str) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == name)
+        with mock.patch.dict(os.environ, self.env):
+            _ = unit_config.park(row.id, worktree, unit_config.RetiredSession("2026-10-31", row.id,
+                unit_config.RecordedStartFolder(worktree), unit_config.Branch(branch)))
 
     def run_lifecycle(self, action: str, *extra: str) -> subprocess.CompletedProcess[str]:
         # Restore import-time state just as a fresh CLI would compute it.
