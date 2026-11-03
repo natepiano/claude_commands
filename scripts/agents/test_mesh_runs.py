@@ -225,7 +225,7 @@ class MeshRunsTests(unittest.TestCase):
         return path
 
     def seat_runs(self, count: int) -> list[Path]:
-        """Create live supervisors for distinct runs in the fixture seat."""
+        """Create live supervisors for distinct runs for the fixture worker."""
         source = self.record(["fixture", "run"])
         template = source.read_text()
         source.unlink()
