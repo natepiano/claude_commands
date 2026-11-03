@@ -31,7 +31,8 @@ class ProducerBackfillTests(ProducerFixture):
 
     def test_a_retired_unit_maps_through_its_removed_worktree(self) -> None:
         self.old_row(self.merge(), reviewed=True)
-        _ = staff.set_worktree(self.unit.id, staff.RemovedWorktree("natedev", self.root / "unit"))
+        _ = staff.set_worktree(self.unit.id, staff.RemovedWorktree("natedev", self.root / "unit"),
+                                   expected=self.unit.worktree)
         self.assertEqual(self.backfill().filled, {"C1": self.unit.id})
         self.assertEqual(change_review.review_snapshot(self.listing).reviewed[0]["Producer"], self.unit.id)
 
@@ -39,6 +40,72 @@ class ProducerBackfillTests(ProducerFixture):
         self.old_row(self.merge("old-plan"))
         _ = staff.rename(self.unit.id, "latest-name")
         self.assertEqual(self.backfill().filled, {"C1": self.unit.id})
+
+    def test_an_old_prefixed_name_maps_without_a_units_key_and_saves_once(self) -> None:
+        self.old_row(self.merge("build-followups-new-unit"))
+        before = self.listing.read_bytes()
+        self.assertEqual(self.backfill(False).filled, {"C1": self.unit.id})
+        self.assertEqual(self.listing.read_bytes(), before)
+        self.assertEqual(self.backfill().filled, {"C1": self.unit.id})
+        self.assertEqual(change_review.pending(self.listing)[0]["Producer"], self.unit.id)
+        saved = self.listing.read_bytes()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(self.backfill().filled, {})
+        self.assertIn("no change", output.getvalue())
+        self.assertEqual(self.listing.read_bytes(), saved)
+
+    def assert_name_fallback_keeps_other_checkpoint_unmapped(self, name: str) -> None:
+        self.old_row(self.merge("build-followups-new-unit"))
+        self.old_row(self.merge(name))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = self.backfill()
+        self.assertEqual(result.filled, {"C1": self.unit.id})
+        self.assertEqual(result.unmapped, {"C2": name})
+        self.assertIn(self.listing.name + "/C2: " + name, output.getvalue())
+        self.assertEqual([row["Producer"] for row in change_review.pending(self.listing)], [self.unit.id, ""])
+
+    def test_an_old_name_with_two_unit_rows_stays_unmapped_including_a_retired_unit(self) -> None:
+        first = fixture_member("unit", name="style", parent=self.unit.parent,
+            worktree=staff.PresentWorktree("natedev", self.root / "style"))
+        runner = fixture_member("showrunner", name="other")
+        second = fixture_member("unit", name="style", parent=runner.id,
+            worktree=staff.RemovedWorktree("natedev", self.root / "retired-style"))
+        self.assertNotEqual(first.id, second.id)
+        self.assert_name_fallback_keeps_other_checkpoint_unmapped("build-followups-style")
+
+    def test_an_old_name_of_only_a_showrunner_stays_unmapped(self) -> None:
+        _ = fixture_member("showrunner", name="builds")
+        self.assert_name_fallback_keeps_other_checkpoint_unmapped("build-followups-builds")
+
+    def test_an_old_name_without_a_staff_row_stays_unmapped(self) -> None:
+        self.assert_name_fallback_keeps_other_checkpoint_unmapped("build-followups-two-accounts")
+
+    def test_an_old_name_maps_when_its_units_worktree_has_no_staff_row(self) -> None:
+        unit = fixture_member("unit", name="hierarchies", parent=self.unit.parent,
+            worktree=staff.PresentWorktree("natedev", self.root / "staff-hierarchies"))
+        _ = self.doc.write_text(self.doc.read_text()
+            + f"| hierarchies | hierarchies.md | {self.root / 'old-hierarchies'} | build-followups-hierarchies |\n")
+        self.old_row(self.merge("build-followups-hierarchies"))
+        self.assertEqual(self.backfill().filled, {"C1": unit.id})
+        self.assertEqual(change_review.pending(self.listing)[0]["Producer"], unit.id)
+
+    def test_a_units_worktree_producer_wins_over_a_different_staff_name(self) -> None:
+        self.old_row(self.merge("build-followups-new-unit"))
+        other = fixture_member("unit", name="hierarchies", parent=self.unit.parent,
+            worktree=staff.PresentWorktree("natedev", self.root / "hierarchies"))
+        _ = self.doc.write_text(self.doc.read_text().replace("| old-branch |", "| build-followups-hierarchies |"))
+        self.old_row(self.merge("build-followups-hierarchies"))
+        self.assertEqual(self.backfill().filled, {"C1": self.unit.id, "C2": self.unit.id})
+        rows = change_review.pending(self.listing)
+        self.assertEqual([row["Producer"] for row in rows], [self.unit.id, self.unit.id])
+        self.assertNotEqual(rows[1]["Producer"], other.id)
+
+    def test_a_name_without_the_old_prefix_stays_unmapped_despite_a_matching_unit(self) -> None:
+        _ = fixture_member("unit", name="legacy-style", parent=self.unit.parent,
+            worktree=staff.PresentWorktree("natedev", self.root / "legacy-style"))
+        self.assert_name_fallback_keeps_other_checkpoint_unmapped("legacy-style")
 
     def test_an_unmapped_checkpoint_is_reported_by_name_and_stays_empty(self) -> None:
         self.old_row(self.merge("unknown-unit"))
