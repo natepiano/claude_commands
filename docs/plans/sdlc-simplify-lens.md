@@ -202,3 +202,55 @@ The second live simplify run (2026-11-02, pass 1 through `review.sh`) raised 25 
 **Constraints from prior phases:** `decision` never applies the proposed change; it records words only. Only the user's own words go into `--user-words` (memory: record only the user's answer).
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/direct -p test_findings.py` and `test_findings_simplify.py` pass; `basedpyright scripts/direct/findings.py scripts/direct/test_findings.py` reports 0 errors, 0 warnings, 0 notes.
+
+### Phase 4 — test_verify_doc.py leaves no lint sweep after it ends  · status: done
+
+**Depends on:** Phase 3
+
+#### Work Order
+
+**Goal:** `scripts/direct/test_verify_doc.py` passes every run. No detached lint sweep writes into the test's temporary home after the test ends.
+
+**Spec:**
+1. The failure: the temporary home cleanup fails with `Directory not empty: case/home/.local/state/lint-sweep`. A lint sweep child writes after the test ends.
+2. `sweep_after_step` in `scripts/lint/invoke.sh` starts a detached sweep after each step. `LINT_SKIP_SWEEP=1` turns it off. The doc fixture (`scripts/direct/verify_doc_test_support.py`) removes every `LINT_` variable and does not set `LINT_SKIP_SWEEP`. Other verify fixtures set it (`verify_step_routes_test_support.py:69`, `test_verify_checks_fail_closed.py:97`).
+3. Find the process that writes `home/.local/state/lint-sweep`, and confirm that `LINT_SKIP_SWEEP=1` stops it. If a different child writes there, stop that child at its cause.
+4. Set `LINT_SKIP_SWEEP=1` in the doc fixture environment. Add no wait, retry or cleanup loop.
+5. The phase adds no lines to staff or lifecycle code.
+
+**Files:**
+- `scripts/direct/verify_doc_test_support.py` — the fixture environment
+
+**Workers:** 1 writer.
+- `impl` — the fixture change and the proof
+
+**Acceptance gate:** `python3 -m unittest scripts.direct.test_verify_doc` passes 5 runs in a row in one mesh run, and no `lint-sweep` folder is left under the case root; `basedpyright scripts/direct/verify_doc_test_support.py` reports 0 errors, 0 warnings, 0 notes.
+
+### Phase 5 — assertion_guard.py accepts one ruling for a deleted mechanism  · status: in progress
+
+**Depends on:** Phase 4
+
+#### Work Order
+
+**Goal:** one `Assertion-Change` line rules every removed test of a deleted mechanism.
+
+**User ruling (to devtools, 2026-11-03 12:1x):** "yes the guard should accept one line for a whole deleted mechanism".
+
+**Spec:**
+1. The new form: `Assertion-Change: <path>::<test-name-prefix>* — <mechanism> deleted`. The trailing `*` marks a prefix ruling.
+2. A prefix ruling rules each `test removed` finding in `<path>` whose test name starts with the prefix. It does not rule a `removed` or `weaker` assertion in a test that stays.
+3. A prefix ruling that matches no removed test is blocking. The guard prints the ruling and says it matched no removed test.
+4. The output for each ruled finding stays as now: `— ruled: <why>`.
+5. Delete the per-test code that the prefix form replaces where you can. The tool must not grow by much. Net lines in `assertion_guard.py` must be 20 or fewer.
+6. Docs: name the prefix form beside the per-test form in `commands/unit/direct.md` and `docs/as-built/phase-checks.md`. Add text; do not reword pinned phrases (`scripts/hooks/test_direct_command.py` pins them).
+7. Tests, one per behavior, in `scripts/direct/test_assertion_guard.py`: a prefix rules two removed tests; a prefix does not rule a weaker assertion in a kept test; a prefix that matches no removed test blocks.
+
+**Files:**
+- `scripts/direct/assertion_guard.py` — `read_rulings`, `run`
+- `scripts/direct/test_assertion_guard.py` — the tests in Spec item 7
+- `commands/unit/direct.md`, `docs/as-built/phase-checks.md` — the prefix form
+
+**Workers:** 1 writer.
+- `impl` — all files
+
+**Acceptance gate:** `test_assertion_guard.py`, `test_verify_assertion_guard.py` and `scripts/hooks/test_direct_command.py` pass; `basedpyright scripts/direct/assertion_guard.py scripts/direct/test_assertion_guard.py` reports 0 errors, 0 warnings, 0 notes.
