@@ -590,8 +590,8 @@ class UnitTransferTests(UnitTransferFixture):
         # showrunner, 2026-10-21: hierarchies-unit had its plan and other files edited, not committed.
         plan = self.unit / "docs/plans/alpha.md"
         self.write(plan, plan.read_text(encoding="utf-8") + "A new step, not committed.\n")
-        self.write(self.unit / "measure.py", "staged = True\n")
-        _ = self.git("add", "measure.py", cwd=self.unit)
+        self.write(self.unit / "work.py", "staged = True\n")
+        _ = self.git("add", "work.py", cwd=self.unit)
         tip = self.git("rev-parse", "demo-alpha")
         self.assert_ok(self.transfer("apply"))
         self.assertEqual(self.git("rev-parse", "demo-alpha^"), tip)
@@ -602,8 +602,8 @@ class UnitTransferTests(UnitTransferFixture):
         text = plan.read_text(encoding="utf-8")
         self.assertIn("> **Production: other**", text)
         self.assertIn("A new step, not committed.", text)
-        self.assertEqual(self.git("status", "--porcelain", cwd=self.unit), "M docs/plans/alpha.md\nA  measure.py")
-        self.assertEqual(self.git("diff", "--cached", "--name-only", cwd=self.unit), "measure.py")
+        self.assertEqual(self.git("status", "--porcelain", cwd=self.unit), "M docs/plans/alpha.md\nA  work.py")
+        self.assertEqual(self.git("diff", "--cached", "--name-only", cwd=self.unit), "work.py")
 
     def test_plan_refuses_a_receiving_doc_with_uncommitted_changes_before_any_stop(self) -> None:
         doc = self.receiving / "docs/plans/other-production.md"

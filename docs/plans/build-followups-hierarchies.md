@@ -530,3 +530,19 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **Gotchas:** an early option scan must not refuse an unknown short option (`git commit -qJ`) outside Cargo; unreadable plain calls keep the old scope.
 
 **Ruled out:** reading `--trailer` values into the message (git's `=` form, amend and subject order made it unsafe); listing merge-only commits as change-review rows.
+
+### Phase 19 — The hierarchy measure command and its tests are deleted  · status: done
+
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/hierarchies/measure.py` and its tests are gone. Nothing runs the command and no phase reads its output (user, 2026-11-03: "delete it and its tests"; change-review row C201 returned for it).
+
+**Spec:**
+- Delete `scripts/hierarchies/measure.py` and `scripts/hierarchies/test_measure.py`.
+- Delete each helper module that only the measure uses (check `log_records.py`, `worker_owners.py`, `push_audit.py` and their tests); keep a module that another script still imports.
+- Remove every remaining reference in code, tests, commands, config and as-built docs (`grep -rn "measure.py\|hierarchies.measure\|hierarchies/measure"`). Done plan phases stay as history.
+- The phase deletes code; it adds no new code.
+
+**Acceptance gate:** `grep -rn "hierarchies/measure\|hierarchies.measure" scripts commands config docs/as-built` prints nothing; the unittest modules of every changed test file pass; basedpyright on every changed file ends `0 errors, 0 warnings, 0 notes`.
