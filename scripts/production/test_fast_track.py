@@ -20,6 +20,8 @@ from scripts.lint.memory_test_support import config_environment
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture
+from scripts.production import fast_track
+from scripts.production.cli_fixture import invoke_cli
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -227,14 +229,15 @@ class FastTrackTests(MergeCheckpointFixture):
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
         })
         with patch.dict(os.environ, {"CONF_DIR": str(REPOSITORY / "config")}):
+            settings_read = conf.read("fast_track")
             self.settings = {
-                "max_changed_lines": conf.whole("fast_track", "max_changed_lines"),
-                "max_files": conf.whole("fast_track", "max_files"),
-                "check_time_limit_seconds": conf.number("fast_track", "check_time_limit_seconds"),
-                "max_push_attempts": conf.whole("fast_track", "max_push_attempts"),
-                "fetch_lock_attempts": conf.whole("fast_track", "fetch_lock_attempts"),
-                "fetch_lock_wait_seconds": conf.number("fast_track", "fetch_lock_wait_seconds"),
-                "refused_paths": list(conf.words("fast_track", "refused_paths")),
+                "max_changed_lines": settings_read.whole("max_changed_lines"),
+                "max_files": settings_read.whole("max_files"),
+                "check_time_limit_seconds": settings_read.number("check_time_limit_seconds"),
+                "max_push_attempts": settings_read.whole("max_push_attempts"),
+                "fetch_lock_attempts": settings_read.whole("fetch_lock_attempts"),
+                "fetch_lock_wait_seconds": settings_read.number("fetch_lock_wait_seconds"),
+                "refused_paths": list(settings_read.words("refused_paths")),
             }
         self.settings.update(max_changed_lines=100, max_files=10, check_time_limit_seconds=30,
                              max_push_attempts=2, fetch_lock_attempts=3, fetch_lock_wait_seconds=0.01)
@@ -859,6 +862,20 @@ class FastTrackTests(MergeCheckpointFixture):
         self.assertEqual(attempt.read_bytes(), saved)
         self.assertEqual(self.git("write-tree", cwd=self.unit), index)
         self.assertEqual((self.unit / "scripts/sample/item.py").read_bytes(), content)
+
+    def test_one_command_shares_its_settings_through_fetch_and_recovery(self) -> None:
+        self.change_module()
+        arguments = ["--unit", "alpha-unit", "--production", str(self.doc),
+                     "--why", "repair the sample", "scripts/sample/item.py"]
+        with patch.object(conf, "read", wraps=conf.read) as reads:
+            result = invoke_cli(fast_track, lambda: fast_track.main(arguments), arguments, self.env, self.unit)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([call.args[0] for call in reads.call_args_list if call.args[0] == "fast_track"],
+                         ["fast_track"])
+        tip = self.git("rev-parse", "refs/heads/main", cwd=self.origin)
+        self.assertNotEqual(tip, self.initial)
+        self.assertEqual((self.unit / "scripts/sample/item.py").read_text(), MODULE)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
 
     def test_push_checks_only_direct_tests_in_a_private_clone_and_restores_named_paths(self) -> None:
         self.change_module()

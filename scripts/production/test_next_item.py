@@ -30,7 +30,7 @@ from scripts.production import staff
 from scripts.production.staff_test_support import (
     fixture_member, isolated_source_readers, isolated_staff_file, source_environment, unit_membership,
 )
-from scripts.production.test_change_routing import checkpoint_rows
+from scripts.production.test_change_review import producer_rows
 from change_review import Visible
 from next_item import NextError, Queue
 
@@ -247,7 +247,7 @@ class NextItemTests(unittest.TestCase):
         # A row written before the Production column belongs to the list's root.
         _ = path.write_text(path.read_text(encoding="utf-8").replace(" gone |", "  |"), encoding="utf-8")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
-        checkpoint_rows(self.root, docs, {path: "top", side_list: "side"})
+        producer_rows(self.root, docs, {path: "top", side_list: "side"})
         for slug, doc in docs.items():
             parent_name = {"kid": "top", "grand": "kid"}.get(slug)
             parent = next((row.id for row in staff.find(kind="showrunner") if row.name == parent_name), None)
@@ -318,7 +318,7 @@ class NextItemTests(unittest.TestCase):
             return path
 
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
-        checkpoint_rows(self.root, {"top": top, "kid": kid}, {path: "top"})
+        producer_rows(self.root, {"top": top, "kid": kid}, {path: "top"})
         with mock.patch.object(change_review, "production_list", the_list), \
                 mock.patch.object(showrunner_tree, "root_of", return_value="top"), \
                 mock.patch.object(showrunners, "timer_docs", return_value={"top": top, "kid": kid}), \
@@ -359,7 +359,7 @@ class NextItemTests(unittest.TestCase):
         selected_rows = {path: {row["#"] for row in change_review.pending(path)} for path in listings}
         if self._testMethodName == "test_stopped_root_keeps_columnless_rows_when_own_list_becomes_current":
             selected_rows[folder / "change-review - top.md"].difference_update({"C9", "C434"})
-        checkpoint_rows(self.root, docs, listings, selected_rows=selected_rows)
+        producer_rows(self.root, docs, listings, selected_rows=selected_rows)
         return docs
 
     def test_attached_earlier_rows_keep_list_names_in_show_move_and_count(self) -> None:

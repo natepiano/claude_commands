@@ -18,6 +18,9 @@ if TYPE_CHECKING:
 else:
     from test_target_state import IsolatedTargetState, SCRIPTS, TARGET_NAMES, build_hold, mac_test, targets
 
+ORIGINAL_RUN = subprocess.run
+ORIGINAL_POPEN = subprocess.Popen
+
 
 class TargetHoldTests(IsolatedTargetState):
     @override
@@ -26,6 +29,9 @@ class TargetHoldTests(IsolatedTargetState):
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=self.target_command))
 
     def target_command(self, arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+        if arguments[:2] == ["git", "-C"]:
+            with mock.patch.object(subprocess, "Popen", ORIGINAL_POPEN):
+                return ORIGINAL_RUN(arguments, capture_output=True, text=True, check=False)
         self.assertEqual(arguments[:2], [sys.executable, str(SCRIPTS / "mac_test/mac_test.py")])
         self.assertTrue(options.get("capture_output"))
         self.assertTrue(options.get("text"))
@@ -100,7 +106,7 @@ class TargetHoldTests(IsolatedTargetState):
         before = {name: (self.directory(name) / "block.json").read_bytes() for name in ("mac", "linux-two")}
         result = self.invoke_hold(["release", "--target", "aws", "--holder", "alice"])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIsInstance(targets.target_state(self.selected_target("aws")), targets.Free)
+        self.assertIsInstance(targets.target_state(self.selected_target("aws")), targets.AwsStatusRow)
         for name in ("mac", "linux-two"):
             self.assertEqual((self.directory(name) / "block.json").read_bytes(), before[name])
             self.assertEqual(self.claim(name).returncode, 10)
@@ -113,7 +119,7 @@ class TargetHoldTests(IsolatedTargetState):
         self.assertIsInstance(targets.target_state(self.selected_target("aws")), targets.Held)
         result = self.invoke_hold(["release", "--target", "aws", "--holder", "alice"])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIsInstance(targets.target_state(self.selected_target("aws")), targets.Free)
+        self.assertIsInstance(targets.target_state(self.selected_target("aws")), targets.AwsStatusRow)
 
     def test_begin_and_end_events_record_the_actual_target(self) -> None:
         for name in TARGET_NAMES:
@@ -154,7 +160,8 @@ class TargetHoldTests(IsolatedTargetState):
         self.assertTrue((self.root / "holders/alice").is_file())
         for name in TARGET_NAMES:
             self.assertFalse(self.directory(name).exists())
-            self.assertIsInstance(targets.target_state(self.selected_target(name)), targets.Free)
+            self.assertIsInstance(targets.target_state(self.selected_target(name)),
+                                  targets.AwsStatusRow if name == "aws" else targets.Free)
 
 
 if __name__ == "__main__":

@@ -444,11 +444,11 @@ def _repair_round(state: dict[str, object], session_dir: Path) -> int:
     return len(phase_rounds(events)) + 1
 
 
-def _astra_due(entry: dict[str, object], repair_round: int) -> bool:
+def _astra_due(entry: dict[str, object], repair_round: int, settings_read: conf.ConfigRead) -> bool:
     if _string(entry.get("state")) != STATE_OPEN:
         return False
     attempts = _integer(entry.get("fix_attempts"))
-    triggered = repair_round >= conf.whole("direct", "ROUTING_FROM_ROUND") or attempts >= conf.whole("direct", "ASTRA_AFTER_FAILED_FIXES")
+    triggered = repair_round >= settings_read.whole("ROUTING_FROM_ROUND") or attempts >= settings_read.whole("ASTRA_AFTER_FAILED_FIXES")
     return triggered and not any(
         _integer(record.get("fix_attempts"), -1) == attempts
         for record in _object_list(entry.get("astra_reviews"))
@@ -589,13 +589,13 @@ def _review_cancellations(passes: list[PhasePass]) -> int:
     return max(per_slot.values(), default=0)
 
 
-def _repair_budget(state: dict[str, object]) -> int:
+def _repair_budget(state: dict[str, object], settings_read: conf.ConfigRead) -> int:
     """How many fix rounds this phase's original finding count justifies."""
     rounds = _rounds(state)
     if not rounds:
         return 0
     initial = _integer(rounds[0].get("gating_open_before"), 0)
-    return max(conf.whole("direct", "MIN_REPAIR_BUDGET"), math.ceil(initial * conf.number("direct", "REPAIR_ROUNDS_PER_FINDING")))
+    return max(settings_read.whole("MIN_REPAIR_BUDGET"), math.ceil(initial * settings_read.number("REPAIR_ROUNDS_PER_FINDING")))
 
 
 def _gating_severities(state: dict[str, object]) -> tuple[str, ...]:
@@ -670,6 +670,7 @@ def _advisory_reason(
     state: dict[str, object],
     gating_open: int,
     passes: list[PhasePass],
+    settings_read: conf.ConfigRead,
 ) -> str:
     """The convergence pattern worth reporting this round, or "" for none.
 
@@ -686,31 +687,31 @@ def _advisory_reason(
         entry = _finding(state, finding_id)
         if _string(entry.get("state")) != STATE_OPEN:
             continue
-        if _integer(entry.get("reopen_count")) >= conf.whole("direct", "MAX_REOPENS"):
+        if _integer(entry.get("reopen_count")) >= settings_read.whole("MAX_REOPENS"):
             return f"{finding_id} reopened {_integer(entry.get('reopen_count'))} times after being accepted"
     for finding_id in sorted(_findings(state)):
         entry = _finding(state, finding_id)
         if _string(entry.get("state")) != STATE_OPEN:
             continue
-        if _integer(entry.get("fix_attempts")) >= conf.whole("direct", "MAX_FIX_ATTEMPTS"):
+        if _integer(entry.get("fix_attempts")) >= settings_read.whole("MAX_FIX_ATTEMPTS"):
             attempts = _integer(entry.get("fix_attempts"))
             return f"{finding_id} failed to close after {attempts} repair attempts"
     kind, run = _consecutive_same_kind(passes)
-    if run >= conf.whole("direct", "MAX_CONSECUTIVE_SAME_KIND_PASSES"):
+    if run >= settings_read.whole("MAX_CONSECUTIVE_SAME_KIND_PASSES"):
         return f"{run} consecutive {kind} passes ran without the phase advancing"
     cancellations = _review_cancellations(passes)
-    if cancellations > conf.whole("direct", "MAX_REVIEW_CANCELLATIONS"):
+    if cancellations > settings_read.whole("MAX_REVIEW_CANCELLATIONS"):
         return f"the blind review was canceled {cancellations} times, so it is never completing"
     # Stall and budget read live rounds: an abandoned round repaired nothing, so
     # counting it would stop the phase for a repair that never ran.
     rounds = _live_rounds(state)
-    if len(rounds) >= conf.whole("direct", "STALLED_ROUNDS"):
+    if len(rounds) >= settings_read.whole("STALLED_ROUNDS"):
         previous = _integer(rounds[-1].get("gating_open_before"), -1)
         earlier = _integer(rounds[-2].get("gating_open_before"), -1)
         if previous >= 0 and earlier >= 0 and gating_open >= previous >= earlier:
             trend = f"({earlier} -> {previous} -> {gating_open})"
-            return f"the gating open count has not decreased for {conf.whole("direct", "STALLED_ROUNDS")} rounds {trend}"
-    budget = _repair_budget(state)
+            return f"the gating open count has not decreased for {settings_read.whole("STALLED_ROUNDS")} rounds {trend}"
+    budget = _repair_budget(state, settings_read)
     if budget and len(rounds) >= budget:
         initial = _integer(rounds[0].get("gating_open_before"), 0)
         return (
@@ -719,8 +720,8 @@ def _advisory_reason(
         )
     # The backstop counts every dispatch, abandoned ones included: a loop that
     # keeps launching repairs that keep dying is exactly the runaway it guards.
-    if len(_rounds(state)) >= conf.whole("direct", "RUNAWAY_ROUNDS"):
-        return f"the runaway backstop of {conf.whole("direct", "RUNAWAY_ROUNDS")} fix rounds was reached"
+    if len(_rounds(state)) >= settings_read.whole("RUNAWAY_ROUNDS"):
+        return f"the runaway backstop of {settings_read.whole("RUNAWAY_ROUNDS")} fix rounds was reached"
     return ""
 
 
@@ -838,7 +839,7 @@ def _verdict(args: argparse.Namespace) -> None:
     print(f"{finding_id} {_string(entry.get('state'))}")
 
 
-def _gate_payload(state: dict[str, object], session_dir: Path) -> dict[str, object]:
+def _gate_payload(state: dict[str, object], session_dir: Path, settings_read: conf.ConfigRead) -> dict[str, object]:
     gating = _gating_severities(state)
     batch = _open_entries(state, gating)
     counts = _open_counts(state)
@@ -850,7 +851,7 @@ def _gate_payload(state: dict[str, object], session_dir: Path) -> dict[str, obje
         "round": len(_rounds(state)) + 1,
         "repair_round": repair_round,
         "astra_review_due": [_string(entry.get("id")) for entry in batch
-                             if _astra_due(entry, repair_round)],
+                             if _astra_due(entry, repair_round, settings_read)],
         "gating_severities": list(gating),
         "open_counts": counts,
         "batch": [_summarize(entry) for entry in batch],
@@ -858,7 +859,7 @@ def _gate_payload(state: dict[str, object], session_dir: Path) -> dict[str, obje
             _summarize(entry)
             for entry in _open_entries(state, tuple(s for s in SEVERITIES if s not in gating))
         ],
-        "repair_budget": _repair_budget(state),
+        "repair_budget": _repair_budget(state, settings_read),
         "passes_run": len(passes),
         "consecutive_same_kind": {"kind": kind, "count": run} if run else None,
         "review_cancellations": _review_cancellations(passes),
@@ -871,11 +872,12 @@ def _gate_payload(state: dict[str, object], session_dir: Path) -> dict[str, obje
     # one finding still gets its fifth; the difference is that the gate says so
     # out loud instead of refusing.
     payload["verdict"] = "dispatch"
-    payload["advisory"] = _advisory_reason(state, gating_open, passes) or None
+    payload["advisory"] = _advisory_reason(state, gating_open, passes, settings_read) or None
     return payload
 
 
 def _gate(args: argparse.Namespace) -> None:
+    settings_read = _command_settings(args)
     session_dir = _session_dir(args)
     now = _now_epoch()
     state = _read_state(session_dir, now, _arg_string(args, "phase"))
@@ -894,7 +896,7 @@ def _gate(args: argparse.Namespace) -> None:
             + ", ".join(pending)
             + " before gating the next round"
         )
-    payload = _gate_payload(state, session_dir)
+    payload = _gate_payload(state, session_dir, settings_read)
     _write_state(session_dir, state)
     _append_event(
         session_dir,
@@ -911,7 +913,7 @@ def _gate(args: argparse.Namespace) -> None:
             "open_counts": payload.get("open_counts"),
         },
     )
-    if _integer(payload.get("repair_round")) >= conf.whole("direct", "ROUTING_FROM_ROUND") and any(
+    if _integer(payload.get("repair_round")) >= settings_read.whole("ROUTING_FROM_ROUND") and any(
         _integer(entry.get("fix_attempts")) >= 1
         for entry in _open_entries(state, _gating_severities(state))
     ):
@@ -944,6 +946,7 @@ def _required_text(args: argparse.Namespace, name: str) -> str:
 
 
 def _route(args: argparse.Namespace) -> None:
+    settings_read = _command_settings(args)
     session_dir = _session_dir(args)
     now = _now_epoch()
     state = _read_state(session_dir, now, _arg_string(args, "phase"))
@@ -952,7 +955,7 @@ def _route(args: argparse.Namespace) -> None:
     if _string(entry.get("state")) != STATE_OPEN:
         raise SystemExit(f"{finding_id} is {entry.get('state')}; only open findings can be routed")
     repair_round = _repair_round(state, session_dir)
-    if _string(entry.get("severity")) in _gating_severities(state) and _astra_due(entry, repair_round):
+    if _string(entry.get("severity")) in _gating_severities(state) and _astra_due(entry, repair_round, settings_read):
         raise SystemExit(f"Astra review due for {finding_id}; record it with findings.py astra before routing")
     records = _object_list(entry.get("astra_reviews"))
     route: dict[str, object] = {
@@ -1028,10 +1031,11 @@ def _close_route(args: argparse.Namespace) -> None:
 
 
 def _dispatch(args: argparse.Namespace) -> None:
+    settings_read = _command_settings(args)
     session_dir = _session_dir(args)
     now = _now_epoch()
     state = _read_state(session_dir, now, _arg_string(args, "phase"))
-    payload = _gate_payload(state, session_dir)
+    payload = _gate_payload(state, session_dir, settings_read)
     verdict = _string(payload.get("verdict"))
     if verdict != "dispatch":
         raise SystemExit(f"gate says {verdict}; there is nothing to dispatch")
@@ -1060,11 +1064,11 @@ def _dispatch(args: argparse.Namespace) -> None:
         raise SystemExit('--accepted-checks "none:" requires a reason')
     repair_round = _integer(payload.get("repair_round"))
     due = sorted(finding_id for finding_id in covered & expected
-                 if _astra_due(_finding(state, finding_id), repair_round))
+                 if _astra_due(_finding(state, finding_id), repair_round, settings_read))
     if due:
         raise SystemExit("Astra review due for " + ", ".join(due) + "; record it with findings.py astra")
     kept = _kept_evidence(args, covered)
-    if repair_round >= conf.whole("direct", "ROUTING_FROM_ROUND"):
+    if repair_round >= settings_read.whole("ROUTING_FROM_ROUND"):
         missing_kept = sorted(covered - set(kept))
         if missing_kept:
             raise SystemExit(
@@ -1435,16 +1439,24 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def require_configuration() -> None:
+def _command_settings(args: argparse.Namespace) -> conf.ConfigRead:
+    """Use the file read that main made for this command."""
+    value = cast(object, getattr(args, "config_read"))
+    if not isinstance(value, conf.ConfigRead):
+        raise TypeError("command configuration must be a ConfigRead")
+    return value
+
+
+def require_configuration(settings_read: conf.ConfigRead) -> None:
     problems: list[str] = []
     for key in ("MAX_FIX_ATTEMPTS", "MAX_REOPENS", "STALLED_ROUNDS", "RUNAWAY_ROUNDS",
                 "ROUTING_FROM_ROUND", "ASTRA_AFTER_FAILED_FIXES", "MIN_REPAIR_BUDGET",
                 "MAX_CONSECUTIVE_SAME_KIND_PASSES", "MAX_REVIEW_CANCELLATIONS", "REPAIR_ROUNDS_PER_FINDING"):
         try:
             if key == "REPAIR_ROUNDS_PER_FINDING":
-                _ = conf.number("direct", key)
+                _ = settings_read.number(key)
             else:
-                _ = conf.whole("direct", key)
+                _ = settings_read.whole(key)
         except conf.Unusable as error:
             message = str(error)
             if "key is missing" in message:
@@ -1461,7 +1473,9 @@ def require_configuration() -> None:
 
 def main() -> None:
     args = _build_parser().parse_args()
-    require_configuration()
+    settings_read = conf.read("direct")
+    require_configuration(settings_read)
+    args.config_read = settings_read
     handler_value: object = getattr(args, "handler")  # pyright: ignore[reportAny]
     if not callable(handler_value):
         raise SystemExit("No command handler selected")

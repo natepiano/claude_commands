@@ -484,16 +484,17 @@ def config_path(target: str = "") -> Path:
 
 def read_config(target: str = "") -> MacTestConfig:
     settings = config_path(target)
-    values = conf.values(settings)
+    config = conf.read(settings)
+    values = config.values()
     if "ci_repo" not in values:
-        ci_repo = conf.text(settings, "ci_repo")
+        ci_repo = config.text("ci_repo")
     else:
         ci_repo = values["ci_repo"]
     if target:
         configured = offload.configured_ssh_target(target)
         if configured.platform == "linux" and ci_repo:
             raise StateReadError(f"{settings}: ci_repo must be empty for a Linux target")
-    ci_fields = {key: conf.text(settings, key) if ci_repo else values.get(key, "")
+    ci_fields = {key: config.text(key) if ci_repo else values.get(key, "")
                  for key in ("ci_variable", "ci_workflow", "ci_job")}
 
     return MacTestConfig(
@@ -501,14 +502,14 @@ def read_config(target: str = "") -> MacTestConfig:
         ci_variable=ci_fields["ci_variable"],
         ci_workflow=ci_fields["ci_workflow"],
         ci_job=ci_fields["ci_job"],
-        gh_timeout_s=conf.number(settings, "gh_timeout_s"),
-        block_hours=conf.number(settings, "block_hours"),
-        block_max_hours=conf.number(settings, "block_max_hours"),
-        block_warn_minutes=conf.number(settings, "block_warn_minutes"),
-        host=conf.text(settings, "host"),
-        connect_timeout_s=conf.number(settings, "connect_timeout_s"),
-        claim_idle_minutes=conf.number(settings, "claim_idle_minutes"),
-        claim_poll_seconds=conf.number(settings, "claim_poll_seconds"),
+        gh_timeout_s=config.number("gh_timeout_s"),
+        block_hours=config.number("block_hours"),
+        block_max_hours=config.number("block_max_hours"),
+        block_warn_minutes=config.number("block_warn_minutes"),
+        host=config.text("host"),
+        connect_timeout_s=config.number("connect_timeout_s"),
+        claim_idle_minutes=config.number("claim_idle_minutes"),
+        claim_poll_seconds=config.number("claim_poll_seconds"),
     )
 
 
@@ -942,7 +943,7 @@ def scopes_overlap(first: ClaimScope, second: ClaimScope) -> bool:
 def slot_capacity(paths: StatePaths, scope: ClaimScope) -> int:
     if target_config.uses_legacy_mac_layout(paths.platform) or isinstance(scope, WholeMacScope):
         return 1
-    values = conf.values(config_path(paths.target))
+    values = conf.read(config_path(paths.target)).values()
     value = values.get(f"slots.{scope.name}", values.get("slots", ""))
     if not value and not scope.key:
         return 1  # Preserve the legacy claim protocol for records without an origin.

@@ -29,6 +29,7 @@ import remote
 from remote import other_machine, run_remote
 from scripts.production import staff_sources
 from scripts.production import showrunners
+from scripts.message import send_result
 import sessions
 import inventory as stop_work
 from user_zone import user_zone
@@ -200,26 +201,27 @@ def _deliver_message(
         )
     except subprocess.TimeoutExpired as error:
         raise RuntimeError(f"send to {recipient} timed out after {timeout:g} seconds") from error
-    parsed = message_send.parse_outcome(result.stdout)
-    if isinstance(parsed, message_send.OutcomeHeader):
+    outcome = send_result.send_outcome(result.returncode, result.stdout)
+    if isinstance(outcome, send_result.ConfirmedSendOutcome):
+        parsed = outcome.header
         detail = parsed.detail
-        if result.returncode == 0:
-            if parsed.outcome == "sent":
+        match parsed.outcome:
+            case "sent":
                 return MessageSent(kind="sent")
-            if parsed.outcome == "skipped":
+            case "skipped":
                 if message_send.is_acknowledged_skip(detail):
                     return MessageAcknowledged(kind="acknowledged", reason=detail)
                 return MessageWindowSkipped(kind="window skipped", reason=detail)
-            if parsed.outcome == "kept":
+            case "kept":
                 return MessageKept(kind="kept", reason=detail)
-            if parsed.outcome == "replaced":
+            case "replaced":
                 return MessageReplaced(kind="replaced", reason=detail)
-        elif result.returncode == 1 and parsed.outcome == "queued":
-            return MessageQueued(kind="queued", reason=detail)
-    if result.returncode == 0:
-        return MessageUnconfirmed(kind="unconfirmed", reason="send returned no outcome header")
-    if result.returncode == 1:
-        return MessageQueued(kind="queued", reason="exit 1")
+            case "queued":
+                return MessageQueued(kind="queued", reason=detail)
+            case "failed" | "refused" | "held" | "pending":
+                pass
+    if isinstance(outcome, send_result.UnconfirmedSendOutcome):
+        return MessageUnconfirmed(kind="unconfirmed", reason="send returned no confirmed outcome")
     reason = (result.stderr or result.stdout).splitlines()
     raise RuntimeError(
         reason[0] if reason else f"send to {recipient} exited {result.returncode}"

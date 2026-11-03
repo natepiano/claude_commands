@@ -25,12 +25,12 @@ class NotesConfigurationTests(unittest.TestCase):
             _ = (notes / "claude1.md").write_text("---\nlogin: fixture\n---\n")
             _ = (config / "accounts.conf").write_text(f"notes_directory={notes}\n")
             with (patch.dict(os.environ, {"HOME": str(config)}),
-                  patch.object(conf, "text", wraps=conf.text) as read):
+                  patch.object(conf, "read", wraps=conf.read) as read):
                 _ = os.environ.pop("AGENT_NOTES_DIR", None)
                 for _ in range(20):
                     self.assertEqual(note_file.note_path("claude1"), notes / "claude1.md")
                     self.assertEqual([note.label for note in note_file.read_notes()], ["claude1"])
-                read.assert_called_once_with("accounts", "notes_directory")
+                read.assert_called_once_with("accounts")
 
 
 @final

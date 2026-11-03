@@ -149,7 +149,7 @@ class StyleSyncTests(unittest.TestCase):
         _ = sender.write_text(
             "import json,sys\nfrom pathlib import Path\n"
             + f"Path({str(self.root / 'sent.json')!r}).write_text(json.dumps({{'arguments':sys.argv[1:]}}))\n"
-            + "raise SystemExit(0)\n",
+            + "print('SENT: fixture')\nraise SystemExit(0)\n",
         )
         address = self.root / "address.py"
         _ = address.write_text("print('session:fake-style')\n")
@@ -458,6 +458,24 @@ class StyleSyncTests(unittest.TestCase):
         code, output = self.notice()
         self.assertEqual(code, 0)
         self.assertEqual(output, "style_sync: notify: send.py: stdout: FAILED: unavailable\n")
+
+    def test_notify_requires_a_confirmed_success_outcome(self) -> None:
+        self.production()
+        cases = ((0, "SENT: fixture", True), (0, "SKIPPED: repeated", True),
+                 (0, "KEPT: silence", True), (0, "REPLACED: revision", True),
+                 (1, "QUEUED: offline", False), (3, "FAILED: unavailable", False),
+                 (2, "REFUSED: invalid", False), (4, "HELD: decision", False), (5, "PENDING: active", False),
+                 (0, "", False), (0, "QUEUED: inconsistent", False),
+                 (1, "SENT: inconsistent", False), (0, "FAILED: inconsistent", False))
+        for code, text, accepted in cases:
+            with self.subTest(code=code, text=text):
+                _ = (self.root / "send.py").write_text(f"print({text!r})\nraise SystemExit({code})\n")
+                result, output = self.notice()
+                self.assertEqual(result, 0)
+                if accepted:
+                    self.assertEqual(output, "")
+                else:
+                    self.assertIn("style_sync: notify: send.py:", output)
 
     def test_notify_lookup_refusal_prints_one_prefix_and_keeps_the_merge_successful(self) -> None:
         with mock.patch.object(style_sync, "standing_style_production",
@@ -1003,7 +1021,8 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         _ = (self.root / "send.py").write_text(
             "import json,sys\nfrom pathlib import Path\n"
             + f"with Path({str(self.root / 'notices.jsonl')!r}).open('a') as out:\n"
-            + " out.write(json.dumps(sys.argv[1:]) + '\\n')\n",
+            + " out.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            + "print('SENT: fixture')\n",
         )
         return checkpoint
 
@@ -1167,10 +1186,37 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
     def test_queued_send_handoff_is_sent_to_the_parent(self) -> None:
         """send.py queued a hand-off and the row stayed pending, so its merge was refused (cargo-liner, 2026-10-27)."""
         checkpoint = self.handoff_checkpoint()
-        self.handoff_sender("QUEUED: relay timed out", 1)
+        self.handoff_sender("checking recipient\nQUEUED: relay timed out", 1)
         self.assertEqual(self.send_handoff(checkpoint), (0, f"hand-off {checkpoint[:7]}: queued for parent\n"))
         self.assertEqual(self.handoff_rows()[0][:3], (checkpoint, "sent", "parent"))
         self.assertEqual(len(self.handoff_notices()), 1)
+
+    def test_kept_handoff_notice_records_acceptance_and_reports_queued(self) -> None:
+        checkpoint = self.handoff_checkpoint()
+        self.handoff_sender("KEPT: until silence ends", 0)
+        self.assertEqual(self.send_handoff(checkpoint), (0, f"hand-off {checkpoint[:7]}: queued for parent\n"))
+        self.assertEqual(self.handoff_rows()[0][:3], (checkpoint, "sent", "parent"))
+        self.assertEqual(len(self.handoff_notices()), 1)
+
+    def test_handoff_without_a_confirmed_send_result_stays_pending(self) -> None:
+        checkpoint = self.handoff_checkpoint()
+        for output, code in (("", 0), ("unrelated output", 0), ("QUEUED: offline", 0),
+                             ("SENT: apparent delivery", 1), ("FAILED: unavailable\nQUEUED: quoted result", 1),
+                             ("REFUSED: action required", 2), ("HELD: review", 4), ("PENDING: active", 5)):
+            with self.subTest(output=output, code=code):
+                self.handoff_sender(output, code)
+                result, diagnostic = self.send_handoff(checkpoint)
+                self.assertEqual(result, 1)
+                self.assertIn("style_sync: hand-off: send.py:", diagnostic)
+                self.assertEqual(self.handoff_rows()[0][:3], (checkpoint, "pending", ""))
+
+    def test_skipped_and_replaced_handoff_notices_record_parent_acceptance(self) -> None:
+        checkpoint = self.handoff_checkpoint()
+        for output in ("SKIPPED: acknowledged", "REPLACED: newer notice"):
+            with self.subTest(output=output):
+                self.handoff_sender(output, 0)
+                self.assertEqual(self.send_handoff(checkpoint), (0, ""))
+                self.assertEqual(self.handoff_rows()[0][:3], (checkpoint, "sent", "parent"))
 
     def test_undelivered_send_handoff_stays_pending(self) -> None:
         checkpoint = self.handoff_checkpoint()

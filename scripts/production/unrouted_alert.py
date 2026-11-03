@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import cast
 
 from scripts.lib import atomic_file, conf, file_lock
+from scripts.message import send_result
 
 
 def send_message(recipient: str, sender: str, message: str) -> None:
@@ -17,8 +18,14 @@ def send_message(recipient: str, sender: str, message: str) -> None:
     result = subprocess.run([sys.executable, str(Path(__file__).resolve().parents[1] / "message/send.py"),
                              "--to", recipient, "--from", sender, "--text", message],
                             capture_output=True, text=True, check=False)
-    if result.returncode and not (result.returncode == 1 and result.stdout.startswith("QUEUED:")):
-        raise RuntimeError((result.stderr or result.stdout).strip() or "message delivery failed")
+    outcome = send_result.send_outcome(result.returncode, result.stdout)
+    if isinstance(outcome, send_result.ConfirmedSendOutcome):
+        match outcome.header.outcome:
+            case "sent" | "queued" | "kept":
+                return
+            case "skipped" | "replaced" | "failed" | "refused" | "held" | "pending":
+                pass
+    raise RuntimeError((result.stderr or result.stdout).strip() or "message delivery failed")
 
 
 def notify(root: Path, listing: str, row: dict[str, str], reason: str, candidates: tuple[str, ...]) -> None:
@@ -45,7 +52,8 @@ def _notify(root: Path, listing: str, row: dict[str, str], reason: str, candidat
             saved = {}
         if saved.get("sent") is True:
             return
-        pause = conf.value_origin("review_links", "unrouted_alert_retry_seconds", float)
+        settings = conf.read("review_links")
+        pause = settings.origin("unrouted_alert_retry_seconds", float)
         if isinstance(pause, conf.UnavailableValue):
             raise conf.Unusable(pause.reason)
         now = time.time()
@@ -56,7 +64,7 @@ def _notify(root: Path, listing: str, row: dict[str, str], reason: str, candidat
         message = "\n".join(("Change review routing needs attention", f"List: {listing}", f"Row: {row['#']}",
                               f"Change: {row.get('Change', '')}", f"Reason: {reason}",
                               "Candidates: " + ", ".join(candidates)))
-        recipient = conf.value_origin("review_links", "unrouted_alert_recipient", str)
+        recipient = settings.origin("unrouted_alert_recipient", str)
         if isinstance(recipient, conf.UnavailableValue):
             raise conf.Unusable(recipient.reason)
         send_message(recipient.value, Path(__file__).stem, message)

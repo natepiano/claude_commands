@@ -424,7 +424,7 @@ def answer_status(verdict: str, slots: DeliverySlots) -> str:
 def list_routing(snapshots: dict[Path, change_review.ReviewListSnapshot]) -> change_routing.StaffRouting:
     documents = change_routing.production_documents(dict(showrunners.timer_docs()),
         ((listing.stem.removeprefix(change_review.PREFIX), snapshot.text) for listing, snapshot in snapshots.items()))
-    return change_routing.StaffRouting(staff.snapshot(), documents, change_review)
+    return change_routing.StaffRouting(staff.snapshot(), documents)
 
 
 def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO_ANSWER_NOTICE) -> bytes:
@@ -698,8 +698,9 @@ def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatu
     """Deliver each saved message and report exhausted attempts to its showrunner."""
     if isinstance(delivery, NoMessageDelivery):
         return
-    tries = conf.whole("review_links", "delivery_tries")
-    pause = conf.number("review_links", "delivery_pause_seconds")
+    settings = conf.read("review_links")
+    tries = settings.whole("delivery_tries")
+    pause = settings.number("delivery_pause_seconds")
     with status.locked():
         slots = status.slots(delivery.page, delivery.row)
         ownership = status.request_attempts.get(delivery.attempt)

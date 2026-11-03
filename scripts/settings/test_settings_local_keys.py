@@ -96,11 +96,12 @@ class SettingsFilterTests(unittest.TestCase):
             _ = shutil.copy2(KEYS.parents[1] / "lib" / name, self.root / "scripts/lib" / name)
         _ = shutil.copy2(KEYS.parents[2] / "config/settings.conf", self.root / "config/settings.conf")
         _ = shutil.copy2(KEYS.with_name("local_key_notices.py"), self.root / "scripts/settings/local_key_notices.py")
+        _ = shutil.copy2(KEYS.parents[1] / "message/send_result.py", self.root / "scripts/message/send_result.py")
         _ = (self.root / "scripts/message/send.py").write_text('''import json, sys, runpy
 from pathlib import Path
 if __name__ != "__main__":
     protocol = runpy.run_path(REAL_SENDER)
-    TIMEOUT, OutcomeHeader, parse_outcome = (protocol[name] for name in ("TIMEOUT", "OutcomeHeader", "parse_outcome"))
+    TIMEOUT = protocol["TIMEOUT"]
 else:
     root = Path(__file__).resolve().parents[2]
     with (root / "sent.jsonl").open("a") as output:
