@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import sys
+import io
+from contextlib import redirect_stdout
 import tempfile
 import subprocess
 import os
@@ -292,9 +294,11 @@ class WatchTests(unittest.TestCase):
             concurrent.append(self.watch([report("Claude", 90)]))
 
         with (patch.object(five_hour, "recipients", return_value=["natedev"]),
-              patch.object(five_hour, "relay", side_effect=relay)):
+              patch.object(five_hour, "relay", side_effect=relay),
+              redirect_stdout(io.StringIO()) as output):
             self.assertEqual(self.watch([report("Claude", 90)]),
                              ["5-hour limit: Claude 10% left -> natedev"])
+        self.assertEqual(output.getvalue(), f"already claimed by {os.getpid()}\n")
         self.assertEqual(concurrent, [[]])
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(five_hour.notice_path(claude_notice_key()).read_text(), "Claude")
