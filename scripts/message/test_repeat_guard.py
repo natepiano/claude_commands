@@ -37,6 +37,8 @@ NOTICE_FIXTURE = r'''import sys,os,json,signal,io
 from pathlib import Path
 from unittest.mock import patch
 import send,repeat_guard as g,roster
+from scripts.production import staff
+staff.snapshot=lambda: staff.StaffSnapshot(())
 role,mode,root,sink=sys.argv[1:]
 if role=='supervise':
     limits=g.configuration()

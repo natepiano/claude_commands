@@ -16,6 +16,60 @@ from scripts.production.update_registration_test_support import setUpModule as s
 
 
 class RegistrationTests(RegistrationFixture):
+    def test_question_without_a_proposals_line_can_be_filed_listed_and_answered(self) -> None:
+        _ = self.doc.write_text("\n".join(line for line in self.doc.read_text().splitlines()
+                                         if not line.startswith("- **Proposals:**")) + "\n")
+        owner = self.fixture_staff_id()
+        folder = self.state / "showrunner" / owner / "questions"
+        state = self.question_state([{"text": "Choose the layout", "question": "Keep this layout?"}])
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?")):
+            filed = self.run_command("questions", "--state", str(state))
+        self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
+        records = list(folder.glob("question-*.md"))
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertIn(f"asked_by: {owner}", record.read_text().splitlines())
+        self.assertEqual(self.open_rows()[0]["asked_by"], owner)
+        self.assertFalse(self.outstanding().exists())
+        self.assertEqual(list((self.root / "issues").iterdir()), [])
+
+        listed = self.run_command("questions-table")
+        self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
+        self.assertIn("Choose the layout", listed.stdout)
+        self.assertIn("waiting for your answer", listed.stdout)
+        answered = self.run_command("answer", "--item", "Choose the layout")
+        self.assertEqual(answered.returncode, 0, answered.stdout + answered.stderr)
+        self.assertIn("answer: ok", answered.stdout)
+        self.assertIn("status: closed", record.read_text().splitlines())
+        self.assertEqual(self.open_rows(), [])
+        listed_after_answer = self.run_command("questions-table")
+        self.assertEqual(listed_after_answer.returncode, 0, listed_after_answer.stdout + listed_after_answer.stderr)
+        self.assertEqual(listed_after_answer.stdout.strip(), "no open questions")
+
+    def test_question_migration_without_a_proposals_line_preserves_records_on_a_rerun(self) -> None:
+        _ = self.doc.write_text("\n".join(line for line in self.doc.read_text().splitlines()
+                                         if not line.startswith("- **Proposals:**")) + "\n")
+        owner = self.fixture_staff_id()
+        folder = self.state / "showrunner" / owner / "questions"
+        question = {"since": "2026-10-06T08:00", "text": "Choose the layout",
+                    "question": "Keep this layout?", "asked_by": str(owner)}
+        reminder = {"since": "2026-10-06T09:00", "text": "Review the colors"}
+        legacy = self.outstanding()
+        _ = legacy.write_text(json.dumps([question, reminder]) + "\n")
+        migrated = self.run_command("migrate-questions")
+        self.assertEqual(migrated.returncode, 0, migrated.stdout + migrated.stderr)
+        records = list(folder.glob("question-*.md"))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(json.loads(legacy.read_text()), [reminder])
+        self.assertEqual(next(row for row in self.open_rows() if "question" in row), question)
+        self.assertEqual(list((self.root / "issues").iterdir()), [])
+        paths = [legacy, *records]
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+        repeated = self.run_command("migrate-questions")
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertEqual(list(folder.glob("question-*.md")), records)
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
+
     def test_stopped_list_rewrites_keep_prior_questions_and_ask_retry_registers_once(self) -> None:
         for action in ("ask", "mark-important", "questions"):
             with self.subTest(action=action):
