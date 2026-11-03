@@ -39,10 +39,12 @@ There is no separate charge timer.
 5. Read current Spot, EBS, gp3 performance, root storage, and public IPv4 prices.
 6. Select one available zone in `us-east-2` from those reads.
 
-The account (created 2026-11-03) is a "new experience" project account. Its AWS-managed service control policies set these limits:
+The account (created 2026-11-03) is a project account. The user activated advanced features on 2026-11-03. Its service control policies now set these limits:
 
-- The project Region is `us-east-2`. The policy denies most actions in `us-east-1`, the Pricing API included. Read prices from the public AWS price pages.
-- The Paid Plan policy denies Spot launches (`DenyRequestSpotInstances`, `DenySpotMarketType`). The stack cannot launch until the user removes those statements after activating advanced features, or the design moves to On-Demand. The user makes that choice.
+- `RegionFloor` allows only `us-east-1`, `us-east-2` and `us-west-2`. The policy denies most actions in `us-east-1`, the Pricing API included. Use `us-east-2`, and read prices from the public AWS price pages.
+- No policy denies Spot. Activation removed the Paid Plan policy. A `run-instances --dry-run` with `MarketType=spot` in `us-east-2` succeeded on 2026-11-03.
+- The AWS spend limit is gone. The stack's $400 Budget with its stop action is the AWS-side backstop.
+- The four `BudgetsSpendLimit*` policies must have no target. In the Organizations console, open each policy's Targets tab, and detach the project account if it is listed.
 7. Record the public prices and their read time in configuration.
 8. Confirm that the fixed components sum to `fixed_usd_per_month`.
 9. Confirm that `limit_reserve_usd` covers the configured drain and idle intervals.
