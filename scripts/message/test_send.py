@@ -45,6 +45,7 @@ import rca
 
 import review
 import push_texts
+import push_reference
 import postmaster
 import silence
 from test_postmaster import FakeClock
@@ -368,6 +369,107 @@ class RecipientStaffFixture:
 
 
 class SendTests(RecipientStaffFixture, ShutdownTestCase):
+    def decision_arguments(self, *extra: str) -> list[str]:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
+        return ["--to", "user", "--text-id", entry.id,
+                *(item for key, value in entry.examples[0].values.items() for item in ("--value", f"{key}={value}")), *extra]
+
+    def question_file(self, status: str = "open", since: str = "2026-11-03T12:00") -> Path:
+        path = self.root / "question-layout.md"
+        _ = path.write_text("---\nrecord_type: question\nstatus: " + status
+                            + '\nregistration: ' + json.dumps({"since": since}) + '\n---\n')
+        return path
+
+    def test_decision_refuses_missing_invalid_and_closed_questions_before_delivery(self) -> None:
+        invalid = self.root / "ordinary.md"
+        _ = invalid.write_text("Not a question.")
+        closed = self.question_file("closed")
+        for extra in ([], ["--question", str(self.root / "missing.md")],
+                      ["--question", str(invalid)], ["--question", str(closed)]):
+            with (self.subTest(extra=extra), mock.patch.object(review, "review") as read,
+                  mock.patch.object(send, "claim") as claim, mock.patch.object(send, "run") as run,
+                  redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit) as caught):
+                _ = send.parse(self.decision_arguments(*extra))
+            self.assertEqual(caught.exception.code, 2)
+            self.assertIn("question", errors.getvalue())
+            read.assert_not_called()
+            claim.assert_not_called()
+            run.assert_not_called()
+
+    def test_question_reference_and_default_key_survive_local_and_remote_delivery(self) -> None:
+        path = self.question_file()
+        options = send.parse(self.decision_arguments("--question", str(path)))
+        expected = push_reference.QuestionReference(kind="question", path=str(path.resolve()), since="2026-11-03T12:00")
+        self.assertEqual(options.reference, expected)
+        self.assertEqual(options.key, "question:" + str(path.resolve()))
+        message = send.Message("user", "hana", "Choose the layout", "Details", options.key)
+        assert isinstance(options.action, (ActionRequired, NoActionRequired))
+        with mock.patch.object(send, "run", return_value=(0, "SENT: to the user\n", "")) as run:
+            self.assertEqual(send.user(message, options.need, options.action, options.timeout,
+                                      text_id=options.text_id, values=options.values, reference=options.reference).outcome, "sent")
+            argv = cast(list[str], run.call_args.args[0])
+            self.assertEqual(cast(object, json.loads(argv[argv.index("--push-reference") + 1])), expected)
+            self.assertEqual(send.remote(message, "natedev", options).outcome, "sent")
+            remote = shlex.split(cast(list[str], run.call_args.args[0])[-1])
+            encoded = remote[remote.index("--push-reference") + 1]
+            self.assertEqual(cast(object, json.loads(encoded)), expected)
+            path.unlink()
+            with mock.patch.dict(os.environ, {"SSH_CONNECTION": "origin 1 receiver 2"}):
+                received = send.parse(self.decision_arguments("--push-reference", encoded,
+                    "--here", "--forwarded-sender-stamp", "session:origin"))
+                self.assertEqual(received.reference, expected)
+                self.assertEqual(send.user(message, received.need, options.action, received.timeout,
+                    text_id=received.text_id, values=received.values, reference=received.reference,
+                    remote_forward=True).outcome, "sent")
+                self.assertIn("--ssh-forwarded-reference", cast(list[str], run.call_args.args[0]))
+        _ = self.question_file()
+        explicit = send.parse(self.decision_arguments("--push-reference", json.dumps(expected), "--key", "chosen"))
+        self.assertEqual(explicit.key, "chosen")
+
+    def test_local_forwarded_reference_cannot_bypass_question_admission(self) -> None:
+        for status in ("closed", "absent"):
+            with self.subTest(status=status):
+                path = self.question_file(status="closed")
+                if status == "absent":
+                    path.unlink()
+                reference = {"kind": "question", "path": str(path), "since": "forged"}
+                with (mock.patch.object(review, "review") as read,
+                      mock.patch.object(send, "claim") as claim, mock.patch.object(send, "run") as run,
+                      redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught):
+                    _ = send.parse(self.decision_arguments("--push-reference", json.dumps(reference)))
+                self.assertEqual(caught.exception.code, 2)
+                read.assert_not_called()
+                claim.assert_not_called()
+                run.assert_not_called()
+
+    def test_forwarded_reference_reads_a_local_question_even_on_an_ssh_receive(self) -> None:
+        path = self.question_file()
+        reference = {"kind": "question", "path": str(path), "since": "2026-11-03T12:00"}
+        argv = self.decision_arguments("--push-reference", json.dumps(reference),
+                                       "--here", "--forwarded-sender-stamp", "session:origin")
+        with mock.patch.dict(os.environ, {"SSH_CONNECTION": "origin 1 receiver 2"}):
+            self.assertEqual(send.parse(argv).reference, reference)
+            for status, since, reason in (
+                ("closed", "2026-11-03T12:00", "question closed"),
+                ("open", "2026-11-03T12:01", "question reopened since the push was made"),
+            ):
+                with self.subTest(status=status, since=since):
+                    _ = self.question_file(status=status, since=since)
+                    error = io.StringIO()
+                    with (mock.patch.object(review, "review") as read,
+                          redirect_stderr(error), self.assertRaises(SystemExit) as caught):
+                        _ = send.parse(argv)
+                    self.assertEqual(caught.exception.code, 2)
+                    self.assertIn(reason, error.getvalue())
+                    self.assertEqual(len(error.getvalue().splitlines()), 1)
+                    read.assert_not_called()
+
+    def test_review_watch_gets_a_reference_without_a_new_caller_argument(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "review_watch.acknowledge")
+        options = send.parse(["--to", "user", "--text-id", entry.id,
+                              *(item for key, value in entry.examples[0].values.items() for item in ("--value", f"{key}={value}"))])
+        self.assertEqual(options.reference, {"kind": "review_watch"})
+
     def test_outcome_parser_preserves_first_header_payload_and_acknowledgement(self) -> None:
         acknowledged = send.acknowledged_skip_reason("shutdown-fixture", "2026-10-30T12:00:00+00:00")
         self.assertEqual(acknowledged, "key 'shutdown-fixture' acknowledged at 2026-10-30T12:00:00+00:00; `send.py reopen` to resume")

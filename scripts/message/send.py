@@ -154,6 +154,7 @@ if TYPE_CHECKING:
     from ..accounts import accounts
     from ..whoami.account import named_account_environment
 import push_texts  # noqa: E402
+import push_reference
 import rca  # noqa: E402
 import repeat_guard  # noqa: E402
 import review  # noqa: E402
@@ -711,6 +712,7 @@ class Options(NamedTuple):
     report_recipient: bool = False
     sender_origin: RuntimeSender | ForwardedSender = RuntimeSender()
     due: str = ""
+    reference: push_reference.PushReference = push_reference.NO_REFERENCE
 
     @property
     def to(self) -> str:
@@ -2056,7 +2058,7 @@ def reviewed_failure(stdout: str, original: FailedPush, *,
     return original
 
 
-def user(message: Message, need: Need, action: UserAction, timeout: float, *, answerable: bool = False, text_id: str = "", values: tuple[str, ...] = (), due: str = "") -> Result:
+def user(message: Message, need: Need, action: UserAction, timeout: float, *, answerable: bool = False, text_id: str = "", values: tuple[str, ...] = (), due: str = "", reference: push_reference.PushReference = push_reference.NO_REFERENCE, remote_forward: bool = False) -> Result:
     """Reach the user. The channel is this function's business alone."""
     key = ["--key", message.key] if message.key else []
     selected_priority = decision_priority.priority(need, due)
@@ -2069,6 +2071,10 @@ def user(message: Message, need: Need, action: UserAction, timeout: float, *, an
             command.extend(["--value", value])
     if due:
         command[2:2] = ["--due", due]
+    if reference["kind"] != "none":
+        command[2:2] = ["--push-reference", json.dumps(reference)]
+    if remote_forward:
+        command[2:2] = ["--ssh-forwarded-reference"]
     code, out, err = run(command, "", timeout)
     if code == 6:
         failed = reviewed_failure(out, FailedPush(message.summary, action, message.text, need=need, held=True, text_id=text_id, sender=message.sender))
@@ -2191,6 +2197,8 @@ def remote(message: Message, host: str, options: Options) -> Result:
         forwarded += ["--key", message.key]
     if message.to == USER:
         forwarded += ["--need", options.need]
+        if options.reference["kind"] != "none":
+            forwarded += ["--push-reference", json.dumps(options.reference)]
         if options.due:
             forwarded += ["--due", options.due]
         if options.need == "blocked":
@@ -2435,6 +2443,8 @@ def parse(argv: list[str]) -> Options:
     _ = parser.add_argument("--priority", choices=("0", "1", "2"), help=argparse.SUPPRESS)
     _ = parser.add_argument("--need", choices=list(CHANNEL_PRIORITY), default="note",
                             help="to `user`: what they must do (default note: nothing)")
+    _ = parser.add_argument("--question", default="", help="the open question record for decision.choices")
+    _ = parser.add_argument("--push-reference", default="", help=argparse.SUPPRESS)
     _ = parser.add_argument("--due", default="", help="decision deadline in ISO 8601 with an explicit offset")
     _ = parser.add_argument("--action", help="to `user`: what the user does")
     _ = parser.add_argument("--no-action", action="store_true", help="to `user`: nothing is needed")
@@ -2457,8 +2467,26 @@ def parse(argv: list[str]) -> Options:
     _ = body.add_argument("--text")
     _ = body.add_argument("--file")
     args = parser.parse_args(argv)
+    forwarded_stamp = optional_str(attr(args, "forwarded_sender_stamp"))
+    origin: RuntimeSender | ForwardedSender = RuntimeSender()
+    if forwarded_stamp is not None:
+        if attr(args, "here") is not True:
+            parser.error("--forwarded-sender-stamp needs --here")
+        if "SSH_CONNECTION" not in os.environ:
+            parser.error("--forwarded-sender-stamp needs an SSH receive environment (SSH_CONNECTION)")
+        try:
+            origin = ForwardedSender(read_sender_stamp(forwarded_stamp))
+        except ValueError as error:
+            parser.error(str(error))
     to = as_str(attr(args, "to"))
     text_id = as_str(attr(args, "text_id"))
+    try:
+        reference = push_reference.admission_reference(text_id, as_str(attr(args, "question")), as_str(attr(args, "push_reference")),
+            remote_forward=isinstance(origin, ForwardedSender))
+    except (OSError, ValueError) as error:
+        usage_error(str(error).replace("\n", " "))
+    if reference["kind"] == "question" and attr(args, "key") is None:
+        args.key = "question:" + reference["path"]
     raw_values = cast(list[str], attr(args, "value"))
     # Only auto_mode.refused repeats a key: one command value for each refused command.
     commands: list[str] = []
@@ -2540,23 +2568,12 @@ def parse(argv: list[str]) -> Options:
     forwarded_sender = optional_str(attr(args, "forwarded_shown_sender"))
     if forwarded_sender is not None and (attr(args, "here") is not True or not forwarded_sender):
         parser.error("--forwarded-shown-sender needs --here and nonempty sending-machine display text")
-    forwarded_stamp = optional_str(attr(args, "forwarded_sender_stamp"))
-    origin: RuntimeSender | ForwardedSender = RuntimeSender()
-    if forwarded_stamp is not None:
-        if attr(args, "here") is not True:
-            parser.error("--forwarded-sender-stamp needs --here")
-        if "SSH_CONNECTION" not in os.environ:
-            parser.error("--forwarded-sender-stamp needs an SSH receive environment (SSH_CONNECTION)")
-        try:
-            origin = ForwardedSender(read_sender_stamp(forwarded_stamp))
-        except ValueError as error:
-            parser.error(str(error))
     scope: RecipientResolutionScope = (
         NamedMachine(host) if host is not None else
         LocalOnly() if attr(args, "here") is True else LocalThenPeer()
     )
     get = {name: attr(args, name) for name in Options._fields
-           if name not in {"action", "selection", "scope", "values", "commands", "shown_sender", "sender_origin"}}
+           if name not in {"action", "selection", "scope", "values", "commands", "shown_sender", "sender_origin", "reference"}}
     options = Options(selection=selection, sender=optional_str(get["sender"]), summary=optional_str(get["summary"]),
                       key=optional_str(get["key"]), repeat_minutes=optional_float(get["repeat_minutes"]),
                       scope=scope, timeout=optional_float(get["timeout"]) or delivery_timeout(),
@@ -2567,7 +2584,7 @@ def parse(argv: list[str]) -> Options:
                       human=get["human"] is True, no_accounting=get["no_accounting"] is True,
                       report_recipient=get["report_recipient"] is True,
                       shown_sender=ShownSender(forwarded_sender) if forwarded_sender is not None else SenderNotResolved(),
-                      sender_origin=origin, due=due)
+                      sender_origin=origin, due=due, reference=reference)
     if options.to == USER and (options.summary is None or isinstance(options.selection, MeshWorker)):
         parser.error("--to user needs --summary, its title, and takes no --codex")
     if options.to != USER and options.need != "note":
@@ -2817,7 +2834,7 @@ def send(options: Options) -> Result:
     elif isinstance(route, UserDelivery):
         if isinstance(options.action, NoUserRecipient):
             raise AssertionError("a user message must state its action")
-        result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values, due=options.due)
+        result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values, due=options.due, reference=options.reference, remote_forward=isinstance(options.sender_origin, ForwardedSender))
         if options.text_id == AUTO_MODE_TEXT and result.outcome in ("sent", "kept"):
             _ = rca.open_case(refusal_report(options), defer_owner=True)
     elif isinstance(route, CodexWorkerRecipient):
