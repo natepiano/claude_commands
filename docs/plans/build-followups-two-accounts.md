@@ -3123,6 +3123,21 @@ natedev 2026-11-02: the hard-coded values proposal, phase 3 (user approved 2026-
 
 **As-built:** `config/accounts.conf` holds one commented key per accounts tunable (timeouts, intervals, ages, counts, the nixos and notes path roots), each with its old value; the code reads each key at use through `scripts/lib/conf.py` with no fallback literal. Owner loops (refusal watch placement and pick) read the usage age once and pass it down. `scripts/whoami/note_file.py` resolves the notes folder as `AGENT_NOTES_DIR`, then the `AGENTS_DIR` override, then `notes_directory`, read once per process (`functools.cache`); `new_account.py` and the missing-note repair steps in `accounts.py` use that one helper. Tests run on a scratch `CONF_DIR` copy (`scratch_accounts_config` in `scripts/accounts/home_test_support.py`); caller test fixtures that clear `CONF_DIR` (herdr sessions, account move, send, codex mesh, profile notes pass) enter it too. `docs/accounts.md` names the file and says a change needs no build, and a new process for a notes-folder change.
 
+### Phase 101z — Accounts config reads work in temp-home tests  · status: done
+**Depends on:** Phase 101w (order only).
+
+natedev 2026-11-02: main red after 101w; 23 modules with temp homes have no accounts.conf. Runs before 101y's checkpoint.
+
+#### Work Order
+**Goal:** every accounts config read works in a test whose temp home has no `~/.claude/config/accounts.conf`, with each value unchanged.
+**Spec:**
+1. Fix at the cause in `scripts/lib/conf.py` for every caller; no literal fallback in accounts code.
+2. Regression test: a temp HOME with no config still reads the committed accounts value.
+3. Run every test module that imports accounts or conf, in the merge-gate form.
+**Files:**
+- `scripts/lib/conf.py`
+- `scripts/lib/test_conf.py`
+
 ### Phase 101y — A new settings key on one machine never blocks promotion  · status: todo
 **Depends on:** Phase 101x (order only; both edit `scripts/settings/settings_local_keys.sh`).
 
