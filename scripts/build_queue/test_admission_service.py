@@ -2266,6 +2266,16 @@ class CutoverServiceTests(unittest.TestCase):
             finally:
                 proc.close()
 
+    def test_serve_without_state_dir_uses_the_buildlog_admission_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            server = mock.MagicMock()
+            with mock.patch.object(gate.store, "root", return_value=root), \
+                 mock.patch.object(service, "AdmissionServer", return_value=server) as made, \
+                 mock.patch.object(sys, "argv", ["admission_service", "serve"]):
+                self.assertEqual(service.main(), 0)
+            self.assertEqual(made.call_args.args[0], root / "admission")
+
     def test_service_drain_other_folder_ignores_verify_process(self) -> None:
         status, output = self.service_drain_with_process("verify.sh", default_folder=False)
         self.assertEqual(status, 0)
