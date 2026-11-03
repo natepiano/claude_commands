@@ -93,10 +93,13 @@ When the user asks to review changes, open the prepared page:
 2. Give the link to the user.
 
 The page contains every waiting change, with staff-based showrunner tabs.
-The router follows unit rename records before it uses the list's showrunner for an unknown producer.
-Known units take priority over unknown aliases.
-Several units under one showrunner belong to that showrunner and send messages only to that showrunner.
-The `unrouted` tab shows conflicts between showrunners or a known unit without a showrunner.
+Each row stores its producer's fixed staff id in the Producer cell.
+The reader follows that id to the unit's current staff showrunner.
+An empty cell belongs to the list's showrunner.
+A showrunner id belongs to that showrunner.
+Names come from the staff record at use.
+Renamed and retired units keep their ids.
+The `unrouted` tab shows an unknown id or a broken staff parent chain.
 Verdicts save without sending a message.
 This tab offers no question control, and the server refuses question submissions without saving.
 Its count covers all page lists, including independent production roots.
@@ -170,10 +173,12 @@ there leaves the row open. Then:
 Pass the ID as `/next` shows it, such as `C434` or `sdlc/C9`.
 It moves the row to `## Reviewed` with the verdict, today's date and its Merged cell, and prints
 `C<n> landed` or `C<n> returns to its unit (merged …)`. Either way it removes
-the row's scratch folders and prints `removed <path>` for each. Send a returning row,
-its change and the user's words to the unit that made it: the merge commit it
-names gives the checkpoint, and so the unit. A change outside a unit goes back
-to the session that added it. The fix comes back as a new row.
+the row's scratch folders and prints `removed <path>` for each.
+The Producer cell stays with the row in Reviewed.
+Send a returning row and the user's words to its Producer staff id.
+Read its current session from the staff record at send time.
+An empty Producer cell belongs to the list's showrunner.
+The fix returns as a new row.
 
 Rerunning the same verdict prints `already has this verdict`, the first run's
 line and the scratch removal lines. A different verdict for a Reviewed row is
@@ -212,3 +217,29 @@ The command refuses an old or unknown ID, a different answer, or a row without a
 A change for the user to check is never put in `open_for_user` and never
 counted among the open questions. It goes on this list, and the user asks for
 "change review" when they want it.
+
+### Producer ids
+
+The merge writer matches each checkpoint branch to a Units row.
+It reads that row's Worktree path and stores the unit's fixed staff id in Producer.
+An unregistered unit leaves the cell empty and prints one named note.
+For `add`, `--repo` selects the directory; the default is `.`.
+A unit worktree stores its id.
+A showrunner directory or an unowned directory leaves the cell empty.
+The page, status line, and `/next` use one staff routing rule.
+The owner's staff showrunner supplies the production document, even when the list's document reference is missing.
+
+1. Run `change_review.py backfill-producer [--list <path>]` to inspect older rows.
+2. Run the command with `--write` to fill mapped Producer cells.
+3. Read each named report for an unmapped row.
+
+The command searches To review and Reviewed.
+It uses the checkpoint's Change-Review text when a merge contains several units.
+If no included checkpoint names the change, the command checks the merge commit's own checkpoint subject.
+It matches old Branch, Plan, and Unit names through retained Worktree paths.
+It copies each changed list to `<name>.backup-<timestamp>` before the locked write.
+An unmapped row stays empty.
+A repeated run changes nothing.
+After the lists are filled, remove `scripts/production/producer_backfill.py`, including its adapter.
+Remove the `backfill-producer` CLI case and argparse choice from `change_review.py`.
+Remove `scripts/production/test_producer_backfill.py`.
