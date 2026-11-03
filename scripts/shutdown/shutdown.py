@@ -760,15 +760,12 @@ def _all_accounts(options: CommandLine) -> int:
 def _dispatch(options: CommandLine) -> int:
     if options.command in {"stop", "resume"}:
         result = (stop_resume.stop(options.session) if options.command == "stop"
-                  else stop_resume.resume(options.session, why=options.why, to=options.resume_to, restore_missing=True, resume_ended=True))
+                  else stop_resume.resume(options.session, why=options.why, to=options.resume_to))
         if isinstance(result, stop_resume.SessionNotFound):
             print(f"{result.name}: no tab on this machine")
             return 1 if options.command == "resume" else 2
         if isinstance(result, (stop_resume.StopFailed, stop_resume.ResumeFailed)):
             print(f"{result.session_id}: {options.command} failed: {next(iter(result.reason.splitlines()), 'unknown error')}")
-            return 1
-        if isinstance(result, stop_resume.RunningOnAnotherAccount):
-            print(f"{result.session_id}: resume failed: {stop_resume.resume_failure_reason(result)}")
             return 1
         if isinstance(result, stop_resume.ClaudeUp):
             print(stop_resume.claude_up_line(result))
