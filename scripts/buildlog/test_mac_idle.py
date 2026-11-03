@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from .mac_idle_test_support import NotificationGuardedTestCase, NotificationTransportBlocked, private_sender_acceptance, write_idle_config
     from ..mac_test import mac_test
     from ..build_queue import admission_protocol as wire
+    from ..build_queue import admission_client
     from ..build_queue.admission_test_support import AdmissionFixture, caller_admission
     from ..direct import step_record
     from ..lint.memory_test_support import fake_memory_readings
@@ -43,6 +44,7 @@ else:
     from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, NotificationTransportBlocked, private_sender_acceptance, write_idle_config
     from scripts.mac_test import mac_test
     from scripts.build_queue import admission_protocol as wire
+    from scripts.build_queue import admission_client
     from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
     from scripts.direct import step_record
     from scripts.lint.memory_test_support import fake_memory_readings
@@ -470,6 +472,69 @@ class MacIdleTests(NotificationGuardedTestCase):
                 self.assertIsNone(mac_idle.mac_idle_alert.alert_line(self.paths.state / "alert.json", 1600, ZoneInfo("UTC")))
                 notify.assert_not_called()
                 push.assert_not_called()
+
+    def test_disk_exclusion_alerts_without_retrying_the_excluded_call(self) -> None:
+        for state in (step_record.StepState.WAITING_HOLD, step_record.StepState.WAITING_MAC,
+                      step_record.StepState.ON_NATEDEV):
+            with self.subTest(state=state):
+                step_record.write(step_record.StepRecord(
+                    self.call.call_id, self.call.pid, self.call.start, Path(self.call.repo), "test",
+                    self.call.package, step_record.NatedevOnly("disk"), state, "2026-11-03T18:00:00Z"))
+                mac_idle.write_record(mac_idle.call_path(self.paths, self.call.call_id),
+                                      asdict(replace(self.call, local_reason="disk")))
+                (self.paths.state / "alert.json").unlink(missing_ok=True)
+                with mock.patch.object(mac_idle, "notify_outage", side_effect=REAL_NOTIFY_OUTAGE), \
+                     mock.patch.object(mac_idle, "notify_showrunner", return_value=True) as notify, \
+                     mock.patch.object(mac_idle, "push_outage", return_value=True) as push:
+                    mac_idle.watch_once(self.paths, 1600, 100)
+                saved = mac_idle.read_record(self.paths.state / "alert.json")
+                self.assertEqual((saved["waiting"], saved["cause"]), (1, "disk"))
+                self.assertIn("disk", mac_idle.mac_idle_alert.alert_line(
+                    self.paths.state / "alert.json", 1600, ZoneInfo("UTC")) or "")
+                notify.assert_called_once()
+                message = cast(str, notify.call_args.args[0])
+                self.assertIn("disk", message)
+                push.assert_called_once()
+                self.assertFalse(mac_idle.marker_path(self.paths, self.call.call_id).exists())
+                self.assertEqual(self.rows(), [])
+
+    def test_admission_query_failure_reports_reason_and_preserves_independent_checks(self) -> None:
+        for blocked, reason in ((False, "no socket"), (True, "connect refused")):
+            with self.subTest(blocked=blocked, reason=reason):
+                if blocked:
+                    self.block()
+                (self.paths.state / "alert.json").unlink(missing_ok=True)
+                with mock.patch.object(admission_client, "view", side_effect=wire.AdmissionUnavailable(reason)), \
+                     mock.patch.object(mac_idle, "notify_outage", side_effect=REAL_NOTIFY_OUTAGE), \
+                     mock.patch.object(mac_idle, "notify_showrunner", return_value=True) as notify, \
+                     redirect_stderr(io.StringIO()) as errors:
+                    mac_idle.watch_once(self.paths, 1180, 100)
+                    mac_idle.watch_once(self.paths, 1240, 160)
+                line = mac_idle.mac_idle_alert.alert_line(self.paths.state / "alert.json", 1240, ZoneInfo("UTC")) or ""
+                self.assertIn("admission query failed", line)
+                self.assertIn(reason, line)
+                self.assertIn(reason, errors.getvalue())
+                message = cast(str, notify.call_args_list[0].args[0])
+                self.assertIn(reason, message)
+                if not blocked:
+                    self.assertEqual(mac_idle.marker_path(self.paths, self.call.call_id).read_text(), "retry_delayed\n")
+                mac_idle.watch_once(self.paths, 1300, 220)
+                self.assertNotIn("admission query failed", mac_idle.mac_idle_alert.alert_line(
+                    self.paths.state / "alert.json", 1300, ZoneInfo("UTC")) or "")
+
+    def test_admission_numeric_overflow_reports_query_failure_without_stopping_the_watcher(self) -> None:
+        reply = wire.encode_reply(wire.BuildHistoryReply(10**400))
+        with mock.patch.object(self.admission.server, "line_filter", return_value=reply), \
+             redirect_stderr(io.StringIO()) as errors:
+            mac_idle.watch_once(self.paths, 1180, 100)
+            mac_idle.watch_once(self.paths, 1240, 160)
+        line = mac_idle.mac_idle_alert.alert_line(self.paths.state / "alert.json", 1240, ZoneInfo("UTC")) or ""
+        self.assertIn("admission query failed: invalid admission message", line)
+        self.assertIn("admission query failed: invalid admission message", errors.getvalue())
+        self.assertEqual(mac_idle.marker_path(self.paths, self.call.call_id).read_text(), "retry_delayed\n")
+        mac_idle.watch_once(self.paths, 1300, 220)
+        self.assertNotIn("admission query failed", mac_idle.mac_idle_alert.alert_line(
+            self.paths.state / "alert.json", 1300, ZoneInfo("UTC")) or "")
 
     def test_unreachable_and_unreadable_readings_save_diagnostics_without_sends(self) -> None:
         for name, content, state in (("unreachable_until", "2000", "unreachable"),

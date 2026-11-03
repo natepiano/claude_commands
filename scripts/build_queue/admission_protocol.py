@@ -238,7 +238,7 @@ def _parse(line: str | bytes, variants: dict[str, type]) -> object:
         if not isinstance(name, str) or name not in variants or set(envelope) != {"v", "type", "data"}:
             raise ValueError("invalid admission envelope")
         return gate.parse_snapshot_value(envelope["data"], variants[name])
-    except (KeyError, TypeError, UnicodeError) as error:
+    except (ArithmeticError, KeyError, TypeError, UnicodeError) as error:
         raise ValueError("invalid admission message") from error
 
 

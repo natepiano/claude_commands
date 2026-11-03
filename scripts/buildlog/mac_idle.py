@@ -25,7 +25,7 @@ sys.path.insert(0, str(SCRIPTS / "notify"))
 
 if TYPE_CHECKING:
     from ..lint import memory_admit
-    from ..build_queue import admission_client
+    from ..build_queue import admission_client, admission_protocol
     from ..direct import step_record
     from ..mac_test import mac_test
     from ..notify import push_texts
@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from ..message.unit_labels import unit_labels_for
 else:
     from scripts.lint import memory_admit
-    from scripts.build_queue import admission_client
+    from scripts.build_queue import admission_client, admission_protocol
     from scripts.direct import step_record
     from scripts.mac_test import mac_test
     import push_texts
@@ -156,13 +156,21 @@ def belongs_to(process: LiveProcess, call: VerifyCall, live: dict[int, LiveProce
     return False
 
 
-def admission_waiters() -> list[memory_admit.Waiter]:
-    return [row for _, row in admission_client.view().ordered]
+@dataclass(frozen=True)
+class AdmissionWaiters:
+    waiters: list[memory_admit.Waiter]
 
 
-def waiting_evidence(call: VerifyCall, live: dict[int, LiveProcess]) -> str:
-    """Match service waiters to the call by process identity."""
-    return _waiting_evidence(call, live, admission_waiters())
+@dataclass(frozen=True)
+class AdmissionQueryFailed:
+    reason: str
+
+
+def admission_waiters() -> AdmissionWaiters | AdmissionQueryFailed:
+    try:
+        return AdmissionWaiters([row for _, row in admission_client.view().ordered])
+    except admission_protocol.AdmissionUnavailable as error:
+        return AdmissionQueryFailed(str(error))
 
 
 def _waiting_evidence(call: VerifyCall, live: dict[int, LiveProcess],
@@ -219,8 +227,13 @@ def waiting_calls(paths: MacIdlePaths, live: dict[int, LiveProcess]) -> tuple[Ve
             continue
         if not isinstance(record, step_record.StepRecord):
             continue
-        if (not step_record.mac_eligible(record)
-                or record.state not in (step_record.StepState.WAITING_HOLD, step_record.StepState.WAITING_MAC)):
+        disk_excluded = isinstance(record.runs_on, step_record.NatedevOnly) and record.runs_on.reason == "disk"
+        if disk_excluded:
+            if record.state not in (step_record.StepState.WAITING_HOLD, step_record.StepState.WAITING_MAC,
+                                    step_record.StepState.ON_NATEDEV):
+                continue
+        elif (not step_record.mac_eligible(record)
+              or record.state not in (step_record.StepState.WAITING_HOLD, step_record.StepState.WAITING_MAC)):
             continue
         process = live.get(record.pid)
         if process is None:
@@ -239,10 +252,10 @@ def waiting_calls(paths: MacIdlePaths, live: dict[int, LiveProcess]) -> tuple[Ve
         if call.pid != record.pid or call.start != record.proc_start:
             call = replace(call, pid=record.pid, start=record.proc_start, marker_hook=False,
                            session="", temp_dir="", hold_waiter="", token_dir="")
-        if call.local_reason:
+        if call.local_reason and call.local_reason != "disk" and not disk_excluded:
             continue
         calls.append(replace(call, repo=str(record.repo), package=step_record.package_name(record.package), kind=record.kind,
-                             wait_state=record.state))
+                             wait_state=record.state, local_reason="disk" if disk_excluded else call.local_reason))
     if diagnostics != old_diagnostics:
         write_record(paths.state / "step_diagnostics.json", diagnostics)
     return tuple(calls)
@@ -371,12 +384,14 @@ def mac_work(paths: MacIdlePaths, now: float) -> NatedevJobOnMac | IdleMac | Mac
 
 
 def notify_outage(paths: MacIdlePaths, saved: mac_idle_alert.SavedAlert, now: float,
-                  calls: tuple[VerifyCall, ...], live: dict[int, LiveProcess]) -> bool:
+                  calls: tuple[VerifyCall, ...], live: dict[int, LiveProcess],
+                  admission: AdmissionWaiters | AdmissionQueryFailed) -> bool:
     line = mac_idle_alert.alert_line(paths.state / "alert.json", now, user_zone())
+    waiters = admission.waiters if isinstance(admission, AdmissionWaiters) else []
     text = (line or "") + "".join(
         f"\nRepo {mac_idle_alert.display_field(call.repo)}; {call.kind} "
         + f"{mac_idle_alert.display_field(call.package)}; pid {call.pid}; "
-        + f"wait {waiting_evidence(call, live)}" for call in calls)
+        + f"wait {call.local_reason or _waiting_evidence(call, live, waiters)}" for call in calls)
     return notify_showrunner(text, identity=OutageMessage(int(saved["since"]), now))
 
 
@@ -385,6 +400,7 @@ def push_outage(saved: mac_idle_alert.SavedAlert, now: float) -> bool:
     blocked = saved["cause"] == "blocked"
     clears = (f"/build:mac unblock by {holder}" if blocked else f"release of the idle claim {detail}"
               if saved["cause"] == "claim_idle" else
+              "the Mac has enough free disk space" if saved["cause"] == "disk" else
               "the builds showrunner checks why the waiting steps do not take the Mac")
     values = {"minutes": str(int((now - saved["since"]) // 60)), "waiting": str(saved["waiting"]),
               "since": mac_idle_alert.clock_text(saved["since"], user_zone(), include_zone=True), "clears": clears}
@@ -472,24 +488,35 @@ def watch_once(paths: MacIdlePaths, now: float, monotonic: float) -> None:
                         label = labels.get(reading.delivery.name)
                         saved["holder"] = label.session if label is not None else reading.holder
                     write_record(idle_file, {"since": since, "owner": owner})
+        if any(call.local_reason == "disk" for call in calls):
+            if saved["cause"] == "free":
+                saved["cause"] = "disk"
+            saved["detail"] = (saved["detail"] + "; " if saved["detail"] else "") + "Mac disk exclusion"
         write_record(paths.state / "alert.json", saved)
         settings = mac_idle_alert.read_idle_config()
-        if not isinstance(reading, IdleMac) or now - saved["since"] < settings.alert_seconds:
+        if not isinstance(reading, IdleMac) or now - saved["since"] < settings.alert_seconds or not calls:
             return
-        if calls:
-            # Wait evidence and free-Mac repairs need ancestry; counting steps does not.
-            live = processes(paths.proc)
-            if not saved["messaged"]:
-                # Unconfirmed attempts retry; send.py owns keyed delivery deduplication.
-                saved["messaged"] = notify_outage(paths, saved, now, calls, live)
-                write_record(paths.state / "alert.json", saved)
-            if now - saved["since"] >= settings.push_seconds and not saved["pushed"]:
-                saved["pushed"] = push_outage(saved, now)
-                write_record(paths.state / "alert.json", saved)
+        # Only wait evidence and repairs need the process ancestry.
+        live = processes(paths.proc)
+        admission = admission_waiters()
+        if isinstance(admission, AdmissionQueryFailed):
+            saved["admission_error"] = admission.reason
+            print(f"Mac idle watch: admission query failed: {mac_idle_alert.display_field(admission.reason)}",
+                  file=sys.stderr)
+            write_record(paths.state / "alert.json", saved)
+        if not saved["messaged"]:
+            # The sender owns delivery deduplication. Retry unconfirmed attempts.
+            saved["messaged"] = notify_outage(paths, saved, now, calls, live, admission)
+            write_record(paths.state / "alert.json", saved)
+        if now - saved["since"] >= settings.push_seconds and not saved["pushed"]:
+            saved["pushed"] = push_outage(saved, now)
+            write_record(paths.state / "alert.json", saved)
         if not isinstance(reading, FreeMac):
             return
-        waiters = admission_waiters()
+        waiters = admission.waiters if isinstance(admission, AdmissionWaiters) else []
         for call in calls:
+            if call.local_reason == "disk":
+                continue
             case_file = call_path(paths, call.call_id).with_suffix(".cases")
             cases = read_record(case_file)
             wait = _waiting_evidence(call, live, waiters)
