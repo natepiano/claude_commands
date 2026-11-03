@@ -17,6 +17,11 @@ from scripts.production.proposals_folder import slug_of
 
 PREFIX = "change-review - "
 PRODUCER = "Producer"
+LISTS = Path(os.environ.get("CHANGE_REVIEW_DIR") or Path.home() / "rust/hanadocs/change-review")
+
+
+def _is_real_list(review_list: Path) -> bool:
+    return review_list.resolve().parent == LISTS.resolve()
 
 
 @dataclass(frozen=True)
@@ -195,7 +200,7 @@ class StaffRouting:
     def unrouted(self, review_list: Path, row: dict[str, str], note: str, producer: str) -> UnroutedChange:
         list_owner = self.list_owner(review_list)
         print(f"staff: {note[0].lower() + note[1:]} (change {list_owner}/{row['#']})", file=sys.stderr)
-        if not row.get("Verdict") and waits_for_user(review_list, row, review_root()):
+        if _is_real_list(review_list) and not row.get("Verdict") and waits_for_user(review_list, row, review_root()):
             member = self.record.by_id(staff.StaffId(producer))
             names = (member.name if member is not None else producer,)
             unrouted_alert.notify(review_root(), list_owner, row, note, names)

@@ -104,7 +104,10 @@ A verdict on an unrouted row saves without sending a message or recording a deli
 An unrouted row offers no question control.
 The server refuses its question submissions without saving.
 The Production cell supplies no tab or message recipient.
-The router alerts the configured showrunner about each new unrouted row and reason.
+The router alerts the configured showrunner about each new unrouted row and reason only within the real change-review folder.
+The list's resolved parent must equal `change_routing.LISTS.resolve()`.
+`CHANGE_REVIEW_DIR` sets this folder when the module loads; the default is `~/rust/hanadocs/change-review`.
+Lists outside this folder print the routing note without sending an alert or writing an alert record.
 `unrouted_alert_recipient` starts at `natedev` in `config/review_links.conf`.
 `unrouted_alert_retry_seconds` starts at 60 and accepts 5 through 3600 seconds.
 The router reads both keys when it uses them.

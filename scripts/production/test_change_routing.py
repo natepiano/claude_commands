@@ -62,6 +62,7 @@ class StaffRoutingTests(unittest.TestCase):
                          change_routing.ShowrunnerOwnChange(self.top.id, "top"))
 
     def test_an_unknown_producer_id_is_unrouted_and_alerts_with_the_row(self) -> None:
+        _ = self.enterContext(mock.patch.object(change_routing, "LISTS", self.root))
         identity = fixture_runtime_id("missing-producer")
         owner = self.router().owner({"#": "C777", "Producer": identity}, self.root / "change-review - top.md")
         self.assertIsInstance(owner, change_routing.UnroutedChange)
@@ -69,6 +70,26 @@ class StaffRoutingTests(unittest.TestCase):
         self.assertIn(identity, owner.note)
         self.assertEqual(owner.tab, "unrouted")
         self.assertEqual(cast(mock.Mock, self.alert).call_args.args[2]["#"], "C777")
+
+    def test_a_fixture_list_outside_the_real_folder_sends_no_alert_and_writes_no_record(self) -> None:
+        with mock.patch.object(unrouted_alert, "send_message") as send:
+            owner = self.router().owner({"#": "C9", "Producer": "unknown"},
+                                        self.root / "change-review - top.md")
+        self.assertIsInstance(owner, change_routing.UnroutedChange)
+        cast(mock.Mock, self.alert).assert_not_called()
+        send.assert_not_called()
+        self.assertFalse((self.root / "links/.review-link-unrouted").exists())
+        self.assertFalse((self.root / "links").exists())
+
+    def test_patching_only_the_review_reader_folder_sends_no_alert(self) -> None:
+        with (mock.patch.object(change_review, "LISTS", self.root),
+              mock.patch.object(unrouted_alert, "send_message") as send):
+            owner = self.router().owner({"#": "C9", "Producer": "unknown"},
+                                        self.root / "change-review - top.md")
+        self.assertIsInstance(owner, change_routing.UnroutedChange)
+        cast(mock.Mock, self.alert).assert_not_called()
+        send.assert_not_called()
+        self.assertFalse((self.root / "links/.review-link-unrouted").exists())
 
     def test_renamed_and_retired_units_keep_their_producer_route(self) -> None:
         row = {"#": "C1", "Producer": self.unit.id}

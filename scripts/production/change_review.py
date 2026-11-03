@@ -122,7 +122,7 @@ _CHECKPOINT = re.compile(r"^checkpoint\((?P<branch>[^)]+)\):")
 _HASH = re.compile(r"\b[0-9a-f]{7,40}\b")
 # The columns an older row keeps its merge hash in, in the order they are read.
 HASH_COLUMNS = ("Merged", "On the Mac build")
-LISTS = Path(os.environ.get("CHANGE_REVIEW_DIR") or Path.home() / "rust/hanadocs/change-review")
+LISTS = change_routing.LISTS
 PREFIX = "change-review - "
 FENCE = "---"
 PRODUCTIONS = "productions"
