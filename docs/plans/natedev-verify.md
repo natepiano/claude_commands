@@ -79,6 +79,8 @@ i need changes to verify
 
 #### Work Order
 
+**Constraints from the phase 20, 23 and 24 review:** Phase 23 cancellation behavior stays: a group TERM of a lint run exits 143, repeated INT/TERM/HUP during cleanup are ignored, and no verify process, admission place or step record remains. The acceptance gate keeps the `test_verify_tree_cancel_lint.py` checks green.
+
 **Goal:** a refused step makes `verify.sh` exit non-zero on every host, and every process-start reader in this unit's code reads a start on the Mac as it does on Linux, through one shared reader.
 
 **Defect:** on the Mac, `verify.sh`'s step recorder (`step_record.py process_start`) reads `/proc/<pid>/stat`, which Darwin does not have. The step is refused, but the wrapper exits 0, so the failure reads as a pass.
@@ -330,6 +332,8 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 
 #### Work Order
 
+**Constraints from the phase 20, 23 and 24 review:** Phase 20 replaced the `memory_admit.py check` loop: `scripts/direct/memory_gate.sh` (near line 155) now uses one admission client with wait events. Agree the holder event contract with queue-unit before dispatch, then use one writer and one tester. Phase 23 cancellation behavior stays: a group TERM of a lint run exits 143, repeated INT/TERM/HUP during cleanup are ignored, and no verify process, admission place or step record remains. The acceptance gate keeps the `test_verify_tree_cancel_lint.py` checks green.
+
 **Source:** sdlc hand-off, approved by builds 2026-10-29.
 
 **Goal:** every wait verify.sh records names who holds what it waits on.
@@ -529,6 +533,8 @@ Checkpoint 404a4ea0 on `natedev-verify-cancel`.
 
 #### Work Order
 
+**Constraints from the phase 20, 23 and 24 review:** The base selector is now `commit_bases` in `scripts/direct/assertion_guard.py` (near line 1387), with merge regression tests; `default_base` and `comparison_bases` no longer exist. Reproduce each Spec part against `commit_bases` first and implement only what still fails.
+
 **Source:** builds, 2026-10-31. tool-based-ui-inspectors merged trunk init/catalyst 489bcff1a5 into HEAD 6236e6f419. `default_base` picks one of the upstream merge-base and the production merge-base, the side with fewer commits; after the merge that is 489bcff1a5, also the merge's second parent. `commit_bases` then adds only merged-in parents, so the branch side (upstream merge-base b45c99b672) is never a base. Lint blocked on 26 removals (db889600), 6 on 48859c93; all but one are old branch-versus-trunk differences, present on trunk and absent on the branch since before the phase. Reproduction: `/tmp/claude/unit/bf5b8d4c-77ff-4f7b-9318-afb6114ad8f2/guard26_repro.md`.
 
 **Goal:** after a merge from trunk, the guard still judges against the branch side, so an old branch-versus-trunk difference never blocks and a real removal in the phase still does.
@@ -563,6 +569,8 @@ Checkpoint 404a4ea0 on `natedev-verify-cancel`.
 **Depends on:** Phase 14 (same branch). Nothing else. This unit owns `scripts/buildlog/mac_idle.py` (production doc Units row). The two views belong to queue-unit (`/build:queue`, `/build:status`); this phase adds only the small read of the saved result there and names those paths in the checkpoint's also-touches line.
 
 #### Work Order
+
+**Constraints from the phase 20, 23 and 24 review:** The Phase 16 alert code (reader, watcher, views, notification recovery and tests) shipped on the Phase 20 branch (natedev-verify-cancel 41a3ce6d4). Phase 24 (verify-idle-disk 4b0e023bf) adds the disk exclusion and the admission-query-error cause, and supersedes this Work Order's exclusion rule and constants-based timing. This phase is now closure with one writer: check the shipped code against the acceptance gate, and add the two view checks (`/build:queue`, `/build:status` read the saved alert) and the admission-error recovery check.
 
 **Source:** builds showrunner ruling, 2026-10-31 07:47 EDT (binding). Cause today: `mac_idle.watch_once` (`scripts/buildlog/mac_idle.py:257-337`) returns at lines 277-280 when a claim, `run.json` or `block.json` exists, and at 287-289 for a future `unreachable_until`. It reads only steps in `waiting_hold`/`waiting_mac`, never reaches the user, and `notify_director` (lines 220-246) sends only to the `builds-unit` director of production `build-followups` (line 235), which no longer directs. At 07:47 EDT research held a block (`~/.local/state/mac-test/block.json`, holder `research`, for `P15 F11 L0 run`), no natedev job ran on the Mac, and live `mac_allowed` test steps waited in `waiting_hold` on natedev (7 at 07:49). The watch saw nothing. From 07:50 to about 07:57 the second idle stretch was a live research claim with only a parked hana app on the Mac: no compile or test ran while 7 test runs waited. The claim watcher counts the app as Mac activity, so it wrote no `idle_since`.
 
@@ -656,6 +664,8 @@ Checkpoint 404a4ea0 on `natedev-verify-cancel`.
 **Depends on:** Phase 16, and it runs after Phase 16 on the same branch. It cannot run beside Phase 16: the files overlap. The cause is in `scripts/build_targets/build_targets.py` (`mac_target_eligibility`, `command_kind_eligible`), and its tests are in `scripts/build_targets/test_build_targets.py`. Phase 16 also edits both files (its `test` worker owns them; `command_status` and its tests), and it owns `docs/as-built/mac-test-offload.md` and `docs/as-built/build-targets.md`, which this phase also changes. `scripts/direct/verify.sh` is not a Phase 16 file. Start this phase when Phase 16's checkpoint is on the branch.
 
 #### Work Order
+
+**Constraints from the phase 20, 23 and 24 review:** Phase 27 lands first: it changes Mac eligibility and the retry hooks (`target_can_retry`) and gives a disk decline the same leave hook as busy, with no 180-second delay. After Phase 27, reduce this phase to the cases Phase 27 does not cover, with one integration writer and one tester. Phases 17 and 27 share one acceptance test: a disk decline keeps the Phase 24 Mac disk alert (`mac_idle.py` counts `NatedevOnly("disk")`) through retry eligibility and local execution.
 
 **Source:** builds showrunner ruling, 2026-10-31 ~07:57 EDT (binding). Cause at e6f8540f:
 - `initialize_step_record` (`scripts/direct/verify.sh:1697-1773`) runs `build_targets.py eligible --kind` once. Its first line becomes the step's `runs_on` (`step_record.py write --runs-on`, lines 1741-1745).
@@ -815,14 +825,135 @@ Start reasons, by class (evidence at e6f8540f):
 - Live: the director runs this phase's own gate with `copies.py run` (verify-unit, this repo), twice: the second run builds nothing new and the tree path is `~/worktrees/gates/.claude/verify-unit-gate`.
 ### Phase 20 — Run clippy judgment first, fix only on a finding, and send Mac-allowed lint to a free Mac  · status: done
 
-**Origin:** builds showrunner, 2026-10-31 15:17 EDT, the user's order for more build capacity: in 24 h, 278 of 537 natedev clippy runs repeated a tree that had already passed the same command (169 h queue wait, 10 h run). Also the builds report of 15:10: the Mac was free while 17 natedev steps waited.
+#### As-built
+
+Checkpoint 41a3ce6d4 on `natedev-verify-cancel`.
+
+- `verify.sh lint` runs mend, fmt and Taplo before workspace clippy judgment with all targets, all features and `--keep-going`. A clean judgment ends the stage without clippy fixes.
+- Any Cargo status 101 permits clippy fixes unless a lint hold or kill report prevents repair. Compile errors, mixed failures and unknown 101 diagnostics also permit repair; no lint-finding classifier exists.
+- Fixes and fmt repeat until the tree stops changing or reaches `clippy_fix_pass_limit`, then another judgment supplies the result. `config/lint.conf` supplies the limit at repair time; integers 1–9999 are valid, with 3 for missing or invalid values.
+- Mac-allowed lint, check and doc steps use the same `free-now` decision as tests during the token wait. A free Mac triggers reservation and routing without an idle marker; unavailable capacity leaves the step waiting locally.
+- The Mac idle watcher and alert display also ship on this branch. They read `config/mac_test.conf` through `conf.py`, query admission waiters, display the saved alert in build views, and notify the builds showrunner.
+
+**Files:**
+
+- `scripts/direct/verify.sh`, `config/lint.conf` — judgment order, bounded repairs, verdict keys, tree watches and Mac routing.
+- `scripts/direct/test_verify_lint_judgment.py`, `scripts/direct/test_verify_mac_lint_token.py` — judgment, kill, hold, limit and shared-routing contracts.
+- `scripts/direct/verify_tree_cancel_test_support.py`, `scripts/direct/test_verify_tree_cancel_lint.py` — the first stub judgment exits 101; rewrites retain cancellation coverage.
+- `scripts/buildlog/mac_idle.py`, `scripts/buildlog/mac_idle_alert.py`, `scripts/buildlog/test_mac_idle_alert.py` — the idle watcher, saved alert and config contract.
+- `scripts/mac_test/offload.py`, `scripts/mac_test/test_offload_forward.py`, `scripts/build_targets/test_build_targets.py` — fetch connection settings and isolated alert configuration.
+
+**Binds later work:** Repair eligibility uses status, hold and kill evidence. Mac routing uses the existing availability decision and admission reservation.
+
+**Gotchas:** A kill flag or Cargo signal report vetoes repair independently. A final changing fix prevents a cached lint failure. The stub must return 101 to exercise repairs.
+
+**Ruled out:** A lint-finding classifier; an idle-marker prerequisite for Mac routing; splitting whole-workspace hana lint between Mac and Linux. A workspace containing configured Linux-only members remains ineligible for Mac lint.
+
+### Phase 21 — Pair a skipUnless decorator with the test it decorates  · status: todo
+
+**Origin:** builds showrunner, 2026-11-03 08:5x EST, held item 1: the assertion guard reported a change at `scripts/lib/test_build_folders.py:122` against the test above it.
+
+**Depends on:** none. Its tree takes the Phase 20 test stub repair 41a3ce6d4 only to pass the merge gate.
 
 #### Work Order
 
-**Source:** the worker prompts `phases/20/impl_prompt.md` and `phases/20/test_prompt.md` in the run directory.
+1. `scripts/direct/assertion_guard.py` attributes a `@unittest.skipUnless(...)` decorator, and any decorator line, to the test function it decorates, not to the test that ends above it.
 
-1. `verify.sh lint` runs clippy judgment first. A pass ends the stage with no fix pass. A clippy finding runs `--fix`, fmt, then judgment once more. Any other failure exits with its status and runs no fix. The fix-pass limit (default 3) is read from the lint config.
-2. A mac_allowed lint step leaves the natedev queue for the Mac whenever the Mac can take it now, by the one decision the test steps use, not only after the Mac-idle marker appears.
-3. A whole-workspace hana clippy can run on the Mac with its Linux-only members (`hana_video`, `hana_clerestory`) excluded, and those members stay linted on natedev; or the cause and size are reported if the change is large.
+**Acceptance gate:** a regression test in the assertion guard tests fails on the old code and passes on the new; the assertion guard suites pass; basedpyright 0/0/0 on changed Python; merge gate `--tests-only` green on a tree merged with origin/builds.
 
-**Acceptance gate:** the verify lint tests show one clippy call and no `--fix` on a passing tree, the fix loop only after a finding, no fix on a non-lint failure, and the limit from config; Mac routing and eligibility regression tests fail on the old code; basedpyright 0/0/0 on changed Python; `bash -n` and shellcheck on verify.sh; merge gate `--tests-only` green on a tree merged with origin/builds.
+### Phase 22 — Refuse an unknown verify verb, and key the lint cache by tool versions  · status: todo
+
+**Origin:** builds showrunner, 2026-11-03 08:5x EST, held items 2 and 3.
+
+**Depends on:** none. Its tree takes the Phase 20 test stub repair 41a3ce6d4 only to pass the merge gate.
+
+#### Work Order
+
+**Constraints from the phase 20, 23 and 24 review:** Phase 23 cancellation behavior stays: a group TERM of a lint run exits 143, repeated INT/TERM/HUP during cleanup are ignored, and no verify process, admission place or step record remains. The acceptance gate keeps the `test_verify_tree_cancel_lint.py` checks green. This tree still has the outer mend pipeline (`verify.sh` near line 3554) that Phase 23 removes; its merge with Phase 23 keeps the removal.
+
+1. `verify.sh` refuses an unknown verb (for example `fmt`) right after `CMD=` is set: it prints the usage text and exits 2, before any step record or target query. Log: `/tmp/claude/delegate/fc206247-76c0-4607-b268-025299592a62/mesh_runs/20261103T002337-2080568-f123.log`.
+2. The lint result cache key includes the version of each lint tool (mend, rustfmt, clippy, taplo). A cached result made by another tool version never replays. Log: `/tmp/claude/delegate/fc206247-76c0-4607-b268-025299592a62/mesh_runs/20261103T021458-742941-b3cb.log` (mend 0.22.3 replayed a 0.23.0-dev failure).
+
+**Acceptance gate:** a test for each item fails on the old code; the verify and lint cache suites pass; `bash -n` and shellcheck on verify.sh; basedpyright 0/0/0 on changed Python; merge gate `--tests-only` green on a tree merged with origin/builds.
+
+### Phase 23 — A cancelled lint run leaves no verify process and no queue place  · status: done
+
+#### As-built
+
+Checkpoint 353e00511 on `verify-lint-cancel`.
+
+- The lint mend stage calls `invoke_mend` directly. The parent verifier retains `RUN_STEP_PID` and stops the active step group during interruption cleanup.
+- The existing `run()` tee captures mend diagnostics through `MEND_LOG`; the mend stage reads its command status directly.
+- A group TERM ends the verifier and its step, releases admission and token resources, removes the step record, and records status 143. Cancellation creates no cached verdict.
+- `verify_interrupted` and `hold_interrupted` ignore repeated INT, TERM and HUP signals until cleanup completes.
+
+**Files:**
+
+- `scripts/direct/verify.sh` — parent-owned mend execution, shared diagnostic capture and signal-safe cleanup.
+- `scripts/direct/test_verify_tree_cancel_lint.py` — cancellation during memory admission, mend, clippy and repeated TERM; `CompletedLintRun` types the recorded exit status.
+- `scripts/direct/verify_tree_cancel_test_support.py` — an optional real `mesh_runs.py` supervisor with private result delivery.
+- `scripts/direct/verify_token_ownership_test_support.py` — bounded group-exit observation with the existing default retained.
+
+**Binds later work:** Lint execution retains the active step PID in the parent verifier. Interruption cleanup retains ownership until admission, token and step records are removed.
+
+**Gotchas:** An outer shell pipeline can place the step PID in a subshell. A supervisor can forward TERM after a group TERM reaches the verifier; cleanup must tolerate both signals.
+
+**Ruled out:** A separate cancellation service; a cleanup sweep; reliance on admission-service cleanup alone.
+
+### Phase 24 — Raise the Mac idle alert on a disk exclusion, and survive an admission query error  · status: done
+
+#### As-built
+
+Checkpoint 23aa6712f on `verify-idle-disk`.
+
+- The Mac idle watcher counts `NatedevOnly("disk")` steps in `WAITING_HOLD`, `WAITING_MAC` and `ON_NATEDEV`. Other natedev-only reasons retain their existing behavior.
+- The saved alert includes the disk exclusion and displays “Mac disk exclusion”. Its push names sufficient Mac disk space as the clearing condition; excluded calls receive no retry marker.
+- `admission_waiters()` returns `AdmissionWaiters` or `AdmissionQueryFailed`. A failed query records its reason in the saved alert and stderr; the watcher continues independent checks.
+- `SavedAlert.admission_error` stores the query failure when present. A later successful sample removes it.
+- The admission decoder converts arithmetic decode errors, including numeric overflow, into an invalid-message error. The client reports that error as `AdmissionUnavailable`.
+
+**Files:**
+
+- `scripts/buildlog/mac_idle.py` — disk-exclusion counting, typed admission results, continued checks and disk-specific notification text.
+- `scripts/buildlog/mac_idle_alert.py` — the `disk` cause, optional admission error and display validation.
+- `scripts/buildlog/test_mac_idle.py` — disk states, query failures, recovery and an overflowing reply through `watch_once`.
+- `scripts/build_queue/admission_protocol.py` — arithmetic decode errors become invalid admission messages.
+
+**Binds later work:** Mac disk exclusions use `NatedevOnly("disk")`. The idle alert preserves that reason and does not retry an excluded call.
+
+**Gotchas:** A huge integer can overflow during numeric validation. The watcher catches `AdmissionUnavailable`; the decoder converts malformed replies at the protocol boundary. The Mac disk minimum remains unchanged.
+
+**Ruled out:** Lowering the disk minimum to restore routing; treating every natedev-only reason as a Mac exclusion; catching all exceptions in the watcher.
+
+### Phase 25 — Run the Mac floor sweep on a disk exclusion, then check again  · status: todo
+
+**Origin:** builds showrunner ruling, 2026-11-03 15:0x EST: a disk exclusion runs the existing floor sweep, then checks again; no second sweeper. resources-unit owns `sweep.py` and adds the Mac entry point and the mac_test claim check (their Phase 50, checkpoint d70f1dedf).
+
+#### Work Order
+
+**Constraints from the phase 20, 23 and 24 review:** Safe call sites: disk checks are in `scripts/build_targets/build_targets.py` (near line 280) and `scripts/mac_test/offload.py` (near line 1869); `mac_test.free_now` reads local state only and stays so. Resources' `floor_claims.py` (near line 104) holds claim locks during the sweep, so run the sweep with no claim lock held. Test concurrent sweeps, cancellation, a failed sweep and a fresh disk read after the sweep. The acceptance gate also owns the disk alert's recovery and clearing checks.
+
+1. When admission finds the Mac under its disk minimum, mac_test runs resources' entry point once (`ssh mac '~/.claude/scripts/lib/py ~/.claude/scripts/lint/sweep.py --floor-only --host mac'`), then reads Mac free space again and admits the step when it is above the minimum. One sweep at a time; a run that finds a sweep running waits for its result.
+
+**Pending decision:** none.
+
+**Depends on:** Phase 24 (the disk exclusion read), and resources Phase 50 (checkpoint d70f1dedf, the Mac floor sweep) landed in origin/builds.
+
+2. The Mac test mirror root is spelled in one place: one key in `config/mac_test.conf` (value `~/.local/state/mac-test/mirror`, no move), read at use by `scripts/mac_test/offload.py` and by resources' `sweep.py`. No other literal of that path stays in code. Builds ruling 2026-11-03 (this replaces the dropped mirror-move phase).
+
+**Acceptance gate:** a test with a fake Mac that is under the minimum before the sweep and over it after, which admits the step; one with a sweep that frees too little, which keeps the step on natedev; a scan that finds the mirror root only in `config/mac_test.conf`; merge gate `--tests-only` green on a tree merged with origin/builds.
+
+### Phase 27 — A step sent to natedev after a Mac disk decline goes back to a free Mac  · status: todo
+
+**Origin:** builds showrunner, 2026-11-03 14:4x EST, RED Mac idle again: queue-unit found that verify.sh gives the leave hook only to `busy` and `blocked` declines, so a step sent to natedev after a `disk` decline never checks the Mac again. Two hana nextest steps waited for natedev memory while the Mac had 213 GiB free. Hotfix checkpoint, branched from origin/builds, merged ahead of Phase 20 and Phase 24.
+
+**Depends on:** none (hotfix from origin/builds).
+
+#### Work Order
+
+**Constraints from the phase 20, 23 and 24 review:** Phase 24's disk alert needs `NatedevOnly("disk")` evidence (`scripts/buildlog/mac_idle.py` near line 230). A disk decline must keep that evidence while it gains the leave hook; the acceptance gate adds that check (shared with Phase 17). Phase 23 cancellation behavior stays: a group TERM of a lint run exits 143, repeated INT/TERM/HUP during cleanup are ignored, and no verify process, admission place or step record remains. The acceptance gate keeps the `test_verify_tree_cancel_lint.py` checks green.
+
+1. A `disk` decline gets the same leave hook as `busy`: the waiting step leaves for the Mac when free-now says the Mac is free.
+2. Every other decline reason is checked for the same gap. Each reason that can clear while a step waits gets the hook; each that cannot is named with its reason in the summary.
+
+**Acceptance gate:** a test that declines a step for disk, then frees the Mac, and sees the step leave for the Mac; it fails on the old code; the verify suites that cover routing pass; merge gate `--tests-only` green on the hotfix tree.
