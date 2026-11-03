@@ -675,6 +675,15 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         self.assertEqual(code, 0, output)
         self.assertEqual(list(self.lint_temp.iterdir()), [])
 
+    def test_lint_keeps_intermediates_with_the_shared_warm_target(self) -> None:
+        target = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir")) / scratch.STYLE_TARGET_NAME
+        code, output = self.run_lint(
+            '[[ "$CARGO_BUILD_BUILD_DIR" == "$(realpath target)/intermediates" ]] || exit 2\n'
+            + 'printf warm > "$CARGO_BUILD_BUILD_DIR/intermediate"\n')
+        self.assertEqual(code, 0, output)
+        self.assertEqual((target / "intermediates/intermediate").read_text(), "warm")
+        self.assertEqual(list(self.lint_temp.iterdir()), [])
+
     def test_lint_links_a_warm_target_and_cleanup_keeps_it_until_the_production_ends(self) -> None:
         target = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir")) / scratch.STYLE_TARGET_NAME
         code, output = self.run_lint('[[ -L target ]] || exit 2\nprintf warm > target/artifact\n')

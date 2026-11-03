@@ -1428,7 +1428,7 @@ Owner: builds-resources. Asked by builds 2026-11-03 15:00 EST; it held natest's 
 
 **Checks.** A test that reproduces the fault without load (for example, a forced slow read or a stale /proc start time). test_build_hold.py and test_hold_enforcer.py pass. basedpyright 0/0/0 on the changed files and their callers.
 
-### Phase 53 — After the /build switch, cleanup removes a checkout's outside build cache, and the disk reports show each drive  · status: in progress
+### Phase 53 — After the /build switch, cleanup removes a checkout's outside build cache, and the disk reports show each drive  · status: done
 
 Owner: builds-resources. Asked by natedev (#35); builds started it 2026-11-03 16:05 EST with Phase 51. Phase 51 rules 1-3 apply here too: it works before and after the switch with no step between; it reads the one mapping in `scripts/lib/cargo_roots.py` (Phase 51), never a hard-coded /build; free-space reads use the filesystem that holds the output.
 

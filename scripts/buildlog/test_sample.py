@@ -52,6 +52,22 @@ class SampleTests(unittest.TestCase):
             _ = self.enterContext(patch.object(sample, name, proc / filename))
         _ = self.enterContext(patch.object(sample, "POWER_PROFILE_STATE", self.root / "absent-profile"))
 
+    def test_default_filesystem_uses_resolved_intermediate_root(self) -> None:
+        import filesystem
+        from cargo_output import CargoOutputRoots
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            output = root / "intermediates"
+            output.mkdir()
+            roots = CargoOutputRoots(root, root / "target", output)
+            with patch.dict(os.environ, {}, clear=True), \
+                 patch.object(sample, "read_cargo_output_roots", return_value=roots), \
+                 patch.object(filesystem, "filesystem_usage", return_value=filesystem.FilesystemUsage(20, 80, 100, "2:1")) as usage:
+                result = sample.filesystem_reading()
+            self.assertEqual(result["state"], "measured")
+            usage.assert_called_once_with(str(output))
+
     def test_filesystem_reading_does_not_import_disk_or_sweep(self) -> None:
         command = (
             "import sys; sys.path.insert(0, sys.argv[1]); import sample; "
@@ -70,6 +86,16 @@ class SampleTests(unittest.TestCase):
             timeout=30,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_failed_output_mapping_reports_unavailable(self) -> None:
+        import filesystem
+        from cargo_output import CargoOutputUnavailable
+
+        with patch.dict(os.environ, {}, clear=True), \
+             patch.object(sample, "read_cargo_output_roots", return_value=CargoOutputUnavailable("no metadata")), \
+             patch.object(filesystem, "filesystem_usage") as usage:
+            self.assertEqual(sample.filesystem_reading(), {"state": "unavailable"})
+        usage.assert_not_called()
 
     def test_pool_token_readings_use_read_only_commands_and_short_timeouts(self) -> None:
         with patch.object(subprocess, "run", side_effect=[

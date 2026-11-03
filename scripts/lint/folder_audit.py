@@ -60,9 +60,9 @@ from pathlib import Path
 from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lint import tmp_sweep
+from scripts.lint import sweep, tmp_sweep
 from scripts.lint.tmp_sweep import SYSTEM_TEMP_NAMES, SYSTEM_TEMP_PREFIXES, TEMPFILE_NAME
-from scripts.lib import conf, copy_record, scratch, unit_runs
+from scripts.lib import cargo_output, conf, copy_record, scratch, unit_runs
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lint.tmp_sweep import ProcessUsesUnavailable as ProcessUsesUnavailable
 
@@ -155,15 +155,18 @@ def remove_clone_targets(path: Path, removing: bool, *,
     """Keep unsaved source. Delete only build output from its independent clones."""
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
+    saved = scratch.save_cargo_outputs(path) if removing else ()
     targets = [repo / "target" for repo in scratch.repos(path, scratch_settings=scratch_settings)
                if (repo / "target").is_dir() and not (repo / "target").is_symlink()]
-    if not targets:
+    if not targets and not saved:
         return tmp_sweep.GitWork.UNSAVED.value
     if not removing:
         return WOULD_REMOVE_TARGET
     try:
+        scratch.clean_cargo_outputs(path, saved)
         for target in targets:
             tmp_sweep.delete_tree(str(target))
+        scratch.cargo_removal_mark(path.resolve()).unlink(missing_ok=True)
     except OSError as error:
         return f"target removal failed: {error}"
     return TARGET_REMOVED
@@ -622,7 +625,68 @@ def message(folders: list[Loose], *,
             + "`scratch.py new`.")
 
 
+def clean_checkout_cargo_output(path: Path) -> None:
+    """Remove external output only after ownership, use stamps, locks and processes permit removal."""
+    attempt_started = time.time()
+    saved = scratch.save_cargo_outputs(path)
+    if not any(not output.roots.build_directory.is_relative_to(path)
+               and output.roots.build_directory.exists()
+               and not output.borrows_build_directory()
+               for output in saved):
+        return
+    index = sweep.saved_cargo_output_roots()
+    if not index.workspaces:
+        raise OSError("the saved mapping index is empty or unreadable")
+    known = list(index.workspaces) + list(index.history)
+    for output in saved:
+        for peer in output.other_checkouts:
+            if peer.is_relative_to(path) or not peer.exists():
+                continue
+            mapping = cargo_output.read_cargo_output_roots(peer)
+            if isinstance(mapping, cargo_output.CargoOutputUnavailable):
+                raise OSError(f"cannot read {peer}: {mapping.reason}")
+            known.append(mapping)
+    for output in saved:
+        root = output.roots.build_directory
+        if root.is_relative_to(path) or not root.exists():
+            continue
+        if path.is_relative_to(root) or root == output.roots.workspace_root:
+            raise OSError(f"unsafe Cargo output root: {root}")
+        if output.borrows_build_directory():
+            continue
+        shared = any(other.workspace_root != output.roots.workspace_root
+                     and not other.workspace_root.is_relative_to(path)
+                     and (root.is_relative_to(other.target_directory)
+                          or other.target_directory.is_relative_to(root)
+                          or root.is_relative_to(other.build_directory)
+                          or other.build_directory.is_relative_to(root)) for other in known)
+        if shared:
+            continue
+        trees = list(dict.fromkeys([str(root), *sweep.build_trees(str(root))]))
+        locked = sweep.lock_trees(trees)
+        if isinstance(locked, sweep.TargetLockBusy):
+            raise OSError(f"Cargo output is locked: {locked.path}")
+        try:
+            uses = process_uses([root])
+            if isinstance(uses, ProcessUsesUnavailable) or any(
+                    pid != os.getpid() and Path(used).resolve().is_relative_to(root) for used, pid, _ in uses.paths):
+                raise OSError(f"Cargo output is busy or unreadable: {root}")
+            stamp = root / scratch.USE_STAMP
+            if stamp.exists() and stamp.stat().st_mtime > attempt_started:
+                raise OSError(f"Cargo output was used after cleanup started: {root}")
+            shutil.rmtree(root)
+        finally:
+            sweep.release(locked.held)
+
+
 def main(argv: list[str]) -> int:
+    if len(argv) == 2 and argv[0] == "--clean-cargo-output":
+        try:
+            clean_checkout_cargo_output(Path(argv[1]).resolve())
+            return 0
+        except (OSError, ValueError) as error:
+            print(f"Cargo output kept: {error}", file=sys.stderr)
+            return 1
     lint_settings = conf.read("lint")
     scratch_settings = conf.read("scratch")
     parser = argparse.ArgumentParser(prog="folder_audit.py", description="Find loose folders, remove the idle ones "

@@ -71,7 +71,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import conf, copy_record  # noqa: E402
+from scripts.lib import cargo_output, conf, copy_record  # noqa: E402
 from scripts.lib.conf import UseConfiguredValue
 
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -903,6 +903,125 @@ def renew(path: Path, now: float | None = None, *,
         os.utime(path / copy_record.RECORD, (moment, moment))
 
 
+@dataclass(frozen=True)
+class SavedCargoOutput:
+    """Output ownership saved before a checkout can disappear."""
+    roots: cargo_output.CargoOutputRoots
+    other_checkouts: tuple[Path, ...]
+    shared_output_roots: tuple[Path, ...] = ()
+    saved_at: float = 0.0
+
+    def borrows_build_directory(self) -> bool:
+        return any(self.roots.build_directory.is_relative_to(root) for root in self.shared_output_roots)
+
+
+def cargo_removal_mark(path: Path) -> Path:
+    return path.parent / f".scratch-cargo-{path.name}.json"
+
+
+def cargo_checkout_peers(workspace: Path) -> tuple[Path, ...]:
+    """Read related worktrees and registered scratch checkouts before source removal."""
+    peers: set[Path] = set()
+    result = _git(workspace, "worktree", "list", "--porcelain")
+    if result.returncode == 0:
+        peers.update(Path(line.removeprefix("worktree ")).resolve()
+                     for line in result.stdout.splitlines() if line.startswith("worktree "))
+    for folder in folders():
+        peers.update(repo.resolve() for repo in repos(folder.path))
+    peers.update(repo.resolve() for held in holds() for repo in repos(Path(held)))
+    return tuple(sorted(peers - {workspace}))
+
+
+def save_cargo_outputs(path: Path) -> tuple[SavedCargoOutput, ...]:
+    """Save the mapping outside the deletion tree. Keep the first mapping on retries."""
+    path = path.resolve()
+    mark = cargo_removal_mark(path)
+    if mark.exists():
+        try:
+            raw = cast(object, json.loads(mark.read_text()))
+        except (ValueError, UnicodeError) as error:
+            raise OSError(f"invalid Cargo removal record: {mark}: {error}") from error
+        if not isinstance(raw, list):
+            raise OSError(f"invalid Cargo removal record: {mark}")
+        saved: list[SavedCargoOutput] = []
+        for item in cast(list[object], raw):
+            if not isinstance(item, dict):
+                raise OSError(f"invalid Cargo removal record: {mark}")
+            fields = cast(dict[str, object], item)
+            values = [fields.get(key) for key in ("workspace_root", "target_directory", "build_directory")]
+            peers = fields.get("other_checkouts")
+            if (not all(isinstance(value, str) and Path(value).is_absolute() for value in values)
+                    or not isinstance(peers, list) or not all(isinstance(peer, str) and Path(peer).is_absolute()
+                                                                           for peer in cast(list[object], peers))):
+                raise OSError(f"invalid Cargo removal record: {mark}")
+            roots = cargo_output.CargoOutputRoots(*(Path(cast(str, value)).resolve() for value in values))
+            if not roots.workspace_root.is_relative_to(path):
+                raise OSError(f"Cargo workspace is outside removal tree: {mark}")
+            saved_at = fields.get("saved_at", 0.0)
+            if not isinstance(saved_at, (int, float)):
+                raise OSError(f"invalid Cargo removal record: {mark}")
+            target_link = roots.workspace_root / "target"
+            legacy_shared = target_link.resolve() if target_link.is_symlink() else roots.target_directory
+            shared = fields.get("shared_output_roots", [str(legacy_shared)]
+                                if fields.get("shared_target") is True else [])
+            if (not isinstance(shared, list)
+                    or not all(isinstance(root, str) and Path(root).is_absolute()
+                               for root in cast(list[object], shared))):
+                raise OSError(f"invalid Cargo removal record: {mark}")
+            saved.append(SavedCargoOutput(roots, tuple(Path(peer) for peer in cast(list[str], peers)),
+                                          tuple(Path(root).resolve() for root in cast(list[str], shared)), float(saved_at)))
+        return tuple(saved)
+    found: list[SavedCargoOutput] = []
+    checkouts = set(repos(path))
+    if (path / "Cargo.toml").is_file():
+        checkouts.add(path)
+    for checkout in sorted(checkouts):
+        if not (checkout / "Cargo.toml").is_file():
+            continue
+        roots = cargo_output.read_cargo_output_roots(checkout)
+        if isinstance(roots, cargo_output.CargoOutputUnavailable):
+            print(f"scratch: cannot read Cargo output for {checkout}: {roots.reason}", file=sys.stderr)
+            continue
+        if roots.workspace_root.is_relative_to(path) and roots not in [item.roots for item in found]:
+            found.append(SavedCargoOutput(roots, cargo_checkout_peers(roots.workspace_root),
+                                          ((checkout / "target").resolve(),) if (checkout / "target").is_symlink() else (),
+                                          time.time()))
+    if found:
+        atomic_record(mark, [{"workspace_root": str(item.roots.workspace_root),
+                             "target_directory": str(item.roots.target_directory),
+                             "build_directory": str(item.roots.build_directory),
+                             "other_checkouts": [str(peer) for peer in item.other_checkouts],
+                             "shared_output_roots": [str(root) for root in item.shared_output_roots],
+                             "saved_at": item.saved_at} for item in found])
+    return tuple(found)
+
+
+def clean_cargo_outputs(path: Path, saved: tuple[SavedCargoOutput, ...]) -> None:
+    """Run the shared guard without importing the sweep back into scratch."""
+    if not any(not item.roots.build_directory.is_relative_to(path.resolve())
+               and item.roots.build_directory.exists() for item in saved):
+        return
+    result = subprocess.run([sys.executable, str(Path(__file__).parents[1] / "lint" / "folder_audit.py"),
+                             "--clean-cargo-output", str(path.resolve())],
+                            capture_output=True, text=True, check=False)
+    if result.returncode:
+        raise OSError(result.stderr.strip() or "Cargo output cleanup failed")
+    if result.stderr:
+        print(result.stderr.strip(), file=sys.stderr)
+
+
+def remove_with_cargo_output(path: Path, delete: Callable[[Path], None]) -> None:
+    """Keep the saved mapping until output and source deletion both finish."""
+    path = path.absolute()
+    if path.is_symlink():
+        delete(path)
+        return
+    saved = save_cargo_outputs(path)
+    clean_cargo_outputs(path, saved)
+    delete(path)
+    cargo_removal_mark(path.resolve()).unlink(missing_ok=True)
+
+
 def remove(path: Path) -> None:
     """Delete one folder, its record last; a linked git worktree through its source repo first.
     Callers go through remove_marked, so a stop at any line leaves the task findable."""
@@ -939,7 +1058,7 @@ def remove_marked(path: Path, delete: Callable[[Path], None], *,
             raise ScratchError(pending.reason)
         if isinstance(pending, copy_record.NotRegistered) and (copy or isinstance(copy_record.read_record(path / copy_record.RECORD), copy_record.Registered)):
             _ = update_record(path, removing, removal=True, scratch_settings=scratch_settings)
-        delete(path)
+        remove_with_cargo_output(path, delete)
         removal_mark(path).unlink(missing_ok=True)
 
 
@@ -953,6 +1072,7 @@ def clear_finished_copy_removals(base: Path, *,
         if not os.path.lexists(path) and isinstance(pending_removal(path, scratch_settings=scratch_settings), copy_record.Registered):
             with removal_lock(path) as idle:
                 if idle and not os.path.lexists(path):
+                    remove_with_cargo_output(path, lambda folder: None)
                     removal_mark(path).unlink(missing_ok=True)
 
 
@@ -1205,6 +1325,8 @@ def main(argv: list[str]) -> int:
         else:
             _ = command.add_argument("--name", default="")
             _ = command.add_argument("--visible", action="store_true")
+    for action in ("cargo-save", "cargo-clean"):
+        _ = commands.add_parser(action).add_argument("path")
     _ = commands.add_parser("release").add_argument("path")
     _ = commands.add_parser("renew").add_argument("path")
     _ = commands.add_parser("end").add_argument("--task", required=True)
@@ -1218,7 +1340,13 @@ def main(argv: list[str]) -> int:
     arguments = parser.parse_args(argv)
     command = cast(str, arguments.command)
     try:
-        if command == "new":
+        if command in ("cargo-save", "cargo-clean"):
+            path = Path(cast(str, arguments.path)).resolve()
+            saved = save_cargo_outputs(path)
+            if command == "cargo-clean":
+                clean_cargo_outputs(path, saved)
+                cargo_removal_mark(path).unlink(missing_ok=True)
+        elif command == "new":
             print(new(chosen_task(arguments), cast(str, arguments.name), cast(bool, arguments.visible), scratch_settings=scratch_settings))
         elif command == "clone":
             print(clone(Path(cast(str, arguments.path)), chosen_task(arguments), cast(str, arguments.name), scratch_settings=scratch_settings))

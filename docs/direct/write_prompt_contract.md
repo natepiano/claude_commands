@@ -267,9 +267,10 @@ reading.
 </PhaseMesh>
 
 <BuildTokenContract>
-Both agents share one `target/` directory and one Cargo lock, so an
-uncoordinated `verify.sh` run blocks its peer for minutes while holding
-nothing useful.
+Both agents share Cargo output roots and Cargo locks.
+Cargo stores final binaries in `target_directory` and intermediates in `build_directory`.
+Check both output filesystems with `df -h` before a large build.
+An uncoordinated `verify.sh` run can block its peer for minutes.
 
 **`verify.sh` takes the `cargo` token itself, and no prompt ever asks an agent
 to take it.** `implement.sh` exports the board directory and the slot;

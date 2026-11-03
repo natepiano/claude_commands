@@ -30,10 +30,12 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
     from ..lib import build_folders
+    from ..lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
     from ..aws_target import ledger
     from ..build_targets.target_config import SshTarget, is_aws_target
 else:
     from scripts.lib import build_folders
+    from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
     from scripts.build_targets.target_config import SshTarget, is_aws_target
 
 
@@ -170,7 +172,20 @@ def probe_script(mirror: str, *, shell_environment: bool = False) -> str:
     return '\n'.join((
         ':' if shell_environment else 'export PATH="$HOME/.cargo/bin:$PATH"',
         f'mkdir -p -- "$HOME"/{shlex.quote(mirror)} || exit 1',
-        'free_gib=$(df -Pk "$HOME" | awk \'NR == 2 {printf "%.6f", $4 / 1048576}\') || exit 1',
+        f'checkout="$HOME"/{shlex.quote(mirror)}',
+        'if [[ -f "$checkout/Cargo.toml" ]]; then',
+        "  capacity_code=" + shlex.quote("\n".join((
+            "import sys",
+            "from pathlib import Path",
+            "sys.path.insert(0, str(Path.home() / '.claude'))",
+            "from scripts.mac_test.linux_runner import output_free_bytes",
+            "print(f'{output_free_bytes(Path(sys.argv[1])) / 1024 ** 3:.6f}')",
+        ))),
+        '  free_gib=$(python3 -c "$capacity_code" "$checkout") || { printf \'disk capacity unavailable\\n\' >&2; exit 1; }',
+        'else',
+        '  disk_usage=$(df -Pk "$checkout") || exit 1',
+        '  free_gib=$(printf \'%s\\n\' "$disk_usage" | awk \'NR > 1 {if (!seen || $4 < free) free=$4; seen=1} END {printf "%.6f", free / 1048576}\') || exit 1',
+        'fi',
         'printf \'free_gib=%s\\nhost=%s\\n\' "$free_gib" "$(hostname -s)"',
         'rustc_version=$(rustc -V) || exit 1',
         'nextest_version=$(cargo nextest --version) || exit 1',
@@ -564,6 +579,30 @@ def run(mirror: Path, values: dict[str, str], repository: str, verb: str,
         return 75
 
 
+def output_filesystem_paths(checkout: Path) -> tuple[Path, ...]:
+    """Resolve the checkout and its Cargo output filesystems."""
+    outputs = read_cargo_output_roots(checkout)
+    if isinstance(outputs, CargoOutputUnavailable):
+        if not (checkout / "Cargo.toml").exists():
+            return (checkout,)
+        raise OSError(outputs.reason)
+    return (checkout, outputs.target_directory, outputs.build_directory)
+
+
+def output_free_bytes(checkout: Path) -> int:
+    readings: list[int] = []
+    for path in output_filesystem_paths(checkout):
+        while True:
+            try:
+                readings.append(shutil.disk_usage(path)[2])
+                break
+            except FileNotFoundError:
+                if path == path.parent:
+                    raise
+                path = path.parent
+    return min(readings)
+
+
 def trim_build_folder(target: Path, environment: dict[str, str]) -> int:
     """Use the existing budget sweep without the machine-wide disk sweep."""
     code = '\n'.join((
@@ -574,7 +613,12 @@ def trim_build_folder(target: Path, environment: dict[str, str]) -> int:
         'import conf',
         'config = conf.read(conf.path("lint"))',
         'recent_seconds = int(config.number(sweep.RECENT_KEY) * 60)',
-        'sys.exit(sweep.sweep_workspace(sys.argv[1], config, False, recent_seconds / 60))',
+        'import os',
+        'target = Path(sys.argv[1])',
+        'checkout = Path(os.environ["BUILDLOG_WORKSPACE"])',
+        'os.chdir(checkout)',
+        'selected = None if (checkout / "Cargo.toml").is_file() else str(target)',
+        'sys.exit(sweep.sweep_workspace(selected, config, False, recent_seconds / 60))',
     ))
     return subprocess.run([sys.executable, '-c', code, str(target)],
                           env={**os.environ, **environment}, check=False).returncode
@@ -616,6 +660,7 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         'BUILDLOG_TARGET': values.get('selected_target', ''),
         'BUILDLOG_SYNC': '0', 'LINT_SKIP_SWEEP': '1',
         'CARGO_TARGET_DIR': str(target),
+        'BUILDLOG_WORKSPACE': str(mirror),
     }
     if tree_key:
         environment['BUILDLOG_SENT_TREE_KEY'] = tree_key
@@ -643,11 +688,11 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         status = completed.returncode if completed.returncode >= 0 else 128 - completed.returncode
         step_started = started.exists()
     try:
-        free = shutil.disk_usage(mirror).free / (1024 ** 3)
+        free = output_free_bytes(mirror) / (1024 ** 3)
         if free < floor:
             if target.exists():
                 shutil.rmtree(target)
-            cleanup = '0'
+            cleanup = '0' if trim_build_folder(target, environment) == 0 else '1'
         else:
             trimmed = trim_build_folder(target, environment)
             cleanup = 'kept' if trimmed == 0 else '1'

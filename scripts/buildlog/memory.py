@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -23,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
 
 import conf
+from cargo_output import CargoOutputRoots, read_cargo_output_roots
 
 GIB = 2**30
 SNAPSHOT_DISTANCE_S = 120
@@ -77,6 +79,34 @@ def cmdline_program(cmdline: str) -> str:
     return cmdline.partition(" ")[0]
 
 
+def build_output_program(program: str) -> bool:
+    """Match an executable against Cargo's resolved output roots."""
+    executable = Path(program)
+    if not executable.is_absolute():
+        return False
+    roots: set[Path] = set()
+    checkouts: set[Path] = {Path.cwd()}
+    try:
+        with closing(sqlite3.connect(f"{index.index_path().as_uri()}?mode=ro", uri=True)) as connection:
+            rows = cast(list[tuple[str, str, str, str]], connection.execute(
+                "SELECT DISTINCT target_directory, build_directory, worktree, cwd FROM steps WHERE host = ?",
+                (store.host_name(),),
+            ).fetchall())
+        for target, build, worktree, cwd in rows:
+            roots.update(Path(path).resolve() for path in (target, build) if path and Path(path).is_absolute())
+            checkouts.update(Path(path) for path in (worktree, cwd) if path and Path(path).is_absolute())
+    except (OSError, sqlite3.Error):
+        pass
+    for checkout in checkouts:
+        if not (checkout / "Cargo.toml").is_file():
+            continue
+        outputs = read_cargo_output_roots(checkout)
+        if isinstance(outputs, CargoOutputRoots):
+            roots.update((outputs.target_directory, outputs.build_directory))
+    resolved = executable.resolve()
+    return any(resolved.is_relative_to(root) for root in roots)
+
+
 @dataclass(frozen=True)
 class EarlyoomKill:
     at: datetime
@@ -89,12 +119,12 @@ class EarlyoomKill:
     def outside_build_gate(self) -> bool:
         if self.oom_score_adj == conf.read("lint").whole("build_oom_score_adj") or not isinstance(self.cmdline, str):
             return False
-        return "/target/" in cmdline_program(self.cmdline)
+        return build_output_program(cmdline_program(self.cmdline))
 
     @property
     def is_build(self) -> bool:
         return (self.oom_score_adj == conf.read("lint").whole("build_oom_score_adj")
-                or isinstance(self.cmdline, str) and "/target/" in cmdline_program(self.cmdline))
+                or isinstance(self.cmdline, str) and build_output_program(cmdline_program(self.cmdline)))
 
 
 def service_state(value: int | None) -> ServiceState:

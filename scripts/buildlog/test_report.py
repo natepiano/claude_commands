@@ -3052,6 +3052,22 @@ class ReportTests(unittest.TestCase):
         self.assertIn("| free | 1.0 GiB |", lines)
         self.assertNotIn("free (floor", "\n".join(lines))
 
+    def test_disk_section_names_each_filesystem_once(self) -> None:
+        snapshot: disk.DiskSnapshot = {
+            "measured_at": "2026-10-04T16:14:00+00:00", "host": "natedev", "rows": [],
+            "used": 10 * (2**30), "free": (2**30), "floor": None,
+            "filesystems": [
+                {"path": "/", "device": "1:1", "device_name": "root", "used": 10 * (2**30), "free": (2**30)},
+                {"path": "/build", "device": "2:1", "device_name": "build", "used": 20 * (2**30), "free": 3 * (2**30)},
+                {"path": "/alias", "device": "2:1", "device_name": "build", "used": 20 * (2**30), "free": 3 * (2**30)},
+            ],
+        }
+        with mock.patch("report.disk.read_snapshot", return_value=snapshot):
+            text = "\n".join(report.disk_section())
+        self.assertIn("/build (2:1, build) free | 3.0 GiB", text)
+        self.assertIn("/ (1:1, root) free | 1.0 GiB", text)
+        self.assertNotIn("/alias", text)
+
     def test_disk_section_clamps_other_when_rows_exceed_used(self) -> None:
         unit = 2**30
         snapshot: disk.DiskSnapshot = {

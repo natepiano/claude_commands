@@ -6,6 +6,8 @@ the tmp sweep owns empty temp folders."""
 from __future__ import annotations
 
 import os
+import io
+import json
 import fcntl
 import socket
 import subprocess
@@ -13,15 +15,15 @@ import sys
 import time
 import unittest
 from collections.abc import Generator, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 from typing import cast, override
 
 import unittest.mock
 
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.lint import tmp_sweep, folder_audit
-from scripts.lib import build_folders, conf, copy_record, scratch
+from scripts.lint import tmp_sweep, folder_audit, sweep
+from scripts.lib import build_folders, cargo_output, conf, copy_record, scratch
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 DAY = 86_400
@@ -100,6 +102,167 @@ class FolderAuditTests(unittest.TestCase):
                                                                 **config_environment(self.root / "config")}))
         _ = write_config_fixture(self.root / "config/hana_instances.conf", "clone_max_hours=2.5\n")
         _ = write_config_fixture(self.root / "config/mac_test.conf", "free_floor_gib=8\n")
+
+    def cargo_checkout(self) -> tuple[Path, Path]:
+        checkout = self.root / "cargo-checkout"
+        checkout.mkdir()
+        _ = (checkout / "Cargo.toml").write_text("private fixture")
+        cache = self.root / "external-intermediates"
+        cache.mkdir()
+        _ = (cache / "output").write_text("build output")
+        roots = cargo_output.CargoOutputRoots(checkout, checkout / "target", cache)
+        _ = self.enterContext(unittest.mock.patch.object(cargo_output, "read_cargo_output_roots", return_value=roots))
+        _ = self.enterContext(unittest.mock.patch.object(scratch, "cargo_checkout_peers", return_value=()))
+        _ = self.enterContext(unittest.mock.patch.object(folder_audit, "process_uses", return_value=tmp_sweep.ProcessUsesKnown([])))
+        self.enterContext(unittest.mock.patch.dict(os.environ, {"LINT_SWEEP_STATE_DIR": str(self.root / "cargo-state")}))
+        index = sweep.cargo_output_cache_path()
+        index.parent.mkdir()
+        _ = index.write_text(json.dumps([{"workspace_root": str(checkout), "target_directory": str(checkout / "target"), "build_directory": str(cache)}]))
+        _ = scratch.save_cargo_outputs(checkout)
+        return checkout, cache
+
+    def test_external_cache_cleanup_uses_the_index_and_keeps_shared_outputs(self) -> None:
+        checkout, cache = self.cargo_checkout()
+        index = sweep.cargo_output_cache_path()
+        for other_root in (cache, cache.parent):
+            with self.subTest(other_root=other_root):
+                _ = index.write_text(json.dumps([{"workspace_root": str(self.root / "unrelated-checkout"),
+                    "target_directory": str(other_root), "build_directory": str(self.root / "other-cache")}]))
+                folder_audit.clean_checkout_cargo_output(checkout)
+                self.assertTrue((cache / "output").exists())
+        own = {"workspace_root": str(checkout), "target_directory": str(checkout / "target"), "build_directory": str(cache)}
+        history = {"workspace_root": str(self.root / "historical-checkout"),
+                   "target_directory": str(self.root / "historical-target"), "build_directory": str(cache)}
+        _ = index.write_text(json.dumps({"workspaces": [own], "history": [history]}))
+        folder_audit.clean_checkout_cargo_output(checkout)
+        self.assertTrue(cache.exists())
+        _ = index.write_text(json.dumps({"workspaces": [own], "history": []}))
+        folder_audit.clean_checkout_cargo_output(checkout)
+        self.assertFalse(cache.exists())
+        self.assertTrue(checkout.exists())
+        folder_audit.clean_checkout_cargo_output(checkout)
+
+    def test_external_cache_cleanup_keeps_unreadable_index_and_live_or_locked_output(self) -> None:
+        checkout, cache = self.cargo_checkout()
+        index = sweep.cargo_output_cache_path()
+        for contents in ("[]", "broken", "{}", '[{"workspace_root":"/missing"}]'):
+            with self.subTest(contents=contents):
+                _ = index.write_text(contents)
+                with self.assertRaisesRegex(OSError, "index is empty or unreadable"):
+                    folder_audit.clean_checkout_cargo_output(checkout)
+                self.assertTrue(cache.exists())
+        index.unlink()
+        with self.assertRaisesRegex(OSError, "index is empty or unreadable"):
+            folder_audit.clean_checkout_cargo_output(checkout)
+        self.assertTrue(cache.exists())
+        _ = index.write_text(json.dumps([{"workspace_root": str(checkout), "target_directory": str(checkout / "target"), "build_directory": str(cache)}]))
+        for uses in (tmp_sweep.ProcessUsesKnown([(str(cache / "output"), 123456, "fd")]),
+                     tmp_sweep.ProcessUsesUnavailable()):
+            with self.subTest(uses=uses), unittest.mock.patch.object(folder_audit, "process_uses", return_value=uses):
+                with self.assertRaisesRegex(OSError, "busy or unreadable"):
+                    folder_audit.clean_checkout_cargo_output(checkout)
+                self.assertTrue(cache.exists())
+        with (cache / ".cargo-lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(OSError, "locked"):
+                folder_audit.clean_checkout_cargo_output(checkout)
+        def new_use(paths: list[Path]) -> tmp_sweep.ProcessUsesKnown:
+            self.assertEqual(paths, [cache])
+            _ = (cache / scratch.USE_STAMP).write_text("new use")
+            stamp(cache / scratch.USE_STAMP, time.time() + 1)
+            return tmp_sweep.ProcessUsesKnown([])
+        with unittest.mock.patch.object(folder_audit, "process_uses", side_effect=new_use):
+            with self.assertRaisesRegex(OSError, "used after"):
+                folder_audit.clean_checkout_cargo_output(checkout)
+        (cache / scratch.USE_STAMP).unlink()
+        folder_audit.clean_checkout_cargo_output(checkout)
+        self.assertFalse(cache.exists())
+
+    def test_unreadable_index_keeps_the_source_and_mark_until_cleanup_can_finish(self) -> None:
+        checkout, cache = self.cargo_checkout()
+        index = sweep.cargo_output_cache_path()
+        valid_index = index.read_text()
+        _ = index.write_text("broken")
+        error = io.StringIO()
+        with redirect_stderr(error):
+            self.assertEqual(folder_audit.main(["--clean-cargo-output", str(checkout)]), 1)
+        self.assertEqual(len(error.getvalue().splitlines()), 1)
+        def clean(path: Path, saved: tuple[scratch.SavedCargoOutput, ...]) -> None:
+            self.assertEqual(saved[0].roots.build_directory, cache)
+            folder_audit.clean_checkout_cargo_output(path)
+        with unittest.mock.patch.object(scratch, "clean_cargo_outputs", side_effect=clean):
+            with self.assertRaisesRegex(OSError, "index is empty or unreadable"):
+                scratch.remove_with_cargo_output(checkout, scratch.remove)
+            self.assertTrue(checkout.exists())
+            self.assertTrue(cache.exists())
+            self.assertTrue(scratch.cargo_removal_mark(checkout).exists())
+            _ = index.write_text(valid_index)
+            scratch.remove_with_cargo_output(checkout, scratch.remove)
+        self.assertFalse(checkout.exists())
+        self.assertFalse(cache.exists())
+        self.assertFalse(scratch.cargo_removal_mark(checkout).exists())
+
+    def test_shared_symlink_output_survives_a_different_cargo_target_setting(self) -> None:
+        checkout, cache = self.cargo_checkout()
+        (checkout / "target").symlink_to(cache, target_is_directory=True)
+        scratch.cargo_removal_mark(checkout).unlink()
+        roots = cargo_output.CargoOutputRoots(checkout, self.root / "inherited-target", cache)
+        with unittest.mock.patch.object(cargo_output, "read_cargo_output_roots", return_value=roots):
+            saved = scratch.save_cargo_outputs(checkout)
+        self.assertEqual(saved[0].shared_output_roots, (cache,))
+        sweep.cargo_output_cache_path().unlink()
+        with unittest.mock.patch.object(cargo_output, "read_cargo_output_roots", side_effect=AssertionError("saved mapping required")):
+            folder_audit.clean_checkout_cargo_output(checkout)
+        self.assertTrue((cache / "output").exists())
+
+    def test_a_new_cleanup_attempt_keeps_the_mapping_and_accepts_completed_use(self) -> None:
+        checkout, cache = self.cargo_checkout()
+        original_mark = scratch.cargo_removal_mark(checkout).read_bytes()
+        started = time.time()
+        def new_use(paths: list[Path]) -> tmp_sweep.ProcessUsesKnown:
+            self.assertEqual(paths, [cache])
+            _ = (cache / scratch.USE_STAMP).write_text("new use")
+            stamp(cache / scratch.USE_STAMP, started + 10)
+            return tmp_sweep.ProcessUsesKnown([])
+        with (unittest.mock.patch.object(time, "time", return_value=started),
+              unittest.mock.patch.object(folder_audit, "process_uses", side_effect=new_use)):
+            with self.assertRaisesRegex(OSError, "used after"):
+                folder_audit.clean_checkout_cargo_output(checkout)
+        self.assertTrue(cache.exists())
+        self.assertEqual(scratch.cargo_removal_mark(checkout).read_bytes(), original_mark)
+        with (unittest.mock.patch.object(time, "time", return_value=started + 20),
+              unittest.mock.patch.object(cargo_output, "read_cargo_output_roots", side_effect=AssertionError("saved mapping required"))):
+            folder_audit.clean_checkout_cargo_output(checkout)
+        self.assertFalse(cache.exists())
+
+    def test_external_cleanup_preserves_both_output_roots_inside_another_cache(self) -> None:
+        checkout, cache = self.cargo_checkout()
+        index = sweep.cargo_output_cache_path()
+        own = {"workspace_root": str(checkout), "target_directory": str(checkout / "target"), "build_directory": str(cache)}
+        for output_kind in ("target_directory", "build_directory"):
+            with self.subTest(output_kind=output_kind):
+                artifacts = cache / "artifacts"
+                artifacts.mkdir(exist_ok=True)
+                _ = (artifacts / "binary").write_text("another workspace")
+                peer = {"workspace_root": str(self.root / "other-workspace"),
+                        "target_directory": str(self.root / "other-target"),
+                        "build_directory": str(self.root / "other-build")}
+                peer[output_kind] = str(artifacts)
+                _ = index.write_text(json.dumps([own, peer]))
+                folder_audit.clean_checkout_cargo_output(checkout)
+                self.assertEqual((artifacts / "binary").read_text(), "another workspace")
+                self.assertTrue((cache / "output").exists())
+
+    def test_saved_output_mapping_survives_partial_source_removal_and_retries(self) -> None:
+        checkout, cache = self.cargo_checkout()
+        (checkout / "Cargo.toml").unlink()
+        with unittest.mock.patch.object(cargo_output, "read_cargo_output_roots", side_effect=AssertionError("source no longer readable")):
+            folder_audit.clean_checkout_cargo_output(checkout)
+        self.assertFalse(cache.exists())
+        self.assertTrue(scratch.cargo_removal_mark(checkout).exists())
+        scratch.remove_with_cargo_output(checkout, lambda path: path.rmdir())
+        self.assertFalse(checkout.exists())
+        self.assertFalse(scratch.cargo_removal_mark(checkout).exists())
 
     def clone_folder(self, name: str, hours: float, *, dirty: bool = False) -> Path:
         source = self.root / "clone-source"

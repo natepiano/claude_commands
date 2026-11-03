@@ -133,6 +133,22 @@ class TmpSweepCase(unittest.TestCase):
 class CopyTests(TmpSweepCase):
     now: float = 0.0
 
+    def test_unregistered_checkout_removal_uses_the_cargo_output_guard(self) -> None:
+        checkout = self.tmp / "old-checkout"
+        checkout.mkdir(parents=True)
+        events: list[str] = []
+        def clean(path: Path, saved: tuple[scratch.SavedCargoOutput, ...]) -> None:
+            self.assertEqual(path, checkout)
+            self.assertEqual(saved, ())
+            self.assertTrue(path.exists())
+            events.append("guard")
+        entry = tmp_sweep.RemovableEntry(str(checkout), str(self.tmp), self.now, 0)
+        result = tmp_sweep.Sweep()
+        with mock.patch.object(scratch, "clean_cargo_outputs", side_effect=clean):
+            self.assertTrue(tmp_sweep.remove_idle_entry(entry, result, False))
+        self.assertEqual(events, ["guard"])
+        self.assertFalse(checkout.exists())
+
     def test_private_root_never_selects_the_live_copies_authority(self) -> None:
         authority_root = self.tmp.parent / "authority copies"
         with mock.patch.object(copy_record, "copies_root", return_value=authority_root) as authority:

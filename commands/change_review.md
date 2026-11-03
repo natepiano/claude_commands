@@ -157,7 +157,9 @@ copy), make it after `add` prints the row's number, never by hand:
 It prints `~/rust/repro/<showrunner>-C<n>-<word>`, where cargo-port lists it.
 Name that path in the row's How to check cell (`edit`). `adopt <path>` with the
 same options moves a folder that already exists there. Without `--visible`
-the folder goes in `/tmp/claude/scratch`. The row's verdict removes both.
+the folder uses the configured scratch root. The row's verdict removes the folder and its owned Cargo outputs.
+Cargo stores final binaries in `target_directory` and intermediates in `build_directory`.
+Check both output filesystems with `df -h` before a large build.
 
 ## verdict
 

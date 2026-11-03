@@ -1217,8 +1217,8 @@ condition: wrap neither waits on it nor retires its worktree or branch.
     lock, run fewer at once, never none. User, 2026-10-06, replacing the
     2026-10-01 one-phase rule.
 - **Disk.** Units keep saved run output under a few GB (`/unit:direct` →
-  <ToolingContract/>). When builds turn cold for no reason, run `df -h /` and
-  find the large output before anything else. User, 2026-10-04.
+  <ToolingContract/>). When builds turn cold for no reason, check `df -h /` and, when present, `df -h /build`.
+  Find the large output before any other action. User, 2026-10-04.
 - Never ask the user to review until <DesignCheck/> passed on the shots.
 - Never pass on a unit director's claim without checking it.
 - Updates hold only what the schedule prompt allows.

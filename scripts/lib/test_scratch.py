@@ -18,7 +18,7 @@ from threading import Event, current_thread
 from typing import cast, override
 from unittest import mock
 
-from scripts.lib import copy_record, scratch
+from scripts.lib import cargo_output, copy_record, scratch
 from scripts.lint import sweep
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "style"))
 from scripts.style import style_sync
@@ -83,6 +83,59 @@ class ScratchTests(unittest.TestCase):
         scratch.register_copy(path, task=task, owner_unit="maker-unit", source_path=str(path),
                               source_commit="a" * 40, copy_commit="b" * 40, target_mode="none",
                               seed_source="", borrows_from="", **details)
+
+    def test_checkout_removal_saves_outputs_before_source_deletion_and_keeps_retry_evidence(self) -> None:
+        checkout = self.base / "cargo-checkout"
+        checkout.mkdir()
+        manifest = checkout / "Cargo.toml"
+        _ = manifest.write_text("private manifest")
+        cache = self.base / "outside-cache"
+        roots = cargo_output.CargoOutputRoots(checkout, checkout / "target", cache)
+        calls: list[str] = []
+        def clean(path: Path, saved: tuple[scratch.SavedCargoOutput, ...]) -> None:
+            self.assertEqual(path, checkout)
+            self.assertEqual(saved[0].roots, roots)
+            self.assertTrue(scratch.cargo_removal_mark(checkout).exists())
+            calls.append("cache")
+        def interrupted(path: Path) -> None:
+            self.assertEqual(calls, ["cache"])
+            (path / "Cargo.toml").unlink()
+            raise OSError("stopped source deletion")
+        with (mock.patch.object(cargo_output, "read_cargo_output_roots", return_value=roots),
+              mock.patch.object(scratch, "cargo_checkout_peers", return_value=()),
+              mock.patch.object(scratch, "clean_cargo_outputs", side_effect=clean)):
+            with self.assertRaisesRegex(OSError, "stopped source"):
+                scratch.remove_with_cargo_output(checkout, interrupted)
+            self.assertTrue(scratch.cargo_removal_mark(checkout).exists())
+            with mock.patch.object(cargo_output, "read_cargo_output_roots", side_effect=AssertionError("lost source")):
+                scratch.remove_with_cargo_output(checkout, lambda path: path.rmdir())
+        self.assertEqual(calls, ["cache", "cache"])
+        self.assertFalse(checkout.exists())
+        self.assertFalse(scratch.cargo_removal_mark(checkout).exists())
+
+    def test_invalid_cargo_removal_marks_report_an_oserror_and_keep_the_source(self) -> None:
+        checkout = self.base / "invalid-mark-checkout"
+        checkout.mkdir()
+        mark = scratch.cargo_removal_mark(checkout)
+        for contents in (b"{broken", b"\xff"):
+            with self.subTest(contents=contents):
+                _ = mark.write_bytes(contents)
+                with mock.patch.object(scratch, "remove", side_effect=AssertionError("source must remain")):
+                    with self.assertRaisesRegex(OSError, "invalid Cargo removal record"):
+                        scratch.remove_with_cargo_output(checkout, scratch.remove)
+                self.assertTrue(checkout.exists())
+                self.assertEqual(mark.read_bytes(), contents)
+
+    def test_contained_cargo_output_needs_no_external_cleanup(self) -> None:
+        checkout = self.base / "cargo-checkout"
+        (checkout / "target" / "debug").mkdir(parents=True)
+        _ = (checkout / "Cargo.toml").write_text("private manifest")
+        roots = cargo_output.CargoOutputRoots(checkout, checkout / "target", checkout / "target")
+        with (mock.patch.object(cargo_output, "read_cargo_output_roots", return_value=roots),
+              mock.patch.object(scratch, "cargo_checkout_peers", return_value=()),
+              mock.patch.object(subprocess, "run", side_effect=AssertionError("external guard was unnecessary"))):
+            scratch.remove_with_cargo_output(checkout, scratch.remove)
+        self.assertFalse(checkout.exists())
 
     def test_a_test_clone_and_its_build_output_end_with_the_task(self) -> None:
         source = self.base / "source"

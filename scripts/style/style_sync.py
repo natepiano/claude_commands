@@ -263,7 +263,8 @@ def verifier_command(directory: Path, owner: int) -> list[str]:
 def verify_lint(directory: Path) -> tuple[int, str]:
     # Held from Popen until the child stop below is in force; start_new_session makes `$$` the group id.
     with signal_mask(signal.SIG_BLOCK), subprocess.Popen(
-        verifier_command(directory, os.getpid()), cwd=directory / "checkout", env={**os.environ, "UNIT_DETACHED_RUN": "1"},
+        verifier_command(directory, os.getpid()), cwd=directory / "checkout", env={**os.environ, "UNIT_DETACHED_RUN": "1",
+            "CARGO_BUILD_BUILD_DIR": str((directory / "checkout/target").resolve() / "intermediates")},
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         start_new_session=True, preexec_fn=unblock_held_signals,
     ) as child:
@@ -292,7 +293,7 @@ def remove_lint_dir(repo: Path, directory: Path) -> bool:
         if snapshot.is_symlink():
             snapshot.unlink()
         elif snapshot.is_dir():
-            shutil.rmtree(snapshot)
+            scratch.remove_with_cargo_output(snapshot, shutil.rmtree)
         registered = {Path(line.removeprefix("worktree "))
                       for line in git(repo, "worktree", "list", "--porcelain").splitlines()
                       if line.startswith("worktree ")}
@@ -347,6 +348,7 @@ def lint_target(common_dir: Path) -> Path:
     """One Cargo target per main repo, retained across style production tasks."""
     target = common_dir / scratch.STYLE_TARGET_NAME
     scratch.mark_cargo_cache(target)
+    scratch.mark_cargo_cache(target / "intermediates")
     _ = scratch.release(target)
     return target
 
@@ -378,6 +380,14 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
                 _ = git(checkout, "worktree", "add", "--detach", str(snapshot), tip)
                 target_link = snapshot / "target"
                 target_link.symlink_to(target, target_is_directory=True)
+
+                saved = subprocess.run(
+                    [str(PYTHON), str(Path(scratch.__file__)), "cargo-save", str(snapshot)],
+                    env={**os.environ, "CARGO_BUILD_BUILD_DIR": str(target / "intermediates")},
+                    capture_output=True, text=True, check=False,
+                )
+                if saved.returncode:
+                    raise Refusal(saved.stderr.strip() or "cannot save Cargo output roots")
                 returncode, output = verify_lint(directory)
                 print(output, end="")
                 # The generated target link is ours, including in a repo without a target ignore rule.

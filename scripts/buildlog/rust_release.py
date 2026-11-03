@@ -20,9 +20,9 @@ from typing import TYPE_CHECKING, BinaryIO, Literal, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
-    from ..lib import build_folders
+    from ..lib import build_folders, cargo_output, scratch
 else:
-    from scripts.lib import build_folders
+    from scripts.lib import build_folders, cargo_output, scratch
 
 import store
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -151,8 +151,19 @@ def run_process(args: list[str], cwd: Path | None, env: dict[str, str], timeout:
 
 
 def free_space_gib() -> float:
-    disk = os.statvfs(Path.home())
-    return disk.f_bavail * disk.f_frsize / GIB
+    paths = [Path.home(), default_trial_parent(), HANA]
+    roots = cargo_output.read_cargo_output_roots(HANA)
+    if isinstance(roots, cargo_output.CargoOutputRoots):
+        paths.extend((roots.target_directory, roots.build_directory))
+    devices: dict[int, float] = {}
+    for path in paths:
+        while not path.exists() and path != path.parent:
+            path = path.parent
+        device = path.stat().st_dev
+        if device not in devices:
+            disk = os.statvfs(path)
+            devices[device] = disk.f_bavail * disk.f_frsize / GIB
+    return min(devices.values())
 
 
 def build_hold_active(folder: Path = HOLD_DIR) -> bool:
@@ -312,11 +323,27 @@ def directory_gib(path: Path) -> float:
 
 
 def remove_clone(path: Path) -> None:
+    scratch.remove_with_cargo_output(path, remove_clone_tree)
+
+
+def remove_clone_tree(path: Path) -> None:
     if path.is_symlink():
         path.unlink()
     elif path.exists():
         shutil.rmtree(path)
 
+
+
+def trial_output_gib(clone: Path) -> tuple[float, float]:
+    """Count each physical output root once, including saved external intermediates."""
+    saved = scratch.save_cargo_outputs(clone)
+    roots = {clone / "target"}
+    for output in saved:
+        roots.update((output.roots.target_directory, output.roots.build_directory))
+    mend = clone / "mend-target"
+    roots = {root.resolve() for root in roots if not root.resolve().is_relative_to(mend.resolve())}
+    outer = [root for root in roots if not any(root != parent and root.is_relative_to(parent) for parent in roots)]
+    return sum(directory_gib(root) for root in outer), directory_gib(mend)
 
 def trial_step_was_killed(result: subprocess.CompletedProcess[str]) -> bool:
     if result.returncode == 0:
@@ -382,6 +409,7 @@ def trial_release(
                     return {"status": "waiting", "version": version, "reason": "build hold active"}
                 step = "clippy"
                 clippy_env = env | {"CARGO_INCREMENTAL": "0", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=mold -C target-cpu=x86-64-v3"}
+                _ = scratch.save_cargo_outputs(clone)
                 clippy = run_command(["nix", "develop", ".#ci", "-c", "cargo", f"+{version}", "clippy", "--workspace", "--all-targets", "--all-features", "--message-format=json"], clone, clippy_env, 7200)
                 if held():
                     return {"status": "waiting", "version": version, "reason": "build hold active"}
@@ -394,20 +422,21 @@ def trial_release(
                 if held():
                     return {"status": "waiting", "version": version, "reason": "build hold active"}
                 step = "cargo-mend"
-                mend_env = env | {"RUSTC_BOOTSTRAP": "1", "CARGO_TARGET_DIR": str(clone / "mend-target")}
+                mend_env = env | {"RUSTC_BOOTSTRAP": "1", "CARGO_TARGET_DIR": str(clone / "mend-target"),
+                                  "CARGO_BUILD_BUILD_DIR": str(clone / "mend-target/intermediates")}
                 mend = run_command(["cargo", f"+{version}", "install", "--path", str(Path.home() / "rust/cargo-liner/crates/cargo-mend"), "--root", str(clone / "mend-root")], clone, mend_env, 3600)
                 if held():
                     return {"status": "waiting", "version": version, "reason": "build hold active"}
                 if trial_step_was_killed(mend):
                     return {"status": "waiting", "version": version, "reason": "cargo-mend killed; retry next night"}
                 mend_builds = mend.returncode == 0
-        target_gib = directory_gib(clone / "target")
-        mend_target_gib = directory_gib(clone / "mend-target")
+        target_gib, mend_target_gib = trial_output_gib(clone)
         if reason:
             return {"status": "failed", "version": version, "step": step, "reason": reason, "target_gib": target_gib, "mend_target_gib": mend_target_gib}
         return {"status": "finished", "version": version, "warnings": warnings, "warning_crates": warning_crates, "errors": errors, "error_crates": error_crates, "mend_builds": mend_builds, "target_gib": target_gib, "mend_target_gib": mend_target_gib}
     except (OSError, subprocess.SubprocessError) as error:
-        return {"status": "failed", "version": version, "step": step, "reason": str(error).splitlines()[0], "target_gib": directory_gib(clone / "target"), "mend_target_gib": directory_gib(clone / "mend-target")}
+        target_gib, mend_target_gib = trial_output_gib(clone)
+        return {"status": "failed", "version": version, "step": step, "reason": str(error).splitlines()[0], "target_gib": target_gib, "mend_target_gib": mend_target_gib}
     finally:
         remove_clone(clone)
 
