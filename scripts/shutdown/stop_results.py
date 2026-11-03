@@ -44,7 +44,6 @@ class ClaudeUp:
     pane_id: str
     account: str
     elapsed_seconds: float = field(default=0.0, compare=False)
-    trust_copied_from: str = field(default="", compare=False)
     start_state: ClaudeStartState = field(default=ClaudeStartState.STARTED, compare=False)
 
 
@@ -80,5 +79,4 @@ def claude_up_line(result: ClaudeUp) -> str:
     if result.start_state is ClaudeStartState.ALREADY_RUNNING:
         return f"{result.session_id}: unchanged; Claude runs on {result.account} in {result.pane_id}"
     return (f"{result.session_id}: Claude is up on {result.account} in {result.pane_id} "
-            + f"({result.elapsed_seconds:.1f} s)"
-            + (f"; copied folder trust from {result.trust_copied_from}" if result.trust_copied_from else ""))
+            + f"({result.elapsed_seconds:.1f} s)")
