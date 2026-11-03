@@ -14,6 +14,7 @@ from scripts.aws_target import ledger
 from scripts.aws_target.ledger import ChargeRead as ChargeRead, read_charge as read_charge, charge_record as charge_record
 from scripts.aws_target.config import MeasurementUnavailable as MeasurementUnavailable, SpendingSettings, offload_enabled, read_settings
 from scripts.lib.atomic_file import create_text_atomic
+from scripts.lib import conf
 if TYPE_CHECKING:
     from ..mac_test import mac_test
 else:
@@ -82,7 +83,7 @@ def record_go_live(directory: Path, now: int) -> None:
 def read_status_measurement(settings_path: Path, directory: Path, now: int, *,
                             inputs: MeasurementInputs | None = None) -> AwsStatusMeasurement | MeasurementUnavailable:
     try:
-        enabled = offload_enabled(settings_path)
+        enabled = offload_enabled(conf.read(settings_path))
         source = read_inputs(settings_path, directory) if inputs is None else inputs
         state, settings = source.state, source.settings
         row = mac_test.read_json_object(directory / 'controller.json')

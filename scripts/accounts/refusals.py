@@ -69,7 +69,7 @@ def _reading_window(window: usage_store.StoredWindow) -> ReadingWindow:
 
 def stored_reading(tool: Literal["claude", "codex"], login: str, now: datetime) -> FreshReading | StaleReading | NoReading:
     """Read saved usage with the configured age limit."""
-    stale_after = timedelta(minutes=conf.whole("accounts", "usage_stale_minutes"))
+    stale_after = timedelta(minutes=conf.read("accounts").whole("usage_stale_minutes"))
     return stored_reading_with_age(tool, login, now, stale_after)
 
 

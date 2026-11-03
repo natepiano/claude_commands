@@ -17,6 +17,7 @@ from unittest import mock
 from scripts.issue_score.test_config import ConfiguredTestCase, patch_thresholds
 from scripts.issue_score import client, decide, evaluate, questions, records, score_issues, vault
 from scripts.issue_score.test_decide import choice_answer
+from scripts.lib import conf
 from scripts.prioritize import renumber
 
 FIXTURES = Path(__file__).with_name("fixtures")
@@ -47,6 +48,18 @@ def table(report: str, first_header: str) -> list[dict[str, str]]:
 
 
 class MetricTests(ConfiguredTestCase):
+    def test_routing_counts_use_the_displayed_threshold_after_the_live_file_changes(self) -> None:
+        path = self.configuration(**{"threshold.backlog_goal": ".8"})
+        scoring_config = conf.read("issue_score")
+        self.change_configuration(path, **{"threshold.backlog_goal": ".2"})
+        issue = vault.Issue(Path("fixture.md"), "Fixture", "hana", "", {})
+        observation = evaluate.FieldObservation(issue, "ship_hana", "ship_hana",
+            decide.FieldDecision("ship_hana", .5, "unsure"), {"ship_hana": .5})
+        report = evaluate._routing_summary("backlog_goal", [observation], scoring_config=scoring_config)  # pyright: ignore[reportPrivateUsage]
+        self.assertIn("configured threshold 0.80", report)
+        self.assertIn("taken (sure): 0.0000", report)
+        self.assertIn("routed to the user (unsure): 1.0000", report)
+
     def test_split_hashes_the_filename_including_extension_and_ignores_parent(self) -> None:
         # SHA1 residues modulo ten are 1, 8, 9, and 7 respectively.
         for filename, expected in (("Target A.md", "tune"), ("Target G.md", "holdout"),

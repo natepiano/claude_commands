@@ -99,7 +99,7 @@ class InvalidFloor(ValueError):
 
 def read_floor() -> int | None:
     config = str(conf.path("lint"))
-    floor, key = sweep.floor_bytes(conf.values(Path(config)), socket.gethostname())
+    floor, key = sweep.floor_bytes(conf.read(Path(config)).values(), socket.gethostname())
     if floor is None and key is not None:
         raise InvalidFloor(f"{key} in {config} must be a non-negative number of GiB")
     return floor

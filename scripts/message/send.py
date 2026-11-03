@@ -2395,11 +2395,12 @@ def read_sender_stamp(value: object) -> SenderStamp:
 def morty_stamp(stamp: SenderStamp) -> bool:
     if isinstance(stamp, UnavailableSender):
         return False
+    config = conf.read("send")
     # A recovered configuration value cannot grant authority after a missing live key.
-    if not isinstance(conf.value_origin("send", "MORTY_NATIVE_ID", str), conf.UsableLiveValue):
+    if not isinstance(config.origin("MORTY_NATIVE_ID", str), conf.UsableLiveValue):
         return False
     try:
-        expected = conf.text("send", "MORTY_NATIVE_ID")
+        expected = config.text("MORTY_NATIVE_ID")
         kind, _, identity = expected.partition(":")
         if kind not in ("session", "codex"):
             return False

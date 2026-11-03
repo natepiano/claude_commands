@@ -101,7 +101,7 @@ def claim(session_id: str) -> AlertClaim | AlertInFlight | AlertDelivered:
             if existing["state"] == "delivered":
                 return AlertDelivered()
             # Entries from before owner leases have no active owner.
-            if (time.time() - existing.get("at", 0) < conf.whole("accounts", "outage_claim_lease_seconds")
+            if (time.time() - existing.get("at", 0) < conf.read("accounts").whole("outage_claim_lease_seconds")
                     and _owner_alive(existing.get("pid", 0))):
                 return AlertInFlight()
         token = uuid.uuid4().hex

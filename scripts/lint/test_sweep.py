@@ -303,7 +303,7 @@ class SweepTests(SweepCase):
         without_window = cast(Callable[[list[str], list[str], int, str, bool], int], sweep.sweep)
         workspace_without_window = cast(Callable[[str | None, str, bool], int], sweep.sweep_workspace)
         before = {path: path.read_bytes() for path in target.root.rglob("*") if path.is_file()}
-        with mock.patch("sweep.conf.number", side_effect=AssertionError("No implicit configuration read expected")):
+        with mock.patch("sweep.conf.ConfigRead.number", side_effect=AssertionError("No implicit configuration read expected")):
             with self.assertRaisesRegex(TypeError, "recent_minutes"):
                 _ = without_window(roots, trees, 0, "test", False)
             with self.assertRaisesRegex(TypeError, "recent_minutes"):
@@ -4103,6 +4103,33 @@ class BudgetTests(unittest.TestCase):
         _ = path.write_text(CONFIG)
         return str(path)
 
+    def test_sweep_recovers_missing_live_recent_minutes_from_the_repository(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        live = root / "live"
+        live.mkdir()
+        _ = (live / "lint.conf").write_text("# range: 0..\nsweep_budget_gib=1\n")
+        repository = root / "repository.conf"
+        _ = repository.write_text("# range: 0..\nrecent_minutes=60\n")
+        environment = {key: value for key, value in os.environ.items() if key != "CONF_DIR"}
+        with (mock.patch.dict(os.environ, environment, clear=True),
+              mock.patch.object(conf, "directory", return_value=live),
+              mock.patch.object(conf, "_repository_path", return_value=repository),
+              mock.patch.object(sweep, "sweep_workspace", return_value=0) as workspace,
+              redirect_stderr(io.StringIO())):
+            self.assertEqual(sweep.main([]), 0)
+        self.assertEqual(workspace.call_args.args[3], 60.0)
+
+    def test_one_sweep_shares_settings_with_its_workspace_budget(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = write_config_fixture(root / "lint.conf", "recent_minutes=60\nsweep_budget_gib=1\n")
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(root), sweep.BUDGET_ENV: ""}),
+              mock.patch.object(conf, "read", wraps=conf.read) as reads,
+              mock.patch.object(sweep, "cargo_roots", return_value=[]),
+              mock.patch.object(sweep, "hold_floor", return_value=0),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(sweep.main([]), 0)
+        reads.assert_called_once_with("lint")
+
     def test_sweep_imports_in_a_fresh_interpreter(self) -> None:
         base = Path(self.enterContext(tempfile.TemporaryDirectory()))
         environment = {**os.environ, "BUILD_HOLD_DIR": str(base / "holders"),
@@ -4115,13 +4142,13 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_config_reads_as_lint_config_sh_does(self) -> None:
-        values = conf.values(Path(self.config()))
+        values = conf.read(Path(self.config())).values()
         self.assertEqual(values["sweep"], "on")
         self.assertEqual(values["sweep_budget_gib"], "24")
         self.assertEqual(values["sweep_budget_gib.hana"], "96")
         self.assertEqual(values["sweep_budget_gib.unset"], "")
         with self.assertRaises(conf.Unusable):
-            _ = conf.values(Path("/nonexistent/lint.conf"))
+            _ = conf.read(Path("/nonexistent/lint.conf")).values()
 
     def test_repo_key_then_default_key_then_built_in(self) -> None:
         config = self.config()

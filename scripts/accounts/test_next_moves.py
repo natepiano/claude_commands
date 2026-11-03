@@ -12,6 +12,8 @@ from unittest.mock import patch
 
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, next_moves, role_map
+from scripts.issue_score.selection import UseConfiguredValue
+from scripts.lib import conf
 from scripts.whoami import run_out
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
 import quota_alert
@@ -295,6 +297,26 @@ class NextMovesTests(unittest.TestCase):
                 "added_at": NOW.isoformat()}])
             with self.subTest(group=group, mode=mode), self.assertRaises(next_moves.NextMoveError):
                 _ = next_moves.decode_next_moves(document)
+
+    def test_half_point_duration_keeps_the_callers_settings_after_a_live_change(self) -> None:
+        account_config = conf.read("accounts")
+        path = conf.path("accounts")
+        contents = path.read_text()
+        if not path.write_text(contents.replace("hold_default_minutes=40", "hold_default_minutes=99")):
+            self.fail("The hold configuration fixture is empty")
+        with (patch.object(next_moves, "account_pace", return_value=next_moves.NoUsablePace()),
+              patch.object(conf, "read", side_effect=AssertionError("hold read the configuration again"))):
+            resolved = next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW,
+                                                account_config=account_config)
+        self.assertEqual(resolved, next_moves.ResolvedHold(40, next_moves.NoUsablePace()))
+
+    def test_half_point_hold_reads_current_settings_for_the_named_request(self) -> None:
+        with (patch.object(conf, "read", wraps=conf.read) as reads,
+              patch.object(next_moves, "account_pace", return_value=next_moves.NoUsablePace())):
+            resolved = next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW,
+                                                account_config=UseConfiguredValue.CURRENT)
+        self.assertEqual(resolved, next_moves.ResolvedHold(40, next_moves.NoUsablePace()))
+        reads.assert_called_once_with("accounts")
 
     def test_half_point_duration_uses_selected_accounts_pace_in_points_per_second(self) -> None:
         path = self.home / "pace.jsonl"
