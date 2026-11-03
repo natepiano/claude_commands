@@ -1927,6 +1927,8 @@ def _signal_process(pid: object, signum: int, *, group: bool = False) -> None:
 
 def _pid_alive(pid: int) -> bool:
     """A recorded pid is live only if the OS can represent and find it."""
+    if pid <= 0:
+        return False
     try:
         _signal_process(pid, 0)
     except OSError as exc:
@@ -3515,11 +3517,13 @@ ThreadState = ThreadIdle | ThreadLive | ThreadActiveWithoutTurn | ThreadStateUnk
 @dataclass(frozen=True)
 class RelaunchAllowed:
     """Cleanup found no confirmed live turn that it could not interrupt."""
+    interrupt_requested: bool = False
 
 
 @dataclass(frozen=True)
 class RelaunchBlockedByLiveTurn:
     """The old thread still has a turn this launcher could not stop."""
+    interrupt_requested: bool = False
 
 
 UnwatchedTurnCleanupResult = RelaunchAllowed | RelaunchBlockedByLiveTurn
@@ -4416,11 +4420,16 @@ def _attach_and_run(
                                 old_port, old_thread, Path(_as_str(_attr(args, "log_file")))
                             )
                             if isinstance(cleanup, RelaunchBlockedByLiveTurn):
+                                if _pid_alive(_as_int(old_entry.get("launcher_pid"))):
+                                    print(
+                                        f"codex_mesh: {name}: thread {old_thread} still has a live turn that could not be interrupted; relaunch once it ends",
+                                        file=sys.stderr,
+                                    )
+                                    return WorkerLaunchRefused()
                                 print(
-                                    f"codex_mesh: {name}: thread {old_thread} still has a live turn that could not be interrupted; relaunch once it ends",
+                                    f"codex_mesh: {name}: thread {old_thread} has a stale turn with no live launcher; interrupt not confirmed; continuing relaunch",
                                     file=sys.stderr,
                                 )
-                                return WorkerLaunchRefused()
                         old_thread = ""
                     elif old_entry.get("status") == WAITING_CAPACITY:
                         # A dead waiting launcher cannot resume this thread.
@@ -4435,17 +4444,33 @@ def _attach_and_run(
                     except (ConnectionError, OSError, SystemExit) as exc:
                         live = ThreadStateUnknown(str(exc) or exc.__class__.__name__)
                     if isinstance(live, ThreadStateUnknown):
+                        if _pid_alive(_as_int(old_entry.get("launcher_pid"))):
+                            print(
+                                f"codex_mesh: {name}: thread {old_thread}: thread state unknown ({live.reason}); "
+                                + f"recorded launcher is alive; use codex_mesh.py end --to {name} before relaunching",
+                                file=sys.stderr,
+                            )
+                            return WorkerLaunchRefused()
+                        cleanup = _end_unwatched_turn(old_port, old_thread, log_path)
+                        detail = ("interrupt requested" if cleanup.interrupt_requested
+                                  else "cleanup attempted; interrupt not confirmed")
                         print(
-                            f"codex_mesh: {name}: thread {old_thread}'s state could not be read ({live.reason}); use codex_mesh.py end --to {name} before relaunching",
+                            f"codex_mesh: {name}: thread {old_thread}: thread state unknown ({live.reason}); "
+                            + f"{detail}; continuing relaunch",
                             file=sys.stderr,
                         )
-                        return WorkerLaunchRefused()
-                    if not isinstance(live, ThreadIdle):
-                        print(
-                            f"codex_mesh: {name}: thread {old_thread} has a live turn; use codex_mesh.py end --to {name} before relaunching",
-                            file=sys.stderr,
-                        )
-                        return WorkerLaunchRefused()
+                    elif not isinstance(live, ThreadIdle):
+                        if _pid_alive(_as_int(old_entry.get("launcher_pid"))):
+                            print(
+                                f"codex_mesh: {name}: thread {old_thread} has a live turn; use codex_mesh.py end --to {name} before relaunching",
+                                file=sys.stderr,
+                            )
+                            return WorkerLaunchRefused()
+                        cleanup = _end_unwatched_turn(old_port, old_thread, log_path)
+                        detail = ("interrupt requested" if cleanup.interrupt_requested
+                                  else "cleanup attempted; interrupt not confirmed")
+                        print(f"codex_mesh: {name}: thread {old_thread} has a stale turn with no live launcher; "
+                              + f"{detail}; continuing relaunch", file=sys.stderr)
             client = Client(port, name)
             _ = _bind_serving_server(client, session_dir, started_here=started_here)
             published = _create_published_worker(client, session_dir, staff_admission, "thread/start",
@@ -6219,6 +6244,7 @@ def _end_unwatched_turn(
     port: int, thread_id: str, log_path: Path
 ) -> UnwatchedTurnCleanupResult:
     """Best effort cleanup when this launcher cannot watch another turn."""
+    interrupt_requested = False
     try:
         with worker_lifecycle.operation_deadline(timeout=THREAD_RELEASE_TIMEOUT_SECS) as deadline:
             client = Client(port, f"cleanup-{os.getpid()}", operation_deadline=deadline)
@@ -6228,12 +6254,13 @@ def _end_unwatched_turn(
                 turn_id = _interruptible_turn_id(client, thread_id, live)
                 if isinstance(turn_id, ThreadLive):
                     reply = _interrupt_turn(client, thread_id, turn_id.turn_id)
+                    interrupt_requested = True
                     if "error" in reply:
                         reason = _as_str(_as_dict(reply["error"]).get("message")) or "turn/interrupt failed"
                         remaining = _read_live_turn(client, thread_id)
                         if isinstance(remaining, (ThreadLive, ThreadActiveWithoutTurn)):
                             _log_uninterrupted_thread(log_path, thread_id, reason)
-                            return RelaunchBlockedByLiveTurn()
+                            return RelaunchBlockedByLiveTurn(interrupt_requested=True)
                         if isinstance(remaining, ThreadStateUnknown):
                             _log_uninterrupted_thread(log_path, thread_id, reason)
                 elif isinstance(turn_id, (ThreadStateUnknown, ThreadActiveWithoutTurn)):
@@ -6244,8 +6271,12 @@ def _end_unwatched_turn(
             finally:
                 client.close()
     except (ConnectionError, OSError, SystemExit) as exc:
-        _log_uninterrupted_thread(log_path, thread_id, str(exc))
-    return RelaunchAllowed()
+        try:
+            _log_uninterrupted_thread(log_path, thread_id, str(exc))
+        except OSError as log_error:
+            print(f"codex_mesh: thread {thread_id}: cleanup failed ({exc}); cleanup log failed ({log_error})",
+                  file=sys.stderr)
+    return RelaunchAllowed(interrupt_requested=interrupt_requested)
 
 
 def command_send(args: argparse.Namespace) -> int:
