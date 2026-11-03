@@ -16,6 +16,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib import unit_runs
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -29,7 +30,7 @@ import sessions
 from fake_unit_host import HostedUnit
 from sessions import SessionRecord
 from unit_lookup import ClaudeNotRunning, ClaudeUnknown, LiveClaude, UnitState
-from scripts.production import staff
+from scripts.production import staff, session_staff, unit_config
 from scripts.shutdown import remote
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership, showrunner_relationship, fixture_runtime_id, StaffTestCase
 
@@ -38,6 +39,30 @@ SCRIPT = Path(__file__).with_name("unit_lookup.py")
 
 def marked(label: str, pane: str, unit: str, slug: str = "show", **extra: str) -> HostedUnit:
     return HostedUnit(label, pane, {"SHOWRUNNER_UNIT": slug, "SHOWRUNNER_UNIT_ID": unit, **extra})
+
+
+class UnitReferenceTests(StaffTestCase):
+    def test_selected_identity_keeps_its_parent_after_a_session_and_name_change(self) -> None:
+        fixture = self.row_production()
+        row = staff.rename(fixture.unit.id, "renamed")
+        record = staff.snapshot()
+        sources = unit_lookup.member_sources()
+        before = self.staff_file.read_bytes()
+        for reference in (session_staff.StoredReference(row.id),
+                          session_staff.StoredReference(row.current_session),
+                          session_staff.LiveSession(row.current_session)):
+            with self.subTest(reference=reference):
+                self.assertEqual(unit_lookup.unit_row("wrong-name", record, reference=reference), row)
+                self.assertEqual(unit_lookup.unit_parent("wrong-name", reference, record=record, sources=sources),
+                                 unit_lookup.UnitProduction(fixture.slug, str(fixture.doc)))
+        for reference in (session_staff.StoredReference(fixture_runtime_id("missing-reference")),
+                          session_staff.LiveSession(fixture_runtime_id("missing-reference"))):
+            with self.subTest(reference=reference):
+                with self.assertRaises(staff.StaffUnreadable):
+                    _ = unit_lookup.unit_row(row.name, record, reference=reference)
+                with self.assertRaises(staff.StaffUnreadable):
+                    _ = unit_lookup.unit_parent(row.name, reference, record=record, sources=sources)
+        self.assertEqual(self.staff_file.read_bytes(), before)
 
 
 class UnitLookupTests(unittest.TestCase):
@@ -70,7 +95,7 @@ class UnitLookupTests(unittest.TestCase):
         sources = unit_lookup.MemberSources({}, ())
         self.assertEqual(unit_lookup.production_members(record, sources), {"current": (live,), "show": ()})
         self.assertIsNotNone(record.by_id(retired.id))
-        self.assertEqual(unit_lookup.unit_row("retired-unit", record, staff_id=retired.id).id, retired.id)
+        self.assertEqual(unit_lookup.unit_row("retired-unit", record, reference=session_staff.StoredReference(retired.id)).id, retired.id)
 
     def test_retired_pane_marks_are_left_out_while_live_siblings_and_retained_identity_stay(self) -> None:
         retired = unit_membership("show", "retired-unit")
@@ -87,11 +112,12 @@ class UnitLookupTests(unittest.TestCase):
                 found = unit_lookup.marked_units("show", record=record)
                 self.assertEqual(list(found), ["live-unit"])
                 self.assertEqual(found["live-unit"].place, herdr.HerdrPlace("live", "w2:p1"))
-                selected = sources.member(unit_lookup.ObservedUnit("retired-unit", durable_id), record)
+                selected = sources.member(unit_lookup.ObservedUnit("retired-unit", session_staff.LiveSession(durable_id)
+                                                                 if durable_id else session_staff.NoSession()), record)
                 self.assertIsInstance(selected, unit_lookup.MemberFound)
                 assert isinstance(selected, unit_lookup.MemberFound)
                 self.assertEqual(selected.row, retired)
-                self.assertEqual(unit_lookup.unit_row("retired-unit", record, staff_id=retired.id), retired)
+                self.assertEqual(unit_lookup.unit_row("retired-unit", record, reference=session_staff.StoredReference(retired.id)), retired)
 
     def test_pane_marks_under_a_wrapped_parent_are_left_out_without_hiding_other_units(self) -> None:
         historical = unit_membership("wrapped", "historical-unit")
@@ -179,12 +205,26 @@ class UnitLookupTests(unittest.TestCase):
         live = unit_membership("receiving", "alpha-unit")
         old = unit_membership("former", "alpha-unit")
         _ = staff.set_worktree(old.id, staff.RemovedWorktree("natedev", self.root / "old"))
-        cells = {"Unit": "alpha-unit", "Plan": "plan.md", "Worktree": "/live", "Branch": "alpha"}
-        lines = ["## Units", "", "| Unit | Plan | Worktree | Branch |", "| --- | --- | --- | --- |",
-                 "| alpha-unit | plan.md | /live | alpha |"]
-        metadata = unit_lookup.unit_metadata(staff.snapshot(), unit_lookup.MemberSources({}, ()),
-                                             documents={"old-doc": lines})
-        self.assertEqual(metadata, {live.id: cells})
+        worktree = Path("/live")
+        cells = {"Unit": "alpha", "Plan": str(worktree / "plan.md"), "Worktree": "`/live`", "Branch": "alpha"}
+        _ = staff.set_worktree(live.id, staff.PresentWorktree("natedev", worktree))
+        doc = self.root / "receiving-production.md"
+        write_text_atomic(doc, "# Receiving production\n")
+        owner = showrunner_relationship("receiving")
+        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
+        facts = {"git:/live": ("value", "alpha"),
+                 "file:/live/.unit.toml": ("value", 'plan = "plan.md"\nresponsibilities = []\n'),
+                 "file:" + str(doc): ("value", doc.read_text())}
+
+        def read_facts(requests: list[tuple[str, str]]) -> dict[str, tuple[str, str]]:
+            return {kind + ":" + path: facts[kind + ":" + path] for kind, path in requests}
+
+        config = unit_config.UnitConfig(unit_config.PlanFile(Path("plan.md")), unit_config.NoAppPort(), ())
+        with (mock.patch.object(session_staff, "_read_facts", side_effect=read_facts),
+              mock.patch.object(unit_config, "read", return_value=config)):
+            metadata = unit_lookup.unit_metadata(staff.snapshot(), unit_lookup.MemberSources({}, ()))
+        self.assertEqual(metadata.cells, {live.id: cells})
+        self.assertEqual(metadata.problems, ())
 
     @override
     def setUp(self) -> None:

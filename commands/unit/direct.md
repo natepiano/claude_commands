@@ -573,7 +573,7 @@ launcher's own `landed` and `abandon` reach that phase's ledger.
 | `exposure --proposal <P1\|P2> --basis "<text>" [--decision "<text>"]` | record trial exposure before the decision (the user, 2026-10-28) |
 | `abandon --reason <r> [--edits-landed]` | a dispatched repair died; reopen its batch |
 | `verdict --id F001 --state <accepted\|still_open\|reopened> [--evidence <e>]` | record closure evidence |
-| `decision --id F001 --answer <approved\|declined> --user-words "<answer>"` | Record the user's answer to a held item. This command applies no change. |
+| `decision --id F001 --answer <approved\|declined> --user-words "<answer>" [--withdraw "<reason>"]` | Record the user's answer. Use `--withdraw` to replace a decided ruling and preserve its history. This command applies no change. |
 
 `findings.py` owns batching and gating: the first round gates blockers and
 minors, later rounds gate blockers, nits never gate. It rejects a partial batch,
@@ -1301,8 +1301,9 @@ reporting anything about the round.
    Record each simplify item; discard none.
    Open behavior-preserving items within the phase as `minor --lens simplify`.
    Add `--held-for-decision` for each behavior change or change outside the phase.
+   Open a change that removes a copy as `minor --lens simplify`, not held, also outside the phase.
    Include the proposed change, files, and reason in its detail.
-   Only the user can decide a held simplify item.
+   A held item goes to the user only when it touches money, safety, product behavior the user sees, or an act that cannot be undone. Settle every other held item under DecisionEconomy and state the call in one line (user, 2026-11-02).
    Record the user's answer with `decision --user-words`.
    Explain each refuted finding from another lens.
    Report reviewer disagreements under <DelegationResultFormat/>.

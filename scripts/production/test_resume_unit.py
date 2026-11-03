@@ -105,7 +105,7 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertEqual((self.staff.staff_file.read_bytes(), self.doc.read_bytes()), before)
 
     def test_neither_config_refuses_with_the_backfill_instruction_before_any_change(self) -> None:
-        self.staff.register_production("alpha", self.doc)
+        _ = self.staff.record_production("alpha", self.doc)
         row = unit_membership("alpha", "alpha-unit")
         row = staff.update_current_session(row.current_session, staff.StaffId(DIRECTOR))
         _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree))
@@ -174,7 +174,7 @@ class ResumeUnitTests(unittest.TestCase):
         _ = cast(MutableMapping[str, str], self.enterContext(
             mock.patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
                                        "HERDR_PANE_RECORD_DIR": str(self.root / "pane-launches")})))
-        self.staff.register_production("alpha", self.doc)
+        _ = self.staff.record_production("alpha", self.doc)
         row = unit_membership("alpha", "alpha-unit")
         row = staff.update_current_session(row.current_session, staff.StaffId(DIRECTOR))
         _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree))
@@ -231,7 +231,7 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertIn("alpha-unit resumed", output)
 
     def test_resume_unit_rerun(self) -> None:
-        self.staff.register_production("alpha", self.doc)
+        _ = self.staff.record_production("alpha", self.doc)
         row = unit_membership("alpha", "alpha-unit")
         row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree))
         saved = unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
@@ -470,6 +470,9 @@ class ResumeUnitTests(unittest.TestCase):
         source = self.staff.production("alpha", "alpha-unit")
         source.unlink()
         source.symlink_to(self.doc)
+        _ = self.staff.record_production("alpha", source)
+        row = unit_membership("alpha", "alpha-unit")
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree))
         wrapper = self.root / "resume-launch.py"
         # The inner launcher boundary supplies no live pane. Its public main and
         # staff step are real, including the inherited operation lock.

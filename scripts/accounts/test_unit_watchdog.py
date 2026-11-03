@@ -6,7 +6,9 @@ import io
 import os
 import runpy
 import signal
+import shutil
 import subprocess
+from subprocess import run as run_git
 import tempfile
 import time
 import unittest
@@ -24,11 +26,13 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+GIT: str = shutil.which("git") or "git"
+
 from scripts.accounts import accounts, next_moves, outage_alerts, refusal_watch, role_map, unit_watchdog
 from scripts.accounts import test_refusal_watch as fixtures
 from scripts.production import showrunners, staff
 from scripts.shutdown.remote import local_machine
-from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
+from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership, recorded_unit
 from scripts.shutdown import folder_trust, stop_resume
 from scripts.shutdown import pane_record as hook_pane_record
 from scripts.notify.push_texts import RenderedPush
@@ -137,10 +141,11 @@ class UnitWatchdogTests(unittest.TestCase):
         for name in self.units:
             member = unit_membership("fixture", name)
             tree = self.home / name
+            _ = recorded_unit("fixture", name, tree, self.doc, plan="docs/plan.md")
             if name in self.retired:
                 _ = staff.set_worktree(member.id, staff.RemovedWorktree(local_machine(), tree))
             tree.mkdir(exist_ok=True)
-            _ = (tree / ".git").write_text("gitdir: scratch\n")
+            _ = run_git([GIT, "init", "-b", "fixture", str(tree)], check=True, capture_output=True)
             events: list[dict[str, object]] = [{"event_type": "run_started", "working_dir": str(tree), "run_started_at": 1}]
             if name in self.finished:
                 events.append({"event_type": "run_finished"})
@@ -196,6 +201,8 @@ class UnitWatchdogTests(unittest.TestCase):
         return stop_resume.ClaudeUp(identity, identity, to)
 
     def command(self, argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+        if argv[0] == "git":
+            return run_git([GIT, *argv[1:]], capture_output=True, text=True, check=False)
         self.assertIn("--recover", argv)
         self.assertLessEqual(cast(float, options["timeout"]), 5)
         self.assertIn("--no-block", argv)
@@ -1500,7 +1507,8 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = self.pass_at(0)
         elapsed = [0.0]
         def slow(argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-            elapsed[0] += cast(float, options["timeout"])
+            if argv[0] != "git":
+                elapsed[0] += cast(float, options["timeout"])
             return self.command(argv, **options)
         with (patch.object(time, "monotonic", side_effect=lambda: elapsed[0]),
               patch.object(subprocess, "run", side_effect=slow)):

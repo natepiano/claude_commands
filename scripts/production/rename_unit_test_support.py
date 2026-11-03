@@ -27,7 +27,7 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_test_support import bind_staff_fixture
 from scripts.production.staff_test_support import fixture_member, StaffTestCase, unit_membership
 from scripts.shutdown import stop_resume
-from scripts.production import staff
+from scripts.production import staff, unit_config
 from scripts.lib.atomic_file import write_text_atomic
 
 import fake_showrunner
@@ -366,7 +366,10 @@ class UnitRenameFixture(StaffTestCase):
             f"| names-unit | `{plan}` | `{worktree}` | demo-names |")
         self.write(self.doc, text)
         parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == SLUG)
-        _ = fixture_member("unit", name="names", parent=parent.id)
+        _ = fixture_member("unit", name="names", parent=parent.id,
+                           worktree=staff.PresentWorktree("natedev", worktree))
+        _ = unit_config.write(worktree, unit_config.UnitConfig(
+            unit_config.PlanFile(plan), unit_config.NoAppPort(), ()))
         for directory in (self.checkout, worktree):
             self.write(directory / plan, "# Names\n\n> **Production:** demo (names-unit)\n"
                        + "> **Standing:** style_plan.py\n\nnames-unit history stays.\n")

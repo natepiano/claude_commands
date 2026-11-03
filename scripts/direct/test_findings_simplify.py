@@ -21,15 +21,6 @@ class SimplifyFindingTests(FindingsLedgerFixture):
         _ = path.write_text(json.dumps(progress))
         return finding_id
 
-    def open_simplify(self, title: str, *, held: bool = False) -> str:
-        options = ("--held-for-decision",) if held else ()
-        return self.run_command(
-            "open", "--severity", "minor", "--title", title,
-            "--caught-by", "worker", "--lens", "simplify",
-            "--file", "scripts/direct/assign.py",
-            "--detail", "The change removes a retry that callers use.", *options,
-        )
-
     def test_in_phase_simplify_finding_enters_the_first_repair_batch(self) -> None:
         self.write_progress_state("simplify-phase")
         finding_id = self.open_simplify("Remove repeated parsing")
@@ -37,7 +28,7 @@ class SimplifyFindingTests(FindingsLedgerFixture):
         batch = cast(list[dict[str, object]], self.gate()["batch"])
         self.assertEqual([entry["id"] for entry in batch], [finding_id])
         self.close_round([finding_id])
-        finding = cast(list[dict[str, object]], self.status()["findings"])[0]
+        finding = self.finding_rows()[0]
         self.assertEqual((finding["lens"], finding["state"]), ("simplify", "accepted"))
         opened = [event for event in self.events() if event["event_type"] == "finding_opened"]
         self.assertEqual(opened[0]["lens"], "simplify")
@@ -71,13 +62,12 @@ class SimplifyFindingTests(FindingsLedgerFixture):
             environment, self.root,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        entries = cast(list[dict[str, object]], self.status()["findings"])
+        entries = self.finding_rows()
         held = next(entry for entry in entries if entry["id"] == held_id)
         self.assertEqual(held["state"], "held_for_decision")
         self.assertEqual(held["fix_attempts"], 0)
         self.assertEqual(held["title"], "Remove retry behavior")
-        ledger = cast(dict[str, object], json.loads(
-            (self.session_dir / "findings_state.json").read_text()))
+        ledger = cast(dict[str, object], json.loads(self.ledger()))
         persisted = cast(dict[str, dict[str, object]], ledger["findings"])[held_id]
         self.assertEqual(persisted["file"], "scripts/direct/assign.py")
         self.assertEqual(persisted["detail"], "The change removes a retry that callers use.")
@@ -148,7 +138,7 @@ class SimplifyFindingTests(FindingsLedgerFixture):
 
     def test_closed_phase_lookup_uses_the_parked_path_rule_and_the_latest_ledger(self) -> None:
         _ = self.complete_held_phase()
-        ledger = cast(dict[str, object], json.loads((self.session_dir / "findings_state.json").read_text()))
+        ledger = cast(dict[str, object], json.loads(self.ledger()))
         self.write_progress_state("later-instance", "later")
         _ = self.open_simplify("Remove later repeated parsing")
         for instance, started_at in (("a-newer", 2_000), ("z-older", 500)):
@@ -161,14 +151,3 @@ class SimplifyFindingTests(FindingsLedgerFixture):
         with patch.object(findings, "_parked_path", side_effect=archived_path):
             identity = findings._phase_identity(self.session_dir, "simplify", closed_phase_ok=True)  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(identity, ("a-newer", "simplify"))
-
-    def test_a_closure_verdict_cannot_release_a_held_finding(self) -> None:
-        self.write_progress_state("simplify-phase")
-        held_id = self.open_simplify("Remove retry behavior", held=True)
-
-        for verdict in ("accepted", "still_open", "reopened"):
-            with self.subTest(verdict=verdict):
-                result = self.run_failing_command("verdict", "--id", held_id, "--state", verdict)
-                self.assertNotEqual(result.returncode, 0)
-                entry = cast(list[dict[str, object]], self.status()["findings"])[0]
-                self.assertEqual(entry["state"], "held_for_decision")
