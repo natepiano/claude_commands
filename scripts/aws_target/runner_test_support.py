@@ -6,6 +6,7 @@ from decimal import Decimal
 from functools import lru_cache
 import json
 from pathlib import Path
+import signal
 import tempfile
 
 from scripts.aws_target import ledger, remote
@@ -41,11 +42,20 @@ def runner_permission_records(now: int, boot_id: str) -> RunnerPermissionRecords
                                        (directory / "generation.json").read_text())
 
 
-def seed_runner_permission(root: Path, settings: Path, now: int, boot_id: str) -> None:
+def seed_runner_permission(root: Path, settings: Path, now: int, boot_id: str) -> Path:
     records = runner_permission_records(now, boot_id)
     directory = root / "runner-permission/remote"
     directory.mkdir(parents=True, exist_ok=True)
     _ = (directory / "admission.json").write_text(records.admission)
     _ = (directory / "generation.json").write_text(records.generation)
-    with settings.open("a") as output:
-        _ = output.write(f"\nremote_state_directory={directory}\n")
+    lines = [line for line in settings.read_text().splitlines()
+             if line.partition("=")[0].strip() != "remote_state_directory"]
+    _ = settings.write_text("\n".join([*lines, f"remote_state_directory={directory}", ""]))
+    return directory
+
+
+def interrupt_runner(directory: Path, at: int) -> None:
+    """Write interruption evidence and send SIGTERM twice."""
+    remote.write_interruption(directory, target="aws", generation="fixture-generation", at=at)
+    signal.raise_signal(signal.SIGTERM)
+    signal.raise_signal(signal.SIGTERM)

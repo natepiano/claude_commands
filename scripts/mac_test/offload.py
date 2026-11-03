@@ -48,6 +48,11 @@ MACOSX_DEPLOYMENT_TARGET = "14.0"
 MacVerb = Literal["nextest", "check", "clippy", "mend-check", "doc"]
 
 
+def step_kind(verb: str) -> str:
+    """Map a command verb to its recorded step kind."""
+    return {"test": "nextest", "mend-check": "mend"}.get(verb, verb)
+
+
 NonBusyMacDeclineReason = Literal[
     "off",
     "repo",

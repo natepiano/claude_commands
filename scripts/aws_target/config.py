@@ -11,6 +11,11 @@ from scripts.lib import conf
 
 
 @dataclass(frozen=True)
+class MeasurementUnavailable:
+    reason: str
+
+
+@dataclass(frozen=True)
 class LimitSettingEvidence:
     key: str
     origin: Literal["live", "recovered", "unavailable"]
@@ -40,6 +45,8 @@ class SpendingSettings:
     notification_recipient: str
     notification_timeout_s: int
     notification_retry_s: int
+    cost_explorer_tag_key: str
+    cost_explorer_tag_value: str
     limits: tuple[LimitSettingEvidence, ...]
 
 
@@ -113,7 +120,8 @@ def read_settings(path: Path | conf.ConfigRead) -> SpendingSettings:
                             components, zone, seconds("price_refresh_seconds"), seconds("price_max_age_seconds"),
                             seconds("observation_max_age_seconds"), seconds("cost_explorer_interval_seconds"),
                             explorer, live_text("notification_recipient"), seconds("notification_timeout_s"),
-                            seconds("notification_retry_s"), tuple(limits))
+                            seconds("notification_retry_s"), live_text("cost_explorer_tag_key"),
+                            live_text("cost_explorer_tag_value"), tuple(limits))
 
 
 @dataclass(frozen=True)
@@ -137,10 +145,14 @@ class ControlSettings:
     remote_state_directory: str
 
 
+def offload_enabled(settings: conf.ConfigRead) -> bool:
+    return settings.text('offload') == 'on'
+
+
 def read_control_settings(path: Path | conf.ConfigRead) -> ControlSettings:
     settings = conf.read(path) if isinstance(path, Path) else path
     values = settings.values()
-    enabled = settings.text('offload') == 'on'
+    enabled = offload_enabled(settings)
     def required(key: str) -> str:
         value = settings.text(key)
         if not value.strip():

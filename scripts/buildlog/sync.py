@@ -18,7 +18,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 from urllib.parse import quote
 
 import health
@@ -43,6 +43,17 @@ class SyncRecord(TypedDict):
     peer: str
     ok: bool
     last_ok: str | None
+    last_failure: NotRequired[str]
+
+
+@dataclass(frozen=True)
+class SyncFailure:
+    at: str
+
+
+@dataclass(frozen=True)
+class NoSyncFailure:
+    pass
 
 
 @dataclass(frozen=True)
@@ -61,6 +72,7 @@ class SyncStatus:
     peer: str
     ok: bool
     last_good: LastSynced | NeverSynced
+    last_failure: SyncFailure | NoSyncFailure
 
 
 @dataclass(frozen=True)
@@ -83,6 +95,20 @@ class SyncPeer:
     target: str
     host: str
     legacy_override: bool = False
+
+
+@dataclass(frozen=True)
+class PeerExchange:
+    peer: SyncPeer
+    status: SyncStatus | NeverSynced
+
+
+def peer_exchanges() -> tuple[PeerExchange, ...]:
+    """Read each active peer without performing an exchange."""
+    exchanges: list[PeerExchange] = []
+    for peer in configured_peers():
+        exchanges.append(PeerExchange(peer, read_target_status(peer.target)))
+    return tuple(exchanges)
 
 
 def configured_peers() -> tuple[SyncPeer, ...]:
@@ -123,23 +149,38 @@ def read_status(peer: str = "") -> SyncStatus | NeverSynced:
     at, peer_host, ok, last_ok = (fields.get(name) for name in ("at", "peer", "ok", "last_ok"))
     if not isinstance(at, str) or not isinstance(peer_host, str) or not isinstance(ok, bool):
         return NeverSynced()
+    failure: SyncFailure | NoSyncFailure = NoSyncFailure()
+    if isinstance(fields.get('last_failure'), str):
+        failure = SyncFailure(str(fields['last_failure']))
+    elif not ok:
+        failure = SyncFailure(at)
     return SyncStatus(
         at, peer_host, ok,
         LastSynced(last_ok) if isinstance(last_ok, str) else NeverSynced(),
+        failure,
     )
 
 
+
+def read_target_status(target: str) -> SyncStatus | NeverSynced:
+    status = read_status(target)
+    if isinstance(status, NeverSynced) and target in record.mac_targets():
+        return read_status()
+    return status
+
 def write_status(peer: str, ok: bool, target: str = "mac") -> None:
     now = store.utc_iso(time.time())
-    previous = read_status(peer)
-    if isinstance(previous, NeverSynced) and target in record.mac_targets():
-        previous = read_status()
+    previous = read_target_status(target)
     status: SyncRecord = {
         "at": now,
         "peer": peer,
         "ok": ok,
         "last_ok": now if ok else (previous.last_good.at if isinstance(previous, SyncStatus) and isinstance(previous.last_good, LastSynced) else None),
     }
+    if not ok:
+        status['last_failure'] = now
+    elif isinstance(previous, SyncStatus) and isinstance(previous.last_failure, SyncFailure):
+        status['last_failure'] = previous.last_failure.at
     write_text_atomic(status_path(peer), json.dumps(status) + "\n")
     if target in record.mac_targets():
         write_text_atomic(status_path(), json.dumps(status) + "\n")

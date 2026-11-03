@@ -21,12 +21,12 @@ import unittest
 from unittest import mock
 
 if TYPE_CHECKING:
-    from ..aws_target.runner_test_support import seed_runner_permission
+    from ..aws_target.runner_test_support import interrupt_runner, seed_runner_permission
     from . import linux_runner, mac_test, offload, test_target_slots
     from ..lint import sweep
     from ..lint.memory_test_support import write_config_fixture
 else:
-    from scripts.aws_target.runner_test_support import seed_runner_permission
+    from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
     import linux_runner
     import mac_test
     import offload
@@ -126,6 +126,7 @@ class LinuxShellTests(unittest.TestCase):
     source: Path = Path()
     mirror: Path = Path()
     settings: Path = Path()
+    permission_directory: Path = Path()
     event_path: Path = Path()
     environment: dict[str, str] = {}
     use_real_sweep: bool = False
@@ -170,7 +171,7 @@ class LinuxShellTests(unittest.TestCase):
         for tool in ("nix", "df", "rm"):
             self.write_tool(tools / tool)
         self.write_tool(self.root / ".claude/scripts/lint/lint")
-        seed_runner_permission(self.root, self.settings, self.permission_at, "fixture-boot")
+        self.permission_directory = seed_runner_permission(self.root, self.settings, self.permission_at, "fixture-boot")
         _ = self.enterContext(mock.patch.object(linux_runner, "boot_identity", return_value="fixture-boot"))
         self.environment = {
             "HOME": str(self.root), "PATH": f"{tools}:/run/current-system/sw/bin:/usr/bin:/bin",
@@ -216,7 +217,7 @@ class LinuxShellTests(unittest.TestCase):
             offload.read_config(self.settings), request, self.identity, offload.KnownTreeKey("sent-tree-key"),
         )
 
-    def execute(self, request: offload.OffloadRequest) -> subprocess.CompletedProcess[str]:
+    def execute(self, request: offload.OffloadRequest, *, interrupt: bool = False) -> subprocess.CompletedProcess[str]:
         arguments = shlex.split(self.command(request))
         self.assertEqual(arguments[:3], ["python3", ".claude/scripts/mac_test/linux_runner.py", "run"])
         output, errors = io.StringIO(), io.StringIO()
@@ -247,8 +248,11 @@ class LinuxShellTests(unittest.TestCase):
                     else:
                         status = 0
                 return subprocess.CompletedProcess(argv, status, "", "")
-            return real_run(argv, cwd=cwd or self.root, check=check, capture_output=capture_output,
-                            text=True, timeout=timeout, env=env)
+            completed = real_run(argv, cwd=cwd or self.root, check=check, capture_output=capture_output,
+                                 text=True, timeout=timeout, env=env)
+            if interrupt and argv[:2] == ["bash", "-c"]:
+                interrupt_runner(self.permission_directory, self.permission_at)
+            return completed
 
         with mock.patch.dict(os.environ, self.environment, clear=True), \
                 mock.patch.object(sys, "argv", arguments[1:]), \
@@ -288,6 +292,16 @@ class LinuxShellTests(unittest.TestCase):
         self.assertTrue(any(argument.endswith("#ci") for argument in evaluations[0]["args"]))
         self.assertEqual(event["environment"].get("TEST_SHELL_PROOF"), "loaded")
         self.assertEqual(event["cwd"], str(self.mirror))
+
+    def test_sigterm_prints_one_interruption_marker_and_preserves_the_child_status(self) -> None:
+        self.environment["FAKE_LINT_STATUS"] = "143"
+
+        result = self.execute(self.request(), interrupt=True)
+
+        self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
+        lines = result.stdout.splitlines()
+        markers = [line for line in lines if line.startswith(("aws_interrupted=", "mac_exit=", "mac_cleanup="))]
+        self.assertEqual(markers, ["mac_exit=143", "mac_cleanup=kept", "aws_interrupted=fixture-generation"])
 
     def test_unchanged_inputs_reuse_exports_and_the_slot_build_folder(self) -> None:
         _ = self.assert_ran(self.request())
@@ -1323,7 +1337,7 @@ class LinuxDispatchTests(unittest.TestCase):
             + "mend=mend fixture\nscripts_commit=fixture-commit\nrc=0\n"
         )
         self.controller = offload.ProcessController()
-        seed_runner_permission(self.fixture.root, self.settings, 1_793_570_400, "fixture-boot")
+        _ = seed_runner_permission(self.fixture.root, self.settings, 1_793_570_400, "fixture-boot")
         _ = self.enterContext(mock.patch.object(linux_runner, "boot_identity", return_value="fixture-boot"))
         _ = self.enterContext(mock.patch.object(time, "time", return_value=1_793_570_400.0))
         _ = self.enterContext(mock.patch.object(self.controller, "complete_claim", side_effect=self.complete_claim))

@@ -6,6 +6,7 @@ import fcntl
 import time
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -38,6 +39,17 @@ class UnroutedAlertTests(unittest.TestCase):
 
     def notify(self, reason: str = "conflict") -> None:
         unrouted_alert.notify(self.root / "links", "top", self.row, reason, ("one", "two"))
+
+    def test_importing_the_alert_does_not_load_the_sender(self) -> None:
+        command = """import sys
+sys.path.insert(0, sys.argv[1])
+from scripts.production import unrouted_alert
+assert 'scripts.message.send' not in sys.modules
+assert 'send' not in sys.modules
+"""
+        result = subprocess.run([sys.executable, "-I", "-c", command, str(Path(__file__).resolve().parents[2])],
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def assert_pending_alert_failure(self) -> None:
         error = StringIO()
@@ -129,6 +141,42 @@ class UnroutedAlertTests(unittest.TestCase):
             self.notify()
         send.assert_called_once()
         self.notify_after_acceptance()
+
+    def test_delivered_and_kept_alerts_remain_accepted_after_another_render(self) -> None:
+        for header in ("SENT", "KEPT"):
+            with self.subTest(header=header):
+                with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, header + ": accepted", "")) as send:
+                    self.notify(header)
+                    self.notify(header)
+                send.assert_called_once()
+
+    def test_unaccepted_send_outcomes_keep_alerts_pending(self) -> None:
+        for code, header in ((0, "SKIPPED"), (0, "REPLACED"), (3, "FAILED"), (2, "REFUSED"), (4, "HELD")):
+            with self.subTest(header=header):
+                error = StringIO()
+                with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, header + ": unaccepted", "")), redirect_stderr(error):
+                    self.notify(header)
+                self.assertEqual(error.getvalue().splitlines(), ["review-links unrouted alert: " + header + ": unaccepted"])
+        for path in (self.root / "links/.review-link-unrouted").glob("*.json"):
+            self.assertIs(cast(dict[str, object], json.loads(path.read_text()))["sent"], False)
+
+    def test_inconsistent_send_results_keep_alerts_pending(self) -> None:
+        for code, header in ((0, "QUEUED"), (1, "SENT"), (1, "KEPT")):
+            with self.subTest(header=header):
+                error = StringIO()
+                with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, header + ": inconsistent", "")), redirect_stderr(error):
+                    self.notify(header)
+                self.assertEqual(error.getvalue().splitlines(), ["review-links unrouted alert: " + header + ": inconsistent"])
+        for path in (self.root / "links/.review-link-unrouted").glob("*.json"):
+            self.assertIs(cast(dict[str, object], json.loads(path.read_text()))["sent"], False)
+
+    def test_a_zero_exit_without_a_send_header_keeps_the_alert_pending(self) -> None:
+        error = StringIO()
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")), redirect_stderr(error):
+            self.notify()
+        self.assertEqual(error.getvalue().splitlines(), ["review-links unrouted alert: message delivery failed"])
+        path = next((self.root / "links/.review-link-unrouted").glob("*.json"))
+        self.assertIs(cast(dict[str, object], json.loads(path.read_text()))["sent"], False)
 
     def test_a_held_alert_lock_does_not_wait_or_send(self) -> None:
         with patch.object(fcntl, "flock", side_effect=BlockingIOError), patch.object(unrouted_alert, "send_message") as send:
