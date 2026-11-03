@@ -290,6 +290,7 @@ KeyedMessage = TypedDict(
         "sender_native_id": NotRequired[str],
         "socket_recovery": NotRequired[str],
         "stable_recipient": NotRequired[str],
+        "send_order": NotRequired[int],
     },
 )
 UnkeyedMessage = TypedDict(
@@ -306,6 +307,7 @@ UnkeyedMessage = TypedDict(
         "sender_native_id": NotRequired[str],
         "socket_recovery": NotRequired[str],
         "stable_recipient": NotRequired[str],
+        "send_order": NotRequired[int],
     },
 )
 
@@ -354,6 +356,41 @@ class RuntimeSender:
 @dataclass(frozen=True)
 class ForwardedSender:
     stamp: SenderStamp
+
+
+@dataclass(frozen=True)
+class QueueOrder:
+    """Order one send before its delivery can finish."""
+    value: int
+
+
+def new_queue_order() -> QueueOrder:
+    """Issue a shared sequence number under the queue lock."""
+    with locked():
+        path = STATE / "queue-order"
+        try:
+            previous = int(path.read_text(encoding="utf-8"))
+            if previous < 0:
+                raise ValueError("negative queue order")
+        except (OSError, ValueError):
+            previous = 0
+            for queue in (STATE / "queue").glob("*.jsonl"):
+                try:
+                    entries = read_queue(queue)
+                except UnicodeError:
+                    continue
+                previous = max(previous, max((entry.get("send_order", 0) for entry in entries), default=0))
+        order = QueueOrder(previous + 1)
+        write_atomic(path, str(order.value) + "\n")
+        return order
+
+
+@dataclass(frozen=True)
+class LegacyQueueOrder:
+    """Keep the queue rules for a caller without an attempt order."""
+
+
+LEGACY_QUEUE_ORDER = LegacyQueueOrder()
 
 
 @dataclass(frozen=True)
@@ -760,6 +797,9 @@ def _queued_message(value: object) -> QueuedMessage | None:
         return None
     if "stable_recipient" in values and not isinstance(values["stable_recipient"], str):
         return None
+    order = values.get("send_order")
+    if "send_order" in values and (not isinstance(order, int) or isinstance(order, bool) or order < 0):
+        return None
     if "sender_native_id" in values:
         try:
             _ = read_sender_stamp(values["sender_native_id"])
@@ -790,52 +830,69 @@ def _matches_queued_key(entry: QueuedMessage, key: str,
     return own_path
 
 
+def _queued_not_newer(entry: QueuedMessage, order: QueueOrder | LegacyQueueOrder) -> bool:
+    """Keep legacy handling when either side has no attempt order."""
+    return isinstance(order, LegacyQueueOrder) or "send_order" not in entry or entry["send_order"] <= order.value
+
+
 def enqueue(message: Message, reason: str, at: datetime, *,
-            recipient: StableRecipient | TransportQueueOwner = TRANSPORT_QUEUE_OWNER) -> None:
+            recipient: StableRecipient | TransportQueueOwner = TRANSPORT_QUEUE_OWNER,
+            order: QueueOrder | LegacyQueueOrder = LEGACY_QUEUE_ORDER) -> None:
     """Keep an undelivered message under its transport address.
 
-    Retain its stable recipient when known. Replace the same recipient and key across queue files.
+    Retain its stable recipient when known. Replace only older copies across queue files.
     """
     path = queue_for(message.to)
     if message.key is None:
-        entry: QueuedMessage = UnkeyedMessage(
-            time=at.isoformat(),
-            to=message.to,
-            key=None,
-            summary=message.summary,
-            text=message.text,
-            reason=reason,
-            shown_sender=message.shown_sender,
-            sender_native_id=sender_native_id(message.stamp),
-            **{"from": message.sender},
-        )
+        entry: QueuedMessage = {
+            "time": at.isoformat(),
+            "to": message.to,
+            "key": None,
+            "summary": message.summary,
+            "text": message.text,
+            "reason": reason,
+            "shown_sender": message.shown_sender,
+            "sender_native_id": sender_native_id(message.stamp),
+            "from": message.sender,
+        }
     else:
-        entry = KeyedMessage(
-            time=at.isoformat(),
-            to=message.to,
-            key=message.key,
-            summary=message.summary,
-            text=message.text,
-            reason=reason,
-            shown_sender=message.shown_sender,
-            sender_native_id=sender_native_id(message.stamp),
-            **{"from": message.sender},
-        )
+        entry = {
+            "time": at.isoformat(),
+            "to": message.to,
+            "key": message.key,
+            "summary": message.summary,
+            "text": message.text,
+            "reason": reason,
+            "shown_sender": message.shown_sender,
+            "sender_native_id": sender_native_id(message.stamp),
+            "from": message.sender,
+        }
     if isinstance(recipient, StableRecipient):
         entry["stable_recipient"] = recipient.value
+    if isinstance(order, QueueOrder):
+        entry["send_order"] = order.value
     with locked():
         path.parent.mkdir(parents=True, exist_ok=True)
-        kept = [old for old in read_queue(path) if message.key is None
-                or not _matches_queued_key(old, message.key, recipient, own_path=True)]
-        write_atomic(path, "".join(json.dumps(item) + "\n" for item in [*kept, entry]))
+        queues = [(path, read_queue(path))]
         if message.key is not None and isinstance(recipient, StableRecipient):
             for previous in path.parent.glob("*.jsonl"):
                 if previous == path:
                     continue
                 try:
-                    entries = read_queue(previous)
+                    queues.append((previous, read_queue(previous)))
                 except UnicodeError:
                     continue
+        if message.key is not None and any(
+            _matches_queued_key(old, message.key, recipient, own_path=previous == path)
+            and not _queued_not_newer(old, order)
+            for previous, entries in queues for old in entries
+        ):
+            return
+        kept = [old for old in queues[0][1] if message.key is None
+                or not _matches_queued_key(old, message.key, recipient, own_path=True)]
+        write_atomic(path, "".join(json.dumps(item) + "\n" for item in [*kept, entry]))
+        if message.key is not None and isinstance(recipient, StableRecipient):
+            for previous, entries in queues[1:]:
                 remaining = [old for old in entries
                              if not _matches_queued_key(old, message.key, recipient, own_path=False)]
                 if len(remaining) != len(entries):
@@ -859,8 +916,9 @@ def _queue_paths_for_address(to: str) -> list[Path]:
 
 
 def remove_queued_key(to: str, key: str, *,
-                      recipient: StableRecipient | TransportQueueOwner = TRANSPORT_QUEUE_OWNER) -> int:
-    """Remove the queued copy of a delivered message with a key."""
+                      recipient: StableRecipient | TransportQueueOwner = TRANSPORT_QUEUE_OWNER,
+                      order: QueueOrder | LegacyQueueOrder = LEGACY_QUEUE_ORDER) -> int:
+    """Remove matching copies no newer than the delivered send."""
     paths = _queue_paths_for_address(to)
     removed = 0
     with locked():
@@ -874,7 +932,8 @@ def remove_queued_key(to: str, key: str, *,
                     raise
                 continue
             kept = [entry for entry in entries
-                    if not _matches_queued_key(entry, key, recipient, own_path=path in paths)]
+                    if not (_matches_queued_key(entry, key, recipient, own_path=path in paths)
+                            and _queued_not_newer(entry, order))]
             if len(kept) != len(entries):
                 _rewrite_queue(path, kept)
             removed += len(entries) - len(kept)
@@ -1495,7 +1554,11 @@ def pending(to: str | None) -> str:
             owner = entry.get("stable_recipient")
             key = entry["key"]
             if owner is not None and key is not None:
-                newest[owner, key] = entry
+                previous = newest.get((owner, key))
+                if (previous is None
+                        or "send_order" not in previous and "send_order" not in entry
+                        or "send_order" in entry and _queued_not_newer(previous, QueueOrder(entry["send_order"]))):
+                    newest[owner, key] = entry
             else:
                 unkeyed_or_legacy.append(entry)
         entries = sorted([*unkeyed_or_legacy, *newest.values()], key=lambda entry: entry["time"])
@@ -2671,6 +2734,7 @@ def send(options: Options) -> Result:
         print("send.py: sender 'morty' does not match MORTY_NATIVE_ID", file=sys.stderr)
     message = Message(destination, sender, summary, text, key, display, options.human, stamp)
     started = now()
+    order = new_queue_order() if options.to != USER else LEGACY_QUEUE_ORDER
     # An emergency push repeats on the phone until the user acknowledges it, it is retired, or it
     # expires: with no --repeat-minutes, a send with its key inside that lifetime is skipped.
     live = emergency and options.repeat_minutes is None
@@ -2735,7 +2799,7 @@ def send(options: Options) -> Result:
                 if message.to.startswith("uds:") and recipient is None:
                     return Result("failed", f"{relayed_result.detail}; {dead_socket_reason(message.to)}")
                 queued = replace(message, to=f"session:{recipient['sessionId']}") if recipient is not None else message
-                enqueue(queued, relayed_result.detail, started, recipient=stable)
+                enqueue(queued, relayed_result.detail, started, recipient=stable, order=order)
                 if recipient is None:
                     return Result("queued", f"{relayed_result.detail}; no live session answers to {message.to},"
                                   + " so it is kept under that name")
@@ -2747,7 +2811,7 @@ def send(options: Options) -> Result:
                 "queued",
                 f"no live session answers to {plan.address}, so it is kept under that name",
             )
-            enqueue(message, result.detail, started, recipient=stable)
+            enqueue(message, result.detail, started, recipient=stable, order=order)
             log_route = ClaudeRoute("queue", "unresolved", time.monotonic() - claude_started)
         else:
             live = sessions.live_sessions()
@@ -2771,9 +2835,9 @@ def send(options: Options) -> Result:
                 result = relay_and_queue(plan.message, options.timeout)
                 log_route = ClaudeRoute("relay", "unresolved", time.monotonic() - claude_started)
     if result.outcome == "sent" and message.key is not None:
-        _ = remove_queued_key(message.to, message.key, recipient=stable)
+        _ = remove_queued_key(message.to, message.key, recipient=stable, order=order)
         if options.to != message.to:
-            _ = remove_queued_key(options.to, message.key, recipient=stable)
+            _ = remove_queued_key(options.to, message.key, recipient=stable, order=order)
     # A failed send can retry. A queue or kept push owns its copy until delivery.
     if (key is not None and not refused and held is None and isinstance(claim_result, ClaimGranted)
             and result.outcome in {"failed", "refused", "held", "pending"}):
