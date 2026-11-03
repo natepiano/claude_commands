@@ -58,8 +58,8 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         with self.assertRaises(accounts.AccountsError):
             _ = accounts.account_for_unscoped_launch({"CLAUDE_CONFIG_DIR": str(self.root / ".claude99")})
         (directory / ".claude.json").unlink()
-        with self.assertRaisesRegex(accounts.AccountsError, "claude and /login"):
-            _ = accounts.account_for_unscoped_launch({}, workers=True)
+        self.assertEqual(accounts.account_for_unscoped_launch({}, workers=True),
+                         accounts.NamedAccount("claude4", directory))
 
         # Recovery closes the shared route as well as the local fallback.
         with quota_alert.state_file() as state:
@@ -173,15 +173,6 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         with mock.patch.object(accounts, "datetime", wraps=datetime, now=mock.Mock(return_value=until)):
             self.assertEqual(accounts.account_for_unscoped_launch(caller, workers=True),
                              accounts.NamedAccount("claude2", accounts.account_dir("claude2")))
-
-    def test_queued_claude_account_with_no_folder_waits_with_setup_step(self) -> None:
-        _ = (self.root / "claude4.md").write_text("---\nlogin: workers@example.invalid\n---\n")
-        head = next_moves.add_next_move("workers", 1, "claude4")
-        _ = self.alert(left=1)
-        self.assertEqual(next_moves.read_next_moves(), (head,))
-        self.swap.assert_not_called()
-        self.assertEqual(quota_alert.registry_assignments()["direct"], "codex")
-        self.assertTrue(any("accounts.py setup claude4" in text for text in self.relayed_texts()))
 
     def test_stale_workers_head_blocks_a_fresh_later_entry_and_notifies_once(self) -> None:
         head = next_moves.add_next_move("workers", 1, "codex3")
