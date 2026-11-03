@@ -1742,35 +1742,23 @@ Test failed close and interrupted retirement, then rerun without another launch.
 
 ### Phase 6c — The startup reader keeps one deadline and a strong Mac process generation  · status: done
 
-**Owner:** herdr-unit (follow-up of Phase 6a, 2026-11-03).
+#### As-built
 
-**Depends on:** Phase 6a, Phase 6b. Land before Phase 7, which makes `herdr.py` read-only.
-
-#### Work Order
-
-**Goal:** a launch observes startup processes within its own deadline, and a darwin cleanup signals a process only when its identity proves the same process generation.
-
-**Spec:**
-1. **One deadline.** `start_command` (`herdr.py:1775`) passes its remaining deadline to `_startup_processes`. The darwin reader gives each `ps` call only the time that remains. A read that the deadline stops makes the walk unreadable, never gone.
-2. **Strong darwin generation.** On darwin, `AgentProcessIdentity` carries the process start time to the microsecond, from `proc_pidinfo(PROC_PIDTBSDINFO)` (`pbi_start_tvsec`, `pbi_start_tvusec`) through `ctypes`. Probe the struct layout on the Mac first and record it in the module comment.
-3. When the microsecond read fails, the identity is weak. `_terminate_startup_agents` (`herdr.py:4204`) sends no signal to a weak identity and keeps the pane.
-4. Linux behavior stays the same.
-
-**Constraints from prior phases (6b):**
-- The herdr suite passes on the Mac at 6b (381 tests, 0 failures, 0 errors). Keep it at 0 failures and 0 errors.
-- `native_process_commands(pid)` in `test_herdr.py` is the one fixture that gives darwin process facts. It answers `ps -o lstart=,tty= -p <pid>` and `lsof -a -p <pid> -Fn`, and patches `sessions.process_start`, for one pid only. Any other pid raises `AssertionError`.
-- When the darwin identity moves to `proc_pidinfo`, change that helper in the same place. Keep the one-pid guard.
-- `fake_herdr.py` reads `HERDR_PROC` on every host.
-- Run the Mac suite from `scripts/herdr` on a copy of the tree. Use `rsync` of `scripts` and `config` to `mac:/tmp/<folder>/`, then `cd /tmp/<folder>/scripts/herdr`. Set `PYTHONPATH=/tmp/<folder>` and `HERDR_BIN=/nonexistent/herdr`, then run `python3 -m unittest discover`. Judge the run only by its `Ran`/`OK`/`FAILED` lines.
+- `start_command` passes one launch deadline, a `_ProcessReadDeadline`, to `_startup_processes`. Each darwin `ps` call gets only the time that remains, and a read the deadline stops makes the walk unreadable, never gone. Callers outside startup pass a float and keep their per-call timeout; for them `_darwin_processes` skips a pid whose read times out.
+- On darwin, `AgentProcessIdentity.start_ticks: int | ProcessGenerationUnavailable` holds the libproc start time in microseconds, read with `proc_pidinfo(PROC_PIDTBSDINFO)` through `ctypes` into `_DarwinProcessBSDInfo`. A failed read is `ProcessGenerationUnavailable`. Linux keeps its start ticks.
+- Cleanup sends no signal on weak generation evidence: `_require_startup_generations` raises `failed agent generation is unavailable; pane left open`, and the pane stays.
+- A pid that reads a different strong generation leaves the tracked set and must prove its agent command again before it is signalled.
+- `_track_startup_identity` keeps the strong identity when a later read of the same pid is weak, so a reparented agent stays tracked.
 
 **Files:**
-- `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py`
+- `scripts/herdr/herdr.py` — the startup reader, the darwin libproc identity and the cleanup guard.
+- `scripts/herdr/test_herdr.py` — deadline, pid-reuse, weak-read, reparent and fallback-timeout tests; `native_process_commands` answers the libproc read for its one pid.
 
-**Workers:** `1 writer + 1 tester` — `impl`: `herdr.py`; `test`: `test_herdr.py`.
+**Binds later work:** a failed start with weak generation evidence keeps its pane, maybe with the agent still running; a rerun reaches it only through `ExistingPane`, which refuses unless the pane reads `PaneAtShell`. Compare darwin identities only by equality.
 
-**State:** `AgentProcessIdentity` on darwin holds microsecond start time, not `ps lstart` seconds.
+**Gotchas:** `proc_bsdinfo` is 136 bytes on the Mac: `pbi_pid` at offset 12, `pbi_start_tvsec` at 120, `pbi_start_tvusec` at 128. Only a `_ProcessReadDeadline` caller re-raises a per-pid `TimeoutExpired`. On darwin, `start_ticks` holds microseconds, not ticks.
 
-**Acceptance gate:** a test where a darwin pid is reused in the same second with a different microsecond start: the pane stays and no signal is sent; a test where the microsecond read fails: no signal; a test that the whole startup observation stays within the launch deadline when each `ps` call is slow; the herdr suite on natedev and on the Mac, each with 0 failures and 0 errors; the shutdown suite on natedev; basedpyright 0/0/0 on both files and their caller modules.
+**Ruled out:** `ps lstart` seconds as the darwin generation — a pid reused in the same second reads the same.
 
 ### Phase 7 — worker_panes.py: start-or-resume, close, observe  · status: todo
 
@@ -1884,6 +1872,7 @@ Test failed close and interrupted retirement, then rerun without another launch.
 - Phase 3s review (2026-11-02): a Codex worker's `OpenWorker` matches the Codex conversation id (thread id); a Claude worker's matches the Claude session id. `herdr.native_process` falls back to `CODEX_THREAD_ID` when no rollout is open, and that value can name the launch thread after `/new`. It is not proof of the current thread: give unknown evidence, and add an idle-thread-change test that opens no other backend.
 - Phase 3s review (2026-11-02): publish complete result unions in this phase, `AdmissionRefused` and `UnpublishedWorker` included, in the signatures. Phases 8-13 handle each one with tests: failed publication, unknown process evidence, and no unproved delivery.
 - Phase 3s review (2026-11-02): the pane-location fields send a notice to cargo-liner (an outside `staff.json` reader) with a representative stored-record fixture.
+- Phase 6c (2026-11-03): a failed start whose agent generation cannot be proved raises `failed agent generation is unavailable; pane left open`, sends no signal and keeps the pane, possibly with the agent still running. A rerun of `start-or-resume` that finds that pane by its label goes through `ExistingPane`, which refuses unless the pane reads `PaneAtShell`; report that refusal with its reason and never close the pane. On darwin, `AgentProcessIdentity.start_ticks` holds libproc start microseconds or `ProcessGenerationUnavailable`; compare identities only by equality.
 
 **Acceptance gate:**
 - basedpyright 0/0 on the new files and every caller module.
