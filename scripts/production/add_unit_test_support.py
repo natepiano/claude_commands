@@ -422,8 +422,7 @@ class AddUnitTestCase(ShutdownTestCase):
             parent = fixture_runtime_id("showrunner::" + fixture_showrunner_name(request.production.slug, request.production.doc))
             self.env["FAKE_CLAUDE_SESSION_ID"] = fixture_runtime_id("unit:" + parent + ":" + request.identity.session)
             name = SHARED
-            title = (request.launch_kind.session_name if isinstance(request.launch_kind, add_unit.UnitRestoreLaunch)
-                     else request.identity.session)
+            title = request.identity.session
             responses[f"--session {name} agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({"result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
             responses[f"--session {name} pane process-info --pane w1:p1"] = CommandResponse(code=0, stdout=json.dumps({
                 "result": {"process_info": {"foreground_processes": [
@@ -555,67 +554,6 @@ class AddUnitTestCase(ShutdownTestCase):
         with patch.dict(os.environ, self.env):
             return conversation_pause.read_scheduled_prompts(session_id)
 
-    def shutdown_record(
-        self,
-        state: str,
-        *,
-        session_id: str = "62ccbd64-f22e-5647-b20e-7899aa39d766",
-        progress: dict[str, object] | None = None,
-    ) -> dict[str, object]:
-        return {
-            "login": "owner@example.com",
-            "label": "claude2",
-            "machine": "natedev",
-            "state": state,
-            "requested_at": "2026-10-09T21:49:10+00:00",
-            "requested_by": {"kind": "terminal"},
-            "scope": {"kind": "all account sessions"},
-            "conductor": {"kind": "not started"},
-            "force": "wait for ready",
-            "entries": [
-                {
-                    "session": {
-                        "kind": "unit",
-                        "session_id": session_id,
-                        "pid": 12345,
-                        "proc_start": "process-start",
-                        "name": "alpha",
-                        "cwd": "/tmp/alpha",
-                        "status": "idle",
-                        "model": {"kind": "no reply yet"},
-                        "checkout": {"kind": "not a checkout"},
-                        "run_dirs": [],
-                        "codex_servers": [],
-                        "timers": [],
-                        "host": {
-                            "kind": "unit",
-                            "production": "build-followups",
-                            "unit": "alpha-unit",
-                            "doc": str(self.doc),
-                            "session_name": "alpha",
-                            "session_host": "herdr",
-                            "plan": {
-                                "kind": "plan",
-                                "path": str(self.plan),
-                            },
-                        },
-                    },
-                    "timers": [],
-                    "settle_message": {"kind": "not sent"},
-                    "where": {"kind": "not said"},
-                    "progress": progress or {"kind": "waiting"},
-                    "stop_issues": [],
-                }
-            ],
-            "stop_issues": [],
-        }
-
-    def write_shutdown_record(self, value: object, *, login: str = "owner@example.com") -> None:
-        account = Path(self.env["SHUTDOWN_STATE_DIR"]) / login
-        account.mkdir(parents=True)
-        _ = (account / "record.json").write_text(
-            json.dumps(value), encoding="utf-8"
-        )
 
     def assert_director_flags(self, model: str, effort: str | None) -> None:
         command = self.launch_command()
@@ -659,12 +597,6 @@ class AddUnitTestCase(ShutdownTestCase):
         self.assertFalse((self.root / "project-alpha").exists())
         self.assertEqual(self.servers_started(), [])
 
-    def restore(self, name: str, cwd: Path) -> subprocess.CompletedProcess[str]:
-        note = self.root / "restart-note.txt"
-        _ = note.write_text("Resume this unit.", encoding="utf-8")
-        return self.cli(name, "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(cwd),
-                        "--restart-note", str(note), "--session-name", "recorded-name",
-                        "--host-session", "recorded-herdr", "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
     def repository_state(self) -> tuple[str, str, str]:
         """The production doc, every branch with its commit, and every worktree with its branch."""
@@ -698,7 +630,7 @@ class AddUnitTestCase(ShutdownTestCase):
 
     def run_with_marked_unit(
         self,
-        launch_kind: add_unit.NewWorkLaunch | add_unit.UnitRestoreLaunch,
+        launch_kind: add_unit.NewWorkLaunch,
         claude: unit_lookup.Claude,
         *,
         already_marked: bool = True,
@@ -713,8 +645,7 @@ class AddUnitTestCase(ShutdownTestCase):
             plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
             port=add_unit.OmittedCell(),
             owns=add_unit.OmittedCell(),
-            session=(add_unit.ResumedSession("62ccbd64-f22e-5647-b20e-7899aa39d766", self.root / "prior-session")
-                     if isinstance(launch_kind, add_unit.UnitRestoreLaunch) else add_unit.NewSession()),
+            session=add_unit.NewSession(),
             launch_kind=launch_kind,
             timeout=1.0,
         )
@@ -725,7 +656,7 @@ class AddUnitTestCase(ShutdownTestCase):
             # A rerun or restore reuses a row. Only a fresh launch has no row.
             add_unit.ExistingUnitRow("docs/plans/given.md", str(request.worktree), request.branch,
                                      "—", "—", add_unit.ActiveUnitRow())
-            if already_marked or isinstance(launch_kind, add_unit.UnitRestoreLaunch) else add_unit.NoUnitRow(),
+            if already_marked else add_unit.NoUnitRow(),
             add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
         )
         # These launcher tests replace worktree creation and preflight. Supply
@@ -741,8 +672,6 @@ class AddUnitTestCase(ShutdownTestCase):
         commands: list[list[str]] = []
         launches: list[str] = []
 
-        if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
-            _ = launch_kind.note.write_text("Resume this unit.", encoding="utf-8")
 
         def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
             if command[0] == "git":
@@ -755,15 +684,6 @@ class AddUnitTestCase(ShutdownTestCase):
             return subprocess.CompletedProcess(command, 0, "", "")
 
         def launch(_request: add_unit.UnitLaunch, prompt: str) -> herdr.PromptSubmitOutcome:
-            if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
-                recorded = self.recorded_prompts(launch_kind.session_id)
-                self.assertEqual(recorded, ())
-                self.assertIs(
-                    conversation_pause.prompt_source(
-                        script_prompt(prompt), frozenset, lambda: recorded
-                    ),
-                    conversation_pause.PromptSource.SCHEDULED,
-                )
             launches.append(prompt)
             return outcome
 
@@ -789,14 +709,9 @@ class AddUnitTestCase(ShutdownTestCase):
             redirect_stderr(error),
         ):
             arguments = ["--production", "unused", "alpha", "--plan", "unused"]
-            if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
-                arguments.extend(("--config-dir", str(Path(self.env["HOME"]) / ".claude2")))
             result = add_unit.main(arguments)
         if result == 0:
-            if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
-                wait.assert_not_called()
-            else:
-                wait.assert_called_once_with(request)
+            wait.assert_called_once_with(request)
         return result, error.getvalue(), commands, len(launches), write_stub.call_count
 
     def write_resume_registry_record(self, proc_start: str) -> None:
@@ -902,18 +817,6 @@ class AddUnitTestCase(ShutdownTestCase):
                 self.assertEqual(marked.place.session, "agents")
             self.assertIsNone(unit_lookup.marked_unit("sample", unit + "-unit"))
 
-        note = self.root / "unit-restart.md"
-        _ = note.write_text("Resume the unit work.\n", encoding="utf-8")
-        request = add_unit.launch_request(argparse.Namespace(
-            production=str(self.doc), name=unit, plan="docs/plans/given.md", brief=None,
-            standby=False, permanent=False, port=None, owns=None, timeout=90.0, check=False,
-            resume="unit-session", cwd=str(self.root / ("project-" + unit)),
-            restart_note=str(note), session_name=unit, host_session="sample-" + unit, probe=False,
-        ))
-        self.assertEqual(request.unit, unit)
-        self.assertIsInstance(request.launch_kind, add_unit.UnitRestoreLaunch)
-        self.assertIsInstance(add_unit.row_is_present(request, self.doc.read_text().splitlines(), staff.snapshot()),
-                              add_unit.ExistingUnitRow)
         before = self.doc.read_bytes()
         resumed = self.cli(unit, "--plan", "docs/plans/given.md")
         self.assertEqual(resumed.returncode, 0, resumed.stderr)

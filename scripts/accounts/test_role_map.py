@@ -298,7 +298,6 @@ class RoleMapTests(unittest.TestCase):
               patch.object(role_map, "datetime", RoleMapReadTime),
               patch.object(accounts, "account_identity", side_effect=identity),
               patch.object(refusals, "stored_reading_with_age", return_value=reading),
-              patch("shutdown_record.all_session_records", return_value=[]),
               patch.object(refusal_watch, "_notify_blocked_head", return_value=False),
               patch.object(accounts, "prepared_account", side_effect=AssertionError("blocked target was prepared"))):
             with patch.object(Path, "mkdir", new=stop_after_selection):
@@ -746,8 +745,6 @@ class RoleMapTests(unittest.TestCase):
                 expected_codex = (f"~/.codex1: not logged in; the home has no readable sign-in; affected roles: workers; sign in as codex1 at ~/.codex1; {codex_step}"
                     if is_set_up else f"* codex1: {state}; no folder holds this account; affected roles: workers; {codex_step}")
                 self.assertIn(expected_codex, output.splitlines())
-
-
 
 
 if __name__ == "__main__":
