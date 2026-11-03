@@ -424,7 +424,7 @@ def answer_status(verdict: str, slots: DeliverySlots) -> str:
 def list_routing(snapshots: dict[Path, change_review.ReviewListSnapshot]) -> change_routing.StaffRouting:
     documents = change_routing.production_documents(dict(showrunners.timer_docs()),
         ((listing.stem.removeprefix(change_review.PREFIX), snapshot.text) for listing, snapshot in snapshots.items()))
-    return change_routing.StaffRouting(staff.snapshot(), documents, change_review)
+    return change_routing.StaffRouting(staff.snapshot(), documents)
 
 
 def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO_ANSWER_NOTICE) -> bytes:

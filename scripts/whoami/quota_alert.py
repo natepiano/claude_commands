@@ -1522,7 +1522,7 @@ def relay(recipient: str, text: str, key: str | None) -> str | None:
             case "queued":
                 # refusal_watch accepts a queued copy through this header.
                 return " ".join(f"QUEUED: {outcome.header.detail}".split())
-            case "failed" | "refused" | "held":
+            case "failed" | "refused" | "held" | "pending":
                 pass
     return " ".join(failure_detail(done).split())
 
@@ -1558,7 +1558,7 @@ def tell_user(push: RenderedPush) -> PushDelivery:
         match outcome.header.outcome:
             case "sent" | "skipped" | "kept" | "replaced":
                 return PushSent()
-            case "queued" | "failed" | "refused" | "held":
+            case "queued" | "failed" | "refused" | "held" | "pending":
                 pass
     return PushFailed(" ".join(failure_detail(done).split()))
 

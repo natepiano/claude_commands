@@ -464,7 +464,7 @@ class StyleSyncTests(unittest.TestCase):
         cases = ((0, "SENT: fixture", True), (0, "SKIPPED: repeated", True),
                  (0, "KEPT: silence", True), (0, "REPLACED: revision", True),
                  (1, "QUEUED: offline", False), (3, "FAILED: unavailable", False),
-                 (2, "REFUSED: invalid", False), (4, "HELD: decision", False),
+                 (2, "REFUSED: invalid", False), (4, "HELD: decision", False), (5, "PENDING: active", False),
                  (0, "", False), (0, "QUEUED: inconsistent", False),
                  (1, "SENT: inconsistent", False), (0, "FAILED: inconsistent", False))
         for code, text, accepted in cases:
@@ -1202,7 +1202,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         checkpoint = self.handoff_checkpoint()
         for output, code in (("", 0), ("unrelated output", 0), ("QUEUED: offline", 0),
                              ("SENT: apparent delivery", 1), ("FAILED: unavailable\nQUEUED: quoted result", 1),
-                             ("REFUSED: action required", 2), ("HELD: review", 4)):
+                             ("REFUSED: action required", 2), ("HELD: review", 4), ("PENDING: active", 5)):
             with self.subTest(output=output, code=code):
                 self.handoff_sender(output, code)
                 result, diagnostic = self.send_handoff(checkpoint)

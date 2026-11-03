@@ -30,6 +30,7 @@ import unit_runs  # noqa: E402
 import herdr  # noqa: E402
 import codex_daemon  # noqa: E402
 import process_table  # noqa: E402
+import sessions  # noqa: E402
 from scripts.astra import design_roles  # noqa: E402
 from scripts.production import staff
 from scripts.lib import names  # noqa: E402
@@ -1349,12 +1350,17 @@ def machine_name() -> str:
     return socket.gethostname().split(".", 1)[0]
 
 
-def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnapshot | None = None) -> Roster:
+def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnapshot | None = None,
+                  records: list[SessionRecord] | None = None) -> Roster:
     home_state = account.home_account_state()
     problems: list[str] = []
     warnings: list[str] = []
     machine = machine_name()
-    records = _newest_sessions()
+    running = sessions.running_sessions() if records is None else records
+    newest: dict[str, SessionRecord] = {}
+    for record in running:
+        _ = newest.setdefault(record["sessionId"], record)
+    records = list(newest.values())
     details = _raw_session_details(records, problems)
     try:
         if membership is None:
@@ -1362,7 +1368,8 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
     except staff.StaffUnreadable as error:
         _problem(problems, "staff membership", error)
         membership = staff.StaffSnapshot(())
-    registered = _registered_showrunners(environment, problems, membership=membership)
+    registered = _registered_showrunners(environment, problems, membership=membership,
+                                        known_sessions={record["sessionId"]: record for record in records})
     runner_ids = _showrunner_ids(records, registered)
     roots = unit_runs.run_roots(environment.get("ROSTER_RUN_ROOT"))
     runs = _live_runs(roots, {record["sessionId"] for record in records}, problems)
@@ -1370,8 +1377,9 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
     production_places: dict[str, _ProductionPlace] = {}
     if registered:
         try:
+            # Older running records can still identify the director's marked pane.
             production_places = _production_places(
-                records, registered, runner_ids, set(workers), problems, record=membership
+                running, registered, runner_ids, set(workers), problems, record=membership
             )
         except staff.StaffUnreadable as error:
             _problem(problems, "staff membership", error)
@@ -1456,14 +1464,14 @@ def peer_roster(environment: Mapping[str, str]) -> Roster:
 
 @role_map_command
 def roster(environment: Mapping[str, str], scope: RosterScope, *,
-           membership: staff.StaffSnapshot | None = None) -> Roster:
+           membership: staff.StaffSnapshot | None = None, records: list[SessionRecord] | None = None) -> Roster:
     match scope:
         case ThisMachine():
-            return _local_roster(environment, membership=membership)
+            return _local_roster(environment, membership=membership, records=records)
         case AllMachines():
             with ThreadPoolExecutor(max_workers=2) as pool:
                 peer = pool.submit(peer_roster, environment)
-                local = _local_roster(environment, membership=membership)
+                local = _local_roster(environment, membership=membership, records=records)
                 other = peer.result()
             return Roster([*local.entries, *other.entries], [*local.problems, *other.problems],
                           [*local.warnings, *other.warnings])

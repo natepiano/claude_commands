@@ -16,6 +16,7 @@ import time
 from collections.abc import Mapping, Callable, Generator, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
+from functools import cached_property
 from importlib import import_module
 from pathlib import Path
 from typing import Literal, NewType, Protocol, TypeVar, cast
@@ -330,8 +331,12 @@ class StaffSnapshot:
     schema: int = field(default=2, compare=False)
     current_sessions_recorded: bool = field(default=True, compare=False)
 
+    @cached_property
+    def rows_by_id(self) -> dict[StaffId, StaffRow]:
+        return {row.id: row for row in self.rows}
+
     def by_id(self, staff_id: StaffId) -> StaffRow | None:
-        return _row_by_id(self.rows, staff_id)
+        return self.rows_by_id.get(staff_id)
 
     def by_current_session(self, session_id: str) -> StaffRow | None:
         return next((row for row in self.rows if row.current_session == session_id), None)
@@ -347,6 +352,14 @@ class StaffSnapshot:
         matches = [row for row in self.rows if isinstance(row.worktree, PresentWorktree)
                    and row.worktree.machine == machine and path.is_relative_to(row.worktree.path)]
         return max(matches, key=lambda row: len(cast(PresentWorktree, row.worktree).path.parts), default=None)
+
+    def unit_by_worktree(self, machine: str, path: Path) -> StaffRow | None:
+        """A path that a live unit holds belongs to that unit; the newest row wins within each state."""
+        matches = [row for row in reversed(self.rows) if row.kind == "unit"
+                   and isinstance(row.worktree, (PresentWorktree, RemovedWorktree))
+                   and row.worktree.machine == machine and row.worktree.path == path]
+        return next((row for row in matches if isinstance(row.worktree, PresentWorktree)),
+                    next(iter(matches), None))
 
     def by_doc(self, machine: str, path: Path) -> StaffRow | None:
         document = path.absolute()
