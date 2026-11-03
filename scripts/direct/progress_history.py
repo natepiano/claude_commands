@@ -33,7 +33,8 @@ from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
-from scripts.production import production_doc  # noqa: E402
+from scripts.production import production_doc, session_staff, showrunners, staff  # noqa: E402
+from scripts.shutdown import remote  # noqa: E402
 
 
 SCHEMA_VERSION = 1
@@ -523,9 +524,10 @@ def _refresh_phase_table(session_dir: Path) -> None:
             Path(_string(state.get("working_dir"))),
             plan_doc,
         )
-        if "> **Production:" not in plan_path.read_text(encoding="utf-8"):
+        if isinstance(plan_history.plan_member(plan_path), session_staff.NoSuchMember):
             return
-    except (OSError, UnicodeError, SystemExit):
+    except (OSError, UnicodeError, SystemExit) as error:
+        print(f"phase table not written: {error}", file=sys.stderr)
         return
 
     command = [
@@ -548,6 +550,8 @@ def _refresh_phase_table(session_dir: Path) -> None:
         print(f"phase table not written: {error}", file=sys.stderr)
         return
     if result.returncode == 0:
+        if result.stderr:
+            print(result.stderr.rstrip(), file=sys.stderr)
         return
     reason = " ".join(result.stderr.split()) or f"exit status {result.returncode}"
     print(f"phase table not written: {reason}", file=sys.stderr)
@@ -5016,22 +5020,39 @@ class ProductionNotRecorded:
     reason: str
 
 
-def resolve_production_unit(state: Mapping[str, object]) -> ProductionUnitIdentity | ProductionNotRecorded:
-    """Read metadata only; never recover worker moves or take a run lock."""
+def resolve_production_unit(state: Mapping[str, object], *, resolver: session_staff.RowResolver | None = None) -> ProductionUnitIdentity | ProductionNotRecorded:
+    """Keep recorded history; resolve missing ownership from the current row."""
     production, unit = _string(state.get("production")), _string(state.get("unit"))
-    if not production or not unit:
-        worktree = Path(_string(state.get("working_dir")) or ".").expanduser()
-        plan = _string(state.get("project_plan_doc")) or _string(state.get("plan_doc"))
-        try:
-            content = (worktree / plan).read_text(encoding="utf-8") if plan else ""
-        except OSError:
-            content = ""
-        match = re.search(r'^> \*\*Production:(?: (.+?)\*\*|\*\* (.+?)) — unit `([^`]+)`;', content, re.MULTILINE)
-        if match:
-            production, unit = match.group(1) or match.group(2), match.group(3)
-    if not production or not unit:
-        return ProductionNotRecorded("run and plan have no production and unit identity")
-    return ProductionUnitIdentity(production, unit)
+    if production and unit:
+        return ProductionUnitIdentity(production, unit)
+    try:
+        resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+        record = resolver.record
+        identity = _string(state.get("director_session"))
+        row = record.by_current_session(identity) if identity else None
+        if row is None:
+            folder = _string(state.get("working_dir"))
+            if folder:
+                member = resolver.member_by_folder(remote.local_machine(), Path(folder).expanduser().resolve())
+                row = member.row if isinstance(member, session_staff.MemberFound) else None
+        if row is None or row.kind != "unit":
+            plan = _string(state.get("project_plan_doc")) or _string(state.get("plan_doc"))
+            working_dir = _string(state.get("working_dir"))
+            if plan and working_dir:
+                try:
+                    # Read the artifact only to report a file failure.
+                    _ = (Path(working_dir).expanduser() / plan).read_text(encoding="utf-8")
+                except (OSError, UnicodeError) as error:
+                    return ProductionNotRecorded(f"phase plan cannot be read: {error}")
+            return ProductionNotRecorded("the run has no matching unit staff row")
+        parent = record.by_id(row.parent) if row.parent is not None else None
+        if parent is None:
+            return ProductionNotRecorded(f"{row.name}: the staff parent is unavailable")
+        timer = showrunners.timer_for(parent, record)
+        slug = timer.slug if isinstance(timer, showrunners.Timer) else parent.name
+        return ProductionUnitIdentity(production or slug, unit or row.name)
+    except (OSError, ValueError) as error:
+        return ProductionNotRecorded(str(error))
 
 
 @dataclass(frozen=True)
@@ -5124,27 +5145,11 @@ def _phase_production_name(production: str, working_dir: str) -> RecordedPhaseMe
 def _phase_plan_names(state: Mapping[str, object]) -> tuple[
     RecordedPhaseMetadata | PhaseMetadataNotRecorded, RecordedPhaseMetadata | PhaseMetadataNotRecorded
 ]:
-    working_dir = _string(state.get("working_dir"))
-    plan = _string(state.get("project_plan_doc")) or _string(state.get("plan_doc"))
-    if not working_dir or not plan:
-        missing = PhaseMetadataNotRecorded("phase has no working directory or plan document")
+    identity = resolve_production_unit(state)
+    if isinstance(identity, ProductionNotRecorded):
+        missing = PhaseMetadataNotRecorded(identity.reason)
         return missing, missing
-    try:
-        content = (Path(working_dir).expanduser() / plan).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as error:
-        missing = PhaseMetadataNotRecorded(f"phase plan cannot be read: {error}")
-        return missing, missing
-    header = re.search(r'^> \*\*Production:(?:[ \t]+(.+?)\*\*([^\r\n]*)|\*\*[ \t]+([^\r\n]*))',
-                       content, re.MULTILINE)
-    if header is None:
-        missing = PhaseMetadataNotRecorded("phase plan has no production header")
-        return missing, missing
-    text = (header.group(1) + header.group(2)) if header.group(1) is not None else header.group(3)
-    production = re.split(r" — | \(", text, maxsplit=1)[0].strip()
-    unit = re.search(r'(?:^| — )unit[ \t]+(?:`([^`]+)`|([^,;\s]+))', text)
-    return (_phase_production_name(production, working_dir),
-            _recorded_phase_metadata((unit.group(1) or unit.group(2)).strip() if unit else "",
-                                     "phase plan header names no unit"))
+    return RecordedPhaseMetadata(identity.production), RecordedPhaseMetadata(identity.unit)
 
 
 def _phase_source_identity(state: Mapping[str, object]) -> PhaseSourceIdentity:
@@ -5156,6 +5161,8 @@ def _phase_source_identity(state: Mapping[str, object]) -> PhaseSourceIdentity:
             production = plan_production
         if isinstance(unit, PhaseMetadataNotRecorded):
             unit = plan_unit
+    if isinstance(production, RecordedPhaseMetadata):
+        production = _phase_production_name(production.value, _string(state.get("working_dir")))
     return PhaseSourceIdentity(production, unit, _phase_repository(_string(state.get("working_dir"))))
 
 
@@ -5448,17 +5455,17 @@ def _finish_external_wait(args: argparse.Namespace) -> None:
 
 
 def _showrunner_supplier(state: dict[str, object]) -> NamedSupplier | NoNamedSupplier:
-    identity = resolve_production_unit(state)
-    if isinstance(identity, ProductionNotRecorded):
-        return NoNamedSupplier(identity.reason)
-    from scripts.production import showrunners
-
     try:
-        address = showrunners.current_address(identity.production)
+        resolver = session_staff.RowResolver(staff.snapshot())
+        identity = resolve_production_unit(state, resolver=resolver)
+        if isinstance(identity, ProductionNotRecorded):
+            return NoNamedSupplier(identity.reason)
+        address = _supplier_address("showrunner:" + identity.production, resolver=resolver)
     except (OSError, ValueError) as error:
         return NoNamedSupplier(f"showrunner address unavailable: {error}")
-    # Keep the production alias, so a restart resolves its new socket on arrival.
-    return NamedSupplier("showrunner:" + identity.production) if address else NoNamedSupplier("production has no running showrunner address")
+    if isinstance(address, NoNamedSupplier):
+        return address
+    return NamedSupplier("showrunner:" + identity.production)
 
 
 def _supplier_fields(supplier: NamedSupplier | NoNamedSupplier) -> dict[str, object]:
@@ -5474,13 +5481,20 @@ def _turn_supplier(state: dict[str, object], reason: str) -> NamedSupplier | NoN
     return NamedSupplier(match[1]) if match else NoNamedSupplier("wait names no supplier address")
 
 
-def _supplier_address(identity: str) -> NamedSupplier | NoNamedSupplier:
+def _supplier_address(identity: str, *, resolver: session_staff.RowResolver | None = None) -> NamedSupplier | NoNamedSupplier:
     """Resolve the supplier alias at arrival, including a restarted showrunner."""
     if identity.startswith("showrunner:"):
-        from scripts.production import showrunners
+        from scripts.message import sessions
 
-        address = showrunners.current_address(identity.removeprefix("showrunner:"))
-        return NamedSupplier(address) if address else NoNamedSupplier("showrunner has no current address")
+        resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+        production = identity.removeprefix("showrunner:")
+        records = {item["sessionId"]: item for item in sessions.live_sessions()}
+        for row in staff.active(resolver.record, "showrunner"):
+            timer = showrunners.timer_for(row, resolver.record)
+            slug = timer.slug if isinstance(timer, showrunners.Timer) else row.name
+            if slug == production and row.current_session in records:
+                return NamedSupplier("uds:" + records[row.current_session]["messagingSocketPath"])
+        return NoNamedSupplier("showrunner has no current address")
     if identity.startswith(("uds:/", "codex:")):
         return NamedSupplier(identity)
     if identity.startswith("worker:"):

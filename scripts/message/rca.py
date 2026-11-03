@@ -68,7 +68,7 @@ import sessions  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
 import silence  # noqa: E402
 from user_zone import user_zone  # noqa: E402
-from session_staff import PRODUCTION_MARK  # noqa: E402
+from scripts.production import staff  # noqa: E402
 
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "message" / "rca"
 SEND = Path(os.environ.get("RCA_SEND") or Path(__file__).resolve().parent / "send.py")
@@ -211,17 +211,36 @@ def transcript_of(report: Report) -> str:
 
 
 def production_of(report: Report) -> str:
-    slug = report.production or os.environ.get(PRODUCTION_MARK, "")
-    return showrunners.canonical_slug(slug) if slug else ""
+    if report.production:
+        return report.production
+    record = staff.snapshot()
+    known = sessions.named(report.session, sessions.live_sessions())
+    identity = known["sessionId"] if known is not None else ""
+    row = record.by_current_session(identity)
+    while row is not None and row.kind != "showrunner":
+        row = record.by_id(row.parent) if row.parent is not None else None
+    if row is None:
+        return ""
+    timer = showrunners.timer_for(row, record)
+    return timer.slug if isinstance(timer, showrunners.Timer) else row.name
 
 
 def owner_address(production: str, *, deadline: float = math.inf) -> str:
     """Where the case's owner gets messages: the production's showrunner, else the natedev session."""
-    if not production:
+    if not production or monotonic() >= deadline:
         return NATEDEV
     try:
-        return showrunners.current_address(production, deadline=deadline) or NATEDEV
-    except ValueError:
+        record = staff.snapshot()
+        for row in staff.active(record, "showrunner"):
+            timer = showrunners.timer_for(row, record)
+            slug = timer.slug if isinstance(timer, showrunners.Timer) else row.name
+            if slug == production:
+                socket = showrunners.socket_for(f"session:{row.current_session}", deadline=deadline)
+                return f"uds:{socket}" if socket else NATEDEV
+        return NATEDEV
+    except TimeoutError:
+        raise
+    except (OSError, ValueError):
         return NATEDEV
 
 

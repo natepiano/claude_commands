@@ -14,11 +14,13 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from typing import override
 
 from scripts.hierarchies import push_audit as audit
 from scripts.hierarchies import log_records
 from scripts.hierarchies.test_log_records import phone_overflow_lines, read_report_blocks, summary_lines
-from scripts.production import showrunners
+from scripts.production import showrunners, staff, fake_showrunner
+from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, recorded_unit
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -63,13 +65,23 @@ class PushAuditTest(unittest.TestCase):
         self.save(self.pushes, [])
         self.save(self.reviews, [])
 
+    @override
+    def setUp(self) -> None:
+        _ = self.enterContext(isolated_staff_file(self.home / "staff.json", {}))
+        _ = (self.home / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
+
     def production(self, slug: str, units: Sequence[tuple[str, str]]) -> None:
         instance = self.home / ".local/state/notifier" / f"showrunner-{slug}"
         instance.mkdir(parents=True)
         doc = self.home / f"{slug}.md"
         rows = "".join(f"| {name} | {plan} |\n" for name, plan in units)
         _ = doc.write_text("# Production\n\n## Units\n\n| Unit | Plan |\n|---|---|\n" + rows, encoding="utf-8")
-        _ = (instance / "conf").write_text(f"CHECK=bash /fixture/production_check.sh {doc}\n", encoding="utf-8")
+        owner = recorded_showrunner(slug + "-owner", doc)
+        _ = fake_showrunner.write_timer(instance.parent, slug, owner.current_session, "UTC", doc)
+        for name, plan in units:
+            row = recorded_unit(owner.name, name, self.home / slug / name, doc, plan=plan)
+            if plan.startswith("retired"):
+                _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.home / slug / name))
 
     def save(self, path: Path, records: Sequence[JsonRecord]) -> None:
         _ = path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")

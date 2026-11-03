@@ -27,7 +27,7 @@ from scripts.production import staff
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr.herdr import HerdrPlace
 from scripts.shutdown.remote import local_machine
-from scripts.production.staff_test_support import StaffTestCase, fixture_showrunner_name, unit_membership, showrunner_relationship
+from scripts.production.staff_test_support import StaffTestCase, fixture_showrunner_name, recorded_unit, unit_membership, showrunner_relationship
 from unit_lookup import UnitState
 from dailies_input_test_support import (DailiesInputFixture, SCRIPT, RENDERER, WAITING, STAMP, AT,
                                         ALPHA, BETA, RACE_WATCH_STUB)
@@ -196,6 +196,10 @@ class DailiesInputTests(DailiesInputFixture):
         ])
 
     def test_real_phase_table_command_supplies_the_record_after_peer_handoff(self) -> None:
+        worktree = self.root / "alpha"
+        (worktree / ".git").unlink()
+        _ = recorded_unit(fixture_showrunner_name("example", self.doc), ALPHA,
+                          worktree, self.doc, plan="docs/alpha.md")
         plan = self.root / "alpha/docs/alpha.md"
         plan.parent.mkdir()
         _ = plan.write_text(
