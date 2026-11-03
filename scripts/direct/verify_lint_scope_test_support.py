@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from scripts.build_queue.admission_test_support import caller_admission
+from scripts.lib.py_floor_test_support import cache_file_name
+
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 import json
@@ -190,6 +193,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
         if "fixture_seed" not in type(self).__dict__ or not self.fixture_seed.is_dir():
             self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
             self.build_fixture()
+            _ = caller_admission(self, self.root, self.environment)
             return
         self.root = self.fixture_root
         _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
@@ -198,6 +202,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
         self.events = self.root / "cargo-events.jsonl"
         self.taplo_events = self.root / "taplo-events.jsonl"
         self.environment = self.fixture_environment.copy()
+        _ = caller_admission(self, self.root, self.environment)
 
     def build_fixture(self) -> None:
         home = self.root / "home"
@@ -222,7 +227,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
             self.write_shell(bin_directory / name, "exit 99\n")
         for directory in ("tmp", "state", "cache", "runtime", "target", "cargo-home", ".git", "cgroup"):
             (self.root / directory).mkdir()
-        interpreter_cache = self.root / "cache" / "claude" / "python3-3.11"
+        interpreter_cache = self.root / "cache" / "claude" / cache_file_name()
         interpreter_cache.parent.mkdir()
         _ = interpreter_cache.write_text(sys.executable + "\n", encoding="utf-8")
         pressure = self.root / "memory-pressure"

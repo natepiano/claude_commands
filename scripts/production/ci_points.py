@@ -9,12 +9,12 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import build_folders
 
 from scripts.lib.process_failure import failure_detail
 from production_units import Production, read_production
@@ -157,8 +157,9 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
     checkpoint = (f"{last_code.unit} phase {last_code.phase}" if isinstance(last_code, MergeEntry)
                   else "production wrap")
     state_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="ci-point-", dir=state_dir.resolve()) as temporary:
-        checkout = Path(temporary) / "checkout"
+    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
+            build_folders.FOLDER_PREFIXES["ci-point"], build_folders.ExplicitBuildParent(state_dir.resolve()))) as temporary:
+        checkout = temporary / "checkout"
         _ = required(command("ci start", "git", "clone", "--shared", "--no-checkout", "--",
                              str(production.checkout.resolve()), str(checkout)), "ci start")
         _ = required(git(checkout, "remote", "set-url", "origin", origin), "ci start")

@@ -92,8 +92,8 @@ class NextItemTests(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             _ = cast(object, stack.enter_context(mock.patch.dict(
                 os.environ, {"NEXT_STATE_DIR": str(self.root / "next"), "NIGHTLY_REVIEW_NOTE": str(self.root / "note.md")})))
-            _ = cast(object, stack.enter_context(mock.patch.object(candidates, "ROOT", self.root)))
-            _ = stack.enter_context(mock.patch.object(change_review, "LISTS", self.root / "change-review"))
+            _ = cast(object, stack.enter_context(mock.patch.object(candidates, "state_root", return_value=self.root)))
+            _ = stack.enter_context(mock.patch.object(change_review, "lists_directory", return_value=self.root / "change-review"))
             self.addCleanup(stack.pop_all().close)
         self.queues = {
             "change": Queue("change-natedev", [Entry("C1", "C1 Old change", since=at(1)),

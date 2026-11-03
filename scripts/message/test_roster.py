@@ -27,7 +27,7 @@ from unittest import mock
 from scripts.production import staff
 from scripts.production.staff_test_support import (
     isolated_staff_file, production_membership, unit_membership, showrunner_relationship, showrunner_launch,
-    fixture_worker,
+    fixture_worker, recorded_unit,
 )
 from scripts.astra import design_roles
 from scripts.astra.design_role_test_support import write_empty_binding_record
@@ -256,6 +256,7 @@ class RosterTests(unittest.TestCase):
             "| --- | --- | --- | --- | --- | --- |",
             f"| unit-one | docs/plan.md | {director_cwd} | unit-one | — | — |",
         )), encoding="utf-8")
+        _ = recorded_unit("alpha", "unit-one", director_cwd, self.production_doc, plan="docs/plan.md")
         self._write_showrunner_timer()
         self._write_session(str(os.getpid()), "runner", "acd50bad-5afa-5d3d-b155-3766b7d113e0", runner_cwd, status="ready")
         self._write_session(
@@ -387,6 +388,48 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(found.problems, [])
         return {entry.name: entry for entry in found.entries}
 
+    def test_codex_session_without_a_staff_row_is_freestanding_and_lists_successfully(self) -> None:
+        result, _, errors = self._run_main("--json")
+        entry = self._entries()["Codex window"]
+        self.assertEqual((result, errors), (0, []))
+        self.assertEqual(
+            (entry.role, entry.assignment, entry.showrunner, entry.director),
+            ("freestanding", roster.NotAWorker(), roster.NoShowrunner(), roster.NoDirector()),
+        )
+        self.assertEqual(entry.reach, roster.Messageable("codex:eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"))
+
+    def test_codex_unit_row_without_a_parent_claim_is_freestanding_and_lists_successfully(self) -> None:
+        record = staff.snapshot()
+        row = staff.StaffRow(
+            staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), "unit", "Codex window", None,
+            current_session=staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"),
+        )
+        with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((*record.rows, row))):
+            result, _, errors = self._run_main("--json")
+            entry = self._entries()["Codex window"]
+        self.assertEqual((result, errors), (0, []))
+        self.assertEqual(
+            (entry.role, entry.assignment, entry.showrunner, entry.director),
+            ("freestanding", roster.NotAWorker(), roster.NoShowrunner(), roster.NoDirector()),
+        )
+        self.assertEqual(entry.reach, roster.Messageable("codex:eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"))
+
+    def test_codex_unit_with_an_unavailable_recorded_parent_keeps_its_named_problem(self) -> None:
+        record = staff.snapshot()
+        wrong_kind = next(row.id for row in record.rows if row.kind == "unit")
+        for parent in (staff.StaffId("missing-owner"), wrong_kind):
+            with self.subTest(parent=parent):
+                row = staff.StaffRow(
+                    staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), "unit", "Codex window", parent,
+                    current_session=staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"),
+                )
+                with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((*record.rows, row))):
+                    result, lines, errors = self._run_main("--json")
+                self.assertEqual(result, 1)
+                self.assertEqual(json.loads("\n".join(lines))["problems"],
+                                 ["Codex window: the staff parent is unavailable"])
+                self.assertEqual(errors, ["could not read: Codex window: the staff parent is unavailable"])
+
     def test_keyed_send_reuses_roster_registry_before_delivery(self) -> None:
         state = self.root / "message"
         state.mkdir()
@@ -430,6 +473,7 @@ class RosterTests(unittest.TestCase):
         _ = env_file.write_bytes(env_file.read_bytes() + f"\0CODEX_THREAD_ID={row.id}".encode())
         doc = self.root / "receiving-production.md"
         _ = doc.write_text("# Receiving\n\n## Units\n| Unit | Worktree | Plan |\n| --- | --- | --- |\n")
+        _ = staff.set_doc(receiving.id, staff.LiveDoc("natedev", doc))
         timer = self.notifier / "showrunner-receiving"
         timer.mkdir()
         _ = (timer / "conf").write_text(f"TARGET=session:522e6367-86e1-5829-ada8-2c71b5c28c97\nCHECK=zsh /scripts/production_check.sh {doc}\n")
@@ -956,8 +1000,11 @@ class RosterTests(unittest.TestCase):
         peer = self._entry('natedev', 'freestanding', 'session:peer-session')
         os.environ['SSH_SNAPSHOT'] = roster.RosterSnapshot(roster.Roster([peer], [])).encode()
         output, errors = io.StringIO(), io.StringIO()
+        doc = self.root / 'peer-production.md'
+        _ = doc.write_text('# Peer production\n')
         membership = staff.StaffSnapshot((staff.StaffRow(staff.StaffId('peer-session'), 'showrunner',
-            'natedev', None, current_session=staff.StaffId('peer-session')),))
+            'natedev', None, current_session=staff.StaffId('peer-session'),
+            doc=staff.LiveDoc('natedev', doc)),))
         with mock.patch.object(staff, 'snapshot', return_value=membership), \
                 mock.patch.object(send, 'STATE', self.root / 'send-state'), \
                 mock.patch.object(send, 'remote', return_value=send.Result('sent', 'fixture peer')) as deliver, \
@@ -1644,8 +1691,6 @@ class RosterTests(unittest.TestCase):
     def test_unit_without_marked_session_does_not_claim_a_worktree_session(self) -> None:
         _ = (self.root / "herdr-proc/991100/environ").write_bytes(b"HERDR_PANE_ID=w1:p1\0")
         worktree = self.home / "projects" / "unit-one"
-        worktree.mkdir(parents=True)
-        _ = (worktree / ".git").write_text("gitdir: fixture\n", encoding="utf-8")
         self._write_session(
             "helper", "helper", "a24eb3a2-e6ab-50ff-b5ff-654fb1ab9708", worktree,
             tmux="unmarked:@2.%2",
@@ -1668,8 +1713,7 @@ class RosterTests(unittest.TestCase):
         with mock.patch.object(unit_lookup, "every_marked_unit", side_effect=with_duplicate), \
                 mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
             found = roster.roster(os.environ, roster.ThisMachine())
-        self.assertEqual(found.problems, [
-            "unit hosts left out under alpha: unit-two: its mark is on herdr sessions copy and first"])
+        self.assertEqual(found.problems, [])
         director = next(entry for entry in found.entries if entry.name == "director")
         self.assertEqual(director.role, "unit director")
         self.assertEqual(director.director, roster.DirectsUnit("unit-one"))
@@ -2427,6 +2471,7 @@ class UnitLabelsTests(unittest.TestCase):
         assert unit.parent is not None
         worker = fixture_worker("types-review", unit.id)
         doc = root / "production.md"
+        _ = staff.set_doc(unit.parent, staff.LiveDoc("natedev", doc))
         _ = doc.write_text(
             "## Units\n| Unit | Plan | Worktree | Branch | Port | Owns |\n"
             + "| --- | --- | --- | --- | --- | --- |\n"

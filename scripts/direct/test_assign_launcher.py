@@ -5,7 +5,7 @@ from scripts.lint.memory_test_support import config_environment, write_config_fi
 
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 
 import fcntl
 import json
@@ -71,7 +71,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         _ = self.paths.write_text("src/worker.py\ntests/test_worker.py\n")
         self.prompt = self.session_dir.parent / "assignment.txt"
         self.write_phase_prompt("7", "Assignment core", "Implement the assigned change.")
-        self.registry = self.session_dir.parent / "agents.conf"
+        self.registry = self.session_dir.parent / "models.conf"
         _ = write_registry(self.registry, {'codex.agents': {'gpt-kept-sol': 'low,medium,high,xhigh,max', 'gpt-other-sol': 'low,medium,high,xhigh,max'}, 'assignments': {'direct': 'codex'}, 'direct.codex': {'impl': 'gpt-kept-sol:high', 'test': 'gpt-kept-sol:high', 'fix': 'gpt-kept-sol:high', 'review': 'gpt-kept-sol:high'}})
         checkpoint = self.session_dir.parent / "catalog-current"
         checkpoint.touch()
@@ -80,7 +80,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
             "UNIT_HISTORY_DIR": str(self.history),
             "UNIT_ACTIVE_DIR": str(self.session_dir.parent / "active"),
             **config_environment(self.session_dir.parent),
-            "AGENTS_CONFIG_FILE": str(self.registry), "AGENTS_CONFIG_PUBLISH": "0",
+            "MODELS_CONFIG_FILE": str(self.registry), "MODELS_CONFIG_PUBLISH": "0",
             "CODEX_CATALOG_SYNC_STATE_FILE": str(checkpoint),
             "NOTIFIER_SESSIONS_DIR": str(self.session_dir.parent / "sessions"),
             "SHUTDOWN_STATE_DIR": str(self.session_dir.parent / "shutdown"),

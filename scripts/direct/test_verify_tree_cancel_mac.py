@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
 from scripts.direct.verify_tree_cancel_test_support import VerifyTreeCancelFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -23,7 +24,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
 
     def test_local_memory_wait_to_mac_preserves_existing_watcher(self) -> None:
         environment = self.mac_environment(local_first=True)
-        low_memory = self.root / "low-memory"
+        low_memory = Path(self.environment["BUILDLOG_MEMINFO"])
         _ = low_memory.write_text("MemAvailable: 1024 kB\n")
         free_now = self.root / "free-now.py"
         self.write_tool(free_now, "raise SystemExit(0)\n")

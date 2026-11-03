@@ -376,251 +376,373 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 **Gotchas:** `step_promise` reads the cap case from the waiter's recorded `need_source`, not from the step name.
 
-### Phase 10 — Every build, view and command uses the queue service, and the polling admission goes  · status: todo
-**Depends on:** Phase 5 (the service's new files), Phase 8 and Phase 9 (resources Phases 15 and 27; same file, `memory_admit.py`)
-**Blocked by:** (1) the socket and service units of Spec 13 are in `/etc/nixos/modules/linux/development.nix` on natedev. Queue-unit sent the units and the `OOMScoreAdjust` question to the natedev showrunner on 2026-10-30 (builds showrunner ask). The units land disabled and stopped before the merge, and the cut-over enables them (Spec 12); (2) the natedev NixOS session has `OnFailure=` and the alert unit of Spec 13 in place (the alert unit only calls a command, so it can land first); (3) resources Phase 33 merged on `origin/builds` (33 edits `release` and the owner-gone finalizer; resources-unit, 2026-10-30; resources 30 and 31 are before this phase through Phase 4, and resources 26 and 27 through Phases 8 and 9), and resources 20 not yet started (the chain Decided block). Tell resources-unit, verify-unit and the natedev showrunner through berth when this phase starts and when it lands.
-**Estimate:** about 15 h of worker time.
+### Phase 10 — Every build, view and command uses the queue service, and the polling admission goes  · status: done
+#### As-built
+
+- The queue service (`admission_service.py`) is the one admitter. `memory_gate.sh`, `verify.sh`, `invoke.sh`, the BRP launch gate, `build_hold.py`, `merge_gate.py` and `queue_place.py` call `admission_client.py` (`admit`, `launch`, `release`, `width`, `token_wait`, `view`, `explain`, `mine`). The polling `check`, the admission lock, the file readers, `.waiting`, `.reservation` and the old `queue.json` ledger do not exist.
+- The shared rules stay in `memory_admit.py` (`step_estimate` with `StepEstimate`, the pure `QueueInputs` builder, `queue_read_from_pass`); the service calls them and holds no copy. `view`, `explain` and `mine` read the stored pass.
+- `admission/state.json` holds reservations, waiter order and episodes, the `QueuePriority`, the admit-head record, the recovery spacing, the replay ledger and a durable build-history generation, written through `os.replace`. A first start imports the old files once and deletes them.
+- A finished build advances the build-history generation. An estimate carries the generation it read; a grant needs an equal generation, otherwise the reply is `EstimateExpired` and the client refreshes the estimate.
+- A durable grant replays on reconnect with the same reply and reservation, charged once. The client keeps one receive buffer per socket across timeouts.
+- Each pass writes the snapshot `admission/queue.json` through `scripts/build_queue/queue_snapshot.py` (atomic replace; a write error is ignored). AWS control reads it and refuses a start on a missing, stale or partial snapshot.
+- `admission_client.py --wait-events` prints `first` and `done`. `memory_gate.sh` pipes them to `buildlog_memory_event`, and `verify.sh` records the memory phase waits in phase history.
+- Each pass counts `builds.slice` memory that no reservation owns (`UnownedSliceMemory`), and a held head shows real free, reserve and need in the view and the card.
+- `admission_service.py drain-check [--service]` is the drain barrier; `export-priority` exports the active priority for a rollback.
+
+**Files:**
+- `scripts/build_queue/admission_service.py` — the service, `StateIntents`, the import, the snapshot writer, the generation rule, `drain-check`, `export-priority`
+- `scripts/build_queue/admission_client.py` — the client for every caller, the wait line, the wait events
+- `scripts/build_queue/admission_protocol.py` — the messages; `admission_socket_path` calls the override guard
+- `scripts/build_queue/queue_snapshot.py` — the one queue snapshot form, its reader and writer
+- `scripts/build_queue/admission_test_support.py` — the in-process service on a per-test socket, the fake clock, the fault hooks
+- `scripts/lint/memory_admit.py` — the shared rules
+- `scripts/lint/memory_gate.sh`, `scripts/direct/verify.sh`, `scripts/lint/invoke.sh`, `scripts/hooks/pre-tool-use-brp-launch-gate.sh`, `scripts/build_hold/build_hold.py`, `scripts/build_hold/override_guard.py`, `scripts/build_hold/override_guard.sh`, `scripts/build_queue/queue_place.py`, `scripts/buildlog/mac_idle.py`, `scripts/buildlog/record.py` — client callers
+- `scripts/build_queue/build_queue.py`, `build_why.py`, `queue_view.py`, `queue_card.py`, `commands/build/queue.md` — the view and the card on `admission_client.view` and `explain`
+- `scripts/build_queue/test_admission_client_wait.py` — the wait-line regressions against the in-process service
+- `docs/as-built/build-memory-admission.md` — the service, the protocol, the state file, the cut-over and rollback
+
+**Binds later work:**
+- The cut-over and rollback steps are in `docs/as-built/build-memory-admission.md` → "Startup, cut-over, and rollback". The builds showrunner runs them at the merge to main, after the user's go.
+- The service owns `admission/` (`state.json`, the `queue.json` snapshot) under its state folder; `queue_snapshot.py` names `admission/queue.json`.
+- The owner key is `Owner` in `admission_protocol.py` and the service. A run place keeps the `--wait-events` client path.
+- The card and `build_why.py` read the service only through `admission_client.view` and `explain`.
+- `[memory]` keys are read at each service pass; the snapshot writer and AWS control do not read them.
+
+**Gotchas:**
+- A test that counts grants counts distinct reservations, because a replay resends the grant.
+- Tests and `verify.sh` fixtures use the private service socket, never the live one. A direct `handle_request` call in a test goes inside `fixture.loop_turn`.
+- Timing tests (`test_queue_view` render time, `review_links` `test_change_page`, `codex_mesh`) can fail once at load 60-100 and pass alone.
+
+**Ruled out:**
+- A shadow run beside the old checker (user, 2026-10-31): one cut-over, no second admitter.
+
+### Phase 10a — One function names every /tmp and /dev/shm build folder  · status: done
+**Depends on:** Phase 10 (the queue service names the admission and build folders)
+
+Asked by the builds showrunner on 2026-11-02, after the Phase 10 checkpoint. Spec at phase start: list every place that makes a build folder under `/tmp` or `/dev/shm`, name the one function that makes the name, and move each maker to it. No code before the Phase 10 checkpoint.
+
+Inventory and Work Order: Phase 10 architect review, 2026-11-03.
 
 #### Work Order
 
-**Goal:** Phase 5's service becomes the one admitter. The shared rules move into `memory_admit.py`, every build step, BRP launch, merge gate, stop, view and command asks the service, all in one merge, and the same merge deletes the polling admission: `check`, the locks, the file readers, the poll loop, `.waiting`, `.reservation`, `admission/lock` and Phase 3's `queue.json` writer. A step starts only on an `admitted` answer, each step starts Python once instead of once every 5 s, and the view answers in under 0.25 s.
+**Goal:** One function names temporary build folders under `/tmp`, `/dev/shm`, or an inherited temporary parent. Existing helpers retain their ownership and cleanup rules.
 
 **Spec:**
 
-Source: S2 and S3 of `docs/plans/builds-queue-service-design.md` (with §2 The service, §3 Decisions stay in one place, §4 Commands, §5 When the service is down and §8 Tests), approved by the user at `93c86342` ("yes i want the build queue"). The design's shadow run in S2 is dropped: the user ruled on 2026-10-31 to cut over and not run the old and the new admission at the same time (Decided block). The builds showrunner split the former single phase on 2026-10-31: Phase 5 wrote the service's new files and tested them in process; this phase is the cut-over. The design's views and commands phase (the former S4) is part of this phase, because a separate phase would keep the `queue.json` writer alive as a second copy of queue state. The design's line numbers are at `d27e24a1`; find each function by its name. The design's `bump {selector, actor}` request is out of date: resources Phase 26 replaced the bump with a queue priority, and this phase carries it into the service (Spec 6). This Spec builds on the state in the code now (Decided block, 2026-10-31): the waiter order fields `since`, `priority_rank`, `priority_since` and `token_left_at` (`waiter_order` = `(priority_rank, since, pid)`, `memory_admit.py` :2703), the `QueuePriority` record and Phase 32's `admit_head`. `BumpOff`, `bump_order`, `holds_younger` and `bump_waiter` exist nowhere in `scripts` or `mods`. Where the merged resources code differs from this Spec, its code holds and this Spec follows it.
+1. Add `scripts/lib/build_folders.py::create_build_folder` as the common entry point.
+2. Provide a CLI for shell callers of this function.
+3. Use named request variants for unique temporary folders and stable owner folders.
+4. Preserve explicit parents, existing prefixes, permissions, and cleanup lifetimes.
+5. Keep folder creation atomic.
+6. Delegate registered task folders to `scripts.lib.scratch.new()`.
+7. Retain `scratch.target()` as the task naming rule.
+8. Obtain scratch roots from `copy_record.root()` and `copy_record.copies_root()`.
+9. Obtain unit run roots from `unit_runs.run_roots()`.
+10. Replace the separate sweep-state default in `memory_admit.py` with `tmp_sweep.state_dir()`.
+11. Preserve the existing sweep classification of each folder.
+12. Update cleanup readers only where the common function changes their inputs.
 
-1. **One cut-over, no second path (user, 2026-10-30 11:42 EDT and 2026-10-31).** Every caller moves in this phase's one merge. There is no shadow run, no mode file, no fallback to the lock and no second admitter: callers split between the lock and the service would be two admitters that cannot see each other's reservations, so both admit into the same free memory. The proof that the service decides as today's admission does is in process: the service calls `admission_pass` and acts on its result, and the tests (Phase 5's and Spec 14) show its decisions equal `admission_pass` on the same inputs. Rollback is a git revert of this phase, which brings back Phase 4's polling admission, but never a bare revert: after the cut-over, live reservations exist only in `admission/state.json`, and the restored polling `check` does not read that file, so a revert while a build still holds a service reservation hides its charge from admission. The rollback steps (Spec 12) hold natedev and drain the service first.
-2. **Phase 5's files gain their live parts.**
-   - `admission_protocol.py`: `admission_socket_path()` calls the override guard (Spec 9).
-   - `admission_service.py`: `StateIntents` (Spec 3), the one import (Spec 5), `outage_alerts.clear` at start (Spec 13), the `drain-check` command and its `--service` form (Spec 11), and `admission/` as the default state dir (`--state-dir <dir>` still changes it). The service calls the shared rules of Spec 3 in place of Phase 5's stand-ins.
-   - `admission_client.py`: the `admit` and `launch` CLI subcommands, `step_estimate` as the refresh, the wait line form, the leave hook and `down-alert` (Spec 8).
-3. **Shared rules move into one function each in `memory_admit.py` (no copy).**
-   - Stem rule: `reservation_stem(directory: Path, pid: int, start_time: int, admitted_ns: int) -> Path` gives `admission/<pid>-<start>-<ns>`. It replaces Phase 5's service stem function. The service's reservation id is the stem's name, `finalize_reservation` builds its `.max` and `.wave` paths from it, and the service sends the `.max` and `.wave` paths in `admitted`. `invoke.sh` :288 takes the `.max` path from `admitted` (Spec 9).
-   - Estimate: the estimate part at the top of `check` (from `estimate_time` to the profile its locked part uses: a `ProgramProfile` (Phase 4h) with `FixedCapSizing` as Phase 9 leaves the merge gate (the cap, with no estimate and no refresh) or with `HistoryPeakSizing` (refreshed every `head_seconds` through `program_peak_estimate`), the expiry of a cached `StepProfile`, and `git_identity`, `expected_peak` and `filtered_peak` for `InferFromArgv`) moves to `step_estimate(argv: list[str], cwd: str, profile: InferFromArgv | StepProfile | ProgramProfile, now: datetime, root: Path, policy: AdmissionPolicy) -> StepEstimate`. `StepEstimate` holds `profile: StepProfile | ProgramProfile` and `cache: FreshTest | ReusableEstimate`, the fresh-test cache policy. Today `check` computes `fresh` (`is_fresh_test` for a `nextest` step) and writes it as `waiter["fresh_test"]`; a waiter with `fresh_test` true never reuses its cached profile on the next poll. The client calls `step_estimate` before it connects and on each `EstimateExpired` refresh (it is the `refresh` of Phase 5's client API), and sends the policy with its profile in `admit` as the `fresh_test` field (true for `FreshTest`); the service keeps it on the waiter as `fresh_test`. `estimate_expired` gains the fresh-test age: a `fresh_test` waiter expires once its estimate is one poll interval (5 s) old, in the same one classifier. `is_fresh_test` has one caller, `step_estimate`.
-   - Finalization intent: today `finalize_reservation` writes its `FinalizationIntent` into the `.reservation` file before it appends to `anon_peaks.jsonl`, and deletes the file after. The intent store becomes an argument: `finalize_reservation(stem, row, outcome, now, status, *, intents: FinalizationIntents)`, where `FinalizationIntents` is a protocol with `save(row, intent)` (it persists the intent before the history append) and `clear(row)` (it removes the row after the append). The protocol is there because `memory_admit.py` cannot import the service. Its one adapter is the service's `StateIntents`: it writes the intent into the reservation's entry in `state.json` through `os.replace`, and `clear` drops the entry in one more `state.json` write. No code writes a `.reservation` file or Phase 5's stem file. The intent carries Phase 8's test-phase evidence as it is. The history append keeps its `reservation_id` match, so a second run after a crash appends no second row. The `.max`, `.wave` and sidecar deletes do not change.
-   - Inputs: the service builds `QueueInputs` with the same code as Phase 3's `gather_queue_inputs`. If `gather_queue_inputs` reads files or `/proc` itself, split it: the reads stay in it, and one pure builder takes what it read. The service calls that builder in place of Phase 5's own composition. The service passes its own pass readings as one `QueueSnapshotReadings` (host, pressure, recovery, compilers), so the builder reads none of them again. `QueueInputs` holds no limits and no policy (Phases 4f and 4g): the service resolves the limits with `resolve_admission_limits` and the policy with `read_memory_config()` at each pass and passes both in.
-   - Projection: `queue_read_from_pass(inputs: QueueInputs, limits, policy, result: PassResult) -> QueueRead` holds the body of `queue_read_from` after its `admission_pass` call. `queue_read_from(inputs, limits, policy)` stays, as the composition `queue_read_from_pass(inputs, limits, policy, admission_pass(inputs, inputs.now, limits, policy))`. There is one projection: the service and `queue_read_from` both call it, and the service stops calling `queue_read_from` for its queries. The service calls it on the inputs and the `PassResult` it stored, so `view`, `explain` and `mine` run no second admission walk.
-4. **What the service holds** is as Phase 5 built it (Phase 5 Spec 3): the waiter record (one place per step, no time at head, no bump end time; user, 2026-10-31), the reservations, the admit-head record, the recovery spacing, the last host reading, the last pass and the replay ledger, persisted in `<state dir>/state.json`. This phase adds the saved finalization intent to each reservation's entry (`StateIntents`, Spec 3), and the state dir is `admission/`. Phases 8 and 9 come into the service with no second rule: after it admits a nextest step and on each `width`, the service computes Phase 8's test-phase need with Phase 8's one rule and stores it in the reservation's `state.json` entry (Phase 8's file update helper goes with `set_width`); a merge gate's `admit` carries the `ProgramProfile` with `FixedCapSizing` that holds its cap (Phase 9), and `queue_place` (Phase 4h) sends that profile.
-   - Test-phase need through the one estimate worker thread. `test_phase_need(row, host, now, root, *, history_path, config)` (`memory_admit.py` :2140; the shipped service calls it at `admission_service.py` :616 with the pass's `MemoryConfig`) is one call over one reader (`anonymous_history_rows`) and one rule, and it reads `anon_peaks.jsonl`, which can be large. The loop never runs it. After the service admits a nextest step and on each `width`, it hands the call to its one estimate worker thread (Phase 5 Spec 3), tagged with the reservation id, the width and the resolved `MemoryConfig` of the event that queued it (the admit or the `width`). The thread uses that captured config and never reads config again, so a later edit cannot change the margin of a queued job. The thread holds no service state and posts the tagged result back through a pipe on the epoll. The loop stores a result only while its reservation is live and its width is still the current width; it drops a stale result. Until a result comes back, the step keeps today's charge (`NoTestPhaseNeed(not_recorded)`). There is no index of `anon_peaks.jsonl` and no cache: an index would be a second reader of that file. A call that fails stores nothing, and the admission stays, as today `check` ignores a failed `test_phase_need` write after admission (:3224-3233). Test: edit the margin between the enqueue and the run; the stored need uses the margin of the enqueue, beside the stale-width and frozen-need tests. The margin is frozen per need record: `set_width` reads the margin live again when it writes a new need (:4150), so a width change writes a new need with the live margin, and a written need never changes. The service keeps that rule.
-   - Test-phase charge evidence. Today `check` writes the first-selection evidence after the pure pass through `record_test_phase_charge_use` (:3165, :4005): it writes `.test-phase-charge.json` only if none exists and ignores a failed write. `finalize_reservation` copies it through `read_test_phase_charge_use` (:4070) and never builds it again. The service moves that evidence into the reservation's `state.json` entry and keeps every rule: first selection only, written outside the pure pass, admission succeeds when the optional write fails, and the finalizer only copies it into the history row. No code writes `.test-phase-charge.json`. Missing evidence stays `unknown` in queue-unit's 24 h report.
-   - Release cost. The finalizer's duplicate check scans the whole `anon_peaks.jsonl` (:4080) at each release, on the loop. The timing test of Spec 14 includes a release with a large history file. If it misses the bound, fix the scan in `finalize_reservation`, the one finalizer, not in the service.
-5. **The import and the start.**
-   - One import at start, only when `admission/state.json` is absent: each `.reservation` row (through `reservation_lifetime`: live rows keep their charge, ended rows go through `finalize_reservation` with `StateIntents`; a row that holds a saved `finalization` intent moves into `state.json` with it and finishes from it), each `.waiting` row's order fields keyed by owner, Phase 32's admit-head record (its `waiter` name maps to the service's key, `<pid>-<start_time>`) and the recovery spacing (`read_recovery`). The import reads them with the readers that exist today; there is no second parser. It also takes resources Phase 26's state: `queue_priority.json` (one `QueuePriority`), each `.waiting` row's `priority_since` and `token_left_at`, each `.reservation` row's `queue_waiter`, and a `.token-wait` intent (it finishes the token handoff of Spec 6 from it). Legacy nullable reservation fields convert on import, in the one conversion function each way of Phase 5: `test_threads: None` becomes `UnspecifiedTestWidth` for a nextest step and `NoTestWidth` for any other step, an int becomes `RequestedTestWidth`; `call_id: None` becomes `NoCallRecord`, a string `CallRecord`. The service writes `state.json`, then deletes the files it imported. A later start finds `state.json` and imports nothing.
-   - At each start, after its reservation check (Phase 5), the service calls `outage_alerts.clear("build-admission", now)` (Spec 13), then sends `READY=1`.
-   - New code after a merge to `~/.claude` main starts through Phase 5's restart rule (its Decided block, 2026-10-30). A source file that is gone counts as changed, so a rollback revert that deletes `admission_service.py` also stops the service.
-6. **Protocol** as Phase 5 built it (Phase 5 Spec 5), with three new requests that carry resources Phase 26's state and the token handoff. Each carries a `request_id` and goes through the replay ledger like every mutation.
-   - `priority_set {request_id, unit, why, actor}` and `priority_clear {request_id, actor}` reply `ok` or `refused`. The client CLI calls `require_showrunner` and sends its result as `actor`; a caller that is not a showrunner exits 3, as `build_queue.py bump` does today. The service keeps the one `QueuePriority{unit, why, set_at, set_by, transition{id, action, at}}` in `state.json` and writes one `record.queue_priority` row per transition id through the function `priority_set` and `priority_clear` use today (`memory_admit.py` :558-650), so a replayed request writes no second row. Each pass sets each waiter's `priority_rank` (0 or 1) with `resolve_queue_order`'s rule from roster unit labels; split that rule into one pure function in `memory_admit.py` that both the service and the import call, with no copy. `stored_waiter` keeps dropping `priority_rank` from the persisted place. `build_queue.py bump <unit>` sends `priority_set` with `why` "the user's bump".
-   - `token_wait {request_id, reservation}` replies `ok`. It does what the `token-wait` action does today (`memory_admit.py` :3001-3033) in one `state.json` write: it finalizes the reservation as `Completed` through `finalize_reservation` with `StateIntents`, and puts the waiter back at its place from the reservation's `queue_waiter` with `token_left_at`. When the same owner's next `admit` carries `BUILDLOG_MEM_TOKEN_BACK_AT`, the service appends one `token_gap` row to `queue_times.jsonl` through `append_queue_time`, with the duplicate check of today (:3146-3153), keyed by the episode. `memory_gate.sh` `buildlog_token_wait` (:326) sends `token_wait` in place of the checker action; `verify.sh` :2641 keeps its call.
-   - `admit` and the reservation entries carry `RequestedTestWidth | UnspecifiedTestWidth | NoTestWidth` and `CallRecord | NoCallRecord` (Phase 5). This phase moves those types from `admission_protocol.py` into `memory_admit.py` (one definition) and changes `Reservation.test_threads` and `Reservation.call_id` to them, so the nullable forms and the service's conversion go except in the import.
-7. **When a pass runs** is as Phase 5 built it (Phase 5 Spec 6). `view`, `explain` and `mine` now read the stored pass through `queue_read_from_pass` (Spec 3), so they run no second admission walk.
-8. **The client, `admission_client.py`.**
-   - Python API as Phase 5 built it (Phase 5 Spec 7); each caller passes a `refresh` that calls `step_estimate`. `merge_gate.py` calls this API in process.
-   - CLI: this phase adds `admit` and `launch` (each builds its request from argv, cwd and `step_estimate`) and `down-alert` (Spec 13) to Phase 5's subcommands. On `admitted` or `launch_admitted`, `admit` and `launch` print one protocol line to stdout and exit 0; on a refusal they print the reason to stderr and exit 2.
-   - The wait line form and the leave hook move here from `memory_gate.sh`, one function each, and the shell copies go. The wait line form is today's `buildlog_memory_line_inner` and the `printf` lines in `buildlog_wait_for_memory`: the client prints the same lines as today, on stderr, from the `wait` messages. The leave hook is today's loop: `LINT_QUEUE_LEAVE_HOOK`, else `BUILDLOG_MAC_IDLE_HOOK`, runs every 5 s; a success closes the connection and exits as `LeftQueue` with today's exit code.
-   - Queries are bounded as Phase 5 built them (`QUERY_TIMEOUT_SECONDS`, `AdmissionUnavailable`). `/build:queue`, its card, build-why and the pane keep their own failure output on this error (Spec 9).
-   - Phase 5's three outcomes and launch deadline replace the shell's own rules in `memory_gate.sh`, and Phase 7's wait rules stay true through them; there is no closed list of `source` values. With `step_estimate` as the refresh, the outcomes read:
-     - Transport unavailable: the service is gone or silent (no socket, a refused connect, a closed connection, or no `wait` line for 120 s). The client never refuses for this and never falls back to the lock (design §5). A closed connection: it connects again at once, sends its first request again with its first `since` and its episode or `request_id`, and prints `admission service restarted; waiting again` once. No socket, or a refused connect: it tries again every 2 s and prints one line a minute. No `wait` line for 120 s: it prints `admission service not answering since HH:MM` (time in the user zone, through `user_zone.py`) and keeps waiting. The first call follows the same rule: a client that finds no service at its first connect keeps trying.
-     - Checker failure while waiting: the client cannot get a valid answer for its step although it reached the service. That is, its `step_estimate` raises (at the start or on an `EstimateExpired` refresh), or a reply line fails `admission_protocol.py`'s parser. Phase 7's rule holds: after the first `wait` line, the client prints `memory admission check failed (<reason>); trying again, the step keeps its place`, resends with the same episode and first `since`, and refuses only after `BUILDLOG_MEM_CHECK_RETRY_S` (default 60 s, a value that is not a whole number gives 60) of failures with no valid answer between them. A valid `wait` line resets that count. An empty failure reason uses Phase 7's fallback reason. A failure before the first `wait` line refuses at once, with no retry.
-     - Explicit refusal: a `refused` reply. The client stops at once with its reason, and the CLI exits 2. It does not retry.
-     - Launch deadline: a `launch` that has no `launch_admitted` within `BUILDLOG_MEM_WAIT_LIMIT_S` (default 900 s; 0 refuses at the first hold) refuses with `launch wait limit reached without admission`. The limit runs on all three paths: a transport wait and a checker retry never extend it. An `admit` has no such limit.
-9. **Callers.**
-   - `memory_gate.sh`: `buildlog_wait_for_memory` runs one foreground `admission_client.py admit ...` and reads its `admitted` line. `buildlog_release_memory` runs `admission_client.py release`, and the width call runs `width`. `memory_gate.sh` keeps today's exit codes for admitted, refused and left. It makes one episode per `admission_client.py admit` call (Phase 5 Spec 5).
-   - `invoke.sh` :288: the `.max` path comes from the `admitted` line (`max_path`), not from `${BUILDLOG_MEM_RESERVATION%.reservation}`. `BUILDLOG_MEM_RESERVATION` holds the reservation id, not a file path. The sampler `buildlog_sample_anon` does not change.
-   - `verify.sh`: the cancel path (:1171–1181) drops its reservation list, because the owner's end releases.
-   - `pre-tool-use-brp-launch-gate.sh`: runs `admission_client.py launch` and reads its `launch_admitted` line; it never reads a reservation or a sidecar path. The launch keeps Phase 4's standalone checks through the service (Phase 5 Spec 5).
-   - `build_hold.py` `admitted_processes`: owners from `view`'s reservations. A service that does not answer within the query bound raises `AdmissionUnavailable` (Spec 8), and the callers treat it as they treat an unreadable admission folder today.
-   - `override_guard.py` and `override_guard.sh`: `ADMISSION_SOCKET` joins `OVERRIDE_VARIABLES`, so the installed client refuses a socket outside the test's own folder, as it refuses `BUILD_HOLD_DIR` today. `admission_socket_path()` calls the guard; there is no second refusal check.
-   - `queue_place.py` (Phase 4h): the body of `queue_place` calls `admission_client.admit` and `release` in process (Spec 8's Python API) in place of its `memory_admit.check` loop, `release` and `cancel_waiter`. Its signature does not change, so `merge_gate.gate_reservation` and every other holder keep their calls. `before_check` runs before each `admit` attempt.
-   - `stop.py` `_release_build_claims`: its admission part goes, because the service ends a stopped owner's waiter and reservation from its pidfd. Its `admitted(owner)` check asks `mine`.
-   - `mac_idle.py` `waiting_evidence`: waiting steps come from `view`, not from `.waiting` files.
-   - `build_queue.py` (the view, the card and `--json`) and `build_why.py` keep reading through `queue_read()`, now the service adapter (Spec 10); neither sends `view` or `explain` itself. `build_queue.py` asks `mine`, and its admit-head command sends `admit_head` (`require_showrunner` stays in the CLI). Its bump command sends `priority_set` and its clear sends `priority_clear` (Spec 6; `require_showrunner` stays in the CLI, exit 3 for a caller that is not a showrunner). `commands/build/queue.md` names the new source.
-   - Queue questions fail within the bound, apart from admission waiting. On `AdmissionUnavailable`, `build_queue.py` (the view and the card) and `build_why.py` print `build queue: admission service unavailable: <reason>` on stderr and exit 2 within 1 s. The pane keeps its one failure message, `Build queue could not be read.`, and keeps its `QueueSelection` (Phase 3), so the next refresh opens the same card.
-10. **Deletions in `memory_admit.py`.** `check`, `locked_queue_read`, `current_blocker`, `blocker_snapshot`, `live_waiters`, `live_reservations`, `queue_rows`, `cancel_waiter`, `release`, `set_width`, `write_admission_record`, `run_action`'s file protocol (it keeps only the actions with a caller outside admission, such as `tripwire`), every `flock`, Phase 3's `write_queue_snapshot`, the `queue.json` file read, the admit-head file writer (`admit_head`, and the file delete in `end_head_override`; the service calls `head_override_event`), and `commit_pass_effects` (it writes the recovery and admit-head files; `check` is its only caller), the `token-wait` action and its `.token-wait` intent file, and the `queue_priority.json` file writes in `priority_set` and `priority_clear` (the service holds the record; the `record.queue_priority` row writer stays and the service calls it). The readers of today's files that the import uses stay (`reservation_rows`, `read_waiter`, `read_recovery`, `read_head_override` and the `queue_priority.json` reader); only the import and the drain barrier (Spec 11) call them.
-    - `queue_read() -> QueueRead` stays the one entry point for the view, the card and build-why, and becomes the service adapter: it returns `admission_client.view()`'s `QueueRead` (its `explanation` carries `decided_from`) or raises `AdmissionUnavailable`. It imports `admission_client` in its body, because `admission_client` imports `memory_admit` at load. The cache-only outcomes go: `QueueBusy`, `StaleReading`, `CurrentReading`, `QueueRead.freshness`, `QUEUE_READ_LOCK_SECONDS`, `SNAPSHOT_MAX_AGE_SECONDS`, the `queue busy; try again` line and the view's stale header tone. Spec 9's `AdmissionUnavailable` output replaces them. The generic codec (`snapshot_value`, `parse_snapshot_value`) stays: the protocol's replies and `state.json` use it.
-    - The rules, estimates and readers stay (design §3): `admission_pass`, `admission_walk`, `decide`, `build_charge`, `charge_basis`, `growth_headroom`, `head_priority`, `head_window`, `head_wait_text`, `head_override_event`, `blocking_index`, `blocker_identity`, `head_after_steps_end`, `smallest_head_release`, `expected_peak`, `filtered_peak`, Phase 8's test-phase need rule, `step_estimate`, `read_meminfo`, `read_pressure`, `reservation_memory`, `sccache_memory`, `queue_read_from`, `queue_read_from_pass`, `reservation_stem`, `finalize_reservation`, `reservation_lifetime`. Live admission runs only in the service: it is the only caller of `admission_pass` on live inputs. Build-why's release calculation stays outside the service: `head_after_steps_end` and `smallest_head_release` run `admission_pass` on the frozen `decided_from` of an `explain` reply. That is allowed, because it admits nothing and writes nothing.
-11. **The drain barrier and the service drain, `admission_service.py drain-check`.**
-    - `drain-check` reads only, and it uses the import's own reader of `.waiting` and `.reservation` rows (no second parser). It counts three things: waiter rows whose owner is alive (pid and start time), reservation rows that `reservation_lifetime` gives as live, and live processes that hold the old gate functions. A process holds them when its command line runs a script that sources `memory_gate.sh` directly or through `invoke.sh` (`verify.sh`, `invoke.sh`, `pre-tool-use-brp-launch-gate.sh`), or runs `merge_gate.py` (it calls `memory_admit.check` in process before the cut-over). The list is one constant in the barrier. With all three counts 0 it prints `drained` and exits 0; else it prints each count with up to 5 owners or pids and exits 1.
-    - `drain-check --service` is the same command's rollback form. It reads only. It reads `admission/state.json` through the service's own state reader (no second parser) and counts three things: reservations that `reservation_lifetime` gives as live, waiter entries whose owner is alive (pid and start time), and live client processes. A process is a client when its command line runs `admission_client.py`, or runs a script on the barrier's one process list (after the cut-over those scripts call the client, and `merge_gate.py` calls it in process). It uses the same process list constant; there is no second list. With all three counts 0 it prints `drained` and exits 0; else it prints each count with up to 5 owners or pids and exits 1. `--state-dir <dir>` reads another state folder; the Spec 12 prerequisite reads `/var/lib/build-admission`.
-12. **Cut-over steps.** The builds showrunner runs them at the merge to main, in a quiet hour. A running bash keeps the `memory_gate.sh` functions it read at its start, so a step that started before the merge would call the deleted `check`.
-    Every step that needs root is a named user or natedev step; a worker cannot run them. NixOS changes go as a branch hash from queue-unit to the builds showrunner, who passes it to natedev; natedev reviews and pushes; the user rebuilds.
+**Inventory and Files:**
 
-    Why the units are disabled until the merge: the shipped unit passes `--state-dir /var/lib/build-admission`, and main's `serve` before this phase requires `--state-dir`. A rebuilt unit with no `--state-dir` that starts before the merge fails, hits the start limit and fires `OnFailure=`. A disabled, stopped unit never starts, so no alert can fire in that window. Picked over an earlier checkpoint that lands the `admission/` default first: that default with a running unit would import the live `.waiting` and `.reservation` files while `check` still admits, which makes two admitters.
+Paths below are relative to the repository. “Not named” means the supplied ownership documents assign no owner.
 
-    Prerequisite, before the merge:
-    1. queue-unit: an `/etc/nixos` branch drops `--state-dir` and `StateDirectory=` from the service, and removes `WantedBy=` from the socket. The service has no `WantedBy=` since the 2026-11-01 socket-order fix. Send its hash to the builds showrunner.
-    2. natedev: from the merge checkout, `~/.claude/scripts/lib/py <merge checkout>/scripts/build_queue/admission_service.py drain-check --service --state-dir /var/lib/build-admission` reports `drained`. No build uses the service before this phase, so it holds nothing live.
-    3. user: `sudo systemctl stop build-admission.socket build-admission.service`, then `sudo systemctl reset-failed build-admission.service`. Stop before the rebuild: a rebuild restarts a changed unit that is running.
-    4. natedev pushes the branch; user rebuilds. Check: `systemctl show -p UnitFileState,ActiveState build-admission.socket build-admission.service` gives `disabled` and `inactive` for both.
-    5. user: `sudo rm -rf /var/lib/build-admission`.
+| Maker or helper | Existing names or purpose | Required change | Owner |
+|---|---|---|---|
+| `scripts/production/merge_gate.py` | `merge-gate-*`, module folders, `promotion-index-*`, `merge-gate-nightly-*` | Use the common function, including the explicit `/dev/shm` parent. | natedev showrunner |
+| `scripts/production/fast_track.py` | Check, promotion, checkout, and temporary index folders | Use the common function. | Not named |
+| `scripts/production/waiting.py` | `production-scratch-*` test checkout | Use the common function. | Not named |
+| `scripts/production/bump_gate.py` | `bump-gate-*` checkout beneath the record parent | Preserve the explicit parent. | Not named |
+| `scripts/production/ci_points.py` | `ci-point-*` validation checkout beneath the state directory | Preserve the explicit parent. | Not named |
+| `scripts/style/bulk_run.py` | `bulk-rule-test-*` checkout | Use the common function. | Not named |
+| `scripts/style/style_sync.py` | `style-sync-lint-*` checkout and control files | Preserve owner records and interrupted-run cleanup. | Not named |
+| `scripts/buildlog/rust_release.py` | `rust-release-trial-<version>` beneath `default_trial_parent()` | Preserve replacement and retry behavior. | report-unit |
+| `scripts/direct/verify.sh` | Run `tmp/`, `verify-tree.*`, `verify-doc-*`, `verify-copy.*`, `verify-hold.*` | Use the common function through its CLI. | verify-unit |
+| `scripts/lint/invoke.sh` | Creates inherited `TMPDIR`; names the `lint-sweep` stamp directory | Use the common naming rule where it creates these folders. | verify-unit |
+| `scripts/direct/prepare_session.sh` | `/tmp/claude/unit/<uuid>` | Use the existing unit-root authority through the common entry point. | Not named |
+| `scripts/direct/implement.sh` | Session `tmp/` | Use the common function through its CLI. | Not named |
+| `scripts/agents/codex_mesh.py::_set_run` | Run `tmp/` | Preserve the exported `TMPDIR` and ownership. | Not named |
+| `scripts/hooks/session-start-temp-root.py` | `/tmp/claude/session/<session>` | Preserve stable names, permissions, and short socket paths. | resources-unit |
+| `scripts/lib/scratch.py` | Registered task folders | Retain registration and task lifetime rules. | resources-unit |
+| `scripts/lib/copy_record.py` | Scratch and copy roots | Retain the existing root readers. | Not named |
+| `scripts/lib/unit_runs.py` | Current and former unit roots | Retain current and former root handling. | Not named |
+| `scripts/build_queue/queue_place.py` | `queue-place-*` sidecar parent | Preserve the folder until program cleanup and release finish. | queue-unit |
+| `scripts/build_queue/admission_test_support.py` | `admit-test-*`, short `/tmp/admit-sock-*` parent | Preserve private state and socket isolation. | queue-unit |
+| `scripts/mac_test/copy_watch.py` | `copy-watch.*` control folder | Use the common function. | verify-unit |
+| `scripts/mac_test/linux_runner.py` | Staging folders beneath cache and mirror parents | Preserve explicit parents, including temporary fixture parents. | verify-unit |
+| `scripts/lint/style_review.py` | Review folders beneath a phase directory | Preserve the phase parent and ownership records. | Not named |
+| `scripts/hooks/pre-tool-use-checkpoint-doc-gate.py` | `checkpoint-doc-*`, `checkpoint-paths-*` | Use the common function for these build-check folders. | verify-unit |
+| `scripts/lint/memory_admit.py` | Separate `LINT_SWEEP_STATE_DIR` default | Call `scripts.lint.tmp_sweep.state_dir()`. | queue-unit |
 
-    Cut-over, at the merge to main (the builds showrunner runs it, in a quiet hour):
-    1. `/build:hold hold "admission cut-over"` on natedev.
-    2. Wait until `/build:hold quiet` reports quiet and the drain barrier reports `drained`: `~/.claude/scripts/lib/py <merge checkout>/scripts/build_queue/admission_service.py drain-check`, run from the merge checkout before the push. `/build:hold quiet` alone is not enough: its `quiet_verdict` counts only processes whose command name is a build command, so a shell that waits in admission (its poll sleeps between `check` passes) or that holds the old gate functions reads as quiet.
-    3. Merge to main. Until step 4 ends, the socket is not active: a step's client gets transport unavailable and waits (Spec 9), and the hold is in force.
-    4. queue-unit: an `/etc/nixos` branch puts `WantedBy=` back on the socket only (Spec 13). natedev pushes it; user rebuilds. The rebuild starts the socket on the new code; the first connect starts the service, which imports and answers.
-    5. natedev: `systemctl show -p ExecStart build-admission.service` has no `--state-dir`, and `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/admission_client.py view` answers from the live service.
-    6. `/build:hold release`.
+The scan also finds temporary folders for screenshots, messages, configuration validation, installation, and proposal text. These folders do not contain builds.
 
-    Rollback steps. The builds showrunner runs them, in the same form as the cut-over:
-    1. `/build:hold hold "admission rollback"` on natedev.
-    2. Wait until `/build:hold quiet` reports quiet and `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/admission_service.py drain-check --service` reports `drained`. While it reports not drained, the rollback does not go ahead: a live service reservation or client would lose its charge or its admission at the revert.
-    3. user: `sudo systemctl stop build-admission.socket build-admission.service`. Phase 5's `admission_service.py` stays after the revert, so `ConditionPathExists=` still holds; only a stopped, disabled unit stays down.
-    4. queue-unit: an `/etc/nixos` branch removes `WantedBy=` again (the prerequisite's form). natedev pushes it; user rebuilds. Check: both units are `disabled` and `inactive`.
-    5. Revert this phase and merge to main. The restored `check` starts from an empty `.waiting` and `.reservation` set, which is correct because nothing is live. An admit-head record in `state.json` ends with the service; the showrunner sets it again through the restored command if it still needs it.
-    6. `/build:hold release`.
-13. **systemd system units (queue-unit writes the socket and service units in an `/etc/nixos` worktree; natedev reviews, commits and pushes; the natedev NixOS session writes the alert unit; they go live at the user's next rebuild).** natedev, 2026-10-30: a user unit cannot set `OOMScoreAdjust=-900`, because natedev's user manager runs at `oom_score_adj` 100 and an unprivileged process cannot go below its own floor. So the units are system units that run as the user. Do not lower `user@1000`'s score: that would protect every user process, builds included.
-    - `build-admission.socket`: `ListenStream=/run/build-admission/build-admission.sock`, `SocketUser=natepiano`, `SocketMode=0600`, `RuntimeDirectory=build-admission`, `WantedBy=sockets.target` (from cut-over step 4).
-    - `build-admission.service`: `User=natepiano`, `Type=notify`, `NotifyAccess=all`, `ExecStart=/home/natepiano/.claude/scripts/lib/py /home/natepiano/.claude/scripts/build_queue/admission_service.py serve`, `ConditionPathExists=/home/natepiano/.claude/scripts/build_queue/admission_service.py`, `Restart=always`, `RestartSec=1`, `WatchdogSec=30`, `OOMScoreAdjust=-900`, `CPUWeight=1000`, `OnFailure=build-admission-alert.service`, outside `builds.slice`, `Requires=` and `After=build-admission.socket`, and no `WantedBy=`. Only the socket starts it: a service with its own `WantedBy=` can start before the socket listens, bind the socket itself, fail on the root-owned `/run/build-admission`, and make the socket refuse to listen (the bb634ce switch, 2026-11-01). The socket-only start (nixos d94db090) passed a real root switch at 21:32 EST on 2026-11-01 (nixos 5f926ff): the socket was active, the first `view` started the service, and no unit failed. There is no `--state-dir` and no `StateDirectory=`: `serve` uses `admission/`. From the prerequisite rebuild to cut-over step 4, the socket carries no `WantedBy=` and both units stay stopped (Spec 12). After step 4 the socket starts at boot, and it starts the service on the first connect.
-    - `build-admission-alert.service`: `Type=oneshot`, `ExecStart=%h/.claude/scripts/lib/py %h/.claude/scripts/build_queue/admission_client.py down-alert`.
-    - Down alert. `admission_client.py down-alert` waits until the service has been down for 2 min (the socket refuses, or no answer), takes a claim with `outage_alerts.claim("build-admission")`, sends `build admission service is down; builds wait` through `send.py`'s outage path with a new `push_catalog.py` entry, and calls `outage_alerts.delivered`. A claim that is in flight or delivered sends nothing, so there is one push for each outage. The service clears the claim after each start (Spec 5).
-14. **Tests.** Every test that needs a server uses Phase 5's `admission_test_support.py` (the in-process server, the fake clock, the per-test socket and the fault hooks); this phase adds the fault hooks its import, drain and finalization cases need there, and writes no second fixture.
-    - These 13 modules move to a per-test `ADMISSION_SOCKET` with the in-process server: `test_verify_hold_memory`, `test_verify_token_reservation`, `test_verify_tree_cancel_reacquire`, `test_verify_checks_fail_closed`, `test_verify_lint_guard_key`, `verify_tree_cancel_test_support`, `test_brp_launch_gate`, `test_build_hold`, `build_hold_test_support`, `test_hold_shortcut`, `test_mac_idle`, `test_bounded_stop`, `test_merge_gate_suites_admission`. The merge-gate test runs start an in-process server in place of real check and release processes against fake state under `/dev/shm`.
-    - `scripts/lint/test_memory_gate_wait.py` moves to `scripts/build_queue/test_admission_client_wait.py`: each of its six regressions runs `buildlog_wait_for_memory` against the in-process server, with the checker failure made by the server fixture, and keeps its assertions. The old module goes.
-    - Tests of deleted functions go with them. `test_aged_launch_without_a_ledger_keeps_its_own_memory_checks` goes with `check`; its service twin stays, and `test_brp_launch_gate` gains the same case through the hook. Phase 3's `StaleReading` and `QueueBusy` tests go; the bounded query failure tests replace them.
-15. **Docs.** `docs/as-built/build-memory-admission.md`: rewrite the admission part for the service (the three files, what it holds, the protocol table, the state file, release by pidfd and scope, the rule when it is down, the import, the restart rule, the cut-over and rollback steps and `drain-check --service`) and delete the lock, `.waiting`, `.reservation` and `queue.json` parts. `commands/build/queue.md`: the new source.
+`smoke_launch.sh` creates application configuration after the build finishes. Its temporary folder is an application launch folder.
 
-No-copies rule (user, 2026-10-30): one place for each thing. A second copy of setup, a fixture, a config writer, a parser or a helper is a defect. A copy exists only with the user's own approval. Fix at the cause, never a patch at each site.
+`demo_refusals.sh` creates a director demonstration fixture. It does not create a build workspace.
 
-**Decided (user, 2026-10-31): cut over, with no shadow run.** "we should cutover and not try to run the old and the new at the same time." The service is built and made live in this one phase. There is no shadow mode, no `admission/shadow/` state, no shadow decision log or report, and no live comparison beside the old checker. The in-process tests (Phase 5's and Spec 14) are the proof: the service calls `admission_pass`, and its decisions equal `admission_pass` on the same inputs. The phase lands alone in its own promote, with no other admission change in it (showrunner, 2026-10-31).
-
-**Restart rule:** Phase 5's Decided block (showrunner, 2026-10-30, Option A) holds here; the rollback (Spec 12) uses it.
-
-**Decided (showrunner, 2026-10-31): this phase carries resources Phase 26's state into the service.** Resources Phase 26 is built (58391add) and lands before this phase, so this phase does the carry, with one copy of each field, under an also-touches line. This phase does not redesign it. The state extends three things together and nothing else: `QueueInputs`, the pass effects (`ProposedAdmission` and `PassResult`), and the generic codec (`snapshot_value`, `parse_snapshot_value`), which the protocol and `state.json` use. The requests (`priority_set`, `priority_clear`, `token_wait`), client calls, callers, import inputs and build log rows (`record.queue_priority`, `token_gap`) come with that carry (Specs 5 and 6).
-
-**Decided (showrunner, 2026-10-30): where this phase lands in resources-unit's chain.** Option A: after resources 27 and before 20 (chain 21 → 16 → 25 → 24 → 26 → 15 (Phase 8) → 27 (Phase 9) → **this phase** → 20 → 11 → 17 → 18 → 19 → 8; resources 15 and 27 moved to queue-unit as Phases 8 and 9, builds showrunner, 2026-10-31). 27 is the one remaining resources phase that changes a caller this phase moves (`gate_reservation`), so landing after it moves that caller once; 20, 11, 17, 18 and 19 change rules and estimates that stay in `memory_admit.py`, which the service runs; 8 decides whether the service's `state.json` is shared build state. queue-unit confirms this place with resources-unit against its Work Orders.
-
-**Decided (builds showrunner, 2026-10-31): the queue counts and shows all `builds.slice` memory, and a held head shows its numbers.** At 11:42 a python replay and rust-analyzer, started through `mesh_runs`, held 17.4 GiB in `builds.slice` with no queue row. The view said "free 12.1" while a 7.7 GiB step waited, and the user could not see why it waited. This phase builds two things:
-1. **Memory that no queue step owns.** Each pass reads `builds.slice` once, beside `sccache_memory` and through the same `BUILDLOG_BUILDS_CGROUP` path. Each child cgroup that no reservation's sidecar names and that is not `sccache.service` becomes one `UnownedSliceMemory(cgroup, owner, bytes)` row, where `owner` is the scope or service name. A step charged by its process tree whose pids sit in that cgroup is subtracted from it, so no byte counts twice. The row goes into `QueueInputs` with the other running steps, and admission counts it in `BudgetCheck.charged`. The view and the card print it as its own line with its owner and size. They do no arithmetic of their own (Invariants).
-2. **A held head shows its numbers.** When the head holds, the view's head line and its card print real free (`FreeCheck.available`), the reserve (`FreeCheck.reserve`) and the need (`FreeCheck.need`) in GiB, from the `HeadExplanation` that admission wrote.
+Ordinary test roots remain private `tempfile` roots. Shared fixtures that name build or admission folders use the common function.
 
 **Files:**
-- `scripts/build_queue/admission_protocol.py` — `admission_socket_path` calls the override guard (Phase 5's file; owner queue-unit)
-- `scripts/build_queue/admission_service.py` — `StateIntents`, the one import, `outage_alerts.clear` at start, `drain-check` and its `--service` form, the `admission/` default, the calls of the shared rules in place of Phase 5's stand-ins, Phase 8's need on admit and `width` (Phase 5's file; owner queue-unit)
-- `scripts/build_queue/admission_client.py` — the `admit` and `launch` CLI subcommands, `step_estimate` as the refresh, the wait line form, the leave hook, `down-alert` (Phase 5's file; owner queue-unit)
-- `scripts/lint/memory_admit.py` — `reservation_stem`, `step_estimate` with `StepEstimate`, the pure `QueueInputs` builder, `queue_read_from_pass` (and `queue_read_from` as its composition), `FinalizationIntents`, the fresh-test age in `estimate_expired`; Spec 10 deletions and the `queue_read` adapter (owner queue-unit since 2026-10-30; resources-unit reviews the diff)
-- `scripts/build_queue/build_why.py`, `scripts/build_queue/build_queue.py`, `commands/build/queue.md` — `queue_read()` as the service adapter, `mine`, `admit_head`, the `AdmissionUnavailable` output; the `queue busy; try again` line goes (owner queue-unit)
-- `scripts/build_queue/queue_view.py`, `scripts/build_queue/queue_card.py` — the stale header tone goes; the `UnownedSliceMemory` line and a held head's free, reserve and need (owner queue-unit)
-- `scripts/lint/memory_gate.sh` — the client calls; the wait line form and the leave-hook loop go (owner queue-unit since Phase 7)
-- `scripts/hooks/pre-tool-use-brp-launch-gate.sh` — `launch` (owner resources-unit)
-- `scripts/build_hold/build_hold.py` — `admitted_processes` (owner resources-unit)
-- `scripts/build_hold/override_guard.py`, `scripts/build_hold/override_guard.sh` — `ADMISSION_SOCKET` (owner resources-unit)
-- `scripts/lint/invoke.sh` — the `.max` path from `admitted` (owner verify-unit); `buildlog_sample_anon` (:188) gets its test-phase context from the grant, not from a reservation file
-- `scripts/buildlog/record.py` — `test-phase-context` reads the sampling context the grant carries (owner as `docs/plans/builds-production.md` names it; also-touches line if not queue-unit)
-- `scripts/buildlog/test_test_phase_peak.py` — the sampler marks the test phase from the grant's context, with no reservation file (owner as for `record.py`)
-- `scripts/direct/verify.sh` — the cancel path (owner verify-unit)
-- `scripts/buildlog/mac_idle.py` — `waiting_evidence` (owner verify-unit, per `docs/plans/builds-production.md`) and the missing-leave-hook branch (:320), which tests `.waiting` paths today; it reads the service's waiter list instead
-- `scripts/build_queue/queue_place.py` — the `queue_place` body on the client (Phase 4h's file; owner queue-unit)
-- `scripts/production/merge_gate.py` — no change past Phase 4h's adapter; listed for its test (owner the natedev showrunner)
-- `scripts/shutdown/stop.py` — `_release_build_claims` (owner the natedev showrunner)
-- `scripts/notify/push_catalog.py` — the down push entry (natedev messaging-unit's file; the showrunner gave queue-unit the edit, 2026-10-30; also-touches line for natedev, trial-merged against natedev's tip)
-- `scripts/accounts/outage_alerts.py` — called for `claim`, `delivered` and `clear`; changed only if a claim with a key that is not a session id needs it (the showrunner gave queue-unit the edit, 2026-10-30; also-touches line for natedev, trial-merged against natedev's tip)
-- `/etc/nixos/modules/linux/development.nix` — Spec 13's socket and service units (written in an `/etc/nixos` worktree; natedev reviews, commits and pushes); the alert unit is the natedev NixOS session's
-- `scripts/build_queue/admission_test_support.py` — the fault hooks for the import, drain and `StateIntents` cases (Phase 5's file)
-- `scripts/build_queue/test_admission_service.py`, `scripts/build_queue/test_admission_client.py` — this phase's cases (Phase 5's files)
-- `scripts/build_queue/test_admission_client_wait.py` — new: the seven regressions of `scripts/lint/test_memory_gate_wait.py` (Phase 9's `cap` case included), moved, against the in-process server (owner queue-unit)
-- `scripts/lint/test_memory_gate_wait.py` — goes; its regressions move to `test_admission_client_wait.py` (owner queue-unit)
-- `scripts/lint/test_memory_admit.py` — tests of the new functions; tests of deleted functions go
-- `scripts/build_queue/test_build_queue.py`, `scripts/build_queue/test_build_why.py`, `scripts/build_queue/test_queue_view.py`, `scripts/build_queue/test_queue_card.py` — the service adapter, the bounded query failures, the expiry outcomes through the adapter, the unowned memory line and a held head's numbers
-- `scripts/build_queue/test_queue_place.py` — Phase 4h's cases against the in-process server on a per-test socket (owner queue-unit)
-- `scripts/direct/test_verify_hold_memory.py`, `scripts/direct/test_verify_token_reservation.py`, `scripts/direct/test_verify_tree_cancel_reacquire.py`, `scripts/direct/test_verify_checks_fail_closed.py`, `scripts/direct/test_verify_lint_guard_key.py`, `scripts/direct/verify_tree_cancel_test_support.py`, `scripts/buildlog/test_mac_idle.py` — per-test socket (owner verify-unit)
-- `scripts/hooks/test_brp_launch_gate.py`, `scripts/build_hold/test_build_hold.py`, `scripts/build_hold/build_hold_test_support.py`, `scripts/build_hold/test_hold_shortcut.py` — per-test socket; `test_brp_launch_gate.py` also gains the aged-launch case (owner resources-unit)
-- `scripts/shutdown/test_bounded_stop.py`, `scripts/production/test_merge_gate_suites_admission.py` — per-test socket (owner the natedev showrunner)
-- `mods/unit-board/tests/queue.test.ts` — the pane keeps its failure message and selection when the service is unavailable (owner natedev unit-board-unit)
-- `docs/as-built/build-memory-admission.md` — Spec 15
 
+- `scripts/lib/build_folders.py` — new: `create_build_folder` and its CLI
+- `scripts/lib/test_build_folders.py` — new: the helper tests
+- `scripts/production/merge_gate.py` — moves its folder maker to the common function (see the inventory for the owner)
+- `scripts/production/fast_track.py` — moves its folder maker to the common function (see the inventory for the owner)
+- `scripts/production/waiting.py` — moves its folder maker to the common function (see the inventory for the owner)
+- `scripts/production/bump_gate.py` — moves its folder maker to the common function (see the inventory for the owner)
+- `scripts/production/ci_points.py` — moves its folder maker to the common function (see the inventory for the owner)
+- `scripts/style/bulk_run.py` — moves its folder maker to the common function (see the inventory for the owner)
+- `scripts/style/style_sync.py` — moves its folder maker to the common function (see the inventory for the owner)
+- `scripts/buildlog/rust_release.py` — moves its folder maker to the common function (see the inventory for the owner)
+- `scripts/direct/verify.sh` — moves its folder maker to the common function (see the inventory for the owner)
+- `scripts/lint/invoke.sh` — moves its folder maker to the common function (see the inventory for the owner)
+- `scripts/direct/prepare_session.sh` — moves its folder maker to the common function (see the inventory for the owner)
+- `scripts/direct/implement.sh` — moves its folder maker to the common function (see the inventory for the owner)
+- `scripts/agents/codex_mesh.py` — moves its folder maker to the common function (see the inventory for the owner)
+- `scripts/hooks/session-start-temp-root.py` — moves its folder maker to the common function (see the inventory for the owner)
+- `scripts/build_queue/queue_place.py` — moves its folder maker to the common function (see the inventory for the owner)
+- `scripts/build_queue/admission_test_support.py` — moves its folder maker to the common function (see the inventory for the owner)
+- `scripts/mac_test/copy_watch.py` — moves its folder maker to the common function (see the inventory for the owner)
+- `scripts/mac_test/linux_runner.py` — moves its folder maker to the common function (see the inventory for the owner)
+- `scripts/lint/style_review.py` — moves its folder maker to the common function (see the inventory for the owner)
+- `scripts/hooks/pre-tool-use-checkpoint-doc-gate.py` — moves its folder maker to the common function (see the inventory for the owner)
+- `scripts/lint/memory_admit.py` — moves its folder maker to the common function (see the inventory for the owner)
+- `scripts/lint/test_memory_admit.py` — the shared sweep-state reader
+- `scripts/lint/test_tmp_sweep.py`, `scripts/lib/test_folder_audit.py`, `scripts/lib/test_scratch.py` — preserved cleanup classifications
+- `docs/as-built/build-memory-admission.md` — the folder naming rule
+  The tests beside each changed maker change with it. The notice records each cross-owner change.
 
-**Workers:** 1 writer + 1 tester — the cut-over cannot split: callers split between the lock and the service are two admitters (Spec 1), so one writer moves every caller. The Spec and Phase 5's files fix the protocol, the client API, the fault hooks and the drain output, so the tester writes from them alone. Each worker runs its own checks: `impl` runs the type check of the Acceptance gate over its files when they are ready; `test` runs the gate's suites as soon as the interface they call exists. Neither waits for a done post from the other.
-- `impl` — production code and docs: every file above that is not a test, a test support module or a fixture, with `commands/build/queue.md`, `build-memory-admission.md` and `development.nix` (Spec 13's two units, in an `/etc/nixos` worktree). It is the one owner of `scripts/lint/memory_admit.py`; hub: `scripts/lint/memory_admit.py` (resources-unit reviews it)
-- `test` — tests, shared test support and fixtures: `admission_test_support.py`, `test_admission_service.py`, `test_admission_client.py`, `test_memory_admit.py`, `test_build_queue.py`, `test_build_why.py`, `test_queue_view.py`, `test_queue_card.py`, `test_queue_place.py`, the 13 moved modules (`verify_tree_cancel_test_support.py` and `build_hold_test_support.py` included), `queue.test.ts`, and the move of `test_memory_gate_wait.py`'s regressions to `test_admission_client_wait.py` (the tester owns this move):
-  - Bounded query failures in the views: with no socket, and with a service that accepts and sends nothing, `build_queue.py`, `build_queue.py 4` and `build_why.py` each exit 2 within 1 s with the stderr line; the pane shows `Build queue could not be read.` and keeps its card selection. `queue_read` returns the in-process server's `QueueRead`.
-  - Phase 7's regressions in `test_admission_client_wait.py`, each with its assertions kept: an unknown `source` and one failed check keep the real waiter and its `since`; failures for `BUILDLOG_MEM_CHECK_RETRY_S` refuse with status 2; checker retries do not extend a launch wait limit; a valid held answer resets the failure count; an empty checker error uses the fallback reason; a first-call checker failure refuses with no retry.
-  - The three outcomes through `memory_gate.sh`: a service that goes away while a step waits (transport unavailable) makes the step wait again and never refuse; an explicit `refused` exits 2 at once; the launch deadline holds on the transport path.
-  - `memory_gate.sh`'s admit, release and width against an in-process server print today's lines and exit with today's codes; the leave hook exits as `LeftQueue`.
-  - The token path in `memory_gate.sh` against an in-process server: admit, `buildlog_token_wait` (it sends `token_wait`), admit again with `BUILDLOG_MEM_TOKEN_BACK_AT` gives two episodes, each with its own reservation; the second waits at the first one's place (user, 2026-10-31), and one `token_gap` row is written.
-  - Expired explanation through the adapter: build-why's estimate refresh line and release line through `queue_read()` against the in-process server equal the lines from a local pass.
-  - No second walk: with `admission_pass` wrapped to count calls, `view`, `explain` and `mine` answered from the stored pass add no call. `queue_read_from(inputs, limits, policy)` equals `queue_read_from_pass(inputs, limits, policy, admission_pass(inputs, inputs.now, limits, policy))`.
-  - `reservation_stem`, `step_estimate` and the `QueueInputs` builder each have a test, and every existing test of a function that stays passes with no changed assertion.
-  - Fresh tests: a fresh `nextest` step's `StepEstimate.cache` is `FreshTest`, and its `admit` request carries that policy; a step that is not fresh gives `ReusableEstimate`. The service marks a `FreshTest` waiter `EstimateExpired` once its estimate is one poll interval (5 s) old, through the one `estimate_expired` classifier with the fresh-test age, so the client estimates again as often as today's poll does.
-  - Finalization crash, with `StateIntents` and a fault hook in `admission_test_support.py`: a crash after the intent is saved in `state.json` and before the history append, and a crash after the append and before the entry clears. Each time a new server on the same state dir finishes the row: `anon_peaks.jsonl` has exactly one record for its `reservation_id`, and no `.reservation` file is created.
-  - Supplied readings: the service's builder, given a `QueueSnapshotReadings` with host, pressure, recovery and compiler readings, reads none of them again (tripwire armed). A change to the reader's environment (`BUILDLOG_BUILD_BUDGET_GIB`) after a pass does not change the decisions in that pass's `decided_from`.
-  - The import runs when `state.json` is absent and keeps each live reservation's charge; an imported `.reservation` row with a saved intent finishes with exactly one `anon_peaks.jsonl` record; the imported files are deleted; a second start imports nothing.
-  - The BRP launch gate, `admitted_processes`, `_release_build_claims`, `waiting_evidence` and `gate_reservation` each work against an in-process server.
-  - The override guard refuses an `ADMISSION_SOCKET` outside the test's own folder.
-  - `down-alert` with a fake send: one push for each outage, none while a claim is in flight or delivered, and the claim clears after a start.
-  - The 13 modules pass on a per-test socket and never reach the live service.
-  - The drain barrier, on fixture files that hold the state before the merge that deletes `check`: an old `.waiting` row with a live owner and no running build command gives not drained and the count; a live reservation gives not drained; a live process whose command line runs `verify.sh` gives not drained; none of these gives `drained`.
-  - Rollback refusal: `drain-check --service` on a fixture `state.json` with a live reservation exits 1 and prints the count; with a live waiter whose owner is alive, exits 1; with a live process whose command line runs `admission_client.py`, exits 1; with none of these, prints `drained` and exits 0.
-  - The aged-launch case through the hook: `test_brp_launch_gate` holds the launch on free memory (4 GiB free of 60 GiB, 8 GiB of compiler-service memory, need 8 GiB, `since` older than `head_seconds`), makes no reservation and adds no waiter.
-  - The client's refresh is `step_estimate`: on a `wait` with reason `EstimateExpired`, the `admit` CLI runs `step_estimate` again and resends with the same episode and its first `since`.
-  - `build_queue.py`'s admit-head command sends `admit_head` with `require_showrunner`'s session as `actor`; `build_queue.py bump <unit>` sends `priority_set` with `why` "the user's bump", and a caller that is not a showrunner exits 3.
-  - Priority and token handoff across a restart and a replay: a `priority_set` and a `token_wait`, each with a crash after its `state.json` write and before its reply (a fault hook), then a new server on the same state dir and the client's resend: one `QueuePriority`, one `record.queue_priority` row per transition id, one finalized reservation, the waiter at its old place with `token_left_at`, and one `token_gap` row after the next `admit` with `BUILDLOG_MEM_TOKEN_BACK_AT`. Each waiter's `priority_rank` and the queue order stay across the restart.
-  - Import of resources Phase 26's state: a `queue_priority.json`, a `.waiting` row with `priority_since` and `token_left_at`, a `.reservation` row with `queue_waiter`, and a `.token-wait` intent each come into `state.json` with one copy of each field.
-  - Legacy width and call id on import: `.reservation` rows with `test_threads` an int, `None` on a nextest step and `None` on another step, and `call_id` a string and `None`, import as `RequestedTestWidth`, `UnspecifiedTestWidth`, `NoTestWidth`, `CallRecord` and `NoCallRecord`; each round-trips through `state.json`.
-  - Estimate worker timing: a large `anon_peaks.jsonl` and a fault hook that delays `test_phase_need` by 2 s, beside `view` requests and one release. Each `view` answers within the bound of the Acceptance gate (under 1 s, p95 under 0.25 s); until the result comes back the step's charge is `NoTestPhaseNeed(not_recorded)`; a result tagged with an old width or an ended reservation is dropped.
-  - Test-phase charge evidence: the first selection writes it into the `state.json` entry and a later selection does not change it; a failed write leaves the admission in place; a margin change between two `width` calls gives the second need the new margin and leaves the first need's margin as written; an owner that dies late (after its scope empties) and a finalization stopped after the intent is saved each give one history row that copies the evidence; a reservation with no evidence gives `unknown` in queue-unit's 24 h report.
-  - Timed passes while steps run: one running nextest step, no waiters and changing test-phase readings; with the service on the default state dir layout (`admission/` under a temporary root), the view shows a running step's test-phase charge within `running_pass_seconds`.
-  - Phases 8 and 9 through the service: after a nextest step's admission and after a `width`, its `state.json` entry holds `test_phase_need` from Phase 8's rule; a merge gate's reservation holds `--memory-cap-mib` from start to its last module (Phase 9's case, against the in-process server).
-  - With no `--state-dir`, `serve` uses `admission/`.
-  - Memory that no queue step owns (Decided block, 2026-10-31): a fixture `builds.slice` with one child scope that no reservation names (17.4 GiB) and one scope that a reservation names. The pass gives one `UnownedSliceMemory` row for the first scope, `BudgetCheck.charged` includes it once, the reservation's scope is not counted twice, and the view prints its own line with the scope name and size. A held head's line and card print free, reserve and need as numbers.
+**Workers:** `1 writer + 1 tester`
 
-**State:** `admission/state.json` (reservations with their test-phase charge evidence, waiter order fields and episodes, the `QueuePriority`, the admit-head record, the recovery spacing, the replay ledger), written through `os.replace`; the one import at first start, which deletes the `.waiting`, `.reservation`, `.token-wait`, `queue_priority.json`, admit-head and recovery files it imported; `record.queue_priority` rows (one per transition id) and `token_gap` rows in `queue_times.jsonl` (one per episode); `anon_peaks.jsonl` rows through `finalize_reservation` with `StateIntents`; the deletion of `scripts/lint/test_memory_gate_wait.py`. A rerun after a crash at any point appends no second history row and makes no second charge (Specs 3, 5 and 6).
+- `impl` — The common function, its CLI, production callers, and documentation. Hub: `scripts/lib/build_folders.py`.
+- `test` — The new helper tests, shared fixtures, cleanup regressions, and affected caller tests.
+
+**State:** Existing scratch records, owner records, and unit markers keep their formats. The phase creates no second registry.
 
 **Constraints from prior phases:**
-- Hold check (builds showrunner, 2026-11-01): `admission_client.admit` takes a private per-attempt hook. `queue_place` passes `before_check` to it, and its public signature stays the same. The hook runs before each attempt and once more after the grant, just before the program starts; a hold seen after the grant releases the place. Tests: a hold set during the wait keeps the program from starting, and a hold set during the grant releases the place.
-- Phase 4h/4i: `queue_place` callers start programs only in a scope (nested when the holder is in `builds.slice`); `BUILDLOG_SCOPE=0` is test-only. With no scope, `QueuePlace.popen` raises `QueuePlaceRefused` before the fork. `finish()` reads the scope's `cgroup.procs` again until it is empty (TERM, then `cgroup.kill` at `program_stop_seconds`), and only then releases. Keep that contract when `queue_place` moves to the service.
-- Phase 4h: `gate_reservation` turns `QueuePlaceRefused` into `GateRefused`; the gate prints `REFUSED: …` and exits 1 before any module starts. Keep it; `test_merge_gate_suites_admission.py` holds the test.
-- Phase 4h: `ProgramSizeUnavailable` comes from `read_memory_config`; `memory_config` prints it before `queue_place` calls `check`, and the test proves `check` never runs. Keep it: name the invalid key, refuse the start, never admit zero bytes.
-- Phase 4h: `queue_place` prints its held-wait lines to stdout today. The move to the client wait lines puts them on stderr; add a held-program test that stdout carries no admission line.
-- Phase 4h: a queue place installs its stop handler only where the caller has the default handler; a caller's own handler stays (the merge gate exits 1 on stop, not 143). Add `scripts.production.test_merge_gate_suites_signals` to the Acceptance gate command.
-- The tester owns `scripts/build_queue/test_admission_protocol.py`: the migration of the width and call types that move into `memory_admit.py`, and the new request codec tests.
-- Corrections: `AdmissionPolicy` includes `peak_hold` (`PeakHold`); the wait-reason function is `queue_place.wait_reasons` (not `merge_gate.gate_wait_reasons`). One captured policy serves the readings, the decision and the explanations.
-- Build rules (user, 2026-10-31, in force for every worker): fix every failure you can see before you rerun; do not run a test after each small edit, finish the edit round and run once. After a pass, do not run again until your edits are done. While you edit, use `verify.sh check`; run lint (clippy) once, at the phase gate. The phase gate and its listed tests still run in full.
-- Phase 5: `admission_protocol.py`, `admission_service.py`, `admission_client.py` and `admission_test_support.py` exist and pass in process. The service holds waiters (one place per step, keyed by owner and first `since`; no head time field; no bump end time), reservations, the admit-head record, the recovery spacing, the last pass and the replay ledger in `state.json`; it calls `admission_pass` for every decision and `decide` for a launch alone. Its stand-ins until this phase: `queue_read_from` for queries, its own `QueueInputs` composition, its own stem function, `finalize_reservation` with a stem file for the intent, and a caller's `refresh` in place of `step_estimate`. `serve` needs `--state-dir`. The CLI has `release`, `width`, `view`, `explain`, `mine` and `admit-head`. The restart rule is built.
-- Phase 8 (resources Phase 15): a nextest step's charge falls to its test-phase need at its test-phase mark; `check` stores `test_phase_need` after admission and `set_width` stores it on each width change, through one rule and one reservation update helper; `FinalizationIntent` carries the test-phase evidence.
-- Phase 9 architect review (2026-11-02), facts the Spec must keep:
-  - Sampler: `invoke.sh` `buildlog_sample_anon` (:188) marks the test phase only when its reservation file is readable (`record.py test-phase-context RESERVATION`). With no reservation file, Phase 8's test-phase charge never starts. The `Admitted` grant carries the sampling context (reservation id, need, test-phase evidence) that `record.py test-phase-context` reads; a regression shows a nextest step's charge falls to its test-phase need through the service.
-  - Wait output: `admission_protocol.Wait` (:143) holds `reason`, `position`, `head`, `text` only. The wait line today prints free memory, the reserve, measured memory and the running summary, also for `BehindHead`. `Wait` carries the pass's decision snapshot fields and the policy it was decided under, so the client prints the same line. All seven `test_memory_gate_wait.py` regressions move (the six named in Files plus Phase 9's `cap` wait-line case), with unchanged assertions.
-  - Estimate order: Spec 4 accepts an estimate result when its reservation and width still match. With widths 2 → 4 → 2, an old width-2 result can install an obsolete margin after the last request. Each estimate request carries a revision that the service increments per `width` and `admit`; the service drops a result whose revision is not the current one. A regression runs the 2 → 4 → 2 order.
-  - Rollback and priority: the import deletes `queue_priority.json`. Spec 12's rollback writes the service's active `QueuePriority` back to `queue_priority.json` before it restores polling, and a second cut-over imports it again. A rehearsal case runs cut-over, rollback, cut-over and keeps one priority.
-  - Mac boundary: `memory_gate.sh` (:207) grants at once on the Mac (`OSTYPE` darwin, no `BUILDLOG_MEMINFO`), which has no socket service and no `/proc`. The client calls keep that branch: the Mac uses its claim admission and never opens the socket. A regression with no socket and no `/proc` files passes on that branch.
-  - `mac_idle.py` (:320) tests `.waiting` paths to find a missing leave hook. After the waiter files go, it reads the service's waiter list; else it picks `idle_with_waiter` where it must pick `missing_leave_hook`. A service-backed regression covers it.
-  - Phase 9 through the service: the acceptance case checks the `cap` source and the `ProgramMemoryCap` basis in the queue view, build-why and the wait line; the `LifetimePromise` charge and headroom after `ramp_seconds`, after the peak hold decays and after a service restart; and the same cap text with no refresh after `head_seconds`, also with `fresh_test=True`.
-  - Process identity: `admission_service.Proc.owner_start` (:73) returns `str | None`. Replace it with named results (a live owner with its start time, or an owner that is gone), and use one start-time form (the `/proc/<pid>/stat` field as `Owner.start_time` stores it, a string) for every lifetime comparison. Phase 11's run watch uses the same form.
-- Phase 9 (resources Phase 27): the merge gate's `ProgramProfile` uses `FixedCapSizing(cap)` and holds its cap (`ExpectedPeak(cap_bytes, "cap", 0)`) from start to end, with no estimate and no refresh; `step_promise(row, now, reading)` gives `LifetimePromise(row["need"])` to a row that records fixed-cap sizing and to a release build. `program_peak_estimate`, `MeasuredProgramPeak`, `FirstProgramPeak` and `HistoryPeakSizing` stay for the other programs. The `cap` need carries the basis `ProgramMemoryCap(program)` through the `need_basis` codec (`{"kind": "program_memory_cap", "program": ...}`); the service keeps it in the waiter record and `QueueInputs`, so build-why still says "the merge gate's memory cap". `estimate_expired` is never true for a waiter whose `need_source` is `cap`; when this phase moves the fresh-test age into the service, a `cap` waiter still never gets `EstimateExpired`, and a regression covers it.
-- Phase 4f: `QueueInputs` and the `queue.json` envelope hold no budget and no limits. The reader resolves the limits live and passes them in. After Phase 4g the signatures are `admission_pass(inputs, now, limits, policy)` and `queue_read_from(inputs, limits, policy)`; use these.
-- Phase 4g: `AdmissionPolicy(timing: AdmissionTiming, pressure: PressurePolicy)` comes from `read_memory_config()` (no warning; `check`'s path) or `memory_config()` (warns once per process; the views and commands). The rules take it as an argument, the same way as the limits, so the merged form is `admission_pass(inputs, now, limits, policy)`. `QueueExplanation` carries the policy it was decided by, and the counterfactual passes use it. `CheckResult.policy` feeds `merge_gate.gate_wait_reasons`; the service's `wait` messages carry the same policy for the wait reasons. The `[memory]` keys are read at use; the service reads them at each pass, never once at start.
-- Phase 4g evidence and policy: `queue.json` v4 records the exact policy its evidence was captured under, and `queue_read` never uses it under another policy. This phase deletes `queue.json`, and that pairing moves into the service: the stored pass keeps the policy it was decided by, and `QueueExplanation` carries it. A projection never joins old evidence with a newly read policy. Replace the cache mismatch tests (a policy change gives the live read or `QueueBusy`) with service tests: a policy edit between two passes changes the pressure, ramp and peak classes on the next pass, and the counterfactuals of an earlier reply do not change.
-- Phase 4g warnings: a missing or invalid `[memory]` key prints one line per process (`memory_config()`). The client-facing commands own that line: the `view` and `explain` replies carry the fallbacks of the config their pass read, and the client prints each one once per process on stderr, in today's text. The protocol stream carries no warning text. Keep the queue and build-why warning tests through the change; Phase 4h's helper regression stays green.
-- External (builds showrunner; waits for the builds go): after devtools Phase 1, the `[memory]` admission keys move from `config/lint.conf` to `config/build_admission.conf`, and the 21 GiB fallback goes. Do not make that move in this phase. If it lands first, use its approved reader and put this phase's keys there.
-- Phase 4h: `queue_place(program, repo, *, sizing, before_check)` in `scripts/build_queue/queue_place.py` is the one queue place for a program that cargo does not start; `merge_gate.gate_reservation` calls it. `ProgramProfile(program, repo, worktree, sizing: FixedCapSizing | HistoryPeakSizing)` replaces `GateProfile`. Its `observe`, its sampler thread and its release on every exit stay; this phase changes only its admission calls.
-- Phase 4: `admission_pass` (`admission_pass(inputs, now, limits, policy) -> PassResult` after Phases 4f and 4g) in `memory_admit.py` is the one decision for every waiting row; it walks once per input scenario, and `queue_decision` is gone. `QueueExplanation.decided_from: QueueInputs` holds the frozen inputs, and `head_after_steps_end` and `smallest_head_release` run the pass on a changed copy of it. `PassRow` has `owner`, `decision`, `reason`, `blocker` and `admission: ProposedAdmission | NotAdmitted`; `ProposedAdmission` has `rank`, `recovery` and `override`, and a caller applies them only for an admission it commits; `PassResult` has `head_marks`, and the `recovery` and `override` to write when the caller commits none. `next_recovery` is the one recovery change. `EstimateExpired` is a `WaitReason`. `blocking_index` and `blocker_identity` replace `reservation_blocker`.
-- Phase 4 (launch): a launch with no ledger (no `admission/` folder) and no pressure hold decides alone through `decide()` with its own need, the compiler-service memory and the pressure; it gains no synthetic waiter, no head priority and no wait credit. `test_aged_launch_without_a_ledger_keeps_its_own_memory_checks` in `test_memory_admit.py` holds this until this phase deletes `check`; the service twin and the hook case carry it on. `CheckResult.reservation` is `NotReserved("launch")` for every launch.
-- Phase 3: `queue.json` (`{"v": 4, "written_at", "policy", "inputs"}` after Phase 4g: no budget and no limits, and the exact policy its evidence was captured under), its writer and its one parser, which is also the one `QueueInputs` serial form; `queue_read`'s snapshot path, `StaleReading` and `QueueBusy` (deleted here); `gather_queue_inputs` (with raw `recovery` and the admit-head `override`; the reader resolves the limits and passes them to `queue_read_from(inputs, limits, policy)`), `queue_read_from`, `match_waiters`, `step_matches`, `queue_view.reason_phrase`. `resolve_admission_limits(total)` is the one limit resolver. `gather_queue_inputs` takes `readings: QueueSnapshotReadings` and uses the host, pressure, recovery and compiler readings in it in place of a second read. `decision_checks` is the only code that builds a `BudgetCheck` or a `FreeCheck`. Keep all three so. `queue_read()` is the one entry point of the view, the card and build-why; the card and the renderer read `QueueRead`; the pane's `QueueSelection`.
-- Phase 3's codec: `snapshot_value` and `parse_snapshot_value` in `memory_admit.py` are the generic codec for domain records (tagged dataclasses, TypedDicts, unions); `write_queue_snapshot` and `read_queue_snapshot` use them. The codec stays when they go.
-- Phase 7: `memory_gate.sh`'s wait loop retries a failed check after the first wait line and refuses only after `BUILDLOG_MEM_CHECK_RETRY_S` (default 60 s) of failures; a failure before the first wait line refuses at once; the launch wait limit (`BUILDLOG_MEM_WAIT_LIMIT_S`, default 900 s) applies on the retry path; `scripts/lint/test_memory_gate_wait.py` holds these rules in six regressions.
-- Resources Phase 24 Part B: `finalize_reservation`, `reservation_lifetime`. Phase 32: `admit_head`, `end_head_override`, `require_showrunner`. The waiter order fields in the code now are `since`, `priority_rank`, `priority_since` and `token_left_at` (`waiter_order` = `(priority_rank, since, pid)`, `head_window`, the head marks of `admission_pass`); the `Waiter` schema is `memory_admit.py` :505-530, and `Reservation` also has `queue_waiter`.
-- Resources: the phases that land before this one: through resources 27 (Phase 9; the chain Decided block). Their rules and estimates stay in `memory_admit.py`, and the service runs them.
-- Resources Phase 26 is built (58391add, on `origin/builds` at e2773be6). `queue_priority.json` holds `QueuePriority{unit, why, set_at, set_by, transition{id, action, at}}`; `priority_set` and `priority_clear` call `require_showrunner` and write one `record.queue_priority` row per transition id (`memory_admit.py` :558-650); `resolve_queue_order` sets `priority_rank` from roster unit labels; `stored_waiter` drops `priority_rank`; `build_queue.py bump <unit>` runs `priority set --why "the user's bump"`. The token handoff: `verify.sh` :2641 calls `buildlog_token_wait` (`memory_gate.sh` :326), which runs the `token-wait` action (:3001-3033); `check` appends the `token_gap` row (:3146-3153). This phase carries all of it into the service (Decided block, 2026-10-31).
 
+1. Keep durable admission state outside temporary build folders.
+2. Preserve `admission/state.json` and the service-owned `admission/queue.json`.
+3. Preserve the short socket parent used by `AdmissionFixture`.
+4. Preserve Mac temporary-root handling.
+5. Preserve scope cleanup before queue-place release.
+6. Keep `tmp_sweep.state_dir()` as the sweep-state authority.
+7. Keep scratch task registration in `scratch.py`.
+8. Do not access the live admission service from tests.
 
 **Acceptance gate:**
-- The phase lands alone in its own promote, with no other admission change in it.
-- Before the cut-over, the full merge gate as `docs/plans/builds-production.md` names it, green.
-- `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY python3 -m unittest scripts.lint.test_memory_admit scripts.build_queue.test_admission_protocol scripts.build_queue.test_admission_service scripts.build_queue.test_admission_client scripts.build_queue.test_admission_client_wait scripts.build_queue.test_build_queue scripts.build_queue.test_build_why scripts.build_queue.test_queue_view scripts.direct.test_verify_hold_memory scripts.direct.test_verify_token_reservation scripts.direct.test_verify_tree_cancel_reacquire scripts.direct.test_verify_checks_fail_closed scripts.direct.test_verify_lint_guard_key scripts.hooks.test_brp_launch_gate scripts.build_hold.test_build_hold scripts.build_hold.test_hold_shortcut scripts.buildlog.test_mac_idle scripts.shutdown.test_bounded_stop scripts.production.test_merge_gate_suites_admission scripts.build_queue.test_queue_place scripts.build_queue.test_queue_card scripts.buildlog.test_record` green, with no changed assertion in an existing test of a function that stays. It includes Phase 5's decisions-equal-the-pass case and the rollback refusal case: `drain-check --service` exits 1 while a service reservation, a live waiter or a client is live.
-- The mod's test command (as `docs/as-built/unit-board.md` names it) over `mods/unit-board/tests/queue.test.ts` green.
-- `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python` over each slot's changed Python files: `0 errors, 0 warnings, 0 notes`.
-- `scripts/lint/test_memory_gate_wait.py` no longer exists, and `scripts.build_queue.test_admission_client_wait` holds its seven regressions (Phase 9's `cap` case included) with unchanged assertions.
-- `grep -n "json.loads\|json.dumps" scripts/build_queue/admission_service.py scripts/build_queue/admission_client.py` finds nothing: every message goes through `admission_protocol.py`.
-- `grep -n "flock" scripts/lint/memory_admit.py scripts/lint/memory_gate.sh scripts/build_queue/admission_*.py` finds only the shared read lock in `anonymous_history_rows` (`fcntl.flock(..., LOCK_SH)`, `memory_admit.py` :1409 at this branch's head), the one history reader that report-unit's writers share; no admission lock is left. `grep -n "\.waiting\|\.reservation\|admission/lock\|queue\.json"` over the Files' code files finds only the one import in `admission_service.py`, the drain barrier that uses its readers, and those readers in `memory_admit.py` (Spec 10).
-- Before the cut-over, `admission_service.py drain-check` prints `drained` with the hold in force; the summary gives its output.
-- A user-scope rehearsal of the Spec 12 order, with scratch unit names, a socket in a temporary folder and no root: the old tree's `serve` with no `--state-dir` exits nonzero (why the units stay disabled); the disabled pair never starts and no `OnFailure=` unit runs; enabling it on the new tree starts the service, which imports and answers `view`; a restart keeps its state; a rollback with the service file present and the socket active at its start stops both and leaves them stopped after the revert. The summary gives each step's result.
-- Each `/etc/nixos` branch hash evaluates: `nix eval` of the service's `ExecStart` has no `--state-dir`, the service's `wantedBy` gives `[]` on every branch, and the socket's gives `[]` for the prerequisite and rollback branches and `["sockets.target"]` for the cut-over branch.
-- Live after cut-over step 4: `systemctl show -p ExecStart build-admission.service` has no `--state-dir`; no `build-admission-alert.service` run is in the journal from the prerequisite rebuild to that step.
-- Live after the cut-over: `systemctl show -p MainPID,ControlGroup build-admission.service` gives a cgroup that is not under `builds.slice`, and `/proc/<MainPID>/oom_score_adj` reads `-900`. The summary gives both.
-- Live after the cut-over, at load above 100: 50 timed calls each of `admission_client.py view`, `build_queue.py`, `build_queue.py 4` (the card) and `build_why.py`, all under 1 s, p95 under 0.25 s. The summary gives the times.
-- 24 h after the cut-over: no earlyoom kill caused by admission (earlyoom's journal), and the median and p90 of `steps.mem_wait_s` against the 24 h before. The summary gives the numbers.
-- The notice has `also touches` lines for `memory_admit.py`, `test_memory_admit.py`, `memory_gate.sh`, `pre-tool-use-brp-launch-gate.sh`, `build_hold.py`, `override_guard.py`, `override_guard.sh` and their tests, and for the carry of resources Phase 26's state (resources-unit reviewed the diff; trial-merged against `origin/builds-resources`); `invoke.sh`, `verify.sh`, `mac_idle.py` and their tests (verify-unit, against `origin/natedev-verify`); `merge_gate.py`, `stop.py` and their tests (the natedev showrunner, against `origin/natedev`); `push_catalog.py` and `queue.test.ts` (natedev messaging-unit and unit-board-unit, against `origin/natedev`); and `outage_alerts.py` if it changed (its owner as the builds showrunner names it).
-- Change-Review line: builds wait on the queue service, and the polling admission is gone | on natedev while steps wait, type `/build:queue`, then run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/admission_client.py view` | the queue answers in under a quarter second, and each waiting step's output shows the same wait line as before.
+
+1. Test every inventory category through the common function.
+2. Test an inherited `TMPDIR`, an explicit parent, and `/dev/shm`.
+3. Test stable owner names and concurrent unique allocations.
+4. Test paths containing spaces.
+5. Test refusal when the required memory filesystem is unavailable.
+6. Test cleanup after normal completion and interruption.
+7. Test that live scratch ownership still prevents deletion.
+8. Test that `memory_admit.py` observes a changed `LINT_SWEEP_STATE_DIR` through `tmp_sweep.state_dir()`.
+9. Retain the admission fixture test with a long `TMPDIR`.
+10. Retain the service snapshot tests and AWS snapshot refusal test.
+11. Run affected tests and the full merge gate.
+12. Require `basedpyright` to report `0 errors, 0 warnings, 0 notes`.
+
+**Change-Review line:** build folders use one naming function | run a merge gate and a verify step with a private `TMPDIR` | their folders use the common function, and cleanup preserves live work.
+
+### Phase 10b — The /build:queue card carries the build-why facts, and build-why goes  · status: todo
+**Depends on:** Phase 10 (the card reads the queue service); Phase 10a (same build_queue files)
+
+The user returned change review C683 on 2026-11-02: "this seems to be duplicative with /build:queue # - both are showing information about where an item sits in a queue - these capabilities should be combined into the /build:queue # command". The builds showrunner decided: put the build-why facts in the card and keep one place for each fact.
+
+Decision (queue-unit, 2026-11-02): remove `build_why.py` and the `build-why` command; keep no alias, so there is one way to see a step. The card (shown below the queue view since Phase 10) gains the facts build-why showed and the card lacks: the head's recorded evidence, how long the first step has been head, and the release advice. Each fact appears once on the page. Spec at phase start: list build-why's facts against the card's, and every caller and doc of `build_why.py`.
+
+Resources Phase 42's card rules are not part of this phase (builds showrunner, 2026-11-03): the user keeps Phase 42 paused, so 10b builds the card without them. They return only when the user releases Phase 42.
+
+Work Order: Phase 10 architect review, 2026-11-03.
+
+#### Work Order
+
+**Goal:** `/build:queue <position|session|folder>` provides the facts currently available through build-why. Remove `build_why.py` without an alias.
+
+**Spec:**
+
+1. Keep the full queue view above the card.
+2. Keep one blank line between the view and card.
+3. Use one `QueueRead` for the complete page.
+4. Read optional head history once through `head_facts.read_head_facts()`.
+5. Resolve labels once for the complete page.
+6. Move explanation formatters into `scripts/build_queue/queue_evidence.py`.
+7. Make the card use those formatters.
+8. Keep admission rules and release calculations in `memory_admit.py`.
+9. Use the reply's policy and limits when formatting recorded evidence.
+10. Read no live configuration to reinterpret an earlier reply.
+11. Display each fact once on the complete page.
+12. Preserve useful “unknown” states when optional evidence is absent.
+13. Remove `scripts/build_queue/build_why.py`.
+14. Remove any remaining build-why command registration.
+15. Add no alias.
+
+No build-why command file exists under `commands/` in this tree. The remaining command instruction is in `commands/build/queue.md`.
+
+**Fact inventory:**
+
+| Fact | Current build-why output | Current card or queue output | Required destination |
+|---|---|---|---|
+| Reading time | Header | Queue header | Keep once in the header. |
+| Available RAM and total RAM | Header | Head checks show available RAM; total RAM is absent. | Add the missing total. |
+| Charged memory and budget | Header and totals | Queue budget display | Keep one summary. |
+| Pressure and recovery spacing | Header and detailed checks | Admission checks | Preserve values and thresholds without repeated paragraphs. |
+| Local load and CPU count | Header | Absent | Add one optional host line. |
+| Running step identities | Running table | Only a selected running step has details. | Add the running evidence required to explain the head. |
+| Admission time and running age | Running table | Selected running step | Share one rendering. |
+| Promise, charge, and current use | Running table | Selected running step lacks the promise. | Show all three values once. |
+| Charge basis | Detailed text | Absent | Add the recorded basis text. |
+| Total current use | Running totals | Absent | Add once. |
+| Head identity, need, and waiting age | Head section | Queue and card | Reuse the existing facts. |
+| Need source and basis | Detailed head text | Absent | Add runs, shape, history window, floor, factor, and cap evidence. |
+| Filter, package, and width | Need text | Absent | Add recorded values. |
+| Historical bump events | Counts and grouped records | Some records currently explain order. | Keep today's card text; do not change how bump records explain order. |
+| Current unit priority | Order text | Repeated through several lines | Keep today's card text. |
+| Strict or backfill window | Order text | Order check | Preserve the window and remaining time. |
+| Completed CPU-token waits | Durations and time spans | Absent | Add recorded waits and unknown states. |
+| Budget arithmetic | Detailed check | Existing check lines | Preserve the complete arithmetic once. |
+| Free-memory arithmetic | Detailed check | Existing check lines | Preserve reserve and unused growth terms. |
+| Followers that fit now | Line summary | Partial ahead-step list | Add count, need range, and oldest waiting age. |
+| Estimate expiry | Explicit text | Card text mentions a poll. | Describe the service refresh. |
+| Release advice | Minimum endings or recovery time | Absent | Add the existing counterfactual result. |
+| Unowned slice memory | Not fully represented by the old table | Queue and card | Preserve each row once. |
+
+**Head timing:**
+
+1. Describe `joined_at` as queue arrival.
+2. Describe elapsed time as time waiting.
+3. Show the existing order-window deadline separately.
+4. Add no `head_since` state.
+5. Remove “time as head” from this phase's Change-Review text.
+
+**Callers and documentation:**
+
+| Current reference | Required action |
+|---|---|
+| `scripts/build_queue/test_build_why.py` | Move retained formatter and behavior tests to the card and evidence tests. |
+| `scripts/build_queue/test_admission_protocol.py` | Import the new evidence formatters. Preserve serialized-reply parity tests. |
+| `scripts/build_queue/test_admission_service.py` | Preserve cap text and captured-policy tests through the new formatters. |
+| `scripts/build_queue/test_build_queue.py` | Replace build-why parity and CLI cases with combined-page cases. |
+| `scripts/build_queue/head_facts.py` | Correct the module description. Retain its bounded history reader. |
+| `scripts/lib/test_terminal_cells.py` | Correct the description of its consumers. |
+| `commands/build/queue.md` | Replace the build-why instruction with the selected queue page. |
+| `docs/as-built/build-memory-admission.md` | Describe the combined page and the new formatter location. |
+| `docs/plans/builds-production.md` | Remove build-why from the active unit description. |
+| `docs/plans/builds-report.md` | Correct active test references. |
+| `docs/plans/builds-resources.md` | Retarget active Phases 17, 19, 20, and 39 to the new formatter and tests. |
+| `docs/plans/builds-queue-service-design.md` | Mark obsolete user instructions as superseded. |
+| `docs/plans/builds-queue.md` | Correct remaining active references. Preserve completed-phase history. |
+
+Resources Phase 20 currently assigns release text to `build_why.release_text`. Retarget that ownership rule before deleting the file.
+
+**Files:**
+
+- `scripts/build_queue/queue_evidence.py` — new home for explanation formatters.
+- `scripts/build_queue/queue_card.py`, `queue_view.py`, `head_facts.py`, `build_queue.py` — the combined page.
+- `scripts/build_queue/build_why.py` — delete.
+- `scripts/build_queue/test_queue_evidence.py` — new formatter tests.
+- `scripts/build_queue/test_queue_card.py`, `test_queue_view.py`, `test_head_facts.py`, `test_build_queue.py` — page and fact tests.
+- `scripts/build_queue/test_admission_protocol.py`, `test_admission_service.py` — retained consumer tests.
+- `scripts/build_queue/test_build_why.py` — remove after its retained cases move.
+- `scripts/lib/test_terminal_cells.py` — consumer description.
+- `mods/unit-board/tests/queue.test.ts` — combined-page and failed-refresh coverage.
+- `commands/build/queue.md`, `docs/as-built/build-memory-admission.md`, `docs/plans/builds-production.md`, `docs/plans/builds-report.md`, `docs/plans/builds-resources.md`, `docs/plans/builds-queue-service-design.md` — the command and doc changes in the table above
+  Queue-unit owns the Python queue files. Coordinate the pane tests with unit-board-unit and the resource-plan changes with resources-unit.
+
+Queue-unit owns the Python queue files. Coordinate the pane tests with unit-board-unit and the resource-plan changes with resources-unit.
+
+**Workers:** `1 writer + 1 tester`
+
+- `impl` — The evidence formatters, page renderers, deletion, command text, and documentation. Hub: `queue_evidence.py`.
+- `test` — Migrated formatter tests, consumer tests, page tests, and pane regressions.
+
+**State:** The phase adds no admission state or history format. The pane keeps its selected card and last complete page.
+
+**Constraints from prior phases:**
+
+| State or outcome | Observer and visible effect | Ownership and acceptance |
+|---|---|---|
+| `admission/queue.json` | AWS control reads it. Invalid evidence prevents an AWS start. No new queue control is needed. | Phase 10 owns the implementation. Phase 10a preserves its path and existing snapshot tests. |
+| Memory wait history | `/history` and build reports show recorded waits. | Phase 11 preserves balanced events through `test_verify_token_memory_history`. |
+| Durable grant replay | The client receives the same reservation. The user sees one charge. | Phase 11 preserves distinct-reservation replay tests. No extra UI state is needed. |
+| Build-history generation | The client refreshes an invalid estimate. The user sees the normal waiting output. | Phases 10c and 11 preserve generation tests. This phase retains useful expiry text. |
+
+**Acceptance gate:**
+
+1. Cover every row of the fact inventory.
+2. Compare terminal and pane output from the same `QueueRead`.
+3. Test head, follower, running, multiple-match, and empty selections.
+4. Test missing history, missing load, and unreadable optional records.
+5. Preserve cap-basis text and `LifetimePromise` text.
+6. Preserve failed-peak, test-phase, decay, and captured-policy cases.
+7. Test release advice for endings, recovery spacing, pressure, and expired estimates.
+8. Test that a failed pane refresh keeps the complete previous page.
+9. Keep the existing bounded service-failure behavior.
+10. Leave no executable caller or active acceptance gate importing `build_why`.
+11. Run the affected Python suites and unit-board tests.
+12. Require a clean type check and a green merge gate.
+
+**Change-Review line:** the queue card contains the build-why facts | type `/build:queue 1` while a step waits | the queue appears above its evidence and release advice, with each fact shown once.
+
+### Phase 10c — The admission settings live in config/build_admission.conf, and the code keeps no copy of them  · status: todo
+**Depends on:** Phase 10 (scripts/lib/conf.py reads in memory_admit.py); Phase 10b (same memory_admit.py and build_queue files)
+**Config reader (builds showrunner, 2026-11-02):** devtools Phase 4r replaces `conf.text`, `number`, `whole`, `words` and `values` with `conf.read(file) -> ConfigRead`. If 4r is on main when this phase starts, use `conf.read`.
+
+**Why.** Showrunner request, 2026-11-02 (builds): config phase 2 gets a place in this plan. The `[memory]` admission keys sit in `config/lint.conf`, and `scripts/lint/memory_admit.py` keeps copies of their values (`FALLBACK = 12 * GIB` for `program_first_peak_gib.cargo`, `FALLBACK_BUILD_BUDGET_BYTES = 21 * GIB`, `FALLBACK_TEST_PHASE_MARGIN = 1.2`, `DEFAULT_MEMORY_CONFIG`). User rule 2026-10-31: tunables live in config, read at use; no hard-coded copy. The External note in Phase 10 holds this move until now.
+
+**Work Order.**
+1. Move every `[memory]` key from `config/lint.conf` to `config/build_admission.conf`, with its comments. Add `program_first_peak_gib.cargo=12`. Read the file through `scripts/lib/conf.py`, the approved reader on main.
+2. Remove the value copies from `memory_admit.py`: `FALLBACK` as a config value, `FALLBACK_BUILD_BUDGET_BYTES`, `FALLBACK_TEST_PHASE_MARGIN` and the default policy values. A missing or invalid key refuses with one line that names the file and the key: the service holds the queue and says why; a client exits with its checker-failure status. No silent default.
+3. Measured constants that are not tunables stay in code with their evidence comments (`RELEASE_HEADROOM`, `ANON_SHARE`, `FILTERED_FLOOR`, `HISTORY_DAYS`).
+4. The `ConfigFallback` warning path goes with the fallbacks. The views and `explain` show a config refusal in its place.
+5. Tests read a fixture `build_admission.conf` through `CONF_DIR`; no test depends on the live file.
+6. Update `docs/as-built/build-memory-admission.md` and every doc that names `config/lint.conf` `[memory]`.
+
+**Constraints from the Phase 10 architect review (2026-11-03):**
+- Correct Work Order item 2 against the code now on the branch: `program_first_peak_gib.cargo=12` already exists in the config, and `FALLBACK_BUILD_BUDGET_BYTES`, `FALLBACK_TEST_PHASE_MARGIN` and `DEFAULT_MEMORY_CONFIG` are gone. At phase start, list the policy defaults that remain in code, their reader functions, the protocol diagnostics that carry config fallbacks, the config fixtures and their consumers. Remove each default from that list.
+- Config result: a named result type, usable or unusable. `conf.value_origin()` tells a live value from a recovered value. A recovered value (the repository file or the committed file, through `conf.read`) is usable and prints its warning once. An unavailable value is unusable: the service grants nothing while a key it needs is unusable, and it says why in the view.
+- Release and cleanup never need config: `persist()` in `admission_service.py` and `QueuePlace.finish()` in `queue_place.py` read config today. A config refusal must not stop a release, a reservation end or a scope cleanup.
+- A test edits a key to a bad value, sees grants stop with the refusal line, then edits it back and sees the next pass grant again. No grant uses the rejected value.
+- Use `conf.read` (devtools 4r is on builds at 92ce5f38a). One `ConfigRead` per pass.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — `config/build_admission.conf`, `config/lint.conf`, `memory_admit.py`, the service and client consumers, `queue_place.py`, the docs; hub: `scripts/lint/memory_admit.py`
+- `test` — the config fixtures through `CONF_DIR`, the usable and unusable config tests, the protocol diagnostic tests and the release and cleanup regressions
+
+**Acceptance.** `config/lint.conf` has no `[memory]` section; `memory_admit.py` holds no copy of a config value; a test with the key removed sees the refusal line; a release and a scope cleanup succeed while the config is unusable. Change-Review: open the Build queue pane; it reads as before; `config/build_admission.conf` holds the admission keys.
+
+### Phase 10d — hana CI builds wait in the build admission queue  · status: todo
+**Depends on:** Phase 10 (the admission client); Phase 10c (the CI admission reads build_admission.conf)
+
+**Why.** Showrunner decision, 2026-11-02 (builds): hana CI on natedev ran out of memory at 13:50 EST. The Test Suite and "Linux: Compile and Production Wiring" jobs built hana at the same time inside `hana-ci.slice` (`MemoryMax=18G`), and the kernel killed a 6.7 GB rustc. CI memory sits outside the 24 GiB admission budget, so two budgets split one machine. CI runner builds go through build admission, as every other build does, so one budget holds all build memory.
+
+**Work Order.**
+1. Hook point: each building cargo call in a runner job holds one admission reservation for its lifetime, the same contract as `scripts/build_hold/cargo` for sessions. Non-building commands pass through. The cargo-tile shim stays; the admission step runs in front of the real cargo.
+2. Client delivery: the runner accounts cannot read `~/.claude`. The client reaches them from the store, pinned from this repo the way `cargo-tile` is pinned from cargo-liner. No copy of client code in /etc/nixos.
+3. Identity: the owner is the cargo process (pid and start time). The service runs as natepiano and must read the runner process start time in /proc (no hidepid today; prove it in a test). The queue view labels the step "hana CI · <runner> · <job>" from the runner environment (`GITHUB_JOB`, `RUNNER_NAME`), through config, not hard-coded.
+4. Estimates and history: CI builds use the same history keys (repository, host, shape). The service writes their history rows. A CI kill records a failed peak like any other build.
+5. Waits: a CI step waits in the queue with the normal wait output in the job log. Priority and bump stay user-only. An admission outage follows the same client rule as other builds.
+6. Tests: a runner-account client admitted through the group socket in a fixture; two concurrent CI cargo calls that do not fit wait in order; the queue view shows the CI label.
+
+**What /etc/nixos must change (natedev pushes it; no unit edits /etc/nixos):**
+1. `modules/linux/development.nix` `build-admission.socket`: `SocketGroup = "build-admission"`, `SocketMode = "0660"`; add group `build-admission` with natepiano and the hana runner accounts. This changes the "runner accounts are in no group" rule in `hana-runners.nix` for this one socket; record it there.
+2. `modules/linux/hana-runners.nix`: put the pinned admission cargo front on each runner's PATH ahead of the cargo-tile shim; add `ADMISSION_SOCKET` only if the path differs from the default; `BindPaths` for `/run/build-admission` if the runner units' sandbox hides `/run`.
+3. `hana-ci.slice`: raise `MemoryMax` from 18G to the admission budget (24G), so admission decides and the slice only catches a wrong estimate. Keep `MemorySwapMax=2G` and the `steve-ci` slot pool (CPU slots, not memory).
+4. Order: the nixos change lands only after the admission cut-over enables the socket; until then CI keeps today's slice.
+
+**Constraints from the Phase 10 architect review (2026-11-03):**
+- Estimate inputs: `step_request()` in `admission_client.py` reads config and history through the home folder of the client's account. A runner account cannot read `/home/natepiano`. The service runs as natepiano and already reads both, so the service makes the estimate for a client that sends no estimate: the client sends the repository, host, shape and owner; the service reads config and history and replies with the need it charged. The runner client package holds no config or history path. A test runs an estimate under an account with no access to `/home/natepiano`.
+- Service authorization: `handle_request()` in `admission_service.py` accepts priority mutations and `admit_head` without a check of the connecting account; today only the CLI checks for a showrunner. Before the socket opens to a group, the service reads the peer account (`SO_PEERCRED`) and refuses from a runner account: priority set and clear, `admit_head`, and any release, width or token request for an owner that the runner did not register. Tests deny each of these to a runner account.
+- Cargo lifetime: `scripts/build_hold/cargo` handles holds and scopes but does not take memory admission. The CI front takes one admission reservation for the life of each building cargo call, the same contract as `queue_place` (`scripts/build_queue/queue_place.py`): descendants are tracked, memory is sampled, a cancel releases, and the release happens on every exit. It covers the toolchain shims (`cargo-tile`, rustup proxies) so that a call by full path still goes through admission; state each path that cannot be covered and why.
+- Owners: queue-unit owns the repository code and fixtures. natedev owns the NixOS package, the socket group, the sandbox and the slice changes.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — the CI cargo front, the service authorization and estimate path, the client package entry; hub: `scripts/build_queue/admission_service.py`
+- `test` — the runner-account fixtures, the authorization denial tests, the estimate-without-home test and the two-job ordering test
+
+**Acceptance.** Two hana CI jobs that would together pass the free budget run one after the other, shown in `/build:queue` with the CI label; no CI rustc dies at the slice cap. Change-Review: in the Build queue pane during a hana CI run, the CI step shows as "hana CI · <runner> · <job>" and waits behind a session build when memory is short.
 
 ### Phase 11 — Every later step of one verify.sh run keeps the queue place of the run's first step  · status: todo
 **Depends on:** Phase 10 (the queue service holds the queue and the place record)
@@ -673,12 +795,19 @@ No-copies rule (user, 2026-10-30): one place for each thing. A second copy of se
   - Run end: when the run's process ends, each waiter that took the run's `since` goes back to its own first `since` (its step's own arrival), in the waiter row and in its persisted `WaiterPlace`. A regression runs a run that exits while its child step still waits.
   - Mac boundary: on the Mac (`OSTYPE` darwin), `verify.sh` reads no `/proc` and the client sends `NoRun`; the Mac keeps its claim admission. A regression with no `/proc` files covers it.
   - Start time: `RunIdentity.start_time` uses the same form as `Owner.start_time` (the `/proc/<pid>/stat` field, a string), not an integer, and the run watch uses Phase 10's named live/gone owner result.
+- Phase 10 architect review (2026-11-03), facts the Spec must keep:
+  - Arrival and order are two fields. `_place_key()` in `admission_service.py` uses `since` as the place identity, and `Controller._queued()` in `aws_target.py` uses it as the waiting age. Keep each step's own arrival in `since`; add a separate order time that the run sets. `waiter_order` reads the order time. Reconnect keys, the token reacquire, the display age and AWS eligibility keep the step's own arrival. Tests cover reconnect, token reacquire, run end, the queue display and the AWS waiting threshold.
+  - State migration: the state codec needs exact fields. `read_state` migrates a Phase 10 `state.json` with no run places and keeps the build-history generation, pending finalizations, the queue priority and the replay ledger. An upgrade test reads a Phase 10 state file.
+  - Run watch: `_prune_watches()` keeps watches only for step owners and scopes. A run watch stays between steps, while no step of the run waits, until the run's process ends.
+  - `RunPlace.first_owner` is an `Owner`, not a string.
+  - Memory wait history: Phase 10's `--wait-events` path (`first`, `done`) keeps one balanced pair per step; `test_verify_token_memory_history` stays green. Durable grant replay keeps one reservation per step.
+  - Replace "waits for its queue place once" in the live check with "keeps its order while each step passes admission".
 
 **Acceptance gate:**
 - `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY python3 -m unittest scripts.build_queue.test_admission_protocol scripts.build_queue.test_admission_service scripts.build_queue.test_admission_client scripts.build_queue.test_admission_client_wait scripts.direct.test_verify_run_place` green.
 - `basedpyright` over the changed Python files: `0 errors, 0 warnings, 0 notes`.
 - The notice has an `also touches` line for `verify.sh` and `test_verify_run_place.py` (verify-unit, against `origin/natedev-verify`).
-- A live check: one `verify.sh lint` with three steps waits for its queue place once, not three times. The summary gives the three steps' wait times.
+- A live check: one `verify.sh lint` with three steps keeps its order while each step passes admission; no later step goes to the back of the queue. The summary gives the three steps' wait times.
 - Change-Review line: later steps of one verify run keep the run's queue place | on natedev while other steps wait, run `bash ~/.claude/scripts/direct/verify.sh lint <pkg>`, then type `/build:queue` between its steps | its second and third steps show the first step's place, not the back of the queue.
 
 ### Phase 7 — A promote never refuses a step that already waits for memory  · status: done

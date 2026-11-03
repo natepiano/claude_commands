@@ -9,12 +9,12 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, NamedTuple, TypeVar, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import build_folders
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 
@@ -271,8 +271,8 @@ def scratch_test(production: Production, name: str, tests: str, state_dir: Path)
     stamp = datetime.now(production.zone).strftime("%Y%m%d-%H%M%S-%f")
     log = state_dir / f"scratch-test-{unit.name}-{stamp}.log"
     cleanup: CleanupClean | CleanupFailed = CleanupClean()
-    with tempfile.TemporaryDirectory(prefix="production-scratch-") as parent:
-        worktree = Path(parent) / "checkout"
+    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["production-scratch"])) as parent:
+        worktree = parent / "checkout"
         added = False
         try:
             add = git(production.checkout, "worktree", "add", "--detach", str(worktree), unit.branch)

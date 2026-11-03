@@ -6,17 +6,11 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast, final
+from typing import TYPE_CHECKING, Literal, cast, final, override
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
 else:
     from scripts.lib import test_hang_guard
-
-if TYPE_CHECKING:
-    from typing import override
-else:
-    def override(method: object) -> object:
-        return method
 
 
 CountMode = Literal["single", "multiple", "verify"]

@@ -182,7 +182,7 @@ class MeasurementTests(MeasurementFixture):
 
                 execute = mock.Mock(side_effect=date_only_api)
                 controller = aws_target.Controller(self.settings, directory, self.root / "admission", execute=execute)
-                result = controller.refresh_charges(aws_target.AwsCli(aws_config.read_control_settings(self.settings), execute), instant(when))
+                result = controller.refresh_charges(aws_target.AwsCli('build-scaler', 'us-east-1', 30, execute), instant(when))
                 result = narrow(self, result, measurement.ChargeRead)
                 arguments = cast(Sequence[str], execute.call_args.args[0])
                 period = arguments[arguments.index("--time-period") + 1]
@@ -364,8 +364,8 @@ class MeasurementTests(MeasurementFixture):
 
         controller = aws_target.Controller(self.settings, self.state, self.root / "admission",
                                            execute=execute, clock=lambda: float(NOW + 86400))
-        first = controller.refresh_charges(aws_target.AwsCli(aws_config.read_control_settings(self.settings), execute), NOW + 86400)
-        second = controller.refresh_charges(aws_target.AwsCli(aws_config.read_control_settings(self.settings), execute), NOW + 86401)
+        first = controller.refresh_charges(aws_target.AwsCli('build-scaler', 'us-east-1', 30, execute), NOW + 86400)
+        second = controller.refresh_charges(aws_target.AwsCli('build-scaler', 'us-east-1', 30, execute), NOW + 86401)
         self.assertIsInstance(first, measurement.ChargeRead)
         self.assertEqual(second, first)
         self.assertEqual(len(calls), 1)

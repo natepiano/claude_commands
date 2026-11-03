@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 from scripts.lib.atomic_file import write_bytes_atomic
 
 import contextlib
@@ -34,7 +34,7 @@ from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.message import sessions
 from scripts.production import staff
-from scripts.production.staff_test_support import fixture_runtime_id, StaffTestCase, isolated_source_readers, showrunner_relationship
+from scripts.production.staff_test_support import fixture_runtime_id, StaffTestCase, isolated_source_readers, showrunner_relationship, recorded_unit
 
 
 SCRIPT = Path(__file__).with_name("workers.py")
@@ -418,6 +418,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         plan = worktree / "plan.md"
         production_doc = worktree / "production.md"
         _ = production_doc.write_text("## Production Context\n\n- **Formerly:** `demo`\n")
+        _ = recorded_unit("demo", "builders", worktree, production_doc, plan="plan.md")
         notifier = Path(os.environ["NOTIFIER_STATE_DIR"]) / "showrunner-renamed"
         notifier.mkdir(parents=True)
         _ = (notifier / "conf").write_text(
@@ -443,6 +444,10 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         worktree = Path(str(state["working_dir"]))
         plan = worktree / "unit-plan.md"
         _ = plan.write_text('> **Production: fixture-production** — unit `fixture-unit`; production doc `production.md`\n')
+        document = worktree / "production.md"
+        _ = document.write_text("# Production — fixture-production\n")
+        member = recorded_unit("fixture-production", "fixture-unit", worktree, document, plan=plan.name)
+        _ = staff.rename(member.id, "fixture-unit")
         state["project_plan_doc"] = plan.name
         _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
         # A read-only metadata caller must not recover even an invalid pending
@@ -467,7 +472,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.patches.enter_context(patch.dict(os.environ, {
             "UNIT_WORKERS_STATE": str(self.session_dir.parent / "unit-workers"),
             "NOTIFIER_STATE_DIR": str(self.session_dir.parent / "notifier"),
-            "AGENTS_CONFIG_FILE": str(write_registry(self.session_dir / "registry.conf", {
+            "MODELS_CONFIG_FILE": str(write_registry(self.session_dir / "registry.conf", {
                 "direct.codex": dict.fromkeys(("impl", "test", "fix", "review"), "gpt-kept-sol:xhigh"),
             })),
         }))
@@ -538,7 +543,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         checkpoint = self.session_dir.parent / "catalog-current"
         checkpoint.touch()
         self.patches.enter_context(patch.dict(os.environ, {
-            "AGENTS_CONFIG_FILE": str(registry),
+            "MODELS_CONFIG_FILE": str(registry),
             "CODEX_CATALOG_SYNC_STATE_FILE": str(checkpoint),
         }))
 
@@ -1013,7 +1018,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.configure_new_worker()
         self.assertEqual(self.resolve(self.session_dir), "impl")
         self.complete_assignment("impl")
-        registry = Path(os.environ["AGENTS_CONFIG_FILE"])
+        registry = Path(os.environ["MODELS_CONFIG_FILE"])
         _ = write_registry(registry, {"direct.codex": {"impl": "gpt-kept-sol:high"}},
                            base_text=registry.read_text())
         self.assertEqual(self.resolve(self.session_dir), "impl")
@@ -1657,6 +1662,9 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         old = self.session_dir.parent / "repository"
         plan = old / "plan.md"
         _ = plan.write_text('> **Production: demo** — unit `builders`; plan\n')
+        document = self.session_dir.parent / "demo-production.md"
+        _ = document.write_text("# Production — demo\n")
+        row = recorded_unit("demo", "builders", old, document, plan=plan.name)
         state = json_object(self.session_dir / workers.STATE)
         state["plan_doc"] = str(plan)
         _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
@@ -1666,6 +1674,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         workers.pause_unit("demo", "builders")
         new = old.with_name("moved-repository")
         _ = old.rename(new)
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", new), expected=row.worktree)
         destination = self.next_run("after-worktree-move")
         state = json_object(destination / workers.STATE)
         state.update({"working_dir": str(new), "plan_doc": str(new / "plan.md")})
@@ -1678,6 +1687,9 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         old = self.session_dir.parent / "repository"
         plan = old / "plan.md"
         _ = plan.write_text('> **Production:** demo — unit `builders`; plan\n')
+        document = self.session_dir.parent / "demo-production.md"
+        _ = document.write_text("# Production — demo\n")
+        row = recorded_unit("demo", "builders", old, document, plan=plan.name)
         state = json_object(self.session_dir / workers.STATE)
         state.update({"plan_doc": str(plan), "project_plan_doc": str(plan)})
         _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
@@ -1691,6 +1703,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         original_home = os.environ["CODEX_HOME"]
         new = old.with_name("moved-repository")
         _ = old.rename(new)
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", new), expected=row.worktree)
         with patch.dict(os.environ, {"UNIT_RUN_ROOT": str(self.session_dir.parent)}):
             found = workers.find_moved_unit_runs((workers.UnitWorktree("demo", "builders", new, "new-branch"),), ())
             self.assertEqual(len(found.moves), 1)

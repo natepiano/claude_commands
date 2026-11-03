@@ -8,7 +8,7 @@ import unittest
 from email.message import Message
 from http.client import BadStatusLine, IncompleteRead
 from pathlib import Path
-from typing import TYPE_CHECKING, final
+from typing import final, override
 from unittest import mock
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -16,12 +16,6 @@ from urllib.request import Request
 
 import crates_io_pacer
 import upstream
-
-if TYPE_CHECKING:
-    from typing import override
-else:
-    def override(method: object) -> object:
-        return method
 
 API = "https://crates.io/api/v1/crates"
 

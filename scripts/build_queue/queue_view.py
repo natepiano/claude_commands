@@ -270,7 +270,7 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     budget_label = f"budget {budget:.1f}"
     lines: list[Line] = [
         (Span(f"Build queue · {clock(model, explanation.now)}",
-              "warning" if isinstance(model.reading.freshness, gate.StaleReading) else "inactive"),), (),
+              "inactive"),), (),
         (Span(" " * bar_column), *labels),
         (Span(pad_right(budget_label, bar_column), "inactive"), *budget_bar(budget, free, colour=colour)), (),
         (Span(pad_left("#", place_width) + " " + pad_right(cut_tail("showrunner", show_width), show_width) + " "
@@ -292,4 +292,11 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
             Span(bar, "warning"), Span(f" {step.need / gate.GIB:.1f}", tone),
         )
         lines.append((*row, *status) if index == 0 else row)
+    head = explanation.head
+    if isinstance(head, gate.HeadExplanation) and head.decision.state == "hold":
+        lines.append((Span(f"Head: free {head.free.available / gate.GIB:.1f} GiB; "
+            + f"reserve {head.free.reserve / gate.GIB:.1f} GiB; need {head.free.need / gate.GIB:.1f} GiB"),))
+    for step in model.reading.view.running:
+        if isinstance(step.measured, gate.UnownedSliceMemory):
+            lines.append((Span(f"{step.measured.owner}: {step.measured.bytes / gate.GIB:.1f} GiB (unowned)"),))
     return [clip(line, columns) for line in lines]

@@ -106,7 +106,7 @@ def git_output(repo: Path, *arguments: str) -> str:
 def full_suite_trigger(path: str) -> bool:
     name = Path(path).name
     return (path.startswith("scripts/lib/")
-            or name in {"conftest.py", "settings.json", "merge_gate.py", "affected_modules.py", "agents_config.sh"})
+            or name in {"conftest.py", "settings.json", "merge_gate.py", "affected_modules.py", "models_config.sh"})
 
 
 # Bump the extractor version whenever source-fact semantics change.

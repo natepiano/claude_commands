@@ -25,7 +25,7 @@ review, gate and report. Every prompt sent to a worker carries them inline per
 <HeldAstraRoles>
 For LongLivedWorkers and LaunchImplementation, the director briefs and accepts;
 Astra authors the assigned design. Use one `design_roles.py` designer and at most one
-reviewer per design, with models resolved from `design_roles` in `agents.conf`. Open
+reviewer per design, with models resolved from `design_roles` in `models.conf`. Open
 once; resume the same instance across rounds, phases and runs. `design_roles.py` saves
 each headed prompt and reply; do not also use `astra_work.py brief` for that role.
 For a designer outside `design_roles.py`, include `config/design_roles/designer.md` in its brief
@@ -307,6 +307,10 @@ started with `mesh_runs.py start`, detaches and pushes its own result to the
 worker, per <WritePromptContract/> item 3. A live run keeps the worker's
 launcher attached, so the dispatch finishes only when the worker is done.
 Records are in `${SESSION_DIR}/mesh_runs/`, each log beside its record.
+`start` checks for a live twin before it applies `config/mesh_runs.conf` `LIVE_RUN_LIMIT` to that worker.
+At the limit, exit 4 starts nothing and names the live runs on stderr.
+Wait for a run's result as the next message, or put more files in one run.
+Exit 3 means the caller is not a mesh worker; only that exit permits attached execution.
 A message from a worker's run saying no
 launcher is attached carries the result to you: dispatch that worker
 (`implement.sh --to <full worker name>`) when it should act on it.

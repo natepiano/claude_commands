@@ -22,10 +22,10 @@ from test_index import use_test_log
 use_test_log()
 
 if TYPE_CHECKING:
-    from ..aws_target import measurement
+    from ..aws_target import ledger, measurement
     from ..aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, MeasurementFixture, narrow, read_only_evidence
 else:
-    from scripts.aws_target import measurement
+    from scripts.aws_target import ledger, measurement
     from scripts.aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, MeasurementFixture, narrow, read_only_evidence
 
 
@@ -33,6 +33,11 @@ class AwsReportTests(MeasurementFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        registry = self.root / "build_targets.conf"
+        _ = registry.write_text(
+            registry.read_text()
+            + "# whole: 0..10\nvault.lock_retries=5\n"
+            + "# range: 0..5\nvault.lock_retry_delay_s=3\n")
         self.state: Path = self.root / ".local/state/build-targets/aws"
         self.seed_cost()
         self.text_setting("host", "aws-build")
@@ -172,6 +177,21 @@ class AwsReportTests(MeasurementFixture):
         self.assertIn("0 steps", output)
         self.assertIn("0.00 h of queue wait saved", output)
         self.assertIn("unavailable per saved hour", output)
+
+    def test_report_prices_pending_requests_without_confirmed_uptime_and_keeps_resolved_costs(self) -> None:
+        request = self.pending_request()
+        output = self.render()
+        self.assertIn('AWS: up 2.00 h', output)
+        self.assertIn('for $22.00', output)
+        saved = self.book().path.read_bytes()
+        for resolution in (ledger.ComputeInstanceConfirmed(NOW, 'i-fixture'), ledger.ComputeResourcesAbsent(NOW)):
+            with self.subTest(resolution=resolution):
+                _ = self.book().path.write_bytes(saved)
+                later = self.resolve_request(request, resolution)
+                with mock.patch.object(time, 'time', return_value=float(later)):
+                    output = self.render()
+                self.assertIn('AWS: up 2.00 h', output)
+                self.assertIn('for $22.00', output)
 
     def test_daily_charge_reconciliation_changes_cost_once_and_shows_its_difference(self) -> None:
         at = NOW + 86400

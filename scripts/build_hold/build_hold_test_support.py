@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+
 from collections.abc import Callable
 from contextvars import ContextVar
 from contextlib import redirect_stdout, redirect_stderr
@@ -21,8 +22,10 @@ from unittest import mock
 
 import build_hold
 if TYPE_CHECKING:
+    from ..build_queue.admission_test_support import AdmissionFixture, caller_admission
     from ..lib import test_hang_guard
 else:
+    from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
     from scripts.lib import test_hang_guard
 from override_guard import require_checkout
 
@@ -103,6 +106,7 @@ def recorded_hold_events(root: Path, expected: int) -> list[HoldEventRecord]:
 
 
 class IsolatedBuildHoldTest(unittest.TestCase):
+    admission_fixture: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
     scratch: Path = Path()
     socket_dir: Path = Path()
     lifetime_reader: int = -1
@@ -164,6 +168,7 @@ class IsolatedBuildHoldTest(unittest.TestCase):
             "BUILD_HOLD_TEST_LIFETIME_FIFO": str(fifo),
             "PYTHONPATH": os.pathsep.join(filter(None, (str(lifetime), os.environ.get("PYTHONPATH", "")))),
         }))
+        self.admission_fixture = caller_admission(self, self.scratch, dict(os.environ))
         token = _finish_writers.set(self.finish_writers)
         self.addCleanup(_finish_writers.reset, token)
         self.addCleanup(self.reap_recorders)

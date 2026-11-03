@@ -29,7 +29,7 @@ import process_group
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from scripts.lib import conf
+from scripts.lib import build_folders, conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 
@@ -167,8 +167,8 @@ def selected_paths(repo: Path, names: list[str], config: FastTrackLimits) -> lis
 
 def patch_for(repo: Path, paths: list[str]) -> bytes:
     """Use a private index to include new files without changing the director's index."""
-    with tempfile.TemporaryDirectory(prefix="fast-track-index-") as temporary:
-        environment = {**os.environ, "GIT_INDEX_FILE": str(Path(temporary) / "index"),
+    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track-index"])) as temporary:
+        environment = {**os.environ, "GIT_INDEX_FILE": str(temporary / "index"),
                        "GIT_LITERAL_PATHSPECS": "1"}
         _ = git(repo, "read-tree", "HEAD", environment=environment)
         # A missing untracked path after a successful restore is an empty patch.
@@ -419,9 +419,9 @@ def fast_check(repo: Path, paths: list[str], config: FastTrackLimits) -> None:
     environment = {key: value for key, value in os.environ.items()
                    if key not in ("PYTHONUNBUFFERED", "REFUSAL_WATCH_INVENTORY", "STAFF_OPERATION_FD")}
     environment["HERDR_BIN"] = "/nonexistent/herdr"
-    with tempfile.TemporaryDirectory(prefix="fast-track-check-") as temporary:
+    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track-check"])) as temporary:
         for number, module in enumerate(sorted(modules)):
-            root = Path(temporary) / str(number)
+            root = temporary / str(number)
             root.mkdir()
             isolated = merge_gate.test_module_environment(root, environment)
             check_command([sys.executable, "-m", "unittest", "discover", "-s", str(module.parent),
@@ -456,8 +456,8 @@ def select_patch(repo: Path, paths: list[str]) -> Generator[SelectedPatch]:
         patch = patch_for(repo, paths)
         if git(repo, "rev-parse", "HEAD").strip() != head:
             raise Refused("HEAD changed while selecting the patch; retry the command")
-        with tempfile.TemporaryDirectory(prefix="fast-track-restore-index-") as temporary:
-            environment = {**os.environ, "GIT_INDEX_FILE": str(Path(temporary) / "index")}
+        with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track-restore-index"])) as temporary:
+            environment = {**os.environ, "GIT_INDEX_FILE": str(temporary / "index")}
             _ = git(repo, "read-tree", head, environment=environment)
             if patch:
                 result = subprocess.run(["git", "-C", str(repo), "apply", "--cached"], input=patch,
@@ -678,8 +678,8 @@ def promote(production: Path, repo: Path, commit: str, unit: str) -> None:
         if isinstance(promotion, production_doc.PromoteTo) and not promotion.checkouts and isinstance(promotion.mac, production_doc.MacCheckout):
             # The director stays on its branch. A Mac-only destination still needs
             # a local main ref at the published commit for the existing pull helper.
-            with tempfile.TemporaryDirectory(prefix="fast-track-promote-") as temporary:
-                source = Path(temporary) / "checkout"
+            with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track-promote"])) as temporary:
+                source = temporary / "checkout"
                 _ = git(repo, "clone", "--shared", "--no-checkout", str(repo), str(source))
                 _ = git(source, "update-ref", "refs/heads/main", commit)
                 merge_checkpoint.promote_targets(promotion, "main", commit, source=source, label=f"fast-track {unit}")
@@ -695,15 +695,15 @@ def push_patch(repo: Path, production: Path, unit: str, why: str, paths: list[st
 
     patch = selection.patch
     digest = hashlib.sha256(patch).hexdigest()
-    with tempfile.TemporaryDirectory(prefix="fast-track-") as temporary:
-        copy = Path(temporary) / "checkout"
+    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track"])) as temporary:
+        copy = temporary / "checkout"
         fetch_main(repo, settings_read)
         _ = git(repo, "clone", "--shared", "--no-checkout", str(repo), str(copy))
         _ = git(copy, "remote", "set-url", "origin", git(repo, "remote", "get-url", "origin").strip())
         for key in ("user.name", "user.email"):
             value = git(repo, "config", "--get", key).strip()
             _ = git(copy, "config", key, value)
-        patch_file = Path(temporary) / "fix.patch"
+        patch_file = temporary / "fix.patch"
         _ = patch_file.write_bytes(patch)
         for _attempt in range(config.max_push_attempts):
             _ = reconcile(repo, unit, settings_read=settings_read)

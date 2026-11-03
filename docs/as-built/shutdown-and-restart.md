@@ -4,7 +4,51 @@ Stop, resume and account move use `scripts/shutdown/stop_resume.py`.
 
 `stop(session)` ends only the selected local session's Claude process. It reads identity through `sessions.session_liveness`, keeps the pid and start time, checks that identity before each signal, sends TERM, and checks exit every 0.1 seconds and sends KILL after two seconds if the same process survives. After exit, `stall_watch.retire_session_prompt(session_id)` atomically publishes only `{session_id, at}` with no launch, pane or parent lookup. It takes no watcher lock and sends nothing; stall-watch finds saved prompts by their owning session id and retires their stored keys on its next pass, even after launch deletion. Any cancellation exception prints a separate warning and does not prevent intentional-stop bookkeeping or change the stop result. It waits up to five seconds after KILL. It waits for that pid and start time to leave. Registry removal alone does not prove exit. A surviving process returns `StopFailed`. Workers keep their threads. No stopping record, ready mark, account hold or conductor is created.
 
-`resume(session, why=..., to=...)` finds the session's own herdr tab and its launch entry, then runs the account exec command through `Herdr.run_in_pane`. The resume arguments and message have one builder each. The message says why the session stopped and resumed, tells it to continue its work, and explains how to resume existing workers. When herdr has a stale or empty conversation id, the saved launch entry supplies it unless another Claude runs in that pane. The command sets the destination pane's `HERDR_PANE_ID` and `HERDR_WORKSPACE_ID`. It unsets `HERDR_TAB_ID`, so a moved tab does not reuse its shell's old marks. No tab opens or closes. A live Claude refuses resume.
+`resume NAME [--why TEXT] [--to ACCOUNT]` works from any directory.
+The executable is `scripts/shutdown/resume`.
+The wrapper uses the shared Python launcher and locates `shutdown.py` beside the wrapper.
+The installation link belongs in `~/.local/bin` after merge.
+
+One `LaunchNames.read()` supplies the staff snapshot for lookup, labels, and restore.
+The lookup accepts a short name, a staff id, or a current session id.
+Unknown names return status 1.
+They list up to five close names from local units and showrunners when available.
+Ambiguous names return status 1 with up to five matching members.
+A remote member returns status 1 with its machine name.
+A session already running on the target account returns status 0 with an already-running line.
+A session running on another account returns status 1 without a stop.
+A retry accepts a session that started on the target account between attempts.
+The default reason is `resumed by name`.
+
+The shared resume path reads the saved account, environment, arguments, and folder.
+It restores a closed tab through `restore_missing`.
+An explicit CLI resume can restore an intentionally stopped session.
+Automatic recovery preserves an intentional stop.
+A separate terminal starts the account command in the target pane.
+The command changes to the saved folder before the account launch.
+The pane receives one opening message after identity confirmation.
+
+An empty target pane cannot receive its own foreground command through pane typing.
+The own-pane path saves the resolved launch as an attempt before `exec`.
+It preserves the intentional-stop state and records no verified proof before the launch.
+An exec error uses the existing failure path and keeps the pane.
+It uses the same account command with the opening message as a Claude argument.
+It changes to the saved folder and replaces the foreground process.
+The SessionStart hook records the new process and clears the intentional-stop state.
+This path cannot perform the later pid confirmation or detached stay check.
+
+`resume_message.py` builds every opening message.
+The restore paths use these causes:
+
+1. A named resume uses `resumed by name` unless `--why` supplies another reason.
+2. An account move uses its supplied reason and the source and target accounts.
+3. A refusal-watch move uses the refusal-watch reason through the shared account move.
+4. A folder move uses `the session folder moved`.
+5. A herdr server restore resumes the saved conversation without a generated prompt.
+6. A relaunch with no known cause uses `you were stopped and resumed`.
+
+The relaunch supervisor preserves explicit prompts.
+The pane path marks prompt delivery as `pane` to prevent a second automatic prompt.
 
 `ClaudeUp` means the registry reports a live Claude within 20 seconds. The command prints `ID: Claude is up on ACCOUNT in PANE (2.4 s)` and returns. The elapsed time includes that session's move stop. A detached check watches its pid and start generation for ten seconds. If it ends, the check tells the showrunner, sends the reviewed `shutdown.restart_failed` push, and enters the existing unit watchdog pass for a unit. Probe sessions skip the user push. The watchdog owns later recovery; the stay check does not retry. A Claude that never starts runs the same command in the same pane up to three times, then returns `ResumeFailed: never started`. A missing tab or unreadable identity returns a named failure. Batch stops and resumes run concurrently; all stops finish before any resume. Launch seeding reads process info only for selected panes; the seed CLI still reads all panes.
 
