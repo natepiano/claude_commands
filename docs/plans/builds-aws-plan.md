@@ -356,152 +356,30 @@ Delivery failures, restarts, and failed ledger writes preserve the event and dup
 ### Phase 8 — Control starts, drain and interruption recovery  · status: done
 **Depends on:** Phase 7
 
-#### Work Order
+#### As-built
 
-**Goal:** The controller runs AWS only for eligible queued work within the spending guard.
-
-**Spec:**
-
-1. Add `aws_target.py tick`, `start` and `stop`, with one bounded AWS CLI adapter and an injectable command executor.
-   Read region, instance ID and profile from config. Use profile `build-scaler` without reading or printing its credential file.
-   Keep every AWS call absent from imports, tests and disabled target paths.
-2. Have `tick` read `admission/queue.json` through `read_queue_snapshot`; never call the live queue reader.
-   Require a fresh, complete snapshot. Select queued test, check and doc rows with known repository identity.
-   Preserve typed queue order and exclude `token_left_at` rows.
-   Start only when configured `start_min_waiting` rows exceed `start_after_wait_s`, the guard permits spend, and capacity backoff has ended.
-   Record a capacity miss and retry after `capacity_backoff_s`; leave local work queued.
-3. Record `stopped`, `starting`, `running`, `draining` and refused-start reasons with evidence timestamps.
-   Reconcile instance state before each action. Serialize tick, manual start and manual stop.
-   Treat API uncertainty as refusal for starts. Keep ledger evidence across command failures.
-   Record API failures as controller evidence. Append only confirmed lifecycle states to ledger observations.
-4. Publish the guard's admission state to the Linux probe and runner.
-   Transfer guard decisions through an explicit natedev-initiated channel.
-   Do not use buildlog synchronization to distribute admission state.
-   Refuse execution when guard evidence is missing, stale, malformed, or belongs to another instance generation.
-   Decode `ledger._decision_record` into named permission states; keep absent cost evidence explicit. The ledger stays the decision authority.
-   Publish a versioned envelope with target, admission purpose, instance generation, decision time and expiry; parser tests accept and reject each field.
-   Publish permission only after the current guard call confirms its durable write. Never substitute an earlier allowed record.
-   For AWS targets, validate spending permission before shell evaluation or `shellHook` in both `linux_runner.probe_shell` and `linux_runner.run`.
-   Keep other Linux targets and the loopback proof usable without AWS permission.
-   Test guard refusal after slot reservation but before execution.
-   At a limit, reject new work, let running work end, then stop the instance.
-   Bound the drain by `drain_max_minutes` in config, initially 60: at the deadline, stop the instance; its running steps are lost and re-enter natedev's queue at their place.
-   Account for an AWS-initiated restart before accepting work. It must not bypass the guard:
-   a tick that finds an unexpected restarted generation running while the guard refuses spend stops it at once, and the box's own idle stop is the second bound.
-   An existing controlled drain keeps its recorded deadline; repeated refused ticks neither reset nor bypass that deadline.
-5. Add `remote.py` for the box's idle and interruption checks.
-   Read `idle_stop_minutes` from its synchronized config. Shut down with instance shutdown behavior `stop` after the idle interval.
-   Read IMDSv2 interruption notices at the configured interval, initially 5 seconds in config.
-   Mark draining before ending active step process groups.
-   Have `remote.py` write a generation-bound interruption record on the target.
-   Have the runner read that record when the stream ends and print `aws_interrupted=<generation>`.
-   Parse this record as a distinct interruption-loss result; preserve the original queue timestamp.
-   Persist the interruption evidence in the attempt record through `write_result`.
-   Reject evidence from another generation; distinguish interruption loss from startup refusal and confirmed completion.
-6. Release kept AWS claims only after instance evidence reports `stopping`, `stopped` or `terminated`.
-   Record the state evidence with each release; do not require SSH cleanup for those states.
-   Preserve claims for running, unknown or unreachable state. Keep release idempotent under tick reruns.
-   Bind release evidence to the target, instance generation, and claim identities.
-   Validate those identities under the target lock before release.
-   Preserve claims created after the observed stop.
-   Never release another target's claims or replace retained job fields during recovery.
-   Test stop evidence followed by restart and a new claim before release.
-   Reconcile retained `.linux-run.json` markers on the target and local claims before new work.
-   Bind marker process identity to boot identity because `/home` survives restart.
-   Use evidence to recover old markers without selecting or killing new work that reuses a PID.
-   Keep claims and markers when evidence cannot confirm recovery.
-   Test restart with a retained marker and reused PID; preserve new work and permit recovery from sufficient evidence.
-7. Add tick settings with an initial 30-second interval in config.
-   Keep the actual timer disabled until Phase 10. Store every retry, timeout, stale threshold and poll interval in config.
-   Bound routine tick work; refresh prices only when due, rather than on each tick.
-8. Test threshold selection, stale snapshots, concurrent tick/start, capacity backoff, limit drain, interruption and evidence-based release.
-   Inject AWS, IMDS, process groups, clocks and notification delivery. Test no-work AWS restart behavior without real AWS.
-   Extend `test_remote.py` through both runner entry points; invalid permission starts neither shell evaluation nor work.
-   Test interruption through the real stream parser and attempt writer.
-   Distinguish interruption loss, startup refusal and confirmed completion while preserving the original queue timestamp.
-   Test that interruption fallback records `ON_NATEDEV` before local compilation starts.
-   Test that a build hold keeps protecting a step in `WAITING_SSH` or `ON_SSH`, and stops only local work.
-   Test that `test_control.py` and both runner entry points reject permission after an injected ledger-write failure.
-   Test that permission returns after a temporary API failure without deleting accounting evidence.
-   Test repeated refused ticks during a controlled drain against its recorded deadline.
-
-**Held changes:** Resources changes `QueueInputs`, `RankedWaiter`, `waiter_state`, `first_queued_waiter` and `stored_waiter`.
-Consume decoded rows without replacing snapshot serialization or the admission walk.
-Verify changes `run_is_kept`, `claim_once`, `command_claim` and wait-claim adoption in `mac_test.py`.
-Add one explicit AWS state-evidence release operation; preserve the existing live-process and remote-leftover checks.
-Keep interruption decoding separate from `OffloadRequest.admission` and `claim_arguments` transfer changes.
+- `aws_target.py tick|start|stop` run through `Controller` under `control_lock`. `AwsCli` is the one bounded AWS CLI adapter, with an injectable `AwsExecutor`; profile `build-scaler` is never read or printed.
+  `controller.json` holds the state (`off`, `refused`, `stopped`, `starting`, `running`, `draining`, `stopping`), `generation`, `permitted_generation`, the drain deadline and capacity backoff. `instance_generation(directory)` reads the generation.
+- `tick` reads a fresh `admission/queue.json` snapshot through `read_queue_snapshot` and starts only for enough eligible waiting rows, guard permission and ended backoff.
+  A refused restart generation stops at once; a controlled drain keeps its recorded deadline (`drain_max_minutes`).
+- `ledger.py` decodes decisions into `PermissionAllowed`, `PermissionRefused` and `PermissionUnavailable` (`decode_permission`, `permission_record`).
+  `remote.py` publishes a versioned `AdmissionEnvelope` (target, purpose, generation, decision time, expiry) only after a confirmed guard write; `execution_permission` refuses missing, stale, malformed or wrong-generation evidence.
+- `linux_runner.py` checks AWS permission before shell evaluation in `probe_shell` and `run`, and again after `prepare_shell`. `AwsExecutionContext` versus `IndependentLinuxExecution` keeps other Linux targets free of AWS permission.
+  `boot_identity`, `SlotBoot` and `slot_boot` bind retained markers to boot identity, so a reused PID never selects new work.
+- `remote.py` `RemoteAgent` stops the box after `idle_stop_minutes` idle, polls IMDSv2 every `interruption_poll_s`, and writes a generation-bound interruption record. A process-evidence failure counts as idle.
+  The runner prints `aws_interrupted=<generation>`; offload parses it as `InterruptedTargetRun`, keeps the queue timestamp and records `ON_NATEDEV` before local work.
+- `mac_test.RELEASE_STATES = ('stopping','stopped','terminated')`. `release_stopped_claims` releases only claims bound by `instance_generation` to the stopped host and generation, under the target lock, and writes `release-evidence/`.
 
 **Files:**
 
-- `scripts/aws_target/aws_target.py`, `scripts/aws_target/remote.py` — new controller and remote lifecycle checks.
-- `scripts/aws_target/config.py`, `scripts/aws_target/ledger.py` — named guard decisions, validation evidence and publication settings.
-- `scripts/mac_test/mac_test.py` — state-evidence claim release and local claim reconciliation.
-- `scripts/mac_test/offload.py`, `scripts/mac_test/linux_runner.py` — guard checks before shell evaluation and generation-bound interruption records.
-  Reconcile retained markers with boot identity and preserve startup-refusal handling.
-- `scripts/lib/conf.py` — read the shared configuration and live-value spending guarantee.
-- `scripts/lint/memory_admit.py` — read snapshot schema and decoder; modify only a necessary narrow reader boundary.
-- `config/aws_target.conf`, `config/README.md` — lifecycle settings.
-- `scripts/aws_target/test_control.py`, `scripts/aws_target/test_remote.py` — fake control and remote tests.
-- `scripts/aws_target/test_ledger.py` — publication and write-failure regressions.
-- `scripts/direct/test_verify_ssh_targets.py` — the interruption fallback and hold-protection route regressions.
+- `scripts/aws_target/aws_target.py`, `scripts/aws_target/remote.py` — controller and box lifecycle.
+- `scripts/aws_target/config.py`, `scripts/aws_target/ledger.py` — `ControlSettings` and named permission decisions.
+- `scripts/mac_test/mac_test.py`, `scripts/mac_test/offload.py`, `scripts/mac_test/linux_runner.py` — claim release, interruption results and permission checks.
+- `config/aws_target.conf`, `config/README.md` — tick, timeout, snapshot, permission, interruption and remote-state settings.
 
-**Workers:** 1 writer + 1 tester; the controller owns its side-effect order and claim release.
+**Binds later work:** Reports read controller state from `controller.json` and the generation through `aws_target.instance_generation`. `ControlSettings` has no `host` or `connect_timeout_s`; SSH uses `offload.read_connection_settings` and `offload.ssh_options`.
 
-- `impl` — lifecycle, publication and retained-claim release in source and config files; hub: `scripts/aws_target/config.py`, `scripts/mac_test/mac_test.py`, `config/aws_target.conf`.
-- `test` — the control and remote tests, ledger publication regressions and the route regressions; model AWS, IMDS and queue snapshots with temporary typed fixtures.
-
-**State:** Controller lock, capacity backoff, current state, drain marker, idle evidence and claim-release evidence persist.
-Record intent before an AWS action; reconcile actual state after an uncertain response instead of repeating an unguarded start.
-Guard evidence and claim-release evidence identify the target and instance generation.
-Release evidence also identifies the affected claims. Later claims remain intact.
-Retained slot markers carry boot identity; recovery reconciles remote markers and local claims before new work.
-Generation-bound interruption records persist on the target and in durable attempts.
-
-**Constraints from prior phases:** Phase 6 supplies the ledger and shared guard. Phase 4 preserves queue age on loss.
-Phase 7 supplies `SshConnectionSettings` for SSH cleanup, `is_aws_target` beside `SshTarget`, bounded limit-notice retries and confirmed-only ledger observations.
-`CostLedger.observe` raises `ObservationRejected` for an unknown instance state and leaves the ledger unchanged; record only confirmed states. Pass the controller's injected clock to `spending_guard`, which forwards it to `CostLedger.guard`. Limit notices send with key `aws-limit:<event_id>` and retry no sooner than `notification_retry_s`.
-Use `is_aws_target` at every controller and runner permission check. Each guard call writes a decision record.
-`ledger._decision_record` stores one latest decision with conditional fields and current-day intervals, and no target or generation identity.
-Keep `spending_limit` and `spending_unavailable` outside capacity retries; keep `off` inert; preserve reservation statuses 0, 11 and 1.
-Phase 3 supplies the Linux probe. Phase 2 supplies slot claims and retained job fields.
-Phase 6 supplies named allowed, refused and unavailable guard decisions with decision times and validation evidence.
-Only usable live limits permit spend; committed recovery values do not permit spend.
-Phase 3 evaluates the shell in both `probe_shell` and `run`; copy scripts, public configuration and source before the execution probe.
-Phase 3 keeps `.linux-run.json` during uncertain cleanup; `/home` preserves these markers across restarts.
-Phase 4 preserves completion, cleanup state, unresolved count and evidence time in each attempt.
-Startup refusal and `LeftoversRemain` stay busy without backoff; missing completion remains loss.
-Keep numeric selector status internal and preserve the existing Mac serialization.
-Phase 5 made `hold_enforcer.protected_reason` protect every valid step state except `ON_NATEDEV`, so a hold stops only local work.
-A step that falls back from an interrupted AWS run must record `ON_NATEDEV` before local compilation, so the hold reaches it.
-Read configuration through `conf.py`; tests use `CONF_DIR`, private `build_targets.conf` and numeric limit comments.
-Buildlog synchronization excludes admission state. Use an explicit natedev-initiated channel for guard transfer.
-No real resource exists before Phase 10's user gate.
-
-**Verification — impl:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/aws_target/config.py scripts/aws_target/ledger.py scripts/aws_target/aws_target.py scripts/aws_target/remote.py scripts/mac_test/mac_test.py scripts/mac_test/offload.py scripts/mac_test/linux_runner.py`
-
-**Verification — test:** `python3 -m unittest discover -s scripts/aws_target -p 'test_control.py'`
-
-**Verification — test:** `python3 -m unittest discover -s scripts/aws_target -p 'test_remote.py'`
-**Verification — test:** `python3 -m unittest discover -s scripts/mac_test -p 'test_*.py'` (the full Mac suite; Phase 4 found result-class failures only there)
-
-**Verification — test:** `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'`
-
-**Verification — test:** `python3 -m unittest discover -s scripts/direct -p 'test_verify_ssh_targets.py'`
-
-**Verification — test types:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/aws_target/test_control.py scripts/aws_target/test_remote.py`
-
-**Acceptance gate:** The commands pass. Fake interruption preserves queue age; stopped-state evidence releases only the affected AWS claims.
-An over-limit AWS restart never becomes ready for new work.
-AWS guard refusal after slot reservation prevents shell evaluation, `shellHook` and work through both runner entry points.
-Other Linux targets and the loopback proof remain usable without AWS permission.
-Missing, stale, malformed or wrong-generation evidence prevents execution.
-Stop evidence followed by restart releases only the identified old claims under the target lock.
-Recovery reconciles remote markers and local claims using boot identity before new work.
-Interruption fallback records `ON_NATEDEV` before local compilation; a hold still protects `WAITING_SSH` and `ON_SSH` steps.
-A retained marker with a reused PID cannot select or kill new work; sufficient evidence permits recovery.
-Real parsers distinguish generation-bound interruption loss, startup refusal and confirmed completion in durable attempts without changing queue age.
-
-**Also touches:** `scripts/mac_test/`, offload (owner verify-unit); `scripts/lint/memory_admit.py` if changed (owner queue-unit).
+**Gotchas:** `permitted_generation`, not `generation`, is restart protection. `offload.py` puts its own directory on `sys.path` for callers outside `scripts/mac_test`. The tick timer stays disabled until go-live.
 
 ### Phase 9 — Report AWS use, cost and estimated wait saved  · status: todo
 **Depends on:** Phase 8
@@ -582,6 +460,10 @@ A retry must not repeat a successful daily charge read or duplicate a reconcilia
 Read retained slot evidence and peer exchange status without probes or writes.
 
 **Constraints from prior phases:** Phase 8 records controller state, drain reason and slot-release evidence.
+Phase 8 controller state lives in `controller.json` (states off, refused, stopped, starting, running, draining, stopping); read its generation with `aws_target.instance_generation`. `permitted_generation`, not `generation`, is restart protection.
+Phase 8 binds AWS remote claims with `instance_generation`; `mac_test.RELEASE_STATES` names release states; release proofs go to `release-evidence/`.
+Phase 8 `ControlSettings` has no `host` or `connect_timeout_s`; SSH uses `offload.read_connection_settings` and `offload.ssh_options`.
+Replace each `# range: 5e-324..` comment in `config/aws_target.conf` with a readable positive-number form that `conf.py` accepts, and fix the matching `config/README.md` line.
 Phase 6 owns cost totals and `CostLedger.reconcile`. Phase 4 records each SSH attempt independently of the call's final target.
 Read ledger snapshots without calling `guard` or `estimate`, which can create coordination files; decode missing evidence into named unavailable states.
 Published current-day intervals are not complete history. Reuse the existing reconciliation arithmetic.
