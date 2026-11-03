@@ -385,7 +385,7 @@ class NewAccountTests(unittest.TestCase):
               patch.object(new_account, "nixos_shell_module", return_value=module)):
             _, stdout, stderr = self.run_cli("claude", "claude5")
         self.assertEqual(stderr, "")
-        self.assertIn(f"for you: add to shellAliases in {module}, then rebuild:", stdout)
+        self.assertIn(f"done: anomaly: add to shellAliases in {module}, then rebuild:", stdout)
         self.assertIn('claude5 = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec claude5";', stdout)
         self.assertEqual(module.read_text(), '  claude1 = "existing command";\n')
 
@@ -395,7 +395,7 @@ class NewAccountTests(unittest.TestCase):
                   patch.object(new_account, "nixos_shell_module", return_value=None)):
                 _, stdout, stderr = self.run_cli("claude", "claude5")
                 self.assertEqual(stderr, "")
-                self.assertIn("for you: no nixos shell module", stdout)
+                self.assertIn("done: anomaly: no nixos shell module", stdout)
                 self.assertIn("claude5 alias", stdout)
                 self.assertIn(f"modules/{folder}/shell.nix", stdout)
 
@@ -413,8 +413,8 @@ class NewAccountTests(unittest.TestCase):
         for platform in ("linux", "darwin"):
             with self.subTest(platform=platform), patch.object(sys, "platform", platform):
                 step = new_account.alias_step(account)
-                self.assertEqual(step, new_account.Step(False,
-                    f'add to shellAliases in {self.nixos}, then rebuild:\n'
+                self.assertEqual(step, new_account.Step(True,
+                    f'anomaly: add to shellAliases in {self.nixos}, then rebuild:\n'
                     + '    codex3 = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec codex3";'))
 
     def test_codex_setup_appends_alias_on_both_platforms_only_after_success(self) -> None:
@@ -431,8 +431,8 @@ class NewAccountTests(unittest.TestCase):
                 alias.assert_called_once_with(account)
                 self.assertIn("set up ~/.codex3", steps[0].text)
                 self.assertIn("codex login", steps[1].text)
-                self.assertEqual(steps[-1], new_account.Step(False,
-                    f'add to shellAliases in {self.nixos}, then rebuild:\n'
+                self.assertEqual(steps[-1], new_account.Step(True,
+                    f'anomaly: add to shellAliases in {self.nixos}, then rebuild:\n'
                     + '    codex3 = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec codex3";'))
 
     def test_codex_signed_in_check_appends_alias_on_both_platforms_only_after_success(self) -> None:
@@ -449,7 +449,7 @@ class NewAccountTests(unittest.TestCase):
                 alias.assert_called_once_with(account)
                 self.assertIn("set up and signed in", steps[0].text)
                 self.assertIn('codex3 = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec codex3";', steps[-1].text)
-                self.assertFalse(steps[-1].done)
+                self.assertTrue(steps[-1].done)
 
 
 class ShellModuleTests(unittest.TestCase):
