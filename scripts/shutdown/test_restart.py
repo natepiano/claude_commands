@@ -2182,7 +2182,8 @@ class RestartTests(ShutdownTestCase):
               redirect_stdout(io.StringIO())):
             result = restart._herdr_launch(parts, restart.SharedHerdrTab("writing"), owner, dry_run=False)  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(result.prompt_outcome, SUBMITTED_PROMPT)
-        self.assertEqual(launch.call_args.args[2], row.name)
+        self.assertEqual(cast(herdr.NewTab, launch.call_args.args[1]).title, row.name)
+        self.assertEqual(launch.call_args.kwargs["agent"], row.name)
         self.assertEqual(present.call_args.args[3], row.name)
 
     def test_restart_keeps_saved_labels_and_reports_unreadable_sources_once(self) -> None:
