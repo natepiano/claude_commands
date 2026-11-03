@@ -19,10 +19,14 @@ from typing import TypeVar
 _warning_sink: ContextVar[Callable[[str], None] | None] = ContextVar("configuration_warning_sink", default=None)
 
 
+def _print_warning(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
 def _warning(message: str) -> None:
     sink = _warning_sink.get()
     if sink is None:
-        print(message, file=sys.stderr)
+        _print_warning(message)
     else:
         sink(message)
 
@@ -35,7 +39,7 @@ def diagnostics(*, report: bool = True) -> Generator[list[str]]:
     def collect(message: str) -> None:
         messages.append(message)
         if report:
-            print(message, file=sys.stderr)
+            _print_warning(message)
 
     token = _warning_sink.set(collect)
     try:
