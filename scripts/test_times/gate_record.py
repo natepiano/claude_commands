@@ -1,0 +1,173 @@
+"""Read module times and append gate runs to the build log."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import json
+import math
+from pathlib import Path
+import sys
+import time
+from typing import Literal, TypedDict, cast, get_args
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.buildlog import record, store
+from scripts.lib import conf
+
+
+TestStatus = Literal["pass", "fail", "error", "skip", "expected_failure", "unexpected_success"]
+_TEST_STATUSES = frozenset(cast(tuple[str, ...], get_args(TestStatus)))
+
+
+class TestTime(TypedDict):
+    test: str
+    s: float
+    status: TestStatus
+
+
+class ModuleTimes(TypedDict):
+    wall_s: float
+    cpu_s: float
+    tests_s: float
+    tests_run: int
+    failures: int
+    errors: int
+    skipped: int
+    tests: list[TestTime]
+
+
+class ModuleRun(TypedDict):
+    suite: str
+    module: str
+    attempt: int
+    wall_s: float
+    cpu_s: float
+    peak_mib: float
+    status: int
+    tests_run: int
+    failures: int
+    errors: int
+    skipped: int
+    tests_s: float
+    tests: list[TestTime]
+    restart: str
+    times_missing: str
+
+
+class SuiteRun(TypedDict):
+    suite: str
+    wall_s: float
+    status: int
+
+
+class GateRun(TypedDict):
+    started_at: str
+    ended_at: str
+    wall_s: float
+    hold_wait_s: float
+    selection: str
+    reason: str
+    status: int
+    max_jobs: int
+    peak_mib: float
+    cap_mib: float
+    checkout: str
+    branch: str
+    sha: str
+    tree: str
+    source: str
+    aborted: bool
+    dirty: bool
+    suites: list[SuiteRun]
+    modules: list[ModuleRun]
+
+
+class GateRunRecord(GateRun):
+    kind: str
+    v: int
+    id: str
+    host: str
+
+
+@dataclass(frozen=True)
+class NoModuleTimes:
+    reason: str
+
+
+def _fields(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("expected an object")
+    return cast(dict[str, object], value)
+
+
+def _seconds(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("expected seconds as a number")
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError("expected finite, nonnegative seconds")
+    return seconds
+
+
+def _count(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("expected a nonnegative integer")
+    return value
+
+
+def _test_time(value: object) -> TestTime:
+    fields = _fields(value)
+    test = fields["test"]
+    status = fields["status"]
+    if not isinstance(test, str):
+        raise ValueError("expected a test name")
+    if not isinstance(status, str) or status not in _TEST_STATUSES:
+        raise ValueError("invalid test status")
+    return {"test": test, "s": _seconds(fields["s"]), "status": cast(TestStatus, status)}
+
+
+def read_module_times(path: Path) -> ModuleTimes | NoModuleTimes:
+    """Validate the complete file before returning module times."""
+    try:
+        decoded = cast(object, json.loads(path.read_text(encoding="utf-8")))
+        fields = _fields(decoded)
+        tests = fields["tests"]
+        if not isinstance(tests, list):
+            raise ValueError("expected a list of test times")
+        return {
+            "wall_s": _seconds(fields["wall_s"]),
+            "cpu_s": _seconds(fields["cpu_s"]),
+            "tests_s": _seconds(fields["tests_s"]),
+            "tests_run": _count(fields["tests_run"]),
+            "failures": _count(fields["failures"]),
+            "errors": _count(fields["errors"]),
+            "skipped": _count(fields["skipped"]),
+            "tests": [_test_time(test) for test in cast(list[object], tests)],
+        }
+    except (OSError, UnicodeError, ValueError, KeyError, OverflowError, RecursionError) as error:
+        return NoModuleTimes(f"{path}: {str(error).replace(chr(10), ' ')}")
+
+
+def kept_tests(times: ModuleTimes, slow_test_s: float) -> list[TestTime]:
+    """Keep failures and tests that meet the time threshold."""
+    return sorted(
+        (test for test in times["tests"]
+         if test["status"] in {"fail", "error", "unexpected_success"} or test["s"] >= slow_test_s),
+        key=lambda test: test["s"], reverse=True,
+    )
+
+
+def slow_test_s() -> float:
+    return conf.read("test_times").number("SLOW_TEST_S")
+
+
+def write_gate_run(run: GateRun) -> None:
+    """Append one gate record without failing the caller."""
+    try:
+        epoch = time.time()
+        host = store.host_name()
+        entry: GateRunRecord = {"kind": "gate_run", "v": record.RECORD_VERSION,
+                                "id": record.new_id(host, epoch), "host": host, **run}
+        store.append_line(store.host_file(host, epoch), entry)
+    except Exception as error:
+        detail = str(error).replace("\n", " ")
+        print(f"gate run not written: {detail}", file=sys.stderr)
