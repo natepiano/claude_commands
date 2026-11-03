@@ -1308,3 +1308,19 @@ The Phase 26 checkpoint did not name two narrowed assertions; this phase's check
 **Files:** `scripts/lint/test_tmp_sweep.py`, `scripts/lint/test_folder_audit.py`, `scripts/production/test_mac_run.py`, `scripts/lint/test_sweep.py`.
 
 **Gotchas:** a test that copies the repo `lint.conf` must set every value its expected text depends on; the `mac_run` command stub links `curl`, so no test reaches the network.
+
+### Phase 47 — This unit's settings reads use conf.read  · status: done
+
+#### Work Order
+
+Devtools 4r removed `conf.text`, `conf.number`, `conf.whole`, `conf.words`, `conf.values` and `conf.value_origin`. The Phase 45 and 46 reads use them, so the merge type check fails.
+
+1. Merge origin/builds into this branch and resolve its conflicts. Keep the Phase 45 reads and their values.
+2. Change every removed-reader call in this unit's files to `conf.read(file)`. Call it once for each pass and use the returned `ConfigRead` (`text`, `number`, `whole`, `words`, `values`, `origin`).
+3. A helper that takes the read uses the default `UseConfiguredValue.CURRENT`, never `None`.
+4. Keep every value the same. A value change needs nate's approval.
+5. The contract is in `scripts/lib/conf.py` and `config/README.md`.
+
+**Files:** the Phase 45 and 46 readers and tests: `scripts/lint/hanas.py`, `scripts/lint/folder_audit.py`, `scripts/lint/sweep.py`, `scripts/lint/tmp_sweep.py`, `scripts/lint/scratch.py`, `scripts/hana_shot/`, `scripts/production/`, and their tests. The worker's list of remaining calls is the full set.
+
+**Acceptance:** `git grep` finds no removed-reader call in `scripts/`; the merge gate type check and the touched suites pass; the Phase 46 regression tests still pass.

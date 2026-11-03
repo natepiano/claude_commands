@@ -225,11 +225,11 @@ class GroupTests(SweepCase):
         targets = [self.target(), self.target()]
         trees = [str(target.tree) for target in targets]
         scan = sweep.Scan()
-        with mock.patch("sweep.conf.whole", wraps=conf.whole) as whole:
+        with mock.patch("sweep.conf.ConfigRead.whole", side_effect=conf.read("lint").whole) as whole:
             owners = sweep.group_roots(trees, scan)
         self.assertTrue(all(str(target.app_dep_info) in owners for target in targets))
         self.assertGreater(len(scan.groups), 2)
-        self.assertEqual(whole.call_args_list, [mock.call("lint", "sweep_dep_info_head_bytes")])
+        self.assertEqual(whole.call_args_list, [mock.call("sweep_dep_info_head_bytes")])
 
     def test_linker_temp_and_copied_up_output_belong_to_their_unit(self) -> None:
         target = self.target()
@@ -374,8 +374,8 @@ class SweepTests(SweepCase):
         confirmed: list[sweep.ConfirmedDeletion] = []
         remove = sweep.remove
 
-        def measured(groups: list[sweep.Group]) -> sweep.ConfirmedDeletion:
-            account = remove(groups)
+        def measured(groups: list[sweep.Group], *, lint_settings: conf.ConfigRead) -> sweep.ConfirmedDeletion:
+            account = remove(groups, lint_settings=lint_settings)
             if any(group.kind != "orphan" for group in groups):
                 confirmed.append(account)
             return account
@@ -1100,13 +1100,13 @@ class FloorTests(SweepCase):
         original_remove = sweep.remove
         checked: list[str] = []
 
-        def inspect_intent(groups: Sequence[sweep.FloorTake]) -> sweep.ConfirmedDeletion:
+        def inspect_intent(groups: Sequence[sweep.FloorTake], *, lint_settings: conf.ConfigRead) -> sweep.ConfirmedDeletion:
             if any(isinstance(group, sweep.Group) and group.build_tree == str(nested_tree) for group in groups):
                 intent = sweep.read_trim_intent(sweep.trim_intent_path(str(nested_tree.parent)))
                 self.assertEqual(intent.target, str(nested_tree.parent))
                 self.assertTrue(intent.pending)
                 checked.append(intent.target)
-            return original_remove(groups)
+            return original_remove(groups, lint_settings=lint_settings)
 
         with mock.patch.object(sweep, "remove", side_effect=inspect_intent):
             self.assertEqual(self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB])[0], 0)
@@ -1339,8 +1339,8 @@ class FloorTests(SweepCase):
                 base = self.base()
                 root, payload = self.residue_target(base, "docs", time.time() - DAY)
                 original_scan = sweep.scan_floor_roots
-                def change_after_scan(roots: list[str], trees: dict[str, list[str]]) -> sweep.Scan:
-                    result = original_scan(roots, trees)
+                def change_after_scan(roots: list[str], trees: dict[str, list[str]], *, lint_settings: conf.ConfigRead) -> sweep.Scan:
+                    result = original_scan(roots, trees, lint_settings=lint_settings)
                     if change == "build hold":
                         holds.return_value = {str(root): sweep.BuildHoldTarget("builder")}
                     elif change == "process":
@@ -1365,8 +1365,8 @@ class FloorTests(SweepCase):
         lock = write(tree / sweep.LOCK_NAMES[0], 0)
         original_scan = sweep.scan_floor_roots
         with lock.open("r+") as handle:
-            def lock_after_scan(roots: list[str], trees: dict[str, list[str]]) -> sweep.Scan:
-                result = original_scan(roots, trees)
+            def lock_after_scan(roots: list[str], trees: dict[str, list[str]], *, lint_settings: conf.ConfigRead) -> sweep.Scan:
+                result = original_scan(roots, trees, lint_settings=lint_settings)
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return result
             with mock.patch.object(sweep, "scan_floor_roots", side_effect=lock_after_scan):
@@ -1587,7 +1587,7 @@ class FloorTests(SweepCase):
         if caller == "floor":
             return self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB])[0]
         with mock.patch.dict(os.environ, {sweep.BUDGET_ENV: "0"}), redirect_stdout(io.StringIO()):
-            return sweep.sweep_workspace(str(target), str(base / "lint.conf"), False, recent_minutes=60)
+            return sweep.sweep_workspace(str(target), conf.read("lint"), False, recent_minutes=60)
 
     def running_nextest(self, base: Path, build_dir: str,
                         process_uses: Callable[[Sequence[str], str], dict[str, sweep.TargetUse]],
@@ -1634,10 +1634,10 @@ class FloorTests(SweepCase):
                         append(folder, bytes_freed, extent, cause, at)
 
                     def interrupted_delete(group: sweep.Group, scan: sweep.Scan,
-                                           remaining: dict[sweep.InodeKey, int], dry_run: bool
-                                           ) -> sweep.ReclamationEstimate | sweep.ConfirmedDeletion:
+                                           remaining: dict[sweep.InodeKey, int], dry_run: bool, *,
+                                           lint_settings: conf.ConfigRead) -> sweep.ReclamationEstimate | sweep.ConfirmedDeletion:
                         nonlocal stopped
-                        _ = reclaim(group, scan, remaining, dry_run)
+                        _ = reclaim(group, scan, remaining, dry_run, lint_settings=lint_settings)
                         self.assertFalse(output.exists())
                         stopped = True
                         raise KeyboardInterrupt("injected stop after deletion")
@@ -1878,9 +1878,9 @@ with open(sys.argv[1], 'a') as lock:
         # Start the race only inside the deletion, after the scan and validation.
         remove = sweep.remove
 
-        def raced_remove(groups: list[sweep.Group]) -> sweep.ConfirmedDeletion:
+        def raced_remove(groups: list[sweep.Group], *, lint_settings: conf.ConfigRead) -> sweep.ConfirmedDeletion:
             with mock.patch.object(os, "lstat", side_effect=swap_before_open):
-                return remove(groups)
+                return remove(groups, lint_settings=lint_settings)
 
         with (mock.patch.object(sweep, "remove", side_effect=raced_remove),
               redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
@@ -2025,7 +2025,7 @@ with open(sys.argv[1], 'a') as lock:
         attempts: list[bool] = []
 
         def late_holder(group: sweep.Group, scan: sweep.Scan, remaining: dict[sweep.InodeKey, int],
-                        dry_run: bool) -> sweep.ReclamationEstimate | sweep.ConfirmedDeletion:
+                        dry_run: bool, *, lint_settings: conf.ConfigRead) -> sweep.ReclamationEstimate | sweep.ConfirmedDeletion:
             with mark.open("a") as holder:
                 try:
                     fcntl.flock(holder, fcntl.LOCK_SH | fcntl.LOCK_NB)
@@ -2033,7 +2033,7 @@ with open(sys.argv[1], 'a') as lock:
                     attempts.append(False)
                 else:
                     attempts.append(True)
-                return reclaim(group, scan, remaining, dry_run)
+                return reclaim(group, scan, remaining, dry_run, lint_settings=lint_settings)
 
         self.assertFalse(mark.exists())
         with mock.patch.object(sweep, "reclaim", late_holder):
@@ -2065,8 +2065,8 @@ with open(sys.argv[1], 'a') as lock:
         mark = tree.parent.parent / ".claude-busy"
         scan = sweep.scan_floor_roots
         with mark.open("a") as holder:
-            def start_after_scan(roots: list[str], trees: dict[str, list[str]]) -> sweep.Scan:
-                result = scan(roots, trees)
+            def start_after_scan(roots: list[str], trees: dict[str, list[str]], *, lint_settings: conf.ConfigRead) -> sweep.Scan:
+                result = scan(roots, trees, lint_settings=lint_settings)
                 fcntl.flock(holder, fcntl.LOCK_SH)
                 return result
             with (mock.patch.object(sweep, "scan_floor_roots", side_effect=start_after_scan),
@@ -2079,8 +2079,8 @@ with open(sys.argv[1], 'a') as lock:
         base = self.base()
         _, output = cargo_target(base, "old", APP, time.time() - DAY)
         original_scan = sweep.scan_floor_roots
-        def link_after_scan(roots: list[str], trees: dict[str, list[str]]) -> sweep.Scan:
-            scan = original_scan(roots, trees)
+        def link_after_scan(roots: list[str], trees: dict[str, list[str]], *, lint_settings: conf.ConfigRead) -> sweep.Scan:
+            scan = original_scan(roots, trees, lint_settings=lint_settings)
             os.link(output, base / "outside-target")
             return scan
         with (mock.patch.object(sweep, "scan_floor_roots", side_effect=link_after_scan),
@@ -2139,9 +2139,9 @@ with open(sys.argv[1], 'a') as lock:
         clock = [now]
         original_remove, original_release = sweep.remove, sweep.release
         releases: list[float] = []
-        def delete_at_known_time(groups: list[sweep.Group]) -> sweep.ConfirmedDeletion:
+        def delete_at_known_time(groups: list[sweep.Group], *, lint_settings: conf.ConfigRead) -> sweep.ConfirmedDeletion:
             clock[0] = now + (10 if groups[0].build_tree == str(first_tree) else 30)
-            return original_remove(groups)
+            return original_remove(groups, lint_settings=lint_settings)
         def rebuild_after_release(held: list[int]) -> None:
             try:
                 if not releases:
@@ -2200,9 +2200,9 @@ with open(sys.argv[1], 'a') as lock:
             original_release(held)
             for fd in held:
                 active.remove(fd)
-        def scan_unlocked(roots: list[str], trees: list[str]) -> sweep.Scan:
+        def scan_unlocked(roots: list[str], trees: list[str], *, lint_settings: conf.ConfigRead) -> sweep.Scan:
             self.assertEqual(active, [], "Candidate scan must hold no cargo locks")
-            return original_scan(roots, trees)
+            return original_scan(roots, trees, lint_settings=lint_settings)
         def size_unlocked(path: str, seen: set[sweep.InodeKey] | None = None) -> int:
             self.assertEqual(active, [], "Size walks must hold no cargo locks")
             return original_sizes(path, seen)
@@ -2615,7 +2615,7 @@ with open(sys.argv[1], 'a') as lock:
             self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 9 * GIB])[0], 0)
         self.assertEqual(send.call_count, 1)
         self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
-        threshold = conf.whole("lint", "sweep_large_removal_bytes") / GIB
+        threshold = conf.read("lint").whole("sweep_large_removal_bytes") / GIB
         self.assertIn(f"removed more than {threshold:g} GiB", cast(str, send.call_args.args[0]))
 
     def test_failed_removal_stays_in_record_and_send_failure_keeps_status(self) -> None:
@@ -2758,7 +2758,7 @@ raise SystemExit(int(os.environ[variable]))
         long_paths = [f"/tmp/claude-1000/{'x' * 60}/{index}: frees 1.0 GiB." for index in range(6)]
         push = sweep.disk_floor_push(0, 0, 300 * GIB, long_paths)
         listed = push.values["paths"].split("\n\n")
-        self.assertLess(len(push.message), conf.whole("lint", "sweep_push_text_limit"))
+        self.assertLess(len(push.message), conf.read("lint").whole("sweep_push_text_limit"))
         self.assertTrue(listed)
         self.assertEqual(listed, long_paths[:len(listed)])
         self.assertEqual(sweep.disk_floor_push(0, 0, 300 * GIB, []).values["paths"], sweep.NO_PAGE_PATHS)
@@ -2841,7 +2841,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         start = time.time()
         clock = [start]
 
-        def deliver(_message: str, _channels: object) -> bool:
+        def deliver(_message: str, _channels: object, **_settings: object) -> bool:
             clock[0] = start + 80
             return True
 
@@ -2926,7 +2926,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
             ],
         }))
         lines = sweep.disk_measurement_lines(sweep.read_disk_measurement(), 0, 0, time.time(),
-                                             False, int(conf.words("lint", "sweep_message_path_widths")[0]))
+                                             False, int(conf.read("lint").words("sweep_message_path_widths")[0]))
         text = "\n".join(lines)
         self.assertIn("No earlier buildlog-disk measurement", text)
         self.assertIn("/tmp/four", text)
@@ -3064,8 +3064,8 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         _ = write(home / ".cache" / "sccache" / "0" / "1" / "01d2c3b4a5968778")
         _ = write(home / ".cache" / "sccache" / "debug" / ".fingerprint" / "x" / "y")
         self.enterContext(mock.patch.dict(os.environ, {"HOME": str(home)}))
-        self.assertIn("~/.cache", conf.words("lint", "sweep_floor_roots"))
-        found = sweep.target_dirs([root for root in conf.words("lint", "sweep_floor_roots") if root.startswith("~/.cache")])
+        self.assertIn("~/.cache", conf.read("lint").words("sweep_floor_roots"))
+        found = sweep.target_dirs([root for root in conf.read("lint").words("sweep_floor_roots") if root.startswith("~/.cache")])
         self.assertEqual(found, [str(root)])
 
     def test_exhausted_cache_tells_the_holding_session_and_pages_only_when_none_was_told(self) -> None:
@@ -3290,7 +3290,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         sending, finish_send, competing_started = Event(), Event(), Event()
         messages: list[str] = []
 
-        def send(message: str, channels: sweep.FloorAlertChannels) -> bool:
+        def send(message: str, channels: sweep.FloorAlertChannels, **_settings: object) -> bool:
             self.assertEqual(channels, sweep.FloorAlertChannels.NATEDEV)
             messages.append(message)
             if len(messages) == 1:
@@ -3700,7 +3700,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         roots = [str(base / name / "target") for name in ("first", "second")]
         with mock.patch.object(sweep, "cargo_roots", return_value=roots), \
              mock.patch.dict(os.environ, {sweep.BUDGET_ENV: "1024"}), redirect_stdout(io.StringIO()):
-            self.assertEqual(sweep.sweep_workspace(None, "/nonexistent/lint.conf", False, recent_minutes=60), 0)
+            self.assertEqual(sweep.sweep_workspace(None, conf.read("lint"), False, recent_minutes=60), 0)
             for root in roots:
                 self.assertTrue((Path(root) / sweep.USE_STAMP).exists())
             for root in roots:
@@ -3708,7 +3708,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
             lock = os.open(first_tree / sweep.LOCK_NAMES[0], os.O_RDONLY | os.O_CREAT)
             self.addCleanup(os.close, lock)
             fcntl.flock(lock, fcntl.LOCK_EX)
-            self.assertEqual(sweep.sweep_workspace(None, "/nonexistent/lint.conf", False, recent_minutes=60), 0)
+            self.assertEqual(sweep.sweep_workspace(None, conf.read("lint"), False, recent_minutes=60), 0)
         for root in roots:
             self.assertGreater((Path(root) / sweep.USE_STAMP).stat().st_mtime, 1)
 
@@ -3719,7 +3719,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         roots = [str(base / name / "target") for name in ("first", "second")]
         with mock.patch.object(sweep, "cargo_roots", return_value=roots), \
              mock.patch.dict(os.environ, {sweep.BUDGET_ENV: "1024"}), redirect_stdout(io.StringIO()):
-            self.assertEqual(sweep.sweep_workspace(None, "/nonexistent/lint.conf", True, recent_minutes=60), 0)
+            self.assertEqual(sweep.sweep_workspace(None, conf.read("lint"), True, recent_minutes=60), 0)
         for root in roots:
             self.assertFalse((Path(root) / sweep.USE_STAMP).exists())
 
@@ -3728,7 +3728,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         _, _ = cargo_target(base, "repo", APP, time.time() - DAY)
         root = base / "repo" / "target"
         with mock.patch.dict(os.environ, {sweep.BUDGET_ENV: "1024"}), redirect_stdout(io.StringIO()):
-            self.assertEqual(sweep.sweep_workspace(str(root), "/nonexistent/lint.conf", True, recent_minutes=60), 0)
+            self.assertEqual(sweep.sweep_workspace(str(root), conf.read("lint"), True, recent_minutes=60), 0)
         self.assertFalse((root / sweep.USE_STAMP).exists())
 
     def test_a_target_a_build_holds_is_left_alone(self) -> None:
@@ -3796,10 +3796,10 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
             _ = write(root / "doc" / "search.index" / "index")
         original = sweep.record_target_deletes
 
-        def record(paths: Sequence[str], *, known_targets: Sequence[str] = ()) -> None:
+        def record(paths: Sequence[str], *, known_targets: Sequence[str] = (), lint_settings: conf.ConfigRead) -> None:
             if str(roots[0]) in paths or str(roots[0]) in known_targets:
                 raise OSError("private state write failed")
-            original(paths, known_targets=known_targets)
+            original(paths, known_targets=known_targets, lint_settings=lint_settings)
 
         output = io.StringIO()
         with mock.patch.object(sweep, "record_target_deletes", side_effect=record), redirect_stdout(output), redirect_stderr(output):
@@ -3872,7 +3872,8 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         self.assertEqual({path.relative_to(tree.parent): path.read_bytes()
                           for path in tree.parent.rglob("*") if path.is_file()}, before)
         locks.assert_called_once_with([str(other_tree)])
-        scan.assert_called_once_with([str(other_tree.parent)], [str(other_tree)])
+        scan.assert_called_once_with([str(other_tree.parent)], [str(other_tree)],
+                                     lint_settings=conf.read("lint"))
         self.assertNotIn(mock.call(str(tree.parent)), sizes.call_args_list)
         self.assertIn(f"build-speed holds natedev builds; {tree.parent} left alone", output)
         self.assertIn("1 left alone while a build or test run uses them", output)
@@ -4021,10 +4022,11 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
                     mock.patch.object(sweep.tmp_sweep, "run_if_due", return_value=0) as scratch,
                     mock.patch.object(sweep, "hold_floor", return_value=0) as floor,
                 ):
+                    lint_settings = conf.read("lint")
                     self.assertEqual(sweep.main([sweep.FLOOR_ONLY_FLAG]), 0)
                 workspace.assert_not_called()
-                scratch.assert_called_once_with(False)
-                floor.assert_called_once_with(7 * GIB, False)
+                scratch.assert_called_once_with(False, lint_settings=lint_settings)
+                floor.assert_called_once_with(7 * GIB, False, lint_settings=lint_settings)
 
     def test_malformed_floor_is_an_error(self) -> None:
         config = self.base() / "lint.conf"
@@ -4095,7 +4097,7 @@ class LockHolderTests(unittest.TestCase):
             self.assertEqual(sweep.lock_holder(str(lock), "locks"), 4242)
         with mock.patch.object(sweep, "open", create=True, side_effect=never_held) as opened:
             self.assertIsNone(sweep.lock_holder(str(lock), "locks"))
-        self.assertEqual(opened.call_count, conf.whole("lint", "sweep_proc_locks_reads"))
+        self.assertEqual(opened.call_count, conf.read("lint").whole("sweep_proc_locks_reads"))
 
     @unittest.skipUnless(os.path.isfile(sweep.PROC_LOCKS), "the lock holder is read from /proc/locks")
     def test_a_live_flock_names_this_process(self) -> None:
@@ -4129,6 +4131,34 @@ class BudgetTests(unittest.TestCase):
         path = Path(self.enterContext(tempfile.TemporaryDirectory())) / "lint.conf"
         _ = path.write_text(CONFIG)
         return str(path)
+
+    def test_environment_budget_does_not_need_a_config_file(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        missing = root / "missing.conf"
+        self.assertEqual(
+            sweep.budget_bytes({sweep.BUDGET_ENV: "1024"}, conf.read(missing), None),
+            (1024 * GIB, f"{sweep.BUDGET_ENV} in the environment"),
+        )
+
+    def test_workspace_recovers_doc_budget_separately_from_a_private_budget_file(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        budget_path = root / "lint.conf"
+        _ = budget_path.write_text("# range: 0..\nsweep_budget_gib=17\n")
+        target = root / "target"
+        target.mkdir()
+        repository = Path(__file__).resolve().parents[2] / "config" / "lint.conf"
+        doc_budget = int(conf.read(repository).number("sweep_doc_index_mib") * sweep.MIB)
+        environment = {key: value for key, value in os.environ.items() if key != "CONF_DIR"}
+        environment.update({sweep.BUDGET_ENV: "", sweep.DOC_INDEX_ENV: ""})
+        with (mock.patch.dict(os.environ, environment, clear=True),
+              mock.patch.object(conf, "directory", return_value=root),
+              mock.patch.object(sweep, "process_uses", return_value={}),
+              mock.patch.object(sweep, "_build_trees", return_value=[]),
+              mock.patch.object(sweep, "prune_doc_index", return_value=0) as prune,
+              mock.patch.object(sweep, "sweep", return_value=0) as workspace):
+            self.assertEqual(sweep.sweep_workspace(str(target), conf.read(budget_path), True, 60), 0)
+        self.assertEqual(prune.call_args.args[1], doc_budget)
+        self.assertEqual(workspace.call_args.args[2], 17 * GIB)
 
     def test_sweep_recovers_missing_live_recent_minutes_from_the_repository(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))

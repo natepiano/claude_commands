@@ -9,7 +9,7 @@ from scripts.lib import conf
 
 from .client import Answer, ChoiceAnswer, ScoreAnswer, TypeSafeError
 from . import questions
-from .selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 from .questions import GOAL_LABELS, URGENCY_EVIDENCE
 from .questions import MinimumGap as MinimumGap, ReportOnly as ReportOnly, Supported as Supported, ThresholdOutcome as ThresholdOutcome, Unsupported as Unsupported
 

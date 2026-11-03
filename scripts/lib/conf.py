@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from enum import Enum
 import math
 import os
 from pathlib import Path
@@ -52,6 +53,12 @@ class _MissingKey(ValueError):
 class _UnreadableFile:
     reason: str
     missing: bool
+
+
+class UseConfiguredValue(Enum):
+    """Read current configuration when the call starts."""
+
+    CURRENT = "current configuration"
 
 
 @dataclass(frozen=True)

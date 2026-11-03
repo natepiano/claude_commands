@@ -55,7 +55,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff, staff_sources, unit_config
 from scripts.shutdown.remote import local_machine
 from scripts.lib import process_group, conf
-from scripts.issue_score.selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 from scripts.agents import worker_lifecycle
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))

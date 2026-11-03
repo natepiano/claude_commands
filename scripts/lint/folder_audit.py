@@ -65,7 +65,9 @@ from tmp_sweep import ProcessUsesUnavailable as ProcessUsesUnavailable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import scratch  # noqa: E402
-import conf  # noqa: E402
+from scripts.lib import conf  # noqa: E402
+from scripts.lib.conf import UseConfiguredValue
+
 from scripts.lib import copy_record  # noqa: E402
 
 RUST_ROOTS_FILE = Path(__file__).resolve().parents[2] / "config" / "rust_roots.txt"
@@ -95,9 +97,9 @@ TARGET_REMOVED = "removed target; kept unsaved source"
 WOULD_REMOVE_TARGET = "would remove target; keep unsaved source"
 
 
-def listed() -> str:
+def listed(*, lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> str:
     """Describe the configured age required for ordinary folder removal."""
-    days = conf.whole("lint", "folder_remove_after_seconds") / 86400
+    days = tmp_sweep.wide_idle_seconds(lint_settings=lint_settings) / 86400
     return f"idle less than {days:g} days"
 
 
@@ -109,20 +111,26 @@ class ClonePolicy:
 
 def clone_policy() -> ClonePolicy:
     """Read clone age and the Mac floor through the shared reader."""
-    return ClonePolicy(conf.number("hanas", "clone_max_hours") * 3600,
-                       conf.number("mac_test", "free_floor_gib") * 1024**3)
+    hanas_settings = conf.read("hanas")
+    mac_test_settings = conf.read("mac_test")
+    return ClonePolicy(hanas_settings.number("clone_max_hours") * 3600,
+                       mac_test_settings.number("free_floor_gib") * 1024**3)
 
 
-def is_clone(path: Path) -> bool:
+def is_clone(path: Path, *, scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> bool:
     """A registered test clone (also when partial), or a loose independent Git clone."""
-    record = scratch.task_of(path)
+    record = scratch.task_of(path, scratch_settings=scratch_settings)
     if isinstance(record, copy_record.Registered) and record.fields.get("test_hana_clone") is True:
         return True
     return (path / ".git").is_dir() and not (path / ".git").is_symlink()
 
 
-def test_clones(roots: list[Path]) -> list[Path]:
+def test_clones(roots: list[Path], *,
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> list[Path]:
     """Only registered test clones under protected scratch roots belong to this audit."""
+    if isinstance(scratch_settings, UseConfiguredValue):
+        scratch_settings = conf.read("scratch")
     found: list[Path] = []
     for root in roots:
         try:
@@ -132,7 +140,7 @@ def test_clones(roots: list[Path]) -> list[Path]:
         for entry in entries:
             if entry.is_symlink() or not entry.is_dir():
                 continue
-            record = scratch.task_of(entry)
+            record = scratch.task_of(entry, scratch_settings=scratch_settings)
             if isinstance(record, copy_record.Registered) and record.fields.get("test_hana_clone") is True:
                 found.append(entry)
     return found
@@ -142,9 +150,13 @@ def free_bytes(path: Path) -> int:
     return shutil.disk_usage(path).free
 
 
-def remove_clone_targets(path: Path, removing: bool) -> str:
+def remove_clone_targets(path: Path, removing: bool, *,
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> str:
     """Keep unsaved source. Delete only build output from its independent clones."""
-    targets = [repo / "target" for repo in scratch.repos(path)
+    if isinstance(scratch_settings, UseConfiguredValue):
+        scratch_settings = conf.read("scratch")
+    targets = [repo / "target" for repo in scratch.repos(path, scratch_settings=scratch_settings)
                if (repo / "target").is_dir() and not (repo / "target").is_symlink()]
     if not targets:
         return tmp_sweep.GitWork.UNSAVED.value
@@ -182,9 +194,11 @@ def kept_in_temp(entry: Path) -> bool:
     return tmp_sweep.holds_no_file(str(entry)) or tmp_sweep.VERIFY_TEMP_NAME.fullmatch(name) is not None
 
 
-def candidates(rust: Path, temps: list[Path], expected: frozenset[str] | None) -> list[Path]:
+def candidates(rust: Path, temps: list[Path], expected: frozenset[str] | None, *,
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> list[Path]:
     """Every loose folder this user owns, before the age rule."""
-    visible_root = scratch.visible_root()
+    visible_root = scratch.visible_root(scratch_settings=scratch_settings)
 
     def kept_in_rust(entry: Path) -> bool:
         return expected is None or entry == visible_root or entry.name in expected or entry.name in KEPT_NAMES
@@ -216,9 +230,16 @@ class FolderScanLimits:
     skipped: tuple[str, ...]
 
 
-def folder_scan_limits() -> FolderScanLimits:
-    return FolderScanLimits(conf.whole("lint", "folder_idle_depth"),
-                            conf.whole("lint", "folder_idle_entry_limit"), conf.words("scratch", "repo_skip"))
+def folder_scan_limits(*,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> FolderScanLimits:
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
+    if isinstance(scratch_settings, UseConfiguredValue):
+        scratch_settings = conf.read("scratch")
+    return FolderScanLimits(lint_settings.whole("folder_idle_depth"),
+                            lint_settings.whole("folder_idle_entry_limit"), scratch_settings.words("repo_skip"))
 
 
 def _walk(path: Path, limits: FolderScanLimits) -> Iterator[os.DirEntry[str]]:
@@ -235,12 +256,21 @@ def _walk(path: Path, limits: FolderScanLimits) -> Iterator[os.DirEntry[str]]:
                 continue
 
 
-def last_change(path: Path) -> float | str:
+def last_change(path: Path, *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> float | str:
     """The newest mtime in path (see the module text), or TOO_LARGE."""
-    return _last_change(path, folder_scan_limits())
+    if isinstance(scratch_settings, UseConfiguredValue):
+        scratch_settings = conf.read("scratch")
+    return _last_change(path, folder_scan_limits(lint_settings=lint_settings, scratch_settings=scratch_settings), scratch_settings=scratch_settings)
 
 
-def _last_change(path: Path, limits: FolderScanLimits) -> float | str:
+def _last_change(path: Path, limits: FolderScanLimits, *,
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> float | str:
+    if isinstance(scratch_settings, UseConfiguredValue):
+        scratch_settings = conf.read("scratch")
     newest = _mtime(path)
     for count, entry in enumerate(_walk(path, limits)):
         if count >= limits.entry_limit:
@@ -249,7 +279,7 @@ def _last_change(path: Path, limits: FolderScanLimits) -> float | str:
             newest = max(newest, entry.stat(follow_symlinks=False).st_mtime)
         except OSError:
             continue
-    for repo in scratch.repos(path):
+    for repo in scratch.repos(path, scratch_settings=scratch_settings):
         git = scratch.git_directory(repo)
         if isinstance(git, scratch.GitDirectory):
             newest = max([newest, *(_mtime(git.path / name) for name in GIT_TIME_FILES)])
@@ -266,7 +296,7 @@ def bound_sockets(table: str = UNIX_SOCKETS) -> frozenset[str] | None:
 
 
 def live_socket(path: Path, bound: frozenset[str] | None) -> bool:
-    """Whether a socket in path is live; every socket counts as live when `bound` is None."""
+    """Check whether a socket is live. All sockets count when the table is unavailable."""
     return _live_socket(path, bound, folder_scan_limits())
 
 
@@ -299,10 +329,14 @@ def process_uses(paths: list[Path], proc: str = tmp_sweep.PROC_DIR) -> tmp_sweep
     return found
 
 
-def worktree_sources(path: Path) -> list[Path]:
+def worktree_sources(path: Path, *,
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> list[Path]:
     """The source repo of each linked worktree in path, to prune once path is gone."""
+    if isinstance(scratch_settings, UseConfiguredValue):
+        scratch_settings = conf.read("scratch")
     sources: list[Path] = []
-    for repo in scratch.repos(path):
+    for repo in scratch.repos(path, scratch_settings=scratch_settings):
         if (repo / ".git").is_file():
             result = subprocess.run(["git", "-C", str(repo), "rev-parse", "--path-format=absolute",
                                      "--git-common-dir"], capture_output=True, text=True, check=False)
@@ -311,12 +345,14 @@ def worktree_sources(path: Path) -> list[Path]:
     return sources
 
 
-def state_dir() -> Path:
-    return Path(os.path.expanduser(os.environ.get(STATE_ENV) or conf.text("lint", "folder_state_dir")))
+def state_dir(*, lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Path:
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
+    return Path(os.path.expanduser(os.environ.get(STATE_ENV) or lint_settings.text("folder_state_dir")))
 
 
-def armed() -> bool:
-    return (state_dir() / ARMED_NAME).is_file()
+def armed(*, lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> bool:
+    return (state_dir(lint_settings=lint_settings) / ARMED_NAME).is_file()
 
 
 @dataclass(frozen=True)
@@ -348,8 +384,8 @@ def finish_pending_prune(record: Path, pending: PendingWorktreePrune) -> None:
     record.unlink()
 
 
-def resume_pending_prunes() -> None:
-    directory = state_dir()
+def resume_pending_prunes(*, lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> None:
+    directory = state_dir(lint_settings=lint_settings)
     if not directory.exists():
         return
     with (directory / "prune.lock").open("a+") as lock:
@@ -364,15 +400,22 @@ def resume_pending_prunes() -> None:
                 print(f"folder audit: pending prune {record}: {error}", file=sys.stderr)
 
 
-def remove(path: Path, changed: float, now: float) -> str:
+def remove(path: Path, changed: float, now: float, *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> str:
     """Remove path and prune its worktrees; REMOVED, or why it stays."""
-    directory = state_dir()
+    if isinstance(scratch_settings, UseConfiguredValue):
+        scratch_settings = conf.read("scratch")
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
+    directory = state_dir(lint_settings=lint_settings)
     directory.mkdir(parents=True, exist_ok=True)
     record = directory / (hashlib.sha256(os.fsencode(path)).hexdigest() + ".prune")
     with (directory / "prune.lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            sources = worktree_sources(path)
+            sources = worktree_sources(path, scratch_settings=scratch_settings)
             if record.exists():
                 previous = read_pending_prune(record)
                 if previous.removed_path != path:
@@ -385,13 +428,13 @@ def remove(path: Path, changed: float, now: float) -> str:
                     os.replace(temporary, record)
                 finally:
                     temporary.unlink(missing_ok=True)
-            scratch.remove_marked(path, lambda folder: tmp_sweep.delete_tree(str(folder)))
+            scratch.remove_marked(path, lambda folder: tmp_sweep.delete_tree(str(folder)), scratch_settings=scratch_settings)
             if sources:
                 finish_pending_prune(record, PendingWorktreePrune(path, sources))
         except (OSError, ValueError, scratch.ScratchError, subprocess.SubprocessError) as error:
             return f"removal failed: {error}"
 
-    log = state_dir() / REMOVED_LOG
+    log = state_dir(lint_settings=lint_settings) / REMOVED_LOG
     try:
         log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("a", encoding="utf-8") as handle:
@@ -403,23 +446,30 @@ def remove(path: Path, changed: float, now: float) -> str:
 
 def judge(found: list[tuple[Path, float]], now: float, removing: bool, proc: str = tmp_sweep.PROC_DIR,
           sockets: str = UNIX_SOCKETS, *, mac: bool | None = None,
-          free_space: Callable[[Path], int] | None = None) -> dict[Path, str]:
+          free_space: Callable[[Path], int] | None = None,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> dict[Path, str]:
     """Apply the same keep checks to aged folders and clones selected by age or Mac floor."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
+    if isinstance(scratch_settings, UseConfiguredValue):
+        scratch_settings = conf.read("scratch")
     policy = clone_policy()
     on_mac = sys.platform == "darwin" if mac is None else mac
     space = free_bytes if free_space is None else free_space
-    clones = {path for path, _ in found if is_clone(path)}
-    pending = {path for path, _ in found if isinstance(scratch.pending_removal(path), copy_record.Registered)}
-    remove_after = conf.whole("lint", "folder_remove_after_seconds")
-    limits = folder_scan_limits()
+    clones = {path for path, _ in found if is_clone(path, scratch_settings=scratch_settings)}
+    pending = {path for path, _ in found if isinstance(scratch.pending_removal(path, scratch_settings=scratch_settings), copy_record.Registered)}
+    remove_after = tmp_sweep.wide_idle_seconds(lint_settings=lint_settings)
+    limits = folder_scan_limits(lint_settings=lint_settings, scratch_settings=scratch_settings)
     due = [path for path, changed in found
            if now - changed >= (policy.max_idle_seconds if path in clones else remove_after)
            or on_mac and path in clones or path in pending]
-    listed_outcome = listed()
+    listed_outcome = listed(lint_settings=lint_settings)
     outcomes = {path: listed_outcome for path, _ in found}
     if not due:
         return outcomes
-    holds = scratch.holds()
+    holds = scratch.holds(scratch_settings=scratch_settings)
     uses = process_uses(due, proc)
     used_entries = (tmp_sweep.entry_uses(uses.paths, sorted({str(path.parent) for path in due}))
                     if isinstance(uses, tmp_sweep.ProcessUsesKnown) else {})
@@ -451,13 +501,13 @@ def judge(found: list[tuple[Path, float]], now: float, removing: bool, proc: str
                 continue
             # This certificate was published only after the original Git check.
             # A partial deletion can no longer pass that check, but all live-use guards still apply.
-            resuming = isinstance(scratch.pending_removal(path), copy_record.Registered)
+            resuming = isinstance(scratch.pending_removal(path, scratch_settings=scratch_settings), copy_record.Registered)
             git = tmp_sweep.GitWork.SAVED if resuming else tmp_sweep.git_work(path)
             if git is not tmp_sweep.GitWork.SAVED:
-                outcomes[path] = (remove_clone_targets(path, removing)
+                outcomes[path] = (remove_clone_targets(path, removing, scratch_settings=scratch_settings)
                                   if below_floor and git is tmp_sweep.GitWork.UNSAVED else git.value)
             else:
-                outcomes[path] = remove(path, changed[path], now) if removing else WOULD_REMOVE
+                outcomes[path] = remove(path, changed[path], now, lint_settings=lint_settings, scratch_settings=scratch_settings) if removing else WOULD_REMOVE
 
     return outcomes
 
@@ -468,11 +518,15 @@ def transcripts() -> list[Path]:
     return [path for folder in folders for path in folder.glob("*/*.jsonl")]
 
 
-def makers(paths: list[Path], files: list[Path]) -> dict[Path, str]:
+def makers(paths: list[Path], files: list[Path], *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> dict[Path, str]:
     """The earliest-started session whose own commands name each path, since a folder's maker named it
     before any later session that only talked about it; a path no command names is left out.
     One ripgrep pass reads every transcript: a Python scan of 22 GB took 4 h 24 min (2026-10-26). A
     name must end at a path boundary, so ~/rust/hana is not named by ~/rust/hana_catalyst."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     if not paths or not files:
         return {}
     names = {str(path) for path in paths}
@@ -481,9 +535,9 @@ def makers(paths: list[Path], files: list[Path]) -> dict[Path, str]:
     in_command = re.compile(f"(?:{alternatives})(?![A-Za-z0-9_.-])")
     earliest: dict[str, tuple[float, str]] = {}
     started: dict[str, float] = {}
-    files_per_call = conf.whole("lint", "folder_rg_files_per_call")
-    start_lines = conf.whole("lint", "folder_start_lines")
-    start_bytes = conf.whole("lint", "folder_start_bytes")
+    files_per_call = lint_settings.whole("folder_rg_files_per_call")
+    start_lines = lint_settings.whole("folder_start_lines")
+    start_bytes = lint_settings.whole("folder_start_bytes")
     for start in range(0, len(files), files_per_call):
         chunk = [str(file) for file in files[start:start + files_per_call]]
         result = subprocess.run(["rg", "--only-matching", "--with-filename", "--null", "--no-line-number",
@@ -522,38 +576,47 @@ def _mtime(path: Path) -> float:
 def audit(rust: Path, temps: list[Path], expected: frozenset[str] | None, now: float,
           files: list[Path] | None = None, removing: bool = False, proc: str = tmp_sweep.PROC_DIR,
           sockets: str = UNIX_SOCKETS, *, clone_roots: list[Path] | None = None,
-          mac: bool | None = None, free_space: Callable[[Path], int] | None = None) -> list[Loose]:
+          mac: bool | None = None, free_space: Callable[[Path], int] | None = None,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> list[Loose]:
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
+    if isinstance(scratch_settings, UseConfiguredValue):
+        scratch_settings = conf.read("scratch")
     if removing:
-        resume_pending_prunes()
+        resume_pending_prunes(lint_settings=lint_settings)
     changes: dict[Path, float | str] = {}
-    limits = folder_scan_limits()
-    listed_outcome = listed()
-    minimum_folder_age = conf.whole("lint", "folder_min_age_seconds")
-    discovered = candidates(rust, temps, expected) + test_clones([copy_record.root()] if clone_roots is None else clone_roots)
+    limits = folder_scan_limits(lint_settings=lint_settings, scratch_settings=scratch_settings)
+    listed_outcome = listed(lint_settings=lint_settings)
+    minimum_folder_age = lint_settings.whole("folder_min_age_seconds")
+    discovered = candidates(rust, temps, expected, scratch_settings=scratch_settings) + test_clones([copy_record.root()] if clone_roots is None else clone_roots, scratch_settings=scratch_settings)
     # macOS reports /private/tmp in lsof even when discovery started through /tmp.
     # Resolve once at discovery, before age, hold, process, socket and lock checks.
     for entry in dict.fromkeys(entry.resolve() for entry in discovered):
-        when = _last_change(entry, limits)
+        when = _last_change(entry, limits, scratch_settings=scratch_settings)
         if isinstance(when, float):
-            minimum_age = 0 if is_clone(entry) else minimum_folder_age
+            minimum_age = 0 if is_clone(entry, scratch_settings=scratch_settings) else minimum_folder_age
             change = tmp_sweep.last_change(str(entry), tmp_sweep.Limit(now - minimum_age, listed_outcome))
             when = change if isinstance(change, str) else max(when, change[0])
         changes[entry] = when
     found = [(entry, when) for entry, when in changes.items()
-             if isinstance(when, float) and when and (is_clone(entry) or now - when >= minimum_folder_age)]
-    outcomes = judge(found, now, removing, proc, sockets, mac=mac, free_space=free_space)
+             if isinstance(when, float) and when and (is_clone(entry, scratch_settings=scratch_settings) or now - when >= minimum_folder_age)]
+    outcomes = judge(found, now, removing, proc, sockets, mac=mac, free_space=free_space, lint_settings=lint_settings, scratch_settings=scratch_settings)
     too_large = [entry for entry, when in changes.items() if when == TOO_LARGE]
     named_paths = [entry for entry, _ in found] + too_large
     sessions = transcripts() if files is None and named_paths else (files or [])
-    named = makers(named_paths, sessions)
+    named = makers(named_paths, sessions, lint_settings=lint_settings)
     return ([Loose(entry, when, named.get(entry, ""), outcomes[entry]) for entry, when in found]
             + [Loose(entry, 0.0, named.get(entry, ""), TOO_LARGE) for entry in too_large])
 
 
-def message(folders: list[Loose]) -> str:
+def message(folders: list[Loose], *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> str:
     shown = "; ".join(f"{folder.path} ({folder.outcome})" for folder in folders)
     return (f"folder audit: loose folder(s) you made: {shown}. The audit uses hanas.conf clone_max_hours "
-            + f"for clones and {conf.whole('lint', 'folder_remove_after_seconds') / 86400:g} idle days for other folders. The Mac floor can remove idle clones sooner, "
+            + f"for clones and {tmp_sweep.wide_idle_seconds(lint_settings=lint_settings) / 86400:g} idle days for other folders. The Mac floor can remove idle clones sooner, "
             + "or just their targets when source is unsaved. Holds and live processes keep them. Move each you need into a "
             + "task's scratch (`~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py adopt <path> --task "
             + "<task>`) or hold it (`scratch.py hold <path> --reason <why>`). Make new scratch only with "
@@ -561,13 +624,15 @@ def message(folders: list[Loose]) -> str:
 
 
 def main(argv: list[str]) -> int:
+    lint_settings = conf.read("lint")
+    scratch_settings = conf.read("scratch")
     parser = argparse.ArgumentParser(prog="folder_audit.py", description="Find loose folders, remove the idle ones "
                                      + "that lose no work, and tell their makers.")
     _ = parser.add_argument("action", nargs="?", choices=("arm", "disarm"))
     _ = parser.add_argument("--send", action="store_true")
     arguments = parser.parse_args(argv)
     action = cast(str | None, arguments.action)
-    marker = state_dir() / ARMED_NAME
+    marker = state_dir(lint_settings=lint_settings) / ARMED_NAME
     if action == "arm":
         marker.parent.mkdir(parents=True, exist_ok=True)
         _ = marker.write_text(f"{time.time()}\n", encoding="utf-8")
@@ -584,9 +649,9 @@ def main(argv: list[str]) -> int:
     temps = list(dict.fromkeys(Path(os.path.realpath(path)) for path in
                                ("/tmp", "/tmp/claude", os.environ.get("TMPDIR", "")) if path))
     now = time.time()
-    removing = armed()
+    removing = armed(lint_settings=lint_settings)
     try:
-        loose = audit(Path(os.path.realpath(Path.home() / "rust")), temps, expected, now, removing=removing)
+        loose = audit(Path(os.path.realpath(Path.home() / "rust")), temps, expected, now, removing=removing, lint_settings=lint_settings, scratch_settings=scratch_settings)
     except (OSError, UnicodeError, ValueError) as error:
         print(f"folder audit: {error}", file=sys.stderr)
         return 2
@@ -601,7 +666,7 @@ def main(argv: list[str]) -> int:
         for maker, folders in by_maker.items():
             if maker:
                 _ = subprocess.run([sys.executable, str(SEND), "--to", f"session:{maker}", "--from", "folder-audit",
-                                    "--text", message(folders)], check=False)
+                                    "--text", message(folders, lint_settings=lint_settings)], check=False)
     return 0
 
 

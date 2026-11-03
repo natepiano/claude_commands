@@ -56,7 +56,7 @@ import pane_record
 from scripts.production.staff import StaffId
 from scripts.production import staff, unit_config
 from scripts.production.rename_rerun_test_support import saved_fixture
-from scripts.issue_score.selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import conf
 from scripts.agents import worker_lifecycle
 

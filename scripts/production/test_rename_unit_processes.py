@@ -36,7 +36,7 @@ else:
 
 from scripts.production.rename_unit_test_support import SLUG, UnitRenameFixture
 from scripts.production.fake_unit_host import stopped_record
-from scripts.issue_score.selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment

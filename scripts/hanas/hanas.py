@@ -25,6 +25,8 @@ sys.path.insert(0, str(ROOT / "scripts" / "mac_test"))
 sys.path.insert(0, str(ROOT / "scripts" / "lint"))
 
 from scripts.lib import conf
+from scripts.lib.conf import UseConfiguredValue
+
 
 
 @dataclass(frozen=True)
@@ -62,18 +64,20 @@ class HanaProcess:
     environment_status: EnvironmentKnown | EnvironmentUnknown = ENVIRONMENT_KNOWN
 
 
-def read_config() -> HanasConfig:
-    settings = conf.path("hanas")
-    values = conf.values("hanas")
+def read_config(*, hanas_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> HanasConfig:
+    if isinstance(hanas_settings, UseConfiguredValue):
+        hanas_settings = conf.read("hanas")
+    settings = hanas_settings.source
+    values = hanas_settings.values()
     try:
         ports = frozenset(int(item.strip()) for item in values["exempt_ports"].split(",") if item.strip())
     except (KeyError, ValueError) as error:
         raise ValueError(f"{settings}: exempt_ports needs comma-separated ports") from error
     if any(not 0 < port <= 65535 for port in ports):
         raise ValueError(f"{settings}: exempt_ports contains an invalid port")
-    return HanasConfig(ports, conf.number("hanas", "test_max_hours") * 3600,
-                       conf.number("hanas", "unlabelled_max_minutes") * 60,
-                       conf.number("hanas", "stop_grace_seconds"))
+    return HanasConfig(ports, hanas_settings.number("test_max_hours") * 3600,
+                       hanas_settings.number("unlabelled_max_minutes") * 60,
+                       hanas_settings.number("stop_grace_seconds"))
 
 
 @dataclass(frozen=True)

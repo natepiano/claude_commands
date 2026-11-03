@@ -33,7 +33,7 @@ else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
     import sessions
 
-from scripts.lib import copy_record
+from scripts.lib import conf, copy_record
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 DAY = 86_400
@@ -225,9 +225,10 @@ class CopyTests(TmpSweepCase):
         _ = write(path / copy_record.RECORD, json.dumps({"task": "until:2000-01-01T0000Z"}))
         original = tmp_sweep.remove_entry
         with (path / ".claude-busy").open("a") as holder:
-            def start_before_remove(entry: tmp_sweep.RemovableEntry, result: tmp_sweep.Sweep, dry_run: bool) -> bool:
+            def start_before_remove(entry: tmp_sweep.RemovableEntry, result: tmp_sweep.Sweep, dry_run: bool,
+                                    *, scratch_settings: conf.ConfigRead) -> bool:
                 fcntl.flock(holder, fcntl.LOCK_SH)
-                return original(entry, result, dry_run)
+                return original(entry, result, dry_run, scratch_settings=scratch_settings)
             with mock.patch.object(tmp_sweep, "remove_entry", side_effect=start_before_remove):
                 _ = self.sweep()
         self.assertTrue(path.is_dir())
@@ -280,10 +281,11 @@ class CopyTests(TmpSweepCase):
         scratch.exclude_copy_metadata(path)
         original = tmp_sweep.remove_entry
 
-        def edit_before_remove(entry: tmp_sweep.RemovableEntry, result: tmp_sweep.Sweep, dry_run: bool) -> bool:
+        def edit_before_remove(entry: tmp_sweep.RemovableEntry, result: tmp_sweep.Sweep, dry_run: bool,
+                              *, scratch_settings: conf.ConfigRead) -> bool:
             if entry.path == str(path):
                 _ = write(path / "ordinary", "unsaved work")
-            return original(entry, result, dry_run)
+            return original(entry, result, dry_run, scratch_settings=scratch_settings)
 
         with mock.patch.object(tmp_sweep, "remove_entry", side_effect=edit_before_remove):
             result = self.sweep()
@@ -888,8 +890,10 @@ class LogTests(TmpSweepCase):
         idle = write(self.tmp / "shots" / "1.png")
         run = tmp_sweep.run
 
-        def fixture_run(dry_run: bool, now: float) -> int:
-            return run(dry_run, now, self.roots(), str(self.proc))
+        def fixture_run(dry_run: bool, now: float, *, lint_settings: conf.ConfigRead,
+                        scratch_settings: conf.ConfigRead) -> int:
+            return run(dry_run, now, self.roots(), str(self.proc),
+                       lint_settings=lint_settings, scratch_settings=scratch_settings)
 
         with (mock.patch.object(tmp_sweep, "default_roots", return_value=self.roots()),
               mock.patch.object(tmp_sweep, "run", side_effect=fixture_run),

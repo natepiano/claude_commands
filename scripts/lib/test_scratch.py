@@ -456,8 +456,8 @@ class ScratchTests(unittest.TestCase):
         path = self.copy(task="gate:old")
         snapshot = scratch.folders()
 
-        def transfer() -> list[scratch.Folder]:
-            scratch.hand_over(path, "next-unit", "gate:next")
+        def transfer(*, scratch_settings: conf.ConfigRead) -> list[scratch.Folder]:
+            scratch.hand_over(path, "next-unit", "gate:next", scratch_settings=scratch_settings)
             return snapshot
 
         with mock.patch.object(scratch, "folders", side_effect=transfer):
@@ -764,12 +764,12 @@ class ScratchTests(unittest.TestCase):
         self.assertIsInstance(record, copy_record.Registered)
         assert isinstance(record, copy_record.Registered)
         task = record.task
-        deadline = scratch.task_end(task, 1_000_000.0 + conf.whole("scratch", "default_life_seconds"))
+        deadline = scratch.task_end(task, 1_000_000.0 + conf.read("scratch").whole("default_life_seconds"))
         self.assertIsInstance(deadline, scratch.Ended)
         assert isinstance(deadline, scratch.Ended)
-        self.assertEqual(deadline.at, 1_000_000.0 + conf.whole("scratch", "default_life_seconds") - 40)
+        self.assertEqual(deadline.at, 1_000_000.0 + conf.read("scratch").whole("default_life_seconds") - 40)
         self.assertFalse(scratch.ended(task, 1_000_000.0))
-        self.assertTrue(scratch.ended(task, 1_000_000.0 + conf.whole("scratch", "default_life_seconds")))
+        self.assertTrue(scratch.ended(task, 1_000_000.0 + conf.read("scratch").whole("default_life_seconds")))
         self.assertFalse(scratch.ended(RUN, 9e12))
         self.assertTrue(scratch.parsed_until("2026-10-28 09:30").startswith("until:2026-10-28T"))
         with self.assertRaises(scratch.ScratchError):
@@ -794,12 +794,12 @@ class ScratchTests(unittest.TestCase):
             (repo / ".git").mkdir(parents=True)
         with (
             mock.patch.dict(os.environ, config_environment(self.base / "config")),
-            mock.patch("scratch.conf.whole", wraps=conf.whole) as whole,
-            mock.patch("scratch.conf.words", wraps=conf.words) as words,
+            mock.patch("scratch.conf.ConfigRead.whole", side_effect=conf.read("scratch").whole) as whole,
+            mock.patch("scratch.conf.ConfigRead.words", side_effect=conf.read("scratch").words) as words,
         ):
             self.assertEqual(scratch.repos(root), repositories)
-        self.assertEqual(whole.call_args_list, [mock.call("scratch", "repo_depth")])
-        self.assertEqual(words.call_args_list, [mock.call("scratch", "repo_skip")])
+        self.assertEqual(whole.call_args_list, [mock.call("repo_depth")])
+        self.assertEqual(words.call_args_list, [mock.call("repo_skip")])
 
     def test_repository_scan_depth_reads_the_private_config_at_use(self) -> None:
         root = self.base / "repos"

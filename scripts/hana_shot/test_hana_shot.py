@@ -1703,15 +1703,15 @@ class ShotTests(HanaShotTest):
 
     def test_brp_reads_host_and_timeout_once_per_instance(self) -> None:
         with (
-            mock.patch("scripts.hana_shot.hana_shot.conf.text", wraps=conf.text) as text,
-            mock.patch("scripts.hana_shot.hana_shot.conf.number", wraps=conf.number) as number,
+            mock.patch("scripts.hana_shot.hana_shot.conf.ConfigRead.text", side_effect=conf.read("hana_shot").text) as text,
+            mock.patch("scripts.hana_shot.hana_shot.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
         ):
             brp = hana_shot.Brp(self.port)
             first = brp.diagnostics()
             second = brp.diagnostics()
         self.assertGreater(hana_shot.frame_number(second), hana_shot.frame_number(first))
-        self.assertEqual(text.call_args_list, [mock.call("hana_shot", "host")])
-        self.assertEqual(number.call_args_list, [mock.call("hana_shot", "call_timeout_seconds")])
+        self.assertEqual(text.call_args_list, [mock.call("host")])
+        self.assertEqual(number.call_args_list, [mock.call("call_timeout_seconds")])
 
     def test_readiness_and_shutdown_read_poll_settings_once_per_call(self) -> None:
         _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "poll_seconds=0.001\nwarm_frame_ms=20\n")
@@ -1726,23 +1726,23 @@ class ShotTests(HanaShotTest):
         with (
             mock.patch.object(time, "sleep", side_effect=tick),
             mock.patch.object(brp, "diagnostics", side_effect=diagnostics) as readings,
-            mock.patch("scripts.hana_shot.hana_shot.conf.number", wraps=conf.number) as number,
+            mock.patch("scripts.hana_shot.hana_shot.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
         ):
             hana_shot.wait_ready(brp, process, log)
         self.assertEqual(readings.call_count, 3)
         for key in ("poll_seconds", "warm_frame_ms", "ready_seconds", "warm_seconds"):
-            self.assertEqual(number.call_args_list.count(mock.call("hana_shot", key)), 1, key)
+            self.assertEqual(number.call_args_list.count(mock.call(key)), 1, key)
         with (
             mock.patch.dict(os.environ, self.script_environment()),
             mock.patch.object(hana_shot.Brp, "call", return_value=None),
             mock.patch.object(hana_shot, "port_answers", side_effect=[True, True, False]) as answers,
             mock.patch.object(time, "sleep"),
-            mock.patch("scripts.hana_shot.hana_shot.conf.number", wraps=conf.number) as number,
+            mock.patch("scripts.hana_shot.hana_shot.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
             redirect_stderr(io.StringIO()),
         ):
             hana_shot.shutdown(self.port)
         self.assertEqual(answers.call_count, 3)
-        self.assertEqual(number.call_args_list.count(mock.call("hana_shot", "poll_seconds")), 1)
+        self.assertEqual(number.call_args_list.count(mock.call("poll_seconds")), 1)
 
     def test_home_shot_writes_the_png_and_one_timing_line(self) -> None:
         result = self.shot("--mode", "home")

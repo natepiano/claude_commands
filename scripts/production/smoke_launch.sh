@@ -13,14 +13,13 @@ set -euo pipefail
 
 HANA_TEST_PURPOSE="${HANA_TEST_PURPOSE:-}"
 HANA_TEST_OWNER="${HANA_TEST_OWNER:-${SHOWRUNNER_UNIT_ID:-}}"
-[[ -n "${HANA_TEST_PURPOSE//[[:space:]]/}" ]] || { printf '%s\n' 'smoke_launch: set HANA_TEST_PURPOSE to the feature under test' >&2; exit 2; }
 export HANA_TEST_PURPOSE HANA_TEST_OWNER
 
 CHECKOUT="${1:?Usage: smoke_launch.sh <checkout> <sha> <log> [port]}"
 SHA="${2:?Usage: smoke_launch.sh <checkout> <sha> <log> [port]}"
 LOG="${3:?Usage: smoke_launch.sh <checkout> <sha> <log> [port]}"
 LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)"
-source "$LIB/conf.sh"
+conf_value() { "$LIB/py" "$LIB/conf.py" get "$1" "$2"; }
 PORT="${4:-$(conf_value production smoke_port)}"
 READY_SECONDS=$(conf_value production smoke_ready_seconds)
 EXIT_SECONDS=$(conf_value production smoke_exit_seconds)
@@ -68,6 +67,8 @@ TARGET_DIR="$(checkout_cargo metadata --no-deps --format-version 1 \
     --manifest-path "$CHECKOUT/Cargo.toml" 2>>"$LOG" | jq -r .target_directory)"
 BIN="$TARGET_DIR/debug/hana"
 [[ -x "$BIN" ]] || fail "no binary at $BIN"
+
+[[ -n "${HANA_TEST_PURPOSE//[[:space:]]/}" ]] || { printf '%s\n' 'smoke_launch: set HANA_TEST_PURPOSE to the feature under test' >&2; exit 2; }
 
 SCRATCH="$(mktemp -d)"
 mkdir "$SCRATCH/xdg"

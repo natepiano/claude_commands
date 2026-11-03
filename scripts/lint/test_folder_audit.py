@@ -173,12 +173,12 @@ class FolderAuditTests(unittest.TestCase):
         paths = [folder(self.temp / name, 10) for name in ("first", "second")]
         found = [(path, changed(path)) for path in paths]
         (self.root / "proc").mkdir()
-        with unittest.mock.patch("folder_audit.conf.whole", wraps=conf.whole) as whole:
+        with unittest.mock.patch("folder_audit.conf.ConfigRead.whole", side_effect=conf.read("lint").whole) as whole:
             outcomes = folder_audit.judge(found, time.time(), False, proc=str(self.root / "proc"),
                                           sockets=str(self.root / "unix"), mac=False)
         self.assertEqual(outcomes, {path: folder_audit.WOULD_REMOVE for path in paths})
         for key in ("folder_idle_depth", "folder_idle_entry_limit"):
-            self.assertEqual(whole.call_args_list.count(unittest.mock.call("lint", key)), 1, key)
+            self.assertEqual(whole.call_args_list.count(unittest.mock.call(key)), 1, key)
 
     def test_ordinary_folder_removal_age_reads_the_private_config_at_use(self) -> None:
         ordinary = folder(self.temp / "ordinary", 3 / 24)
