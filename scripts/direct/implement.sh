@@ -510,8 +510,12 @@ bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" register \
 export UNIT_RUN_DIR="${SESSION_DIR}"
 # Test temp folders (mktemp, tempfile, Rust .tmpXXXXXX) land in the run folder and end with it;
 # the hourly tmp sweep judges each entry there with its 4 h rule.
-mkdir -p "${SESSION_DIR}/tmp"
-export TMPDIR="${SESSION_DIR}/tmp"
+BUILD_FOLDERS_SCRIPT="${SCRIPT_DIR}/../lib/build_folders.py"
+TMPDIR="$("$PY" "$BUILD_FOLDERS_SCRIPT" run-temp-path "$SESSION_DIR")"
+if [[ ! -d "$TMPDIR" ]]; then
+    "$PY" "$BUILD_FOLDERS_SCRIPT" stable --run-temp "$SESSION_DIR" >/dev/null
+fi
+export TMPDIR
 
 # A claude-family worker launches as a NAMED BACKGROUND session so it joins the
 # machine's session mesh: it can message its peers and the unit director, and both

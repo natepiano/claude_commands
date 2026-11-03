@@ -2273,9 +2273,11 @@ def is_fresh_test(root: Path, host: str, worktree: str, package: str,
             target = target.resolve()
             if not target.is_dir():
                 return False
-            state = Path(os.environ.get("LINT_SWEEP_STATE_DIR", "~/.local/state/lint-sweep")).expanduser()
+            from scripts.lint import tmp_sweep
+
+            state = tmp_sweep.state_dir()
             try:
-                deleted = cast(object, json.loads((state / "target-deletes.json").read_text()))
+                deleted = cast(object, json.loads((state / tmp_sweep.TARGET_DELETES_NAME).read_text()))
             except FileNotFoundError:
                 deleted = {}
             if not isinstance(deleted, dict):

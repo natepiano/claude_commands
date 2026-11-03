@@ -57,6 +57,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import process_group
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import build_folders
 from scripts.production import change_review  # noqa: E402
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
@@ -944,10 +945,11 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     maximum_load = starting_load
     began = time.monotonic()
     python = os.environ.get("MERGE_GATE_PYTHON", sys.executable)
-    with (tempfile.TemporaryDirectory(prefix="merge-gate-", dir=tmpfs) as temporary,
-          gate_reservation(repo, memory_cap_mib, Path(temporary), hold) as reservation,
+    with (build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
+              build_folders.FOLDER_PREFIXES["merge-gate"], build_folders.ExplicitBuildParent(tmpfs))) as temporary,
+          gate_reservation(repo, memory_cap_mib, temporary, hold) as reservation,
           shared_cpu_pool() as cpu_pool):
-        environment = {**os.environ, "TMPDIR": temporary}
+        environment = {**os.environ, "TMPDIR": str(temporary)}
         types_python = typecheck_python() if type_dirs else ""
         if isinstance(types_python, Path):
             pending.appendleft(GateJobRequest("types", repo / "basedpyright", "basedpyright", GateJobKind.TYPE_CHECK))
@@ -988,7 +990,8 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                         break
                     request = pending.popleft()
                     suite, path = request.suite, request.path
-                    root = Path(tempfile.mkdtemp(prefix=f"{suite}-{path.stem}-", dir=temporary))
+                    root = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
+                        build_folders.FOLDER_PREFIXES["merge-gate-module"].format(owner=f"{suite}-{path.stem}"), build_folders.ExplicitBuildParent(temporary)))
                     log = root / "output.log"
                     job_environment = ({**environment, "TMPDIR": str(root)} if request.kind is GateJobKind.TYPE_CHECK
                                        else test_module_environment(root, environment))
@@ -1487,8 +1490,8 @@ def nightly(args: GateArguments) -> int:
     _ = nightly_git(repo, "fetch", "origin",
                     f"+refs/heads/{args.merge_branch}:refs/remotes/origin/{args.merge_branch}")
     commit = checked_git(repo, "rev-parse", f"refs/remotes/origin/{args.merge_branch}")
-    with tempfile.TemporaryDirectory(prefix="merge-gate-nightly-") as temporary:
-        clone = Path(temporary) / "checkout"
+    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["merge-gate-nightly"])) as temporary:
+        clone = temporary / "checkout"
         _ = nightly_git(repo, "clone", "--shared", "--no-checkout", "--", str(repo), str(clone))
         _ = nightly_git(clone, "checkout", "--detach", commit)
         tree = checked_git(clone, "rev-parse", "HEAD^{tree}")

@@ -11,12 +11,12 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from typing import TYPE_CHECKING, BinaryIO, TypedDict, Unpack
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import build_folders
 from scripts.lint import memory_admit
 from scripts.build_queue import admission_client, admission_protocol as wire
 import uuid
@@ -372,8 +372,8 @@ def queue_place(program: str, repo: Path, *,
     profile: memory_admit.ProgramProfile | memory_admit.StepProfile = memory_admit.ProgramProfile(
         program, str(Path.home() / ".claude"), str(repo.resolve()), sizing)
     pid = os.getpid()
-    with tempfile.TemporaryDirectory(prefix="queue-place-") as temporary:
-        sidecar = Path(temporary) / "program.cgroup"
+    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["queue-place"])) as temporary:
+        sidecar = temporary / "program.cgroup"
         _ = sidecar.write_text("")
         handlers = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT)}
         for number, handler in handlers.items():

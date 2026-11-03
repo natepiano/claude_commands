@@ -31,6 +31,21 @@ class ServiceGateFixture(GateSuitesFixture):
 
 @final
 class SharedGateAdmissionTests(ServiceGateFixture):
+    def test_suites_refuse_unwritable_memory_parent_before_admission(self) -> None:
+        access = os.access
+
+        def writable(path: str | os.PathLike[str], mode: int) -> bool:
+            return False if Path(path) == Path("/dev/shm") else access(path, mode)
+
+        with mock.patch.dict(os.environ, self.environment), \
+             mock.patch.object(os, "access", side_effect=writable), \
+             mock.patch.object(merge_gate, "gate_reservation") as admission:
+            with self.assertRaisesRegex(merge_gate.GateRefused,
+                                        "requires writable tmpfs at /dev/shm"):
+                _ = merge_gate.run_suites(self.checkout)
+            admission.assert_not_called()
+        self.assert_gate_released()
+
     def test_gate_reservation_refuses_unusable_config_before_explicit_sizing_admission(self) -> None:
         config = self.root / "invalid-config" / "lint.conf"
         self.write(config, "[memory]\n# range: 0..\nbuild_budget_gib=invalid\n")

@@ -183,7 +183,10 @@ if [[ "${1:-}" == final-pass || ( "${1:-}" == --session-dir && "${3:-}" == final
     export CLAUDE_PYTHON="${CLAUDE_PYTHON:-python3}"
     exec "$VERIFY_QUERY_DIR/../lib/py" "$VERIFY_QUERY_DIR/final_pass.py" query "$VERIFY_QUERY_DIR/verify.sh" "$@"
 fi
-if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then mkdir -p -- "$TMPDIR"; fi
+# Create the inherited temporary parent before environment commands use it.
+VERIFY_INVOKE_DIR="${BASH_SOURCE[0]%/*}"
+[[ "$VERIFY_INVOKE_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_INVOKE_DIR=.
+source "$VERIFY_INVOKE_DIR/../lint/invoke.sh" --prepare-temp || exit 2
 # Load the environment once through the shared helper, before tool setup or records.
 if [[ -n "${VERIFY_NIX_ENV_REEXEC:-}" ]]; then
     if [[ -n "${IN_NIX_SHELL:-}" ]]; then
@@ -888,8 +891,9 @@ if [[ "${1:-}" == "--session-dir" ]]; then
     export UNIT_SESSION_DIR="${2:?verify.sh --session-dir <dir> <command> ...}"
     shift 2
     # Test temp folders land in the run folder and end with it (tmp_sweep.py judges each entry).
-    if mkdir -p "${UNIT_SESSION_DIR}/tmp" 2>/dev/null; then
-        export TMPDIR="${UNIT_SESSION_DIR}/tmp"
+    SESSION_TMPDIR="$("$PY" "$BUILD_FOLDERS_SCRIPT" run-temp-path "$UNIT_SESSION_DIR")"
+    if [[ -d "$SESSION_TMPDIR" ]] || "$PY" "$BUILD_FOLDERS_SCRIPT" stable --run-temp "$UNIT_SESSION_DIR" >/dev/null 2>&1; then
+        export TMPDIR="$SESSION_TMPDIR"
     fi
 fi
 
@@ -1211,7 +1215,7 @@ cancel_tree_run() {
 
 start_tree_watch() {
     [[ -z "$TREE_WATCH_PID" ]] || return 0
-    TREE_WATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-tree.$$.XXXXXX")"
+    TREE_WATCH_DIR="$("$PY" "$BUILD_FOLDERS_SCRIPT" unique --kind verify-tree --owner "$$")"
     VERDICT_KEY="$(tree_key --watch-start "$TREE_WATCH_DIR/start")"
     [[ -s "$TREE_WATCH_DIR/start" ]] || { rm -rf "$TREE_WATCH_DIR"; TREE_WATCH_DIR=""; return 0; }
     local scope=()
@@ -1232,23 +1236,25 @@ finish_tree_watch() {
 # Git's staged tree identity. A private copy avoids updating the real index's
 # cache-tree extension when write-tree runs.
 doc_tree() {
-    "$PY" - <<'PYDOC'
+    "$PY" - "$BUILD_FOLDERS_SCRIPT" <<'PYDOC'
 import os
 from pathlib import Path
 import subprocess
-import tempfile
+import sys
 import shutil
 
-with tempfile.TemporaryDirectory(prefix="verify-doc-", dir="/tmp") as temporary:
+sys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))
+from scripts.lib import build_folders
+
+with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
+        build_folders.FOLDER_PREFIXES["verify-doc"], build_folders.SystemTemporaryParent())) as temporary:
     top = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
     original = Path(subprocess.check_output(["git", "rev-parse", "--git-path", "index"], text=True).strip())
-    private_index = Path(temporary) / "index"
+    private_index = temporary / "index"
     if original.exists():
         shutil.copyfile(original, private_index)
     environment = {**os.environ, "GIT_INDEX_FILE": str(private_index)}
-    def git(*arguments: str) -> str:
-        return subprocess.check_output(["git", "-C", top, *arguments], env=environment, text=True).strip()
-    print(git("write-tree"))
+    print(subprocess.check_output(["git", "-C", top, "write-tree"], env=environment, text=True).strip())
 PYDOC
 }
 
@@ -2037,7 +2043,9 @@ route_test() {
 # the run's hold folder, so the EXIT trap removes both, and both names carry
 # the run's pid for tmp_sweep.py when a kill skips the trap.
 start_copy_watch() {
-    COPY_WATCH_DIR="$(mktemp -d "${HOLD_WAIT_DIR:-${TMPDIR:-/tmp}}/verify-copy.$$.XXXXXX")"
+    local copy_parent=()
+    [[ -z "${HOLD_WAIT_DIR:-}" ]] || copy_parent=(--parent "$HOLD_WAIT_DIR")
+    COPY_WATCH_DIR="$("$PY" "$BUILD_FOLDERS_SCRIPT" unique --kind verify-copy --owner "$$" "${copy_parent[@]}")"
     VERIFY_STEP_INFO_FILE="$COPY_WATCH_DIR/step"
     local watch_args=(--info "$VERIFY_STEP_INFO_FILE" --result "$COPY_WATCH_DIR/result"
         --runner "$MAC_RUNNER" --settings "$MAC_LEAVE_SETTINGS"
@@ -2319,7 +2327,7 @@ if [[ "$CMD" == test && -z "${GATE_METADATA}" ]]; then
     GATE_METADATA="$(cargo metadata --no-deps --format-version 1 2>/dev/null)" || GATE_METADATA=""
 fi
 
-HOLD_WAIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-hold.$$.XXXXXX")"
+HOLD_WAIT_DIR="$("$PY" "$BUILD_FOLDERS_SCRIPT" unique --kind verify-hold --owner "$$")"
 export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds"
 export BUILDLOG_HOLD_WAITER_FILE="$HOLD_WAIT_DIR/waiter"
 export BUILDLOG_CHECK_FAILED_FILE="$HOLD_WAIT_DIR/check-failed"

@@ -416,7 +416,7 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 **Ruled out:**
 - A shadow run beside the old checker (user, 2026-10-31): one cut-over, no second admitter.
 
-### Phase 10a — One function names every /tmp and /dev/shm build folder  · status: todo
+### Phase 10a — One function names every /tmp and /dev/shm build folder  · status: done
 **Depends on:** Phase 10 (the queue service names the admission and build folders)
 
 Asked by the builds showrunner on 2026-11-02, after the Phase 10 checkpoint. Spec at phase start: list every place that makes a build folder under `/tmp` or `/dev/shm`, name the one function that makes the name, and move each maker to it. No code before the Phase 10 checkpoint.

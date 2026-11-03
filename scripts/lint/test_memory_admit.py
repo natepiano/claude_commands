@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scripts.lint import memory_admit as gate
+from scripts.lint import memory_admit as gate, tmp_sweep
 import conf
 from scripts.build_queue import admission_client as client, admission_protocol as wire, queue_view
 from scripts.build_queue.admission_test_support import AdmissionFixture, InjectedCrash, only_admitted
@@ -708,7 +708,7 @@ class FreshTestPromiseTests(unittest.TestCase):
         (self.worktree / "target").mkdir(parents=True)
         self.state = self.root / "sweep-state"
         self.state.mkdir()
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"LINT_SWEEP_STATE_DIR": str(self.state)})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {tmp_sweep.STATE_ENV: str(self.state)})))
         (self.root / "admission").mkdir()
         with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
             _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
@@ -1005,6 +1005,21 @@ class FreshTestPromiseTests(unittest.TestCase):
         _ = (self.state / "target-deletes.json").write_text("not json")
         self.assertFalse(self.fresh())
         self.assertEqual(self.promise().bytes, 10 * GIB)
+
+    def test_freshness_reads_the_current_shared_sweep_state(self) -> None:
+        self.previous_build()
+        self.assertTrue(self.fresh())
+        other = self.root / "other sweep state"
+        other.mkdir()
+        _ = (other / "target-deletes.json").write_text(json.dumps({
+            str(self.worktree / "target"): (NOW - timedelta(seconds=30)).timestamp(),
+        }))
+        with patch.dict(os.environ, {tmp_sweep.STATE_ENV: str(other)}):
+            self.assertFalse(self.fresh())
+        self.assertTrue(self.fresh())
+        with patch.object(tmp_sweep, "state_dir", return_value=other) as authority:
+            self.assertFalse(self.fresh())
+            authority.assert_called_once_with()
 
     def test_unknown_compile_count_and_compile_failures_are_not_fresh_history(self) -> None:
         self.samples([GIB], crates=None)

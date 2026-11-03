@@ -6,6 +6,61 @@ Every build on natedev, CI's and the sessions', is admitted so that it fits in m
 
 ## How it works
 
+### Temporary build folders
+
+`scripts.lib.build_folders.create_build_folder(request) -> Path` allocates temporary build folders.
+
+1. `UniqueBuildFolder(prefix, parent)` creates a private folder atomically with mode `0700`.
+2. `StableOwnerFolder(name, parent, mode)` retains the owner's folder, contents, and existing permissions.
+
+`FOLDER_PREFIXES` defines each build kind's prefix.
+Dynamic prefixes use an `owner` field for the process, module, review, version, or cache key.
+`MKDTEMP_SUFFIX_PATTERN` defines the allocator's eight-character suffix rule for cleanup readers.
+The sweep also reads old six-character shell suffixes until 2026-12-03.
+
+`InheritedTemporaryParent` reads `TMPDIR` at each allocation.
+`inherited_temporary_parent()` exposes that same rule to callers that retain their own folder creation.
+`ExplicitBuildParent` retains an explicit parent.
+`SystemTemporaryParent` uses the short system parent for socket and index folders.
+`UnitRunParent` reads the current root from `unit_runs.run_roots()`.
+The merge gate checks `/dev/shm` before allocation and uses an explicit parent without a disk fallback.
+
+Shell callers use these forms:
+
+1. `unique --kind KIND [--owner TEXT] [--parent PATH | --system-temp]`
+2. `unique --prefix TEXT [--parent PATH | --system-temp]`
+3. `stable --name NAME (--parent PATH | --unit-root)`
+4. `stable --path PATH`
+5. `stable --run-temp RUN`
+6. `run-temp-path RUN`
+
+The CLI prints one path on success.
+Shell callers request allocation only when a stable folder is missing.
+`verify.sh` first sources `invoke.sh --prepare-temp` to create a missing inherited `TMPDIR` before environment loading.
+This mode uses the same allocation block as a normal `invoke.sh` call.
+`unit_runs.RUN_TEMP_NAME` defines the run temporary folder name.
+`unit_runs.activate()` writes the current marker and removes the former marker.
+
+`temporary_build_folder()` yields a `Path` and uses the standard library's cleanup and permission repair.
+Other callers retain their cleanup traps, owner records, task records, and release order.
+The three shell verify allocations retain the CLI cost required by the Work Order.
+The promotion check sent over ssh uses a self-contained standard-library temporary folder.
+It imports no repository modules before the Mac fetch.
+
+The director removed the unused task and scratch-parent wrappers during repair round 1.
+This decision departs from Spec items 6 and 8.
+`scratch.new()` and `scratch.target()` retain task registration and task naming.
+`copy_record.root()` and `copy_record.copies_root()` retain the scratch and copies root rules.
+The sweep reads those authorities and `unit_runs.run_roots()`.
+An explicit private sweep root selects its own `copies` folder instead of the live copies root.
+
+Stable session folders retain their short paths and mode `0700`.
+The session hook defines the session temporary root.
+The admission fixture uses `short_socket_directory(prefix)` for its separate short socket parent.
+The service keeps `admission/state.json` and `admission/queue.json` outside temporary build folders.
+`memory_admit.is_fresh_test()` and the disk sweep read `tmp_sweep.state_dir()` at use.
+`tmp_sweep.TARGET_DELETES_NAME` defines the shared deletion record name.
+
 ### Machine side (`/etc/nixos`, natedev only)
 
 Not in this repo; listed because the code here reads it.

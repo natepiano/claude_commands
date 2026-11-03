@@ -13,7 +13,6 @@ import select
 import signal
 import socket
 import subprocess
-import tempfile
 import threading
 import time
 import unittest
@@ -27,6 +26,8 @@ from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_service as service
 from scripts.build_queue.queue_fixture import write_process
 from scripts.lib.test_hang_guard import LauncherHangGuard
+from scripts.lib import build_folders
+from scripts.lib.socket_test_support import short_socket_directory
 
 NOW = datetime(2026, 10, 31, 12, tzinfo=UTC).timestamp()
 GIB = gate.GIB
@@ -287,11 +288,12 @@ class AdmissionFixture(ExitStack):
         super().__init__()
         if not hasattr(os, "pidfd_open") or not Path("/sys/fs/cgroup/cgroup.controllers").exists():
             raise unittest.SkipTest("admission service needs Linux pidfd and cgroup v2")
-        self.root: Path = root if root is not None else Path(
-            self.enter_context(tempfile.TemporaryDirectory(prefix="admit-test-")))
+        self.root: Path = root if root is not None else self.enter_context(
+            build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
+                prefix=build_folders.FOLDER_PREFIXES["admit-test"])))
         # AF_UNIX addresses have a small byte limit; TMPDIR may be a deep merge checkout.
         self.socket_dir: Path = Path(self.enter_context(
-            tempfile.TemporaryDirectory(prefix="admit-sock-", dir="/tmp")))
+            short_socket_directory(build_folders.FOLDER_PREFIXES["admit-sock"])))
         self.state_dir: Path = (log_dir if log_dir is not None else self.root / "log") / "admission"
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.socket_path: Path = self.socket_dir / "admission.sock"

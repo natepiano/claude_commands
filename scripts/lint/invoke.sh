@@ -12,9 +12,14 @@
 # invoke_clippy_fix applies fixes; fmt_cargo formats them before invoke_clippy
 # judges the result. Worker verdict keys include this policy file.
 
-if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then mkdir -p -- "$TMPDIR" || return; fi
-
 [[ -n "${LINT_INVOKE_SOURCED:-}" ]] && return 0
+
+BUILD_FOLDERS_SCRIPT="$(cd -- "${BASH_SOURCE[0]%/*}/../lib" && pwd)/build_folders.py"
+if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then
+    "${BUILD_FOLDERS_SCRIPT%/*}/py" "$BUILD_FOLDERS_SCRIPT" stable --path "$TMPDIR" >/dev/null || return
+fi
+# verify.sh needs the temporary parent before it loads the environment.
+[[ "${1:-}" == --prepare-temp ]] && return 0
 LINT_INVOKE_SOURCED=1
 
 # macOS sandboxes cannot nest. A dependency whose build script shells out to
@@ -417,17 +422,22 @@ SWEEP_EVERY_S=300
 
 sweep_after_step() {
     [[ "${LINT_SKIP_SWEEP:-}" == 1 ]] && return 0
-    local arg now last=0 dir stamp
+    local arg now last=0 parent name=lint-sweep dir stamp
     for arg in "$@"; do
         [[ "$arg" == */sweep.py ]] && return 0
     done
-    dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/lint-sweep"
+    parent="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+    dir="$parent/$name"
     stamp="$dir/${PWD//\//%}"
     now="${EPOCHSECONDS:-$(date +%s)}"
     [[ -r "$stamp" ]] && read -r last < "$stamp"
     [[ "$last" =~ ^[0-9]+$ ]] || last=0
     (( now - last >= SWEEP_EVERY_S )) || return 0
-    mkdir -p "$dir" && printf '%s\n' "$now" > "$stamp" || return 0
+    if [[ ! -d "$dir" ]]; then
+        "${BUILD_FOLDERS_SCRIPT%/*}/py" "$BUILD_FOLDERS_SCRIPT" stable \
+            --parent "$parent" --name "$name" >/dev/null || return 0
+    fi
+    printf '%s\n' "$now" > "$stamp" || return 0
     # Detached work and its descendants do not own verify.sh's foreground step.
     ( trap '' HUP; TOKEN_HELD=0; invoke_sweep </dev/null >/dev/null 2>&1 & )
 }
