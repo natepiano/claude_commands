@@ -353,7 +353,7 @@ Delivery failures, restarts, and failed ledger writes preserve the event and dup
 
 **Ruled out:** Changes to `send.py`; its existing repeat window suppresses duplicates.
 
-### Phase 8 — Control starts, drain and interruption recovery  · status: todo
+### Phase 8 — Control starts, drain and interruption recovery  · status: done
 **Depends on:** Phase 7
 
 #### Work Order

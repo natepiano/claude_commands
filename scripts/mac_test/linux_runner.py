@@ -7,6 +7,8 @@ import argparse
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import Enum
+from importlib import import_module
 import fcntl
 import hashlib
 import json
@@ -16,13 +18,49 @@ import re
 from pathlib import Path
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
-from typing import TypedDict, cast
+import time
+from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, cast
+from types import FrameType
 import uuid
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if TYPE_CHECKING:
+    from ..aws_target import ledger
+    from ..build_targets.target_config import SshTarget, is_aws_target
+else:
+    from scripts.build_targets.target_config import SshTarget, is_aws_target
+
+
 PROC_ROOT = Path('/proc')
+
+
+def boot_identity(proc_root: Path = PROC_ROOT) -> str:
+    identity = (proc_root / 'sys/kernel/random/boot_id').read_text().strip()
+    if not identity:
+        raise ValueError('boot identity is missing')
+    return identity
+
+
+class SlotBoot(Enum):
+    CURRENT = 'current'
+    PREVIOUS = 'previous'
+    LEGACY = 'legacy'
+
+
+def slot_boot(lease: SlotRun, current_boot: str, *, require_boot_identity: bool = False) -> SlotBoot:
+    """Keep unconfirmed AWS ownership separate from a confirmed earlier boot."""
+    if 'boot_id' not in lease:
+        if require_boot_identity:
+            raise SlotProcessesUnresolved('retained marker has no boot identity')
+        return SlotBoot.LEGACY
+    identity = lease['boot_id']
+    if not identity:
+        raise ValueError('invalid slot boot identity')
+    return SlotBoot.CURRENT if identity == current_boot else SlotBoot.PREVIOUS
 
 
 @dataclass(frozen=True)
@@ -148,6 +186,7 @@ class SlotRun(TypedDict):
     start_time: int
     process_group: int
     token: str
+    boot_id: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -167,8 +206,14 @@ def read_slot_run(marker: Path) -> SlotRun | UnmarkedSlot:
             raise ValueError('invalid slot process identity')
     if not isinstance(fields.get('token'), str) or not fields['token']:
         raise ValueError('invalid slot process token')
-    return {'pid': cast(int, fields['pid']), 'start_time': cast(int, fields['start_time']),
-            'process_group': cast(int, fields['process_group']), 'token': cast(str, fields['token'])}
+    lease: SlotRun = {'pid': cast(int, fields['pid']), 'start_time': cast(int, fields['start_time']),
+                      'process_group': cast(int, fields['process_group']), 'token': cast(str, fields['token'])}
+    if 'boot_id' in fields:
+        identity = fields['boot_id']
+        if not isinstance(identity, str) or not identity:
+            raise ValueError('invalid slot boot identity')
+        lease['boot_id'] = identity
+    return lease
 
 
 def process_fields(pid: int, proc_root: Path = PROC_ROOT) -> list[str]:
@@ -189,16 +234,21 @@ class SlotProcessesUnresolved(RuntimeError):
 
 
 class SlotStartupRefused(RuntimeError):
-    """An earlier run still has unresolved process ownership."""
+    """A slot has live processes or unresolved process ownership."""
 
 
 SLOT_PROCESSES_UNRESOLVED = 3
 STARTUP_REFUSAL_RECORD = 'linux_startup=unresolved'
 
 
-def select_slot_processes(mirror: Path, proc_root: Path = PROC_ROOT) -> SlotProcessSelection:
+def select_slot_processes(mirror: Path, proc_root: Path = PROC_ROOT, *,
+                          require_boot_identity: bool = False) -> SlotProcessSelection:
     """Read each ownership source independently before deciding uncertainty."""
     lease = read_slot_run(mirror / '.linux-run.json')
+    if not isinstance(lease, UnmarkedSlot):
+        current_boot = boot_identity(proc_root) if 'boot_id' in lease or require_boot_identity else ''
+        if slot_boot(lease, current_boot, require_boot_identity=require_boot_identity) is SlotBoot.PREVIOUS:
+            return SlotProcessSelection((), False)
     selected: set[int] = set()
     parents: dict[int, int] = {}
     uncertain: set[int] = set()
@@ -279,9 +329,10 @@ def select_slot_processes(mirror: Path, proc_root: Path = PROC_ROOT) -> SlotProc
     return SlotProcessSelection(tuple(sorted(selected)), bool(uncertain))
 
 
-def slot_processes(mirror: Path, proc_root: Path = PROC_ROOT) -> tuple[int, ...]:
+def slot_processes(mirror: Path, proc_root: Path = PROC_ROOT, *,
+                   require_boot_identity: bool = False) -> tuple[int, ...]:
     """Return only confirmed processes, or refuse uncertain cleanup."""
-    selection = select_slot_processes(mirror, proc_root)
+    selection = select_slot_processes(mirror, proc_root, require_boot_identity=require_boot_identity)
     if selection.unresolved:
         raise SlotProcessesUnresolved('slot process ownership remains unresolved')
     if not selection.pids:
@@ -289,10 +340,10 @@ def slot_processes(mirror: Path, proc_root: Path = PROC_ROOT) -> tuple[int, ...]
     return selection.pids
 
 
-def print_slot_processes(mirror: Path) -> int:
+def print_slot_processes(mirror: Path, *, require_boot_identity: bool = False) -> int:
     """Refuse an uncertain external selection without a traceback or kill list."""
     try:
-        pids = slot_processes(mirror)
+        pids = slot_processes(mirror, require_boot_identity=require_boot_identity)
     except SlotProcessesUnresolved:
         return SLOT_PROCESSES_UNRESOLVED
     except (OSError, ValueError):
@@ -303,17 +354,18 @@ def print_slot_processes(mirror: Path) -> int:
 
 
 @contextmanager
-def slot_run(mirror: Path) -> Generator[None, None, None]:
+def slot_run(mirror: Path, *, require_boot_identity: bool = False) -> Generator[None, None, None]:
     """Publish ownership before shell evaluation can start a child process."""
     try:
-        if (mirror / '.linux-run.json').exists() and slot_processes(mirror):
-            raise ValueError('the slot still has running processes')
-    except SlotProcessesUnresolved as error:
+        if ((mirror / '.linux-run.json').exists()
+                and slot_processes(mirror, require_boot_identity=require_boot_identity)):
+            raise SlotStartupRefused('the slot still has running processes')
+    except (OSError, ValueError, SlotProcessesUnresolved) as error:
         raise SlotStartupRefused('an earlier run still has unresolved ownership') from error
     pid = os.getpid()
     token = uuid.uuid4().hex
     lease: SlotRun = {'pid': pid, 'start_time': int(process_fields(pid)[19]),
-                      'process_group': os.getpgrp(), 'token': token}
+                      'process_group': os.getpgrp(), 'token': token, 'boot_id': boot_identity()}
     marker = mirror / '.linux-run.json'
     with marker.open('x') as output:
         _ = output.write(json.dumps(lease))
@@ -328,7 +380,7 @@ def slot_run(mirror: Path) -> Generator[None, None, None]:
             del os.environ['BUILD_TARGET_RUN_TOKEN']
         # Keep the marker when a detached child still owns the slot.
         try:
-            children = slot_processes(mirror)
+            children = slot_processes(mirror, require_boot_identity=require_boot_identity)
         except (OSError, ValueError, SlotProcessesUnresolved):
             print('mac_cleanup=unconfirmed', flush=True)
         else:
@@ -338,12 +390,12 @@ def slot_run(mirror: Path) -> Generator[None, None, None]:
                 marker.unlink(missing_ok=True)
 
 
-def mirror_selector_script(mirror: str) -> str:
+def mirror_selector_script(mirror: str, *, require_boot_identity: bool = False) -> str:
     """Select the runner and its children even outside the slot directory."""
     code = ("import sys; from pathlib import Path; "
             + "sys.path.insert(0, str(Path.home()/'.claude/scripts/mac_test')); "
             + "from linux_runner import print_slot_processes; "
-            + "sys.exit(print_slot_processes(Path(sys.argv[1])))")
+            + f"sys.exit(print_slot_processes(Path(sys.argv[1]), require_boot_identity={require_boot_identity!r}))")
     return ('select_leftovers() {\n'
             + f'    python3 -c {shlex.quote(code)} "$HOME"/{shlex.quote(mirror)}\n'
             + '}\n')
@@ -386,13 +438,103 @@ def probe_command_script(mirror: str, values: dict[str, str], repository: str) -
                        '--mirror', mirror, '--values', json.dumps(values), '--repository', repository])
 
 
+class AwsExecutionEvidence(Protocol):
+    """Read generation-bound AWS evidence only for an AWS execution."""
+
+    def current_generation(self, directory: Path, boot_id: str) -> str: ...
+    def interruption_generation(self, directory: Path, *, target: str, generation: str) -> str: ...
+    def execution_permission(self, directory: Path, target: str, *, now: int,
+                             boot_id: str) -> ledger.AdmissionPermission: ...
+
+
+def aws_execution_evidence() -> AwsExecutionEvidence:
+    return cast(AwsExecutionEvidence, cast(object, import_module('scripts.aws_target.remote')))
+
+
+@dataclass(frozen=True)
+class AwsExecutionContext:
+    target: str
+    directory: Path
+
+
+@dataclass(frozen=True)
+class IndependentLinuxExecution:
+    """This Linux target does not use AWS spending permission."""
+
+
+def aws_execution_context(values: dict[str, str]) -> AwsExecutionContext | IndependentLinuxExecution:
+    target = SshTarget(values.get('selected_target', ''), 'linux', Path(values.get('selected_settings', '')))
+    if not is_aws_target(target):
+        return IndependentLinuxExecution()
+    return AwsExecutionContext(target.name, Path.home() / values['remote_state_directory'])
+
+
+def print_interruption(values: dict[str, str]) -> bool:
+    try:
+        context = aws_execution_context(values)
+        if isinstance(context, IndependentLinuxExecution):
+            return False
+        remote = aws_execution_evidence()
+        generation = remote.current_generation(context.directory, boot_identity())
+        interrupted = remote.interruption_generation(context.directory, target=context.target, generation=generation)
+        if interrupted:
+            print(f'aws_interrupted={interrupted}', flush=True)
+            return True
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return False
+
+
+def permission_refused(values: dict[str, str]) -> bool:
+    try:
+        context = aws_execution_context(values)
+        if isinstance(context, IndependentLinuxExecution):
+            return False
+        if TYPE_CHECKING:
+            from ..aws_target import ledger
+        else:
+            from scripts.aws_target import ledger
+        remote = aws_execution_evidence()
+        permission = remote.execution_permission(context.directory, context.target, now=int(time.time()),
+                                                 boot_id=boot_identity())
+        if isinstance(permission, ledger.PermissionAllowed):
+            return False
+        reason = permission.reason
+    except (OSError, ValueError, KeyError) as error:
+        reason = str(error)
+    print(f'aws_permission=refused reason={reason}', flush=True)
+    return True
+
+
+@contextmanager
+def interruption_signals(values: dict[str, str]) -> Generator[None, None, None]:
+    if isinstance(aws_execution_context(values), IndependentLinuxExecution):
+        yield
+        return
+
+    def interrupted(signum: int, _frame: FrameType | None) -> None:
+        if not print_interruption(values):
+            raise SystemExit(128 + signum)
+
+    previous = signal.signal(signal.SIGTERM, interrupted)
+    try:
+        yield
+    finally:
+        _ = signal.signal(signal.SIGTERM, previous)
+        _ = print_interruption(values)
+
+
 def probe_shell(mirror: Path, values: dict[str, str], repository: str) -> int:
     """Read parity inside the same cached environment as the work."""
+    if permission_refused(values):
+        return 75
     try:
-        with slot_run(mirror):
+        with interruption_signals(values), slot_run(mirror, require_boot_identity=isinstance(aws_execution_context(values), AwsExecutionContext)):
             shell = prepare_shell(mirror, Path.home() / values['shell_cache'],
                                   policy_setting(values, 'devshell', repository),
                                   positive_setting(values, 'shell_timeout_s'))
+            if permission_refused(values):
+                return 75
             command = (f'source {shlex.quote(str(shell.exports))} || exit 75\n'
                        + 'if [[ -n ${shellHook-} ]]; then eval "$shellHook" || exit 75; fi\n'
                        + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'
@@ -405,8 +547,10 @@ def probe_shell(mirror: Path, values: dict[str, str], repository: str) -> int:
 
 def run(mirror: Path, values: dict[str, str], repository: str, verb: str,
         words: tuple[str, ...], call_id: str, tree_key: str) -> int:
+    if permission_refused(values):
+        return 75
     try:
-        with slot_run(mirror):
+        with interruption_signals(values), slot_run(mirror, require_boot_identity=isinstance(aws_execution_context(values), AwsExecutionContext)):
             return execute_slot(mirror, values, repository, verb, words, call_id, tree_key)
     except SlotStartupRefused:
         print(STARTUP_REFUSAL_RECORD, flush=True)
@@ -441,6 +585,8 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
     selector = policy_setting(values, 'devshell', repository)
     shell = prepare_shell(mirror, Path.home() / values['shell_cache'], selector,
                           positive_setting(values, 'shell_timeout_s'))
+    if permission_refused(values):
+        return 75
     build_budget = positive_setting(values, 'build_budget_gib')
     budget = float(policy_setting(values, 'target_budget_gib', repository))
     if not math.isfinite(budget) or not 0 < budget <= build_budget:
@@ -499,6 +645,8 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
             cleanup = 'kept' if trimmed == 0 else '1'
     except OSError:
         cleanup = '1'
+    if print_interruption(values):
+        return 75
     if step_started:
         print(f'mac_exit={status}', flush=True)
     print(f'mac_cleanup={cleanup}', flush=True)
