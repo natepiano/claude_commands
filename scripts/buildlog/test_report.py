@@ -3171,9 +3171,11 @@ class ReportTests(unittest.TestCase):
         _ = (self.root / "sync_paused.json").write_text(json.dumps({
             "since": "2026-10-06T11:00:00Z", "why": "Mac hold",
         }))
-        note = report.mac_note()
-        self.assertTrue(note.startswith("Mac: sync paused since "))
-        self.assertIn("(Mac hold). Mac rows as of the ", note)
+        lines = report.peer_sync_lines()
+        mac = [line for line in lines if line.startswith("mac (")]
+        self.assertEqual(len(mac), 1)
+        self.assertIn("sync globally paused (Mac hold); run buildlog sync resume", mac[0])
+        self.assertIn("last successful exchange", mac[0])
 
     def test_every_step_kind_and_summary_places_p95_after_average(self) -> None:
         kinds = ("check", "clippy", "doc", "nextest", "mend", "fmt")

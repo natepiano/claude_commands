@@ -152,17 +152,15 @@ def read_test_tree_evidence(connection: sqlite3.Connection, start: str, end: str
     ).fetchall())
     mac_keys: dict[str, set[TestSelectionTree]] = {}
     local_passes: set[TestSelectionTree] = set()
-    local_targets = record.local_targets()
-    local_hosts = {host for target in local_targets for host in record.target_hosts(target)}
+    local_identity = record.local_step_identity()
     for call_id, caller, status, tree_key, package, command, target, host in rows:
-        if caller == "verify-linux":
-            continue
         if not isinstance(tree_key, str) or not tree_key or not isinstance(package, str) or not isinstance(command, str):
             continue
         key = TestSelectionTree(package, command, tree_key)
         if is_mac_step(caller):
             mac_keys.setdefault(str(call_id), set()).add(key)
-        elif status == 0 and (target in local_targets if target else host in local_hosts):
+        elif status == 0 and record.is_local_step(target, host, caller,
+                                                targets=local_identity.targets, hosts=local_identity.hosts):
             local_passes.add(key)
     return TestTreeEvidence(mac_keys, local_passes)
 
