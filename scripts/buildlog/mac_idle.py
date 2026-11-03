@@ -20,6 +20,11 @@ import store
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS.parent))
+sys.path.insert(0, str(SCRIPTS / "message"))
+if TYPE_CHECKING:
+    from ..message import send_budget
+else:
+    import send_budget
 
 if TYPE_CHECKING:
     from ..lint import memory_admit
@@ -252,7 +257,7 @@ def notify_director(call: VerifyCall, cause: str) -> bool:
                     "--from", "Mac idle watch", "--text", f"Mac idle watch: {cause}\nRepo {call.repo}; call {call.call_id}; "
                     + f"verify.sh {call.kind} {call.package}, pid {call.pid}. The Mac has no claim for at least 3 minutes. "
                     + "The call is still waiting on natedev. Check its wait and Mac result."],
-                    capture_output=True, text=True, timeout=45, check=False)
+                    capture_output=True, text=True, timeout=send_budget.seconds(), check=False)
             except (OSError, subprocess.SubprocessError):
                 return False
             return sent.returncode in (0, 1)

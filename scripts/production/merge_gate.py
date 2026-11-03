@@ -680,7 +680,10 @@ raise SystemExit(99)
         executable = tools / name
         _ = executable.write_text(script)
         executable.chmod(0o755)
-    return {**environment, "TMPDIR": str(root), "BUILDLOG_DIR": str(buildlog),
+    return {**environment, "TMPDIR": str(root),
+            "STAFF_FILE": str(root / "staff.json"),
+            "HERDR_PANE_RECORD_DIR": str(root / "herdr-panes"),
+            "BUILDLOG_DIR": str(buildlog),
             "TEST_TIMES_OUT": str(root / "test-times.json"),
             "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(root / "live-memory-reads.jsonl"),
             "PATH": str(tools) + os.pathsep + environment.get("PATH", os.defpath)}
@@ -1446,7 +1449,8 @@ def merge_checkpoint(args: GateArguments) -> int:
     except change_review.ChangeReviewError as error:
         raise GateRefused(str(error)) from error
     if refused := change_review.missing(commits):
-        raise GateRefused("checkpoint commits without a Change-Review line: " + "; ".join(refused))
+        raise GateRefused(f"checkpoint commits without a {change_review.TRAILER} line: "
+                          + "; ".join(refused) + "; " + change_review.HELD_NEXT_STEP)
     changes: list[change_review.PublicationChange] = []
     if review_list is not None:
         try:

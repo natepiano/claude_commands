@@ -10,17 +10,28 @@ import io
 import os
 from pathlib import Path
 import re
-from typing import cast, final
-from contextlib import redirect_stdout
+from typing import cast, final, override
+from contextlib import AbstractContextManager, redirect_stdout
 from unittest import mock
 from scripts.production import change_review, merge_gate, staff
 from scripts.production.test_change_review import ProducerFixture
-from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production.staff_test_support import (
+    fixture_unit_location, isolated_source_readers, isolated_staff_file, recorded_showrunner, source_environment,
+)
 from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
 
 
 @final
 class MergeGateCheckpointTests(MergeGateFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        environment = source_environment(self.root / "staff-sources")
+        environment["NOTIFIER_STATE_DIR"] = self.environment["NOTIFIER_STATE_DIR"]
+        self.environment.update(environment)
+        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, environment)))
+        _ = self.enterContext(isolated_source_readers())
+
     def review_producer(self, doc: Path) -> staff.StaffId:
         """Give the checkpoint unit a private staff record and a Units row."""
         self.write(doc, doc.read_text() + "\n## Units\n\n"
@@ -28,9 +39,8 @@ class MergeGateCheckpointTests(MergeGateFixture):
                    + f"| fixture | unit-phase | {self.unit} |\n")
         path = Path(self.environment["HOME"]) / ".local/state/staff/staff.json"
         with isolated_staff_file(path, self.environment):
-            runner = fixture_member("showrunner", name="fixture-showrunner", doc=staff.LiveDoc("natedev", doc))
-            unit = fixture_member("unit", name="fixture-unit", parent=runner.id,
-                                  worktree=staff.PresentWorktree("natedev", self.unit))
+            runner = recorded_showrunner("fixture-showrunner", doc)
+            unit = fixture_unit_location(runner, "fixture-unit", self.unit)
         return unit.id
 
     def test_checkout_holds_a_shared_copy_lock_through_suites_and_releases_it_on_error(self) -> None:
@@ -276,6 +286,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         result = self.run_gate(checkpoint=checkpoint)
         self.assert_refused_before_gate(result)
         self.assertIn("checkpoint(fixture): grid fades: no Change-Review line", result.stderr)
+        self.assertIn(change_review.HELD_NEXT_STEP, result.stderr)
 
     def test_a_green_merge_adds_one_row_per_visible_change_to_the_named_list(self) -> None:
         review, doc = self.review_list()
@@ -472,6 +483,13 @@ if __name__ == "__main__":
 
 
 class MergeGateProducerTests(ProducerFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        environment = source_environment(self.root / "staff-sources")
+        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, environment)))
+        _ = self.enterContext(isolated_source_readers())
+
     def test_record_changes_writes_the_checkpoint_units_staff_id(self) -> None:
         merged = self.merge()
         commits = change_review.merge_commits(self.repo, merged)

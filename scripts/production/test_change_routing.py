@@ -38,7 +38,7 @@ class StaffRoutingTests(unittest.TestCase):
         self.alert = cast(mock.Mock, self.enterContext(mock.patch.object(unrouted_alert, "notify")))
         self.top = fixture_member("showrunner", name="top")
         self.child = fixture_member("showrunner", name="child", parent=self.top.id)
-        self.unit = fixture_member("unit", name="builder-unit", parent=self.child.id,
+        self.unit = fixture_member("unit", name="builder", parent=self.child.id,
             worktree=staff.PresentWorktree("natedev", self.root / "builder"))
 
     def router(self, record: staff.StaffSnapshot | None = None) -> change_routing.StaffRouting:
@@ -116,7 +116,7 @@ class StaffRoutingTests(unittest.TestCase):
     def test_renamed_and_retired_units_keep_their_producer_route(self) -> None:
         row = {"#": "C1", "Producer": self.unit.id}
         before = self.router().owner(row, self.root / "change-review - top.md")
-        _ = staff.rename(self.unit.id, "renamed-unit")
+        _ = staff.rename(self.unit.id, "renamed")
         _ = staff.set_worktree(self.unit.id, staff.RemovedWorktree("natedev", self.root / "builder"),
                                    expected=self.unit.worktree)
         self.assertEqual(self.router().owner(row, self.root / "change-review - top.md"), before)
@@ -226,9 +226,9 @@ class StaffRoutingTests(unittest.TestCase):
             _ = doc.write_text(f"# {name}\n- **Change review:** `{listing}`\n")
         _ = staff.set_doc(self.top.id, staff.LiveDoc("natedev", docs["top"]))
         _ = staff.set_doc(self.child.id, staff.LiveDoc("natedev", docs["child"]))
-        retired = fixture_member("unit", name="retired-unit", parent=self.child.id,
+        retired = fixture_member("unit", name="retired", parent=self.child.id,
                                 worktree=staff.RemovedWorktree("natedev", self.root / "removed"))
-        _ = staff.rename(self.unit.id, "renamed-unit")
+        _ = staff.rename(self.unit.id, "renamed")
         _ = change_review.append_rows(listing, [change_review.Visible(f"Change {i}", "Read", "Proof") for i in range(5)],
             date(2026, 11, 2), "", docs["top"],
             producers=[self.unit.id, change_review.UnknownProducer(), staff.StaffId(fixture_runtime_id("missing-producer")), retired.id, self.child.id])
