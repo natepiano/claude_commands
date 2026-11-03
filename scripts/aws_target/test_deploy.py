@@ -100,6 +100,7 @@ class DeploymentTests(CostFixture):
     now: int = 0
     bundle: Path = Path()
     credentials: Path = Path()
+    notification_file: Path = Path()
     patch_sections: ClassVar[dict[str, str]] = {}
 
     @override
@@ -128,11 +129,14 @@ class DeploymentTests(CostFixture):
         )))
         _ = (hosts / 'aws-build-base.nix').write_text(
             '# The base shares the transport module.\n{ ... }: { imports = [ ../modules/linux/tailscale.nix ]; }')
+        self.notification_file = self.root / 'notification-email'
+        _ = self.notification_file.write_text('build@example.invalid\n')
+        self.text_setting('notification_email_file', str(self.notification_file))
         values = {
             'offload': 'off', 'deployment_profile': 'build-admin', 'stack_name': 'fixture-build',
             'ami_id': 'ami-fixture', 'ami_owner_id': '123456789012', 'nixos_release': '26.05',
             'availability_zone': 'us-east-1a', 'vpc_id': 'vpc-fixture', 'subnet_id': 'subnet-fixture',
-            'notification_email': 'build@example.invalid', 'existing_data_volume_id': '',
+            'existing_data_volume_id': '',
             'root_device_name': '/dev/xvda', 'scaler_user_name': 'build-scaler',
             'bootstrap_template_path': str(bootstrap_template),
             'scripts_source_url': 'https://example.invalid/public/commit.tar.gz',
@@ -389,6 +393,71 @@ class DeploymentTests(CostFixture):
                 self.assertEqual([(r.start, r.end, r.usd, r.confirmed_uptime_s) for r in requests],
                                  [(start, midnight, Decimal('6'), 0), (midnight, self.now, Decimal('6.5'), 0)])
 
+    def test_bootstrap_renders_without_a_notification_address_file(self) -> None:
+        self.notification_file.unlink()
+        rendered = self.reviewed_bundle()
+        self.assertIn('aws-build-first-boot-stop', rendered)
+        self.assertIn('/etc/aws-build/remote.conf', rendered)
+
+    def test_prepare_refuses_missing_or_unreadable_notification_files(self) -> None:
+        self.notification_file.unlink()
+        for unreadable in (False, True):
+            with self.subTest(unreadable=unreadable):
+                if unreadable:
+                    self.notification_file.mkdir()
+                with self.assertRaises((deploy.DeploymentRefused, ValueError)) as failure:
+                    _ = self.deployment().prepare()
+                self.assertIn('notification_email_file', str(failure.exception))
+                self.assertIn(str(self.notification_file), str(failure.exception))
+
+    def test_prepare_refuses_invalid_notification_content_without_printing_it(self) -> None:
+        for content in ('', ' \n', 'build example@example.invalid', 'build.example.invalid',
+                        'build@example.invalid\nother@example.invalid\n'):
+            with self.subTest(content=content):
+                _ = self.notification_file.write_text(content)
+                with self.assertRaises((deploy.DeploymentRefused, ValueError)) as failure:
+                    _ = self.deployment().prepare()
+                message = str(failure.exception)
+                self.assertIn('notification_email_file', message)
+                self.assertIn(str(self.notification_file), message)
+                if content.strip():
+                    self.assertNotIn(content.strip(), message)
+
+    def test_prepare_refuses_notification_paths_inside_the_public_repository(self) -> None:
+        tracked_path = Path(__file__).resolve()
+        self.notification_file.unlink()
+        self.notification_file.symlink_to(tracked_path)
+        for path in (tracked_path, self.notification_file):
+            with self.subTest(path=path):
+                self.replace('notification_email_file', str(path))
+                with self.assertRaises((deploy.DeploymentRefused, ValueError)) as failure:
+                    _ = self.deployment().prepare()
+                self.assertIn('notification_email_file', str(failure.exception))
+                self.assertIn(str(path.resolve()), str(failure.exception))
+
+    def test_prepare_uses_the_private_notification_address_in_saved_parameters(self) -> None:
+        self.replace('notification_email_file', '~/notification-email')
+        _ = self.notification_file.write_text('  build@example.invalid\n')
+        prepared = self.deployment().prepare()
+        self.assertEqual(prepared.parameters['NotificationEmail'], 'build@example.invalid')
+        saved = cast(list[dict[str, str]], json.loads((self.bundle / 'parameters.json').read_text()))
+        self.assertEqual([row['ParameterValue'] for row in saved if row['ParameterKey'] == 'NotificationEmail'],
+                         ['build@example.invalid'])
+        _ = self.notification_file.write_text('other@example.invalid\n')
+        updated = self.deployment().prepare()
+        self.assertEqual(updated.parameters['NotificationEmail'], 'other@example.invalid')
+        self.assertNotEqual(updated.fingerprint, prepared.fingerprint)
+
+    def test_apply_refuses_when_the_private_notification_file_disappears_after_prepare(self) -> None:
+        subject = self.deployment()
+        _ = subject.prepare()
+        self.notification_file.unlink()
+        with self.assertRaises((deploy.DeploymentRefused, ValueError)) as failure:
+            _ = subject.apply(approve_resources=True)
+        self.assertIn('notification_email_file', str(failure.exception))
+        self.assertIn(str(self.notification_file), str(failure.exception))
+        self.assertEqual(self.commands('deploy'), [])
+
     def test_prepare_is_local_and_first_boot_needs_no_observation(self) -> None:
         prepared = self.deployment().prepare()
         self.assertEqual(self.commands(), [])
@@ -481,6 +550,14 @@ class DeploymentTests(CostFixture):
         self.assertEqual(conf.read(self.settings).text('offload'), 'off')
         self.assertFalse((self.state / 'admission.json').exists())
         self.assertEqual(ledger.CostLedger(self.state).read_snapshot().observations[-1].state, 'pending')
+
+    def test_setup_restart_uses_prepared_parameters_without_the_private_address_file(self) -> None:
+        subject = self.deployment()
+        _ = subject.prepare()
+        _ = subject.apply(approve_resources=True)
+        self.notification_file.unlink()
+        self.assertEqual(subject.setup_start(approve_resources=True), {'InstanceId': 'i-fixture', 'State': 'pending'})
+        self.assertEqual(len(self.commands('start-instances')), 1)
 
     def test_setup_restart_refuses_a_changed_limit_before_any_resource_request(self) -> None:
         subject = self.deployment()
