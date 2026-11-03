@@ -75,7 +75,7 @@ class MoveJournalTests(unittest.TestCase):
                     with redirect_stdout(io.StringIO()):
                         self.assertEqual(len(moves.read_journal()), 1)
                 else:
-                    self.assertEqual(evidence, moves.RecordedAutoEntries(frozenset()))
+                    self.assertIsInstance(evidence, moves.UnreadableMoveJournal)
                 self.assertEqual(path.read_bytes(), valid + suffix)
 
     def test_an_auto_entry_read_recovers_interrupted_worker_name_conversion(self) -> None:

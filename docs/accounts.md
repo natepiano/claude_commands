@@ -489,7 +489,8 @@ A workers move to Claude needs a known source weekly reset and holds its work ro
 Failed routing-journal appends retain the Claude hold and a saved retry. A refused workers swap saves its failure before attempting the journal append; pending rows must reach the journal before replay checks can consume entries.
 
 Both engines read recorded entry IDs before they run entries.
-An unreadable move history prints one diagnostic and does not block moves.
+An unreadable workers move history preserves the queued workers entry and the workers role.
+The Claude engine reports an unreadable move history and continues.
 Journal writers append each complete row with one write and retry a short write.
 
 Install this version on both natedev and the Mac before adding the first workers entry: older readers reject a log containing workers entries. Verify rollout with a scratch home.

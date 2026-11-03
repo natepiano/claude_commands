@@ -279,7 +279,7 @@ def recorded_auto_entries() -> RecordedAutoEntries | UnreadableMoveJournal:
         return RecordedAutoEntries(frozenset())
     except (OSError, ValueError, UnicodeError) as error:
         print(f"account moves: anomaly: cannot read recorded workers moves: {error}")
-        return RecordedAutoEntries(frozenset())
+        return UnreadableMoveJournal()
 
 
 def append_move(entry: MoveEntry) -> None:
