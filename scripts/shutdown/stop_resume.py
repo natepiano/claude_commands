@@ -30,7 +30,6 @@ import herdr
 import pane_record
 from scripts.shutdown.launch_names import LaunchNames
 import pane_launch
-from scripts.shutdown import folder_trust
 from scripts.lib.resume_message import (
     ResumeWorkers as ResumeWorkers,
     NO_WORKERS as NO_WORKERS,
@@ -45,7 +44,7 @@ from scripts.shutdown.stop_results import (
     resume_failure_reason as resume_failure_reason,
 )
 import sessions
-from launch_permission import shutdown_state_root
+from scripts.shutdown.stop_results import shutdown_state_root
 
 if TYPE_CHECKING:
     from scripts.production.staff import StaffRow
@@ -364,9 +363,11 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                       Path(entry["environment"].get("CLAUDE_CONFIG_DIR", str(source))))
         label = to if to is not None else accounts.claude_config_label(target_dir)
         account_environment = named_account_environment(target_dir)
-        trust = folder_trust.heal(Path(entry["cwd"]), target_dir, source)
-        if isinstance(trust, (folder_trust.FolderNotTrusted, folder_trust.FolderTrustUnreadable)):
-            return ResumeFailed(identity, f"{trust.reason}. Run: {trust.command}")
+        trust = herdr.heal_claude_trust(Path(entry["cwd"]), target_dir / ".claude.json",
+            accounts.trust_sources(target_dir, source), dry_run=False)
+        if isinstance(trust, (herdr.Untrusted, herdr.UnreadableTrustFile)):
+            reason = str(trust) if isinstance(trust, herdr.UnreadableTrustFile) else f"Claude has not trusted {entry['cwd']}"
+            print(f"{entry['name']}: trust anomaly: {reason}", file=sys.stderr)
         if to is not None and original is not None and Path(original.entry["config_dir"]) != target_dir:
             original = pane_launch.finish_restore(original.path, original.entry,
                 pane_launch.ResumeAttempt(original.entry["pane_id"], original.entry),

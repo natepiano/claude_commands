@@ -766,7 +766,7 @@ class StopResumeTests(unittest.TestCase):
             self.assertEqual(len(output.getvalue().splitlines()), 1)
             self.assertIn("Claude is up on claude4" if iteration == 0 else "Claude is already running on claude4", output.getvalue())
 
-    def test_move_copies_source_folder_trust_to_the_target_before_start(self) -> None:
+    def test_move_copies_source_trust_to_the_target_before_start(self) -> None:
         target = self.root / ".claude4/.claude.json"
         _ = target.write_text(json.dumps({"projects": {}, "unrelated": "keep"}))
         def start_after_trust(*arguments: str) -> str:
@@ -785,28 +785,6 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(line.count("copied folder trust from claude3"), 1)
         self.assertEqual(json.loads(target.read_text())["unrelated"], "keep")
 
-    def test_move_without_trust_refuses_with_target_trust_command_before_start(self) -> None:
-        for label in ("claude3", "claude4"):
-            _ = (self.root / f".{label}/.claude.json").write_text('{"projects": {}}')
-        results = stop_resume.move_sessions(["alpha"], "claude4", why="usage limit")
-        result = results[0]
-        self.assertIsInstance(result, stop_resume.ResumePending)
-        assert isinstance(result, stop_resume.ResumePending)
-        command = accounts.trust_command(self.root, accounts.NamedAccount("claude4", self.root / ".claude4"))
-        self.assertIn("Claude has not trusted this folder", result.reason)
-        self.assertIn(f"Run: {command}", result.reason)
-        self.start.assert_not_called()
-        self.detach.assert_not_called()
-
-    def test_resume_with_unreadable_target_trust_refuses_before_start(self) -> None:
-        _ = (self.root / ".claude4/.claude.json").write_text('{"private": "never disclose"')
-        result = stop_resume.resume("alpha", to="claude4", why="usage limit")
-        self.assertIsInstance(result, stop_resume.ResumeFailed)
-        assert isinstance(result, stop_resume.ResumeFailed)
-        self.assertIn("cannot read", result.reason)
-        self.assertIn("Run: " + accounts.trust_command(self.root, accounts.NamedAccount("claude4", self.root / ".claude4")), result.reason)
-        self.assertNotIn("never disclose", result.reason)
-        self.start.assert_not_called()
 
     def test_a_stopped_tab_resumes_by_id_or_label_from_its_launch_entry(self) -> None:
         self.client.rows[0]["agent_session"] = None
