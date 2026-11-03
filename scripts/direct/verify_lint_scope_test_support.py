@@ -113,6 +113,11 @@ if arguments[:1] == ["clippy"]:
     if "TEST_CLIPPY_EXPECT_SOURCE" in os.environ:
         if source.read_text(encoding="utf-8") != os.environ["TEST_CLIPPY_EXPECT_SOURCE"]:
             raise SystemExit(101)
+    if "TEST_CLIPPY_STATUSES" in os.environ:
+        judgments = [json.loads(line)["args"] for line in
+                     Path(os.environ["TEST_CARGO_EVENTS"]).read_text(encoding="utf-8").splitlines()]
+        judgment_count = sum(args[:1] == ["clippy"] and "--fix" not in args for args in judgments)
+        raise SystemExit(json.loads(os.environ["TEST_CLIPPY_STATUSES"])[judgment_count - 1])
     raise SystemExit(int(os.environ.get("TEST_CLIPPY_STATUS", "0")))
 if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
     events = [json.loads(line)["args"] for line in
@@ -460,7 +465,7 @@ raise SystemExit(128 + signal if signal else result.returncode)
 
     def assert_fix_and_judgment_calls(self, *, fix_passes: int = 1) -> None:
         scope = ["--workspace", "--all-targets", "--all-features", "--keep-going"]
-        self.assertEqual(self.calls("clippy"), [
+        self.assertEqual(self.calls("clippy"), [[*scope, "--", "-D", "warnings"]] + [
             ["--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs",
              *scope, "--", "-D", "warnings"],
         ] * fix_passes + [[*scope, "--", "-D", "warnings"]])

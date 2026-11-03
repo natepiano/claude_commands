@@ -1,49 +1,30 @@
 # Write a worker prompt
 
-Read at the point of use from `/unit:direct`. Defines `<WritePromptContract/>`,
-`<PhaseTeam/>`, `<CoordinationBoard/>`, `<PhaseMesh/>`, `<BuildTokenContract/>`,
-`<TeamFilePartition/>`, and `<RoleReassignment/>` in full.
-
-**Read when:** writing any implementation, fix, or review prompt.
+Use from `/unit:direct` for implementation, fix, test, and review prompts.
 
 <WritePromptContract>
-Every implementation or fix prompt sent to a worker contains sections 1–9.
-Compaction can replace earlier prompt text with a summary, so a follow-up or
-repair is complete on its own. Section 7 may use its follow-up pointer; section
-9 is always inline. Never abbreviate the new Project Context, Work
-Specification, team partition, boundaries, or verification on the strength of
-earlier work.
+Include sections 1–10 in every implementation, test, and repair prompt.
+Make each prompt complete after compaction. Keep sections 9 and 10 inline.
+A follow-up may use the section 7 pointer.
+Review prompts include sections 7 and 9 and the <ReviewPromptContract/> opening.
+Codex review prompts also include section 3's command block.
 
-Every review prompt carries sections 7 and 9 the same way, plus the role-switch
-opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
-3's `## Builds and tests` section verbatim.
-
-1. Role: write the requested code directly; do not ask questions. Name the
-   slot this prompt is for and the role assigned by the Work Order's **Workers**
-   field per <PhaseTeam/>. A new-phase continuation begins: `You are slot
-   <slot>, continuing into phase <N> as <role>. Your earlier work is
-   committed.` A replacement thread uses opening wording instead.
-2. Boundaries: do not commit, branch, or touch unrelated files; summarize files,
-   reasons, and deviations when done, and **write that summary to this slot's
-   `${PHASE_DIR}/impl_summary_<slot>.txt`, its path written out in full, as the
-   last act before finishing** — a background
-   session has no output redirect, so a summary left only in the reply is a
-   summary the unit director never sees. State this slot's file set and the
-   peer's file set per <TeamFilePartition/>, and that a peer's file is blocked
-   rather than merged. The summary also carries the three things no reader can
-   recover from the diff: **what this slot is unsure about, what it could not
-   verify, and what it touched outside its file set**. No reviewer receives a
-   summary, so a doubt left unstated arrives at review as a line of code that
-   looks deliberate. Implementation, fix and test prompts carry verbatim:
-   "Do not open the `rust_style` skill or run `load-rust-style.sh`; the reviewer
-   worker owns the phase style review." Review prompts use
+1. Role: instruct the worker to write code directly without questions.
+   Name its slot and Work Order role under <PhaseTeam/>.
+   Continue an existing thread with: `You are slot <slot>, continuing into phase <N> as <role>. Your earlier work is committed.`
+   Use opening wording for a replacement thread.
+2. Boundaries: prohibit commits, branches, and unrelated edits.
+   State both file sets under <TeamFilePartition/>. Block changes to a peer's files.
+   Require the summary as the last act at the full `${PHASE_DIR}/impl_summary_<slot>.txt` path.
+   Include files, reasons, deviations, doubts, unverified checks, and edits outside the file set.
+   Implementation, fix and test prompts carry verbatim:
+   "Do not open the `rust_style` skill or run `load-rust-style.sh`; the reviewer worker owns the phase style review."
+   Review prompts use
    <ReviewPromptContract/>'s style assignment instead.
-3. Narration: when the activity changes — a new piece of work, or a run
-   started — run
+3. Narration: require this command when the activity changes, with the concrete path and assigned slot:
    `bash ~/.claude/scripts/direct/board.sh post <concrete SESSION_DIR> <slot> status "<activity>"`.
-   Use short present-tense text and never read the heartbeat file. Post
-   nothing while the activity stays the same. Every prompt to a Codex worker
-   carries this section verbatim, after section 2:
+   Use short present-tense text. Do not read the heartbeat file or post unchanged activity.
+   Include this command block verbatim after section 2 in every Codex prompt:
 
    ```
    ## Builds and tests
@@ -71,75 +52,38 @@ opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
    `kill -TERM -- -<pid>`.
    ```
 
-   Every model call resends the worker's whole context, and on 2026-10-15
-   68% of worker calls were waits, sleeps and status posts. The unit
-   director's side is <WorkerRuns/> in `/unit:direct`. A Claude worker
-   gets no such section: it runs its commands with `run_in_background: true`
-   and ends its turn until the task notification arrives. Role
-   changes: **before the first tool call in a new role** — taking a slice of
-   the test work, standing down — run
-   `bash ~/.claude/scripts/direct/board.sh role <concrete SESSION_DIR> <slot> <impl|fix|test|review> "<why>"`,
-   written out with the real path and this slot's name. A `status` sentence
-   saying the same thing does not count: the table reads the `role=` field,
-   and a move that is not posted is a row the run never shows.
-
-   **The slot in every one of these commands is this prompt's slot.** Composing
-   both prompts from one draft carries the first slot into both, and the board
-   then reads as one worker doing the whole round while the other sits silent —
-   the attribution the required argument exists to keep. Nothing downstream can
-   catch it, because each post is well-formed. Before dispatch, check that the
-   two prompts name different slots.
-4. `## Team` — state the assignment from Workers (`1 writer + 1 tester` or
-   `2 writers`, and the role each slot takes), then name both slots and who
-   holds which files, each hub file with its one owner. Copy
-   the board commands from <CoordinationBoard/>, and say a `verify.sh` run may
-   pause while a peer finishes its own. Copy <BuildTokenContract/>'s
-   worker-facing prohibition: never mention, request, or acquire the cargo
-   token. State the one rule plainly: **a question to a peer is a message, a
-   decision is a board post**, and the board has no `ask` kind to fall back on.
-   State too: **say where anything you pass to a peer came from**; only the unit
-   director relays the user's words, labelled as the user's. User, 2026-10-04.
-   Give this slot its own mesh name, its peer's name, the call that reaches
-   it, and — on the claude path — the unit director's name from
-   `ListAgents`, per <PhaseMesh/>. An address a member has to go looking for is
-   one it will not use, and a codex peer needs the literal `codex_mesh.py`
-   command line with the concrete `--session-dir` already filled in, not a
-   description of it. A slot whose register line says `mesh=none` has no peer
-   channel at all: say so, and tell it to read the board rather than wait on a
-   reply. A repair worker per <FixDispatch/> has no peer: its `## Team` carries
-   its file set, the other repair workers' files as read only, and the token
-   prohibition.
-
-5. `## Project Context`.
-6. `## Work Specification`.
-   Every implementation, test and repair prompt carries verbatim: "Do not weaken, delete or turn off an existing assertion or test to make a test pass. If one must change, post blocked with the test, the old assertion, the new assertion and why." The unit director answers a blocked post in the next work order: it rejects the change, or it adds the ruling line `Assertion-Change: <path>::<test> — <why>`, which `assertion_guard.py` reads from the run's work orders and from the commit message. Without that line, `verify.sh lint` and the checkpoint commit refuse a removed, weaker or turned-off assertion or test. In cargo-liner-tile checkpoint e21d5b93 a worker changed an `assert_eq!` to a bound `assert!` to make its change pass, and no review saw it (user, 2026-10-28).
-
-   For workers writing tests, carry: "Do not write trivial tests that cannot fail for a real defect: assertions of a constant, literal or default against itself, implementation repetition, tests of the standard library or a mock they configure, name-existence or import-only checks, or duplicates of another test; a test that pins behaviour a user or another script depends on is not trivial."
-
-   Every repair prompt's Work Specification also carries these fixing rules inline:
-
-   - Remove dead code; do not mark it as dead to silence a warning.
-   - Remove an unused binding; do not prefix its name with `_`.
-   - Before a rename or signature change, use LSP `findReferences` to find
-     every reference and update each affected reference. Reread the changed
-     body afterwards.
-   - Before fixing a clippy lint, find its governing style rule with:
-
-     ```bash
-     grep -l "^lint:.*\b<lint>\b" ~/rust/nate_style/rust/*.md docs/style/*.md
-     ```
-
-     Read each matching rule, apply it, and cite its file in the fix summary.
-     If none matches, report that no style-guide rule governs the lint and
-     choose the fix from the finding and surrounding code.
-   - On a `cargo mend --fix` rollback, stop and keep the tree for inspection.
-7. `## Type Design Contract` per <TypeDesignContract/>. Copy it verbatim in an
-   opening prompt. A follow-up may instead say: `Read
-   ~/.claude/docs/type_design.md in full and apply its Type Design Contract to
-   this work.`
-8. `## Verification` per <VerificationContract/>, exactly as listed and with
-   nothing added around it.
-9. `## Three Gods`, always inline:
+   Claude workers use `run_in_background: true` and end the turn until the result arrives.
+   Before a role change, require `bash ~/.claude/scripts/direct/board.sh role <concrete SESSION_DIR> <slot> <impl|fix|test|review> "<why>"`.
+   Use the concrete path and the prompt's slot. Check that different prompts name different slots.
+4. `## Team`: copy the Workers assignment and file ownership, including one owner for each hub file.
+   Copy the <CoordinationBoard/> commands. State that `verify.sh` may pause for a peer.
+   Prohibit cargo token requests, acquisition, and discussion under <BuildTokenContract/>.
+   Send questions by message. Record decisions on the board. State each source when passing information.
+   Label the user's words only when the unit director relays them.
+   Include each mesh name and its concrete contact command under <PhaseMesh/>.
+   Include the unit director's `ListAgents` name for Claude workers.
+   For `mesh=none`, state that no peer channel exists and require the worker to read the board.
+   For repairs, list the file set, other workers' files as read-only, and the token prohibition under <FixDispatch/>.
+5. `## Project Context`: include the current context. Omit plan **Style** metadata.
+6. `## Work Specification`: include the following instructions verbatim.
+   "Do not weaken, delete or turn off an existing assertion or test to make a test pass. If one must change, post blocked with the test, the old assertion, the new assertion and why."
+   The next Work Order rejects the change or records `Assertion-Change: <path>::<test> — <why>` for `assertion_guard.py`.
+   For tests, prohibit constant comparisons, implementation copies, library tests, configured mock tests, existence checks, and duplicate behavior tests.
+   Include these repair rules:
+   - Remove dead code and unused bindings. Do not suppress warnings or prefix unused names with `_`.
+   - Before a rename or signature change, use LSP `findReferences`. Update all references and reread the changed body.
+   - Before a clippy repair, run `grep -l "^lint:.*\b<lint>\b" ~/rust/nate_style/rust/*.md docs/style/*.md`.
+   - Read matching rules, apply them, and cite them in the summary.
+   - If no rule matches, report that fact and use the finding and nearby code.
+   - After a `cargo mend --fix` rollback, stop and keep the tree for inspection.
+7. `## Type Design Contract`: copy <TypeDesignContract/> verbatim in opening prompts.
+   A follow-up may say: `Read ~/.claude/docs/type_design.md in full and apply its Type Design Contract to this work.`
+8. `## Verification`: copy <VerificationContract/> commands and worker rules without extra requirements.
+   Do not require lint before tests. Permit only listed commands, with the sandbox disabled, and prohibit raw Cargo.
+   Require every result and its output before the final report. For Codex, require results from section 3's runs.
+   Read the named log for `PASS (recorded)`. Add `--no-cache` only for an intentional repeat, such as a flake investigation.
+   Add the package's scoped `verify.sh test` when an edited package has no listed test command. Report the addition.
+9. Include this section verbatim:
 
    ```
    ## Three Gods
@@ -147,18 +91,17 @@ opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
    We believe in three gods, Simple, Fast and Beautiful, with correctness as the
    floor beneath them.
    ```
+10. Include this section inline in every implementation, test, and repair prompt:
 
-The Verification section carries the applicable command lines and every
-worker-facing rule from <VerificationContract/>, with nothing added around
-them. Command-list order must not make lint a precondition for test. It must
-also say: run only its listed commands, never raw Cargo; run each
-with the sandbox disabled; do not report until every command has exited and its
-output has been read. For a Codex worker, the final report waits for the
-results item 3's runs send. Status 77 means cancelled because the tree changed:
-resubmit after your edits are done; it is not a test failure. A run that prints
-`PASS (recorded)` is that gate's result, and the log it names is the output to read; add `--no-cache` only to re-run a
-passing gate on purpose, as in a flake hunt. If an edited package has no listed `test` line, add that
-package's scoped `verify.sh test` and report it. Omit plan **Style** metadata.
+    ```
+    ## Build rules
+
+    1. Fix every visible failure before you rerun. Finish the edit round. Then run once.
+    2. After a pass, do not run again until your edits are done.
+    3. While editing, use `verify.sh check`. Lint runs once, at the phase gate.
+    ```
+
+    Run the phase and merge gates in full. Require each worker's listed tests before its checkpoint.
 </WritePromptContract>
 
 <PhaseTeam>

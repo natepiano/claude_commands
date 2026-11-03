@@ -114,7 +114,7 @@ class StatusTests(IsolatedBuildTargetTest):
         config = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         expected = ("MAC IDLE 10 min: 7 steps wait for the Mac. Blocked by research since "
                     "13:50 (P15 F11 L0 run); /build:mac unblock clears it.")
-        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
              mock.patch.object(time, "time", return_value=NOW.timestamp()):
             for terminal in (False, True):
                 with self.subTest(terminal=terminal):
@@ -129,7 +129,7 @@ class StatusTests(IsolatedBuildTargetTest):
     def test_stale_mac_reading_prints_before_target_status(self) -> None:
         _ = write_idle_alert(self.root / "mac-idle", NOW.timestamp(), written_age=301)
         config = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
-        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
              mock.patch.object(time, "time", return_value=NOW.timestamp()):
             code, output, errors = self.capture_status()
         self.assertEqual((code, errors), (0, ""))

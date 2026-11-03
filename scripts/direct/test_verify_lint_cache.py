@@ -14,6 +14,7 @@ class VerifyLintScopeTests(VerifyLintJudgmentFixture):
             "TEST_CLIPPY_FIRST_STATUS": "101",
             "TEST_FIX_SOURCE": "pub fn value()->u8{2}\n",
             "TEST_FMT_SOURCE": formatted,
+            "TEST_CLIPPY_EXPECT_SOURCE": formatted,
         })
         result = self.verify("lint", "sample")
         self.assert_fix_and_judgment_calls(fix_passes=2)

@@ -28,7 +28,7 @@ class VerifyLintScopeTests(support.VerifyLintScopeFixture):
         _ = self.verify("lint", "sample")
         self.assertEqual(events.read_text().splitlines(), ["RUSTFMT"])
 
-    def test_unchanged_tree_runs_one_judgment_without_fixes_or_rustdoc(self) -> None:
+    def test_clean_tree_runs_one_judgment_without_repairs_or_rustdoc(self) -> None:
         result = self.verify("lint", "--workspace")
         self.assertEqual(self.calls("clippy"), [[
             "--workspace", "--all-targets", "--all-features", "--keep-going", "--", "-D", "warnings",
@@ -41,14 +41,14 @@ class VerifyLintScopeTests(support.VerifyLintScopeFixture):
         self.assertIn("style-lint: clippy passed", result.stdout.splitlines())
 
     def test_lint_matches_ci_and_preserves_other_stages(self) -> None:
+        self.environment["TEST_CLIPPY_STATUSES"] = "[101, 0]"
         _ = self.verify("lint", "sample")
         self.assert_workspace_taplo_check()
-        self.assertEqual(self.calls("clippy"), [[
-            "--workspace", "--all-targets", "--all-features", "--keep-going", "--", "-D", "warnings",
-        ]])
+        self.assert_fix_and_judgment_calls()
         self.assertEqual(self.calls("mend"), [["--all-targets", "--workspace", "--fix"]])
         self.assertEqual(self.calls("+nightly"), [
             ["fmt", "--version"], ["fmt", "-p", "sample"],
+            ["fmt", "-p", "sample"],
         ])
         self.assertEqual(self.calls("doc"), [])
 
