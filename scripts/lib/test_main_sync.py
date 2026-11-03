@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import io
 import os
 import subprocess
 import tempfile
 import unittest
 import unittest.mock
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import override
 
@@ -26,6 +28,7 @@ class MainSyncTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(redirect_stdout(io.StringIO()))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(unittest.mock.patch.dict(os.environ, {main_sync.STATE_ENV: str(self.root / "state")}))
         self.origin = self.root / "origin.git"

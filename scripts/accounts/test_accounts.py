@@ -5347,8 +5347,11 @@ finally:
         _ = groups.write_text('{"showrunners": "claude2", "units": "claude2"}')
         code, output, error = self.run_cli("status", "--stored")
         self.assertEqual((code, error), (0, ""))
-        row = next(line for line in output.splitlines() if "| claude2 " in line)
-        self.assertEqual([cell.strip() for cell in row.split("|")][3], "units, showrunners")
+        lines = output.splitlines()
+        index = next(index for index, line in enumerate(lines) if "| claude2 " in line)
+        self.assertEqual([cell.strip() for cell in lines[index].strip("|").split("|")][2], "units")
+        self.assertEqual([cell.strip() for cell in lines[index + 1].strip("|").split("|")],
+                         ["", "", "showrunners", "", "", "", "", ""])
 
     def json_status_fixture(self) -> tuple[datetime, datetime]:
         self.login_directory("claude2", "main@example.invalid")
@@ -8337,6 +8340,25 @@ class SharedStatusDocumentTests(unittest.TestCase):
         status = cast(dict[str, object], json.loads(accounts.render_status_json(self.reading(row))))
         self.assertEqual(status["problems"], ["Fixture problem."])
         return cast(list[dict[str, object]], status["accounts"])[0]
+
+    def test_multiple_roles_have_separate_rows_without_repeated_account_cells(self) -> None:
+        row = replace(self.row(), roles=("units", "showrunners"),
+                      role_counts=(accounts.RoleSessionCounts(1, 1, 1), accounts.RoleSessionCounts(1, 0, 1)))
+        reading = self.reading(row)
+        table = accounts.render_status_table(reading)
+        cells = [tuple(cell.strip() for cell in line.strip("|").split("|"))
+                 for line in table.split("\n\n", 1)[0].splitlines()[2:]]
+        self.assertEqual(len(cells), 2)
+        first_role = replace(row, roles=("units",), role_counts=row.role_counts[:1])
+        single = accounts.render_status_table(self.reading(first_role))
+        self.assertEqual(cells[0], tuple(cell.strip() for cell in single.splitlines()[2].strip("|").split("|")))
+        self.assertEqual(cells[1], ("", "", "showrunners", "", "", "", "", ""))
+        document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+        self.assertEqual(len(document["accounts"]), 1)
+        self.assertEqual(document["accounts"][0]["roles"], ["units", "showrunners"])
+        self.assertEqual(document["accounts"][0]["role_counts"], [
+            {"busy": 1, "shell": 1, "idle": 1, "total": 3},
+            {"busy": 1, "shell": 0, "idle": 1, "total": 2}])
 
     def test_usage_failure_timing_names_the_last_attempt_without_promising_a_retry(self) -> None:
         now = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)

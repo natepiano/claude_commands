@@ -6,6 +6,7 @@ import fcntl
 import os
 import re
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -17,8 +18,8 @@ if __package__ in (None, ""):
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.atomic_file import write_text_atomic
 
-DEFAULT_PATH = Path("~/.claude/config/agents.conf").expanduser()
-REGISTRY_PATH = "config/agents.conf"
+DEFAULT_PATH = Path("~/.claude/config/models.conf").expanduser()
+REGISTRY_PATH = "config/models.conf"
 
 
 class RegistryRow(NamedTuple):
@@ -52,7 +53,7 @@ class FastForward(NamedTuple):
 
 
 def registry_path() -> Path:
-    configured = os.environ.get("AGENTS_CONFIG_FILE")
+    configured = os.environ.get("MODELS_CONFIG_FILE")
     return Path(configured) if configured else DEFAULT_PATH
 
 
@@ -60,17 +61,47 @@ def registry_text(registry: Path | None = None) -> str:
     return (registry or registry_path()).read_text(encoding="utf-8")
 
 
-def _rows(text: str) -> dict[tuple[str, str], RegistryRow]:
-    rows: dict[tuple[str, str], RegistryRow] = {}
+def _records(text: str) -> list[RegistryRow]:
+    records: list[RegistryRow] = []
     section = ""
     for line in text.splitlines():
         content = line.partition("#")[0].strip()
+        if not content:
+            continue
         if content.startswith("[") and content.endswith("]"):
             section = content[1:-1]
-        elif "=" in content:
-            key, value = (part.strip() for part in content.split("=", 1))
-            rows[section, key] = RegistryRow(section, key, value, line)
-    return rows
+            records.append(RegistryRow(section, "", "", line))
+        else:
+            key, separator, value = content.partition("=")
+            records.append(RegistryRow(section, key.strip(), value.strip() if separator else "", line))
+    return records
+
+
+def parse_registry(text: str) -> dict[str, dict[str, str]]:
+    """Parse sections and rows from registry text, including empty sections."""
+    sections: dict[str, dict[str, str]] = {}
+    for row in _records(text):
+        values = sections.setdefault(row.section, {})
+        if row.key:
+            values[row.key] = row.value
+    return sections
+
+
+def shell_assignments(text: str) -> str:
+    """Return quoted Bash arrays from the shared parser."""
+    sections: list[str] = []
+    rows: list[str] = []
+    for row in _records(text):
+        sections.append(shlex.quote(row.section))
+        content = row.line.partition("#")[0].strip() if row.key else ""
+        rows.append(shlex.quote(content))
+    return ("_models_table_sections=(" + " ".join(sections) + ")\n"
+            + "_models_table_rows=(" + " ".join(rows) + ")\n")
+
+
+def _rows(text: str) -> dict[tuple[str, str], RegistryRow]:
+    return {(row.section, row.key): row for row in _records(text)
+            if row.key and "=" in row.line.partition("#")[0]}
 
 
 def _changes(before: str, after: str) -> list[RowChange]:
@@ -165,7 +196,7 @@ def _git(repo: Path, *arguments: str, input_text: str | None = None,
 
 
 def _publish_repository(path: Path) -> SharedRegistry | UnpublishedRegistry:
-    if os.environ.get("AGENTS_CONFIG_PUBLISH") == "0" or path.resolve() != DEFAULT_PATH.resolve():
+    if os.environ.get("MODELS_CONFIG_PUBLISH") == "0" or path.resolve() != DEFAULT_PATH.resolve():
         return UnpublishedRegistry()
     repo = Path(_git(DEFAULT_PATH.parent, "rev-parse", "--show-toplevel"))
     if path.resolve() != (repo.resolve() / REGISTRY_PATH):
@@ -327,7 +358,7 @@ def store_registry(registry: Path, before: str, after: str, description: str, *,
                    additive_catalog: bool = False) -> bool:
     """Replay this edit atomically; on the real registry fetch, ff, commit only it, and push.
 
-    Publishing is disabled by AGENTS_CONFIG_PUBLISH=0 and for every other path.
+    Publishing is disabled by MODELS_CONFIG_PUBLISH=0 and for every other path.
     Rejected pushes replay every pending local row on the fetched tip, at most
     three tries. An identical command recovers unfinished publication first.
     The registry commit is parented on local HEAD, so publishing an ahead
@@ -341,7 +372,7 @@ def store_registry(registry: Path, before: str, after: str, description: str, *,
     target = _publish_repository(path)
     if isinstance(target, SharedRegistry):
         repo = target.repository
-        lock_path = Path(_git(repo, "rev-parse", "--absolute-git-dir")) / "agents-config.publish.lock"
+        lock_path = Path(_git(repo, "rev-parse", "--absolute-git-dir")) / "models-config.publish.lock"
         with lock_path.open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             return _publish(repo, path, changes, description, additive_catalog)
@@ -360,7 +391,7 @@ def store_registry(registry: Path, before: str, after: str, description: str, *,
 class Arguments(argparse.Namespace):
     command: str = ""
     registry: Path = DEFAULT_PATH
-    before: Path = Path()
+    before: Path = Path("/dev/stdin")
     after: Path = Path()
     description: str = "update registry"
     additive_catalog: bool = False
@@ -368,14 +399,17 @@ class Arguments(argparse.Namespace):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("command", choices=("store", "catalog"))
+    _ = parser.add_argument("command", choices=("store", "catalog", "shell"))
     _ = parser.add_argument("--registry", type=Path, default=registry_path())
-    _ = parser.add_argument("--before", type=Path, required=True)
-    _ = parser.add_argument("--after", type=Path, required=True)
+    _ = parser.add_argument("--before", type=Path, default=Path("/dev/stdin"))
+    _ = parser.add_argument("--after", type=Path, default=Path())
     _ = parser.add_argument("--description", default="update registry")
     _ = parser.add_argument("--additive-catalog", action="store_true")
     arguments = parser.parse_args(namespace=Arguments())
     try:
+        if arguments.command == "shell":
+            print(shell_assignments(arguments.before.read_text(encoding="utf-8")), end="")
+            return 0
         before = arguments.before.read_text(encoding="utf-8")
         after = arguments.after.read_text(encoding="utf-8")
         if arguments.command == "catalog":

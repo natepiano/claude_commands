@@ -69,6 +69,9 @@ class VerifyNixShellTests(NixFixture):
         self.verify_script.chmod(0o755)
         self.script(scripts / "lib/py", PYTHON_SHIM)
         (scripts / "lib/nix_env.py").symlink_to(SCRIPTS / "lib/nix_env.py")
+        (scripts / "lint").mkdir()
+        _ = shutil.copy2(SCRIPTS / "lint/invoke.sh", scripts / "lint/invoke.sh")
+        _ = shutil.copy2(SCRIPTS / "lib/build_folders.py", scripts / "lib/build_folders.py")
         guards = scripts / "build_hold"
         guards.mkdir()
         _ = shutil.copy2(SCRIPTS / "build_hold/override_guard.sh", guards / "override_guard.sh")

@@ -11,13 +11,18 @@ import socket
 import stat
 import subprocess
 import sys
-import tempfile
 import tomllib
 import urllib.request
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, Literal, TypedDict, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if TYPE_CHECKING:
+    from ..lib import build_folders
+else:
+    from scripts.lib import build_folders
 
 import store
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -322,13 +327,13 @@ def trial_step_was_killed(result: subprocess.CompletedProcess[str]) -> bool:
 
 
 def default_trial_parent() -> Path:
-    return Path(tempfile.gettempdir())
+    return build_folders.inherited_temporary_parent()
 
 
 def trial_release(
     version: str, run_command: RunCommand, held: Callable[[], bool], trial_parent: Path,
 ) -> TrialOutcome:
-    clone = trial_parent / f"rust-release-trial-{version}"
+    clone = trial_parent / build_folders.FOLDER_PREFIXES["rust-release-trial"].format(owner=version)
     env = trial_environment()
     warnings = warning_crates = errors = error_crates = 0
     step = "toolchain"

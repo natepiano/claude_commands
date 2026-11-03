@@ -75,7 +75,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
             self.assertTrue(select.select([ready], [], [], TEST_HANG_GUARD_SECS)[0])
             self.assertEqual(ready.read(), b"", "an editor descendant can still change the registry")
         self.assertEqual(self.assignments()["direct"], "codex")
-        self.assertEqual([path.name for path in self.root.glob("agents.conf.*")], [])
+        self.assertEqual([path.name for path in self.root.glob("models.conf.*")], [])
 
 
 if __name__ == "__main__":

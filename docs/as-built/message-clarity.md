@@ -110,7 +110,7 @@ PushNotification (built-in) ── PreToolUse gate ── allowed only with that
 - Each review runs `claude -p` once, through `_review()`:
   - **Binary:** `reviewer_binary()` takes the first executable from `shutil.which("claude")`, `~/.local/bin/claude`, `/etc/profiles/per-user/$USER/bin/claude` or `/run/current-system/sw/bin/claude`. If none is found, the result is `Unreviewed("no claude binary: <paths tried>")`. The `review.jsonl` line records the resolved path or the paths tried.
   - **Account:** `reviewer_environment()` removes the caller's `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` and `CLAUDE_CONFIG_DIR`, then applies `accounts.prepared_account(accounts.role_account("unit").label)`.
-  - **Model:** `agents_resolve_print message_review.reviewer` sets the model, with a 2 s cap on that lookup. When it resolves nothing, the reviewer uses opus at medium effort. `config/agents.conf` has no `message_review` entry today, so the fallback is what runs.
+  - **Model:** `agents_resolve_print message_review.reviewer` sets the model, with a 2 s cap on that lookup. When it resolves nothing, the reviewer uses opus at medium effort. `config/models.conf` has no `message_review` entry today, so the fallback is what runs.
   - **System prompt:** the guide filtered by tag, followed by an instruction. Pushes use `push,all` and `reviewer_prompt.md`. Replies use `reply,all` and an inline prompt. Questions use `question,all` and an inline prompt.
   - **Zone:** the draft prompt of each review (push, reply and question) starts with `zone_line()`: `User zone: AST (America/Curacao). Today: 2026-10-25.`, from `scripts/lib/user_zone.py`. Each system prompt says times are in that zone. The reviewer never assumes a zone (2026-10-25: a reviewer refused AST times as not EDT).
   - **Flags:** `--json-schema SCHEMA --output-format json --tools "" --no-session-persistence --setting-sources ""`.
@@ -433,7 +433,7 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
 - **Outer waits come from `review.py` helpers** (`user_send_seconds()` and the others), never from literals. Each reviewer call can take up to `review_timeout_seconds()`, and wherever a rewrite is checked again, the budget allows two reviews.
 - **A terminal non-delivery** (`SKIPPED`, `REPLACED`) exits 0. Callers treat a nonzero exit as worth a retry or an alarm.
 - **Changes to `questions()` keep calling `record_question_history`** with `question` and `reviewed`, so the nightly count matches the reply. Question detection elsewhere reuses `reply_questions`. Recipient context applies only to the Stop hook, through `user_reply_questions`. `reply_questions` and `sample` stay unchanged.
-- **Do not commit `settings.json` or `config/agents.conf` from a unit worktree;** the showrunner applies the exact lines a change proposes.
+- **Do not commit `settings.json` or `config/models.conf` from a unit worktree;** the showrunner applies the exact lines a change proposes.
 
 ## Calibration and gotchas
 
@@ -502,7 +502,7 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
 - **Reviewer faults send the push as written:** an outage must never silence an alert to the user.
 - **A failed session push is not sent; registry and emergency pushes are:** a live session can revise and resend. A timer or script has no session to revise in time, and holding its push loses it. So the push goes out and a template fix is requested. The hold code stays only so existing holds finish.
 - **Code counts lengths:** the model reported false length failures on short bodies.
-- **The time limit lives in `config/notify.conf`:** a fixed 20 s constant was too short and could not be configured, and `config/agents.conf` is pinned.
+- **The time limit lives in `config/notify.conf`:** a fixed 20 s constant was too short and could not be configured, and `config/models.conf` is pinned.
 - **The gate releases the hold before allowing the fallback:** denying the fallback outright while a claim is live could leave the user with no push at all.
 - **User-specified texts are approved with recorded objections:** the user's own four lines win over the reviewer's rewrite.
 - **No source tracking for example values:** the logs hold no real sends for those senders, so the catalog says where its examples come from instead.

@@ -117,7 +117,7 @@ Go-live is the end of Phase 3, with test, check and doc: about 1,000 of last wee
 2. Run the runbook: `aws cloudformation deploy` of the template, with the region from the placement score and the $400 cap.
 3. In SSM Session Manager on the box: `sudo tailscale up --ssh --advertise-tags=tag:build-aws`, then add the tag rule to the tailnet policy.
 4. Create the scaler user's access key and write it with `aws configure --profile build-scaler` on natedev.
-5. Rebuild natedev and the box from the nixos branch.
+5. Rebuild the box from the nixos branch. natedev was rebuilt on `/etc/nixos` 10353a9 (2026-11-03), which holds the patch.
 
 ## Spending cap (user, 2026-11-01)
 

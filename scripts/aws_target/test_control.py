@@ -258,7 +258,7 @@ with mock.patch.object(linux_runner, "slot_run", return_value=nullcontext()), \
         self.assertEqual(self.aws.count("start-instances"), 0)
 
     def test_missing_stale_and_partial_snapshots_refuse_start_without_live_queue_reads(self) -> None:
-        with mock.patch("scripts.lint.memory_admit.read_queue", side_effect=AssertionError("live queue read")):
+        with mock.patch("scripts.build_queue.admission_client.view", side_effect=AssertionError("live queue read")):
             _ = self.controller().tick()
             self.snapshot(self.waiter(101), self.waiter(102), age=86400)
             _ = self.controller().tick()

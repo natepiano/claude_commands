@@ -20,7 +20,7 @@ from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.signal_test_support import SignalPidGuard, install_signal_pid_guard
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
 
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
@@ -228,7 +228,7 @@ def refuse_real_home(path: Path, source: str) -> None:
 
 
 def assert_fixture_environment() -> None:
-    for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "AGENTS_CONFIG_FILE"):
+    for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "MODELS_CONFIG_FILE"):
         value = os.environ.get(name)
         if not value:
             raise AssertionError(f"{name} is unset; codex_mesh fixture requires setUpModule")
@@ -376,7 +376,7 @@ class FixtureModelDefaults:
         self.environment: dict[str, str] = self.resolver_environment()
         self.files: dict[Path, tuple[int, bytes]] = {
             Path(os.environ[key]): (Path(os.environ[key]).stat().st_mtime_ns, Path(os.environ[key]).read_bytes())
-            for key in ("AGENTS_CONFIG_FILE", "CODEX_CONFIG_FILE", "CODEX_PACER_TIER_FILE",
+            for key in ("MODELS_CONFIG_FILE", "CODEX_CONFIG_FILE", "CODEX_PACER_TIER_FILE",
                         "CODEX_CATALOG_SYNC_STATE_FILE")
         }
         self.run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run
@@ -385,7 +385,7 @@ class FixtureModelDefaults:
     @staticmethod
     def resolver_environment() -> dict[str, str]:
         return {key: value for key, value in os.environ.items()
-                if (key.startswith(("AGENTS_", "CODEX_")) or key in ("BASH_ENV", "ENV", "PATH", "SHELLOPTS", "BASHOPTS"))
+                if (key.startswith(("AGENTS_", "MODELS_", "CODEX_")) or key in ("BASH_ENV", "ENV", "PATH", "SHELLOPTS", "BASHOPTS"))
                 and key not in ("CODEX_HOME",)}
 
     def unchanged(self) -> bool:
@@ -489,17 +489,17 @@ def setUpModule() -> None:
             _ = discovery_path.start()
             unittest.addModuleCleanup(discovery_path.stop)
     restore_notes = set_environment("AGENT_NOTES_DIR", home.name)
-    unittest.addModuleCleanup(set_environment("AGENTS_CONFIG_PUBLISH", "0"))
+    unittest.addModuleCleanup(set_environment("MODELS_CONFIG_PUBLISH", "0"))
     # Tier tests never read the caller's registry, config, or pacer choice.
     tier_files = {
-        "AGENTS_CONFIG_FILE": str(Path(home.name) / "agents.conf"),
+        "MODELS_CONFIG_FILE": str(Path(home.name) / "models.conf"),
         "CODEX_CATALOG_SYNC_STATE_FILE": str(Path(home.name) / "catalog-sync"),
         "CODEX_CONFIG_FILE": str(Path(home.name) / "codex.toml"),
         "CODEX_PACER_TIER_FILE": str(Path(home.name) / "pacer-tier"),
     }
     for path in tier_files.values():
         _ = Path(path).write_text("", encoding="utf-8")
-    _ = write_registry(Path(tier_files["AGENTS_CONFIG_FILE"]))
+    _ = write_registry(Path(tier_files["MODELS_CONFIG_FILE"]))
     for key, value in tier_files.items():
         unittest.addModuleCleanup(set_environment(key, value))
     # The complete shared fixture costs seconds to validate in Bash. Reuse
@@ -814,8 +814,8 @@ def _as_test_dict(value: object) -> dict[str, object]:
 class FixtureModelDefaultsTests(unittest.TestCase):
     def test_only_unchanged_baseline_results_are_reused(self) -> None:
         with tempfile.TemporaryDirectory() as root:
-            registry = write_registry(Path(root) / "agents.conf")
-            with patch.dict(os.environ, {"AGENTS_CONFIG_FILE": str(registry)}):
+            registry = write_registry(Path(root) / "models.conf")
+            with patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)}):
                 resolve = MagicMock(return_value=("gpt-test", "high"))
                 defaults = FixtureModelDefaults(resolve)
                 args = argparse.Namespace(role="impl", task="", model="gpt-test", effort="high")
@@ -833,7 +833,7 @@ class FixtureModelDefaultsTests(unittest.TestCase):
         defaults = FixtureModelDefaults(resolve)
         args = argparse.Namespace(role="review", task="", model="gpt-test", effort="high")
         self.assertEqual(defaults(args), ("gpt-test", "high"))
-        with patch.dict(os.environ, {"AGENTS_CONFIG_FILE": "/tmp/custom-mesh-registry"}):
+        with patch.dict(os.environ, {"MODELS_CONFIG_FILE": "/tmp/custom-mesh-registry"}):
             self.assertEqual(defaults(args), ("gpt-test", "high"))
             self.assertEqual(defaults(args), ("gpt-test", "high"))
         with patch.object(subprocess, "run"):
@@ -3197,8 +3197,8 @@ class FixtureHomeSafetyTests(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp")))
         real = root / "real"
         real.mkdir()
-        for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "AGENTS_CONFIG_FILE"):
-            environment = {key: str(root / "safe") for key in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "AGENTS_CONFIG_FILE")}
+        for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "MODELS_CONFIG_FILE"):
+            environment = {key: str(root / "safe") for key in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "MODELS_CONFIG_FILE")}
             environment[name] = str(real / "nested")
             with (self.subTest(variable=name), patch(f"{__name__}.REAL_HOME", real),
                   patch.dict(os.environ, environment),
@@ -4954,11 +4954,11 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         })
 
     def tier_environment(self, registry: dict[str, dict[str, str]], config: str = "") -> dict[str, str]:
-        registry_file = self.session_dir / "agents.conf"
+        registry_file = self.session_dir / "models.conf"
         config_file = self.session_dir / "codex.toml"
         _ = write_registry(registry_file, registry)
         _ = config_file.write_text(config, encoding="utf-8")
-        return {"AGENTS_CONFIG_FILE": str(registry_file), "CODEX_CONFIG_FILE": str(config_file),
+        return {"MODELS_CONFIG_FILE": str(registry_file), "CODEX_CONFIG_FILE": str(config_file),
                 "CODEX_PACER_TIER_FILE": str(self.session_dir / "pacer-tier")}
 
     def test_finished_run_wake_uses_the_recorded_task_and_not_the_launch_tier(self) -> None:
@@ -4983,7 +4983,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                             self.assertEqual(codex_mesh.command_send(argparse.Namespace(
                                 session_dir=str(self.session_dir), to="worker",
                                 message="Run finished: fixture build passed", message_file="")), 0)
-                        _ = write_registry(Path(environment["AGENTS_CONFIG_FILE"]),
+                        _ = write_registry(Path(environment["MODELS_CONFIG_FILE"]),
                             {"delegate.options": {"codex_service_tier": "flex"},
                              f"{function}.options": {f"codex_service_tier.{row}": "default"}})
                     return frame
@@ -5481,7 +5481,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         with patch.dict(os.environ, self.prepare_turn_display_worker()):
             first, _output, errors = self.run_mesh(self.follow_cli())
             self.assertEqual((first, errors), (0, ""))
-            registry_path = Path(os.environ["AGENTS_CONFIG_FILE"])
+            registry_path = Path(os.environ["MODELS_CONFIG_FILE"])
             _ = write_registry(registry_path, {"direct.codex": {"review": "gpt-current:low"}}, update=True)
             second, _output, errors = self.run_mesh(self.follow_cli())
         self.assertEqual((second, errors), (0, ""))
@@ -13722,12 +13722,12 @@ class WorkerAdoptionTests(MeshCommandFixture):
         }})
 
     def configure_allocation(self) -> None:
-        registry = self.session_dir / "workers-agents.conf"
+        registry = self.session_dir / "workers-models.conf"
         _ = write_registry(registry, {'codex.agents': {'gpt-fixture-sol': 'high,xhigh,max'}, 'assignments': {'direct': 'codex'}, 'direct.codex': {'impl': 'gpt-fixture-sol:xhigh'}, 'direct.options': {'codex_service_tier.impl': 'fast'}})
         checkpoint = self.session_dir / "catalog-current"
         checkpoint.touch()
         self.patches.enter_context(patch.dict(os.environ, {
-            "AGENTS_CONFIG_FILE": str(registry),
+            "MODELS_CONFIG_FILE": str(registry),
             "CODEX_CATALOG_SYNC_STATE_FILE": str(checkpoint),
         }))
 
@@ -13850,7 +13850,7 @@ class WorkerAdoptionTests(MeshCommandFixture):
 
     def test_new_review_thread_has_its_configured_shown_name_before_any_turn(self) -> None:
         self.configure_allocation()
-        registry = self.session_dir / "workers-agents.conf"
+        registry = self.session_dir / "workers-models.conf"
         _ = write_registry(registry, {"direct.codex": {"review": "gpt-fixture-sol:xhigh"}}, update=True)
         state = self.session_dir / plan_history.STATE_FILENAME
         _ = state.write_text(json.dumps({"working_dir": str(self.session_dir),

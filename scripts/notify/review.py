@@ -669,7 +669,7 @@ def reviewer_environment() -> tuple[dict[str, str], str]:
 def reviewer_assignment(runner: ProcessRunner, environment: dict[str, str],
                         timeout: float) -> tuple[str, str]:
     try:
-        result = runner(["bash", "-c", "source ~/.claude/scripts/agents/agents_config.sh; " +
+        result = runner(["bash", "-c", "source ~/.claude/scripts/agents/models_config.sh; " +
                          "agents_resolve_print message_review.reviewer"],
                         timeout=timeout, env=environment)
         fields = dict(item.split("=", 1) for item in result.stdout.split() if "=" in item)

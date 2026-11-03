@@ -36,7 +36,7 @@ from scripts.message import send_result
 from scripts.message import send_budget
 from scripts.whoami import note_file
 
-from scripts.lib import agents_registry  # noqa: E402
+from scripts.lib import models_registry  # noqa: E402
 
 from scripts.lib.user_zone import user_zone
 from scripts.whoami import agent_accounts
@@ -251,9 +251,9 @@ STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state
 SEND = Path(__file__).resolve().parent.parent / "message" / "send.py"
 SESSIONS = Path.home() / ".claude" / "sessions"
 PROTOCOL = Path.home() / ".claude" / "docs" / "quota_alerts.md"
-AGENTS = Path(__file__).resolve().parent.parent / "agents" / "agents_config.sh"
-# The same override agents_config.sh reads; edit_registry() passes it on explicitly.
-REGISTRY = Path(os.environ.get("AGENTS_CONFIG_FILE") or Path.home() / ".claude" / "config" / "agents.conf")
+AGENTS = Path(__file__).resolve().parent.parent / "agents" / "models_config.sh"
+# The same override models_config.sh reads; edit_registry() passes it on explicitly.
+REGISTRY = models_registry.registry_path()
 # The session whose user is shown a switch on their next prompt.
 OWNER = "natedev"
 # These values keep the existing 30-second relay delivery limit.
@@ -789,28 +789,19 @@ def local_time(stamp: str) -> str:
 
 def registry_assignments() -> dict[str, str]:
     """[assignments] in the registry: function, or exact-task override, -> family."""
-    found: dict[str, str] = {}
-    section = ""
-    for line in agents_registry.registry_text(REGISTRY).splitlines():
-        text = line.split("#", 1)[0].strip()
-        if text.startswith("[") and text.endswith("]"):
-            section = text[1:-1]
-        elif section == "assignments" and "=" in text:
-            key, family = text.split("=", 1)
-            found[key.strip()] = family.strip()
-    return found
+    rows = models_registry.parse_registry(models_registry.registry_text(REGISTRY))
+    return rows.get("assignments", {})
 
 
 def edit_registry(editor: str, *args: str) -> str | None:
-    """Run one of agents_config.sh's validated editors on REGISTRY; None when it took, otherwise why not.
+    """Run a validated registry editor and return its failure cause.
 
-    A timeout kills the editor's whole process group, so no orphaned mv lands after the caller has read
-    the registry back.
+    A timeout stops the process group before the caller reads the result.
     """
     command = ["bash", "-c", f'source "$0" && {editor} "$@"', str(AGENTS), *args]
     try:
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                   env={**os.environ, "AGENTS_CONFIG_FILE": str(REGISTRY)}, start_new_session=True)
+                                   env={**os.environ, "MODELS_CONFIG_FILE": str(REGISTRY)}, start_new_session=True)
     except OSError as error:
         return str(error)
     with process:

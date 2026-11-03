@@ -192,7 +192,8 @@ if TYPE_CHECKING:
     from ..notify import review
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import tmp_sweep
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lint import tmp_sweep
     import scratch
     from atomic_file import write_text_atomic
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
@@ -247,10 +248,9 @@ USE_STAMP = scratch.USE_STAMP
 # CARGO_TARGET_DIR, had stayed unseen. ~/.cache/sccache holds no .rustc_info.json and no cargo
 # cache tag, so is_cargo_target never takes it.
 FLOOR_ROOTS = ("~/rust", "~/.local/state", "~/.cache", "/tmp")
-FLOOR_LOCK = os.path.join("~", ".local", "state", "lint-sweep", "floor.lock")
 # Claude Code keeps each session's scratch (scratchpad/, tasks/) in <root>/<project>/<session id>/,
 # where <project> is the session's working directory with every / as -.
-FLOOR_STATE_ENV = "LINT_SWEEP_STATE_DIR"
+FLOOR_STATE_ENV = tmp_sweep.STATE_ENV
 BUILDLOG_DIR_ENV = "BUILDLOG_DIR"
 CI_TARGETS = ("/var/lib/hana-ci/hana-linux-1", "/var/lib/hana-ci/hana-linux-2")
 GROWTH_WINDOW_SECONDS = 30 * 60
@@ -2187,8 +2187,7 @@ def floor_bytes(values: dict[str, str], host: str) -> tuple[int | None, str | No
 
 
 def floor_record_path() -> Path:
-    state = os.environ.get(FLOOR_STATE_ENV) or "~/.local/state/lint-sweep"
-    return Path(os.path.expanduser(state)) / "floor.json"
+    return tmp_sweep.state_dir() / "floor.json"
 
 
 def _finite_number(value: object) -> TypeGuard[int | float]:
@@ -2196,7 +2195,7 @@ def _finite_number(value: object) -> TypeGuard[int | float]:
 
 
 def target_deletes_path() -> Path:
-    return floor_record_path().with_name("target-deletes.json")
+    return tmp_sweep.state_dir() / tmp_sweep.TARGET_DELETES_NAME
 
 
 def read_target_deletes(path: Path, now: float) -> dict[str, float]:
@@ -2697,9 +2696,10 @@ def hold_floor(
     floor: int,
     dry_run: bool,
     roots: Sequence[str] = FLOOR_ROOTS,
-    lock: str = FLOOR_LOCK,
+    lock: str = "",
 ) -> int:
     """Below the floor, take the shortfall from the least used idle targets."""
+    lock = lock or str(tmp_sweep.state_dir() / "floor.lock")
     if not dry_run:
         recover_pending_trims()
     home = os.path.expanduser("~")

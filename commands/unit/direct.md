@@ -25,7 +25,7 @@ review, gate and report. Every prompt sent to a worker carries them inline per
 <HeldAstraRoles>
 For LongLivedWorkers and LaunchImplementation, the director briefs and accepts;
 Astra authors the assigned design. Use one `design_roles.py` designer and at most one
-reviewer per design, with models resolved from `design_roles` in `agents.conf`. Open
+reviewer per design, with models resolved from `design_roles` in `models.conf`. Open
 once; resume the same instance across rounds, phases and runs. `design_roles.py` saves
 each headed prompt and reply; do not also use `astra_work.py brief` for that role.
 For a designer outside `design_roles.py`, include `config/design_roles/designer.md` in its brief

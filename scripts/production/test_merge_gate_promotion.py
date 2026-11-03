@@ -21,6 +21,36 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 @final
 class MergeGatePromotionTests(MergeGateFixture):
+    def test_remote_tracked_check_runs_without_repository_modules(self) -> None:
+        empty = self.root / "isolated-python"
+        empty.mkdir()
+        index_path = Path(self.git(self.main, "rev-parse", "--git-path", "index"))
+        index = index_path.read_bytes()
+        isolation = """import sys
+class NoRepositoryModules:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "scripts" or fullname.startswith("scripts."):
+            raise ModuleNotFoundError("remote host has no repository modules")
+sys.meta_path.insert(0, NoRepositoryModules())
+"""
+        environment = {**self.environment, "GIT_DIR": self.git(self.main, "rev-parse", "--absolute-git-dir"),
+                       "GIT_WORK_TREE": str(self.main)}
+        for edited in (False, True):
+            with self.subTest(edited=edited):
+                if edited:
+                    self.write(self.main / "subject.txt", "remote local edit\n")
+                result = subprocess.run([sys.executable, "-I", "-c",
+                                         isolation + merge_gate.PROMOTION_TRACKED_CHECK],
+                                        cwd=empty, env=environment, text=True,
+                                        capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, int(edited), result.stdout + result.stderr)
+                self.assertEqual(result.stderr, "")
+                if edited:
+                    self.assertIn('tracked edits differ from HEAD: "subject.txt"', result.stdout)
+                else:
+                    self.assertEqual(result.stdout, "")
+                self.assertEqual(index_path.read_bytes(), index)
+
     def test_mac_timeout_or_interruption_reports_that_main_was_already_promoted(self) -> None:
         args = merge_gate.GateArguments(main_repo=str(self.main), merge_branch="integration",
                                        ssh="fake-ssh", mac_repo="~/fixture", mac_host="fixture")

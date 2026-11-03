@@ -1,7 +1,7 @@
 """Tests for setting every unit director's effort and the launch row together."""
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 
 import contextlib
 import io
@@ -23,7 +23,7 @@ from fake_unit_host import HostedUnit
 from unit_effort import Ready, Skipped
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import agents_registry  # noqa: E402
+from scripts.lib import models_registry  # noqa: E402
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership, fixture_runtime_id
 
 RULE_TOP = "──── review ──────────"
@@ -75,7 +75,7 @@ class UnitEffortTests(unittest.TestCase):
         self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.records = self.root / "sessions"
         self.records.mkdir()
-        self.registry = self.root / "agents.conf"
+        self.registry = self.root / "models.conf"
         _ = write_registry(self.registry, {'assignments': {'production': 'claude'}, 'production.claude': {'director': 'opus:xhigh'}, 'claude.agents': {'opus': 'low,medium,high,xhigh,max'}})
         _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": '{"sessions": []}'}}))
         synced = self.root / "catalog-sync-success"
@@ -87,7 +87,7 @@ class UnitEffortTests(unittest.TestCase):
             "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "conversation-pause"),
             "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
-            "NOTIFIER_SESSIONS_DIR": str(self.records), "AGENTS_CONFIG_FILE": str(self.registry),
+            "NOTIFIER_SESSIONS_DIR": str(self.records), "MODELS_CONFIG_FILE": str(self.registry),
             "CODEX_CONFIG_FILE": str(self.root / "codex.toml"),
             "CODEX_MODELS_CACHE_FILE": str(self.root / "models.json"),
             "CODEX_CATALOG_SYNC_STATE_FILE": str(synced)}))
@@ -121,7 +121,7 @@ class UnitEffortTests(unittest.TestCase):
         return [call for call in fake_unit_host.calls(os.environ) if call[2:4] == ["agent", "prompt"]]
 
     def director_row(self) -> str:
-        return next(line for line in agents_registry.registry_text(self.registry).splitlines()
+        return next(line for line in models_registry.registry_text(self.registry).splitlines()
                     if line.startswith("director="))
 
     def test_the_dry_run_sends_nothing_and_changes_nothing(self) -> None:
