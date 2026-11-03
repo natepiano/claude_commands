@@ -12299,9 +12299,9 @@ class FollowEventRegressionTests(MeshCommandFixture):
             if item.get("type") == "agentMessage" and not created.is_set():
                 self.assertFalse(stream.runs.last_observed.live)
                 self.assertGreater(stream.runs.next_check, self.lifecycle_clock.monotonic())
-                _ = run.write_text(json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
+                atomic_file.write_text_atomic(run, json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
                 pending = self.session_dir / "worker.pending.json"
-                _ = pending.write_text(pending.read_text() + "\n")
+                atomic_file.write_text_atomic(pending, pending.read_text() + "\n")
                 if resident:
                     record = self.worker_record()
                     record["status"] = "done"
@@ -12336,7 +12336,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
                     held = codex_mesh.hold_message(str(self.session_dir), "worker", "detached run result",
                                                    without_launcher=False)
                     self.assertIsInstance(held, codex_mesh.HeldForLauncher)
-                _ = run.write_text('{"worker":"worker","status":"finished"}')
+                atomic_file.write_text_atomic(run, '{"worker":"worker","status":"finished"}')
                 if resident:
                     _ = (self.session_dir / "worker.end").write_text("end")
             code, errors = LauncherHangGuard(self.id()).result(future)
