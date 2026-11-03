@@ -465,10 +465,13 @@ class RepositorySlotTests(unittest.TestCase):
         self.assertIn("slot", self.claims("mac")[103])
 
     def test_target_state_includes_every_active_slot(self) -> None:
+        registry = self.root / "build_targets.conf"
+        _ = registry.write_text(registry.read_text().replace("aws", "linux-one"))
+        _ = (self.root / "aws.conf").rename(self.root / "linux-one.conf")
         root = self.repository("project", "https://github.com/nate/project.git")
         for pid in (101, 102):
-            self.assertEqual(self.claim("aws", root, pid)[0], 0)
-        configured = next(target for target in targets.read_targets() if target.name == "aws")
+            self.assertEqual(self.claim("linux-one", root, pid)[0], 0)
+        configured = next(target for target in targets.read_targets() if target.name == "linux-one")
 
         state = targets.target_state(configured)
 

@@ -63,7 +63,7 @@ class PrunePhaseNotesTests(unittest.TestCase):
         owner = showrunner_relationship(slug)
         _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
         unit = unit_membership(slug, "alpha-unit")
-        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", alpha))
+        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", alpha), expected=unit.worktree)
         return doc
 
     def timer(self, slug: str, doc: Path) -> None:

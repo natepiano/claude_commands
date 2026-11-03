@@ -90,6 +90,7 @@ The spending limit is the user's number; it is the one question in this design.
 ### Measurement
 
 - **Dollars.** The ledger (above) per day, and once a day one Cost Explorer read of the real charge ($0.01 a call), so the estimate is checked against the bill.
+- **Uptime.** Hours up count pending, running and stopping time, as the cost rule does (Phase 9 F045).
 - **Work.** Box steps carry `host=aws-build` and reach natedev through `buildlog sync`, as Mac steps do. Calls carry `target=aws`.
 - **Wait saved (estimate).** For a step that left natedev's queue after waiting t seconds: the median of (wait − t) over that day's natedev steps of the same kind and repository that waited longer than t. This is the rule `### Mac copies` uses. Add the difference between natedev's median run time and the box's run time for that command; it can be negative.
 - **Report.** `/build:status` gets an `aws:` row: `stopped`, `starting since HH:MM`, `running <n> of <m> slots`, `draining — Spot interruption at HH:MM`, or `start refused — month limit reached`, each with the month's dollars against the cap. `/build:report` gets an `### AWS` section and one lead line: `AWS: up <h>, <n> steps, about <h> of queue wait saved for $<d> ($<d> per saved hour, estimated).` It also shows natedev's daily summed queue wait before and after go-live, labelled as not matched for load.
@@ -121,6 +122,35 @@ Go-live is the end of Phase 3, with test, check and doc: about 1,000 of last wee
 ## Spending cap (user, 2026-11-01)
 
 `monthly_limit_usd=400` and `daily_limit_usd=20` (the monthly cap / 20). The AWS Budget uses the same $400. Phase 0 expects about $250 a month on Spot for test, check and doc, so the cap leaves room for Phase 4's lint (about $274).
+
+## Review answers (user, 2026-11-02)
+
+Finding ids restart in each phase, so each answer names its phase.
+
+### Phase 8
+
+- **F038, "a".** The Linux runner prints the `aws_interrupted=` marker once. The second print in `execute_slot` goes; the sender still reports the interrupted run, and the exit status is the child's. This is plan Phase 10.
+- **F039, "d".** The build log entry does not store `interruption_generation`. Every outcome writes a plain SSH attempt record; the generation stays in the remote record for routing.
+- **F040, "a - i want only one way of doing things".** `conf.py` reads a config file once, and every caller (`scripts/aws_target/config.py` included) uses that one reader. devtools-unit makes this change.
+
+### Phase 9 (AWS cost and status reporting)
+
+- **F034, "b": declined.** Status keeps reading the build log files for attempt results, not the build log index. Reading only the `YYYY-MM.jsonl` files gives the speed.
+- **F035, "yes we should honor the cost limits": approved.** The cap, the accounting zone and both Cost Explorer tag keys are read only through the strict settings reader. An invalid cap is refused and the guard stops; status shows the cap as unavailable. A missing tag key stops AWS work.
+- **F036 and F040, copy removals: approved** under "you never have to ask me to remove duplication". One local-step rule serves the SQL and Python paths for old rows with no target. The report prints the Mac sync state once (`peer_sync_lines` replaces `mac_note`).
+- **F039, "a": approved.** The build report shows every AWS target, not only the target named `aws`.
+- **F041, "a": approved.** The status reader is separate from the report reader. Status does not read the charge files or `go-live.json`.
+- **F042, "a": approved.** Each tick reads only the newest charge file. A saved reply that is not reconciled still reconciles first.
+- **"settle": approved** (the showrunner's recommendations):
+  - F037: the memory section counts steps and calls by the target rule; machine samples keep the host rule.
+  - F038: the wait-saved estimate uses the report's local day.
+  - F043: a day's cost prices only that day, not the whole ledger history.
+  - F044: `CostLedger.refresh_charges` owns the charge schedule, its lock and the reconcile-once check.
+  - F045: uptime counts pending, running and stopping time, with the cost rule's cap on a stale observation.
+  - F046: the controller record stores the recovery case; status builds the recovery words.
+  - F047: the controller state file has no `charge_error`.
+  - F048: the charge difference is computed (actual minus estimate), not stored in `charges/<day>.json`.
+- **F049, "settle": declined.** No index on `ssh_attempts` for now; the table is small.
 
 ## Phase 0 result — queue replay (2026-10-31)
 

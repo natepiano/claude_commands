@@ -38,7 +38,7 @@ import argparse
 import re
 import subprocess
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import cast
 
@@ -76,6 +76,11 @@ UnrecordedStartFolder = unit_config.UnrecordedStartFolder
 
 
 @dataclass(frozen=True)
+class SavedUnitName:
+    """A caller has supplied only the saved unit name."""
+
+
+@dataclass(frozen=True)
 class RetiredUnit:
     production: Production
     name: str
@@ -87,6 +92,7 @@ class RetiredUnit:
     start_folder: RecordedStartFolder | UnrecordedStartFolder
     saved_branch: retire_unit.SavedBranch | retire_unit.NoSavedBranch = retire_unit.NoSavedBranch()
     recovery: unit_config.UnitConfig | unit_config.NoRetiredSession = unit_config.NoRetiredSession()
+    display_name: str | SavedUnitName = field(default_factory=SavedUnitName)
 
 
 def find_unit(slug: str, given: str, *, record: staff.StaffSnapshot | None = None) -> RetiredUnit:
@@ -128,7 +134,7 @@ def find_unit(slug: str, given: str, *, record: staff.StaffSnapshot | None = Non
                                + "run staff_sources.py fill --retired or ask the showrunner")
     if not retired and isinstance(saved, unit_config.ConfigMissing):
         return RetiredUnit(production, name, worktree, branch, production_units.cell_value(plan), "", False,
-                           UnrecordedStartFolder())
+                           UnrecordedStartFolder(), display_name=member.row.name)
     if isinstance(saved, unit_config.ConfigMissing):
         saved = staff_sources.prepare_retirement({**row, "Plan": plan}, sources, member, slug)
         assert isinstance(current, unit_config.UnitConfig)
@@ -151,7 +157,8 @@ def find_unit(slug: str, given: str, *, record: staff.StaffSnapshot | None = Non
     config_plan = (saved.plan.path.as_posix() if isinstance(saved.plan, unit_config.PlanFile) else
                    "permanent" if isinstance(saved.plan, unit_config.PermanentPlan) else "standby")
     folder = RecordedStartFolder(facts.start_folder.path)
-    return RetiredUnit(production, name, worktree, facts.branch.value, config_plan, member.row.current_session, True, folder, retire_unit.saved_branch_in_note(plan), saved)
+    return RetiredUnit(production, name, worktree, facts.branch.value, config_plan, member.row.current_session,
+                       True, folder, retire_unit.saved_branch_in_note(plan), saved, member.row.name)
 
 
 def resume_record(production: Production, name: str) -> Path:
@@ -226,7 +233,8 @@ def refusals(unit: RetiredUnit) -> list[str]:
 def launch_command(unit: RetiredUnit) -> list[str]:
     if not unit.session_id:
         raise Refused(f"{unit.name}: its Units row names no session to resume")
-    return [sys.executable, str(ADD_UNIT), "--production", str(unit.production.doc), unit.name,
+    name = unit.name if isinstance(unit.display_name, SavedUnitName) else unit.display_name
+    return [sys.executable, str(ADD_UNIT), "--production", str(unit.production.doc), name,
             "--resume", unit.session_id, "--cwd", str(resume_folder(unit)), *production_units.plan_arguments(unit.plan)]
 
 

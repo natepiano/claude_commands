@@ -48,6 +48,11 @@ MACOSX_DEPLOYMENT_TARGET = "14.0"
 MacVerb = Literal["nextest", "check", "clippy", "mend-check", "doc"]
 
 
+def step_kind(verb: str) -> str:
+    """Map a command verb to its recorded step kind."""
+    return {"test": "nextest", "mend-check": "mend"}.get(verb, verb)
+
+
 NonBusyMacDeclineReason = Literal[
     "off",
     "repo",
@@ -828,20 +833,25 @@ def state_directory(target: str = "mac") -> Path:
 
 def read_connection_settings(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> SshConnectionSettings:
     settings = config_path() if isinstance(path, DefaultMacSettings) else path.expanduser()
-    return SshConnectionSettings(conf.text(settings, "host"), conf.number(settings, "connect_timeout_s"),
-                                 conf.number(settings, "leftover_timeout_s"))
+    return connection_settings(conf.read(settings))
+
+
+def connection_settings(config: conf.ConfigRead) -> SshConnectionSettings:
+    return SshConnectionSettings(config.text("host"), config.number("connect_timeout_s"),
+                                 config.number("leftover_timeout_s"))
 
 
 def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> OffloadConfig:
     settings = config_path() if isinstance(path, DefaultMacSettings) else path.expanduser()
-    values = conf.values(settings)
+    config = conf.read(settings)
+    values = config.values()
     return OffloadConfig(
-        enabled=conf.text(settings, "offload") == "on",
-        connection=read_connection_settings(settings),
-        probe_timeout_s=conf.number(settings, "probe_timeout_s"),
-        unreachable_backoff_s=conf.number(settings, "unreachable_backoff_s"),
-        free_floor_gib=conf.number(settings, "free_floor_gib"),
-        default_target_budget_gib=conf.text(settings, "target_budget_gib" if "target_budget_gib" in values else "mac_budget_gib"),
+        enabled=config.text("offload") == "on",
+        connection=connection_settings(config),
+        probe_timeout_s=config.number("probe_timeout_s"),
+        unreachable_backoff_s=config.number("unreachable_backoff_s"),
+        free_floor_gib=config.number("free_floor_gib"),
+        default_target_budget_gib=config.text("target_budget_gib" if "target_budget_gib" in values else "mac_budget_gib"),
         values=values,
         source=settings,
     )

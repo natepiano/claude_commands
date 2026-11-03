@@ -291,8 +291,9 @@ def _shell_module_path() -> Path:
 
 
 def nixos_shell_module() -> Path | None:
+    account_config = conf.read('accounts')
     relative = _shell_module_path()
-    for repository in (Path(conf.text("accounts", "nixos_repository_root")), Path(conf.text("accounts", "home_nixos_repository_root")).expanduser()):
+    for repository in (Path(account_config.text("nixos_repository_root")), Path(account_config.text("home_nixos_repository_root")).expanduser()):
         module = repository / relative
         if module.is_file():
             return module

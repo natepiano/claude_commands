@@ -44,6 +44,25 @@ from scripts.message import sessions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 class NativeClaudeShowrunnerTests(StaffTestCase):
+    def test_resume_uses_the_row_name_after_rename_and_conversation_change(self) -> None:
+        document = self.production("demo")
+        _ = document.write_text(document.read_text() + "\n- **Merge branch:** `main`\n"
+                                + f"- **Showrunner checkout:** `{self.root}`\n- **Log:** `demo-log.md`\n")
+        owner = fixture_member("showrunner", name="demo", doc=staff.LiveDoc("natedev", document))
+        current = staff.native_id(fixture_runtime_id("renamed-showrunner-current"))
+        _ = staff.update_current_session(owner.current_session, current)
+        _ = staff.rename(owner.id, "row-name")
+        _ = fixture_member("showrunner", name="demo", runtime_id=fixture_runtime_id("decoy-showrunner"))
+        with (patch.object(runtime, "start_server"), patch.object(runtime, "launch_agent", return_value=
+              runtime.AgentLaunched("w1:p1", runtime.PromptSubmitted(datetime.now(timezone.utc)))) as launch):
+            _ = add_showrunner.launch(production_units.read_production(document), "fixture", "high", current,
+                                      self.root, accounts.NamedAccount("claude1", self.root))
+        arguments = cast(list[str], launch.call_args.kwargs["agent_arguments"])
+        self.assertEqual(arguments[arguments.index("-n") + 1], "row-name")
+        self.assertEqual(arguments[arguments.index("--remote-control") + 1], "row-name")
+        self.assertEqual(launch.call_args.args[2], "row-name")
+        self.assertNotIn("STAFF_ID", cast(dict[str, str], launch.call_args.args[4]))
+
     def test_fresh_showrunner_uses_the_observed_claude_id_before_its_opening_prompt(self) -> None:
         document = self.production("demo")
         _ = document.write_text(document.read_text() + "\n- **Merge branch:** `main`\n"

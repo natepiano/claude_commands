@@ -1583,7 +1583,7 @@ def _test_phase_margin_value(raw: object) -> float:
 
 
 def test_phase_margin() -> float:
-    return conf.number("lint", "test_phase_margin")
+    return conf.read("lint").number("test_phase_margin")
 
 
 def build_budget_bytes() -> int:
@@ -1591,69 +1591,70 @@ def build_budget_bytes() -> int:
     environment_budget = _positive_gib_bytes(os.environ.get("BUILDLOG_BUILD_BUDGET_GIB", ""))
     if environment_budget is not None:
         return environment_budget
-    return max(1, int(conf.number("lint", "build_budget_gib") * GIB))
+    return max(1, int(conf.read("lint").number("build_budget_gib") * GIB))
 
 
 def request_max_bytes() -> int:
-    return conf.whole("lint", "request_max_bytes")
+    return conf.read("lint").whole("request_max_bytes")
 
 def running_pass_seconds() -> float:
-    return conf.number("lint", "running_pass_seconds")
+    return conf.read("lint").number("running_pass_seconds")
 
 def waiting_pass_seconds() -> float:
-    return conf.number("lint", "waiting_pass_seconds")
+    return conf.read("lint").number("waiting_pass_seconds")
 
 def wait_reply_seconds() -> float:
-    return conf.number("lint", "wait_reply_seconds")
+    return conf.read("lint").number("wait_reply_seconds")
 
 def replay_retention_seconds() -> float:
-    return conf.number("lint", "replay_retention_seconds")
+    return conf.read("lint").number("replay_retention_seconds")
 
 def reconnect_seconds() -> float:
-    return conf.number("lint", "reconnect_seconds")
+    return conf.read("lint").number("reconnect_seconds")
 
 def silence_seconds() -> float:
-    return conf.number("lint", "silence_seconds")
+    return conf.read("lint").number("silence_seconds")
 
 def outage_notice_seconds() -> float:
-    return conf.number("lint", "outage_notice_seconds")
+    return conf.read("lint").number("outage_notice_seconds")
 
 def source_check_seconds() -> float:
-    return conf.number("lint", "source_check_seconds")
+    return conf.read("lint").number("source_check_seconds")
 
 def source_settle_seconds() -> float:
-    return conf.number("lint", "source_settle_seconds")
+    return conf.read("lint").number("source_settle_seconds")
 
 def override_reconnect_seconds() -> float:
-    return conf.number("lint", "override_reconnect_seconds")
+    return conf.read("lint").number("override_reconnect_seconds")
 
 
 def read_memory_config() -> MemoryConfig:
     """Resolve the live configuration for one admission decision."""
-    values = conf.values("lint")
-    timing = AdmissionTiming(*(conf.whole("lint", key) for key in (
+    settings_read = conf.read('lint')
+    values = settings_read.values()
+    timing = AdmissionTiming(*(settings_read.whole(key) for key in (
         "ramp_seconds", "head_seconds", "strict_seconds", "backfill_seconds",
         "recovery_start_seconds", "recovery_window_seconds")))
-    pressure = PressurePolicy(*(conf.number("lint", key) for key in (
+    pressure = PressurePolicy(*(settings_read.number(key) for key in (
         "full_pressure_limit", "swap_used_limit", "some_pressure_limit")))
-    kinds = {key.removeprefix("peak_hold_seconds."): conf.whole("lint", key)
+    kinds = {key.removeprefix("peak_hold_seconds."): settings_read.whole(key)
              for key in values if key.startswith("peak_hold_seconds.")}
     first_peaks = {key.removeprefix("program_first_peak_gib."):
-                   max(1, int(conf.number("lint", key) * GIB))
+                   max(1, int(settings_read.number(key) * GIB))
                    for key in values if key.startswith("program_first_peak_gib.")}
     return MemoryConfig(
-        policy=AdmissionPolicy(timing, pressure, PeakHold(conf.whole("lint", "peak_hold_seconds"), kinds)),
-        test_phase_margin=test_phase_margin(),
-        build_budget_bytes=max(1, int(conf.number("lint", "build_budget_gib") * GIB)),
-        running_pass_seconds=running_pass_seconds(), waiting_pass_seconds=waiting_pass_seconds(),
-        wait_reply_seconds=wait_reply_seconds(), replay_retention_seconds=replay_retention_seconds(),
-        reconnect_seconds=reconnect_seconds(), silence_seconds=silence_seconds(),
-        outage_notice_seconds=outage_notice_seconds(), source_check_seconds=source_check_seconds(),
-        source_settle_seconds=source_settle_seconds(), override_reconnect_seconds=override_reconnect_seconds(),
-        request_max_bytes=request_max_bytes(), program_first_peaks=first_peaks,
-        program_sample_seconds=conf.number("lint", "program_sample_seconds"),
-        program_stop_seconds=conf.number("lint", "program_stop_seconds"),
-        peak_wave_seconds=conf.number("lint", "peak_wave_seconds"))
+        policy=AdmissionPolicy(timing, pressure, PeakHold(settings_read.whole("peak_hold_seconds"), kinds)),
+        test_phase_margin=settings_read.number("test_phase_margin"),
+        build_budget_bytes=max(1, int(settings_read.number("build_budget_gib") * GIB)),
+        running_pass_seconds=settings_read.number("running_pass_seconds"), waiting_pass_seconds=settings_read.number("waiting_pass_seconds"),
+        wait_reply_seconds=settings_read.number("wait_reply_seconds"), replay_retention_seconds=settings_read.number("replay_retention_seconds"),
+        reconnect_seconds=settings_read.number("reconnect_seconds"), silence_seconds=settings_read.number("silence_seconds"),
+        outage_notice_seconds=settings_read.number("outage_notice_seconds"), source_check_seconds=settings_read.number("source_check_seconds"),
+        source_settle_seconds=settings_read.number("source_settle_seconds"), override_reconnect_seconds=settings_read.number("override_reconnect_seconds"),
+        request_max_bytes=settings_read.whole("request_max_bytes"), program_first_peaks=first_peaks,
+        program_sample_seconds=settings_read.number("program_sample_seconds"),
+        program_stop_seconds=settings_read.number("program_stop_seconds"),
+        peak_wave_seconds=settings_read.number("peak_wave_seconds"))
 
 
 def memory_config() -> MemoryConfig:

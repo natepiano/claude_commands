@@ -469,20 +469,16 @@ def aws_execution_context(values: dict[str, str]) -> AwsExecutionContext | Indep
     return AwsExecutionContext(target.name, Path.home() / values['remote_state_directory'])
 
 
-def print_interruption(values: dict[str, str]) -> bool:
+def interruption_generation(values: dict[str, str]) -> str:
     try:
         context = aws_execution_context(values)
         if isinstance(context, IndependentLinuxExecution):
-            return False
+            return ''
         remote = aws_execution_evidence()
         generation = remote.current_generation(context.directory, boot_identity())
-        interrupted = remote.interruption_generation(context.directory, target=context.target, generation=generation)
-        if interrupted:
-            print(f'aws_interrupted={interrupted}', flush=True)
-            return True
+        return remote.interruption_generation(context.directory, target=context.target, generation=generation)
     except (OSError, ValueError, KeyError, TypeError):
-        pass
-    return False
+        return ''
 
 
 def permission_refused(values: dict[str, str]) -> bool:
@@ -513,7 +509,7 @@ def interruption_signals(values: dict[str, str]) -> Generator[None, None, None]:
         return
 
     def interrupted(signum: int, _frame: FrameType | None) -> None:
-        if not print_interruption(values):
+        if not interruption_generation(values):
             raise SystemExit(128 + signum)
 
     previous = signal.signal(signal.SIGTERM, interrupted)
@@ -521,7 +517,16 @@ def interruption_signals(values: dict[str, str]) -> Generator[None, None, None]:
         yield
     finally:
         _ = signal.signal(signal.SIGTERM, previous)
-        _ = print_interruption(values)
+        if generation := interruption_generation(values):
+            print(f'aws_interrupted={generation}', flush=True)
+
+
+@contextmanager
+def interruptible_slot(mirror: Path, values: dict[str, str]) -> Generator[None, None, None]:
+    with interruption_signals(values), slot_run(
+        mirror, require_boot_identity=isinstance(aws_execution_context(values), AwsExecutionContext)
+    ):
+        yield
 
 
 def probe_shell(mirror: Path, values: dict[str, str], repository: str) -> int:
@@ -529,7 +534,7 @@ def probe_shell(mirror: Path, values: dict[str, str], repository: str) -> int:
     if permission_refused(values):
         return 75
     try:
-        with interruption_signals(values), slot_run(mirror, require_boot_identity=isinstance(aws_execution_context(values), AwsExecutionContext)):
+        with interruptible_slot(mirror, values):
             shell = prepare_shell(mirror, Path.home() / values['shell_cache'],
                                   policy_setting(values, 'devshell', repository),
                                   positive_setting(values, 'shell_timeout_s'))
@@ -550,7 +555,7 @@ def run(mirror: Path, values: dict[str, str], repository: str, verb: str,
     if permission_refused(values):
         return 75
     try:
-        with interruption_signals(values), slot_run(mirror, require_boot_identity=isinstance(aws_execution_context(values), AwsExecutionContext)):
+        with interruptible_slot(mirror, values):
             return execute_slot(mirror, values, repository, verb, words, call_id, tree_key)
     except SlotStartupRefused:
         print(STARTUP_REFUSAL_RECORD, flush=True)
@@ -566,7 +571,7 @@ def trim_build_folder(target: Path, environment: dict[str, str]) -> int:
         'import sweep',
         'import conf',
         'config = conf.path("lint")',
-        'recent_seconds = int(conf.number(config, sweep.RECENT_KEY) * 60)',
+        'recent_seconds = int(conf.read(config).number(sweep.RECENT_KEY) * 60)',
         'sys.exit(sweep.sweep_workspace(sys.argv[1], str(config), False, recent_seconds / 60))',
     ))
     return subprocess.run([sys.executable, '-c', code, str(target)],
@@ -645,8 +650,6 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
             cleanup = 'kept' if trimmed == 0 else '1'
     except OSError:
         cleanup = '1'
-    if print_interruption(values):
-        return 75
     if step_started:
         print(f'mac_exit={status}', flush=True)
     print(f'mac_cleanup={cleanup}', flush=True)

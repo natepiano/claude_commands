@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import fcntl
 import json
+import math
 import os
 import shlex
 import signal
@@ -37,6 +38,17 @@ class ResumeClock(local):
 
 @final
 class StopResumeTests(unittest.TestCase):
+    def test_resume_arguments_use_the_current_row_name_after_a_rename_and_clear(self) -> None:
+        fixed = staff.StaffId(self.entry["session_id"])
+        current = staff.StaffId("019b3a40-4250-7000-8000-000000000103")
+        owner = staff.StaffRow(fixed, "unit", "row-name", None, current_session=current)
+        with patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((owner,))):
+            arguments = stop_resume.resume_arguments(self.entry)
+        self.assertEqual(arguments[arguments.index("--resume") + 1], current)
+        self.assertEqual(arguments[arguments.index("-n") + 1], "row-name")
+        self.assertEqual(arguments[arguments.index("--remote-control") + 1], "row-name")
+        self.assertEqual(self.entry["name"], "alpha")
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -45,6 +57,8 @@ class StopResumeTests(unittest.TestCase):
             ["claude", "-n", "alpha", "--remote-control", "alpha", "--model", "sonnet"])
         self.client = FakeClient([{"pane_id": "w1:p2", "tab_id": "w1:t9", "label": "alpha", "workspace_id": "w1",
                                    "agent_session": {"kind": "id", "value": "019b3a40-4250-7000-8000-000000000102"}}])
+        self.client_result = self.client.result
+        self.tab_titles: dict[str, str] = {"w1:t9": "alpha"}
         for label in ("claude3", "claude4"):
             config = self.root / f".{label}"
             config.mkdir()
@@ -70,6 +84,7 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(patch.object(herdr, "repository_trust_key", return_value=self.root))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root), "STAFF_FILE": str(self.root / "staff.json"),
+            "XDG_STATE_HOME": str(self.root / "state"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "CLAUDE_CODE_SESSION_ID": "", "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
         })))
@@ -86,6 +101,7 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(patch.object(stop_resume, "Event", self.wait))
         cast(Mock, cast(Mock, self.wait.return_value).wait).side_effect = self.advance
         _ = self.enterContext(patch.object(self.client, "run", self.pane_run))
+        _ = self.enterContext(patch.object(self.client, "result", self.pane_result))
         _ = self.enterContext(patch.object(stop_resume, "monotonic", lambda: self.clock.elapsed))
         _ = self.enterContext(patch.object(time, "sleep", self.advance))
         _ = self.enterContext(patch("unit_runs.held", return_value=[]))
@@ -102,7 +118,25 @@ class StopResumeTests(unittest.TestCase):
         return sessions.LiveSessionProcess(456) if session in self.launched else cast(
             sessions.LiveSessionProcess | sessions.SessionNotLive | sessions.SessionLivenessUnknown, self.live(session))
 
+    def pane_result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
+        if arguments[:2] == ("tab", "list"):
+            return {"tabs": [{"tab_id": row.get("tab_id", str(row["pane_id"]) + ":tab"),
+                              "label": self.tab_titles.get(
+                                  str(row.get("tab_id", str(row["pane_id"]) + ":tab")), row["label"]),
+                              "pane_count": 1} for row in self.client.rows]}
+        return self.client_result(*arguments, deadline=deadline)
+
     def pane_run(self, *arguments: str) -> str:
+        if arguments[:2] in (("pane", "rename"), ("tab", "rename")):
+            for row in self.client.rows:
+                tab = str(row.get("tab_id", str(row["pane_id"]) + ":tab"))
+                if arguments[:2] == ("pane", "rename") and arguments[2] == row["pane_id"]:
+                    if tab not in self.tab_titles:
+                        self.tab_titles[tab] = str(row["label"])
+                    row["label"] = arguments[3]
+                elif arguments[:2] == ("tab", "rename") and arguments[2] == tab:
+                    self.tab_titles[tab] = arguments[3]
+            return "{}"
         result = cast(str, self.start(*arguments))
         command = self._typed(arguments)
         identity = command[command.index("--resume") + 1]
@@ -110,7 +144,8 @@ class StopResumeTests(unittest.TestCase):
         self.client.native_ids[arguments[2]] = identity
         pane = arguments[2]
         if pane not in pane_record.read("agents"):
-            original = pane_record.launch_for_session(identity)
+            original = next((entry for entry in pane_record.read("agents").values()
+                             if entry["session_id"] == identity), None)
             assert original is not None
             environment = dict(original["environment"])
             for item in command[:command.index("exec")]:
@@ -119,7 +154,10 @@ class StopResumeTests(unittest.TestCase):
                     environment[key] = value
             replacement = pane_record.launch(pane, identity, original["cwd"], environment,
                 ["claude", *command[command.index("exec") + 2:]])
-            pane_record.write("agents", replacement)
+            replacement["session_id"] = original["session_id"]
+            entries = pane_record.read("agents")
+            entries[pane] = replacement
+            pane_record.save("agents", entries)
         return result
 
     @staticmethod
@@ -172,6 +210,104 @@ class StopResumeTests(unittest.TestCase):
         self.assertIn("019b3a40-4250-7000-8000-000000000102", self.launched)
         self.assertEqual(pane_record.read("agents")["w2:p3"]["session_id"], "019b3a40-4250-7000-8000-000000000102")
         self.assertEqual(self._typed(self.start.call_args.args)[2], "w2:p3")
+
+    def test_recovery_uses_one_snapshot_for_the_renamed_row_title_and_arguments(self) -> None:
+        from scripts.production import session_staff
+
+        fixed = staff.StaffId(self.entry["session_id"])
+        current = staff.StaffId("019b3a40-4250-7000-8000-000000000103")
+        row = staff.StaffRow(fixed, "showrunner", "row-name", None, current_session=current)
+        record = staff.StaffSnapshot((row,))
+        retained = self.entry.copy()
+        retained["session_id"] = current
+        pane_record.save("agents", {retained["pane_id"]: retained})
+        self.client.rows.clear()
+        opened: list[str] = []
+
+        def open_tab(space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
+            _ = space, cwd, environment
+            opened.append(title)
+            self.client.rows.append({"pane_id": "w2:p3", "label": title, "workspace_id": "w2"})
+            return "w2:p3"
+
+        with (patch.object(staff, "initial_snapshot", return_value=record) as snapshot,
+              patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources({}, ())),
+              patch.object(self.client, "open_tab", side_effect=open_tab)):
+            result = stop_resume.resume(str(fixed), why="recovery", restore_missing=True)
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.assertEqual(opened, ["row-name"])
+        snapshot.assert_called_once()
+        command = self._typed(self.start.call_args.args)
+        self.assertEqual(command[command.index("-n") + 1], "row-name")
+        self.assertEqual(command[command.index("--resume") + 1], current)
+        self.assertEqual(pane_record.read("agents")["w2:p3"]["name"], "row-name")
+
+    def test_recovery_retitles_an_existing_pane_with_the_current_row_name(self) -> None:
+        from scripts.production import session_staff
+
+        identity = staff.StaffId(self.entry["session_id"])
+        row = staff.StaffRow(identity, "showrunner", "row-name", None, current_session=identity)
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))) as snapshot,
+              patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources({}, ()))):
+            result = stop_resume.resume(str(identity), why="recovery")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.assertEqual(self.client.rows[0]["label"], "row-name")
+        command = self._typed(self.start.call_args.args)
+        self.assertEqual(command[command.index("-n") + 1], "row-name")
+        snapshot.assert_called_once()
+
+    def test_recovery_reconciles_titles_and_preserves_unnamed_titles(self) -> None:
+        from scripts.production import session_staff
+
+        identity = staff.StaffId(self.entry["session_id"])
+        cases = (
+            ("stale-tab", "row-name", "row-name", "old-tab", 1),
+            ("current-titles", "row-name", "row-name", "row-name", 2),
+            ("unnamed", "", "manual-pane", "manual-tab", 1),
+        )
+        for case, name, pane_title, tab_title, attempts in cases:
+            with self.subTest(case=case):
+                retained = self.entry.copy()
+                retained["name"] = name
+                pane_record.save("agents", {retained["pane_id"]: retained})
+                self.client.rows[0]["label"] = pane_title
+                self.tab_titles["w1:t9"] = tab_title
+                record = staff.StaffSnapshot((staff.StaffRow(
+                    identity, "showrunner", name, None, current_session=identity),)) if name else staff.StaffSnapshot(())
+                state = self.root / case
+                with (patch.dict(os.environ, {"XDG_STATE_HOME": str(state)}),
+                      patch.object(staff, "initial_snapshot", return_value=record),
+                      patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources({}, ())),
+                      patch.object(self.client, "retitle", wraps=self.client.retitle) as retitle,
+                      patch.object(self.client, "run", wraps=self.client.run) as commands,
+                      patch.object(self.client, "order_tabs", return_value={}) as order,
+                      patch.object(self.client, "save_layout", wraps=self.client.save_layout) as save):
+                    for _ in range(attempts):
+                        self.launched.clear()
+                        result = stop_resume.resume(str(identity), why="recovery")
+                        self.assertIsInstance(result, stop_resume.ClaudeUp)
+                    renames = [invocation for invocation in commands.call_args_list
+                               if invocation.args[:2] in (("pane", "rename"), ("tab", "rename"))]
+                    if case == "stale-tab":
+                        self.assertEqual(renames, [call("tab", "rename", "w1:t9", name)])
+                        order.assert_called_once()
+                        save.assert_called_once()
+                    else:
+                        self.assertEqual(renames, [])
+                        order.assert_not_called()
+                        save.assert_not_called()
+                        self.assertFalse(herdr.layout_path("agents").exists())
+                    self.assertEqual(self.client.rows[0]["label"], name or pane_title)
+                    self.assertEqual(self.tab_titles["w1:t9"], name or tab_title)
+                    if name:
+                        self.assertEqual(retitle.call_count, attempts)
+                    else:
+                        retitle.assert_not_called()
+
+    def test_recovery_fixture_rejects_an_unrecorded_resume_identity(self) -> None:
+        with self.assertRaises(AssertionError):
+            _ = self.pane_run("pane", "run", "w2:p3", "exec claude --resume unrecorded-session")
+        self.assertNotIn("w2:p3", pane_record.read("agents"))
 
     def test_fixed_owner_resume_uses_current_pane_and_preserves_staff_and_retained_record(self) -> None:
         from scripts.production.staff_test_support import isolated_staff_file, isolated_source_readers, source_environment

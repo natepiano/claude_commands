@@ -308,7 +308,7 @@ class RemoteAgentTests(ControlFixture):
         before = marker.read_bytes()
         self.replace("idle_stop_minutes", "1")
         agent = self.agent(process_groups=remote.active_process_groups)
-        values = {**conf.values(self.settings), "selected_target": "aws",
+        values = {**conf.read(self.settings).values(), "selected_target": "aws",
                   "selected_settings": str(self.settings), "remote_state_directory": str(self.remote_directory)}
         with (
             mock.patch.object(Path, "home", return_value=self.root),
@@ -364,7 +364,7 @@ class RunnerPermissionTests(ControlFixture):
         self.mirror = self.root / "mirror"
         self.mirror.mkdir()
         self.remote_directory = self.root / "remote"
-        self.values = {**conf.values(self.settings), "selected_target": "aws",
+        self.values = {**conf.read(self.settings).values(), "selected_target": "aws",
                        "selected_settings": str(self.settings), "remote_state_directory": str(self.remote_directory)}
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         _ = self.enterContext(mock.patch.object(time, "time", return_value=self.clock.now))

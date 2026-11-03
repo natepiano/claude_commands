@@ -1597,6 +1597,20 @@ class HerdrTests(unittest.TestCase):
         self.assertNotIn("SHOWRUNNER_UNIT_ID", environment)
         self.assertEqual(environment["KEPT_SETTING"], "kept")
 
+    def test_agent_environment_removes_parent_identity_before_and_after_environment_loading(self) -> None:
+        identities = {"STAFF_ID": "parent", "CLAUDE_CODE_SESSION_ID": "parent-Claude", "CODEX_THREAD_ID": "parent-Codex"}
+        with patch.dict(os.environ, identities):
+            environment = herdr.agent_base_environment({**identities, "KEPT_SETTING": "kept"}, frozenset())
+        for key in identities:
+            self.assertNotIn(key, environment)
+        self.assertEqual(environment["KEPT_SETTING"], "kept")
+        with patch.object(herdr.nix_env, "ensure", return_value=herdr.nix_env.NoEnvrc({**environment, **identities})):
+            prepared = herdr.prepare_agent_environment(str(self.root), identities)
+        assert isinstance(prepared, herdr.PreparedAgentEnvironment)
+        for key in identities:
+            self.assertNotIn(key, prepared.env)
+        self.assertEqual(prepared.env["KEPT_SETTING"], "kept")
+
     def configure(self, arguments: list[str], stdout: str = "", code: int = 0, stderr: str = "") -> None:
         self.responses[" ".join(arguments)] = {"stdout": stdout, "code": code, "stderr": stderr}
         _ = self.responses_path.write_text(json.dumps(self.responses))
@@ -4485,6 +4499,33 @@ class HerdrTests(unittest.TestCase):
                          {"theme": "dark", "projects": {str(main): {"history": ["kept"], "hasTrustDialogAccepted": True}}})
         self.assertEqual(target.stat().st_mode & 0o777, 0o600)
 
+    def test_trust_copy_creates_a_missing_target_with_private_mode(self) -> None:
+        folder = self.root / "worktree"
+        main = self.root / "main"
+        self.trust_git(folder, folder, main)
+        source, target = self.root / "source.json", self.root / "missing-target.json"
+        _ = source.write_text(json.dumps({"projects": {
+            str(main): {"hasTrustDialogAccepted": True},
+            str(self.root / "other"): {"hasTrustDialogAccepted": True},
+        }}))
+        self.assertEqual(herdr.copy_claude_trust(folder, source, target), herdr.Trusted(folder, target, main))
+        self.assertEqual(json.loads(target.read_text()),
+                         {"projects": {str(main): {"hasTrustDialogAccepted": True}}})
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_failed_first_trust_publication_leaves_no_target_and_a_rerun_recovers(self) -> None:
+        folder = self.root / "worktree"
+        main = self.root / "main"
+        self.trust_git(folder, folder, main)
+        source, target = self.root / "source.json", self.root / "missing-target.json"
+        _ = source.write_text(json.dumps({"projects": {str(main): {"hasTrustDialogAccepted": True}}}))
+        with patch("scripts.lib.atomic_file.os.replace", side_effect=OSError("disk full")):
+            self.assertIsInstance(herdr.copy_claude_trust(folder, source, target), herdr.UnreadableTrustFile)
+        self.assertFalse(target.exists())
+        self.assertEqual(herdr.copy_claude_trust(folder, source, target), herdr.Trusted(folder, target, main))
+        self.assertEqual(json.loads(target.read_text()), {"projects": {str(main): {"hasTrustDialogAccepted": True}}})
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
     def test_trust_copy_never_adds_trust_the_source_lacks(self) -> None:
         folder = self.root / "worktree"
         main = self.root / "main"
@@ -4702,7 +4743,7 @@ class SavedLayoutTests(unittest.TestCase):
     def test_retained_removed_units_and_wrapped_parents_do_not_classify_tabs_as_current_staff(self) -> None:
         retired = unit_membership("current", "retired-unit")
         old_child = unit_membership("wrapped", "child-unit")
-        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"))
+        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"), expected=retired.worktree)
         assert old_child.parent is not None
         _ = staff.set_doc(old_child.parent, staff.WrappedDoc("natedev", self.root / "archive.md"))
         processes = [herdr.HerdrProcess(1, herdr.HerdrPlace("fixture", "w1:p1"),

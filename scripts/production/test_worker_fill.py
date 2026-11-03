@@ -570,7 +570,7 @@ class WorkerFillTests(StaffTestCase):
         _ = self.recorded_production("demo", "models-unit")
         production_membership("demo", "models-unit")
         parent = unit_membership("demo", "models-unit")
-        _ = staff.set_worktree(parent.id, staff.RemovedWorktree("natedev", self.root / "gone"))
+        _ = staff.set_worktree(parent.id, staff.RemovedWorktree("natedev", self.root / "gone"), expected=parent.worktree)
         run = self.worker_run("demo", "models-unit", "director")
         with self.assertRaises(worker_fill.AdmissionRefused):
             _ = worker_fill.admit("impl", run, role='impl')
