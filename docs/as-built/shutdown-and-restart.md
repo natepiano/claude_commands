@@ -16,7 +16,12 @@ Retirement, checkout moves, running-session attach and nix-shell healing use thi
 
 Watchdog recovery reads the unit's pane launch and live liveness. It keeps one notes pass of grace and resumes the same conversation on the launch account. The unit must not be retired, must have a worktree, and its run must not have finished. A unit with no run record is standing by and can recover. A queued recovery refuses a changed or ended launch. Shared resume creates a fresh tab when the pane is gone. Pending jobs prevent duplicate dispatch; unreadable live confirmation preserves their evidence. The watchdog excludes existing intentional stop records at or after the retained pane launch. It checks the record again before a queued recovery starts. An explicit later launch supersedes an older stop. It does not read account holds. Its outage state retains pending recovery jobs and first-seen times. The agent-notes job runs this check in its own process with the limits in `config/agent_notes.toml`. Shared resume supplies the restarted session’s prompt; the watchdog sends no messages to live sessions, showrunner notices or phone pushes. Record-driven restart still retries unconfirmed owner cleanup through `stop_resume.stop` before launching; a failed retry keeps the issue and a retry command.
 
-Record-driven restart, status, forget, account holds and launch barriers remain until Phase 8. The recovery snapshot command, collector, stored observations and all their restore/status readers are deleted. `restart_support.py` owns the retained record-driven message, notifier and status helpers. Inventory owns fresh session attribution. Unit rename and production rename keep their Phase 9 journals; their stop boundary uses `stop_resume`.
+Record-driven restart, status, forget, account holds, and launch barriers remain available.
+Recovery snapshots and their restore and status readers are deleted.
+`restart_support.py` owns the retained record-driven message, notifier, and status helpers.
+Inventory owns fresh session attribution.
+Unit rename and production rename retain journals; their stop boundary uses `stop_resume`.
+The [account design](accounts.md) describes role selection, moves, and worker routing.
 
 ## Session hosting and manual recovery
 
@@ -57,5 +62,34 @@ The restart output keeps the trust command for each folder.
 Configured trust covers exact folder, repository-root, or main-checkout keys, not arbitrary descendants.
 Manual failures share one count push per machine. Its action requests a resume from the shutdown records.
 The same failed sessions, a subset, or a changed failure reason sends no second push.
-A confirmed recovery clears the outage claims. A later failure can send a new push.
+A confirmed recovery clears only outage claims older than its live observation.
+A later failure can send a new push.
 Failed push delivery releases the claims for a retry.
+
+## Outage alert ledger
+
+`scripts/accounts/outage_alerts.py` owns `~/.local/state/accounts/unit_outage_alerts.json`.
+A file lock and atomic replacement protect the ledger.
+Session ids identify outages independently of shutdown-record archival.
+An entry contains a token, owner pid, claim time, and `claimed` or `delivered` state.
+`AlertClaim`, `AlertInFlight`, and `AlertDelivered` distinguish permission to send from suppression.
+
+Each sender claims the sessions for one push immediately before that push.
+It includes only claimed sessions when the text lists sessions.
+It finishes delivery or releases those claims before reserving another push.
+The session's machine owns its ledger and sends its alerts.
+A remote caller prints peer results without claiming the peer's sessions locally.
+`--no-alert` suppresses delivery on the owning machine too.
+
+A successful push marks the matching token delivered.
+A failed push releases it for a later retry.
+An owner that exits leaves a stale claim that another sender can replace.
+A claim also expires after the configured lease, which defaults to fifteen minutes.
+That lease exceeds the normal send deadline.
+An older token cannot deliver or release its replacement.
+The record's `restore_alerted` mark remains separate from successful delivery in the ledger.
+
+`clear(session_id, observed_at)` removes only an entry claimed before the live observation.
+Callers pass the observation time, not the later archive time.
+A slow probe or batch archive therefore cannot remove an alert for a newer crash.
+The watchdog applies this rule when it sees a live unit, but sends no phone push itself.
