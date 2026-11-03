@@ -57,63 +57,28 @@ The settings.json entry, one more SessionStart item:
   config sets `[session] resume_agents_on_restore = false`. Else herdr resumes each pane itself
   on the server's account, so `_clear_restored_workspaces` clears the layout, as for every other
   session.
-- `restart._herdr_launch` runs `pane_restore.restore` once, when its launch started the shared
-  server (`ServerCreated` or `WindowServerCreated`) and the layout is kept. The restore resumes each eligible stopped conversation from its pane launch entry.
-  Stale shutdown records do not prevent pane restore. A restore that leaves a pane not
-  resumed prints a restart issue that names the command to run it again.
-- `herdr._submit_server`, for the shared session only, starts `herdr-<name>.service` with
-  `systemctl --user start` when a unit file defines it (`systemctl show -p FragmentPath`, not
-  under `/transient/`). Otherwise it runs `systemd-run` as before. A transient unit cannot start
-  under the boot unit's name. The Mac never reaches `_submit_server` (it uses
-  `_start_darwin_server`), so the Mac has no boot start yet.
+- `agents restart` selects sessions from shutdown records and saved pane launches. It
+  starts or adopts the shared herdr server and restores each selected session in its
+  own tab on its own account. It does not call `pane_restore.restore` for other panes.
+- A restore takes focus only when that launch created a window
+  (`WindowServerCreated`). After focusing that window, it closes untouched startup
+  workspaces. Restoring into an existing server leaves focus and startup workspaces alone.
+- On natedev, `herdr-agents.service` is a transient unit created by `systemd-run`.
+  `systemctl --user list-unit-files` shows no herdr restore unit. No installed boot
+  unit runs `pane_restore.py`.
+- The herdr startup path adopts an answering server. Otherwise it starts one with
+  `systemd-run` on Linux. On the Mac it starts the server directly from a desktop
+  session, or opens an attach window to start it from a non-desktop session.
+  Herdr can replay saved pane commands when its configuration allows agent restore.
+  Claude commands wrapped by `lib/relaunch.py` recover the matching conversation's
+  session labels and resume note. This is separate from `agents restart`.
+- `pane_restore.py` remains an explicit command for eligible saved panes. Run it
+  when needed; no service invokes it automatically.
 
 Settings entry for the user, one more SessionEnd item:
 
 ```json
 {"hooks": [{"type": "command", "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-end-pane-record.py\""}]}
-```
-
-Steps on natedev, in order, after promotion:
-
-1. herdr `~/.config/herdr/config.toml`: add `[session]` with `resume_agents_on_restore = false`,
-   then `herdr --session agents server reload-config`.
-2. `~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/pane_record.py seed` once.
-3. The nixos units below, added to `modules/linux/herdr.nix`, then
-   rebuild. The shared server running now is the transient unit `herdr-agents.service` that
-   `systemd-run` made, the same name, and the transient file wins while it runs. Not tested: how
-   the rebuild treats a unit file under the name of an active transient unit. After the rebuild,
-   check `systemctl --user status herdr-agents.service` and that only one
-   `herdr --session agents server` runs. The boot unit takes over at the next reboot. Linger is
-   off, so both units start at login. Both take the user manager's PATH, as the transient unit
-   does now.
-
-```nix
-{ inputs, pkgs, ... }:
-{
-  # environment.systemPackages as now.
-
-  systemd.user.services.herdr-agents = {
-    description = "The shared herdr session, from login";
-    wantedBy = [ "default.target" ];
-    serviceConfig = {
-      ExecStart = "/run/current-system/sw/bin/herdr --session agents server";
-      # The restore takes minutes; its own unit keeps it out of this unit's start time.
-      ExecStartPost = "/run/current-system/sw/bin/systemctl --user start --no-block herdr-agents-restore.service";
-      Restart = "on-failure";
-      RestartSec = 5;
-    };
-  };
-  systemd.user.services.herdr-agents-restore = {
-    description = "Resume each herdr pane's Claude on its own account";
-    after = [ "herdr-agents.service" ];
-    serviceConfig = {
-      Type = "oneshot";
-      ExecStart = "%h/.claude/scripts/lib/py %h/.claude/scripts/shutdown/pane_restore.py";
-      # Up to 90 s per pane; the 90 s default start timeout would kill it.
-      TimeoutStartSec = "1h";
-    };
-  };
-}
 ```
 
 - The Mac has no `/proc`. There `pane_record` reads a parent with `ps -o ppid= -p <pid>`, and the
@@ -125,5 +90,5 @@ Steps on natedev, in order, after promotion:
 
 ## Still to come
 
-- The Mac: a launchd agent and the Mac desktop rule for herdr.
-- Last: retire `agent-sessions-snapshot.timer` after one real reboot restores every pane.
+- Automatic boot restore is not installed on either machine.
+- Layout saving and detection-rule refresh run in `herdr-upkeep`.

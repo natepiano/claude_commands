@@ -28,7 +28,7 @@ def main() -> None:
         return
     payload = cast(HookInput, json.loads(sys.stdin.read()))
     session_id = payload.get("session_id", "")
-    if not session_id or payload.get("reason", "other") == "other":
+    if not session_id or payload.get("reason", "other") in ("other", "clear"):
         return
     pane_record.end(os.environ.get("HERDR_SESSION") or "default", pane_id, session_id)
 

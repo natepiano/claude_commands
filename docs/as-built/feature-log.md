@@ -390,7 +390,7 @@ Numbers:
 
 The script:
 
-- The scripts run under Python 3.11 or later on the Mac (`scripts/lib/py`); the tests run only on natedev's 3.13 and use 3.12 names.
+- The scripts run under Python 3.12 or later on the Mac (`scripts/lib/py`). The tests run only on natedev's 3.13 and use 3.12 names.
 - A tool or test run off natedev without `FEATURE_LOG_VAULT` reaches natedev's live vault. An empty `FEATURE_LOG_VAULT` stops forwarding and selects the local `~/rust/hanadocs`.
 - A forwarded call runs natedev's deployed `~/.claude` copy, not the caller's checkout.
 - `date_created` and `date_modified` use the vault host's local date (natedev is America/New_York); a defaulted `completed_date` and event times are in the user's zone.
@@ -425,7 +425,7 @@ Ledgers and evidence:
 - `git log -S` on a bullet's current wording finds the last commit that rewrapped it. cargo-liner's changelog rewrap `a5f4bf0b` (2026-09-16) is the known case: 48 notes link the pre-rewrap match, one links the rewrap, which added that bullet, and seven cargo-port notes link `d9558a79`, a summary rewrite later than the behavior.
 - `git log --first-parent --merges --ancestry-path <c>..<audit>` alone returns nothing for work that entered on a merge's second parent (a subtree import, a workspace consolidation). An introducing commit can also sit off the first-parent line outside any import.
 - A docs-move or docs checkpoint commit can hold a link by mistake; the link is the commit that made the behavior true. A note stating specific values links the first-parent commit that reached them.
-- A `See it` command resolves with `command -v`: natedev installs `plasma-review`, not `plasma-diff`. Read a command's source before running it: `agent-sessions-snapshot --help` ignores the flag and regenerates the vault's agent-session pages.
+- A `See it` command resolves with `command -v`: natedev installs `plasma-review`, not `plasma-diff`. Read a command's source before running it: the now-removed `agent-sessions-snapshot --help` ignored the flag and regenerated the vault's agent-session pages.
 - An app check at an audit ref runs from a detached worktree with `BRP_EXTRAS_PORT=15798 cargo run` and JSON-RPC over curl to `http://127.0.0.1:15798`; one app holds the port at a time.
 
 ## Why

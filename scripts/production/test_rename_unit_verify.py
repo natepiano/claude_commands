@@ -78,7 +78,7 @@ class UnitRenameVerifyTests(UnitRenameFixture):
             ]), layout["workspaces"][1],
         ])
         self.assertEqual(saved, expected)
-        _ = self.mark_live("gamma-unit", "sid-alpha")
+        _ = self.mark_live("gamma-unit", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
         self.assert_ok(self.rename("apply"))
         self.assert_ok(self.rename("verify"))
         self.assertEqual(json.loads(path.read_text()), expected)

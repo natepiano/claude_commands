@@ -43,29 +43,31 @@ def aligned_table(headers: Sequence[str], rows: Sequence[Sequence[str]], numeric
     return [row_text(headers), *(row_text(row) for row in rows)]
 
 
-def charge_text(basis: gate.ChargeBasis, zone: ZoneInfo) -> str:
+def charge_text(basis: gate.ChargeBasis, zone: ZoneInfo, policy: gate.AdmissionPolicy,
+                step: str) -> str:
     if isinstance(basis, gate.PromiseNoReading):
         return "promise: no reading yet"
     if isinstance(basis, gate.RampPromise):
-        return f"ramp promise: first {gate.RAMP_SECONDS // 60} min after admission"
+        return f"ramp promise: first {policy.timing.ramp_seconds / 60:g} min after admission"
     if isinstance(basis, gate.LifetimePromise):
-        return "release build promise: holds until the step ends"
+        name = "release build" if step == "build" else "merge gate" if step == "merge-gate" else step
+        return f"{name} promise: holds until the step ends"
     if isinstance(basis, gate.TestPhaseCharge):
         need = basis.need
         return (f"tests since {minute(basis.started_at, zone)}: peak so far {gib(basis.peak_so_far)}, "
                 f"need {gib(need.bytes)} ({need.form}, p90 of {need.runs} runs at width {need.recorded_width}), "
                 f"× {basis.need.margin:g}")
     if isinstance(basis, gate.PeakSoFar):
-        text = f"compiling, peak so far {gib(basis.bytes)}"
+        text = f"{gate.peak_activity(step)}, peak so far {gib(basis.bytes)}"
         if isinstance(basis.peak_at, float):
             text += f" at {minute(basis.peak_at, zone)}"
         if basis.old_sampler:
-            text += "; old-sampler rule: peak drops 25 min after its last new peak"
+            text += f"; old-sampler rule: peak drops {policy.peak_hold.seconds_for(step) / 60:g} min after its last new peak"
         return text
     if isinstance(basis, gate.PeakDecayed):
         text = f"peak decayed at {minute(basis.decayed_at, zone)}; using now"
         if basis.old_sampler:
-            text += "; old-sampler rule: peak drops 25 min after its last new peak"
+            text += f"; old-sampler rule: peak drops {policy.peak_hold.seconds_for(step) / 60:g} min after its last new peak"
         return text
     if isinstance(basis, gate.PeakFileUnreadable):
         return "peak file unreadable: promise kept"
@@ -82,6 +84,9 @@ def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded) -> str:
     if isinstance(source, gate.NeedSourceNotRecorded):
         return "source not recorded"
     basis = source.basis
+    if isinstance(basis, gate.ProgramMemoryCap):
+        program = "the merge gate" if basis.program == "merge-gate" else basis.program
+        return f"{program}'s memory cap"
     if isinstance(basis, (gate.ShapeP90, gate.ShapeLargest, gate.ShapeFallback)):
         if isinstance(basis, gate.ShapeP90):
             text = f"same-shape p90 of {basis.runs} runs"
@@ -117,6 +122,8 @@ def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded) -> str:
         text = "fallback: fewer than 5 runs"
     elif source.source == "shape":
         text = "same-shape promise: basis not recorded"
+    elif source.source == "cap":
+        text = "memory cap: program not recorded"
     else:
         assert_never(source.source)
     text += f", last {source.history_days} days"
@@ -147,9 +154,10 @@ def free_text(check: gate.FreeCheck) -> str:
     return f"Free memory: free {gib(check.available)} {relation} {terms} = {gib(check.threshold)}: {result}"
 
 
-def pressure_text(pressure: gate.MemoryPressure, zone: ZoneInfo) -> str:
+def pressure_text(pressure: gate.MemoryPressure, zone: ZoneInfo,
+                  policy: gate.AdmissionPolicy) -> str:
     if pressure.next_start_at:
-        return f"recovery spacing: starts 30 s apart, next start at {minute(pressure.next_start_at, zone)}"
+        return f"recovery spacing: starts {policy.timing.recovery_start_seconds:g} s apart, next start at {minute(pressure.next_start_at, zone)}"
     return (f"memory pressure: full avg10 {pressure.full_avg10:.1f}%, "
             + f"some avg10 {pressure.some_avg10:.1f}%, swap used {pressure.swap_used_percent:.1f}%")
 
@@ -199,7 +207,7 @@ def render_explanation(explanation: gate.QueueExplanation, zone: ZoneInfo,
     header = (f"Build queue at {minute(explanation.now, zone)}: free {gib(host.available)} of {total}; "
               + f"build charges {gib(explanation.totals.charged)} of {gib(host.budget)} budget")
     if isinstance(host.pressure, gate.MemoryPressure):
-        header += "; " + pressure_text(host.pressure, zone)
+        header += "; " + pressure_text(host.pressure, zone, explanation.policy)
     load_path = Path(os.environ.get("BUILDLOG_PROC", "/proc")) / "loadavg"
     try:
         load = float(load_path.read_text().split()[0])
@@ -214,7 +222,7 @@ def render_explanation(explanation: gate.QueueExplanation, zone: ZoneInfo,
             identity.showrunner, identity.unit, identity.session, running.step.step,
             (f"{build_queue.age(running.admitted_at, explanation.now)} min"
              if isinstance(running.admitted_at, float) else "—"), gib(running.promise),
-            gib(running.charged), gib(running.measured), charge_text(running.basis, zone))])
+            gib(running.charged), gib(running.measured), charge_text(running.basis, zone, explanation.policy, running.step.step))])
     if rows:
         lines.extend(aligned_table(("Showrunner", "Unit", "Session", "Step", "Age", "Promise", "Charged",
                                     "Using now", "Charge basis"), rows, frozenset((4, 5, 6, 7))))
@@ -239,7 +247,7 @@ def render_explanation(explanation: gate.QueueExplanation, zone: ZoneInfo,
     lines.extend(head_facts.cargo_token_lines(facts, zone, labels))
     lines.extend(("", budget_text(head.budget), free_text(head.free)))
     if isinstance(head.decision.pressure, gate.MemoryPressure):
-        lines.append("Pressure: " + pressure_text(head.decision.pressure, zone))
+        lines.append("Pressure: " + pressure_text(head.decision.pressure, zone, explanation.policy))
     line = explanation.line
     lines.append(f"The line: {line.count} waiting behind it; {line.fitting} would fit now under both checks; "
                  + f"needs from {line.smallest_need / gate.GIB:.1f} to {gib(line.largest_need)}; "
@@ -252,7 +260,7 @@ def render_explanation(explanation: gate.QueueExplanation, zone: ZoneInfo,
     if not head.free.passes:
         causes.append("free memory")
     if isinstance(head.decision.pressure, gate.MemoryPressure):
-        causes.append(pressure_text(head.decision.pressure, zone))
+        causes.append(pressure_text(head.decision.pressure, zone, explanation.policy))
     if head.decision.state == "admit":
         causes = ["ready for the next admission check"]
     elif not causes:
@@ -263,6 +271,7 @@ def render_explanation(explanation: gate.QueueExplanation, zone: ZoneInfo,
 
 
 def main() -> int:
+    _ = gate.memory_config()
     try:
         # A damaged recovery record must not turn the one-line failure protocol into a traceback.
         with redirect_stderr(io.StringIO()):

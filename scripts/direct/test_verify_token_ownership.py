@@ -5,7 +5,8 @@ import json
 import subprocess
 from typing import cast
 from scripts.direct.verify_token_wait_test_support import VERIFY, BOARD
-from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture, TEST_HANG_GUARD_SECS
+from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyTokenOwnershipTests(VerifyTokenOwnershipFixture):

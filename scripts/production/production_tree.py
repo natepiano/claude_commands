@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from scripts.astra import astra_roles  # noqa: E402
-from scripts.production import staff, staff_sources
+from scripts.production import staff, staff_sources, session_staff
 from scripts.production import showrunners  # noqa: E402
 import showrunner_tree
 import unit_lookup  # noqa: E402
@@ -83,9 +83,12 @@ def _json_object(path: Path) -> dict[str, object]:
     return cast(dict[str, object], raw) if isinstance(raw, dict) else {}
 
 
-def showrunner_sessions() -> dict[str, str]:
+def showrunner_sessions(*,
+                        membership: staff.StaffSnapshot | showrunners.DiscoverMembership = showrunners.DISCOVER_MEMBERSHIP,
+                        ) -> dict[str, str]:
     """Each production slug to its showrunner's session id, from its update timer, wherever it runs."""
     found: dict[str, str] = {}
+    record = staff.initial_snapshot() if isinstance(membership, showrunners.DiscoverMembership) else membership
     for instance in sorted(showrunners.NOTIFIER_STATE_DIR.glob("showrunner-*")):
         try:
             lines = (instance / "conf").read_text(encoding="utf-8").splitlines()
@@ -94,7 +97,8 @@ def showrunner_sessions() -> dict[str, str]:
         target = next((line.removeprefix("TARGET=") for line in lines if line.startswith("TARGET=")), "")
         session_id = target.removeprefix("session:") if target.startswith("session:") else ""
         if session_id:
-            found[instance.name.removeprefix("showrunner-")] = session_id
+            owner = record.by_id(staff.StaffId(session_id))
+            found[instance.name.removeprefix("showrunner-")] = owner.current_session if owner is not None else session_id
     return found
 
 
@@ -126,7 +130,9 @@ def unit_edges(sessions: dict[str, str], running: set[str], marked: unit_lookup.
             claude = units[unit].claude
             if not isinstance(claude, unit_lookup.LiveClaude) or claude.session_id not in running:
                 continue
-            found = staff_sources.member(staff_sources.ObservedUnit(unit, units[unit].staff_id), record)
+            identity = units[unit].staff_id
+            reference = session_staff.LiveSession(identity) if identity else session_staff.NO_SESSION
+            found = staff_sources.member(staff_sources.ObservedUnit(unit, reference), record)
             if isinstance(found, staff_sources.NoSuchMember) or found.row.parent is None:
                 continue
             manager = managers.get(found.row.parent, "")
@@ -249,13 +255,12 @@ def worker_edges(running: set[str], astra_threads: set[str] | None = None) -> li
 
 def tree() -> list[Edge]:
     running = {record["sessionId"] for record in running_sessions()}
-    sessions = showrunner_sessions()
-    marked = None
     astra = astra_edges()
     showrunner: list[Edge] = []
     directors: list[Edge] = []
     try:
         record = staff.snapshot()
+        sessions = showrunner_sessions(membership=record)
         marked = marked_units(record=record)
         showrunner = showrunner_edges(sessions, running, record)
         if marked is not None:

@@ -1,5 +1,5 @@
 ---
-description: Show the build budget and waiting steps, or one step's place and why it waits. Args - `[<position|session|folder>|bump <unit>|close]`.
+description: Show build queue positions and budget.
 ---
 
 Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py $ARGUMENTS`. Show the output as is inside a `text` code block.

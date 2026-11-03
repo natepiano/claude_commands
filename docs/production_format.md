@@ -263,7 +263,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
 
    ```
    From <unit>: phase <N> checkpoint <hash> — <title>. Shots: <paths | none, no visible change>. Phase <next> ETA: <HH:MM zone>
-   review trial: ux <N> findings, code <N> findings, review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>
+   review trial: ux <N> findings, code <N> findings, review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>, simplify <N> findings, simplify minutes <S>
    Parallel: <Phase N, Phase M could start | none — <what the next phase waits on>>
    design check: <pass | N defects, each moved to <phase>> — fresh check on exactly these shots, built from <hash>
    ```
@@ -316,7 +316,8 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    better run as its own unit goes to the showrunner as a proposed split
    (phases, files, shared files, merge order), never to the user.
 4. **The merge branch is the showrunner's.** Never merge into it or push it.
-   Push only your own branch; <PushCheckpoint/> does it at each checkpoint.
+   Push only your own branch except <FastTrack/> (`commands/unit/fast_track.md`);
+   <PushCheckpoint/> does it at each checkpoint.
    <PeriodicCI/> and <CICleanup/> do not run in a unit; the showrunner runs CI
    on the merge branch.
 5. **One more commit kind.** Besides checkpoints, a unit director merges the

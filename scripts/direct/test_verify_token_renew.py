@@ -531,14 +531,17 @@ printf '%s\n' "$acquisitions:$hold_checks" > "$TMPDIR/rechecks"
 buildlog_memory_python() { printf 'hold|100|100|fallback|0|0|0|0|fixture||repo|nextest|1|held|tree\n'; }
 buildlog_memory_line() { :; }
 sleep() { :; }
-mac_retry_hook() { echo true; }
+ssh_retry_hook() { echo true; }
+try_reserved_target() { try_mac_test; }
+target_for_settings() { echo mac; }
+target_platform() { echo macos; }
 start_copy_watch() { :; }
 stop_copy_watch() { :; }
 remember_mac_retry() { :; }
 try_mac_test() { EPOCHSECONDS=$(( EPOCHSECONDS + 100 )); }
 unset EPOCHSECONDS
 EPOCHSECONDS=100
-HOLD_WAIT_DIR=$2 MAC_LEAVE_SETTINGS=settings MAC_RETRY_AFTER=0 MAC_LEAVE_REASON=busy
+HOLD_WAIT_DIR=$2 MAC_LEAVE_SETTINGS=settings MAC_RETRY_AFTER=0 MAC_LEAVE_REASON=busy STEP_RUNS_ON=mac_allowed
 MAC_COPY_WATCH=/does-not-exist MAC_RUNNER=/does-not-exist LINT_LEFT_QUEUE_STATUS=75
 NEXTEST_ARGS=(run) rounds=0
 run_nextest() {
@@ -571,10 +574,13 @@ run_local_test
             _ = harness.write_text('set -eu\nsource "$1"\n' + shell_functions(VERIFY, "run_local_test") + r'''
 unset EPOCHSECONDS SECONDS
 EPOCHSECONDS=100 SECONDS=0
-HOLD_WAIT_DIR=$2 MAC_LEAVE_SETTINGS=settings MAC_RETRY_AFTER=0 MAC_LEAVE_REASON=busy
+HOLD_WAIT_DIR=$2 MAC_LEAVE_SETTINGS=settings MAC_RETRY_AFTER=0 MAC_LEAVE_REASON=busy STEP_RUNS_ON=mac_allowed
 MAC_COPY_WATCH=/does-not-exist MAC_RUNNER=/does-not-exist
 NEXTEST_ARGS=(run) rounds=0
-mac_retry_hook() { echo true; }
+ssh_retry_hook() { echo true; }
+try_reserved_target() { try_mac_test; }
+target_for_settings() { echo mac; }
+target_platform() { echo macos; }
 remember_mac_retry() { :; }
 try_mac_test() {
     printf 'declined\n' >> "$HOLD_WAIT_DIR/mac-attempts"

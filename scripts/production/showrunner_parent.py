@@ -101,7 +101,13 @@ def attach_parent(child: str, parent: str = "") -> None:
         if isinstance(pending, PendingParentNotice) and pending != PendingParentNotice("attach", parent):
             raise staff.StaffRefused(f"{child}: finish its pending {pending.action} to {pending.parent} first")
         child_row, parent_row = _row(child, record), _row(parent, record)
-        finished = child_row.parent == parent_row.id and isinstance(pending, NoPendingParentNotice)
+        path = showrunners.SHOWRUNNER_STATE_DIR / child / showrunners.PARENT_FILE
+        try:
+            recorded_parent = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            recorded_parent = ""
+        finished = (child_row.parent == parent_row.id and recorded_parent == parent
+                    and isinstance(pending, NoPendingParentNotice))
         if finished:
             print(f"{child} already reports to {parent}; done")
             return

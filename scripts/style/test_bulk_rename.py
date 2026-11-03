@@ -21,17 +21,18 @@ from typing import cast, override
 from unittest import mock
 
 import bulk_rename as bulk
+from style_child_test_support import StyleQueueFake, unqueued_style_children
+import approved_renames
+from approved_renames import OuterBindingBlocked, OuterBindingUnproved
 import berth_board
 import rules
 import style_ledger
 from ledger_test_support import remove_generation_schema
 import style_rules
 from scripts.direct.test_verify_untested_examples import rust_tool_path, workspace_metadata
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from approved_renames import AppliedInCode, BindingRename, NoBindingScope, binding_rename_check, binding_scope, rename_declaration
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 class ScriptedServer:
     def __init__(self, edit: Callable[[str, int, str], tuple[bulk.SourceEdit, ...]]) -> None:
@@ -61,14 +62,19 @@ class ScriptedServer:
         return bulk.WorkspaceRename((bulk.DocumentEdits(path, text, self.edit(text, offset, new)),))
 
     def definitions(self, path: Path, text: str, offsets: tuple[int, ...]) -> tuple[bulk.DefinitionResolution, ...]:
-        spans = bulk.BindingText(text).spans
+        parsed = bulk.BindingText(text)
+        spans = parsed.spans
+        names = bulk.source_name_index(parsed)
         answers: list[bulk.DefinitionResolution] = []
         for offset in offsets:
-            token = next(span.token.value for span in spans if span.start == offset)
+            token = next((span.token.value for span in spans if span.start == offset), None)
+            if token is None:
+                # RA resolves format captures inside literals to their binding too.
+                token = next(name for name, points in names.items() if offset in points)
             if token in self.derive_origins:
                 answers.append(self.derive_origins[token])
                 continue
-            declaration = next(span for span in spans if span.token.value == token)
+            declaration = next(span for span in spans if span.token.value.removeprefix("r#") == token.removeprefix("r#"))
             begin, end = bulk.lsp_position(text, declaration.start), bulk.lsp_position(text, declaration.end)
             answers.append(bulk.DefinitionTarget(path.as_uri(), (begin["line"], begin["character"]),
                                                 (end["line"], end["character"])))
@@ -82,6 +88,7 @@ def word_edits(source: str, old: str, new: str, *, macros: bool = True) -> tuple
 
 
 class CargoProjectTests(unittest.TestCase):
+    queue: StyleQueueFake = StyleQueueFake()
     repo: Path = Path()
     root: Path = Path()
 
@@ -89,6 +96,7 @@ class CargoProjectTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="bulk-rename-test-")))
         self.set_up_tools()
+        self.queue = self.enterContext(unqueued_style_children())
         self.repo = self.root / "project"
         (self.repo / "src").mkdir(parents=True)
         _ = (self.repo / "Cargo.toml").write_text('[package]\nname="bulk_sample"\nversion="0.1.0"\nedition="2021"\n')
@@ -115,8 +123,9 @@ class CargoProjectTests(unittest.TestCase):
         return subprocess.run(["git", "-C", str(self.repo), *args], capture_output=True, text=True, check=True).stdout.strip()
 
     def finding(self, source: str, old: str = "old", new: str = "number", line: int = 2,
-                identity: str = "finding") -> bulk.RenameFinding:
-        return bulk.RenameFinding(identity, "src/lib.rs", BindingRename(line, source.splitlines()[line - 1], old, new))
+                identity: str = "finding", path: str = "src/lib.rs") -> bulk.RenameFinding:
+        return bulk.RenameFinding(identity, path, BindingRename(line, source.splitlines()[line - 1], old, new),
+                                  approved_renames.AnchoredRenameSource("immutable-fixture", path, line, source), identity)
 
     def rename(self, source: str, findings: tuple[bulk.RenameFinding, ...], server: ScriptedServer) -> bulk.FileRenames:
         return bulk.rename_file(server, self.repo / "src/lib.rs", "src/lib.rs", source, findings, bulk.repository_docs(self.repo))
@@ -148,12 +157,16 @@ class CargoProjectTests(unittest.TestCase):
         source = (self.repo / "src/lib.rs").read_text()
         issue = self.root / "decision.md"
         _ = issue.write_text("Approved names")
+        ledger.ticket_add("judging-1", "judging", "read", "names", ".", ["src/lib.rs"], [definition.rule_id])
+        ledger.ticket_assign("judging-1", "main")
+        _ = ledger.ticket_base("judging-1")
         ids: list[str] = []
         for line, old, new in ((2, "old", "number"), (3, "missing", "replacement")):
             held = ledger.hold(definition.rule_id, "src/lib.rs", line, source.splitlines()[line - 1],
                                "rename", old, new, definition.blob, "judging-1")
             ledger.file_held(held.finding_id, issue)
             ids.append(held.finding_id)
+        ledger.ticket_drop("judging-1")
         ledger.ticket_add("names-1", "names", "proposal", "names", ".", ["src/lib.rs"], [definition.rule_id],
                           proposal=str(issue), finding_ids=tuple(ids))
         ledger.ticket_assign("names-1", "main")
@@ -161,6 +174,229 @@ class CargoProjectTests(unittest.TestCase):
 
 
 class RenameTests(CargoProjectTests):
+    def test_bulk_rename_uses_current_parameters_instead_of_anchor_blockers(self) -> None:
+        from test_approved_renames import PARAMETER_CHANGES
+        for label, source, current, blocked in PARAMETER_CHANGES:
+            with self.subTest(parameter=label):
+                server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+                finding = self.finding(source, "g", "checkout_info", 2)
+                result = self.rename(current, (finding,), server)
+                if blocked:
+                    self.assertEqual(server.calls, [])
+                    self.assertEqual(result.kept, ())
+                    self.assertEqual(result.edited, current)
+                    refusal, = result.refusals
+                    self.assertIsInstance(refusal, bulk.BlockedRename)
+                    assert isinstance(refusal, bulk.BlockedRename)
+                    self.assertIsInstance(refusal.blocker, OuterBindingBlocked)
+                    assert isinstance(refusal.blocker, OuterBindingBlocked)
+                    self.assertEqual(refusal.blocker.text, current.splitlines()[0])
+                else:
+                    self.assertEqual(len(server.calls), 1)
+                    self.assertEqual(result.refusals, ())
+                    self.assertEqual(tuple(row.finding for row in result.kept), (finding,))
+                    self.assertEqual(result.edited, current.replace("|g| g", "|checkout_info| checkout_info"))
+
+    def test_unread_local_body_never_reaches_analyzer_after_a_signature_change(self) -> None:
+        from test_approved_renames import UNREAD_LOCAL_BODIES
+        for label, source in UNREAD_LOCAL_BODIES:
+            with self.subTest(body=label):
+                current = source.replace("label()", "label(extra: usize)")
+                server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+                result = self.rename(current, (self.finding(source, "g", "checkout_info", 2),), server)
+                self.assertEqual(server.calls, [])
+                self.assertEqual(result.kept, ())
+                self.assertEqual(result.edited, current)
+                refusal, = result.refusals
+                self.assertIsInstance(refusal, bulk.BlockedRename)
+                assert isinstance(refusal, bulk.BlockedRename)
+                self.assertIsInstance(refusal.blocker, OuterBindingUnproved)
+                self.assertIn("containing item body unread", refusal.reason)
+
+    def test_proved_item_with_unread_body_reaches_the_bulk_rename_proof(self) -> None:
+        from test_approved_renames import UNREAD_ITEM_BODIES
+        for label, source in UNREAD_ITEM_BODIES:
+            with self.subTest(body=label):
+                server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+                result = self.rename(source, (self.finding(source, "g", "checkout_info", 2),), server)
+                self.assertEqual(result.refusals, ())
+                self.assertEqual(len(server.calls), 1)
+                self.assertEqual(len(result.kept), 1)
+                self.assertEqual(result.edited, source.replace("fn g(", "fn checkout_info("))
+
+    def test_generic_parameters_refuse_before_any_bulk_rename_request(self) -> None:
+        from test_approved_renames import GENERIC_PARAMETER_BINDINGS
+        self.assert_local_declarations_refuse_before_bulk_rename(GENERIC_PARAMETER_BINDINGS)
+
+    def assert_local_declarations_refuse_before_bulk_rename(self, forms: tuple[tuple[str, str], ...]) -> None:
+        for label, source in forms:
+            with self.subTest(form=label):
+                server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+                result = self.rename(source, (self.finding(source, "g", "checkout_info", 2),), server)
+                self.assertEqual(server.calls, [])
+                self.assertEqual(result.kept, ())
+                self.assertEqual(result.edited, source)
+                refusal, = result.refusals
+                self.assertIsInstance(refusal, bulk.BlockedRename)
+
+    def test_field_expression_bindings_refuse_before_any_bulk_rename_request(self) -> None:
+        from test_approved_renames import FIELD_EXPRESSION_BINDINGS
+        self.assert_local_declarations_refuse_before_bulk_rename(FIELD_EXPRESSION_BINDINGS)
+
+    def test_bulk_anchor_matrix_never_requests_a_rename_without_current_identity(self) -> None:
+        from test_approved_renames import IDENTICAL_BINDING_ITEMS
+        original = IDENTICAL_BINDING_ITEMS
+        for probe in ("missing_anchor", "later_base", "removed", "raw_pair"):
+            with self.subTest(probe=probe):
+                source = original.replace("|g| g", "|r#g| r#g", 1) if probe == "raw_pair" else original
+                pair = self.finding(source, "r#g" if probe == "raw_pair" else "g", "checkout_info", 2)
+                current = source.replace("first()", "first(checkout_info: usize)")
+                if probe == "missing_anchor":
+                    pair = replace(pair, authority=approved_renames.RenameAnchorUnavailable("no readable finding anchor"))
+                    current = source[source.index("fn second"):]+source[:source.index("fn second")]
+                if probe == "removed":
+                    current = source.replace("map(|g| g + 1)", "consume(42)", 1)
+                server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+                result = self.rename(current, (pair,), server)
+                self.assertEqual(server.calls, [])
+                self.assertEqual(result.kept, ())
+                self.assertIsInstance(result.refusals[0], bulk.BlockedRename)
+
+    def test_bulk_admission_never_substitutes_an_identical_sibling_for_a_renamed_target(self) -> None:
+        from test_approved_renames import IDENTICAL_BINDING_ITEMS
+        original = IDENTICAL_BINDING_ITEMS
+        current = original.replace("first()", "first(checkout_info: usize)").replace("|g| g", "|checkout_info| checkout_info", 1)
+        finding = self.finding(original, "g", "checkout_info", 2)
+        server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+        result = self.rename(current, (finding,), server)
+        self.assertEqual(server.calls, [])
+        self.assertEqual(result.kept, ())
+        self.assertEqual(result.edited, current)
+        refusal, = result.refusals
+        self.assertIsInstance(refusal, bulk.BlockedRename)
+        assert isinstance(refusal, bulk.BlockedRename)
+        self.assertIsInstance(refusal.blocker, OuterBindingUnproved)
+        # The unblocked format-capture path retains the existing analyzer proof.
+        from test_approved_renames import CAPTURE_BINDING_ITEM
+        def capture_edits(text: str, _offset: int, new: str) -> tuple[bulk.SourceEdit, ...]:
+            begin = text.index("{g}") + 1
+            return (*word_edits(text, "g", new), bulk.SourceEdit(begin, begin + 1, new))
+        capture_server = ScriptedServer(capture_edits)
+        library = self.root / "library"
+        capture_server.derive_origins["println"] = bulk.DefinitionTarget((library / "std/src/macros.rs").as_uri(), (0, 0), (0, 7))
+        with mock.patch.object(bulk, "standard_library", return_value=library):
+            capture = self.rename(CAPTURE_BINDING_ITEM, (self.finding(CAPTURE_BINDING_ITEM, "g", "checkout_info", 2),), capture_server)
+        self.assertEqual(capture.refusals, ())
+        self.assertEqual(len(capture.kept), 1)
+        self.assertIn('println!("{checkout_info}")', capture.edited)
+
+    def test_bulk_admission_refuses_duplicate_recorded_item_paths(self) -> None:
+        from test_approved_renames import DUPLICATE_BINDING_ITEM_PATH
+        source = DUPLICATE_BINDING_ITEM_PATH
+        server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+        result = self.rename(source, (self.finding(source, "g", "checkout_info", 2),), server)
+        self.assertEqual(server.calls, [])
+        self.assertEqual(result.edited, source)
+        refusal, = result.refusals
+        self.assertIsInstance(refusal, bulk.BlockedRename)
+        self.assertIn("item path is not unique", refusal.reason)
+
+    def test_inner_attributes_in_every_enclosing_scope_refuse_before_analyzer_rename(self) -> None:
+        from test_approved_renames import INHERITED_INNER_ATTRIBUTES
+        # The bulk entry point reads the source after a later outer parameter arrives too.
+        self.assert_outer_block_before_analyzer("fn label(checkout_info: usize) {\nmap(|g| g + 1)\n}\n")
+        for label, source in INHERITED_INNER_ATTRIBUTES:
+            with self.subTest(scope=label):
+                server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+                result = self.rename(source, (self.finding(source, "g", "checkout_info", 2),), server)
+                self.assertEqual(server.calls, [])
+                self.assertEqual(result.kept, ())
+                self.assertEqual(result.edited, source)
+                refusal, = result.refusals
+                self.assertIsInstance(refusal, bulk.BlockedRename)
+                assert isinstance(refusal, bulk.BlockedRename)
+                self.assertIsInstance(refusal.blocker, OuterBindingUnproved)
+                self.assertIn("unresolved attribute macro 'inject'", refusal.reason)
+
+    def test_item_presence_refusals_never_request_an_analyzer_rename(self) -> None:
+        from test_approved_renames import PRESENCE_REFUSALS
+        for label, source, line, expected in PRESENCE_REFUSALS:
+            with self.subTest(form=label):
+                server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+                finding = self.finding(source, "g", "checkout_info", line)
+                result = self.rename(source, (finding,), server)
+                self.assertEqual(server.calls, [])
+                self.assertEqual(result.kept, ())
+                refusal, = result.refusals
+                self.assertIsInstance(refusal, bulk.BlockedRename)
+                assert isinstance(refusal, bulk.BlockedRename)
+                self.assertIsInstance(refusal.blocker, expected)
+                self.assertEqual(result.edited, source)
+
+    def test_unread_enclosing_scopes_refuse_before_analyzer_rename(self) -> None:
+        for source, line in (
+                ("fn label() {\n    if let Some(checkout_info) = if flag { value } else { other } {\n"
+                 + "        map(|g| g + 1);\n    }\n}\n", 3),
+                ("fn label() { introduce!(checkout_info);\n    map(|g| g + 1)\n}\n", 2)):
+            server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+            result = self.rename(source, (self.finding(source, "g", "checkout_info", line),), server)
+            with self.subTest(source=source):
+                self.assertEqual(server.calls, [])
+                self.assertEqual(result.edited, source)
+                self.assertEqual(result.kept, ())
+                refusal, = result.refusals
+                self.assertTrue(refusal.reason.startswith("outer binding visibility unproved:"), refusal.reason)
+
+    def test_stale_local_text_is_terminal_before_any_analyzer_rename(self) -> None:
+        source = "fn label(checkout_info: usize) {\n    map(|g| g + 1)\n}\n"
+        server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+        original = self.finding(source, "g", "checkout_info", 2)
+        finding = replace(original, rename=replace(original.rename, text=original.rename.text + " // stale"))
+        result = self.rename(source, (finding,), server)
+        self.assertEqual(server.calls, [])
+        self.assertEqual(result.edited, source)
+        self.assertEqual(result.kept, ())
+        refusal, = result.refusals
+        self.assertIsInstance(refusal, bulk.BlockedRename)
+        assert isinstance(refusal, bulk.BlockedRename)
+        self.assertIsInstance(refusal.blocker, OuterBindingBlocked)
+        assert isinstance(refusal.blocker, OuterBindingBlocked)
+        self.assertEqual((refusal.blocker.name, refusal.blocker.line), ("checkout_info", 1))
+
+    def test_same_line_outer_bindings_refuse_before_analyzer_rename(self) -> None:
+        source = "fn label(checkout_info: usize) { let checkout_info = 1;\n    map(|g| g + 1)\n}\n"
+        self.assert_outer_block_before_analyzer(source)
+
+    def test_raw_outer_binding_refuses_before_analyzer_rename(self) -> None:
+        source = "fn label(r#checkout_info: usize) {\n    map(|g| g + 1)\n}\n"
+        self.assert_outer_block_before_analyzer(source)
+
+    def assert_outer_block_before_analyzer(self, source: str) -> None:
+        server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+        result = self.rename(source, (self.finding(source, "g", "checkout_info", 2),), server)
+        self.assertEqual(server.calls, [])
+        self.assertEqual(result.edited, source)
+        self.assertEqual(result.kept, ())
+        refusal, = result.refusals
+        self.assertIsInstance(refusal, bulk.BlockedRename)
+        assert isinstance(refusal, bulk.BlockedRename)
+        assert isinstance(refusal.blocker, OuterBindingBlocked)
+        self.assertEqual((refusal.blocker.name, refusal.blocker.line), ("checkout_info", 1))
+
+    def test_outer_binding_block_is_typed_and_never_requests_an_analyzer_rename(self) -> None:
+        source = "fn label(checkout_info: usize) -> usize {\n    map(|g| g + 1)\n}\n"
+        server = ScriptedServer(lambda text, offset, new: word_edits(text, "g", new))
+        finding = self.finding(source, "g", "checkout_info", 2)
+        result = self.rename(source, (finding,), server)
+        self.assertEqual(result.edited, source)
+        self.assertEqual(result.kept, ())
+        self.assertEqual(server.calls, [])
+        blocked, = result.refusals
+        self.assertIsInstance(blocked, bulk.BlockedRename)
+        assert isinstance(blocked, bulk.BlockedRename)
+        assert isinstance(blocked.blocker, OuterBindingBlocked)
+        self.assertEqual((blocked.blocker.name, blocked.blocker.line), ("checkout_info", 1))
+
     def test_parameter_own_docs_are_coordinated_without_editing_external_or_neighbor_docs(self) -> None:
         source = ("/// Neighbor uses `old`.\nfn neighbor() {}\n"
                   "/// Add `old`; older is ordinary prose.\nfn run(old: usize) -> usize { old + 1 }\n")
@@ -359,7 +595,7 @@ class RenameTests(CargoProjectTests):
                 return definitions(path, text, offsets)
             with mock.patch.object(server, "definitions", side_effect=refuse):
                 rolled_back = bulk.rename_file(server, child, "src/child.rs", other,
-                                               (self.finding(other, "other", "count", 1),))
+                                               (self.finding(other, "other", "count", 1, path="src/child.rs"),))
             self.assertIn("test rollback", rolled_back.refusals[0].reason)
             self.assertEqual(server.documents[child], other)
             self.assertEqual(bulk.crate_name_documents(server, root, "count"), ())
@@ -971,6 +1207,11 @@ while True:
                 self.assertIn("let number", bulk.apply_edits(source, edits.documents[0].edits))
         messages = [bulk.object_fields(cast(object, json.loads(line))) for line in log.read_text().splitlines()]
         methods = [message.get("method") for message in messages]
+        self.assertEqual(self.queue.calls, [("rust-analyzer", self.repo)])
+        place, = self.queue.places
+        self.assertEqual(place.arguments, [("rust-analyzer",)])
+        self.assertTrue(place.closed)
+        self.assertTrue(all(process.returncode is not None for process in place.processes))
         self.assertEqual(methods.count("textDocument/prepareRename"), 2)
         self.assertEqual(methods.count("textDocument/rename"), 1)
         initialize = next(message for message in messages if message.get("method") == "initialize")
@@ -1064,6 +1305,16 @@ class ValidationTests(CargoProjectTests):
         self.assertEqual(len({item.finding.finding_id for item in sample}), 60)
         self.assertEqual({item.kind for item in sample}, {"let", "closure"})
         self.assertEqual(len(bulk.sample_findings(findings[:3])), 3)
+
+    def test_blocking_writer_availability_retains_every_holder_as_typed_evidence(self) -> None:
+        writer = berth_board.Reservation("writer", "main", self.root / "writer", "refs/heads/writer",
+                                         ("src/lib.rs",), "active", "blocking")
+        reader = replace(writer, reservation_id="reader", edit_blocking_status="clear")
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((reader, writer))):
+            with self.assertRaises(bulk.ReservationBlocked) as caught:
+                bulk.check_available(self.repo, "src/lib.rs")
+        self.assertEqual(caught.exception.path, "src/lib.rs")
+        self.assertEqual(caught.exception.holders, (writer,))
 
     def test_busy_path_or_unreadable_board_refuses_writes(self) -> None:
         reservation = berth_board.Reservation("other", "x", self.root / "other", "branch", ("src/lib.rs",), "active", "blocking")
@@ -1599,7 +1850,7 @@ pub fn run(parameter: usize) -> usize {
         _ = (self.repo / "src/lib.rs").write_text(source)
         path = self.repo / "src/record.rs"
         _ = path.write_text(declaration)
-        finding = bulk.RenameFinding("field", "src/record.rs", BindingRename(1, declaration.strip(), "old", "number"))
+        finding = bulk.RenameFinding("field", "src/record.rs", BindingRename(1, declaration.strip(), "old", "number"), approved_renames.AnchoredRenameSource("immutable-fixture", "src/record.rs", 1, declaration), "field")
         with bulk.RustAnalyzer(self.repo, timeout=120) as analyzer:
             result = bulk.rename_file(analyzer, path, "src/record.rs", declaration, (finding,))
         self.assertEqual(result.refusals, ())

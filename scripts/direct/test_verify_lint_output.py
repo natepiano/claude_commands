@@ -9,7 +9,8 @@ import tempfile
 from typing import final
 import unittest
 
-from scripts.direct.verify_lint_scope_test_support import SCRIPTS, TEST_HANG_GUARD_SECS, VERIFY
+from scripts.direct.verify_lint_scope_test_support import SCRIPTS, VERIFY
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.direct.shell_function_test_support import shell_functions
 
 INVOKE = SCRIPTS / "lint" / "invoke.sh"

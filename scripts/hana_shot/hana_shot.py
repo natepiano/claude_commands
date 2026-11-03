@@ -29,8 +29,18 @@ import tempfile
 import time
 import tomllib
 from types import FrameType
-from typing import IO, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast, override
+from typing import TYPE_CHECKING, IO, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast, override
 
+
+if TYPE_CHECKING:
+    from scripts.lib import process_group
+else:
+    process_group_path = Path(__file__).resolve().parents[1] / "lib" / "process_group.py"
+    process_group_spec = importlib.util.spec_from_file_location("_hana_shot_process_group", process_group_path)
+    if process_group_spec is None or process_group_spec.loader is None:
+        raise ImportError(f"cannot load process group helper at {process_group_path}")
+    process_group = importlib.util.module_from_spec(process_group_spec)
+    process_group_spec.loader.exec_module(process_group)
 
 REFUSED_PORT = 15702
 HOST = "127.0.0.1"
@@ -2246,7 +2256,7 @@ def shutdown(port: int, process: subprocess.Popen[bytes] | None = None) -> None:
             if same_binary(pid, state["binary"]):
                 for signal_number in (signal.SIGTERM, signal.SIGKILL):
                     try:
-                        os.killpg(pid, signal_number)
+                        process_group.send_process_group(pid, signal_number)
                     except ProcessLookupError:
                         break
                     time.sleep(2)

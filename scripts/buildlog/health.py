@@ -30,6 +30,7 @@ SNAPSHOT_CLOCK_SKEW_SECONDS = 5 * 60
 class Machine(StrEnum):
     NATEDEV = "natedev"
     MAC = "Mac"
+    AWS = "aws"
 
 
 @dataclass(frozen=True)
@@ -62,11 +63,10 @@ type RecorderHealth = FreshRecorderHealth | StaleRecorderHealth | RecorderHealth
 
 
 def machine_for_host(host: str) -> Machine:
-    """The historical Mac folder names in the sync allow-list name one machine."""
-    if host == Machine.NATEDEV:
-        return Machine.NATEDEV
-    if host in record.SYNC_HOSTS:
-        return Machine.MAC
+    """Resolve the host through the configured target mapping."""
+    for machine in Machine:
+        if host in record.target_hosts(machine.value.lower()):
+            return machine
     raise ValueError(f"unknown build-log host: {host}")
 
 
@@ -164,7 +164,7 @@ def read_snapshots() -> tuple[RecorderHealth, ...]:
     """Read one state per machine; the newest usable Mac alias wins."""
     now = time.time()
     latest: dict[Machine, RecorderHealthSnapshot] = {}
-    for host in record.SYNC_HOSTS:
+    for host in record.synchronized_hosts():
         try:
             snapshot = _read_snapshot(host)
         except (OSError, ValueError):
@@ -175,7 +175,10 @@ def read_snapshots() -> tuple[RecorderHealth, ...]:
         if previous is None or snapshot.generated_at > previous.generated_at:
             latest[snapshot.machine] = snapshot
     states: list[RecorderHealth] = []
+    active = set(record.configured_targets())
     for machine in Machine:
+        if machine.value.lower() not in active:
+            continue
         snapshot = latest.get(machine)
         if snapshot is None:
             states.append(RecorderHealthUnavailable(machine))

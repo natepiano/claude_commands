@@ -34,10 +34,10 @@ opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
    recover from the diff: **what this slot is unsure about, what it could not
    verify, and what it touched outside its file set**. No reviewer receives a
    summary, so a doubt left unstated arrives at review as a line of code that
-   looks deliberate. Carry verbatim: "Do not open the `rust_style` skill or run
-   `load-rust-style.sh`; the unit director runs the style review in its main
-   review each phase." Codex lists `rust_style` to every worker, which loads
-   it unless told not to.
+   looks deliberate. Implementation, fix and test prompts carry verbatim:
+   "Do not open the `rust_style` skill or run `load-rust-style.sh`; the reviewer
+   worker owns the phase style review." Review prompts use
+   <ReviewPromptContract/>'s style assignment instead.
 3. Narration: when the activity changes — a new piece of work, or a run
    started — run
    `bash ~/.claude/scripts/direct/board.sh post <concrete SESSION_DIR> <slot> status "<activity>"`.
@@ -53,7 +53,11 @@ opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
    detached: each verify.sh line as listed, which detaches itself, or any
    other command as
    `python3 ~/.claude/scripts/agents/mesh_runs.py start --label "<what>" -- <command>`.
-   Either returns at once with one line naming the run, its pid and its log.
+   A successful start returns at once with the run, its pid and its log.
+   A live twin takes priority over config/mesh_runs.conf LIVE_RUN_LIMIT.
+   Exit 4 refuses a new run at that limit and names the live runs.
+   Wait for a run's result, or put more files in one run. Never run attached after exit 4.
+   Exit 3 means the caller is not a mesh worker; run attached only for that exit.
    Keep working if you have other work; otherwise end your turn. The result
    (pass or fail, exit code, log path, last lines) arrives as your next
    message, also after an account move or a stop. Never poll, sleep, call
@@ -135,7 +139,7 @@ opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
    this work.`
 8. `## Verification` per <VerificationContract/>, exactly as listed and with
    nothing added around it.
-9. `## Three Gods`, always inline; item 2's `rust_style` line still holds:
+9. `## Three Gods`, always inline:
 
    ```
    ## Three Gods

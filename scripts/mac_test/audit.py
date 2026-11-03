@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 from bisect import bisect_right
 from dataclasses import dataclass
-import os
 from pathlib import Path
 import re
 import sys
@@ -17,7 +16,8 @@ from typing import Literal, cast
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 import override_guard
-import sweep
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import conf
 
 import cargo_manifest
 import offload
@@ -296,8 +296,7 @@ def suggestion(
 def configured_packages(repository: offload.RepositoryIdentity) -> frozenset[str]:
     if isinstance(repository, offload.UnknownRepository):
         return frozenset()
-    config = os.environ.get("MAC_TEST_CONFIG", "~/.claude/config/mac_test.conf")
-    values = sweep.config_values(str(Path(config).expanduser()))
+    values = conf.read("mac_test").values()
     return frozenset(offload.comma_values(values.get(f"linux_only.{repository.name}", "")))
 
 

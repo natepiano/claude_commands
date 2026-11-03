@@ -113,6 +113,21 @@ class PushTextTests(unittest.TestCase):
                     self.assertLess(len(text), 500)
                     self.assertLess(len(push.title), 45)
 
+    def test_ups_maintenance_alerts_keep_the_approved_text_and_nonurgent_action(self) -> None:
+        cases = (
+            ("nixos.ups_replace_battery", "UPS battery needs replacing",
+             "Replace the battery in the natedev UPS.",
+             "The natedev UPS reports that its battery is worn out. During a power outage it may not keep natedev on long enough to shut down safely."),
+            ("nixos.ups_no_contact", "natedev lost contact with its UPS",
+             "Check the USB cable between the UPS and natedev.",
+             "natedev cannot read its UPS. During a power outage it gets no warning and cannot shut down safely."),
+        )
+        for text_id, title, action, body in cases:
+            with self.subTest(id=text_id):
+                push = push_texts.render(text_id)
+                self.assertEqual((push.sender, push.need, push.title, push.action, push.body),
+                                 ("ups", "note", title, ActionRequired(action), body))
+
     def test_every_gpu_xid_renders_its_meaning_and_restart_action(self) -> None:
         for code, meaning in gpu_xid.XID_MEANINGS.items():
             with self.subTest(xid=code):
@@ -143,15 +158,58 @@ class PushTextTests(unittest.TestCase):
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(result.stderr, f"gpu_xid: unknown Xid code: {shown}\n")
 
-    def test_failed_restart_catalog_examples_show_named_sessions(self) -> None:
+    def test_failed_restart_catalog_examples_show_the_count_and_one_command(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.restart_failed")
         self.assertEqual({example.name for example in entry.examples}, {"typical", "one_long_name"})
         for example in entry.examples:
             with self.subTest(example=example.name):
                 push = push_texts.render_entry(entry, example.values)
                 stopped = push.values["stopped"]
-                self.assertRegex(stopped, r"\([^()]+\)")
+                self.assertRegex(stopped, r"^(?:1 session|[1-9][0-9]* sessions)")
                 self.assertIn(stopped, push.message)
+                self.assertIn("Coding work stays stopped until the restart succeeds.", push.body)
+                self.assertEqual(cast(ActionRequired, push.action).text.count("/shutdown restart"), 1)
+                self.assertIn("natedev", cast(ActionRequired, push.action).text)
+                self.assertLess(len(push.message), 500)
+        self.assertEqual(entry.examples[0].values["stopped"], "5 sessions")
+
+    def test_trust_catalog_selects_commands_for_configured_folders_and_a_request_for_unlisted_folders(self) -> None:
+        entries = {entry.id: entry for entry in push_texts.catalog()}
+        covered = entries["shutdown.restart_untrusted"]
+        self.assertEqual({example.name for example in covered.examples}, {"typical"})
+        for example in covered.examples:
+            push = push_texts.render_entry(covered, example.values)
+            self.assertIn(example.values["stopped"], push.body)
+            action = cast(ActionRequired, push.action).text
+            self.assertEqual(action.count("accounts.py trust"), 1)
+            self.assertEqual(action.count("/shutdown restart"), 1)
+            self.assertNotIn("cd /", push.message)
+            self.assertLess(len(push.message), 500)
+        unlisted = entries["shutdown.restart_untrusted_unlisted"]
+        self.assertEqual({example.values["stopped"] for example in unlisted.examples}, {"1 session", "4 sessions"})
+        for example in unlisted.examples:
+            push = push_texts.render_entry(unlisted, example.values)
+            self.assertIn(example.values["stopped"], push.body)
+            self.assertIn(". Claude does not trust the folders. ", push.body)
+            self.assertIn(f'Trust the folders of the stopped Claude sessions on {example.values["machine"]} from their shutdown records.',
+                          cast(ActionRequired, push.action).text)
+            self.assertNotIn("accounts.py trust", push.message)
+            self.assertNotIn("/shutdown restart", push.message)
+            self.assertNotIn("cd /", push.message)
+            self.assertLess(len(push.message), 500)
+        self.assertNotIn("shutdown.move_untrusted", entries)
+
+    def test_manual_restart_catalog_groups_sessions_by_machine(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.manual_restart")
+        self.assertEqual({example.values["stopped"] for example in entry.examples}, {"1 session", "3 sessions"})
+        for example in entry.examples:
+            with self.subTest(example=example.name):
+                push = push_texts.render_entry(entry, example.values)
+                self.assertIn(example.values["stopped"], push.body)
+                self.assertIn(f'Resume the stopped Claude sessions on {example.values["machine"]} from their shutdown records.',
+                              cast(ActionRequired, push.action).text)
+                self.assertNotIn("/shutdown restart", push.message)
+                self.assertLess(len(push.message), 500)
 
     def test_every_catalog_example_keeps_email_addresses_out_of_pushes(self) -> None:
         for entry in push_texts.catalog():
@@ -176,8 +234,8 @@ class PushTextTests(unittest.TestCase):
         self.assertFalse(entry.agent_written)
         self.assertEqual(push_texts.fingerprint(entry), push_texts.fingerprint(replace(entry, agent_written=True)))
 
-    def test_only_nate_adhoc_is_agent_written_and_its_approval_is_current(self) -> None:
-        self.assertEqual([entry.id for entry in push_texts.catalog() if push_texts.agent_written(entry.id)], ["nate.adhoc"])
+    def test_agent_written_entries_and_nate_approval_are_current(self) -> None:
+        self.assertEqual([entry.id for entry in push_texts.catalog() if push_texts.agent_written(entry.id)], ["alert.blocked", "alert.decision", "nate.adhoc"])
         self.assertFalse(push_texts.agent_written("unknown"))
         self.assertRegex(push_texts.approval_date("nate.adhoc"), r"^\d{4}-\d{2}-\d{2}$")
 

@@ -1,5 +1,5 @@
 ---
-description: Generate project-specific Bevy migration plan by analyzing the current codebase against official migration guides
+description: Plan a Bevy version migration.
 ---
 
 # Bevy Migration Plan Generator

@@ -43,6 +43,10 @@ else:
     from scripts.notify.push_catalog import mac_idle_reservation
     from scripts.message import send
 from test_index import use_test_log
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 use_test_log()
 REAL_NOTIFY_OUTAGE = mac_idle.notify_outage
@@ -567,6 +571,39 @@ class MacIdleTests(NotificationGuardedTestCase):
                 self.assertFalse(mac_idle.marker_path(self.paths, self.call.call_id).exists())
                 self.assertEqual(self.rows(), [])
 
+    def test_linux_only_waits_and_linux_execution_never_trigger_mac_repairs(self) -> None:
+        cases = (
+            (step_record.SshAllowed(("aws",)), step_record.StepState.WAITING_HOLD, ""),
+            (step_record.SshAllowed(("aws",)), step_record.StepState.WAITING_SSH, ""),
+            (step_record.SshAllowed(("mac", "aws"), ("mac",)), step_record.StepState.ON_SSH, "aws"),
+        )
+        for permission, state, selected in cases:
+            with self.subTest(state=state, selected=selected):
+                step_record.write(step_record.StepRecord(
+                    self.call.call_id, self.call.pid, self.call.start, Path(self.call.repo), "check",
+                    step_record.WorkspacePackages(), permission, state, "2026-11-02T10:00:00Z",
+                    selected_target=selected))
+                self.assertIsInstance(step_record.read(self.call.call_id), step_record.StepRecord)
+                with mock.patch.object(mac_idle, "notify_director") as send:
+                    self.two_passes()
+                send.assert_not_called()
+                self.assertEqual(mac_idle.waiting_calls(self.paths, mac_idle.processes(self.paths.proc)), ())
+                self.assertFalse(mac_idle.marker_path(self.paths, self.call.call_id).exists())
+                self.assertEqual(self.rows(), [])
+
+    def test_mixed_target_record_keeps_mac_wait_observation_after_decoding(self) -> None:
+        step_record.write(step_record.StepRecord(
+            self.call.call_id, self.call.pid, self.call.start, Path(self.call.repo), "test",
+            step_record.NamedPackage("sample"), step_record.SshAllowed(("studio", "aws"), ("studio",)),
+            step_record.StepState.WAITING_HOLD, "2026-11-02T10:00:00Z"))
+
+        self.two_passes()
+
+        self.assertEqual(mac_idle.marker_path(self.paths, self.call.call_id).read_text(), "retry_delayed\n")
+        calls = mac_idle.waiting_calls(self.paths, mac_idle.processes(self.paths.proc))
+        self.assertEqual([(call.call_id, call.package) for call in calls], [(self.call.call_id, "sample")])
+        self.assertEqual([row["cause"] for row in self.rows()], ["retry_delayed"])
+
     def test_unreadable_and_stale_records_are_named_without_hiding_a_live_waiter(self) -> None:
         step_record.write(step_record.StepRecord("stale-call", 123, "old-start", Path(self.call.repo),
             "check", None, step_record.MacAllowed(), step_record.StepState.WAITING_MAC, "2026-10-28T22:00:00Z"))
@@ -752,7 +789,7 @@ test "$BUILDLOG_MEM_OUTCOME" = LeftQueue
 '''
         result = subprocess.run(["bash", "-c", command, "memory-marker-test",
             str(mac_idle.SCRIPTS / "lint/memory_gate.sh")], env={**os.environ, "BUILDLOG_MEMINFO": str(meminfo),
-            "TEST_RETRY_MARKER": str(marker)}, capture_output=True, text=True, timeout=300, check=False)
+            "TEST_RETRY_MARKER": str(marker)}, capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(marker.exists())
 

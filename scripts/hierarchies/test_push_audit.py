@@ -14,11 +14,14 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from typing import override
 
 from scripts.hierarchies import push_audit as audit
 from scripts.hierarchies import log_records
 from scripts.hierarchies.test_log_records import phone_overflow_lines, read_report_blocks, summary_lines
-from scripts.production import showrunners
+from scripts.production import showrunners, staff, fake_showrunner
+from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, recorded_unit
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 JsonRecord = dict[str, object]
@@ -62,13 +65,23 @@ class PushAuditTest(unittest.TestCase):
         self.save(self.pushes, [])
         self.save(self.reviews, [])
 
+    @override
+    def setUp(self) -> None:
+        _ = self.enterContext(isolated_staff_file(self.home / "staff.json", {}))
+        _ = (self.home / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
+
     def production(self, slug: str, units: Sequence[tuple[str, str]]) -> None:
         instance = self.home / ".local/state/notifier" / f"showrunner-{slug}"
         instance.mkdir(parents=True)
         doc = self.home / f"{slug}.md"
         rows = "".join(f"| {name} | {plan} |\n" for name, plan in units)
         _ = doc.write_text("# Production\n\n## Units\n\n| Unit | Plan |\n|---|---|\n" + rows, encoding="utf-8")
-        _ = (instance / "conf").write_text(f"CHECK=bash /fixture/production_check.sh {doc}\n", encoding="utf-8")
+        owner = recorded_showrunner(slug + "-owner", doc)
+        _ = fake_showrunner.write_timer(instance.parent, slug, owner.current_session, "UTC", doc)
+        for name, plan in units:
+            row = recorded_unit(owner.name, name, self.home / slug / name, doc, plan=plan)
+            if plan.startswith("retired"):
+                _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.home / slug / name), expected=row.worktree)
 
     def save(self, path: Path, records: Sequence[JsonRecord]) -> None:
         _ = path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
@@ -107,7 +120,7 @@ class PushAuditTest(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, str(AUDIT_SCRIPT), "report", "--full", "--since", since, "--until", until],
             cwd=AUDIT_SCRIPT.parents[2], env=environment, capture_output=True, text=True,
-            check=False, timeout=15,
+            check=False, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         return result.stdout
@@ -376,6 +389,17 @@ class PushAuditTest(unittest.TestCase):
         self.assertIn("ApprovedRegisteredText", detail_section(output))
         self.assertIn(REGISTERED_TEXT, output)
         self.assertIn("hana", output)
+
+    def test_both_footer_generations_keep_the_registered_identity_and_body_match(self) -> None:
+        for separator in ("\n", " · "):
+            with self.subTest(separator=separator):
+                push = self.push("Footer generations", text_id=REGISTERED_TEXT)
+                push["message"] = str(push["message"]).replace("\nTemplate:", separator + "Template:")
+                self.save(self.pushes, [push])
+                self.save(self.reviews, [self.failed_review("Footer generations")])
+                output = self.report()
+                self.assertIn("ApprovedRegisteredText", detail_section(output))
+                self.assertIn(REGISTERED_TEXT, output)
 
     def test_registered_text_id_can_come_from_review_or_delivered_footer(self) -> None:
         for review_id, footer_id in ((REGISTERED_TEXT, ""), ("", REGISTERED_TEXT)):

@@ -1,5 +1,5 @@
 ---
-description: Create a new issue in the hanadocs vault from a project shorthand, title, and optional body.
+description: Create a Hanadocs issue.
 ---
 
 Create a new issue in the hanadocs vault.

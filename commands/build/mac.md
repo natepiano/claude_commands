@@ -1,5 +1,5 @@
 ---
-description: Hold the Mac, remove its block, settle and show its state, or audit Rust packages. Args - `block <why> [hours N]`, `unblock`, `status`, or `audit <repo dir>`.
+description: Hold the Mac or audit Rust packages.
 ---
 
 `$ARGUMENTS` is `block <why> [hours N]`, `unblock`, `status`, or `audit <repo dir>`.

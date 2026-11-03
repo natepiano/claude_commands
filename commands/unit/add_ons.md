@@ -1,5 +1,5 @@
 ---
-description: Review the add-ons a /unit:direct run has collected for later.
+description: Review a unit run's pending add-ons.
 ---
 
 # Direct — next items

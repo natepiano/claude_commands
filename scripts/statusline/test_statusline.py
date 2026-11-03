@@ -57,9 +57,9 @@ def status_lines(*inputs: object, labels: Path | None = None, account: str = "cl
     return result.stdout.splitlines()
 
 
-OWNER = staff.StaffRow(staff.StaffId("s00000000001"), "showrunner", "show", None)
-UNIT = staff.StaffRow(staff.StaffId("s00000000002"), "unit", "trunk", OWNER.id)
-WORKER = staff.StaffRow(staff.StaffId("s00000000003"), "worker", "impl", UNIT.id)
+OWNER = staff.StaffRow(staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd"), "showrunner", "show", None, current_session=staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd"))
+UNIT = staff.StaffRow(staff.StaffId("d9962532-4f02-5126-b86a-08c69f70031c"), "unit", "trunk", OWNER.id, current_session=staff.StaffId("d9962532-4f02-5126-b86a-08c69f70031c"))
+WORKER = staff.StaffRow(staff.StaffId("d78dc003-79c1-56d5-a006-8568ea72bd81"), "worker", "impl", UNIT.id, current_session=staff.StaffId("d78dc003-79c1-56d5-a006-8568ea72bd81"))
 
 
 def staff_text(*rows: staff.StaffRow) -> str:
@@ -83,7 +83,7 @@ class ShowrunnerRecord(TypedDict):
 
 class ColorTests(unittest.TestCase):
     def test_direct_jq_colors_the_entire_staff_assignment(self) -> None:
-        line = status_lines({}, colors=SHIPPED_COLORS, staff_text=staff_text(OWNER, UNIT), STAFF_ID=UNIT.id)[0]
+        line = status_lines({"session_id": UNIT.id}, colors=SHIPPED_COLORS, staff_text=staff_text(OWNER, UNIT))[0]
         self.assertEqual(line.split(" | ")[0], "\x1b[33mtrunk unit for show\x1b[0m")
 
     def test_direct_jq_with_invalid_or_non_object_staff_text_keeps_both_lines(self) -> None:
@@ -98,7 +98,7 @@ class ColorTests(unittest.TestCase):
 
     def test_the_user_s_examples_render_the_role_with_its_path_then_the_account_model_tokens_and_weekly(self) -> None:
         home = os.environ["HOME"]
-        payload = {**limits({"used_percentage": 20}, {"used_percentage": 9}), "session_id": "sid",
+        payload = {**limits({"used_percentage": 20}, {"used_percentage": 9}), "session_id": OWNER.id,
                    "model": {"display_name": "Opus 5.5"}, "effort": {"level": "high"},
                    "context_window": ContextWindow(total_input_tokens=103_438, context_window_size=250_000)}
         own = json.dumps({"sessionId": "sid", "name": "natedev"})
@@ -106,14 +106,14 @@ class ColorTests(unittest.TestCase):
                           (home, "~"), (f"{home}x/elsewhere", f"{home}x/elsewhere"), ("/", "/")):
             with self.subTest(cwd=cwd):
                 self.assertEqual(status_lines({**payload, "workspace": {"current_dir": cwd}}, own=own,
-                                             staff_text=staff_text(staff.StaffRow(OWNER.id, "showrunner", "natedev", None)),
+                                             staff_text=staff_text(staff.StaffRow(OWNER.id, "showrunner", "natedev", None, current_session=OWNER.id)),
                                              STAFF_ID=OWNER.id), [
                     f"natedev showrunner | {path}", "claude1 | Opus 5.5 high | 103,438 | weekly 91% left"])
         unit = json.dumps({"sessionId": "sid", "name": "cables"})
-        lines = status_lines({**payload, "workspace": {"current_dir": f"{home}/rust/hana_catalyst_cables"}},
+        lines = status_lines({**payload, "session_id": UNIT.id, "workspace": {"current_dir": f"{home}/rust/hana_catalyst_cables"}},
                              own=unit, staff_text=staff_text(
-                                 staff.StaffRow(OWNER.id, "showrunner", "hana", None),
-                                 staff.StaffRow(UNIT.id, "unit", "cables", OWNER.id)), STAFF_ID=UNIT.id)
+                                 staff.StaffRow(OWNER.id, "showrunner", "hana", None, current_session=OWNER.id),
+                                 staff.StaffRow(UNIT.id, "unit", "cables", OWNER.id, current_session=UNIT.id)), STAFF_ID=UNIT.id)
         self.assertEqual(lines[0], "cables unit for hana | ~/rust/hana_catalyst_cables")
 
     def test_shipped_role_colors_and_plain_worker_and_unassigned(self) -> None:
@@ -125,7 +125,7 @@ class ColorTests(unittest.TestCase):
         )
         for expected, identity in cases:
             with self.subTest(role=expected):
-                line = status_lines({"session_id": "session-id"}, colors=SHIPPED_COLORS,
+                line = status_lines({"session_id": identity}, colors=SHIPPED_COLORS,
                                     staff_text=staff_text(OWNER, UNIT, WORKER), STAFF_ID=identity)[0]
                 self.assertEqual(line.split(" | ")[0], expected)
 
@@ -217,7 +217,7 @@ class ColorTests(unittest.TestCase):
     def test_colors_wrap_only_the_fields_and_preserve_both_plain_lines(self) -> None:
         reset = int(datetime(2026, 12, 3, 12, tzinfo=timezone.utc).timestamp())
         payload = {**limits({"used_percentage": 91, "resets_at": reset}, {"used_percentage": 95, "resets_at": reset}),
-                   "session_id": "sid", "workspace": {"current_dir": "/tmp/project"},
+                   "session_id": OWNER.id, "workspace": {"current_dir": "/tmp/project"},
                    "model": {"display_name": "Opus"}, "effort": {"level": "high"},
                    "context_window": ContextWindow(total_input_tokens=80_000, context_window_size=100_000)}
         plain = status_lines(payload, staff_text=staff_text(OWNER), STAFF_ID=OWNER.id)
@@ -445,17 +445,17 @@ class RoleTests(unittest.TestCase):
         self.showrunner_record(os.getpid(), "trunk", session_id="own-id")
         for shell in SHELLS:
             with self.subTest(shell=shell):
-                line = self.command_lines({"session_id": "own-id"}, shell=shell)[0]
+                line = self.command_lines({"session_id": UNIT.id}, shell=shell)[0]
                 self.assertEqual(line.split(" | ")[0], "\x1b[33mtrunk unit for show\x1b[0m")
                 self.assertEqual(self.command_lines({"session_id": "other-id"}, shell=shell)[0].split(" | ")[0],
                                  "unassigned")
 
     def test_current_staff_parent_and_name_are_read_each_refresh(self) -> None:
         for name in ("initial", "renamed"):
-            _ = self.write_staff(staff.StaffRow(OWNER.id, "showrunner", name, None), UNIT)
+            _ = self.write_staff(staff.StaffRow(OWNER.id, "showrunner", name, None, current_session=OWNER.id), UNIT)
             for shell in SHELLS:
                 with self.subTest(name=name, shell=shell):
-                    self.assertEqual(ANSI.sub("", self.command_lines({}, shell=shell, STAFF_ID=UNIT.id)[0]),
+                    self.assertEqual(ANSI.sub("", self.command_lines({"session_id": UNIT.id}, shell=shell)[0]),
                                      f"trunk unit for {name} | ~")
 
     def test_staff_identity_wins_over_stale_environment_and_the_registry_name(self) -> None:
@@ -463,10 +463,10 @@ class RoleTests(unittest.TestCase):
         self.showrunner_record(os.getpid(), "show", session_id="own-id")
         for shell in SHELLS:
             with self.subTest(shell=shell):
-                line = self.command_lines({"session_id": "own-id"}, shell=shell, STAFF_ID=WORKER.id,
+                line = self.command_lines({"session_id": WORKER.id}, shell=shell, STAFF_ID=OWNER.id,
                                           SHOWRUNNER_UNIT="wrong", UNIT_TEAM_ROLE="director")[0]
                 self.assertEqual(line, "worker | ~")
-                self.assertEqual(self.command_lines({}, shell=shell, STAFF_ID=OWNER.id,
+                self.assertEqual(self.command_lines({"session_id": OWNER.id}, shell=shell, STAFF_ID=WORKER.id,
                                                     SHOWRUNNER_UNIT="wrong")[0].split(" | ")[0],
                                  "\x1b[38;5;141mshow showrunner\x1b[0m")
 
@@ -492,18 +492,18 @@ class RoleTests(unittest.TestCase):
 
     def test_missing_parent_keeps_the_unit_role_without_inventing_a_parent_name(self) -> None:
         _ = self.write_staff(UNIT)
-        self.assertEqual(ANSI.sub("", self.command_lines({}, STAFF_ID=UNIT.id)[0]), "trunk unit | ~")
+        self.assertEqual(ANSI.sub("", self.command_lines({"session_id": UNIT.id})[0]), "trunk unit | ~")
 
     def test_staff_file_override_is_the_same_as_the_python_reader(self) -> None:
         path = self.write_staff(OWNER, UNIT)
         moved = self.home / "moved-staff.json"
         _ = path.rename(moved)
-        self.assertEqual(ANSI.sub("", self.command_lines({}, STAFF_FILE=str(moved), STAFF_ID=UNIT.id)[0]),
+        self.assertEqual(ANSI.sub("", self.command_lines({"session_id": UNIT.id}, STAFF_FILE=str(moved))[0]),
                          "trunk unit for show | ~")
 
     def test_jq_and_queue_reader_agree_on_identity_unique_names_and_ambiguity(self) -> None:
-        other = staff.StaffRow(staff.StaffId("s00000000005"), "showrunner", "other", None)
-        duplicate = staff.StaffRow(staff.StaffId("s00000000004"), "unit", "trunk", other.id)
+        other = staff.StaffRow(staff.StaffId("9ac86c12-2241-576a-ba84-431dc42bb778"), "showrunner", "other", None, current_session=staff.StaffId("9ac86c12-2241-576a-ba84-431dc42bb778"))
+        duplicate = staff.StaffRow(staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"), "unit", "trunk", other.id, current_session=staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"))
         rows = (OWNER, UNIT, WORKER)
         for members in (rows, (*rows, other, duplicate)):
             _ = self.write_staff(*members)
@@ -514,10 +514,10 @@ class RoleTests(unittest.TestCase):
                                    ("s99999999999", "trunk")):
                 with self.subTest(identity=identity, name=name, duplicate=len(members) == 5):
                     environment = {"STAFF_ID": identity} if identity else {}
-                    resolved = reader.environment(environment, "own-id", name)
-                    row = reader.record.by_id(staff.StaffId(resolved.get("STAFF_ID", "")))
+                    resolved = reader.environment(environment, identity)
+                    row = reader.record.by_id(staff.StaffId(resolved.get("CLAUDE_CODE_SESSION_ID", "")))
                     self.showrunner_record(os.getpid(), name, session_id="own-id")
-                    role = ANSI.sub("", self.command_lines({"session_id": "own-id"}, **environment)[0]).split(" | ")[0]
+                    role = ANSI.sub("", self.command_lines({"session_id": identity}, **environment)[0]).split(" | ")[0]
                     if row is None:
                         self.assertEqual(role, "unassigned")
                     elif row.kind == "worker":
@@ -536,8 +536,8 @@ class RoleTests(unittest.TestCase):
         runner = replace(OWNER, name="hana", doc=staff.LiveDoc(machine, doc))
         folder = str(self.home / "geometry material")
         unit = replace(UNIT, name="geometry-material", worktree=staff.PresentWorktree(machine, Path(folder)))
-        other = staff.StaffRow(staff.StaffId("s00000000004"), "showrunner", "other", None)
-        duplicate = replace(unit, id=staff.StaffId("s00000000005"), parent=other.id)
+        other = staff.StaffRow(staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"), "showrunner", "other", None, current_session=staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"))
+        duplicate = replace(unit, id=staff.StaffId("9ac86c12-2241-576a-ba84-431dc42bb778"), parent=other.id)
         source = showrunners.ShowrunnerSource(showrunners.Timer("different-slug", "session:runner-id", doc, "UTC"), "")
         sources = {source.timer.slug: source}
         instance = self.home / ".local/state/notifier/showrunner-different-slug"
@@ -546,14 +546,16 @@ class RoleTests(unittest.TestCase):
         _ = (instance / "conf").write_text(
             f"TARGET=session:runner-id\nCHECK=zsh /scripts/production_check.sh {shlex.quote(str(doc))}\n")
         cases: list[tuple[str, tuple[staff.StaffRow, ...], dict[str, str], str, str, str, str]] = [
-            ("folder before name", (runner, unit, other), {}, "own-id", "other", folder, unit.id),
-            ("timer before folder", (runner, unit, other), {}, "runner-id", "other", folder, runner.id),
-            ("identity before timer", (runner, unit, other), {"STAFF_ID": other.id}, "runner-id", "", folder, other.id),
+            ("folder gives no identity", (runner, unit, other), {}, "own-id", "other", folder, ""),
+            ("timer gives no identity", (runner, unit, other), {}, "runner-id", "other", folder, ""),
+            ("native unit before folder and name", (runner, unit, other), {}, unit.id, "other", "/elsewhere", unit.id),
+            ("native worker ignores inherited identity", (runner, unit, other, WORKER), {"STAFF_ID": runner.id}, WORKER.id, "hana", folder, WORKER.id),
+            ("runtime before timer", (runner, unit, other), {"STAFF_ID": other.id}, runner.id, "", folder, runner.id),
             ("unknown identity", (runner, unit, other), {"STAFF_ID": "s99999999999"}, "runner-id", "hana", folder, ""),
             ("duplicate folders", (runner, unit, other, duplicate), {}, "own-id", "organon", folder, ""),
-            ("duplicate falls to name", (runner, unit, other, duplicate), {}, "own-id", "other", folder, other.id),
+            ("duplicate falls to name", (runner, unit, other, duplicate), {}, "own-id", "other", folder, ""),
             ("remote folder ignored", (runner, replace(unit, worktree=staff.PresentWorktree("elsewhere", Path(folder))), other),
-             {}, "own-id", "other", folder, other.id),
+             {}, "own-id", "other", folder, ""),
             ("removed folder ignored", (runner, replace(unit, worktree=staff.RemovedWorktree(machine, Path(folder))), other),
              {}, "own-id", "organon", folder, ""),
             ("unfilled folder ignored", (runner, replace(unit, worktree=staff.WorktreeUnfilled()), other),
@@ -561,9 +563,9 @@ class RoleTests(unittest.TestCase):
             ("descendant is not equal", (runner, unit, other), {}, "own-id", "organon", folder + "/child", ""),
             ("prefix is not equal", (runner, unit, other), {}, "own-id", "organon", folder + "-other", ""),
             ("empty cwd", (runner, unit, other), {}, "own-id", "organon", "", ""),
-            ("name fallback", (runner, unit, other), {}, "own-id", "geometry-material_unit", "/elsewhere", unit.id),
+            ("name fallback", (runner, unit, other), {}, "own-id", "geometry-material_unit", "/elsewhere", ""),
             ("retained name fallback", (runner, unit, other), {"SHOWRUNNER_UNIT_ID": "geometry-material-unit"},
-             "own-id", "organon", "/elsewhere", unit.id),
+             "own-id", "organon", "/elsewhere", ""),
         ]
         for label, rows, environment, session_id, name, cwd, expected in cases:
             with self.subTest(case=label):
@@ -571,11 +573,12 @@ class RoleTests(unittest.TestCase):
                 # Exercise the schema emitted by staff's current writer.
                 _ = path.write_text(json.dumps({"schema": 2, "rows": [row.to_json() for row in rows]}))
                 reader = session_labels.StaffLabels(staff.StaffSnapshot(rows), sources, {source.timer.slug: runner})
-                resolved = reader.environment(environment, session_id, name, cwd)
-                row = reader.record.by_id(staff.StaffId(resolved.get("STAFF_ID", "")))
+                resolved = reader.environment(environment, session_id)
+                row = reader.record.by_id(staff.StaffId(resolved.get("CLAUDE_CODE_SESSION_ID", "")))
                 self.assertEqual(row.id if row is not None else "", expected)
                 self.showrunner_record(os.getpid(), name, session_id=session_id)
-                role = (f"{row.name} unit for hana" if row is not None and row.kind == "unit"
+                role = ("worker" if row is not None and row.kind == "worker"
+                        else f"{row.name} unit for hana" if row is not None and row.kind == "unit"
                         else f"{row.name} showrunner" if row is not None else "unassigned")
                 for shell in SHELLS:
                     rendered = self.command_lines({"session_id": session_id, "cwd": cwd}, shell=shell, **environment)
@@ -605,7 +608,7 @@ class RoleTests(unittest.TestCase):
                    "model": {"display_name": "Opus"},
                    "context_window": ContextWindow(total_input_tokens=90_000, context_window_size=100_000)}
         _ = self.write_staff(OWNER, UNIT)
-        self.assertEqual(self.command_lines(payload, CLAUDE_CONFIG_DIR=str(config), STAFF_ID=UNIT.id), [
+        self.assertEqual(self.command_lines({**payload, "session_id": UNIT.id}, CLAUDE_CONFIG_DIR=str(config)), [
             "\x1b[33mtrunk unit for show\x1b[0m | /tmp/project",
             "\x1b[38;5;208mclaude4\x1b[0m | Opus | \x1b[91m90,000\x1b[0m | 5-hour \x1b[91m5% left\x1b[0m | weekly \x1b[92m11% left\x1b[0m",
         ])
@@ -619,7 +622,7 @@ class RoleTests(unittest.TestCase):
         payload = {**limits({"used_percentage": 95}, {"used_percentage": 90}),
                    "context_window": ContextWindow(total_input_tokens=90_000, context_window_size=100_000)}
         _ = self.write_staff(OWNER, UNIT, WORKER)
-        self.assertEqual(self.command_lines(payload, command=command, STAFF_ID=WORKER.id), [
+        self.assertEqual(self.command_lines({**payload, "session_id": WORKER.id}, command=command), [
             "worker | ~",
             "90,000 | 5-hour 5% left | weekly 10% left",
         ])
@@ -671,7 +674,7 @@ class CountsRowTests(unittest.TestCase):
                            + f"- **Improvement queue:** {self.ledger}\n", encoding="utf-8")
         instance = self.home / ".local/state/notifier/showrunner-show"
         instance.mkdir(parents=True)
-        _ = (instance / "conf").write_text(f"TARGET=session:aaaa-1111\nCHECK=zsh /x/production_check.sh {doc}\n",
+        _ = (instance / "conf").write_text(f"TARGET=session:{OWNER.id}\nCHECK=zsh /x/production_check.sh {doc}\n",
                                            encoding="utf-8")
         self.cache = self.home / ".local/state/showrunner/counts/show"
         path = self.home / ".local/state/staff/staff.json"
@@ -684,7 +687,7 @@ class CountsRowTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(json.dumps(list(items)), encoding="utf-8")
 
-    def lines(self, session_id: str = "aaaa-1111", shell: str = "/bin/sh") -> list[str]:
+    def lines(self, session_id: str = OWNER.id, shell: str = "/bin/sh") -> list[str]:
         env = {"PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id}
         result = subprocess.run([shell, "-c", COMMAND], input=json.dumps({"session_id": session_id}),
                                 capture_output=True, text=True, check=True, env=env, cwd=self.home)
@@ -705,7 +708,7 @@ class CountsRowTests(unittest.TestCase):
         _ = self.ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n", encoding="utf-8")
         self.questions(*(OutstandingItem(since="2026-10-16T19:00", text=f"Q{n}") for n in range(12)))
         env = {"PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id}
-        result = subprocess.run(["/bin/sh", "-c", COMMAND], input=json.dumps({"session_id": "aaaa-1111"}),
+        result = subprocess.run(["/bin/sh", "-c", COMMAND], input=json.dumps({"session_id": OWNER.id}),
                                 capture_output=True, text=True, check=True, env=env, cwd=self.home)
         self.assertEqual(result.stdout.splitlines()[-1],
                          "For you: \x1b[91m\x1b[1m12\x1b[22m questions\x1b[0m, "

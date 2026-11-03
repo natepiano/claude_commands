@@ -25,7 +25,7 @@ import coverage_report
 import unit_files
 
 
-from ledger_test_support import (remove_generation_schema, LedgerTestCase, LedgerStatus)
+from ledger_test_support import (remove_finding_anchor_schema, remove_generation_schema, LedgerTestCase, LedgerStatus)
 
 
 @final
@@ -355,6 +355,7 @@ class StyleLedgerTicketsTests(LedgerTestCase):
                           proposal=str(issue), finding_ids=(finding.finding_id,))
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
             _ = connection.execute("DROP TABLE ticket_proposals")
+            remove_finding_anchor_schema(connection)
             _ = connection.execute("UPDATE schema_version SET version=30")
             generations = connection.execute("SELECT * FROM rule_generations").fetchall()
             judgments = connection.execute("SELECT * FROM active_judgments").fetchall()
@@ -363,7 +364,7 @@ class StyleLedgerTicketsTests(LedgerTestCase):
                 self.assertEqual(upgraded.ticket_proposals("legacy-1"), (issue,))
                 self.assertEqual(upgraded.ticket_proposals("judge-1"), ())
         with closing(sqlite3.connect(ledger.database)) as connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (31,))
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
             self.assertEqual(connection.execute("SELECT * FROM ticket_proposals").fetchall(), [("legacy-1", str(issue))])
             self.assertEqual(connection.execute("SELECT * FROM rule_generations").fetchall(), generations)
             self.assertEqual(connection.execute("SELECT * FROM active_judgments").fetchall(), judgments)
@@ -1218,7 +1219,7 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         self.set_tip(self.initial_tip)
         _ = self.hold_finding(rule_id, 1, ticket="A")
         self.record(rule_id, self.sources[0], self.initial_tip, "held", ticket="A")
-        self.record(rule_id, self.sources[0], self.initial_tip, "clean", ticket="B")
+        self.record(rule_id, self.sources[0], self.initial_tip, "exception", ticket="B", detail="Reviewed exception")
         self.record(rule_id, self.sources[0], self.initial_tip, "held", ticket="A")
 
         row = next(line.split("\t") for line in self.cli("status").stdout.splitlines() if line.startswith(rule_id + "\t"))

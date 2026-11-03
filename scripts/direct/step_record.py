@@ -17,6 +17,8 @@ KINDS = ("check", "lint", "doc", "test", "build", "example", "final")
 class StepState(str, Enum):
     WAITING_HOLD = "waiting_hold"
     WAITING_MAC = "waiting_mac"
+    WAITING_SSH = "waiting_ssh"
+    ON_SSH = "on_ssh"
     ON_MAC = "on_mac"
     ON_NATEDEV = "on_natedev"
     LOCAL_NONCOMPILING = "local_noncompiling"
@@ -78,6 +80,11 @@ def _validate_fields(value: object, call_id: str) -> dict[str, object]:
     location = cast(dict[str, object], target)
     if location.get("kind") == "natedev_only":
         _ = _text(location.get("reason"))
+    elif location.get("kind") == "ssh_allowed":
+        for field, items in (("eligible_targets", row.get("eligible_targets")),
+                             ("mac_targets", location.get("mac_targets", []))):
+            if not isinstance(items, list) or not all(isinstance(item, str) and item for item in cast(list[object], items)):
+                raise ValueError(f"invalid {field}")
     elif location.get("kind") != "mac_allowed":
         raise ValueError("invalid run location")
     for field in ("proc_start", "repo", "updated"):
@@ -85,11 +92,16 @@ def _validate_fields(value: object, call_id: str) -> dict[str, object]:
     state_value = _text(row.get("state"))
     if state_value not in STATE_VALUES:
         raise ValueError(f"{state_value!r} is not a valid StepState")
+    selected = row.get("selected_target", "")
+    if not isinstance(selected, str):
+        raise ValueError("invalid selected target")
+    targets = row.get("eligible_targets", ["mac", "natedev"] if location["kind"] == "mac_allowed" else ["natedev"])
     return dict(v=1, call_id=call_id, pid=pid, proc_start=row["proc_start"],
                 repo=str(Path(cast(str, row["repo"]))), kind=row["kind"], package=package,
                 runs_on={"kind": location["kind"],
-                         **({"reason": location["reason"]} if location["kind"] == "natedev_only" else {})},
-                state=state_value, updated=row["updated"])
+                         **({"reason": location["reason"]} if location["kind"] == "natedev_only" else
+                            {"mac_targets": location.get("mac_targets", [])} if location["kind"] == "ssh_allowed" else {})},
+                state=state_value, updated=row["updated"], eligible_targets=targets, selected_target=selected)
 
 
 def _write_fields(call_id: str, row: dict[str, object]) -> None:
@@ -132,8 +144,9 @@ def _read_fields(call_id: str) -> dict[str, object]:
     return row
 
 
-def _update_state(call_id: str, next_state: StepState) -> None:
+def _update_state(call_id: str, next_state: StepState, target: str = "") -> None:
     row = _read_fields(call_id)
+    row["selected_target"] = target or ("mac" if next_state == StepState.ON_MAC else "natedev" if next_state == StepState.ON_NATEDEV else "")
     row["state"] = next_state.value
     row["updated"] = datetime.now(timezone.utc).isoformat()
     _write_fields(call_id, row)
@@ -191,10 +204,10 @@ _CALL_ID = _CommandArgument("--call-id", required=True)
 _COMMAND_ARGUMENTS = {
     "write": (_CALL_ID, *(_CommandArgument("--" + name, required=True)
                          for name in ("pid", "kind", "runs-on", "state")),
-              *(_CommandArgument("--" + name) for name in ("repo", "package", "reason")),
+              *(_CommandArgument("--" + name) for name in ("repo", "package", "reason", "eligible-targets", "mac-targets")),
               _CommandArgument("--clock-offset", switch=True,
                                help_text="print wall minus monotonic microseconds after writing")),
-    "state": (_CALL_ID, _CommandArgument("state", required=True, choices=STATE_VALUES)),
+    "state": (_CALL_ID, _CommandArgument("state", required=True, choices=STATE_VALUES), _CommandArgument("--target")),
     "remove": (_CALL_ID,),
     "stopped": (_CALL_ID, _CommandArgument("--consumed", required=True)),
 }
@@ -238,7 +251,7 @@ def _execute_record_command(command: str, values: dict[str, str]) -> int:
         pid = int(values["pid"])
         kind, location = values["kind"], values["runs-on"]
         reason = values.get("reason", "")
-        if kind not in KINDS or location not in ("mac_allowed", "natedev_only"):
+        if kind not in KINDS or location not in ("mac_allowed", "natedev_only", "ssh_allowed"):
             raise ValueError("invalid step kind or run location")
         if location == "natedev_only" and not reason:
             raise ValueError("natedev-only step needs a reason")
@@ -247,7 +260,10 @@ def _execute_record_command(command: str, values: dict[str, str]) -> int:
         row: dict[str, object] = dict(
             v=1, call_id=call_id, pid=pid, proc_start=start, repo=str(repo), kind=kind,
             package=values.get("package"),
-            runs_on={"kind": location, **({"reason": reason} if location == "natedev_only" else {})},
+            eligible_targets=list(filter(None, values.get("eligible-targets", "").split(","))) if location == "ssh_allowed" else ["mac", "natedev"] if location == "mac_allowed" else ["natedev"],
+            selected_target="",
+            runs_on={"kind": location, **({"reason": reason} if location == "natedev_only" else
+                     {"mac_targets": list(filter(None, values.get("mac-targets", "").split(",")))} if location == "ssh_allowed" else {})},
             state=StepState(values["state"]).value, updated=datetime.now(timezone.utc).isoformat())
         _write_fields(call_id, row)
         if "clock-offset" in values:
@@ -255,7 +271,7 @@ def _execute_record_command(command: str, values: dict[str, str]) -> int:
 
             print((time.time_ns() - time.monotonic_ns()) // 1000)
     elif command == "state":
-        _update_state(call_id, StepState(values["state"]))
+        _update_state(call_id, StepState(values["state"]), values.get("target", ""))
     elif command == "remove":
         remove(call_id)
     else:
@@ -299,21 +315,69 @@ class NatedevOnly:
     reason: str
 
 
-RunsOn = MacAllowed | NatedevOnly
+@dataclass(frozen=True)
+class SshAllowed:
+    targets: tuple[str, ...]
+    mac_targets: tuple[str, ...] = ()
+
+
+RunsOn = MacAllowed | NatedevOnly | SshAllowed
 
 
 @dataclass(frozen=True)
+class WorkspacePackages:
+    """The command selects the workspace without a named package."""
+
+
+@dataclass(frozen=True)
+class NamedPackage:
+    name: str
+
+
+PackageSelection = WorkspacePackages | NamedPackage
+
+
+def package_selection(value: PackageSelection | str | None) -> PackageSelection:
+    return value if isinstance(value, (WorkspacePackages, NamedPackage)) else NamedPackage(value) if value else WorkspacePackages()
+
+
+def package_name(value: PackageSelection) -> str:
+    return value.name if isinstance(value, NamedPackage) else ""
+
+
+def mac_eligible(record: StepRecord) -> bool:
+    return isinstance(record.runs_on, MacAllowed) or (
+        isinstance(record.runs_on, SshAllowed) and bool(record.runs_on.mac_targets))
+
+
+@dataclass(frozen=True, init=False)
 class StepRecord:
     call_id: str
     pid: int
     proc_start: str
     repo: Path
     kind: str
-    package: str | None
+    package: PackageSelection
     runs_on: RunsOn
     state: StepState
     updated: str
     v: int = 1
+    selected_target: str = ""
+
+    def __init__(self, call_id: str, pid: int, proc_start: str, repo: Path, kind: str,
+                 package: PackageSelection | str | None, runs_on: RunsOn, state: StepState,
+                 updated: str, v: int = 1, selected_target: str = "") -> None:
+        for name, value in (("call_id", call_id), ("pid", pid), ("proc_start", proc_start),
+                            ("repo", repo), ("kind", kind), ("package", package_selection(package)),
+                            ("runs_on", runs_on), ("state", state), ("updated", updated),
+                            ("v", v), ("selected_target", selected_target)):
+            object.__setattr__(self, name, value)
+
+    @property
+    def eligible_targets(self) -> tuple[str, ...]:
+        if isinstance(self.runs_on, SshAllowed):
+            return self.runs_on.targets
+        return ("mac", "natedev") if isinstance(self.runs_on, MacAllowed) else ("natedev",)
 
 
 @dataclass(frozen=True)
@@ -337,12 +401,18 @@ ReadResult = StepRecord | MissingRecord | StaleRecord | UnreadableRecord
 
 def _decode(row: dict[str, object], call_id: str) -> StepRecord:
     location = cast(dict[str, object], row["runs_on"])
-    runs_on: RunsOn = (MacAllowed() if location["kind"] == "mac_allowed"
-                      else NatedevOnly(cast(str, location["reason"])))
+    runs_on: RunsOn
+    if location["kind"] == "mac_allowed":
+        runs_on = MacAllowed()
+    elif location["kind"] == "ssh_allowed":
+        runs_on = SshAllowed(tuple(cast(list[str], row["eligible_targets"])),
+                             tuple(cast(list[str], location["mac_targets"])))
+    else:
+        runs_on = NatedevOnly(cast(str, location["reason"]))
     return StepRecord(call_id, cast(int, row["pid"]), cast(str, row["proc_start"]),
                       Path(cast(str, row["repo"])), cast(str, row["kind"]),
                       cast(str | None, row["package"]), runs_on, StepState(cast(str, row["state"])),
-                      cast(str, row["updated"]))
+                      cast(str, row["updated"]), selected_target=cast(str, row["selected_target"]))
 
 
 def _unavailable_result(error: _RecordUnavailable) -> MissingRecord | StaleRecord | UnreadableRecord:
@@ -367,16 +437,19 @@ def live_records() -> list[StepRecord]:
 
 def write(record: StepRecord) -> None:
     location = ({"kind": "mac_allowed"} if isinstance(record.runs_on, MacAllowed)
+                else {"kind": "ssh_allowed", "mac_targets": list(record.runs_on.mac_targets)}
+                if isinstance(record.runs_on, SshAllowed)
                 else {"kind": "natedev_only", "reason": record.runs_on.reason})
-    row: dict[str, object] = dict(v=record.v, call_id=record.call_id, pid=record.pid,
-               proc_start=record.proc_start, repo=str(record.repo), kind=record.kind,
-               package=record.package, runs_on=location, state=record.state.value, updated=record.updated)
+    row: dict[str, object] = dict(v=record.v, call_id=record.call_id, pid=record.pid, proc_start=record.proc_start,
+               repo=str(record.repo), kind=record.kind, package=package_name(record.package) or None,
+               eligible_targets=list(record.eligible_targets), selected_target=record.selected_target,
+               runs_on=location, state=record.state.value, updated=record.updated)
     _write_fields(record.call_id, row)
 
 
-def state(call_id: str, next_state: StepState) -> None:
+def state(call_id: str, next_state: StepState, target: str = "") -> None:
     try:
-        _update_state(call_id, next_state)
+        _update_state(call_id, next_state, target)
     except _RecordUnavailable as error:
         raise ValueError(f"cannot update step record: {_unavailable_result(error)}") from error
 

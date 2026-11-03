@@ -3,6 +3,8 @@
 
 Envrc files below ~/rust, ~/worktrees or ~/.claude*, and in linked worktrees
 registered by repositories below those roots, are allowed automatically.
+Registered scratch copies also qualify when their regular top-level envrc
+matches the recorded source commit in a repository below those roots.
 Other directories keep direnv's explicit approval boundary.
 No envrc means the caller's environment is retained, without running direnv.
 """
@@ -16,13 +18,13 @@ from typing import TYPE_CHECKING, NamedTuple, cast
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+    from scripts.lib.conf import ConfigRead
 
 if __name__ == "nix_env":
     _ = sys.modules.setdefault("scripts.lib.nix_env", sys.modules[__name__])
 elif __name__ == "scripts.lib.nix_env":
     _ = sys.modules.setdefault("nix_env", sys.modules[__name__])
 
-TIMEOUT_SECONDS = 600
 # Internal, one-session handoff from the healer to shutdown restart. These are
 # consumed before opening a pane and never exported to the resumed agent.
 HEAL_SESSION_ENV = "NIX_HEAL_PREPARED_SESSION"
@@ -42,6 +44,15 @@ class Refused(NamedTuple):
     reason: str
 
 
+def _settings() -> ConfigRead:
+    if __package__:
+        from . import conf
+    else:
+        import conf  # pyright: ignore[reportImplicitRelativeImport]
+
+    return conf.read("nix_env")
+
+
 def nearest_envrc(directory: Path) -> Path | None:
     """Find the nearest envrc, including the directory itself."""
     directory = directory.expanduser().resolve()
@@ -55,8 +66,9 @@ def trusted_root(path: Path) -> bool:
         relative = path.resolve().relative_to(Path.home().resolve())
     except (OSError, ValueError, RuntimeError):
         return False
-    return bool(relative.parts and (relative.parts[0] in {"rust", "worktrees"}
-                                  or relative.parts[0].startswith(".claude")))
+    settings = _settings()
+    return bool(relative.parts and (relative.parts[0] in settings.words("trusted_home_folders")
+                                  or relative.parts[0].startswith(settings.text("trusted_home_prefix"))))
 
 
 def registered_worktree(folder: Path) -> bool:
@@ -87,11 +99,55 @@ def registered_worktree(folder: Path) -> bool:
         return False
 
 
+def _git_environment() -> dict[str, str]:
+    """Keep caller overrides from choosing git's repository or object store."""
+    return {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+
+
+def registered_copy(envrc: Path) -> bool:
+    """Prove a copy's envrc matches its recorded commit in a trusted source."""
+    # Keep copy_record and subprocess off the no-envrc and trusted-root paths.
+    import subprocess
+
+    try:
+        if not stat.S_ISREG(envrc.lstat().st_mode):
+            return False
+        folder = envrc.parent.resolve(strict=True)
+        repository_root = str(Path(__file__).resolve().parents[2])
+        if repository_root not in sys.path:
+            sys.path.insert(0, repository_root)
+        from scripts.lib import copy_record
+
+        if envrc.name != ".envrc" or copy_record.copy_folder(folder) != folder:
+            return False
+        record = copy_record.read_record(folder / copy_record.RECORD)
+        if not isinstance(record, copy_record.Registered):
+            return False
+        source_path = record.fields.get("source_path")
+        source_commit = record.fields.get("source_commit")
+        if not isinstance(source_path, str) or not source_path or not isinstance(source_commit, str) or not source_commit:
+            return False
+        source = Path(source_path).resolve(strict=True)
+        if not source.is_dir() or not trusted_root(source):
+            return False
+        timeout = _settings().number("command_timeout_seconds")
+        environment = _git_environment()
+        expected = subprocess.run(
+            ["git", "rev-parse", "--verify", "--end-of-options", f"{source_commit}:.envrc"],
+            cwd=source, env=environment, capture_output=True, text=True, timeout=timeout, check=True)
+        actual = subprocess.run(
+            ["git", "hash-object", "--no-filters", "--", str(folder / ".envrc")],
+            cwd=source, env=environment, capture_output=True, text=True, timeout=timeout, check=True)
+        return bool(expected.stdout.strip()) and expected.stdout.strip() == actual.stdout.strip()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return False
+
+
 def trusted_envrc(envrc: Path) -> bool:
     """Approval belongs to the file's resolved location, never a symlink alias."""
     try:
-        envrc = envrc.resolve(strict=True)
-        return trusted_root(envrc) or registered_worktree(envrc.parent)
+        resolved = envrc.resolve(strict=True)
+        return trusted_root(resolved) or registered_worktree(resolved.parent) or registered_copy(envrc)
     except (OSError, ValueError, RuntimeError):
         return False
 
@@ -114,6 +170,7 @@ def ensure(directory: Path, base_env: Mapping[str, str] = os.environ) -> Loaded 
         # Avoid subprocess's startup cost when no envrc needs loading.
         import subprocess
 
+        timeout = _settings().number("command_timeout_seconds")
         trusted = trusted_envrc(envrc)
         commands = (["direnv", "allow", str(envrc)], ["direnv", "export", "json"]) if trusted else (
             ["direnv", "export", "json"],)
@@ -121,7 +178,7 @@ def ensure(directory: Path, base_env: Mapping[str, str] = os.environ) -> Loaded 
         try:
             for command in commands:
                 result = subprocess.run(command, cwd=directory, env=environment, capture_output=True,
-                                        text=True, timeout=TIMEOUT_SECONDS, check=False)
+                                        text=True, timeout=timeout, check=False)
                 if result.returncode:
                     reason = last_line(result.stderr, f"direnv exit {result.returncode}")
                     if not trusted and any(word in result.stderr.lower() for word in ("not allowed", "blocked", "denied")):
@@ -134,7 +191,7 @@ def ensure(directory: Path, base_env: Mapping[str, str] = os.environ) -> Loaded 
         except subprocess.TimeoutExpired as error:
             detail = error.stderr
             stderr = detail.decode(errors="replace") if isinstance(detail, bytes) else detail or ""
-            return Refused(f"nix_env: {directory}: " + last_line(stderr, "direnv timed out after 600 s"))
+            return Refused(f"nix_env: {directory}: " + last_line(stderr, f"direnv timed out after {timeout:g} s"))
         # Pay JSON's startup cost only when decoding an envrc export.
         import json
 

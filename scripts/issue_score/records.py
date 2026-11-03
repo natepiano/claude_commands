@@ -3,9 +3,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypedDict
 
+from scripts.lib import conf
+from .selection import UseConfiguredValue
+
 from . import client, questions
 
-STATE_DIR = Path.home() / ".local/state/issue-score"
+def state_dir(scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Path:
+    scoring_config = conf.read("issue_score") if isinstance(scoring_config, UseConfiguredValue) else scoring_config
+    return Path(scoring_config.text("state_dir")).expanduser()
 
 
 class RequestPayload(TypedDict):

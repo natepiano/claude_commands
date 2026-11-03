@@ -6,12 +6,13 @@ import re
 import sys
 from pathlib import Path
 from typing import NamedTuple
+from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
 for directory in (Path(__file__).resolve().parent, Path(__file__).resolve().parents[2]):
     if str(directory) not in sys.path:
         sys.path.insert(0, str(directory))
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 import unit_names
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
@@ -22,6 +23,9 @@ from scripts.production.unit_table import (
     Refusal as Refusal, cell_value as cell_value, unit_rows as unit_rows,
     row_cells as row_cells, unit_headings as unit_headings, unit_table as unit_table,
 )
+
+
+WRAPPED = "> **Status: PRODUCTION — wrapped.**"
 
 
 class Production(NamedTuple):
@@ -99,3 +103,108 @@ def read_production(path: Path) -> Production:
         return Production(doc, slug, merge_branch, checkout, checkout / log, zone)
     except (OSError, UnicodeError, KeyError, ValueError) as error:
         raise Refusal(f"cannot read production doc: {error}") from error
+
+
+@dataclass(frozen=True)
+class DocumentSource:
+    machine: str
+    path: Path
+
+
+@dataclass(frozen=True)
+class DocumentUnavailable:
+    reason: str
+
+
+@dataclass(frozen=True)
+class UnitRowFound:
+    source: DocumentSource
+    cells: dict[str, str]
+    line: int
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class UnitRowMissing:
+    reason: str
+    cell: str = ""
+
+
+@dataclass(frozen=True)
+class UnitRowAmbiguous:
+    reason: str
+
+
+@dataclass(frozen=True)
+class UnitSearchIncomplete:
+    reason: str
+    unavailable: tuple[DocumentSource, ...]
+    matches: tuple[UnitRowFound, ...] = ()
+
+
+def lookup_unit(name: str, parent: DocumentSource, documents: Iterable[DocumentSource],
+                load: Callable[[DocumentSource], str | DocumentUnavailable], *, established: bool = True,
+                aliases: Iterable[str] = (),
+                ) -> UnitRowFound | UnitRowMissing | UnitRowAmbiguous | UnitSearchIncomplete:
+    """Find a row in the parent document before searching other bound documents."""
+    wanted = {unit_names.name(name), *(unit_names.name(alias) for alias in aliases)}
+    rejected: list[tuple[str, str]] = []
+    unavailable: list[DocumentSource] = []
+    problems: list[str] = []
+
+    def search(source: DocumentSource) -> list[UnitRowFound]:
+        text = load(source)
+        label = f"{source.machine}:{source.path}"
+        if isinstance(text, DocumentUnavailable):
+            unavailable.append(source)
+            problems.append(f"{label}: {text.reason}")
+            return []
+        try:
+            lines = text.splitlines()
+            cells_list = unit_table(lines)
+            _, raw_rows = unit_rows(lines)
+        except Refusal as error:
+            unavailable.append(source)
+            problems.append(f"{label}: {error}")
+            return []
+        found: list[UnitRowFound] = []
+        start = lines.index("## Units")
+        for cells, raw in zip(cells_list, raw_rows, strict=True):
+            line = lines.index(raw, start) + 1
+            start = line
+            cell = cells.get("Unit", "")
+            try:
+                candidate = unit_names.name(cell_value(cell))
+            except unit_names.BadName as error:
+                rejected.append((cell, str(error)))
+                continue
+            if candidate in wanted:
+                found.append(UnitRowFound(source, cells, line))
+        return found
+
+    matches = search(parent)
+    if len(matches) == 1:
+        return matches[0]
+    if not matches and established:
+        visited = {parent}
+        for source in documents:
+            if source not in visited:
+                visited.add(source)
+                matches.extend(search(source))
+    if len(matches) > 1:
+        sources = ", ".join(f"{item.source.machine}:{item.source.path}" for item in matches)
+        return UnitRowAmbiguous(f"expected one Units row for {name}; found {len(matches)} in {sources}")
+    if unavailable:
+        if matches:
+            sources = ", ".join(f"{item.source.machine}:{item.source.path}" for item in matches)
+            problems.append(f"known matching Units row in {sources}")
+        return UnitSearchIncomplete("; ".join(problems), tuple(unavailable), tuple(matches))
+    if matches:
+        item = matches[0]
+        note = (f"{item.source.machine}:{item.source.path} is not the parent's document "
+                + f"({parent.machine}:{parent.path})")
+        return UnitRowFound(item.source, item.cells, item.line, note)
+    if rejected:
+        cell, reason = rejected[0]
+        return UnitRowMissing(f"invalid unit name {cell!r}: {reason}", cell)
+    return UnitRowMissing(f"expected one Units row for {name}; found 0")

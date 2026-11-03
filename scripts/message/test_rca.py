@@ -32,7 +32,8 @@ import review  # noqa: E402
 import send  # noqa: E402
 import sessions  # noqa: E402
 import session_staff  # noqa: E402
-from scripts.production import showrunners  # noqa: E402
+from scripts.production import showrunners, staff, fake_showrunner  # noqa: E402
+from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, fixture_member  # noqa: E402
 from test_showrunners import stalled_session_reader  # noqa: E402
 import silence  # noqa: E402
 from user_action import NoActionRequired  # noqa: E402
@@ -53,6 +54,7 @@ raise SystemExit(int(os.environ.get('RCA_TEST_EXIT', '0')))
 """
 # The stub of subprocess.Popen keeps the real one: subprocess.run calls Popen too.
 REAL_POPEN = subprocess.Popen
+REAL_SOCKET_FOR = showrunners.socket_for
 Stream = int | IO[str] | None
 HANDLER = rca.Report("handler-unit", "natedev", "prompt", ("cargo build -p cargo-handler",), "/tmp/t.jsonl",
                      "cargo-liner")
@@ -71,12 +73,6 @@ REFUSED = review.Failed(REWRITE, ["plain-words"], failures=(review.RuleFailure("
 
 def same_slug(slug: str) -> str:
     return slug
-
-
-def showrunner_address(slug: str, *, deadline: float = math.inf) -> str:
-    """Only cargo-liner's showrunner runs."""
-    del deadline
-    return SHOWRUNNER if slug == "cargo-liner" else ""
 
 
 def flags(argv: list[str]) -> dict[str, str]:
@@ -117,11 +113,24 @@ class RcaTests(unittest.TestCase):
             "RCA_TEST_LOG": str(self.log), "USER_ZONE": "America/Puerto_Rico",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "NOTIFY_STATE_DIR": str(self.root / "notify")},
             clear=True))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = (self.root / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
         # No test runs the real push review (claude -p).
         self.verdict, self.reviewed = None, []
         _ = self.enterContext(mock.patch.object(review, "review", side_effect=self.review))
         _ = self.enterContext(mock.patch.object(showrunners, "canonical_slug", side_effect=same_slug))
-        _ = self.enterContext(mock.patch.object(showrunners, "current_address", side_effect=showrunner_address))
+        timers = self.root / "notifiers"
+        _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", timers))
+        document = self.root / "cargo-production.md"
+        _ = document.write_text("# Cargo production\n")
+        owner = recorded_showrunner("cargo-owner", document)
+        _ = fake_showrunner.write_timer(timers, "cargo-liner", owner.current_session, "UTC", document)
+
+        def live_socket(target: str, *, deadline: float = math.inf) -> str | None:
+            del deadline
+            return SHOWRUNNER.removeprefix("uds:") if target.removeprefix("session:") == owner.current_session else None
+
+        _ = self.enterContext(mock.patch.object(showrunners, "socket_for", side_effect=live_socket))
         self.owner_processes = []
         _ = self.enterContext(mock.patch.object(subprocess, "Popen", self.popen))
 
@@ -213,14 +222,16 @@ with socket.socket(socket.AF_UNIX) as client:
 pathlib.Path(os.environ['OWNER_TEST_RECEIPT']).write_text('delivered')
 print('SENT: fake owner socket')
 """)
-        caller = """import json, math, os, pathlib, signal, sys
+        caller = """import json, math, os, pathlib, subprocess, sys
 from scripts.production import stall_watch
 rca = stall_watch.rca
 rca.STATE = pathlib.Path(os.environ['OWNER_TEST_CASE_DIR'])
-def owner_address(production: str, *, deadline: float = math.inf) -> str:
-    del production, deadline
-    return 'fake-owner'
-rca.owner_address = owner_address
+from scripts.production import showrunners
+showrunners.NOTIFIER_STATE_DIR = pathlib.Path(os.environ['OWNER_TEST_CASE_DIR']).parent / 'notifiers'
+def live_socket(target: str, *, deadline: float = math.inf) -> str:
+    del target, deadline
+    return '/private/owner.sock'
+showrunners.socket_for = live_socket
 if sys.argv[1] == 'rca':
     case = rca.loaded('261023-1')
     failure = rca.tell_owner(case)
@@ -233,8 +244,13 @@ else:
     failure = ''
 pathlib.Path(os.environ['OWNER_TEST_RETURN']).write_text(json.dumps({
     'failure': failure, 'delivered': pathlib.Path(os.environ['OWNER_TEST_RECEIPT']).exists()}))
-# Model a service manager ending the caller's process group as soon as the one-shot returns.
-os.killpg(os.getpgrp(), signal.SIGTERM)
+# A separate service manager can end the test's caller group without signalling its own group.
+subprocess.run([sys.executable, '-c',
+    "import pathlib, signal, sys; "
+    "sys.path.insert(0, str(pathlib.Path.cwd() / 'scripts' / 'lib')); "
+    "import process_group; "
+    "process_group.send_process_group(int(sys.argv[1]), signal.SIGTERM)",
+    str(os.getpgrp())], start_new_session=True, check=True)
 """
         for mode in ("rca", "stall-watch"):
             with self.subTest(sender=mode), socket.socket(socket.AF_UNIX) as receiver:
@@ -280,8 +296,22 @@ os.killpg(os.getpgrp(), signal.SIGTERM)
 
     def test_the_owner_is_natedev_without_a_running_showrunner_and_the_mark_names_the_production(self) -> None:
         _ = rca.open_case(HANDLER._replace(production=""), OPENED)
+        stopped_doc = self.root / "stopped-production.md"
+        _ = stopped_doc.write_text("# Stopped production\n")
+        stopped = recorded_showrunner("stopped-owner", stopped_doc)
+        _ = fake_showrunner.write_timer(self.root / "notifiers", "stopped-production",
+                                         stopped.current_session, "UTC", stopped_doc)
         _ = rca.open_case(HANDLER._replace(session="other", production="stopped-production"), OPENED)
-        with mock.patch.dict(os.environ, {session_staff.PRODUCTION_MARK: "cargo-liner"}):
+        doc = self.root / "cargo-production.md"
+        _ = doc.write_text("# Cargo production\n")
+        owner = recorded_showrunner("cargo-owner", doc)
+        member = fixture_member("unit", name="marked", parent=owner.id,
+                                 worktree=staff.PresentWorktree("natedev", self.root / "marked"))
+        self.live_session("marked", member.current_session)
+        timers = self.root / "notifiers"
+        _ = fake_showrunner.write_timer(timers, "cargo-liner", owner.current_session, "UTC", doc)
+        with (mock.patch.dict(os.environ, {session_staff.PRODUCTION_MARK: "cargo-liner"}),
+              mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", timers)):
             _ = rca.open_case(HANDLER._replace(session="marked", production=""), OPENED)
         self.assertEqual([flags(argv)["--to"] for argv in self.sends()], ["natedev", "natedev", SHOWRUNNER])
         self.assertEqual(self.case("261023-3")["production"], "cargo-liner")
@@ -581,11 +611,9 @@ os.killpg(os.getpgrp(), signal.SIGTERM)
     def test_stalled_owner_lookup_ends_at_the_deadline_and_keeps_the_notice_pending(self) -> None:
         _ = rca.open_case(HANDLER, OPENED, defer_owner=True)
         reader = stalled_session_reader(self.root)
-        def lookup(slug: str, *, deadline: float) -> str:
-            return showrunners.socket_for(slug, deadline=deadline) or ""
         errors = io.StringIO()
         began = monotonic()
-        with (mock.patch.object(showrunners, "current_address", side_effect=lookup),
+        with (mock.patch.object(showrunners, "socket_for", wraps=REAL_SOCKET_FOR),
               mock.patch.object(showrunners, "SESSIONS", reader), redirect_stderr(errors)):
             rca.remind(OPENED, deadline=began + 0.15)
         self.assertLess(monotonic() - began, 1.5)

@@ -10,7 +10,7 @@ START..END windows; date-only END includes that day. Add --full to print the tab
 from __future__ import annotations
 
 import argparse
-from contextlib import closing, redirect_stderr
+from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Sequence
@@ -18,7 +18,6 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import json
-import io
 from functools import lru_cache
 from itertools import groupby
 import math
@@ -42,7 +41,10 @@ from scripts.hierarchies import log_records, push_audit
 from scripts.hierarchies.log_records import EventSource as EventSource
 from scripts.lib import unit_runs
 from scripts.message import roster
-from scripts.production import showrunners, production_units, issues, change_review, dailies_render
+from scripts.production import showrunners, session_staff, staff, issues, change_review, dailies_render
+from scripts.production.unit_table import Refusal
+from scripts.message import unit_labels
+from scripts.shutdown import remote
 from scripts.production import unit_lookup
 from scripts.production.proposal_issue import proposal_progress, AwaitingApproval
 from scripts.production.proposals_table import backlog_rows, REVIEW_STATE
@@ -535,7 +537,7 @@ def capacity(units: Sequence[Unit], workers: Sequence[Worker], snapshot: str) ->
         scope = "Hana" if hana else "other"
         rows.append(log_records.MeasureRow(
             f"units / {production} / {repo} / {scope}", str(count), count, snapshot,
-            "showrunners + units_table production_units loader", quantity=log_records.Snapshot(count),
+            "staff row resolver", quantity=log_records.Snapshot(count),
         event_source=log_records.SourceNotApplicable.STATE))
     for tree in sorted({worker.worktree for worker in workers}):
         group = [worker for worker in workers if worker.worktree == tree]
@@ -549,7 +551,7 @@ def capacity(units: Sequence[Unit], workers: Sequence[Worker], snapshot: str) ->
             len(group), snapshot, "codex_mesh via session roster; natedev only", quantity=log_records.Snapshot(len(group)),
         event_source=log_records.SourceNotApplicable.STATE))
     if not units:
-        rows.append(log_records.MeasureRow("live units", "0", 0, snapshot, "showrunners + units_table", quantity=log_records.Snapshot(0), event_source=log_records.SourceNotApplicable.STATE))
+        rows.append(log_records.MeasureRow("live units", "0", 0, snapshot, "staff rows", quantity=log_records.Snapshot(0), event_source=log_records.SourceNotApplicable.STATE))
     if not workers:
         rows.append(log_records.MeasureRow("workers", "0", 0, snapshot, "session roster; natedev only", quantity=log_records.Snapshot(0), event_source=log_records.SourceNotApplicable.STATE))
     return rows
@@ -1507,7 +1509,7 @@ def read_source[T](source: str, loader: Callable[[], T], fallback: T, problems: 
                    event_source: EventSource | log_records.SourceNotApplicable = log_records.SourceNotApplicable.UNSPECIFIED) -> T:
     try:
         return loader()
-    except (OSError, ValueError, UnicodeError, sqlite3.Error, RuntimeError, production_units.Refusal, subprocess.SubprocessError,
+    except (OSError, ValueError, UnicodeError, sqlite3.Error, RuntimeError, Refusal, subprocess.SubprocessError,
             change_review.ChangeReviewError, dailies_render.InputError) as error:
         reason = "missing" if isinstance(error, FileNotFoundError) else "unreadable"
         problems.append(log_records.SourceProblem(source, f"{reason}: {error}", event_source))
@@ -1528,31 +1530,56 @@ def read_issues(folder: Path) -> list[issues.Issue]:
 
 def read_units(problems: list[log_records.SourceProblem]) -> list[Unit]:
     result: list[Unit] = []
-    # These are the same loaders used by showrunners list and units_table.
-    warnings = io.StringIO()
-    with redirect_stderr(warnings):
-        runners = showrunners.registered_showrunners()
-    if warnings.getvalue().strip():
-        problems.append(log_records.SourceProblem("showrunners", warnings.getvalue().strip().replace("\n", "; "), event_source=log_records.SourceNotApplicable.STATE))
-    marks = read_source("unit sessions", unit_lookup.every_marked_unit, unit_lookup.MarkedProductions({}, {}), problems, event_source=log_records.SourceNotApplicable.STATE)
-    running = read_source("unit running phases", lambda: running_phase_worktrees(unit_lookup.runs_dir(), problems), set[str](), problems, event_source=log_records.SourceNotApplicable.STATE)
-    for runner in runners:
-        doc = Path(runner["doc"])
-        lines = read_source(str(doc), lambda: doc.read_text(encoding="utf-8").splitlines(), [], problems, event_source=log_records.SourceNotApplicable.STATE)
-        repo = read_source(str(doc), lambda: production_units.production_field(lines, "Repository"), "repository not recorded", problems, event_source=log_records.SourceNotApplicable.STATE)
-        rows = read_source(str(doc), lambda: unit_lookup.live_unit_table(lines, runner["slug"]), [], problems, event_source=log_records.SourceNotApplicable.STATE)
-        for row in rows:
-            tree = production_units.cell_value(row.get("Worktree", ""))
-            name = production_units.cell_value(row.get("Unit", ""))
-            issue = production_units.cell_value(row.get("Issue", ""))
-            marked = marks.units.get(runner["slug"], {}).get(name)
-            activity = UnitActivity.INACTIVE
-            if tree in running or (marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude)):
-                activity = UnitActivity.LIVE
-            elif marks.production_fault(runner["slug"]) or (marked is not None and isinstance(marked.claude, unit_lookup.ClaudeUnknown)):
+    try:
+        record = staff.snapshot()
+        resolver = session_staff.RowResolver(record)
+        live = {item["sessionId"] for item in unit_labels.newest_sessions()}
+        running = running_phase_worktrees(unit_lookup.runs_dir(), problems)
+        for row in staff.active(record, "unit"):
+            parent = record.by_id(row.parent) if row.parent is not None else None
+            if parent is None:
+                problems.append(log_records.SourceProblem(row.name, "the staff parent is unavailable", event_source=log_records.SourceNotApplicable.STATE))
+                continue
+            if isinstance(parent.doc, staff.WrappedDoc):
+                continue
+            causes: list[str] = []
+            try:
+                timer = showrunners.timer_for(parent, record)
+            except (OSError, ValueError) as error:
+                causes.append(str(error))
+                timer = showrunners.NoTimer(str(error))
+            slug = timer.slug if isinstance(timer, showrunners.Timer) else parent.name
+            tree = resolver.unit_worktree(row)
+            doc = resolver.production_doc(row)
+            branch = resolver.unit_branch(row)
+            try:
+                config = resolver.unit_config(row)
+            except ValueError as error:
+                config = session_staff.ConfigMissing(str(error))
+            if not isinstance(tree, staff.PresentWorktree):
+                causes.append("the worktree is not recorded")
+            if not isinstance(doc, session_staff.ProductionDoc):
+                causes.append(doc.reason)
+            if not isinstance(branch, session_staff.Branch):
+                causes.append(branch.reason)
+            if not isinstance(config, session_staff.UnitConfig):
+                causes.append(getattr(config, "reason", "the unit configuration is unavailable"))
+            path = str(tree.path) if isinstance(tree, staff.PresentWorktree) else ""
+            repo = ""
+            if isinstance(tree, staff.PresentWorktree) and tree.machine == remote.local_machine():
+                git = subprocess.run(["git", "-C", path, "rev-parse", "--git-common-dir"], capture_output=True, text=True, check=False)
+                if git.returncode == 0:
+                    common = (tree.path / git.stdout.strip()).resolve()
+                    repo = str(common.parent)
+                else:
+                    causes.append(git.stderr.strip())
+            activity = UnitActivity.LIVE if row.current_session in live or path in running else UnitActivity.INACTIVE
+            if causes:
                 activity = UnitActivity.UNKNOWN
-                problems.append(log_records.SourceProblem(f"unit activity / {runner['slug']} / {name}", "running phase or live session not recorded", event_source=log_records.SourceNotApplicable.STATE))
-            result.append(Unit(runner["slug"], name, repo, tree, is_hana(tree), issue, runner["session"], activity))
+                problems.append(log_records.SourceProblem(row.name, "; ".join(dict.fromkeys(causes)), event_source=log_records.SourceNotApplicable.STATE))
+            result.append(Unit(slug, row.name, repo, path, is_hana(path), "", parent.name, activity))
+    except (OSError, ValueError) as error:
+        problems.append(log_records.SourceProblem("staff", str(error), event_source=log_records.SourceNotApplicable.STATE))
     return result
 
 
@@ -1765,16 +1792,30 @@ def read_waiting(
     for candidate in candidates.ranked(lines):
         if candidate.state == "proposed":
             waiting.append(WaitingItem("efficiency items", log_records.moment(candidate.night[:10])))
-    folder = state / "showrunner/outstanding"
-    paths = read_source(str(folder), lambda: [path for path in folder.iterdir() if path.suffix == ".json"], [], problems, event_source=log_records.SourceNotApplicable.STATE)
-    for path in sorted(paths):
-        outstanding = read_source(str(path), lambda: dailies_render.read_outstanding(path), [], problems, event_source=log_records.SourceNotApplicable.STATE)
-        for item in outstanding:
-            if isinstance(item, dailies_render.OutstandingReminder):
-                continue
-            since = item.since
-            opened = since.replace(tzinfo=user_zone()) if since.tzinfo is None else since
-            waiting.append(WaitingItem("questions", opened))
+    from scripts.production.update_registration import QuestionStaff, OutstandingReminder, read_open_items
+
+    def read_questions() -> list[WaitingItem]:
+        identities = QuestionStaff.read()
+        documents = identities.documents()
+        folder = state / "showrunner/outstanding"
+        paths = {path.stem: path for path in folder.glob("*.json")}
+        questions: list[WaitingItem] = []
+        for slug in sorted(set(paths) | set(documents)):
+            reminder_path = paths.get(slug)
+            document = documents.get(slug)
+            source = str(document if document is not None else reminder_path)
+            outstanding = read_source(source, lambda: read_open_items(reminder_path, document=document, identities=identities),
+                                      [], problems, event_source=log_records.SourceNotApplicable.STATE)
+            for item in outstanding:
+                if isinstance(item, OutstandingReminder):
+                    continue
+                since = item.since
+                opened = since.replace(tzinfo=user_zone()) if since.tzinfo is None else since
+                questions.append(WaitingItem("questions", opened))
+        return questions
+
+    waiting.extend(read_source("showrunner questions", read_questions, [], problems,
+                               event_source=log_records.SourceNotApplicable.STATE))
     return waiting
 
 
@@ -1785,7 +1826,7 @@ def load_sources(window: log_records.Window) -> BaselineSources:
 def load_window_sources(window: log_records.Window, notifications: push_audit.AuditSources) -> BaselineSources:
     state, vault = Path.home() / ".local/state", Path.home() / "rust/hanadocs"
     problems: list[log_records.SourceProblem] = []
-    units = read_source("showrunners / units_table", lambda: read_units(problems), [], problems, event_source=log_records.SourceNotApplicable.STATE)
+    units = read_source("staff rows", lambda: read_units(problems), [], problems, event_source=log_records.SourceNotApplicable.STATE)
     # The roster and usage store do not depend on the other sources. Read them
     # while the main thread reads files. Each reader keeps its own diagnostics.
     worker_problems: list[log_records.SourceProblem] = []

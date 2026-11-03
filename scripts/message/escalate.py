@@ -35,7 +35,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
 from scripts.lib.process_failure import failure_detail
-from scripts.production.showrunners import load_settings, registered_showrunners
+from scripts.production.showrunners import load_settings
+from scripts.production import staff
 if TYPE_CHECKING:
     from ..whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
                                         codex_account, workers_home)
@@ -421,21 +422,26 @@ def close(key: str) -> bool:
     return True
 
 
+def _outgoing_codex_hold(key: str, held: ReadHeld, home: Path, login: str) -> bool:
+    """Legacy Codex holds and holds of another account must retire, never deliver."""
+    return key == "five-hour-codex" or (isinstance(held, HeldMessage)
+            and isinstance(held.owner, KnownCodexAccount)
+            and (held.owner.home != home or held.owner.login.casefold() != login.casefold()))
+
+
 def _cancel_outgoing_codex_holds(home: Path, login: str) -> None:
     for path in (STATE / "held").glob("*.json"):
         held = read(path)
         if isinstance(held, RetiredScriptHold):
             _ = discard_script_hold(path, held)
             continue
-        if path.stem == "five-hour-codex" or (isinstance(held, HeldMessage)
-                and isinstance(held.owner, KnownCodexAccount)
-                and (held.owner.home != home or held.owner.login.casefold() != login.casefold())):
+        if _outgoing_codex_hold(path.stem, held, home, login):
             relays = held.relays if isinstance(held, HeldMessage) else ()
             if not relays:
                 try:
-                    names = [*load_settings()["always"], *(runner["session"] for runner in registered_showrunners())]
+                    names = [*load_settings()["always"], *(f"session:{row.current_session}" for row in staff.active(staff.snapshot(), "showrunner"))]
                 except (OSError, ValueError):
-                    names = []
+                    continue
                 label = held.owner.label if isinstance(held, HeldMessage) and isinstance(held.owner, KnownCodexAccount) else "Codex"
                 relays = tuple(HeldRelay(recipient=name, key=f"5-hour {label}") for name in dict.fromkeys(names))
             for relay in relays:
@@ -514,6 +520,10 @@ def due(now: float) -> list[Settled]:
             if held.outcome != "waiting":
                 continue
             if (path.stem == "five-hour-codex" or isinstance(held.owner, KnownCodexAccount)) and isinstance(identity, UnknownCodexAccount):
+                continue
+            if (isinstance(identity, KnownCodexAccount)
+                    and _outgoing_codex_hold(path.stem, held, identity.home, identity.login)):
+                # Cancellation may need a later inventory; the outgoing account must never alert meanwhile.
                 continue
             if seen >= held.held_at:
                 held = replace(held, outcome="answered")

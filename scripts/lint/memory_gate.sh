@@ -176,6 +176,12 @@ buildlog_memory_line_inner() {
     local kind=$1 available=$2 threshold=$3 need=$4 source=$5 count=$6 promised=$7 running=$8 reserve=$9 summary=${10}
     local description
     case "$source" in
+        cap)
+            if [[ "${12:-build}" == merge-gate ]]; then
+                description="the merge gate's memory cap"
+            else
+                description="${12:-build}'s memory cap"
+            fi ;;
         measured) description="the 90th percentile of $count measured runs" ;;
         buildlog) description="0.65 of the 90th percentile peak of $count runs" ;;
         pooled) description="the 90th percentile of $count measured runs of this step in every repo" ;;

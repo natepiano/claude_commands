@@ -1,5 +1,5 @@
 ---
-description: Undo the most recent banned-word counter bump from its backup
+description: Restore the last forbidden word count.
 ---
 
 Roll the local banned-word counter file back to its backup — the snapshot taken

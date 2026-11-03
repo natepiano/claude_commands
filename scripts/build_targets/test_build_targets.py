@@ -33,6 +33,14 @@ else:
     import record
     import store
 from test_targets import END, NOW, SHIPPED_CONFIG, SINCE, IsolatedTargetTest
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import write_config_fixture
+else:
+    from memory_test_support import write_config_fixture
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 REAL_SUBPROCESS_RUN = subprocess.run
 REAL_SUBPROCESS_POPEN = subprocess.Popen
@@ -67,7 +75,7 @@ class FolderInvocationTests(NotificationGuardedTestCase):
             [sys.executable, "-m", "unittest",
              "test_build_targets.WaitLocalTests.test_hold_and_release_write_temp_log_without_writing_real_log"],
             cwd=Path(__file__).resolve().parent,
-            capture_output=True, text=True, check=False, timeout=30,
+            capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -76,6 +84,10 @@ class IsolatedBuildTargetTest(NotificationGuardedTestCase, IsolatedTargetTest):
     @override
     def setUp(self) -> None:
         super().setUp()
+        folder = self.root / ".claude/config"
+        folder.mkdir(parents=True, exist_ok=True)
+        _ = (folder / "build_targets.conf").write_text(SHIPPED_CONFIG.read_text())
+        _ = (folder / "mac_test.conf").write_text(self.settings.read_text())
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "MAC_IDLE_STATE_DIR": str(self.root / "mac-idle"),
@@ -151,7 +163,7 @@ class StatusTests(IsolatedBuildTargetTest):
             "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n",
         )
-        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}), \
              mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
             return self.capture_status()
 
@@ -187,7 +199,7 @@ class StatusTests(IsolatedBuildTargetTest):
             "live-session": roster.UnitLabels("report", "builds", "report"),
             "stale-session": roster.UnitLabels("inspectors", "hana", "inspectors"),
         }
-        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}), \
              mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"), \
              mock.patch.object(mac_test, "read_claims", wraps=mac_test.read_claims) as claims_read, \
              mock.patch.object(roster, "unit_labels_for", return_value=labels) as lookup:
@@ -215,7 +227,7 @@ class StatusTests(IsolatedBuildTargetTest):
         _ = (self.holders / "hana").rename(self.holders / "report-session")
         config = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         labels = {"report-session": roster.UnitLabels("report", "builds", "report")}
-        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}), \
              mock.patch.object(roster, "unit_labels_for", return_value=labels):
             result = self.capture_status()
         self.assertEqual(result, (
@@ -228,7 +240,7 @@ class StatusTests(IsolatedBuildTargetTest):
             "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n",
         )
         labels = {"hana-session": roster.UnitLabels("inspectors", "hana", "inspectors")}
-        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}), \
              mock.patch.object(roster, "unit_labels_for", return_value=labels):
             result = self.capture_status()
         self.assertEqual(result, (
@@ -245,7 +257,7 @@ class StatusTests(IsolatedBuildTargetTest):
             "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n",
         )
-        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}), \
              mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
             code, output, errors = self.capture_status()
         self.assertEqual((code, errors), (0, ""))
@@ -263,7 +275,7 @@ class StatusTests(IsolatedBuildTargetTest):
             "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n",
         )
-        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}), \
              mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
             code, output, errors = self.capture_status()
         self.assertEqual((code, errors), (0, ""))
@@ -384,7 +396,7 @@ class StatusTests(IsolatedBuildTargetTest):
         self.assertEqual(build_targets.local_time(instant), "13:05 PST")
 
     def test_shipped_config_prints_one_line_per_target_without_probe(self) -> None:
-        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(SHIPPED_CONFIG)}):
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(SHIPPED_CONFIG).parent)}):
             with mock.patch.object(build_targets, "probe_target", side_effect=AssertionError("Probe not requested")):
                 self.assertEqual(self.capture_status(), (0, "mac: free\nnatedev: free\n", ""))
 
@@ -394,7 +406,7 @@ class StatusTests(IsolatedBuildTargetTest):
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
         )
         self.write_block()
-        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}):
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}):
             self.assertEqual(self.capture_status(), (
                 0,
                 "natedev: free\nmac: held by hana since 13:05 PDT until 15:05 PDT — render checks\n",
@@ -411,7 +423,7 @@ class StatusTests(IsolatedBuildTargetTest):
         self.write_holder()
         output = io.StringIO()
         errors = io.StringIO()
-        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(SHIPPED_CONFIG)}):
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(SHIPPED_CONFIG).parent)}):
             with mock.patch.object(build_targets, "probe_target", side_effect=unavailable):
                 with mock.patch.object(sys, "argv", ["build_targets.py", "status", "--probe"]):
                     with redirect_stdout(output), redirect_stderr(errors):
@@ -427,7 +439,7 @@ class StatusTests(IsolatedBuildTargetTest):
     def test_status_argument_defaults_to_recorded_state(self) -> None:
         output = io.StringIO()
         errors = io.StringIO()
-        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(SHIPPED_CONFIG)}):
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(SHIPPED_CONFIG).parent)}):
             with mock.patch.object(build_targets, "probe_target", side_effect=AssertionError("Probe not requested")):
                 with mock.patch.object(sys, "argv", ["build_targets.py", "status"]):
                     with redirect_stdout(output), redirect_stderr(errors):
@@ -448,7 +460,7 @@ class StatusTests(IsolatedBuildTargetTest):
             "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n"
         )
-        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}):
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}):
             with mock.patch.object(
                 offload, "repository_identity",
                 side_effect=AssertionError("Reachability needs no repository"),
@@ -461,7 +473,7 @@ class StatusTests(IsolatedBuildTargetTest):
 
     def test_probe_uses_shared_settings_reader_without_building_config(self) -> None:
         target = targets.SshTarget("mac", "macos", self.settings)
-        config = offload.OffloadConfig(False, "reader-mac", 2.0, 3.0, 4.0, 5.0, "6", {})
+        config = offload.OffloadConfig(False, offload.SshConnectionSettings("reader-mac", 2.0, 10.0), 3.0, 4.0, 5.0, "6", {})
         calls: list[offload.OffloadConfig] = []
 
         def reachable(
@@ -500,9 +512,12 @@ class EligibleCommandTests(IsolatedBuildTargetTest):
                                         ("linux_only.hana=hana\n", [], "linux_only"),
                                         ("", ["--local", "Linux filesystem required"], "Linux filesystem required")):
             with self.subTest(reason=reason):
-                _ = self.settings.write_text(settings)
+                _ = write_config_fixture(self.settings, settings, template="mac_test")
+                if "linux_only.hana=" not in settings:
+                    _ = self.settings.write_text("\n".join(line for line in self.settings.read_text().splitlines()
+                        if not line.startswith("linux_only.hana=")) + "\n")
                 output = io.StringIO()
-                with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
+                with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}), \
                      mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("hana")), \
                      mock.patch.object(sys, "argv", ["build_targets.py", "eligible", "--repo-root", str(self.root),
                                                     "--package", "hana", *local]), redirect_stdout(output):
@@ -518,13 +533,13 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         config = self.write_config(
             "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n")
-        _ = self.settings.write_text("offload=on\nlinux_only.hana=linux-part\nfree_floor_gib=60\n")
+        _ = write_config_fixture(self.settings, "offload=on\nlinux_only.hana=linux-part\nfree_floor_gib=60\n", template="mac_test")
         _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers=["crates/*"]\nexclude=["crates/excluded"]\n')
         for directory, name in (("portable", "portable"), ("excluded", "linux-part")):
             member = self.root / "crates" / directory
             member.mkdir(parents=True)
             _ = (member / "Cargo.toml").write_text(f'[package]\nname="{name}"\nversion="0.1.0"\n')
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)})))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)})))
         _ = self.enterContext(mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("hana")))
 
     def kind_output(self, kind: str, package: str = "", free_gib: float = 60) -> str:
@@ -541,7 +556,7 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
 
     def test_kind_table_keeps_target_order_settings_and_each_mac_decision(self) -> None:
         other_settings = self.settings.with_name("other.conf")
-        _ = other_settings.write_text("offload=off\nlinux_only.hana=\n")
+        _ = write_config_fixture(other_settings, "offload=off\nlinux_only.hana=\n", template="mac_test")
         _ = self.write_config(
             "targets=natedev,other,mac\nkind.natedev=local\nplatform.natedev=linux\n"
             + "kind.other=ssh\nplatform.other=macos\nsettings.other=other.conf\n"
@@ -582,8 +597,21 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         self.assertEqual(self.kind_answer("check", free_gib=59), "natedev_only disk\n")
         offload.write_backoff(time.time() + 60)
         self.assertEqual(self.kind_answer("doc"), "natedev_only backoff\n")
-        _ = self.settings.write_text("offload=off\nlinux_only.hana=\n")
+        _ = write_config_fixture(self.settings, "offload=off\nlinux_only.hana=\n", template="mac_test")
         self.assertEqual(self.kind_answer("lint"), "natedev_only off\n")
+
+    def test_unresolved_probe_excludes_target_as_busy(self) -> None:
+        target = targets.SshTarget("mac", "macos", self.settings)
+        with mock.patch.object(offload, "probe_mac", return_value=offload.UnresolvedSlotStartup()) as probe:
+            result = build_targets.mac_target_eligibility(
+                target, self.root, "portable", "test", targets.AnyEligibleTarget(),
+            )
+        self.assertIsInstance(result, targets.ExcludedTarget)
+        assert isinstance(result, targets.ExcludedTarget)
+        self.assertEqual(result.target, target)
+        self.assertIn("busy", result.reason)
+        self.assertNotIn("unreachable", result.reason)
+        probe.assert_called_once()
 
     def test_unreadable_workspace_cannot_be_sent_to_the_mac(self) -> None:
         _ = (self.root / "Cargo.toml").write_text("[")
@@ -695,7 +723,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
                     self.assertIsNone(process.poll())
                 _ = build_hold.release_cycle(self.holders, "hana")
                 for process in processes:
-                    output, errors = process.communicate(timeout=10)
+                    output, errors = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                     self.assertEqual(process.returncode, 0, output + errors)
                 cycle = build_hold.read_cycle()
                 assert cycle is not None
@@ -704,7 +732,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
                 for process in processes:
                     if process.poll() is None:
                         process.terminate()
-                    _ = process.communicate(timeout=10)
+                    _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
 
 
     def test_unheld_call_skips_owner_and_admission_lookup(self) -> None:

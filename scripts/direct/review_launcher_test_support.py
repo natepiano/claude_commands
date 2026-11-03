@@ -8,9 +8,14 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
-from typing import TypedDict, cast, override
+from typing import TYPE_CHECKING, TypedDict, cast, override
 
 from scripts.direct.recorder_fixture import LauncherFixture, STUB_ATOMIC_JSON_WRITER, communicate_launcher, configure_launcher_fixture, launcher_environment, launcher_registry, prepare_launcher_runtime
+
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import config_environment, write_config_fixture
+else:
+    from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 DIRECT_DIR = Path(__file__).parent
@@ -128,6 +133,11 @@ elif verb == 'follow':
     pathlib.Path(session / 'follow_message.txt').write_text(
         pathlib.Path(option('--message-file')).read_text()
     )
+    if os.environ.get('STUB_EXPECT_PREPARED_STYLE'):
+        prompt = pathlib.Path(option('--message-file')).read_text()
+        diff_line = next(line for line in prompt.splitlines() if line.startswith('- Diff '))
+        diff = pathlib.Path(diff_line.split(': ', 1)[1])
+        pathlib.Path(session / 'prepared_at_dispatch.diff').write_bytes(diff.read_bytes())
     finish_file = os.environ.get('STUB_REVIEW_FINISH_FILE', '')
     if finish_file:
         sys.path.insert(0, os.environ['TEST_WAIT_HELPER_DIR'])
@@ -209,6 +219,8 @@ class ReviewLauncherFixture(LauncherFixture):
                 "",
             ), AGENTS_REGISTRY,
         )
+        _ = write_config_fixture(self.config_file, self.config_file.read_text(encoding="utf-8"))
+        _ = config_environment(self.root)
         reviewed = self.working_dir / "reviewed.txt"
         _ = reviewed.write_text("original\n", encoding="utf-8")
         _ = subprocess.run(
@@ -218,6 +230,7 @@ class ReviewLauncherFixture(LauncherFixture):
             check=True,
             capture_output=True,
             text=True,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         _ = subprocess.run(
             ["git", "-c", "user.name=Review Test", "-c",
@@ -226,6 +239,7 @@ class ReviewLauncherFixture(LauncherFixture):
             check=True,
             capture_output=True,
             text=True,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.review_script = self.build_script_tree()
 
@@ -237,12 +251,40 @@ class ReviewLauncherFixture(LauncherFixture):
         no model tokens. The real heartbeat watcher uses a short interval.
         """
         direct_dir, agents, lib = prepare_launcher_runtime(self.root)
-        _ = shutil.copy2(DIRECT_DIR.parent / "production/showrunners.py",
-                         self.root / "scripts/production/showrunners.py")
+        for name in ("showrunners.py", "session_staff.py", "staff.py", "session_labels.py",
+                     "unit_config.py", "unit_names.py", "unit_table.py"):
+            _ = shutil.copy2(DIRECT_DIR.parent / "production" / name,
+                             self.root / "scripts/production" / name)
+        for directory, names in (("herdr", ("place.py", "pane_launch.py")),
+                                 ("shutdown", ("remote.py",))):
+            destination = self.root / "scripts" / directory
+            destination.mkdir()
+            for name in names:
+                _ = shutil.copy2(DIRECT_DIR.parent / directory / name, destination / name)
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib/git_exclude.py", lib / "git_exclude.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/probe_session.py", lib / "probe_session.py")
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib/process_failure.py", lib / "process_failure.py")
+        for name in ("conf.py", "conf.sh"):
+            _ = shutil.copy2(DIRECT_DIR.parent / "lib" / name, lib / name)
+        _ = shutil.copy2(DIRECT_DIR.parent / "production/fast_track.py",
+                         self.root / "scripts/production/fast_track.py")
+        config = self.root / "config"
+        config.mkdir(exist_ok=True)
+        _ = shutil.copy2(DIRECT_DIR.parents[1] / "config/fast_track.conf", config / "fast_track.conf")
         for name in ("review.sh", "review_tree.py", "tag_inventory.py"):
             _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
         configure_launcher_fixture(direct_dir / "review.sh")
+        lint = self.root / "scripts/lint"
+        lint.mkdir()
+        for name in ("style_review.py", "lint_config.sh"):
+            _ = shutil.copy2(DIRECT_DIR.parent / "lint" / name, lint / name)
+        message = self.root / "scripts/message"
+        message.mkdir()
+        for name in ("sessions.py", "process_identity.py", "relay_identity.py"):
+            _ = shutil.copy2(DIRECT_DIR.parent / "message" / name, message / name)
+        review_config = self.root / "config/review"
+        review_config.mkdir(parents=True)
+        _ = shutil.copy2(DIRECT_DIR.parents[1] / "config/review/style.md", review_config / "style.md")
         stub = agents / "agent_exec.sh"
         _ = stub.write_text(STUB_AGENT_EXEC, encoding="utf-8")
         stub.chmod(0o755)
@@ -254,8 +296,11 @@ class ReviewLauncherFixture(LauncherFixture):
     @override
     def environment(self) -> dict[str, str]:
         environment = launcher_environment(self.root)
+        environment["LINT_CONFIG_FILE"] = str(self.root / "lint.conf")
         environment["UNIT_EARLY_POLL_SECS"] = "0.01"
         environment["TEST_WAIT_HELPER_DIR"] = str(DIRECT_DIR.resolve())
+        environment["FAST_TRACK_STATE_DIR"] = str(self.root / "fast-track-state")
+        environment["CONF_DIR"] = str(self.root)
         # Early mode starts a detached Stage 2 run; the stub records its arguments instead.
         mesh_runs = self.root / "mesh_runs_stub.py"
         if not mesh_runs.exists():
@@ -427,11 +472,12 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         session = self.start_implementation(name)
         self.finish_implementation(session)
         # The stub's commit adds every file, so the plan start_implementation writes is committed first.
-        _ = subprocess.run(["git", "add", "plan.md"], cwd=self.working_dir, check=True, capture_output=True)
+        _ = subprocess.run(["git", "add", "plan.md"], cwd=self.working_dir, check=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         _ = subprocess.run(
             ["git", "-c", "user.name=Review Test", "-c", "user.email=review@example.com",
              "commit", "-q", "-m", "plan"],
             cwd=self.working_dir, check=True, capture_output=True, text=True,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         for phase, files in (("3", "reviewed.txt\n"), ("4", "other.txt\n")):
             directory = session / "phases" / phase

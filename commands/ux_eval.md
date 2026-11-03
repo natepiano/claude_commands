@@ -1,5 +1,5 @@
 ---
-description: Judge Hana screenshots against the UX guide and report each defect with its rule and fix. Reads only.
+description: Review Hana screenshots for UX defects.
 ---
 
 # UX eval

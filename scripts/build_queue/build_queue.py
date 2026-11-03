@@ -41,6 +41,7 @@ def default_columns() -> int:
 
 
 def main() -> int:
+    _ = memory_admit.memory_config()
     import argparse
 
     if len(sys.argv) > 1 and sys.argv[1] == "bump":

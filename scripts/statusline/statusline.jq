@@ -116,20 +116,8 @@ def timer_owners($rows; $session_id; $machine):
    | select(length == 1) | .[0]];
 
 def assignment($rows; $name; $session_id; $cwd):
-  ($ENV.STAFF_ID // "") as $id
-  | ($ARGS.named.machine // "") as $machine
-  | (if $id != "" then [$rows[] | select(.id == $id)]
-     else timer_owners($rows; $session_id; $machine) as $timers
-       | [$rows[] | select(.kind == "unit" and $cwd != "" and .worktree.state == "present"
-                          and .worktree.machine == $machine and .worktree.path == $cwd)] as $folders
-       | if ($timers | length) == 1 then $timers
-         elif ($folders | length) == 1 then $folders
-         else ($ENV.SHOWRUNNER_UNIT_ID // "" | if . == "" then $name // "" else . end
-                         | if test("^[A-Za-z0-9][A-Za-z0-9_-]*$")
-                         then sub("[-_]unit$"; "") else "" end) as $short
-       | [$rows[] | select((.kind == "unit" or .kind == "showrunner") and .name == $short)]
-         end
-     end)
+  ($session_id // $ENV.CODEX_THREAD_ID // $ENV.CLAUDE_CODE_SESSION_ID // "") as $id
+  | [$rows[] | select((.current_session // .id) == $id)]
   | if length == 1 then .[0] else null end;
 
 def remaining($window):

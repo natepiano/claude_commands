@@ -1,5 +1,5 @@
 ---
-description: Release a Rust crate or workspace — version bump, publish, and tagging, with dry-run and RC support.
+description: Publish a Rust crate or workspace.
 ---
 
 # Unified Release Command

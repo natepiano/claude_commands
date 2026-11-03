@@ -206,7 +206,7 @@ def waiting_calls(paths: MacIdlePaths, live: dict[int, LiveProcess]) -> tuple[Ve
             continue
         if not isinstance(record, step_record.StepRecord):
             continue
-        if (not isinstance(record.runs_on, step_record.MacAllowed)
+        if (not step_record.mac_eligible(record)
                 or record.state not in (step_record.StepState.WAITING_HOLD, step_record.StepState.WAITING_MAC)):
             continue
         process = live.get(record.pid)
@@ -221,14 +221,14 @@ def waiting_calls(paths: MacIdlePaths, live: dict[int, LiveProcess]) -> tuple[Ve
         try:
             call = registered_call(read_record(call_path(paths, record.call_id)))
         except ValueError:
-            call = VerifyCall(record.call_id, record.pid, record.proc_start, str(record.repo), record.package or "",
+            call = VerifyCall(record.call_id, record.pid, record.proc_start, str(record.repo), step_record.package_name(record.package),
                 "", "", "", "", "", 0, False)
         if call.pid != record.pid or call.start != record.proc_start:
             call = replace(call, pid=record.pid, start=record.proc_start, marker_hook=False,
                            session="", temp_dir="", hold_waiter="", token_dir="")
         if call.local_reason:
             continue
-        calls.append(replace(call, repo=str(record.repo), package=record.package or "", kind=record.kind,
+        calls.append(replace(call, repo=str(record.repo), package=step_record.package_name(record.package), kind=record.kind,
                              wait_state=record.state))
     if diagnostics != old_diagnostics:
         write_record(paths.state / "step_diagnostics.json", diagnostics)

@@ -1,5 +1,5 @@
 ---
-description: Query stage, phase, and run timings across skill run history
+description: Report skill run, stage, and phase times.
 ---
 
 # history

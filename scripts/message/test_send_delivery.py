@@ -96,7 +96,7 @@ class KeyedDeliveryStopTests(NotificationGuardedTestCase):
                         _ = send.send(fixture.options(channel))
                 with stopped_sender(child), private_sender_acceptance(state) as fixture:
                     result = send.send(fixture.options(channel))
-                    self.assertEqual(result.outcome, "retry")
+                    self.assertEqual(result.outcome, "pending")
                     self.assertNotIn(send.EXIT[result.outcome], (0, 1))
                     self.assertEqual(fixture.count(), 0)
                 with private_sender_acceptance(state) as fixture:

@@ -30,6 +30,8 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 for directory in ("production", "shutdown", "herdr", "message", "whoami"):
     sys.path.insert(0, str(SCRIPTS / directory))
 
+from scripts.shutdown import shutdown_record
+
 if TYPE_CHECKING:
     from scripts.production import live_units, production_units, unit_lookup
     from scripts.herdr import herdr
@@ -153,6 +155,9 @@ def _write_state(state: dict[str, DownOutage]) -> None:
 def _sources(report_failure: Callable[[str], None] = lambda _message: None) -> dict[tuple[str, str], RecoverySource]:
     sources: dict[tuple[str, str], RecoverySource] = {}
     newest: dict[tuple[str, str], pane_record.PaneLaunch] = {}
+    # Records are ordered by their validated UTC request time; the latest stop wins.
+    stops = {record["session"]["session_id"]: record for record in shutdown_record.all_session_records()
+             if record["then"] == "stop"}
     for entry in sorted(pane_record.launches(), key=lambda item: item["written_at"]):
         marks = entry["environment"]
         unit, production = marks.get("SHOWRUNNER_UNIT_ID", ""), marks.get("SHOWRUNNER_UNIT", "")
@@ -163,6 +168,9 @@ def _sources(report_failure: Callable[[str], None] = lambda _message: None) -> d
         newest[key] = entry
     for key, entry in newest.items():
         if entry.get("ended", False):
+            continue
+        stopped = stops.get(entry["session_id"])
+        if stopped is not None and datetime.fromisoformat(stopped["requested_at"]) >= datetime.fromisoformat(entry["written_at"]):
             continue
         production, unit = key
         try:
@@ -178,7 +186,7 @@ def _sources(report_failure: Callable[[str], None] = lambda _message: None) -> d
 
 
 class ResumeUnit(Protocol):
-    def __call__(self, session: str, *, why: str, to: str, restore_missing: bool) -> stop_results.ClaudeUp | stop_results.ResumeFailed | stop_results.SessionNotFound: ...
+    def __call__(self, session: str, *, why: str, to: str, restore_missing: bool) -> stop_results.ResumeResult: ...
 
 
 def _restart(label: str, identity: str, source: str) -> str:
@@ -196,7 +204,9 @@ def _restart(label: str, identity: str, source: str) -> str:
         result = resume(identity, why="unit watchdog recovery", to=label, restore_missing=True)
         if isinstance(result, stop_results.ClaudeUp):
             return ""
-        return result.reason if isinstance(result, stop_results.ResumeFailed) else f"{identity}: no pane launch"
+        return (stop_results.resume_failure_reason(result)
+                if isinstance(result, (stop_results.ResumeFailed, stop_results.RunningOnAnotherAccount))
+                else f"{identity}: no pane launch")
     except (OSError, ValueError, herdr.HerdrFailure) as error:
         return str(error)
 
@@ -291,6 +301,7 @@ def run(now: datetime, *, dry_run: bool) -> list[str]:
 def _run(now: datetime, *, dry_run: bool) -> list[str]:
     """Check local production units, under the watcher's lock."""
     lines: list[str] = []
+    runners = showrunners.ShowrunnerDiscovery()
     from scripts.maintenance.settings import settings
     limits = settings()
     dispatch_deadline = time.monotonic() + limits.recovery_dispatch_seconds
@@ -306,7 +317,11 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
         def unit_observations() -> unit_lookup.MarkedProductions:
             return unit_lookup.every_marked_unit()
 
-        retained: dict[str, DownOutage] = {}
+        observed = {runner["slug"] for runner in runners}
+        # Absence from a partial inventory is not evidence that a recovery ended.
+        retained = ({key: outage for key, outage in state.items()
+                     if "alert_context" not in outage or outage["alert_context"]["production"] not in observed}
+                    if runners.lookup_failures else {})
         for runner in runners:
             if not runner["doc"]:
                 continue
@@ -441,6 +456,10 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
             _write_state(retained)
     except (OSError, ValueError) as error:
         lines.append(f"watchdog: {error}")
+    if runners.lookup_failures:
+        for line in lines:
+            print(line)
+        _ = showrunners.require_complete(runners)
     return lines
 
 

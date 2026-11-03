@@ -4,6 +4,7 @@ from __future__ import annotations
 import unittest
 
 from scripts.direct.verify_tree_cancel_test_support import VerifyTreeCancelFixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyTreeCancelTests(VerifyTreeCancelFixture):
@@ -24,7 +25,7 @@ if stage == os.environ.get("TEST_BLOCK_STAGE", "test"):''')
         self.wait_for_running(self.control / "running", process)
         self.assert_resources_held()
         _ = (self.control / "release").touch()
-        output, errors = process.communicate(timeout=30)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertNotIn("cancelled", output + errors)
         for stage in ("mend", "fix", "fmt"):

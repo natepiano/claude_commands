@@ -6,7 +6,10 @@ remain only for the pending archive cleanup; they do not dispatch new reviews.
 
 ## What it is
 
-Every external-CLI agent this configuration launches — `/unit:direct`'s implementer and reviewer, the production unit directors `add_unit.py` starts, the `~/.zshrc` CLI aliases, `/ask_a_friend`, and the `/team_review` / `/api_review` / `/module_review` review teams — resolves which vendor CLI to run, which model, and at what reasoning effort from one file (`config/agents.conf`) through one resolver (`scripts/agents/agents_config.sh`), and launches through one dispatcher (`scripts/agents/agent_exec.sh`). The problem it solves: without a registry each consumer carries its own private assignment state in its own conf file and hard-codes its own vendor flags, so switching a function between vendors means editing several scripts and auditing "what runs what" means reading all of them. Here, a major function switches between the `codex` and `claude` families, or a single sub-task is re-pointed to a different model or effort, with one `/agent` edit, and no consumer assembles vendor flags itself.
+External agents resolve their family, model, and effort from `config/agents.conf` through `scripts/agents/agents_config.sh`.
+Consumers include unit workers, production unit directors, CLI aliases, and `/ask_a_friend`.
+The registry gives each task one source for its launch settings.
+`/agent` changes a function's family or a task's model and effort.
 
 ## How it works
 
@@ -53,12 +56,11 @@ Every function carries *both* family sets, fully specified at all times, so a fa
 | `worker` | `impl`, `test`, `fix`, `review` |
 | `cli` | `commit_prep`, `merge_branch`, `interactive` |
 | `ask_a_friend` | `consultation` |
-| `team_review` | `expert` |
-| `api_review` | `reviewer`, `adversary` |
-| `module_review` | `reviewer`, `validation` |
 | `production` | `director` |
 
-`[codex.agents]` is machine-generated (`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark` today). `[claude.agents]` is hand-maintained: `fable`, `opus`, `sonnet`, each `low,medium,high,xhigh,max`. Five functions are assigned `codex`, `production` is assigned `claude` (its only set; `director=opus:xhigh`), and `ask_a_friend` is assigned `caller` — it runs on the family of the agent asking, because only a like-to-like pair talks both ways (claude reaches claude by `SendMessage`, codex reaches codex through `codex_mesh.py`, and a codex friend has no route back to a claude caller).
+`[codex.agents]` is machine-generated (`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark` today). `[claude.agents]` is hand-maintained: `fable`, `opus`, `sonnet`, each `low,medium,high,xhigh,max`. The `[assignments]` section selects each function's family.
+`production` has only a Claude set.
+`ask_a_friend` uses the asking session's family so the two sessions can exchange messages.
 
 ### Resolution algorithm and precedence
 
@@ -117,7 +119,12 @@ agent_exec.sh <task> <write|readonly> <working_dir> <prompt_file> <output_file> 
 Wrong arg count or a bad mode returns 2. A missing prompt file writes `Prompt not found: <path>` to the log file and returns 1. Otherwise it sources `agents_config.sh`, calls `agents_resolve <task>`, reads the prompt into a variable, and dispatches on family (internal entry point `agents_exec_main`):
 
 - **codex** — `codex exec <agents_codex_args> [extra] --ephemeral (--full-auto | --sandbox read-only) -C <working_dir> -o <output_file> "$PROMPT" > <log_file> 2>&1`.
-- **claude** — `claude --print (--dangerously-skip-permissions | --permission-mode plan) --settings '{"sandbox":{"enabled":false}}' --verbose --output-format stream-json <agents_claude_args> [extra] -- "$PROMPT"`, executed in a subshell as `( cd "$working_dir" && … > "$log_file" 2>&1 )` because the claude CLI has no `-C`. The streamed JSON log is what `heartbeat_watch.sh` narrates; afterwards `agents_claude_extract_result` (an inline `python3` heredoc) pulls the final `result` event's text into `<output_file>`, preserving the caller contract "output = final answer, log = full log". Claude's own exit code is returned.
+- **claude** — Each print launch sets `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` and sends the prompt through stdin.
+  The launcher uses plan permissions for readonly tasks and skips permissions for write tasks.
+  It retains the stream-json events in the log.
+  `scripts/agents/claude_result.py` writes the final answer to the output file.
+  An `is_error` result or an `errors` array writes `ERROR: <reason>` and returns exit 1.
+  Otherwise, the launcher returns Claude's exit code.
 
 `AGENT_EXEC_EXTRA_ARGS` is appended to the family CLI's arg list. `AGENT_EXEC_DRY_RUN=1` prints the fully assembled command — every argv token `printf '%q'`-quoted by `agents_exec_print_argv`, with the redirection suffix, and a `cd <working_dir> && ` prefix on the claude branch — then exits 0 without executing. `agent_exec` exports nothing; consumers that need provenance re-resolve themselves.
 
@@ -324,7 +331,6 @@ A thin dispatcher over the resolver:
 | `scripts/cli_agent/cli_agent.sh` | zshrc-alias dispatcher (`commit_no`, `commit_yes`, `merge`, `code`). `cli_agent_print_status` prints the four `cli.*` rows via `agents_resolve_print`; `cli_agent_run` maps no args → `cli.interactive` REPL and a skill name → `cli.<skill>` (unknown skill errors with the known list), then `exec`s codex on the signed-in workers account home with `agents_codex_args` (the registry tier included), overriding a caller's `CODEX_HOME`, or claude with `-- "/$invocation"`. An unavailable workers account refuses before Codex starts. It has no assignment editor — assignment changes go through `/agent`. |
 | `scripts/production/add_unit.py` | `production.director`, resolved directly (not through `agent_exec`) because a unit director is a long-lived herdr session: `director_agent` runs `bash -c` sourcing `agents_config.sh` and `agents_resolve production.director`, refuses any family but `claude`, and launches it through `herdr.start_agent(kind="claude", agent_arguments=[--model <agent>, [--effort <effort>], --remote-control …])`. `produce.md`'s Resume runs `add_unit.py ... --resume <session-id> --cwd <cwd>`, which resolves the same row and keeps the transcript's last model unless `--model` is given. |
 | `scripts/ask_a_friend/prepare_session.sh` / `launch_friend.sh` / `end_friend.sh` | `ask_a_friend.consultation`, resolved directly (not through `agent_exec`) because the friend is a live peer, not a one-shot: claude → `agent_bg.sh` with `AGENT_BG_DETACH=1` (the one `claude --bg --name <friend>` recipe; answers by `SendMessage`; `friend_id` for `claude stop`), codex → `codex_mesh.py start --resident --service-tier "$AGENT_SERVICE_TIER"` (a thread that outlives its turns; replies print between `=== reply from <friend> (N) ===` / `=== end reply ===`; `end` releases it). Protocol files: `friend_name`, `question.md`, `message_<N>.md`, `answer.txt` (codex), `status` `running\|ended\|error`, `agent.log`, provenance `consult_agent`. One friend carries consultation and implementation, so there is one row per family. |
-| `commands/team_review.md`, `api_review.md`, `module_review.md` | Call `agent_exec … readonly` directly, backgrounded, one call per lens/pass, with self-contained prompt files under wave-namespaced session dirs (`cycle2/`, `adversary/`, `pass3/`) and provenance captured in-session via `agents_resolve_print`. |
 | `commands/unit/direct.md`, `commands/ask_a_friend.md` | Consumer docs: call sites, log/provenance names, and `/agent` as the switch surface. |
 
 All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK" 2>"$LOG_FILE"`) so an "on error read the log" instruction is true even on the resolution-failure path.
@@ -510,3 +516,8 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - **An owed resume after a completed turn starts at once.** The completed turn shows the model is serving, so a wait would only delay the worker's own work; only a capacity refusal earns one.
 
 Accepted Codex turns record `turn_model` and `turn_effort` in the roster for display only. Board worker rows and progress worker notes read these fields. Durable identity model fields remain compatibility data and do not choose a dispatch model; worker reuse is by role and availability. Every turn resolves its current shared role default or an explicit dispatch override.
+
+
+The simplify launch lock owner alone writes its report, status, and summary.
+The `review_status_simplify` file contains one atomic status line: `preparing`, `reviewing`, `reviewed`, or `error`.
+A rejected launch writes its reason to stderr and preserves the shared files.

@@ -1,6 +1,8 @@
 """Transfer units between disposable productions with real Git worktrees."""
 from __future__ import annotations
 
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+
 import json
 import os
 import shutil
@@ -9,32 +11,73 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-from typing import cast, final
+from typing import cast, final, override
 from unittest import mock
 from collections.abc import Callable
 from contextlib import ExitStack
+from dataclasses import replace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.astra import design_roles
 from scripts.astra.design_role_test_support import write_empty_binding_record
 from scripts.direct import workers
-from scripts.production import staff, staff_sources, staff_move
+from scripts.production import staff, staff_sources, staff_move, unit_config
 from scripts.production.rename_test_support import legacy_staff_journal, stop_at_staff_write
 from scripts.production.rename_rerun_test_support import final_files, saved_fixture
-from scripts.production.staff_test_support import SOURCES_SCRIPT, PROCESS_TIMEOUT
+from scripts.production.staff_test_support import SOURCES_SCRIPT
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production.transfer_unit_test_support import (
-    UnitTransferFixture, SCRIPT, TEST_HANG_GUARD_SECS,
+    UnitTransferFixture, SCRIPT,
 )
 import transfer_unit
 from rename_state import write_text
 import fake_showrunner
 import fake_unit_host
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS as PROCESS_TIMEOUT
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
 class UnitTransferTests(UnitTransferFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        for slug, checkout in (("demo", self.giving), ("other", self.receiving)):
+            owner = next(row for row in staff.find(kind="showrunner") if row.name == slug)
+            _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", checkout / f"docs/plans/{slug}-production.md"))
+
+    @override
+    def add_destination(self, slug: str) -> Path:
+        doc = super().add_destination(slug)
+        owner = next(row for row in staff.find(kind="showrunner") if row.name == slug)
+        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
+        return doc
+
+    def test_transfer_changes_only_parent_and_preserves_locations_and_config_bytes(self) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.unit), expected=row.worktree)
+        receiving = next(row for row in staff.find(kind="showrunner") if row.name == "other")
+        assert row.parent is not None
+        giving = staff.by_id(row.parent)
+        assert giving is not None
+        parents = tuple(staff.set_doc(parent.id, staff.LiveDoc(
+            "natedev", checkout / "docs/plans" / f"{parent.name}-production.md"))
+            for parent, checkout in ((giving, self.giving), (receiving, self.receiving)))
+        _ = unit_config.write(self.unit, unit_config.UnitConfig(
+            unit_config.PlanFile(Path("docs/plans/alpha.md")), unit_config.AppPort(8123), ("review",)))
+        path = self.unit / ".unit.toml"
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        self.assert_ok(self.transfer("apply"))
+        self.assertEqual(staff.by_id(row.id), replace(row, parent=receiving.id))
+        self.assertEqual(tuple(staff.by_id(parent.id) for parent in parents), parents)
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertTrue(self.unit.is_dir())
+        self.assertEqual(self.git("check-ignore", ".unit.toml", cwd=self.unit), ".unit.toml")
+        self.assert_ok(self.transfer("apply"))
+        self.assertEqual(staff.by_id(row.id), replace(row, parent=receiving.id))
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
     def test_bad_unrelated_record_warns_once_across_move_and_verification(self) -> None:
         self.env['DESIGN_ROLES_STATE'] = str(self.root / 'state/astra/design-roles')
         with mock.patch.dict(os.environ, self.env):
@@ -56,7 +99,8 @@ class UnitTransferTests(UnitTransferFixture):
         row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
         parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "other")
         self.assert_ok(self.transfer("apply"))
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", row.name, parent.id))
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", row.name, parent.id, current_session=row.id,
+                                worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled()))
         self.assertNotIn("alpha-unit", (self.giving / "docs/plans/demo-production.md").read_text())
         self.assertIn("alpha-unit", (self.receiving / "docs/plans/other-production.md").read_text())
         calls = fake_unit_host.calls(self.env)
@@ -65,7 +109,7 @@ class UnitTransferTests(UnitTransferFixture):
         self.assertIn(["--session", "agents", "tab", "rename", "w2:t1", "alpha"], calls)
         messages = self.messages()
         self.assertEqual([command[command.index("--to") + 1] for command in messages],
-                         ["session:sid-alpha", self.showrunner_addresses["demo"], self.showrunner_addresses["other"]])
+                         ["session:5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", self.showrunner_addresses["demo"], self.showrunner_addresses["other"]])
         self.assertTrue(all("alpha-unit" in command[command.index("--text") + 1] for command in messages))
         self.assertFalse(log.exists(), "transfer ran a shutdown command")
         self.assertFalse(any(command[2:4] in (["agent", "start"], ["pane", "close"], ["tab", "create"])
@@ -86,24 +130,25 @@ class UnitTransferTests(UnitTransferFixture):
         _ = staff_move.move_unit("demo", "alpha-unit", "other")
         # The former pane launch can name a retired identity while the resumed
         # receiving pane pins the current row. Only the target selector resolves it.
-        self.pane("w1:p1", session_id="former-session", environment={
-            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit", "STAFF_ID": "s00000000000",
+        self.pane("w1:p1", session_id="689f1253-a9a2-5ce1-974f-0061257d1b36", environment={
+            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit", "CLAUDE_CODE_SESSION_ID": "81f54a2b-5266-5561-9976-2d7e73a96e96",
         })
-        self.pane("w2:p1", session_id="sid-alpha", environment={
-            "SHOWRUNNER_UNIT": "other", "SHOWRUNNER_UNIT_ID": "alpha-unit", "STAFF_ID": row.id,
+        self.pane("w2:p1", session_id="5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", environment={
+            "SHOWRUNNER_UNIT": "other", "SHOWRUNNER_UNIT_ID": "alpha-unit", "CLAUDE_CODE_SESSION_ID": row.id,
         })
         before = self.staff_file.read_bytes()
         planned = self.transfer("plan")
         self.assert_ok(planned)
         self.assertEqual(self.staff_file.read_bytes(), before)
         self.assert_ok(self.transfer("apply"))
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", row.name, parent.id))
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", row.name, parent.id, current_session=row.id,
+                                worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled()))
         self.assertNotIn("alpha-unit", (self.giving / "docs/plans/demo-production.md").read_text())
         self.assertIn("alpha-unit", (self.receiving / "docs/plans/other-production.md").read_text())
         self.assert_ok(self.transfer("verify"))
 
     def test_transfer_completes_when_the_receiving_showrunner_is_not_running(self) -> None:
-        self.remove_showrunner_session("other-showrunner")
+        self.remove_showrunner_session("cc9c5b71-6f71-5499-a4bb-e6ad5d02930d")
         completed = self.transfer("apply")
         self.assert_ok(completed)
         self.assertEqual(completed.stdout.splitlines().count("other is not running: tell it when it starts"), 1)
@@ -127,8 +172,8 @@ class UnitTransferTests(UnitTransferFixture):
         self.assertNotIn("from_address", saved)
         self.assertNotIn("to_address", saved)
         del self.env["TRANSFER_SEND_FAIL_TO"]
-        self.remove_showrunner_session("other-showrunner")
-        address = self.running_showrunner("other", "other-showrunner")
+        self.remove_showrunner_session("cc9c5b71-6f71-5499-a4bb-e6ad5d02930d")
+        address = self.running_showrunner("other", "cc9c5b71-6f71-5499-a4bb-e6ad5d02930d")
         self.assertNotEqual(address, self.showrunner_addresses["other"])
         self.assert_ok(self.transfer("apply"))
         retried = self.messages()
@@ -183,7 +228,7 @@ class UnitTransferTests(UnitTransferFixture):
         path = self.pause_before_source_commit()
         fields = cast(dict[str, object], json.loads(path.read_text()))
         del fields["version"]
-        fields.update(step=3, account="owner@example.com", session_id="sid-alpha")
+        fields.update(step=3, account="owner@example.com", session_id="5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
         self.write(path, json.dumps(fields))
         shutdown_log = self.seed_record()
         self.assert_transfer_resumed(path)
@@ -196,7 +241,8 @@ class UnitTransferTests(UnitTransferFixture):
         staff_id = staff.StaffId(cast(str, fields["staff_id"]))
         renamed = staff.rename(staff_id, "panes")
         parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "demo")
-        replacement = staff.ensure("unit", name="alpha", parent=parent.id)
+        replacement = fixture_member("unit", name="alpha", parent=parent.id,
+                                     runtime_id=fixture_runtime_id("replacement-alpha-backend"))
         self.assert_transfer_resumed(path)
         record = staff.snapshot()
         self.assertEqual(record.by_id(staff_id), renamed)
@@ -207,7 +253,7 @@ class UnitTransferTests(UnitTransferFixture):
         path = self.root / "state/showrunner/demo/transfer_unit.json"
         fields = cast(dict[str, object], json.loads(path.read_text()))
         del fields["version"]
-        fields.update(account="owner@example.com", session_id="sid-alpha")
+        fields.update(account="owner@example.com", session_id="5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
         self.write(path, json.dumps(fields))
         before = final_files(self.root)
         repeated = self.transfer("apply")
@@ -218,16 +264,17 @@ class UnitTransferTests(UnitTransferFixture):
     def test_transfer_keeps_staff_ids_and_workers(self) -> None:
         row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
         parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "other")
-        worker = staff.ensure("worker", name="impl1", parent=row.id)
+        worker = fixture_member("worker", name="impl1", parent=row.id)
         self.assert_ok(self.transfer("apply"))
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id))
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id, current_session=row.id,
+                                worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled()))
         self.assertEqual(staff.snapshot().by_id(worker.id), worker)
         saved = cast(dict[str, object], json.loads((self.root / "state/showrunner/demo/transfer_unit.json").read_text()))
         self.assertEqual(saved["staff_id"], row.id)
 
     def test_taken_staff_name_refuses_before_sources_change(self) -> None:
         parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "other")
-        _ = staff.ensure("unit", name="alpha", parent=parent.id)
+        _ = fixture_member("unit", name="alpha", parent=parent.id)
         before = final_files(self.root)
         failed = self.transfer("apply")
         self.assertEqual(failed.returncode, 2, failed.stderr)
@@ -240,7 +287,7 @@ class UnitTransferTests(UnitTransferFixture):
         self.add_transfer_unit("beta")
         third = self.add_destination("third")
         parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "third")
-        _ = staff.ensure("unit", name="beta", parent=parent.id)
+        _ = fixture_member("unit", name="beta", parent=parent.id)
         before = final_files(self.root)
         messages = self.messages()
         refused = self.transfer("apply", "beta-unit", third)
@@ -254,7 +301,7 @@ class UnitTransferTests(UnitTransferFixture):
 
     def test_missing_staff_member_refuses_before_sources_change(self) -> None:
         row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
-        _ = staff.retire(row.id)
+        self.forget_rows(row.id)
         before = final_files(self.root)
         failed = self.transfer("apply")
         self.assertEqual(failed.returncode, 2, failed.stderr)
@@ -303,7 +350,8 @@ class UnitTransferTests(UnitTransferFixture):
             with mock.patch.object(self, "root", Path(directory)):
                 listener = contexts.enter_context(self.lock_notice(lock))
             def pause(transfer: transfer_unit.UnitTransfer, save: Callable[[], None]) -> None:
-                self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id))
+                self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id, current_session=row.id,
+                                worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled()))
                 process = self.start_script(SOURCES_SCRIPT, "seed")
                 pending.append(process)
                 self.assert_operation_blocks(process, listener)
@@ -315,7 +363,8 @@ class UnitTransferTests(UnitTransferFixture):
                 self.assert_ok(self.transfer("apply"))
             output, errors = pending[0].communicate(timeout=PROCESS_TIMEOUT)
         self.assertEqual(pending[0].returncode, 0, output + errors)
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id))
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id, current_session=row.id,
+                                worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled()))
 
     def test_rerun_finishes_each_uncommitted_document_write(self) -> None:
         snapshot = Path(self.enterContext(tempfile.TemporaryDirectory())) / "before"
@@ -372,7 +421,7 @@ class UnitTransferTests(UnitTransferFixture):
     def test_verify_allows_a_running_session_to_keep_its_original_marks(self) -> None:
         self.moved_unit_with_leftover_marks()
         pid = self.live_pid()
-        old = fake_showrunner.write_session(self.root / "state/sessions", "old", "sid-old", pid)
+        old = fake_showrunner.write_session(self.root / "state/sessions", "old", "66549537-4a24-5327-9a6e-e8eef3edab29", pid)
         self.addCleanup(old.close)
         fake_unit_host.place_process(self.env, pid, "w3:p3Y")
         self.assert_ok(self.transfer("verify"))
@@ -405,7 +454,7 @@ class UnitTransferTests(UnitTransferFixture):
 
     def test_transfer_keeps_a_stopped_record_and_never_restarts_it(self) -> None:
         log = self.seed_record()
-        path = self.root / "home/.local/state/shutdown/owner@example.com/sessions/sid-alpha.json"
+        path = self.root / "home/.local/state/shutdown/owner@example.com/sessions/5ad615f2-4e04-5121-a102-9d6b2e2a6eb3.json"
         before = path.read_bytes()
         result = self.transfer("apply")
         self.assert_ok(result)
@@ -425,7 +474,7 @@ class UnitTransferTests(UnitTransferFixture):
 
         _ = self.seed_record()
         self.assert_ok(self.transfer("apply"))
-        path = self.root / "home/.local/state/shutdown/owner@example.com/sessions/sid-alpha.json"
+        path = self.root / "home/.local/state/shutdown/owner@example.com/sessions/5ad615f2-4e04-5121-a102-9d6b2e2a6eb3.json"
         saved = shutdown_record.parse_session_records(f"[{path.read_text()}]")[0]
         host = saved["session"]["host"]
         assert host["kind"] == "unit"
@@ -433,14 +482,14 @@ class UnitTransferTests(UnitTransferFixture):
         self.assertNotIn("production", host)
         self.assertNotIn("doc", host)
         receiving = self.receiving / "docs/plans/other-production.md"
-        self.assertEqual(staff_sources.unit_parent("alpha-unit", "sid-alpha"),
+        self.assertEqual(staff_sources.unit_parent("alpha-unit", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3"),
                          staff_sources.UnitProduction("other", str(receiving)))
         with (mock.patch.object(restart, "_note_path", return_value=self.root / "restart-note"),
               mock.patch.object(accounts, "account_for_group_launch",
                                 return_value=Account("claude", "owner@example.com", "claude2"))):
             argv = restart._unit_argv(saved)  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(argv[argv.index("--production") + 1], str(receiving))
-        self.assertEqual(argv[argv.index("--resume") + 1], "sid-alpha")
+        self.assertEqual(argv[argv.index("--resume") + 1], "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
 
     def test_plan_lists_the_steps_and_changes_nothing(self) -> None:
         before = self.git("rev-parse", "demo", "other", "demo-alpha")

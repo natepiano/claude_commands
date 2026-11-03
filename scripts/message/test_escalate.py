@@ -16,6 +16,8 @@ from unittest.mock import patch
 import escalate
 import send
 import sessions
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file
 if TYPE_CHECKING:
     from ..whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
 else:
@@ -47,6 +49,8 @@ class EscalateTests(unittest.TestCase):
             **os.environ, "ESCALATE_STATE_DIR": str(self.root / "state"), "LOG": str(self.root / "log"),
             "ESCALATE_SEND": str(self.root / "send.py"), "ESCALATE_NOTIFIER": str(self.root / "notifier.sh"),
         }
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        _ = (self.root / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
 
     def run_script(self, *arguments: str, **environment: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), *arguments], env={**self.environment, **environment},
@@ -306,6 +310,8 @@ class EscalateTests(unittest.TestCase):
 
     def test_due_after_swap_cancels_outgoing_account_without_waiting_for_updater(self) -> None:
         with (patch.dict(os.environ, {"HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root)}),
+              patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
+              patch.object(escalate, "load_settings", return_value={"always": []}),
               patch.object(escalate, "STATE", self.root / "owned holds"),
               patch.object(escalate, "schedule"), patch.object(escalate, "deliver", return_value="") as deliver):
             a = self.select_codex(1)
@@ -343,6 +349,57 @@ class EscalateTests(unittest.TestCase):
             deliver.assert_not_called()
             self.assertEqual({path.name: path.read_text() for path in (escalate.STATE / "held").glob("*.json")}, before)
 
+    def test_unknown_relay_inventory_keeps_the_hold_for_cancellation_retry(self) -> None:
+        with (patch.dict(os.environ, {"HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root)}),
+              patch.object(escalate, "STATE", self.root / "owned holds"),
+              patch.object(escalate, "schedule")):
+            a = self.select_codex(1)
+            _ = escalate.hold("a-window", escalate.SessionPush("codex1", "A low", NoActionRequired(), "note"), owner=a)
+            b = self.select_codex(2)
+            path = escalate.held_path("a-window")
+            saved = path.read_bytes()
+            with (patch.object(staff, "snapshot", side_effect=OSError("fixture lookup failed")),
+                  patch.object(escalate, "load_settings", return_value={"always": ["offline"]}),
+                  patch.object(escalate, "deliver", return_value="") as deliver,
+                  patch.object(subprocess, "run") as send):
+                escalate.reconcile_codex_holds(b.home, b.login)
+                _ = escalate.due(10**12)
+            send.assert_not_called()
+            deliver.assert_not_called()
+            self.assertEqual(path.read_bytes(), saved)
+
+    def test_legacy_codex_hold_waits_for_cancellation_without_delivering(self) -> None:
+        with (patch.dict(os.environ, {"HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root)}),
+              patch.object(escalate, "STATE", self.root / "owned holds"),
+              patch.object(escalate, "schedule"),
+              patch.object(escalate, "typed_at", return_value=0),
+              patch.object(escalate, "load_settings", return_value={"always": ["offline"]}),
+              patch.object(escalate, "deliver", return_value="") as deliver):
+            selected = self.select_codex(1)
+            _ = escalate.hold("five-hour-codex", escalate.SessionPush(
+                "Old Codex", "Old account needs attention", ActionRequired("Select an account.")), minutes=0)
+            _ = escalate.hold("other-tool", escalate.SessionPush(
+                "Other tool", "A distinct question", ActionRequired("Answer the question.")), minutes=0)
+            path = escalate.held_path("five-hour-codex")
+            saved = path.read_bytes()
+            self.assertIsInstance(cast(escalate.HeldMessage, escalate.read(path)).owner, escalate.UnownedHold)
+            with (patch.object(staff, "snapshot", side_effect=OSError("fixture lookup failed")),
+                  patch.object(subprocess, "run") as retire):
+                for attempt in range(3):
+                    escalate.reconcile_codex_holds(selected.home, selected.login)
+                    _ = escalate.due(10**12 + attempt)
+                    self.assertEqual(path.read_bytes(), saved)
+                retire.assert_not_called()
+            self.assertEqual([call.args[1] for call in deliver.call_args_list], ["other-tool"])
+            with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
+                  patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as retire):
+                _ = escalate.due(10**12 + 4)
+            self.assertFalse(path.exists())
+            self.assertEqual(retire.call_count, 1)
+            self.assertEqual(retire.call_args.args[0][2:], [
+                "retire", "--to", "offline", "--from", "quota_alert", "--key", "5-hour Codex"])
+            self.assertEqual(deliver.call_count, 1)
+
     def test_due_retires_outgoing_and_legacy_relays_for_an_offline_recipient(self) -> None:
         with (patch.dict(os.environ, {"HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root)}),
               patch.object(escalate, "STATE", self.root / "owned holds"),
@@ -351,7 +408,7 @@ class EscalateTests(unittest.TestCase):
               patch.object(escalate, "schedule"), patch.object(escalate, "deliver", return_value="") as deliver):
             a = self.select_codex(1)
             for key in ("5-hour codex1", "5-hour Codex", "5-hour Claude"):
-                send.enqueue(send.Message("offline", "quota_alert", "", "low window", key), "offline", datetime.now(timezone.utc))
+                send.enqueue(send.Message("offline", "quota_alert", "", "low window", key, stamp=send.UnavailableSender()), "offline", datetime.now(timezone.utc))
             relay = escalate.HeldRelay(recipient="offline", key="5-hour codex1")
             _ = escalate.hold("a-window", escalate.SessionPush("codex1", "A low", NoActionRequired(), "note"), owner=a, relays=(relay,))
             _ = escalate.hold("five-hour-codex", escalate.SessionPush("legacy", "old low", NoActionRequired(), "note"))
@@ -362,7 +419,7 @@ class EscalateTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, "", "")
             with (patch.object(subprocess, "run", side_effect=retire),
                   patch.object(escalate, "load_settings", return_value={"always": ["offline"]}),
-                  patch.object(escalate, "registered_showrunners", return_value=[])):
+                  patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(()))):
                 _ = escalate.due(10**12)
             deliver.assert_not_called()
             self.assertEqual([item["key"] for item in send.read_queue(send.queue_path("offline"))], ["5-hour Claude"])

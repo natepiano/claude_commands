@@ -579,7 +579,7 @@ describe("accounts pane clock", () => {
   });
 
   for (const surface of ["terminal", "desktop"] as const) {
-    test(`${surface}: an unchanged tick across local midnight redraws resets and read age from the new now`, async ($, on) => {
+    test(`${surface}: an unchanged tick across local midnight redraws resets from the new now`, async ($, on) => {
       const fake = accountsClockHost(on);
       const midnight = Date.UTC(2026, 9, 17, 4, 0);
       await fake.clock.advance(midnight - NOW - 5_000);
@@ -587,12 +587,12 @@ describe("accounts pane clock", () => {
       const ui = await $.ui.mount({ plugin: "unit-board", requestId: "accounts-board", component: "Pane", surface,
         props: { ...props, title: "Accounts", bodyColumns: 120 } });
       const before = drawnText(await ui.drawn()).replace(/\s+/g, " ");
-      expect(before).toContain("account role left resets credits enabled in use read");
-      expect(before).toMatch(/● Fixture workers 60% 23:59 0s\s*$/);
+      expect(before).toContain("account left role busy shell idle total resets credits enabled");
+      expect(before).toMatch(/● Fixture 60% workers 23:59 total 0 0 0\s*$/);
       await fake.clock.advance(10_000);
       const after = drawnText(await ui.drawn()).replace(/\s+/g, " ");
-      expect(after).toContain("account role left resets credits enabled in use read");
-      expect(after).toMatch(/● Fixture workers 60% Fri 23:59 10s\s*$/);
+      expect(after).toContain("account left role busy shell idle total resets credits enabled");
+      expect(after).toMatch(/● Fixture 60% workers Fri 23:59 total 0 0 0\s*$/);
       expect(fake.snapshots.at(-1)?.now).toBe((midnight + 5_000) / 1000);
       expect(fake.processes.length).toBe(1);
       expect(fake.reads).toEqual([]);

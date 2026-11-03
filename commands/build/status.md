@@ -1,5 +1,5 @@
 ---
-description: Show each build target's recorded state; use `--probe` to check the Mac connection.
+description: Show build target status.
 ---
 
 Run `python3 ~/.claude/scripts/build_targets/build_targets.py status` and show its lines unchanged. `$ARGUMENTS` accepts only `--probe`: add it to run `python3 ~/.claude/scripts/build_targets/build_targets.py status --probe`. Without it, this command only reads coordination state. `/build:mac status` instead settles block state and can change it.
