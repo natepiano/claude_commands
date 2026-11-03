@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 from typing import Literal, NotRequired, TypedDict, cast
+from scripts.production import staff
 
 
 class PlanFromRunRecord(TypedDict):
@@ -458,12 +459,43 @@ def _parse_codex_server(value: object, place: str) -> CodexServer:
     }
 
 
+def unit_worktree(session_id: str) -> staff.PresentWorktree | staff.RemovedWorktree | staff.WorktreeUnfilled:
+    """Join a unit or its worker to the unit's staff location."""
+    try:
+        record = staff.snapshot()
+    except staff.StaffUnreadable as error:
+        raise InvalidInventory(f"{session_id}: cannot read the staff folder: {error}") from error
+    row = record.by_member_reference(session_id)
+    if row is None:
+        raise InvalidInventory(f"{session_id}: no staff row for the session")
+    if row.kind == "worker":
+        parent = record.by_id(row.parent) if row.parent is not None else None
+        if parent is None:
+            raise InvalidInventory(f"{session_id}: no staff parent for the worker")
+        row = parent
+    if row.kind != "unit":
+        return staff.WorktreeUnfilled()
+    if isinstance(row.worktree, staff.WorktreeUnfilled):
+        raise InvalidInventory(f"{session_id}: the staff worktree is unavailable")
+    return row.worktree
+
+
 def parse_session(value: object, place: str) -> Session:
     """Validate and return one session from an inventory or shutdown record."""
     data = wire_object(value, place)
     kind = wire_kind(data, place)
     if kind not in {"showrunner", "unit", "worker", "top-level"}:
         raise InvalidInventory(f"{place}.kind is invalid")
+    if kind in {"unit", "worker"}:
+        identity = wire_string(wire_required(data, "session_id", place), f"{place}.session_id")
+        location = unit_worktree(identity)
+        if kind == "unit" and isinstance(location, staff.WorktreeUnfilled):
+            raise InvalidInventory(f"{place}: {identity}: the staff worktree is unavailable")
+        if not isinstance(location, staff.WorktreeUnfilled):
+            data = {**data, "cwd": str(location.path)}
+            checkout = wire_object(wire_required(data, "checkout", place), f"{place}.checkout")
+            if checkout.get("kind") == "git":
+                data["checkout"] = {**checkout, "path": str(location.path)}
     parsed: dict[str, object] = {
         "kind": kind,
         "session_id": wire_string(

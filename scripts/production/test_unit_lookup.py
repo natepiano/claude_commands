@@ -32,7 +32,7 @@ from sessions import SessionRecord
 from unit_lookup import ClaudeNotRunning, ClaudeUnknown, LiveClaude, UnitState
 from scripts.production import staff, session_staff, unit_config
 from scripts.shutdown import remote
-from scripts.production.staff_test_support import isolated_staff_file, unit_membership, showrunner_relationship, fixture_runtime_id, StaffTestCase
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership, showrunner_relationship, fixture_runtime_id, fixture_member, StaffTestCase
 
 SCRIPT = Path(__file__).with_name("unit_lookup.py")
 
@@ -70,7 +70,7 @@ class UnitLookupTests(unittest.TestCase):
     records: Path = Path()
     environment: dict[str, str] = {}
 
-    def test_missing_absolute_plan_folder_cannot_select_an_ancestor_checkout(self) -> None:
+    def test_staff_folder_ignores_a_missing_absolute_plan_folder(self) -> None:
         repository = self.root / "repository"
         repository.mkdir()
         _ = subprocess.run(["git", "init", str(repository)], check=True, capture_output=True,
@@ -78,8 +78,7 @@ class UnitLookupTests(unittest.TestCase):
         row = unit_membership("show", "alpha-unit")
         row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", repository), expected=row.worktree)
         cells = {"Unit": "alpha-unit", "Plan": str(repository / "removed/docs/plan.md")}
-        with self.assertRaisesRegex(staff.StaffUnreadable, "Plan folder is missing"):
-            _ = unit_lookup.plan_worktree(cells, unit_lookup.MemberFound(row))
+        self.assertEqual(unit_lookup.plan_worktree(cells, unit_lookup.MemberFound(row)), repository)
 
     def test_retirement_follows_the_retained_worktree_mark_and_restore_clears_it(self) -> None:
         row = unit_membership("show", "marked-unit")
@@ -956,7 +955,12 @@ print(observed.row.id)
         """Write the record of a /unit:direct run in `worktree`, as the recorder would."""
         runs = self.root / "history/runs"
         runs.mkdir(parents=True, exist_ok=True)
-        events = [{"event_type": "run_started", "working_dir": str(worktree.resolve()), "run_started_at": started},
+        owner = showrunner_relationship("history")
+        row = staff.snapshot().unit_by_worktree("natedev", worktree.resolve())
+        if row is None:
+            row = fixture_member("unit", name="history-" + name, parent=owner.id,
+                                 worktree=staff.PresentWorktree("natedev", worktree.resolve()))
+        events = [{"event_type": "run_started", "main_agent": {"session_id": row.current_session}, "run_started_at": started},
                   *({"event_type": kind} for kind in later)]
         path = runs / f"{name}.jsonl"
         _ = path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
@@ -971,52 +975,82 @@ print(observed.row.id)
         folder.mkdir(parents=True)
         _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"history_file": str(history)}))
         unit_runs.record_director(folder, director)
+        first = cast(dict[str, object], json.loads(history.read_text().splitlines()[0]))
+        agent = cast(dict[str, str], first["main_agent"])
+        source = staff.snapshot().by_member_reference(agent["session_id"])
+        if source is None:
+            source = next(row for row in staff.snapshot().find(kind="unit") if row.name == "history-" + history.stem)
+        row = staff.snapshot().by_member_reference(director)
+        if row is None:
+            _ = staff.update_current_session(staff.StaffId(source.current_session), staff.StaffId(director))
+        elif row.worktree != source.worktree:
+            location = source.worktree
+            assert isinstance(location, staff.PresentWorktree)
+            _ = staff.set_worktree(source.id, staff.RemovedWorktree(location.machine, location.path),
+                                   expected=source.worktree)
+            _ = staff.set_worktree(row.id, location, expected=row.worktree)
+        first["main_agent"] = {"session_id": director}
+        later = history.read_text().splitlines()[1:]
+        _ = history.write_text("\n".join([json.dumps(first), *later]) + "\n")
         return folder
 
-    def test_unfinished_held_run_uses_its_recorded_worktree(self) -> None:
+    def test_run_state_follows_staff_without_a_history_rewrite(self) -> None:
+        old = self.root / "old-folder"
+        history = self.record("staff-run", old, 1.0, "run_finished")
+        before = history.read_bytes(), history.stat().st_mtime_ns
+        row = staff.snapshot().unit_by_worktree("natedev", old)
+        assert row is not None
+        destination = self.root / "staff-folder"
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", destination), expected=row.worktree)
+        current = unit_lookup.read_run_states()
+        self.assertIs(current.state(destination), UnitState.RUN_FINISHED)
+        self.assertIs(current.state(old), UnitState.STANDING_BY)
+        self.assertEqual((history.read_bytes(), history.stat().st_mtime_ns), before)
+
+    def test_unfinished_held_run_uses_the_staff_worktree(self) -> None:
         old = self.record("old-run", self.root / "old", 1.0, "run_finished")
         current = self.record("different-run-id", self.root / "new", 2.0)
-        _ = self.held_folder(old, "staff-director")
-        _ = self.held_folder(current, "staff-director")
+        _ = self.held_folder(old, fixture_runtime_id("staff-director"))
+        _ = self.held_folder(current, fixture_runtime_id("staff-director"))
         with mock.patch.object(Path, "open", autospec=True, side_effect=Path.open) as opened:
             runs = unit_lookup.HeldRunLookup()
-            found = runs.unfinished_held_run("staff-director")
+            found = runs.unfinished_held_run(fixture_runtime_id("staff-director"))
             history_opens = [call for call in opened.call_args_list if call.args[0] in (old, current)]
         # Read the first and last events of different-run-id; stop before old-run.
         self.assertEqual(len(history_opens), 2)
         self.assertIsInstance(found, unit_lookup.HeldRun)
         assert isinstance(found, unit_lookup.HeldRun)
         self.assertEqual((found.path, found.worktree), (current, self.root / "new"))
-        self.assertIs(unit_lookup.read_run_states().state(self.root / "old"), UnitState.RUN_FINISHED)
+        self.assertIs(unit_lookup.read_run_states().state(self.root / "old"), UnitState.STANDING_BY)
         self.assertIsInstance(runs.unfinished_held_run("missing-session"), unit_lookup.NoUnfinishedRun)
         old.unlink()
         current.unlink()
-        self.assertEqual(runs.unfinished_held_run("staff-director"), found)
+        self.assertEqual(runs.unfinished_held_run(fixture_runtime_id("staff-director")), found)
 
     def test_recorded_replacement_director_owns_the_run_even_with_a_stale_marker(self) -> None:
         history = self.record("run", self.root / "tree", 1.0)
         lines = history.read_text().splitlines()
         first = cast(dict[str, object], json.loads(lines[0]))
-        first["main_agent"] = {"session_id": "original"}
+        first["main_agent"] = {"session_id": fixture_runtime_id("original")}
         _ = history.write_text(json.dumps(first) + "\n")
-        folder = self.held_folder(history, "replacement")
+        folder = self.held_folder(history, fixture_runtime_id("replacement"))
         active = self.root / "held/active"
         active.mkdir()
-        _ = (active / "original").write_text(str(folder) + "\n")
+        _ = (active / fixture_runtime_id("original")).write_text(str(folder) + "\n")
         runs = unit_lookup.HeldRunLookup()
-        self.assertIsInstance(runs.unfinished_held_run("replacement"), unit_lookup.HeldRun)
-        self.assertIsInstance(runs.unfinished_held_run("original"), unit_lookup.NoUnfinishedRun)
+        self.assertIsInstance(runs.unfinished_held_run(fixture_runtime_id("replacement")), unit_lookup.HeldRun)
+        self.assertIsInstance(runs.unfinished_held_run(fixture_runtime_id("original")), unit_lookup.NoUnfinishedRun)
 
     def test_held_run_order_skips_finished_marker_and_keeps_an_older_open_run(self) -> None:
         open_run = self.record("open-run", self.root / "tree", 1.0)
         latest = self.record("finished-run", self.root / "tree", 2.0, "run_finished")
-        _ = self.held_folder(open_run, "director")
-        finished_folder = self.held_folder(latest, "director")
+        _ = self.held_folder(open_run, fixture_runtime_id("director"))
+        finished_folder = self.held_folder(latest, fixture_runtime_id("director"))
         active = self.root / "held/active"
         active.mkdir()
-        _ = (active / "director").write_text(str(finished_folder) + "\n")
+        _ = (active / fixture_runtime_id("director")).write_text(str(finished_folder) + "\n")
         runs = unit_lookup.HeldRunLookup()
-        found = runs.unfinished_held_run("director")
+        found = runs.unfinished_held_run(fixture_runtime_id("director"))
         self.assertIsInstance(found, unit_lookup.HeldRun)
         assert isinstance(found, unit_lookup.HeldRun)
         self.assertEqual(found.path, open_run)
@@ -1024,34 +1058,34 @@ print(observed.row.id)
 
     def test_finished_held_run_is_not_eligible(self) -> None:
         history = self.record("finished", self.root / "tree", 1.0, "run_finished")
-        _ = self.held_folder(history, "director")
-        self.assertIsInstance(unit_lookup.HeldRunLookup().unfinished_held_run("director"), unit_lookup.NoUnfinishedRun)
+        _ = self.held_folder(history, fixture_runtime_id("director"))
+        self.assertIsInstance(unit_lookup.HeldRunLookup().unfinished_held_run(fixture_runtime_id("director")), unit_lookup.NoUnfinishedRun)
 
     def test_held_history_read_failures_are_unknown_and_cached(self) -> None:
         history = self.record("run", self.root / "tree", 1.0)
-        _ = self.held_folder(history, "director")
-        for contents in (b"not JSON\n", b"\xff\n", b'{"event_type":"run_started"}\n',
+        _ = self.held_folder(history, fixture_runtime_id("director"))
+        for contents in (b"not JSON\n", b"\xff\n", b'{"event_type":"not_run_started"}\n',
                          b'{"event_type":"run_started","working_dir":"/tree"}\n\xff\n'):
             with self.subTest(contents=contents):
                 _ = history.write_bytes(contents)
                 runs = unit_lookup.HeldRunLookup()
-                found = runs.unfinished_held_run("director")
+                found = runs.unfinished_held_run(fixture_runtime_id("director"))
                 self.assertIsInstance(found, unit_lookup.HeldRunUnknown)
                 assert isinstance(found, unit_lookup.HeldRunUnknown)
                 self.assertEqual(found.path, history)
                 history.unlink()
-                self.assertEqual(runs.unfinished_held_run("director"), found)
-        self.assertIsInstance(unit_lookup.HeldRunLookup().unfinished_held_run("director"), unit_lookup.HeldRunUnknown)
+                self.assertEqual(runs.unfinished_held_run(fixture_runtime_id("director")), found)
+        self.assertIsInstance(unit_lookup.HeldRunLookup().unfinished_held_run(fixture_runtime_id("director")), unit_lookup.HeldRunUnknown)
 
     def test_unfinished_marker_run_precedes_an_alphabetically_earlier_run(self) -> None:
         first = self.record("a-run", self.root / "a-tree", 1.0)
         marked = self.record("z-run", self.root / "z-tree", 2.0)
-        _ = self.held_folder(first, "director")
-        folder = self.held_folder(marked, "director")
+        _ = self.held_folder(first, fixture_runtime_id("director"))
+        folder = self.held_folder(marked, fixture_runtime_id("director"))
         active = self.root / "held/active"
         active.mkdir()
-        _ = (active / "director").write_text(str(folder) + "\n")
-        found = unit_lookup.HeldRunLookup().unfinished_held_run("director")
+        _ = (active / fixture_runtime_id("director")).write_text(str(folder) + "\n")
+        found = unit_lookup.HeldRunLookup().unfinished_held_run(fixture_runtime_id("director"))
         self.assertIsInstance(found, unit_lookup.HeldRun)
         assert isinstance(found, unit_lookup.HeldRun)
         self.assertEqual(found.path, marked)
@@ -1085,7 +1119,8 @@ print(observed.row.id)
         first = path.read_text(encoding="utf-8").strip()
         last = json.dumps({"event_type": "run_finished"})
         _ = path.write_text(first + "\nnot JSON\n[also broken\n" + last + "\n", encoding="utf-8")
-        with mock.patch.object(json, "loads", wraps=json.loads) as parses:
+        with mock.patch.object(unit_lookup, "json", wraps=json) as history_json:
+            parses = cast(mock.MagicMock, history_json.loads)
             self.assertIs(unit_lookup.run_state(tree), UnitState.RUN_FINISHED)
         self.assertEqual(parses.call_args_list, [mock.call(first + "\n"), mock.call(last)])
 

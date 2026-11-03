@@ -10,8 +10,9 @@ from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production import staff
 from scripts.lib import unit_runs  # noqa: E402
-from scripts.production import session_staff, staff  # noqa: E402
+from scripts.production import session_staff  # noqa: E402
 from scripts.shutdown import remote  # noqa: E402
 from scripts.direct.recorder_state import STATE_FILENAME as STATE_FILENAME  # noqa: E402
 
@@ -186,6 +187,33 @@ def run_started_event(path: Path) -> dict[str, object] | None:
     return event
 
 
+def _text(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot) -> dict[str, object]:
+    """Resolve the director's current folder without changing its stored record."""
+    raw_identity = fields.get("main_agent")
+    identity = cast(dict[str, object], raw_identity) if isinstance(raw_identity, dict) else {}
+    session_id = _text(identity.get("session_id")) or _text(fields.get("owner_session"))
+    row = record.by_member_reference(session_id) if session_id else None
+    if row is not None and row.kind == "worker":
+        row = record.by_id(row.parent) if row.parent else None
+    if row is None or row.kind != "unit":
+        return fields
+    previous = _text(fields.get("working_dir"))
+    for key in ("plan_doc", "project_plan_doc"):
+        value = _text(fields.get(key))
+        if previous and value.startswith(previous + "/"):
+            fields[key] = str(Path(value).relative_to(previous))
+    for key in ("working_dir", "worktree"):
+        if key in fields:
+            del fields[key]
+    if not isinstance(row.worktree, staff.WorktreeUnfilled):
+        fields.update(working_dir=str(row.worktree.path), worktree=row.worktree.path.name)
+    return fields
+
+
 def plan_runs(plan_path: Path) -> list[Path]:
     """Return this plan's durable run files, oldest first."""
     target = plan_path.expanduser().resolve()
@@ -193,11 +221,12 @@ def plan_runs(plan_path: Path) -> list[Path]:
         paths = list((history_root() / "runs").glob("*.jsonl"))
     except OSError:
         return []
+    starts = [(path, event) for path in paths if (event := run_started_event(path)) is not None]
+    record = (staff.snapshot() if any(event.get("main_agent") or event.get("owner_session") for _, event in starts)
+              else staff.StaffSnapshot(()))
     matches: list[tuple[float, str, Path]] = []
-    for path in paths:
-        event = run_started_event(path)
-        if event is None:
-            continue
+    for path, event in starts:
+        event = staff_directory(event, record)
         working_dir = event.get("working_dir")
         plan_doc = event.get("plan_doc")
         if not isinstance(working_dir, str) or not isinstance(plan_doc, str):

@@ -60,8 +60,7 @@ class NativeMigrationTests(StaffTestCase):
         target = showrunners.read_bound_source(timer.parent, document).timer.target
         _ = timer.write_text(timer.read_text().replace("TARGET=" + target, "TARGET=session:" + native_owner))
         configuration = unit_config.UnitConfig(unit_config.StandbyPlan(), unit_config.AppPort(8123), ("nightly",),
-            unit_config.RetiredSession("2026-10-31", native_unit,
-                                      unit_config.RecordedStartFolder(self.root / "original"), unit_config.Branch("models")))
+            unit_config.RetiredSession("2026-10-31", native_unit, unit_config.Branch("models")))
         _ = unit_config.write_parked(old_unit, configuration)
         reference = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / "demo" / "rename.json"
         self.write_json(reference, {"old": "former", "new": "demo", "owner": old_owner, "unit": old_unit})

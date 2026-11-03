@@ -86,7 +86,7 @@ def session(session_id: str, name: str, pid: int) -> SessionRecord:
 
 @final
 class RetireUnitTests(unittest.TestCase):
-    def test_retirement_uses_the_plan_worktree_without_a_worktree_column(self) -> None:
+    def test_retirement_uses_the_staff_worktree_without_a_worktree_column(self) -> None:
         plan = self.worktree / "docs/plans/alpha.md"
         plan.parent.mkdir(parents=True, exist_ok=True)
         _ = plan.write_text("# Plan\n")
@@ -96,14 +96,16 @@ class RetireUnitTests(unittest.TestCase):
         _ = git(self.checkout, "merge", "--no-ff", "-m", "Merge the unit plan", "alpha-branch")
         _ = self.doc.write_text(self.doc.read_text().replace("docs/plans/alpha.md", str(plan)))
         director = self.root / "director-folder"
-        _ = git(self.checkout, "worktree", "add", "--detach", str(director), "HEAD")
+        _ = git(self.worktree, "checkout", "--detach")
+        _ = git(self.checkout, "worktree", "add", str(director), "alpha-branch")
         _ = unit_config.write(director, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
                                                              unit_config.AppPort(1), ("scripts",)))
         _ = staff.set_worktree(self.unit_staff_id, staff.PresentWorktree("natedev", director), expected=staff.PresentWorktree("natedev", self.worktree))
         without_worktree_column(self.doc)
         code, output = self.retire()
         self.assertEqual(code, 0, output)
-        self.assertFalse(self.worktree.exists())
+        self.assertFalse(director.exists())
+        self.assertTrue(self.worktree.exists())
         row = staff.snapshot().by_id(self.unit_staff_id)
         self.assertIsNotNone(row)
         assert row is not None
@@ -1440,11 +1442,11 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(bad.read_bytes(), record)
         self.assertTrue(self.worktree.is_dir())
 
-    def test_a_stopped_director_is_found_by_its_newest_interactive_transcript(self) -> None:
+    def test_a_stopped_director_uses_the_staff_session_instead_of_newer_transcripts(self) -> None:
         self.marked = None
         folder = self.config / "projects" / unit_move.project_folder(str(self.worktree))
         folder.mkdir(parents=True, exist_ok=True)
-        for name, entrypoint, mtime in (("older", "cli", 100), (DIRECTOR, "cli", 200), (SEAT, "sdk-cli", 300)):
+        for name, entrypoint, mtime in (("other", "cli", 300), (DIRECTOR, "cli", 200), (SEAT, "sdk-cli", 400)):
             transcript = folder / f"{name}.jsonl"
             _ = transcript.write_text('{"type": "summary"}\n' + json.dumps({"entrypoint": entrypoint, "cwd": str(self.worktree)}) + "\n",
                                       encoding="utf-8")
@@ -1471,40 +1473,44 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.assertIn(f"would stop: Claude session alpha ({DIRECTOR}, pid 4101)", output)
         self.assertNotIn("nothing to stop", output)
-        self.assertIn(f"session {DIRECTOR}, folder {folder})", output)
+        self.assertIn(f"session {DIRECTOR})", output)
+        self.assertNotIn(f", folder {folder}", output)
         self.assertEqual(self.stops(), [])
 
-    def test_retires_the_marked_director_outside_the_worktree_and_records_its_start_folder(self) -> None:
+    def test_retirement_keeps_the_session_id_without_a_folder_copy(self) -> None:
         folder = self.outside_director()
         code, output = self.retire()
         self.assertEqual(code, 0, output)
         self.assertIn(["stop_resume.stop", DIRECTOR], self.calls)
         self.assertEqual(pane_record.read("alpha"), {})
-        self.assertIn(f"session {DIRECTOR}, folder {folder})", self.doc.read_text())
+        self.assertIn(f"session {DIRECTOR})", self.doc.read_text())
+        self.assertNotIn(f", folder {folder}", self.doc.read_text())
         self.assertFalse(self.worktree.exists())
 
-    def test_retired_note_uses_the_folder_holding_a_renamed_directors_transcript(self) -> None:
+    def test_retirement_keeps_the_transcript_in_its_original_folder(self) -> None:
         folder = self.outside_director()
         transcript = self.config / "projects" / unit_move.project_folder(str(folder)) / f"{DIRECTOR}.jsonl"
         old = self.root / "old-checkout"
         _ = transcript.write_text("\n".join(json.dumps({"cwd": str(cwd)})
                                             for cwd in (old, old, folder, folder)) + "\n")
+        before = transcript.read_bytes(), transcript.stat().st_mtime_ns
         code, output = self.retire()
         self.assertEqual(code, 0, output)
-        self.assertIn(f"session {DIRECTOR}, folder {folder})", self.doc.read_text())
+        self.assertIn(f"session {DIRECTOR})", self.doc.read_text())
+        self.assertNotIn(f", folder {folder}", self.doc.read_text())
         self.assertNotIn(str(old), self.doc.read_text())
         self.assertFalse(self.worktree.exists())
+        self.assertEqual((transcript.read_bytes(), transcript.stat().st_mtime_ns), before)
 
-    def test_transcript_without_a_matching_cwd_refuses_retire_before_stopping(self) -> None:
+    def test_retirement_ignores_the_transcript_cwd(self) -> None:
         transcript = self.config / "projects" / unit_move.project_folder(str(self.worktree)) / f"{DIRECTOR}.jsonl"
         _ = transcript.write_text(json.dumps({"cwd": str(self.root / "old-checkout")}) + "\n")
-        before = self.doc.read_bytes()
+        before = transcript.read_bytes(), transcript.stat().st_mtime_ns
         code, output = self.retire()
-        self.assertEqual(code, 1, output)
-        self.assertIn(f"no cwd matching its project folder {transcript.parent.name}", output)
-        self.assertEqual(self.stops(), [])
-        self.assertEqual(self.doc.read_bytes(), before)
-        self.assertTrue(self.worktree.exists())
+        self.assertEqual(code, 0, output)
+        self.assertIn(["stop_resume.stop", DIRECTOR], self.calls)
+        self.assertFalse(self.worktree.exists())
+        self.assertEqual((transcript.read_bytes(), transcript.stat().st_mtime_ns), before)
 
     def test_final_live_mark_prevents_marking_and_removal_including_an_already_retired_row(self) -> None:
         for retired in (False, True):
@@ -1588,7 +1594,8 @@ class RetireUnitTests(unittest.TestCase):
         self.assertIsNone(self.marked)
         code, output = self.retire()
         self.assertEqual(code, 0, output)
-        self.assertIn(f"session {DIRECTOR}, folder {folder})", self.doc.read_text())
+        self.assertIn(f"session {DIRECTOR})", self.doc.read_text())
+        self.assertNotIn(f", folder {folder}", self.doc.read_text())
         self.assertFalse(self.worktree.exists())
         self.assertEqual(len([call for call in self.calls if call == ["stop_resume.stop", DIRECTOR]]), 1)
         self.assertEqual(pane_record.read("alpha"), {})

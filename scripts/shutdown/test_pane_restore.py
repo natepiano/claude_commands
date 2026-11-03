@@ -782,7 +782,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
             moved = self.finished_move_rerun()
         self.assertEqual(moved.returncode, 0, moved.stderr)
         owners = [entry for entry in pane_record.read("agents").values() if entry["session_id"] == self.owner.id]
-        self.assertEqual([(entry["pane_id"], entry["cwd"]) for entry in owners], [("w1:p3", str(self.new_folder))])
+        self.assertEqual([(entry["pane_id"], pane_record.resume_launch(entry)["cwd"]) for entry in owners], [("w1:p3", str(self.new_folder))])
 
 
     def test_restart_replacement_retires_its_old_record_before_a_folder_move(self) -> None:
@@ -832,7 +832,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
             result = self.finished_move_rerun()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("w1:p1", pane_record.read("agents"))
-        self.assertEqual(pane_record.read("agents")["w1:p3"]["cwd"], str(self.new_folder))
+        self.assertEqual(pane_record.resume_launch(pane_record.read("agents")["w1:p3"])["cwd"], str(self.new_folder))
 
 
     def moved_codex(self) -> tuple[FolderMoveBackend, Path]:
@@ -845,7 +845,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         moved = invoke_cli(unit_move, lambda: unit_move.main(arguments), arguments,
                            dict(os.environ), self.checkout)
         self.assertEqual(moved.returncode, 0, moved.stderr)
-        self.assertEqual(pane_record.read("agents")["w1:p1"]["cwd"], str(self.new_folder))
+        self.assertEqual(pane_record.resume_launch(pane_record.read("agents")["w1:p1"])["cwd"], str(self.new_folder))
         backend.live = False
         backend.publish_process_state()
         transcript = backend.config / "sessions/2026/11/02" / f"rollout-{self.owner.current_session}.jsonl"
@@ -962,7 +962,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         launches = [entry for entry in pane_record.read("agents").values()
                     if entry["session_id"] in (self.owner.id, self.owner.current_session)]
         self.assertEqual(len(launches), 1)
-        self.assertEqual((launches[0]["pane_id"], launches[0]["cwd"]), ("w1:p3", str(destination)))
+        self.assertEqual((launches[0]["pane_id"], pane_record.resume_launch(launches[0])["cwd"]), ("w1:p3", str(destination)))
         self.assertTrue((destination / ".git").is_file())
 
     def test_codex_restore_publication_allows_a_second_folder_move(self) -> None:

@@ -530,6 +530,10 @@ class StaffTestCase(unittest.TestCase):
         ]))
         self.register_production(slug, doc)
         production_membership(slug, *units)
+        for unit in units:
+            row = unit_membership(slug, unit)
+            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.source_root / "worktrees" / unit),
+                                   expected=row.worktree)
         # Do not import the checkout's real showrunner registry into the fill.
         registry = self.source_root / "showrunners.json"
         self.write_json(registry, {"always": []})
@@ -598,6 +602,8 @@ class StaffTestCase(unittest.TestCase):
         for unit in units:
             worktree = self.source_root / "worktrees" / unit
             _ = self.fixture_git(repository, "worktree", "remove", str(worktree))
+            row = unit_membership(slug, unit)
+            _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", worktree), expected=row.worktree)
             folder = self.root / "original" / unit
             note = f"(retired 2026-10-31, worktree removed, session session-{unit}, folder {folder}) standby"
             text = "\n".join(line.replace("`standby`", note) if line.startswith(f"| `{unit}` |") else line

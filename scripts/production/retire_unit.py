@@ -1,42 +1,22 @@
 #!/usr/bin/env python3
-"""Retire one unit: stop everything it owns, mark its Units row retired, remove its worktree and branch.
+"""Stop and retire one unit while retaining its staff identity.
 
 Usage: retire_unit.py <slug> <unit> [--dry-run] [--wait-minutes N]
 
-A showrunner runs it through /showrunner:retire_unit. Uncommitted work refuses. Commits the merge
-branch lacks are pushed to origin as refs/retired/<staff id> and confirmed before any removal.
-The retired note keeps that ref and its full tip, alongside the staff id, director session and resume folder.
-The `Project started` line the /unit:direct recorder adds to a plan, alone in its file's diff, is not
-uncommitted work: no person wrote it. Then it stops what the unit owns. It finds each thing by its own record, never by a name pattern:
+Staff supplies the unit folder and session id. Run ownership uses the director's session id.
+Claude transcripts remain in place. The retired note retains the session id and any saved branch ref.
+The parked configuration retains the plan, branch, retirement date, and formatting settings.
 
-- the marked director and each session recorded by the worktree's runs, wherever it works, stop
-  through `stop_resume.stop`, which ends its Claude process, and its
-  pane launch is then forgotten, so pane restore does not bring it back;
-- each run of the worktree that has an app-server stops it and ends its Codex workers
-  (`codex_mesh.py stop`);
-- the build holds of the unit's sessions release, its berth reservations release, and the
-  process of each Mac claim on the worktree stops;
-- the unit's exact pane shell does not block retirement; another process inside the worktree
-  blocks unless its environment proves the recorded session owns it, that session is dead,
-  and the group's worktree, ownership and start times still match before a checked signal.
+Uncommitted work refuses retirement. Unmerged commits remain under a confirmed retirement ref.
+Retirement stops the unit's sessions, workers, build claims, and timers before it removes the worktree.
+A live process or an unreadable liveness check refuses removal. A preview changes no file.
 
-When nothing is left running, the Units row's Plan cell gets "(retired <date>, worktree removed,
-session <id>)", adding ", folder <path>" when its transcript resumes outside the worktree,
-committed on the merge branch. Unmerged work adds ", ref refs/retired/<staff id>, tip <SHA>".
-Only then do the worktree, local branch and origin branch go. The retired ref stays for resume.
-The staff row is retired; resume restores it with the id in the note.
-Shutdown completion and forgetting its restore must succeed; a final liveness and record check
-refuses marking or removal while a known session still runs or its liveness is unreadable.
---dry-run prints each refusal and everything it would stop and remove, and changes nothing.
-
-Exit 0 when the unit is retired; 1 on a refusal or when something still runs (a rerun resumes);
-2 on usage.
+Exit 0 on success, 1 on a refusal or failure, and 2 on invalid arguments.
 """
 from __future__ import annotations
 
 
 import argparse
-import itertools
 import json
 import os
 import re
@@ -421,11 +401,15 @@ def _json(path: Path) -> dict[str, object]:
 
 
 def runs_of(worktree: Path) -> list[Path]:
-    """Every /unit:direct run folder whose history names the worktree."""
+    """Read run ownership through the staff row's session identities."""
+    record = staff.snapshot()
+    owner = record.by_worktree(local_machine(), worktree.resolve())
+    if owner is None:
+        return []
     found: list[Path] = []
     for root in unit_runs.run_roots(os.environ.get("RETIRE_UNIT_RUN_ROOT") or None):
         for folder in sorted(root.iterdir()) if root.is_dir() else ():
-            if folder.name != "active" and _json(folder / unit_runs.STATE_FILE).get("working_dir") == str(worktree):
+            if folder.name != "active" and record.by_member_reference(unit_runs.director(folder)) == owner:
                 found.append(folder)
     return found
 
@@ -546,22 +530,6 @@ def gather(unit: Unit) -> Found:
                  tuple(pid for pid in inside if pid not in known and pid != os.getpid()))
 
 
-def _interactive(transcript: Path) -> bool:
-    """Whether a transcript is an interactive session's; a Claude worker runs with --print."""
-    try:
-        with transcript.open(encoding="utf-8") as lines:
-            for line in itertools.islice(lines, 50):
-                try:
-                    entrypoint = cast(dict[str, object], json.loads(line)).get("entrypoint")
-                except (json.JSONDecodeError, AttributeError):
-                    continue
-                if entrypoint is not None:
-                    return entrypoint == "cli"
-    except OSError:
-        return False
-    return False
-
-
 def marked_director(unit: Unit) -> unit_lookup.LiveClaude | unit_lookup.ClaudeNotRunning:
     try:
         found = unit_lookup.marked_unit(unit.production.slug, unit.name)
@@ -580,71 +548,35 @@ def transcript_locations(session_id: str) -> list[Path]:
                    for path in (directory / "projects").glob(f"*/{session_id}.jsonl")})
 
 
-def transcript_resume_folder(transcript: Path) -> Path:
-    """The first recorded cwd whose project folder still holds this transcript after renames."""
-    with transcript.open(encoding="utf-8") as lines:
-        for line in lines:
-            try:
-                value = cast(object, json.loads(line))
-            except ValueError:
-                continue
-            if isinstance(value, dict):
-                cwd = cast(dict[str, object], value).get("cwd")
-                if isinstance(cwd, str) and cwd:
-                    folder = Path(cwd).expanduser()
-                    if unit_move.project_folder(str(folder)) == transcript.parent.name:
-                        return folder
-    raise Refused(f"transcript {transcript} has no cwd matching its project folder {transcript.parent.name}")
-
-
 def director_resume_folder(session_id: str, *, dependencies: Callable[[Path], None] | None = None) -> Path:
-    transcripts = transcript_locations(session_id)
-    if len(transcripts) != 1:
-        places = ", ".join(str(path.parent) for path in transcripts) or "none"
-        raise Refused(f"no account has the transcript of session {session_id} in exactly one project folder; found: {places}")
+    """Read the resume folder from the session's staff row."""
+    record = staff.snapshot()
     if dependencies is not None:
-        dependencies(transcripts[0])
-    return transcript_resume_folder(transcripts[0])
+        for path in record.inputs:
+            dependencies(Path(path))
+    row = record.by_member_reference(session_id)
+    if row is None or isinstance(row.worktree, staff.WorktreeUnfilled):
+        raise Refused(f"{session_id}: the staff worktree is unavailable")
+    return row.worktree.path
 
 
 def last_session(unit: Unit) -> str:
-    """The marked director, an existing retirement's session, or the newest interactive transcript
-    under the worktree's project folder; empty when none can be found."""
-    marked = marked_director(unit)
-    if isinstance(marked, unit_lookup.LiveClaude):
-        return marked.session_id
-    if unit.retired:
-        for row in production_units.unit_table(unit.production.doc.read_text(encoding="utf-8").splitlines()):
-            if production_units.cell_value(row.get("Unit", "")) == unit.name:
-                saved = re.match(r"^\s*\(retired [^)]*, session ([0-9A-Za-z-]+)(?=,|\))", row.get("Plan", ""))
-                if saved:
-                    return saved[1]
-    launches = [entry for entry in pane_record.launches()
-                if entry["environment"].get("SHOWRUNNER_UNIT_ID") == unit.name and entry["session_id"]]
-    if launches:
-        return max(launches, key=lambda entry: entry["written_at"])["session_id"]
-    return last_interactive_session(unit.worktree)
-
-
-def last_interactive_session(worktree: Path, *, dependencies: Callable[[Path], None] | None = None) -> str:
-    """Recover the newest interactive transcript from this worktree's project folder."""
-    folder = unit_move.project_folder(str(worktree))
-    transcripts: set[Path] = set()
-    for directory in unit_move.config_dirs():
-        project = directory / "projects" / folder
-        if dependencies is not None:
-            dependencies(project)
-        for path in project.glob("*.jsonl"):
-            if dependencies is not None:
-                dependencies(path)
-            if _interactive(path):
-                transcripts.add(path.resolve())
-    return max(transcripts, key=lambda path: path.stat().st_mtime).stem if transcripts else ""
+    """Read the director's conversation from the unit's staff row."""
+    member = unit_lookup.member_sources().member(unit_lookup.UnitMember(unit.production.slug, unit.name), staff.snapshot())
+    if isinstance(member, unit_lookup.NoSuchMember):
+        raise Refused(f"{unit.name}: no staff row")
+    return member.row.current_session
 
 
 def director_session(unit: Unit) -> DirectorSession | NoDirectorSession:
     session_id = last_session(unit)
-    return DirectorSession(session_id, director_resume_folder(session_id)) if session_id else NoDirectorSession()
+    if not session_id:
+        return NoDirectorSession()
+    marked = marked_director(unit)
+    if not transcript_locations(session_id) and not (
+            isinstance(marked, unit_lookup.LiveClaude) and marked.session_id == session_id):
+        return NoDirectorSession()
+    return DirectorSession(session_id, director_resume_folder(session_id))
 
 
 def retired_note(unit: Unit, director: DirectorSession | NoDirectorSession,
@@ -653,8 +585,6 @@ def retired_note(unit: Unit, director: DirectorSession | NoDirectorSession,
     session = ""
     if isinstance(director, DirectorSession):
         session = SESSION_NOTE.format(id=director.session_id)
-        if director.resume_folder.resolve() != unit.worktree.resolve():
-            session += f", folder {director.resume_folder}"
     if isinstance(saved, SavedBranch):
         session += f", ref {saved.ref}, tip {saved.tip}"
     return RETIRED_NOTE.format(date=date, session=session)
@@ -1012,7 +942,7 @@ def prepare_retirement(unit: Unit, row: staff.StaffRow, *, settings: conf.Config
     if not isinstance(director, DirectorSession):
         raise Refused(f"{unit.name}: no recorded director session for retirement")
     return unit_config.RetiredSession(datetime.now(unit.production.zone).strftime("%Y-%m-%d"),
-        director.session_id, unit_config.RecordedStartFolder(director.resume_folder), unit_config.Branch(unit.branch))
+        director.session_id, unit_config.Branch(unit.branch))
 
 
 def retire(unit: Unit, wait_minutes: float, *, settings: conf.ConfigRead,
@@ -1031,9 +961,7 @@ def retire(unit: Unit, wait_minutes: float, *, settings: conf.ConfigRead,
     _ = unit_config.park(member.row.id, location.path, facts)
     saved = preserve_branch(unit, settings=settings)
     pane = unit_move.unit_pane(unit_lookup.marked_unit(unit.production.slug, unit.name), unit.production.slug)
-    if not isinstance(facts.start_folder, unit_config.RecordedStartFolder):
-        raise Refused(f"{unit.name}: parked start folder is missing")
-    director = DirectorSession(facts.session_id, facts.start_folder.path)
+    director = DirectorSession(facts.session_id, location.path)
     session_id = facts.session_id
     found = gather(unit)
     ids = {item["sessionId"] for item in found.claude}

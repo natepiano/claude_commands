@@ -203,7 +203,7 @@ class AddUnitRerunTests(AddUnitTestCase):
         marked = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.LiveClaude("alpha", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/fixture", 1234),
                                        herdr.HerdrPlace("agents", "w1:p1"))
         unit = resume_unit.RetiredUnit(read_production(self.doc), "alpha-unit", self.root / "project-alpha",
-            "build-followups-alpha", "docs/plans/given.md", "62ccbd64-f22e-5647-b20e-7899aa39d766", True, resume_unit.RecordedStartFolder(prior))
+            "build-followups-alpha", "docs/plans/given.md", "62ccbd64-f22e-5647-b20e-7899aa39d766", True)
         before = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
         output = io.StringIO()
 

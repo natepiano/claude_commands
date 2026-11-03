@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import final, override
 
 from scripts.production import staff
-from scripts.production.staff_test_support import fixture_member, isolated_staff_file, recorded_showrunner, without_worktree_column
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file, recorded_showrunner, without_worktree_column
 from scripts.usage.collect import MAC_HOST
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -107,6 +107,17 @@ class UnitRunTests(unittest.TestCase):
         runs = history / "runs"
         runs.mkdir(parents=True, exist_ok=True)
         path = runs / f"{run_id}.jsonl"
+        owner = next(row for row in staff.snapshot().find(kind="showrunner"))
+        for event in events:
+            folder = event.pop("working_dir", None)
+            if event.get("event_type") == "run_started" and isinstance(folder, str):
+                normalized = Path(os.path.normpath(folder))
+                row = staff.snapshot().unit_by_worktree("natedev", normalized)
+                if row is None:
+                    row = fixture_member("unit", name="history-" + run_id, parent=owner.id,
+                                         runtime_id=fixture_runtime_id("history:" + run_id),
+                                         worktree=staff.PresentWorktree("natedev", normalized))
+                event["main_agent"] = {"family": "claude", "session_id": row.current_session}
         _ = path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
         return path
 
@@ -159,6 +170,15 @@ class UnitRunTests(unittest.TestCase):
         self.assertIn("mac", result.stderr)
         self.assertEqual(result.stdout, "")
 
+    def test_run_history_follows_a_staff_folder_change_without_a_record_rewrite(self) -> None:
+        path = self.record(self.history, "staff-run", str(self.worktree), 10)
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "review")
+        destination = self.root / "staff-folder"
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", destination), expected=row.worktree)
+        self.assert_match(self.run_script("--no-mac"), "staff-run", "natedev", 10)
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
     def test_newest_start_wins_over_filename_and_file_modification_time(self) -> None:
         old = self.record(self.history, "zzz-old", str(self.worktree), 10)
         newest = self.record(self.history, "aaa-newest.session", str(self.worktree), 30.25)
@@ -184,7 +204,7 @@ class UnitRunTests(unittest.TestCase):
         _ = self.record(self.history, "decoy", "/other/table", 100)
         self.assert_match(self.run_script("--no-mac"), "staff-run", "natedev", 10)
 
-    def test_run_working_dir_is_normalized_without_resolving_the_filesystem(self) -> None:
+    def test_history_reader_uses_the_staff_folder_without_resolving_the_filesystem(self) -> None:
         _ = self.record(self.history, "matching", str(self.worktree) + "/missing/../", 10)
         self.assert_match(self.run_script("--no-mac"), "matching", "natedev", 10)
 

@@ -11,7 +11,7 @@ import os
 import shlex
 import re
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
 from importlib import import_module
@@ -150,9 +150,7 @@ def _collect(record: staff.StaffSnapshot, sources: _MemberSources) -> staff.Seed
                 # A moved unit can remain in its old Units table. Import never recreates it there.
                 if name in imported_unit_names:
                     continue
-                path_text = production_units.cell_value(unit_cells.get("Worktree", ""))
-                if (not path_text or not Path(path_text).expanduser().is_dir()
-                        or production_units.plan_cell_is_retired(unit_cells.get("Plan", ""))):
+                if production_units.plan_cell_is_retired(unit_cells.get("Plan", "")):
                     continue
                 if len(identities) != 1:
                     _problem(unit, "no unique native session identity for seed")
@@ -1367,27 +1365,10 @@ def _fill_config(cells: dict[str, str]) -> unit_config.UnitConfig:
     return unit_config.UnitConfig(plan, port, duties)
 
 
-def _fill_worktree(row: staff.StaffRow, cells: dict[str, str], machine: str) -> staff.PresentWorktree:
+def _fill_worktree(row: staff.StaffRow) -> staff.PresentWorktree:
     if isinstance(row.worktree, staff.PresentWorktree):
         return row.worktree
-    if isinstance(row.worktree, staff.RemovedWorktree):
-        raise ValueError(f"{row.name}: staff worktree is removed")
-    path_text = production_units.cell_value(cells.get("Worktree", ""))
-    branch = production_units.cell_value(cells.get("Branch", ""))
-    if not path_text or path_text in ("—", "-"):
-        raise ValueError("missing Worktree cell")
-    worktree = Path(path_text).expanduser()
-    if not worktree.is_absolute():
-        raise ValueError("Worktree cell must be absolute")
-    if not branch:
-        raise ValueError("missing Branch cell")
-    actual = _fill_git(worktree, "symbolic-ref", "--quiet", "--short", "HEAD")
-    root = Path(_fill_git(worktree, "rev-parse", "--show-toplevel"))
-    if root.resolve() != worktree.resolve():
-        raise ValueError("Worktree cell is not a git worktree root")
-    if actual != branch:
-        raise ValueError(f"worktree is on branch {actual}, expected {branch}")
-    return staff.PresentWorktree(machine, worktree)
+    raise ValueError(f"{row.name}: the staff worktree is not present")
 
 
 
@@ -1410,73 +1391,27 @@ def _fill_doc_location(document: FillDocument, machine: str) -> staff.LiveDoc:
     return staff.LiveDoc(machine, path)
 
 
-def prepare_retirement(cells: dict[str, str], sources: _MemberSources,
-                       selected: MemberFound | NoSuchMember, slug: str,
-                       *, date: str = "", dependencies: Callable[[Path], None] | None = None) -> unit_config.UnitConfig:
-    """Prepare complete facts using the existing note and transcript readers.
-
-    A missing session uses scoped launch evidence, then the interactive transcripts
-    in the recorded worktree's project folder. A same-name session in another production is not evidence.
-    """
-    # Reuse the transitional note parser and transcript reader without a module cycle.
+def prepare_retirement(cells: dict[str, str], selected: MemberFound | NoSuchMember,
+                       *, date: str = "") -> unit_config.UnitConfig:
+    """Take the retired session identity from its staff row."""
     resume = import_module("scripts.production.resume_unit")
-    retirement = import_module("scripts.production.retire_unit")
     retired_note = cast(re.Pattern[str], resume.RETIRED)
-    session_note = cast(re.Pattern[str], resume.SESSION)
-    resume_folder = cast(Callable[..., Path], retirement.director_resume_folder)
-    refused = cast(type[Exception], retirement.Refused)
-
+    if isinstance(selected, NoSuchMember):
+        raise ValueError("no staff row for retirement")
+    session_id = selected.row.current_session
+    if not session_id:
+        raise ValueError("the staff row has no director session for retirement")
     plan = cells.get("Plan", "")
     note = retired_note.match(plan)
-    session = session_note.match(plan)
     if note is not None:
         date = note[0].strip().removeprefix("(retired ").partition(",")[0].removesuffix(")")
     config = _fill_config({**cells, "Plan": retired_note.sub("", plan)})
-    session_id = session[1] if session is not None else ""
-    if not session_id:
-        name = production_units.cell_value(cells.get("Unit", ""))
-        evidence = [launch for launch in sources.launches
-                    if launch["session_id"] and isinstance(selected, MemberFound)
-                    and launch["session_id"] == selected.row.current_session]
-        if not evidence:
-            evidence = [launch for launch in sources.launches
-                        if launch["session_id"]
-                        and launch["environment"].get("SHOWRUNNER_UNIT") == slug
-                        and launch["environment"].get("SHOWRUNNER_UNIT_ID") == name]
-        identities = {launch["session_id"] for launch in evidence}
-        if len(identities) > 1:
-            raise ValueError("no unique recorded director session for retirement")
-        if identities:
-            session_id = next(iter(identities))
-        else:
-            if isinstance(selected, MemberFound) and not isinstance(selected.row.worktree, staff.WorktreeUnfilled):
-                location = selected.row.worktree
-                if location.machine != remote.local_machine():
-                    raise ValueError(f"staff worktree is on {location.machine}")
-                worktree = location.path
-            else:
-                path_text = production_units.cell_value(cells.get("Worktree", ""))
-                if not path_text or path_text in ("—", "-"):
-                    raise ValueError("missing legacy Worktree cell")
-                worktree = Path(path_text).expanduser()
-            recover = cast(Callable[..., str], retirement.last_interactive_session)
-            session_id = recover(worktree, dependencies=dependencies)
-            if not session_id:
-                raise ValueError("no unique recorded director session for retirement")
     if not date:
         raise ValueError("missing retirement date")
     branch = production_units.cell_value(cells.get("Branch", ""))
     if not branch or branch in ("—", "-"):
         raise ValueError("missing Branch cell")
-    try:
-        if session is not None and session[2]:
-            folder = Path(session[2]).expanduser()
-        else:
-            folder = resume_folder(session_id, dependencies=dependencies)
-    except refused as error:
-        raise ValueError(str(error)) from error
-    return replace(config, retired=unit_config.RetiredSession(
-        date, session_id, unit_config.RecordedStartFolder(folder), unit_config.Branch(branch)))
+    return replace(config, retired=unit_config.RetiredSession(date, session_id, unit_config.Branch(branch)))
 
 
 @dataclass(frozen=True)
@@ -1549,37 +1484,26 @@ def retirement_plan(scan: _FillSources, documents: tuple[FillDocument, ...],
                     continue
                 try:
                     selected = joined.member(UnitMember(slug, name), scan.record)
-                    if isinstance(selected, MemberFound) and isinstance(selected.row.worktree, staff.RemovedWorktree):
-                        location = selected.row.worktree
-                    else:
-                        path_text = production_units.cell_value(cells.get("Worktree", ""))
-                        if not path_text or path_text in ("—", "-"):
-                            raise ValueError("missing Worktree cell")
-                        location = staff.RemovedWorktree(machine, Path(path_text).expanduser())
-                        if (isinstance(selected, MemberFound)
-                                and isinstance(selected.row.worktree, staff.PresentWorktree)
-                                and (selected.row.worktree.machine, selected.row.worktree.path)
-                                != (location.machine, location.path)):
-                            raise ValueError(f"existing worktree {selected.row.worktree!r} conflicts with removed location {location!r}")
+                    if isinstance(selected, NoSuchMember) or isinstance(selected.row.worktree, staff.WorktreeUnfilled):
+                        raise ValueError(f"{name}: the staff worktree is unavailable")
+                    location = staff.RemovedWorktree(selected.row.worktree.machine, selected.row.worktree.path)
                     if location.machine != machine:
                         raise ValueError(f"{name}: staff worktree is on {location.machine}")
                     if location.path.exists():
                         raise ValueError(f"retired worktree still exists: {location.path}")
-                    config = prepare_retirement(cells, joined, selected, slug, dependencies=scan.dependencies)
+                    config = prepare_retirement(cells, selected)
                     repository = Path(_fill_git(document.path.parent, "rev-parse", "--show-toplevel"))
                     config = replace(config, formatting=unit_config.repository_formatting(repository))
-                    needs_publication = True
-                    if isinstance(selected, MemberFound):
-                        parked = unit_config.parked_path(selected.row.id)
-                        scan.dependencies(parked)
-                        current = unit_config.read_parked(selected.row.id, cleanup=False)
-                        if isinstance(current, unit_config.UnitConfig) and current != config:
-                            raise ValueError(f"{parked}: existing parked configuration conflicts with document facts")
-                        if isinstance(current, unit_config.UnitConfig) and isinstance(current.formatting, unit_config.RepositoryTaploConfig):
-                            config = replace(config, formatting=current.formatting)
-                        needs_publication = (selected.row.worktree != location
-                                             or isinstance(current, unit_config.ConfigMissing)
-                                             or (check_format and unit_config.parked_needs_write(selected.row.id, config)))
+                    parked = unit_config.parked_path(selected.row.id)
+                    scan.dependencies(parked)
+                    current = unit_config.read_parked(selected.row.id, cleanup=False)
+                    if isinstance(current, unit_config.UnitConfig) and current != config:
+                        raise ValueError(f"{parked}: existing parked configuration conflicts with document facts")
+                    if isinstance(current, unit_config.UnitConfig) and isinstance(current.formatting, unit_config.RepositoryTaploConfig):
+                        config = replace(config, formatting=current.formatting)
+                    needs_publication = (selected.row.worktree != location
+                                         or isinstance(current, unit_config.ConfigMissing)
+                                         or (check_format and unit_config.parked_needs_write(selected.row.id, config)))
                     candidate = RetiredFillUnit(name, selected, location, config, f"{document.path}:{line}",
                                                needs_publication)
                     previous_unit = units.get(key)
@@ -1666,7 +1590,10 @@ def migration_peer_identities(record: staff.StaffSnapshot) -> tuple[dict[staff.S
             location = row.worktree
             candidates = [entry for entry in peer.entries
                           if entry.machine == location.machine and entry.role == "unit director"
-                          and entry.cwd == str(location.path)]
+                          and ((isinstance(entry.session, roster.ClaudeSession)
+                                and entry.session.session_id == row.current_session)
+                               or (isinstance(entry.thread, roster.CodexThread)
+                                   and entry.thread.thread_id == row.current_session))]
         if candidates:
             entries[row.id] = candidates
     # A worker is proved only by the address of its proved parent, never a global name.
@@ -1702,7 +1629,17 @@ def migration_sources(record: staff.StaffSnapshot) -> tuple[_MemberSources, tupl
     import herdr
     from scripts.shutdown import pane_record
     launches = pane_record.read_strict(herdr.shared_session())
-    permitted = tuple(launch for launch in launches.values() if source_allowed(Path(launch["cwd"])))
+    permitted: list[pane_record.PaneLaunch] = []
+    for launch in launches.values():
+        owner = record.by_member_reference(launch["session_id"])
+        if owner is not None and owner.kind == "worker":
+            owner = record.by_id(owner.parent) if owner.parent else None
+        if owner is not None:
+            location = owner.worktree
+            if not isinstance(location, staff.WorktreeUnfilled) and source_allowed(location.path):
+                permitted.append(launch)
+            elif isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) and source_allowed(owner.doc.path):
+                permitted.append(launch)
     productions: dict[str, showrunners.ShowrunnerSource] = {}
     for row in record.find(kind="showrunner"):
         location = row.doc
@@ -1726,7 +1663,7 @@ def migration_sources(record: staff.StaffSnapshot) -> tuple[_MemberSources, tupl
             productions[slug] = source
         except (OSError, ValueError) as error:
             problems.append(f"{row.id} {row.name}: {error}")
-    return BoundMigrationSources(productions, permitted), tuple(problems)
+    return BoundMigrationSources(productions, tuple(permitted)), tuple(problems)
 
 
 def migration_retirements(record: staff.StaffSnapshot) -> tuple[RetirementPlan, tuple[str, ...]]:
@@ -1843,7 +1780,6 @@ class _LiveFillSources(_FillSources):
             if sessions.running_session(item.record)
         }
         self.row_sessions: dict[staff.StaffId, list[sessions.RegistryObservation]] = {}
-        self.director_folders: dict[staff.StaffId, set[str]] = {}
         self.director_names: dict[staff.StaffId, set[str]] = {}
         self.document_cache: dict[production_units.DocumentSource, str | production_units.DocumentUnavailable] = {}
         # Use the same id-first join as every other membership reader.
@@ -1863,8 +1799,6 @@ class _LiveFillSources(_FillSources):
                 continue
             if isinstance(found, MemberFound):
                 self.row_sessions.setdefault(found.row.id, []).append(self.running[identity])
-                if launch["cwd"]:
-                    self.director_folders.setdefault(found.row.id, set()).add(launch["cwd"])
                 previous_name = environment.get("SHOWRUNNER_UNIT_ID", "")
                 try:
                     previous_name = unit_names.name(previous_name)
@@ -1965,34 +1899,10 @@ class _LiveFillSources(_FillSources):
         return document
 
     def session_worktree(self, row: staff.StaffRow, machine: str) -> staff.PresentWorktree:
-        folders = self.director_folders.get(row.id, set()) - {""}
-        roots: set[Path] = set()
-        for folder in folders:
-            path = Path(folder).expanduser()
-            if not path.is_absolute():
-                continue
-            try:
-                roots.add(Path(_fill_git(path, "rev-parse", "--show-toplevel")))
-            except (OSError, ValueError):
-                continue
-        if len(roots) > 1:
-            raise ValueError("director launches disagree on the working folder: " + ", ".join(map(str, sorted(roots))))
-        if roots:
-            return staff.PresentWorktree(machine, next(iter(roots)))
-        # A native session can recover an existing configuration, but cannot create one from its current folder.
-        current = {item.details.get("cwd", "") for item in self.row_sessions.get(row.id, [])} - {""}
-        if not current:
-            raise ValueError("no verified live session supplies its working folder")
-        if len(current) != 1:
-            raise ValueError("live sessions disagree on the working folder: " + ", ".join(sorted(current)))
-        folder = Path(next(iter(current))).expanduser()
-        if not folder.is_absolute():
-            raise ValueError("live session working folder is not absolute")
-        root = Path(_fill_git(folder, "rev-parse", "--show-toplevel"))
-        self.dependencies(root / ".unit.toml")
-        if row.kind == "unit" and isinstance(unit_config.read(root, cleanup=False), unit_config.ConfigMissing):
-            raise ValueError("no verified director launch supplies its unit worktree")
-        return staff.PresentWorktree(machine, root)
+        location = _fill_worktree(row)
+        if location.machine != machine:
+            raise ValueError(f"staff worktree is on {location.machine}")
+        return location
 
     def session_unit(self, row: staff.StaffRow, machine: str, source: str) -> _LiveUnitFill:
         location = self.session_worktree(row, machine)
@@ -2016,12 +1926,18 @@ class _LiveFillSources(_FillSources):
         if production_units.plan_cell_is_retired(cells.get("Plan", "")):
             return _RetiredUnitDeferred()
         try:
-            location = _fill_worktree(row, cells, selected.source.machine)
+            location = self.session_worktree(row, machine)
+            branch = production_units.cell_value(cells.get("Branch", ""))
+            if not branch:
+                raise ValueError("missing Branch cell")
+            actual = _fill_git(location.path, "symbolic-ref", "--quiet", "--short", "HEAD")
+            root = Path(_fill_git(location.path, "rev-parse", "--show-toplevel"))
+            if root.resolve() != location.path.resolve():
+                raise ValueError("staff worktree is not a git worktree root")
+            if actual != branch:
+                raise ValueError(f"worktree is on branch {actual}, expected {branch}")
         except (OSError, ValueError) as error:
-            try:
-                location = self.session_worktree(row, machine)
-            except (OSError, ValueError) as session_error:
-                raise ValueError(f"{document.path}:{line}: {error}; {session_error}") from session_error
+            raise ValueError(f"{document.path}:{line}: {error}") from error
         try:
             config = _fill_config(cells)
         except ValueError as error:

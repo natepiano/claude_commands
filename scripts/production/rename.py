@@ -102,23 +102,25 @@ def _push_unit_branch(plan: RenamePlan, record: dict[str, object]) -> None:
                           _string(record, "tip"), (plan.merge_branch, plan.branch))
 
 
-def _move_unit_worktree(plan: RenamePlan, record: dict[str, object]) -> None:
+def _move_unit_worktree(plan: RenamePlan, record: dict[str, object], folders: PathMove) -> None:
     member_id = staff.StaffId(_string(record, "staff_id"))
-    source = Path(_string(record, "old_worktree"))
-    destination = Path(_string(record, "new_worktree"))
+    source, destination = folders.source, folders.destination
     git_exclude.require_untracked_ignored(source if source.exists() else destination,
                                           ".unit.toml", planned_pattern="/.unit.toml")
-    unit_move.move_worktree(plan.checkout, _string(record, "old_branch"), _string(record, "new_branch"),
-                            Path(_string(record, "old_worktree")), Path(_string(record, "new_worktree")),
-                            _string(record, "tip"))
-    worktree = Path(_string(record, "new_worktree"))
-    git_exclude.ensure_excluded(worktree, "/.unit.toml")
-    rename_unit.relocate_staff_worktree(member_id, worktree)
+    if source != destination:
+        unit_move.move_worktree(plan.checkout, _string(record, "old_branch"), _string(record, "new_branch"),
+                                source, destination, _string(record, "tip"))
+    git_exclude.ensure_excluded(destination, "/.unit.toml")
+    rename_unit.relocate_staff_worktree(member_id, destination)
 
 
-def _move_unit_configs(record: dict[str, object]) -> None:
-    old, new = Path(_string(record, "old_worktree")), Path(_string(record, "new_worktree"))
-    unit_move.move_configs(str(old), str(new))
+def _move_unit_configs(record: dict[str, object], folders: PathMove) -> None:
+    old, new = folders.source, folders.destination
+    for directory in unit_move.config_dirs():
+        config = (Path.home() / ".claude.json" if directory == Path.home() / ".claude"
+                  else directory / ".claude.json")
+        if config.exists():
+            unit_move.copy_trust(config, str(old), str(new))
     run = unit_move.newest_run(old) or unit_move.newest_run(new)
     if run is not None:
         unit_move.move_run(run, old, new, _string(record, "new_branch"))
@@ -261,6 +263,11 @@ def _save(plan: RenamePlan, completed: tuple[str, ...]) -> None:
     original = fields.copy()
     for key in LOCATION_FIELDS:
         _ = fields.pop(key, None)
+    if "unit_moves" in fields:
+        fields["unit_moves"] = {
+            name: {key: item for key, item in _object(value).items() if key not in {"old_worktree", "new_worktree"}}
+            for name, value in _object(fields["unit_moves"]).items()
+        }
     fields.update({
         "version": 1, "old": plan.old, "new": plan.new, "merge_branch": plan.merge_branch,
         "base": plan.base, "units": list(plan.units), "plans": [_relative(plan, path) for path in plan.plans],
@@ -625,9 +632,6 @@ def _apply(old: str, new: str) -> RenamePlan:
         _preflight(result)
     result.journal.parent.mkdir(parents=True, exist_ok=True)
     with unit_move.production_lock():
-        for slug in {result.old, result.new}:
-            if rename_state.unfinished(rename_state.unit_journal(slug)):
-                raise RenameRefused(f"{slug}: a unit rename is unfinished; finish it first")
         if result.journal.exists():
             fresh = False
             result, completed = _load(result.journal, old, new)
@@ -715,14 +719,11 @@ def _saved_restore(record: dict[str, object]) -> UnitRestore:
                               session_id=_string(restore, "session_id"))
 
 
-def _repoint_unit_restore(_plan: RenamePlan, name: str, record: dict[str, object],
-                          restore: StoppedUnitRestore) -> None:
+def _repoint_unit_restore(name: str, record: dict[str, object],
+                          restore: StoppedUnitRestore, note: str) -> None:
     import herdr
 
-    old, new = _string(record, "old_worktree"), _string(record, "new_worktree")
     branch = _string(record, "new_branch")
-    note = (f"While you were paused the production moved your unit: your worktree is now {new} "
-            f"on branch {branch}. {old} no longer exists; wherever your instructions name it, use {new}.")
     host_names = {herdr.generated_session_name(_string(record, "old_branch")):
                   herdr.generated_session_name(branch)}
 
@@ -730,7 +731,7 @@ def _repoint_unit_restore(_plan: RenamePlan, name: str, record: dict[str, object
         host = saved["session"]["host"]
         if host["kind"] != "unit" or host["unit"] != name:
             raise RenameRefused(f"shutdown record {restore['session_id']} is not {name}'s")
-        rename_unit.repoint_shutdown_worktree(saved, old, new, host_names, note)
+        rename_unit.repoint_shutdown_worktree(saved, host_names, note)
 
     try:
         _ = shutdown_record.update_session(restore["login"], restore["session_id"], change)
@@ -755,19 +756,28 @@ def _prepare_unit(plan: RenamePlan, name: str, row: dict[str, str], members: sta
     new_branch = f"{plan.new}-{stem}"
     if unit_move.branch_tip(plan.checkout, new_branch) or unit_move.remote_tip(plan.checkout, new_branch):
         raise RenameRefused(f"branch {new_branch} already exists")
-    suffix = f"-{plan.old}-{stem}"
-    repository = (worktree.name[:-len(suffix)] if worktree.name.endswith(suffix) else plan.checkout.name)
-    basename = f"{repository}-{plan.new}-{stem}"
-    destination = worktree.with_name(basename)
-    if unit_move.exists(destination):
-        raise RenameRefused(f"destination already exists: {destination}")
     if unit_move.git(worktree, "branch", "--show-current") != branch:
         raise RenameRefused(f"{worktree} is not on {branch}")
     if unit_move.git(plan.checkout, "branch", "--show-current") != plan.branch or _dirty(plan):
         raise RenameRefused(f"showrunner checkout must be clean and on the merge branch {plan.branch}")
-    return {"old_branch": branch, "new_branch": new_branch, "old_worktree": str(worktree),
-            "new_worktree": str(destination), "tip": unit_move.git(worktree, "rev-parse", "HEAD"),
+    return {"old_branch": branch, "new_branch": new_branch, "tip": unit_move.git(worktree, "rev-parse", "HEAD"),
             "base": unit_move.git(plan.checkout, "rev-parse", "HEAD"), "step": 0}
+
+
+def _unit_folders(plan: RenamePlan, record: dict[str, object], members: staff.StaffSnapshot) -> PathMove:
+    """Take the current folder from staff and derive an unfinished move's target."""
+    member = members.by_id(staff.StaffId(_string(record, "staff_id")))
+    if member is None:
+        raise staff.StaffUnreadable("the renamed unit has no staff row")
+    source = unit_lookup.local_worktree(staff_sources.MemberFound(member)).path
+    completed = record.get("step", 0)
+    if ((isinstance(completed, int) and completed >= 2)
+            or (source.is_dir() and unit_move.git(source, "branch", "--show-current") == _string(record, "new_branch"))):
+        return PathMove(source, source)
+    stem = _string(record, "old_branch").removeprefix(plan.old + "-")
+    suffix = f"-{plan.old}-{stem}"
+    repository = source.name[:-len(suffix)] if source.name.endswith(suffix) else plan.checkout.name
+    return PathMove(source, source.with_name(f"{repository}-{plan.new}-{stem}"))
 
 
 def _unit_doc(plan: RenamePlan, name: str, record: dict[str, object]) -> None:
@@ -784,12 +794,12 @@ def _unit_doc(plan: RenamePlan, name: str, record: dict[str, object]) -> None:
             continue
         cells = production_units.row_cells(line)
         if cells and production_units.cell_value(cells[0]) == name:
-            for field, value in (("Worktree", _string(record, "new_worktree")),
+            for field, value in (("Worktree", "—"),
                                  ("Branch", _string(record, "new_branch"))):
                 if field not in headings:
                     continue
                 column = headings.index(field)
-                cells[column] = f"`{value}`"
+                cells[column] = value if field == "Worktree" else f"`{value}`"
             lines[index] = "| " + " | ".join(cells) + " |\n"
             write_text(plan.new_doc, "".join(lines))
             return
@@ -820,10 +830,10 @@ def _commit_unit(plan: RenamePlan, name: str, record: dict[str, object]) -> None
     _ = unit_move.git(plan.checkout, "push", "origin", f"{plan.branch}:refs/heads/{plan.branch}")
 
 
-def _repoint_unit_workers(plan: RenamePlan, name: str, record: dict[str, object], *, dry_run: bool = False) -> None:
+def _repoint_unit_workers(plan: RenamePlan, name: str, record: dict[str, object], folders: PathMove, *, dry_run: bool = False) -> None:
     from scripts.direct import workers
     changes = workers.repoint_unit_worktree(
-        plan.new, name, Path(_string(record, "old_worktree")), Path(_string(record, "new_worktree")),
+        plan.new, name, folders.source, folders.destination,
         _string(record, "new_branch"), from_production=plan.old, dry_run=dry_run)
     for change in changes:
         print(f"{name}: {'would change' if dry_run else 'changed'} {change}")
@@ -866,30 +876,9 @@ def repair_workers(new: str, *, dry_run: bool = False) -> None:
         found = workers.find_moved_unit_runs(units, former)
         for skipped in found.skipped:
             print(skipped)
-        records = _object(journal.get("unit_moves", {}))
-        journaled: set[tuple[str, Path]] = set()
         reported: set[str] = set()
-        for name, raw in sorted(records.items()):
-            record = _object(raw)
-            completed = record.get("step")
-            if type(completed) is not int or completed < 2:
-                continue
-            old = Path(_string(record, "old_worktree"))
-            changes = workers.repoint_unit_worktree(new, name, old, Path(_string(record, "new_worktree")),
-                _string(record, "new_branch"), from_production=former[0] if former else new, dry_run=dry_run)
-            for change in changes:
-                print(f"{name}: {'would change' if dry_run else 'changed'} {change}")
-            if not changes:
-                print(f"{name}: workers have nothing to change")
-            reported.add(name)
-            journaled.add((name, old))
-            if not dry_run and not record.get("workers_repointed", False):
-                record["workers_repointed"] = True
-                write_json(path, journal)
         for move in found.moves:
             name = move.current.unit
-            if (name, move.old) in journaled:
-                continue
             changes = workers.repoint_moved_unit_runs(move, from_production=former[0] if former else new, dry_run=dry_run)
             for change in changes:
                 print(f"{name}: {'would change' if dry_run else 'changed'} {change}")
@@ -941,13 +930,7 @@ def unit(new: str, name: str) -> None:
         completed = record.get("step")
         if type(completed) is not int or not 0 <= completed <= 5:
             raise RenameRefused(f"{name}: invalid unit rename progress")
-        if completed >= 2:
-            current = members.by_id(staff.StaffId(_string(record, "staff_id")))
-            if current is None:
-                raise staff.StaffUnreadable(f"{name}: no retained staff member")
-            location = unit_lookup.local_worktree(staff_sources.MemberFound(current))
-            if not isinstance(location, staff.PresentWorktree) or location.path != Path(_string(record, "new_worktree")):
-                raise RenameRefused(f"{name}: staff worktree differs from the rename record")
+        folders = _unit_folders(result, record, members)
         _retarget_phase_notes(result)
         if completed < 5:
             _stopped_unit(result, name)
@@ -958,22 +941,25 @@ def unit(new: str, name: str) -> None:
             write_json(result.journal, journal)
         if completed < 2:
             _stopped_unit(result, name)
-            _move_unit_worktree(result, record)
+            _move_unit_worktree(result, record, folders)
             record["step"] = 2
             write_json(result.journal, journal)
         if not record.get("workers_repointed", False):
-            _repoint_unit_workers(result, name, record)
+            _repoint_unit_workers(result, name, record, folders)
             record["workers_repointed"] = True
             write_json(result.journal, journal)
         if not record.get("restore_repointed", False):
             if restore["kind"] == "stopped":
-                _repoint_unit_restore(result, name, record, restore)
+                current = staff_sources.member(staff_sources.UnitMember(result.new, name), staff.snapshot())
+                destination = unit_lookup.local_worktree(current).path
+                _repoint_unit_restore(name, record, restore,
+                                      rename_unit.seat_note(folders.source, destination, _string(record, "new_branch")))
             record["restore_repointed"] = True
             write_json(result.journal, journal)
         if completed < 3:
-            _move_unit_configs(record)
+            _move_unit_configs(record, folders)
             _move_held_roles(design_roles.UnitHolder(result.old, name), design_roles.UnitHolder(result.new, name),
-                             _string(record, "old_worktree"), _string(record, "new_worktree"))
+                             str(folders.source), str(folders.destination))
             record["step"] = 3
             write_json(result.journal, journal)
         if completed < 4:
@@ -991,7 +977,7 @@ def unit(new: str, name: str) -> None:
             print(f"relaunch: shutdown.py restart --only {shlex.quote(restore['session_id'])}")
         else:
             print(f"{name} has no shutdown record to relaunch from")
-        print(f"{name} moved to {_string(record, 'new_worktree')}; add_unit writes the herdr mark at next launch")
+        print(f"{name} moved to {folders.destination}; add_unit writes the herdr mark at next launch")
 
 
 def finish(new: str) -> None:

@@ -460,8 +460,7 @@ class PreparedWrapUnit(NamedTuple):
 
 
 def prepare_wrap_units(production: Production, lines: list[str], rows: tuple[UnitRow, ...],
-                       members: tuple[staff_sources.MemberFound | staff_sources.NoSuchMember, ...],
-                       sources: unit_lookup.MemberSources) -> tuple[PreparedWrapUnit, ...]:
+                       members: tuple[staff_sources.MemberFound | staff_sources.NoSuchMember, ...]) -> tuple[PreparedWrapUnit, ...]:
     """Validate all retirement evidence before the first worktree is removed."""
     prepared: list[PreparedWrapUnit] = []
     cells_by_name = {cell_value(cells.get("Unit", "")): cells for cells in unit_table(lines)}
@@ -479,15 +478,15 @@ def prepare_wrap_units(production: Production, lines: list[str], rows: tuple[Uni
         saved = unit_config.read_parked(found.row.id, cleanup=False)
         current = unit_config.read(unit.worktree, cleanup=False)
         if isinstance(saved, unit_config.UnitConfig):
-            if not isinstance(saved.retired, unit_config.RetiredSession) or not isinstance(saved.retired.start_folder, unit_config.RecordedStartFolder):
+            if not isinstance(saved.retired, unit_config.RetiredSession):
                 raise LifecycleStop("retire", "held", f"{unit.name}: parked retirement facts are incomplete")
             config = saved
         else:
             if isinstance(current, unit_config.ConfigMissing):
                 raise LifecycleStop("retire", "held", current.reason)
             try:
-                config = staff_sources.prepare_retirement(cells_by_name[unit.name], sources, found,
-                            production.slug, date=datetime.now(production.zone).date().isoformat())
+                config = staff_sources.prepare_retirement(cells_by_name[unit.name], found,
+                            date=datetime.now(production.zone).date().isoformat())
             except ValueError as error:
                 raise LifecycleStop("retire", "held", str(error)) from error
             config = replace(config, responsibilities=current.responsibilities)
@@ -572,7 +571,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
             if item not in done:
                 raise LifecycleStop("close-out", "held", f'{item} is not recorded done; finish it or get the owner\'s OK, then pass --close-out-done "{item}"')
             report("close-out", "ok", f"{item} (recorded done)")
-    prepared = prepare_wrap_units(production, lines, rows, members, sources)
+    prepared = prepare_wrap_units(production, lines, rows, members)
     tip = checked(production.checkout, "wrap", "rev-parse", "HEAD")
     commit_count = "0"
     if isinstance(status, ProductionRunning):

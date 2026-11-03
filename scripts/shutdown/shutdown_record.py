@@ -25,7 +25,8 @@ from typing import Literal, NotRequired, Protocol, TypedDict, cast, overload
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.shutdown.stop_results import shutdown_state_root
-from session_types import Session, parse_session
+from session_types import Session, parse_session, unit_worktree
+from scripts.production import staff
 from session_types import (
     TimerRestore as TimerRestore,
 )
@@ -389,11 +390,6 @@ class PausedSeat(TypedDict):
     launcher_command: list[str]
 
 
-class CheckoutMove(TypedDict):
-    old: str
-    new: str
-
-
 class OwnerPaneScope(TypedDict):
     """Pane membership verified while this recorded process identity was alive."""
     pid: int
@@ -475,8 +471,6 @@ class SessionShutdown(TypedDict):
     renamed: NotRequired[str]
     # A move stopped the session mid-turn; its last tool call, or "" when the transcript showed none.
     cut_off: NotRequired[str]
-    # Set by `rename.py checkout` for a stopped showrunner: the launch moves its checkout first (restart.move_checkout).
-    checkout_move: NotRequired[CheckoutMove]
 
 
 class RegistrationOwner(TypedDict):
@@ -1052,7 +1046,7 @@ def _write_record(path: Path, record: object) -> None:
     temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            json.dump(record, output, indent=2, sort_keys=True)
+            json.dump(_stored_sessions(record), output, indent=2, sort_keys=True)
             _ = output.write("\n")
             output.flush()
             _ = os.fsync(output.fileno())
@@ -1061,6 +1055,27 @@ def _write_record(path: Path, record: object) -> None:
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+
+
+def _stored_sessions(value: object) -> object:
+    """Keep unit identities in records and read their folders from staff."""
+    if isinstance(value, list):
+        return [_stored_sessions(item) for item in cast(list[object], value)]
+    if not isinstance(value, dict):
+        return value
+    fields = cast(dict[str, object], value)
+    stored = {key: _stored_sessions(item) for key, item in fields.items() if key != "checkout_move"}
+    if fields.get("kind") == "unit" or (
+            fields.get("kind") == "worker" and isinstance(fields.get("session_id"), str)
+            and not isinstance(unit_worktree(cast(str, fields["session_id"])), staff.WorktreeUnfilled)):
+        if "cwd" in stored:
+            del stored["cwd"]
+        checkout = stored.get("checkout")
+        if isinstance(checkout, dict):
+            checkout_fields = cast(dict[str, object], checkout)
+            if "path" in checkout_fields:
+                del checkout_fields["path"]
+    return stored
 
 
 def _existing_account_directory(login: str) -> Path | None:
@@ -1203,10 +1218,6 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
     for field in ("source_label", "why", "renamed", "cut_off"):
         if field in values:
             _ = _string(values[field], f"{place}.{field}")
-    if "checkout_move" in values:
-        move = _mapping(values["checkout_move"], f"{place}.checkout_move")
-        values["checkout_move"] = {key: _string(_required(move, key, f"{place}.checkout_move"), f"{place}.checkout_move.{key}")
-                                   for key in ("old", "new")}
     for field, allowed in (
         ("hold", {"account", "session"}),
         ("force", {"wait for ready", "now"}),

@@ -775,7 +775,7 @@ def _model(session_id: str, config_dir: Path) -> LastModel:
 
 
 def _launcher_command(pid: int) -> list[str]:
-    """Find the nearest live launcher ancestor without flattening argv boundaries."""
+    """Read the nearest live launcher ancestor and preserve argument boundaries."""
     try:
         darwin = {process.pid: process for process in herdr._darwin_processes()} if sys.platform == "darwin" else {}  # pyright: ignore[reportPrivateUsage]
     except (OSError, herdr.HerdrFailure):
@@ -1283,7 +1283,7 @@ def _session_details(record: SessionFile, entry: ListedSession, *, directories: 
         "name": entry.name, "cwd": cwd, "config_dir": str(entry.config_dir),
         "probe": environment.get(PROBE_ENV) == "1", "status": _string(record.get("status"), "unknown"),
         "updated_at": _wire_integer(record.get("updatedAt", 0), "session.updatedAt"),
-        "model": _model(entry.session_id, entry.config_dir), "checkout": _checkout(cwd),
+        "model": _model(entry.session_id, entry.config_dir), "checkout": {"kind": "not a checkout"},
         "run_dirs": [str(directory) for directory in directories],
         "codex_servers": _codex_servers(directories), "timers": timers, "host": host,
         "kind": "top-level" if entry.kind == "unit" and host["kind"] == "unknown" else entry.kind,
@@ -1292,7 +1292,9 @@ def _session_details(record: SessionFile, entry: ListedSession, *, directories: 
         common.update(production=entry.production, doc=entry.doc)
     elif entry.kind == "worker":
         common["owner"] = worker_owner
-    return parse_session(common, "observed session")
+    session = parse_session(common, "observed session")
+    session["checkout"] = _checkout(session["cwd"])
+    return session
 
 
 class MatchingSession(TypedDict):

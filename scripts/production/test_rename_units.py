@@ -18,6 +18,25 @@ from scripts.production.rename_rerun_test_support import final_files
 
 @final
 class ProductionRenameTests(support.ProductionRenameFixture):
+    def test_completed_unit_rename_follows_a_later_staff_folder_without_journal_copies(self) -> None:
+        self.prepare_unit_moves()
+        self.assert_success(self.run_rename("apply"))
+        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
+        moves = cast(dict[str, dict[str, object]], self.journal()["unit_moves"])
+        self.assertNotIn("old_worktree", moves["alpha-unit"])
+        self.assertNotIn("new_worktree", moves["alpha-unit"])
+        original = self.unit_worktree(NEW, "alpha-unit")
+        destination = self.root / "later-staff-folder"
+        _ = self.git("worktree", "move", str(original), str(destination))
+        row = staff.snapshot().by_path(f"{NEW}/alpha")
+        assert row is not None
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", destination), expected=row.worktree)
+        before = final_files(self.root)
+        rerun = self.run_command("unit", NEW, "alpha-unit")
+        self.assert_success(rerun)
+        self.assertIn(str(destination), rerun.stdout)
+        self.assertEqual(final_files(self.root), before)
+
     def test_retry_after_unit_folder_move_updates_the_pinned_row_and_preserves_its_config(self) -> None:
         self.prepare_unit_moves()
         row = staff.snapshot().by_path(f"{OLD}/alpha")
@@ -51,6 +70,9 @@ class ProductionRenameTests(support.ProductionRenameFixture):
     def test_unit_repoints_stopped_restore_and_prints_its_relaunch(self) -> None:
         self.prepare_unit_moves()
         path = self.seed_shutdown_record()
+        original = cast(dict[str, object], json.loads(path.read_text()))
+        original_session = cast(dict[str, object], original["session"])
+        original_plan = cast(dict[str, object], cast(dict[str, object], original_session["host"])["plan"])
         self.assert_success(self.run_rename("apply"))
         result = self.run_command("unit", NEW, "alpha-unit")
         self.assert_success(result)
@@ -61,17 +83,17 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         new = self.unit_worktree(NEW, "alpha-unit")
         self.assertEqual((session["session_id"], session["name"], host["unit"]),
                          (unit_membership(NEW, "alpha-unit").id, "alpha", "alpha-unit"))
-        self.assertEqual(session["cwd"], f"{new}/sub")
-        self.assertEqual(cast(list[dict[str, object]], saved["workers"])[0]["cwd"], f"{new}/worker")
-        self.assertEqual(cast(dict[str, object], host["plan"])["path"], f"{new}/docs/plans/alpha-unit.md")
+        row = unit_membership(NEW, "alpha-unit")
+        self.assertEqual(row.worktree, staff.PresentWorktree("natedev", new))
+        self.assertEqual(host["plan"], original_plan)
         self.assertEqual(host["session_name"], "new-alpha-unit")
         self.assertNotIn("production", host)
         self.assertNotIn("doc", host)
         self.assertEqual(staff_sources.unit_parent("alpha-unit", unit_membership(NEW, "alpha-unit").id),
                          staff_sources.UnitProduction(NEW, str(self.new_doc)))
         worker = cast(list[dict[str, object]], saved["codex_seats"])[0]
-        self.assertEqual(worker["launcher_command"],
-                         ["bash", "/scripts/direct/implement.sh", str(new), f"{new}/prompt.md"])
+        # The saved seat keeps its task command, so resume keeps the task; resume replaces its folder arguments.
+        self.assertEqual(cast(list[str], worker["launcher_command"])[1], "/scripts/direct/implement.sh")
         note = (self.root / "runs/r1/impl.resume-prompt.md").read_text()
         self.assertTrue(note.startswith("Continue the task.\n"))
         self.assertIn(f"your worktree is now {new} on branch new-alpha-unit", note)
@@ -147,7 +169,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(self.git("rev-parse", NEW), branch_tip)
         self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
 
-    def test_unit_moves_punctuated_transcript_paths_and_default_and_named_account_trust(self) -> None:
+    def test_unit_preserves_transcript_paths_and_copies_default_and_named_account_trust(self) -> None:
         self.prepare_unit_moves()
         configs = [self.home / ".claude", self.home / ".claude-other"]
         for directory in configs:
@@ -162,8 +184,8 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assert_unit_moved("alpha-unit")
         old, new = self.unit_worktree(OLD, "alpha-unit"), self.unit_worktree(NEW, "alpha-unit")
         for directory in configs:
-            self.assertFalse((directory / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(old))).exists())
-            self.assertEqual((directory / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(new)) / "session.jsonl").read_text(),
+            self.assertFalse((directory / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(new))).exists())
+            self.assertEqual((directory / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(old)) / "session.jsonl").read_text(),
                              "historical transcript for old\n")
             config = self.home / ".claude.json" if directory == self.home / ".claude" else directory / ".claude.json"
             fields = cast(dict[str, object], json.loads(config.read_text()))

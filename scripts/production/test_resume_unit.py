@@ -192,12 +192,11 @@ class ResumeUnitTests(unittest.TestCase):
         _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree), expected=row.worktree)
         self.retained_config()
 
-    def retained_config(self, *, plan: str = "docs/plans/alpha.md", folder: Path | None = None) -> None:
+    def retained_config(self, *, plan: str = "docs/plans/alpha.md") -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         unit_config.discard_parked(row.id)
         _ = unit_config.write_parked(row.id, unit_config.UnitConfig(unit_config.PlanFile(Path(plan)),
-            unit_config.AppPort(1), ("scripts",), unit_config.RetiredSession("2026-10-20", DIRECTOR,
-                unit_config.RecordedStartFolder(folder or self.worktree), unit_config.Branch("alpha-branch"))))
+            unit_config.AppPort(1), ("scripts",), unit_config.RetiredSession("2026-10-20", DIRECTOR, unit_config.Branch("alpha-branch"))))
 
     def write_row(self, plan: str) -> None:
         _ = self.doc.write_text(
@@ -248,8 +247,7 @@ class ResumeUnitTests(unittest.TestCase):
         row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree), expected=row.worktree)
         saved = unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
             unit_config.AppPort(1), ("scripts",),
-            unit_config.RetiredSession("2026-10-20", DIRECTOR,
-                unit_config.RecordedStartFolder(self.worktree), unit_config.Branch("alpha-branch")))
+            unit_config.RetiredSession("2026-10-20", DIRECTOR, unit_config.Branch("alpha-branch")))
         _ = unit_config.write_parked(row.id, saved)
         parked = unit_config.parked_path(row.id)
         retained = parked.read_bytes(), parked.stat().st_mtime_ns
@@ -696,33 +694,32 @@ class ResumeUnitTests(unittest.TestCase):
         folder = self.root / "original-checkout"
         folder.mkdir()
         self.transcript(self.configs[0], folder)
-        self.retained_config(folder=folder)
         return folder
 
-    def test_folder_note_resumes_in_the_start_folder_and_restores_the_unit_worktree(self) -> None:
+    def test_legacy_folder_note_does_not_override_the_staff_worktree(self) -> None:
         folder = self.external_transcript()
         self.write_row(f"(retired 2026-10-28, worktree removed, session {DIRECTOR}, folder {folder}) `docs/plans/alpha.md` (run done)")
         code, output = self.resume()
         self.assertEqual(code, 0, output)
         self.assertEqual(self.calls, [["add_unit.py", "--production", str(self.doc), "alpha", "--resume", DIRECTOR,
-                                      "--cwd", str(folder), "--plan", "docs/plans/alpha.md"]])
+                                      "--cwd", str(self.worktree), "--plan", "docs/plans/alpha.md"]])
         self.assertTrue(self.worktree.is_dir())
         self.assertIn("| `docs/plans/alpha.md` (run done) |", self.row())
         self.assertNotIn("(retired", self.row())
 
-    def test_older_note_finds_the_original_folder_from_the_transcript(self) -> None:
-        folder = self.external_transcript()
+    def test_resume_finds_the_session_transcript_outside_the_staff_worktree(self) -> None:
+        _ = self.external_transcript()
         code, output = self.resume("--dry-run")
         self.assertEqual(code, 0, output)
         self.assertIn(f"would make: worktree {self.worktree} on alpha-branch", output)
-        self.assertIn(f"--cwd {folder}", output)
+        self.assertIn(f"--cwd {self.worktree}", output)
         self.assertEqual(self.calls, [])
         code, output = self.resume()
         self.assertEqual(code, 0, output)
-        self.assertIn(["--cwd", str(folder)], [call[index:index + 2] for call in self.calls for index in range(len(call) - 1)])
+        self.assertIn(["--cwd", str(self.worktree)], [call[index:index + 2] for call in self.calls for index in range(len(call) - 1)])
         self.assertTrue(self.worktree.is_dir())
 
-    def test_renamed_transcript_resumes_in_its_current_project_folder(self) -> None:
+    def test_renamed_transcript_keeps_the_staff_resume_folder(self) -> None:
         transcript = self.configs[0] / "projects" / unit_move.project_folder(str(self.worktree)) / f"{DIRECTOR}.jsonl"
         old = self.root / "alpha-old-wt"
         _ = transcript.write_text("\n".join(json.dumps({"cwd": str(cwd)})
@@ -736,39 +733,41 @@ class ResumeUnitTests(unittest.TestCase):
         self.assert_resumed(*self.resume())
         self.assertEqual(len(self.calls), 1)
 
-    def test_no_cwd_matches_the_holding_project_folder(self) -> None:
+    def test_resume_ignores_the_transcript_folder_and_recorded_cwd(self) -> None:
         transcript = self.configs[0] / "projects" / unit_move.project_folder(str(self.worktree)) / f"{DIRECTOR}.jsonl"
         _ = transcript.write_text(json.dumps({"cwd": str(self.root / "alpha-old-wt")}) + "\n")
-        before = self.doc.read_bytes()
-        for arguments in (("--dry-run",), ()):
-            with self.subTest(arguments=arguments):
-                code, output = self.resume(*arguments)
-                self.assertEqual(code, 1, output)
-                self.assertIn(f"no cwd matching its project folder {transcript.parent.name}", output)
-                self.assertEqual(self.calls, [])
-                self.assertFalse(self.worktree.exists())
-                self.assertEqual(self.doc.read_bytes(), before)
+        before = transcript.read_bytes(), transcript.stat().st_mtime_ns
+        self.assert_resumed(*self.resume())
+        self.assertEqual((transcript.read_bytes(), transcript.stat().st_mtime_ns), before)
 
-    def test_older_note_refuses_no_transcript_or_two_project_folders(self) -> None:
-        first = self.external_transcript()
-        second = self.root / "another-checkout"
-        self.transcript(self.configs[1], second)
-        before = self.doc.read_bytes()
-        code, output = self.resume()
-        self.assertEqual(code, 1, output)
-        for folder, config in ((first, self.configs[0]), (second, self.configs[1])):
-            self.assertIn(str(config / "projects" / unit_move.project_folder(str(folder))), output)
-        self.assertEqual(self.calls, [])
-        self.assertFalse(self.worktree.exists())
-        self.assertEqual(self.doc.read_bytes(), before)
+    def test_duplicate_transcript_locations_do_not_change_the_staff_resume_folder(self) -> None:
+        _ = self.external_transcript()
+        self.transcript(self.configs[1], self.root / "another-checkout")
+        self.assert_resumed(*self.resume())
+
+    def test_missing_session_transcript_keeps_the_retirement_record(self) -> None:
         for config in self.configs:
             for transcript in (config / "projects").glob(f"*/{DIRECTOR}.jsonl"):
                 transcript.unlink()
+        before = self.doc.read_bytes()
         code, output = self.resume()
         self.assertEqual(code, 1, output)
-        self.assertIn("found: none", output)
+        self.assertIn(f"no account has the transcript of session {DIRECTOR}", output)
         self.assertEqual(self.calls, [])
+        self.assertFalse(self.worktree.exists())
         self.assertEqual(self.doc.read_bytes(), before)
+
+    def test_resume_uses_a_changed_staff_folder_without_rewriting_retirement_facts(self) -> None:
+        row = unit_membership("alpha", "alpha-unit")
+        parked = unit_config.parked_path(row.id)
+        before = parked.read_bytes(), parked.stat().st_mtime_ns
+        destination = self.root / "changed-staff-folder"
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", destination), expected=row.worktree)
+        unit = resume_unit.find_unit("alpha", "alpha-unit")
+        command = resume_unit.launch_command(unit)
+        self.assertEqual(command[command.index("--cwd") + 1], str(destination))
+        self.assertTrue(resume_unit.has_transcript(unit))
+        self.assertEqual((parked.read_bytes(), parked.stat().st_mtime_ns), before)
 
     def test_backtick_plan_keeps_its_retired_note_until_resume_and_preserves_the_raw_plan(self) -> None:
         plan = "`docs/as-built/feature-log.md` (run done)"

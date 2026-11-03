@@ -24,7 +24,9 @@ from typing import TextIO, cast, override
 from unittest.mock import patch
 
 from scripts.production import staff
-from scripts.production.staff_test_support import isolated_staff_file, fixture_member, recorded_showrunner, recorded_unit
+from scripts.production.staff_test_support import (
+    StaffTestCase, fixture_member, isolated_staff_file, recorded_showrunner, recorded_unit,
+)
 from scripts.direct import phase_reservation, phase_table, plan_history, progress_history, recorder_state
 # These regressions check the private verifier's semantic result before wait closure.
 from scripts.direct.progress_history import _supplier_message  # pyright: ignore[reportPrivateUsage]
@@ -85,6 +87,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = (self.root / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
+        _ = fixture_member("showrunner", name="recorder")
         self.history_dir = self.root / "history"
         self.working_dir = self.root / "bevy_hana_rubric"
         self.working_dir.mkdir()
@@ -7736,6 +7739,8 @@ class PublicPhaseHelperTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = fixture_member("showrunner", name="phase-helper")
 
     def test_recorder_helpers_use_public_names_without_private_aliases(self) -> None:
         with patch.dict(os.environ, {"UNIT_NOW_EPOCH": "123.5"}):
@@ -8057,6 +8062,74 @@ class EtaWorkClockTests(unittest.TestCase):
         # Work time: 3600 + grace + 3400 of 3600 + grace + 3600. Wall time read 79%.
         expected = 100.0 * (7_000 + self.grace) / (7_200 + self.grace)
         self.assertAlmostEqual(cast(float, sample["temporal_percent"]), expected, places=3)
+
+
+class StaffProgressHistoryTests(StaffTestCase):
+    def test_plan_history_finds_folderless_runs_after_the_staff_folder_changes(self) -> None:
+        owner = fixture_member("showrunner", name="progress")
+        row = fixture_member("unit", name="progress", parent=owner.id,
+                             worktree=staff.PresentWorktree("natedev", self.root / "first"))
+        runs = self.root / "history/runs"
+        runs.mkdir(parents=True)
+        history = runs / "run.jsonl"
+        events = [
+            {"event_type": "run_started", "main_agent": {"session_id": row.current_session},
+             "plan_doc": "plan.md", "run_started_at": 100},
+            {"event_type": "phase_started", "phase_id": "1", "phase_instance_id": "phase-1",
+             "timestamp_epoch": 110},
+            {"event_type": "phase_finished", "phase_id": "1", "phase_instance_id": "phase-1",
+             "timestamp_epoch": 140, "phase_elapsed_seconds": 30, "status": "completed"},
+        ]
+        _ = history.write_text("".join(json.dumps(event) + "\n" for event in events))
+        before = history.read_bytes()
+        destination = self.root / "second"
+        destination.mkdir()
+        plan = destination / "plan.md"
+        _ = plan.write_text("# Plan\n\n### Phase 1 — History · status: done\n")
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", destination), expected=row.worktree)
+        with patch.dict(os.environ, {"UNIT_HISTORY_DIR": str(runs.parent)}):
+            self.assertEqual(plan_history.plan_runs(plan), [history])
+            record = phase_table.build_plan(plan)
+        phase = record.phases[0]
+        self.assertIsInstance(phase, phase_table.DonePhase)
+        assert isinstance(phase, phase_table.DonePhase)
+        self.assertIsInstance(phase.times, phase_table.CompletedPhaseTiming)
+        assert isinstance(phase.times, phase_table.CompletedPhaseTiming)
+        self.assertEqual(phase.times.seconds, 30)
+        self.assertEqual(history.read_bytes(), before)
+
+    def test_state_and_events_follow_staff_without_rewriting_the_run(self) -> None:
+        owner = fixture_member("showrunner", name="progress")
+        first = self.root / "first"
+        row = fixture_member("unit", name="progress", parent=owner.id,
+                             worktree=staff.PresentWorktree("natedev", first))
+        run = self.root / "run"
+        run.mkdir()
+        history = self.root / "history.jsonl"
+        state: dict[str, object] = {
+            "main_agent": {"session_id": row.current_session},
+            "working_dir": str(first), "worktree": first.name,
+            "plan_doc": str(first / "plan.md"), "history_file": str(history),
+        }
+        write = cast(Callable[[Path, dict[str, object]], None], getattr(progress_history, "_write_state"))
+        read = cast(Callable[[Path], dict[str, object]], getattr(progress_history, "_read_state"))
+        append = cast(Callable[[dict[str, object], dict[str, object]], None],
+                      getattr(progress_history, "_append_event"))
+        write(run, state)
+        append(state, {**state, "event_type": "run_started"})
+        path = run / "progress_history_state.json"
+        for stored in (cast(dict[str, object], json.loads(path.read_text())),
+                       cast(dict[str, object], json.loads(history.read_text()))):
+            self.assertNotIn("working_dir", stored)
+            self.assertNotIn("worktree", stored)
+            self.assertEqual(stored["plan_doc"], "plan.md")
+        before = [(item.read_bytes(), item.stat().st_mtime_ns) for item in (path, history)]
+        destination = self.root / "second"
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", destination), expected=row.worktree)
+        loaded = read(run)
+        self.assertEqual(loaded["working_dir"], str(destination))
+        self.assertEqual(loaded["worktree"], destination.name)
+        self.assertEqual([(item.read_bytes(), item.stat().st_mtime_ns) for item in (path, history)], before)
 
 
 if __name__ == "__main__":

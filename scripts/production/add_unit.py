@@ -30,7 +30,6 @@ sys.path.insert(0, str(SCRIPTS / "message"))
 sys.path.insert(0, str(SCRIPTS / "shutdown"))
 
 import autocompact
-import rename_state
 from scripts.production import showrunners
 import sessions
 import unit_names
@@ -437,7 +436,7 @@ def launch_request(args: argparse.Namespace, *,
 
 def desired_row(request: UnitLaunch, headings: list[str]) -> str:
     """The unit's row in the doc's own columns. A column this script does not fill gets a dash."""
-    cells = {"Unit": request.identity.unit, "Plan": request.plan_cell, "Worktree": str(request.worktree),
+    cells = {"Unit": request.identity.unit, "Plan": request.plan_cell, "Worktree": "—",
              "Branch": request.branch}
     for heading, cell in (("Port", request.port), ("Owns", request.owns)):
         if isinstance(cell, SuppliedCell):
@@ -595,8 +594,6 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
     branch = git(production, "branch", "--show-current").stdout.strip()
     if branch != production.merge_branch:
         raise Refusal(f"Showrunner checkout is not on {production.merge_branch}")
-    if request.unit in rename_state.rename_claim(production.slug):
-        raise Refusal(f"{request.unit} is being renamed; finish it with rename_unit.py apply")
     try:
         _ = production.doc.relative_to(production.checkout)
     except ValueError as error:

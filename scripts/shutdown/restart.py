@@ -1396,7 +1396,7 @@ def _launch_session(
             if supervisor["kind"] == "supervisor":
                 request = relaunch.RelaunchRequest(
                     argv=[herdr.herdr_binary() if sys.platform == "darwin" else "herdr",
-                          "session", "attach", name], cwd=parts.cwd,
+                          "session", "attach", name],
                     environment={}, unset=[],
                     written_at=datetime.now(timezone.utc).isoformat(timespec="seconds"), note=note)
                 if dry_run:
@@ -1890,47 +1890,6 @@ def _folder_exists(folder: str) -> bool:
     return Path(folder).is_dir()
 
 
-class CheckoutMover(Protocol):
-    def move(self, old: Path, new: Path) -> None: ...
-
-
-def _under(path: str, old: str, folder: str) -> str:
-    """`path` with the leading folder `old` replaced by `folder`; any other path as it is."""
-    return folder + path[len(old):] if path == old or path.startswith(old.rstrip("/") + "/") else path
-
-
-def move_checkout(record: SessionShutdown, *, dry_run: bool) -> SessionShutdown:
-    """Move a stopped showrunner's checkout before its launch, as `rename.py checkout` asked
-    (`checkout_move`), and point the record at the folder that holds it: the new one once git moved the
-    worktree, else the old one. A move that fails part way never keeps the session down (showrunner,
-    2026-10-27): the launch goes on in whichever folder holds the checkout."""
-    move = record.get("checkout_move")
-    if move is None or dry_run:
-        return record
-    old, new = move["old"], move["new"]
-    try:
-        cast(CheckoutMover, cast(object, import_module("rename_checkout"))).move(Path(old), Path(new))
-    except Exception as error:
-        print(f"{record['session']['name']}: checkout move {old} -> {new} failed: {' '.join(str(error).splitlines())}")
-    folder = new if (Path(new) / ".git").exists() else old
-
-    def change(saved: SessionShutdown) -> None:
-        _ = saved.pop("checkout_move", None)
-        for session in (saved["session"], *saved["workers"]):
-            fields = cast(dict[str, object], cast(object, session))
-            if isinstance(cwd := fields.get("cwd"), str):
-                fields["cwd"] = _under(cwd, old, folder)
-            for part, key in (("checkout", "path"),):
-                inner = cast(dict[str, object], fields.get(part, {}))
-                if isinstance(value := inner.get(key), str):
-                    inner[key] = _under(value, old, folder)
-
-    try:
-        return recovery_store.update_session(record["login"], record["session"]["session_id"], change)
-    except NoLiveRecord:
-        return record
-
-
 def drop_restore_without_folder(record: SessionShutdown, *, dry_run: bool) -> bool:
     """Refuse a missing checkout visibly, retaining its record for repair."""
     folder = record["session"]["cwd"]
@@ -2397,8 +2356,8 @@ def relaunch_session(
         reason = ""
         try:
             cleanup = stop_resume.stop(current["session"]["session_id"])
-            if isinstance(cleanup, stop_resume.SessionNotFound):
-                # The tab reader proved no pane; registry absence alone cannot prove the saved Claude exited.
+            if isinstance(cleanup, (stop_resume.SessionNotFound, stop_resume.NotRunning)):
+                # Registry absence does not prove that the recorded Claude process exited.
                 observed = _owner_liveness(current["session"])
                 if isinstance(observed, SessionLivenessUnknown):
                     reason = observed.reason
@@ -2844,7 +2803,7 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
     ready_to_launch: list[SessionShutdown] = []
     for saved in eligible:
         try:
-            ready_to_launch.append(move_checkout(saved, dry_run=dry_run))
+            ready_to_launch.append(saved)
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             reason = _error_reason(error)
             progress_line("failed", saved["session"]["name"], reason)

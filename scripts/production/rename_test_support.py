@@ -25,7 +25,7 @@ from scripts.direct import workers
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_unit_host
 from scripts.production import staff, unit_config
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, unit_membership, StaffTestCase, isolated_source_readers
+from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_runtime_id, unit_membership, StaffTestCase, isolated_source_readers
 from scripts.lib.atomic_file import write_text_atomic
 import fake_herdr
 import herdr
@@ -743,7 +743,8 @@ class ProductionRenameFixture(StaffTestCase):
             "host": {"kind": "unit", "production": OLD, "unit": "alpha-unit", "doc": str(self.doc),
                      "session_name": "old-alpha-unit", "session_host": "herdr",
                      "plan": {"kind": "plan", "path": f"{old}/docs/plans/alpha-unit.md"}}}
-        worker = {**session, "session_id": "sid-worker", "name": "worker", "cwd": f"{old}/worker",
+        worker_row = fixture_worker("worker", staff.StaffId(native_session))
+        worker = {**session, "session_id": worker_row.current_session, "name": "worker", "cwd": str(old),
                   "kind": "worker", "host": {"kind": "terminal"},
                   "owner": {"kind": "director", "session_id": native_session}}
         saved: dict[str, object] = {
@@ -802,7 +803,8 @@ class ProductionRenameFixture(StaffTestCase):
                          f"{self.old_tip}\trefs/heads/new-{unit}")
         self.assertIn(f"worktree {new}\n", self.git("worktree", "list", "--porcelain") + "\n")
         row = next(line for line in self.new_doc.read_text().splitlines() if line.startswith(f"| {unit} |"))
-        self.assertIn(f"`{new}`", row)
+        self.assertEqual(unit_membership(NEW, unit).worktree, staff.PresentWorktree("natedev", new))
+        self.assertIn("| — |", row)
         self.assertIn(f"`new-{unit}`", row)
         self.assertNotIn(f"old-{unit}", row)
         self.assertEqual(self.git("status", "--porcelain"), "")

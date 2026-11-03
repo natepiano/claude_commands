@@ -91,27 +91,11 @@ def local_worktree(selected: MemberFound | NoSuchMember) -> staff.PresentWorktre
 
 
 def plan_worktree(cells: dict[str, str], selected: MemberFound | NoSuchMember) -> Path:
-    """Read the branch worktree from the Plan folder, after checking staff ownership."""
+    """Read the unit folder from staff, regardless of the Plan cell."""
     location = local_worktree(selected)
     if isinstance(location, staff.RemovedWorktree):
         raise staff.StaffUnreadable(f"{cells.get('Unit', '')}: staff worktree is removed")
-    plan = cell_value(cells.get("Plan", ""))
-    if not plan or plan in ("—", "-", "standby", "permanent"):
-        raise staff.StaffUnreadable(f"{cells.get('Unit', '')}: Plan folder is unavailable")
-    path = Path(plan).expanduser()
-    if not path.is_absolute():
-        return location.path
-    from scripts.direct.phase_reservation import repository_root
-    try:
-        directory = path if path.is_dir() else path.parent
-        if not directory.is_dir():
-            raise staff.StaffUnreadable(f"{cells.get('Unit', '')}: Plan folder is missing: {directory}")
-        root = repository_root(directory)
-    except (OSError, UnicodeError) as error:
-        raise staff.StaffUnreadable(f"{cells.get('Unit', '')}: cannot read Plan folder: {error}") from error
-    if root is None:
-        raise staff.StaffUnreadable(f"{cells.get('Unit', '')}: Plan folder is outside Git: {path.parent}")
-    return root
+    return location.path
 
 
 class ProductionMembers:
@@ -370,13 +354,13 @@ class HeldRunLookup:
                         first = _event(handle.readline().decode("utf-8"))
                     if first is None or first.get("event_type") != "run_started":
                         raise ValueError("history does not start with run_started")
-                    worktree = first.get("working_dir")
-                    if not isinstance(worktree, str) or not worktree:
-                        raise ValueError("run_started has no worktree")
+                    row = staff.snapshot().by_member_reference(session_id)
+                    if row is None or isinstance(row.worktree, staff.WorktreeUnfilled):
+                        raise ValueError(f"{session_id}: the staff worktree is unavailable")
                     last = _last_event(path)
                     state = (UnitState.RUN_FINISHED if last is not None
                              and last.get("event_type") == "run_finished" else UnitState.RUNNING)
-                    self._histories[path] = HeldRun(path, Path(worktree).expanduser().resolve(), state)
+                    self._histories[path] = HeldRun(path, row.worktree.path, state)
                 except (OSError, UnicodeError, ValueError) as error:
                     self._histories[path] = HeldRunUnknown(path, str(error))
             run = self._histories[path]
@@ -386,7 +370,6 @@ class HeldRunLookup:
 
 
 class RunStates(NamedTuple):
-    # Keep the recorded spelling: unit_move matches working_dir exactly.
     records: dict[str, RunRecord]
 
     def state(self, worktree: Path) -> UnitState:
@@ -430,14 +413,11 @@ def _last_event(path: Path) -> dict[str, object] | None:
 
 
 def read_run_states() -> RunStates:
-    """Snapshot newest runs once: each file's first line, then each newest file's last event.
-
-    Keys keep working_dir as recorded; state() looks up a resolved worktree path. Unreadable
-    records raise OSError, and invalid UTF-8 in the lines read raises UnicodeError.
-    """
+    """Join each run's director to its staff folder and read the newest run state."""
     directory = runs_dir()
     if not directory.exists():
         return RunStates({})
+    record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT
     newest: dict[str, _StartedRun] = {}
     for path in directory.iterdir():
         if path.suffix != ".jsonl":
@@ -446,9 +426,16 @@ def read_run_states() -> RunStates:
             first = _event(handle.readline().decode("utf-8"))
         if first is None or first.get("event_type") != "run_started":
             continue
-        worktree = first.get("working_dir")
-        if not isinstance(worktree, str) or not worktree:
+        agent = first.get("main_agent")
+        identity = cast(dict[str, object], agent).get("session_id") if isinstance(agent, dict) else None
+        if not isinstance(identity, str):
             continue
+        if isinstance(record, session_staff.ReadCurrentStaff):
+            record = staff.snapshot()
+        row = record.by_member_reference(identity)
+        if row is None or isinstance(row.worktree, staff.WorktreeUnfilled):
+            continue
+        worktree = str(row.worktree.path)
         started = first.get("run_started_at")
         at = float(started) if isinstance(started, (int, float)) and not isinstance(started, bool) else 0.0
         if worktree not in newest or at > newest[worktree].at:

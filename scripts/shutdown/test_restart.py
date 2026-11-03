@@ -15,7 +15,6 @@ from scripts.lib.test_names import fixture_names
 from unit_staff_test_support import unit_host, legacy_unit_host
 import copy
 import io
-from types import SimpleNamespace
 import json
 from datetime import datetime, tzinfo
 import os
@@ -42,7 +41,6 @@ import sessions
 import remote_control
 from user_action import ActionRequired
 from push_texts import RenderedPush
-from session_types import GitCheckout
 import restart
 from scripts.shutdown import stop_resume
 import relaunch
@@ -332,6 +330,10 @@ class RestartTests(ShutdownTestCase):
     account = Account("claude", LOGIN, LABEL)
     conversation_lookup = staticmethod(restart._conversation_launch)  # pyright: ignore[reportPrivateUsage]
 
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.unit_rows: dict[str, staff.StaffRow] = {}
+
     def test_showrunner_workspace_comes_from_its_production_document(self) -> None:
         doc = self.root / "slug-production.md"
         _ = doc.write_text("- **Showrunner session:** `production-space`\n")
@@ -492,6 +494,14 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(accounts.setup("claude2"), [])
         _ = (self.root / ".claude2/.claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": LOGIN}}))
         self.configure_groups()
+        self.unit_rows = {}
+        read_staff = staff.snapshot
+
+        def staff_with_units() -> staff.StaffSnapshot:
+            record = read_staff()
+            return replace(record, rows=(*record.rows, *self.unit_rows.values()))
+
+        _ = self.enterContext(patch.object(staff, "snapshot", side_effect=staff_with_units))
         # Existing restart fixtures represent sessions with saved conversations.
         def saved_conversation(session_id: str, config_dir: Path) -> restart.ResumeConversation:
             del config_dir
@@ -544,6 +554,19 @@ class RestartTests(ShutdownTestCase):
 
     def create(self, records: list[SessionShutdown]) -> None:
         for item in records:
+            session = item["session"]
+            if session["kind"] == "unit":
+                record = staff.snapshot()
+                if record.by_member_reference(session["session_id"]) is None:
+                    identity = staff.StaffId(session["session_id"])
+                    self.unit_rows[identity] = staff.StaffRow(
+                        identity, "unit", session["name"], record.find(kind="showrunner")[0].id,
+                        current_session=identity,
+                        worktree=staff.PresentWorktree(item["machine"], Path(session["cwd"])),
+                    )
+                checkout = session["checkout"]
+                if checkout["kind"] == "git":
+                    session["checkout"] = {**checkout, "path": session["cwd"]}
             self.assertTrue(shutdown_record.create_session(item))
 
 
@@ -1570,7 +1593,6 @@ class RestartTests(ShutdownTestCase):
             self.assertNotEqual(Path(source), destination)
             self.assertFalse(destination.exists(), "reader can see only the complete request")
             value = cast(dict[str, object], json.loads(Path(source).read_text()))
-            self.assertEqual(value["cwd"], owner["cwd"])
             published.append(value)
             replace(source, target)
         with (patch.object(inventory, "_process_start", return_value="supervisor-start"),
@@ -1585,6 +1607,7 @@ class RestartTests(ShutdownTestCase):
         argv = cast(list[str], request["argv"])
         self.assertEqual(argv, ["herdr", "session", "attach", "writing"])
         parts = cast(restart.ResumeParts, launch.call_args.args[0])
+        self.assertEqual(parts.cwd, owner["cwd"])
         self.assertEqual(parts.account, restart.MoveResumeAccount("claude3"))
         self.assertEqual(parts.claude_arguments[parts.claude_arguments.index("--model") + 1], "opus")
         self.assertEqual(parts.opening_prompt, script_prompt("resume this work"))
@@ -1868,11 +1891,12 @@ class RestartTests(ShutdownTestCase):
         server.assert_called_once_with("writing", 90_000)
         request = cast(relaunch.RelaunchRequest, json.loads(relaunch.request_path(902).read_text()))
         self.assertEqual(request["argv"], [str(self.root / "fake-herdr"), "session", "attach", "writing"])
-        self.assertEqual(request["cwd"], owner["cwd"])
         self.assertEqual(request["environment"], {})
         self.assertEqual(request["unset"], [])
         self.assertEqual(self.desktop_state.started_windows, 0)
         calls = self.herdr_calls(log)
+        opened = next(row for row in calls if row[2:4] == ["workspace", "create"])
+        self.assertEqual(opened[opened.index("--cwd") + 1], owner["cwd"])
         self.assertEqual(len([row for row in calls if row[2:4] == ["agent", "start"]]), 1)
         self.assertEqual([row for row in calls if row[2:4] == ["agent", "prompt"]],
             [["--session", "writing", "agent", "prompt", "w2:p1", script_prompt(prompt)]])
@@ -3097,31 +3121,6 @@ class RestartTests(ShutdownTestCase):
                 self.assertIsInstance(trust, herdr.Untrusted if dry_run else herdr.Trusted)
 
 
-    def test_a_checkout_move_that_fails_launches_in_whichever_folder_holds_the_checkout(self) -> None:
-        old, new = self.root / "demo-old-trunk", self.root / "demo-new-trunk"
-        for moved in (False, True):
-            with self.subTest(moved=moved), patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / f"move-{moved}")}):
-                old.mkdir(exist_ok=True)
-                saved = entry(top_level("mover", name="natedev", cwd=str(old)))
-                saved["checkout_move"] = {"old": str(old), "new": str(new)}
-                checkout: GitCheckout = {"kind": "git", "path": str(old), "head": {"kind": "branch", "name": "trunk"},
-                                         "upstream": {"kind": "no upstream"}, "dirty": []}
-                saved["session"]["checkout"] = checkout
-                self.create([saved])
-
-                def fail(_old: Path, _new: Path, moved: bool = moved) -> None:
-                    if moved:
-                        (new / ".git").mkdir(parents=True, exist_ok=True)
-                    raise RuntimeError("trust copy refused")
-
-                mover = SimpleNamespace(move=fail)
-                with patch.object(restart, "import_module", return_value=mover), redirect_stdout(io.StringIO()) as output:
-                    updated = restart.move_checkout(saved, dry_run=False)
-                self.assertEqual(updated["session"]["cwd"], str(new if moved else old))
-                self.assertEqual(updated["session"]["checkout"].get("path"), str(new if moved else old))
-                self.assertNotIn("checkout_move", updated)
-                self.assertEqual(shutdown_record.session_records(LOGIN)[0]["session"]["cwd"], str(new if moved else old))
-                self.assertIn("checkout move", output.getvalue())
 
     def test_a_restore_whose_folder_is_gone_fails_and_keeps_its_record_and_hold(self) -> None:
         for dry_run, host in ((dry_run, host) for dry_run in (True, False) for host in (
@@ -5588,7 +5587,7 @@ class RestartTests(ShutdownTestCase):
                       patch.object(restart, "_live_session_ids", return_value=frozenset()),
                       patch.object(pane_record, "seed"),
                       patch.object(pane_record, "read", return_value={}),
-                      patch.object(herdr.Herdr, "panes", return_value=[]) as panes,
+                      patch.object(herdr.Herdr, "panes", return_value=[]),
                       patch.object(sessions, "session_liveness", return_value=restart.SessionNotLive()),
                       patch.object(sessions, "process_liveness", return_value=observed) as process,
                       patch.object(restart, "_launch_session", return_value=restart.SessionLaunched(SUBMITTED_PROMPT)) as launch):
@@ -5602,7 +5601,6 @@ class RestartTests(ShutdownTestCase):
                     launch.assert_not_called()
                     self.assertEqual(current["progress"]["kind"], "restart failed")
                     self.assertEqual(current["stop_issues"], saved["stop_issues"])
-                panes.assert_called_once()
 
     def test_unconfirmed_cleanup_prevents_launch_and_timer_restore(self) -> None:
         saved = self.unit_with_unconfirmed_cleanup(TimerRestore(instance="timer", was_enabled=True))

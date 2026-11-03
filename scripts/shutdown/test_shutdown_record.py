@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from unit_staff_test_support import unit_host
 import fcntl
 import json
 import os
@@ -19,9 +18,14 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from unittest.mock import Mock, patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from unit_staff_test_support import unit_host
 from test_support import ShutdownTestCase
 import inventory
 import shutdown_record as shutdown_store
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_worker
 
 
 # Hang guard: natedev reached load 136 on 2026-10-29; scheduling delays are not failures.
@@ -220,9 +224,13 @@ def account_hold(login: str = "owner@example.com") -> shutdown_store.AccountHold
 
 
 def owned_worker(owner: str = "session-1") -> inventory.WorkerSession:
+    runner = fixture_member("showrunner", name="record-tests")
+    parent = fixture_member("unit", name="worker-owner", parent=runner.id,
+                            worktree=staff.PresentWorktree("natedev", Path(os.environ["SHUTDOWN_STATE_DIR"]) / "worker"))
+    row = fixture_worker("worker", parent.id)
     return inventory.WorkerSession(
-        kind="worker", probe=False, session_id="worker-1", pid=20001, proc_start="worker-start",
-        name="worker", cwd="/tmp/worker", status="idle", updated_at=0,
+        kind="worker", probe=False, session_id=row.current_session, pid=20001, proc_start="worker-start",
+        name="worker", cwd=str(parent.worktree.path) if isinstance(parent.worktree, staff.PresentWorktree) else "", status="idle", updated_at=0,
         model=inventory.NoReplyYet(kind="no reply yet"),
         checkout=inventory.NotACheckout(kind="not a checkout"),
         run_dirs=[], codex_servers=[], timers=[], host=inventory.UnknownHost(kind="unknown"),
@@ -244,6 +252,45 @@ class SessionRecordTests(ShutdownTestCase):
             "HOME": str(self.root), "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
         })))
         del context
+
+    def unit_row(self) -> staff.StaffRow:
+        runner = fixture_member("showrunner", name="record-tests")
+        return fixture_member("unit", name="one", parent=runner.id,
+                              worktree=staff.PresentWorktree("natedev", Path(session()["cwd"])))
+
+    def test_unit_and_worker_records_follow_staff_without_a_record_rewrite(self) -> None:
+        row = self.unit_row()
+        owner = cast(inventory.UnitSession, cast(object, {**session(), "kind": "unit",
+                     "session_id": row.current_session,
+                     "host": unit_host(kind="unit", production="record-tests", unit="one", doc=str(self.root / "production.md"),
+                                       session_name="one", session_host="herdr",
+                                       plan=inventory.NoRunRecord(kind="no run record"))}))
+        worker_row = fixture_worker("reader", row.id)
+        worker = owned_worker(owner["session_id"])
+        worker["session_id"] = worker_row.current_session
+        worker["cwd"] = owner["cwd"]
+        owner["checkout"] = inventory.GitCheckout(kind="git", path=owner["cwd"], head=inventory.OnBranch(kind="branch", name="topic"),
+                                                   upstream=inventory.NoUpstream(kind="no upstream"), dirty=[])
+        saved = session_shutdown()
+        saved["session"], saved["workers"] = owner, [worker]
+        self.assertTrue(shutdown_store.create_session(saved))
+        path = self.directory / "sessions" / f"{row.current_session}.json"
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        stored_owner = cast(dict[str, object], fields["session"])
+        self.assertNotIn("cwd", stored_owner)
+        self.assertNotIn("path", cast(dict[str, object], stored_owner["checkout"]))
+        self.assertNotIn("cwd", cast(list[dict[str, object]], fields["workers"])[0])
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        destination = self.root / "staff-folder"
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", destination), expected=row.worktree)
+        loaded = shutdown_store.find_session(saved["login"], row.current_session)
+        assert loaded is not None
+        self.assertEqual(loaded["session"]["cwd"], str(destination))
+        self.assertEqual(loaded["session"]["checkout"], inventory.GitCheckout(kind="git", path=str(destination),
+                         head=inventory.OnBranch(kind="branch", name="topic"),
+                         upstream=inventory.NoUpstream(kind="no upstream"), dirty=[]))
+        self.assertEqual(loaded["workers"][0]["cwd"], str(destination))
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
     def test_legacy_not_ready_failure_recovers_at_every_record_read_boundary(self) -> None:
         for index, progress in enumerate(("waiting", "ready", "held by usage limit")):
@@ -562,14 +609,14 @@ class SessionRecordTests(ShutdownTestCase):
                     saved = session_shutdown()
                     document = cast(dict[str, object], json.loads(json.dumps(saved)))
                     wire_session = cast(dict[str, object], document["session"])
-                    wire_session.update(kind="unit", host=host)
+                    wire_session.update(kind="unit", host=host, session_id=self.unit_row().current_session)
                     expected = {"kind": "legacy tmux unit", "unit": "one", "session_name": "unit-session"}
                     parsed = shutdown_store.parse_session_records(json.dumps([document]))[0]
                     self.assertEqual(parsed["session"]["host"], expected)
-                    path = self.directory / "sessions/session-1.json"
+                    path = self.directory / "sessions" / f"{wire_session["session_id"]}.json"
                     path.parent.mkdir(parents=True, exist_ok=True)
                     _ = path.write_text(json.dumps(document))
-                    self.assertEqual(shutdown_store.find_session(saved["login"], "session-1"), parsed)
+                    self.assertEqual(shutdown_store.find_session(saved["login"], str(wire_session["session_id"])), parsed)
 
     def test_old_tmux_hosts_normalize_in_records(self) -> None:
         saved = session_shutdown()
@@ -595,12 +642,12 @@ class SessionRecordTests(ShutdownTestCase):
     def test_herdr_unit_transport_round_trips_through_the_record_store(self) -> None:
         saved = session_shutdown()
         saved["session"] = cast(inventory.UnitSession, cast(object, {
-            **session(), "kind": "unit", "host": unit_host(kind="unit", production="build", unit="one",
+            **session(), "kind": "unit", "session_id": self.unit_row().current_session, "host": unit_host(kind="unit", production="build", unit="one",
                 doc="/tmp/build.md", session_name="herdr-unit", session_host="herdr",
                 plan=inventory.NoRunRecord(kind="no run record")),
         }))
         self.assertTrue(shutdown_store.create_session(saved))
-        self.assertEqual(shutdown_store.find_session(saved["login"], "session-1"), saved)
+        self.assertEqual(shutdown_store.find_session(saved["login"], saved["session"]["session_id"]), saved)
         self.assertEqual(shutdown_store.parse_session_records(json.dumps([saved])), [saved])
 
     def test_unit_host_rejects_invalid_transport_instead_of_defaulting_to_tmux(self) -> None:
@@ -610,6 +657,7 @@ class SessionRecordTests(ShutdownTestCase):
                 document = cast(dict[str, object], json.loads(json.dumps(saved)))
                 wire_session = cast(dict[str, object], document["session"])
                 wire_session["kind"] = "unit"
+                wire_session["session_id"] = self.unit_row().current_session
                 wire_session["host"] = {
                     "kind": "unit", "production": "build", "unit": "one", "doc": "/tmp/build.md",
                     "session_name": "unit", "session_host": transport, "plan": {"kind": "no run record"},
@@ -622,6 +670,7 @@ class SessionRecordTests(ShutdownTestCase):
         document = cast(dict[str, object], json.loads(json.dumps(saved)))
         wire_session = cast(dict[str, object], document["session"])
         wire_session["kind"] = "unit"
+        wire_session["session_id"] = self.unit_row().current_session
         wire_session["host"] = {
             "kind": "unit", "production": "build", "unit": "one", "doc": "/tmp/build.md",
             "session_name": "new", "tmux_session": "old", "plan": {"kind": "no run record"},
@@ -1270,7 +1319,9 @@ class SessionRecordTests(ShutdownTestCase):
         slot = shutdown_record(progress=shutdown_store.SessionWaiting(kind="waiting"))
         slot_worker = entry(number=9)
         worker = owned_worker()
-        worker["session_id"] = "slot-worker"
+        registered = staff.snapshot().by_current_session(worker["session_id"])
+        assert registered is not None and registered.parent is not None
+        worker["session_id"] = fixture_worker("slot-worker", registered.parent).current_session
         slot_worker["session"] = worker
         slot["entries"].append(slot_worker)
         write_old(slot)

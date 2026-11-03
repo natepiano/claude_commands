@@ -141,8 +141,7 @@ class AuditUnitPortsTests(StaffTestCase):
         web = self.write_configuration("web", unit_config.AppPort(8211))
         retired = self.write_configuration("retired", unit_config.AppPort(8212))
         folder = self.source_root / "worktrees" / "retired"
-        facts = unit_config.RetiredSession("2026-10-31", "retired-session",
-                                         unit_config.RecordedStartFolder(folder), unit_config.Branch("retired"))
+        facts = unit_config.RetiredSession("2026-10-31", "retired-session", unit_config.Branch("retired"))
         _ = unit_config.park(retired.id, folder, facts)
         retired = self.unit("retired", removed=True)
         parked = unit_config.parked_path(retired.id)
@@ -163,8 +162,7 @@ class AuditUnitPortsTests(StaffTestCase):
     def test_retired_unit_uses_the_parked_file_instead_of_a_stray_worktree_file(self) -> None:
         retired = self.write_configuration("retired", unit_config.AppPort(8212))
         folder = self.source_root / "worktrees" / "retired"
-        facts = unit_config.RetiredSession("2026-10-31", "retired-session",
-                                         unit_config.RecordedStartFolder(folder), unit_config.Branch("retired"))
+        facts = unit_config.RetiredSession("2026-10-31", "retired-session", unit_config.Branch("retired"))
         _ = unit_config.park(retired.id, folder, facts)
         original = unit_config.read(folder, cleanup=False)
         assert isinstance(original, unit_config.UnitConfig)

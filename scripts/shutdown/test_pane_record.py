@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import json
 import math
 import os
@@ -10,7 +9,6 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from contextlib import redirect_stderr
 from typing import cast, final, override
 from unittest import mock
 
@@ -258,60 +256,8 @@ class PaneRecordTests(unittest.TestCase):
         pane_record.write("agents", observed)
         self.assertEqual((record_path.read_bytes(), record_path.stat().st_mtime_ns), retained)
 
-    def test_folder_move_updates_only_owner_cwd_with_the_supplied_snapshot_and_reruns_without_writes(self) -> None:
-        owner, current, path = self.current_owner()
-        old, new = self.root / "old-folder", self.root / "new-folder"
-        fixed = pane_record.launch("w1:p2", owner.id, str(old), {}, ["claude", "-n", "alpha"])
-        live = pane_record.launch("w2:p1", current, str(old), {}, ["claude", "-n", "alpha"])
-        other = pane_record.launch("w1:p3", "019b3a40-4250-7000-8000-000000000104", str(old), {}, ["claude"])
-        fixed["ended"] = True
-        pane_record.write("agents", fixed)
-        pane_record.write("agents", other)
-        with pane_record.locked("retained"):
-            pane_record.save("retained", {"w2:p1": live})
-        record = staff.snapshot()
-        before = path.read_bytes()
 
-        with mock.patch.object(staff, "snapshot", side_effect=AssertionError("reuse the supplied snapshot")):
-            pane_record.move_cwd(owner.id, old, new, record)
-            self.assertEqual(pane_record.read("agents"), {"w1:p2": {**fixed, "cwd": str(new)}, "w1:p3": other})
-            self.assertEqual(pane_record.read("retained"), {"w2:p1": {**live, "cwd": str(new)}})
-            paths = [self.records / name for name in ("agents.json", "retained.json")]
-            moved = [(entry.read_bytes(), entry.stat().st_mtime_ns) for entry in paths]
-            pane_record.move_cwd(owner.id, old, new, record)
-            self.assertEqual([(entry.read_bytes(), entry.stat().st_mtime_ns) for entry in paths], moved)
-        self.assertEqual(path.read_bytes(), before)
 
-    def test_folder_move_skips_an_owner_launch_from_an_unrelated_folder(self) -> None:
-        owner, _current, path = self.current_owner()
-        retained = pane_record.launch("w1:p2", owner.id, str(self.root / "unrelated"), {}, ["claude"])
-        pane_record.write("agents", retained)
-        record_path = self.records / "agents.json"
-        before = path.read_bytes(), record_path.read_bytes(), record_path.stat().st_mtime_ns
-        output = io.StringIO()
-        with redirect_stderr(output):
-            pane_record.move_cwd(owner.id, self.root / "old", self.root / "new", staff.snapshot())
-        self.assertEqual(len(output.getvalue().splitlines()), 1)
-        self.assertIn("different working folder", output.getvalue())
-        self.assertEqual((path.read_bytes(), record_path.read_bytes(), record_path.stat().st_mtime_ns), before)
-
-    def test_folder_move_updates_later_records_after_a_different_folder_is_skipped(self) -> None:
-        owner, current, path = self.current_owner()
-        old, new = self.root / "old", self.root / "new"
-        skipped = pane_record.launch("w1:p1", owner.id, str(self.root / "elsewhere"), {}, ["claude"])
-        selected = pane_record.launch("w2:p1", current, str(old), {}, ["claude"])
-        pane_record.write("agents", skipped)
-        with pane_record.locked("later"):
-            pane_record.save("later", {"w2:p1": selected})
-        before = path.read_bytes()
-        output = io.StringIO()
-        with redirect_stderr(output):
-            pane_record.move_cwd(owner.id, old, new, staff.snapshot())
-        self.assertEqual(len(output.getvalue().splitlines()), 1)
-        self.assertIn("different working folder", output.getvalue())
-        self.assertEqual(pane_record.read("agents")["w1:p1"], skipped)
-        self.assertEqual(pane_record.read("later")["w2:p1"], {**selected, "cwd": str(new)})
-        self.assertEqual(path.read_bytes(), before)
 
     def test_current_conversation_lookup_projects_only_its_exact_retained_pane_without_writing(self) -> None:
         owner, current, path = self.current_owner()

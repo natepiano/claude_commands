@@ -737,7 +737,7 @@ Assertion-Change: scripts/direct/test_assertion_guard_revisions.py::test_large_d
 
 **Acceptance gate:** `wc -l scripts/production/unit_move.py` is below 1532. Tests: (a) a running Claude unit with one working worker: stop, pause, move, staff row, one resume with the worker's resume line; (b) a stopped unit moves and stays stopped; (c) a held lock refuses; (d) an existing target: git's error, the session resumed, exit 1; (e) a move with no launch record or a failed pause prints one line and finishes; (f) a rerun prints `unchanged` and writes nothing; (g) a crash rerun after the git move finishes. Run `scripts/production/test_unit_move.py`, `scripts/shutdown/test_pane_restore.py`, `scripts/shutdown/test_pane_record.py`, `scripts/production/test_rename_units.py`. `basedpyright` on each slot's files reads `0 errors, 0 warnings, 0 notes`. One review, then one director gate.
 
-### Phase 4w — Folder paths live only in the staff row  · status: todo
+### Phase 4w — Folder paths live only in the staff row  · status: done
 
 **Depends on:** Phase 4s
 

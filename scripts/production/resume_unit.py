@@ -1,35 +1,13 @@
 #!/usr/bin/env python3
-"""Resume one retired unit: make its worktree again and resume the session its director last used.
+"""Restore a retired unit's worktree and resume its staff session.
 
 Usage: resume_unit.py <slug> <unit> [--dry-run]
 
-A showrunner runs it through /showrunner:resume_unit. retire_unit.py leaves the unit's Units row with
-"(retired <date>, worktree removed, session <id>)" in front of its Plan cell, and the row still names
-the worktree path, the branch and the plan. resume_unit refuses, and changes nothing, when the row is
-not retired or names no session, when no Claude config dir holds that session's transcript under its
-start folder's project folder (`claude --resume` finds a transcript only there), when a folder at the
-worktree path is not the unit's worktree, or when the branch is still here or on origin without it.
-Every account links its `projects` folder to the shared one, so a units account that moved since the
-retire reads the same transcript.
+Staff supplies the worktree and the session id. Claude transcripts are found by session id.
+The parked configuration supplies the plan and branch. A saved retirement ref restores its exact tip.
+Each completed step remains complete on a rerun. A preview changes no file.
 
-A note can include ", folder <path>" after the session id. Older notes find the transcript across
-all config dirs and read the first cwd matching the project folder that holds it; none, ambiguous
-project folders or no matching cwd refuse. When the
-start folder is outside the worktree, resume uses --cwd there and restores the unit worktree too.
-The parked configuration supplies the session, folder, branch and plan after backfill. A preview
-does not recover a session by name or need the original retirement note's session and folder.
-
-When the note names a retired ref and tip, resume fetches that ref and restores the branch and
-worktree at that exact tip, even when the session starts elsewhere. It checks worktree HEAD before
-deleting the origin ref. A stop after branch creation or ref deletion resumes safely on a rerun.
-Without a saved ref, it makes the worktree from the merge branch as before. Then it resumes the
-session through `add_unit.py --resume` (the units account, the unit's name and Remote Control); and
-takes the retired note out of the Plan cell, committed on the merge branch. Each step checks whether
-it is done, so a rerun after a failure resumes: the note goes last, because it holds the session id.
-Resume restores the retained staff row and keeps its id and parent.
---dry-run prints each refusal and each step, and changes nothing.
-
-Exit 0 when the unit is resumed; 1 on a refusal or a failed step; 2 on usage.
+Exit 0 on success, 1 on a refusal or failure, and 2 on invalid arguments.
 """
 from __future__ import annotations
 
@@ -51,7 +29,6 @@ import add_unit
 import production_units
 import retire_unit
 import unit_lookup
-import unit_move
 import unit_names
 import pane_record
 from production_units import Production
@@ -59,7 +36,6 @@ from atomic_file import write_text_atomic
 
 ADD_UNIT = Path(__file__).resolve().parent / "add_unit.py"
 RETIRED = re.compile(r"^\s*\(retired [^)]*\)\s*")
-SESSION = re.compile(r"^\s*\(retired [^)]*, session ([0-9A-Za-z-]+)(?:, folder (.*?))?(?:, (?:ref|staff) [^)]*)?\)")
 
 
 class Refused(Exception):
@@ -69,10 +45,6 @@ class Refused(Exception):
 class BackfillRequired(Refused):
     """The configuration must be filled before preview or apply."""
 
-
-
-RecordedStartFolder = unit_config.RecordedStartFolder
-UnrecordedStartFolder = unit_config.UnrecordedStartFolder
 
 
 @dataclass(frozen=True)
@@ -89,7 +61,6 @@ class RetiredUnit:
     plan: str
     session_id: str
     retired: bool
-    start_folder: RecordedStartFolder | UnrecordedStartFolder
     saved_branch: retire_unit.SavedBranch | retire_unit.NoSavedBranch = retire_unit.NoSavedBranch()
     recovery: unit_config.UnitConfig | unit_config.NoRetiredSession = unit_config.NoRetiredSession()
     display_name: str | SavedUnitName = field(default_factory=SavedUnitName)
@@ -131,9 +102,9 @@ def find_unit(slug: str, given: str, *, record: staff.StaffSnapshot | None = Non
                                + "run staff_sources.py fill --retired or ask the showrunner")
     if not retired and isinstance(saved, unit_config.ConfigMissing):
         return RetiredUnit(production, name, worktree, branch, production_units.cell_value(plan), "", False,
-                           UnrecordedStartFolder(), display_name=member.row.name)
+                           display_name=member.row.name)
     if isinstance(saved, unit_config.ConfigMissing):
-        saved = staff_sources.prepare_retirement({**row, "Plan": plan}, sources, member, slug)
+        saved = staff_sources.prepare_retirement({**row, "Plan": plan}, member)
         assert isinstance(current, unit_config.UnitConfig)
         saved = replace(saved, responsibilities=current.responsibilities)
         key = unit_config.first_difference(replace(saved, retired=unit_config.NoRetiredSession()), current)
@@ -149,13 +120,10 @@ def find_unit(slug: str, given: str, *, record: staff.StaffSnapshot | None = Non
     facts = saved.retired
     if branch and branch not in ("—", "-") and facts.branch.value != branch:
         raise Refused(f"{name}: parked branch conflicts with Units row")
-    if not isinstance(facts.start_folder, unit_config.RecordedStartFolder):
-        raise Refused(f"{name}: parked retirement folder is missing; run staff_sources.py fill --retired")
     config_plan = (saved.plan.path.as_posix() if isinstance(saved.plan, unit_config.PlanFile) else
                    "permanent" if isinstance(saved.plan, unit_config.PermanentPlan) else "standby")
-    folder = RecordedStartFolder(facts.start_folder.path)
     return RetiredUnit(production, name, worktree, facts.branch.value, config_plan, member.row.current_session,
-                       True, folder, retire_unit.saved_branch_in_note(plan), saved, member.row.name)
+                       True, retire_unit.saved_branch_in_note(plan), saved, member.row.name)
 
 
 def resume_record(production: Production, name: str) -> Path:
@@ -179,16 +147,8 @@ def has_worktree(unit: RetiredUnit) -> bool:
             == unit.branch)
 
 
-def resume_folder(unit: RetiredUnit) -> Path:
-    if isinstance(unit.start_folder, RecordedStartFolder):
-        return unit.start_folder.path
-    return retire_unit.director_resume_folder(unit.session_id)
-
-
 def has_transcript(unit: RetiredUnit) -> bool:
-    folder = unit_move.project_folder(str(resume_folder(unit)))
-    return any((directory / "projects" / folder / f"{unit.session_id}.jsonl").is_file()
-               for directory in unit_move.config_dirs())
+    return bool(retire_unit.transcript_locations(unit.session_id))
 
 
 def is_running(unit: RetiredUnit) -> bool:
@@ -207,14 +167,9 @@ def refusals(unit: RetiredUnit) -> list[str]:
     if not unit.session_id:
         return [f"{unit.name}: its Units row names no session to resume"]
     refused: list[str] = []
-    folder = unit.worktree
     try:
-        folder = resume_folder(unit)
-        actual = retire_unit.director_resume_folder(unit.session_id)
-        if actual.resolve() != folder.resolve():
-            refused.append(f"{unit.name}: transcript folder {actual} conflicts with parked folder {folder}")
         if not has_transcript(unit):
-            refused.append(f"{unit.name}: no account has the transcript of session {unit.session_id} under {folder}")
+            refused.append(f"{unit.name}: no account has the transcript of session {unit.session_id}")
     except (retire_unit.Refused, OSError) as error:
         refused.append(f"{unit.name}: {error}")
     if unit.worktree.exists() and not has_worktree(unit):
@@ -232,7 +187,7 @@ def launch_command(unit: RetiredUnit) -> list[str]:
         raise Refused(f"{unit.name}: its Units row names no session to resume")
     name = unit.name if isinstance(unit.display_name, SavedUnitName) else unit.display_name
     return [sys.executable, str(ADD_UNIT), "--production", str(unit.production.doc), name,
-            "--resume", unit.session_id, "--cwd", str(resume_folder(unit)), *production_units.plan_arguments(unit.plan)]
+            "--resume", unit.session_id, "--cwd", str(unit.worktree), *production_units.plan_arguments(unit.plan)]
 
 
 def make_worktree(unit: RetiredUnit) -> None:
@@ -296,7 +251,7 @@ def launch(unit: RetiredUnit) -> None:
         print(result.stdout.strip())
     if result.returncode:
         raise Refused(f"add_unit.py --resume: {retire_unit.failure(result)}")
-    print(f"resumed: session {unit.session_id} in {resume_folder(unit)}")
+    print(f"resumed: session {unit.session_id} in {unit.worktree}")
 
 
 def unmark(unit: RetiredUnit) -> None:
@@ -331,7 +286,7 @@ def dry_run(unit: RetiredUnit) -> int:
         source = (unit.saved_branch.tip if isinstance(unit.saved_branch, retire_unit.SavedBranch)
                   else unit.production.merge_branch)
         print(f"would make: worktree {unit.worktree} on {unit.branch}, from {source}")
-    print(f"would resume: session {unit.session_id} through add_unit.py --resume --cwd {resume_folder(unit)}")
+    print(f"would resume: session {unit.session_id} through add_unit.py --resume --cwd {unit.worktree}")
     print(f"would unmark: the Units row, committed on {unit.production.merge_branch}")
     return 1 if refused else 0
 
