@@ -18,16 +18,14 @@ class DeliveryIntent:
     """One message attempt, without a second copy of a saved verdict."""
 
     attempt: str
-    state: Literal["pending", "failed"]
     kind: Literal["verdict", "validation", "question"]
     feedback: str = ""
     recipients: tuple[staff.StaffId, ...] = ()
-    failure_note: str = ""
 
 
 @dataclass(frozen=True)
 class ValidationRequested:
-    """The showrunner owns validation after a delivered request."""
+    """The showrunner owns validation after a saved request."""
 
     attempt: str
     feedback: str
@@ -45,11 +43,6 @@ class OpenQuestion:
     question_id: str
     text: str
     delivery: DeliveryIntent | NoDelivery
-
-    @property
-    def awaiting_answer(self) -> bool:
-        """Only a delivered question transfers the row to the showrunner."""
-        return isinstance(self.delivery, NoDelivery)
 
 
 @dataclass(frozen=True)
@@ -69,10 +62,16 @@ class DeliverySlots:
     verdict: DeliveryIntent | NoDelivery
     question: NoQuestion | OpenQuestion | AnsweredQuestion = NoQuestion()
 
-    def selected(self, saved: bool) -> DeliveryIntent | NoDelivery:
-        intent = (self.verdict if saved else self.question.delivery
-                  if isinstance(self.question, OpenQuestion) else self.validation)
-        return intent if isinstance(intent, DeliveryIntent) else NoDelivery()
+    @property
+    def validation_requested(self) -> bool:
+        return not isinstance(self.validation, NoDelivery)
+
+    def waits_for_user(self, verdict_saved: bool) -> bool:
+        return not (verdict_saved or self.validation_requested or isinstance(self.question, OpenQuestion))
+
+    def intents(self) -> tuple[DeliveryIntent, ...]:
+        question = self.question.delivery if isinstance(self.question, OpenQuestion) else NoDelivery()
+        return tuple(intent for intent in (self.validation, self.verdict, question) if isinstance(intent, DeliveryIntent))
 
     def updated(self, kind: Literal["verdict", "validation", "question"], intent: DeliveryIntent | NoDelivery) -> DeliverySlots:
         if kind == "question":
@@ -83,7 +82,7 @@ class DeliverySlots:
 def decode_validation(value: object) -> DeliveryIntent | ValidationRequested | NoDelivery:
     fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
     attempt, feedback = fields.get("attempt"), fields.get("feedback", "")
-    if fields.get("state") == "sent" and isinstance(attempt, str) and isinstance(feedback, str):
+    if fields.get("state") in ("sent", "failed") and isinstance(attempt, str) and isinstance(feedback, str):
         return ValidationRequested(attempt, feedback)
     return decode_slot(fields, "validation")
 
@@ -103,11 +102,9 @@ def decode_slot(value: object, kind: Literal["verdict", "validation", "question"
     fields = cast(dict[str, object], value)
     attempt, state = fields.get("attempt"), fields.get("state")
     feedback = fields.get("feedback", "") if kind == "validation" else ""
-    if not isinstance(attempt, str) or state not in ("pending", "failed") or not isinstance(feedback, str):
+    if not isinstance(attempt, str) or state != "pending" or not isinstance(feedback, str):
         return NoDelivery()
-    note = fields.get("failure_note", "")
-    return DeliveryIntent(attempt, state, kind, feedback, decode_recipients(fields.get("recipients")),
-                          note if isinstance(note, str) else "")
+    return DeliveryIntent(attempt, kind, feedback, decode_recipients(fields.get("recipients")))
 
 def decode_recipients(value: object) -> tuple[staff.StaffId, ...]:
     if not isinstance(value, list):
@@ -119,21 +116,23 @@ def decode(content: str) -> DeliverySlots:
     try:
         value = cast(object, json.loads(content))
     except ValueError:
-        return DeliverySlots(NoDelivery(), DeliveryIntent("", "failed", "verdict"))
+        return DeliverySlots(NoDelivery(), NoDelivery())
+    return decode_value(value)
+
+
+def decode_value(value: object) -> DeliverySlots:
     fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
     if "validation" in fields or "verdict" in fields or "question" in fields:
         return DeliverySlots(decode_validation(fields.get("validation")),
                              decode_slot(fields.get("verdict"), "verdict"),
                              decode_question(fields.get("question")))
-    # Older records contain one intent or only validation feedback.
-    feedback = fields.get("feedback", "")
-    if not isinstance(feedback, str):
-        feedback = ""
-    attempt, state, kind = (fields.get(key) for key in ("attempt", "state", "kind"))
-    if isinstance(attempt, str) and state in ("pending", "failed") and kind in ("verdict", "validation"):
-        intent = DeliveryIntent(attempt, state, kind, feedback if kind == "validation" else "",
-                                decode_recipients(fields.get("recipients")))
-    else:
-        intent = DeliveryIntent("", "failed", "validation" if "feedback" in fields else "verdict", feedback)
-    return DeliverySlots(NoDelivery(), NoDelivery()).updated(intent.kind, intent)
-
+    # Older records contain one intent.
+    kind = fields.get("kind")
+    if kind == "validation":
+        return DeliverySlots(decode_validation(fields), NoDelivery())
+    if kind == "verdict":
+        return DeliverySlots(NoDelivery(), decode_slot(fields, "verdict"))
+    feedback = fields.get("feedback")
+    if isinstance(feedback, str):
+        return DeliverySlots(ValidationRequested("", feedback), NoDelivery())
+    return DeliverySlots(NoDelivery(), NoDelivery())

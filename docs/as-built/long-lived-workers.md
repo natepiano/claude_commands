@@ -44,6 +44,15 @@ current assignment.
 
 ## How it works
 
+### Account selection
+
+The [account design](accounts.md) owns the shared workers account selection and its authority on natedev.
+Both machines resolve that selection through `role_map.py`.
+The selected account is separate from a worker's thread and role.
+Account moves preserve those threads while the worker machinery changes the serving home.
+Claude assignment fallback does not replace the selected Codex account.
+The lifecycle and held-role rules below still apply during a move.
+
 ### Worker lifecycle in `scripts/agents/codex_mesh.py`
 
 Each run has one detached `codex app-server --listen ws://127.0.0.1:<port>`. Each worker is a named, non-ephemeral thread on it.
