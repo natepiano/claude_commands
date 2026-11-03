@@ -26,9 +26,10 @@ from scripts.production import showrunners as showrunners
 import dailies_render as dailies_render
 from production_units import read_production as read_production
 from scripts.production.cli_fixture import invoke_cli
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import (
-    fixture_showrunner_name, isolated_staff_file, showrunner_launch, showrunner_relationship,
+    fixture_showrunner_name, isolated_staff_file, recorded_showrunner, showrunner_launch, showrunner_relationship,
 )
 
 if TYPE_CHECKING:
@@ -174,7 +175,7 @@ class RegistrationFixture(unittest.TestCase):
             f"| `alpha-unit` | `docs/alpha.md` | `{alpha}` | `alpha` | — | — |",
             "", "## Gates", "",
         )), encoding="utf-8")
-        _ = showrunner_relationship(fixture_showrunner_name("example", self.doc))
+        _ = recorded_showrunner(fixture_showrunner_name("example", self.doc), self.doc)
         _ = self.git("add", ".")
         _ = self.git("commit", "-m", "initial")
 
@@ -266,9 +267,13 @@ class RegistrationFixture(unittest.TestCase):
         """A production with a complete update timer, so the tree counts it."""
         instance = self.state / "notifier" / f"showrunner-{slug}"
         instance.mkdir(parents=True)
-        row = showrunner_relationship(fixture_showrunner_name(slug, self.doc))
+        doc = self.doc if slug == "example" else self.doc.with_name(f"{slug}-production.md")
+        if not doc.exists():
+            write_text_atomic(doc, self.doc.read_text().replace("example", slug).replace(
+                "- **Showrunner session:** first-showrunner", f"- **Showrunner session:** {slug}"))
+        row = recorded_showrunner(fixture_showrunner_name(slug, doc), doc)
         _ = (instance / "conf").write_text(
-            f"TARGET=session:{row.id}\nCHECK=zsh /x/production_check.sh {self.doc}\n", encoding="utf-8")
+            f"TARGET=session:{row.id}\nCHECK=zsh /x/production_check.sh {doc}\n", encoding="utf-8")
         showrunner_launch(row, row.id, self.env)
 
     def attach(self, child: str, parent: str) -> None:

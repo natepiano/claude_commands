@@ -77,7 +77,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = fixture_member("showrunner", name="top")
+        _ = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", self.doc("top")))
 
     def test_launch_passes_the_ensured_showrunner_staff_id_to_the_pane(self) -> None:
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
@@ -754,7 +754,8 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         _ = edge.write_text("top\n", encoding="utf-8")
         top = fixture_member("showrunner", name="top")
         _ = fixture_member("showrunner", name="kid", parent=top.id,
-                           runtime_id="cfc4564d-fed3-5803-9a4c-e3119733bb53")
+                           runtime_id="cfc4564d-fed3-5803-9a4c-e3119733bb53",
+                           doc=staff.LiveDoc("natedev", self.doc("kid")))
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53")
         result = self.run_command("kid", "--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53", "--cwd", str(self.root), "--account", "claude2")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

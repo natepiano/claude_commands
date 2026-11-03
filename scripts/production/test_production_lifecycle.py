@@ -929,6 +929,9 @@ class LifecycleTests(LifecycleFixture):
         _ = self.git("push", "origin", "production")
         self.doc = kept
 
+        runner = next(row for row in staff.find(kind="showrunner") if row.name == "old-showrunner")
+        _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", kept))
+
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assert_step(result, "ok")
         relative = "archive/checkout/example/example-production.md"
@@ -952,6 +955,8 @@ class LifecycleTests(LifecycleFixture):
         _ = self.git("commit", "-m", "keep the doc in productions/")
         _ = self.git("push", "origin", "production")
         self.doc = kept
+        runner = next(row for row in staff.find(kind="showrunner") if row.name == "old-showrunner")
+        _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", kept))
         real_checked = production_lifecycle.checked
 
         def stop_at_commit(checkout: Path, step: str, *arguments: str) -> str:

@@ -445,7 +445,9 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(reads.call_count, 1)
 
     def test_renamed_production_has_the_same_full_and_fast_labels(self) -> None:
-        showrunner_launch(showrunner_relationship("alpha"), "acd50bad-5afa-5d3d-b155-3766b7d113e0", self.environment)
+        owner = showrunner_relationship("alpha")
+        owner = staff.set_doc(owner.id, staff.LiveDoc("natedev", self.production_doc))
+        showrunner_launch(owner, "acd50bad-5afa-5d3d-b155-3766b7d113e0", self.environment)
         _ = (self.notifier / "showrunner-alpha").rename(self.notifier / "showrunner-builds")
         _ = self.production_doc.write_text(
             "## Production Context\n\n- **Formerly:** `alpha`\n\n" + self.production_doc.read_text(),
@@ -2208,7 +2210,7 @@ class CodexHolderLabelsTests(unittest.TestCase):
         assert unit.parent is not None
         self.runner_id = unit.parent
         # Both registry records are live processes, with real start identities.
-        # Only their declared unit marks and run metadata come from fixture files.
+        # Only their declared session labels and run metadata come from fixture files.
         for pid, sid, name in ((os.getppid(), self.director_id, "report-director"),
                                (os.getpid(), self.runner_id, "builds-runner")):
             start = sessions.process_start(pid)

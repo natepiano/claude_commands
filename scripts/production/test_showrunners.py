@@ -178,6 +178,7 @@ raise SystemExit(1)
         doc = self.root / f"{slug}-production.md"
         row = fixture_member("showrunner", name=slug)
         self.instance(f"showrunner-{slug}", target=f"session:{row.id}", doc=doc)
+        _ = staff.set_doc(row.id, staff.LiveDoc("natedev", doc))
         if formerly:
             names = ", ".join(f"`{old}`" for old in formerly)
             _ = doc.write_text(f"# Production\n\n## Production Context\n\n- **Formerly:** {names}\n",
@@ -214,6 +215,43 @@ raise SystemExit(1)
         marks = {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": unit}
         self.hosted_units.append(HostedUnit(f"label-of-{unit}", pane, marks))
         fake_unit_host.write(self.environment(), self.hosted_units)
+
+
+class RowTimerJoinTests(StaffTestCase):
+    def test_a_timer_target_cannot_replace_a_missing_document_join(self) -> None:
+        from scripts.production import session_staff
+
+        fixture = self.row_production()
+        timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{fixture.slug}" / "conf"
+        other_doc = self.root / "unowned-production.md"
+        write_text_atomic(other_doc, "# Unowned production\n")
+        write_text_atomic(timer, f"TARGET=session:{fixture.runner.id}\n"
+                          + f"CHECK=zsh /fixture/production_check.sh {other_doc}\n")
+        record = staff.snapshot()
+        before = self.staff_file.read_bytes()
+        sources = session_staff.member_sources()
+        self.assertIsInstance(sources.member(session_staff.ShowrunnerMember(fixture.slug), record),
+                              session_staff.NoSuchMember)
+        self.assertIsInstance(showrunners.timer_for(fixture.runner, record), showrunners.NoTimer)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_timer_joins_the_row_document_when_the_slug_name_and_target_disagree(self) -> None:
+        fixture = self.row_production()
+        timer_dir = Path(os.environ["NOTIFIER_STATE_DIR"])
+        decoy = timer_dir / f"showrunner-{fixture.runner.name}" / "conf"
+        decoy.parent.mkdir()
+        other_doc = self.root / "other-production.md"
+        write_text_atomic(other_doc, "# Other production\n")
+        write_text_atomic(decoy, f"TARGET=session:{fixture.runner.id}\n"
+                          + f"CHECK=zsh /fixture/production_check.sh {other_doc}\n")
+        expected_doc = fixture.doc
+        before = self.staff_file.read_bytes()
+        timer = showrunners.timer_for(fixture.runner, staff.snapshot())
+        self.assertIsInstance(timer, showrunners.Timer)
+        assert isinstance(timer, showrunners.Timer)
+        self.assertEqual(timer.slug, fixture.slug)
+        self.assertEqual(timer.doc, expected_doc)
+        self.assertEqual(self.staff_file.read_bytes(), before)
 
 
 class ShowrunnerRegistryTests(ShowrunnerFixture):

@@ -71,7 +71,9 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         _ = self.git("add", str(self.doc))
         _ = self.git("commit", "-m", "Record workspace name")
         self.assert_success(self.run_rename("apply"))
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "showrunner", "new", None, current_session=row.id))
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(
+            row.id, "showrunner", "new", None, current_session=row.id,
+            doc=staff.LiveDoc("natedev", self.new_doc)))
         self.assertEqual(self.journal()["staff_id"], row.id)
         self.assertIn("- **Showrunner session:** `new`", self.new_doc.read_text())
 
@@ -118,6 +120,9 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         for path in (self.doc, self.new_doc):
             if path.exists():
                 self.write(path, path.read_text().replace(str(old), str(self.checkout)))
+        row = next(row for row in staff.find(kind="showrunner") if row.name in (OLD, NEW))
+        location = self.new_doc if self.new_doc.exists() else self.doc
+        _ = staff.set_doc(row.id, staff.LiveDoc("natedev", location))
         for conf in self.notifier.glob("showrunner-*/conf"):
             self.write(conf, conf.read_text().replace(str(old), str(self.checkout)))
         for unit in UNITS:
@@ -204,6 +209,8 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.new_doc = self.doc.with_name("new-production.md")
         _ = self.git("worktree", "repair")
         self.write(self.new_doc, self.new_doc.read_text().replace(str(old), str(self.checkout)))
+        row = next(row for row in staff.find(kind="showrunner") if row.name == NEW)
+        _ = staff.set_doc(row.id, staff.LiveDoc("natedev", self.new_doc))
         conf = self.notifier / "showrunner-new/conf"
         self.write(conf, conf.read_text().replace(str(old), str(self.checkout)))
         self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
@@ -448,6 +455,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         moved_doc = directory / self.doc.name
         _ = self.git("mv", str(self.doc), str(moved_doc))
         self.doc = moved_doc
+        _ = staff.set_doc(self.production_row().id, staff.LiveDoc("natedev", moved_doc))
         self.new_doc = directory / "new-production.md"
         _ = self.git("commit", "-m", "Keep the production doc under a path with spaces")
         prefix = "CHECK=env 'NOTE=keep  spacing'  zsh /scripts/production_check.sh "

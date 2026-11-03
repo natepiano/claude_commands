@@ -98,7 +98,7 @@ def configure_test_zone() -> None:
 
 
 from scripts.production.staff_test_support import (
-    StaffTestCase, fixture_runtime_id, fixture_showrunner_name, showrunner_relationship, unit_membership,
+    StaffTestCase, fixture_runtime_id, fixture_showrunner_name, unit_membership,
 )
 
 
@@ -239,8 +239,7 @@ class AddUnitTestCase(ShutdownTestCase):
                     "CODEX_CATALOG_SYNC_STATE_FILE": str(sync_state)}
         self.env["STAFF_FILE"] = str(self.staff.staff_file)
         self.env["HERDR_PANE_RECORD_DIR"] = str(self.staff.source_root / "panes")
-        self.staff.register_production("build-followups", self.doc)
-        _ = showrunner_relationship(fixture_showrunner_name("build-followups", self.doc))
+        _ = self.staff.record_production("build-followups", self.doc)
         self.herdr_overrides = {}
         fake_path = self.bin / "fake-herdr"
         source = (SCRIPT.parents[1] / "herdr/fake_herdr.py").read_text()
@@ -905,7 +904,7 @@ class AddUnitTestCase(ShutdownTestCase):
         _ = self.git("add", str(self.doc.relative_to(self.checkout)))
         _ = self.git("commit", "-m", "Add sample fixture production")
         _ = self.git("push", "origin", "build-followups")
-        self.staff.register_production("sample", self.doc)
+        _ = self.staff.record_production("sample", self.doc)
 
         result = self.successful(unit, "--plan", "docs/plans/given.md")
         self.assertIn(f"{unit} started", result.stdout)

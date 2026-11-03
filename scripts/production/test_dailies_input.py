@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import io
+from contextlib import redirect_stderr
 import dailies_input
 import dailies_render
 import os
@@ -12,7 +14,7 @@ import sys
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TextIO, cast
+from typing import TextIO, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -22,15 +24,87 @@ from dailies_input import (BevyUpgradeUnavailable, Block, ClaudeNotRunning, Deci
                            Running, SessionGone, StillWaiting, TicksFailing, bevy_upgrade_watch)
 import unit_lookup
 from scripts.production import staff
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.herdr.herdr import HerdrPlace
 from scripts.shutdown.remote import local_machine
-from scripts.production.staff_test_support import fixture_showrunner_name, unit_membership
+from scripts.production.staff_test_support import StaffTestCase, fixture_showrunner_name, unit_membership, showrunner_relationship
 from unit_lookup import UnitState
 from dailies_input_test_support import (DailiesInputFixture, SCRIPT, RENDERER, WAITING, STAMP, AT,
                                         ALPHA, BETA, RACE_WATCH_STUB)
 from dailies_input_test_support import setUpModule as setUpModule
 
 
+class RowDailiesTests(StaffTestCase):
+    def test_incomplete_unit_facts_keep_the_dailies_row_and_one_named_problem(self) -> None:
+        fixture = self.row_production()
+        unavailable = fixture.worktree.with_name("unavailable-member")
+        for failure in ("branch", "configuration"):
+            with self.subTest(failure=failure):
+                if failure == "branch":
+                    _ = fixture.worktree.rename(unavailable)
+                else:
+                    _ = unavailable.rename(fixture.worktree)
+                    (fixture.worktree / ".unit.toml").unlink()
+                errors = io.StringIO()
+                with redirect_stderr(errors):
+                    units = dailies_input.units_from_doc(fixture.doc.read_text().splitlines(), fixture.slug,
+                                                        record=staff.snapshot())
+                self.assertEqual([item.name for item in units], ["member-unit"])
+                self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                self.assertIn(fixture.unit.name, errors.getvalue())
+                self.assertIn(str(fixture.worktree), errors.getvalue())
+                if failure == "configuration":
+                    self.assertIn(".unit.toml", errors.getvalue())
+
+    def test_both_live_unit_label_forms_join_the_same_row_and_session(self) -> None:
+        fixture = self.row_production()
+        unit = staff.rename(fixture.unit.id, "writer")
+        before = self.staff_file.read_bytes()
+        for label in ("writer", "writer-unit"):
+            with self.subTest(label=label):
+                live = unit_lookup.MarkedUnit(label, unit_lookup.LiveClaude(
+                    "live-writer", unit.current_session, "", os.getpid()), HerdrPlace("writer", "w1:p1"),
+                    staff_id=unit.id)
+                with mock.patch.object(unit_lookup, "marked_units", return_value={label: live}):
+                    units = dailies_input.units_from_doc(fixture.doc.read_text().splitlines(), fixture.slug,
+                                                        record=staff.snapshot())
+                self.assertEqual([(item.name, item.session) for item in units], [("writer-unit", "live-writer")])
+                self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_run_status_uses_the_row_worktree_when_the_table_names_another_folder(self) -> None:
+        fixture = self.row_production()
+        runs = unit_lookup.RunStates({str(fixture.worktree): unit_lookup.RunRecord(
+            self.root / "finished-run.jsonl", UnitState.RUN_FINISHED)})
+        with mock.patch.object(unit_lookup, "read_run_states", return_value=runs):
+            units = dailies_input.units_from_doc(fixture.doc.read_text().splitlines(), fixture.slug,
+                                                 record=staff.snapshot())
+        self.assertEqual([(unit.name, unit.run) for unit in units], [("member-unit", UnitState.RUN_FINISHED)])
+
+
 class DailiesInputTests(DailiesInputFixture):
+    @override
+    def timer(self, slug: str) -> None:
+        super().timer(slug)
+        doc = self.doc if slug == "example" else self.root / f"{slug}-production.md"
+        if doc != self.doc:
+            write_text_atomic(doc, self.doc.read_text().replace(
+                "- **Showrunner session:** test-showrunner", f"- **Showrunner session:** {slug}"))
+        row = showrunner_relationship(fixture_showrunner_name(slug, self.doc))
+        _ = staff.set_doc(row.id, staff.LiveDoc("natedev", doc))
+        conf = self.root / "notifier-state" / f"showrunner-{slug}" / "conf"
+        write_text_atomic(conf, f"TARGET=session:{row.id}\nCHECK=zsh /x/production_check.sh {doc}\n")
+
+    @override
+    def production_doc(self, *, beta: bool = False) -> None:
+        super().production_doc(beta=beta)
+        for label, name in ((ALPHA, "alpha"), (BETA, "beta")) if beta else ((ALPHA, "alpha"),):
+            row = unit_membership(fixture_showrunner_name("example", self.doc), label)
+            folder = self.root / name
+            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", folder))
+            assert row.parent is not None
+            _ = staff.set_doc(row.parent, staff.LiveDoc("natedev", self.doc))
+            write_text_atomic(folder / ".unit.toml", f'plan = "docs/{name}.md"\nresponsibilities = []\n')
+
     def test_a_unit_whose_run_is_finished_needs_no_entry_and_is_left_out(self) -> None:
         self.production_doc(beta=True)
         self.status_lines(f"== {ALPHA}", "● Checking panel labels", f"== {BETA}", "● Standing by")

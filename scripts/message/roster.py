@@ -853,10 +853,9 @@ def mesh_shown_name(session_dir: str, name: str, record: Mapping[str, object]) -
     director: DirectorRelationship = NoDirector()
     problems: list[str] = []
     records = _newest_sessions()
-    details = _raw_session_details(records, problems)
     membership = staff.initial_snapshot()
     registered = _registered_showrunners(os.environ, problems, membership=membership)
-    places = (_production_places(records, details, registered,
+    places = (_production_places(records, registered,
                                  _showrunner_ids(records, registered), set(), problems, record=membership)
               if registered else {})
     place = places.get(unit_runs.director(run))
@@ -1371,7 +1370,7 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
     if registered:
         try:
             production_places = _production_places(
-                records, details, registered, runner_ids, set(workers), problems, record=membership
+                records, registered, runner_ids, set(workers), problems, record=membership
             )
         except staff.StaffUnreadable as error:
             _problem(problems, "staff membership", error)
