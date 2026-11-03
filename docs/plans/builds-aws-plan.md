@@ -452,72 +452,28 @@ Delivery failures, restarts, and failed ledger writes preserve the event and dup
 
 **Ruled out:** replacing known instance charges with the fallback rate during an unconfirmed request — it under-counts; charging an unconfirmed request at a historical Spot price — it is not an upper bound.
 
-### Phase 12 — Exact spending caps, the midnight total and the NixOS regression tests  · status: todo
-**Depends on:** Phase 11
+### Phase 12 — Exact spending caps, the midnight total and the NixOS regression tests  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** The spending guard refuses a cap a fraction above $400/month or $20/day, its daily total never drops across local midnight, and tests fail when a NixOS recovery step is removed.
-
-**Acceptance gate:** Complete Phase 12 before any user deployment or activation. Keep `offload=off` and keep AWS outside `targets`.
-
-**Constraints from prior phases:**
-
-- `config.py` `service_loop` already reads the first interval before any action. Keep the two service interval tests (first read fails; later read fails and the last usable interval stays). Spec 3 owns only the systemd restart settings.
-- Users see a first-interval failure through systemd status and the journal, correct the configuration, and restart the service. No more application state is required.
-- Compute request records stay internal: users act through spending decisions. `scripts/aws_target/measurement.py` (about lines 103 and 163) shows request costs in status and the daily report.
-
-**Spec:**
-
-1. Make the shared range check exact.
-   - Now: `scripts/lib/conf.py` `_limits` (about line 218) compares `# range:` values through `_number`, which returns `float`. `monthly_limit_usd=400.0000000000000001` and `daily_limit_usd=20.0000000000000001` round to the bound and pass.
-   - Compare `Decimal` values in the range path. Keep the finite-number check. Keep the value types that `conf.read` returns unchanged.
-   - Regression tests in `scripts/lib/test_conf.py`: a value a fraction above a decimal upper bound and a fraction below a lower bound are refused; the bound itself is accepted.
-   - Extend the cap test near `scripts/aws_target/test_deploy.py:875` (it covers one-cent increases): require refusal of `monthly_limit_usd=400.0000000000000001` and `daily_limit_usd=20.0000000000000001`. Both pass validation on the current tree.
-2. Pin the bootstrap retry with an existing watchdog.
-   - The bootstrap in `docs/plans/builds-aws/nixos.patch` (about line 57) checks the `aws-build-first-boot-stop.timer` load state before `systemd-run`.
-   - Render the bootstrap through the deploy bundle. Run its watchdog block twice with fake `systemctl` and `systemd-run` on `PATH`. The second run must not call `systemd-run` and must not extend the deadline.
-   - The test must fail if the load-state check is removed.
-3. Pin the controller restart settings.
-   - `aws-target.service` in `nixos.patch` (about line 283) has `Restart = "on-failure"` and `RestartSec`.
-   - Read the working-tree patch and require both settings on that unit. The test must fail if either is removed.
-4. Pin the volume check in both installation modes.
-   - The shared `aws-build-volume` script is in `hosts/aws-build-base.nix` in `nixos.patch` (about lines 128-144); `hosts/aws-build.nix` imports it (about line 256). Bootstrap formats with `mkfs.ext4 -L`; the full host refuses blank media.
-   - Render the Nix inputs into an isolated test copy. Fake the state paths, `udevadm`, `readlink`, the block-device check, `wipefs`, `lsblk`, `blkid` and `mkfs.ext4`. Keep the production serial and filesystem comparisons.
-   - Test bootstrap and full-host modes separately. Both modes refuse a wrong serial and keep an existing filesystem. Bootstrap formats matching blank media once. The full host refuses matching blank media.
-   - Require that `hosts/aws-build.nix` imports the base file. The tests must fail if the serial check or the import is removed.
-5. Test request costs at their user surfaces.
-   - In `scripts/build_targets/test_aws_status.py` and `scripts/buildlog/test_aws_report.py`, cover: pending request costs, a guard refusal, confirmed-instance reconciliation and confirmed-absence reconciliation.
-   - Confirmed uptime must not increase from a request in any case.
-6. Keep the daily total from dropping across local midnight.
-   - Now: `ledger.py` reconciliation (about line 489) spreads the Cost Explorer remainder over the period's accounting days. A higher estimate for an earlier day can lower a later day's share, so today's guard total can fall.
-   - Change the rule so a reconciliation never lowers an accounting day's established estimate. Monthly totals follow the same rule.
-   - Regression test: a Cost Explorer reconciliation whose period crosses local midnight, with a raised estimate for the earlier day. The daily and monthly guard totals for the later day do not fall.
-7. Do not run any AWS command. Do not rebuild any machine. Offload stays off.
-8. If a test can run a script only after a `nixos.patch` change, keep that change minimal. After any NixOS change, the director requires both host evaluations (natedev and aws-build), an exact match between the patch and the NixOS branch, a new commit on branch `aws-build` (clone `/home/natepiano/worktrees/nixos-aws-build`), and its hand-off to the natedev showrunner.
+- `conf` range checks compare exact `Decimal` values, so a cap a fraction above `monthly_limit_usd=400` or `daily_limit_usd=20` is refused. Public `conf.decimal` is the one finite-number parser: it accepts a value only when the `Decimal` and its `float()` conversion are both finite, and `conf.check` refuses a value such as `1e400`. `_number`, `aws_target/config.money` and `measurement.number` use it. `decimal` loads only inside `conf.decimal`, so plain `conf` importers do not load it.
+- Each Cost Explorer reconciliation stores `established_days`: the reconciled amount it established for each accounting day. A day is charged the higher of its computed total and its established total, so no day's daily or monthly total falls when a bill crosses local midnight or a later price sample lowers an estimate. A bill that matches the estimates adds no charge.
+- `_charges` is pure and returns the updated reconciliations with the `CostEstimate`. Only `guard` and `estimate` save them, through `CostLedger._save_estimate`, which keeps distinct replies for the same period. Status and report read the saved amounts and write nothing.
+- Regression tests cover the bootstrap retry that keeps an existing watchdog deadline, the controller restart after a failed first interval read, both volume modes (wrong serials refused, existing filesystems kept, matching blank media formatted once in bootstrap and refused in full-host mode with `existingVolume=""`), and pending and resolved request costs in status and report output. No NixOS file changed.
 
 **Files:**
+- `scripts/lib/conf.py` — `decimal` parser and exact range checks.
+- `scripts/aws_target/ledger.py` — per-day established reconciliation amounts and `_save_estimate`.
+- `scripts/aws_target/config.py`, `scripts/aws_target/measurement.py` — numbers through `conf.decimal`.
+- `scripts/aws_target/measurement_test_support.py` — `pending_request` and `resolve_request` fixture helpers.
+- `scripts/aws_target/test_deploy.py` — NixOS script regression tests (one shell dispatcher for the volume fakes) and the midnight reconciliation test.
+- `scripts/build_targets/test_aws_status.py`, `scripts/buildlog/test_aws_report.py`, `scripts/lib/test_conf.py` — status, report and conf tests.
 
-- `scripts/lib/conf.py`, `scripts/lib/test_conf.py` — exact `Decimal` range check (also touches; owner of the shared conf module).
-- `scripts/aws_target/ledger.py` — reconciliation that never lowers a day's estimate.
-- `scripts/aws_target/test_deploy.py` — cap refusal, watchdog retry, restart settings, volume check and midnight tests.
-- `scripts/build_targets/test_aws_status.py`, `scripts/buildlog/test_aws_report.py` — request costs at status and report (the status test also touches; owner resources-unit).
-- `scripts/aws_target/deploy.py` — read only, unless the tests need a bundle accessor.
-- `docs/plans/builds-aws/nixos.patch` — read only, unless item 8 applies.
+**Binds later work:** offload stays off and AWS stays out of `targets` until the user's go-live gate; no AWS resource exists before it.
 
-**Workers:** 1 writer.
+**Gotchas:** an established day total can exceed a later bill or estimate; that is the cost of a total that never falls. Read-only paths must not save established amounts.
 
-- `impl` — all files above.
-
-**Verification:**
-
-- `python3 -m unittest discover -s scripts/aws_target -p 'test_*.py'`
-- `python3 -m unittest discover -s scripts/lib -p 'test_conf*.py'`
-- `python3 -m unittest discover -s scripts/build_targets -p 'test_*.py'`
-- `python3 -m unittest discover -s scripts/buildlog -p 'test_aws_report.py'`
-- `basedpyright` on each changed Python file; the footer must read 0 errors, 0 warnings, 0 notes.
-
-**Also touches:** `scripts/lib/conf.py`, `scripts/lib/test_conf.py` (owner of the shared conf module); `scripts/build_targets/test_aws_status.py` (owner resources-unit). Name each owner in the checkpoint notice.
+**Ruled out:** a stateless per-day floor (bill share minus day estimate) — it over-counts the common uneven case, a $10 bill becoming $17.92 across two days; moving the midnight test to `test_ledger.py` — it stays with the deploy tests.
 
 ## Compilation record
 

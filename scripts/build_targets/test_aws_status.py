@@ -94,6 +94,21 @@ class AwsStatusTests(MeasurementFixture):
                 self.assertEqual(path.read_text(), "{broken")
                 path.unlink()
 
+    def test_status_prices_pending_requests_and_keeps_the_guard_refusal_after_resolution(self) -> None:
+        request = self.pending_request()
+        pending = self.render()
+        self.assertIn('month $22.00 / $400.00', pending)
+        self.assertIn('spending refused', pending)
+        saved = self.book().path.read_bytes()
+        for resolution in (ledger.ComputeInstanceConfirmed(NOW, 'i-fixture'), ledger.ComputeResourcesAbsent(NOW)):
+            with self.subTest(resolution=resolution):
+                _ = self.book().path.write_bytes(saved)
+                later = self.resolve_request(request, resolution)
+                with mock.patch.object(time, 'time', return_value=float(later)):
+                    output = self.render()
+                self.assertIn('month $22.00 / $400.00', output)
+                self.assertIn('spending refused', output)
+
     def test_invalid_monthly_limit_shows_unavailable_cap_and_refuses_spending(self) -> None:
         self.commit_settings()
         self.replace("monthly_limit_usd", "broken")
