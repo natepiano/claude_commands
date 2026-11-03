@@ -1321,3 +1321,38 @@ The Phase 26 checkpoint did not name two narrowed assertions; this phase's check
 **Files:** `scripts/hanas/hanas.py`, `scripts/hana_shot/hana_shot.py`, `scripts/lib/scratch.py`, `scripts/lib/conf.py`, `scripts/issue_score/selection.py`, `scripts/lint/folder_audit.py`, `scripts/lint/sweep.py`, `scripts/lint/tmp_sweep.py`, `scripts/mac_test/linux_runner.py`, `scripts/production/smoke_launch.sh`, the `UseConfiguredValue` importers (`scripts/issue_score/`, `scripts/accounts/next_moves.py`, `scripts/direct/simplify_result.py`, `scripts/production/retire_unit.py`), and their tests.
 
 **Gotchas:** a lib module that imports a package outside `scripts/lib` fails in the merge gate's command copy, though the worktree suites pass. The tests `test_environment_budget_does_not_need_a_config_file` and `test_workspace_recovers_doc_budget_separately_from_a_private_budget_file` guard the two sweep budget reads.
+
+### Phase 48 — The test Hana tool gets a clear name: `hanas` becomes `hana_instances`  · status: done
+
+#### Work Order
+
+The user asked for a better name than `hanas`. The builds showrunner chose `hana_instances`; no file or command uses it now. Keep every config key and value, and every behavior.
+
+1. Move `scripts/hanas/` to `scripts/hana_instances/`: `hana_instances.py` and `test_hana_instances.py`. Use `git mv`.
+2. Move `config/hanas.conf` to `config/hana_instances.conf`, keys and values unchanged. Every `conf.read("hanas")` becomes `conf.read("hana_instances")`.
+3. Change every caller and doc: `scripts/lint/folder_audit.py` and its test, `scripts/production/mac_run.sh` and `test_mac_run.py`, `config/README.md`, `docs/as-built/hana-test-windows.md`, `docs/as-built/build-memory-admission.md`. The tool's output prefix `hanas:` becomes `hana-instances:`.
+4. The shell command becomes `hana-instances`, and its sweep job becomes `hana-instances-sweep`. Change the nixos branch `resources-hanas-sweep` (ee026629, `modules/common/agents.nix`) with a new commit on that branch, without a checkout in `/etc/nixos`. The showrunner tells natedev about the branch.
+5. `git grep -w hanas` finds only completed-phase history in `docs/plans/builds-resources.md`.
+
+**Files:** `scripts/hanas/` → `scripts/hana_instances/`, `config/hanas.conf` → `config/hana_instances.conf`, `scripts/lint/folder_audit.py`, `scripts/lint/test_folder_audit.py`, `scripts/production/mac_run.sh`, `scripts/production/test_mac_run.py`, `config/README.md`, `docs/as-built/hana-test-windows.md`, `docs/as-built/build-memory-admission.md`; nixos `modules/common/agents.nix` on branch `resources-hanas-sweep`.
+
+**Acceptance:** the `hana_instances`, folder-audit and `mac_run` suites pass; basedpyright is clean on the changed Python files; `git grep -w hanas` finds no live use. The Mac runs `mac_run.sh`'s `stop-checkout` from its own `~/.claude` checkout, so the rename works there only after the Mac takes the same main.
+
+### Phase 49 — A hold that starts during a merge gate stops whole test modules, so the gate runs them again after the release  · status: todo
+
+#### Work Order
+
+Builds found the defect: the merge gate for report 15cddc6 started at 08:57, and a builds hold started at 09:02. The hold enforcer stopped build-like processes deep inside running test modules (a stub `cargo nextest` that a test starts). Each module kept running, saw its child exit with -15, and failed. Five modules went red with the hold text in stderr: `buildlog/test_test_phase_peak.py`, `buildlog/test_record_rerun.py`, `direct/test_verify_hold_wait.py`, `direct/test_verify_hold_mac.py`, `production/test_merge_gate_suites_resources.py`. Log: `/tmp/claude-1000/-home-natepiano-worktrees-claude-natedev-builds/51505394-82db-43d3-a528-136f4ee38d7a/scratchpad/merge_15cddc6_test.log`.
+
+The user's rule stays: during a hold, no test of another session runs, and the enforcer stops running ones. The gate already queues a module again when the module itself ends on a signal during a hold (`merge_gate.py`, "stopped during a natedev hold; queued again"). So the fix is in the enforcer's choice of process to stop:
+
+1. In `scripts/build_hold/hold_enforcer.py`, a stopped process that has a waiting-gate ancestor (`is_waiting_gate`: `merge_gate.py` or `verify.sh`) is not stopped alone. The enforcer stops that gate's child that contains it (the gate's job), with all its descendants. The gate itself stays protected.
+2. Keep every other route the same: kept holders, the sole holder, step records, sccache, user terminals, the refusal line, and the stop record.
+3. The gate then sees its job end on SIGTERM while the hold is in force, and its existing path queues the module again after the release. `verify.sh` keeps its `step_stopped_by_hold` path.
+4. Tests in `scripts/build_hold/test_build_hold.py`: a build-like grandchild under a merge-gate job makes the enforcer stop the job root, not only the grandchild; a process with no gate ancestor is stopped as before. In `scripts/production/test_merge_gate_holds.py`, prove that a job stopped this way is queued again and is not red.
+5. A kept run and all its descendants run to the end. Builds took its hold with `--keep 1912105` (a `verify.sh test` for hana). At 14:03:40Z the enforcer still stopped `sleep 1` (pid 1620929) with that step's `BUILDLOG_CALL_ID`: the keep check walks only live ancestors, and this process was not under 1912105 in the process table. Keep a process when its step record's controller is kept or has a kept ancestor, as well as by ancestry. Test: a process with a kept step's call id and no kept ancestor is kept.
+6. The refusal line then reached that step's log after a real test failure (5126 of 5127 passed), and `verify.sh` read it as a hold stop and waited at the hold. `verify.sh` reads a hold stop only when the step ended on a signal, not from log text alone. Test: a step that fails on its own with the refusal text in its log is a failure, not a hold stop.
+
+**Files:** `scripts/build_hold/hold_enforcer.py`, `scripts/build_hold/test_build_hold.py`, `scripts/production/test_merge_gate_holds.py`, `scripts/direct/verify.sh` (only `step_stopped_by_hold`) and its hold test.
+
+**Acceptance:** the build-hold and merge-gate hold suites pass after the cut-over hold ends; basedpyright is clean on the changed files. A gate run that a hold interrupts shows "stopped during a natedev hold; queued again" for each stopped module and no red from the hold.

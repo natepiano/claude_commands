@@ -83,7 +83,7 @@ release_mac_claim() {
   (( mac_claimed )) || return 0
   local cleanup_failed=0 confirmation
   if [[ -n $clone_task ]]; then
-    if [[ -n $clone ]] && confirmation=$(on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/hanas/hanas.py stop-checkout $clone_arg") && [[ ${confirmation##*$'\n'} == 'hanas: checkout clear' ]]; then
+    if [[ -n $clone ]] && confirmation=$(on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/hana_instances/hana_instances.py stop-checkout $clone_arg") && [[ ${confirmation##*$'\n'} == 'hana-instances: checkout clear' ]]; then
       if ! on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py end --task $clone_task" >/dev/null; then
         print -u2 "mac_run: scratch cleanup failed; kept task $clone_task"
         cleanup_failed=1
@@ -168,7 +168,7 @@ EOF
 ssh $host "open -a Terminal $launch_arg"
 run_exit=$(ssh $host "for i in {1..$(( hold + status_grace ))}; do [ -f $status_arg ] && break; sleep $poll_seconds; done; cat $status_arg 2>/dev/null; rm -f $launch_arg $status_arg")
 if [[ $run_exit != <-> ]]; then
-  on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/hanas/hanas.py stop-checkout $clone_arg" || exit 7
+  on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/hana_instances/hana_instances.py stop-checkout $clone_arg" || exit 7
   run_exit=255
 fi
 if (( run_exit == 142 )); then

@@ -478,7 +478,7 @@ Measured over the 24 h after the target-first order went live (2026-10-06 16:33 
 The scratch code reads those values through `scripts/lib/conf.py` when an operation needs them.
 `CONF_DIR` selects the configuration folder.
 
-The folder audit reads clone age from `hanas.conf` and the Mac disk floor from `mac_test.conf`.
+The folder audit reads clone age from `hana_instances.conf` and the Mac disk floor from `mac_test.conf`.
 It reads its other limits and default state folder from `lint.conf` through the same reader.
 The audit and temporary sweep share `folder_remove_after_seconds`.
 The audit and repository scan share `scratch.conf` `repo_skip`.

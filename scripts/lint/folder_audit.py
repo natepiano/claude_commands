@@ -18,7 +18,7 @@ folder mtimes and each git repo's HEAD, index and HEAD log, so a commit counts. 
 change-time scan also checks mtime and ctime throughout the tree, so copying files with preserved
 mtimes starts a new idle period. Removal uses lint.conf folder_remove_after_seconds.
 
-A loose clone uses clone_max_hours from hanas.conf. Other folders use folder_remove_after_seconds from lint.conf.
+A loose clone uses clone_max_hours from hana_instances.conf. Other folders use folder_remove_after_seconds from lint.conf.
 On the Mac, free_floor_gib from mac_test.conf can select younger idle clones too, oldest first.
 Under that floor, unsaved clones lose only target. These rules share all of the following keeps:
 
@@ -111,9 +111,9 @@ class ClonePolicy:
 
 def clone_policy() -> ClonePolicy:
     """Read clone age and the Mac floor through the shared reader."""
-    hanas_settings = conf.read("hanas")
+    hana_instances_settings = conf.read("hana_instances")
     mac_test_settings = conf.read("mac_test")
-    return ClonePolicy(hanas_settings.number("clone_max_hours") * 3600,
+    return ClonePolicy(hana_instances_settings.number("clone_max_hours") * 3600,
                        mac_test_settings.number("free_floor_gib") * 1024**3)
 
 
@@ -615,7 +615,7 @@ def message(folders: list[Loose], *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> str:
     shown = "; ".join(f"{folder.path} ({folder.outcome})" for folder in folders)
-    return (f"folder audit: loose folder(s) you made: {shown}. The audit uses hanas.conf clone_max_hours "
+    return (f"folder audit: loose folder(s) you made: {shown}. The audit uses hana_instances.conf clone_max_hours "
             + f"for clones and {tmp_sweep.wide_idle_seconds(lint_settings=lint_settings) / 86400:g} idle days for other folders. The Mac floor can remove idle clones sooner, "
             + "or just their targets when source is unsaved. Holds and live processes keep them. Move each you need into a "
             + "task's scratch (`~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py adopt <path> --task "

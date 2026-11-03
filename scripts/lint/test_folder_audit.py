@@ -104,7 +104,7 @@ class FolderAuditTests(unittest.TestCase):
                                                                 "SCRATCH_VISIBLE_ROOT": str(self.root / "repro"),
                                                                 "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
                                                                 **config_environment(self.root / "config")}))
-        _ = write_config_fixture(self.root / "config/hanas.conf", "clone_max_hours=2.5\n")
+        _ = write_config_fixture(self.root / "config/hana_instances.conf", "clone_max_hours=2.5\n")
         _ = write_config_fixture(self.root / "config/mac_test.conf", "free_floor_gib=8\n")
 
     def clone_folder(self, name: str, hours: float, *, dirty: bool = False) -> Path:
@@ -142,7 +142,7 @@ class FolderAuditTests(unittest.TestCase):
         self.assertFalse(old.exists())
         self.assertTrue(young.exists())
         self.assertTrue(ordinary.exists())
-        _ = write_config_fixture(self.root / "config/hanas.conf", "clone_max_hours=1\n")
+        _ = write_config_fixture(self.root / "config/hana_instances.conf", "clone_max_hours=1\n")
         self.assertEqual(self.judge_clones([young])[young], folder_audit.REMOVED)
         self.assertFalse(young.exists())
 

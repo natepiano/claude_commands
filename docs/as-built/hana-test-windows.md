@@ -13,7 +13,7 @@ Test clones on either machine use `scratch.py clone <source> --task gate:<id>`
 task before Git starts and prints the checkout inside its scratch folder.
 `scratch.py end --task gate:<id>` removes the clone. A failed clone remains
 owned by its task, so the same end command removes a partial copy.
-`mac_run.sh` uses one gate task per run. On exit, `hanas stop-checkout <path>`
+`mac_run.sh` uses one gate task per run. On exit, `hana-instances stop-checkout <path>`
 stops its test Hanas through the identity-checked stop path, confirms they
 exited, and checks for surviving builds and examples through the audit's
 process-use scan. Only then does the script end the task. A failed stop,
@@ -21,7 +21,7 @@ unreadable inventory or failed SSH keeps the checkout and names the cause.
 It keeps no standing test clone. Purpose and owner reach the Terminal command.
 
 The folder audit also checks registered test clones in the scratch root and
-loose Git clones. `clone_max_hours` in `hanas.conf` sets their idle limit;
+loose Git clones. `clone_max_hours` in `hana_instances.conf` sets their idle limit;
 other loose folders keep their existing limits. On the Mac, an audit below
 `mac_test.conf`'s `free_floor_gib` removes idle clones oldest first until the
 floor is met. A clone with unsaved work keeps its source and loses only its
@@ -38,7 +38,7 @@ The BRP launch hook checks the Hana target's `env.HANA_TEST_PURPOSE` before
 the hold and memory checks. An empty or missing purpose denies the launch
 and names the key to add. Other targets use the existing memory gate.
 
-`scripts/hanas/hanas.py list` reads natedev's process table and the Mac's
+`scripts/hana_instances/hana_instances.py list` reads natedev's process table and the Mac's
 `ps eww` output over SSH. On macOS it reads the local process table with
 `ps`, without `/proc`. Darwin environment reads use herdr's stable command
 and environment boundary. It identifies executables at `target/<profile>/hana`
@@ -49,9 +49,9 @@ An environment read failure keeps the process in the list with unknown labels
 and reports the cause. Stop refuses that row, and sweep leaves it alone while
 it handles other processes and returns a failure status.
 
-`hanas stop <machine>:<pid|port>` stops a matching test Hana. An already-gone
-process succeeds. `hanas sweep --dry-run` lists test Hanas over their limits;
-`hanas sweep` sends TERM and then KILL after the configured grace period if
+`hana-instances stop <machine>:<pid|port>` stops a matching test Hana. An already-gone
+process succeeds. `hana-instances sweep --dry-run` lists test Hanas over their limits;
+`hana-instances sweep` sends TERM and then KILL after the configured grace period if
 the process remains. Collection saves the process start identity. Each TERM
 and KILL checks that identity again, so a reused PID receives no signal. A
 stop prints success only after the saved process is gone. Sweep reports each
@@ -59,7 +59,7 @@ failed stop, continues with the other processes, and exits non-zero if any
 stop failed. No owner-session record is
 needed: the process carries its own labels.
 
-`config/hanas.conf` holds the exempt ports, labelled lifetime, unlabelled
+`config/hana_instances.conf` holds the exempt ports, labelled lifetime, unlabelled
 lifetime and stop grace. Each invocation reads those values through
 `scripts/lib/conf.py`. `CONF_DIR` selects the configuration folder.
 A Hana is a test when it has either test label.
@@ -69,7 +69,7 @@ a user Hana, and neither stop nor sweep signals it. A test with neither label
 uses the shorter unlabelled limit.
 
 Tests inject process files, environment reads, SSH output and signals. They
-never signal a real process or SSH to the Mac. Installation of the `hanas`
+never signal a real process or SSH to the Mac. Installation of the `hana-instances`
 wrapper and the scheduled sweep belongs to the director after checkpoint.
 
 Capture limits come from `config/hana_shot.conf` through the same reader.

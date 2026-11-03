@@ -88,11 +88,11 @@ if arguments[-1:] == ["true"] and "-o" in arguments:
 
 remote = arguments[-1]
 clone_head = state / "clone-head"
-if "hanas.py stop-checkout " in remote:
+if "hana_instances.py stop-checkout " in remote:
     (state / "cleanup-called").write_text("called\n", encoding="utf-8")
     status = int(os.environ.get("MAC_RUN_CLEANUP_STATUS", "0"))
     if status == 0 and os.environ.get("MAC_RUN_CONFIRM_STOP", "1") == "1":
-        print("hanas: checkout clear")
+        print("hana-instances: checkout clear")
         (state / "checkout-clear").write_text("confirmed\n", encoding="utf-8")
     print(f"mac_exit={status}")
     raise SystemExit(0)
@@ -565,7 +565,7 @@ class MacRunTests(unittest.TestCase):
                                              "MAC_RUN_CONFIRM_STOP": confirm})
                 events = self.events()
                 stop = [event for event in events if event["command"] == "ssh"
-                        and "hanas.py stop-checkout " in event["args"][-1]]
+                        and "hana_instances.py stop-checkout " in event["args"][-1]]
                 self.assertEqual(len(stop), 1, events)
                 self.assertTrue(stop[0]["claimed"])
                 words = shlex.split(stop[0]["args"][-1])
@@ -646,7 +646,7 @@ class MacRunTests(unittest.TestCase):
                 self.assertIn("/tmp/mac_run_hana.status", remote)
                 events = self.events()
                 stops = [event for event in events if event["command"] == "ssh"
-                         and "hanas.py stop-checkout " in event["args"][-1]]
+                         and "hana_instances.py stop-checkout " in event["args"][-1]]
                 self.assertEqual(len(stops), 1, events)
                 self.assertTrue(stops[0]["claimed"])
                 words = shlex.split(stops[0]["args"][-1])

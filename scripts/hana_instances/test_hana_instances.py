@@ -18,7 +18,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.hanas import hanas
+from scripts.hana_instances import hana_instances
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
@@ -44,7 +44,7 @@ sleep() {
 '''
 
 
-class HanasTests(unittest.TestCase):
+class HanaInstancesTests(unittest.TestCase):
     root: Path = Path()
     proc: Path = Path()
     config: Path = Path()
@@ -77,7 +77,7 @@ class HanasTests(unittest.TestCase):
         self.remote_shell = "bash"
         self.mac_environment_failure = False
         _ = (self.root / "remote-identity").write_text(MAC_STARTED)
-        self.config = self.root / "config/hanas.conf"
+        self.config = self.root / "config/hana_instances.conf"
         _ = write_config_fixture(self.config,
             "exempt_ports=31000,31001\ntest_max_hours=2.5\n"
             + "unlabelled_max_minutes=7\nstop_grace_seconds=0.125\n"
@@ -90,12 +90,12 @@ class HanasTests(unittest.TestCase):
 
     def test_config_folder_selects_limits_and_exempt_ports_at_use(self) -> None:
         other = self.root / "other-config"
-        _ = write_config_fixture(other / "hanas.conf", "exempt_ports=32000\ntest_max_hours=3.75\n")
+        _ = write_config_fixture(other / "hana_instances.conf", "exempt_ports=32000\ntest_max_hours=3.75\n")
         with mock.patch.dict(os.environ, config_environment(other)):
-            config = hanas.read_config()
+            config = hana_instances.read_config()
         self.assertEqual(config.exempt_ports, frozenset({32000}))
         self.assertEqual(config.test_max_seconds, 3.75 * 3600)
-        self.assertEqual(hanas.read_config().exempt_ports, frozenset({31000, 31001}))
+        self.assertEqual(hana_instances.read_config().exempt_ports, frozenset({31000, 31001}))
 
     def process(self, pid: int, environment: dict[str, str], *, age: float = 600.0, executable: str = "target/debug/hana") -> Path:
         directory = self.proc / str(pid)
@@ -120,8 +120,8 @@ class HanasTests(unittest.TestCase):
         fields = (self.proc / str(pid) / "environ").read_bytes().split(b"\0")
         return dict(field.decode().split("=", 1) for field in fields if b"=" in field)
 
-    def local_rows(self) -> list[hanas.HanaProcess]:
-        return hanas.local_processes(self.proc, now=201_000, environment_reader=self.environment)
+    def local_rows(self) -> list[hana_instances.HanaProcess]:
+        return hana_instances.local_processes(self.proc, now=201_000, environment_reader=self.environment)
 
     def ssh(self, command: list[str]) -> subprocess.CompletedProcess[str]:
         self.ssh_calls.append(command)
@@ -152,30 +152,30 @@ class HanasTests(unittest.TestCase):
         if number == signal.SIGKILL:
             (self.proc / str(pid) / "stat").unlink()
 
-    def identity(self, pid: int) -> hanas.ProcessIdentity | hanas.ProcessGone:
-        return hanas.local_identity(pid, self.proc)
+    def identity(self, pid: int) -> hana_instances.ProcessIdentity | hana_instances.ProcessGone:
+        return hana_instances.local_identity(pid, self.proc)
 
-    def mac_row(self) -> hanas.HanaProcess:
+    def mac_row(self) -> hana_instances.HanaProcess:
         self.mac_output = f"201 {MAC_STARTED} 00:45 /Users/test/work/target/debug/hana\n"
         self.mac_environments = {201: {"BRP_EXTRAS_PORT": "31003"}}
-        return hanas.mac_processes(self.mac_output, self.mac_environments.__getitem__)[0]
+        return hana_instances.mac_processes(self.mac_output, self.mac_environments.__getitem__)[0]
 
     def invoke(
-        self, *argv: str, stop_call: Callable[[hanas.HanaProcess, hanas.HanasConfig], None] | None = None,
+        self, *argv: str, stop_call: Callable[[hana_instances.HanaProcess, hana_instances.HanaInstancesConfig], None] | None = None,
     ) -> tuple[int, str, str]:
-        collection = hanas.collect_processes(self.local_rows, self.ssh)
-        stop = hanas.stop_process
+        collection = hana_instances.collect_processes(self.local_rows, self.ssh)
+        stop = hana_instances.stop_process
 
-        def stop_fixture(row: hanas.HanaProcess, config: hanas.HanasConfig) -> None:
+        def stop_fixture(row: hana_instances.HanaProcess, config: hana_instances.HanaInstancesConfig) -> None:
             stop(row, config, signal_call=self.send_signal, sleep_call=self.sleeps.append, ssh_runner=self.ssh, identity_reader=self.identity)
 
         output, errors = io.StringIO(), io.StringIO()
         with (
             redirect_stdout(output), redirect_stderr(errors),
-            mock.patch.object(hanas, "collect_processes", return_value=collection),
-            mock.patch.object(hanas, "stop_process", side_effect=stop_fixture if stop_call is None else stop_call),
+            mock.patch.object(hana_instances, "collect_processes", return_value=collection),
+            mock.patch.object(hana_instances, "stop_process", side_effect=stop_fixture if stop_call is None else stop_call),
         ):
-            code = hanas.main(list(argv))
+            code = hana_instances.main(list(argv))
         return code, output.getvalue(), errors.getvalue()
 
     def test_linux_rows_read_identity_labels_age_and_checkout_from_private_proc(self) -> None:
@@ -212,7 +212,7 @@ class HanasTests(unittest.TestCase):
                   "HANA_TEST_PURPOSE": "panel label spacing"},
             202: {"BRP_EXTRAS_PORT": "31004"},
         }
-        rows, problems = hanas.collect_processes(self.local_rows, self.ssh)
+        rows, problems = hana_instances.collect_processes(self.local_rows, self.ssh)
         self.assertEqual(problems, [])
         self.assertEqual([row.pid for row in rows], [201, 202])
         self.assertEqual((rows[0].machine, rows[0].port, rows[0].owner, rows[0].purpose),
@@ -243,18 +243,18 @@ class HanasTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, arguments + suffix + "\n", "")
 
         with mock.patch.object(herdr, "run_program", side_effect=ps):
-            rows = hanas.mac_processes(command, hanas.darwin_environment)
+            rows = hana_instances.mac_processes(command, hana_instances.darwin_environment)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].environment, {"BRP_EXTRAS_PORT": "31000"})
         self.assertEqual(rows[0].purpose, "")
-        self.assertFalse(hanas.is_test_hana(rows[0], hanas.read_config()))
+        self.assertFalse(hana_instances.is_test_hana(rows[0], hana_instances.read_config()))
         self.assertEqual(len(reads), 3)
         self.assertTrue(all(argv[-1] == "201" for argv in reads))
 
     def test_unreadable_mac_environment_stays_visible_and_cannot_be_stopped(self) -> None:
         row = self.mac_row()
         self.mac_environment_failure = True
-        rows, problems = hanas.collect_processes(self.local_rows, self.ssh)
+        rows, problems = hana_instances.collect_processes(self.local_rows, self.ssh)
         self.assertEqual(len(rows), 1)
         self.assertEqual((rows[0].pid, rows[0].start_identity, rows[0].checkout),
                          (row.pid, row.start_identity, row.checkout))
@@ -295,26 +295,26 @@ class HanasTests(unittest.TestCase):
         ):
             with self.subTest(case=case):
                 self.mac_output = f"201 {MAC_STARTED} 00:45 {process_checkout}/target/debug/hana\n"
-                collection = hanas.collect_processes(self.local_rows, self.ssh)
+                collection = hana_instances.collect_processes(self.local_rows, self.ssh)
                 self.assertEqual(len(collection[0]), 1)
                 self.assertEqual(len(collection[1]), 1)
                 if case == "global inventory failure":
                     collection[1].append("mac: process table unavailable")
-                inventories: list[tuple[list[hanas.HanaProcess], list[str]]] = (
+                inventories: list[tuple[list[hana_instances.HanaProcess], list[str]]] = (
                     [collection, collection] if inventory_index == 0 else [([], []), collection]
                 )
                 output, errors = io.StringIO(), io.StringIO()
                 with (
                     redirect_stdout(output), redirect_stderr(errors),
-                    mock.patch.object(hanas, "collect_processes", side_effect=inventories) as collect,
-                    mock.patch.object(hanas, "stop_process", side_effect=AssertionError("unreadable process signalled")) as stop,
+                    mock.patch.object(hana_instances, "collect_processes", side_effect=inventories) as collect,
+                    mock.patch.object(hana_instances, "stop_process", side_effect=AssertionError("unreadable process signalled")) as stop,
                     mock.patch.object(folder_audit, "process_uses", return_value=tmp_sweep.ProcessUsesKnown([])) as uses,
                 ):
-                    code = hanas.main(["stop-checkout", str(checkout)])
+                    code = hana_instances.main(["stop-checkout", str(checkout)])
                 stop.assert_not_called()
                 if case == "unrelated":
                     self.assertEqual((code, output.getvalue(), errors.getvalue()),
-                                     (0, "hanas: checkout clear\n", ""))
+                                     (0, "hana-instances: checkout clear\n", ""))
                     self.assertEqual(collect.call_count, 2)
                     uses.assert_called_once_with([checkout.resolve()])
                 else:
@@ -327,26 +327,26 @@ class HanasTests(unittest.TestCase):
     def test_each_configured_exempt_port_requires_labels_or_agent_environment(self) -> None:
         _ = self.process(101, {"BRP_EXTRAS_PORT": "31002"})
         base = self.local_rows()[0]
-        config = hanas.read_config()
+        config = hana_instances.read_config()
         for port in (31000, 31001):
             user = replace(base, port=port, environment={"BRP_EXTRAS_PORT": str(port)})
             with self.subTest(port=port, case="user"):
-                self.assertFalse(hanas.is_test_hana(user, config))
-                self.assertFalse(hanas.over_limit(replace(user, age_seconds=1_000_000), config))
+                self.assertFalse(hana_instances.is_test_hana(user, config))
+                self.assertFalse(hana_instances.over_limit(replace(user, age_seconds=1_000_000), config))
             for key in ("CLAUDECODE", "SSH_CONNECTION", "SHOWRUNNER_UNIT_ID"):
                 with self.subTest(port=port, agent=key):
-                    self.assertTrue(hanas.is_test_hana(replace(user, environment={**user.environment, key: "agent"}), config))
-            self.assertTrue(hanas.is_test_hana(replace(user, owner="window-unit"), config))
-            self.assertTrue(hanas.is_test_hana(replace(user, purpose="CI icon"), config))
+                    self.assertTrue(hana_instances.is_test_hana(replace(user, environment={**user.environment, key: "agent"}), config))
+            self.assertTrue(hana_instances.is_test_hana(replace(user, owner="window-unit"), config))
+            self.assertTrue(hana_instances.is_test_hana(replace(user, purpose="CI icon"), config))
         unknown = replace(base, port=0, environment={})
-        self.assertFalse(hanas.is_test_hana(unknown, config))
-        self.assertFalse(hanas.over_limit(replace(unknown, age_seconds=1_000_000), config))
-        self.assertTrue(hanas.is_test_hana(replace(unknown, purpose="CI icon"), config))
+        self.assertFalse(hana_instances.is_test_hana(unknown, config))
+        self.assertFalse(hana_instances.over_limit(replace(unknown, age_seconds=1_000_000), config))
+        self.assertTrue(hana_instances.is_test_hana(replace(unknown, purpose="CI icon"), config))
         owner_only = replace(base, owner="window-unit", age_seconds=421)
-        self.assertFalse(hanas.over_limit(owner_only, config))
-        self.assertTrue(hanas.over_limit(replace(owner_only, age_seconds=9001), config))
+        self.assertFalse(hana_instances.over_limit(owner_only, config))
+        self.assertTrue(hana_instances.over_limit(replace(owner_only, age_seconds=9001), config))
         # The usual user port is deliberately not exempt in this private config.
-        self.assertTrue(hanas.is_test_hana(replace(base, port=15702), config))
+        self.assertTrue(hana_instances.is_test_hana(replace(base, port=15702), config))
 
     def test_sweep_uses_runtime_limits_and_only_stops_overdue_test_hanas(self) -> None:
         cases = (
@@ -420,7 +420,7 @@ class HanasTests(unittest.TestCase):
 
         output = io.StringIO()
         with redirect_stdout(output):
-            hanas.stop_process(row, hanas.read_config(), signal_call=exits_after_term,
+            hana_instances.stop_process(row, hana_instances.read_config(), signal_call=exits_after_term,
                                sleep_call=self.sleeps.append, ssh_runner=self.ssh, identity_reader=self.identity)
         self.assertEqual(self.signals, [(101, signal.SIGTERM)])
         self.assertEqual(output.getvalue(), "natedev:101: stopped\n")
@@ -484,7 +484,7 @@ class HanasTests(unittest.TestCase):
                 self.sleeps.clear()
                 output = io.StringIO()
                 with redirect_stdout(output):
-                    hanas.stop_process(row, hanas.read_config(),
+                    hana_instances.stop_process(row, hana_instances.read_config(),
                                        signal_call=self.send_signal, identity_reader=self.identity,
                                        sleep_call=reuse_during_grace, ssh_runner=self.ssh)
                 self.assertEqual(self.signals, [] if before_term else [(101, signal.SIGTERM)])
@@ -499,7 +499,7 @@ class HanasTests(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0, "", "")
 
         with redirect_stdout(output), self.assertRaisesRegex(ValueError, "stop could not be confirmed"):
-            hanas.stop_process(row, hanas.read_config(), ssh_runner=masked_status)
+            hana_instances.stop_process(row, hana_instances.read_config(), ssh_runner=masked_status)
         self.assertEqual(output.getvalue(), "")
 
     def test_reused_remote_pid_is_not_signalled_before_term_or_after_grace(self) -> None:
@@ -526,7 +526,7 @@ class HanasTests(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0, self.mac_output, "")
 
         with mock.patch.object(sys, "platform", "darwin"):
-            rows, problems = hanas.collect_processes(
+            rows, problems = hana_instances.collect_processes(
                 local_source=mock.Mock(side_effect=AssertionError("Darwin read /proc")),
                 ssh_runner=mock.Mock(side_effect=AssertionError("Darwin used ssh")),
                 local_runner=ps, environment_reader=self.mac_environments.__getitem__,
@@ -542,7 +542,7 @@ class HanasTests(unittest.TestCase):
             _ = self.process(pid, {"BRP_EXTRAS_PORT": "31002"}, age=421)
         attempted: list[int] = []
 
-        def stop(row: hanas.HanaProcess, config: hanas.HanasConfig) -> None:
+        def stop(row: hana_instances.HanaProcess, config: hana_instances.HanaInstancesConfig) -> None:
             attempted.append(row.pid)
             self.assertEqual(config.stop_grace_seconds, 0.125)
             if row.pid in (101, 102):

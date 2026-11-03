@@ -30,7 +30,7 @@ from scripts.lib.conf import UseConfiguredValue
 
 
 @dataclass(frozen=True)
-class HanasConfig:
+class HanaInstancesConfig:
     exempt_ports: frozenset[int]
     test_max_seconds: float
     unlabelled_max_seconds: float
@@ -64,20 +64,20 @@ class HanaProcess:
     environment_status: EnvironmentKnown | EnvironmentUnknown = ENVIRONMENT_KNOWN
 
 
-def read_config(*, hanas_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> HanasConfig:
-    if isinstance(hanas_settings, UseConfiguredValue):
-        hanas_settings = conf.read("hanas")
-    settings = hanas_settings.source
-    values = hanas_settings.values()
+def read_config(*, hana_instances_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> HanaInstancesConfig:
+    if isinstance(hana_instances_settings, UseConfiguredValue):
+        hana_instances_settings = conf.read("hana_instances")
+    settings = hana_instances_settings.source
+    values = hana_instances_settings.values()
     try:
         ports = frozenset(int(item.strip()) for item in values["exempt_ports"].split(",") if item.strip())
     except (KeyError, ValueError) as error:
         raise ValueError(f"{settings}: exempt_ports needs comma-separated ports") from error
     if any(not 0 < port <= 65535 for port in ports):
         raise ValueError(f"{settings}: exempt_ports contains an invalid port")
-    return HanasConfig(ports, hanas_settings.number("test_max_hours") * 3600,
-                       hanas_settings.number("unlabelled_max_minutes") * 60,
-                       hanas_settings.number("stop_grace_seconds"))
+    return HanaInstancesConfig(ports, hana_instances_settings.number("test_max_hours") * 3600,
+                       hana_instances_settings.number("unlabelled_max_minutes") * 60,
+                       hana_instances_settings.number("stop_grace_seconds"))
 
 
 @dataclass(frozen=True)
@@ -205,12 +205,12 @@ def mac_processes(output: str, environment_reader: Callable[[int], dict[str, str
     return rows
 
 
-def is_test_hana(row: HanaProcess, config: HanasConfig) -> bool:
+def is_test_hana(row: HanaProcess, config: HanaInstancesConfig) -> bool:
     return bool(row.owner or row.purpose or (row.port != 0 and row.port not in config.exempt_ports)
                 or any(key in row.environment for key in ("CLAUDECODE", "SSH_CONNECTION", "SHOWRUNNER_UNIT_ID")))
 
 
-def over_limit(row: HanaProcess, config: HanasConfig) -> bool:
+def over_limit(row: HanaProcess, config: HanaInstancesConfig) -> bool:
     limit = config.test_max_seconds if row.owner or row.purpose else config.unlabelled_max_seconds
     return is_test_hana(row, config) and row.age_seconds > limit
 
@@ -292,7 +292,7 @@ def darwin_identity(pid: int, runner: Callable[[list[str]], subprocess.Completed
     return ProcessGone()
 
 
-def remote_stop(row: HanaProcess, config: HanasConfig,
+def remote_stop(row: HanaProcess, config: HanaInstancesConfig,
                 ssh_runner: Callable[[list[str]], subprocess.CompletedProcess[str]]) -> None:
     from scripts.mac_test import offload
     # Read the complete table so a failed ps cannot be mistaken for an absent pid.
@@ -301,7 +301,7 @@ def remote_stop(row: HanaProcess, config: HanasConfig,
     current=$(printf '%s\n' "$table" | awk '$1 == {row.pid} {{$1=""; sub(/^ +/, ""); gsub(/ +/, " "); print}}')
     [ "$current" = {shlex.quote(row.start_identity)} ]
 }}
-gone() {{ printf '%s\n' 'hanas: process gone'; exit 0; }}
+gone() {{ printf '%s\n' 'hana-instances: process gone'; exit 0; }}
 same_process
 identity_status=$?
 [ "$identity_status" = 1 ] && gone
@@ -318,12 +318,12 @@ identity_status=$?
 [ "$identity_status" = 1 ] && gone
 exit 2"""
     result = ssh_runner([*offload.ssh_prefix(offload.read_config()), command])
-    if result.returncode or result.stdout.strip() != "hanas: process gone":
+    if result.returncode or result.stdout.strip() != "hana-instances: process gone":
         raise ValueError(f"mac:{row.pid}: stop could not be confirmed")
 
 
 def stop_process(
-    row: HanaProcess, config: HanasConfig, *,
+    row: HanaProcess, config: HanaInstancesConfig, *,
     signal_call: Callable[[int, int], object] = os.kill,
     sleep_call: Callable[[float], object] = time.sleep,
     ssh_runner: Callable[[list[str]], subprocess.CompletedProcess[str]] = run_ssh,
@@ -365,7 +365,7 @@ def row_text(row: HanaProcess) -> str:
             f"purpose {row.purpose or 'unlabelled'} age {row.age_seconds / 3600:.2f} h checkout {row.checkout}")
 
 
-def stop_checkout(checkout: Path, config: HanasConfig) -> None:
+def stop_checkout(checkout: Path, config: HanaInstancesConfig) -> None:
     """Confirm test Hanas exited and no process still uses a checkout before its task ends."""
     checkout = checkout.resolve()
 
@@ -393,7 +393,7 @@ def stop_checkout(checkout: Path, config: HanasConfig) -> None:
         raise ValueError(f"{checkout}: process use could not be read")
     if any(Path(path).resolve().is_relative_to(checkout) for path, _, _ in uses.paths):
         raise ValueError(f"{checkout}: a process still uses the checkout")
-    print("hanas: checkout clear")
+    print("hana-instances: checkout clear")
 
 
 class Arguments(argparse.Namespace):
@@ -434,7 +434,7 @@ def main(argv: list[str] | None = None) -> int:
                         try:
                             stop_process(row, config)
                         except (OSError, ValueError, subprocess.TimeoutExpired) as error:
-                            print(f"hanas: {error}", file=sys.stderr)
+                            print(f"hana-instances: {error}", file=sys.stderr)
                             failed = True
             return 2 if failed else 0
         else:
@@ -452,7 +452,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{args.target}: already gone")
         return 0
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
-        print(f"hanas: {error}", file=sys.stderr)
+        print(f"hana-instances: {error}", file=sys.stderr)
         return 2
 
 

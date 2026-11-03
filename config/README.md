@@ -132,9 +132,9 @@ The `folder_*` keys control the folder audit. The `sweep_*` keys control the bui
 Floor records and `floor.lock` use `tmp_sweep.state_dir()`.
 Disk measurements and build history use `scripts/buildlog/store.py::root()`.
 
-## hanas.conf
+## hana_instances.conf
 
-`scripts/hanas/hanas.py` reads these settings through `scripts/lib/conf.py` on each invocation.
+`scripts/hana_instances/hana_instances.py` reads these settings through `scripts/lib/conf.py` on each invocation.
 `CONF_DIR` selects the configuration folder, including temporary test folders.
 An exempt port still identifies a test Hana when the process has test labels or an agent environment.
 Mac host and SSH settings remain in `mac_test.conf`.
