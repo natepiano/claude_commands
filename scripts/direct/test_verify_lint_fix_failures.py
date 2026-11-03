@@ -12,7 +12,7 @@ class VerifyLintScopeTests(VerifyLintJudgmentFixture):
         self.environment["TEST_CLIPPY_FIX_STATUS"] = "41"
         for judgment_status in (0, 43):
             with self.subTest(judgment_status=judgment_status):
-                self.environment["TEST_CLIPPY_STATUS"] = str(judgment_status)
+                self.environment["TEST_CLIPPY_STATUSES"] = f"[101, {judgment_status}]"
                 result = self.invoke_verify("lint", "sample", cwd=self.root)
                 self.assertEqual(result.returncode, judgment_status, result.stdout + result.stderr)
                 self.assert_fix_and_judgment_calls()

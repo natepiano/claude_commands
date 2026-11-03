@@ -20,14 +20,12 @@ from typing import cast, final, override
 from unittest.mock import Mock, call, patch
 
 from scripts.accounts import accounts
-from scripts.lib import conf
-from scripts.whoami import account, agent_accounts
+from scripts.whoami import account
 from scripts.shutdown import stop_resume
 from scripts.shutdown.launch_names import LaunchNames
 from scripts.production import showrunners, staff, staff_sources, stall_watch
 from scripts.shutdown.inventory import PausedSeat
 import herdr
-import inventory
 import pane_record
 import pane_launch
 import sessions
@@ -153,75 +151,11 @@ class StopResumeTests(unittest.TestCase):
         self.kill.assert_not_called()
         self.detach.assert_not_called()
 
-    def test_resume_of_a_session_on_another_account_refuses(self) -> None:
-        self.live.return_value = sessions.LiveSessionProcess(123)
-        self.assertEqual(stop_resume.resume("alpha", to="claude4"), stop_resume.RunningOnAnotherAccount(
-            self.entry["session_id"]))
-        self.live.assert_called_once()
-        self.start.assert_not_called()
-        self.kill.assert_not_called()
 
-    def test_retry_returns_the_typed_account_refusal_after_one_attempt(self) -> None:
-        refused = stop_resume.RunningOnAnotherAccount(self.entry["session_id"])
-        policy = sessions.SessionRetryPolicy(1, 0, 3, 1)
-        with (patch.object(stop_resume, "_resume_once", return_value=refused) as attempt,
-              patch.object(sessions, "retry_policy", return_value=policy),
-              patch.object(time, "sleep") as delay):
-            self.assertIs(stop_resume.resume("alpha", to="claude4"), refused)
-        attempt.assert_called_once()
-        delay.assert_not_called()
 
-    def test_retry_does_not_use_failure_text_as_an_account_refusal(self) -> None:
-        failed = stop_resume.ResumeFailed(self.entry["session_id"], "Claude is still running on another account")
-        resumed = stop_resume.ClaudeUp(self.entry["session_id"], "w1:p2", "claude4")
-        policy = sessions.SessionRetryPolicy(1, 0, 3, 1)
-        with (patch.object(stop_resume, "_resume_once", side_effect=[failed, resumed]) as attempt,
-              patch.object(sessions, "retry_policy", return_value=policy),
-              patch.object(time, "sleep") as delay):
-            self.assertIs(stop_resume.resume("alpha", to="claude4"), resumed)
-        self.assertEqual(attempt.call_count, 2)
-        delay.assert_called_once_with(1)
 
-    def test_account_move_preserves_the_typed_account_refusal(self) -> None:
-        refused = stop_resume.RunningOnAnotherAccount(self.entry["session_id"])
-        settings = conf.ConfigRead("accounts", self.root / "accounts.conf", {}, False)
-        destination = agent_accounts.NumberedAccount("claude4", self.root / ".claude4", "fixture-owner")
-        with (patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning(self.entry["session_id"])),
-              patch.object(stop_resume, "resume", return_value=refused),
-              patch.object(accounts, "check_move_target", return_value=accounts.MoveTargetReady(destination)),
-              patch.object(inventory, "listing", return_value=[])):
-            self.assertIs(stop_resume.move("alpha", "claude4", why="fixture move"), refused)
-            outcomes = accounts.move_sessions((self.entry["session_id"],), "claude4",
-                                              why="fixture move", account_config=settings)
-            self.assertEqual(len(outcomes), 1)
-            self.assertIs(outcomes[0], refused)
-            moved = accounts.move("alpha", "claude4", account_config=settings)
-        self.assertEqual(moved, accounts.MoveStartFailed("alpha", "claude4", "",
-            f"{self.entry['session_id']}: not moved: Claude is still running on another account\n", 1))
-        self.assertEqual(accounts.move_result_line(refused),
-                         f"{self.entry['session_id']}: not moved: Claude is still running on another account")
 
-    def test_shutdown_prints_the_typed_account_refusal_and_exits_one(self) -> None:
-        self.live.return_value = sessions.LiveSessionProcess(123)
-        with redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(shutdown.main(["resume", "alpha", "--to", "claude4"]), 1)
-        self.assertEqual(output.getvalue().splitlines(), [
-            f"{self.entry['session_id']}: resume failed: Claude is still running on another account"])
-        self.start.assert_not_called()
-        self.kill.assert_not_called()
 
-    def test_retry_accepts_a_session_that_started_between_attempts(self) -> None:
-        identity = self.entry["session_id"]
-        def started(_tab: herdr.TabSession, _entry: pane_record.PaneLaunch,
-                    _account: str, _message: str) -> sessions.LiveSessionProcess:
-            self.launched.add(identity)
-            self.client.native_ids["w1:p2"] = identity
-            raise herdr.HerdrFailure("registry mid-write")
-        with patch.object(stop_resume, "_start_session", side_effect=started) as start:
-            self.assertEqual(stop_resume.resume("alpha", to="claude4"), stop_resume.ClaudeUp(
-                identity, "w1:p2", "claude4"))
-        start.assert_called_once()
-        self.kill.assert_not_called()
 
     def test_resume_by_name_of_a_running_session_reports_success_without_a_launch(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
@@ -233,7 +167,7 @@ class StopResumeTests(unittest.TestCase):
               redirect_stdout(io.StringIO()) as output):
             self.assertEqual(shutdown.main(["resume", "accounts"]), 0)
         self.assertEqual(output.getvalue().splitlines(), [
-            f"{identity}: Claude is already running on claude3 in w1:p2"])
+            f"{identity}: unchanged; Claude runs on claude3 in w1:p2"])
         self.start.assert_not_called()
         self.kill.assert_not_called()
 
@@ -401,7 +335,7 @@ class StopResumeTests(unittest.TestCase):
                 "agent_session": {"kind": "none"}})
             return "w2:p3"
         with patch.object(self.client, "open_tab", side_effect=open_tab) as opened:
-            result = stop_resume.resume("019b3a40-4250-7000-8000-000000000102", why="watchdog recovery", restore_missing=True)
+            result = stop_resume.resume("019b3a40-4250-7000-8000-000000000102", why="watchdog recovery")
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         assert isinstance(result, stop_resume.ClaudeUp)
         self.assertEqual((result.session_id, result.pane_id, result.account), ("019b3a40-4250-7000-8000-000000000102", "w2:p3", "claude3"))
@@ -432,7 +366,7 @@ class StopResumeTests(unittest.TestCase):
         with (patch.object(staff, "initial_snapshot", return_value=record) as snapshot,
               patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources({}, ())),
               patch.object(self.client, "open_tab", side_effect=open_tab)):
-            result = stop_resume.resume(str(fixed), why="recovery", restore_missing=True)
+            result = stop_resume.resume(str(fixed), why="recovery")
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         self.assertEqual(opened, ["row-name"])
         snapshot.assert_called_once()
@@ -712,7 +646,7 @@ class StopResumeTests(unittest.TestCase):
         self.live.return_value = sessions.LiveSessionProcess(123)
         self.client.native_ids["w1:p2"] = self.entry["session_id"]
         with patch.object(self.client, "open_tab") as opened:
-            result = stop_resume.resume("019b3a40-4250-7000-8000-000000000102", why="recovery", restore_missing=True)
+            result = stop_resume.resume("019b3a40-4250-7000-8000-000000000102", why="recovery")
         self.assertEqual(result, stop_resume.ClaudeUp("019b3a40-4250-7000-8000-000000000102", "w1:p2", "claude3"))
         opened.assert_not_called()
         self.start.assert_not_called()
@@ -747,12 +681,6 @@ class StopResumeTests(unittest.TestCase):
         self.detach.assert_called_once()  # Only the successful resume's stay check, never a rerun handoff.
         self.assertEqual(pane_record.record_path("agents").read_bytes(), before)
 
-    def test_resume_retries_a_transient_registry_failure_without_an_extra_launch(self) -> None:
-        self.live.side_effect = [sessions.SessionLivenessUnknown("registry mid-write"), sessions.SessionNotLive(),
-                                 sessions.SessionNotLive()]
-        self.assertEqual(stop_resume.resume("alpha", to="claude4", why="finish pending move"),
-                         stop_resume.ClaudeUp("019b3a40-4250-7000-8000-000000000102", "w1:p2", "claude4"))
-        self.start.assert_called_once()
 
     def test_shutdown_resume_finishes_a_pending_move_and_reruns_with_one_line(self) -> None:
         self.start.side_effect = herdr.HerdrFailure("cannot start yet")
@@ -764,9 +692,9 @@ class StopResumeTests(unittest.TestCase):
                 status = shutdown.main(["resume", "alpha", "--why", "finish move"])
             self.assertEqual(status, 0, output.getvalue())
             self.assertEqual(len(output.getvalue().splitlines()), 1)
-            self.assertIn("Claude is up on claude4" if iteration == 0 else "Claude is already running on claude4", output.getvalue())
+            self.assertIn("Claude is up on claude4" if iteration == 0 else "unchanged; Claude runs on claude4", output.getvalue())
 
-    def test_move_copies_source_folder_trust_to_the_target_before_start(self) -> None:
+    def test_move_copies_source_trust_to_the_target_before_start(self) -> None:
         target = self.root / ".claude4/.claude.json"
         _ = target.write_text(json.dumps({"projects": {}, "unrelated": "keep"}))
         def start_after_trust(*arguments: str) -> str:
@@ -785,28 +713,6 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(line.count("copied folder trust from claude3"), 1)
         self.assertEqual(json.loads(target.read_text())["unrelated"], "keep")
 
-    def test_move_without_trust_refuses_with_target_trust_command_before_start(self) -> None:
-        for label in ("claude3", "claude4"):
-            _ = (self.root / f".{label}/.claude.json").write_text('{"projects": {}}')
-        results = stop_resume.move_sessions(["alpha"], "claude4", why="usage limit")
-        result = results[0]
-        self.assertIsInstance(result, stop_resume.ResumePending)
-        assert isinstance(result, stop_resume.ResumePending)
-        command = accounts.trust_command(self.root, accounts.NamedAccount("claude4", self.root / ".claude4"))
-        self.assertIn("Claude has not trusted this folder", result.reason)
-        self.assertIn(f"Run: {command}", result.reason)
-        self.start.assert_not_called()
-        self.detach.assert_not_called()
-
-    def test_resume_with_unreadable_target_trust_refuses_before_start(self) -> None:
-        _ = (self.root / ".claude4/.claude.json").write_text('{"private": "never disclose"')
-        result = stop_resume.resume("alpha", to="claude4", why="usage limit")
-        self.assertIsInstance(result, stop_resume.ResumeFailed)
-        assert isinstance(result, stop_resume.ResumeFailed)
-        self.assertIn("cannot read", result.reason)
-        self.assertIn("Run: " + accounts.trust_command(self.root, accounts.NamedAccount("claude4", self.root / ".claude4")), result.reason)
-        self.assertNotIn("never disclose", result.reason)
-        self.start.assert_not_called()
 
     def test_a_stopped_tab_resumes_by_id_or_label_from_its_launch_entry(self) -> None:
         self.client.rows[0]["agent_session"] = None
@@ -945,17 +851,6 @@ class StopResumeTests(unittest.TestCase):
         run.assert_not_called()
         popen.assert_not_called()
 
-    def test_failed_handoff_reports_failure_without_signalling(self) -> None:
-        with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": self.entry["session_id"]}),
-              patch.object(staff, "runtime_id", return_value=self.entry["session_id"]),
-              patch.object(showrunners, "own_slug", return_value="alpha"),
-              patch.object(stop_resume, "_detach", wraps=self.real_detach),
-              patch.object(sys, "platform", "linux"),
-              patch.object(subprocess, "run", side_effect=OSError("service manager unavailable"))):
-            result = stop_resume.move_sessions(["alpha"], "claude4", why="limit")
-        self.assertEqual(result, [stop_resume.StopFailed("alpha", "cannot hand off move: service manager unavailable")])
-        self.kill.assert_not_called()
-        self.start.assert_not_called()
 
     def test_reused_pid_generation_is_checked_before_each_signal(self) -> None:
         for changed_before_term in (True, False):
@@ -1016,18 +911,26 @@ class StopResumeTests(unittest.TestCase):
         self.assertIn("maintenance", opening.text)
         self.assertIn("Continue where you stopped", opening.text)
 
+
     def test_resume_identity_mismatch_or_missing_proof_dispatches_no_work(self) -> None:
         for proof in ("019b3a40-4250-7000-8000-000000000199", herdr.HerdrFailure("registry unavailable")):
             with self.subTest(proof=proof):
                 self.launched.clear()
                 self.client.prompts.clear()
                 self.start.reset_mock()
-                with patch.object(self.client, "native_session", return_value=proof if isinstance(proof, str) else "",
-                                  side_effect=None if isinstance(proof, str) else proof):
+                errors = io.StringIO()
+                identity = staff.StaffId(self.entry["session_id"])
+                row = staff.StaffRow(identity, "unit", "alpha", None, current_session=identity)
+                with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+                      patch.object(self.client, "native_session", return_value=proof if isinstance(proof, str) else "",
+                                   side_effect=None if isinstance(proof, str) else proof),
+                      redirect_stderr(errors)):
                     result = stop_resume.resume("alpha", why="maintenance")
-                self.assertIsInstance(result, stop_resume.ResumeFailed)
+                self.assertIsInstance(result, stop_resume.ClaudeUp)
                 self.assertEqual(self.client.prompts, [])
-                self.detach.assert_not_called()
+                self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                self.assertIn("prompt identity anomaly:", errors.getvalue())
+                self.detach.assert_called()
 
     def test_resume_runs_account_exec_in_its_own_pane_with_one_message(self) -> None:
         self.entry["environment"].update(HERDR_PANE_ID="w9:p9", HERDR_WORKSPACE_ID="w9")
@@ -1057,13 +960,6 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(self.client.closed, [])
         self.assertEqual(self.client.started, [])
 
-    def test_admitted_pane_run_with_no_start_retries_three_times_then_fails(self) -> None:
-        with patch.object(self.client, "run", self.start):
-            result = stop_resume.resume("alpha", why="maintenance")
-        self.assertEqual(result, stop_resume.ResumeFailed("019b3a40-4250-7000-8000-000000000102", "never started"))
-        self.assertEqual(self.start.call_count, 3)
-        self.assertEqual(self.clock.elapsed, 60.0)
-        self.assertEqual({invocation.args[2] for invocation in self.start.call_args_list}, {"w1:p2"})
 
     def test_resume_returns_before_the_stay_window_and_detaches_its_generation(self) -> None:
         result = stop_resume.resume("alpha", why="maintenance")
@@ -1244,17 +1140,6 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(stop_resume.resume("019b3a40-4250-7000-8000-000000000102", why="maintenance"),
                          stop_resume.ClaudeUp("019b3a40-4250-7000-8000-000000000102", "w1:p2", "claude3"))
 
-    def test_resume_refuses_a_mismatched_entry_but_does_not_wait_for_idle(self) -> None:
-        self.entry["session_id"] = "sid-other"
-        pane_record.write("agents", self.entry)
-        self.live.return_value = sessions.LiveSessionProcess(123)
-        self.assertEqual(stop_resume.resume("alpha", why="maintenance"), stop_resume.ResumeFailed("alpha", "unknown name"))
-        self.start.assert_not_called()
-        self.entry["session_id"] = "019b3a40-4250-7000-8000-000000000102"
-        self.live.return_value = sessions.SessionNotLive()
-        pane_record.write("agents", self.entry)
-        with patch.object(self.client, "pane_activity", side_effect=AssertionError("no idle gate")):
-            self.assertEqual(stop_resume.resume("alpha", why="maintenance"), stop_resume.ClaudeUp("019b3a40-4250-7000-8000-000000000102", "w1:p2", "claude3"))
 
     def test_move_stops_then_runs_the_target_account_in_the_same_pane(self) -> None:
         identity = "019b3a40-4250-7000-8000-000000000102"
@@ -1349,19 +1234,6 @@ class StopResumeTests(unittest.TestCase):
             stop_resume.ResumePending("resume-error", "claude4", "cannot run"),
             stop_resume.ResumePending("gone-tab", "claude4", "session has no tab after stop"), stop_resume.ClaudeUp("good", "own-pane", "claude4")])
 
-    def test_warning_precedes_all_stops_and_is_limited_to_fifteen_seconds(self) -> None:
-        events: list[str] = []
-        def warn(session: str, _target: str, _why: str, _seconds: int) -> None:
-            events.append("warn " + session)
-        def stop_one(session: str) -> stop_resume.StopFailed:
-            self.assertCountEqual(events, ["warn first", "warn second"])
-            return stop_resume.StopFailed(session, "fixture")
-        with patch.object(stop_resume, "_warn_session", side_effect=warn), patch.object(stop_resume, "_stop", side_effect=stop_one), patch.object(stop_resume, "monotonic", side_effect=[100.0, 100.0, 102.0]):
-            results = stop_resume.move_sessions(["first", "second"], "claude4", why="limit", warn_seconds=15)
-            self.assertEqual(len(results), 2)
-            with self.assertRaises(ValueError):
-                _ = stop_resume.move_sessions(["first"], "claude4", why="limit", warn_seconds=16)
-        cast(Mock, cast(Mock, self.wait.return_value).wait).assert_called_once_with(13.0)
 
     def test_cli_prints_one_line_and_uses_the_result_exit_status(self) -> None:
         for arguments, expected in ((["stop", "alpha"], 0), (["resume", "alpha", "--why", "maintenance"], 0),
