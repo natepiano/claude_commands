@@ -3,9 +3,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypedDict
 
+from scripts.lib import conf
+
 from . import client, questions
 
-STATE_DIR = Path.home() / ".local/state/issue-score"
+def state_dir() -> Path:
+    return Path(conf.text("issue_score", "state_dir")).expanduser()
 
 
 class RequestPayload(TypedDict):
