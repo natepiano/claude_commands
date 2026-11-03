@@ -18,7 +18,7 @@ import time
 import threading
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cas
 
 import reply_asks
 import push_texts
+import push_reference
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone, user_zone_name, zone_label  # noqa: E402
@@ -107,6 +108,7 @@ class Draft:
     answerable: bool
     session: NotificationSession = NO_SESSION_LINE
     due: str = ""
+    reference: push_reference.PushReference = field(default_factory=lambda: push_reference.NO_REFERENCE)
 
 
 @dataclass(frozen=True)
@@ -343,6 +345,7 @@ ClaimDelivery = ClaimSent | ClaimCancelled | ClaimFailed
 
 
 class MessageRecord(TypedDict):
+    reference: NotRequired[push_reference.PushReference]
     session: NotRequired[str]
     title: str
     action: str | None
@@ -460,6 +463,8 @@ def switched_off() -> bool:
 def message_record(draft: Draft) -> MessageRecord:
     action = draft.action.text if isinstance(draft.action, ActionRequired) else None
     record: MessageRecord = {"title": draft.title, "action": action, "body": draft.body}
+    if draft.reference["kind"] != "none":
+        record["reference"] = draft.reference
     if isinstance(draft.session, SessionLine):
         record["session"] = draft.session.text
     return record
@@ -523,7 +528,8 @@ def _draft(value: object) -> Draft:
         raise ValueError("priority")
     return Draft(_text(record, "source"), priority, _text(record, "title"),
                  _action(record), _text(record, "body"), answerable, _session(record),
-                 _text(record, "due") if "due" in record else "")
+                 _text(record, "due") if "due" in record else "",
+                 push_reference.read_reference(record.get("reference")))
 
 
 def length_failures(draft: Draft) -> list[str]:

@@ -114,13 +114,19 @@ def notice_state_lock(key: str) -> Generator[None]:
 @contextmanager
 def notice_claim(key: str) -> Generator[WarningDelivery | NoticeNotClaimed]:
     """Hold the send claim until this pass ends; a stopped owner releases it."""
-    with (STATE / f"{key}.claim").open("a") as claim:
+    with (STATE / f"{key}.claim").open("a+") as claim:
         try:
             fcntl.flock(claim.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            _ = claim.seek(0)
+            print(f"already claimed by {claim.read().strip() or key}")
             yield NoticeNotClaimed()
             return
         try:
+            _ = claim.seek(0)
+            _ = claim.truncate()
+            _ = claim.write(str(os.getpid()))
+            claim.flush()
             delivery: WarningDelivery | NoticeNotClaimed = NoticeNotClaimed()
             with notice_state_lock(key):
                 previous = read_delivery(key)

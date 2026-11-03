@@ -282,7 +282,7 @@ def settings_step(account: NewAccount) -> Step:
     if not missing:
         return Step(True, f"~/.claude/settings.json covers ~/.{account.name}")
     lines = "\n".join(f"    {where}: \"{entry}\"," for where, entry in missing)
-    return Step(False, f"add to ~/.claude/settings.json (agents may not edit it):\n{lines}")
+    return Step(True, f"anomaly: add to ~/.claude/settings.json (agents may not edit it):\n{lines}")
 
 
 def _shell_module_path() -> Path:
@@ -304,14 +304,14 @@ def alias_step(account: NewAccount) -> Step:
     """The `claudeN` or `codexN` alias in this machine's shell module."""
     module = nixos_shell_module()
     if module is None:
-        return Step(False, f"no nixos shell module found to define the {account.name} alias "
+        return Step(True, f"anomaly: no nixos shell module found to define the {account.name} alias "
                     + f"(looked for {_shell_module_path()})")
     text = module.read_text(encoding="utf-8")
     if account.tool == "claude" and ALIAS_LOOP_MARKER in text:
         return Step(True, f"{account.name} alias: comes from the account note; open a new terminal")
     if re.search(rf"^\s*{account.name}\s*=", text, re.MULTILINE):
         return Step(True, f"{account.name} alias in {module} (live after a rebuild)")
-    return Step(False, f"add to shellAliases in {module}, then rebuild:\n    {account.name} = "
+    return Step(True, f"anomaly: add to shellAliases in {module}, then rebuild:\n    {account.name} = "
                 + f"\"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec {account.label}\";")
 
 

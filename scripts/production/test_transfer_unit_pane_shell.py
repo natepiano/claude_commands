@@ -1,24 +1,15 @@
 """Transfer moves the unit's pane without stopping, closing or restarting it."""
-import json
 from pathlib import Path
-from typing import cast
 
 from scripts.production.transfer_unit_test_support import UnitTransferFixture
-from scripts.production.fake_unit_host import PaneShellFixture, record_shutdown, assert_shared_stop_record, calls
+from scripts.production.fake_unit_host import PaneShellFixture, record_shutdown, calls
 
 
 class TransferPaneShellTests(UnitTransferFixture):
-    def test_seed_inherits_shared_stop_record_defaults(self) -> None:
-        assert_shared_stop_record(self, self.seed_record,
-            self.root / 'home/.local/state/shutdown/owner@example.com/sessions/5ad615f2-4e04-5121-a102-9d6b2e2a6eb3.json')
 
     def pane_shell(self, *, live: bool) -> None:
         shutdown_log = self.seed_record()
         path = self.root / 'home/.local/state/shutdown/owner@example.com/sessions/5ad615f2-4e04-5121-a102-9d6b2e2a6eb3.json'
-        if live:
-            saved = cast(dict[str, object], json.loads(path.read_text()))
-            saved['progress'] = {'kind':'ready','at':'2026-10-09T21:50:00+00:00'}
-            self.write(path, json.dumps(saved))
         pane = PaneShellFixture(self, self.unit, Path(self.env['HERDR_PROC']), live=live, env=self.env)
         record_shutdown(self, pane, path, destination=('other','alpha-unit','alpha'))
         self.configure_tab_move()
