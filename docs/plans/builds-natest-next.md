@@ -38,3 +38,8 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Why needed: `module_seconds.json` keeps 728 keys for 664 test files; old `delegate/*` keys remain after the folder moved. Memory admission reads the peak file the same way.
   - Completion condition: send the showrunner a proposal to drop keys whose module file is gone, with the key counts.
   - Revealed by: plan research, 2026-11-03.
+- [ ] **The build log test suite finishes about 20 seconds sooner.**
+  - Target: `scripts/buildlog/test_index.py` — `LogIsolationTests.test_each_module_uses_a_temporary_log`
+  - Why needed: the test starts one Python process for each of the 33 `test_*.py` modules in `scripts/buildlog`: 24.5 s of the 34.8 s suite run at load 70 (11:24 EST, 2026-11-03). It is the slowest test in the index suite, and each new module adds one more process.
+  - Completion condition: one process imports every module and reports each module's log root; the test keeps one assertion per module and takes under 3 s on an idle natedev.
+  - Revealed by: Phase 3
