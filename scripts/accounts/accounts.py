@@ -4628,7 +4628,7 @@ def _status_row_cells(row: StatusRow, zone: tzinfo, checked_at: datetime, *, acc
     reset = row.resets_at
     credits = row.credits
     read = row.read_at
-    role_cell = ", ".join(row.roles) if row.roles else NO_VALUE if row.tool == "codex" else ""
+    role_cell = row.roles[0] if row.roles else NO_VALUE if row.tool == "codex" else ""
     if isinstance(weekly, WeeklyNotReadSince):
         weekly_cell = f"not read since {weekly.read_at.astimezone(zone):%H:%M}"
         if isinstance(weekly.reason, agent_accounts.StaleTokenSkip):
@@ -4856,7 +4856,12 @@ def _read_failure_problem(row: StatusRow, zone: tzinfo,
 
 def render_status_table(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> str:
     account_config = read_account_settings(account_config)
-    return "\n".join([_render_table([_status_row_cells(row, reading.zone, reading.checked_at, account_config=account_config) for row in reading.rows]), "",
+    rows: list[tuple[str, ...]] = []
+    for row in reading.rows:
+        cells = _status_row_cells(row, reading.zone, reading.checked_at, account_config=account_config)
+        rows.append(cells)
+        rows.extend(tuple(role if index == 2 else "" for index in range(len(cells))) for role in row.roles[1:])
+    return "\n".join([_render_table(rows), "",
         *reading.notes, *reading.detail_lines])
 
 
