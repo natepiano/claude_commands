@@ -16,7 +16,7 @@ from functools import cached_property
 from pathlib import Path
 from typing import Protocol, cast
 
-from scripts.production import delivery_state, staff, unit_names
+from scripts.production import delivery_state, staff, unit_names, unrouted_alert
 from scripts.production.production_units import Refusal, production_field
 from scripts.production.proposals_folder import slug_of
 
@@ -81,6 +81,14 @@ class UnavailableProduction:
 
 
 @dataclass(frozen=True)
+class ChangeAssignment:
+    """The current staff owner and production document for one review row."""
+
+    owner: ChangeOwner
+    production: Path | UnavailableProduction
+
+
+@dataclass(frozen=True)
 class CommitNode:
     parents: tuple[str, ...]
     message: str
@@ -112,6 +120,17 @@ def list_documents(text: str) -> list[Path]:
                 documents.append(path)
     return documents
 
+
+def production_documents(initial: dict[str, Path], lists: Iterable[tuple[str, str]]) -> dict[str, Path]:
+    """Add each list's production references without replacing initial documents."""
+    documents = dict(initial)
+    for owner, text in lists:
+        docs = list_documents(text)
+        for doc in docs:
+            _ = documents.setdefault(slug_of(doc), doc)
+        if docs:
+            _ = documents.setdefault(owner, docs[0])
+    return documents
 
 class StaffRouting:
     """Read staff edges and commit messages once, without a live session probe."""
@@ -375,16 +394,22 @@ class StaffRouting:
                     if row.get("Change", "") in self.history.checkpoint_changes(message):
                         candidates = self.checkpoint_unit(message)
                         break
-        if not candidates:
+        units = {unit.id: unit for name in candidates
+                 if (unit := self.record.by_id(staff.StaffId(name)) or self.record.by_path(name)) is not None
+                 and unit.kind == "unit"}
+        if not units and candidates:
+            for old in candidates:
+                identity = self.renamed_units.get(old)
+                unit = self.record.by_id(identity) if identity is not None else None
+                if unit is not None and unit.kind == "unit":
+                    units[unit.id] = unit
+        if not units:
             runner = self.record.by_path(list_owner)
             if runner is not None and runner.kind == "showrunner":
                 return ShowrunnerOwnChange(runner.id, runner.name)
             return ShowrunnerOwnChange(MissingShowrunner(list_owner), list_owner)
-        if len(candidates) == 1:
-            identity = next(iter(candidates))
-            unit = self.record.by_id(staff.StaffId(identity))
-            if unit is None:
-                return self.unrouted(list_owner, row, f"No staff record for {identity}")
+        parents: dict[staff.StaffId, staff.StaffRow] = {}
+        for unit in units.values():
             parent = unit
             seen: set[staff.StaffId] = set()
             while parent.kind != "showrunner" and parent.parent is not None and parent.id not in seen:
@@ -393,13 +418,53 @@ class StaffRouting:
                 if ancestor is None:
                     break
                 parent = ancestor
-            if parent.kind == "showrunner":
-                return StaffRoutedChange(unit.id, parent.id, parent.name)
-            return self.unrouted(list_owner, row, f"No staff showrunner for {unit.name}")
-        return self.unrouted(list_owner, row, "More than one staff unit owns this change")
+            if parent.kind != "showrunner":
+                return self.unrouted(list_owner, row, f"No staff showrunner for {unit.name}", candidates)
+            parents[parent.id] = parent
+        if len(parents) > 1:
+            return self.unrouted(list_owner, row, "More than one staff unit owns this change", candidates)
+        parent = next(iter(parents.values()))
+        if len(units) == 1:
+            return StaffRoutedChange(next(iter(units)), parent.id, parent.name)
+        return ShowrunnerOwnChange(parent.id, parent.name)
 
-    def unrouted(self, list_owner: str, row: dict[str, str], note: str) -> UnroutedChange:
+    # Phase 17i reads the staff id stored on the row.
+    # It changes owner, which this function, the footer and /next all call, and the document step in this function.
+    def owner_and_production(self, review_list: Path, row: dict[str, str]) -> ChangeAssignment:
+        """Resolve the current owner and its production through one rule."""
+        list_owner = review_list.stem.removeprefix(PREFIX)
+        owner = self.owner(row, list_owner)
+        source_doc = self.production_for_list(review_list)
+        doc = (self.documents.get(owner.tab) if isinstance(source_doc, Path)
+               and owner.tab in self.repositories else None)
+        return ChangeAssignment(owner, doc or source_doc)
+
+    @cached_property
+    def renamed_units(self) -> dict[str, staff.StaffId]:
+        """Read unit rename journals in the existing showrunner state folder."""
+        root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner").expanduser()
+        found: dict[str, staff.StaffId] = {}
+        for path in root.glob("*/rename_unit.json"):
+            try:
+                value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+                fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
+                old, new, identity = (fields.get(key) for key in ("old", "new", "staff_id"))
+                member = self.record.by_id(staff.StaffId(identity)) if isinstance(identity, str) else None
+                if member is None and isinstance(new, str):
+                    member = self.record.by_path(new)
+                if isinstance(old, str) and member is not None:
+                    found[old] = member.id
+                    found[unit_names.stem(old)] = member.id
+            except (OSError, ValueError):
+                continue
+        return found
+
+    def unrouted(self, list_owner: str, row: dict[str, str], note: str, candidates: set[str]) -> UnroutedChange:
         print(f"staff: {note[0].lower() + note[1:]} (change {list_owner}/{row['#']})", file=sys.stderr)
+        if not row.get("Verdict") and waits_for_user(self.list_paths.get(list_owner, Path(list_owner)), row, review_root()):
+            names = tuple(sorted(member.name if (member := self.record.by_id(staff.StaffId(name))) else name
+                                 for name in candidates))
+            unrouted_alert.notify(review_root(), list_owner, row, note, names)
         return UnroutedChange(note + "; no message goes out")
 
     def production_for_list(self, path: Path) -> Path | UnavailableProduction:
@@ -449,19 +514,46 @@ def _ref_marks(directory: Path) -> Iterator[tuple[Path, os.stat_result]]:
         return
 
 
+def delivery_name(resolved_list: Path, row: str) -> str:
+    """Name one row record from its resolved list path."""
+    identity = json.dumps([str(resolved_list), row]).encode("utf-8")
+    return ".review-link-delivery-" + hashlib.sha256(identity).hexdigest()
+
+
 def delivery_path(root: Path, review_list: Path, row: str) -> Path:
-    identity = json.dumps([str(review_list.resolve()), row]).encode("utf-8")
-    return root / (".review-link-delivery-" + hashlib.sha256(identity).hexdigest())
+    return root / delivery_name(review_list.resolve(), row)
+
+
+def review_root() -> Path:
+    return Path(os.environ.get("REVIEW_LINKS_ROOT") or Path.home() / ".local/share/review-links").expanduser()
 
 
 def waits_for_user(review_list: Path, row: dict[str, str], root: Path) -> bool:
-    """Read the existing per-row mark without another copy of its state."""
-    if row.get("Verdict"):
-        return False
+    """Use the shared typed waiting rule."""
     try:
-        content = delivery_path(root, review_list, row["#"]).read_text(encoding="utf-8")
+        slots = delivery_state.decode(delivery_path(root, review_list, row["#"]).read_text(encoding="utf-8"))
     except OSError:
-        return True
-    slots = delivery_state.decode(content)
-    return not (isinstance(slots.validation, delivery_state.ValidationRequested)
-                or isinstance(slots.question, delivery_state.OpenQuestion) and slots.question.awaiting_answer)
+        slots = delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
+    return slots.waits_for_user(bool(row.get("Verdict")))
+
+
+def waiting_rows(review_list: Path, rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Scan delivery names once and open only records that exist."""
+    root = review_root()
+    names = {path.name for path in root.glob(".review-link-delivery-*")}
+    resolved = review_list.resolve()
+    empty = delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
+    found: list[dict[str, str]] = []
+    for row in rows:
+        if row.get("Verdict"):
+            continue
+        name = delivery_name(resolved, row["#"])
+        slots = empty
+        if name in names:
+            try:
+                slots = delivery_state.decode((root / name).read_text(encoding="utf-8"))
+            except OSError:
+                pass
+        if slots.waits_for_user(False):
+            found.append(row)
+    return found
