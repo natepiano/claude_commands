@@ -647,7 +647,10 @@ raise SystemExit(99)
         executable = tools / name
         _ = executable.write_text(script)
         executable.chmod(0o755)
-    return {**environment, "TMPDIR": str(root), "BUILDLOG_DIR": str(buildlog),
+    return {**environment, "TMPDIR": str(root),
+            "STAFF_FILE": str(root / "staff.json"),
+            "HERDR_PANE_RECORD_DIR": str(root / "herdr-panes"),
+            "BUILDLOG_DIR": str(buildlog),
             "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(root / "live-memory-reads.jsonl"),
             "PATH": str(tools) + os.pathsep + environment.get("PATH", os.defpath)}
 

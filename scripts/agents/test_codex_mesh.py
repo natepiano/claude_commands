@@ -70,15 +70,26 @@ from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.lib import atomic_file, nix_env, unit_runs
 from scripts.message import process_table, sessions, unit_labels, roster as message_roster
 from scripts.production import showrunners
+from scripts.herdr import herdr
 from scripts.usage import agents_log
 from scripts.accounts import accounts, moves, refusals, role_map
 from scripts.astra import astra_work, design_roles
 from scripts.whoami import account, agent_accounts
 
 
+MESH_PROCESS_ROOT = Path("/proc")
 REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
 # Intentional contention probes bypass fixture observers and bookkeeping.
 KERNEL_FLOCK = fcntl.flock
+
+
+def write_server_record(session_dir: Path, port: int, workers_home: Path, dev_shell_worktree: str = "") -> None:
+    """Seed a complete server record for the fixture's checkout."""
+    _ = (session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
+        "port": port, "pid": os.getpid(), "codex_home": str(workers_home),
+        "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
+        "dev_shell_worktree": dev_shell_worktree,
+    }), encoding="utf-8")
 
 
 def worker_state_lock_path(path: Path) -> Path:
@@ -915,6 +926,7 @@ class MeshCommandFixture(unittest.TestCase):
         self.loop_budget = FixtureLoopBudget(self.id())
         self.temporary = tempfile.TemporaryDirectory(dir="/tmp", prefix="codex-mesh-test-")
         self.addCleanup(self.temporary.cleanup)
+        self.addCleanup(self.assert_no_mesh_process_leaks)
         self.home = Path(self.temporary.name).resolve() / "home"
         self.home.mkdir()
         self.patches = contextlib.ExitStack()
@@ -971,10 +983,10 @@ class MeshCommandFixture(unittest.TestCase):
         self.start_args_timeout = TEST_HANG_GUARD_SECS
         select_fixture_workers(self.home, notes=self.home)
         self.server = StubAppServer(self.respond)
-        _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(
-            json.dumps({"port": self.server.port, "pid": os.getpid(), "codex_home": str(agent_accounts.workers_home()), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS}),
-            encoding="utf-8",
-        )
+        _ = self.start_stub_server(str(self.session_dir), agent_accounts.workers_home())
+        _ = self.patches.enter_context(patch.object(codex_mesh, "_start_server", side_effect=self.start_stub_server))
+        _ = self.patches.enter_context(patch.object(codex_mesh, "_start_watcher",
+            return_value=codex_mesh.ExistingServerWatcher()))
         read_frame = codex_mesh.Client.next_frame
 
         def bounded_read(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
@@ -995,9 +1007,66 @@ class MeshCommandFixture(unittest.TestCase):
 
     @override
     def tearDown(self) -> None:
-        self.patches.close()
         self.server.close()
-        self.temporary.cleanup()
+
+    def start_stub_server(self, session_dir: str, workers_home: Path,
+                          *_extra: object) -> int:
+        shell = next((value for value in _extra if isinstance(value, codex_mesh.WorktreeDevShell)),
+                     codex_mesh.InheritedServerEnvironment())
+        write_server_record(Path(session_dir), self.server.port, workers_home,
+                            str(shell.worktree) if isinstance(shell, codex_mesh.WorktreeDevShell) else "")
+        return self.server.port
+
+    def assert_no_mesh_process_leaks(self, proc: Path = MESH_PROCESS_ROOT) -> None:
+        root = str(Path(self.temporary.name).resolve())
+        leaks: list[str] = []
+        candidates: list[list[str]] = []
+        if sys.platform == "darwin":
+            observed = subprocess.run(["ps", "-axo", "pid=,args="], capture_output=True,
+                                      text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+            candidates = [line.strip().split(None, 1) for line in observed.stdout.splitlines()]
+        else:
+            for process in proc.iterdir():
+                if not process.name.isdigit():
+                    continue
+                try:
+                    command = os.fsdecode((process / "cmdline").read_bytes()).replace("\0", " ")
+                except OSError:
+                    continue
+                candidates.append([process.name, command])
+        for fields in candidates:
+            if len(fields) != 2:
+                continue
+            pid, command = fields
+            if not (("codex" in command and "app-server" in command) or "idle-stop" in command):
+                continue
+            evidence = command
+            if sys.platform == "darwin":
+                observed = subprocess.run(["lsof", "-a", "-p", pid, "-d", "cwd", "-Fn"],
+                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                evidence += "\n" + observed.stdout
+                try:
+                    environment = herdr.darwin_process_environment(int(pid))
+                except herdr.HerdrFailure as error:
+                    try:
+                        os.kill(int(pid), 0)
+                    except ProcessLookupError:
+                        continue
+                    except OSError:
+                        pass
+                    self.fail(f"Cannot check fixture mesh process {pid}: {error}")
+                codex_home = environment.get("CODEX_HOME", "")
+                if codex_home and Path(codex_home).expanduser().resolve().is_relative_to(Path(root)):
+                    evidence += "\n" + root
+            else:
+                try:
+                    evidence += "\n" + os.fsdecode((proc / pid / "environ").read_bytes())
+                    evidence += "\n" + str((proc / pid / "cwd").resolve())
+                except (OSError, ValueError):
+                    pass
+            if root in evidence:
+                leaks.append(f"{pid} {command}")
+        self.assertEqual(leaks, [], "The fixture leaves live mesh processes: " + "; ".join(leaks))
 
     def clock(self) -> float:
         _ = self.loop_budget.check()
@@ -1738,9 +1807,7 @@ class MeshCommandFixture(unittest.TestCase):
         _ = (selected / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
         _ = (notes / "codex2.md").write_text(f"---\nlogin: {login}\n---\n")
         self.assertEqual(accounts.main(["set-role", "workers", "codex2"]), 0)
-        _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
-            "port": self.server.port, "pid": os.getpid(), "codex_home": str(selected), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
-        }))
+        write_server_record(self.session_dir, self.server.port, selected)
         if stub_ensure:
             _ = self.patches.enter_context(patch.object(codex_mesh, "ensure_server", return_value=(self.server.port, True)))
         return agent_accounts.KnownCodexAccount(selected, login, "codex2")
@@ -3325,6 +3392,82 @@ class QueueGraceSettingsTests(unittest.TestCase):
 @final
 class MeshCommandTests(MeshCommandFixture):
     """Launcher and recovery behavior against the shared bounded fake server."""
+
+    def test_fixture_guard_rejects_live_servers_and_watchers_in_its_temporary_folder(self) -> None:
+        proc = self.session_dir / "proc"
+        process = proc / "998099"
+        process.mkdir(parents=True)
+        _ = (process / "environ").write_bytes(os.fsencode(f"CODEX_HOME={self.home}/.codex\0"))
+        (process / "cwd").symlink_to(self.session_dir)
+        for command in ("codex app-server", "sh -c idle-stop"):
+            with self.subTest(command=command):
+                _ = (process / "cmdline").write_bytes(os.fsencode(command.replace(" ", "\0")))
+                with patch.object(sys, "platform", "linux"), patch.object(subprocess, "run") as external:
+                    with self.assertRaisesRegex(AssertionError, "fixture leaves live mesh processes"):
+                        self.assert_no_mesh_process_leaks(proc)
+                    external.assert_not_called()
+        _ = (process / "cmdline").write_bytes(b"unrelated\0command")
+        with patch.object(sys, "platform", "linux"):
+            self.assert_no_mesh_process_leaks(proc)
+
+    def test_darwin_fixture_guard_finds_servers_and_watchers_by_their_working_folder(self) -> None:
+        for command in ("codex app-server --listen ws://127.0.0.1:4001", "sh -c idle-stop"):
+            with self.subTest(command=command):
+                observed = subprocess.CompletedProcess(["ps"], 0, f"998099 {command}\n", "")
+                folder = subprocess.CompletedProcess(["lsof"], 0, f"p998099\nn{self.session_dir}\n", "")
+                with patch.object(sys, "platform", "darwin"), patch.object(
+                        subprocess, "run", side_effect=[observed, folder]) as inspect_process, patch.object(
+                            herdr, "darwin_process_environment", return_value={}):
+                    with self.assertRaisesRegex(AssertionError, "fixture leaves live mesh processes"):
+                        self.assert_no_mesh_process_leaks()
+                    self.assertEqual(inspect_process.call_args_list[1].args[0],
+                        ["lsof", "-a", "-p", "998099", "-d", "cwd", "-Fn"])
+
+    def test_darwin_fixture_guard_finds_a_server_home_with_a_checkout_working_folder(self) -> None:
+        command = "codex app-server --listen ws://127.0.0.1:4001"
+        observed = subprocess.CompletedProcess(["ps"], 0, f"998099 {command}\n", "")
+        folder = subprocess.CompletedProcess(["lsof"], 0, "p998099\nn/checkout\n", "")
+        for home, leaked in ((self.home / ".codex", True), (Path("/unrelated/account"), False)):
+            with (self.subTest(home=home), patch.object(sys, "platform", "darwin"),
+                  patch.object(subprocess, "run", side_effect=[observed, folder]),
+                  patch.object(herdr, "darwin_process_environment", return_value={"CODEX_HOME": str(home)})):
+                if leaked:
+                    with self.assertRaisesRegex(AssertionError, "fixture leaves live mesh processes"):
+                        self.assert_no_mesh_process_leaks()
+                else:
+                    self.assert_no_mesh_process_leaks()
+
+    def test_darwin_fixture_guard_finds_a_watcher_by_its_run_argument_outside_the_fixture_cwd(self) -> None:
+        command = f"sh -c idle-stop /checkout/codex_mesh.py 998098 4001 {self.session_dir}"
+        observed = subprocess.CompletedProcess(["ps"], 0, f"998099 {command}\n", "")
+        folder = subprocess.CompletedProcess(["lsof"], 0, "p998099\nn/checkout\n", "")
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(subprocess, "run", side_effect=[observed, folder]),
+              patch.object(herdr, "darwin_process_environment", return_value={})):
+            with self.assertRaisesRegex(AssertionError, "fixture leaves live mesh processes"):
+                self.assert_no_mesh_process_leaks()
+
+    def test_darwin_fixture_guard_distinguishes_an_exited_process_from_unreadable_evidence(self) -> None:
+        observed = subprocess.CompletedProcess(["ps"], 0, "998099 codex app-server\n", "")
+        folder = subprocess.CompletedProcess(["lsof"], 0, "p998099\nn/checkout\n", "")
+        for exited in (True, False):
+            with (self.subTest(exited=exited), patch.object(sys, "platform", "darwin"),
+                  patch.object(subprocess, "run", side_effect=[observed, folder]),
+                  patch.object(herdr, "darwin_process_environment", side_effect=herdr.HerdrFailure("environment unreadable")),
+                  patch.object(os, "kill", side_effect=ProcessLookupError if exited else None)):
+                if exited:
+                    self.assert_no_mesh_process_leaks()
+                else:
+                    with self.assertRaisesRegex(AssertionError, "Cannot check fixture mesh process 998099"):
+                        self.assert_no_mesh_process_leaks()
+
+    def test_complete_stub_seed_reuses_its_checkout_server(self) -> None:
+        shell = codex_mesh.WorktreeDevShell(self.session_dir, "fixture-revision")
+        _ = self.start_stub_server(str(self.session_dir), agent_accounts.workers_home(), shell)
+        with (patch.object(codex_mesh, "_server_dev_shell", return_value=shell),
+              patch.object(codex_mesh, "_start_server", wraps=self.start_stub_server) as start):
+            self.assertEqual(self.run_start(), (0, ""))
+        start.assert_not_called()
 
     def test_child_inherits_zero_queue_grace_without_waiting_for_a_frame(self) -> None:
         script = """
@@ -7194,15 +7337,11 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         _ = (source / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{source_claims}.signature"}}))
         _ = (home / "codex9.md").write_text(f"---\nlogin: {source_login}\n---\n")
         self.assertEqual(accounts.main(["set-role", "workers", "codex9"]), 0)
-        _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
-            "port": self.server.port, "pid": os.getpid(), "codex_home": str(home / ".codex"), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
-        }))
+        write_server_record(self.session_dir, self.server.port, home / ".codex")
         new = StubAppServer(self.respond)
         _ = self.patches.callback(new.close)
         def start(session_dir: str, *_args: object) -> int:
-            _ = (Path(session_dir) / codex_mesh.SERVER_FILE).write_text(json.dumps({
-                "port": new.port, "pid": os.getpid(), "codex_home": str(agent_accounts.workers_home()), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
-            }))
+            write_server_record(Path(session_dir), new.port, agent_accounts.workers_home())
             return new.port
         _ = self.patches.enter_context(patch.object(codex_mesh, "_start_server", side_effect=start))
         _ = self.patches.enter_context(patch.object(codex_mesh, "_start_watcher"))
@@ -7939,9 +8078,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         rejected.respond = refuse_submission
         def start(session_dir: str, home: Path) -> int:
             server = rejected if home == target else recovered
-            _ = (Path(session_dir) / codex_mesh.SERVER_FILE).write_text(json.dumps({
-                "port": server.port, "pid": os.getpid(), "codex_home": str(home), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
-            }))
+            write_server_record(Path(session_dir), server.port, home)
             return server.port
         def move_on_refusal(_name: str, serving: codex_mesh.CodexServingState, _detail: str, *,
                             session_dir: str, thread_id: str,
@@ -8065,9 +8202,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         _ = (numbered.parent / "codex2.md").write_text(f"---\nlogin: {login}\n---\n")
         source, destination = (numbered, default) if default_destination else (default, numbered)
         source_label, destination_label = ("codex1", "default") if default_destination else ("default", "codex1")
-        _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
-            "port": self.server.port, "pid": os.getpid(), "codex_home": str(source), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
-        }))
+        write_server_record(self.session_dir, self.server.port, source)
         evidence = accounts.roles_history_file()
         evidence.parent.mkdir(parents=True, exist_ok=True)
         _ = evidence.write_text(json.dumps({"at": "2026-10-01T00:00:00Z", "role": "workers",
@@ -17238,7 +17373,7 @@ class WorkersHomeTests(unittest.TestCase):
         return home
 
     def record(self, home: Path, port: int = 4001) -> None:
-        _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({"port": port, "pid": os.getpid(), "codex_home": str(home), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS}))
+        write_server_record(self.session_dir, port, home)
 
     def writer_process_is_live(self, pid: int) -> bool:
         return pid == os.getpid()
@@ -17413,7 +17548,7 @@ class WorkersHomeTests(unittest.TestCase):
         other_run = self.session_dir.parent / "other-run"
         other_run.mkdir()
         self.record(selected)
-        _ = (other_run / codex_mesh.SERVER_FILE).write_text(json.dumps({"port": 4002, "pid": os.getpid(), "codex_home": str(self.home / ".codex"), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS}))
+        write_server_record(other_run, 4002, self.home / ".codex")
         with patch.dict(os.environ, {"CODEX_HOME": str(selected)}), patch.object(codex_mesh, "_sign_in_changed_at", return_value=2000), patch.object(codex_mesh, "_server_started_at", return_value=1000), patch.object(codex_mesh, "_stop_unused", return_value=False), patch.object(codex_mesh, "_start_watcher"), patch.object(codex_mesh, "_notify_holder"), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(codex_mesh.command_signin_changed(argparse.Namespace(root=str(self.session_dir.parent))), 0)
         self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
@@ -17426,7 +17561,7 @@ class WorkersHomeTests(unittest.TestCase):
         other_run = root / "other-run"
         other_run.mkdir()
         self.record(self.home / ".codex")
-        _ = (other_run / codex_mesh.SERVER_FILE).write_text(json.dumps({"port": 4002, "pid": os.getpid(), "codex_home": str(self.home / ".codex"), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS}))
+        write_server_record(other_run, 4002, self.home / ".codex")
         _ = (root / "active" / "director-one").write_text(str(self.session_dir) + "\n")
         _ = (root / "active" / "director-two").write_text(str(other_run) + "\n")
         with patch.object(codex_mesh, "SWEEP_ROOTS", (root,)), patch.object(codex_mesh, "_stop_unused", return_value=False), patch.object(codex_mesh, "_start_watcher"), patch.object(codex_mesh, "_notify_holder") as notify:

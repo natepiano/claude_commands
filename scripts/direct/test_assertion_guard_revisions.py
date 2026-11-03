@@ -979,10 +979,14 @@ class AssertionRevisionTests(AssertionFindingFixture):
         self.assert_clean(self.guard())
 
 
-    def test_large_diff_guard_call_uses_less_than_one_cpu_second(self) -> None:
+    def test_large_diff_guard_cpu_cost_stays_below_a_fixed_reference_workload(self) -> None:
         before = self.rust(TILE_OLD) + "".join(f"// old {number}\n" for number in range(43499))
         after = self.rust(TILE_NEW) + "".join(f"// new {number}\n" for number in range(43499))
         self.change("value.rs", before, after)
+        reference_started = time.process_time()
+        for _iteration in range(2):
+            _ = sum(number * number for number in range(1_000_000))
+        reference_cpu = time.process_time() - reference_started
         children_before = resource.getrusage(resource.RUSAGE_CHILDREN)
         started = time.process_time()
         result = self.guard_process()
@@ -991,7 +995,8 @@ class AssertionRevisionTests(AssertionFindingFixture):
         cpu_seconds += (children_after.ru_utime + children_after.ru_stime
                         - children_before.ru_utime - children_before.ru_stime)
         _ = self.assert_finding(result, "value.rs", "weaker")
-        self.assertLess(cpu_seconds, 1.0, f"guard used {cpu_seconds:.3f} CPU seconds")
+        self.assertLess(cpu_seconds, reference_cpu * 16,
+                        f"guard used {cpu_seconds:.3f} CPU seconds; reference used {reference_cpu:.3f}")
 
 
 

@@ -57,11 +57,6 @@ class FolderMoveBackend:
         self.fixture: FolderMoveFixture = fixture
         self.kind: Literal["claude", "codex"] = kind
         self.live: bool = live
-        self.startup_pending: bool = False
-        self.startup_delay_polls: int = 0
-        self.startup_observations: int = 0
-        self.startup_foreground_polls: list[list[dict[str, object]]] = []
-        self.foreground_before_start: list[dict[str, object]] = []
         self.pid: int = 998041
         self.shell_pid: int = 998040
         self.starts: list[tuple[str, list[str]]] = []
@@ -94,35 +89,14 @@ class FolderMoveBackend:
         return [herdr.HerdrProcess(self.pid, herdr.HerdrPlace(self.session, "w1:p1"),
             self.environment(self.pid), self.kind + " resume " + self.fixture.owner.current_session, str(self.cwd))]
 
-    def processes_inside(self, folder: Path) -> list[int]:
-        shell_folder = self.fixture.old_folder if self.fixture.old_folder.exists() else self.fixture.new_folder
-        pids = [self.shell_pid] if folder == shell_folder else []
-        if self.live and folder == self.cwd:
-            pids.append(self.pid)
-        return pids
-
     def pane_activity(self, pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:
         self.fixture.assertEqual(pane, "w1:p1")
-        if self.startup_pending:
-            return herdr.PaneRunning(("python accounts.py",))
         return herdr.PaneRunning((self.kind,)) if self.live else herdr.PaneAtShell()
 
     def result(self, *arguments: str) -> dict[str, object]:
         self.fixture.assertEqual(arguments, ("pane", "process-info", "--pane", "w1:p1"))
-        if self.startup_pending:
-            self.startup_observations += 1
-            if self.startup_delay_polls > 0:
-                self.startup_delay_polls -= 1
-            else:
-                self.startup_pending = False
-                self.live = True
-                self.publish_process_state()
         argv = [self.kind] if self.live else [sys.executable, "/fixture/accounts.py", "exec", self.config.name]
         foreground: list[dict[str, object]] = [{"pid": self.pid, "argv": argv, "cwd": str(self.cwd)}]
-        if self.starts and self.startup_foreground_polls:
-            foreground = self.startup_foreground_polls.pop(0)
-        elif not self.starts and self.foreground_before_start:
-            foreground = self.foreground_before_start
         return {"process_info": {"shell_pid": self.shell_pid, "cwd": str(self.cwd),
                                  "foreground_processes": foreground}}
 
@@ -133,7 +107,7 @@ class FolderMoveBackend:
         self.cwd = Path(command[command.index("sh") + 4])
         self.fixture.assertTrue(self.cwd.is_dir())
         self.starts.append((pane, command.copy()))
-        self.startup_pending = True
+        self.live = True
         self.publish_process_state()
 
     def close_tab_confirmed(self, pane: str) -> None:
@@ -183,7 +157,6 @@ class FolderMoveFixture(StaffTestCase):
         _ = self.enterContext(mock.patch("pane_record.RECORD_DIR", self.records))
         _ = self.enterContext(mock.patch.object(progress_history, "SESSION_ROOTS", (self.run_dir.parent,)))
         _ = self.enterContext(mock.patch("progress_history.SESSION_ROOTS", (self.run_dir.parent,)))
-        _ = self.enterContext(mock.patch.object(unit_move, "processes_inside", return_value=[]))
         _ = self.folder_git(self.checkout, "init", "-b", "kept-branch")
         _ = self.folder_git(self.checkout, "config", "user.name", "Folder Move Test")
         _ = self.folder_git(self.checkout, "config", "user.email", "move@example.invalid")
@@ -225,7 +198,6 @@ class FolderMoveFixture(StaffTestCase):
         backend.publish_process_state()
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(
             os.environ, {"HERDR_PROC": str(self.root / "folder-processes")})))
-        _ = self.enterContext(mock.patch.object(unit_move, "processes_inside", side_effect=backend.processes_inside))
         account_key = "CLAUDE_CONFIG_DIR" if kind == "claude" else "CODEX_HOME"
         launch = pane_record.launch("w1:p1", self.owner.id, str(self.old_folder),
             {account_key: str(backend.config)}, [kind, "-n", "kept-name", "--model", "opus"], kind=kind)

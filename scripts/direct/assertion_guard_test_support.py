@@ -28,6 +28,30 @@ class ComparisonBases(NamedTuple):
     second: str
 
 
+def register_production(root: Path, repo: Path, notifier_dir: Path, merge_branch: str, *,
+                        worktree: str = "", branch: str = "unit", slug: str = "fixture",
+                        status: str = "active", worktree_commentary: str = "") -> Path:
+    """Register a production with its private staff record."""
+    with isolated_staff_file(root / "staff.json", {}):
+        doc = root / f"{slug}-production.md"
+        worktree_cell = f"`{worktree or repo}`" + (f" {worktree_commentary}" if worktree_commentary else "")
+        _ = doc.write_text(
+            f"- **Merge branch:** `{merge_branch}`\n- **Showrunner checkout:** `{repo}`\n\n## Units\n\n"
+            + "| Unit | Worktree | Branch | Plan | Status |\n| --- | --- | --- | --- | --- |\n"
+            + f"| fixture | {worktree_cell} | `{branch}` | `README.md` | {status} |\n", encoding="utf-8")
+        timer = notifier_dir / f"showrunner-{slug}"
+        timer.mkdir(exist_ok=True)
+        _ = (timer / "conf").write_text(
+            f"TARGET=session:fixture\nCHECK=production_check.sh {doc}\n", encoding="utf-8")
+        owner = recorded_showrunner(slug, doc)
+        folder = Path(worktree).expanduser() if worktree.startswith(("/", "~")) else repo
+        member = unit_membership(owner.name, "fixture")
+        location = (staff.RemovedWorktree("natedev", folder)
+                    if status.startswith(("retired", "removed")) or isinstance(member.worktree, staff.RemovedWorktree)
+                    else staff.PresentWorktree("natedev", folder))
+        _ = staff.set_worktree(member.id, location, expected=member.worktree)
+        return doc
+
 class GitRepositoryFixture(unittest.TestCase):
     root: Path = Path()
     repo: Path = Path()
@@ -170,24 +194,8 @@ class GitRepositoryFixture(unittest.TestCase):
 
     def register_production(self, merge_branch: str, *, worktree: str = "", branch: str = "unit",
                             slug: str = "fixture", status: str = "active", worktree_commentary: str = "") -> Path:
-        doc = self.root / f"{slug}-production.md"
-        worktree_cell = f"`{worktree or self.repo}`" + (f" {worktree_commentary}" if worktree_commentary else "")
-        _ = doc.write_text(
-            f"- **Merge branch:** `{merge_branch}`\n- **Showrunner checkout:** `{self.repo}`\n\n## Units\n\n"
-            + "| Unit | Worktree | Branch | Plan | Status |\n| --- | --- | --- | --- | --- |\n"
-            + f"| fixture | {worktree_cell} | `{branch}` | `README.md` | {status} |\n", encoding="utf-8")
-        timer = self.notifier_dir / f"showrunner-{slug}"
-        timer.mkdir(exist_ok=True)
-        _ = (timer / "conf").write_text(
-            f"TARGET=session:fixture\nCHECK=production_check.sh {doc}\n", encoding="utf-8")
-        owner = recorded_showrunner(slug, doc)
-        folder = Path(worktree).expanduser() if worktree.startswith(("/", "~")) else self.repo
-        member = unit_membership(owner.name, "fixture")
-        location = (staff.RemovedWorktree("natedev", folder)
-                    if status.startswith(("retired", "removed")) or isinstance(member.worktree, staff.RemovedWorktree)
-                    else staff.PresentWorktree("natedev", folder))
-        _ = staff.set_worktree(member.id, location, expected=member.worktree)
-        return doc
+        return register_production(self.root, self.repo, self.notifier_dir, merge_branch,
+            worktree=worktree, branch=branch, slug=slug, status=status, worktree_commentary=worktree_commentary)
 
 
 class MergeInProgressFixture(GitRepositoryFixture):
