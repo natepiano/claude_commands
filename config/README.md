@@ -106,6 +106,7 @@ The `folder_*` keys control the folder audit. The `sweep_*` keys control the bui
 | `sweep_proc_locks_reads` | Number of process lock reads before a lock is absent. |
 | `sweep_dep_info_head_bytes` | Maximum bytes read from a dependency file header. |
 | `sweep_max_tree_depth` | Maximum depth for Cargo build tree discovery. |
+| `sweep_free_floor_percent` | Free-space floor on other build filesystems, in percent (20). |
 | `sweep_floor_roots` | Roots for Cargo target discovery. |
 | `sweep_ci_targets` | CI targets measured outside the removable roots. |
 | `sweep_growth_window_seconds` | Maximum interval for a disk growth comparison. |

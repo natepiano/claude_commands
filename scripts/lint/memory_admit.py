@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
 from build_shape import BuildShape, NoBuildShape, build_shape, index_shapes, recorded_build_shape
 from atomic_file import write_text_atomic
+from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 import conf
 
 
@@ -2348,13 +2349,14 @@ def current_worktree_steps(root: Path, host: str, worktree: str,
 
 def is_fresh_test(root: Path, host: str, worktree: str, package: str,
                   scope: TestScope, tree_key: str, now: datetime,
-                  target_dir: str = "") -> bool:
+                  output_roots: CargoOutputRoots | CargoOutputUnavailable) -> bool:
     """Only the last completed matching test build can prove the targets fresh.
 
     The key covers Cargo build inputs, not nextest's run-only selection. Read
     the recorder's current JSONL, since the derived index can lag a finished step.
     """
-    if not tree_key or not package or not worktree or not target_dir:
+    if (not tree_key or not package or not worktree
+            or isinstance(output_roots, CargoOutputUnavailable)):
         return False
     before = store.utc_iso(now.timestamp())
     try:
@@ -2377,11 +2379,8 @@ def is_fresh_test(root: Path, host: str, worktree: str, package: str,
             # cannot prove that their target survived an intervening sweep.
             if now.timestamp() - finished >= 24 * 60 * 60:
                 return False
-            target = Path(target_dir)
-            if not target.is_absolute():
-                target = Path(worktree) / target
-            target = target.resolve()
-            if not target.is_dir():
+            targets = {output_roots.target_directory, output_roots.build_directory}
+            if any(not target.is_dir() for target in targets):
                 return False
             from scripts.lint import tmp_sweep
 
@@ -2393,7 +2392,7 @@ def is_fresh_test(root: Path, host: str, worktree: str, package: str,
             if not isinstance(deleted, dict):
                 return False
             for path, timestamp in cast(dict[str, object], deleted).items():
-                if Path(path).resolve() == target:
+                if Path(path).resolve() in targets:
                     if (not isinstance(timestamp, (float, int)) or not math.isfinite(timestamp)
                             or timestamp >= finished):
                         return False
@@ -3258,9 +3257,14 @@ def step_estimate(argv: list[str], cwd: str, profile: InferFromArgv | StepProfil
             directory = record.git_directory(argv, cwd)
             worktree_path = record.git_facts(directory)["worktree"] or ""
         target_dir = os.environ.get("BUILDLOG_TEST_TARGET_DIR", "")
+        build_dir = os.environ.get("BUILDLOG_TEST_BUILD_DIR", "")
+        output_roots = (CargoOutputRoots(Path(worktree_path).resolve(), Path(target_dir).resolve(),
+                                        Path(build_dir).resolve())
+                        if Path(target_dir).is_absolute() and Path(build_dir).is_absolute()
+                        else CargoOutputUnavailable("verify did not save both output roots"))
         fresh = (step == "nextest" and is_fresh_test(
             root, host, worktree_path, package, scope,
-            os.environ.get("BUILDLOG_TEST_BUILD_KEY", ""), estimate_time, target_dir))
+            os.environ.get("BUILDLOG_TEST_BUILD_KEY", ""), estimate_time, output_roots))
         generation = build_history_generation() if step == "build" else NoBuildHistoryGeneration()
         if step == "build" and callable(now):
             estimate_time = now()

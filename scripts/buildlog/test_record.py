@@ -191,6 +191,24 @@ class RecordTests(unittest.TestCase):
             found += [cast(Record, json.loads(line)) for line in path.read_text().splitlines()]
         return found
 
+    def test_step_records_resolved_target_and_build_directories(self) -> None:
+        cargo = self.base / "tools" / "cargo"
+        target, build = self.repo / "artifacts", self.base / "intermediates"
+        payload = json.dumps({"workspace_root": str(self.repo), "target_directory": str(target),
+                              "build_directory": str(build)})
+        _ = cargo.write_text("#!/bin/sh\nif [ \"$1\" = metadata ]; then\n  printf '%s\\n' '" + payload + "'\nelse\n  exit 99\nfi\n")
+        cargo.chmod(0o755)
+        row = self.step(0, "1", "", "", NEXTEST)
+        self.assertEqual(row["target_directory"], str(target))
+        self.assertEqual(row["build_directory"], str(build))
+        self.assertIn("target_dir", row)
+
+    def test_floor_scan_records_filesystem_identity_without_changing_old_rows(self) -> None:
+        recorder.floor_scan(1, 2, [], START, filesystem="8-1:/outputs")
+        row, = self.records()
+        self.assertEqual(row["filesystem"], "8-1:/outputs")
+        self.assertEqual(row["shortfall"], 1)
+
     def test_floor_scan_records_free_space_shortfall_and_the_idle_target_inventory(self) -> None:
         targets: list[recorder.IdleFloorTarget] = [
             {"folder": "/trees/older/target", "last_use": START - 7200, "bytes": 123456},

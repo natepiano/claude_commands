@@ -91,6 +91,10 @@ else:
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
+    from ..lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
+else:
+    from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
+if TYPE_CHECKING:
     from ..aws_target.config import MeasurementUnavailable
 else:
     from scripts.aws_target.config import MeasurementUnavailable
@@ -908,6 +912,7 @@ def step(args: list[str]) -> None:
                 store.note_error(f"parse {name} {held}")
             if status != 0:
                 log = _log_relative_path(host, start, record_id)
+        output_roots = read_cargo_output_roots(Path(directory)) if name != "sweep" else CargoOutputUnavailable("sweep step")
         memory = peak_and_stall(peak)
         step_slice = "none" if not peak else "builds" if Path(peak).is_file() else "fallback"
         phase = read_test_phase(phase_file)
@@ -927,6 +932,9 @@ def step(args: list[str]) -> None:
             "cwd": cwd,
             "target_dir": str((Path(cwd) / os.environ["CARGO_TARGET_DIR"]).resolve())
                           if "CARGO_TARGET_DIR" in os.environ else TARGET_DIR_UNSET,
+            **({"target_directory": str(output_roots.target_directory),
+                "build_directory": str(output_roots.build_directory)}
+               if isinstance(output_roots, CargoOutputRoots) else {}),
             "repo_identity": repository_key,
             **git_facts(directory),
             **tree,
@@ -1166,13 +1174,15 @@ class IdleFloorTarget(TypedDict):
     reason: NotRequired[str]
 
 
-def floor_scan(free_after_scan: int, floor: int, idle_targets: list[IdleFloorTarget], at: float) -> None:
+def floor_scan(free_after_scan: int, floor: int, idle_targets: list[IdleFloorTarget], at: float,
+               *, filesystem: str = "") -> None:
     host = store.host_name()
     store.append_line(store.host_file(host, at), {
         "kind": "floor_scan", "v": RECORD_VERSION,
         "id": f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
         "free_after_scan": free_after_scan, "floor": floor, "shortfall": floor - free_after_scan,
         "idle_targets": idle_targets,
+        **({"filesystem": filesystem} if filesystem else {}),
     })
 
 

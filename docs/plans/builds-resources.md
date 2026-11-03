@@ -1385,7 +1385,7 @@ Owner: builds-resources. Asked by verify-unit; builds approved 2026-11-03 14:05 
 - basedpyright 0/0/0 on the changed files and their callers.
 - Read-only proof on the Mac: `ssh mac` runs the entry point with `--dry-run`. It prints the targets it would remove, and it deletes nothing.
 
-### Phase 51 — Build output moves to the /build drive, and every tool that reads build folders follows it  · status: in progress
+### Phase 51 — Build output moves to the /build drive, and every tool that reads build folders follows it  · status: done
 
 Owner: builds-resources. Asked by natedev (#35). builds started it 2026-11-03 16:00 EST: the user wants the drive in, and Morty authorized natedev to lead #35. Purchase, install, rebuild and reboot stay with the user.
 

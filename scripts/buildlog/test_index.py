@@ -437,6 +437,22 @@ class IndexTests(unittest.TestCase):
         self.assertCountEqual(columns, [("target_dir", "TEXT", 1), ("repo_identity", "TEXT", 1)])
         self.assertEqual(self.host_file.read_bytes(), original)
 
+    def test_output_roots_survive_indexing_and_legacy_steps_stay_readable(self) -> None:
+        self.write(self.host_file,
+                   step("split", target_dir="/artifacts", target_directory="/artifacts",
+                        build_directory="/intermediates"),
+                   step("same", target_directory="/output", build_directory="/output"),
+                   step("legacy", target_dir="/legacy-output"),
+                   step("unknown"))
+        self.assertEqual(index.update(), 4)
+        self.assertEqual(self.rows(
+            "SELECT id, target_directory, build_directory FROM steps ORDER BY id"), [
+                ("legacy", "/legacy-output", "/legacy-output"),
+                ("same", "/output", "/output"),
+                ("split", "/artifacts", "/intermediates"),
+                ("unknown", UNKNOWN_IDENTITY, UNKNOWN_IDENTITY),
+            ])
+
     def test_schema_twenty_three_rebuilds_history_build_keys_without_rewriting_logs(self) -> None:
         self.write(self.host_file, step("legacy", seat="impl", argv=["cargo", "nextest", "run", "--workspace", "--bin", "hana"]))
         original = self.host_file.read_bytes()
@@ -632,7 +648,7 @@ class IndexTests(unittest.TestCase):
             _ = connection.execute("PRAGMA user_version = 25")
             connection.commit()
         self.assertEqual(index.update(), 3)
-        self.assertEqual(self.rows("PRAGMA user_version"), [(28,)])
+        self.assertEqual(self.rows("PRAGMA user_version"), [(29,)])
         self.assertEqual(path.read_bytes(), original)
         self.assertEqual(json.loads(cast(str, self.rows("SELECT slices FROM samples ORDER BY at")[1][0])), slices)
 

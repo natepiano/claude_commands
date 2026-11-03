@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import sweep
 import conf
+from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.mac_test import floor_claims
 from test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
 from memory_test_support import config_environment, write_config_fixture
@@ -1084,6 +1085,284 @@ class ReclamationTests(SweepCase):
 
 
 class FloorTests(SweepCase):
+    def paired_output(self, base: Path) -> tuple[CargoOutputRoots, Path, Path]:
+        workspace = base / "workspace"
+        target = workspace / "target"
+        build = base / "intermediates"
+        own = unit(build / "debug", "deps", "app", APP, time.time() - 3 * DAY)
+        copy = write(target / "debug" / "app", own.stat().st_size)
+        _ = dep_info(copy)
+        _ = write(build / sweep.RUSTC_INFO, 0)
+        _ = write(workspace / "Cargo.toml", 0)
+        mapping = CargoOutputRoots(workspace, target, build)
+        token = sweep.OUTPUT_ROOTS.set(sweep.CargoOutputIndex((mapping,)))
+        self.addCleanup(sweep.OUTPUT_ROOTS.reset, token)
+        return mapping, own, copy
+
+    def test_external_build_directory_pairs_unit_and_artifact(self) -> None:
+        base = self.base()
+        mapping, own, copy = self.paired_output(base)
+        roots = [str(mapping.target_directory), str(mapping.build_directory)]
+        trees = {root: sweep.build_trees(root) for root in roots}
+        scan = sweep.scan_floor_roots(roots, trees)
+        self.assertEqual(len(scan.groups), 1)
+        group, = scan.groups
+        self.assertIn(str(own), group.entries)
+        self.assertIn(str(copy), group.entries)
+        self.assertIn(str(copy.with_suffix(".d")), group.entries)
+        self.assertEqual(scan.whole_targets, [])
+        with mock.patch.object(sweep, "read_cargo_output_roots", return_value=mapping):
+            status, _ = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB])
+        self.assertEqual(status, 0)
+        self.assertFalse(own.exists())
+        self.assertFalse(copy.exists())
+        deleted = cast(dict[str, object], json.loads(sweep.target_deletes_path().read_text()))
+        self.assertEqual(set(deleted), set(roots))
+
+    def test_selected_unit_frees_both_devices_but_credits_only_the_shortfall_device(self) -> None:
+        base = self.base()
+        mapping, own, copy = self.paired_output(base)
+        other_tree, other = cargo_target(base, "other", TOOL, time.time() - DAY)
+        roots = [str(mapping.build_directory), str(mapping.target_directory), str(other_tree.parent)]
+        group = sweep.Group("unit", str(own.parent.parent), [str(own), str(copy)],
+                            [(2, 1), (1, 2)], time.time() - DAY)
+        unselected = sweep.Group("unit", str(other_tree), [str(other)], [(1, 3)], time.time() - DAY)
+        scan = sweep.Scan(blocks={(2, 1): 20, (1, 2): 40, (1, 3): 100},
+                          links={(2, 1): 1, (1, 2): 1, (1, 3): 1}, groups=[group, unselected])
+        trees = {root: sweep.build_trees(root) for root in roots}
+        tree_targets = {str(own.parent.parent): str(mapping.build_directory), str(other_tree): str(other_tree.parent)}
+        token = sweep.FLOOR_FILESYSTEM.set(sweep.FilesystemFloor(2, str(mapping.build_directory), 20,
+                                                               (str(mapping.build_directory),), False))
+        self.addCleanup(sweep.FLOOR_FILESYSTEM.reset, token)
+        def take_pair(selected: sweep.FloorTake, _scan: sweep.Scan, _remaining: dict[sweep.InodeKey, int],
+                      _dry_run: bool, *, lint_settings: conf.ConfigRead) -> sweep.ConfirmedDeletion:
+            result = sweep.remove([selected], lint_settings=lint_settings)
+            self.assertEqual(result.failures, 0)
+            return sweep.ConfirmedDeletion(60, 0, result.removed, {1: 40, 2: 20})
+        with (mock.patch.object(sweep, "reclaim", side_effect=take_pair),
+              mock.patch.object(sweep, "process_use", return_value={}), redirect_stdout(io.StringIO())):
+            left, failures, taken = sweep.shrink_floor(scan, 20, 0, False, tree_targets, trees, {},
+                lambda item: (item.last_used,), time.time() + 5, sweep.TargetOwnerIndex(roots))
+        self.assertEqual((left, failures), (0, 0))
+        self.assertEqual(taken, [(group, 20)])
+        self.assertFalse(own.exists())
+        self.assertFalse(copy.exists())
+        self.assertTrue(other.exists())
+
+    def test_held_checkout_protects_both_output_roots(self) -> None:
+        base = self.base()
+        mapping, own, copy = self.paired_output(base)
+        since = time.time()
+        self.write_build_hold(base, since)
+        record = cast(sessions.SessionRecord, cast(object, {
+            "sessionId": "holder-session", "pid": 4242, "name": "build-speed",
+        }))
+        proc = base / "proc"
+        (proc / "4242").mkdir(parents=True)
+        (proc / "4242" / "cwd").symlink_to(mapping.workspace_root, target_is_directory=True)
+        with (mock.patch.object(sessions, "live_sessions", return_value=[record]),
+              mock.patch.object(sweep, "PROC_DIR", str(proc))):
+            held = sweep.build_hold_targets([str(mapping.target_directory), str(mapping.build_directory)], {})
+        self.assertEqual(set(held), {str(mapping.target_directory), str(mapping.build_directory)})
+        self.assertTrue(own.exists())
+        self.assertTrue(copy.exists())
+
+    def test_interrupted_pair_keeps_pending_artifact_paths(self) -> None:
+        base = self.base()
+        mapping, own, copy = self.paired_output(base)
+        roots = [str(mapping.build_directory), str(mapping.target_directory)]
+        trees = {root: sweep.build_trees(root) for root in roots}
+        scan = sweep.scan_floor_roots(roots, trees)
+        group, = scan.groups
+        original = sweep.remove_entry
+        stopped = False
+        def stop_at_artifact(path: str) -> sweep.ConfirmedDeletion:
+            nonlocal stopped
+            if Path(path).is_relative_to(mapping.target_directory):
+                stopped = True
+                raise KeyboardInterrupt("stop after intermediates")
+            return original(path)
+        with (mock.patch.object(sweep, "remove_entry", side_effect=stop_at_artifact),
+              self.assertRaises(KeyboardInterrupt)):
+            with sweep.recoverable_trim(str(mapping.build_directory), "floor take", scan, False,
+                                        sweep.TargetOwnerIndex(roots)):
+                _ = sweep.reclaim(group, scan, dict(scan.links), False)
+        self.assertTrue(stopped)
+        self.assertFalse(own.exists())
+        self.assertTrue(copy.exists())
+        intent = sweep.read_trim_intent(sweep.trim_intent_path(str(mapping.build_directory)))
+        self.assertIn(str(copy), intent.group_paths)
+        with mock.patch.object(sweep, "process_uses", return_value={}):
+            sweep.recover_pending_trims()
+            sweep.recover_pending_trims()
+        self.assertFalse(copy.exists())
+        row, = self.trim_rows()
+        self.assertEqual(row["cause"], "floor take")
+        self.assertFalse(sweep.trim_intent_path(str(mapping.build_directory)).exists())
+
+    def prepare_pair_take(self, mapping: CargoOutputRoots) -> sweep.TrimTake:
+        roots = [str(mapping.build_directory), str(mapping.target_directory)]
+        scan = sweep.scan_floor_roots(roots, {root: sweep.build_trees(root) for root in roots})
+        group, = scan.groups
+        take = sweep.TrimTake(str(mapping.build_directory), "floor take", 1, output_roots=tuple(roots))
+        sweep.trim_intent_path(take.target).parent.mkdir(parents=True, exist_ok=True)
+        take.prepare(group)
+        return take
+
+    def test_changed_pair_entries_clear_the_old_intent_and_allow_a_new_take(self) -> None:
+        base = self.base()
+        mapping, own, copy = self.paired_output(base)
+        take = self.prepare_pair_take(mapping)
+        for path in take.group_paths:
+            before = os.lstat(path)
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1))
+        recovered = sweep.read_trim_intent(sweep.trim_intent_path(take.target))
+        _ = recovered.recover()
+        saved = sweep.read_trim_intent(sweep.trim_intent_path(take.target))
+        self.assertEqual(saved.pending, [])
+        self.assertEqual(saved.group_paths, [])
+        self.assertTrue(own.exists())
+        self.assertTrue(copy.exists())
+        self.assertTrue(recovered.publish())
+        self.assertFalse(sweep.trim_intent_path(take.target).exists())
+        with mock.patch.object(sweep, "read_cargo_output_roots", return_value=mapping):
+            self.assertEqual(self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB])[0], 0)
+        self.assertFalse(own.exists())
+        self.assertFalse(copy.exists())
+        self.assertEqual(len(self.trim_rows()), 1)
+
+    def test_pair_recovery_keeps_a_changed_descendant_with_an_unchanged_parent(self) -> None:
+        base = self.base()
+        mapping, own, copy = self.paired_output(base)
+        take = self.prepare_pair_take(mapping)
+        fingerprint = own.parent.parent / ".fingerprint" / f"app-{APP}"
+        changed = fingerprint / "bin-app.json"
+        parent_version = sweep.output_version(fingerprint.stat())
+        _ = changed.write_text('{"new": "build output"}')
+        self.assertEqual(sweep.output_version(fingerprint.stat()), parent_version)
+        recovered = sweep.read_trim_intent(sweep.trim_intent_path(take.target))
+        _ = recovered.recover()
+        self.assertTrue(changed.exists())
+        self.assertEqual(changed.read_text(), '{"new": "build output"}')
+        self.assertFalse(own.exists())
+        self.assertFalse(copy.exists())
+        self.assertEqual(recovered.pending, [])
+        self.assertTrue(recovered.publish())
+        self.assertFalse(sweep.trim_intent_path(take.target).exists())
+
+    def test_ci_exclusion_keeps_both_output_roots_and_takes_only_idle_output(self) -> None:
+        for dry_run in (True, False):
+            for excluded in ("target", "build"):
+                with self.subTest(dry_run=dry_run, excluded=excluded):
+                    base = self.base()
+                    mapping, own, copy = self.paired_output(base)
+                    _, idle = cargo_target(base, "idle", TOOL, time.time() - DAY)
+                    ci = mapping.target_directory if excluded == "target" else mapping.build_directory
+                    _ = write_config_fixture(conf.path("lint"), f"sweep_ci_targets={ci}\n")
+                    with mock.patch.object(sweep, "read_cargo_output_roots", return_value=mapping):
+                        status, text = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB], dry_run)
+                    self.assertEqual(status, 0)
+                    self.assertTrue(own.exists())
+                    self.assertTrue(copy.exists())
+                    self.assertEqual(idle.exists(), dry_run)
+                    lines = [line for line in text.splitlines() if "the floor " in line and " from " in line]
+                    self.assertEqual(len(lines), 1)
+                    self.assertIn(str(idle.parents[2]), lines[0])
+
+    def test_secondary_floor_uses_configured_percent_and_groups_each_device(self) -> None:
+        base = self.base()
+        first = base / "first"
+        second = base / "second"
+        first.mkdir()
+        second.mkdir()
+        _ = write_config_fixture(conf.path("lint"), "sweep_free_floor_percent=25\n")
+        usage = os.statvfs_result((4096, 4096, 1000, 500, 500, 0, 0, 0, 0, 255))
+        def device(path: str) -> int:
+            return 2 if path == str(second) else 1
+        with (mock.patch.object(sweep, "output_device", side_effect=device),
+              mock.patch.object(os, "statvfs", return_value=usage)):
+            floors = sweep.filesystem_floors(12345, [str(first), str(second)], lint_settings=conf.read("lint"))
+        self.assertEqual([(item.device, item.floor_bytes, item.targets) for item in floors],
+                         [(1, 12345, (str(first),)), (2, 1000 * 4096 // 4, (str(second),))])
+        self.assertEqual([item.root_device for item in floors], [True, False])
+
+    def test_missing_or_bad_floor_percent_refuses_once(self) -> None:
+        base = self.base()
+        for value in ("", "bad", "-1", "101"):
+            with self.subTest(value=value):
+                _ = write_config_fixture(conf.path("lint"), f"sweep_free_floor_percent={value}\n")
+                errors = io.StringIO()
+                with redirect_stderr(errors):
+                    self.assertEqual(self.hold(base, 10 * GIB, [10 * GIB])[0], 2)
+                self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                self.assertIn("sweep_free_floor_percent", errors.getvalue())
+
+    def test_busy_floor_lock_does_not_stop_another_filesystem(self) -> None:
+        base = self.base()
+        one = sweep.FilesystemFloor(1, str(base), 100, (), True)
+        two = sweep.FilesystemFloor(2, str(base), 200, (), False)
+        root_record = sweep.floor_record_path()
+        root_record.parent.mkdir(parents=True, exist_ok=True)
+        with (mock.patch.object(sweep, "discover_cargo_outputs", return_value=([], sweep.CargoOutputIndex())),
+              mock.patch.object(sweep, "filesystem_floors", return_value=[one, two]),
+              mock.patch.object(sweep, "free_bytes", return_value=0),
+              mock.patch.object(sweep, "alert_floor_lock"),
+              mock.patch.object(sweep, "send_floor_alert", return_value=False),
+              root_record.with_suffix(".lock").open("a+") as lock,
+              redirect_stdout(io.StringIO())):
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(sweep.hold_floor(100, False), 0)
+        self.assertFalse(root_record.exists())
+        self.assertTrue(root_record.with_name(two.record_stem + ".json").exists())
+
+    def test_paired_roots_with_a_shared_inode_report_no_independent_takeable_bytes(self) -> None:
+        base = self.base()
+        mapping, own, copy = self.paired_output(base)
+        copy.unlink()
+        os.link(own, copy)
+        roots = [str(mapping.target_directory), str(mapping.build_directory)]
+        scan = sweep.scan_floor_roots(roots, {root: sweep.build_trees(root) for root in roots})
+        rows = sweep.floor_scan_targets(scan, roots, dict.fromkeys(roots, 0.0), {})
+        row = next(row for row in rows if row["folder"] == str(mapping.target_directory))
+        self.assertEqual(row.get("takeable_bytes"), copy.with_suffix(".d").stat().st_blocks * 512)
+        self.assertEqual(row.get("reason"), "links outside the target")
+
+    def test_floor_records_and_alerts_are_isolated_by_device(self) -> None:
+        base = self.base()
+        paths: list[Path] = []
+        for device, root in ((1, True), (2, False)):
+            token = sweep.FLOOR_FILESYSTEM.set(sweep.FilesystemFloor(device, str(base), 100, (), root))
+            try:
+                path = sweep.floor_record_path()
+                paths.append(path)
+                with sweep.locked_floor_record(path):
+                    sweep.write_floor_record(path, sweep.FloorRecord(
+                        time.time(), device, 0, sweep.DeliveredAlert(float(device)), sweep.NoDeliveredAlert(),
+                        filesystem=str(device)))
+            finally:
+                sweep.FLOOR_FILESYSTEM.reset(token)
+        self.assertNotEqual(paths[0], paths[1])
+        for device, path in enumerate(paths, 1):
+            saved = sweep.read_floor_record(path)
+            self.assertIsInstance(saved, sweep.FloorRecord)
+            assert isinstance(saved, sweep.FloorRecord)
+            self.assertEqual((saved.free_bytes, saved.alert_history), (device, sweep.DeliveredAlert(float(device))))
+            self.assertTrue(path.with_name(path.stem + "-alert.lock").exists())
+
+    def test_cold_rebuild_joins_an_external_removal_to_its_saved_workspace(self) -> None:
+        base = self.base()
+        mapping, _, _ = self.paired_output(base)
+        sweep.save_cargo_output_roots(sweep.CargoOutputIndex((mapping,)))
+        folder = str(mapping.workspace_root)
+        steps = [sweep.RebuildStep(folder, folder, 1, 2, 0, 0), sweep.RebuildStep(folder, folder, 5, 6, 50, 3)]
+        cold = sweep.rebuild_causes(steps, [sweep.SweepRemoval(3, str(mapping.build_directory), "floor take")], 0, 10)
+        self.assertEqual([item.cause for item in cold], ["floor take"])
+
+    def test_floor_sources_have_no_fixed_build_drive_path(self) -> None:
+        source = Path(sweep.__file__).read_text()
+        self.assertNotIn('"/build/', source)
+        self.assertNotIn("'/build/", source)
+
     def residue_target(self, base: Path, name: str, used: float, *, stamp: bool = True) -> tuple[Path, Path]:
         root = base / name / "target"
         payload = write(root / "doc" / "index.html")

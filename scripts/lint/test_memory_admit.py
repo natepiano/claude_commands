@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.lint import memory_admit as gate, tmp_sweep
+from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 import conf
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service, queue_view
 from scripts.build_queue.admission_test_support import AdmissionFixture, InjectedCrash, only_admitted
@@ -785,9 +786,14 @@ class FreshTestPromiseTests(unittest.TestCase):
         return path
 
     def fresh(self, *, key: str = "current-key", scope: gate.TestScope = "filtered",
-              target_dir: str = "target") -> bool:
+              target_dir: str = "target", build_dir: str = "") -> bool:
+        roots = (CargoOutputUnavailable("the target root is unknown")
+                 if target_dir in ("", "unknown", "unset")
+                 else CargoOutputRoots(self.worktree.resolve(),
+                                       (self.worktree / target_dir).resolve(),
+                                       (self.worktree / (build_dir or target_dir)).resolve()))
         return gate.is_fresh_test(self.root, self.host, str(self.worktree), "hana", scope, key, NOW,
-                                  target_dir=target_dir)
+                                  roots)
 
     def promise(self, *, key: str = "current-key", scope: gate.TestScope = "filtered",
                 filters: tuple[str, ...] = ("native_rate",)) -> gate.ExpectedPeak:
@@ -1036,6 +1042,22 @@ class FreshTestPromiseTests(unittest.TestCase):
         self.assertFalse(self.fresh())
         self.assertEqual(self.promise().bytes, 10 * GIB)
 
+    def test_intermediate_deletion_ends_warm_promise_with_artifacts_present(self) -> None:
+        build = self.root / "intermediates"
+        build.mkdir()
+        self.previous_build()
+        self.assertTrue(self.fresh(build_dir=str(build)))
+        _ = (self.state / "target-deletes.json").write_text(json.dumps({
+            str(build): (NOW - timedelta(seconds=30)).timestamp(),
+        }))
+        self.assertFalse(self.fresh(build_dir=str(build)))
+        self.assertTrue((self.worktree / "target").is_dir())
+
+    def test_missing_intermediates_end_warm_promise_and_equal_roots_stay_warm(self) -> None:
+        self.previous_build()
+        self.assertFalse(self.fresh(build_dir=str(self.root / "missing-intermediates")))
+        self.assertTrue(self.fresh())
+
     def test_deletion_before_build_or_in_other_target_does_not_invalidate_it(self) -> None:
         self.samples([2 * GIB])
         self.previous_build()
@@ -1074,7 +1096,7 @@ class FreshTestPromiseTests(unittest.TestCase):
         meminfo = self.root / 'meminfo'
         _ = meminfo.write_text('MemAvailable: 67108864 kB\n')
         arguments = ['cargo', 'nextest', 'run', '-E', 'package(hana) & test(native_rate)']
-        with patch.dict(os.environ, {'BUILDLOG_TEST_BUILD_KEY': 'current-key', 'BUILDLOG_TREE': 'source-only-key', 'BUILDLOG_TEST_TARGET_DIR': str(configured), 'CARGO_TARGET_DIR': str(self.worktree / 'target')}), patch.object(gate, 'git_identity', return_value=(HANA, 'checkout')), patch.object(gate.store, 'host_name', return_value=self.host), patch.object(gate.record, 'git_directory', return_value=str(self.worktree)), patch.object(gate.record, 'git_facts', return_value={'worktree': str(self.worktree)}), patch.object(gate, 'process_start_time', return_value=None):
+        with patch.dict(os.environ, {'BUILDLOG_TEST_BUILD_KEY': 'current-key', 'BUILDLOG_TREE': 'source-only-key', 'BUILDLOG_TEST_TARGET_DIR': str(configured), 'BUILDLOG_TEST_BUILD_DIR': str(configured), 'CARGO_TARGET_DIR': str(self.worktree / 'target')}), patch.object(gate, 'git_identity', return_value=(HANA, 'checkout')), patch.object(gate.store, 'host_name', return_value=self.host), patch.object(gate.record, 'git_directory', return_value=str(self.worktree)), patch.object(gate.record, 'git_facts', return_value={'worktree': str(self.worktree)}), patch.object(gate, 'process_start_time', return_value=None):
             fresh = gate.step_estimate(arguments, str(self.worktree), gate.INFER_FROM_ARGV, NOW, self.root, gate.DEFAULT_ADMISSION_POLICY)
             self.assertEqual(fresh.profile.peak.bytes, 2 * GIB)
             _ = (self.state / 'target-deletes.json').write_text(json.dumps({str(configured): (NOW - timedelta(seconds=30)).timestamp()}))

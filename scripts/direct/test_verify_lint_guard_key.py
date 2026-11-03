@@ -79,12 +79,14 @@ class VerifyLintGuardKeyTests(support.VerifyLintScopeFixture):
         self.assertFalse(self.clippy_ran())
 
     def calculate_build_keys(self, *arguments: str, extra_environment: dict[str, str] | None = None,
-                        target: str = "") -> tuple[str, str, str]:
+                        target: str = "", build: str = "") -> tuple[str, str, str]:
         """Run the shared production calculator without starting Cargo work."""
         metadata = cast(dict[str, object], json.loads(self.environment["TEST_METADATA"]))
         packages = cast(list[dict[str, object]], metadata["packages"])
         packages[0]["dependencies"] = []
         metadata["target_directory"] = target or str(self.root / "configured-target")
+        if build:
+            metadata["build_directory"] = build
         output = self.root / "test-build-inputs"
         output.unlink(missing_ok=True)
         result = subprocess.run(
@@ -93,13 +95,38 @@ class VerifyLintGuardKeyTests(support.VerifyLintScopeFixture):
              str(support.SCRIPTS / "lint/invoke.sh"), str(self.config), "--", "test", "sample", *arguments],
             input=json.dumps(metadata), cwd=self.root,
             env={**self.environment, "VERIFY_COMPUTE_TEST_BUILD": "1",
+                 "TEST_METADATA": json.dumps(metadata),
                  "VERIFY_TEST_BUILD_INPUTS_FILE": str(output), **(extra_environment or {})},
             capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
         )
         lines = output.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(lines), 2)
+        self.assertEqual(len(lines), 3)
         self.assertRegex(lines[0], r"^[0-9a-f]{64}$")
         return result.stdout.strip(), lines[0], lines[1]
+
+    def test_build_identity_changes_when_only_intermediate_root_changes(self) -> None:
+        _, first, target = self.calculate_build_keys(build=str(self.root / "intermediates-a"))
+        lines = (self.root / "test-build-inputs").read_text().splitlines()
+        self.assertEqual(lines[1:], [target, str(self.root / "intermediates-a")])
+        _, second, same_target = self.calculate_build_keys(build=str(self.root / "intermediates-b"))
+        self.assertEqual(same_target, target)
+        self.assertNotEqual(first, second)
+
+    def test_shell_passes_both_roots_to_admission_after_a_hold(self) -> None:
+        source = support.VERIFY.read_text(encoding="utf-8")
+        function = source.split("refresh_test_build_inputs() {", 1)[1].split("\n}\n", 1)[0]
+        target, build = self.root / "artifacts", self.root / "intermediates"
+        script = "refresh_test_build_inputs() {" + function + "\n}\n" + "\n".join((
+            'tree_key() { printf "key\\n%s\\n%s\\n" "$1" "$2" > "$HOLD_WAIT_DIR/test-build-inputs"; }',
+        ))
+        # The fixture supplies the identity that the real calculator writes.
+        script = script.replace('tree_key)', f'tree_key {shlex.quote(str(target))} {shlex.quote(str(build))})')
+        script += '\nrefresh_test_build_inputs\nprintf "%s\\n%s\\n%s\\n" "$BUILDLOG_TEST_BUILD_KEY" "$BUILDLOG_TEST_TARGET_DIR" "$BUILDLOG_TEST_BUILD_DIR"\n'
+        result = subprocess.run(["bash", "-eu", "-c", script], env={**self.environment,
+            "HOLD_WAIT_DIR": str(self.root / "tmp")}, capture_output=True, text=True,
+            timeout=TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["key", str(target), str(build)])
 
     def test_build_input_key_changes_with_features_profile_flags_and_toolchain(self) -> None:
         arguments = ("--filter", "native_rate", "--features", "a")
@@ -166,9 +193,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 sys.path.insert(0, {str(support.SCRIPTS / 'lint')!r})
 import memory_admit as gate
+from scripts.lib.cargo_output import CargoOutputRoots
 fresh = gate.is_fresh_test(Path(os.environ['BUILDLOG_DIR']), gate.store.host_name(),
     os.getcwd(), 'sample', 'filtered', os.environ['BUILDLOG_TEST_BUILD_KEY'],
-    datetime.now(UTC), os.environ['BUILDLOG_TEST_TARGET_DIR'])
+    datetime.now(UTC), CargoOutputRoots(Path.cwd(), Path(os.environ['BUILDLOG_TEST_TARGET_DIR']),
+                                      Path(os.environ['BUILDLOG_TEST_BUILD_DIR'])))
 Path('admission.json').write_text(json.dumps({{'fresh': fresh,
     'key': os.environ['BUILDLOG_TEST_BUILD_KEY']}}))
 """, encoding="utf-8")

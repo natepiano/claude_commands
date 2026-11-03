@@ -141,7 +141,33 @@ Floor records and `floor.lock` use `tmp_sweep.state_dir()`.
 Disk measurements and build history use `scripts/buildlog/store.py::root()`.
 The first `sweep_message_path_widths` entry supplies the default alert path width.
 
-`scripts/lint/sweep.py` keeps the configured free-space floor (300 GiB on natedev).
+`scripts/lint/sweep.py` keeps a free-space floor on each filesystem that holds build output.
+The root filesystem keeps `sweep_free_floor_gib` (300 GiB on natedev).
+Other build filesystems use `sweep_free_floor_percent` (20 percent of their total size).
+A missing or invalid live percent stops the floor pass with one line.
+
+`cargo_output.py` reads `workspace_root`, `target_directory`, and `build_directory` from Cargo metadata.
+Older Cargo metadata uses `target_directory` for both output roots.
+The sweep saves these mappings in `cargo-output-roots.json` beside its floor records.
+It keeps prior mappings for discovery and cold-rebuild attribution during the drain.
+No separate setup is required when the build drive is absent.
+
+The floor reads free space and computes the shortfall for each filesystem.
+A shortfall selects logical units by their bytes on that filesystem, in target last-use order.
+Each selected unit includes its intermediate files and copied artifacts on both filesystems.
+Only bytes freed on the selected filesystem reduce its shortfall.
+A held checkout protects both output roots.
+The take checks both roots' processes, Cargo locks, use stamps, and observed output before deletion.
+The take records both roots in `target-deletes.json` before it removes any output.
+A saved trim intent retains the paired paths after an interruption.
+
+The root filesystem keeps `floor.json`, `floor.lock`, and `floor-alert.lock`.
+Other filesystems use `floor-<major>-<minor>` with the same suffixes.
+Each filesystem keeps its own growth measurements and alert receipts.
+Old root floor records remain readable.
+Each new `floor_scan` row names its filesystem and probe path.
+CI paths come from `sweep_ci_targets`; missing paths are skipped, and the sweep never takes CI output.
+
 When free space is below the floor, it takes only the shortfall. Orphaned
 copies go first from any idle target. Then whole takes and build-unit batches
 share target last-use order, oldest first, across all locations. A whole take
