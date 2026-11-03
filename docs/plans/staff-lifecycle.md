@@ -40,7 +40,7 @@ Each operation is a short list of plain steps. A rerun with nothing to change pr
 3. **Stop all, restart all** (user, 2026-10-08): one loop. Stop each live row, then start each.
 4. **Folder move:** stop the unit and its workers. Run `git worktree move`. Write `worktree`. Start each.
 5. **Rename:** write `name`. Move the folder to `~/worktrees/<name>` (step 4). Run `git branch -m`. Set the displays.
-6. **Transfer:** write `parent`. Move the unit's Units row to the new production doc.
+6. **Transfer:** write `parent`. Move the unit's Units row to the new production doc. Move its herdr tab, and its workers' tabs, into the new production's group (a display; step 3 restores the same order).
 7. **`/clear`:** write `current_session`.
 8. **Family switch:** start a session of the other family in the same slot, with the transcript extract. Write `current_session`. `id` and `name` stay.
 9. **Retire:** stop the unit and its workers (step 1). Remove the worktree and the branch. Write `worktree` state `removed`; the row stays, so a resume by `id` still works. Delete the Units row. Refuse only on refusal 4; an uncommitted `Project started` plan line alone is not work.
