@@ -134,6 +134,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - Phase 1: `scripts/test_times/module_run.py` keeps `python -m unittest discover` output, exit codes and imports. Its `main()` reads `TEST_TIMES_OUT` once and removes it from the environment before discovery imports a test module. With the wrong argument count it prints one usage line and exits 2. `gate_record.py` gives `read_module_times`, `kept_tests`, `slow_test_s` and `write_gate_run`. `write_gate_run` catches every error and prints `gate run not written: <error>` to stderr. `NoModuleTimes.reason` names the file and the error. `TestTime.status` is the `TestStatus` Literal.
 - The owner of `merge_gate.py` is sdlc devtools-unit (builds showrunner, 2026-11-03). Before the edit lands, send the showrunner the diff; the showrunner gets devtools' agreement through sdlc. devtools fixes a basedpyright exit-3 defect in `merge_gate.py` (due 15:00 EST, 2026-11-03): merge its tip first and test against it. The checkpoint notice says `also touches scripts/production/merge_gate.py (owner devtools-unit), tested against <devtools tip>, clean`.
 - Until the admission rebuild, a tree's own gate waits forever (builds showrunner, 2026-11-03). Gate this phase with main's `merge_gate.py --checkout <tree> --tests-only`.
+- Phase 3 (done before this phase): `scripts/test_times/gate_record.py` holds `TYPE_CHECK_JOB`, the (suite, module) pair `("types", "basedpyright")` that the index leaves out of `modules_run` and `tests_run`. The type job's `GateJobRequest` and `GateJobResult` in `merge_gate.py` (955, 957) use it, so the writer and the reader name it in one place.
 
 **Acceptance gate:**
 - `python3 -m unittest discover -s scripts/production -p 'test_merge_gate*.py'` green
@@ -141,7 +142,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `basedpyright scripts/production/merge_gate.py scripts/production/test_merge_gate.py scripts/production/test_merge_gate_test_times.py` prints `0 errors, 0 warnings, 0 notes`
 - The checkpoint gate, main's `merge_gate.py --checkout <tree> --tests-only`, is green. The fixture tests prove the `gate_run` line; this tree's own gate runs live only after the admission rebuild
 
-### Phase 3 — The build log indexes gate runs  · status: todo
+### Phase 3 — The build log indexes gate runs  · status: done
 **Depends on:** Phase 1
 
 #### Work Order
@@ -155,7 +156,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
    - `gate_suites` — `run_id`, `src`, `host`, `started_at`, `suite`, `wall_s REAL`, `status INTEGER`; `PRIMARY KEY (run_id, suite)`.
    - `gate_modules` — `run_id`, `src`, `host`, `started_at`, `suite`, `module`, `attempt INTEGER` (counts from 1: a hold restart and the rerun alone each add one), `restart`, `times_missing`, `wall_s REAL`, `cpu_s REAL`, `peak_mib REAL`, `status INTEGER`, `tests_run INTEGER`, `failures INTEGER`, `errors INTEGER`, `skipped INTEGER`, `tests_s REAL`; `PRIMARY KEY (run_id, suite, module, attempt)`. The type job is the row with suite `types` and module `basedpyright`.
    - `gate_tests` — `run_id`, `src`, `host`, `started_at`, `suite`, `module`, `attempt INTEGER`, `test`, `duration_s REAL`, `status`; `PRIMARY KEY (run_id, suite, module, attempt, test)`. Description: `per-test rows of a gate module, kept only for tests that failed or took at least SLOW_TEST_S (config/test_times.conf)`.
-2. Indexes in `create_schema`: `gate_runs_started ON gate_runs (started_at)`, `gate_suites_suite ON gate_suites (suite, started_at)`, `gate_modules_key ON gate_modules (suite, module, started_at)`, `gate_tests_key ON gate_tests (suite, module, test, started_at)`, `gate_tests_test ON gate_tests (test, started_at)`.
+2. Indexes in `create_schema`: `gate_runs_started ON gate_runs (started_at)`, `gate_suites_suite ON gate_suites (suite, started_at)`, `gate_modules_key ON gate_modules (suite, module, started_at)`, `gate_tests_key ON gate_tests (suite, module, test, started_at)`. No index on `test` alone: Phase 4 matches a test name by substring, which no B-tree serves; a scan of 250,000 test rows takes 19 ms (measured 2026-11-03).
 3. `add_gate_run(connection, record, src)`: delete the child rows of the run id, then insert the `gate_runs` row and one child row for each suite, module and kept test, in the form of `add_step`. A malformed nested entry (not a dict) is skipped, as `add_step` skips one. Register it as `ADDERS["gate_run"]`.
 4. Raise `SCHEMA_VERSION` by one from its value on the builds branch after report-unit's Phase 5 (`a5e7e768`) merges into it. `open_for_update` (501) deletes the whole index on a version change, so two checkouts with different versions rebuild it in turn. The next `update()` rebuilds it from the JSON lines (1.29 GB and 436 files on 2026-11-03). `index.py` belongs to report-unit. Builds showrunner ruling, 2026-11-03: edit `index.py` now; the schema bump lands only after `a5e7e768` is on builds; merge builds before the Phase 3 notice. So the phase checkpoint waits until `git merge-base --is-ancestor a5e7e768 origin/builds` succeeds. Measure one rebuild on a copy of the live build log (`BUILDLOG_DIR=<copy>`) and report its time.
 
@@ -163,10 +164,12 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `scripts/buildlog/index.py` — the four tables, their indexes, `add_gate_run`, `ADDERS`, `SCHEMA_VERSION`
 - `scripts/buildlog/test_gate_index.py` — new: index tests
 - `scripts/buildlog/test_index.py` — its schema version check (635) follows the new version
+- `scripts/test_times/gate_record.py` — `TYPE_CHECK_JOB`, the (suite, module) of the type job; `write_gate_run` imports `record` and `store` in its body, so `index.py` imports it with no cycle
+- `scripts/buildlog/test_index_rerun.py` — (owner report-unit) imports the shared `rows` helper from `test_index.py` (builds showrunner ruling, 2026-11-03)
 
 **Workers:** 1 writer + 1 tester — the index code and its tests split by file
 - `impl` — `scripts/buildlog/index.py`
-- `test` — `scripts/buildlog/test_gate_index.py`: write `gate_run` lines with `gate_record.write_gate_run` into a `BUILDLOG_DIR` fixture, run `index.update()`, and check the rows of each table; a second `update()` adds no rows; `forget` of the source removes them; a nested entry that is not a dict is skipped; a suite, module and test query over 500 fixture gate runs returns in under 1 s; `scripts/buildlog/test_index.py` (635) expects the new version
+- `test` — `scripts/buildlog/test_gate_index.py`: write `gate_run` lines with `gate_record.write_gate_run` into a `BUILDLOG_DIR` fixture, run `index.update()`, and check the rows of each table; a second `update()` adds no rows; `forget` of the source removes them; a nested entry that is not a dict is skipped; a suite, module and test query over 500 fixture gate runs uses its index (`EXPLAIN QUERY PLAN`; no wall-clock threshold in a test, per the test rules); `scripts/buildlog/test_index.py` (635) expects the new version
 
 **State:** the build log index (`index.sqlite`) is rebuilt at its first update after the version change.
 
@@ -213,7 +216,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Constraints from prior phases:**
 - Phase 1: `config/test_times.conf` holds `TOP_RUNS`; `gate_record.write_gate_run` writes fixture lines.
 - Phase 2: a hold restart is its own module row with `restart: hold`; a failed module's rerun alone is the next attempt. A row with `times_missing` has no measured tests, and its `tests_s` is not a measurement.
-- Phase 3: tables `gate_runs`, `gate_suites`, `gate_modules` (`attempt` counts from 1; the type job is `types`/`basedpyright`) and `gate_tests`, with indexes on `(suite, module, started_at)`, `(suite, module, test, started_at)` and `(test, started_at)`.
+- Phase 3: tables `gate_runs`, `gate_suites`, `gate_modules` (`attempt` counts from 1; the type job is `types`/`basedpyright`) and `gate_tests`, with indexes on `(suite, module, started_at)` and `(suite, module, test, started_at)`; a test-name substring match scans `gate_tests` (19 ms over 250,000 rows).
 
 **Acceptance gate:**
 - `python3 -m unittest discover -s scripts/test_times -p 'test_*.py'` green

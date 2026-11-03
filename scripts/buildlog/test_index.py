@@ -184,6 +184,19 @@ def point_root_at(test: unittest.TestCase, root: Path) -> None:
     test.addCleanup(restore)
 
 
+def rows(sql: str, *parameters: object) -> list[tuple[object, ...]]:
+    with closing(index.read_only()) as connection:
+        return cast(list[tuple[object, ...]], connection.execute(sql, parameters).fetchall())
+
+
+def table_rows(table: str, where: str = "", *parameters: object) -> list[Record]:
+    with closing(index.read_only()) as connection:
+        connection.row_factory = sqlite3.Row
+        records = cast(list[sqlite3.Row],
+                       connection.execute(f"SELECT * FROM {table} {where} ORDER BY 1", parameters).fetchall())
+        return [{name: cast(object, row[name]) for name in row.keys()} for row in records]
+
+
 class LogIsolationTests(unittest.TestCase):
     def test_each_module_uses_a_temporary_log(self) -> None:
         environment = {key: value for key, value in os.environ.items() if key != "BUILDLOG_DIR"}
@@ -230,8 +243,7 @@ class IndexTests(unittest.TestCase):
         _ = path.write_bytes(b"".join(encode(record) for record in records))
 
     def rows(self, sql: str, *parameters: object) -> list[tuple[object, ...]]:
-        with closing(index.read_only()) as connection:
-            return cast(list[tuple[object, ...]], connection.execute(sql, parameters).fetchall())
+        return rows(sql, *parameters)
 
     def ids(self) -> list[object]:
         return [row[0] for row in self.rows("SELECT id FROM steps ORDER BY id")]
@@ -632,7 +644,7 @@ class IndexTests(unittest.TestCase):
             _ = connection.execute("PRAGMA user_version = 25")
             connection.commit()
         self.assertEqual(index.update(), 3)
-        self.assertEqual(self.rows("PRAGMA user_version"), [(28,)])
+        self.assertEqual(self.rows("PRAGMA user_version"), [(index.SCHEMA_VERSION,)])
         self.assertEqual(path.read_bytes(), original)
         self.assertEqual(json.loads(cast(str, self.rows("SELECT slices FROM samples ORDER BY at")[1][0])), slices)
 

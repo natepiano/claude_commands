@@ -7,10 +7,9 @@ import math
 from pathlib import Path
 import sys
 import time
-from typing import Literal, TypedDict, cast, get_args
+from typing import Final, Literal, TypedDict, cast, get_args
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.buildlog import record, store
 from scripts.lib import conf
 
 
@@ -33,6 +32,10 @@ class ModuleTimes(TypedDict):
     errors: int
     skipped: int
     tests: list[TestTime]
+
+
+# The (suite, module) of the merge gate's type-check job, which runs no tests.
+TYPE_CHECK_JOB: Final = ("types", "basedpyright")
 
 
 class ModuleRun(TypedDict):
@@ -163,6 +166,9 @@ def slow_test_s() -> float:
 def write_gate_run(run: GateRun) -> None:
     """Append one gate record without failing the caller."""
     try:
+        # This import keeps gate_record free of an import cycle with index.py.
+        from scripts.buildlog import record, store
+
         epoch = time.time()
         host = store.host_name()
         entry: GateRunRecord = {"kind": "gate_run", "v": record.RECORD_VERSION,
