@@ -315,7 +315,10 @@ Run these suites on the Mac with a scratch home. Run the command from the root o
 - herdr 0.9.0 and 0.9.5 nest the scroll offset under `scroll`, and 0.9.5 omits `scroll` when unset. Fakes in the flat form passed while the real run failed.
 - Linux discovery skips a process whose cwd no longer resolves, so callers that hold a registry pid place it with `herdr_place_of`.
 - natedev's `claude` alias adds `--remote-control` and `--settings`. herdr types a bare `claude` at the pane prompt, so without the `HERDR_AGENT_PANE` guard every session would get those flags twice.
-- An account move cannot run `accounts.py exec` inside herdr, since it removes credentials and checks readiness, which pane variables cannot do. Moves pass `prepared_account(target, resume=True)` variables and removals instead.
+- Account moves use `stop_resume.resume` and run the account exec command through `Herdr.run_in_pane`.
+  The exec path prepares the target environment and removes conflicting account variables.
+  Pane variables alone do not replace account admission.
+  The [shutdown design](shutdown-and-restart.md) owns this shared move path.
 - A detached run is not a unit's second pane. The supervisor of a worker build that `mesh_runs.py supervise` runs stays in its pane's scope (in the herdr service's cgroup when pane scopes are not available), so herdr places it in the session; the command itself runs in a `builds.slice` scope. It inherits the unit's marks and a pane id that can be out of date. `unit_lookup` keeps only the places that can hold the unit's Claude when one does. Without that rule, a unit with a detached run reads as marked twice, and `roster.py` exits 1.
 - `herdr_place_of` reads every process for each call, so 40 calls took 10.7 s. `herdr_places()` places every pid in one read. `roster.py` uses it and takes about 1 s in total.
 

@@ -93,7 +93,10 @@ When the user asks to review changes, open the prepared page:
 2. Give the link to the user.
 
 The page contains every waiting change, with staff-based showrunner tabs.
-The `unrouted` tab shows unit changes without a staff row.
+The router follows unit rename records before it uses the list's showrunner for an unknown producer.
+Known units take priority over unknown aliases.
+Several units under one showrunner belong to that showrunner and send messages only to that showrunner.
+The `unrouted` tab shows conflicts between showrunners or a known unit without a showrunner.
 Verdicts save without sending a message.
 This tab offers no question control, and the server refuses question submissions without saving.
 Its count covers all page lists, including independent production roots.
@@ -103,20 +106,32 @@ Answers save in the background.
 Each successful save opens the next waiting change in the same tab.
 Navigation during a save prevents this automatic change.
 Next skips a change without saving an answer.
-A failed save keeps the answer, failure text, resend control, and waiting count.
-Validate yourself advances the page when the request saves.
-On a page load, only a sent validation message removes the row from the count and Next order.
-Pending and failed validation messages keep the row waiting, with a note and a resend control.
-This state survives a reload and a server restart.
+A failed HTTP save keeps the typed answer, error text, answer form, and waiting count.
+A saved verdict shows **Saved: <answer>**.
+Validate yourself removes the row from every waiting count and Next order when the request saves.
 A direct link shows **The showrunner will validate this** without answer buttons.
-The showrunner receives the validation message.
-The showrunner's `/next` keeps a sent validation request pending and places it last.
-Send feedback removes the row from the page count only when its verdict saves.
 Ask a question uses the one-line feedback field.
-Only a sent question message removes the row from the count until the showrunner answers.
-Delivery without a recipient records a failure and releases the active attempt.
-A resend can recover after the staff record changes.
-Pending and failed question messages keep the row waiting after a page load, with a note and a resend control.
+It removes the row from every waiting count until the showrunner answers.
+A direct link shows **The showrunner will answer this** without answer buttons.
+Send feedback saves the text unchanged; text that starts with `works` or `fine` can land the change.
+The server manages delivery; the page shows no delivery notes, links, or resend controls.
+The server reads `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf` when delivery starts.
+The initial values are 3 tries and a 5 second pause.
+Each round sends to all remaining recipients before one pause; later rounds retry only failed recipients.
+A `QUEUED:` result counts as kept and needs no retry.
+After all tries fail, the server alerts the tab's showrunner once to pass the saved answer on by hand.
+The server resolves every staff recipient ID to its current session for each send.
+At startup, the server scans the review lists and resumes pending records with the same retry budget.
+It ignores legacy page context and reads the current owner and production document through the same function as the browser.
+Recovery skips records that a live request owns.
+It ignores legacy failed records and preserves validation ownership and open questions.
+The router alerts `unrouted_alert_recipient` once for each unrouted row and reason.
+This config key starts at `natedev`.
+`unrouted_alert_retry_seconds` starts at 60 seconds and accepts 5 through 3600 seconds.
+Both keys are in `config/review_links.conf` and are read when used.
+Failed alerts remain pending until the configured pause ends.
+A nonblocking lock prevents two renders from sending one alert at once.
+The router records acceptance only after the sender accepts or queues the alert.
 Do not ask for a batch size or take page answers in chat.
 
 The diagnostic command `show <production>` still prints the current row and count.
