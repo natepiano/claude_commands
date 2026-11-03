@@ -8,12 +8,12 @@ import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Iterable
-from typing import cast
+from typing import cast, override
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from scripts.production import change_review, change_routing, staff
+from scripts.production import change_review, change_routing, staff, unrouted_alert
 from scripts.production.staff_test_support import fixture_member
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -222,8 +222,8 @@ class StaffRoutingTests(unittest.TestCase):
                 row["Merged"] = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
                                                 capture_output=True, text=True).stdout.strip()
                 second = change_routing.StaffRouting(staff.snapshot(), {"top": doc}, change_review).owner(row, "top")
-                self.assertIsInstance(second, change_routing.UnroutedChange)
-                self.assertEqual(second.tab, "unrouted")
+                self.assertIsInstance(second, change_routing.ShowrunnerOwnChange)
+                self.assertEqual(second.tab, "top")
 
     def test_a_remote_configuration_change_keeps_the_history_cache_valid(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -255,9 +255,12 @@ class StaffRoutingTests(unittest.TestCase):
                     return subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True,
                                           text=True, check=True).stdout.strip()
 
+                parent = staff.snapshot().by_path("top")
+                assert parent is not None
+                _ = fixture_member("unit", name="visible-unit", parent=parent.id)
                 original = git("rev-parse", "HEAD")
                 _ = git("checkout", "-b", "hidden")
-                _ = git("commit", "--allow-empty", "-m", "checkpoint(unknown): hidden change")
+                _ = git("commit", "--allow-empty", "-m", "checkpoint(visible-unit): hidden change")
                 hidden = git("rev-parse", "HEAD")
                 _ = git("checkout", "main")
                 _ = git("branch", "-D", "hidden")
@@ -271,36 +274,42 @@ class StaffRoutingTests(unittest.TestCase):
                 reference = "refs/heads/review/nested/visible"
                 _ = git("update-ref", reference, hidden)
                 self.assertIn(repo / ".git" / reference, change_routing.history_sources(repo / ".git"))
-                self.assertIsInstance(owner(), change_routing.UnroutedChange)
+                self.assertIsInstance(owner(), change_routing.StaffRoutedChange)
                 _ = git("update-ref", reference, original)
                 self.assertIsInstance(owner(), change_routing.ShowrunnerOwnChange)
                 _ = git("update-ref", reference, hidden)
-                self.assertIsInstance(owner(), change_routing.UnroutedChange)
+                self.assertIsInstance(owner(), change_routing.StaffRoutedChange)
                 _ = git("update-ref", "-d", reference)
                 self.assertIsInstance(owner(), change_routing.ShowrunnerOwnChange)
 
-    def test_delivered_marks_leave_the_count_but_failed_messages_keep_the_row(self) -> None:
+    def test_saved_requests_leave_the_count_regardless_of_delivery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             listing = root / "change-review - top.md"
             row = {"#": "C1"}
             record = change_routing.delivery_path(root, listing, "C1")
             for fields, expected in (({"validation": {"state": "sent", "attempt": "validation-attempt"}}, False),
-                                     ({"validation": {"state": "failed"}}, True),
+                                     ({"validation": {"state": "failed", "attempt": "old"}}, False),
+                                     ({"validation": {"state": "pending", "attempt": "pending"}}, False),
+                                     ({"question": {"question_id": "q1", "text": "Why?", "delivery": {"state": "pending", "attempt": "pending"}}}, False),
                                      ({"question": {"question_id": "q1", "text": "Why?", "delivery": None}}, False),
                                      ({"question": {"question_id": "q1", "text": "Why?", "answer": "Because"}}, True)):
                 with self.subTest(fields=fields):
                     _ = record.write_text(json.dumps(fields))
                     self.assertEqual(change_routing.waits_for_user(listing, row, root), expected)
 
-    def test_an_unknown_checkpoint_counts_as_unrouted_on_the_page_and_footer_and_saves_without_sending(self) -> None:
+    def test_a_retired_checkpoint_counts_for_its_list_on_the_page_and_footer_and_sends_to_its_showrunner(self) -> None:
         from datetime import date
         from scripts.production import footer_counts, showrunners
         from scripts.review_links import change_browser, change_page
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            environment = {"STAFF_FILE": str(root / "staff.json"), "CHANGE_REVIEW_DIR": str(root),
+            config = root / "config"
+            config.mkdir()
+            source = Path(__file__).resolve().parents[2] / "config/review_links.conf"
+            _ = (config / "review_links.conf").write_text(source.read_text().replace("delivery_pause_seconds=5", "delivery_pause_seconds=0"))
+            environment = {"CONF_DIR": str(config), "STAFF_FILE": str(root / "staff.json"), "CHANGE_REVIEW_DIR": str(root),
                            "XDG_CACHE_HOME": str(root / "cache"), "REVIEW_LINKS_ROOT": str(root / "links"),
                            "NEXT_STATE_DIR": str(root / "next"), "FEATURE_LOG_VAULT": str(root / "vault")}
             with mock.patch.dict(os.environ, environment):
@@ -332,14 +341,14 @@ class StaffRoutingTests(unittest.TestCase):
                     status = change_page.DeliveryStatus(root / "links")
                     prepared = change_browser.prepare(browser, status)
                     unknown = next(item for item in prepared.changes if item.row["#"] == "C777")
-                    self.assertEqual(unknown.tab, "unrouted")
-                    self.assertIn("No staff record for aws-unit; no message goes out", change_browser.render(browser, status).decode())
+                    self.assertEqual(unknown.tab, "natedev")
+                    self.assertNotIn("No staff record for aws-unit", change_browser.render(browser, status).decode())
                     counts = {tab: sum(item.tab == tab and item.waiting for item in prepared.changes) for tab in prepared.queues}
-                    self.assertEqual(counts["unrouted"], 1)
+                    self.assertEqual(counts.get("unrouted", 0), 0)
                     for tab, doc in docs.items():
                         self.assertEqual(counts[tab], footer_counts.changes(doc))
-                    self.assertEqual(counts["unrouted"], footer_counts.unrouted_changes(docs["natedev"]))
-                    self.assertIn("1 unrouted", footer_counts.counts_line(footer_counts.read_counts(docs["natedev"])) or "")
+                    self.assertEqual(counts.get("unrouted", 0), footer_counts.unrouted_changes(docs["natedev"]))
+                    self.assertNotIn("unrouted", footer_counts.counts_line(footer_counts.read_counts(docs["natedev"])) or "")
                     from urllib.parse import urlencode
                     fields = {"row": "natedev/C777", "token": change_browser.row_token(browser, "natedev/C777"),
                               "outcome": "works", "feedback": ""}
@@ -347,6 +356,114 @@ class StaffRoutingTests(unittest.TestCase):
                         delivery, answer = change_browser.submit(browser, urlencode(fields), status)
                         change_page.deliver(delivery, status)
                     self.assertEqual(answer, "works")
-                    send.assert_not_called()
+                    send.assert_called_once()
+                    self.assertEqual(send.call_args.args[0], f"session:{parent.current_session}")
                     self.assertIsInstance(status.slots(change_page.ReviewPage(listing, docs["builds"], (), ""), "C777").verdict,
                                           change_page.NoDelivery)
+
+
+class RoutingGuardTests(unittest.TestCase):
+    root: Path = Path()
+    top: staff.StaffRow = staff.StaffRow(staff.StaffId(""), "showrunner", "", None, current_session=staff.StaffId(""))
+    other: staff.StaffRow = top
+    one: staff.StaffRow = top
+    two: staff.StaffRow = top
+    foreign: staff.StaffRow = top
+    router: change_routing.StaffRouting = change_routing.StaffRouting(staff.StaffSnapshot(()), {}, change_review)
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.dict(os.environ, {"STAFF_FILE": str(self.root / "staff.json"),
+            "SHOWRUNNER_STATE_DIR": str(self.root / "state"), "REVIEW_LINKS_ROOT": str(self.root / "links")}))
+        _ = self.enterContext(mock.patch.object(unrouted_alert, "notify"))
+        self.top = fixture_member("showrunner", name="top")
+        self.other = fixture_member("showrunner", name="other")
+        self.one = fixture_member("unit", name="rich-text", parent=self.top.id)
+        self.two = fixture_member("unit", name="models", parent=self.top.id)
+        self.foreign = fixture_member("unit", name="foreign", parent=self.other.id)
+        self.router = change_routing.StaffRouting(staff.snapshot(), {}, change_review)
+
+    def route(self, candidates: set[str]) -> change_routing.ChangeOwner:
+        selection = change_routing.CheckpointSelection(self.root, ())
+        with (mock.patch.object(self.router, "selection", return_value=selection),
+              mock.patch.object(self.router, "candidate_units", return_value=candidates),
+              mock.patch.object(self.router, "read_messages")):
+            return self.router.owner({"#": "C1", "Change": "A change"}, "top")
+
+    def test_a_retired_unit_returns_to_its_lists_showrunner(self) -> None:
+        owner = self.route({"retired-unit"})
+        self.assertIsInstance(owner, change_routing.ShowrunnerOwnChange)
+        self.assertEqual(owner.tab, "top")
+
+    def test_a_renamed_unit_follows_the_saved_staff_identity(self) -> None:
+        folder = self.root / "state/top"
+        folder.mkdir(parents=True)
+        _ = (folder / "rename_unit.json").write_text(json.dumps({"old": "old-unit", "new": "rich-text",
+                                                               "staff_id": self.one.id, "done": True}))
+        owner = self.route({"old-unit"})
+        self.assertIsInstance(owner, change_routing.StaffRoutedChange)
+        assert isinstance(owner, change_routing.StaffRoutedChange)
+        self.assertEqual(owner.unit_id, self.one.id)
+        self.assertEqual(owner.tab, "top")
+
+    def test_a_plan_alias_does_not_compete_with_its_staff_unit(self) -> None:
+        owner = self.route({str(self.one.id), "rich-text-plan"})
+        self.assertIsInstance(owner, change_routing.StaffRoutedChange)
+        assert isinstance(owner, change_routing.StaffRoutedChange)
+        self.assertEqual(owner.unit_id, self.one.id)
+        self.assertEqual(owner.tab, "top")
+
+    def test_a_productions_own_checkpoint_returns_to_its_list(self) -> None:
+        for candidates in (set[str](), {"old-production"}):
+            with self.subTest(candidates=candidates):
+                owner = self.route(candidates)
+                self.assertIsInstance(owner, change_routing.ShowrunnerOwnChange)
+                self.assertEqual(owner.tab, "top")
+
+    def test_several_units_with_one_showrunner_send_only_to_that_showrunner(self) -> None:
+        from scripts.review_links import change_page
+        owner = self.route({str(self.one.id), str(self.two.id), "retired-alias"})
+        self.assertIsInstance(owner, change_routing.ShowrunnerOwnChange)
+        self.assertEqual(owner.tab, "top")
+        self.assertEqual(change_page.verdict_recipients(owner, "not works"), (self.top.id,))
+
+    def test_units_with_different_showrunners_keep_the_conflict_unrouted(self) -> None:
+        owner = self.route({str(self.one.id), str(self.foreign.id)})
+        self.assertIsInstance(owner, change_routing.UnroutedChange)
+        self.assertEqual(owner.tab, "unrouted")
+        assert isinstance(owner, change_routing.UnroutedChange)
+        self.assertIn("More than one staff unit owns this change", owner.note)
+
+    def test_the_page_and_footer_count_the_same_conflicts_among_all_routing_cases(self) -> None:
+        from scripts.production import footer_counts, showrunners
+        from scripts.review_links import change_browser, change_page
+        listing = self.root / "change-review - top.md"
+        doc = self.root / "top-production.md"
+        _ = doc.write_text(f"# Top\n- **Showrunner checkout:** `{self.root}`\n- **Change review:** `{listing}`\n")
+        _ = staff.set_doc(self.top.id, staff.LiveDoc("natedev", doc))
+        journal = self.root / "state/top/rename_unit.json"
+        journal.parent.mkdir(parents=True)
+        _ = journal.write_text(json.dumps({"old": "old-unit", "new": "rich-text", "staff_id": self.one.id, "done": True}))
+        cases = [{"retired"}, {"old-unit"}, {str(self.one.id), "plan"}, set[str](),
+                 {str(self.one.id), str(self.two.id)}, {str(self.one.id), str(self.foreign.id)}]
+        _ = listing.write_text(f"---\nshowrunner: top\nproductions:\n  - {doc}\n---\n## To review\n\n"
+            + "| # | Change |\n| --- | --- |\n" + "".join(f"| C{i} | Case {i} |\n" for i in range(1, 7)))
+        def selection(router: change_routing.StaffRouting, row: dict[str, str], fallback: str) -> change_routing.CheckpointSelection:
+            del router, fallback
+            return change_routing.CheckpointSelection(Path(row["#"]), ())
+        def candidates(router: change_routing.StaffRouting, chosen: change_routing.CheckpointSelection) -> set[str]:
+            del router
+            return cases[int(chosen.repository.name[1:]) - 1]
+        import change_review as cli_review
+        with (mock.patch.object(change_review, "LISTS", self.root), mock.patch.object(cli_review, "LISTS", self.root),
+              mock.patch.object(showrunners, "timer_docs", return_value={"top": doc}),
+              mock.patch.object(change_routing.StaffRouting, "selection", new=selection),
+              mock.patch.object(change_routing.StaffRouting, "candidate_units", new=candidates),
+              mock.patch.object(change_routing.StaffRouting, "read_messages")):
+            prepared = change_browser.prepare(change_page.ReviewBrowser("secret"), change_page.DeliveryStatus(self.root / "links"))
+            counts = {tab: sum(item.waiting and item.tab == tab for item in prepared.changes) for tab in prepared.queues}
+            self.assertEqual(counts["unrouted"], 1)
+            self.assertEqual(counts["top"], 5)
+            self.assertEqual(footer_counts.unrouted_changes(doc), counts["unrouted"])
+            self.assertEqual(footer_counts.changes(doc), counts["top"])
