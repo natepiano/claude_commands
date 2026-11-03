@@ -291,7 +291,7 @@ class ShellLaunchTests(NixFixture):
     def setUp(self) -> None:
         super().setUp()
         self.scripts = self.home / ".claude/scripts"
-        for relative in ("agents/agent_exec.sh", "agents/agent_bg.sh", "cli_agent/cli_agent.sh", "berth_fix/launch.sh", "make_a_worktree/direnv_allow.sh", "lib/nix_env.py"):
+        for relative in ("agents/agent_exec.sh", "agents/agent_bg.sh", "cli_agent/cli_agent.sh", "berth_fix/launch.sh", "make_a_worktree/direnv_allow.sh", "lib/nix_env.py", "lib/conf.py"):
             destination = self.scripts / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = shutil.copyfile(ROOT / "scripts" / relative, destination)

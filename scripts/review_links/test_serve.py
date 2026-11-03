@@ -34,7 +34,7 @@ else:
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.review_links import serve
-from scripts.lib import atomic_file
+from scripts.lib import atomic_file, conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -43,6 +43,13 @@ class HttpReply:
     status: int
     content_type: str
     body: bytes
+
+
+def setUpModule() -> None:
+    configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    for stem in ("review_links", "change_review"):
+        _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf", configuration / f"{stem}.conf")
+    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
 
 class ReviewLinksServerTests(unittest.TestCase):
@@ -503,6 +510,65 @@ class ServerStartupTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("tailscale", result.stderr.lower())
 
+
+class ReviewLinksConfigTests(unittest.TestCase):
+    def test_service_polls_read_settings_only_when_a_check_is_due(self) -> None:
+        server = serve.ReviewLinksServer.__new__(serve.ReviewLinksServer)
+        server.next_tailscale_check = 200.0
+        server.next_sweep = 300.0
+        server.bound_address = "127.0.0.1"
+        server.root = Path("unused")
+        with (patch.object(time, "monotonic", return_value=100.0) as elapsed,
+              patch.object(conf, "read", wraps=conf.read) as read,
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1") as address,
+              patch.object(serve, "sweep_snapshots", return_value=0) as sweep):
+            server.service_actions()
+            server.service_actions()
+            read.assert_not_called()
+            address.assert_not_called()
+            sweep.assert_not_called()
+            elapsed.return_value = 200.0
+            server.service_actions()
+            read.assert_called_once_with("review_links")
+            address.assert_called_once_with()
+            sweep.assert_not_called()
+            self.assertEqual(server.next_tailscale_check, 260.0)
+            server.next_tailscale_check = 1000.0
+            elapsed.return_value = 300.0
+            server.service_actions()
+            self.assertEqual(read.call_count, 2)
+            sweep.assert_called_once()
+            self.assertEqual(server.next_sweep, 3900.0)
+
+    def test_snapshot_sweeps_read_the_retention_setting_at_use(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = root / "review_links.conf"
+            snapshot = root / "abc123"
+            snapshot.mkdir()
+            _ = (snapshot / "draft.txt").write_text("keep me")
+            os.utime(snapshot, (10, 10))
+            with patch.dict(os.environ, {"CONF_DIR": str(root)}):
+                _ = settings.write_text("# range: 0..\nsnapshot_retention_seconds=100\n")
+                self.assertEqual(serve.sweep_snapshots(root, 50), 0)
+                self.assertTrue(snapshot.is_dir())
+                _ = settings.write_text("# range: 0..\nsnapshot_retention_seconds=1\n")
+                self.assertEqual(serve.sweep_snapshots(root, 50), 1)
+                self.assertFalse(snapshot.exists())
+
+    def test_config_keeps_the_existing_values(self) -> None:
+        from scripts.lib import conf
+
+        settings = conf.read(Path(__file__).resolve().parents[2] / "config/review_links.conf")
+        for key, expected in {'unrouted_alert_recipient': 'natedev'}.items():
+            with self.subTest(key=key):
+                self.assertEqual(settings.text(key), expected)
+        for key, expected in {'delivery_tries': 3, 'server_port': 8765, 'snapshot_allocation_tries': 10}.items():
+            with self.subTest(key=key):
+                self.assertEqual(settings.whole(key), expected)
+        for key, expected in {'delivery_pause_seconds': 5.0, 'unrouted_alert_retry_seconds': 60.0, 'tailscale_timeout_seconds': 10.0, 'snapshot_retention_seconds': 604800.0, 'snapshot_sweep_seconds': 3600.0, 'tailscale_check_seconds': 60.0}.items():
+            with self.subTest(key=key):
+                self.assertEqual(settings.number(key), expected)
 
 if __name__ == "__main__":
     _ = unittest.main()

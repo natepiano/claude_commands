@@ -69,7 +69,7 @@ def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Pa
                         timeout=timeout, env=env, cwd=cwd, stdout=stdout, stderr=stderr, input=input)
 
     with mock.patch.object(subprocess, "run", run), mock.patch.object(
-        change_review, "LISTS", Path(environment["HOME"]) / "rust/hanadocs/change-review",
+        change_review, "lists_directory", return_value=Path(environment["HOME"]) / "rust/hanadocs/change-review",
     ):
         return invoke_cli(merge_checkpoint, merge_checkpoint.main, arguments, environment, cwd,
                           production_state=True)

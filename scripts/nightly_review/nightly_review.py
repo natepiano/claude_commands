@@ -17,7 +17,6 @@ Nothing offers the proposals: the ledger's queue grows until the user asks for /
 
 from __future__ import annotations
 
-import os
 import json
 import re
 import subprocess
@@ -37,14 +36,10 @@ from scripts.lib.process_failure import failure_detail
 from scripts.whoami import account  # noqa: E402
 
 if TYPE_CHECKING:
+    from scripts.lib.conf import ConfigRead
     from scripts.production.unit_lookup import LiveClaude
 
-ROOT = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "nightly-review"
-MODES = ("config", "rust", "messages")
-SESSION = "nightly-review"
-PROMPT = "/nightly_review " + " ".join(MODES)
 SETTINGS = Path(__file__).with_name("settings.json")
-SESSIONS_DIR = Path.home() / ".claude/sessions"
 REVIEW_SCRIPT = SCRIPTS / "notify/review.py"
 
 
@@ -116,13 +111,24 @@ def recent_replies(path: Path, since: datetime) -> bool:
     return False
 
 
+def _settings() -> ConfigRead:
+    from scripts.lib import conf
+
+    return conf.read("nightly_review")
+
+
+def sessions_directory() -> Path:
+    return Path(_settings().text("sessions_directory")).expanduser()
+
+
 def showrunner_transcripts(since: datetime) -> list[Path]:
     """Find dated replies in each showrunner's own account, including natedev."""
     from scripts.production import showrunners
 
+    primary = _settings().text("primary_showrunner_name")
     names = {runner["session"] for runner in showrunners.require_complete(showrunners.registered_showrunners()) if runner["session"]}
     found: set[Path] = set()
-    for path in sorted(SESSIONS_DIR.glob("*.json")):
+    for path in sorted(sessions_directory().glob("*.json")):
         try:
             data = json_record(path.read_text(encoding="utf-8"))
             pid = data.get("pid", 0)
@@ -134,7 +140,7 @@ def showrunner_transcripts(since: datetime) -> list[Path]:
             session, name = record.get("sessionId", ""), record.get("name", "")
             if not session or Path(session).name != session:
                 continue
-            if name != "natedev" and name not in names and showrunners.production_of(session) is None:
+            if name != primary and name not in names and showrunners.production_of(session) is None:
                 continue
             recorded = record.get("transcript_path", "") or record.get("transcriptPath", "")
             config = record.get("config_dir", "")
@@ -209,10 +215,12 @@ def messages(since: datetime) -> list[str]:
     transcripts = showrunner_transcripts(since)
     if not transcripts:
         return [*lines, "No showrunner replies in this interval."]
+    settings = _settings()
+    sample_rows = settings.whole("message_sample_rows")
     try:
         result = subprocess.run([sys.executable, str(REVIEW_SCRIPT), "sample", *(str(path) for path in transcripts),
-                                 "--limit", "20", "--since", since.isoformat()],
-                                capture_output=True, text=True, check=False, timeout=20 * review.user_send_seconds() + 15)
+                                 "--limit", str(sample_rows), "--since", since.isoformat()],
+                                capture_output=True, text=True, check=False, timeout=sample_rows * review.user_send_seconds() + settings.number("sample_timeout_overhead_seconds"))
     except (OSError, subprocess.TimeoutExpired) as error:
         return [*lines, f"Sample failed: {error}"]
     lines.extend(result.stdout.splitlines())
@@ -221,17 +229,23 @@ def messages(since: datetime) -> list[str]:
     return lines
 
 
-NIGHTLY_UNIT = "nightly-review-unit"
+def state_root() -> Path:
+    from scripts.nightly_review.candidates import state_root as candidate_state_root
+
+    return candidate_state_root()
 
 
 def night_dir(day: date) -> Path:
-    return ROOT / day.isoformat()
+    return state_root() / day.isoformat()
 
 
 def job(day: date) -> str:
     """The night's work, sent to the permanent unit as a message."""
-    return (f"Nightly review for NIGHT={day.isoformat()}: follow ~/.claude/commands/nightly_review.md "
-            + f"with the modes {' '.join(MODES)}, in that order.")
+    settings = _settings()
+    modes = settings.words("review_modes")
+    command = settings.text("command_path")
+    return (f"Nightly review for NIGHT={day.isoformat()}: follow {command} "
+            + f"with the modes {' '.join(modes)}, in that order.")
 
 
 @dataclass(frozen=True)
@@ -249,19 +263,22 @@ def nightly_production() -> NightlyProduction | str:
     else:
         import production_units
 
+    settings = _settings()
+    unit_name = settings.text("unit_name")
+    session = settings.text("session_name")
     found: list[NightlyProduction] = []
     for runner in showrunners.require_complete(showrunners.registered_showrunners()):
         try:
             rows = production_units.unit_table(Path(runner["doc"]).read_text(encoding="utf-8").splitlines())
         except (OSError, UnicodeError, production_units.Refusal):
             continue
-        if any(production_units.cell_value(row.get("Unit", "")) == NIGHTLY_UNIT
+        if any(production_units.cell_value(row.get("Unit", "")) == unit_name
                and production_units.cell_value(row.get("Plan", "")) == "permanent" for row in rows):
             found.append(NightlyProduction(Path(runner["doc"]), runner["slug"]))
     if not found:
-        return f"no running production has a permanent {NIGHTLY_UNIT} row; add it with add_unit.py {SESSION} --permanent"
+        return f"no running production has a permanent {unit_name} row; add it with add_unit.py {session} --permanent"
     if len(found) > 1:
-        return f"{len(found)} productions hold {NIGHTLY_UNIT}: " + ", ".join(item.slug for item in found)
+        return f"{len(found)} productions hold {unit_name}: " + ", ".join(item.slug for item in found)
     return found[0]
 
 
@@ -271,12 +288,13 @@ def live_unit(slug: str) -> LiveClaude | None:
     else:
         import unit_lookup
 
-    unit = unit_lookup.marked_unit(slug, NIGHTLY_UNIT)
+    unit = unit_lookup.marked_unit(slug, _settings().text("unit_name"))
     return unit.claude if unit is not None and isinstance(unit.claude, unit_lookup.LiveClaude) else None
 
 
 def tonight(day: date) -> list[str]:
     """Send the night's review to the live unit, starting it first through add_unit when it is gone."""
+    session = _settings().text("session_name")
     production = nightly_production()
     if isinstance(production, str):
         return [f"skipped: {production}"]
@@ -286,20 +304,20 @@ def tonight(day: date) -> list[str]:
         if claude is None:
             # add_unit picks the account, checks shutdown holds and trust, and keeps the unit's launch flags.
             started = subprocess.run([sys.executable, str(SCRIPTS / "production" / "add_unit.py"), "--production",
-                                      str(production.doc), SESSION, "--permanent"], capture_output=True, text=True, check=False)
+                                      str(production.doc), session, "--permanent"], capture_output=True, text=True, check=False)
             if started.returncode != 0:
-                return [f"{SESSION}: not started: {failure_detail(started)}"]
-            lines.append(f"{SESSION}: started")
+                return [f"{session}: not started: {failure_detail(started)}"]
+            lines.append(f"{session}: started")
             claude = live_unit(production.slug)
     except OSError as error:
         return [f"skipped: units unreadable: {error}"]
     if claude is None:
-        return [*lines, f"{SESSION}: no live Claude carries the unit's mark"]
+        return [*lines, f"{session}: no live Claude carries the unit's mark"]
     sent = subprocess.run([sys.executable, str(SCRIPTS / "message" / "send.py"), "--to", f"uds:{claude.socket}",
                            "--from", "nightly-review timer", "--key", f"nightly-{day.isoformat()}", "--text", job(day)],
                           capture_output=True, text=True, check=False)
     outcome = "tonight's review sent" if sent.returncode == 0 else f"tonight's review not sent: {sent.stderr.strip()}"
-    return [*lines, f"{SESSION}: {outcome}"]
+    return [*lines, f"{session}: {outcome}"]
 
 
 def launch(today: date) -> list[str]:
@@ -313,7 +331,8 @@ def launch(today: date) -> list[str]:
 def main() -> None:
     match sys.argv[1:]:
         case ["messages"]:
-            for line in messages(datetime.now(timezone.utc) - timedelta(hours=24)):
+            hours = _settings().number("message_history_hours")
+            for line in messages(datetime.now(timezone.utc) - timedelta(hours=hours)):
                 print(line)
         case ["launch"]:
             for line in launch(date.today()):

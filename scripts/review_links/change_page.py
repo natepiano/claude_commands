@@ -499,11 +499,12 @@ def publish(production: Path, review_list: Path, rows: list[str]) -> str:
                               "rows": list(page.rows), "token": page.token}
     # A fresh page has its own immutable row allowlist. Only metadata is stored
     # beside the HTML: every GET reads the answers from the review record.
+    root = review_link.review_root()
     with tempfile.TemporaryDirectory(prefix="review-changes-") as temporary:
         source = Path(temporary) / PAGE_NAME
         _ = source.write_text("<!doctype html><title>Changes to review</title>", encoding="utf-8")
-        url = review_link.snapshot([source], new=True)[0]
-    folder = review_link.review_root() / urlsplit(url).path.split("/")[1]
+        url = review_link.snapshot_at(root, [source], new=True)[0]
+    folder = root / urlsplit(url).path.split("/")[1]
     atomic_file.write_bytes_atomic(folder / MANIFEST, json.dumps(manifest).encode("utf-8"), mode=0o600)
     return url
 
@@ -753,7 +754,7 @@ def recover_pending(status: DeliveryStatus) -> None:
     if not paths:
         return
     snapshots = {listing: change_review.review_snapshot(listing)
-                 for listing in change_review.LISTS.glob(change_review.PREFIX + "*.md")}
+                 for listing in change_review.lists_directory().glob(change_review.PREFIX + "*.md")}
     routing: change_routing.StaffRouting | None = None
     for listing, snapshot in snapshots.items():
         for row in (*snapshot.pending, *snapshot.reviewed):
@@ -813,11 +814,12 @@ def recover_pending(status: DeliveryStatus) -> None:
 
 def publish_browser(initial: str = "") -> str:
     """Publish one all-list page without copying change records."""
+    root = review_link.review_root()
     with tempfile.TemporaryDirectory(prefix="review-browser-") as temporary:
         source = Path(temporary) / PAGE_NAME
         _ = source.write_text("<!doctype html><title>Changes to review</title>", encoding="utf-8")
-        url = review_link.snapshot([source], new=True)[0]
-    folder = review_link.review_root() / urlsplit(url).path.split("/")[1]
+        url = review_link.snapshot_at(root, [source], new=True)[0]
+    folder = root / urlsplit(url).path.split("/")[1]
     manifest: BrowserManifest = {"token": secrets.token_urlsafe(), "initial": initial}
     atomic_file.write_bytes_atomic(folder / BROWSER_MANIFEST, json.dumps(manifest).encode(), mode=0o600)
     return url
