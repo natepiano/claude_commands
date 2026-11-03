@@ -49,6 +49,22 @@ sdlc corrected its rerun figure: 46% → 16% (same folder, next start 0–10 min
 
 Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's number beside it. For phases, use natedev only and say so. The fail-then-fail gap (ours 80 h against 50–55) goes on the report as a note.
 
+2026-11-03 15:3x EST (the user, to report-unit, after an interview)
+
+The build report is too long for the user and is not used for analysis. Retire it. Keep all the data. report-unit's job is now a loop like the test improvement work. Each round has five steps:
+
+1. Rank the largest build cost.
+2. State a prediction.
+3. Fix the cost where it lives.
+4. Measure the result.
+5. Repeat.
+1. Score: phase time, the wall time of each finished phase. Build hours per phase are the second view.
+2. Scope: all build capacity (natedev, the Mac, CI, and the AWS build machine when it opens), every repository and production. Rank by cost only.
+3. Authority: report-unit fixes buildlog code itself and owns every hypothesis and measurement. A fix in another unit's code goes through the showrunner, and that unit edits. Money (AWS hours), machine changes and worker rule changes go to the user first.
+4. Speed: one or two rounds open. A round is measured after at least 10 finished hana phases, plus one more day if the result is not clear. This is a starting point.
+5. Reports: keep the showrunner informed; the showrunner and report-unit agree when the user hears. The user always hears a measured change, up or down.
+6. Later, lower priority: a way to see the build history as charts, not tables.
+
 ## Delegation Context
 
 - **Project:** `~/.claude` — the build log and its report.
@@ -172,3 +188,26 @@ Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's n
 - Not added: rates per landed commit. A move of the note to one place per report is not made; the note stays under each table.
 
 **Files:** `scripts/buildlog/moments.py`, `scripts/buildlog/report.py`, `scripts/buildlog/test_moments.py`.
+
+### Phase 6 — Dylib A/B timing for hana  · status: todo
+**Depends on:** none
+
+2026-11-03 (the user approved, through the builds showrunner): real-use data cannot isolate the Bevy dylib's effect. Time the same hana commit on the same machine with the dylib on and off. Run each side through verify.sh:
+
+1. Run one cold build.
+2. Run three incremental test runs.
+
+The result goes to the showrunner. No repository code changes.
+
+### Phase 7 — The build improvement loop ranks costs and records each round  · status: done
+**Depends on:** none (runs beside Phase 6)
+
+- Add `buildlog costs [--days N]`: one short ranked list of build hours lost per day by cause and machine (natedev, Mac, CI; AWS when it exists). Causes include memory wait, cold rebuilds, reruns on a tree that passed, failed runs, an idle Mac while steps wait, and cancelled CI. Each line also shows the cost per finished phase.
+- Add phase time to the same command: median and p90 wall time of finished phases, from progress history, for the window.
+- Add the round record `docs/plans/builds-report-rounds.md`: cost, prediction, owner, status, measured result, kept or undone.
+- Retire `/build:report` (`commands/build/report.md`) and move each caller to `buildlog costs` or the CLI. Keep `buildlog report`, the index and every collector.
+
+### Phase 8 — Build history as charts  · status: todo
+**Depends on:** Phase 7
+
+The user, 2026-11-03: tables do not work for them. Lower priority. Design a chart view of the build history (costs and phase time over time, each build change marked). Design first; the build waits for the user's go.
