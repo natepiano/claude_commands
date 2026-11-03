@@ -8,10 +8,10 @@ Each machine that can run a build job is a build target with its own rules. nate
 
 ### Targets: `config/build_targets.conf` and `scripts/build_targets/target_config.py`
 
-- The config is in the `key=value` form `sweep.config_values` reads. `targets=mac,natedev` lists the targets in the order a job tries them. natedev is `kind.natedev=local`, `platform.natedev=linux`. The Mac is `kind.mac=ssh`, `platform.mac=macos`, `settings.mac=mac_test.conf`; its own settings (host, mirror, size budgets, CI switch, disk floor, `linux_only.<repo>`) stay in `config/mac_test.conf`.
+- The config is in the `key=value` form `scripts/lib/conf.py` reads. `targets=mac,natedev` lists the targets in the order a job tries them. natedev is `kind.natedev=local`, `platform.natedev=linux`. The Mac is `kind.mac=ssh`, `platform.mac=macos`, `settings.mac=mac_test.conf`; its own settings (host, mirror, size budgets, CI switch, disk floor, `linux_only.<repo>`) stay in `config/mac_test.conf`.
 - `target_config.py` imports only `sweep`. It holds `Platform = Literal["linux", "macos"]`, the frozen dataclasses `LocalTarget(name, platform)` and `SshTarget(name, platform, settings: Path)`, `Target = LocalTarget | SshTarget`, `ConfigError(ValueError)` and `read_targets(path=None) -> tuple[Target, ...]`. Target names must be distinct and non-empty; a missing or unsupported `kind`, `platform` or `settings` key, or a settings file that does not exist, is a `ConfigError` naming the key. `BUILD_TARGETS_CONFIG` replaces the path, for tests.
 - `targets.py` re-exports those names, so callers import them from one place. `build_hold.py` imports `read_targets` from `target_config` directly; going through `targets` would form the import cycle `build_hold` → `targets` → `build_hold`.
-- A future `ssh` target is a new entry plus its own settings file, and it reuses the same runner (probe, copy, run, release). Every `ssh` target today shares the Mac's claim, block and backoff state under `~/.local/state/mac-test`; a second `ssh` machine needs its own coordination storage before it can run beside the Mac.
+- A new `ssh` target is a new entry plus its own settings file, and it reuses the same runner (probe, copy, run, release). `mac_test.state_paths(target)` gives each target its own claim, block and backoff state: the Mac keeps `~/.local/state/mac-test`, and every other target uses `~/.local/state/build-targets/<target>/`. The AWS target is one such entry; see [builds-aws-target.md](builds-aws-target.md).
 
 ### Target state and eligibility: `scripts/build_targets/targets.py`
 
@@ -133,10 +133,46 @@ Each command shows its script's output unchanged; each script answers in about a
 ### Build output retained by the sweep
 
 `scripts/lint/sweep.py` keeps the configured free-space floor (300 GiB on natedev).
-When free space is below the floor, it takes only the shortfall. After orphaned
-copies, it takes output from idle targets in last-use order, oldest first,
-across all locations. `/tmp` targets have no special priority. A target's last
+When free space is below the floor, it takes only the shortfall. Orphaned
+copies go first from any idle target. Then whole takes and build-unit batches
+share target last-use order, oldest first, across all locations. A whole take
+has no special priority over a target with build units. `/tmp` targets have no
+special priority. A target's last
 use is the newer of its `.lint-sweep-used` stamp and its build units' last uses.
+A target folder is disposable; keep nothing you need in it. An idle target with
+no build-unit groups is a whole take: its contents go through the same
+write-ahead trim intent, confirmed deletion account and `sweep_trim` publication
+as build units. Orphaned copies keep their first place even when their target
+has no build units; a whole take covers the remaining contents. The target
+folder and its lock files stay. A held `doc/.lock`, Cargo lock or style sync lock
+keeps the target. Before the first unlink, the target root is saved durably in
+`target-deletes.json`, so memory admission refuses a warm promise even if the
+take stops. The doc-budget sweep uses this same record-before-delete rule: a
+record failure keeps that doc folder, reports a failure and continues with the
+next target. Cargo markers go last, after every payload delete succeeds. If a
+payload delete fails, the markers keep the target discoverable for the retry. Without a use stamp or build units, the newest mtime of
+the target's top-level entries supplies its last use. An entry that holds a
+nested target does not count as the outer target's use.
+
+Nested Cargo targets outside Cargo's build trees are separate targets, with
+their own last use, locks and busy checks. The outer scan and whole take leave
+them alone. One owner index per floor pass resolves each target once. Paths from
+`/proc` are already resolved by the kernel and need no further resolution. The
+index rejects paths outside every target root before checking parent folders,
+and remembers each distinct path's deepest owner for the pass. Build-tree paths
+from other sources are resolved once. The first process check reads each pid's mappings once. Before each take,
+its live recheck tests only that target: executable and working-directory paths
+are checked by prefix, and mappings are searched as bytes before any matching
+process's lines are decoded. Cargo-nextest still keeps its workspace's target
+between test binaries. Every check uses the same deepest-owner index. Each batch
+still checks live processes, so a use that starts during the scan keeps its target.
+The scan reuses the nested roots from the pass's one target discovery. Paths and
+processes belong to the deepest target, and the byte
+totals count nested output once. A Cargo target inside a build tree belongs to
+the build unit that holds it, including its bytes and change checks. Linker temporary files named
+`.<name>-<hash>.<pid>` in `deps/` go with the unit whose hash they carry;
+copied-up output still goes with its unit.
+
 Build locks, live processes and build holds still keep their targets out of the sweep.
 Candidate and size scans hold no cargo locks. Up to four target scans run
 together; combined inode accounting counts shared blocks once. The floor takes one target's locks
@@ -146,6 +182,17 @@ File identity, size and mtime are checked before deletion; changed output stays.
 Removing a hard link in another target does not change this check.
 The pass stops when successful deletions cover
 the shortfall.
+A dry run takes no `floor.lock`, so it can plan while a real floor pass holds
+that lock and cannot block a real pass. Real passes still take it without waiting and save their pid and hold start
+in the lock file. If a known holder keeps a real pass below the floor from
+running longer than `floor_lock_alert_minutes=15` in `[sweep]`, the waiting pass
+tells natedev its pid, command and the free space. The start time, rather than
+the file's mtime, sets the age. A successful send is saved in the floor record
+once per pid and start time; failed sends are tried on the next pass. A hold
+with no readable identity sends no alert. Waiting passes serialize the receipt
+check, send and success record under a separate stable `floor-alert.lock`.
+The active pass updates its measurement under that same lock, reading the
+latest receipts before it writes, so neither pass can restore an older record.
 
 The floor takes the least recently used idle target first, then orders build
 units within that target by use. Recent targets are not held back. After each
@@ -153,8 +200,13 @@ scan that finds free space under the floor, it writes one `floor_scan`
 build-log row; a dry run writes none. The row records `at`, `free_after_scan` (bytes),
 `floor` (bytes), `shortfall` (bytes), and `idle_targets` in oldest-first order.
 Each idle target has `folder`, `last_use` (epoch seconds), and `bytes` (allocated
-file bytes measured in the scan). These rows keep the scan's capacity and use
-evidence for later replay.
+file bytes measured in the scan). When this differs from what that target's
+candidates could free, `takeable_bytes` gives that estimate and `reason` names
+why: `links outside the target`, `links outside the take candidates` for links
+to unclaimed output inside the target, or `output outside take candidates`.
+Each estimate takes that target alone with no shortfall limit, so links shared
+by two targets are takeable from neither alone. Busy and held targets stay out
+of the row. These rows keep the scan's capacity and use evidence for later replay.
 
 `recent_minutes=60` orders only build units inside one target under its budget:
 older units first, then recent units. Within each group, whole days since last
@@ -258,7 +310,7 @@ Scratch end rechecks the task under the removal lock. A hold on a copy's ancesto
 - `BUILDLOG_TARGET` becomes `mac` when a Mac attempt starts, before the claim is decided; it names where the call was when it ended, not proof that tests ran there.
 - A launch with no session id has the key `""` and waits while any holder file exists. A hold placed under a name that is no live session keys its file by that name, so no session's launch matches it.
 - `holders_in_force`, `natedev_holds` and local hold checks use present holder files, never cycle release fields. A damaged cycle cannot admit a waiter; removing the last holder file permits it even when that cycle remains damaged.
-- `parse_hold_target` runs as argparse's `type=`, so an exception other than `ConfigError` or `UnicodeError` from `read_targets` prints a traceback. `sweep.config_values` catches only `OSError`, so a non-UTF-8 config reaches the caller as `UnicodeDecodeError`.
+- `parse_hold_target` runs as argparse's `type=`, so an exception other than `ConfigError` or `UnicodeError` from `read_targets` prints a traceback. A non-UTF-8 config reaches the caller as `conf.Unusable`, which names the file.
 - `mac_test.py unblock` matches the stored holder name, not the session id; the rename retry runs at most one extra `unblock`.
 - Install rules: change `build_hold.py` on the live machine only while natedev is free and no release runs, because a waiter or driver keeps the code it started with. Install `mac_test.py` and `offload.py` together with no active Mac claim and no old `watch`, `watch-claim` or waiting `claim` running: an older copy reads only `run.json` and never sees `claims/<repo>.json`.
 - The build log carries two Mac host names (`Mac` and `Nates-MacBook-Pro-2023`), so report code selects the Mac as `host <> 'natedev'`, never by one name. The `scripts/buildlog/buildlog` wrapper runs the installed copy; check worktree report code with `~/.claude/scripts/lib/py scripts/buildlog/cli.py` and `BUILDLOG_DIR` on a scratch copy of the log.
@@ -266,7 +318,7 @@ Scratch end rechecks the task under the removal lock. A hold on a copy's ancesto
 - The leftover check ends every process under the Mac's mirror root, for every repository, a person's shell or editor there included. ssh's exit status proves nothing (Tailscale SSH returns 0 whatever ran); only printed lines are read.
 - `MACOSX_DEPLOYMENT_TARGET` was unset because the remote command runs in a non-login ssh shell and the mirror is outside `~/rust`, so direnv never runs there; rustc then links for macOS 11.0. Below 12.0 the SDK records `@rpath/libswift_Concurrency.dylib` and a binary with no rpath aborts at load (exit 104). A changed value costs one rebuild on the Mac (a cold hana build measured 12 min 35 s); nothing in the mirror is deleted by hand.
 - Guard limits: a checkout or any other copy of the scripts accepts the variables, so a worker that runs a copy still passes a hold. Report-only programs and variables outside the list (`VERIFY_MAC_RUNNER`, `LINT_CONFIG_READER`, `MAC_TEST_SESSIONS`, `MAC_TEST_SEND`, the `BUILDLOG_HOLD_*` files) are not guarded. A shell caller started through a link outside `scripts/` looks for `override_guard.sh` beside the link and stops with status 2.
-- Tests: every fixture that can reach the hold wait needs temporary `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR` and `UNIT_ACTIVE_DIR` and cleared `BUILDLOG_CALL_ID` and `BUILDLOG_CALLER`; one that reaches the installed scripts through the real `HOME` rewrites the live release record. Run the suites from a worktree, not inside `~/.claude`, where every case that sets a listed variable meets the refusal. A test that changes `cycle.json` mid-wait writes it whole under `release_lock()` (`change_cycle`), never with `Path.write_text`. A case that reaches a hold-event write sets a temporary `BUILDLOG_DIR` and waits for the detached recorder before checking that no further event was written. The full `scripts/direct` suite takes about 12.5 minutes and is the only check that a sibling import loads where tests import a module as `scripts.<dir>.<file>`.
+- Tests: every fixture that can reach the hold wait needs temporary `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR` and `UNIT_ACTIVE_DIR` and cleared `BUILDLOG_CALL_ID` and `BUILDLOG_CALLER`; one that reaches the installed scripts through the real `HOME` rewrites the live release record. Shared test support and guarded suites call `override_guard.require_checkout(Path(__file__))` at import. From the installed scripts it raises one error: `<suite file>: this suite runs from a checkout, not from the installed scripts under <home>/.claude/scripts; run it from a worktree.` The home comes from the account database and links are followed. Run the suites from a worktree; the check does not skip tests. A test that changes `cycle.json` mid-wait writes it whole under `release_lock()` (`change_cycle`), never with `Path.write_text`. A case that reaches a hold-event write sets a temporary `BUILDLOG_DIR` and waits for the detached recorder before checking that no further event was written. The full `scripts/direct` suite takes about 12.5 minutes and is the only check that a sibling import loads where tests import a module as `scripts.<dir>.<file>`.
 - The test stand-in for `mac_run.sh` answers "not an ancestor" when the sha equals the clone head, where git answers "is an ancestor"; the bundle-path cases depend on that.
 
 ## Why

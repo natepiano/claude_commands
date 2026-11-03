@@ -9,7 +9,6 @@ import fcntl
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -17,17 +16,13 @@ from collections.abc import Generator, Iterator
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
-import tmp_sweep
-if TYPE_CHECKING:
-    from ..lib import scratch
-    from ..message import sessions
-else:
-    import scratch  # on the path once tmp_sweep has put scripts/lib there
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-    import sessions
+from scripts.lint import tmp_sweep
+from scripts.lib import build_folders, copy_record, scratch, test_hang_guard
+from scripts.message import sessions
+
 
 DAY = 86_400
 LIVE_SESSION = "11111111-2222-3333-4444-555555555555"
@@ -135,12 +130,29 @@ class TmpSweepCase(unittest.TestCase):
 class CopyTests(TmpSweepCase):
     now: float = 0.0
 
+    def test_private_root_never_selects_the_live_copies_authority(self) -> None:
+        authority_root = self.tmp.parent / "authority copies"
+        with mock.patch.object(copy_record, "copies_root", return_value=authority_root) as authority:
+            roots = tmp_sweep.default_roots(str(self.tmp), (), (), (), (), (), ())
+        self.assertEqual(roots.copies, (str(self.tmp / "copies"),))
+        self.assertNotIn(str(authority_root), roots.all())
+        authority.assert_not_called()
+
+    def test_default_root_reads_the_current_copies_authority(self) -> None:
+        for name in ("first copies", "second copies"):
+            authority_root = self.tmp.parent / name
+            with mock.patch.object(copy_record, "copies_root", return_value=authority_root) as authority:
+                roots = tmp_sweep.default_roots(run_roots=(), session_roots=(), temp_roots=(),
+                                               scratch_roots=(), wide_roots=(), session_temp_roots=())
+            self.assertEqual(roots.copies, (str(authority_root),))
+            authority.assert_called_once_with()
+
     def copy(self, name: str, **fields: object) -> Path:
         path = self.tmp / "copies" / "show-maker" / name
         path.mkdir(parents=True)
         record: dict[str, object] = {"task": "until:2000-01-01T0000Z", "owner_unit": "maker-unit"}
         record.update(fields)
-        _ = write(path / scratch.RECORD, json.dumps(record))
+        _ = write(path / copy_record.RECORD, json.dumps(record))
         self.enterContext(mock.patch.dict(os.environ, {"SCRATCH_COPIES_ROOT": str(self.tmp / "copies")}))
         self.now += 8 * DAY
         return path
@@ -153,7 +165,7 @@ class CopyTests(TmpSweepCase):
         self.assertTrue(live.exists())
         self.assertTrue(live.parent.exists())
         self.assertIn(str(self.tmp / "copies"), result.kept[tmp_sweep.ROOT])
-        _ = write(live / scratch.RECORD, json.dumps({"task": "until:2000-01-01T0000Z"}))
+        _ = write(live / copy_record.RECORD, json.dumps({"task": "until:2000-01-01T0000Z"}))
         self.now += 8 * DAY
         _ = self.sweep()
         self.assertFalse(live.parent.exists())
@@ -161,7 +173,7 @@ class CopyTests(TmpSweepCase):
 
     def test_dry_run_does_not_add_a_busy_mark_to_an_unregistered_copy(self) -> None:
         path = self.copy("unknown")
-        (path / scratch.RECORD).unlink()
+        (path / copy_record.RECORD).unlink()
         _ = self.sweep(True)
         self.assertFalse((path / scratch.BUSY).exists())
 
@@ -170,13 +182,13 @@ class CopyTests(TmpSweepCase):
         child = self.copy("child", borrows_from=str(parent / ".git"))
 
         def stopped_removal(folder: str) -> None:
-            (Path(folder) / scratch.RECORD).unlink()
+            (Path(folder) / copy_record.RECORD).unlink()
             raise OSError("stopped after record unlink")
 
         with mock.patch.object(tmp_sweep, "delete_tree", side_effect=stopped_removal):
             result = self.sweep()
         self.assertTrue(result.failed)
-        self.assertFalse((child / scratch.RECORD).exists())
+        self.assertFalse((child / copy_record.RECORD).exists())
         _ = self.sweep()
         self.assertFalse(child.exists())
         self.assertFalse(parent.exists())
@@ -208,13 +220,13 @@ class CopyTests(TmpSweepCase):
 
     def test_busy_copy_keeps_even_without_a_record_and_rechecks_before_delete(self) -> None:
         path = self.copy("busy")
-        (path / scratch.RECORD).unlink()
+        (path / copy_record.RECORD).unlink()
         with (path / ".claude-busy").open("w") as holder:
             fcntl.flock(holder, fcntl.LOCK_SH)
             result = self.sweep()
         self.assertTrue(path.is_dir())
         self.assertTrue(any("busy" in reason and str(path) in paths for reason, paths in result.kept.items()))
-        _ = write(path / scratch.RECORD, json.dumps({"task": "until:2000-01-01T0000Z"}))
+        _ = write(path / copy_record.RECORD, json.dumps({"task": "until:2000-01-01T0000Z"}))
         original = tmp_sweep.remove_entry
         with (path / ".claude-busy").open("a") as holder:
             def start_before_remove(entry: tmp_sweep.RemovableEntry, result: tmp_sweep.Sweep, dry_run: bool) -> bool:
@@ -229,7 +241,7 @@ class CopyTests(TmpSweepCase):
         progress = write(run / "progress_history_state.json", json.dumps({"phase": {"id": "21", "status": "active"}}))
         live = self.copy("phase", task="phase:maker-unit/21", run_dir=str(run), phase_id="21")
         unknown = self.copy("unknown")
-        _ = (unknown / scratch.RECORD).write_text("bad json")
+        _ = (unknown / copy_record.RECORD).write_text("bad json")
         self.now += 30 * DAY
         result = self.sweep(True)
         self.assertTrue(live.is_dir())
@@ -289,7 +301,7 @@ class CopyTests(TmpSweepCase):
         self.assertTrue(parent.is_dir())
         self.assertTrue(child.is_dir())
         self.assertTrue(any("borrow" in reason and str(parent) in paths for reason, paths in result.kept.items()))
-        _ = (child / scratch.RECORD).write_text(json.dumps({"task": "until:2000-01-01T0000Z",
+        _ = (child / copy_record.RECORD).write_text(json.dumps({"task": "until:2000-01-01T0000Z",
                                                            "borrows_from": str(parent / ".git")}))
         _ = self.sweep()
         self.assertTrue(parent.is_dir())
@@ -547,6 +559,19 @@ class ProcessUseTests(TmpSweepCase):
 
 
 class ScratchRootTests(TmpSweepCase):
+    def test_common_task_folder_keeps_live_ownership_and_expires_through_the_sweep(self) -> None:
+        with mock.patch.dict(os.environ, {copy_record.ROOT_ENV: str(self.tmp / "scratch"),
+                                           "STAFF_FILE": str(self.tmp / "staff.json")}):
+            live = scratch.new(scratch.until_task(self.now + DAY), "build")
+            due = scratch.new(scratch.until_task(self.now - 60), "build")
+            _ = write(live / "Cargo.toml")
+            _ = write(due / "Cargo.toml")
+            result = self.sweep()
+        self.assertTrue(live.is_dir())
+        self.assertFalse(due.exists())
+        self.assertIn(str(live), result.kept[tmp_sweep.TASK_OPEN])
+        self.assertIn(str(due), [entry["path"] for entry in result.deleted])
+
     def test_a_task_folder_stays_while_its_task_is_open_and_goes_when_its_time_passes(self) -> None:
         scratch_root = self.tmp / "scratch"
         run = write(scratch_root / "run-x-gate-abc123" / "a").parent
@@ -573,6 +598,21 @@ class ScratchRootTests(TmpSweepCase):
 
 
 class TempParentTests(TmpSweepCase):
+    def test_common_session_owner_keeps_its_root_and_sweeps_only_idle_entries(self) -> None:
+        session_parent = self.tmp / "session"
+        owner = build_folders.create_build_folder(build_folders.StableOwnerFolder(
+            LIVE_SESSION, build_folders.ExplicitBuildParent(session_parent), mode=0o700))
+        idle = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
+            "tmp", build_folders.ExplicitBuildParent(owner)))
+        recent = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
+            "tmp", build_folders.ExplicitBuildParent(owner)))
+        _ = write(idle / "output")
+        self.recent(write(recent / "output"))
+        _ = self.sweep()
+        self.assertTrue(owner.is_dir())
+        self.assertFalse(idle.exists())
+        self.assertTrue(recent.is_dir())
+
     def test_entries_in_a_live_sessions_temp_root_and_a_run_temp_go_after_4_h(self) -> None:
         live_root = self.tmp / "session" / LIVE_SESSION
         idle = write(live_root / ".tmpAb12Cd" / "a").parent
@@ -606,6 +646,31 @@ class TempParentTests(TmpSweepCase):
 
 
 class TempFolderTests(TmpSweepCase):
+    def test_every_common_prefix_keeps_its_sweep_classification(self) -> None:
+        pairs: list[tuple[str, Path, Path]] = []
+        parents: list[str] = []
+        for kind, template in build_folders.FOLDER_PREFIXES.items():
+            parent = self.tmp.parent / "common-prefixes" / kind
+            parent.mkdir(parents=True)
+            parents.append(str(parent))
+            prefix = template.format(owner="123")
+            allocated = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
+                prefix, build_folders.ExplicitBuildParent(parent)))
+            previous = parent / (prefix + "Ab12Cd")
+            previous.mkdir()
+            _ = write(allocated / "Cargo.toml")
+            _ = write(previous / "Cargo.toml")
+            pairs.append((kind, previous, allocated))
+        roots = tmp_sweep.default_roots(str(self.tmp.parent / "plain"), (), (), tuple(parents), (),
+                                       tuple(parents), session_temp_roots=())
+        _ = tmp_sweep.sweep(False, roots, self.now, str(self.proc))
+        for kind, previous, allocated in pairs:
+            with self.subTest(kind=kind):
+                self.assertEqual(allocated.exists(), previous.exists(),
+                                 "the common suffix must retain the cleanup classification")
+                if kind in ("verify-copy", "verify-hold"):
+                    self.assertFalse(allocated.exists(), "ended verify runs must release their folders")
+
     def test_only_an_idle_unused_tempfile_folder_in_a_temp_folder_goes(self) -> None:
         temp = self.tmp.parent / "temp"
         idle = write(temp / ".tmpAb12Cd" / "Cargo.toml").parent
@@ -695,6 +760,29 @@ class TempFolderTests(TmpSweepCase):
         later = tmp_sweep.sweep(False, roots, time.time() + 8 * DAY, str(self.proc))
         self.assertEqual([entry["path"] for entry in later.deleted], [str(old_name)])
         self.assertTrue(copy.is_dir())
+
+    def test_common_verify_suffix_keeps_live_runs_and_removes_ended_runs(self) -> None:
+        made = time.time() - 100
+        fake_start(self.proc, 20, made - 50, "bash", "/private/scripts/direct/verify.sh", "test")
+        for prefix in ("verify-hold.", "verify-copy."):
+            with self.subTest(prefix=prefix):
+                parent = self.tmp.parent / prefix
+                live = write(parent / (prefix + "20.a1b_2c3d") / "output").parent
+                ended = write(parent / (prefix + "21.a1b_2c3d") / "output").parent
+                unnamed = write(parent / (prefix + "a1b_2c3d") / "output").parent
+                for path in (live, ended, unnamed):
+                    os.utime(path, (made, made))
+                roots = tmp_sweep.default_roots(str(self.tmp.parent / "plain"), (), (), (str(parent),), (),
+                                               (str(parent),), session_temp_roots=())
+                soon = tmp_sweep.sweep(False, roots, time.time() + 60, str(self.proc))
+                self.assertEqual([entry["path"] for entry in soon.deleted], [str(ended)])
+                self.assertEqual(soon.kept[tmp_sweep.VERIFY_RUNS], [str(live)])
+                self.assertEqual(soon.kept[tmp_sweep.RECENT], [str(unnamed)])
+                self.assertTrue((live / "output").is_file())
+                self.assertFalse(ended.exists())
+                later = tmp_sweep.sweep(False, roots, time.time() + 8 * DAY, str(self.proc))
+                self.assertEqual([entry["path"] for entry in later.deleted], [str(unnamed)])
+                self.assertTrue((live / "output").is_file())
 
     def test_ps_elapsed_time_reads_in_seconds(self) -> None:
         self.assertEqual(tmp_sweep.elapsed_seconds("05:07"), 307)
@@ -1097,7 +1185,7 @@ class HandCleanupTests(TmpSweepCase):
 class WorkerAndGitTests(TmpSweepCase):
     def git(self, repo: Path, *arguments: str) -> None:
         _ = subprocess.run(["git", "-C", str(repo), "-c", "user.name=test", "-c", "user.email=test@test",
-                            *arguments], check=True, capture_output=True, timeout=10,
+                            *arguments], check=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
                            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
 
     def clone(self, name: str, *options: str) -> Path:
@@ -1113,12 +1201,12 @@ class WorkerAndGitTests(TmpSweepCase):
         self.now: float = time.time() + 5 * 3600
         return destination
 
-    def live_worker(self, cwd: Path, status: str = "paused") -> Path:
+    def live_worker(self, cwd: Path, status: str = "paused", *, run_status: str = "running") -> Path:
         run = self.unit / "worker-run"
         _ = write(run / "mesh_roster.json", json.dumps({
             "impl": {"status": status, "thread_id": "worker-thread"},
         }))
-        _ = write(run / "mesh_runs" / "run.json", json.dumps({"cwd": str(cwd)}))
+        _ = write(run / "mesh_runs" / "run.json", json.dumps({"cwd": str(cwd), "status": run_status}))
         return run
 
     def test_dirty_clone_without_worker_stays_and_plan_names_unsaved_work(self) -> None:
@@ -1221,10 +1309,46 @@ class WorkerAndGitTests(TmpSweepCase):
         _ = self.sweep()
         self.assertFalse(folder.exists())
 
+    def test_finished_mesh_records_do_not_keep_a_folder_for_a_worker(self) -> None:
+        self.now = time.time() + 8 * DAY
+        for guard in ("paused worker", "active run"):
+            with self.subTest(guard=guard):
+                folder = write(self.tmp / "scratch" / guard.replace(" ", "-") / "repo" / "file").parents[1]
+                run = self.live_worker(folder / "repo", run_status="finished")
+                if guard == "active run":
+                    _ = write(run / "mesh_roster.json", json.dumps({"impl": {"status": "ended"}}))
+                    _ = write(self.unit / "active" / LIVE_SESSION, str(run))
+                for exit_code in (0, 1, 143):
+                    _ = write(run / "mesh_runs" / f"finished-{exit_code}.json", json.dumps({
+                        "cwd": str(folder / "repo"), "status": "finished", "exit_code": exit_code,
+                    }))
+                result = self.sweep()
+                self.assertNotIn(str(folder), result.kept.get(tmp_sweep.WORKER_USES, []))
+                self.assertIn(str(folder), [entry["path"] for entry in result.deleted])
+                self.assertFalse(folder.exists())
+
+    def test_a_running_mesh_record_keeps_a_folder_among_finished_records(self) -> None:
+        self.now = time.time() + 8 * DAY
+        folder = write(self.tmp / "scratch" / "running-worker" / "repo" / "file").parents[1]
+        run = self.live_worker(folder / "repo")
+        for exit_code in (0, 1):
+            _ = write(run / "mesh_runs" / f"finished-{exit_code}.json", json.dumps({
+                "cwd": str(folder / "repo"), "status": "finished", "exit_code": exit_code,
+            }))
+        result = self.sweep()
+        self.assertTrue(folder.exists())
+        self.assertIn(str(folder), result.kept[tmp_sweep.WORKER_USES])
+        _ = write(run / "mesh_runs" / "run.json", json.dumps({
+            "cwd": str(folder / "repo"), "status": "finished", "exit_code": 0,
+        }))
+        result = self.sweep()
+        self.assertFalse(folder.exists())
+        self.assertIn(str(folder), [entry["path"] for entry in result.deleted])
+
     def test_active_run_mesh_record_keeps_its_working_folder_under_any_root(self) -> None:
         folder = write(self.tmp / "copy" / "repo" / "file").parents[1]
         run = self.unit / "marked-run"
-        _ = write(run / "mesh_runs" / "run.json", json.dumps({"cwd": str(folder / "repo")}))
+        _ = write(run / "mesh_runs" / "run.json", json.dumps({"cwd": str(folder / "repo"), "status": "running"}))
         _ = write(self.unit / "active" / LIVE_SESSION, str(run))
         result = self.sweep()
         self.assertTrue(folder.exists())
@@ -1281,7 +1405,7 @@ class WorkerAndGitTests(TmpSweepCase):
         _ = write(run / "impl.pending.json", json.dumps({"working_dir": str(unrelated)}))
         _ = write(run / "mesh_runs" / "results.json", json.dumps(["pass", {"cwd": str(unrelated)}]))
         _ = write(run / "mesh_runs" / "run.json", json.dumps({
-            "cwd": str(folder), "metadata": {"cwd": str(unrelated)},
+            "cwd": str(folder), "status": "running", "metadata": {"cwd": str(unrelated)},
         }))
         result = self.sweep()
         self.assertTrue(folder.exists())

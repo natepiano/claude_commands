@@ -2,6 +2,7 @@
 """Read or send input to a production unit or live Claude session in herdr."""
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -19,18 +20,20 @@ USAGE = ("usage: session_pane.py <read|type|keys|where> <unit <slug> <unit>|sess
 
 
 class NoSuchTarget(Exception):
-    """No live session or marked unit identifies the requested pane."""
+    """No live session or unit with session labels identifies the requested pane."""
 
 
-def read_place(place: Place, lines: int = 60, *, joined: bool = False, ansi: bool = False) -> str:
+def read_place(place: Place, lines: int = 60, *, joined: bool = False, ansi: bool = False,
+               deadline: float = math.inf) -> str:
     if lines <= 0:
         raise ValueError("lines must be positive")
-    return Herdr(place.session).read(place.pane, lines, joined=joined, ansi=ansi)
+    return Herdr(place.session).read(place.pane, lines, joined=joined, ansi=ansi, deadline=deadline)
 
 
-def agent_status(place: Place) -> str:
-    """herdr's state for the agent in the place's pane, such as `working`, `idle` or `blocked`; empty for none."""
-    return next((agent["agent_status"] for agent in Herdr(place.session).agents() if agent["pane_id"] == place.pane), "")
+def agent_status(place: Place, *, deadline: float = math.inf) -> herdr.AgentStatus:
+    """herdr's state for the agent in the place's pane, as a typed state; unknown when no agent is present."""
+    return next((agent["agent_status"] for agent in Herdr(place.session).agents(deadline=deadline)
+                 if agent["pane_id"] == place.pane), herdr.AgentStatus.UNKNOWN)
 
 
 def type_place(place: Place, text: str) -> None:

@@ -19,6 +19,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import add_unit
+from scripts.production import unit_config
 import production_units
 import autocompact
 import conversation_pause
@@ -28,10 +29,12 @@ import sessions
 from herdr import HerdrPlace
 from scripts.accounts import accounts
 import herdr
+from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.herdr.fake_herdr import CommandResponse
 
 
 from add_unit_test_support import AddUnitTestCase, ObservedUnitLaunch, configure_test_zone, SHARED, SUBMITTED_PROMPT
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 def setUpModule() -> None:
@@ -42,7 +45,7 @@ def setUpModule() -> None:
 class AddUnitRestoreTests(AddUnitTestCase):
     def test_restore_reports_not_submitted_to_its_parent_and_does_not_report_launched(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
-            "session-123", self.root / "restart-note", "recorded-name", "recorded-herdr")
+            "62ccbd64-f22e-5647-b20e-7899aa39d766", self.root / "restart-note", "recorded-name", "recorded-herdr")
         output = io.StringIO()
         with redirect_stdout(output):
             code, error, _commands, launches, _writes = self.run_with_marked_unit(
@@ -60,7 +63,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
 
     def test_restore_returns_zero_without_waiting_for_remote_control(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
-            "session-123", self.root / "restart-note", "recorded-name", "build-followups-recorded-herdr"
+            "62ccbd64-f22e-5647-b20e-7899aa39d766", self.root / "restart-note", "recorded-name", "build-followups-recorded-herdr"
         )
         output = io.StringIO()
         with redirect_stdout(output):
@@ -74,12 +77,12 @@ class AddUnitRestoreTests(AddUnitTestCase):
 
     def test_restore_already_running_reports_missing_submit_proof_without_waiting_for_remote_control(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
-            "session-123", self.root / "restart-note", "recorded-name", "recorded-herdr"
+            "62ccbd64-f22e-5647-b20e-7899aa39d766", self.root / "restart-note", "recorded-name", "recorded-herdr"
         )
         output = io.StringIO()
         with redirect_stdout(output):
             result, error, commands, launches, _writes = self.run_with_marked_unit(
-                launch_kind, unit_lookup.LiveClaude("recorded-name", "session-123", "/socket", 123)
+                launch_kind, unit_lookup.LiveClaude("recorded-name", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/socket", 123)
             )
         self.assertEqual(result, 1)
         self.assertIn("restart prompt not submitted", error)
@@ -90,7 +93,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
 
     def test_restore_replaces_stopped_herdr_unit_by_name_by_herdr_name(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
-            "session-123", self.root / "restart-note", "recorded-name", "recorded-herdr"
+            "62ccbd64-f22e-5647-b20e-7899aa39d766", self.root / "restart-note", "recorded-name", "recorded-herdr"
         )
         with patch("herdr.stop_session") as stopped:
             result, error, commands, launches, writes = self.run_with_marked_unit(
@@ -102,11 +105,11 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertEqual((launches, writes), (1, 1))
 
     def test_restore_already_live_in_herdr_launches_nothing_and_reports_missing_submit_proof(self) -> None:
-        kind = add_unit.UnitRestoreLaunch("session-123", self.root / "restart-note", "recorded-name", "native-unit")
+        kind = add_unit.UnitRestoreLaunch("62ccbd64-f22e-5647-b20e-7899aa39d766", self.root / "restart-note", "recorded-name", "native-unit")
         output = io.StringIO()
         with redirect_stdout(output):
             result, error, commands, launches, _writes = self.run_with_marked_unit(kind,
-                unit_lookup.LiveClaude("recorded-name", "session-123", "/socket", 123),
+                unit_lookup.LiveClaude("recorded-name", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/socket", 123),
                 place=HerdrPlace("native-unit", "w1:p1"))
         self.assertEqual(result, 1)
         self.assertIn("restart prompt not submitted", error)
@@ -131,11 +134,11 @@ class AddUnitRestoreTests(AddUnitTestCase):
         style = dataclasses.replace(request, production=production._replace(slug="cargo-liner-style"),
                                     identity=add_unit.UnitIdentity("cargo-liner-style-names-unit", "cargo-liner-style-names"))
         self.assertEqual(add_unit.host_session_name(style), "cargo-liner-style-names")
-        restore = add_unit.UnitRestoreLaunch("session-123", self.root / "note", "review", "build-followups-review")
+        restore = add_unit.UnitRestoreLaunch("62ccbd64-f22e-5647-b20e-7899aa39d766", self.root / "note", "review", "build-followups-review")
         self.assertEqual(add_unit.host_session_name(dataclasses.replace(request, launch_kind=restore)),
                          "build-followups-review")
         # A record from before the slug led: its bare name may be another production's live session.
-        before = add_unit.UnitRestoreLaunch("session-123", self.root / "note", "review", "review")
+        before = add_unit.UnitRestoreLaunch("62ccbd64-f22e-5647-b20e-7899aa39d766", self.root / "note", "review", "review")
         self.assertEqual(add_unit.host_session_name(dataclasses.replace(hana, launch_kind=before)), "hana-review")
 
     def test_failed_unit_restore_closes_its_tab_after_agent_exit(self) -> None:
@@ -152,10 +155,11 @@ class AddUnitRestoreTests(AddUnitTestCase):
                 branch="build-followups-alpha", worktree=self.root / "project-alpha",
                 plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
                 port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(),
-                session=add_unit.ResumedSession("session-123", prior),
-                launch_kind=add_unit.UnitRestoreLaunch("session-123", note, "recorded-name", "build-followups-alpha"),
+                session=add_unit.ResumedSession("62ccbd64-f22e-5647-b20e-7899aa39d766", prior),
+                launch_kind=add_unit.UnitRestoreLaunch("62ccbd64-f22e-5647-b20e-7899aa39d766", note, "recorded-name", "build-followups-alpha"),
                 timeout=90,
             )
+            _ = self.prepare_restored_worktree("alpha", request.worktree)
             self.configure_herdr(request)
             with self.assertRaises(herdr.AgentExited):
                 _ = add_unit.launch_session(request, add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
@@ -176,16 +180,17 @@ class AddUnitRestoreTests(AddUnitTestCase):
         head = self.git("rev-parse", "HEAD")
         result = self.restore("alpha", prior)
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertIn(f"session session-123 already runs as pid {os.getpid()}", result.stderr)
+        self.assertIn(f"session 62ccbd64-f22e-5647-b20e-7899aa39d766 already runs as pid {os.getpid()}", result.stderr)
         self.assert_no_launch_change(document, head)
         self.assertEqual([row for row in self.herdr_calls() if row[2:4] != ["session", "list"]], [])
-        self.assertEqual(self.recorded_prompts("session-123"), ())
+        self.assertEqual(self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766"), ())
 
     def test_restart_restore_is_allowed_for_its_restarting_unit(self) -> None:
         self.commit_prepared_row(self.unit_row())
         self.write_shutdown_record(self.shutdown_record("restarting"))
         prior = self.root / "prior-session"
         prior.mkdir()
+        _ = self.prepare_restored_worktree("alpha", self.root / "project-alpha", plan="docs/plans/given.md")
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
 
@@ -194,7 +199,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
             "--plan",
             "docs/plans/given.md",
             "--resume",
-            "session-123",
+            "62ccbd64-f22e-5647-b20e-7899aa39d766",
             "--cwd",
             str(prior),
             "--restart-note",
@@ -207,12 +212,13 @@ class AddUnitRestoreTests(AddUnitTestCase):
 
         self.assertIn("alpha-unit restore launched", result.stdout)
         self.assertEqual(len(self.servers_started()), 1)
-        self.assertEqual(len(self.recorded_prompts("session-123")), 1)
+        self.assertEqual(len(self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766")), 1)
 
     def test_restart_from_a_record_before_the_slug_led_skips_another_productions_live_session(self) -> None:
         self.commit_prepared_row(self.unit_row("review"))
         prior = self.root / "prior-session"
         prior.mkdir()
+        _ = self.prepare_restored_worktree("review", self.root / "project-alpha", plan="docs/plans/given.md")
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
         # hana's review-unit holds the bare name this record was written under.
@@ -221,7 +227,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
                                                                  session_dir="/fixture", socket_path="/fixture/socket")])))
 
         result = self.successful(
-            "review", "--plan", "docs/plans/given.md", "--resume", "session-review", "--cwd", str(prior),
+            "review", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior),
             "--restart-note", str(note), "--session-name", "review", "--host-session", "review",
         )
 
@@ -233,16 +239,18 @@ class AddUnitRestoreTests(AddUnitTestCase):
     def test_restart_restore_marks_only_the_probe_pane_despite_inherited_marker(self) -> None:
         self.env["CLAUDE_PROBE_SESSION"] = "1"
         prior = self.root / "prior-session"
-        prior.mkdir()
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
         cases = ((False, ""), (True, ""), (False, "claude2"), (True, "claude2"))
         for probe, target in cases:
             with self.subTest(probe=probe, target=target):
                 name = ("probe" if probe else "ordinary") + ("-move" if target else "-restore")
-                self.commit_prepared_row(self.unit_row(name))
+                prior = self.root / f"prior-{name}"
+                self.commit_prepared_row(self.unit_row(name, branch=f"build-followups-{name}", worktree=prior))
+                self.env["FAKE_RESTORED_SESSION_ID"] = fixture_runtime_id("restore-backend:" + name)
+                _ = self.prepare_restored_worktree(name, prior, branch=f"build-followups-{name}")
                 result = self.successful(
-                    name, "--plan", "docs/plans/given.md", "--resume", f"session-{name}",
+                    name, "--plan", "docs/plans/given.md", "--resume", self.env["FAKE_RESTORED_SESSION_ID"],
                     "--cwd", str(prior), "--restart-note", str(note),
                     "--session-name", name, "--host-session", f"build-followups-{name}",
                     *(["--probe"] if probe else []),
@@ -257,7 +265,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
                           if row[:5] == ["--session", SHARED, "agent", "start", f"build-followups-{name}"]]
                 self.assertEqual(len(starts), 1)
                 arguments = starts[0][starts[0].index("--") + 1:]
-                self.assertEqual(arguments[arguments.index("--resume") + 1], f"session-{name}")
+                self.assertEqual(arguments[arguments.index("--resume") + 1], self.env["FAKE_RESTORED_SESSION_ID"])
                 environment = self.pane_environment()
                 self.assertEqual(environment.get("CLAUDE_PROBE_SESSION", ""), "1" if probe else "")
                 self.assertNotIn("CLAUDE_TEST_SECRET", environment)
@@ -274,6 +282,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.write_shutdown_record(self.shutdown_record("restarting"))
         prior = self.root / "prior-session"
         prior.mkdir()
+        _ = self.prepare_restored_worktree("alpha", self.root / "project-alpha", plan="docs/as-built/alpha.md")
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
 
@@ -282,7 +291,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
             "--plan",
             "docs/as-built/alpha.md",
             "--resume",
-            "session-123",
+            "62ccbd64-f22e-5647-b20e-7899aa39d766",
             "--cwd",
             str(prior),
             "--restart-note",
@@ -294,7 +303,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         )
 
         self.assertIn("alpha-unit restore launched", result.stdout)
-        self.assertEqual(len(self.recorded_prompts("session-123")), 1)
+        self.assertEqual(len(self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766")), 1)
 
     def test_restore_without_a_units_row_is_refused_and_adds_nothing(self) -> None:
         self.write_shutdown_record(self.shutdown_record("restarting"))
@@ -307,7 +316,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
 
         result = self.cli(
             "alpha", "--plan", "docs/plans/given.md",
-            "--resume", "session-123", "--cwd", str(prior),
+            "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior),
             "--restart-note", str(note),
             "--session-name", "recorded-name", "--host-session", "recorded-herdr",
          "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
@@ -333,7 +342,8 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.commit_prepared_row(self.unit_row())
         worktree = self.root / "project-alpha"
         recorded = self.root / "prior-session"
-        _ = self.git("worktree", "add", str(recorded), "-b", "build-followups-alpha")
+        _ = self.git("worktree", "add", str(recorded), "-b", "recorded-alpha")
+        _ = self.prepare_restored_worktree("alpha", worktree)
         before = self.repository_state()
 
         result = self.restore("alpha", recorded)
@@ -342,18 +352,38 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertEqual(result.stderr, "")
         self.assertEqual(self.opened()[self.opened().index("--cwd") + 1], str(recorded))
         self.assertEqual(self.repository_state(), before)
-        self.assertFalse(worktree.exists())
+        self.assertTrue(worktree.exists())
 
-    def test_restore_in_the_row_worktree_on_another_branch_launches(self) -> None:
+    def test_restore_refuses_a_units_row_worktree_other_than_the_retained_worktree(self) -> None:
+        self.commit_prepared_row(self.unit_row())
+        worktree = self.root / "project-alpha"
+        recorded = self.root / "prior-session"
+        _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
+        _ = self.prepare_restored_worktree("alpha", recorded, branch="recorded-alpha")
+        _ = unit_config.write(worktree, unit_config.UnitConfig(
+            unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.NoAppPort(), ()))
+        before = self.repository_state()
+
+        result = self.restore("alpha", recorded)
+
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertIn("scheduled restore worktree conflicts with staff row", result.stderr)
+        self.assertEqual(self.servers_started(), [])
+        self.assertEqual(self.repository_state(), before)
+        self.assertTrue(worktree.exists())
+
+    def test_restore_refuses_the_retained_worktree_on_another_branch(self) -> None:
         self.commit_prepared_row(self.unit_row())
         worktree = self.root / "project-alpha"
         _ = self.git("worktree", "add", str(worktree), "-b", "other-branch")
+        _ = self.prepare_restored_worktree("alpha", worktree)
         before = self.repository_state()
 
         result = self.restore("alpha", worktree)
 
-        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
-        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertIn(f"worktree {worktree} is not on build-followups-alpha", result.stderr)
+        self.assertEqual(self.servers_started(), [])
         self.assertEqual(self.repository_state(), before)
 
     def test_restart_restore_ignores_a_stale_down_record(self) -> None:
@@ -361,6 +391,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.write_shutdown_record(self.shutdown_record("down"))
         prior = self.root / "prior-session"
         prior.mkdir()
+        _ = self.prepare_restored_worktree("alpha", self.root / "project-alpha", plan="docs/plans/given.md")
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
 
@@ -369,7 +400,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
             "--plan",
             "docs/plans/given.md",
             "--resume",
-            "session-123",
+            "62ccbd64-f22e-5647-b20e-7899aa39d766",
             "--cwd",
             str(prior),
             "--restart-note",
@@ -381,7 +412,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
          "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
-        self.assertEqual(len(self.recorded_prompts("session-123")), 1)
+        self.assertEqual(len(self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766")), 1)
         self.assertEqual(len(self.servers_started()), 1)
 
     def test_restart_restore_ignores_a_stale_record_for_another_session(self) -> None:
@@ -391,6 +422,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         )
         prior = self.root / "prior-session"
         prior.mkdir()
+        _ = self.prepare_restored_worktree("alpha", self.root / "project-alpha", plan="docs/plans/given.md")
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
 
@@ -399,7 +431,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
             "--plan",
             "docs/plans/given.md",
             "--resume",
-            "session-123",
+            "62ccbd64-f22e-5647-b20e-7899aa39d766",
             "--cwd",
             str(prior),
             "--restart-note",
@@ -411,7 +443,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
          "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
-        self.assertEqual(len(self.recorded_prompts("session-123")), 1)
+        self.assertEqual(len(self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766")), 1)
         self.assertEqual(len(self.servers_started()), 1)
 
     def test_restore_ignores_unreadable_stale_shutdown_state(self) -> None:
@@ -421,6 +453,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         _ = (account / "record.json").write_text("{", encoding="utf-8")
         prior = self.root / "prior-session"
         prior.mkdir()
+        _ = self.prepare_restored_worktree("alpha", self.root / "project-alpha", plan="docs/plans/given.md")
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
 
@@ -429,7 +462,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
             "--plan",
             "docs/plans/given.md",
             "--resume",
-            "session-123",
+            "62ccbd64-f22e-5647-b20e-7899aa39d766",
             "--cwd",
             str(prior),
             "--restart-note",
@@ -441,17 +474,17 @@ class AddUnitRestoreTests(AddUnitTestCase):
         )
 
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
-        self.assertEqual(len(self.recorded_prompts("session-123")), 1)
+        self.assertEqual(len(self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766")), 1)
         self.assertEqual(len(self.servers_started()), 1)
 
     def test_stale_down_record_does_not_block_a_stopped_marked_restore(self) -> None:
         self.write_shutdown_record(self.shutdown_record("down"))
-        launch_kind = add_unit.UnitRestoreLaunch("session-123", self.root / "restart-note", "recorded-name", "recorded-herdr")
+        launch_kind = add_unit.UnitRestoreLaunch("62ccbd64-f22e-5647-b20e-7899aa39d766", self.root / "restart-note", "recorded-name", "recorded-herdr")
         result, error, commands, launches, writes = self.run_with_marked_unit(launch_kind, unit_lookup.ClaudeNotRunning())
         self.assertEqual(result, 0, error)
         self.assertEqual(commands, [])
         self.assertEqual((launches, writes), (1, 1))
-        self.assertEqual(len(self.recorded_prompts("session-123")), 1)
+        self.assertEqual(len(self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766")), 1)
 
     def test_launch_claim_releases_global_barrier_before_spawn(self) -> None:
         note = self.root / "restart-note"
@@ -465,13 +498,14 @@ class AddUnitRestoreTests(AddUnitTestCase):
             port=add_unit.OmittedCell(),
             owns=add_unit.OmittedCell(),
             session=add_unit.ResumedSession(
-                "session-123", self.root / "prior-session"
+                "62ccbd64-f22e-5647-b20e-7899aa39d766", self.root / "prior-session"
             ),
             launch_kind=add_unit.UnitRestoreLaunch(
-                "session-123", note, "recorded-name", "recorded-herdr"
+                "62ccbd64-f22e-5647-b20e-7899aa39d766", note, "recorded-name", "recorded-herdr"
             ),
             timeout=1.0,
         )
+        _ = self.prepare_restored_worktree("alpha", request.worktree)
         ready = add_unit.ReadyToLaunch(
             request,
             add_unit.NoUnitRow(),
@@ -517,7 +551,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
             self.assertIsNotNone(creator)
             if creator is None:
                 self.fail("shutdown creator did not start")
-            creator_stdout, creator_stderr = creator.communicate(timeout=30)
+            creator_stdout, creator_stderr = creator.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(creator.returncode, 0, (creator_stdout, creator_stderr))
             self.assertEqual(len(launch_permission.pending_launches()), 1)
             lock_path = Path(self.env["SHUTDOWN_STATE_DIR"]) / "launch.lock"
@@ -531,7 +565,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
             self.assertIsNotNone(creator)
             if creator is None:
                 self.fail("shutdown creator did not start")
-            stdout, stderr = creator.communicate(timeout=300)
+            stdout, stderr = creator.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(creator.returncode, 0, (stdout, stderr))
 
         error = io.StringIO()
@@ -564,11 +598,11 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertEqual(result, 0, error.getvalue())
         wait.assert_not_called()
         account = Path(self.env["SHUTDOWN_STATE_DIR"]) / "owner@example.com"
-        self.assertTrue((account / "sessions" / "session-123.json").is_file())
+        self.assertTrue((account / "sessions" / "62ccbd64-f22e-5647-b20e-7899aa39d766.json").is_file())
 
     def test_restore_recording_failure_uses_one_stderr_line_and_does_not_launch(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
-            "session-123", self.root / "restart-note", "recorded-name", "recorded-herdr"
+            "62ccbd64-f22e-5647-b20e-7899aa39d766", self.root / "restart-note", "recorded-name", "recorded-herdr"
         )
 
         with patch.object(
@@ -589,9 +623,9 @@ class AddUnitRestoreTests(AddUnitTestCase):
 
     def test_restore_keeps_marked_herdr_with_live_claude_and_reports_missing_submit_proof(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
-            "session-123", self.root / "restart-note", "recorded-name", "recorded-herdr"
+            "62ccbd64-f22e-5647-b20e-7899aa39d766", self.root / "restart-note", "recorded-name", "recorded-herdr"
         )
-        live = unit_lookup.LiveClaude("recorded-name", "session-123", "/socket", 123)
+        live = unit_lookup.LiveClaude("recorded-name", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/socket", 123)
 
         result, error, commands, launches, writes = self.run_with_marked_unit(launch_kind, live)
 
@@ -603,7 +637,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
 
     def test_restore_refuses_marked_herdr_when_claude_state_is_unknown(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
-            "session-123", self.root / "restart-note", "recorded-name", "recorded-herdr"
+            "62ccbd64-f22e-5647-b20e-7899aa39d766", self.root / "restart-note", "recorded-name", "recorded-herdr"
         )
 
         result, error, commands, launches, writes = self.run_with_marked_unit(
@@ -625,11 +659,12 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.write_shutdown_record(self.shutdown_record("restarting"))
         prior = self.root / "prior-session"
         prior.mkdir()
+        _ = self.prepare_restored_worktree("alpha", self.root / "project-alpha", plan="standby")
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
 
         result = self.successful(
-            "alpha", "--standby", "--resume", "session-123", "--cwd", str(prior),
+            "alpha", "--standby", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior),
             "--restart-note", str(note), "--session-name", "recorded-name",
             "--host-session", "recorded-herdr", "--account", "claude3",
         )
@@ -638,20 +673,22 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertEqual(len(self.servers_started()), 1)
         self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
         arguments = self.agent_arguments()
-        self.assertEqual(arguments[arguments.index("--resume") + 1], "session-123")
+        self.assertEqual(arguments[arguments.index("--resume") + 1], "62ccbd64-f22e-5647-b20e-7899aa39d766")
 
     def test_restart_restore_carries_the_recorded_autocompact_window(self) -> None:
         """A /shutdown restart, account move or rename relaunches through a restore with no flag of its own."""
         prior = self.root / "prior-session"
-        prior.mkdir()
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
-        with patch.dict(os.environ, self.env):
-            autocompact.record("session-compact", "200k")
         for name, flags, expected in (("compact", (), "200k"), ("reverted", ("--autocompact", "auto"), None)):
             with self.subTest(name=name):
-                self.commit_prepared_row(self.unit_row(name))
-                _ = self.successful(name, "--plan", "docs/plans/given.md", "--resume", "session-compact",
+                prior = self.root / f"prior-{name}"
+                self.commit_prepared_row(self.unit_row(name, branch=f"build-followups-{name}", worktree=prior))
+                self.env["FAKE_RESTORED_SESSION_ID"] = fixture_runtime_id("restore-backend:" + name)
+                _ = self.prepare_restored_worktree(name, prior, branch=f"build-followups-{name}")
+                with patch.dict(os.environ, self.env):
+                    autocompact.record(self.env["FAKE_RESTORED_SESSION_ID"], "200k")
+                _ = self.successful(name, "--plan", "docs/plans/given.md", "--resume", self.env["FAKE_RESTORED_SESSION_ID"],
                                     "--cwd", str(prior), "--restart-note", str(note), "--session-name", name,
                                     "--host-session", f"build-followups-{name}", *flags)
                 start = next(row for row in self.herdr_calls()
@@ -662,14 +699,15 @@ class AddUnitRestoreTests(AddUnitTestCase):
                 else:
                     self.assertEqual(arguments[arguments.index("--autocompact") + 1], expected)
         with patch.dict(os.environ, self.env):
-            self.assertEqual(autocompact.recorded("session-compact"), "")
+            self.assertEqual(autocompact.recorded(self.env["FAKE_RESTORED_SESSION_ID"]), "")
 
     def test_registered_unit_autocompact_reaches_its_restore_launch(self) -> None:
+        self.env["FAKE_RESTORED_SESSION_ID"] = "3001165e-ca76-59c2-9490-878224585fad"
         worktree = self.commit_row_off_the_naming_pattern()
         _ = self.set_unit_autocompact("200k")
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
-        _ = self.successful("trunk", "--plan", "docs/plans/given.md", "--resume", "session-trunk",
+        _ = self.successful("trunk", "--plan", "docs/plans/given.md", "--resume", "3001165e-ca76-59c2-9490-878224585fad",
                             "--cwd", str(worktree), "--restart-note", str(note), "--session-name", "trunk",
                             "--host-session", "build-followups-trunk")
         arguments = self.agent_arguments()
@@ -681,10 +719,11 @@ class AddUnitRestoreTests(AddUnitTestCase):
         _ = self.prepare_unit_account("claude2")
         prior = self.root / "prior-session"
         prior.mkdir()
+        _ = self.prepare_restored_worktree("alpha", self.root / "project-alpha", plan="docs/plans/given.md")
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume on the source after the target refused.", encoding="utf-8")
         self.persist_unit_account(directory, session="alpha")
-        flags = ("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(prior),
+        flags = ("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior),
                  "--restart-note", str(note), "--session-name", "recorded-name", "--host-session", "shared-herdr",
                  "--account", "claude1")
         with (patch.object(herdr, "shared_session", return_value="shared-herdr"),
@@ -709,7 +748,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
             new = self.cli("alpha", "--plan", "docs/plans/given.md", "--source-fallback", "--account", "claude2")
             self.assertEqual(new.returncode, 2)
             self.assertIn("requires a resumed session", new.stderr)
-            restore = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(prior),
+            restore = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior),
                 "--restart-note", str(note), "--session-name", "recorded-name", "--host-session", "shared-herdr",
                 "--account", "claude2", "--source-fallback")
             self.assertEqual(restore.returncode, 2)
@@ -733,7 +772,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         }
         restored = add_unit.launch_request(argparse.Namespace(
             **common,
-            resume="session-123",
+            resume="62ccbd64-f22e-5647-b20e-7899aa39d766",
             cwd=str(self.root / "prior-session"),
             restart_note=str(note),
             session_name="recorded name",
@@ -741,7 +780,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         ))
         ordinary_resume = add_unit.launch_request(argparse.Namespace(
             **common,
-            resume="session-123",
+            resume="62ccbd64-f22e-5647-b20e-7899aa39d766",
             cwd=str(self.root / "prior-session"),
             restart_note=None,
             session_name=None,
@@ -759,7 +798,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertEqual(
             restored.launch_kind,
             add_unit.UnitRestoreLaunch(
-                "session-123", note, "recorded name", "recorded herdr"
+                "62ccbd64-f22e-5647-b20e-7899aa39d766", note, "recorded name", "recorded herdr"
             ),
         )
         self.assertIsInstance(ordinary_resume.launch_kind, add_unit.NewWorkLaunch)
@@ -799,6 +838,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.commit_prepared_row(self.unit_row())
         prior = self.root / "prior session"
         prior.mkdir()
+        _ = self.prepare_restored_worktree("alpha", self.root / "project-alpha", plan="docs/plans/given.md")
         note = self.root / "restart note.txt"
         restart_note = "Restarted with spaces, 'quotes', and $() unchanged."
         _ = note.write_text(restart_note, encoding="utf-8")
@@ -807,13 +847,13 @@ class AddUnitRestoreTests(AddUnitTestCase):
         existing_prompt = "Keep this previously scheduled prompt."
         with patch.dict(os.environ, self.env):
             conversation_pause.record_scheduled_prompts(
-                "session-123", (existing_prompt,)
+                "62ccbd64-f22e-5647-b20e-7899aa39d766", (existing_prompt,)
             )
 
         _ = self.successful(
             "alpha",
             "--plan", "docs/plans/given.md",
-            "--resume", "session-123",
+            "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766",
             "--cwd", str(prior),
             "--restart-note", str(note),
             "--session-name", recorded_session,
@@ -823,17 +863,17 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertEqual(self.opened()[1], SHARED)
         self.assertEqual(self.opened()[7], str(prior))
         self.assertIn(["--session", SHARED, "tab", "rename", "w1:t1",
-                       recorded_session], self.herdr_calls())
-        self.assertIn(["--session", SHARED, "pane", "rename", "w1:p1", recorded_session], self.herdr_calls())
+                       "alpha"], self.herdr_calls())
+        self.assertIn(["--session", SHARED, "pane", "rename", "w1:p1", "alpha"], self.herdr_calls())
         claude = self.agent_arguments()
         prompt = self.opening_prompt()
-        self.assertEqual(claude[claude.index("--remote-control") + 1], recorded_session)
-        self.assertEqual(claude[claude.index("-n") + 1], recorded_session)
+        self.assertEqual(claude[claude.index("--remote-control") + 1], "alpha")
+        self.assertEqual(claude[claude.index("-n") + 1], "alpha")
         self.assertNotIn("claude", claude)
         self.assertIn("You are now alpha-unit in production build-followups", prompt)
         self.assertTrue(prompt.endswith(restart_note), prompt)
         self.assertNotIn("Run /unit:direct", prompt)
-        recorded = self.recorded_prompts("session-123")
+        recorded = self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766")
         self.assertEqual(recorded, (existing_prompt, prompt))
         self.assertIs(conversation_pause.prompt_source(prompt, frozenset, lambda: recorded),
                       conversation_pause.PromptSource.SCHEDULED)
@@ -844,6 +884,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.commit_prepared_row(self.unit_row())
         prior = self.root / "prior-session"
         prior.mkdir()
+        _ = self.prepare_restored_worktree("alpha", self.root / "project-alpha", plan="docs/plans/given.md")
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
         _ = self.pause_state.write_text("not a directory", encoding="utf-8")
@@ -851,7 +892,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         result = self.cli(
             "alpha",
             "--plan", "docs/plans/given.md",
-            "--resume", "session-123",
+            "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766",
             "--cwd", str(prior),
             "--restart-note", str(note),
             "--session-name", "recorded-name",

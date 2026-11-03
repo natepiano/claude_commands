@@ -11,23 +11,25 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import build_folders
 from types import FrameType, MappingProxyType
 from typing import Literal, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "production"))
 sys.path.insert(0, str(SCRIPTS / "lib"))
+import process_group
 
 from add_style import NoStyleProduction, standing_style_production
 from production_units import Refusal
 from scripts.copies import copies
+from scripts.message import send_result
 from scripts.production import showrunners
 import style_ledger
 from process_failure import failure_detail
@@ -45,8 +47,8 @@ VERIFY = SCRIPTS / "direct/verify.sh"
 LEDGER = SCRIPTS / "style/style_ledger.py"
 TOOLS: tuple[style_ledger.LintTool, ...] = ("clippy", "mend", "rustfmt")
 # Each lint run owns one `style-sync-lint-*` dir here; a later run removes the dir of a run that was killed.
-LINT_TEMP_PARENT = Path(tempfile.gettempdir())
-LINT_PREFIX = "style-sync-lint-"
+LINT_TEMP_PARENT: Path | build_folders.InheritedTemporaryParent = build_folders.InheritedTemporaryParent()
+LINT_PREFIX = build_folders.FOLDER_PREFIXES["style-sync-lint"]
 OWNER_FILE = "owner.json"
 # Written by the verifier itself, so a SIGKILL of the owner right after Popen still leaves its group recorded.
 VERIFIER_FILE = "verifier.pgid"
@@ -88,11 +90,24 @@ def notify(repo_dir: Path, branch: str, tip: str) -> None:
             "--key", f"style-sync:{standing.slug}",
             "--timeout", str(SEND_SECONDS),
         ], capture_output=True, text=True, check=False, timeout=SEND_RUN_SECONDS)
-        if sent.returncode:
-            raise Refusal(f"send.py: {failure_detail(sent)}")
+        outcome = send_result.send_outcome(sent.returncode, sent.stdout)
+        if isinstance(outcome, send_result.ConfirmedSendOutcome):
+            match outcome.header.outcome:
+                case "sent" | "skipped" | "kept" | "replaced":
+                    return
+                case "queued" | "failed" | "refused" | "held" | "pending":
+                    pass
+        raise Refusal(f"send.py: {failure_detail(sent)}")
     except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
         detail = " ".join(str(error).splitlines()).removeprefix("style_sync: ")
         print("style_sync: notify: " + detail)
+
+
+def lint_temp_parent() -> Path:
+    """Read the current temporary parent unless a test supplies its own parent."""
+    if isinstance(LINT_TEMP_PARENT, Path):
+        return LINT_TEMP_PARENT
+    return build_folders.inherited_temporary_parent()
 
 
 def lint_records(output: str, checkout: Path) -> tuple[ToolLintRecord, ...]:
@@ -223,17 +238,17 @@ def lint_run_running(directory: Path, owner_record: OwnerRecord) -> bool:
     group = int(verifier_file.read_text())
     if group <= 0:
         raise ValueError(f"{VERIFIER_FILE} names no process group")
-    return probe(os.killpg, group)
+    return probe(process_group.send_process_group, group)
 
 
 def stop_lint_child(child: subprocess.Popen[str]) -> None:
     """Stop verify.sh and every process it started, so no cargo build writes into a removed checkout."""
     with suppress(ProcessLookupError):
-        os.killpg(child.pid, signal.SIGTERM)
+        process_group.send_process_group(child.pid, signal.SIGTERM)
     with suppress(subprocess.TimeoutExpired):
         _ = child.wait(CHILD_STOP_SECONDS)
     with suppress(ProcessLookupError):
-        os.killpg(child.pid, signal.SIGKILL)
+        process_group.send_process_group(child.pid, signal.SIGKILL)
     _ = child.wait()
 
 
@@ -322,7 +337,7 @@ def sweep_stale_lint_dirs() -> None:
     A dir without a readable owner record, or whose owner or verifier group runs, stays: a reused id
     keeps a dir, it never removes a running checkout. A failure prints one line and the run continues.
     """
-    for directory in sorted(LINT_TEMP_PARENT.glob(f"{LINT_PREFIX}*")):
+    for directory in sorted(lint_temp_parent().glob(f"{LINT_PREFIX}*")):
         try:
             remove_if_stale(directory)
         # Any failure of one dir's sweep; LintStopped and KeyboardInterrupt are not an Exception.
@@ -348,7 +363,8 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
     sweep_stale_lint_dirs()
     # Signals stay held outside the work, so the dir never exists without its record and its cleanup path.
     with stop_signals_raise(), copies.standing(gate_owner(repo), checkout, tip) as snapshot, signal_mask(signal.SIG_BLOCK):
-        directory = Path(tempfile.mkdtemp(prefix=LINT_PREFIX, dir=LINT_TEMP_PARENT))
+        directory = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
+            LINT_PREFIX, build_folders.ExplicitBuildParent(lint_temp_parent())))
         try:
             OwnerRecord(os.getpid(), Path(common_dir)).write(directory)
             with signal_mask(signal.SIG_UNBLOCK):
@@ -397,11 +413,13 @@ def handoff_notice(slug: str, parent: str, checkpoint: str) -> HandoffDelivery:
         "--text", f"From the showrunner of {slug}: hand-off {checkpoint}",
         "--timeout", str(SEND_SECONDS),
     ], capture_output=True, text=True, check=False, timeout=SEND_RUN_SECONDS)
-    if result.returncode == 1 and result.stdout.startswith("QUEUED:"):
-        return "queued"
-    if result.returncode:
-        raise Refusal(f"send.py: {failure_detail(result)}")
-    return "sent"
+    outcome = send_result.send_outcome(result.returncode, result.stdout)
+    if isinstance(outcome, send_result.ConfirmedSendOutcome):
+        if outcome.header.outcome in {"queued", "kept"}:
+            return "queued"
+        if outcome.header.outcome in {"sent", "skipped", "replaced"}:
+            return "sent"
+    raise Refusal(f"send.py: {failure_detail(result)}")
 
 
 @dataclass(frozen=True)

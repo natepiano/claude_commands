@@ -1,29 +1,38 @@
 """Real verify.sh token reservation behavior."""
 from __future__ import annotations
 
+from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+from scripts.build_queue import admission_protocol as wire
+from scripts.lint import memory_admit as gate
+
 import os
 import shutil
 import signal
 import subprocess
 import time
+from typing import cast, override
 import unittest
 from pathlib import Path
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY, BOARD
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyTokenReservationTests(VerifyTokenWaitFixture):
+    admission: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.admission = caller_admission(self, self.root, self.environment)
+
     def test_a_step_waiting_for_a_busy_token_keeps_no_memory_reservation(self) -> None:
         # A reservation kept through the token wait promises memory no build
         # uses; with many such steps the gate held every step back. The waiter
         # gives the token back for its memory wait, a peer takes it, then the
         # waiter's gate admits it while the token is busy.
         board = self.root / "board"
-        admission = self.root / "buildlog" / "admission"
         waiting = self.root / "waiting-for-token"
         meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
         _ = meminfo.write_text("MemAvailable: 0 kB\n")
-        peer_meminfo = self.root / "peer-meminfo"
-        _ = peer_meminfo.write_text("MemAvailable: 50331648 kB\n")
         sleep = self.root / "stubs" / "sleep"
         _ = sleep.write_text("#!/bin/sh\n"
                              + 'if [ "$1" = 3 ] && [ -n "${TEST_WAITING:-}" ]; then : > "$TEST_WAITING"; fi\n'
@@ -33,25 +42,29 @@ class VerifyTokenReservationTests(VerifyTokenWaitFixture):
                        "UNIT_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1"}
         output = self.root / "waiter.out"
         waiter = self.start_memory_waiter({**environment, "TEST_WAITING": str(waiting)}, output)
+        waiting_admission, = self.admission.server.waiters.values()
+        first_need = waiting_admission.row["need"]
+        waiting_admission.row["need"] = 60 * gate.GIB
+        self.admission.free(48 * gate.GIB)
         holder: subprocess.Popen[bytes] | None = None
         try:
             holder = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
-                                      env={**environment, "BUILDLOG_MEMINFO": str(peer_meminfo),
-                                           "TEST_BLOCK": "1"},
+                                      env={**environment, "TEST_BLOCK": "1"},
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                       start_new_session=True)
             self.started_groups.add(holder.pid)
             self.wait_for_running(self.root / "running", holder)
-            held = sorted(admission.glob("*.reservation"))
+            held = set(self.admission.server.reservations)
             self.assertEqual(len(held), 1, "the running step holds one reservation")
-            _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
+            waiting_admission.row["need"] = first_need
+            self.admission.free(48 * gate.GIB)
             self.wait_for_running(waiting, waiter)
-            self.assertEqual(sorted(admission.glob("*.reservation")), held)
+            self.assertEqual(set(self.admission.server.reservations), held)
             _ = (self.root / "release").touch()
-            self.assertEqual(holder.wait(timeout=300), 0)
-            self.assertEqual(waiter.wait(timeout=300), 0, output.read_text())
+            self.assertEqual(holder.wait(timeout=TEST_HANG_GUARD_SECS), 0)
+            self.assertEqual(waiter.wait(timeout=TEST_HANG_GUARD_SECS), 0, output.read_text())
             self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 2)
-            self.assertEqual(list(admission.glob("*.reservation")), [])
+            self.assertEqual(self.admission.server.reservations, {})
             # The wait after the memory wait shows in the log; on 2026-10-22 its
             # log ended on "starting anyway" for hours.
             text = output.read_text(errors="replace")
@@ -64,7 +77,7 @@ class VerifyTokenReservationTests(VerifyTokenWaitFixture):
                 if process is not None:
                     if process.poll() is None:
                         self.end_group(process.pid)
-                    _ = process.wait(timeout=300)
+                    _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def test_a_step_whose_call_is_gone_stops_waiting_for_the_token(self) -> None:
         # On 2026-10-20 a test killed a call's group and left its step, in a
@@ -90,16 +103,16 @@ class VerifyTokenReservationTests(VerifyTokenWaitFixture):
         call = self.start_memory_waiter(environment, output)
         peer = subprocess.Popen([real_sleep, "600"], start_new_session=True)
         self.started_groups.add(peer.pid)
-        self.addCleanup(peer.wait, 300)
+        self.addCleanup(peer.wait, TEST_HANG_GUARD_SECS)
         taken = subprocess.run(["bash", str(BOARD), "acquire", str(board), "peer", "cargo", "--pid", str(peer.pid),
                                 "--hold", "3600", "--wait", "0"],
-                               capture_output=True, text=True, check=False, timeout=300)
+                               capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(taken.returncode, 0, taken.stderr)
         _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
         self.wait_for_running(waiting, call)
         os.kill(call.pid, signal.SIGKILL)
-        _ = call.wait(timeout=300)
-        deadline = time.monotonic() + 60
+        _ = call.wait(timeout=TEST_HANG_GUARD_SECS)
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         while (left := self.live_group_processes(call.pid)) and time.monotonic() < deadline:
             time.sleep(0.1)
         self.assertEqual(left, [], output.read_text(errors="replace"))
@@ -138,6 +151,14 @@ class VerifyTokenReservationTests(VerifyTokenWaitFixture):
                        "UNIT_TEAM_ROLE": "impl", "TEST_REAL_BOARD": str(BOARD),
                        "TEST_SLEEP_LOG": str(log),
                        "BUILDLOG_MEM_POLL_S": "1", "BUILDLOG_MEM_WAIT_LIMIT_S": "2"}
+        def free_after_wait(reply: wire.Reply) -> wire.Reply:
+            if isinstance(reply, wire.Wait):
+                with log.open("a") as stream:
+                    _ = stream.write("wait\n")
+                self.admission.free(60 * gate.GIB)
+            return reply
+
+        self.admission.server.reply_filter = free_after_wait
         result = self.verify(environment)
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode, 0, output)
@@ -147,8 +168,8 @@ class VerifyTokenReservationTests(VerifyTokenWaitFixture):
         self.assertIn("token", lines)
         # The step's acquire after its failed try is the last one in the log.
         last_token = len(lines) - 1 - lines[::-1].index("token")
-        self.assertIn("sleep 1", lines[:last_token], "the first memory wait polls until memory is free")
-        self.assertNotIn("sleep 1", lines[last_token:], "the pass after the token wait waited again")
+        self.assertIn("wait", lines[:last_token], "the first memory wait keeps the step queued until memory is free")
+        self.assertNotIn("wait", lines[last_token:], "the pass after the token wait waited again")
 
 
 

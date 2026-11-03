@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+
 import json
+import io
+from contextlib import redirect_stderr, redirect_stdout
+from time import monotonic
 from dataclasses import FrozenInstanceError
 import os
 import re
@@ -17,11 +22,10 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-TEST_HANG_GUARD_SECS = 300
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.atomic_file import write_text_atomic
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -37,6 +41,13 @@ from scripts.production.rename_test_support import bind_staff_fixture
 
 SCRIPT = Path(__file__).with_name("showrunners.py")
 LOS_ANGELES = "America/Los_Angeles"
+
+
+def stalled_session_reader(root: Path) -> Path:
+    """An isolated sessions command that never answers; callers must bound its lifetime."""
+    reader = root / "stalled-sessions.py"
+    _ = reader.write_text("import threading\nthreading.Event().wait()\n")
+    return reader
 
 
 def setUpModule() -> None:
@@ -142,7 +153,7 @@ raise SystemExit(1)
                 "NOTIFIER_STATE_DIR": str(self.notifier), "NOTIFIER_SESSIONS_DIR": str(self.sessions),
                 "SHOWRUNNERS_SESSIONS": str(self.sessions_script),
                 "SHOWRUNNER_STATE_DIR": str(self.state), "SHOWRUNNERS_SEND": str(self.send_script),
-                "TEST_SENT": str(self.sent), "CLAUDE_CODE_SESSION_ID": caller,
+                "TEST_SENT": str(self.sent), "CLAUDE_CODE_SESSION_ID": caller, "CODEX_THREAD_ID": caller,
                 **fake_unit_host.environment(self.root), "HERDR_PANE_ID": pane}
 
     @override
@@ -165,14 +176,19 @@ raise SystemExit(1)
     def showrunner(self, slug: str, *, running: bool = True, formerly: tuple[str, ...] = (), name: str = "") -> None:
         """One production with an update timer, its showrunner named `name`, else its slug, when it runs."""
         doc = self.root / f"{slug}-production.md"
-        self.instance(f"showrunner-{slug}", target=f"session:{slug}-id", doc=doc)
+        row = fixture_member("showrunner", name=slug)
+        self.instance(f"showrunner-{slug}", target=f"session:{row.id}", doc=doc)
+        _ = staff.set_doc(row.id, staff.LiveDoc("natedev", doc))
         if formerly:
             names = ", ".join(f"`{old}`" for old in formerly)
             _ = doc.write_text(f"# Production\n\n## Production Context\n\n- **Formerly:** {names}\n",
                                encoding="utf-8")
         if running:
-            _ = self.record(name or slug, f"{slug}-id")
-        _ = staff.ensure("showrunner", name=slug)
+            pid = self.record(name or slug, row.id)
+            path = self.sessions / f"{pid}.json"
+            value = cast(dict[str, object], json.loads(path.read_text()))
+            value["messagingSocketPath"] = str(self.root / f"{slug}-id.sock")
+            write_text_atomic(path, json.dumps(value) + "\n")
 
     def messages(self) -> list[tuple[str, str]]:
         """Each message sent, as the socket it went to and its text."""
@@ -189,8 +205,8 @@ raise SystemExit(1)
     def recorded_parent(self, child: str, parent: str) -> None:
         """Prepare authoritative edges alongside the legacy files still written by tools."""
         record = staff.initial_snapshot()
-        parent_row = record.by_path(parent) or staff.ensure("showrunner", name=parent)
-        child_row = record.by_path(child) or staff.ensure("showrunner", name=child)
+        parent_row = record.by_path(parent) or fixture_member("showrunner", name=parent)
+        child_row = record.by_path(child) or fixture_member("showrunner", name=child)
         _ = staff.move(child_row.id, parent_row.id)
         self.stored_parent(child, parent)
 
@@ -199,6 +215,67 @@ raise SystemExit(1)
         marks = {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": unit}
         self.hosted_units.append(HostedUnit(f"label-of-{unit}", pane, marks))
         fake_unit_host.write(self.environment(), self.hosted_units)
+
+
+class RowTimerJoinTests(StaffTestCase):
+    def test_unreadable_timer_preserves_another_showrunners_document_match(self) -> None:
+        fixture = self.row_production()
+        bad_owner = fixture_member("showrunner", name="broken-owner")
+        bad_doc = self.root / "broken-production.md"
+        write_text_atomic(bad_doc, "# Broken production\n")
+        bad_owner = staff.set_doc(bad_owner.id, staff.LiveDoc("natedev", bad_doc))
+        bad_conf = Path(os.environ["NOTIFIER_STATE_DIR"]) / "showrunner-broken-alias" / "conf"
+        bad_conf.mkdir(parents=True)
+        record = staff.snapshot()
+        errors = io.StringIO()
+
+        with redirect_stderr(errors):
+            timer = showrunners.timer_for(fixture.runner, record)
+            with self.assertRaises(OSError) as raised:
+                _ = showrunners.timer_for(bad_owner, record)
+
+        self.assertIsInstance(timer, showrunners.Timer)
+        assert isinstance(timer, showrunners.Timer)
+        self.assertEqual((timer.slug, timer.doc), (fixture.slug, fixture.doc))
+        self.assertIn(bad_owner.name, str(raised.exception))
+        self.assertIn(str(bad_conf), str(raised.exception))
+        self.assertIn("Is a directory", str(raised.exception))
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_a_timer_target_cannot_replace_a_missing_document_join(self) -> None:
+        from scripts.production import session_staff
+
+        fixture = self.row_production()
+        timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{fixture.slug}" / "conf"
+        other_doc = self.root / "unowned-production.md"
+        write_text_atomic(other_doc, "# Unowned production\n")
+        write_text_atomic(timer, f"TARGET=session:{fixture.runner.id}\n"
+                          + f"CHECK=zsh /fixture/production_check.sh {other_doc}\n")
+        record = staff.snapshot()
+        before = self.staff_file.read_bytes()
+        sources = session_staff.member_sources()
+        self.assertIsInstance(sources.member(session_staff.ShowrunnerMember(fixture.slug), record),
+                              session_staff.NoSuchMember)
+        self.assertIsInstance(showrunners.timer_for(fixture.runner, record), showrunners.NoTimer)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_timer_joins_the_row_document_when_the_slug_name_and_target_disagree(self) -> None:
+        fixture = self.row_production()
+        timer_dir = Path(os.environ["NOTIFIER_STATE_DIR"])
+        decoy = timer_dir / f"showrunner-{fixture.runner.name}" / "conf"
+        decoy.parent.mkdir()
+        other_doc = self.root / "other-production.md"
+        write_text_atomic(other_doc, "# Other production\n")
+        write_text_atomic(decoy, f"TARGET=session:{fixture.runner.id}\n"
+                          + f"CHECK=zsh /fixture/production_check.sh {other_doc}\n")
+        expected_doc = fixture.doc
+        before = self.staff_file.read_bytes()
+        timer = showrunners.timer_for(fixture.runner, staff.snapshot())
+        self.assertIsInstance(timer, showrunners.Timer)
+        assert isinstance(timer, showrunners.Timer)
+        self.assertEqual(timer.slug, fixture.slug)
+        self.assertEqual(timer.doc, expected_doc)
+        self.assertEqual(self.staff_file.read_bytes(), before)
 
 
 class ShowrunnerRegistryTests(ShowrunnerFixture):
@@ -244,6 +321,128 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         check = shlex.join(["zsh", "/opt/tools/production_check.sh", str(doc), "extra"])
         _ = (directory / "conf").write_text(f"TARGET=session:abc\nCHECK={check}\n", encoding="utf-8")
         self.assertEqual(showrunners.checked_doc(directory), showrunners.CheckedDoc(doc))
+
+    def test_stalled_session_discovery_obeys_the_callers_deadline(self) -> None:
+        reader = stalled_session_reader(self.root)
+        self.instance("showrunner-builds", target="session:builds-id", doc=self.doc)
+        began = monotonic()
+        errors = io.StringIO()
+        with mock.patch.object(showrunners, "SESSIONS", reader), redirect_stderr(errors):
+            self.assertEqual(showrunners.registered_showrunners(self.notifier, deadline=began + 0.15), [])
+        self.assertEqual(errors.getvalue().count("lookup timed out; retained"), 1)
+        self.assertLess(monotonic() - began, 1.5)
+        self.assertTrue((self.notifier / "showrunner-builds" / "conf").exists())
+
+    def test_failed_lookup_keeps_healthy_rows_and_reserves_inspection_budget(self) -> None:
+        self.instance("showrunner-a-stalled", target="session:stalled-id", doc=self.doc)
+        self.instance("showrunner-b-healthy", target="session:healthy-id", doc=self.doc)
+        for failure in (TimeoutError, OSError):
+            clock = [100.0]
+            errors = io.StringIO()
+
+            def lookup(target: str, *, deadline: float) -> str:
+                if target == "session:stalled-id":
+                    clock[0] = deadline
+                    raise failure("fixture lookup failed; retained")
+                self.assertGreater(deadline, clock[0])
+                return "/fixture/healthy.sock"
+
+            with (self.subTest(failure=failure),
+                  mock.patch.object(showrunners, "monotonic", side_effect=lambda: clock[0]),
+                  mock.patch.object(showrunners, "socket_for", side_effect=lookup),
+                  mock.patch.object(showrunners, "_session_name", return_value="healthy"),
+                  redirect_stderr(errors)):
+                found = showrunners.registered_showrunners(self.notifier, deadline=210.0)
+                self.assertEqual([row["slug"] for row in found], ["b-healthy"])
+                self.assertEqual(found.exit_code, 1)
+                self.assertEqual(found.failures, (errors.getvalue().strip(),))
+                self.assertLess(clock[0], 210.0)
+                self.assertEqual(errors.getvalue().count("fixture lookup failed; retained"), 1)
+                self.assertTrue((self.notifier / "showrunner-a-stalled/conf").exists())
+
+    def test_commands_finish_healthy_output_before_reporting_lookup_failure(self) -> None:
+        self.showrunner("healthy")
+        self.instance("showrunner-stalled", target="session:stalled-id", doc=self.root / "stalled.md")
+        original = showrunners.socket_for
+
+        def lookup(target: str) -> str | None:
+            if target == "session:stalled-id":
+                raise OSError("fixture registry unreadable")
+            return original(target)
+
+        for command in (("list",), ("name", "healthy"), ("address", "healthy"), ("tree",)):
+            output = io.StringIO()
+            errors = io.StringIO()
+            with (self.subTest(command=command),
+                  mock.patch.dict(os.environ, self.environment()),
+                  mock.patch.multiple(showrunners, NOTIFIER_STATE_DIR=self.notifier,
+                                      SESSIONS_DIR=self.sessions, SESSIONS=self.sessions_script,
+                                      SHOWRUNNER_STATE_DIR=self.state),
+                  mock.patch.object(showrunners, "socket_for", side_effect=lookup),
+                  redirect_stdout(output), redirect_stderr(errors)):
+                self.assertEqual(showrunners.main(list(command)), 1)
+            self.assertIn("healthy", output.getvalue())
+            self.assertEqual(errors.getvalue().count("showrunners: skipping showrunner-stalled:"), 1)
+            self.assertNotIn("<not running>", output.getvalue())
+
+    def test_failed_name_and_address_lookups_do_not_claim_the_showrunner_stopped(self) -> None:
+        self.instance("showrunner-show", doc=self.doc)
+        for action in ("name", "address"):
+            output, errors = io.StringIO(), io.StringIO()
+            with (self.subTest(action=action),
+                  mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
+                  mock.patch.object(showrunners, "socket_for", side_effect=OSError("fixture registry unreadable")),
+                  redirect_stdout(output), redirect_stderr(errors)):
+                self.assertEqual(showrunners.main([action, "show"]), 1)
+            self.assertEqual(output.getvalue(), "")
+            self.assertEqual(errors.getvalue().count("fixture registry unreadable"), 1)
+            self.assertNotIn("not running", errors.getvalue())
+
+    def test_named_lookup_keeps_unknown_liveness_distinct_from_absence(self) -> None:
+        partial = showrunners.ShowrunnerDiscovery([], (
+            showrunners.ShowrunnerLookupFailure("missing", "fixture registry unreadable"),))
+        with (mock.patch.object(showrunners, "canonical_slug", return_value="missing"),
+              mock.patch.object(showrunners, "registered_showrunners", return_value=partial)):
+            with self.assertRaisesRegex(OSError, "fixture registry unreadable"):
+                _ = showrunners.named("missing")
+
+    def test_single_value_lookups_do_not_turn_failed_discovery_into_absence(self) -> None:
+        self.instance("showrunner-show", doc=self.doc)
+        for lookup in (showrunners.current_name, showrunners.current_address):
+            errors = io.StringIO()
+            with (self.subTest(lookup=lookup.__name__),
+                  mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
+                  mock.patch.object(showrunners, "socket_for", side_effect=OSError("fixture registry unreadable")),
+                  redirect_stderr(errors)):
+                with self.assertRaisesRegex(OSError, "fixture registry unreadable"):
+                    _ = lookup("show")
+            self.assertEqual(errors.getvalue().count("showrunners: skipping showrunner-show:"), 1)
+
+    def test_lookup_failure_values_keep_caller_reasons_separate_from_log_diagnostics(self) -> None:
+        self.instance("showrunner-kid", target="session:kid-session", doc=self.doc)
+        self.instance("showrunner-top", target="session:top-session", doc=self.root / "top.md")
+
+        def lookup(target: str) -> str:
+            raise OSError(f"cannot tell whether {target} is running: registry unreadable")
+
+        errors = io.StringIO()
+        with (mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
+              mock.patch.object(showrunners, "socket_for", side_effect=lookup),
+              redirect_stderr(errors)):
+            found = showrunners.registered_showrunners()
+            for slug in ("kid", "top"):
+                with self.assertRaises(OSError) as caught:
+                    _ = showrunners.current_address(slug)
+                self.assertEqual(str(caught.exception),
+                                 "cannot tell whether session:kid-session is running: registry unreadable; " +
+                                 "cannot tell whether session:top-session is running: registry unreadable")
+                self.assertNotIn("showrunners: skipping", str(caught.exception))
+        self.assertEqual([failure.production for failure in found.lookup_failures], ["kid", "top"])
+        self.assertEqual([failure.reason for failure in found.lookup_failures], [
+            "cannot tell whether session:kid-session is running: registry unreadable",
+            "cannot tell whether session:top-session is running: registry unreadable"])
+        self.assertEqual(found.exit_code, 1)
+        self.assertEqual(errors.getvalue().splitlines(), list(found.failures) * 3)
 
     def test_registered_showrunners_uses_supplied_records_without_session_discovery(self) -> None:
         self.instance("showrunner-builds", target="session:builds-id", doc=self.doc)
@@ -311,6 +510,20 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         self.assertIn("show\trenamed\t", self.successful("list"))
         self.assertEqual(self.successful("name", "show"), "renamed\n")
         self.assertFalse(self.config.exists())
+
+    def test_address_follows_current_session_after_clear_while_timer_keeps_fixed_owner(self) -> None:
+        self.showrunner("demo", running=False)
+        row = staff.by_path("demo")
+        assert row is not None
+        current = staff.native_id(fixture_runtime_id("showrunner-after-clear"))
+        _ = staff.update_current_session(row.current_session, current)
+        _ = self.record("still-demo", current)
+        configuration = self.notifier / "showrunner-demo" / "conf"
+        before = configuration.read_bytes(), configuration.stat().st_mtime_ns
+        self.assertEqual(self.successful("address", "demo"), f"uds:{self.root / (current + '.sock')}\n")
+        self.assertEqual(self.successful("name", "demo"), "still-demo\n")
+        self.assertEqual((configuration.read_bytes(), configuration.stat().st_mtime_ns), before)
+        self.assertIn("TARGET=session:" + row.id, configuration.read_text())
 
     def test_a_stopped_timer_still_names_its_showrunner(self) -> None:
         # A production on demand keeps its timer stopped, and the timer is still the showrunner's record.

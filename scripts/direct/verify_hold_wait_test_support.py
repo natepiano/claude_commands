@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.build_queue.admission_test_support import caller_admission
+
 import json
 import os
 import select
@@ -24,6 +26,7 @@ from scripts.build_hold import build_hold
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, CallRecord, CARGO_STUB
 from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -34,8 +37,6 @@ INVOKE = VERIFY.parent.parent / "lint" / "invoke.sh"
 
 CYCLE_ID = "c" * 32
 
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 VERIFY_WAITING = "; waiting (tests that can run on the Mac"
 
@@ -191,6 +192,7 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         self.runner_state: Path = self.root / "runner-state"
         self.cargo_events_path: Path = self.root / "cargo-events.jsonl"
         self.environment: dict[str, str] = self.fixture_environment.copy()
+        _ = caller_admission(self, self.root, self.environment)
 
     @override
     def stop_verify(self, process: subprocess.Popen[str]) -> None:

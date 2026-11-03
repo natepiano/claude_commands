@@ -1,5 +1,5 @@
 ---
-description: Make a named running session a unit director under this showrunner — stop it, resume it in herdr as this production's unit, and hand it a unit plan.
+description: Promote a session to unit director.
 ---
 
 **Usage:** `/showrunner:promote_unit <session name> [unit plan]`. Run it in a showrunner session during `/showrunner:produce`, with that command's state (`PRODUCTION_DOC`, `CHECKOUT`, `MERGE_BRANCH`, `LOG`, `ZONE`, `PROMPT_FILE`).
@@ -15,5 +15,5 @@ The other direction, a unit becoming the showrunner of its own production under 
 4. **Check.** Run `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <unit name> --resume <sessionId> --cwd <cwd> --plan <plan> --check`. On exit 2, stop and tell the user its line; the session remains running.
 5. **Stop it.** First note its pane: `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py where session <sessionId>` prints `herdr:agents:<pane>`. Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py type session <sessionId> /exit`. On exit 4, tell the user the session is at a prompt and nothing was typed. Relaunch only once `pid` is gone, since two processes on one session corrupt it. Then close its old tab: `herdr --session agents pane close <pane>`. Never stop a herdr server: `agents` holds every session.
 6. **Launch and record.** Run `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <unit name> --resume <sessionId> --cwd <cwd> --plan <plan>`. When step 2 found it was another showrunner's unit, tell that showrunner after the launch succeeds: the unit's row stays in its production doc until it marks the Plan cell `retired`.
-   The unit director launch takes its model and effort from `/agent production.director`.
+   The unit director launch takes its model and effort from `/default_models production.director`.
 7. **Tell the user** one line: `<unit name>` is now `<unit name>-unit`, and the place add_unit printed. If the name changed, name the original ListAgents name too.

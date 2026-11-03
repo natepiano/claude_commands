@@ -1,12 +1,12 @@
 ---
-description: Get a second opinion from a friend of your own kind — claude asks claude, codex asks codex — over a live two-way channel, with follow-ups and optional implementation
+description: Consult an agent of the same family.
 ---
 
 # ask_a_friend
 
 `$ARGUMENTS` — the question, or empty to ask the user for one.
 
-Consult a peer session of your own family about a design or debugging question, keep it alive for follow-ups, and optionally have it implement the answer. **This is a conversation, not a query.** The friend stays alive for as long as you need it, and you are expected to keep asking — clarify, push back, test an alternative, ask for the code — until you have a result you can stand behind. The user hears from you when the consultation has converged, not after the first reply. The friend is always like-to-like: a claude session launches a claude friend, a codex session a codex friend. That is the only pairing where messages flow both ways — claude reaches claude by `SendMessage`, codex reaches codex through `codex_mesh.py`, and a codex friend has no route back to a claude caller — so there is no family choice here. The registry enforces it (`[assignments] ask_a_friend=caller` in `config/agents.conf`), and `launch_friend.sh` reads the agent and effort for your family from the `[ask_a_friend.<family>]` row; `/agent ask_a_friend` shows both rows.
+Consult a peer session of your own family about a design or debugging question, keep it alive for follow-ups, and optionally have it implement the answer. **This is a conversation, not a query.** The friend stays alive for as long as you need it, and you are expected to keep asking — clarify, push back, test an alternative, ask for the code — until you have a result you can stand behind. The user hears from you when the consultation has converged, not after the first reply. The friend is always like-to-like: a claude session launches a claude friend, a codex session a codex friend. That is the only pairing where messages flow both ways — claude reaches claude by `SendMessage`, codex reaches codex through `codex_mesh.py`, and a codex friend has no route back to a claude caller — so there is no family choice here. The registry enforces it (`[assignments] ask_a_friend=caller` in `config/models.conf`), and `launch_friend.sh` reads the agent and effort for your family from the `[ask_a_friend.<family>]` row; `/default_models ask_a_friend` shows both rows.
 
 ## State
 

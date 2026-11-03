@@ -10,10 +10,12 @@ import subprocess
 import sys
 from typing import final
 from unittest import mock
+from scripts.lib.process_group import send_process_group
 from scripts.production import merge_gate
 from scripts.direct.wait_for_test_state import wait_until
-from scripts.production.merge_gate_test_support import TEST_HANG_GUARD_SECS, gate_suites
+from scripts.production.merge_gate_test_support import gate_suites
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
@@ -48,7 +50,7 @@ class MergeGateSignalsTests(GateSuitesFixture):
         finally:
             for job in launched:
                 if job.process.poll() is None:
-                    os.killpg(job.process.pid, signal.SIGKILL)
+                    send_process_group(job.process.pid, signal.SIGKILL)
                 _ = job.process.wait(timeout=TEST_HANG_GUARD_SECS)
                 job.output.close()
 
@@ -65,7 +67,7 @@ class MergeGateSignalsTests(GateSuitesFixture):
                        self.state, timeout=TEST_HANG_GUARD_SECS, processes=(process,))
             self.assertTrue((self.state / "module-held").exists())
             self.assertEqual(self.jobserver_tokens(), b"")
-            self.assertEqual(len(list(self.admission_directory.glob("*.reservation"))), 1)
+            self.assertEqual(len(self.admission.server.reservations), 1)
             process.send_signal(signal.SIGTERM)
             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(process.returncode, 1, output + errors)
@@ -79,7 +81,7 @@ class MergeGateSignalsTests(GateSuitesFixture):
             held = self.state / "module-held"
             if held.exists():
                 try:
-                    os.killpg(int(held.read_text()), signal.SIGKILL)
+                    send_process_group(int(held.read_text()), signal.SIGKILL)
                 except ProcessLookupError:
                     pass
 
@@ -105,7 +107,7 @@ class MergeGateSignalsTests(GateSuitesFixture):
                 process = subprocess.Popen(
                     [*self.gate_command(), "--repo", str(self.checkout), "--merge-branch", "integration",
                      "--unit-branch", "unit-phase", "--checkpoint", self.checkpoint, "--previous-checkpoint", self.base,
-                     "--unit", "fixture", "--phase", "repair", "--settings-blob", self.settings_blob,
+                     "--unit", "fixture", "--phase", "repair",
                      "--production", str(self.quiet_production), "--type-dirs", "scripts"], env=self.environment, stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 try:
@@ -127,7 +129,7 @@ class MergeGateSignalsTests(GateSuitesFixture):
                     _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                     if child:
                         try:
-                            os.killpg(child, signal.SIGKILL)
+                            send_process_group(child, signal.SIGKILL)
                         except ProcessLookupError:
                             pass
                     _ = self.git(self.checkout, "reset", "--keep", self.base)
@@ -144,7 +146,7 @@ class MergeGateSignalsTests(GateSuitesFixture):
         process = subprocess.Popen(
             [*self.gate_command(), "--repo", str(self.checkout), "--merge-branch", "integration",
              "--unit-branch", "unit-phase", "--checkpoint", self.checkpoint, "--previous-checkpoint", self.base,
-             "--unit", "fixture", "--phase", "repair", "--settings-blob", self.settings_blob,
+             "--unit", "fixture", "--phase", "repair",
              "--production", str(self.quiet_production)],
             env=self.environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         hook_pid = 0

@@ -1,9 +1,9 @@
 ---
-description: Send every showrunner on both machines a message at once. Args - `<message>`.
+description: Send a message to all showrunners.
 argument-hint: "<message>"
 ---
 
-`$ARGUMENTS` is the user's message. Send it as written, never rephrased, and show the output unchanged:
+Treat `$ARGUMENTS` as the user's message. Send it without changes. Show the command output without changes.
 
 `python3 ~/.claude/scripts/production/broadcast.py --from <your session name> --showrunners "From the user (via <your session name>, <HH:MM zone>): <message>"`
 

@@ -1,7 +1,7 @@
 """Tests for setting every unit director's effort and the launch row together."""
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 
 import contextlib
 import io
@@ -23,12 +23,12 @@ from fake_unit_host import HostedUnit
 from unit_effort import Ready, Skipped
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import agents_registry  # noqa: E402
-from scripts.production.staff_test_support import isolated_staff_file, unit_membership
+from scripts.lib import models_registry  # noqa: E402
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership, fixture_runtime_id
 
-RULE_TOP = "──── review-pool ──────────"
+RULE_TOP = "──── review ──────────"
 RULE = "───────────────────────────"
-STATUS = "  natedev | claude3 | review-pool | 189,709 | Opus 5.5 xhigh"
+STATUS = "  natedev | claude3 | review | 189,709 | Opus 5.5 xhigh"
 EMPTY = f"{RULE_TOP}\n\x1b[39m❯ \n{RULE}\n{STATUS}"
 
 
@@ -75,7 +75,7 @@ class UnitEffortTests(unittest.TestCase):
         self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.records = self.root / "sessions"
         self.records.mkdir()
-        self.registry = self.root / "agents.conf"
+        self.registry = self.root / "models.conf"
         _ = write_registry(self.registry, {'assignments': {'production': 'claude'}, 'production.claude': {'director': 'opus:xhigh'}, 'claude.agents': {'opus': 'low,medium,high,xhigh,max'}})
         _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": '{"sessions": []}'}}))
         synced = self.root / "catalog-sync-success"
@@ -87,24 +87,27 @@ class UnitEffortTests(unittest.TestCase):
             "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "conversation-pause"),
             "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
-            "NOTIFIER_SESSIONS_DIR": str(self.records), "AGENTS_CONFIG_FILE": str(self.registry),
+            "NOTIFIER_SESSIONS_DIR": str(self.records), "MODELS_CONFIG_FILE": str(self.registry),
             "CODEX_CONFIG_FILE": str(self.root / "codex.toml"),
             "CODEX_MODELS_CACHE_FILE": str(self.root / "models.json"),
             "CODEX_CATALOG_SYNC_STATE_FILE": str(synced)}))
         _ = self.enterContext(mock.patch.object(unit_lookup, "live_session", return_value=True))
         units = [
-            HostedUnit("review-pool", "w1:p1", {"SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "review-pool-unit"}, EMPTY),
+            HostedUnit("review", "w1:p1", {"SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "review-unit"}, EMPTY),
             HostedUnit("widget", "w2:p1", {"SHOWRUNNER_UNIT": "tool-based-ui", "SHOWRUNNER_UNIT_ID": "widget-unit"}, screen("❯ my draft")),
             HostedUnit("trunk", "w3:p1", {"SHOWRUNNER_UNIT": "tool-based-ui", "SHOWRUNNER_UNIT_ID": "trunk-unit"}, screen("❯ \x1b[2mtry this\x1b[22m")),
             HostedUnit("notes", "w4:p1", {}, EMPTY),
         ]
+        identities: dict[str, str] = {}
         for unit in units:
             if "SHOWRUNNER_UNIT_ID" in unit.marks:
-                _ = unit_membership(unit.marks["SHOWRUNNER_UNIT"], unit.marks["SHOWRUNNER_UNIT_ID"])
+                row = unit_membership(unit.marks["SHOWRUNNER_UNIT"], unit.marks["SHOWRUNNER_UNIT_ID"])
+                identities[unit.session] = row.id
         fake_unit_host.write(os.environ, units)
         for index, unit in enumerate(units):
             _ = (self.records / f"{unit.session}.json").write_text(json.dumps({
-                "pid": 991001 + index * 2, "sessionId": f"id-{unit.session}", "name": unit.session,
+                "pid": 991001 + index * 2,
+                "sessionId": identities.get(unit.session, fixture_runtime_id(unit.session)), "name": unit.session,
                 "messagingSocketPath": str(self.root / f"{unit.session}.sock"), "updatedAt": 1,
                 "tmux": ""}), encoding="utf-8")
 
@@ -118,14 +121,14 @@ class UnitEffortTests(unittest.TestCase):
         return [call for call in fake_unit_host.calls(os.environ) if call[2:4] == ["agent", "prompt"]]
 
     def director_row(self) -> str:
-        return next(line for line in agents_registry.registry_text(self.registry).splitlines()
+        return next(line for line in models_registry.registry_text(self.registry).splitlines()
                     if line.startswith("director="))
 
     def test_the_dry_run_sends_nothing_and_changes_nothing(self) -> None:
         code, out, _ = self.run_main("high", "--check")
         self.assertEqual(code, 0)
         self.assertEqual(out.splitlines(), [
-            "review-pool: would send",
+            "review: would send",
             "trunk: would send",
             "widget: skipped — a draft is in its input line",
             "registry: production.director would be opus:high (now opus:xhigh)",
@@ -138,7 +141,7 @@ class UnitEffortTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out.splitlines()[-1], "registry: production.director is now opus:high (was opus:xhigh)")
         self.assertIn("widget: skipped — a draft is in its input line", out)
-        self.assertEqual(self.sent(), [["--session", "review-pool", "agent", "prompt", "w1:p1", "/effort high"],
+        self.assertEqual(self.sent(), [["--session", "review", "agent", "prompt", "w1:p1", "/effort high"],
                                        ["--session", "trunk", "agent", "prompt", "w3:p1", "/effort high"]])
         self.assertEqual(self.director_row(), "director=opus:high")
 

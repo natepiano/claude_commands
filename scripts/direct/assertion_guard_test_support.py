@@ -2,24 +2,26 @@
 from __future__ import annotations
 
 import io
+import json
 import re
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
-from typing import ClassVar, NamedTuple, override
+from typing import ClassVar, NamedTuple, cast, override
 from unittest.mock import patch
 
 from scripts.direct import assertion_guard
-from scripts.production import showrunners
+from scripts.production import showrunners, staff
+from scripts.production.staff_test_support import FIXTURE_GIT, isolated_staff_file, recorded_showrunner, fixture_member
 from scripts.production.cli_fixture import invoke_cli
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 GUARD = Path(assertion_guard.__file__)
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 class ComparisonBases(NamedTuple):
     first: str
@@ -44,7 +46,10 @@ class GitRepositoryFixture(unittest.TestCase):
         self.environment = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull,
                             "GIT_CONFIG_NOSYSTEM": "1", "PYTHONDONTWRITEBYTECODE": "1",
                             "NOTIFIER_STATE_DIR": str(self.notifier_dir)}
-        _ = self.environment.pop("VERIFY_ASSERTION_BASE", None)
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        _ = (self.root / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
+        for name in ("VERIFY_ASSERTION_BASE", "UNIT_RUN_DIR", "UNIT_SESSION_DIR"):
+            _ = self.environment.pop(name, None)
         _ = self.git("init", "--bare", "-q", "-b", "main", str(self.root / "remote.git"))
         _ = self.git("init", "-q", "-b", "unit")
         _ = self.git("remote", "add", "origin", str(self.root / "remote.git"))
@@ -55,9 +60,9 @@ class GitRepositoryFixture(unittest.TestCase):
 
     def git(self, *arguments: str) -> str:
         result = subprocess.run(
-            ["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t",
+            [FIXTURE_GIT, "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t",
              "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *arguments],
-            env=self.environment, capture_output=True, text=True, check=True, timeout=5,
+            env=self.environment, capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
         )
         return result.stdout.strip()
 
@@ -73,10 +78,29 @@ class GitRepositoryFixture(unittest.TestCase):
         self.base = self.git("rev-parse", "HEAD")
         _ = self.git("push", "-q", "origin", "HEAD:refs/heads/unit")
 
+    def commit_local_changes(self, message: str) -> str:
+        _ = self.git("add", "--all")
+        _ = self.git("commit", "-q", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def merge_production_into_unit(self, fork: str, *, production_commits: int = 4) -> None:
+        _ = self.git("checkout", "-q", "-b", "builds", fork)
+        for index in range(production_commits):
+            _ = self.save("production.txt", f"production checkpoint {index}\n")
+            _ = self.git("add", "production.txt")
+            _ = self.git("commit", "-q", "-m", "advance production")
+        _ = self.git("push", "-q", "origin", "HEAD:refs/heads/builds")
+        _ = self.git("checkout", "-q", "unit")
+        _ = self.save("unit.txt", "local unit checkpoint\n")
+        _ = self.git("add", "unit.txt")
+        _ = self.git("commit", "-q", "-m", "advance unit without pushing")
+        _ = self.git("merge", "-q", "--no-ff", "origin/builds", "-m", "merge production into unit")
+        _ = self.register_production("builds")
+
     def guard(self, *arguments: str, stdin: str = "") -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, str(GUARD), "--repo", str(self.repo), *arguments],
-            env=self.environment, input=stdin, capture_output=True, text=True, check=False, timeout=5,
+            env=self.environment, input=stdin, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
 
     def change(self, path: str, before: str, after: str) -> None:
@@ -94,13 +118,62 @@ class GitRepositoryFixture(unittest.TestCase):
     def rust(self, assertion: str, name: str = "test_value") -> str:
         return f"#[test]\nfn {name}() {{\n    {assertion}\n}}\n"
 
+    def move_rust_assertion_to_test_file(self, before: str, after: str,
+                                       name: str = "test_value") -> None:
+        _ = self.save("render.rs", "mod tests {\n" + textwrap.indent(self.rust(before, name), "    ") + "}\n")
+        _ = self.save("render/tests/mod.rs", "// Destination for the moved test.\n")
+        self.commit_base()
+        _ = self.save("render.rs", "// Tests moved to render/tests/mod.rs.\n")
+        _ = self.save("render/tests/mod.rs", self.rust(after, name))
+
     def python(self, assertion: str, name: str = "test_value") -> str:
         return f"def {name}(self):\n    {assertion}\n"
+
+    def merge_removing_renamed_assertion(self, *, header_conflict: bool = False) -> str:
+        """Commit a merge removal after the unit published a test rename."""
+        padding = "".join(f"# Header detail {index}.\n" for index in range(40))
+        _ = self.save("test_value.py", "# Original header.\n" + padding
+                      + self.python("self.assertEqual(value, 1)"))
+        self.commit_base()
+        _ = self.git("branch", "rename-fork")
+        unit_header = "# Unit header.\n" if header_conflict else "# Original header.\n"
+        _ = self.save("test_value.py", unit_header + padding
+                      + self.python("self.assertEqual(value, 1)", "test_renamed"))
+        self.commit_base()
+        upstream = self.base
+        _ = self.git("checkout", "-q", "-b", "builds", "rename-fork")
+        if header_conflict:
+            _ = self.save("test_value.py", "# Production header.\n" + padding
+                          + self.python("self.assertEqual(value, 1)"))
+        _ = self.save("production.txt", "production work\n")
+        _ = self.commit_local_changes("advance production")
+        _ = self.git("push", "-q", "origin", "HEAD:refs/heads/builds")
+        _ = self.git("checkout", "-q", "unit")
+        if header_conflict:
+            with self.assertRaises(subprocess.CalledProcessError) as conflict:
+                _ = self.git("merge", "-q", "--no-ff", "--no-commit", "builds")
+            self.assertEqual(conflict.exception.returncode, 1)
+            self.assertIn("test_value.py", self.git("diff", "--name-only", "--diff-filter=U"))
+        else:
+            _ = self.git("merge", "-q", "--no-ff", "--no-commit", "builds")
+        _ = self.save("test_value.py", "# Resolved header.\n" + padding
+                      + self.python("pass", "test_renamed"))
+        _ = self.commit_local_changes("remove renamed assertion during merge")
+        _ = self.save("unit.txt", "later unrelated work\n")
+        _ = self.commit_local_changes("advance unit after merge")
+        _ = self.register_production("builds")
+        return upstream
 
 
     def register_production(self, merge_branch: str, *, worktree: str = "", branch: str = "unit",
                             slug: str = "fixture", status: str = "active", worktree_commentary: str = "") -> Path:
-        doc = self.root / f"{slug}-production.md"
+        production_tree = self.root / f"{slug}-owner"
+        if not production_tree.exists():
+            _ = self.git("worktree", "add", "--detach", str(production_tree), "HEAD")
+        if not self.git("branch", "--list", merge_branch):
+            _ = self.git("branch", merge_branch, "HEAD")
+        _ = self.git("-C", str(production_tree), "symbolic-ref", "HEAD", f"refs/heads/{merge_branch}")
+        doc = production_tree / f"{slug}-production.md"
         worktree_cell = f"`{worktree or self.repo}`" + (f" {worktree_commentary}" if worktree_commentary else "")
         _ = doc.write_text(
             f"- **Merge branch:** `{merge_branch}`\n\n## Units\n\n"
@@ -110,6 +183,20 @@ class GitRepositoryFixture(unittest.TestCase):
         timer.mkdir(exist_ok=True)
         _ = (timer / "conf").write_text(
             f"TARGET=session:fixture\nCHECK=production_check.sh {doc}\n", encoding="utf-8")
+        owner = recorded_showrunner(slug + "-owner", doc)
+        location = Path(worktree or str(self.repo)).expanduser().resolve()
+        if branch == self.git("branch", "--show-current"):
+            location = self.repo.resolve()
+        if worktree.startswith("removed"):
+            location = self.repo
+        removed = status.startswith(("retired", "removed")) or "retired" in worktree_commentary or worktree.startswith("removed")
+        tree = staff.RemovedWorktree("natedev", location) if removed else staff.PresentWorktree("natedev", location)
+        member = fixture_member("unit", name=slug + "-member", parent=owner.id)
+        if not removed:
+            for previous in staff.initial_snapshot().find(kind="unit"):
+                if previous.id != member.id and previous.worktree == tree:
+                    _ = staff.set_worktree(previous.id, staff.RemovedWorktree("natedev", location), expected=previous.worktree)
+        _ = staff.set_worktree(member.id, tree, expected=member.worktree)
         return doc
 
 
@@ -171,11 +258,12 @@ class SeededGitRepositoryFixture(GitRepositoryFixture):
         self.notifier_dir = self.root / "notifier"
         shutil.rmtree(self.root)
         _ = shutil.copytree(self.seed, self.root)
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"STAFF_FILE": self.environment["STAFF_FILE"]})))
 
     @override
     def git(self, *arguments: str) -> str:
         result = subprocess.run(
-            ["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t",
+            [FIXTURE_GIT, "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t",
              "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *arguments],
             env=self.environment, capture_output=True, text=True, check=True,
             timeout=TEST_HANG_GUARD_SECS,
@@ -213,6 +301,21 @@ class AssertionFindingFixture(SeededGitRepositoryFixture):
         self.assertEqual(result.stdout.strip(), CLEAN)
         self.assertEqual(result.stderr, "")
 
+    def assert_blocking_tests(self, result: subprocess.CompletedProcess[str],
+                              expected: dict[str, str]) -> None:
+        self.assert_blocking_test_counts(result, {name: (kind, 1) for name, kind in expected.items()})
+
+    def assert_blocking_test_counts(self, result: subprocess.CompletedProcess[str],
+                                    expected: dict[str, tuple[str, int]]) -> None:
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        findings = [line for line in result.stdout.splitlines()
+                    if not line.startswith("assertion guard:")]
+        total = sum(count for _, count in expected.values())
+        self.assertEqual(len(findings), total, result.stdout)
+        for test, (kind, count) in expected.items():
+            self.assertEqual(sum(f" {test} {kind}:" in line for line in findings), count, result.stdout)
+        self.assertIn(f"assertion guard: {total} blocking;", result.stdout)
+        self.assertEqual(result.stderr, "")
 
     def assert_finding(self, result: subprocess.CompletedProcess[str], path: str, kind: str,
                        test: str = "test_value", status: int = 1) -> str:

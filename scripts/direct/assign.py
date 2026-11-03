@@ -20,12 +20,15 @@ from types import FrameType
 from typing import NoReturn, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.agents import worker_lifecycle
 from scripts.lib.process_failure import failure_detail
 from scripts.agents import codex_mesh
-from scripts.direct import workers
+from scripts.direct import phase_reservation, workers
 from scripts.direct.worker_state import worker_claim_lock, worker_record_path
 from scripts.astra import design_roles
-from scripts.lib import unit_runs
+from scripts.production import staff, worker_admission
+from scripts.lib import conf, unit_runs
+from scripts.lint import style_review
 from scripts.usage.agents_log import LENSES
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -53,10 +56,13 @@ class Arguments(argparse.Namespace):
     paths: str = ""
     phase: str = ""
     early_ready: str = ""
+    style_since: str = ""
+    style_until: str = ""
     session_dir: str = ""
     prompt: str = ""
     cwd: str = ""
     lens: str = ""
+    diff: str = ""
     pass_number: int = 1
     image: list[str] = []
 
@@ -70,16 +76,12 @@ def text(value: object) -> str:
 
 
 def read_object(path: Path) -> dict[str, object]:
-    try:
-        return object_map(cast(object, json.loads(path.read_text())))
-    except (OSError, ValueError):
-        return {}
+    return worker_lifecycle.read_worker_state(path)
 
 
 def read_roster(run: Path, name: str) -> dict[str, object]:
-    with (run / "mesh_roster.json").open() as handle:
-        fcntl.flock(handle, fcntl.LOCK_SH)
-        return object_map(object_map(cast(object, json.load(handle))).get(name))
+    with worker_lifecycle.locked_state(run / "mesh_roster.json", mode=fcntl.LOCK_SH) as state:
+        return object_map(state.read_object().get(name))
 
 
 def refuse(message: str) -> NoReturn:
@@ -104,11 +106,13 @@ def parse_arguments() -> Arguments:
     choice = parser.add_mutually_exclusive_group()
     _ = choice.add_argument("--to", default="")
     _ = choice.add_argument("--new-worker", default="")
-    for option in ("model", "effort", "summary", "fix-cause", "paths", "phase", "early-ready", "session-dir"):
+    for option in ("model", "effort", "summary", "fix-cause", "paths", "phase", "early-ready", "session-dir",
+                   "style-since", "style-until"):
         _ = parser.add_argument("--" + option, default="")
     _ = parser.add_argument("--prompt", required=True)
     _ = parser.add_argument("--cwd", default=str(Path.cwd()))
     _ = parser.add_argument("--lens", choices=LENSES, default="")
+    _ = parser.add_argument("--diff", default="", help="saved phase diff for the simplify lens")
     _ = parser.add_argument("--pass", dest="pass_number", type=int, default=1)
     _ = parser.add_argument("--image", action="append", default=[])
     args = parser.parse_args(namespace=Arguments())
@@ -121,6 +125,16 @@ def parse_arguments() -> Arguments:
         parser.error("--pass must be positive")
     if args.early_ready and args.role != "review":
         parser.error("--early-ready requires review")
+    if args.style_since and (args.role != "review" or args.early_ready):
+        parser.error("--style-since requires a final-diff review")
+    if args.style_until and not args.style_since:
+        parser.error("--style-until requires --style-since")
+    if args.lens == "simplify" and (args.role != "review" or args.early_ready or args.style_since):
+        parser.error("simplify requires a broad review of the completed phase diff")
+    if args.lens == "simplify" and not args.diff:
+        parser.error("--diff is required with --lens simplify")
+    if args.diff and args.lens != "simplify":
+        parser.error("--diff requires --lens simplify")
     return args
 
 
@@ -146,9 +160,10 @@ def authorized_paths(args: Arguments, cwd: Path) -> list[str]:
 
 
 def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -> tuple[Path, str]:
+    director = staff.runtime_id()
     session = args.session_dir
     if not session:
-        marker = unit_runs.marker(os.environ.get("CLAUDE_CODE_SESSION_ID", ""), os.environ.get("UNIT_ACTIVE_DIR"))
+        marker = unit_runs.marker(director, os.environ.get("UNIT_ACTIVE_DIR"))
         if marker.is_file():
             session = marker.read_text().strip()
         elif unit_runs.environ("RUN_DIR"):
@@ -166,7 +181,7 @@ def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -
     state = read_object(state_path)
     stored_phase = object_map(state.get("phase"))
     phase = args.phase or text(stored_phase.get("id")) or "1"
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", phase) or phase in (".", ".."):
+    if phase != "ad hoc" and (not re.fullmatch(r"[A-Za-z0-9_.-]+", phase) or phase in (".", "..")):
         refuse(f"invalid phase id: {phase}")
     if codex_mesh.finished_run_status(str(run)) or not stored_phase:
         identity = next((match for line in prompt.read_text().splitlines()
@@ -174,7 +189,7 @@ def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -
         title = identity.group(2).strip() if identity else text(stored_phase.get("title")) or "Assignment"
         _ = call([PYTHON, PROGRESS, "start-phase", "--session-dir", str(run), "--phase-id", phase,
                   "--phase-title", title], env)
-    unit_runs.record_director(run, os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+    unit_runs.record_director(run, director)
     return run, phase
 
 
@@ -187,7 +202,7 @@ if [[ -n "$3" || -n "$4" ]]; then
  _agents_validate_pair "direct.$2" "$AGENT_FAMILY" "$pair" || exit 2
 fi
 printf '%s\\n' "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "${AGENT_SERVICE_TIER:-default}"
-''', "assign", str(SCRIPTS / "../agents/agents_config.sh"), role, args.model, args.effort], env, capture=True)
+''', "assign", str(SCRIPTS / "../agents/models_config.sh"), role, args.model, args.effort], env, capture=True)
     family, model, effort, tier = result.stdout.strip().splitlines()[-4:]
     if family != "codex":
         print("assign.sh: persistent unit workers require a Codex assignment", file=sys.stderr)
@@ -202,6 +217,18 @@ class WorkerClaim:
     slot: str
     model: str
     effort: str
+
+
+@dataclass
+class NoStyleAssignment:
+    """This dispatch has no phase style result to capture."""
+
+
+@dataclass
+class StyleAssignment:
+    directory: Path
+    summary: Path
+    captured: bool = False
 
 
 @dataclass
@@ -228,6 +255,13 @@ class Dispatch:
     stage_errors: list[str] = field(default_factory=list)
     stage_message: str = ""
     started_at: float = field(default_factory=time.time)
+    style_assignment: NoStyleAssignment | StyleAssignment = field(default_factory=NoStyleAssignment)
+
+    def capture_style(self, code: int) -> None:
+        assignment = self.style_assignment
+        if isinstance(assignment, StyleAssignment) and not assignment.captured:
+            style_review.finish(assignment.directory, assignment.summary, code)
+            assignment.captured = True
 
     def mesh_call(self, verb: str, *options: str, capture: bool = False,
                   check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -328,8 +362,9 @@ class Dispatch:
                 if not record.get("adopted_to") and record.get("thread_id"):
                     identity = read_object(self.claim.identity_path)
                     identity["worker_id"] = record["thread_id"]
-                    _ = self.claim.identity_path.write_text(json.dumps(identity))
+                    worker_lifecycle.WorkerStateFile(self.claim.identity_path).publish(json.dumps(identity))
         workers.release_allocation(self.run, self.worker, self.reservation)
+        self.capture_style(1)  # An interrupted dispatch never settles an assigned style pass.
 
 
 def claim_worker(dispatch: Dispatch) -> WorkerClaim:
@@ -348,7 +383,7 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
         if (identity and identity != expected) or not record.get("thread_id"):
             refuse(f"{dispatch.worker} has no matching durable worker identity for slot {slot}")
         if not identity:
-            _ = identity_path.write_text(json.dumps(expected))
+            worker_lifecycle.WorkerStateFile(identity_path).publish(json.dumps(expected))
         claim_path = dispatch.run / f"impl_claim_{slot}.json"
         previous_claim = read_object(claim_path)
         pid = previous_claim.get("pid")
@@ -377,11 +412,10 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
             refuse(f"{dispatch.worker}: TransferringRole; use its destination holder")
         if record.get("held_design_id"):
             refuse(f"{dispatch.worker}: held roles resume through design_roles.py")
-        config = Path(os.environ.get("UNIT_CONFIG", str(Path.home() / ".claude/config/direct.conf")))
-        match = re.search(r"^UNIT_COMPACT_ABOVE_TOKENS=(\d+)", config.read_text(), re.M) if config.is_file() else None
-        threshold = int(match.group(1)) if match else 0
-        if threshold <= 0:
-            refuse(f"UNIT_COMPACT_ABOVE_TOKENS in {config} must be a positive integer")
+        try:
+            threshold = conf.read("direct").whole("UNIT_COMPACT_ABOVE_TOKENS")
+        except conf.Unusable as error:
+            refuse(str(error))
         context_tokens = record.get("context_tokens")
         if isinstance(context_tokens, int) and context_tokens > threshold:
             compact = dispatch.mesh_call("compact", capture=True, check=False)
@@ -401,8 +435,8 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
         if record.get("status") == "ended":
             _ = dispatch.mesh_call("reopen", capture=True)
         dispatch.claim_follow()
-        _ = claim_path.write_text(json.dumps({"pid": os.getpid(), "worker": dispatch.worker, "turn_id": ""}))
-        # Each turn runs at the caller's model:effort (agents.conf default or explicit override).
+        worker_lifecycle.WorkerStateFile(claim_path).publish(json.dumps({"pid": os.getpid(), "worker": dispatch.worker, "turn_id": ""}))
+        # Each turn runs at the caller's model:effort (models.conf default or explicit override).
         return WorkerClaim(identity_path, slot, dispatch.model, dispatch.effort)
 
 
@@ -473,6 +507,7 @@ def settle_dispatch(dispatch: Dispatch, code: int, completed: bool, shown: str,
         code = 1
     if not summary.read_text().strip() and reply.exists():
         _ = summary.write_text(reply.read_text())
+    dispatch.capture_style(0 if completed else code or 1)
     record_review(dispatch, completed, summary)
     if shown not in summary.read_text():
         _ = summary.write_text(shown + "\n\n" + summary.read_text())
@@ -491,7 +526,7 @@ def settle_dispatch(dispatch: Dispatch, code: int, completed: bool, shown: str,
 def execute(dispatch: Dispatch, paths: list[str]) -> int:
     shown = workers.shown_name(dispatch.run, dispatch.worker)
     args = dispatch.args
-    phase_dir = dispatch.run / "phases" / dispatch.phase
+    phase_dir = phase_reservation.phase_directory(dispatch.run, dispatch.phase)
     phase_dir.mkdir(parents=True, exist_ok=True)
     suffix = "" if dispatch.role != "review" else f"_{args.lens}_{args.pass_number}" if args.lens else f"_{args.pass_number}"
     status = phase_dir / f"{dispatch.role}_status{suffix}"
@@ -512,15 +547,27 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
     dispatch.model, dispatch.effort = dispatch.claim.model, dispatch.claim.effort
     shown = workers.shown_name(dispatch.run, dispatch.worker)
     with (phase_dir / "dispatch.lock").open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_EX)
         numbers = [int(path.stem.split("_")[1]) for path in phase_dir.glob("dispatch_*_paths.json")]
         number = max(numbers, default=0) + 1
         _ = (phase_dir / f"dispatch_{number}_paths.json").write_text(json.dumps(
             {"worker": dispatch.worker, "round": number, "paths": paths}) + "\n")
     message = phase_dir / f"dispatch_{number}_prompt.txt"
     receipts = phase_dir / f"dispatch_{number}_submissions.jsonl"
+    output_instruction = ("Return the complete review result in your final reply; the runner saves the artifacts."
+                          if dispatch.role == "review" else f"As your last act, write your summary to {summary}.")
     _ = message.write_text(dispatch.prompt.read_text() + "\n" + RULES +
-                           f"\nWorker: {shown}\nAs your last act, write your summary to {summary}.\n")
+                           f"\nWorker: {shown}\n{output_instruction}\n")
+    if args.style_since:
+        end = style_review.CommitEnd(args.style_until) if args.style_until else style_review.WORKING_TREE
+        try:
+            directory = style_review.start(dispatch.cwd, args.style_since, phase_dir, message, f"dispatch-{number}", end)
+        except ValueError as error:
+            print(f"assign: {error}", file=sys.stderr)
+            return settle_dispatch(dispatch, 2, False, shown, status, summary, reply)
+        dispatch.style_assignment = StyleAssignment(directory, summary)
+        message = directory / "prompt.md"
+    dispatch.prompt = message
     dispatch.board(dispatch.claim.slot, "register", f"{shown}; mesh={dispatch.worker}; role={dispatch.role}; status in {status}")
     _ = call(["bash", str(SCRIPTS / "../agents/heartbeat.sh"), str(dispatch.run / "heartbeat.log"),
               "header", shown, f"{shown}: {dispatch.role}"], dispatch.env, check=False)
@@ -565,9 +612,8 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
                     code = 1
                 else:
                     pending_path = dispatch.run / f"{dispatch.worker}.pending.json"
-                    with pending_path.open() as inbox:
-                        fcntl.flock(inbox, fcntl.LOCK_SH)
-                        pending = object_map(cast(object, json.load(inbox)))
+                    with worker_lifecycle.locked_state(pending_path, mode=fcntl.LOCK_SH) as inbox:
+                        pending = inbox.read_object()
                     needs_follow = dispatch.stage_message in cast(list[object], pending.get("messages", []))
                     if needs_follow:
                         dispatch.claim_follow()
@@ -588,6 +634,20 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
     return settle_dispatch(dispatch, code, completed, shown, status, summary, reply)
 
 
+def execute_simplify(args: Arguments, run: Path, phase: str, cwd: Path, source_prompt: Path,
+                     env: dict[str, str]) -> int:
+    if conf.read("direct").text("SIMPLIFY_LENS") == "off":
+        print("simplify: off")
+        return 0
+    if args.pass_number != 1:
+        print("simplify: skipped; broad review only")
+        return 0
+    command = ["bash", str(SCRIPTS / "review.sh"), "--phase", phase, "--diff", args.diff,
+               "--summary", str(Path(args.summary).resolve()) if args.summary else "", str(run), str(cwd),
+               str(source_prompt), "simplify", "simplify review", "reviewing the completed phase diff", "1", "simplify"]
+    os.execvpe(command[0], command, env)
+
+
 def main() -> int:
     args = parse_arguments()
     cwd, prompt = Path(args.cwd).expanduser().resolve(), Path(args.prompt).expanduser().resolve()
@@ -596,6 +656,8 @@ def main() -> int:
     paths = authorized_paths(args, cwd)
     env = dict(os.environ)
     run, phase = prepare_run(args, cwd, prompt, env)
+    if args.lens == "simplify":
+        return execute_simplify(args, run, phase, cwd, prompt, env)
     role = "impl" if args.role == "implement" else args.role
     check = [PYTHON, PROGRESS, "check-launch", "--session-dir", str(run), "--pass-kind", role,
              "--phase-id", phase, "--prompt-file", str(prompt), "--fix-cause", args.fix_cause]
@@ -618,6 +680,12 @@ def main() -> int:
             return 3
         worker = resolved.stdout.strip()
         reservation = workers.allocation_for_follow(run, worker)
+    try:
+        _ = worker_admission.admit(worker, run, role=role)
+    except ValueError as error:
+        workers.release_allocation(run, worker, reservation)
+        print(str(error), file=sys.stderr)
+        return 2
     env["UNIT_TEAM_ROLE"] = worker
     env["UNIT_PASS_OWNER"] = "launcher"
     dispatch = Dispatch(args, run, cwd, prompt, phase, role, worker, family, model, effort, tier, env, reservation)

@@ -26,7 +26,7 @@ def order_check(model: QueueModel, position: int) -> Line:
     if isinstance(reason, gate.BehindOlderFit):
         return check_line(False, "queue order      " + reason_phrase(reason, model.reading.view.waiting))
     if isinstance(reason, gate.BehindHead) and isinstance(model.facts, head_facts.HeadFacts):
-        return check_line(False, "#1's turn      " + head_facts.order_text(model.facts, model.zone, include_record=False))
+        return check_line(False, "#1's turn      " + head_facts.order_text(model.facts, model.zone))
     return check_line(True, "queue order")
 
 
@@ -45,8 +45,17 @@ def render_card(model: QueueModel, matches: Sequence[int], columns: int) -> list
              Span(f" · {step.step} · {step.need / gate.GIB:.1f} GiB", bold=True)))
         add((Span(f"Folder {step.folder}. Waited {age(step.since, model.reading.explanation.now)} min (since {clock(model, step.since)}). "
                   + (f"Likely start {start_text(model, position, clock_time=True)}." if estimate_minutes(model, position) else "Likely start —.")),))
+        priority = head_facts.priority_text(model.reading.explanation.priority)
+        if priority:
+            add((Span(priority),))
         add()
         checks = step_checks(model, position)
+        if position == 1 and isinstance(checks, gate.HeadExplanation) and checks.decision.state == "hold":
+            add((Span(f"Free {checks.free.available / gate.GIB:.1f} GiB; "
+                + f"reserve {checks.free.reserve / gate.GIB:.1f} GiB; need {checks.free.need / gate.GIB:.1f} GiB."),))
+        for running in model.reading.view.running:
+            if isinstance(running.measured, gate.UnownedSliceMemory):
+                add((Span(f"{running.measured.owner}: {running.measured.bytes / gate.GIB:.1f} GiB (unowned)."),))
         if (isinstance(step.reason, gate.ReadyForAdmission)
                 or isinstance(checks, gate.HeadExplanation) and checks.decision.state == "admit"):
             add((Span("Next? Yes. It starts at the next check.", bold=True),))
@@ -66,7 +75,7 @@ def render_card(model: QueueModel, matches: Sequence[int], columns: int) -> list
                     later = ahead.since > step.since
                     minutes = age(step.since, ahead.since) if later else age(ahead.since, step.since)
                     detail = f"joined {clock(model, ahead.since)}, {minutes} min {'after' if later else 'before'} it"
-                add((Span(f"  #{place} "), Span("↑  " if is_moved(model, place) else "   ", "warning"),
+                add((Span(f"  #{place} "), Span("↑  " if is_moved(model, place) else "   "),
                      *name_spans(ahead, model.labels), Span(f" {ahead.step}  {detail}")), 6)
             if position > 6:
                 add((Span(f"  and {position - 6} more"),))
@@ -77,6 +86,9 @@ def render_card(model: QueueModel, matches: Sequence[int], columns: int) -> list
         add((Span("Waits on", bold=True),))
         if not isinstance(checks, gate.ReadingUnavailable):
             add((Span("  "), *order_check(model, position)), 4)
+        if isinstance(step.reason, gate.EstimateExpired):
+            add((Span("  "), *check_line(False, "estimate       expired at "
+                + clock(model, step.reason.estimated_at) + "; refreshes on its next poll")), 4)
         for check in check_lines(checks, model, pressure_first=False):
             add((Span("  "), *check), 4)
         if estimate_minutes(model, position):

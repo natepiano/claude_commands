@@ -1,5 +1,5 @@
 ---
-description: Suggest and create a git worktree and branch, and copy local settings into it.
+description: Create a Git worktree and branch.
 ---
 
 Use TodoWrite tool to create initial todos:

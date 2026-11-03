@@ -61,8 +61,8 @@ creates carries the tag from its first moment, and .rustc_info.json may come
 only when the first build ends, or never. Cargo's registry carries the same
 tag with no build tree. A folder made before a build with
 CARGO_CACHE_RUSTC_INFO=0 has neither and stays unseen. Orphaned files go first
-from every idle target. Then the least recently used idle target loses
-output, then by build-unit use within each target. Recent targets are not
+from every idle target. Then whole takes and build-unit batches share target
+last-use order, oldest first, then build-unit use within each target. Recent targets are not
 held back. Each scan under the floor records its shortfall and idle targets.
 On 2026-10-08 the tag rule found 76 targets where
 .rustc_info.json alone found 41: 31 finished scratch targets carried only the
@@ -170,13 +170,15 @@ from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass, field
+from copy import copy
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypeGuard, TypedDict, cast, overload
+from typing import TYPE_CHECKING, Literal, TypeGuard, TypedDict, cast, overload, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import conf
 from process_failure import failure_detail
 from user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
@@ -185,29 +187,24 @@ if TYPE_CHECKING:
     from ..lib import scratch
     from ..lib.atomic_file import write_text_atomic
     from ..buildlog import record, store
-    from .config_values import config_values as config_values
     from ..notify.push_texts import RenderedPush
     from ..notify import review
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import tmp_sweep
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.copies import copies
+    from scripts.lint import tmp_sweep
     import scratch
     from atomic_file import write_text_atomic
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
     import record
     import store
-    from config_values import config_values as config_values
 
 GIB = 1 << 30
 MIB = 1 << 20
 DAY_SECONDS = 86_400
-DEFAULT_BUDGET_GIB = 24.0
 BUDGET_ENV = "LINT_SWEEP_BUDGET_GIB"
 BUDGET_KEY = "sweep_budget_gib"
-CONFIG_ENV = "LINT_CONFIG_FILE"
-DEFAULT_CONFIG = os.path.join("~", ".claude", "config", "lint.conf")
 GIT_DIR = ".git"
 GITDIR_PREFIX = "gitdir:"
 COMMONDIR_FILE = "commondir"
@@ -243,7 +240,7 @@ DEP_INFO_HEAD = 4096
 MAX_TREE_DEPTH = 3
 FLOOR_KEY = "sweep_free_floor_gib"
 RECENT_KEY = "recent_minutes"
-DEFAULT_RECENT_MINUTES = 60.0
+FLOOR_LOCK_ALERT_KEY = "floor_lock_alert_minutes"
 FLOOR_ONLY_FLAG = "--floor-only"
 USE_STAMP = scratch.USE_STAMP
 # Every cargo target directory on natedev was under one of these (2026-10-21). ~/.cache came in when
@@ -251,10 +248,9 @@ USE_STAMP = scratch.USE_STAMP
 # CARGO_TARGET_DIR, had stayed unseen. ~/.cache/sccache holds no .rustc_info.json and no cargo
 # cache tag, so is_cargo_target never takes it.
 FLOOR_ROOTS = ("~/rust", "~/.local/state", "~/.cache", "/tmp")
-FLOOR_LOCK = os.path.join("~", ".local", "state", "lint-sweep", "floor.lock")
 # Claude Code keeps each session's scratch (scratchpad/, tasks/) in <root>/<project>/<session id>/,
 # where <project> is the session's working directory with every / as -.
-FLOOR_STATE_ENV = "LINT_SWEEP_STATE_DIR"
+FLOOR_STATE_ENV = tmp_sweep.STATE_ENV
 BUILDLOG_DIR_ENV = "BUILDLOG_DIR"
 CI_TARGETS = ("/var/lib/hana-ci/hana-linux-1", "/var/lib/hana-ci/hana-linux-2")
 GROWTH_WINDOW_SECONDS = 30 * 60
@@ -321,17 +317,42 @@ class Group:
     observed: dict[str, OutputVersion] = field(default_factory=dict)
 
 
+@dataclass
+class WholeTargetTake:
+    """Observed contents of a target with no build units, leaving its locks and nested targets."""
+
+    target: str
+    entries: list[str] = field(default_factory=list)
+    inodes: list[InodeKey] = field(default_factory=list)
+    observed: dict[str, OutputVersion] = field(default_factory=dict)
+    retained: set[str] = field(default_factory=set)
+
+
+FloorTake = Group | WholeTargetTake
+
+
 # Sort key for build units; the unit with the smallest key is removed first.
 RemovalOrder = Callable[[Group], tuple[float, ...]]
 
 
+class DiscoveredTargetRoots(list[str]):
+    """Roots to scan, with all target roots from this pass's discovery."""
+
+    def __init__(self, roots: Sequence[str], discovered: Sequence[str]) -> None:
+        super().__init__(roots)
+        self.discovered: tuple[str, ...] = tuple(discovered)
+
+
 @dataclass
 class Scan:
+    discovered_targets: tuple[str, ...] = ()
     blocks: dict[InodeKey, int] = field(default_factory=dict)
     links: dict[InodeKey, int] = field(default_factory=dict)
     groups: list[Group] = field(default_factory=list)
     orphans: list[Group] = field(default_factory=list)
     target_bytes: dict[str, int] = field(default_factory=dict)
+    target_links: dict[str, dict[InodeKey, int]] = field(default_factory=dict)
+    whole_targets: list[WholeTargetTake] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -348,6 +369,34 @@ UNKNOWN_HELD_ROOTS = UnknownHeldRoots()
 
 
 @dataclass(frozen=True)
+class KnownFloorLockHolder:
+    pid: int
+    started_at: float
+    command: str
+
+
+@dataclass(frozen=True)
+class UnreadableFloorLockHolder:
+    pid: int
+
+
+@dataclass(frozen=True)
+class NoFloorLockHolder:
+    """No lock holder was observed."""
+
+
+@dataclass(frozen=True)
+class DeliveredFloorLockAlert:
+    pid: int
+    started_at: float
+
+
+@dataclass(frozen=True)
+class NoFloorLockAlert:
+    """No floor lock hold has been reported."""
+
+
+@dataclass(frozen=True)
 class FloorRecord:
     measured_at: float
     free_bytes: int
@@ -355,6 +404,7 @@ class FloorRecord:
     alert_history: NoDeliveredAlert | DeliveredAlert
     push_history: NoDeliveredAlert | DeliveredAlert
     held_roots: UnknownHeldRoots | KnownHeldRoots = UNKNOWN_HELD_ROOTS
+    lock_alert: DeliveredFloorLockAlert | NoFloorLockAlert = NoFloorLockAlert()
 
 
 @dataclass(frozen=True)
@@ -425,20 +475,32 @@ class FloorAlertChannels(Enum):
     NATEDEV_AND_PHONE = "natedev_and_phone"
 
 
-def unit_hash(name: str) -> str | None:
-    """The unit hash cargo appends to a per-unit file or directory name."""
-    stem = name.split(".", 1)[0]
+@dataclass(frozen=True)
+class UnitHash:
+    value: str
+
+
+@dataclass(frozen=True)
+class NoUnitHash:
+    pass
+
+
+def unit_hash(name: str) -> UnitHash | NoUnitHash:
+    """The unit hash, including a linker's hidden temporary output."""
+    source = name[1:] if name.startswith(".") and name.rpartition(".")[2].isdigit() else name
+    stem = source.split(".", 1)[0]
     _, separator, suffix = stem.rpartition("-")
     if not separator or len(suffix) != HASH_LENGTH or not set(suffix) <= HEX_DIGITS:
-        return None
-    return suffix
+        return NoUnitHash()
+    return UnitHash(suffix)
 
 
 def copied_name(name: str) -> str:
-    """name without its unit hash, '-' read as '_': cargo names a copy after
-    its target, hyphens kept, and the unit's own file after the crate."""
-    stem, dot, rest = name.partition(".")
-    if unit_hash(name) is not None:
+    """Name of the output without Cargo's unit hash."""
+    digest = unit_hash(name)
+    source = name.removeprefix(".") if isinstance(digest, UnitHash) else name
+    stem, dot, rest = source.partition(".")
+    if isinstance(digest, UnitHash):
         stem = stem[: -HASH_LENGTH - 1]
     return (stem + dot + rest).replace("-", "_")
 
@@ -473,6 +535,8 @@ def build_trees(root: str) -> list[str]:
     for _ in range(MAX_TREE_DEPTH + 1):
         next_frontier: list[str] = []
         for directory in frontier:
+            if directory != root and is_cargo_target(directory):
+                continue
             if os.path.isdir(os.path.join(directory, FINGERPRINT_DIR)):
                 trees.append(directory)
                 continue
@@ -602,18 +666,76 @@ class FloorHolder:
     session: str | None
 
 
-def mapped_files(maps: bytes, prefix: str) -> list[str]:
-    """Each file under prefix that a /proc/<pid>/maps listing maps."""
-    # A maps line ends in the mapped file's path, after a space.
-    needle = b" " + os.fsencode(prefix)
-    files: list[str] = []
-    start = maps.find(needle)
-    while start >= 0:
-        end = maps.find(b"\n", start)
-        end = len(maps) if end < 0 else end
-        files.append(maps[start + 1:end].decode(errors="replace"))
-        start = maps.find(needle, end)
-    return files
+@dataclass(frozen=True)
+class TargetOwner:
+    target: str
+
+
+@dataclass(frozen=True)
+class OutsideTargets:
+    """No scanned target owns this path."""
+
+
+class TargetOwnerIndex(Sequence[str]):
+    """One pass's resolved targets and memo of the deepest owner of each path."""
+
+    def __init__(self, targets: Sequence[str]) -> None:
+        self.targets: tuple[str, ...] = tuple(targets)
+        self.checked_targets: tuple[str, ...] = self.targets
+        self.rechecking: bool = False
+        self.by_path: dict[str, TargetOwner] = {
+            os.path.realpath(target): TargetOwner(target) for target in targets
+        }
+        self.prefixes: tuple[str, ...] = tuple(path.rstrip(os.sep) + os.sep for path in self.by_path)
+        self.path_owners: dict[str, TargetOwner | OutsideTargets] = dict(self.by_path)
+        self.source_owners: dict[str, TargetOwner | OutsideTargets] = {}
+
+    @overload
+    def __getitem__(self, index: int) -> str: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> tuple[str, ...]: ...
+
+    @override
+    def __getitem__(self, index: int | slice) -> str | tuple[str, ...]:
+        return self.targets[index]
+
+    @override
+    def __len__(self) -> int:
+        return len(self.targets)
+
+    def owner(self, path: str) -> TargetOwner | OutsideTargets:
+        """Resolve a path from a build tree or another source once per pass."""
+        owner = self.source_owners.get(path)
+        if owner is None:
+            owner = self.process_owner(os.path.realpath(path))
+            self.source_owners[path] = owner
+        return owner
+
+    def process_owner(self, path: str) -> TargetOwner | OutsideTargets:
+        """Use a kernel-resolved /proc path directly; look up each distinct path once."""
+        owner = self.path_owners.get(path)
+        if owner is not None:
+            return owner
+        if not path.startswith(self.prefixes):
+            owner = OutsideTargets()
+            self.path_owners[path] = owner
+            return owner
+        parent = path
+        while True:
+            owner = self.by_path.get(parent)
+            if owner is not None:
+                self.path_owners[path] = owner
+                return owner
+            parent = os.path.dirname(parent)
+
+
+def mapped_files(maps: bytes) -> Iterator[str]:
+    """Read each named file from a process's maps once, including paths with spaces."""
+    for line in maps.splitlines():
+        fields = line.split(None, 5)
+        if len(fields) == 6 and fields[5].startswith(b"/"):
+            yield fields[5].decode(errors="replace")
 
 
 def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, TargetUse]:
@@ -629,15 +751,21 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
     mappings under a target are all deleted, working outside it, does not keep the target busy: a
     hung cargo-berth resolve held 26 GiB of cargo-liner's target that way for three days (2026-10-21).
     """
-    prefixes = {target: os.path.realpath(target) + os.sep for target in targets}
+    owners = targets if isinstance(targets, TargetOwnerIndex) else TargetOwnerIndex(targets)
     found: dict[str, TargetUse] = {}
+    checked = owners.checked_targets
+    restricted = owners.rechecking
+    prefixes = tuple(path.rstrip(os.sep) + os.sep for path, owner in owners.by_path.items()
+                     if owner.target in checked) if restricted else ()
+    exact_roots = tuple(prefix[:-1] for prefix in prefixes)
+    encoded_prefixes = tuple(os.fsencode(prefix) for prefix in prefixes)
+
     try:
         names = [name for name in os.listdir(proc) if name.isdigit()]
     except OSError:
         return found
     for name in names:
-        left = [target for target in prefixes if target not in found]
-        if not left:
+        if len(found) == len(checked):
             break
         base = os.path.join(proc, name)
         try:
@@ -650,20 +778,34 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
         except OSError:
             continue
         pid = int(name)
-        for target in left:
-            prefix = prefixes[target]
-            if exe.startswith(prefix) and not exe.endswith(DELETED_SUFFIX):
-                found[target] = TargetUse(pid, f"runs {exe}")
-            elif (cwd + os.sep).startswith(prefix):
-                found[target] = TargetUse(pid, f"works in {cwd}")
-            else:
-                path = next((path for path in mapped_files(maps, prefix) if not path.endswith(DELETED_SUFFIX)), None)
-                if path is not None:
-                    found[target] = TargetUse(pid, f"maps {path}")
+        for path, how in ((exe, "runs"), (cwd, "works in")):
+            if path.endswith(DELETED_SUFFIX) and how == "runs":
+                continue
+            if restricted and path not in exact_roots and not path.startswith(prefixes):
+                continue
+            owner = owners.process_owner(path)
+            if isinstance(owner, TargetOwner) and owner.target in checked:
+                _ = found.setdefault(owner.target, TargetUse(pid, f"{how} {path}"))
+        matching_maps = not restricted or any(prefix in maps for prefix in encoded_prefixes)
+        for path in mapped_files(maps) if matching_maps else ():
+            if path.endswith(DELETED_SUFFIX):
+                continue
+            owner = owners.process_owner(path)
+            if isinstance(owner, TargetOwner) and owner.target in checked:
+                _ = found.setdefault(owner.target, TargetUse(pid, f"maps {path}"))
         if NEXTEST_ARG in argv[1:2] or (argv and os.path.basename(argv[0]) == f"cargo-{NEXTEST_ARG}"):
-            for target in nextest_targets(argv, cwd, os.path.join(base, "environ"), left):
-                _ = found.setdefault(target, TargetUse(pid, f"runs cargo-nextest in {cwd}"))
-    return found
+            for target in nextest_targets(argv, cwd, os.path.join(base, "environ"), owners):
+                if target in checked:
+                    _ = found.setdefault(target, TargetUse(pid, f"runs cargo-nextest in {cwd}"))
+    return {target: found[target] for target in owners if target in found}
+
+
+def process_use(target: str, owners: TargetOwnerIndex, proc: str = PROC_DIR) -> dict[str, TargetUse]:
+    """Recheck one target against live processes, sharing this pass's deepest owners."""
+    check = copy(owners)
+    check.checked_targets = (target,)
+    check.rechecking = True
+    return process_uses(check) if proc == PROC_DIR else process_uses(check, proc)
 
 
 def lock_holder(lock: str, locks: str = PROC_LOCKS) -> int | None:
@@ -688,6 +830,60 @@ def lock_holder(lock: str, locks: str = PROC_LOCKS) -> int | None:
             if len(fields) > 5 and fields[1] == "FLOCK" and fields[5] == device and fields[4].isdigit():
                 return int(fields[4])
     return None
+
+
+def floor_lock_holder(path: str) -> KnownFloorLockHolder | UnreadableFloorLockHolder | NoFloorLockHolder:
+    """Match the durable hold identity to the pid that currently owns the flock."""
+    pid = lock_holder(path)
+    if pid is None:
+        return NoFloorLockHolder()
+    try:
+        raw = cast(object, json.loads(Path(path).read_text()))
+        if isinstance(raw, dict):
+            data = cast(dict[str, object], raw)
+            started = data.get("started_at")
+            if data.get("pid") == pid and _finite_number(started) and started >= 0:
+                command = (Path(PROC_DIR) / str(pid) / "cmdline").read_bytes()
+                text = command.replace(b"\0", b" ").decode(errors="replace").strip()
+                if text and lock_holder(path) == pid:
+                    return KnownFloorLockHolder(pid, float(started), text)
+    except (OSError, ValueError):
+        pass
+    return UnreadableFloorLockHolder(pid)
+
+
+def record_floor_lock(path: str, guard: int, started_at: float) -> None:
+    """Save this hold's identity while the same inode stays locked."""
+    with open(path, "r+", encoding="utf-8") as handle:
+        if os.fstat(handle.fileno()).st_ino != os.fstat(guard).st_ino:
+            raise OSError("floor lock file changed")
+        _ = handle.write(json.dumps({"pid": os.getpid(), "started_at": started_at}) + "\n")
+        _ = handle.truncate()
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def alert_floor_lock(path: str, free: int, floor: int) -> None:
+    """Tell natedev once per overdue hold, retrying failed sends on later passes."""
+    record_path = floor_record_path()
+    with locked_floor_record(record_path) as previous:
+        holder = floor_lock_holder(path)
+        if not isinstance(holder, KnownFloorLockHolder):
+            return
+        seconds = int(conf.read("lint").number(FLOOR_LOCK_ALERT_KEY) * 60)
+        now = time.time()
+        if now - holder.started_at < seconds:
+            return
+        identity = DeliveredFloorLockAlert(holder.pid, holder.started_at)
+        if isinstance(previous, FloorRecord) and previous.lock_alert == identity:
+            return
+        message = (f"natedev has {gib(free)} free, under the {gib(floor)} floor. "
+                   f"The disk floor sweep cannot run: pid {holder.pid} ({holder.command}) "
+                   f"has held floor.lock since {when(holder.started_at)}.")
+        if send_floor_alert(message, FloorAlertChannels.NATEDEV):
+            current = previous if isinstance(previous, FloorRecord) else FloorRecord(
+                now, free, 0, NoDeliveredAlert(), NoDeliveredAlert())
+            write_floor_record(record_path, replace(current, lock_alert=identity))
 
 
 def holder_sessions(pids: Sequence[int]) -> dict[int, str]:
@@ -889,7 +1085,7 @@ def cargo_build_folder(setting: CargoFolderSetting, argv: list[str], cwd: str, c
     return os.path.realpath(setting.base / value)
 
 
-def nextest_targets(argv: list[str], cwd: str, environ: str, targets: list[str]) -> list[str]:
+def nextest_targets(argv: list[str], cwd: str, environ: str, targets: Sequence[str]) -> list[str]:
     """Resolve Cargo's artifact and intermediate folders through one busy check."""
     try:
         with open(environ, "rb") as handle:
@@ -947,9 +1143,10 @@ def nextest_targets(argv: list[str], cwd: str, environ: str, targets: list[str])
                   else os.path.realpath(setting.base / setting.value) for key, setting in settings.items()}
     except (OSError, ValueError):
         return list(targets)
-    return [target for target in targets if os.path.realpath(target) in chosen
+    owners = targets if isinstance(targets, TargetOwnerIndex) else TargetOwnerIndex(targets)
+    return [owner.target for path, owner in owners.by_path.items() if path in chosen
             or ("target-dir" not in settings
-                and (cwd + os.sep).startswith(os.path.dirname(os.path.realpath(target)) + os.sep))]
+                and (cwd + os.sep).startswith(os.path.dirname(path) + os.sep))]
 
 
 def newest_times(directory: str) -> tuple[float, float]:
@@ -986,7 +1183,7 @@ def copied_up(directory: str) -> list[os.DirEntry[str]]:
         entry
         for entry in listing(directory)
         if not entry.name.startswith(".")
-        and unit_hash(entry.name) is None
+        and isinstance(unit_hash(entry.name), NoUnitHash)
         and entry.is_file(follow_symlinks=False)
     ]
 
@@ -1092,12 +1289,12 @@ def group_roots(trees: list[str], scan: Scan) -> dict[str, Group]:
         for hashed in HASHED_DIRS:
             for entry in listing(os.path.join(tree, hashed)):
                 digest = unit_hash(entry.name)
-                if digest is None:
+                if isinstance(digest, NoUnitHash):
                     continue
-                group = units.get(digest)
+                group = units.get(digest.value)
                 if group is None:
                     group = Group(kind="unit", build_tree=tree)
-                    units[digest] = group
+                    units[digest.value] = group
                     scan.groups.append(group)
                 attach(entry.path, group, roots)
                 if hashed == FINGERPRINT_DIR and entry.is_dir(follow_symlinks=False):
@@ -1133,28 +1330,46 @@ def group_roots(trees: list[str], scan: Scan) -> dict[str, Group]:
     return roots
 
 
-def walk(directory: str, owner: Group | None, roots: dict[str, Group], scan: Scan) -> None:
-    try:
-        with os.scandir(directory) as entries:
-            listed = list(entries)
-    except OSError:
-        return
-    for entry in listed:
-        group = roots.get(entry.path, owner)
+def walk(directory: str, owner: FloorTake | None, roots: dict[str, Group], scan: Scan) -> None:
+    discovered = scan.discovered_targets or tuple(target_dirs([directory]))
+    nested_targets = set(discovered) - {os.path.realpath(directory)}
+    target_links = scan.target_links.setdefault(directory, {})
+
+    def visit(directory: str, owner: FloorTake | None) -> None:
         try:
-            stat = entry.stat(follow_symlinks=False)
+            with os.scandir(directory) as entries:
+                listed = list(entries)
         except OSError:
-            continue
-        if group is not None:
-            group.observed[entry.path] = output_version(stat)
-        if entry.is_dir(follow_symlinks=False):
-            walk(entry.path, group, roots, scan)
-            continue
-        key = (stat.st_dev, stat.st_ino)
-        scan.blocks[key] = stat.st_blocks * 512
-        scan.links[key] = stat.st_nlink
-        if group is not None:
-            group.inodes.append(key)
+            return
+        for entry in listed:
+            if entry.path in nested_targets:
+                if isinstance(owner, WholeTargetTake):
+                    owner.retained.add(entry.path)
+                continue
+            if isinstance(owner, WholeTargetTake) and (
+                    entry.name == ".claude-busy" or entry.name in LOCK_NAMES
+                    or entry.path == os.path.join(owner.target, "doc", ".lock")
+                    or entry.name == scratch.STYLE_LOCK_NAME):
+                owner.retained.add(entry.path)
+                continue
+            group = roots.get(entry.path, owner)
+            try:
+                stat = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if group is not None:
+                group.observed[entry.path] = output_version(stat)
+            if entry.is_dir(follow_symlinks=False):
+                visit(entry.path, group)
+                continue
+            key = (stat.st_dev, stat.st_ino)
+            scan.blocks[key] = stat.st_blocks * 512
+            scan.links[key] = stat.st_nlink
+            target_links[key] = target_links.get(key, 0) + 1
+            if group is not None:
+                group.inodes.append(key)
+
+    visit(directory, owner)
 
 
 @dataclass(frozen=True)
@@ -1225,7 +1440,7 @@ class TrimTake:
     def save(self) -> None:
         write_text_atomic(trim_intent_path(self.target), json.dumps(asdict(self)) + "\n")
 
-    def prepare(self, group: Group) -> None:
+    def prepare(self, group: FloorTake) -> None:
         self.pending = []
         self.group_paths = list(group.entries)
         for path in group.observed:
@@ -1378,7 +1593,7 @@ def trim_row_recorded(take: TrimTake) -> bool:
 
 @contextmanager
 def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], scan: Scan,
-                     dry_run: bool) -> Generator[None]:
+                     dry_run: bool, owners: TargetOwnerIndex) -> Generator[None]:
     """One write-ahead deletion and publication path for budget and floor takes."""
     if dry_run:
         yield
@@ -1388,8 +1603,10 @@ def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], s
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_suffix(".lock").open("a") as guard:
         fcntl.flock(guard, fcntl.LOCK_EX)
-        groups = [group for group in scan.groups if Path(group.build_tree).is_relative_to(target)]
-        take = TrimTake(target, cause, len(groups))
+        groups = [group for group in scan.groups if owners.owner(group.build_tree) == TargetOwner(target)]
+        whole_targets = [whole for whole in scan.whole_targets
+                         if cause == "floor take" and whole.target == target]
+        take = TrimTake(target, cause, len(groups) + len(whole_targets))
         recovered = True
         if path.exists():
             unfinished = load_trim_for_recovery(path)
@@ -1400,6 +1617,7 @@ def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], s
                     take = unfinished
         active = dict(TRIM_TAKES.get())
         active.update({group.build_tree: take for group in groups})
+        active.update({whole.target: take for whole in whole_targets})
         token = TRIM_TAKES.set(active)
         try:
             yield
@@ -1437,7 +1655,7 @@ def recover_pending_trims(locked_targets: Sequence[str] = ()) -> None:
                 print(f"lint sweep: could not recover {path}: {error}", file=sys.stderr)
 
 
-def freed_by(group: Group, scan: Scan, remaining: dict[InodeKey, int]) -> ReclamationEstimate:
+def freed_by(group: FloorTake, scan: Scan, remaining: dict[InodeKey, int]) -> ReclamationEstimate:
     """Estimate blocks once a group's links go, counting them off remaining.
 
     A file's blocks come back only when its last link goes, so a file with a
@@ -1511,27 +1729,40 @@ def remove_entry_at(name: str, parent_fd: int, display_path: str) -> ConfirmedDe
     return ConfirmedDeletion(freed, failures, removed)
 
 
-def remove(groups: list[Group]) -> ConfirmedDeletion:
+def remove(groups: Sequence[FloorTake]) -> ConfirmedDeletion:
     failures = 0
     freed = removed = 0
-    changed_trees: set[str] = set()
     for group in groups:
-        for path in group.entries:
+        identity = group.target if isinstance(group, WholeTargetTake) else group.build_tree
+        take = TRIM_TAKES.get().get(identity)
+        known_targets = ([group.target] if isinstance(group, WholeTargetTake)
+                         else [take.target] if take is not None else [])
+        if not record_before_delete([identity], known_targets=known_targets):
+            failures += 1
+            continue
+        markers = {os.path.join(group.target, name) for name in (RUSTC_INFO, CACHE_TAG)} if isinstance(
+            group, WholeTargetTake) else set[str]()
+        paths = [path for path in group.entries if path not in markers]
+        paths.extend(path for path in group.entries if path in markers)
+        group_failures = 0
+        for path in paths:
+            if path in markers and group_failures:
+                break
             account = remove_entry(path)
             freed += account.bytes
             failures += account.failures
+            group_failures += account.failures
             removed += account.removed
-            changed_trees.add(group.build_tree)
-    record_target_deletes(sorted(changed_trees))
     return ConfirmedDeletion(freed, failures, removed)
 
 
-def reclaim(group: Group, scan: Scan, remaining: dict[InodeKey, int],
+def reclaim(group: FloorTake, scan: Scan, remaining: dict[InodeKey, int],
             dry_run: bool) -> ReclamationEstimate | ConfirmedDeletion:
     """Keep scan estimates separate from the live unlink account."""
     if dry_run:
         return freed_by(group, scan, remaining)
-    take = TRIM_TAKES.get().get(group.build_tree) if group.kind != "orphan" else None
+    identity = group.target if isinstance(group, WholeTargetTake) else group.build_tree
+    take = TRIM_TAKES.get().get(identity) if isinstance(group, WholeTargetTake) or group.kind != "orphan" else None
     if take is not None:
         if take.stage == "publishing":
             return ConfirmedDeletion(0, 1)
@@ -1542,7 +1773,8 @@ def reclaim(group: Group, scan: Scan, remaining: dict[InodeKey, int],
     return account
 
 
-def directory_blocks(directory: str, seen: set[InodeKey] | None = None) -> int:
+def directory_blocks(directory: str, seen: set[InodeKey] | None = None,
+                     excluded: Sequence[str] = ()) -> int:
     """Disk blocks under a directory, counting inodes already in seen once."""
     if seen is None:
         seen = set()
@@ -1560,7 +1792,8 @@ def directory_blocks(directory: str, seen: set[InodeKey] | None = None) -> int:
             except OSError:
                 continue
             if entry.is_dir(follow_symlinks=False):
-                frontier.append(entry.path)
+                if entry.path not in excluded:
+                    frontier.append(entry.path)
                 continue
             key = (stat.st_dev, stat.st_ino)
             if key in seen:
@@ -1605,14 +1838,15 @@ def prune_doc_index(roots: list[str], budget: int, dry_run: bool) -> int:
         try:
             size = directory_blocks(doc)
             if not dry_run:
+                if not record_before_delete([root], known_targets=[root]):
+                    failures += 1
+                    continue
                 try:
                     shutil.rmtree(doc)
                 except OSError as error:
                     print(f"lint sweep: could not remove {doc}: {error}", file=sys.stderr)
                     failures += 1
                     continue
-                finally:
-                    record_target_deletes([root])
             verb = "would remove" if dry_run else "removed"
             print(
                 f"lint sweep: {doc} index is {mib(index)}, over the {mib(budget)} budget;"
@@ -1636,17 +1870,35 @@ def when(timestamp: float) -> str:
 
 
 def scan_roots(roots: list[str], trees: list[str]) -> Scan:
-    scan = Scan()
+    discovered = roots.discovered if isinstance(roots, DiscoveredTargetRoots) else tuple(target_dirs(roots))
+    scan = Scan(discovered_targets=discovered)
     owners = group_roots(trees, scan)
     for root in roots:
-        walk(root, None, owners, scan)
+        if scan.groups:
+            walk(root, None, owners, scan)
+        else:
+            whole = WholeTargetTake(root)
+            whole.retained.add(os.path.join(root, "doc", ".lock"))
+            walk(root, whole, owners, scan)
+            scan.whole_targets.append(whole)
     return scan
 
 
 def scan_floor_roots(roots: list[str], trees: dict[str, list[str]]) -> Scan:
     """Scan independent targets with bounded IO concurrency and no cargo locks."""
     def scan_target(root: str) -> Scan:
-        scan = scan_roots([root], trees[root])
+        discovered = roots.discovered if isinstance(roots, DiscoveredTargetRoots) else tuple(trees)
+        scan = scan_roots(DiscoveredTargetRoots([root], discovered), trees[root])
+        if scan.whole_targets:
+            whole, = scan.whole_targets
+            orphan_paths = [path for orphan in scan.orphans for path in orphan.entries]
+            protected = {str(parent) for path in (*whole.retained, *orphan_paths)
+                         for parent in Path(path).parents if parent.is_relative_to(root)}
+            removable = set(whole.observed) - protected
+            whole.entries = [path for path in whole.observed if path in removable
+                             and str(Path(path).parent) not in removable]
+            whole.observed = {path: version for path, version in whole.observed.items()
+                              if path not in protected}
         scan.target_bytes[root] = sum(scan.blocks.values())
         return scan
 
@@ -1654,7 +1906,8 @@ def scan_floor_roots(roots: list[str], trees: dict[str, list[str]]) -> Scan:
         return Scan()
     if len(roots) == 1:
         return scan_target(roots[0])
-    combined = Scan()
+    discovered = roots.discovered if isinstance(roots, DiscoveredTargetRoots) else tuple(trees)
+    combined = Scan(discovered_targets=discovered)
     with ThreadPoolExecutor(max_workers=4) as workers:
         for scan in workers.map(scan_target, roots):
             # Count a shared inode once, keeping its full link count across targets.
@@ -1662,12 +1915,14 @@ def scan_floor_roots(roots: list[str], trees: dict[str, list[str]]) -> Scan:
             combined.links.update(scan.links)
             combined.groups.extend(scan.groups)
             combined.orphans.extend(scan.orphans)
+            combined.whole_targets.extend(scan.whole_targets)
             combined.target_bytes.update(scan.target_bytes)
+            combined.target_links.update(scan.target_links)
     return combined
 
 
 def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run: bool,
-          recent_minutes: float = DEFAULT_RECENT_MINUTES) -> int:
+          recent_minutes: float) -> int:
     if not dry_run:
         recover_pending_trims(roots)
     scan = scan_roots(roots, trees)
@@ -1676,9 +1931,10 @@ def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run:
     state = "within" if total <= budget else "over"
     print(f"lint sweep: {label} is {gib(total)}, {state} the {gib(budget)} budget ({source})")
     now = time.time()
+    owners = TargetOwnerIndex(roots)
     with ExitStack() as takes:
         for root in roots:
-            takes.enter_context(recoverable_trim(root, "budget take", scan, dry_run))
+            takes.enter_context(recoverable_trim(root, "budget take", scan, dry_run, owners))
         left, failures = shrink(
             scan, total, budget, dry_run,
             lambda group: (float(group.last_used > now - recent_minutes * 60), *unit_age(group, now)),
@@ -1742,13 +1998,21 @@ def shrink(
 def target_dirs(roots: Sequence[str]) -> list[str]:
     """Every cargo target directory under roots."""
     found: set[str] = set()
+    owned_trees: set[str] = set()
     for root in roots:
         frontier = [(os.path.expanduser(root), 0)]
         while frontier:
             directory, depth = frontier.pop()
+            if directory in owned_trees:
+                continue
             if is_cargo_target(directory):
                 found.add(os.path.realpath(directory))
-                continue
+                # A target can contain another target in residue, but Cargo's
+                # own build trees belong to this root and need no root search.
+                depth = 0
+                owned_trees.update(build_trees(directory))
+                if directory in owned_trees:
+                    continue
             if depth < FLOOR_SEARCH_DEPTH:
                 # Style keeps one cache under the common git directory. Do not walk git objects.
                 retained = os.path.join(directory, GIT_DIR, scratch.STYLE_TARGET_NAME)
@@ -1759,12 +2023,13 @@ def target_dirs(roots: Sequence[str]) -> list[str]:
                 frontier.extend(
                     (entry.path, depth + 1)
                     for entry in listing(directory)
-                    if entry.name not in FLOOR_SKIP and entry.is_dir(follow_symlinks=False)
+                    if entry.name not in FLOOR_SKIP and entry.path not in owned_trees
+                    and entry.is_dir(follow_symlinks=False)
                 )
     return sorted(found)
 
 
-def group_unchanged(group: Group) -> bool:
+def group_unchanged(group: FloorTake) -> bool:
     """Validate recorded paths, without another directory scan under the lock."""
     for path, observed in group.observed.items():
         try:
@@ -1780,19 +2045,26 @@ def shrink_floor(
     scan: Scan, total: int, budget: int, dry_run: bool,
     tree_targets: dict[str, str], trees: dict[str, list[str]],
     busy: dict[str, TargetUse | LockHeld | BuildHoldTarget], removal_order: RemovalOrder,
-    planned_at: float,
-) -> tuple[int, int, list[tuple[Group, int]]]:
+    planned_at: float, owners: TargetOwnerIndex,
+) -> tuple[int, int, list[tuple[FloorTake, int]]]:
     """Plan unlocked; lock just one target for its deletions, then release it."""
-    batches: list[tuple[str, list[Group]]] = []
-    for groups in (scan.orphans, scan.groups):
-        target_groups: dict[str, list[Group]] = {}
+    orphan_batches: dict[str, list[FloorTake]] = {}
+    target_batches: dict[str, list[FloorTake]] = {}
+    for groups, target_groups in ((scan.orphans, orphan_batches), (scan.groups, target_batches)):
         for group in sorted(groups, key=removal_order):
             root = tree_targets[group.build_tree]
             target_groups.setdefault(root, []).append(group)
-        batches.extend(target_groups.items())
+    for whole in scan.whole_targets:
+        target_batches.setdefault(whole.target, []).append(whole)
+    batches = list(orphan_batches.items()) + sorted(
+        target_batches.items(),
+        key=lambda batch: (target_last_use(batch[0], [
+            group for group in batch[1] if isinstance(group, Group)
+        ], scan.discovered_targets), batch[0]),
+    )
     remaining = dict(scan.links)
-    taken: list[tuple[Group, int]] = []
-    attempted: list[Group] = []
+    taken: list[tuple[FloorTake, int]] = []
+    attempted: list[FloorTake] = []
     failures = 0
     orphaned_bytes = 0
     left = total
@@ -1803,7 +2075,7 @@ def shrink_floor(
             continue
         # Uses can start while the unlocked scan is running.
         current_holds = build_hold_targets([root], trees)
-        current_uses = process_uses([root])
+        current_uses = process_use(root, owners)
         if root in current_holds:
             busy[root] = current_holds[root]
             continue
@@ -1820,9 +2092,34 @@ def shrink_floor(
                 busy[root] = LockHeld(locks.path)
                 continue
             try:
-                if target_last_use(root, []) > planned_at:
+                root_groups = [group for group in scan.groups if tree_targets[group.build_tree] == root]
+                if target_last_use(root, root_groups, scan.discovered_targets) > planned_at:
                     continue
-                with recoverable_trim(root, "floor take", scan, dry_run):
+                doc_lock = os.path.join(root, "doc", ".lock")
+                whole_batch = any(isinstance(candidate, WholeTargetTake) for candidate in candidates)
+                if whole_batch and os.path.isdir(os.path.dirname(doc_lock)) and (
+                        not dry_run or os.path.exists(doc_lock)):
+                    held = try_lock(doc_lock)
+                    if held is None:
+                        busy[root] = LockHeld(doc_lock)
+                        continue
+                    locks.held.append(held)
+                if whole_batch:
+                    checked = set(target_lock_paths(trees[root])) | {doc_lock}
+                    extra = {path for candidate in candidates if isinstance(candidate, WholeTargetTake)
+                             for path in candidate.retained if os.path.basename(path) in (*LOCK_NAMES, scratch.STYLE_LOCK_NAME)
+                             and path not in checked}
+                    blocked = False
+                    for path in sorted(extra):
+                        held = try_lock(path)
+                        if held is None:
+                            busy[root] = LockHeld(path)
+                            blocked = True
+                            break
+                        locks.held.append(held)
+                    if blocked:
+                        continue
+                with recoverable_trim(root, "floor take", scan, dry_run, owners):
                     for group in candidates:
                         if left <= budget:
                             break
@@ -1835,16 +2132,16 @@ def shrink_floor(
                         failures += failed
                         if not failed:
                             taken.append((group, account.bytes))
-                        if group.kind == "orphan":
+                        if isinstance(group, Group) and group.kind == "orphan":
                             orphaned_bytes += account.bytes
             finally:
                 release(locks.held)
     verb, result = ("would remove", "would leave") if dry_run else ("removed", "left")
-    orphans = [group for group in attempted if group.kind == "orphan"]
+    orphans = [group for group in attempted if isinstance(group, Group) and group.kind == "orphan"]
     if orphans:
         print(f"lint sweep: {verb} {sum(len(group.entries) for group in orphans)} orphaned files ({gib(orphaned_bytes)}),"
               + f" copied-up output whose build unit is gone; {result} {gib(left)}")
-    groups = [group for group in attempted if group.kind != "orphan"]
+    groups = [group for group in attempted if isinstance(group, Group) and group.kind != "orphan"]
     if groups:
         units = sum(group.kind == "unit" for group in groups)
         uses = [group.last_used for group in groups]
@@ -1854,12 +2151,24 @@ def shrink_floor(
     return left, failures, taken
 
 
-def target_last_use(root: str, groups: list[Group]) -> float:
+def target_last_use(root: str, groups: list[Group], discovered: Sequence[str] = ()) -> float:
     """Newest workspace step or build-unit use in a target."""
     try:
         stamp_used = os.stat(os.path.join(root, USE_STAMP)).st_mtime
     except OSError:
         stamp_used = 0.0
+    if not groups and not stamp_used:
+        newest = 0.0
+        for entry in listing(root):
+            if (entry.name == ".claude-busy" or entry.name in LOCK_NAMES
+                    or any(target == entry.path or target.startswith(entry.path + os.sep)
+                           for target in discovered if target != root)):
+                continue
+            try:
+                newest = max(newest, entry.stat(follow_symlinks=False).st_mtime)
+            except OSError:
+                continue
+        return newest
     return max(stamp_used, max((group.last_used for group in groups), default=0.0))
 
 
@@ -1878,8 +2187,7 @@ def floor_bytes(values: dict[str, str], host: str) -> tuple[int | None, str | No
 
 
 def floor_record_path() -> Path:
-    state = os.environ.get(FLOOR_STATE_ENV) or "~/.local/state/lint-sweep"
-    return Path(os.path.expanduser(state)) / "floor.json"
+    return tmp_sweep.state_dir() / "floor.json"
 
 
 def _finite_number(value: object) -> TypeGuard[int | float]:
@@ -1887,7 +2195,7 @@ def _finite_number(value: object) -> TypeGuard[int | float]:
 
 
 def target_deletes_path() -> Path:
-    return floor_record_path().with_name("target-deletes.json")
+    return tmp_sweep.state_dir() / tmp_sweep.TARGET_DELETES_NAME
 
 
 def read_target_deletes(path: Path, now: float) -> dict[str, float]:
@@ -1901,10 +2209,12 @@ def read_target_deletes(path: Path, now: float) -> dict[str, float]:
             if _finite_number(at) and now - DAY_SECONDS <= at <= now and os.path.isdir(root)}
 
 
-def record_target_deletes(paths: Sequence[str]) -> None:
-    roots: set[str] = set()
+def record_target_deletes(paths: Sequence[str], *, known_targets: Sequence[str] = ()) -> None:
+    roots = {os.path.realpath(root) for root in known_targets}
     for path in paths:
         directory = Path(path).resolve()
+        if str(directory) in roots:
+            continue
         for ancestor in (directory, *directory.parents):
             if is_cargo_target(str(ancestor)):
                 roots.add(str(ancestor))
@@ -1912,19 +2222,23 @@ def record_target_deletes(paths: Sequence[str]) -> None:
     if not roots:
         return
     path = target_deletes_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix(".lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        now = time.time()
+        deleted = read_target_deletes(path, now)
+        deleted.update(dict.fromkeys(roots, now))
+        write_text_atomic(path, json.dumps(deleted) + "\n")
+
+
+def record_before_delete(paths: Sequence[str], *, known_targets: Sequence[str] = ()) -> bool:
+    """Refuse a deletion whose warm-promise invalidation cannot be saved."""
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.with_suffix(".lock").open("a+") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            now = time.time()
-            deleted = read_target_deletes(path, now)
-            deleted.update(dict.fromkeys(roots, now))
-            partial = path.with_suffix(".tmp")
-            _ = partial.write_text(json.dumps(deleted) + "\n")
-            _ = partial.replace(path)
-    except OSError:
-        # State writes must not change a removal's result.
-        pass
+        record_target_deletes(paths, known_targets=known_targets)
+    except OSError as error:
+        print(f"lint sweep: could not record deletion of {', '.join(paths)}: {error}", file=sys.stderr)
+        return False
+    return True
 
 
 def read_floor_record(path: Path) -> NoFloorRecord | FloorRecord:
@@ -1952,7 +2266,23 @@ def read_floor_record(path: Path) -> NoFloorRecord | FloorRecord:
     held_roots: UnknownHeldRoots | KnownHeldRoots = UNKNOWN_HELD_ROOTS
     if isinstance(roots, list) and all(isinstance(root, str) for root in cast(list[object], roots)):
         held_roots = KnownHeldRoots(frozenset(cast(list[str], roots)))
-    return FloorRecord(float(measured), int(free), int(caches), history, push_history, held_roots)
+    lock_alert: DeliveredFloorLockAlert | NoFloorLockAlert = NoFloorLockAlert()
+    saved_alert = data.get("lock_alert")
+    if isinstance(saved_alert, dict):
+        saved = cast(dict[str, object], saved_alert)
+        pid, started = saved.get("pid"), saved.get("started_at")
+        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and _finite_number(started):
+            lock_alert = DeliveredFloorLockAlert(pid, float(started))
+    return FloorRecord(float(measured), int(free), int(caches), history, push_history, held_roots, lock_alert)
+
+
+@contextmanager
+def locked_floor_record(path: Path) -> Generator[NoFloorRecord | FloorRecord]:
+    """Serialize floor measurements and alert receipts on one stable lock inode."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_name("floor-alert.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield read_floor_record(path)
 
 
 def write_floor_record(path: Path, record: FloorRecord) -> None:
@@ -1967,6 +2297,8 @@ def write_floor_record(path: Path, record: FloorRecord) -> None:
         "last_alert_at": alert_at,
         "last_push_at": push_at,
     }
+    if isinstance(record.lock_alert, DeliveredFloorLockAlert):
+        data["lock_alert"] = asdict(record.lock_alert)
     if isinstance(record.held_roots, KnownHeldRoots):
         data["held_roots"] = sorted(record.held_roots.roots)
     _ = partial.write_text(json.dumps(data) + "\n")
@@ -2334,41 +2666,81 @@ def floor_roots() -> tuple[str, ...]:
     return (*FLOOR_ROOTS, str(copies.gates_root()))
 
 
+def floor_scan_targets(scan: Scan, idle: Sequence[str], target_uses: dict[str, float],
+                       tree_targets: dict[str, str]) -> list[record.IdleFloorTarget]:
+    """Estimate each target independently of the shortfall and all other takes."""
+    candidates: dict[str, list[FloorTake]] = {root: [] for root in idle}
+    for group in (*scan.orphans, *scan.groups):
+        candidates[tree_targets[group.build_tree]].append(group)
+    for whole in scan.whole_targets:
+        candidates[whole.target].append(whole)
+    rows: list[record.IdleFloorTarget] = []
+    for root in sorted(idle, key=lambda root: (target_uses[root], root)):
+        counts: dict[InodeKey, int] = {}
+        for group in candidates[root]:
+            for key in group.inodes:
+                counts[key] = counts.get(key, 0) + 1
+        target_links = scan.target_links[root]
+        outside_target = any(target_links[key] < scan.links[key] for key in counts)
+        outside_candidates = any(count < target_links[key] for key, count in counts.items())
+        remaining = {key: scan.links[key] for key in counts}
+        takeable = sum(freed_by(group, scan, remaining).bytes for group in candidates[root])
+        row: record.IdleFloorTarget = {
+            "folder": root, "last_use": target_uses[root], "bytes": scan.target_bytes[root],
+        }
+        if takeable != row["bytes"]:
+            row["takeable_bytes"] = takeable
+            row["reason"] = ("links outside the target" if outside_target else
+                             "links outside the take candidates" if outside_candidates else
+                             "output outside take candidates")
+        rows.append(row)
+    return rows
+
+
 def hold_floor(
     floor: int,
     dry_run: bool,
     roots: Sequence[str] = (),
-    lock: str = FLOOR_LOCK,
+    lock: str = "",
 ) -> int:
     """Below the floor, take the shortfall from the least used idle targets."""
+    lock = lock or str(tmp_sweep.state_dir() / "floor.lock")
     if not dry_run:
         recover_pending_trims()
     home = os.path.expanduser("~")
     free = free_bytes(home)
     if free >= floor:
         return 0
-    lock_path = os.path.expanduser(lock)
-    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-    guard = try_lock(lock_path)
-    if guard is None:
-        print(f"lint sweep: {gib(free)} free, under the {gib(floor)} floor; another sweep is holding it")
-        return 0
+    guard = None
+    if not dry_run:
+        lock_path = os.path.expanduser(lock)
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        guard = try_lock(lock_path)
+        if guard is None:
+            print(f"lint sweep: {gib(free)} free, under the {gib(floor)} floor; another sweep is holding it")
+            alert_floor_lock(lock_path, free, floor)
+            return 0
     try:
         planned_at = time.time()
+        if guard is not None:
+            record_floor_lock(os.path.expanduser(lock), guard, planned_at)
         record_path = floor_record_path()
-        previous = read_floor_record(record_path)
         idle: list[str] = []
         tree_targets: dict[str, str] = {}
         busy: dict[str, TargetUse | LockHeld | BuildHoldTarget] = {}
         targets = target_dirs(roots or floor_roots())
+        owners = TargetOwnerIndex(targets)
         known_trees: dict[str, list[str]] = {}
         hold_targets = build_hold_targets(targets, known_trees)
-        uses = process_uses(targets)
+        uses = process_uses(owners)
         locked_files = held_cargo_lock_files()
         for root in targets:
+            if root not in known_trees and (root in hold_targets or root in uses):
+                known_trees[root] = []
             with scratch.judgment_lock(Path(root)) as idle_copy:
                 if not idle_copy:
                     busy[root] = LockHeld(os.path.join(root, ".claude-busy"))
+                    _ = known_trees.setdefault(root, [])
                     print(f"lint sweep: busy .claude-busy lock; {root} left alone")
                     continue
             if root in hold_targets:
@@ -2388,15 +2760,18 @@ def hold_floor(
                 busy[root] = LockHeld(blocked)
                 continue
             idle.append(root)
-            tree_targets.update({tree: root for tree in root_trees})
-        scan = scan_floor_roots(idle, known_trees)
+            tree_targets.update({tree: root for tree in root_trees if owners.owner(tree) == TargetOwner(root)})
+        scan = scan_floor_roots(DiscoveredTargetRoots(idle, targets), known_trees)
         target_groups: dict[str, list[Group]] = {root: [] for root in idle}
         for group in scan.groups:
             target_groups[tree_targets[group.build_tree]].append(group)
-        target_uses = {root: target_last_use(root, groups) for root, groups in target_groups.items()}
+        target_uses = {root: target_last_use(root, groups, targets) for root, groups in target_groups.items()}
         total = sum(scan.blocks.values())
         # A held target is not walked even for accounting; its bytes stay unmeasured this pass.
-        busy_bytes = {path: 0 if isinstance(use, BuildHoldTarget) else directory_blocks(path)
+        busy_bytes = {path: 0 if isinstance(use, BuildHoldTarget) else (
+                          directory_blocks(path, excluded=targets) if any(
+                              other != path and other.startswith(path + os.sep) for other in targets)
+                          else directory_blocks(path))
                       for path, use in busy.items()}
         held_bytes = sum(busy_bytes.values())
         ci_bytes = sum(directory_blocks(path) for path in CI_TARGETS)
@@ -2415,29 +2790,27 @@ def hold_floor(
         # took 6.5 GiB of cache while another process had lifted free from 293.5 to 416 GiB.
         budget = total - max(0, floor - scanned_free)
         left, failures = total, 0
-        chosen: list[tuple[Group, int]] = []
+        chosen: list[tuple[FloorTake, int]] = []
         if scanned_free < floor:
             if not dry_run:
-                record.floor_scan(scanned_free, floor, [
-                    {"folder": root, "last_use": target_uses[root], "bytes": scan.target_bytes[root]}
-                    for root in sorted(idle, key=lambda root: (target_uses[root], root))
-                ], time.time())
+                record.floor_scan(scanned_free, floor, floor_scan_targets(
+                    scan, idle, target_uses, tree_targets), time.time())
             left, failures, chosen = shrink_floor(
                 scan, total, budget, dry_run, tree_targets, known_trees, busy,
                 lambda group: (
                     target_uses[tree_targets[group.build_tree]],
                     *unit_age(group, planned_at),
                 ),
-                planned_at,
+                planned_at, owners,
             )
         else:
             print(f"lint sweep: {gib(scanned_free)} free after the scan, not under the {gib(floor)} floor;"
                   + " nothing taken")
         taken: dict[str, int] = {}
         for group, freed in chosen:
-            root = tree_targets[group.build_tree]
+            root = group.target if isinstance(group, WholeTargetTake) else tree_targets[group.build_tree]
             taken[root] = taken.get(root, 0) + freed
-        for root, size in sorted(taken.items(), key=lambda item: (-item[1], item[0])):
+        for root, size in taken.items():
             if size:
                 verb = "would take" if dry_run else "took"
                 print(f"lint sweep: the floor {verb} {gib(size)} from {root},"
@@ -2448,56 +2821,63 @@ def hold_floor(
             now = time.time()
             # The record's free is read before its caches and the next sweep's free after its scan,
             # so a deletion during either walk can only make the computed fall smaller.
-            after_caches = sum(directory_blocks(path) for path in idle) + unchanged_caches
+            seen: set[InodeKey] = set()
+            after_caches = sum(directory_blocks(path, seen, targets) if any(
+                other != path and other.startswith(path + os.sep) for other in targets)
+                else directory_blocks(path, seen) for path in idle) + unchanged_caches
             removed = max(0, before_caches - after_caches)
-            history = previous.alert_history if isinstance(previous, FloorRecord) else NoDeliveredAlert()
-            push_history = previous.push_history if isinstance(previous, FloorRecord) else NoDeliveredAlert()
-            push_due = isinstance(push_history, NoDeliveredAlert) or now - push_history.at >= ALERT_INTERVAL_SECONDS
-            # (user, 2026-10-05) Only an exhausted sweep still under the floor reaches the phone; other alerts reach natedev alone.
-            # (2026-10-21) It never asks the user to free space by hand. Each session whose process
-            # holds a busy target is told; the user gets a page, with exact paths, only when no
-            # session could be told.
-            if left > budget and after_free < floor and push_due:
-                holders = floor_holders({root: use for root, use in busy.items()
-                                         if not isinstance(use, BuildHoldTarget)}, busy_bytes)
-                holders.extend(FloorHolder(root, 0, None, f"{use.holder} holds natedev builds", None)
-                               for root, use in busy.items() if isinstance(use, BuildHoldTarget))
-                told = frozenset(holder.path for holder in holders if holder.session is not None
-                                 and send_holder_message(holder.session, holder_message_text(holder, after_free, floor)))
-                measurement = read_disk_measurement()
-                message = floor_out_of_reach_text(now, removed, after_free, floor, holders, told,
-                                                  ci_bytes, measurement, failures)
-                if told:
-                    delivered = send_floor_alert(message, FloorAlertChannels.NATEDEV)
-                else:
-                    page = disk_floor_push(removed, after_free, floor, page_paths(holders, measurement))
-                    delivered = send_floor_alert(message, FloorAlertChannels.NATEDEV_AND_PHONE, phone=page)
-                if delivered or told:
-                    push_history = DeliveredAlert(time.time())
-            elif removed > 0 and (isinstance(history, NoDeliveredAlert) or now - history.at >= ALERT_INTERVAL_SECONDS):
-                free_fall = previous.free_bytes - scanned_free if isinstance(previous, FloorRecord) else 0
-                cache_growth = before_caches - previous.build_cache_bytes if isinstance(previous, FloorRecord) else 0
-                recent = isinstance(previous, FloorRecord) and 0 <= now - previous.measured_at <= GROWTH_WINDOW_SECONDS
-                same_held_roots = (isinstance(previous, FloorRecord)
-                                   and isinstance(previous.held_roots, KnownHeldRoots)
-                                   and previous.held_roots.roots == frozenset(hold_targets))
-                growth_fired = recent and same_held_roots and free_fall - cache_growth > UNEXPLAINED_FALL_BYTES
-                removal_fired = removed > LARGE_REMOVAL_BYTES
-                if growth_fired or removal_fired:
-                    reasons: list[str] = []
-                    if growth_fired:
-                        reasons.append("free space fell more than 10 GiB beyond build-cache growth")
-                    if removal_fired:
-                        reasons.append("removed more than 32 GiB in one sweep")
-                    message = floor_alert_text(now, removed, previous, free_fall, cache_growth,
-                                               reasons, read_disk_measurement())
-                    if send_floor_alert(message, FloorAlertChannels.NATEDEV):
-                        history = DeliveredAlert(time.time())
-            write_floor_record(record_path, FloorRecord(now, after_free, after_caches, history, push_history,
-                                                       KnownHeldRoots(frozenset(hold_targets))))
+            with locked_floor_record(record_path) as previous:
+                history = previous.alert_history if isinstance(previous, FloorRecord) else NoDeliveredAlert()
+                push_history = previous.push_history if isinstance(previous, FloorRecord) else NoDeliveredAlert()
+                push_due = isinstance(push_history, NoDeliveredAlert) or now - push_history.at >= ALERT_INTERVAL_SECONDS
+                # (user, 2026-10-05) Only an exhausted sweep still under the floor reaches the phone; other alerts reach natedev alone.
+                # (2026-10-21) It never asks the user to free space by hand. Each session whose process
+                # holds a busy target is told; the user gets a page, with exact paths, only when no
+                # session could be told.
+                if left > budget and after_free < floor and push_due:
+                    holders = floor_holders({root: use for root, use in busy.items()
+                                             if not isinstance(use, BuildHoldTarget)}, busy_bytes)
+                    holders.extend(FloorHolder(root, 0, None, f"{use.holder} holds natedev builds", None)
+                                   for root, use in busy.items() if isinstance(use, BuildHoldTarget))
+                    told = frozenset(holder.path for holder in holders if holder.session is not None
+                                     and send_holder_message(holder.session, holder_message_text(holder, after_free, floor)))
+                    measurement = read_disk_measurement()
+                    message = floor_out_of_reach_text(now, removed, after_free, floor, holders, told,
+                                                      ci_bytes, measurement, failures)
+                    if told:
+                        delivered = send_floor_alert(message, FloorAlertChannels.NATEDEV)
+                    else:
+                        page = disk_floor_push(removed, after_free, floor, page_paths(holders, measurement))
+                        delivered = send_floor_alert(message, FloorAlertChannels.NATEDEV_AND_PHONE, phone=page)
+                    if delivered or told:
+                        push_history = DeliveredAlert(time.time())
+                elif removed > 0 and (isinstance(history, NoDeliveredAlert) or now - history.at >= ALERT_INTERVAL_SECONDS):
+                    free_fall = previous.free_bytes - scanned_free if isinstance(previous, FloorRecord) else 0
+                    cache_growth = before_caches - previous.build_cache_bytes if isinstance(previous, FloorRecord) else 0
+                    recent = isinstance(previous, FloorRecord) and 0 <= now - previous.measured_at <= GROWTH_WINDOW_SECONDS
+                    same_held_roots = (isinstance(previous, FloorRecord)
+                                       and isinstance(previous.held_roots, KnownHeldRoots)
+                                       and previous.held_roots.roots == frozenset(hold_targets))
+                    growth_fired = recent and same_held_roots and free_fall - cache_growth > UNEXPLAINED_FALL_BYTES
+                    removal_fired = removed > LARGE_REMOVAL_BYTES
+                    if growth_fired or removal_fired:
+                        reasons: list[str] = []
+                        if growth_fired:
+                            reasons.append("free space fell more than 10 GiB beyond build-cache growth")
+                        if removal_fired:
+                            reasons.append("removed more than 32 GiB in one sweep")
+                        message = floor_alert_text(now, removed, previous, free_fall, cache_growth,
+                                                   reasons, read_disk_measurement())
+                        if send_floor_alert(message, FloorAlertChannels.NATEDEV):
+                            history = DeliveredAlert(time.time())
+                write_floor_record(record_path, FloorRecord(now, after_free, after_caches, history, push_history,
+                                                           KnownHeldRoots(frozenset(hold_targets)),
+                                                           previous.lock_alert if isinstance(previous, FloorRecord)
+                                                           else NoFloorLockAlert()))
         return 1 if failures else 0
     finally:
-        os.close(guard)
+        if guard is not None:
+            os.close(guard)
 
 
 def size_bytes(raw: str, unit: int) -> int | None:
@@ -2596,17 +2976,19 @@ def local_origin_git_dir(common: str) -> str | None:
     return None
 
 
-def budget_bytes(environ: dict[str, str], config: str, repo: str | None) -> tuple[int | None, str]:
+def budget_bytes(environ: dict[str, str], config: str | conf.ConfigRead, repo: str | None) -> tuple[int | None, str]:
     """The sweep budget, None when its value is malformed, and where it came from."""
     raw = environ.get(BUDGET_ENV, "")
     if raw:
         return size_bytes(raw, GIB), f"{BUDGET_ENV} in the environment"
-    values = config_values(config)
+    settings_read = config if isinstance(config, conf.ConfigRead) else conf.read(Path(config))
+    config = str(settings_read.source)
+    values = settings_read.values()
     keys = [f"{BUDGET_KEY}.{repo}", BUDGET_KEY] if repo else [BUDGET_KEY]
     for key in keys:
         if values.get(key):
             return size_bytes(values[key], GIB), f"{key} in {config}"
-    return int(DEFAULT_BUDGET_GIB * GIB), f"the default, no {BUDGET_KEY} in {config}"
+    return int(settings_read.number(BUDGET_KEY) * GIB), f"{BUDGET_KEY} in {config}"
 
 
 def doc_index_bytes() -> int | None:
@@ -2908,18 +3290,20 @@ def main(argv: list[str]) -> int:
         else:
             print(f"lint sweep: unknown argument {arg}", file=sys.stderr)
             return 2
-    config = os.path.expanduser(os.environ.get(CONFIG_ENV) or DEFAULT_CONFIG)
-    values = config_values(config)
-    recent_seconds = size_bytes(values.get(RECENT_KEY, str(DEFAULT_RECENT_MINUTES)), 60)
-    if recent_seconds is None:
-        print(f"lint sweep: {RECENT_KEY} in {config} must be a non-negative number of minutes", file=sys.stderr)
+    config = str(conf.path("lint"))
+    try:
+        settings_read = conf.read("lint")
+        values = settings_read.values()
+        recent_seconds = int(settings_read.number(RECENT_KEY) * 60)
+        floor, floor_key = floor_bytes(values, socket.gethostname())
+    except conf.Unusable as error:
+        print(f"lint sweep: {error}", file=sys.stderr)
         return 2
     recent_minutes = recent_seconds / 60
-    floor, floor_key = floor_bytes(values, socket.gethostname())
     if floor is None and floor_key is not None:
         print(f"lint sweep: {floor_key} in {config} must be a non-negative number of GiB", file=sys.stderr)
         return 2
-    status = 0 if floor_only else sweep_workspace(target_dir, config, dry_run, recent_minutes)
+    status = 0 if floor_only else sweep_workspace(target_dir, settings_read, dry_run, recent_minutes)
     if floor_only:
         status = tmp_sweep.run_if_due(dry_run) or status
     if floor is not None:
@@ -2927,8 +3311,8 @@ def main(argv: list[str]) -> int:
     return status
 
 
-def sweep_workspace(target_dir: str | None, config: str, dry_run: bool,
-                    recent_minutes: float = DEFAULT_RECENT_MINUTES) -> int:
+def sweep_workspace(target_dir: str | None, config: str | conf.ConfigRead, dry_run: bool,
+                    recent_minutes: float) -> int:
     """Sweep target_dir, or the working directory's workspace, to its budget."""
     budget, source = budget_bytes(dict(os.environ), config, repo_name(os.getcwd()))
     if budget is None:

@@ -26,7 +26,9 @@ import unit_table_cells
 
 from scripts.direct import phase_table, plan_history
 from scripts.lib import unit_runs
-from scripts.production import showrunner_tree, production_units, showrunners, unit_run
+from scripts.production import session_staff, showrunners, staff, unit_run, unit_config, unit_names
+from scripts.production.unit_table import cell_value
+from scripts.shutdown import remote
 
 
 def text(value: object) -> str:
@@ -308,8 +310,9 @@ def unit_ticket_progress(worktree: Path, unit_name: str, sources: set[Path]) -> 
         return UnitTicketProgress()
 
 
-def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path]) -> dict[str, object]:
-    value = production_units.cell_value
+def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path],
+         *, resolver: session_staff.RowResolver | None = None) -> dict[str, object]:
+    value = cell_value
     worktree = Path(value(cells.get("Worktree", ""))).expanduser().resolve()
     plan_cell = value(cells.get("Plan", ""))
     plan = plan_history.resolve_plan_path(worktree, plan_cell.split(" ", 1)[0])
@@ -333,28 +336,29 @@ def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path]) -> dict[s
     sources.add(record_plan)
     sources.update(plan_history.plan_runs(record_plan))
     try:
-        record = phase_table.build_plan(record_plan)
+        record = phase_table.build_plan(record_plan, resolver=resolver)
     except phase_table.NoPlan:
         record = phase_table.PhaseRecord(record_plan, datetime.fromtimestamp(clock.now, clock.zone), phase_table.NoOpenPhase(), [], phase_table.UnknownFinish(), phase_table.NothingToStart("no plan"))
     if not record.phases:
-        record = phase_table.build_run(record_plan, events)
+        record = phase_table.build_run(record_plan, events, resolver=resolver)
     state = "standing-by"
     if isinstance(found, unit_run.RunFound):
         state = "run-finished" if events and events[-1].get("event_type") == "run_finished" else "running"
     current = record.current
     unit_name = value(cells.get("Unit", ""))
+    ledger_unit = unit_names.unit_id(unit_name)
     standing = is_standing_plan(record.plan)
-    tickets = unit_ticket_progress(worktree, unit_name, sources) if standing else UnitTicketProgress()
+    tickets = unit_ticket_progress(worktree, ledger_unit, sources) if standing else UnitTicketProgress()
     ticket = tickets.open_ticket
     if isinstance(ticket, TicketInProgress) and isinstance(current, phase_table.OpenPhase):
-        current = next((row for row in phase_table.build_run(record.plan, events).phases if isinstance(row, phase_table.OpenPhase)
+        current = next((row for row in phase_table.build_run(record.plan, events, resolver=resolver).phases if isinstance(row, phase_table.OpenPhase)
                         and (row.phase == ticket.id or re.match(
                             rf"{re.escape(ticket.id)}(?=\s|$)", row.title))), current)
     current_phase: dict[str, object] | None = None
     if isinstance(current, phase_table.OpenPhase):
         if standing:
             if isinstance(ticket, NoTicketInProgress):
-                title_id = re.match(rf"{re.escape(unit_name)}-\d+(?=\s|$)", current.title)
+                title_id = re.match(rf"{re.escape(ledger_unit)}-\d+(?=\s|$)", current.title)
                 ticket = TicketInProgress(title_id[0] if title_id else current.phase)
             title = re.sub(rf"^{re.escape(ticket.id)}(?:\s+—(?:\s+|$)|\s+|$)", "", current.title, count=1)
             current_phase = {"kind": "ticket", "id": ticket.id, "title": title, "merged": tickets.merged}
@@ -368,36 +372,91 @@ def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path]) -> dict[s
             "summary": summary, "steps": phase_steps(events, clock, current), "workers": worker_rows}
 
 
-def checkout(document: Path) -> Path:
-    return next((path for path in document.parents if (path / ".git").exists()), document.parent.parent if document.parent.name == "docs" else document.parent)
+@dataclass(frozen=True)
+class BoardSubtree:
+    record: staff.StaffSnapshot
+    runners: tuple[showrunners.Showrunner, ...]
 
 
-def resolve(cwd: str, production: str, session: str = "") -> list[showrunners.Showrunner]:
-    registered = showrunners.registered_showrunners()
-    if not production:
-        document = showrunners.production_of(session)
-        if document is not None:
-            production = next((runner["slug"] for runner in registered
-                               if Path(runner["doc"]).expanduser().resolve() == document.expanduser().resolve()), "")
-    if not production:
-        directory = Path(cwd).expanduser().resolve()
-        production = next((runner["slug"] for runner in registered
-                           if directory.is_relative_to(checkout(Path(runner["doc"])))), "")
-    by_slug = {runner["slug"]: runner for runner in registered}
-    if production not in by_slug:
-        return []
-    return [by_slug[slug] for slug in [production, *showrunner_tree.descendants_of(production)] if slug in by_slug]
+@dataclass(frozen=True)
+class NoBoardSubtree:
+    pass
 
 
-def build(runner: showrunners.Showrunner) -> dict[str, object]:
+def resolve(production: str, session: str = "") -> BoardSubtree | NoBoardSubtree:
+    try:
+        record = staff.snapshot()
+        members: dict[str, staff.StaffRow] = {}
+        by_slug: dict[str, showrunners.Showrunner] = {}
+        for owner in staff.active(record, "showrunner"):
+            timer = showrunners.timer_for(owner, record)
+            if isinstance(timer, showrunners.NoTimer):
+                continue
+            members[timer.slug] = owner
+            by_slug[timer.slug] = showrunners.Showrunner(
+                slug=timer.slug, session=owner.name, socket="", doc=str(timer.doc), zone=timer.zone)
+        if production:
+            root = members.get(production)
+        else:
+            root = record.by_current_session(session)
+            while root is not None and root.kind != "showrunner":
+                root = record.by_id(root.parent) if root.parent is not None else None
+    except staff.StaffUnreadable as error:
+        print(f"board_json: {error}", file=sys.stderr)
+        return NoBoardSubtree()
+    slugs = {row.id: slug for slug, row in members.items()}
+    if root is None or root.id not in slugs:
+        return NoBoardSubtree()
+    boards: list[showrunners.Showrunner] = []
+    level = [root]
+    while level:
+        for row in level:
+            slug = slugs.get(row.id, "")
+            if slug in by_slug:
+                boards.append(by_slug[slug])
+        level = sorted((child for row in level for child in staff.active(record, "showrunner")
+                        if child.parent == row.id and child.id in slugs),
+                       key=lambda row: slugs.get(row.id, row.name))
+    return BoardSubtree(record, tuple(boards))
+
+
+def build(runner: showrunners.Showrunner, *, record: staff.StaffSnapshot,
+          resolver: session_staff.RowResolver | None = None) -> dict[str, object]:
+    resolver = resolver if resolver is not None else session_staff.RowResolver(record)
     clock = BoardClock(ZoneInfo(runner["zone"]), plan_history.now_epoch())
     document = Path(runner["doc"]).expanduser().resolve()
     sources = {document}
-    rows = production_units.live_unit_table(document.read_text(encoding="utf-8").splitlines(), runner["slug"])
+    owner = record.by_doc(remote.local_machine(), document)
+    units: list[dict[str, object]] = []
+    if owner is None:
+        print(f"board_json: {runner['slug']}: the production document is not recorded", file=sys.stderr)
+    for row in staff.active(record, "unit"):
+        if owner is None or row.parent != owner.id:
+            continue
+        tree = resolver.unit_worktree(row)
+        try:
+            config = resolver.unit_config(row)
+        except ValueError as error:
+            config = session_staff.ConfigMissing(str(error))
+        doc = resolver.production_doc(row)
+        problems: list[str] = []
+        if not isinstance(tree, staff.PresentWorktree):
+            problems.append("the worktree is not recorded")
+        if not isinstance(config, unit_config.UnitConfig):
+            problems.append(getattr(config, "reason", "the unit configuration is unavailable"))
+        if not isinstance(doc, session_staff.ProductionDoc):
+            problems.append(doc.reason)
+        if problems:
+            reason = "; ".join(dict.fromkeys(problems))
+            print(f"board_json: {row.name}: {reason}", file=sys.stderr)
+            units.append({"key": row.name, "state": "unavailable", "problem": reason})
+        elif isinstance(config, unit_config.UnitConfig) and isinstance(tree, staff.PresentWorktree):
+            plan = str(tree.path / config.plan.path) if isinstance(config.plan, unit_config.PlanFile) else "standby" if isinstance(config.plan, unit_config.StandbyPlan) else "permanent"
+            units.append(unit({"Unit": row.name, "Worktree": str(tree.path), "Plan": plan}, clock, sources, resolver=resolver))
     offset = datetime.fromtimestamp(clock.now, clock.zone).utcoffset()
     return {"production": runner["slug"], "as_of": clock.time(clock.now), "zone": runner["zone"],
             "utc_offset_minutes": int(offset.total_seconds() / 60) if offset else 0,
-            "units": [unit(cells, clock, sources) for cells in rows], "sources": existing_sources(sources)}
+            "units": units, "sources": existing_sources(sources)}
 
 
 def write_board(path: Path, board: dict[str, object]) -> None:
@@ -415,21 +474,27 @@ def write_board(path: Path, board: dict[str, object]) -> None:
 
 def main(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    group = parser.add_mutually_exclusive_group(required=True)
-    _ = group.add_argument("--cwd", default="")
-    _ = group.add_argument("--production", default="")
     _ = parser.add_argument("--session", default="")
+    _ = parser.add_argument("--production", default="")
     args = parser.parse_args(arguments)
-    runners = resolve(cast(str, args.cwd), cast(str, args.production), cast(str, args.session))
+    session, production = cast(str, args.session), cast(str, args.production)
+    if not session and not production:
+        parser.error("--session or --production is required")
+    subtree = resolve(production, session)
     root = Path(os.environ.get("UNIT_BOARD_DIR") or str(Path(os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")) / "unit-board")).expanduser().resolve()
     files: list[str] = []
-    for runner in runners:
-        path = root / f"{runner['slug']}.json"
-        write_board(path, build(runner))
-        files.append(str(path))
+    if isinstance(subtree, BoardSubtree):
+        resolver = session_staff.RowResolver(subtree.record)
+        for runner in subtree.runners:
+            path = root / f"{runner['slug']}.json"
+            write_board(path, build(runner, record=subtree.record, resolver=resolver))
+            files.append(str(path))
     watch_sources = {showrunners.NOTIFIER_STATE_DIR, showrunners.SHOWRUNNER_STATE_DIR}
-    watch_sources.update(showrunners.SHOWRUNNER_STATE_DIR / runner["slug"]
-                         for runner in showrunners.registered_showrunners())
+    if isinstance(subtree, BoardSubtree):
+        for row in staff.active(subtree.record, "showrunner"):
+            timer = showrunners.timer_for(row, subtree.record)
+            if isinstance(timer, showrunners.Timer):
+                watch_sources.add(showrunners.SHOWRUNNER_STATE_DIR / timer.slug)
     watch = existing_sources(watch_sources)
     print(json.dumps({"files": files, "watch": watch}))
     return 0

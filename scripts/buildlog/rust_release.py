@@ -17,8 +17,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, Literal, TypedDict, cast
 
-import store
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+import store
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import process_group
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 import override_guard
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
@@ -131,7 +134,7 @@ def run_process(args: list[str], cwd: Path | None, env: dict[str, str], timeout:
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as error:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                process_group.send_process_group(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             stdout, stderr = process.communicate()

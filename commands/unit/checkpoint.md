@@ -1,5 +1,5 @@
 ---
-description: Commit and push a finished /unit:direct phase and release its reservation, when the run did not.
+description: Commit and push a completed phase.
 ---
 
 # Direct — checkpoint

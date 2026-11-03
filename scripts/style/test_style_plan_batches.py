@@ -13,6 +13,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import approved_renames
+import style_footprint
 import style_plan
 import style_proposals
 
@@ -115,7 +116,7 @@ class StylePlanTests(StylePlanFixture):
         runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0))
         with mock.patch.object(style_plan, "run_verification_step", runner):
             for profile in ("default", "default", "changed-policy"):
-                with mock.patch.dict("os.environ", {"NEXTEST_PROFILE": profile, "LINT_CONFIG_FILE": profile}):
+                with mock.patch.dict("os.environ", {"NEXTEST_PROFILE": profile, "LINT_CONFIG_FILE": profile, "CONF_DIR": str(Path(profile).parent)}):
                     self.assertEqual(style_plan.verify_ticket(self.unit, ticket_id), 0)
             self.assertEqual(runner.call_args_list, [mock.call(self.unit, stage, "alpha")
                              for _ in range(3) for stage in ("check", "lint", "test")])
@@ -236,6 +237,27 @@ class StylePlanTests(StylePlanFixture):
             with self.assertRaisesRegex(style_ledger.LedgerError, "crosses crate boundaries"):
                 _ = style_plan.verify_ticket(self.unit, ticket_id)
             runner.assert_not_called()
+
+    def test_verification_after_fast_forward_counts_only_the_tickets_own_paths(self) -> None:
+        ticket_id = self.verification_ticket()
+        own, imported = self.sources[0], self.sources[2]
+        _ = (self.style / imported).write_text("pub fn another_units_merged_work() {}\n")
+        _ = self.git("commit", "-qam", "Another unit's merged crate", cwd=self.style)
+        _ = self.git("merge", "--ff-only", "style/main", cwd=self.unit)
+        _ = (self.unit / own).write_text("pub fn own_committed_work() {}\n")
+        _ = self.git("commit", "-qam", "Ticket's own work", cwd=self.unit)
+        # The same query must also include pending work in the verification snapshot.
+        pending = self.sources[1]
+        _ = (self.unit / pending).write_text("pub fn own_pending_work() {}\n")
+        runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0))
+        with mock.patch.object(style_plan, "run_verification_step", runner):
+            self.assertEqual(style_plan.verify_ticket(self.unit, ticket_id), 0)
+        self.assertEqual(runner.call_args_list, [mock.call(self.unit, stage, "alpha")
+                                               for stage in ("check", "lint", "test")])
+        with self.ledger() as ledger:
+            ticket, = ledger.ticket_open("names-unit")
+            snapshot = style_footprint.worktree_commit(self.unit)
+            self.assertEqual(ledger.ticket_changed_paths(ticket, snapshot), frozenset((own, pending)))
 
     def test_verification_stops_on_a_failed_stage_or_a_changed_tree(self) -> None:
         ticket_id = self.verification_ticket()

@@ -106,13 +106,12 @@ def git_output(repo: Path, *arguments: str) -> str:
 def full_suite_trigger(path: str) -> bool:
     name = Path(path).name
     return (path.startswith("scripts/lib/")
-            or name in {"conftest.py", "settings.json", "merge_gate.py", "affected_modules.py", "agents_config.sh"}
-            or (Path(path).parent == Path("config") and name.endswith(".conf")))
+            or name in {"conftest.py", "settings.json", "merge_gate.py", "affected_modules.py", "models_config.sh"})
 
 
 # Bump the extractor version whenever source-fact semantics change.
 CACHE_FORMAT_VERSION = 1
-EXTRACTOR_VERSION = 1
+EXTRACTOR_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -150,6 +149,10 @@ def extract_facts(text: str, path: str) -> SourceFacts:
         elif isinstance(node, ast.Call):
             name = node.func.attr if isinstance(node.func, ast.Attribute) else (
                 node.func.id if isinstance(node.func, ast.Name) else "")
+            if (isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "conf" and node.args
+                    and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
+                strings.add(f"config/{node.args[0].value}.conf")
             calls.add(name)
             enclosing = (*enclosing, name)
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):

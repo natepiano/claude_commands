@@ -7,11 +7,11 @@ in full.
 completes.
 
 <LaunchImplementation>
-1. Once per phase, create `${PHASE_DIR}` if it is missing (ad hoc work uses
-   `${SESSION_DIR}/phases/adhoc`), then save `git rev-parse HEAD` to
-   `${PHASE_DIR}/phase_baseline` and `git status --short` to
-   `${PHASE_DIR}/progress_baseline_status` before dispatch. Stop if either
-   fails; fixes retain both baselines.
+1. The launcher's `phase_reservation.py claim` writes `${PHASE_DIR}/phase_baseline`
+   (the repository's full `HEAD` id) and `${PHASE_DIR}/progress_baseline_status`
+   (`git status --short`) at the phase's first launch, before the worker opens.
+   A git failure stops the launch. Later launches, including fixes and reopened
+   phases, keep both first baselines. Ad hoc work uses `${SESSION_DIR}/phases/adhoc`.
 2. Close the outgoing phase before opening this one, per <PassOwnership/>: when a
    finished phase's record is still active, run `progress_history.py finish-phase
    --session-dir "${SESSION_DIR}" --status completed` first. A phase opened
@@ -21,7 +21,7 @@ completes.
    "${PHASE_DIR}/implementation_prompt.md"`. Use `ad hoc` plus scope without a
    phased plan; pass the original prompt only. Both run before the dispatch in
    step 4, never after it.
-3. `~/.claude/config/agents.conf` owns worker family/model/effort, one row
+3. `~/.claude/config/models.conf` owns worker family/model/effort, one row
    per kind. On a worker's first phase, its kind is its opening role from the Work
    Order's `Workers:` field: `impl` for the `impl` slot, and for `test` whatever
    its Workers line opens it as — `test` under the default opening. On later
@@ -69,7 +69,7 @@ completes.
    **Task and kind are the same word** on every worker: the fourth argument selects
    the agent and the sixth records the pass, and both say what this worker is
    doing. The vocabulary is `impl`, `test`, `fix`, `review` — nothing else
-   resolves, in `agents.conf` or in the ledger.
+   resolves, in `models.conf` or in the ledger.
 6. Announce prompt, board, and heartbeat paths, set `EARLY_REVIEW=none`, then
    apply <DispatchContract/> once for the whole team.
 7. On completion, read `${PHASE_DIR}/impl_status_impl` and `impl_status_test`; the phase is

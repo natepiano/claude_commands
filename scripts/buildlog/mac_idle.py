@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+
 import fcntl
 import hashlib
 import json
@@ -21,8 +22,12 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS.parent))
 
 if TYPE_CHECKING:
+    from ..lint import memory_admit
+    from ..build_queue import admission_client
     from ..direct import step_record
 else:
+    from scripts.lint import memory_admit
+    from scripts.build_queue import admission_client
     from scripts.direct import step_record
 
 IDLE_SECONDS = 180
@@ -136,13 +141,21 @@ def belongs_to(process: LiveProcess, call: VerifyCall, live: dict[int, LiveProce
     return False
 
 
-def waiting_evidence(call: VerifyCall, paths: MacIdlePaths, live: dict[int, LiveProcess]) -> str:
-    """Read wait records and match their process lifetimes to the call."""
+def admission_waiters() -> list[memory_admit.Waiter]:
+    return [row for _, row in admission_client.view().ordered]
+
+
+def waiting_evidence(call: VerifyCall, live: dict[int, LiveProcess]) -> str:
+    """Match service waiters to the call by process identity."""
+    return _waiting_evidence(call, live, admission_waiters())
+
+
+def _waiting_evidence(call: VerifyCall, live: dict[int, LiveProcess],
+                      waiters: list[memory_admit.Waiter]) -> str:
     children = {pid: child for pid, child in live.items() if belongs_to(child, call, live)}
-    for path in paths.admission.glob("*.waiting"):
-        row = read_record(path)
-        pid = row.get("pid")
-        if isinstance(pid, int) and pid in children and children[pid].start == row.get("start_time"):
+    for row in waiters:
+        pid = row["pid"]
+        if pid in children and children[pid].start == row["start_time"]:
             return "memory"
     if call.token_dir:
         if any(Path(call.token_dir).glob(f"*.{call.pid}")) or any(Path(call.token_dir).glob(f"*.{call.pid}.again")):
@@ -188,7 +201,7 @@ def waiting_calls(paths: MacIdlePaths, live: dict[int, LiveProcess]) -> tuple[Ve
             continue
         if not isinstance(record, step_record.StepRecord):
             continue
-        if (not isinstance(record.runs_on, step_record.MacAllowed)
+        if (not step_record.mac_eligible(record)
                 or record.state not in (step_record.StepState.WAITING_HOLD, step_record.StepState.WAITING_MAC)):
             continue
         process = live.get(record.pid)
@@ -197,12 +210,12 @@ def waiting_calls(paths: MacIdlePaths, live: dict[int, LiveProcess]) -> tuple[Ve
         try:
             call = registered_call(read_record(call_path(paths, record.call_id)))
         except ValueError:
-            call = VerifyCall(record.call_id, record.pid, record.proc_start, str(record.repo), record.package or "",
+            call = VerifyCall(record.call_id, record.pid, record.proc_start, str(record.repo), step_record.package_name(record.package),
                 "", "", "", "", "", 0, False)
         if call.pid != record.pid or call.start != record.proc_start:
             call = replace(call, pid=record.pid, start=record.proc_start, marker_hook=False,
                            session="", temp_dir="", hold_waiter="", token_dir="")
-        calls.append(replace(call, repo=str(record.repo), package=record.package or "", kind=record.kind,
+        calls.append(replace(call, repo=str(record.repo), package=step_record.package_name(record.package), kind=record.kind,
                              wait_state=record.state))
     return tuple(calls)
 
@@ -297,10 +310,11 @@ def watch_once(paths: MacIdlePaths, now: float, monotonic: float) -> None:
         if now - since < IDLE_SECONDS:
             return
         live = processes(paths.proc)
+        waiters = admission_waiters()
         for call in waiting_calls(paths, live):
             case_file = call_path(paths, call.call_id).with_suffix(".cases")
             cases = read_record(case_file)
-            wait = waiting_evidence(call, paths, live)
+            wait = _waiting_evidence(call, live, waiters)
             causes: list[tuple[str, str]] = []
             session_dir = paths.session_root / call.session
             if (SESSION_ID.fullmatch(call.session) and call.temp_dir == str(session_dir) and not session_dir.exists()
@@ -317,7 +331,8 @@ def watch_once(paths: MacIdlePaths, now: float, monotonic: float) -> None:
                     "wait-local" in child.argv and "--leave-hook" not in child.argv for child in children)
                 if wait == "memory":
                     no_hook = no_hook or any(not child.environment.get("LINT_QUEUE_LEAVE_HOOK")
-                        and (paths.admission / f"{child.pid}-{child.start}.waiting").exists() for child in children)
+                        and any(row["pid"] == child.pid and row["start_time"] == child.start
+                                for row in waiters) for child in children)
                 cause, action = ("missing_leave_hook", "retry_marker") if no_hook else ("idle_with_waiter", "message_builds_unit")
             causes.append((cause, action))
             for cause, action in causes:

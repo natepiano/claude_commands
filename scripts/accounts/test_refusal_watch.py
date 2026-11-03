@@ -23,8 +23,9 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from importlib import import_module
 from typing import TYPE_CHECKING, Literal, Self, cast, final, override
-from unittest.mock import call, patch
+from unittest.mock import ANY, Mock, call, patch
 
+from scripts.lib import conf
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, moves, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
@@ -51,6 +52,24 @@ else:
     restart_support = import_module("restart_support")
     sessions = import_module("sessions")
     pane_record = import_module("pane_record")
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(patch.object(accounts, "_start_session_counts_fetch", return_value=True))
+
+
+@contextmanager
+def observe_whole_reads() -> Generator[Mock]:
+    """Record settings reads with the existing file and key evidence."""
+    observed = Mock()
+    whole = conf.ConfigRead.whole
+
+    def record(configuration: conf.ConfigRead, key: str) -> int:
+        observed(configuration.file, key)
+        return whole(configuration, key)
+
+    with patch.object(conf.ConfigRead, "whole", new=record):
+        yield observed
 
 
 NOW = datetime(2026, 10, 14, 12, tzinfo=timezone.utc)
@@ -150,9 +169,7 @@ class RefusalWatchTests(unittest.TestCase):
         identity = accounts.account_identity(directory.path)
         return account.Account("claude", identity.login, identity.label) if isinstance(identity, agent_accounts.NumberedAccount) else None
 
-    def inventory_for(self, login: str, only: frozenset[str] = NO_SESSION_FILTER, *,
-                      refresh_desktops: bool = True) -> inventory.Inventory:
-        self.assertFalse(refresh_desktops, "the watcher must read the desktop snapshot without invoking its timer")
+    def inventory_for(self, login: str, only: frozenset[str] = NO_SESSION_FILTER) -> inventory.Inventory:
         owners = [owner for owner in self.owners
                   if (identity := self.process_account(owner["pid"], home_state=account.home_account_state())) is not None
                   and identity.login.casefold() == login.casefold()
@@ -306,9 +323,19 @@ class RefusalWatchTests(unittest.TestCase):
         with (patch.object(accounts, "renew_login", return_value=accounts.LoginRenewed()) as probe,
               patch.object(agent_accounts, "claude_live", side_effect=AssertionError("unexpected live usage"))):
             self.assertIn("claude2 login renewed", refusal_watch.run(NOW))
-        probe.assert_called_once_with("claude2")
+        probe.assert_called_once_with("claude2", account_config=ANY)
         self.assertEqual(accounts.login_renewal_attempts(),
                          {"claude2": accounts.LoginRenewalAttempt(NOW, accounts.LoginRenewed())})
+
+    def test_a_missing_login_token_uses_the_existing_renewal_path(self) -> None:
+        usage_store.save([agent_accounts.Report("Claude", email="main@example.invalid",
+            usage_read_outcome=agent_accounts.UsageReadOutcome.NO_LOGIN_TOKEN)], NOW)
+        with patch.object(accounts, "renew_login", return_value=accounts.LoginRenewalFailed("usage still shows no login token")) as probe:
+            self.assertEqual(refusal_watch.renew_expired_logins(NOW, False),
+                ["claude2 login renewal failed: usage still shows no login token"])
+        probe.assert_called_once_with("claude2", account_config=ANY)
+        self.assertEqual(accounts.login_renewal_attempts()["claude2"].result,
+                         accounts.LoginRenewalFailed("usage still shows no login token"))
 
     def test_expired_login_wait_keeps_the_last_reading_time(self) -> None:
         _ = self.groups()
@@ -1108,10 +1135,9 @@ class RefusalWatchTests(unittest.TestCase):
         fresh = herdr.HerdrProcess(owner["pid"], herdr.HerdrPlace("agents", "new-pane"),
             {"SHOWRUNNER_UNIT": "fixture", "SHOWRUNNER_UNIT_ID": "new-unit"}, "claude", str(self.home))
         original_inventory = self.inventory_for
-        def observed(login: str, only: frozenset[str] = NO_SESSION_FILTER, *,
-                     refresh_desktops: bool = True) -> inventory.Inventory:
+        def observed(login: str, only: frozenset[str] = NO_SESSION_FILTER) -> inventory.Inventory:
             rows = herdr.herdr_processes()
-            found = original_inventory(login, only, refresh_desktops=refresh_desktops)
+            found = original_inventory(login, only)
             if not rows:
                 # The report predates the new marked pane, so this is top-level.
                 ungrouped: list[inventory.Session] = []
@@ -2087,9 +2113,10 @@ class RefusalWatchTests(unittest.TestCase):
         events: list[str] = []
         original = accounts.placement
 
-        def place(group: accounts.ClaudeGroup, now: datetime, *, exclude: frozenset[str] = NO_SESSION_FILTER) -> accounts.GroupPlacement:
+        def place(group: accounts.ClaudeGroup, now: datetime, *, exclude: frozenset[str] = NO_SESSION_FILTER,
+                  reading_age_minutes: int | accounts.ConfiguredReadingAge) -> accounts.GroupPlacement:
             events.append("placement")
-            return original(group, now, exclude=exclude)
+            return original(group, now, exclude=exclude, reading_age_minutes=reading_age_minutes)
 
         with patch.object(accounts, "placement", side_effect=place):
             _ = refusal_watch.run(NOW, refresh_usage=lambda: events.append("fresh usage"))
@@ -2324,7 +2351,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.owner("unit", host="unit")
         _ = self.transcript("unit")
         original = accounts.move_sessions
-        def requested(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_resume.ClaudeUp | stop_resume.MoveHandedOff | accounts.SessionMoveRefused, ...]:
+        def requested(ids: tuple[str, ...], target: str, *, why: str) -> tuple[accounts.SessionMoveOutcome, ...]:
             self.assertEqual(stored_group_labels(path)["units"], target)
             return original(ids, target, why=why)
         with patch.object(accounts, "move_sessions", side_effect=requested):
@@ -2546,7 +2573,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.groups()
         _ = self.owner("unit", host="unit")
         def manual_inventory(login: str, only: frozenset[str] = NO_SESSION_FILTER, **_options: object) -> inventory.Inventory:
-            return self.inventory_for(login, only, refresh_desktops=False)
+            return self.inventory_for(login, only)
         with patch.object(inventory, "inventory", side_effect=manual_inventory):
             result = accounts.move("unit", "claude3")
         self.assertIsInstance(result, accounts.MoveRefused)
@@ -3163,6 +3190,76 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(len(self.moves.calls), 2)
         self.assertTrue(all(command.target == "claude2" for command in self.moves.calls))
 
+    def test_whole_read_observer_keeps_the_actual_configuration_file(self) -> None:
+        configured = conf.read("accounts")
+        other = conf.read(conf.path("accounts"))
+        with observe_whole_reads() as read:
+            self.assertEqual(configured.whole("usage_stale_minutes"), other.whole("usage_stale_minutes"))
+        self.assertEqual(read.call_args_list, [call("accounts", "usage_stale_minutes"),
+                                             call(other.file, "usage_stale_minutes")])
+        self.assertNotEqual(configured.file, other.file)
+
+    def test_login_renewal_uses_one_accounts_read_for_the_interval_and_probe(self) -> None:
+        self.expired_login()
+        with (patch.object(conf, "read", wraps=conf.read) as read,
+              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 7, "", ""))):
+            lines = refusal_watch.renew_expired_logins(NOW, False)
+        self.assertEqual(lines, ["claude2 login renewal failed: probe exited with status 7"])
+        self.assertEqual(read.call_args_list, [call("accounts")])
+
+    def test_auto_move_hold_uses_the_pass_accounts_read(self) -> None:
+        group_path = self.groups()
+        entry = next_moves.ClaudeGroupMove("half-point", "units", 1, next_moves.HalfPointHold(), "claude2", NOW)
+        self.next_entries(entry)
+        self.reading(SOURCE_LOGIN, 1)
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                holds = ({entry.id: refusal_watch.HoldStarted("claude1", NOW, accounts.NoGroupTransition(), 1)}
+                         if legacy else {})
+                refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={}, auto_move_holds=holds))  # pyright: ignore[reportPrivateUsage]
+                with (patch.object(conf, "read", wraps=conf.read) as read,
+                      patch.object(next_moves, "account_pace", return_value=next_moves.NoUsablePace())):
+                    lines = refusal_watch.run_auto_moves(NOW)
+                self.assertEqual(lines, [])
+                self.assertEqual(read.call_args_list, [call("accounts")])
+                held = refusal_watch._load_state().get("auto_move_holds", {})[entry.id]  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(held.duration, next_moves.ResolvedHold(40, next_moves.NoUsablePace()))
+
+                self.assertEqual(stored_group_labels(group_path)["units"], "claude1")
+
+    def test_owner_loops_read_each_config_value_once(self) -> None:
+        for identity in ("first", "second"):
+            _ = self.owner(identity)
+            _ = self.transcript(identity, "You've hit your session limit")
+        self.reading(SOURCE_LOGIN, 80, five=0, five_reset=NOW + timedelta(minutes=5))
+        with observe_whole_reads() as read:
+            _ = refusal_watch._run(NOW, True)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(read.call_args_list.count(call("accounts", "transcript_chunk_bytes")), 1)
+        self.assertEqual(read.call_args_list.count(call("accounts", "usage_stale_minutes")), 1)
+
+    def test_refused_units_read_usage_age_once_through_placement(self) -> None:
+        _ = self.groups()
+        for identity in ("first", "second"):
+            _ = self.owner(identity, host="unit")
+            _ = self.transcript(identity)
+        with (observe_whole_reads() as read,
+              patch.object(accounts, "placement", wraps=accounts.placement) as placement,
+              patch.object(accounts, "pick", wraps=accounts.pick) as pick):
+            _ = refusal_watch._run(NOW, True)  # pyright: ignore[reportPrivateUsage]
+        self.assertGreaterEqual(placement.call_count, 2)
+        self.assertGreaterEqual(pick.call_count, 2)
+        self.assertEqual(read.call_args_list.count(call("accounts", "usage_stale_minutes")), 1)
+
+    def test_refused_terminal_sessions_read_usage_age_once_through_pick(self) -> None:
+        for identity, label in (("first", "claude1"), ("second", "claude3")):
+            _ = self.owner(identity, label=label)
+            _ = self.transcript(identity)
+        with (observe_whole_reads() as read,
+              patch.object(accounts, "pick", wraps=accounts.pick) as pick):
+            _ = refusal_watch._run(NOW, True)  # pyright: ignore[reportPrivateUsage]
+        self.assertGreaterEqual(pick.call_count, 2)
+        self.assertEqual(read.call_args_list.count(call("accounts", "usage_stale_minutes")), 1)
+
     def test_transcript_lookup_ignores_deeper_folders_and_reads_each_live_owner_once_per_tick(self) -> None:
         _ = self.owner("refused")
         transcript = self.transcript("refused")
@@ -3173,7 +3270,7 @@ class RefusalWatchTests(unittest.TestCase):
         with patch.object(refusal_watch, "_newest_exchange", wraps=refusal_watch._newest_exchange) as detect:  # pyright: ignore[reportPrivateUsage]
             _, output, _ = self.cli("--dry-run")
         self.assertIn("owner refused: refused; move", output)
-        detect.assert_called_once_with(transcript)
+        detect.assert_called_once_with(transcript, 65536)
 
     def test_refusal_pass_searches_projects_once_and_keeps_each_latest_exchange(self) -> None:
         for identity in ("first", "second", "continued"):
@@ -3188,8 +3285,8 @@ class RefusalWatchTests(unittest.TestCase):
         os.utime(newer, (original.stat().st_mtime + 60, original.stat().st_mtime + 60))
         expected = {identity: refusal_watch.session_refusal(identity)
                     for identity in ("first", "second", "continued")}
-        def read_individually(identities: list[str]) -> dict[str, refusal_watch.TranscriptRefusal | refusal_watch.ProofRefusal | refusal_watch.NoSessionRefusal]:
-            return {identity: refusal_watch.session_refusal(identity) for identity in identities}
+        def read_individually(identities: list[str], *, account_config: conf.ConfigRead) -> dict[str, refusal_watch.TranscriptRefusal | refusal_watch.ProofRefusal | refusal_watch.NoSessionRefusal]:
+            return {identity: refusal_watch.session_refusal(identity, account_config=account_config) for identity in identities}
 
         with patch.object(refusal_watch, "session_refusals", side_effect=read_individually):
             expected_code, expected_output, expected_error = self.cli("--dry-run")
@@ -3309,7 +3406,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertIsInstance(result, accounts.GroupMoveStarted)
         transition = accounts.group_transition("showrunners")
         assert isinstance(transition, accounts.GroupTransition)
-        move.assert_called_once_with(("first", "second"), "claude3", why="weekly refusal")
+        move.assert_called_once_with(("first", "second"), "claude3", why="weekly refusal", account_config=ANY)
 
     def test_named_window_without_known_reset_moves(self) -> None:
         _ = self.owner("refused")

@@ -11,9 +11,8 @@ from typing import TypedDict, cast, override
 import unittest
 
 from scripts.lib.nix_env_test_support import NixFixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 VERIFY = Path(__file__).with_name("verify.sh")
 SCRIPTS = VERIFY.parent.parent
@@ -70,6 +69,9 @@ class VerifyNixShellTests(NixFixture):
         self.verify_script.chmod(0o755)
         self.script(scripts / "lib/py", PYTHON_SHIM)
         (scripts / "lib/nix_env.py").symlink_to(SCRIPTS / "lib/nix_env.py")
+        (scripts / "lint").mkdir()
+        _ = shutil.copy2(SCRIPTS / "lint/invoke.sh", scripts / "lint/invoke.sh")
+        _ = shutil.copy2(SCRIPTS / "lib/build_folders.py", scripts / "lib/build_folders.py")
         guards = scripts / "build_hold"
         guards.mkdir()
         _ = shutil.copy2(SCRIPTS / "build_hold/override_guard.sh", guards / "override_guard.sh")

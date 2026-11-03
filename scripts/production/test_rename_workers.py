@@ -9,6 +9,7 @@ from typing import cast, final
 from unittest import mock
 
 from scripts.astra import design_roles
+from scripts.astra.design_role_test_support import write_empty_binding_record
 from scripts.direct import workers
 from scripts.production import rename_test_support as support
 from scripts.production.rename_test_support import NEW, OLD
@@ -16,6 +17,23 @@ from scripts.production.rename_test_support import NEW, OLD
 
 @final
 class ProductionRenameTests(support.ProductionRenameFixture):
+    def test_composite_rename_warns_once_across_the_showrunner_and_unit_moves(self) -> None:
+        self.prepare_unit_moves()
+        self.env['DESIGN_ROLES_STATE'] = str(self.root / 'state/astra/design-roles')
+        with mock.patch.dict(os.environ, self.env):
+            bad = write_empty_binding_record(self.checkout, design_roles.UnitHolder('unrelated', 'other-unit'),
+                                             lifecycle=design_roles.RoleOpen('unrelated-thread'))
+        with design_roles.record_operation():
+            results = [self.run_rename('apply'), self.run_command('unit', NEW, 'alpha-unit'),
+                       self.run_command('unit', NEW, 'beta-unit')]
+        for result in results:
+            self.assert_success(result)
+        self.assertEqual([line for result in results for line in result.stderr.splitlines()],
+                         [f'warning: {bad}: missing or invalid repository'])
+        self.assert_unit_moved('alpha-unit')
+        self.assert_unit_moved('beta-unit')
+        self.assertTrue(bad.is_file())
+
     def test_worker_migration_conflict_prints_a_refusal_without_a_traceback(self) -> None:
         with mock.patch.dict(os.environ, self.env):
             ledger = workers.UnitWorkerLedger(workers.ledger_path(OLD, "alpha-unit"))
@@ -59,14 +77,15 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertEqual(self.snapshot(), before)
         destination = self.root / "runs/after-move"
         self.write(destination / workers.STATE, json.dumps({"status": "active", "working_dir": str(new),
-            "plan_doc": "docs/plans/alpha-unit.md", "run_id": destination.name}))
+            "plan_doc": "docs/plans/alpha-unit.md", "production": NEW, "unit": "alpha-unit",
+            "run_id": destination.name}))
         with mock.patch.dict(os.environ, self.env):
             self.assertEqual(workers.adopt(run, destination, "w7"), "w7")
             target = workers.ledger_for_run(destination)
             self.assertEqual(target.path, workers.ledger_for_run(run).path)
             with target.locked() as ledger:
                 self.assertEqual(ledger.workers["w7"].backend,
-                                 workers.CodexThread("kept-thread", str(self.root / "codex-home")))
+                                 workers.CodexThread("057316c9-bc95-50de-b3fc-9010799ce6e7", str(self.root / "codex-home")))
 
     def test_repair_workers_fixes_old_moves_and_dry_run_and_second_run_change_nothing(self) -> None:
         self.prepare_unit_moves()

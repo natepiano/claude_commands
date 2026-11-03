@@ -32,7 +32,7 @@ from urllib.parse import quote
 import store
 import parse
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 28
 # Step and call fields under a former name, read as the current name.
 FORMER_FIELDS = (("seat", "worker"), ("delegate_session", "unit_session"))
 LOCK_NAME = "index.lock"
@@ -58,7 +58,7 @@ class JobRunState(StrEnum):
 STEP_COLUMNS: list[Column] = [
     ("id", "TEXT PRIMARY KEY", "host-UTC time-random"),
     ("src", "TEXT", "the JSON lines file the row came from, relative to the root"),
-    ("host", "TEXT", "natedev, or the Mac's short host name"),
+    ("host", "TEXT", "the host that ran the step"),
     ("started_at", "TEXT", "UTC ISO time; date(started_at,'localtime') gives the local day"),
     ("ended_at", "TEXT", "UTC ISO time"),
     ("duration_s", "REAL", "wall time of the step"),
@@ -114,6 +114,8 @@ STEP_COLUMNS: list[Column] = [
     ("log", "TEXT", "gzipped output of a failed step, relative to the root"),
     ("started_at_us", "INTEGER", "UTC epoch microseconds; strict instant order for build history"),
     ("test_build_key", "TEXT", "verify test Cargo build-input key, excluding nextest run-only selection; NULL for older or changed builds"),
+    ("scope_resources", "TEXT", "JSON own-scope CPU (excludes sccache.service compiles) and IO counters"),
+    ("target", "TEXT", "the configured build target; NULL for legacy records"),
 ]
 
 TEST_COLUMNS: list[Column] = [
@@ -270,6 +272,9 @@ SAMPLE_COLUMNS: list[Column] = [
     ("cpu_total_ticks", "INTEGER", "CPU total ticks since boot from /proc/stat, USER_HZ, excluding guest fields; NULL when not recorded"),
     ("power_profile", "TEXT", "power-profiles-daemon profile; NULL when not recorded"),
     ("power_profile_since", "TEXT", "UTC ISO mtime of the daemon's state file: when the profile was set"),
+    ("slices", "TEXT", "JSON raw builds and CI slice readings; memory.current is the whole held charge"),
+    ("filesystem", "TEXT", "JSON filesystem free/used/total and top-layer device identity"),
+    ("jobserver", "TEXT", "JSON free pool tokens, not CPUs in use; measured or unavailable"),
 ]
 
 MEMORY_SNAPSHOT_COLUMNS: list[Column] = [
@@ -337,7 +342,26 @@ QUEUE_BUMP_COLUMNS: list[Column] = [
     ("old_position", "INTEGER", "waiting position before the move, starting at one"),
 ]
 
+SSH_ATTEMPT_COLUMNS: list[Column] = [
+    ("id", "TEXT PRIMARY KEY", "attempt identity"),
+    ("src", "TEXT", "source file"),
+    ("host", "TEXT", "recording host"),
+    ("at", "TEXT", "record time"),
+    ("call_id", "TEXT", "verify call identity"),
+    ("target", "TEXT", "selected SSH target"),
+    ("repo_identity", "TEXT", "normalized origin identity"),
+    ("queued_at", "REAL", "original queue timestamp"),
+    ("departed_at", "REAL", "SSH departure timestamp"),
+    ("slot", "INTEGER", "reserved repository slot"),
+    ("outcome", "TEXT", "passed, failed, lost, or declined"),
+    ("completion", "TEXT", "confirmed or missing completion evidence"),
+    ("cleanup", "TEXT", "confirmed or unconfirmed cleanup evidence"),
+    ("unresolved_count", "INTEGER", "remaining processes; NULL when unavailable"),
+    ("evidence_at", "REAL", "ownership evidence timestamp"),
+]
+
 TABLES: dict[str, tuple[list[Column], str, str]] = {
+    "ssh_attempts": (SSH_ATTEMPT_COLUMNS, "", "SSH attempts, including retained capacity after completion"),
     "queue_bumps": (QUEUE_BUMP_COLUMNS, "", "one row per user or session move to the head of the memory queue"),
     "mac_idle": (MAC_IDLE_COLUMNS, "", "one Mac idle case per cause per verify call; actions keep the call as the test owner"),
     "hold_builds": (HOLD_BUILD_COLUMNS, "", "one row per build, hold and action: audit or stopped"),
@@ -761,7 +785,11 @@ def add_queue_bump(connection: sqlite3.Connection, record: dict[str, object], sr
     insert(connection, "queue_bumps", pick({**record, "src": src}, QUEUE_BUMP_COLUMNS))
 
 
-ADDERS = {"queue_bump": add_queue_bump, "mac_idle": add_mac_idle, "hold_build": add_hold_build, "hold_event": add_hold_event, "step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample,
+def add_ssh_attempt(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
+    insert(connection, "ssh_attempts", pick({**record, "src": src}, SSH_ATTEMPT_COLUMNS))
+
+
+ADDERS = {"ssh_attempt": add_ssh_attempt, "queue_bump": add_queue_bump, "mac_idle": add_mac_idle, "hold_build": add_hold_build, "hold_event": add_hold_event, "step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample,
           "memory_snapshot": add_memory_snapshot}
 
 

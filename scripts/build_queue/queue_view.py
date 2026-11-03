@@ -96,23 +96,23 @@ def waiting_moves(model: QueueModel, position: int) -> tuple[head_facts.BumpReco
 
 
 def is_moved(model: QueueModel, position: int) -> bool:
-    return (isinstance(model.facts, head_facts.HeadFacts) and isinstance(model.facts.bumps, head_facts.BumpHistory)
-            and has_move_priority(model, position))
+    return has_move_priority(model, position)
 
 
 def has_move_priority(model: QueueModel, position: int) -> bool:
-    return model.reading.ordered[position - 1][1].get("bump_order", 0) < 0
+    return model.reading.ordered[position - 1][1].get("priority_rank", 1) == 0
 
 
 def pressure_check(pressure: gate.Pressure, model: QueueModel) -> tuple[bool, str]:
+    policy = model.reading.explanation.policy
     if isinstance(pressure, gate.NoPressureHold):
         return True, "memory pressure: no hold"
     if pressure.next_start_at:
-        return False, "recovery spacing: one start per 30 s; next start at " + clock(model, pressure.next_start_at, seconds=True)
-    if pressure.swap_used_percent > gate.SWAP_USED_LIMIT and pressure.some_avg10 > gate.SOME_PRESSURE_LIMIT:
+        return False, f"recovery spacing: one start per {policy.timing.recovery_start_seconds:g} s; next start at " + clock(model, pressure.next_start_at, seconds=True)
+    if pressure.swap_used_percent > policy.pressure.swap_used_limit and pressure.some_avg10 > policy.pressure.some_avg10_limit:
         return False, (f"memory pressure: swap {pressure.swap_used_percent:.1f}% used and some avg10 {pressure.some_avg10:.1f}; "
-                       + f"starts when swap is at most {gate.SWAP_USED_LIMIT:g}% or some avg10 at most {gate.SOME_PRESSURE_LIMIT:.1f}")
-    return False, (f"memory pressure: full avg10 {pressure.full_avg10:.1f} now; starts below {gate.FULL_PRESSURE_LIMIT:.1f}")
+                       + f"starts when swap is at most {policy.pressure.swap_used_limit:g}% or some avg10 at most {policy.pressure.some_avg10_limit:.1f}")
+    return False, (f"memory pressure: full avg10 {pressure.full_avg10:.1f} now; starts below {policy.pressure.full_avg10_limit:.1f}")
 
 
 def check_line(passes: bool, text: str) -> Line:
@@ -143,6 +143,8 @@ def check_lines(checks: gate.HeadExplanation | gate.LineWaiter | gate.ReadingUna
 
 def reason_phrase(reason: gate.WaitReason, waiting: Sequence[gate.WaitingStep]) -> str:
     match reason:
+        case gate.EstimateExpired():
+            return "estimate expired"
         case gate.ReadingUnavailable():
             return "memory reading unavailable"
         case gate.MemoryPressure():
@@ -196,7 +198,9 @@ def head_status(model: QueueModel, budget: int) -> Line:
         result += (Span(" "), Span(countdown(head.order.deadline, model.reading.explanation.now),
                                    tone, until=head.order.deadline))
     reason = head.waiter.reason
-    if isinstance(reason, gate.ReadingUnavailable):
+    if isinstance(reason, gate.EstimateExpired):
+        result += (Span(" estimate expired", "error"),)
+    elif isinstance(reason, gate.ReadingUnavailable):
         result += (Span(" no reading", "error"),)
     elif isinstance(reason, gate.MemoryPressure) or isinstance(head.decision.pressure, gate.MemoryPressure):
         result += (Span(" pressure", "error"),)
@@ -227,7 +231,7 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     explanation = model.reading.explanation
     head, host = explanation.head, explanation.host
     budget_bytes = (host.budget if isinstance(host, gate.HostAvailable) else
-                    head.budget.budget if isinstance(head, gate.HeadExplanation) else gate.BUILD_BUDGET_BYTES)
+                    head.budget.budget if isinstance(head, gate.HeadExplanation) else gate.build_budget_bytes())
     budget = budget_bytes / gate.GIB
     taken = explanation.totals.charged / gate.GIB
     free = max(0.0, budget - taken)
@@ -266,13 +270,16 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     budget_label = f"budget {budget:.1f}"
     lines: list[Line] = [
         (Span(f"Build queue · {clock(model, explanation.now)}",
-              "warning" if isinstance(model.reading.freshness, gate.StaleReading) else "inactive"),), (),
+              "inactive"),), (),
         (Span(" " * bar_column), *labels),
         (Span(pad_right(budget_label, bar_column), "inactive"), *budget_bar(budget, free, colour=colour)), (),
         (Span(pad_left("#", place_width) + " " + pad_right(cut_tail("showrunner", show_width), show_width) + " "
               + pad_right(cut_tail("unit", unit_width), unit_width) + " " + pad_right("step", 7) + " "
               + pad_left("min", minutes_width) + " need", "inactive"),),
     ]
+    priority = head_facts.priority_text(explanation.priority)
+    if priority:
+        lines.insert(2, (Span(priority),))
     for index, (step, (show, unit), bar) in enumerate(zip(waiting, names, bars)):
         tone = "warning" if index == 0 else "inactive"
         row: Line = (
@@ -285,4 +292,11 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
             Span(bar, "warning"), Span(f" {step.need / gate.GIB:.1f}", tone),
         )
         lines.append((*row, *status) if index == 0 else row)
+    head = explanation.head
+    if isinstance(head, gate.HeadExplanation) and head.decision.state == "hold":
+        lines.append((Span(f"Head: free {head.free.available / gate.GIB:.1f} GiB; "
+            + f"reserve {head.free.reserve / gate.GIB:.1f} GiB; need {head.free.need / gate.GIB:.1f} GiB"),))
+    for step in model.reading.view.running:
+        if isinstance(step.measured, gate.UnownedSliceMemory):
+            lines.append((Span(f"{step.measured.owner}: {step.measured.bytes / gate.GIB:.1f} GiB (unowned)"),))
     return [clip(line, columns) for line in lines]

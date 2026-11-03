@@ -1,6 +1,8 @@
 """Seed real Git workspaces for the final gate and its read-only pass query."""
 from __future__ import annotations
 
+from scripts.lib.py_floor_test_support import cache_file_name
+
 import json
 from pathlib import Path
 import shutil
@@ -9,10 +11,10 @@ import sys
 import tempfile
 from typing import ClassVar, override
 
+from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.test_verify_untested_examples import ExampleWorkspaceFixture, VERIFY, workspace_metadata
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 
 class FinalPassFixture(ExampleWorkspaceFixture):
@@ -42,6 +44,7 @@ class FinalPassFixture(ExampleWorkspaceFixture):
         self.calls: Path = self.fixture_root / "cargo-calls"
         self.metadata_calls: Path = self.fixture_root / "metadata-calls"
         self.environment: dict[str, str] = self.fixture_environment.copy()
+        _ = caller_admission(self, self.fixture_root, self.environment)
 
     @override
     def tearDown(self) -> None:
@@ -73,7 +76,7 @@ class FinalPassFixture(ExampleWorkspaceFixture):
         # Exercise the real interpreter shim's cache, avoiding repeated version probes.
         cache = fixture / "cache/claude"
         cache.mkdir(parents=True, exist_ok=True)
-        _ = (cache / "python3-3.11").write_text(sys.executable + "\n")
+        _ = (cache / cache_file_name()).write_text(sys.executable + "\n")
         _ = self.environment.pop("CLAUDE_PYTHON", None)
 
     def git(self, *args: str) -> str:

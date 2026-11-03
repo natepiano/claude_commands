@@ -14,6 +14,7 @@ import unittest
 
 from scripts.direct.test_verify_mac_offload import stub_build_tool_path
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -57,6 +58,7 @@ class VerifyStepOwnerTests(unittest.TestCase):
             "XDG_STATE_HOME": str(self.root / "state"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_PEAK": "",
+            "BUILD_FOLDERS_SCRIPT": str(VERIFY.parent.parent / "lib" / "build_folders.py"),
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "BOARD_DIR": str(self.root / "board"),
@@ -104,7 +106,7 @@ wait_for_file(root / (name + ".release"))
         return subprocess.run(
             ["bash", "-c", self.shell + '\nbuildlog_exec "$@"', "step-owner-test", *command],
             cwd=self.root, env=self.environment, capture_output=True, text=True,
-            check=False, timeout=300, start_new_session=True)
+            check=False, timeout=TEST_HANG_GUARD_SECS, start_new_session=True)
 
     def background_sweep(self) -> subprocess.Popen[str]:
         script = self.shell + '''
@@ -139,10 +141,10 @@ bash "$BOARD_HELPER" release "$BOARD_DIR" fixture cargo --pid "$$"
         for name in ("real.release", "cleanup.release", "sweep.release"):
             (self.root / name).touch()
         try:
-            output, errors = process.communicate(timeout=300)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         except subprocess.TimeoutExpired:
             process.kill()
-            _ = process.communicate(timeout=300)
+            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             raise
         self.assertEqual(process.returncode, 0, output + errors)
 

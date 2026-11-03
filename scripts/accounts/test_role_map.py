@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Self, cast, override
 from unittest.mock import Mock, patch
 
+from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader
@@ -23,6 +24,11 @@ from scripts.agents import codex_mesh
 from scripts.whoami import agent_accounts
 
 send_role_map_command = role_map.ssh_role_map
+
+
+def setUpModule() -> None:
+    install_signal_pid_guard()
+    _ = unittest.enterModuleContext(patch.object(accounts, "_start_session_counts_fetch", return_value=True))
 
 
 class RoleMapReadTime(datetime):
@@ -291,7 +297,7 @@ class RoleMapTests(unittest.TestCase):
               patch.object(socket, "gethostname", return_value="natedev"),
               patch.object(role_map, "datetime", RoleMapReadTime),
               patch.object(accounts, "account_identity", side_effect=identity),
-              patch.object(refusals, "stored_reading", return_value=reading),
+              patch.object(refusals, "stored_reading_with_age", return_value=reading),
               patch("shutdown_record.all_session_records", return_value=[]),
               patch.object(refusal_watch, "_notify_blocked_head", return_value=False),
               patch.object(accounts, "prepared_account", side_effect=AssertionError("blocked target was prepared"))):

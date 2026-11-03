@@ -13,7 +13,7 @@ import unittest
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, final, override
+from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 
 import rust_release
@@ -97,7 +97,7 @@ class RustReleaseTests(unittest.TestCase):
         self.config = Path(temporary) / "lint.conf"
         _ = self.config.write_text("sweep_free_floor_gib = 500\n")
         _ = self.enterContext(mock.patch.object(rust_release, "LINT_CONFIG", self.config))
-        _ = self.enterContext(mock.patch.object(tempfile, "gettempdir", return_value=str(self.scratch)))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"TMPDIR": str(self.scratch)})))
         point_root_at(self, self.root)
         self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.scratch)}))
         source = self.scratch / "hana"

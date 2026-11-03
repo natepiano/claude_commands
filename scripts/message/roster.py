@@ -6,14 +6,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shlex
 import socket
 import subprocess
 import sys
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
@@ -31,8 +30,10 @@ import unit_runs  # noqa: E402
 import herdr  # noqa: E402
 import codex_daemon  # noqa: E402
 import process_table  # noqa: E402
+import sessions  # noqa: E402
 from scripts.astra import design_roles  # noqa: E402
 from scripts.production import staff
+from scripts.production import session_staff
 from scripts.lib import names  # noqa: E402
 from scripts.lib.names import JobKey  # noqa: E402
 if TYPE_CHECKING:
@@ -108,7 +109,7 @@ from scripts.message.unit_labels import (
 )
 
 
-# Compatibility for callers of the full roster’s mark discovery boundary.
+# Keep the discovery boundary for existing callers.
 _every_marked_unit = every_marked_unit
 
 @dataclass(frozen=True)
@@ -154,10 +155,10 @@ class NoClaudeSession:
 
 
 def sender_identity(environment: Mapping[str, str]) -> SenderIdentity:
-    """A Codex shell can inherit its launching Claude session's id."""
+    """Prefer the caller's thread; resolve Claude from its current process registry."""
     if thread_id := environment.get("CODEX_THREAD_ID", ""):
         return CodexThread(thread_id)
-    if session_id := environment.get("CLAUDE_CODE_SESSION_ID", ""):
+    if session_id := staff.runtime_id():
         return ClaudeSession(session_id)
     return NoSession()
 
@@ -203,7 +204,6 @@ class WorkerAssignment:
     session_dir: str
     role: WorkerRoleState = AssignmentUnrecorded()
     slot: str = ""
-    reviewer_type: Literal["code", "ui"] = "code"
 
 
 @dataclass(frozen=True)
@@ -357,13 +357,8 @@ def shown_name(entry: RosterEntry) -> ShownName:
             job = JobUnassigned(f"assignment record not readable: {record}: {assignment.role.value}")
         else:
             slot = assignment.slot
-            pool = re.fullmatch(r"(code|ui)([0-9]+)", slot)
-            if assignment.role == "review" and pool:
-                job = ShownJob("ui_reviewer" if assignment.reviewer_type == "ui" else "code_reviewer",
-                               JobNumber(int(pool[2])))
-            else:
-                job = ShownJob("code_reviewer" if assignment.role == "review" else "worker",
-                               JobSlot(slot) if slot else Unqualified())
+            job = ShownJob("code_reviewer" if assignment.role == "review" else "worker",
+                           JobSlot(slot) if slot else Unqualified())
     address = _address(entry) or _session_address(entry)
     return ShownName(ProductionPart(production) if production else NoProduction(),
                      UnitPart(unit) if unit else NoUnit(), job, address or entry.name)
@@ -373,6 +368,11 @@ def shown_name(entry: RosterEntry) -> ShownName:
 class Roster:
     entries: list[RosterEntry]
     problems: list[str]
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def diagnostics(self) -> list[str]:
+        return [*self.problems, *(f'warning: {warning}' for warning in self.warnings)]
 
 
 def unit_labels(entries: Iterable[RosterEntry]) -> dict[str, UnitLabels]:
@@ -429,7 +429,7 @@ def _assignment_snapshot(assignment: Assignment) -> dict[str, object]:
         "tag": type(role).__name__, **cast(dict[str, str], asdict(role))}
     return {"tag": "WorkerAssignment", "slot_role": assignment.slot_role,
             "session_dir": assignment.session_dir, "role": encoded_role,
-            "slot": assignment.slot, "reviewer_type": assignment.reviewer_type}
+            "slot": assignment.slot}
 
 
 def _snapshot_entry(entry: RosterEntry) -> SnapshotEntry:
@@ -474,7 +474,7 @@ def _decode_state(value: object) -> SnapshotState:
                               _snapshot_string(values, "session_dir"))
     if tag == "WorkerAssignment":
         required = {"tag", "slot_role", "session_dir"}
-        if not required <= set(values) or set(values) - required - {"role", "slot", "reviewer_type"}:
+        if not required <= set(values) or set(values) - required - {"role", "slot"}:
             raise ValueError("invalid fields for snapshot worker assignment")
         role: WorkerRoleState = AssignmentUnrecorded()
         if "role" in values:
@@ -489,13 +489,9 @@ def _decode_state(value: object) -> SnapshotState:
                     raise ValueError("invalid snapshot worker assignment")
             else:
                 role = worker_role({"role": raw})
-        reviewer_type = values.get("reviewer_type", "code")
-        if reviewer_type not in ("code", "ui"):
-            raise ValueError("invalid snapshot reviewer type")
         return WorkerAssignment(_snapshot_string(values, "slot_role"),
                                 _snapshot_string(values, "session_dir"), role,
-                                _snapshot_string(values, "slot") if "slot" in values else "",
-                                reviewer_type)
+                                _snapshot_string(values, "slot") if "slot" in values else "")
     for state in _SNAPSHOT_STATES:
         if state.__name__ == tag:
             names = [field.name for field in fields(state)]
@@ -557,20 +553,24 @@ class RosterSnapshot:
     def encode(self) -> str:
         return json.dumps({"tag": "RosterSnapshot", "entries": [
             _snapshot_entry(entry) for entry in self.result.entries
-        ], "problems": self.result.problems})
+        ], "problems": self.result.problems,
+            **({"warnings": self.result.warnings} if self.result.warnings else {})})
 
     @classmethod
     def decode(cls, text: str) -> RosterSnapshot:
         values = _snapshot_object(cast(object, json.loads(text)))
         entries, problems = values.get("entries"), values.get("problems")
+        warnings = values.get("warnings", [])
         if (values.get("tag") != "RosterSnapshot" or not isinstance(entries, list)
                 or not isinstance(problems, list)):
             raise ValueError("not a roster snapshot")
         raw_problems = cast(list[object], problems)
         if not all(isinstance(problem, str) for problem in raw_problems):
             raise ValueError("snapshot problems must be strings")
+        if not isinstance(warnings, list) or not all(isinstance(warning, str) for warning in cast(list[object], warnings)):
+            raise ValueError("snapshot warnings must be strings")
         return cls(Roster([_decode_entry(entry) for entry in cast(list[object], entries)],
-                          cast(list[str], raw_problems)))
+                          cast(list[str], raw_problems), cast(list[str], warnings)))
 
 
 def cannot_receive_message_text(entry: RosterEntry) -> str:
@@ -820,47 +820,6 @@ def _worker_assignment(run: Path, slot: str, record: Mapping[str, object]) -> Wo
     return WorkerAssignment(label, str(run), role, slot)
 
 
-@dataclass(frozen=True)
-class _PoolReviewer:
-    reviewer_type: Literal["code", "ui"]
-    director: UnderDirector | NoDirector
-
-
-def _pool_root() -> Path:
-    return Path(os.environ.get("REVIEW_POOL_STATE", "~/.local/state/review-pool")).expanduser().resolve()
-
-
-def _pool_reviewers(path: Path) -> dict[str, _PoolReviewer]:
-    reviewers = _snapshot_object(_read_object(path).get("reviewers"))
-    result: dict[str, _PoolReviewer] = {}
-    for name, raw in reviewers.items():
-        reviewer = _snapshot_object(raw)
-        kind = reviewer.get("type")
-        if kind not in ("code", "ui"):
-            raise ValueError(f"invalid reviewer type for {name}")
-        lease = reviewer.get("lease")
-        unit = _snapshot_string(_snapshot_object(lease), "unit") if lease is not None else ""
-        result[name] = _PoolReviewer(kind, UnderDirector(unit, "", "") if unit else NoDirector())
-    return result
-
-
-def _pool_context(run: Path, name: str) -> tuple[ShowrunnerRelationship, DirectorRelationship, str]:
-    """A pool reviewer's current lease supplies its unit, never its mesh name."""
-    root = _pool_root()
-    try:
-        relative = run.resolve().relative_to(root)
-    except ValueError:
-        return NoShowrunner(), NoDirector(), ""
-    if len(relative.parts) != 3 or relative.parts[1] != "mesh":
-        return NoShowrunner(), NoDirector(), ""
-    slug = relative.parts[0]
-    try:
-        reviewer = _pool_reviewers(root / slug / "pool.json")[name]
-    except (OSError, UnicodeError, ValueError, KeyError):
-        return ProductionWithoutRunningShowrunner(slug), NoDirector(), ""
-    return ProductionWithoutRunningShowrunner(slug), reviewer.director, reviewer.reviewer_type
-
-
 def _held_location(holder: design_roles.Holder) -> tuple[ShowrunnerRelationship, DirectorRelationship]:
     return (ProductionWithoutRunningShowrunner(holder.production_slug),
             UnderDirector(holder.unit_name, "", "") if isinstance(holder, design_roles.UnitHolder) else NoDirector())
@@ -892,22 +851,18 @@ def mesh_shown_name(session_dir: str, name: str, record: Mapping[str, object]) -
             machine="", kind="codex", role="astra-designer" if held_role == "designer" else "astra-reviewer",
             name=name, status="", reach=Messageable(name), cwd=design.repository,
             showrunner=showrunner, director=director, assignment=HeldDesignRole(held_role, session_dir)))
-    showrunner, director, reviewer_type = _pool_context(run, name)
-    if isinstance(showrunner, NoShowrunner):
-        problems: list[str] = []
-        records = _newest_sessions()
-        details = _raw_session_details(records, problems)
-        registered = _registered_showrunners(os.environ, problems)
-        places = (_production_places(records, details, registered,
-                                     _showrunner_ids(records, registered), set(), problems, record=staff.snapshot())
-                  if registered else {})
-        place = places.get(unit_runs.director(run))
-        if place is not None:
-            showrunner, director = place.showrunner, UnderDirector(place.director.unit, "", "")
+    showrunner: ShowrunnerRelationship = NoShowrunner()
+    director: DirectorRelationship = NoDirector()
+    problems: list[str] = []
+    records = _newest_sessions()
+    membership = staff.initial_snapshot()
+    resolver = session_staff.RowResolver(membership)
+    places = _production_places(records, set(), problems,
+                                record=membership, resolver=resolver)
+    place = places.get(unit_runs.director(run))
+    if place is not None:
+        showrunner, director = place.showrunner, UnderDirector(place.director.unit, "", "")
     assignment = _worker_assignment(run, _worker_slot(run, name, record, []), record)
-    if reviewer_type in ("code", "ui"):
-        assignment = WorkerAssignment(assignment.slot_role, session_dir, assignment.role, name,
-                                      reviewer_type)
     entry = RosterEntry(machine="", kind="codex", role="worker", name=name, status="",
                         reach=Messageable(name), cwd="", showrunner=showrunner,
                         director=director, assignment=assignment)
@@ -1307,58 +1262,7 @@ def _unit_workers(
     return entries, worker_threads
 
 
-def _pool_workers(
-    machine: str, claude_entries: Mapping[str, RosterEntry],
-    production_places: Mapping[str, _ProductionPlace], problems: list[str], known_threads: set[str],
-) -> tuple[list[RosterEntry], set[str]]:
-    """Discover pool reviewers even when their mesh is outside the unit runs."""
-    entries: list[RosterEntry] = []
-    threads: set[str] = set()
-    directors = {
-        (place.showrunner.production, place.director.unit):
-            UnderDirector(place.director.unit, director.name, _session_address(director))
-        for session_id, place in production_places.items()
-        if (director := claude_entries.get(session_id)) is not None
-    }
-    root = _pool_root()
-    for path in sorted(root.glob("*/pool.json")):
-        try:
-            reviewers = _pool_reviewers(path)
-            meshes = sorted((path.parent / "mesh").glob("*/mesh_roster.json"))
-        except (OSError, UnicodeError, ValueError) as error:
-            _problem(problems, f"review pool {path}", error)
-            continue
-        for mesh in meshes:
-            run = _LiveRun(mesh.parent, _NoRunningDirector())
-            homes = _run_server_homes(run)
-            for name, record in sorted(_mesh_records(run, problems).items()):
-                reviewer = reviewers.get(name)
-                status = _as_string(record.get("status"))
-                thread = _as_string(record.get("thread_id"))
-                if (reviewer is None or status == "ended" or record.get("transferring_role")
-                        or record.get("role_redirect") or not thread or thread in known_threads or thread in threads):
-                    continue
-                threads.add(thread)
-                assignment = _worker_assignment(run.path, name, {**record, "role": "review"})
-                director = reviewer.director
-                if isinstance(director, UnderDirector):
-                    director = directors.get((path.parent.name, director.unit), director)
-                entries.append(RosterEntry(
-                    machine=machine, kind="codex", role="worker", name=name,
-                    status=_worker_status(status),
-                    reach=(Messageable(f"worker:review-pool/{path.parent.name}/{run.path.name}/{name}")
-                           if status in MESSAGEABLE_WORKER_STATUSES else
-                           CannotReceiveMessages(_between_turns_reason(director))),
-                    cwd=_as_string(record.get("cwd")),
-                    showrunner=ProductionWithoutRunningShowrunner(path.parent.name),
-                    director=director,
-                    assignment=WorkerAssignment(assignment.slot_role, assignment.session_dir, "review",
-                                                name, reviewer.reviewer_type),
-                    thread=CodexThread(thread), account=_worker_account(run, record, homes)))
-    return entries, threads
-
-
-def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], problems: list[str]) -> tuple[list[RosterEntry], set[str]]:
+def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: list[str]) -> tuple[list[RosterEntry], set[str]]:
     entries: list[RosterEntry] = []
     threads: set[str] = set()
     for path in sorted(design_roles.state_root().glob('*/design.json')):
@@ -1400,21 +1304,24 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], problems: li
                     assignment=HeldDesignRole(instance.role, str(mesh)), thread=CodexThread(thread),
                     account=AccountUnread('serving home not read')))
         except (OSError, ValueError, TypeError) as error:
-            _problem(problems, 'durable role ' + str(path), error)
+            _problem(warnings, 'durable role ' + str(path), error)
     return entries, threads
 
 
-def _herdr_codex_panes(machine: str) -> Roster:
+def _herdr_codex_panes(machine: str, productions: Iterable[str] = ()) -> Roster:
     """Interactive Codex panes have no messaging address; preserve partial reads."""
     entries: list[RosterEntry] = []
     problems: list[str] = []
     try:
         sessions = herdr.live_sessions()
-    except herdr.HerdrMissing:
-        # A machine without herdr has no herdr panes to list.
+    except herdr.HerdrMissing as error:
+        for production in productions:
+            _problem(problems, f"unit hosts for {production} were not read", error)
         return Roster(entries, problems)
     except herdr.HerdrFailure as error:
         _problem(problems, "herdr sessions", error)
+        for production in productions:
+            _problem(problems, f"unit hosts for {production} were not read", error)
         return Roster(entries, problems)
     processes = herdr.herdr_processes()
     cwds = {process.place: process.cwd for process in processes}
@@ -1433,7 +1340,7 @@ def _herdr_codex_panes(machine: str) -> Roster:
             process = codex_processes.get(herdr.HerdrPlace(name, pane))
             entries.append(RosterEntry(
                 machine=machine, kind="codex", role="freestanding",
-                name=f"herdr {name}:{pane}", status=agent["agent_status"],
+                name=f"herdr {name}:{pane}", status=str(agent["agent_status"]),
                 reach=CannotReceiveMessages("interactive Codex in a herdr pane"),
                 cwd=cwds.get(herdr.HerdrPlace(name, pane), ""),
                 showrunner=NoShowrunner(), director=NoDirector(), assignment=NotAWorker(),
@@ -1446,26 +1353,40 @@ def machine_name() -> str:
     return socket.gethostname().split(".", 1)[0]
 
 
-def _local_roster(environment: Mapping[str, str]) -> Roster:
+def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnapshot | None = None,
+                  records: list[SessionRecord] | None = None) -> Roster:
     home_state = account.home_account_state()
     problems: list[str] = []
+    warnings: list[str] = []
     machine = machine_name()
-    records = _newest_sessions()
+    running = sessions.running_sessions() if records is None else records
+    newest: dict[str, SessionRecord] = {}
+    for record in running:
+        _ = newest.setdefault(record["sessionId"], record)
+    records = list(newest.values())
     details = _raw_session_details(records, problems)
-    registered = _registered_showrunners(environment, problems)
-    runner_ids = _showrunner_ids(records, registered)
+    try:
+        if membership is None:
+            membership = staff.initial_snapshot()
+    except staff.StaffUnreadable as error:
+        _problem(problems, "staff membership", error)
+        membership = staff.StaffSnapshot(())
+    resolver = session_staff.RowResolver(membership)
+    registered = _registered_showrunners(
+        problems, membership=membership, resolver=resolver,
+        known_sessions={record["sessionId"]: record for record in records},
+    )
+    runner_ids = _showrunner_ids(records, registered, membership=membership)
     roots = unit_runs.run_roots(environment.get("ROSTER_RUN_ROOT"))
     runs = _live_runs(roots, {record["sessionId"] for record in records}, problems)
     workers = _ledger_workers(runs, records, problems)
     production_places: dict[str, _ProductionPlace] = {}
-    if registered:
-        try:
-            record = staff.snapshot()
-            production_places = _production_places(
-                records, details, registered, runner_ids, set(workers), problems, record=record
-            )
-        except staff.StaffUnreadable as error:
-            _problem(problems, "staff membership", error)
+    try:
+        production_places = _production_places(
+            records, set(workers), problems, record=membership, resolver=resolver
+        )
+    except staff.StaffUnreadable as error:
+        _problem(problems, "staff membership", error)
     claude = _claude_entries(
         machine, records, details, runner_ids, production_places, runs, workers,
         home_state=home_state, problems=problems,
@@ -1473,10 +1394,7 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
     unit_workers, worker_threads = _unit_workers(
         machine, runs, claude, production_places, problems, home_state=home_state
     )
-    pool_workers, pool_threads = _pool_workers(machine, claude, production_places, problems, worker_threads)
-    unit_workers.extend(pool_workers)
-    worker_threads.update(pool_threads)
-    durable_roles, durable_threads = _durable_roles(machine, claude, problems)
+    durable_roles, durable_threads = _durable_roles(machine, claude, warnings)
     unit_workers.extend(durable_roles)
     worker_threads.update(durable_threads)
     codex_sessions: list[RosterEntry] = []
@@ -1504,10 +1422,10 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
             for session in daemon
             if session.thread_id not in worker_threads
         )
-    interactive = _herdr_codex_panes(machine)
+    interactive = _herdr_codex_panes(machine, (runner["slug"] for runner in registered))
     problems.extend(interactive.problems)
     entries = [*claude.values(), *unit_workers, *codex_sessions, *interactive.entries]
-    return Roster(entries, problems)
+    return Roster(entries, problems, warnings)
 
 
 @dataclass(frozen=True)
@@ -1537,7 +1455,8 @@ def peer_snapshot(environment: Mapping[str, str]) -> Roster | PeerNotReached:
     except (ValueError, TypeError):
         detail = (done.stderr or "invalid roster snapshot").strip().splitlines()
         return PeerNotReached(host, detail[0] if detail else "invalid roster snapshot")
-    return Roster(result.entries, [f"{host}: {problem}" for problem in result.problems])
+    return Roster(result.entries, [f"{host}: {problem}" for problem in result.problems],
+                  [f"{host}: {warning}" for warning in result.warnings])
 
 
 def peer_roster(environment: Mapping[str, str]) -> Roster:
@@ -1548,16 +1467,18 @@ def peer_roster(environment: Mapping[str, str]) -> Roster:
 
 
 @role_map_command
-def roster(environment: Mapping[str, str], scope: RosterScope) -> Roster:
+def roster(environment: Mapping[str, str], scope: RosterScope, *,
+           membership: staff.StaffSnapshot | None = None, records: list[SessionRecord] | None = None) -> Roster:
     match scope:
         case ThisMachine():
-            return _local_roster(environment)
+            return _local_roster(environment, membership=membership, records=records)
         case AllMachines():
             with ThreadPoolExecutor(max_workers=2) as pool:
                 peer = pool.submit(peer_roster, environment)
-                local = _local_roster(environment)
+                local = _local_roster(environment, membership=membership, records=records)
                 other = peer.result()
-            return Roster([*local.entries, *other.entries], [*local.problems, *other.problems])
+            return Roster([*local.entries, *other.entries], [*local.problems, *other.problems],
+                          [*local.warnings, *other.warnings])
 
 
 def _home_shortened(path: str) -> str:
@@ -1727,10 +1648,11 @@ def main(argv: list[str]) -> int:
         print(json.dumps({
             "entries": [_serialized_entry(entry) for entry in entries],
             "problems": result.problems,
+            **({"warnings": result.warnings} if result.warnings else {}),
         }))
     else:
         _print_text(entries, contexts, sender_identity(os.environ))
-    for problem in result.problems:
+    for problem in result.diagnostics:
         print(f"could not read: {problem}", file=sys.stderr)
     return 1 if result.problems else 0
 

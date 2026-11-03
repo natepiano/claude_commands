@@ -7,7 +7,6 @@ good"). The user reads the counts in the status line.
 from __future__ import annotations
 
 import re
-import json
 import os
 import shlex
 import sys
@@ -15,11 +14,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from user_zone import user_zone_name  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
+from update_registration import ReportItem as ReportItem, reports_path as reports_path
+from update_registration import QuestionStaff
 
 DAILIES = Path(__file__).resolve().parent.parent / "production" / "dailies_render.py"
 STATUS = re.compile(r"Status: PRODUCTION — ([a-z]*)")
@@ -57,16 +59,6 @@ def key_values(path: Path) -> dict[str, str]:
 
 def outstanding_path(slug: str) -> Path:
     return state_root() / "outstanding" / f"{slug}.json"
-
-
-class ReportItem(TypedDict):
-    """Something the user asked to be told about, such as "tell me when hanadocs is back"."""
-    text: str
-    until: str
-
-
-def reports_path(slug: str) -> Path:
-    return state_root() / "reports" / f"{slug}.json"
 
 
 def state_root() -> Path:
@@ -122,53 +114,55 @@ def read_production(instance_dir: Path) -> Production | None:
         return None
 
 
-def open_questions(productions: list[Production]) -> int | None:
+def open_questions(productions: list[Production], *, identities: QuestionStaff | None = None) -> int | None:
     """How many items now wait on the user in these productions' own lists; None when a list cannot be read.
 
     Each showrunner counts its own production only: the showrunners above and below it count
     theirs (user, 2026-10-27). An item the user deferred is not counted until its `after` time, as
     the footer's own `nothing needed` is decided.
     """
-    zones = {production.slug: production.zone for production in productions}
+    sys.path.insert(0, str(DAILIES.parent))
+    from update_registration import read_open_items
+    from dailies_render import InputError
+    from dailies_render import due
+
+    try:
+        identities = identities if identities is not None else QuestionStaff.read()
+    except OSError:
+        return None
     count = 0
-    for slug, zone in zones.items():
-        path = outstanding_path(slug)
-        if not path.exists():
-            continue
+    for production in {production.slug: production for production in productions}.values():
         try:
-            entries = cast(object, json.loads(path.read_text(encoding="utf-8")))
-            now = datetime.now(ZoneInfo(zone)).strftime("%Y-%m-%dT%H:%M")
-        except (OSError, ValueError, KeyError):
+            items = read_open_items(outstanding_path(production.slug),
+                                    document=production.doc, identities=identities)
+            now = datetime.now(ZoneInfo(production.zone)).replace(tzinfo=None)
+            count += len(due(items, now))
+        except (InputError, OSError, ValueError):
             return None
-        if not isinstance(entries, list):
-            return None
-        for entry in cast(list[object], entries):
-            after = cast(dict[str, object], entry).get("after") if isinstance(entry, dict) else None
-            # Both are `YYYY-MM-DDTHH:MM` in that zone, so they compare as text.
-            if not isinstance(after, str) or after <= now:
-                count += 1
     return count
 
 
-def deferred_until(slugs: list[str], zone: str) -> datetime | None:
-    """When the soonest item the user deferred falls due, so a count kept from now knows when it ends."""
-    now = datetime.now(ZoneInfo(zone)).strftime("%Y-%m-%dT%H:%M")
-    afters: list[str] = []
+def deferred_until(slugs: list[str], zone: str, *, identities: QuestionStaff | None = None) -> datetime | None:
+    """Return the first future question or reminder time from the owning stores."""
+    sys.path.insert(0, str(DAILIES.parent))
+    from update_registration import read_open_items
+    from dailies_render import InputError
+    from dailies_render import DeferredUntil
+
+    try:
+        identities = identities if identities is not None else QuestionStaff.read()
+    except OSError:
+        return None
+    now = datetime.now(ZoneInfo(zone)).replace(tzinfo=None)
+    afters: list[datetime] = []
     for slug in slugs:
         try:
-            entries = cast(object, json.loads(outstanding_path(slug).read_text(encoding="utf-8")))
-        except (OSError, ValueError):
+            items = read_open_items(outstanding_path(slug), identities=identities)
+        except (InputError, OSError, ValueError):
             continue
-        for entry in cast(list[object], entries) if isinstance(entries, list) else []:
-            after = cast(dict[str, object], entry).get("after") if isinstance(entry, dict) else None
-            if isinstance(after, str) and after > now:
-                afters.append(after)
-    if not afters:
-        return None
-    try:
-        return datetime.fromisoformat(min(afters)).replace(tzinfo=ZoneInfo(zone))
-    except ValueError:
-        return None
+        afters.extend(item.timing.at for item in items
+                      if isinstance(item.timing, DeferredUntil) and item.timing.at > now)
+    return min(afters).replace(tzinfo=ZoneInfo(zone)) if afters else None
 
 
 def counts_line(productions: list[Production], questions: int) -> str | None:
@@ -179,5 +173,8 @@ def counts_line(productions: list[Production], questions: int) -> str | None:
     # The counts read the production scripts, which import this module, so this one imports late.
     import footer_counts
 
-    counts = footer_counts.total([footer_counts.read_counts(production.doc) for production in productions])
+    from scripts.production import staff
+
+    record = staff.snapshot()
+    counts = footer_counts.total([footer_counts.read_counts(production.doc, record=record) for production in productions])
     return footer_counts.counts_line(counts._replace(questions=questions))

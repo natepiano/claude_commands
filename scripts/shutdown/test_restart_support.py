@@ -29,6 +29,7 @@ from user_action import ActionRequired
 from push_texts import RenderedPush, render, catalog
 import restart as restart_work
 import restart_support as settle
+import remote
 if TYPE_CHECKING:
     from ..notify import review
 else:
@@ -57,6 +58,37 @@ class SentCall(TypedDict):
 
 
 from test_restart import top_level, unit, entry as session_shutdown
+
+
+class SendOutcomeTests(unittest.TestCase):
+    def test_confirmed_send_outcomes_preserve_restart_delivery_states(self) -> None:
+        cases: tuple[tuple[int, str, settle.MessageSendOutcome], ...] = (
+            (0, "SENT: fixture", settle.MessageSent(kind="sent")),
+            (0, "SKIPPED: repeated", settle.MessageWindowSkipped(kind="window skipped", reason="repeated")),
+            (0, "SKIPPED: key 'fixture' acknowledged at " + NOW,
+             settle.MessageAcknowledged(kind="acknowledged", reason="key 'fixture' acknowledged at " + NOW)),
+            (0, "KEPT: silence", settle.MessageKept(kind="kept", reason="silence")),
+            (0, "REPLACED: revised", settle.MessageReplaced(kind="replaced", reason="revised")),
+            (1, "QUEUED: offline", settle.MessageQueued(kind="queued", reason="offline")),
+        )
+        for code, output, expected in cases:
+            with self.subTest(output=output), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, output, "")):
+                self.assertEqual(settle.send_message("fixture", "summary", "message"), expected)
+
+    def test_confirmed_send_failures_raise_without_recording_delivery(self) -> None:
+        for code, header in ((3, "FAILED"), (2, "REFUSED"), (4, "HELD"), (5, "PENDING")):
+            with self.subTest(header=header), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, header + ": unavailable", "")):
+                with self.assertRaisesRegex(RuntimeError, header + ": unavailable"):
+                    _ = settle.send_message("fixture", "summary", "message")
+
+    def test_unconfirmed_send_results_preserve_restart_fallback_states(self) -> None:
+        for code, output in ((0, ""), (0, "QUEUED: inconsistent"), (1, ""), (1, "SENT: inconsistent")):
+            with self.subTest(code=code, output=output), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, output, "")):
+                result = settle.send_message("fixture", "summary", "message")
+                self.assertEqual(result, settle.MessageUnconfirmed(kind="unconfirmed", reason="send returned no confirmed outcome"))
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 3, "SENT: inconsistent", "")):
+            self.assertEqual(settle.send_message("fixture", "summary", "message"),
+                             settle.MessageUnconfirmed(kind="unconfirmed", reason="send returned no confirmed outcome"))
 
 
 @final
@@ -221,7 +253,7 @@ class RestartSupportTests(ShutdownTestCase):
 
 
     def test_session_count_text_names_one_and_many_sessions(self) -> None:
-        self.assertEqual(settle.stopped_sessions_text(1), "One session")
+        self.assertEqual(settle.stopped_sessions_text(1), "1 session")
         self.assertEqual(settle.stopped_sessions_text(14), "14 sessions")
 
 
@@ -260,7 +292,7 @@ class RestartSupportTests(ShutdownTestCase):
             "not submitted", "Claude fixture\n❯ unsent opening prompt"))
         for live in (True, False):
             with self.subTest(live=live):
-                with (patch.object(settle, "local_machine", return_value="mac"),
+                with (patch.object(remote, "local_machine", return_value="mac"),
                       patch.object(restart_work, "clear_running_on_target", return_value=restart_work.TargetCheck(remaining=[saved], finished=[])),
                       patch.object(restart_work, "restart_failed_liveness", return_value=restart_work.SessionLive() if live else restart_work.SessionNotLive()),
                       patch.object(settle, "run_remote", return_value=(0, "[]")),
@@ -323,13 +355,15 @@ class RestartSupportTests(ShutdownTestCase):
             if attempt == "unchanged":
                 self.assertEqual(pushes, {})
                 continue
-            self.assertEqual(set(pushes), {"shutdown.restart_untrusted", "shutdown.restart_failed"})
-            trust = pushes["shutdown.restart_untrusted"]
-            self.assertEqual(trust.values, {"session": "Untrusted owner", "machine": "natedev",
-                                            "account": '"claude2"', "command": command})
+            self.assertEqual(set(pushes), {"shutdown.restart_untrusted_unlisted", "shutdown.restart_failed"})
+            trust = pushes["shutdown.restart_untrusted_unlisted"]
+            self.assertEqual(trust.values["stopped"], "1 session")
+            self.assertIn("Trust the folders of the stopped Claude sessions on natedev from their shutdown records.",
+                          cast(ActionRequired, trust.action).text)
+            self.assertNotIn(command, trust.message)
             retry = pushes["shutdown.restart_failed"]
             self.assertEqual((retry.values["stopped"], retry.values["cause"]),
-                             ("One session (Broken owner)", "window failed to open"))
+                             ("1 session (Broken owner)", "window failed to open"))
             self.assertNotIn("Untrusted owner", retry.message)
 
 
@@ -392,7 +426,7 @@ class RestartSupportTests(ShutdownTestCase):
                     self.assertEqual(current.get("restore_alerted"), settle.not_back_text(failed))
 
 
-    def test_automatic_restart_sends_all_split_pushes_and_marks_every_named_failure(self) -> None:
+    def test_automatic_restart_sends_one_push_and_marks_every_failure(self) -> None:
         batches = [[f"Owner{index}-" + "x" * suffix_length for index in range(6)]
                    for suffix_length in (80, 40)]
         batches.append(["Short owner", "Oversize-" + "x" * 201, "Another owner"])
@@ -409,27 +443,12 @@ class RestartSupportTests(ShutdownTestCase):
                       redirect_stdout(io.StringIO())):
                     settle.report_stop(records)
                     pushes = [cast(RenderedPush, call.args[0]) for call in alert.call_args_list]
-                    self.assertGreater(len(pushes), 1)
-                    for push in pushes:
-                        self.assertEqual(push.id, "shutdown.restart_failed")
-                        self.assertLessEqual(len(push.values["stopped"]), 400)
-                        self.assertLess(len(push.message), 500)
-                        self.assertLess(len(push.title), 45)
-                        self.assertTrue(any(name in push.message for name in names)
-                                        or "…" in push.values["stopped"])
-                    for name in names:
-                        if len(name) == 210:
-                            shortened, = [push for push in pushes if "…" in push.values["stopped"]]
-                            displayed = shortened.values["stopped"].removeprefix("One session (").removesuffix(")")
-                            self.assertTrue(displayed.endswith("…"))
-                            self.assertGreater(len(displayed), 1)
-                            self.assertTrue(name.startswith(displayed[:-1]))
-                            self.assertLess(len(displayed[:-1]), len(name))
-                            self.assertTrue(len(shortened.message) == 499
-                                            or len(shortened.values["stopped"]) == 400)
-                            self.assertFalse(any(other in shortened.message for other in names if other != name))
-                        else:
-                            self.assertEqual(sum(push.message.count(name) for push in pushes), 1)
+                    push, = pushes
+                    self.assertEqual(push.id, "shutdown.restart_failed")
+                    self.assertEqual(push.values["stopped"], f"{len(names)} sessions")
+                    self.assertEqual(push.values["cause"], "restart prompt not submitted")
+                    self.assertLess(len(push.message), 500)
+                    self.assertLess(len(push.title), 45)
                     for saved in records:
                         current = shutdown_record.find_session(LOGIN, saved["session"]["session_id"])
                         assert current is not None
@@ -454,9 +473,9 @@ class RestartSupportTests(ShutdownTestCase):
         push = cast(RenderedPush, alert.call_args.args[0])
         self.assertEqual(push.id, "shutdown.manual_restart")
         self.assertNotIn("private resume command", push.body)
-        self.assertIn('send: "Resume the stopped Claude session named Owner on natedev from its shutdown record."', cast(ActionRequired, push.action).text)
+        self.assertIn('send: "Resume the stopped Claude sessions on natedev from their shutdown records."', cast(ActionRequired, push.action).text)
         self.assertIn("on the natedev computer", cast(ActionRequired, push.action).text)
-        self.assertIn("Its terminal cannot restart on its own", push.body)
+        self.assertIn("1 session on natedev cannot restart without help", push.body)
         self.assertIn("manual restart", cast(str, sender.call_args.args[2]))
 
 

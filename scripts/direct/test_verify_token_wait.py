@@ -4,13 +4,95 @@ from __future__ import annotations
 import json
 import unittest
 from pathlib import Path
-from typing import cast
+from typing import cast, override
 
+from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct import test_verify_step_routes as routes
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, Record
 
 
 class VerifyTokenWaitTests(VerifyTokenWaitFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = caller_admission(self, self.root, self.environment)
+
+    def test_token_wait_restores_the_original_place_and_runs_with_memory_and_token(self) -> None:
+        observer = self.root / "observe-token.py"
+        observations = self.root / "token-observations.json"
+        _ = observer.write_text('import sys\n' + f'sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})\n' + '''import json
+import os
+from pathlib import Path
+import sys
+
+from scripts.build_queue.admission_service import read_state, OrderNotStarted, TokenNotLeft
+
+phase = sys.argv[1]
+directory = Path(os.environ["BUILDLOG_DIR"]) / "admission"
+capture = Path(os.environ["TEST_TOKEN_OBSERVATIONS"])
+rows = json.loads(capture.read_text()) if capture.exists() else {}
+state = read_state(directory)
+reservations = list(state.reservations.values())
+if phase == "reserved":
+    assert len(reservations) == 1, reservations
+    rows[phase] = reservations[0].queue_waiter
+elif phase == "waiting":
+    assert not reservations, reservations
+    waiting = list(state.places.values())
+    assert len(waiting) == 1, waiting
+    place = waiting[0]
+    row = {"pid": place.owner.pid, "start_time": place.owner.start_time,
+           "since": place.since}
+    if not isinstance(place.priority_since, OrderNotStarted):
+        row["priority_since"] = place.priority_since
+    if not isinstance(place.token_left_at, TokenNotLeft):
+        row["token_left_at"] = place.token_left_at
+    for field in ("pid", "start_time", "since", "priority_since"):
+        assert row.get(field) == rows["reserved"].get(field), (field, row, rows)
+    assert "token_left_at" in row, row
+    rows[phase] = row
+else:
+    assert len(reservations) == 1, reservations
+    assert (Path(os.environ["UNIT_SESSION_DIR"]) / "locks/cargo.d").is_dir()
+    rows[phase] = reservations[0].queue_waiter
+capture.write_text(json.dumps(rows))
+''')
+        shell = self.root / "miss-once.sh"
+        missed = self.root / "missed-now"
+        _ = shell.write_text('''set -T
+observe_token_wait() {
+    if [[ "$BASH_COMMAND" == try_token_now && ! -e "$TEST_MISSED_NOW" ]]; then
+        python3 "$TEST_TOKEN_OBSERVER" reserved || exit 95
+        : > "$TEST_MISSED_NOW"
+        try_token_now() { return 1; }
+    elif [[ "$BASH_COMMAND" == acquire_token && -e "$TEST_MISSED_NOW" ]]; then
+        python3 "$TEST_TOKEN_OBSERVER" waiting || exit 94
+    fi
+}
+trap observe_token_wait DEBUG
+''')
+        result = self.verify({**self.environment, "BASH_ENV": str(shell), "TEST_MISSED_NOW": str(missed),
+                              "TEST_TOKEN_OBSERVER": str(observer), "TEST_TOKEN_OBSERVATIONS": str(observations)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(missed.exists(), "the step must exercise the token-wait branch")
+        captured = cast(dict[str, Record], json.loads(observations.read_text()))
+        self.assertEqual(set(captured), {"reserved", "waiting", "run"})
+        self.assertEqual(captured["reserved"]["since"], captured["run"]["since"])
+        directory = self.root / "buildlog/admission"
+        rows = [cast(Record, json.loads(line)) for line in (directory / "queue_times.jsonl").read_text().splitlines()]
+        gaps = [row for row in rows if row.get("kind") == "token_gap"]
+        self.assertEqual(len(gaps), 1)
+        gap = gaps[0]
+        self.assertEqual(gap["token_left_at"], captured["waiting"]["token_left_at"])
+        self.assertLessEqual(float(str(gap["token_left_at"])), float(str(gap["token_back_at"])))
+        self.assertGreaterEqual(float(str(gap["at"])), float(str(gap["token_back_at"])))
+        self.assertEqual((gap["pid"], gap["start_time"]),
+                         (captured["waiting"]["pid"], captured["waiting"]["start_time"]))
+        self.assertEqual(gap["step"], "check")
+        self.assertEqual(list(directory.glob("*.reservation")), [])
+        self.assertEqual(len(self.records()), 1)
+        self.assertTrue((self.root / "cargo-calls").read_text().startswith("check "))
+
     def test_mac_routing_under_hold_skips_initial_token_acquisition(self) -> None:
         holders = Path(self.environment["BUILD_HOLD_DIR"])
         holders.mkdir()
@@ -23,7 +105,7 @@ class VerifyTokenWaitTests(VerifyTokenWaitFixture):
             "BUILD_TARGETS_SCRIPT": str(targets), "VERIFY_MAC_RUNNER": str(runner),
             "TEST_ROUTE_EVENTS": str(self.root / "route-events"),
             "TEST_MAC_EVENTS": str(self.root / "mac-events"),
-            "MAC_TEST_CONFIG": str(self.root / "mac-settings"), "TEST_MAC_ALLOWED": "1",
+            "MAC_TEST_CONFIG": str(self.root / "mac-settings"), "CONF_DIR": str(Path(self.root / "mac-settings").parent), "TEST_MAC_ALLOWED": "1",
         })
         result = self.verify(self.environment)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

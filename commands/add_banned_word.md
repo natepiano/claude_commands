@@ -1,5 +1,5 @@
 ---
-description: Add a new banned word to the global style guide
+description: Add a forbidden word to the style guide.
 argument-hint: <stem> [substitute1, substitute2, ...]
 ---
 

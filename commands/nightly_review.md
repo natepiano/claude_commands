@@ -1,7 +1,10 @@
 ---
-description: Read-only review with one proposal per mode, run on demand on natedev in the order config, rust, messages.
+description: Review config, Rust, or messages.
 argument-hint: config | rust | messages | config rust messages
 ---
+
+Run this review on natedev, on demand, in the order `config`, `rust`, `messages`.
+Make one proposal per mode.
 
 Modes: `$ARGUMENTS`, done one at a time in the order given. Finish a mode, its report written and its message sent, before starting the next; a mode that cannot finish says why in its report, and the next still runs. NIGHT is the date the night's job message names (`NIGHT=<date>`), or the local date today when the command is run by hand, DIR is `~/.local/state/nightly-review/NIGHT`, LEDGER is `~/.local/state/nightly-review/ledger.md`.
 

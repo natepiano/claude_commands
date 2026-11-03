@@ -1,5 +1,5 @@
 ---
-description: Reproduce a cargo-mend failure on an external project in a standing checkout or non-git scratch project, diagnose and fix cargo-mend, install after the fix is confirmed, and clean up only after the user verifies
+description: Reproduce and fix a cargo-mend failure.
 ---
 
 # Mend Fix
@@ -60,7 +60,7 @@ echo "EXIT=$?" >> /absolute/session-scratch/repro.log
 - If two attempts fail to resolve it, start an attempts log in the cargo-mend memory directory and log every approach, reasoning, and result before the next attempt — telling the user each time an entry is added.
 
 **STEP 5 — Fix**
-- Run `/rust_style` immediately before editing Rust.
+- This session has no style reviewer; follow `/rust_style` before editing Rust.
 - Make the fix. Add or extend a regression test under `tests/` when the bug is expressible there.
 - `cargo build && cargo +nightly fmt` (background the build).
 

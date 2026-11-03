@@ -4,7 +4,7 @@ from __future__ import annotations
 import unittest
 from typing import final
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture
-from scripts.direct.verify_mac_offload_test_support import HANG_GUARD_S as HANG_GUARD_S
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
@@ -17,7 +17,7 @@ class VerifyMacRoutingTests(VerifyMacOffloadFixture):
             self.resume_routing_sleep(step)
         _ = (self.runner_state / "mac-free").write_text("free\n")
         _ = (self.runner_state / "continue-sleep-4").write_text("continue\n")
-        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(errors.count("verify.sh: natedev is held by hana for render checks.\n"), 1)
         self.assertEqual(errors.count("verify.sh: natedev has been held for 2 h by hana; ask them.\n"), 1)

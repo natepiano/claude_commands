@@ -24,9 +24,8 @@ from typing import NoReturn, cast, override
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.lib import scratch
+from scripts.lib import conf, scratch
 from scripts.lib.atomic_file import remove_dead_temporary_files, write_text_atomic
-from scripts.lint.config_values import config_values
 
 GATE_RECORD = ".gate.json"
 OWNER = re.compile(r"[a-z0-9][a-z0-9-]*")
@@ -107,7 +106,7 @@ class CopiesConfiguration:
 def config_settings() -> tuple[Path, dict[str, str]]:
     path = Path(os.environ.get("COPIES_CONFIG") or Path(__file__).resolve().parents[2] / "config/copies.conf")
     path = path.expanduser()
-    return path, config_values(str(path))
+    return path, conf.read(path).values()
 
 
 def load_config() -> CopiesConfiguration:

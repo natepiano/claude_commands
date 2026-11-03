@@ -17,12 +17,12 @@ from typing import TypedDict, cast, final, override
 from zoneinfo import ZoneInfo
 
 from scripts.usage import collect, weights
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, recorded_showrunner
 from scripts.usage.test_collect import FIXTURES as COLLECT_FIXTURES, MacStreamReport, REPOSITORY, SNAPSHOT_COMMIT_SCRIPT, SshBehavior
 from scripts.usage.test_outcomes import OutcomeFixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 FIXTURES = Path(__file__).with_name("fixtures") / "report"
 REPORT = Path(__file__).with_name("usage_report.py")
@@ -89,6 +89,16 @@ class ReportFixture(OutcomeFixture):
             shutil.rmtree(directory)
         _ = shutil.copytree(FIXTURES / "home", self.root, dirs_exist_ok=True)
         _ = shutil.copytree(FIXTURES / "production-docs", self.production_docs, dirs_exist_ok=True)
+        for filename, entries in (("fixture-production.md", (("Base", "/invented/build"),
+                                                            ("Deep", "/invented/build/component"),
+                                                            ("director", "/invented/director"),
+                                                            ("no-turn", "/invented/no-turn"),
+                                                            ("loose", "/invented/loose"))),
+                                  ("other-production.md", (("Elsewhere", "/invented/elsewhere"),))):
+            owner = recorded_showrunner(filename, self.production_docs / filename)
+            for name, tree in entries:
+                _ = fixture_member("unit", name=name, parent=owner.id,
+                                   worktree=staff.PresentWorktree("natedev", Path(tree)))
         _ = self.commit("checkpoint(report-plan): phase 7 — First", "2026-10-10T21:37:00Z")
         _ = self.commit("checkpoint(report-plan): phase 7 — Second", "2026-10-10T21:38:00Z")
         _ = self.commit("checkpoint(other-plan): phase 7 — Unmapped", "2026-10-11T07:01:00Z")
@@ -469,6 +479,8 @@ raise SystemExit(result)
         self.assert_report("unit", "weighted", "--by", "unit")
         document = self.production_docs / "fixture-production.md"
         _ = document.write_text(document.read_text(encoding="utf-8").replace("| Deep |", "| Renamed |"), encoding="utf-8")
+        deep = next(row for row in staff.snapshot().find(kind="unit") if row.name == "Deep")
+        _ = staff.rename(deep.id, "Renamed")
         self.assert_report("unit-renamed", "weighted", "--by", "unit")
 
     def test_unit_containment_does_not_match_a_neighbor_with_the_same_prefix(self) -> None:

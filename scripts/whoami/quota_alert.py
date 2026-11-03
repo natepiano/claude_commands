@@ -27,12 +27,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import process_group
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.process_failure import failure_detail
-from scripts.message.send import OutcomeHeader, parse_outcome
+from scripts.message import send_result
 from scripts.whoami import note_file
 
-from scripts.lib import agents_registry  # noqa: E402
+from scripts.lib import models_registry  # noqa: E402
 
 from scripts.lib.user_zone import user_zone
 from scripts.whoami import agent_accounts
@@ -237,6 +240,7 @@ from scripts.production.showrunners import (
     ShowrunnerSettings as ShowrunnerSettings,
     load_settings_from as load_settings_from,
     registered_showrunners as registered_showrunners,
+    require_complete,
     socket_for as socket_for,
 )
 
@@ -246,9 +250,9 @@ STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state
 SEND = Path(__file__).resolve().parent.parent / "message" / "send.py"
 SESSIONS = Path.home() / ".claude" / "sessions"
 PROTOCOL = Path.home() / ".claude" / "docs" / "quota_alerts.md"
-AGENTS = Path(__file__).resolve().parent.parent / "agents" / "agents_config.sh"
-# The same override agents_config.sh reads; edit_registry() passes it on explicitly.
-REGISTRY = Path(os.environ.get("AGENTS_CONFIG_FILE") or Path.home() / ".claude" / "config" / "agents.conf")
+AGENTS = Path(__file__).resolve().parent.parent / "agents" / "models_config.sh"
+# The same override models_config.sh reads; edit_registry() passes it on explicitly.
+REGISTRY = models_registry.registry_path()
 # The session whose user is shown a switch on their next prompt.
 OWNER = "natedev"
 # One relay took 9 s when measured. The snapshot timer gives agent_notes.py 60 s in
@@ -604,7 +608,7 @@ def load_config() -> Config:
 def showrunners_now() -> list[Showrunner]:
     """Every showrunner with an update timer. None when the session records cannot say who runs."""
     try:
-        return registered_showrunners()
+        return require_complete(registered_showrunners())
     except OSError as error:
         print(f"quota-alert: showrunners unknown: {error}", file=sys.stderr)
         return []
@@ -785,35 +789,26 @@ def local_time(stamp: str) -> str:
 
 def registry_assignments() -> dict[str, str]:
     """[assignments] in the registry: function, or exact-task override, -> family."""
-    found: dict[str, str] = {}
-    section = ""
-    for line in agents_registry.registry_text(REGISTRY).splitlines():
-        text = line.split("#", 1)[0].strip()
-        if text.startswith("[") and text.endswith("]"):
-            section = text[1:-1]
-        elif section == "assignments" and "=" in text:
-            key, family = text.split("=", 1)
-            found[key.strip()] = family.strip()
-    return found
+    rows = models_registry.parse_registry(models_registry.registry_text(REGISTRY))
+    return rows.get("assignments", {})
 
 
 def edit_registry(editor: str, *args: str) -> str | None:
-    """Run one of agents_config.sh's validated editors on REGISTRY; None when it took, otherwise why not.
+    """Run a validated registry editor and return its failure cause.
 
-    A timeout kills the editor's whole process group, so no orphaned mv lands after the caller has read
-    the registry back.
+    A timeout stops the process group before the caller reads the result.
     """
     command = ["bash", "-c", f'source "$0" && {editor} "$@"', str(AGENTS), *args]
     try:
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                   env={**os.environ, "AGENTS_CONFIG_FILE": str(REGISTRY)}, start_new_session=True)
+                                   env={**os.environ, "MODELS_CONFIG_FILE": str(REGISTRY)}, start_new_session=True)
     except OSError as error:
         return str(error)
     with process:
         try:
             out, err = process.communicate(timeout=EDIT_TIMEOUT)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
+            process_group.send_process_group(process.pid, signal.SIGKILL)
             _ = process.communicate()
             return f"{editor} took longer than {EDIT_TIMEOUT} s and was stopped"
     if process.returncode == 0:
@@ -1510,12 +1505,16 @@ def relay(recipient: str, text: str, key: str | None) -> str | None:
                               check=False)
     except (subprocess.TimeoutExpired, OSError) as error:
         return str(error)
-    if done.returncode == 0:
-        return None
-    # send.py's QUEUED outcome keeps its own header: refusal_watch treats a queued copy as delivered.
-    outcome = parse_outcome(done.stdout)
-    if done.returncode == 1 and isinstance(outcome, OutcomeHeader) and outcome.outcome == "queued":
-        return " ".join(f"QUEUED: {outcome.detail}".split())
+    outcome = send_result.send_outcome(done.returncode, done.stdout)
+    if isinstance(outcome, send_result.ConfirmedSendOutcome):
+        match outcome.header.outcome:
+            case "sent" | "skipped" | "replaced" | "kept":
+                return None
+            case "queued":
+                # refusal_watch accepts a queued copy through this header.
+                return " ".join(f"QUEUED: {outcome.header.detail}".split())
+            case "failed" | "refused" | "held" | "pending":
+                pass
     return " ".join(failure_detail(done).split())
 
 
@@ -1545,8 +1544,13 @@ def tell_user(push: RenderedPush) -> PushDelivery:
                               check=False)
     except (subprocess.TimeoutExpired, OSError) as error:
         return PushFailed(str(error))
-    if done.returncode == 0:
-        return PushSent()
+    outcome = send_result.send_outcome(done.returncode, done.stdout)
+    if isinstance(outcome, send_result.ConfirmedSendOutcome):
+        match outcome.header.outcome:
+            case "sent" | "skipped" | "kept" | "replaced":
+                return PushSent()
+            case "queued" | "failed" | "refused" | "held" | "pending":
+                pass
     return PushFailed(" ".join(failure_detail(done).split()))
 
 

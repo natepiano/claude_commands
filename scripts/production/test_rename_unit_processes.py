@@ -12,7 +12,7 @@ import threading
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, final, override
+from typing import TYPE_CHECKING, NamedTuple, cast, final, override
 from unittest import mock
 from scripts.direct import workers
 from scripts.production import staff_sources
@@ -34,8 +34,12 @@ else:
     # rename_unit puts the shutdown folder on the path.
     import shutdown_record
 
-from scripts.production.rename_unit_test_support import SLUG, TEST_HANG_GUARD_SECS, UnitRenameFixture
+from scripts.production.rename_unit_test_support import SLUG, UnitRenameFixture
 from scripts.production.fake_unit_host import stopped_record
+from scripts.issue_score.selection import UseConfiguredValue
+from scripts.lib import conf
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import config_environment
 
 
 # An app-server's idle-stop watcher, as codex_mesh starts it: the run folder is its fourth argument.
@@ -93,6 +97,7 @@ class RunProcessTests(unittest.TestCase):
         _ = self.enterContext(isolated_parents())
         PARENTS["alpha-unit"] = staff_sources.UnitProduction(SLUG, "/fixture/demo-production.md")
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.dict(os.environ, config_environment(self.root / "config")))
         self.worktree = self.root / "claude-demo-alpha"
         other = self.root / "claude-demo-beta"
         mine = self.run_folder("run-a", self.worktree)
@@ -127,6 +132,7 @@ class RunProcessTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(shutdown_record, "all_session_records", lambda: [STOPPED_RECORD]))
         _ = self.enterContext(mock.patch.object(unit_lookup, "marked_unit", return_value=None))
         _ = self.enterContext(mock.patch.object(unit_lookup, "marked_units", self.no_units))
+        _ = self.enterContext(mock.patch.object(unit_lookup, "observed_staff_marks", return_value=()))
 
     def run_folder(self, name: str, worktree: Path) -> Path:
         worktree.mkdir(parents=True, exist_ok=True)
@@ -153,7 +159,8 @@ class RunProcessTests(unittest.TestCase):
     def inside(self, worktree: Path) -> list[int]:
         return sorted(pid for pid, item in self.processes.items() if item.cwd == worktree)
 
-    def arguments(self, pid: int) -> list[str]:
+    def arguments(self, pid: int, *, settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[str]:
+        del settings
         return self.processes[pid].arguments if pid in self.processes else []
 
     def session(self, pid: int) -> int:
@@ -196,6 +203,16 @@ class RunProcessTests(unittest.TestCase):
         self.assertIn(101, self.processes)
         self.assertIn(102, self.processes)
         self.assertTrue(record.exists())
+
+    def test_run_ownership_passes_one_settings_read_to_process_arguments(self) -> None:
+        with (mock.patch.object(conf, "read", wraps=conf.read) as reads,
+              mock.patch.object(retire_unit, "command_line", wraps=self.arguments) as arguments):
+            found = retire_unit.run_processes(self.worktree, [101, 102])
+        self.assertEqual(set(found), {101, 102})
+        reads.assert_called_once_with("production")
+        settings = [cast(object, call.kwargs["settings"]) for call in arguments.call_args_list]
+        self.assertTrue(settings)
+        self.assertTrue(all(value is settings[0] for value in settings))
 
     def test_dead_server_watchers_and_their_children_need_no_matching_run_folder(self) -> None:
         for folder in (self.root / "runs/run-b", self.root / "elsewhere/run-a", self.root / "gone"):
@@ -265,8 +282,9 @@ class RunProcessTests(unittest.TestCase):
                           502: FakeProcess(self.worktree, 501, ["codex-code-mode-host"])}
         calls: list[list[str]] = []
 
-        def mesh(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-            del cwd
+        def mesh(argv: list[str], cwd: Path | None = None, *,
+                 settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> subprocess.CompletedProcess[str]:
+            del cwd, settings
             calls.append(argv)
             if not code:
                 self.processes.clear()
@@ -319,7 +337,7 @@ class DeadServerWatcherTests(UnitRenameFixture):
         self.assertIn(watcher.pid, unit_move.processes_inside(old))
         with mock.patch.dict(os.environ, self.env):
             self.assertNotIn(self.root / "runs/run-a", retire_unit.runs_of(old))
-        server = retire_unit.command_line(watcher.pid)[4]
+            server = retire_unit.command_line(watcher.pid, settings=conf.read("production"))[4]
         # Reap the actual child on exit: kill(pid, 0) otherwise still sees its zombie.
         reaper = threading.Thread(target=lambda: watcher.wait(timeout=TEST_HANG_GUARD_SECS), daemon=True)
         reaper.start()

@@ -177,9 +177,21 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
         argv = ("env", *configuration, f"CARGO_TARGET_DIR={checkout / 'target'}", "bash", str(script.resolve()),
                 "--validate-only", "--fix-commit",
                 f"ci({production.slug}): validation fixes after {checkpoint}")
-        result = command("validation", *argv, cwd=checkout)
-        if result.returncode:
-            raise PointFailure("validation", failure_detail(result))
+        validation_log = state_dir.resolve() / "ci_validation.log"
+        try:
+            with validation_log.open("w", encoding="utf-8") as output:
+                result = subprocess.run(argv, cwd=checkout, stdout=output, stderr=subprocess.STDOUT,
+                                        text=True, check=False)
+            if result.returncode:
+                detail = f"exit {result.returncode}, no step named"
+                with validation_log.open(encoding="utf-8", errors="replace") as output:
+                    for line in output:
+                        marker = re.fullmatch(r"!!! VALIDATION FAILED at step: (.+) !!!", line.rstrip("\r\n"))
+                        if marker is not None:
+                            detail = f"step {marker.group(1)} failed"
+                raise PointFailure("validation", f"{detail}; log {validation_log}")
+        except OSError as error:
+            raise PointFailure("validation", str(error)) from error
         validated = required(git(checkout, "rev-parse", "HEAD"), "ci start")
         push = ("env", f"PUSH_TARGET_BRANCH={production.merge_branch}", f"CI_VALIDATED_BASE={tip}",
                 f"CANCEL_PRIOR={str(cancel_prior).lower()}", "bash",

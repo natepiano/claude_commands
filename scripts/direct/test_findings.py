@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from argparse import Namespace
 from collections.abc import Callable
 import json
 import os
@@ -16,11 +17,156 @@ from scripts.history.routed import routed_work
 
 
 class FindingsLedgerTests(FindingsLedgerFixture):
+    def hold_finding(self) -> str:
+        self.write_progress_state("decision-phase")
+        return self.open_simplify("Remove retry behavior", held=True)
+
+    def decided_finding(self, answer: str, words: str, *, at: int = 1_000) -> str:
+        finding_id = self.hold_finding()
+        _ = self.run_command("decision", "--id", finding_id, "--answer", answer,
+                             "--user-words", words, at=at)
+        return finding_id
+
+    def assert_refused(self, message: str, *arguments: str) -> None:
+        before = self.ledger()
+        events = self.events()
+        result = self.run_failing_command(*arguments)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(message, result.stderr)
+        self.assertEqual(self.ledger(), before)
+        self.assertEqual(self.events(), events)
+
+    def test_withdraw_replaces_a_decision_and_preserves_each_ruling_in_history(self) -> None:
+        finding_id = self.decided_finding("declined", "Keep the retry.", at=1_010)
+        gate_before = self.gate()
+        expected_history: list[dict[str, object]] = []
+        previous: dict[str, object] = {
+            "answer": "declined", "user_words": "Keep the retry.", "timestamp_epoch": 1_010,
+        }
+        for at, answer, words, reason in (
+            (1_020, "approved", "Remove the retry.", "The current ruling is withdrawn."),
+            (1_030, "declined", "Keep the retry after all.", "The user changed the answer."),
+        ):
+            with self.subTest(answer=answer):
+                _ = self.run_command("decision", "--id", finding_id, "--answer", answer,
+                                     "--user-words", words, "--withdraw", reason, at=at)
+                expected_history.append({**previous, "withdrawn_epoch": at, "withdraw_reason": reason})
+                current: dict[str, object] = {"answer": answer, "user_words": words, "timestamp_epoch": at}
+                entry = self.finding_rows()[0]
+                self.assertEqual(entry["state"], "decided")
+                self.assertEqual(entry["decision"], current)
+                self.assertEqual(entry["decision_history"], expected_history)
+                events = [event for event in self.events() if event["event_type"] == "finding_decision"]
+                self.assertEqual(len(events), len(expected_history) + 1)
+                self.assertEqual(events[-1]["withdrew"], expected_history[-1])
+                self.assertEqual(events[-1]["user_words"], words)
+                self.assertEqual(events[-1]["answer"], answer)
+                self.assertEqual(events[-1]["timestamp_epoch"], at)
+                previous = current
+        self.assertEqual(self.gate(), gate_before)
+
+    def test_retry_after_a_failed_decision_event_preserves_one_withdrawal(self) -> None:
+        finding_id = self.decided_finding("declined", "Keep the retry.", at=1_010)
+        decide = cast(Callable[[Namespace], None], vars(findings)["_decision"])
+        args = Namespace(session_dir=str(self.session_dir), phase="", id=finding_id,
+                         answer="approved", user_words="Remove the retry.", withdraw="The user changed the answer.")
+        with patch.dict(os.environ, self.environment(1_020)), patch.object(
+            findings, "_append_event", side_effect=OSError("The event append failed."),
+        ):
+            with self.assertRaisesRegex(OSError, "The event append failed"):
+                decide(args)
+        saved = self.ledger()
+        self.assertEqual(len(self.events()), 2)
+        for at in (1_030, 1_040):
+            with self.subTest(at=at):
+                _ = self.run_command("decision", "--id", finding_id, "--answer", "approved",
+                                     "--user-words", "Remove the retry.",
+                                     "--withdraw", "The user changed the answer.", at=at)
+                self.assertEqual(self.ledger(), saved)
+                entry = self.finding_rows()[0]
+                history = cast(list[dict[str, object]], entry["decision_history"])
+                self.assertEqual(len(history), 1)
+                events = [event for event in self.events() if "withdrew" in event]
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["withdrew"], history[0])
+                self.assertEqual(events[0]["answer"], "approved")
+                self.assertEqual(events[0]["user_words"], "Remove the retry.")
+                self.assertEqual(events[0]["timestamp_epoch"], 1_020)
+
+    def test_an_identical_decision_without_withdraw_changes_neither_state_nor_events(self) -> None:
+        finding_id = self.decided_finding("declined", "Keep the retry.")
+        before = self.ledger()
+        events = self.events()
+        _ = self.run_command("decision", "--id", finding_id, "--answer", "declined",
+                             "--user-words", "Keep the retry.", at=1_010)
+        self.assertEqual(self.ledger(), before)
+        self.assertEqual(self.events(), events)
+
+    def test_a_decided_finding_requires_withdraw_before_a_new_answer(self) -> None:
+        finding_id = self.decided_finding("declined", "Keep the retry.")
+        for options, message in (
+            ((), "use --withdraw"),
+            (("--withdraw", " "), "--withdraw must not be empty"),
+        ):
+            with self.subTest(options=options):
+                self.assert_refused(message, "decision", "--id", finding_id, "--answer", "approved",
+                                    "--user-words", "Remove the retry.", *options)
+
+    def test_withdraw_on_a_held_finding_is_refused(self) -> None:
+        finding_id = self.hold_finding()
+        for reason in ("No ruling exists.", ""):
+            with self.subTest(reason=reason):
+                self.assert_refused(
+                    "--withdraw requires a decided finding", "decision", "--id", finding_id,
+                    "--answer", "approved", "--user-words", "Remove the retry.", "--withdraw", reason,
+                )
+
+    def test_an_open_finding_refuses_a_decision_with_or_without_withdraw(self) -> None:
+        self.write_progress_state("decision-phase")
+        finding_id = self.open_finding("minor", "Remove repeated parsing")
+        for options in ((), ("--withdraw", "Withdraw the ruling.")):
+            with self.subTest(options=options):
+                self.assert_refused(
+                    "Only a held or decided finding can receive an answer", "decision", "--id", finding_id,
+                    "--answer", "approved", "--user-words", "Remove repeated parsing.", *options,
+                )
+
+    def test_an_approved_decision_permits_a_closure_verdict(self) -> None:
+        finding_id = self.decided_finding("approved", "Remove the retry.")
+        self.assertEqual(self.run_command("verdict", "--id", finding_id, "--state", "accepted"),
+                         f"{finding_id} accepted")
+        entry = self.finding_rows()[0]
+        self.assertEqual(entry["state"], "accepted")
+        self.assertEqual(cast(dict[str, object], entry["decision"])["answer"], "approved")
+        self.assertEqual(self.events()[-1]["event_type"], "finding_verdict")
+
+    def test_a_declined_decision_refuses_a_closure_verdict(self) -> None:
+        finding_id = self.decided_finding("declined", "Keep the retry.")
+        for outcome in ("accepted", "still_open", "reopened"):
+            with self.subTest(outcome=outcome):
+                self.assert_refused("closed by the declined decision", "verdict", "--id", finding_id, "--state", outcome)
+
+    def test_a_held_finding_refuses_a_closure_verdict(self) -> None:
+        finding_id = self.hold_finding()
+        for outcome in ("accepted", "still_open", "reopened"):
+            with self.subTest(outcome=outcome):
+                self.assert_refused("requires the user's decision", "verdict", "--id", finding_id, "--state", outcome)
+
+    def test_changed_config_is_read_on_the_next_command_with_comments(self) -> None:
+        _ = self.open_finding("blocker", "needs a repair")
+        self.close_round(["F001"])
+        self.write_config("MIN_REPAIR_BUDGET=4 # current floor\n")
+        first = self.gate()
+        self.write_config("MIN_REPAIR_BUDGET=8 # revised floor\n")
+        second = self.gate()
+        self.assertEqual(first["repair_budget"], 4)
+        self.assertEqual(second["repair_budget"], 8)
+
     def test_rerun_finding_keeps_its_lens_in_ledger_and_history(self) -> None:
         self.write_progress_state("instance-rerun")
         _ = self.run_command("open", "--severity", "blocker", "--title", "Restore loses records",
                              "--caught-by", "worker", "--lens", "rerun")
-        findings = cast(list[dict[str, object]], self.status()["findings"])
+        findings = self.finding_rows()
         self.assertEqual([entry["lens"] for entry in findings], ["rerun"])
         self.assertEqual([event["lens"] for event in self.events() if event["event_type"] == "finding_opened"],
                          ["rerun"])
@@ -51,7 +197,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         self.assertEqual(self.open_finding("minor", "eighteen's finding"), "F001")
         self.write_progress_state("phase-six", "6")
 
-        findings = cast(list[dict[str, object]], self.status()["findings"])
+        findings = self.finding_rows()
         self.assertEqual([finding["title"] for finding in findings], ["six's finding"])
 
     def test_a_landed_repair_for_the_older_open_phase_touches_only_its_ledger(self) -> None:
@@ -71,8 +217,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         self.assertEqual(newer["in_flight"], [sixteen])
         self.assertEqual([finding["title"] for finding in cast(list[dict[str, object]], newer["findings"])],
                          ["sixteen's finding"])
-        live = cast(dict[str, object], json.loads(
-            (self.session_dir / "findings_state.json").read_text(encoding="utf-8")))
+        live = cast(dict[str, object], json.loads(self.ledger()))
         self.assertEqual(live["phase_id"], "16")
 
     def test_a_ledger_call_naming_no_phase_is_refused_while_two_are_open(self) -> None:
@@ -102,7 +247,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
             "--caught-by", "worker", "--lens", "contract",
         )
         _ = self.open_finding("minor", "main review only")
-        findings = cast(list[dict[str, object]], self.status()["findings"])
+        findings = self.finding_rows()
         self.assertEqual([entry["lens"] for entry in findings], ["contract", ""])
         opened = [event for event in self.events() if event["event_type"] == "finding_opened"]
         self.assertEqual([event["lens"] for event in opened], ["contract", ""])
@@ -110,7 +255,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
     def test_the_former_caught_by_name_is_stored_as_worker(self) -> None:
         self.write_progress_state("instance-a")
         _ = self.run_command("open", "--severity", "minor", "--title", "old prompt", "--caught-by", "delegate")
-        findings = cast(list[dict[str, object]], self.status()["findings"])
+        findings = self.finding_rows()
         self.assertEqual([entry["caught_by"] for entry in findings], ["worker"])
         opened = [event for event in self.events() if event["event_type"] == "finding_opened"]
         self.assertEqual([event["caught_by"] for event in opened], ["worker"])
@@ -124,7 +269,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
                 "--caught-by", "worker", "--lens", lens,
             )
         expected = ["craft", "adversary,craft", "ux", "both", "craft,ux"]
-        findings = cast(list[dict[str, object]], self.status()["findings"])
+        findings = self.finding_rows()
         self.assertEqual([entry["lens"] for entry in findings], expected)
         opened = [event for event in self.events() if event["event_type"] == "finding_opened"]
         self.assertEqual([event["lens"] for event in opened], expected)
@@ -210,7 +355,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         """
         _ = self.open_finding("blocker", "null deref")
         _ = self.run_command("dispatch", "--covers", "F001")
-        findings = cast(list[dict[str, object]], self.status()["findings"])
+        findings = self.finding_rows()
         self.assertEqual(findings[0]["state"], "repair_in_flight")
         self.assertEqual(self.status()["in_flight"], ["F001"])
 
@@ -237,7 +382,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         _ = self.open_finding("blocker", "null deref")
         _ = self.run_command("dispatch", "--covers", "F001")
         _ = self.run_command("abandon", "--reason", "the user stopped the launcher")
-        findings = cast(list[dict[str, object]], self.status()["findings"])
+        findings = self.finding_rows()
         self.assertEqual(findings[0]["state"], "open")
         self.assertEqual(findings[0]["fix_attempts"], 0)
         self.assertEqual(self.status()["rounds_completed"], 0)
@@ -249,7 +394,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         _ = self.run_command(
             "abandon", "--reason", "worker exited with code 1", "--edits-landed"
         )
-        findings = cast(list[dict[str, object]], self.status()["findings"])
+        findings = self.finding_rows()
         self.assertEqual(findings[0]["state"], "open")
         self.assertEqual(findings[0]["fix_attempts"], 1)
         self.assertEqual(self.status()["rounds_completed"], 1)
@@ -376,7 +521,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
 
     def test_a_missing_config_key_stops_the_run(self) -> None:
         """Every limit must be set, and one run names all of the missing ones."""
-        self.write_partial_config("MIN_REPAIR_BUDGET=3\n")
+        self.write_partial_config("# whole: 1..\nMIN_REPAIR_BUDGET=3\n")
         result = self.run_failing_command("gate")
         self.assertEqual(result.returncode, 2)
         self.assertIn("RUNAWAY_ROUNDS is not set", result.stderr)
@@ -760,7 +905,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
                 "--work-order", "plan.md — Phase 6 — Retry", "--due", "checkpoint",
             )
             self.assertNotEqual(denied.returncode, 0, state)
-            rows = cast(list[dict[str, object]], self.status()["findings"])
+            rows = self.finding_rows()
             self.assertEqual(rows[0]["state"], state)
 
     def test_dispatch_requires_nonempty_accepted_checks(self) -> None:

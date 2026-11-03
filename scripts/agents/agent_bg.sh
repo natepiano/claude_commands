@@ -5,6 +5,7 @@
 # Usage: agent_bg.sh <mesh_name> <working_dir> <prompt_file> <summary_file>
 #                    <log_file> <id_file> [model] [poll_secs]
 #   env AGENT_BG_WORKERS=1        use the workers account route
+#   env AGENT_BG_ROLE=<role>      the worker's opening role, independent of its slot
 #   env AGENT_BG_EFFORT=<effort>  adds --effort to the launch
 #   env AGENT_BG_DETACH=1         return once the session is registered, with
 #                                 its id in <id_file>, instead of waiting for
@@ -39,6 +40,7 @@
 # in <id_file>.
 
 set -euo pipefail
+unset STAFF_ID
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
@@ -50,7 +52,7 @@ fi
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
-# repo needs >= 3.11.
+# repo needs >= 3.12.
 PY="${HOME}/.claude/scripts/lib/py"
 NIX_ENV_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)"
 
@@ -95,6 +97,40 @@ if [[ ! "${MESH_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]]; then
   exit 2
 fi
 
+WORKER_FILL="$(dirname "${BASH_SOURCE[0]}")/../production/worker_fill.py"
+ADMISSION_RUN="${UNIT_RUN_DIR:-${WORKING_DIR}}"
+OPENING_ROLE="${AGENT_BG_ROLE:-${UNIT_TEAM_ROLE:-}}"
+"$PY" "$WORKER_FILL" admit --name "$MESH_NAME" --run "$ADMISSION_RUN" --role "$OPENING_ROLE" || exit 2
+
+publish_worker() {
+  # The CLI returns a short backend id. Require one exact, live registry match.
+  NATIVE_ID="$(BG_ID="$BG_ID" "$PY" - "$NIX_ENV_LIB/../.." <<'PYREG'
+import sys
+import os
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from scripts.message import sessions
+from scripts.production import staff
+registry = sessions.read_registry()
+if registry.unreadable:
+    raise SystemExit("staff: registry is incomplete; native identity not published")
+found = [item.record for item in registry.entries
+         if item.record["sessionId"].startswith(os.environ["BG_ID"])
+         and sessions.running_session(item.record)]
+if len(found) != 1:
+    raise SystemExit("staff: backend has no unique live registry identity")
+row = found[0]
+if staff.runtime_id(row["pid"]) != row["sessionId"]:
+    raise SystemExit("staff: Claude process changed during publication")
+print(row["sessionId"])
+PYREG
+)" || return 2
+  if ! "$PY" "$WORKER_FILL" publish --name "$MESH_NAME" --run "$ADMISSION_RUN" --role "$OPENING_ROLE" --runtime-id "$NATIVE_ID"; then
+    echo "staff: ${MESH_NAME}: ${NATIVE_ID}: publication refused; no work dispatched" >&2
+    return 2
+  fi
+}
+
 if [[ "${ATTACH}" == "1" ]]; then
   BG_ID="$(cat "${ID_FILE}" 2>/dev/null || true)"
   [[ -n "${BG_ID}" ]] || { echo "agent_bg.sh: missing worker id" >&2; exit 2; }
@@ -137,6 +173,7 @@ if matches:
 print(count)
 PY
   }
+  publish_worker || exit 2
   before="$(transcript_count)"
   [[ "${before}" != "-1" ]] || { echo "agent_bg.sh: session transcript identity unavailable" >&2; exit 2; }
   SEND_SCRIPT="${AGENT_BG_SEND_SCRIPT:-$(dirname "${BASH_SOURCE[0]}")/../message/send.py}"
@@ -214,7 +251,7 @@ fi
 # cargo token and filed into its session. Hand the worker its worker variables
 # through settings, empty when unset (every reader treats empty as unset), and
 # keep them off the launch below so a daemon it starts carries none.
-WORKER_ENV_NAMES=(UNIT_RUN_DIR UNIT_TEAM_ROLE AGENTS_CONFIG_FILE)
+WORKER_ENV_NAMES=(UNIT_RUN_DIR UNIT_TEAM_ROLE MODELS_CONFIG_FILE)
 worker_settings="$("$PY" - "$WORKING_DIR" "$NIX_ENV_LIB" "${WORKER_ENV_NAMES[@]}" <<'PY'
 import json
 import os
@@ -239,6 +276,10 @@ print(json.dumps({"sandbox": {"enabled": False}, "env": env}))
 PY
 )" || exit 1
 
+if [[ -s "${ID_FILE}" ]]; then
+  echo "staff: ${MESH_NAME}: not opened: recorded backend must be reconciled with --attach" >&2
+  exit 2
+fi
 launch_args=(--bg --name "${MESH_NAME}"
              --dangerously-skip-permissions
              --settings "${worker_settings}")
@@ -250,10 +291,10 @@ if [[ -n "${EFFORT}" ]]; then
 fi
 
 banner="$(cd "${WORKING_DIR}" \
-            && env -u UNIT_RUN_DIR -u UNIT_TEAM_ROLE -u AGENTS_CONFIG_FILE \
+            && env -u UNIT_RUN_DIR -u UNIT_TEAM_ROLE -u MODELS_CONFIG_FILE \
                    -u UNIT_RESOLVES_ROUND -u AGENT_BG_WORKERS \
                    "${PY}" "$NIX_ENV_LIB/nix_env.py" exec "${CLAUDE_BIN}" "${launch_args[@]}" \
-            -- "$(cat "${PROMPT_FILE}")" 2>&1 || true)"
+            2>&1 || true)"
 
 # The banner reads `backgrounded · <id> · <name>`; the separators are multibyte,
 # so match the id itself rather than splitting on them -- on that line alone. A
@@ -268,6 +309,17 @@ if [[ -z "${BG_ID}" ]]; then
   exit 1
 fi
 printf '%s\n' "${BG_ID}" > "${ID_FILE}"
+if ! publish_worker; then
+  "${CLAUDE_BIN}" stop "${BG_ID}" || echo "staff: ${MESH_NAME}: ${BG_ID}: cleanup unproved" >&2
+  exit 2
+fi
+SEND_SCRIPT="${AGENT_BG_SEND_SCRIPT:-$(dirname "${BASH_SOURCE[0]}")/../message/send.py}"
+delivery="$("$PY" "${SEND_SCRIPT}" --to "session:${NATIVE_ID}" --from "launcher" --file "${PROMPT_FILE}")" || exit 2
+if [[ "$delivery" != SENT:* && "$delivery" != SKIPPED:* ]]; then
+  echo "agent_bg.sh: opening prompt was not delivered: ${delivery}" >&2
+  exit 2
+fi
+
 if [[ -n "${LEDGER}" ]]; then
   LEDGER="$("$PY" - "$(dirname "${BASH_SOURCE[0]}")/../direct" "${LEDGER}" <<'PY'
 import sys

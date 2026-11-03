@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from scripts.build_queue.admission_test_support import caller_admission
+from scripts.build_queue import admission_protocol as wire
+from scripts.lib.py_floor_test_support import cache_file_name
+
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+
 import json
 import os
 import errno
@@ -26,13 +32,10 @@ from unittest import mock
 from scripts.build_hold import build_hold
 from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
 from scripts.production.cli_fixture import invoke_cli
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
-# Existing fixture consumers import this name.
-HANG_GUARD_S = TEST_HANG_GUARD_SECS
 
 
 def invoke_mac_claim(arguments: list[str], environment: dict[str, str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -112,7 +115,7 @@ def reap(marker: str) -> set[int]:
     for pid in stopped:
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGKILL)
-    deadline = time.monotonic() + HANG_GUARD_S
+    deadline = time.monotonic() + TEST_HANG_GUARD_SECS
     for pid in stopped:
         try:
             descriptor = os.pidfd_open(pid)
@@ -199,6 +202,7 @@ class CargoMetadata(TypedDict):
 CARGO_STUB = r'''
 from __future__ import annotations
 
+
 import json
 import os
 from pathlib import Path
@@ -264,7 +268,13 @@ if has "$@"; then
     wanted=--short
     if has "$@"; then printf 'abc1234\n'; exit 0; fi
 fi
-for wanted in status diff ls-files ls-tree; do if has "$@"; then exit 0; fi; done
+wanted=ls-files
+if has "$@"; then
+    wanted=--others
+    if ! has "$@"; then printf 'Cargo.toml\0'; fi
+    exit 0
+fi
+for wanted in status diff ls-tree; do if has "$@"; then exit 0; fi; done
 exit 1
 '''
 
@@ -282,6 +292,7 @@ fi
 
 RUNNER_STUB = r'''
 from __future__ import annotations
+
 
 import json
 import os
@@ -672,6 +683,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
             self.build_fixture()
         self.addCleanup(self.assert_nothing_outlives)
+        _ = caller_admission(self, self.root, self.environment)
 
     def fixture_paths(self) -> None:
         self.home = self.root / "home"
@@ -735,9 +747,11 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         # Admission must use this test's memory state, including pressure.
         pressure = self.root / "memory-pressure"
         _ = pressure.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+        _ = write_config_fixture(self.root / "lint.conf")
+        _ = write_config_fixture(self.root / "mac_test.conf")
         settings = self.root / "mac settings.conf"
-        _ = settings.write_text(f"offload=on\nlinux_only.{self.root.name}=\n")
-        config = self.root / "targets.conf"
+        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.root.name}=\n", template="mac_test")
+        config = self.root / "build_targets.conf"
         _ = config.write_text("targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\n"
                               + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n")
         metadata: CargoMetadata = {
@@ -764,6 +778,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         assertion_guard = self.root / "assertion-guard.py"
         self.write_executable(assertion_guard, "raise SystemExit(0)\n")
         self.environment = {
+            **config_environment(self.root),
             **{
                 name: value
                 for name, value in os.environ.items()
@@ -816,12 +831,12 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
             "MAC_IDLE_STATE_DIR": str(self.root / "mac-idle"),
-            "BUILD_TARGETS_CONFIG": str(config),
+
             "MAC_TEST_CONFIG": str(settings),
             "CLAUDE_CODE_SESSION_ID": "", "BUILD_TARGETS_NOW": "",
             "BUILD_TARGETS_POLL_S": "0.05",
             "LINT_CONFIG_READER": str(reader),
-            "LINT_CONFIG_FILE": str(reader),
+            "LINT_CONFIG_FILE": str(reader), "CONF_DIR": str(Path(reader).parent),
             "UNIT_RUN_DIR": str(self.board),
             "UNIT_TEAM_ROLE": "test",
             "VERIFY_MAC_RUNNER": str(self.runner),
@@ -839,7 +854,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog" / "record.py"),
         }
 
-        cache = self.root / "cache/claude/python3-3.11"
+        cache = self.root / "cache/claude" / cache_file_name()
         cache.parent.mkdir(parents=True, exist_ok=True)
         _ = cache.write_text(sys.executable + "\n")
         _ = self.environment.pop("CLAUDE_PYTHON", None)
@@ -855,15 +870,13 @@ class VerifyMacOffloadFixture(unittest.TestCase):
     def verify(
         self, *arguments: str, extra: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["bash", str(VERIFY), *arguments],
-            cwd=self.root,
-            env={**self.environment, **(extra or {})},
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=HANG_GUARD_S,
-        )
+        process = self.start_verify(*arguments, extra=extra)
+        try:
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        except subprocess.TimeoutExpired:
+            self.stop_verify(process)
+            raise
+        return subprocess.CompletedProcess(process.args, process.wait(timeout=TEST_HANG_GUARD_SECS), output, errors)
 
     def start_verify(
         self, *arguments: str, extra: dict[str, str] | None = None
@@ -951,11 +964,12 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         library.unlink()
         library.mkdir()
         self.write_executable(library / "py", ROUTING_CLOCK_SHIM)
+        _ = shutil.copy2(VERIFY.parent.parent / "lib/build_folders.py", library / "build_folders.py")
         self.environment["TEST_ROUTING_CLOCK"] = str(clock)
         return clock
 
     @contextmanager
-    def hold_environment(self, timeout: float = HANG_GUARD_S) -> Generator[None, None, None]:
+    def hold_environment(self, timeout: float = TEST_HANG_GUARD_SECS) -> Generator[None, None, None]:
         children: list[subprocess.Popen[bytes]] = []
         threads: list[threading.Thread] = []
         launch = cast(Callable[..., subprocess.Popen[bytes]], subprocess.Popen)
@@ -1022,7 +1036,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
     def stop_verify(self, process: subprocess.Popen[str]) -> None:
         """Kill the call and every process under it, its steps' own groups and sessions too."""
         _ = reap(self.child_marker())
-        _ = process.communicate(timeout=HANG_GUARD_S)
+        _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def assert_nothing_outlives(self) -> None:
         # Runs after every other cleanup: a process a call left behind
@@ -1030,7 +1044,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         # as a cargo run for as long as it lives.
         # Lint recorders intentionally detach from their caller. Wait for their
         # exit events; a two-second grace period races their work under load.
-        deadline = time.monotonic() + HANG_GUARD_S
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         while children := processes_carrying(self.child_marker()):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1124,6 +1138,13 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         finally:
             for descriptor in descriptors:
                 os.close(descriptor)
+
+    def wait_for_memory_wait(self, process: subprocess.Popen[str]) -> None:
+        """Wait for a held reply from this fixture's service."""
+        admission = caller_admission(self, self.root, self.environment)
+        self.wait_until(lambda: any(isinstance(waiting.last_reply, wire.Wait)
+                                   for waiting in admission.server.waiters.values()),
+                        "the admission wait", (process,))
 
     def hold_memory(self) -> Path:
         """Keep natedev's memory gate holding until the returned meminfo is rewritten."""
@@ -1221,7 +1242,7 @@ trap hold_after_routing DEBUG
             self.assertEqual(len(self.runner_events()), 2)
             self.set_mac_answer("passed", "", 0)
             _ = clock.write_text("460")
-        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(len(self.runner_events()), 3 if repeat_decline else 2)
         self.assertEqual(self.local_runs(), [])
@@ -1241,7 +1262,7 @@ trap hold_after_routing DEBUG
         else:
             board = VERIFY.with_name("board.sh")
             acquired = subprocess.run(["bash", str(board), "acquire", str(self.board), "peer", "cargo",
-                "--pid", str(os.getpid())], env=self.environment, capture_output=True, text=True, timeout=HANG_GUARD_S)
+                "--pid", str(os.getpid())], env=self.environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(acquired.returncode, 0, acquired.stderr)
         self.set_mac_answer("lost", "", 75)
         process = self.start_verify("test", "sample", "--no-cache")
@@ -1252,7 +1273,7 @@ trap hold_after_routing DEBUG
         self.assertEqual(len(paths), 1)
         self.set_mac_answer("passed", "", 0)
         _ = paths[0].with_suffix(".retry").write_text("retry_delayed\n")
-        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(len(self.runner_events()), 2)
         self.assertEqual(self.local_runs(), [])

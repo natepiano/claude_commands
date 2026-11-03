@@ -1,0 +1,655 @@
+"""One private admission server, fake clock and fault boundary for service tests."""
+from __future__ import annotations
+
+from scripts.build_queue.queue_fixture import write_memory_config
+
+from collections import Counter
+from collections.abc import Callable, Generator
+from contextlib import ExitStack, contextmanager
+from datetime import UTC, datetime
+import os
+from pathlib import Path
+import select
+import signal
+import socket
+import subprocess
+import threading
+import time
+import unittest
+import uuid
+from unittest import mock
+from typing import cast, override
+
+from scripts.lint import memory_admit as gate
+from scripts.lint.memory_test_support import fake_memory_readings, gate_isolation_environment
+from scripts.build_queue import admission_protocol as wire
+from scripts.build_queue import admission_service as service
+from scripts.build_queue.queue_fixture import write_process
+from scripts.lib.test_hang_guard import LauncherHangGuard
+from scripts.lib import build_folders
+from scripts.lib.socket_test_support import short_socket_directory
+
+NOW = datetime(2026, 10, 31, 12, tzinfo=UTC).timestamp()
+GIB = gate.GIB
+DEFAULT_WIDTH = gate.RequestedTestWidth(8)
+DEFAULT_CALL = gate.CallRecord("call-1")
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.epoch: float = NOW
+        self.elapsed: float = 0.0
+        self.sleeps: list[float] = []
+        self.on_sleep: Callable[[float], None] = lambda _seconds: None
+
+    def now(self) -> float:
+        return self.epoch
+
+    def monotonic(self) -> float:
+        return self.elapsed
+
+    def advance(self, seconds: float) -> None:
+        if seconds < 0:
+            raise ValueError("fake time cannot move backwards")
+        self.epoch += seconds
+        self.elapsed += seconds
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.advance(seconds)
+        self.on_sleep(seconds)
+
+
+class InjectedCrash(RuntimeError):
+    """A test stops the loop at a persistence boundary."""
+
+
+class Faults:
+    def __init__(self) -> None:
+        self.stage: str = ""
+        self.seen: list[str] = []
+
+    def __call__(self, stage: str) -> None:
+        self.seen.append(stage)
+        if stage == self.stage:
+            self.stage = ""
+            raise InjectedCrash(stage)
+
+
+class ScopeEvents:
+    """Inject kernfs wakeups while keeping real owner and socket epoll events."""
+    def __init__(self, epoll: select.epoll) -> None:
+        self.epoll: select.epoll = epoll
+        self.scopes: set[int] = set()
+        self.registered: list[int] = []
+        self.unregistered: list[int] = []
+        self.events: list[tuple[int, int]] = []
+
+    def register(self, descriptor: int, events: int) -> None:
+        if events & select.EPOLLPRI:
+            self.scopes.add(descriptor)
+            self.registered.append(descriptor)
+        else:
+            self.epoll.register(descriptor, events)
+
+    def unregister(self, descriptor: int) -> None:
+        if descriptor in self.scopes:
+            self.scopes.remove(descriptor)
+            self.unregistered.append(descriptor)
+        else:
+            self.epoll.unregister(descriptor)
+
+    def modify(self, descriptor: int, events: int) -> None:
+        self.epoll.modify(descriptor, events)
+
+    def poll(self, timeout: float = 0) -> list[tuple[int, int]]:
+        events, self.events = self.events, []
+        return self.epoll.poll(timeout) + events
+
+
+class ObservedAdmissionServer(service.AdmissionServer):
+    """Expose loop instrumentation only at the shared test fixture boundary."""
+
+    @staticmethod
+    def reply_filter(reply: wire.Reply) -> wire.Reply:
+        return reply
+
+    @staticmethod
+    def line_filter(line: str) -> str:
+        return line
+
+    @override
+    def _send(self, connection: service.Connection, reply: wire.Reply) -> None:
+        queued = len(connection.sending)
+        super()._send(connection, self.reply_filter(reply))
+        connection.sending = connection.sending[:queued] + self.line_filter(
+            connection.sending[queued:].decode()).encode()
+
+    @override
+    def handle_request(self, request: wire.Request,
+                       connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
+        if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)) and isinstance(self.proc, TestProcesses):
+            self.proc.register(request.owner)
+        return super().handle_request(request, connection)
+
+    def resolve_estimates(self, count: int = 1) -> None:
+        """Use worker completion as the barrier before the loop accepts its results."""
+        completed = [self.estimate_results.get(timeout=5) for _ in range(count)]
+        for result in completed:
+            self.estimate_results.put(result)
+        self._accept_estimates()
+
+    @contextmanager
+    def silent_replies(self) -> Generator[None]:
+        with mock.patch.object(self, "_send", return_value=None):
+            yield
+
+    @property
+    def pending_replies(self) -> dict[str, list[wire.Reply]]:
+        return self._pending_replies
+
+    def send_wait(self, connection: service.Connection, reply: wire.Wait) -> None:
+        self._send(connection, reply)
+
+    @contextmanager
+    def observe_waiter_ordering(self) -> Generator[mock.MagicMock]:
+        with mock.patch.object(self, "_ordered_waiters", wraps=self._ordered_waiters) as ordered:
+            yield ordered
+
+    @contextmanager
+    def observe_wait_initial_states(self) -> Generator[list[wire.Wait | service.NoWaitReply]]:
+        before_delivery: list[wire.Wait | service.NoWaitReply] = []
+        deliver = self._deliver
+
+        def observe(waiting: service.WaitingAdmission, reply: wire.Reply) -> None:
+            before_delivery.append(waiting.last_reply)
+            deliver(waiting, reply)
+
+        with mock.patch.object(self, "_deliver", side_effect=observe):
+            yield before_delivery
+
+
+class TestProcesses:
+    """Real pidfds with private resident-memory files."""
+    def __init__(self, path: Path) -> None:
+        self.path: Path = path
+        path.mkdir(parents=True, exist_ok=True)
+        self.children: list[subprocess.Popen[bytes]] = []
+        self.starts: dict[int, str] = {}
+        self.fixture_owners: dict[int, str] = {}
+
+    def spawn(self, used: int = GIB) -> wire.Owner:
+        child = subprocess.Popen(["sleep", "300"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.children.append(child)
+        start = gate.process_start_time(child.pid)
+        if start is None:
+            raise RuntimeError("child has no process start time")
+        self.starts[child.pid] = start
+        self.register(wire.Owner(child.pid, start), used)
+        return wire.Owner(child.pid, start)
+
+    def register(self, owner: wire.Owner, used: int = 0) -> None:
+        """Supply private memory for an owner that a caller process created."""
+        self.starts[owner.pid] = owner.start_time
+        if not (self.path / str(owner.pid) / "stat").exists():
+            write_process(self.path, owner.pid, used)
+            stat = self.path / str(owner.pid) / "stat"
+            fields = stat.read_text().rsplit(") ", 1)[1].split()
+            fields[19] = owner.start_time
+            _ = stat.write_text(f"{owner.pid} (fixture) {' '.join(fields)}\n")
+
+    def processes(self) -> dict[int, gate.ProcessIdentity]:
+        return gate.process_table(self.path)
+
+    def owner_start(self, pid: int) -> service.LiveOwnerIdentity | service.OwnerProcessGone:
+        start = self.fixture_owners[pid] if pid in self.fixture_owners else gate.process_start_time(pid)
+        return service.OwnerProcessGone() if start is None else service.LiveOwnerIdentity(start)
+
+    def pidfd(self, pid: int) -> int:
+        return os.pidfd_open(os.getpid() if pid in self.fixture_owners else pid)
+
+    def lifetime(self, row: gate.Reservation, owner_live: bool) -> gate.PopulatedStepScope | gate.LiveOwnerProcess | gate.EndedStep:
+        return gate.reservation_lifetime(row, owner_live)
+
+    def kill(self, owner: wire.Owner) -> None:
+        child = next(child for child in self.children if child.pid == owner.pid)
+        child.kill()
+        _ = child.wait(timeout=2)
+
+    def close(self) -> None:
+        for child in self.children:
+            if child.poll() is None:
+                child.kill()
+            _ = child.wait(timeout=2)
+
+
+class PrivateReadings:
+    """Count each real gate reader, against only the fixture's fake files."""
+    def __init__(self, root: Path) -> None:
+        self.root: Path = root
+        self.host_path: Path = root / "meminfo"
+        self.counts: Counter[str] = Counter()
+
+    def host(self) -> gate.HostMemory | gate.ReadingUnavailable:
+        self.counts["host"] += 1
+        try:
+            return gate.read_meminfo(self.host_path)
+        except Exception as error:
+            return gate.ReadingUnavailable(str(error))
+
+    def pressure(self, host: gate.HostMemory, policy: gate.AdmissionPolicy) -> gate.Pressure:
+        self.counts["pressure"] += 1
+        return gate.read_pressure(host, policy=policy)
+
+    def compilers(self) -> list[gate.StepMemory]:
+        self.counts["compilers"] += 1
+        return gate.sccache_memory()
+
+    def reservation(self, path: Path, row: gate.Reservation, now: datetime,
+                    processes: dict[int, gate.ProcessIdentity], proc: Path,
+                    policy: gate.AdmissionPolicy) -> gate.StepMemory:
+        self.counts[f"reservation:{row['pid']}"] += 1
+        return gate.reservation_memory(path, row, now, processes, proc, policy)
+
+
+class SocketPeer:
+    """A protocol connection pumped by the same thread as the epoll server."""
+    def __init__(self, fixture: AdmissionFixture, request: wire.Request | str) -> None:
+        self.fixture: AdmissionFixture = fixture
+        self.socket: socket.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.socket.settimeout(3)
+        self.socket.connect(str(fixture.socket_path))
+        self.socket.sendall((request if isinstance(request, str) else wire.encode_request(request)).encode())
+        self.socket.setblocking(False)
+        self.buffer: bytes = b""
+
+    def replies(self) -> list[wire.Reply]:
+        for _ in range(4):
+            self.fixture.server.run_once(0)
+        deadline = time.monotonic() + 3
+        while select.select([self.socket], [], [], 0)[0]:
+            if time.monotonic() >= deadline:
+                raise AssertionError("the private socket did not finish sending within 3 seconds")
+            chunk = self.socket.recv(65536)
+            if not chunk:
+                break
+            self.buffer += chunk
+        lines = self.buffer.split(b"\n")
+        self.buffer = lines.pop()
+        return [wire.parse_reply(line) for line in lines]
+
+    def close(self) -> None:
+        self.socket.close()
+
+
+class AdmissionFixture(ExitStack):
+    """Every server test uses this temporary state, socket, clock and owner set."""
+    def __init__(self, *, root: Path | None = None, log_dir: Path | None = None) -> None:
+        super().__init__()
+        if not hasattr(os, "pidfd_open") or not Path("/sys/fs/cgroup/cgroup.controllers").exists():
+            raise unittest.SkipTest("admission service needs Linux pidfd and cgroup v2")
+        self.root: Path = root if root is not None else self.enter_context(
+            build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
+                prefix=build_folders.FOLDER_PREFIXES["admit-test"])))
+        # AF_UNIX addresses have a small byte limit; TMPDIR may be a deep merge checkout.
+        self.socket_dir: Path = Path(self.enter_context(
+            short_socket_directory(build_folders.FOLDER_PREFIXES["admit-sock"])))
+        self.state_dir: Path = (log_dir if log_dir is not None else self.root / "log") / "admission"
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.socket_path: Path = self.socket_dir / "admission.sock"
+        self.clock: FakeClock = FakeClock()
+        self.fault: Faults = Faults()
+        self.proc: TestProcesses = TestProcesses(self.root / "proc")
+        _ = self.callback(self.proc.close)
+        memory = ({"BUILDLOG_MEMINFO": str(self.root / "meminfo"),
+                   "BUILDLOG_MEMORY_PRESSURE": str(self.root / "pressure")}
+                  if (self.root / "meminfo").exists() else fake_memory_readings(
+                      self.root, available_kib=60 * GIB // 1024, total_kib=60 * GIB // 1024))
+        environment = {**gate_isolation_environment(self.root), **memory,
+            "BUILDLOG_BUILDS_CGROUP": str(self.root / "builds.slice"),
+            "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(self.root / "live-memory-reads.jsonl"),
+            "LINT_CONFIG_READER": str(Path(__file__).resolve().parents[1] / "lint/lint_config.sh"),
+            "ADMISSION_SOCKET": str(self.socket_path), "BUILDLOG_DIR": str(self.state_dir.parent),
+            "BUILDLOG_PROC": str(self.proc.path), "LINT_CONFIG_FILE": str(self.root / "lint.conf"),
+            "BUILDLOG_BUILD_BUDGET_GIB": "21", "NOTIFY_SOCKET": "", "LISTEN_FDS": "",
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC",
+            "HOME": str(self.root)}
+        self.enter_context(mock.patch.dict(os.environ, environment))
+        if not (self.root / "lint.conf").exists():
+            write_memory_config(self.root / "lint.conf")
+        self.readings: PrivateReadings = PrivateReadings(self.root)
+        self.loop_access: threading.RLock = threading.RLock()
+        try:
+            self.server: ObservedAdmissionServer = self.new_server()
+        except BaseException:
+            self.close()
+            raise
+        _ = self.callback(lambda: self.server.close())
+
+    def new_server(self, *, start: bool = True) -> ObservedAdmissionServer:
+        server = ObservedAdmissionServer(self.state_dir, self.clock, self.readings, self.proc,
+                                         fault=self.fault, socket_path=self.socket_path)
+        if start:
+            server.start()
+        return server
+
+    def restart(self) -> None:
+        self.server.close()
+        self.server = self.new_server()
+
+    @contextmanager
+    def serving(self) -> Generator[AdmissionFixture]:
+        """Run the private loop while a caller uses the socket or starts a child."""
+        stopped = threading.Event()
+        failures: list[BaseException] = []
+
+        real_monotonic = time.monotonic
+
+        def serve() -> None:
+            previous = real_monotonic()
+            try:
+                while not stopped.is_set():
+                    current = real_monotonic()
+                    self.clock.advance(current - previous)
+                    previous = current
+                    with self.loop_turn():
+                        self.server.run_once(0.01)
+            except BaseException as error:
+                failures.append(error)
+                stopped.set()
+
+        worker = threading.Thread(target=serve, name="private-admission-loop")
+        worker.start()
+        try:
+            yield self
+        finally:
+            stopped.set()
+            worker.join(timeout=3)
+            if worker.is_alive():
+                raise AssertionError("the private admission loop did not stop")
+            if failures:
+                raise failures[0]
+
+    def run_pass(self) -> gate.PassResult:
+        """Keep a test pass separate from the private loop's current event."""
+        with self.loop_turn():
+            return self.server.run_pass()
+
+    @contextmanager
+    def loop_turn(self) -> Generator[None]:
+        if not self.loop_access.acquire(timeout=3):
+            raise AssertionError("the private admission loop did not yield within 3 seconds")
+        try:
+            yield
+        finally:
+            self.loop_access.release()
+
+    def configure(self, **seconds: float) -> None:
+        write_memory_config(self.root / "lint.conf", **{name: str(value) for name, value in seconds.items()})
+
+    def scope_events(self) -> ScopeEvents:
+        events = ScopeEvents(self.server.epoll)
+        _ = self.enter_context(mock.patch.object(self.server, "epoll", events))
+        return events
+
+    def kill_socket_server(self) -> None:
+        """Leave the Unix socket inode behind by killing a real server process."""
+        self.server.close()
+        read_fd, write_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(read_fd)
+            try:
+                _ = self.new_server()
+                _ = os.write(write_fd, b"ready")
+                signal.pause()
+            finally:
+                os._exit(1)
+        os.close(write_fd)
+        try:
+            if not select.select([read_fd], [], [], 3)[0] or os.read(read_fd, 5) != b"ready":
+                raise AssertionError("child service did not bind its socket")
+        finally:
+            os.close(read_fd)
+            os.kill(pid, signal.SIGKILL)
+            _ = os.waitpid(pid, 0)
+
+    def fixture_owner(self, pid: int, start: str) -> wire.Owner:
+        """Keep a caller's private process record alive without using a host PID."""
+        owner = wire.Owner(pid, start)
+        self.proc.fixture_owners[pid] = start
+        self.proc.register(owner)
+        return owner
+
+    def end_fixture_owner(self, pid: int) -> None:
+        with self.loop_turn():
+            del self.proc.fixture_owners[pid]
+            events = ScopeEvents(self.server.epoll)
+            events.events = [(descriptor, select.EPOLLIN)
+                for descriptor, watch in self.server.watchers.items()
+                if isinstance(watch, service.OwnerWatch) and watch.owner.pid == pid]
+            with mock.patch.object(self.server, "epoll", events):
+                self.server.run_once(0)
+
+    def build_history_generation(self) -> gate.BuildHistoryGeneration:
+        reply, = self.server.handle_request(wire.BuildHistoryRequest())
+        assert isinstance(reply, wire.BuildHistoryReply)
+        return gate.BuildHistoryGeneration(reply.generation)
+
+    def request(self, *, need: int = 8 * GIB, owner: wire.Owner | None = None,
+                episode: str = "", since: float | None = None, age: float = 0,
+                width: gate.TestWidth = DEFAULT_WIDTH,
+                call: gate.Call = DEFAULT_CALL, step: str = "nextest") -> wire.AdmitRequest:
+        owner = owner or self.proc.spawn()
+        generation: gate.BuildHistoryGeneration | gate.NoBuildHistoryGeneration = gate.NoBuildHistoryGeneration()
+        if step == "build":
+            generation = self.build_history_generation()
+        profile = gate.StepProfile("fixture", step, "tree", gate.ExpectedPeak(need, "measured", 5),
+            estimated_at=self.clock.now() - age, build_history_generation=generation)
+        return wire.AdmitRequest(episode or f"episode-{owner.pid}", owner, ("cargo", step),
+            str(self.root), self.clock.now() if since is None else since, "",
+            wire.Identity(f"session-{owner.pid}", "fixture", step, str(self.root)), call, width,
+            profile, False)
+
+    def launch(self, *, need: int = 8 * GIB, since: float | None = None) -> wire.LaunchRequest:
+        request = self.request(need=need, since=since)
+        return wire.LaunchRequest(request.episode, request.owner, request.since,
+                                  request.identity, request.profile)
+
+    def connect(self, request: wire.Request | str) -> SocketPeer:
+        peer = SocketPeer(self, request)
+        _ = self.callback(peer.close)
+        return peer
+
+    def free(self, available: int) -> None:
+        _ = fake_memory_readings(self.root, available_kib=available // 1024,
+                                 total_kib=60 * GIB // 1024)
+
+    def compiler(self, used: int) -> None:
+        path = self.root / "builds.slice/sccache.service/memory.stat"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(f"anon {used}\n")
+
+    def history(self) -> list[dict[str, object]]:
+        path = self.state_dir / "anon_peaks.jsonl"
+        return list(gate.anonymous_history_rows(path)) if path.exists() else []
+
+    def state_text(self) -> str:
+        return (self.state_dir / "state.json").read_text()
+
+    def transient_scope(self) -> tuple[wire.Owner, Path, Callable[[], None]]:
+        """A real kernfs scope event, with all memory readings still supplied privately."""
+        unit = f"admission-fixture-{uuid.uuid4().hex}.scope"
+        probe = subprocess.run(["systemctl", "--user", "show-environment"],
+            capture_output=True, timeout=3, check=False)
+        if probe.returncode:
+            raise unittest.SkipTest("real transient scope needs a user systemd manager")
+        child: subprocess.Popen[bytes] = subprocess.Popen(["systemd-run", "--user", "--scope", "--quiet", "--expand-environment=no", f"--unit={unit}",
+            "sh", "-c", "echo $$; sleep 300 & wait"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        def stop() -> None:
+            _ = subprocess.run(["systemctl", "--user", "stop", unit], capture_output=True,
+                               timeout=3, check=False)
+            if child.poll() is None:
+                child.kill()
+            _ = child.wait(timeout=3)
+            if child.stdout is not None:
+                child.stdout.close()
+        _ = self.callback(stop)
+        assert child.stdout is not None
+        if not select.select([child.stdout], [], [], 3)[0]:
+            raise unittest.SkipTest("user systemd cannot start a transient scope")
+        line = cast(bytes, child.stdout.readline()).strip()
+        if not line.isdigit():
+            raise unittest.SkipTest("user systemd refused the transient scope")
+        pid = int(line)
+        start = gate.process_start_time(pid)
+        if start is None:
+            raise RuntimeError("scope shell exited before the test")
+        query = subprocess.run(["systemctl", "--user", "show", "--property=ControlGroup", "--value", unit],
+                               capture_output=True, text=True, timeout=3, check=True)
+        directory = Path("/sys/fs/cgroup") / query.stdout.strip().lstrip("/")
+        self.proc.starts[pid] = start
+        write_process(self.proc.path, pid, GIB)
+        return wire.Owner(pid, start), directory, stop
+
+    def scope(self, owner: wire.Owner) -> Path:
+        directory = self.root / f"scope-{owner.pid}"
+        directory.mkdir(exist_ok=True)
+        for name, text in {"cgroup.procs": str(owner.pid), "cgroup.events": "populated 1\n",
+                           "memory.current": str(GIB), "memory.swap.current": "0"}.items():
+            _ = (directory / name).write_text(text)
+        sidecar = self.root / f"sample-{owner.pid}.cgroup"
+        _ = sidecar.write_text(str(directory))
+        return sidecar
+
+    def scoped_peak(self, admitted: wire.Admitted, peak: int = 8 * GIB) -> None:
+        # The finalizer records only sampled scoped steps; give it the same evidence as a sampler.
+        _ = Path(admitted.max_path).write_text(str(peak))
+
+
+def only_admitted(replies: list[wire.Reply]) -> wire.Admitted:
+    admissions = [reply for reply in replies if isinstance(reply, wire.Admitted)]
+    if len(admissions) != 1:
+        raise AssertionError(f"expected one admission, got {replies!r}")
+    return admissions[0]
+
+
+class TimedChunk:
+    def __init__(self, seconds: float, data: bytes) -> None:
+        self.seconds: float = seconds
+        self.data: bytes = data
+
+
+class Exchange:
+    """One peer connection's sends, silence, closure or connect failure."""
+    def __init__(self, *events: bytes | TimedChunk | Exception,
+                 connect_error: OSError | None = None) -> None:
+        self.events: list[bytes | TimedChunk | Exception] = list(events)
+        self.connect_error: OSError | None = connect_error
+
+
+class ScriptSocket:
+    def __init__(self, transport: ScriptedTransport, exchange: Exchange) -> None:
+        self.transport: ScriptedTransport = transport
+        self.exchange: Exchange = exchange
+        self.timeout: float = 0
+
+    def __enter__(self) -> ScriptSocket:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def settimeout(self, timeout: float) -> None:
+        self.timeout = timeout
+        self.transport.timeouts.append(timeout)
+
+    def connect(self, path: str) -> None:
+        self.transport.paths.append(path)
+        if self.exchange.connect_error is not None:
+            raise self.exchange.connect_error
+
+    def sendall(self, data: bytes) -> None:
+        self.transport.requests.append(wire.parse_request(data))
+
+    def recv(self, _size: int) -> bytes:
+        if not self.exchange.events:
+            raise AssertionError("client made an unexpected extra read")
+        event = self.exchange.events.pop(0)
+        if isinstance(event, TimedChunk):
+            self.transport.clock.advance(event.seconds)
+            return event.data
+        if isinstance(event, TimeoutError):
+            self.transport.clock.advance(self.timeout)
+        if isinstance(event, Exception):
+            raise event
+        return event
+
+    def close(self) -> None:
+        pass
+
+
+class ScriptedTransport:
+    """The client's real framing and retry loop, with deterministic peer faults."""
+    def __init__(self, clock: FakeClock, *exchanges: Exchange) -> None:
+        self.clock: FakeClock = clock
+        self.exchanges: list[Exchange] = list(exchanges)
+        self.requests: list[wire.Request] = []
+        self.paths: list[str] = []
+        self.timeouts: list[float] = []
+        self.attempts: list[float] = []
+
+    def socket(self, *_args: object, **_kwargs: object) -> ScriptSocket:
+        self.attempts.append(self.clock.monotonic())
+        if not self.exchanges:
+            raise AssertionError("client made an unexpected extra connection")
+        return ScriptSocket(self, self.exchanges.pop(0))
+
+
+def reply_bytes(reply: wire.Reply) -> bytes:
+    return wire.encode_reply(reply).encode()
+
+
+def wait_reply(reason: gate.WaitReason, position: int = 1, head: str = "head",
+               text: str = "free memory") -> wire.Wait:
+    """Build a held reply with the same decision fields as a real pass."""
+    peak = gate.ExpectedPeak(8 * GIB, "fallback", 0)
+    decision = gate.decide(0, 60 * GIB, peak.bytes, [], limits=gate.AdmissionLimits(21 * GIB, 3 * GIB))
+    snapshot = gate.AdmissionWaitSnapshot(decision, peak, (), 0, "repo", "nextest",
+                                         gate.DEFAULT_ADMISSION_POLICY, ())
+    return wire.Wait(reason, position, head, text, snapshot)
+
+
+def admitted_reply(reservation: str = "stem", need: int = GIB, source: str = "new-source",
+                   max_path: str = "stem.max", wave_path: str = "stem.wave") -> wire.Admitted:
+    """Supply the grant context used by sampler and client protocol tests."""
+    return wire.Admitted(reservation, need, source, max_path, wave_path,
+                         {"reservation_id": reservation, "need": need})
+
+
+_caller_services: dict[str, AdmissionFixture] = {}
+
+
+def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str, str]) -> AdmissionFixture:
+    """Use the one server for existing caller fixtures and their child processes."""
+    existing = _caller_services.get(environment.get("ADMISSION_SOCKET", ""))
+    if existing is not None and existing.root == root and not existing.server.closed:
+        return existing
+    _ = test.enterContext(LauncherHangGuard(test.id()).protect())
+    fixture = test.enterContext(AdmissionFixture(root=root, log_dir=Path(environment["BUILDLOG_DIR"])))
+    _caller_services[str(fixture.socket_path)] = fixture
+    test.addCleanup(_caller_services.pop, str(fixture.socket_path))
+    fixture.enter_context(mock.patch.dict(os.environ, {
+        "BUILDLOG_BUILD_BUDGET_GIB": environment.get("BUILDLOG_BUILD_BUDGET_GIB", "21"),
+    }))
+    fixture.clock.epoch = time.time()
+    launcher = Path.home() / ".claude/scripts/lib/py"
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    if not launcher.exists():
+        launcher.symlink_to(Path(__file__).resolve().parents[1] / "lib/py")
+    _ = environment.setdefault("LINT_CONFIG_READER", os.environ["LINT_CONFIG_READER"])
+    for key in ("ADMISSION_SOCKET", "LINT_CONFIG_FILE", "BUILDLOG_PROC", "BUILDLOG_MEMINFO",
+                "BUILDLOG_MEMORY_PRESSURE", "BUILDLOG_BUILDS_CGROUP", "BUILDLOG_LIVE_MEMORY_TRIPWIRE"):
+        environment[key] = os.environ[key]
+    _ = fixture.enter_context(fixture.serving())
+    return fixture

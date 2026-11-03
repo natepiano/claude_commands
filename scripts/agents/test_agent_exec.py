@@ -1,7 +1,7 @@
 """Shell launchers select the caller's Claude account or the mapped Codex workers home."""
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 
 import json
 import os
@@ -13,6 +13,8 @@ from typing import TypedDict, cast, override
 import unittest
 from unittest.mock import patch
 
+from scripts.message import sessions
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership, fixture_runtime_id
 from scripts.accounts import accounts
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.whoami.account_test_support import write_codex_auth
@@ -50,15 +52,15 @@ class CodexCliLauncherTests(NixFixture):
         selection = self.home / ".claude/config/accounts.json"
         selection.parent.mkdir(parents=True)
         _ = selection.write_text('{"workers": "codex1"}')
-        registry = write_registry(self.root / "agents.conf", {
+        registry = write_registry(self.root / "models.conf", {
             "assignments": {"cli": "codex"},
             "cli.codex": {"interactive": "gpt-test:high", "commit_prep": "gpt-test:high"},
             "cli.options": {"codex_service_tier": "default"},
             "codex.agents": {"gpt-test": "high"},
         })
         self.launched = self.root / "codex-start.json"
-        self.env.update(AGENT_NOTES_DIR=str(notes), AGENTS_CONFIG_FILE=str(registry),
-                        AGENTS_CONFIG_PUBLISH="0", CODEX_CATALOG_SYNC_STATE_FILE=str(registry),
+        self.env.update(AGENT_NOTES_DIR=str(notes), MODELS_CONFIG_FILE=str(registry),
+                        MODELS_CONFIG_PUBLISH="0", CODEX_CATALOG_SYNC_STATE_FILE=str(registry),
                         CODEX_CONFIG_FILE=str(self.root / "codex.toml"),
                         CODEX_MODELS_CACHE_FILE=str(self.root / "models.json"),
                         CODEX_START_LOG=str(self.launched))
@@ -121,7 +123,7 @@ class ClaudeLauncherTests(unittest.TestCase):
         groups = accounts.groups_file()
         groups.parent.mkdir(parents=True, exist_ok=True)
         _ = groups.write_text(json.dumps({"showrunners": "claude3"}))
-        registry = self.home / "agents.conf"
+        registry = self.home / "models.conf"
         _ = write_registry(registry, {'assignments': {'cli': 'claude', 'sample': 'claude'}, 'cli.claude': {'interactive': 'opus:high'}, 'sample.claude': {'task': 'opus:high'}, 'claude.agents': {'opus': 'low,medium,high,max'}})
         binary = self.home / "bin/claude"
         binary.parent.mkdir()
@@ -130,14 +132,15 @@ class ClaudeLauncherTests(unittest.TestCase):
                               + "if '--bg' in sys.argv:\n"
                               + " from pathlib import Path\n"
                               + " Path(os.environ['BACKGROUND_LAUNCH_FILE']).write_text(json.dumps({key: os.environ.get(key, '') for key in ['CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_REMOTE_MEMORY_DIR']}))\n"
-                              + " print('backgrounded · abcdef12 · fixture'); sys.exit(0)\n"
+                              + " Path(os.environ['FIXTURE_REGISTRY_PATH']).write_text(os.environ['FIXTURE_REGISTRY_RECORD'])\n"
+                              + " print('backgrounded · ' + os.environ['FIXTURE_NATIVE_ID'][:8] + ' · fixture'); sys.exit(0)\n"
                               + "print(json.dumps({'config': os.environ.get('CLAUDE_CONFIG_DIR', ''), "
                               + "'memory': os.environ.get('CLAUDE_CODE_REMOTE_MEMORY_DIR', ''), "
                               + "'token': os.environ.get('CLAUDE_CODE_OAUTH_TOKEN', '')}))\n"
                               + "print(json.dumps({'type': 'result', 'result': 'finished'}))\n")
         binary.chmod(0o755)
         self.environment = {key: value for key, value in os.environ.items() if not key.startswith("CLAUDE")}
-        self.environment.update(AGENTS_CONFIG_PUBLISH="0", HOME=str(self.home), AGENT_NOTES_DIR=str(notes), AGENTS_CONFIG_FILE=str(registry),
+        self.environment.update(MODELS_CONFIG_PUBLISH="0", HOME=str(self.home), AGENT_NOTES_DIR=str(notes), MODELS_CONFIG_FILE=str(registry),
                                 CODEX_CATALOG_SYNC_STATE_FILE=str(registry),
                                 XDG_CACHE_HOME=str(self.home / "cache"), XDG_STATE_HOME=str(self.home / "state"),
                                 PATH=str(binary.parent) + os.pathsep + os.environ["PATH"])
@@ -184,9 +187,25 @@ class ClaudeLauncherTests(unittest.TestCase):
         prompt = self.home / "background-prompt"
         _ = prompt.write_text("fixture task")
         captured = self.home / "background-environment.json"
+        private_env: dict[str, str] = {}
+        _ = self.enterContext(isolated_staff_file(self.home / "staff.json", private_env))
+        owner = unit_membership("fixture", "account-selection")
+        registry = self.home / "private-sessions"
+        registry.mkdir()
+        sender = self.home / "send.py"
+        _ = sender.write_text("print('SENT: fixture')\n")
+        native = fixture_runtime_id("background-account-selection")
+        record: dict[str, object] = {"pid": os.getpid(), "procStart": sessions.process_start(os.getpid()),
+                  "sessionId": native, "name": "fixture-worker", "entrypoint": "cli",
+                  "messagingSocketPath": "", "updatedAt": 1, "formerNames": [], "tmux": ""}
         for caller, expected in (("claude1", "claude1"), ("", "claude3")):
             with self.subTest(caller=caller):
-                environment = {**self.environment, "AGENT_BG_DETACH": "1", "BACKGROUND_LAUNCH_FILE": str(captured)}
+                (self.home / "id").unlink(missing_ok=True)
+                environment = {**self.environment, **private_env, "AGENT_BG_ROLE": "impl", "AGENT_BG_DETACH": "1", "BACKGROUND_LAUNCH_FILE": str(captured),
+                               "CODEX_THREAD_ID": owner.id, "NOTIFIER_SESSIONS_DIR": str(registry),
+                               "FIXTURE_REGISTRY_PATH": str(registry / f"{os.getpid()}.json"),
+                               "FIXTURE_REGISTRY_RECORD": json.dumps(record), "FIXTURE_NATIVE_ID": native,
+                               "AGENT_BG_SEND_SCRIPT": str(sender)}
                 if caller:
                     environment["CLAUDE_CONFIG_DIR"] = str(accounts.account_dir(caller))
                 result = subprocess.run(["bash", str(SCRIPTS / "agents/agent_bg.sh"), "fixture-worker", str(self.home),

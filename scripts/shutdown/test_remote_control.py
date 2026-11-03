@@ -20,6 +20,7 @@ import herdr
 import sessions
 import session_pane
 import restart_support
+import remote
 import detached
 from push_texts import RenderedPush
 from herdr import HerdrPlace
@@ -91,7 +92,7 @@ class RemoteControlTests(ShutdownTestCase):
         })))
         _ = self.enterContext(patch.object(Path, "home", return_value=self.root))
         _ = self.enterContext(patch.object(sessions, "process_start", return_value="original"))
-        _ = self.enterContext(patch.object(restart_support, "local_machine", return_value="natedev"))
+        _ = self.enterContext(patch.object(remote, "local_machine", return_value="natedev"))
         self.clock = FakeClock()
         self.write()
         _ = self.enterContext(patch.object(session_pane, "record_place", side_effect=self.find_place))

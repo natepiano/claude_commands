@@ -1,5 +1,5 @@
 ---
-description: List the production's units with their phases or style tickets.
+description: List unit phases and style tickets.
 ---
 
 # Units

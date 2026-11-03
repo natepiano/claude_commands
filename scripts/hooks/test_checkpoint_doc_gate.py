@@ -17,12 +17,11 @@ import tempfile
 from typing import ClassVar, cast, override
 import unittest
 from unittest import mock
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 HOOK = Path(__file__).with_name("pre-tool-use-checkpoint-doc-gate.py")
 CHECKPOINT = 'git commit -m "checkpoint(efficiency): phase 1"'
 DOC_COMMAND = "~/.claude/scripts/direct/verify.sh doc"
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 DECIDE = cast(Callable[[str], str], runpy.run_path(str(HOOK))["decide"])
 
 
@@ -943,6 +942,25 @@ class CheckpointDocGateTests(unittest.TestCase):
                 response = cast(dict[str, dict[str, str]], json.loads(result.stdout))
                 self.assertEqual(response["hookSpecificOutput"]["permissionDecision"], "deny")
                 self.assertIn("FileNotFoundError", response["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_hook_imports_do_not_load_cli_or_owner_modules(self) -> None:
+        probe = """import runpy, sys
+runpy.run_path(sys.argv[1])
+heavy = {'argparse', 'scripts.lib.unit_runs', 'scripts.lib.copy_record',
+         'scripts.lib.scratch', 'herdr'}
+if sys.argv[2] == 'session':
+    heavy.add('scripts.lib.build_folders')
+loaded = sorted(heavy.intersection(sys.modules))
+assert not loaded, loaded
+"""
+        for path, kind in ((HOOK, "checkpoint"), (HOOK.with_name("session-start-temp-root.py"), "session")):
+            with self.subTest(hook=path.name):
+                result = subprocess.run([sys.executable, "-I", "-c", probe, str(path), kind],
+                                        cwd=self.root, env=self.environment, text=True,
+                                        capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, "")
 
     def test_a_later_commits_all_flag_does_not_change_the_checkpoint_tree(self) -> None:
         _ = self.record()

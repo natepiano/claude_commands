@@ -20,9 +20,10 @@
 /config/showrunners.lock
 /config/accounts.json
 /config/accounts.lock
-/config/agents.conf.*
+/config/models.conf.*
 !docs/
 !docs/**
+docs/plans/*-log.md
 !scripts/
 !scripts/**
 !shared/

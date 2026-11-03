@@ -14,6 +14,12 @@ from scripts.agents import codex_mesh, mesh_runs
 from scripts.direct.test_verify_tree_cancel import CANCEL_LINE, VerifyTreeCancelFixture
 from scripts.direct.verify_token_wait_test_support import VERIFY
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.message.repeat_guard_test_support import install_guard_test_budget
+
+
+def setUpModule() -> None:
+    install_guard_test_budget()
 
 
 class MeshTreeCancelTests(VerifyTreeCancelFixture):
@@ -25,8 +31,7 @@ class MeshTreeCancelTests(VerifyTreeCancelFixture):
             "turn_id": identity + "-turn", "port": 4100,
         }}))
         environment = {**fixture.environment, "CODEX_THREAD_ID": identity + "-thread",
-                       "TEST_FINISH": "1", "GUILD_ROLES_STATE": str(fixture.root / "roles"),
-                       "REVIEW_POOL_STATE": str(fixture.root / "review-pool")}
+                       "TEST_FINISH": "1", "GUILD_ROLES_STATE": str(fixture.root / "roles")}
         done_flags: list[str] = []
         if done_message:
             done = fixture.root / "done-message.txt"
@@ -53,7 +58,7 @@ class MeshTreeCancelTests(VerifyTreeCancelFixture):
 
         # Directory events, not a status-file polling loop: completion replaces
         # the run record atomically after it has delivered the message.
-        wait_until(finished, path.parent, timeout=30)
+        wait_until(finished, path.parent, timeout=TEST_HANG_GUARD_SECS)
         return cast(mesh_runs.RunRecord, json.loads(path.read_text()))
 
     def inbox(self, fixture: VerifyTreeCancelFixture, identity: str) -> dict[str, object]:
@@ -64,6 +69,7 @@ class MeshTreeCancelTests(VerifyTreeCancelFixture):
         self.addCleanup(VerifyTreeCancelFixture.doClassCleanups)
         other = VerifyTreeCancelFixture()
         other.setUp()
+        self.addCleanup(other.doCleanups)
         self.addCleanup(other.tearDown)
         first_identity, second_identity = "edited-worker", "stable-worker"
         first_path = self.start_detached(self, first_identity, done_message=True)
@@ -71,8 +77,8 @@ class MeshTreeCancelTests(VerifyTreeCancelFixture):
         # Both must reach Cargo before either tree changes; a sequential run
         # would not prove simultaneous callers are isolated.
         try:
-            wait_until((self.control / "running").exists, self.control, timeout=30)
-            wait_until((other.control / "running").exists, other.control, timeout=30)
+            wait_until((self.control / "running").exists, self.control, timeout=TEST_HANG_GUARD_SECS)
+            wait_until((other.control / "running").exists, other.control, timeout=TEST_HANG_GUARD_SECS)
         except TimeoutError:
             logs = [path.with_suffix(".log").read_text(errors="replace") for path in (first_path, second_path)]
             self.fail("detached verify did not reach Cargo: " + repr(logs))

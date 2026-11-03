@@ -13,7 +13,7 @@ import json
 import io
 import os
 import subprocess
-from typing import cast
+from typing import cast, override
 from unittest.mock import patch
 
 from scripts.hierarchies import measure as m, log_records, push_audit as audit
@@ -22,6 +22,14 @@ from scripts.lib.user_zone import user_zone
 from scripts.lib import unit_runs
 from scripts.production.issues import Issue
 from scripts.usage import collect
+from scripts.production.update_registration_test_support import RegistrationFixture
+from scripts.production.cli_fixture import production_paths
+from scripts.production import fake_showrunner, staff, session_staff
+from scripts.production.staff_test_support import (
+    fixture_member, isolated_staff_file, isolated_source_readers, source_environment,
+    recorded_showrunner, recorded_unit,
+)
+from scripts.shutdown import remote
 
 
 def row_cells(output: str) -> dict[str, list[str]]:
@@ -30,6 +38,147 @@ def row_cells(output: str) -> dict[str, list[str]]:
 
 
 BASELINE_SUMMARY_PREFIXES = ("Window:", "Hana:", "Goal 1:", "User attention:", "Source problems:")
+
+
+class RowUnitReadingTests(unittest.TestCase):
+    root: Path = Path()
+    environment: dict[str, str] = {}
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.environment = {"HOME": str(self.root), **source_environment(self.root / "sources")}
+        _ = cast(object, self.enterContext(patch.dict(os.environ, self.environment)))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        _ = self.enterContext(isolated_source_readers())
+        _ = self.enterContext(patch.object(remote, "local_machine", return_value="natedev"))
+        _ = self.enterContext(patch.object(m, "running_phase_worktrees", return_value=set()))
+
+    def production(self, name: str, slug: str) -> tuple[staff.StaffRow, Path]:
+        doc = self.root / f"{slug}-production.md"
+        _ = doc.write_text("# Production\n\n- **Repository:** fixture\n\n## Units\n"
+                           + "| Unit | Worktree |\n| --- | --- |\n| decoy | /wrong |\n")
+        owner = recorded_showrunner(name, doc)
+        _ = fake_showrunner.write_timer(Path(self.environment["NOTIFIER_STATE_DIR"]),
+                                         slug, owner.current_session, "UTC", doc)
+        return owner, doc
+
+    def read_units(self) -> tuple[list[m.Unit], list[log_records.SourceProblem]]:
+        problems: list[log_records.SourceProblem] = []
+        units = m.read_units(problems)
+        return units, problems
+
+    def test_prefixed_folder_and_conflicting_table_keep_the_recorded_unit(self) -> None:
+        _, doc = self.production("tools", "timer-alias")
+        tree = self.root / "unrelated-prefix-renderer"
+        _ = recorded_unit("tools", "renderer", tree, doc)
+        units, problems = self.read_units()
+        self.assertEqual([(unit.production, unit.name, unit.worktree) for unit in units],
+                         [("timer-alias", "renderer", str(tree))])
+        self.assertEqual(problems, [])
+
+    def test_wrapped_showrunner_children_are_excluded_from_current_units(self) -> None:
+        _, healthy_doc = self.production("healthy-owner", "healthy-alias")
+        _ = recorded_unit("healthy-owner", "healthy", self.root / "healthy", healthy_doc)
+        wrapped, wrapped_doc = self.production("wrapped-owner", "wrapped-alias")
+        _ = recorded_unit("wrapped-owner", "old-child", self.root / "old-child", wrapped_doc)
+        _ = staff.set_doc(wrapped.id, staff.WrappedDoc("natedev", wrapped_doc))
+        units, problems = self.read_units()
+        self.assertEqual([(unit.production, unit.name) for unit in units], [("healthy-alias", "healthy")])
+        self.assertEqual(problems, [])
+
+    def test_transferred_unit_uses_the_new_parent_with_both_tables_unchanged(self) -> None:
+        _, old_doc = self.production("old-owner", "old-alias")
+        destination, _ = self.production("new-owner", "new-alias")
+        tree = self.root / "old-prefix-renderer"
+        unit = recorded_unit("old-owner", "renderer", tree, old_doc)
+        _ = staff.move(unit.id, destination.id)
+        units, problems = self.read_units()
+        self.assertEqual([(unit.production, unit.name, unit.worktree) for unit in units],
+                         [("new-alias", "renderer", str(tree))])
+        self.assertEqual(problems, [])
+
+    def test_unfilled_worktree_reports_the_unit_and_keeps_healthy_units(self) -> None:
+        owner, doc = self.production("tools", "timer-alias")
+        _ = recorded_unit("tools", "healthy", self.root / "healthy", doc)
+        _ = fixture_member("unit", name="missing-tree", parent=owner.id)
+        units, problems = self.read_units()
+        self.assertIn("healthy", [unit.name for unit in units])
+        lines = [problem.reason for problem in problems if "missing-tree" in problem.source + problem.reason]
+        self.assertEqual(len(lines), 1, problems)
+        self.assertIn("worktree", lines[0])
+
+    def test_unfilled_owner_document_reports_the_unit_and_keeps_healthy_units(self) -> None:
+        _, good_doc = self.production("healthy-owner", "healthy-alias")
+        _ = recorded_unit("healthy-owner", "healthy", self.root / "healthy", good_doc)
+        owner, doc = self.production("tools", "timer-alias")
+        _ = recorded_unit("tools", "missing-doc", self.root / "missing-doc", doc)
+        record = staff.snapshot()
+        unfilled = replace(record, rows=tuple(replace(row, doc=staff.DocUnfilled()) if row.id == owner.id else row
+                                               for row in record.rows))
+        with patch.object(staff, "snapshot", return_value=unfilled):
+            units, problems = self.read_units()
+        self.assertIn("healthy", [unit.name for unit in units])
+        lines = [problem.reason for problem in problems if "missing-doc" in problem.source + problem.reason]
+        self.assertEqual(len(lines), 1, problems)
+        self.assertIn("document", lines[0])
+
+    def test_unavailable_document_reports_the_unit_and_keeps_healthy_units(self) -> None:
+        _, good_doc = self.production("healthy-owner", "healthy-alias")
+        _ = recorded_unit("healthy-owner", "healthy", self.root / "healthy", good_doc)
+        _, doc = self.production("tools", "timer-alias")
+        _ = recorded_unit("tools", "unreadable-doc", self.root / "unreadable-doc", doc)
+        _ = doc.write_bytes(b"\xff")
+        units, problems = self.read_units()
+        self.assertIn("healthy", [unit.name for unit in units])
+        lines = [problem.reason for problem in problems if "unreadable-doc" in problem.source + problem.reason]
+        self.assertEqual(len(lines), 1, problems)
+        self.assertIn("decode", lines[0])
+
+    def test_retired_unit_history_keeps_its_recorded_owner_after_a_transfer(self) -> None:
+        _, doc = self.production("old-owner", "old-alias")
+        destination, _ = self.production("new-owner", "new-alias")
+        tree = self.root / "old-prefix-renderer"
+        unit = recorded_unit("old-owner", "renderer", tree, doc)
+        _ = staff.move(unit.id, destination.id)
+        _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", tree), expected=unit.worktree)
+        history = self.root / "history"
+        history.mkdir()
+        path = history / "retired.jsonl"
+        _ = path.write_text(json.dumps({
+            "event_type": "phase_started", "unit": {"state": "Recorded", "value": "renderer"},
+            "production": {"state": "Recorded", "value": "tool-based-ui"},
+            "repository": {"state": "Recorded", "value": "claude"},
+        }) + "\n")
+        original = path.read_bytes()
+        problems: list[log_records.SourceProblem] = []
+        projects = m.read_cause_projects(history, (), problems)
+        recorded = [project for project in projects if project.subject == "unit:renderer"]
+        self.assertEqual(len(recorded), 1)
+        self.assertIsInstance(recorded[0].project, m.HanaProject)
+        self.assertEqual(problems, [])
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_location_failure_reports_its_reason_without_losing_other_units(self) -> None:
+        _, doc = self.production("tools", "timer-alias")
+        affected = recorded_unit("tools", "missing-location", self.root / "affected", doc)
+        _ = recorded_unit("tools", "healthy", self.root / "healthy", doc)
+        read_config = session_staff.RowResolver.unit_config
+
+        def configuration(
+            resolver: session_staff.RowResolver, row: staff.StaffRow,
+        ) -> (session_staff.UnitConfig | session_staff.ConfigMissing | session_staff.NoUnitConfig
+              | session_staff.LocationUnfilled | session_staff.RetiredFactsUnavailable):
+            if row.id == affected.id:
+                return session_staff.LocationUnfilled("fixture location is not recorded")
+            return read_config(resolver, row)
+
+        with patch.object(session_staff.RowResolver, "unit_config", configuration):
+            units, problems = self.read_units()
+        self.assertIn("healthy", [unit.name for unit in units])
+        lines = [problem.reason for problem in problems if "missing-location" in problem.source + problem.reason]
+        self.assertEqual(len(lines), 1, problems)
+        self.assertIn("fixture location is not recorded", lines[0])
 
 
 def push_fixture(at: datetime, title: str, outcome: str = "sent") -> log_records.JsonObject:
@@ -3135,6 +3284,15 @@ class TrunkGitFixture:
 
 
 class SourcesTest(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        environment = source_environment(root / "sources")
+        _ = self.enterContext(isolated_staff_file(root / "staff.json", environment))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
+        _ = self.enterContext(isolated_source_readers())
+        _ = self.enterContext(production_paths(environment))
+
     def test_closed_window_keeps_trunk_merges_after_a_unit_checkpoint_fast_forward(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = TrunkGitFixture(Path(directory))
@@ -3332,9 +3490,19 @@ class SourcesTest(unittest.TestCase):
             )
             _ = (state / "notify/questions/one.json").write_text('{"question":"Held push review; not an open question"}')
             _ = (state / "showrunner/outstanding/hana.json").write_text(
-                '[{"since":"2026-10-05T12:00","text":"Which?","question":"Which size?"},' +
-                '{"since":"2026-10-01T12:00","text":"A reminder"}]'
+                '[{"since":"2026-10-01T12:00","text":"A reminder"}]'
             )
+            questions = root / "questions"
+            questions.mkdir()
+            document = root / "hana-production.md"
+            _ = document.write_text(f"# Production — hana\n\n- **Proposals:** `{questions}`\n")
+            owner = fixture_member("showrunner", name="hana", doc=staff.LiveDoc("natedev", document))
+            fields = {"since": "2026-10-05T12:00", "text": "Which?", "question": "Which size?",
+                      "asked_by": owner.id}
+            _ = (questions / "question-size.md").write_text(
+                f"---\nrecord_type: question\ntags: [question]\nstatus: open\n"
+                + f"production_id: {owner.id}\nasked_by: {owner.id}\n"
+                + f"registration: {json.dumps(fields)}\n---\n# Which?\n")
             answered = state / "showrunner/outstanding/hana.answered.jsonl"
             _ = answered.write_text(json.dumps({"time": "2026-10-07T11:00:00-04:00", "slug": "hana",
                                                 "text": "Answered recently", "asked_by": "fixture-unit"}) + "\n")
@@ -3523,6 +3691,28 @@ class SourcesTest(unittest.TestCase):
             _ = (gitdir / "commondir").write_text('../..')
             _ = (tree / ".git").write_text(f'gitdir: {gitdir}')
             self.assertEqual(m.repository(str(tree)), str(repo))
+
+
+class CanonicalQuestionWaitingTests(RegistrationFixture):
+    def test_waiting_counts_question_records_without_an_outstanding_json_file(self) -> None:
+        self.timer("example")
+        self.write_open_for("example", {"since": "2026-10-05T12:00", "text": "Choose the layout",
+                                        "question": "Keep this layout?"})
+        self.outstanding().unlink()
+        problems: list[log_records.SourceProblem] = []
+        with patch.dict(os.environ, self.env), production_paths(self.env):
+            waiting = m.read_waiting(self.state, self.root / "vault", [], problems)
+        questions = [item for item in waiting if item.kind == "questions"]
+        self.assertEqual(len(questions), 1)
+        self.assertEqual(questions[0].opened, log_records.moment("2026-10-05T12:00"))
+        question_sources = (str(self.doc), str(self.root / "issues"), self.env["STAFF_FILE"],
+                            "question", "staff")
+        self.assertEqual([
+            problem for problem in problems
+            if any(source.casefold() in f"{problem.source} {problem.reason}".casefold()
+                   for source in question_sources)
+        ], [])
+        self.assertFalse(self.outstanding().exists())
 
 
 if __name__ == "__main__":

@@ -12,9 +12,14 @@
 # invoke_clippy_fix applies fixes; fmt_cargo formats them before invoke_clippy
 # judges the result. Worker verdict keys include this policy file.
 
-if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then mkdir -p -- "$TMPDIR" || return; fi
-
 [[ -n "${LINT_INVOKE_SOURCED:-}" ]] && return 0
+
+BUILD_FOLDERS_SCRIPT="$(cd -- "${BASH_SOURCE[0]%/*}/../lib" && pwd)/build_folders.py"
+if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then
+    "${BUILD_FOLDERS_SCRIPT%/*}/py" "$BUILD_FOLDERS_SCRIPT" stable --path "$TMPDIR" >/dev/null || return
+fi
+# verify.sh needs the temporary parent before it loads the environment.
+[[ "${1:-}" == --prepare-temp ]] && return 0
 LINT_INVOKE_SOURCED=1
 
 # macOS sandboxes cannot nest. A dependency whose build script shells out to
@@ -32,9 +37,16 @@ if [[ -f "$LINT_CONFIG_READER" ]]; then
     # shellcheck source=/dev/null
     source "$LINT_CONFIG_READER"
 else
-    echo "invoke.sh: $LINT_CONFIG_READER not found — running every check" >&2
+    echo "invoke.sh: $LINT_CONFIG_READER not found — running every check; using build_oom_score_adj=500" >&2
     lint_config_enabled() { return 0; }
     lint_config_skip_notice() { :; }
+fi
+# Installed and stub readers may predate the numeric setting. Keep their
+# existing behavior quietly, with the same safe kill-order fallback.
+if declare -F lint_config_build_oom_score_adj >/dev/null; then
+    lint_config_build_oom_score_adj BUILD_OOM_SCORE_ADJ
+else
+    BUILD_OOM_SCORE_ADJ=500
 fi
 
 # natedev's machine-wide pool of build slots (/etc/nixos
@@ -82,10 +94,11 @@ fi
 # absence afterwards proves the scope never ran the step (no user manager, a
 # sandbox without its socket, a systemd older than 254 that rejects the
 # option), and run() runs it plainly.
-# The scope raises oom_score_adj to 500, so earlyoom kills build steps before
+# The scope sets oom_score_adj from lint.conf, so earlyoom kills build steps before
 # CI (100) and sessions (200), the largest first.
 BUILDLOG_RECORD="$HOME/.claude/scripts/buildlog/record.py"
-BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; printf "%s\n" "$cgroup" > "$0.cgroup"; { echo 500 > /proc/self/oom_score_adj; } 2>/dev/null || true; "$@"; s=$?; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s'
+BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; printf "%s\n" "$cgroup" > "$0.cgroup"; { echo @BUILD_OOM_SCORE_ADJ@ > /proc/self/oom_score_adj; } 2>/dev/null || true; "$@"; s=$?; cat "$cgroup/cpu.stat" > "$0.cpu.stat" 2>/dev/null || true; cat "$cgroup/io.stat" > "$0.io.stat" 2>/dev/null || true; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s'
+BUILDLOG_SCOPE_SH="${BUILDLOG_SCOPE_SH//@BUILD_OOM_SCORE_ADJ@/$BUILD_OOM_SCORE_ADJ}"
 source "$(dirname "${BASH_SOURCE[0]}")/memory_gate.sh" || {
     printf 'invoke.sh: cannot load admission and hold checks; step refused\n' >&2
     return 2
@@ -174,11 +187,11 @@ buildlog_sample_anon() {
     local temporary="$maximum.tmp.${BASHPID:-$$}"
     local near_peak="${maximum%.max}.wave" last_near_peak_at=0 sampled_at peak_published
     local near_peak_temporary="$near_peak.tmp.${BASHPID:-$$}"
-    local phase_file=${4:-} reservation=${5:-} phase_context="" phase_started=null phase_peak=null
+    local phase_file=${4:-} sampling_context=${5:-} phase_context="" phase_started=null phase_peak=null
     local phase_temporary="$phase_file.tmp.${BASHPID:-$$}" membership pid executable
     local executables=()
-    if [[ -n "$phase_file" && -r "$reservation" ]]; then
-        phase_context=$(buildlog_memory_python "$BUILDLOG_RECORD" test-phase-context "$reservation" "${@:6}") || phase_context=""
+    if [[ -n "$phase_file" && -n "$sampling_context" ]]; then
+        phase_context=$(buildlog_memory_python "$BUILDLOG_RECORD" test-phase-context "$sampling_context" "${@:6}") || phase_context=""
         if [[ "$phase_context" == \{*\} ]]; then
             if printf '{"test_phase_peak_bytes":null,"test_phase_started_at":null,%s\n' "${phase_context#\{}" > "$phase_temporary"; then
                 mv -f "$phase_temporary" "$phase_file" || true
@@ -335,8 +348,8 @@ run_once() {
     fi
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" && -n "${BUILDLOG_PEAK:-}" ]]; then
         BUILDLOG_TEST_PHASE_FILE="$BUILDLOG_PEAK.test-phase.json"
-        buildlog_sample_anon "$BUILDLOG_PEAK.cgroup" "${BUILDLOG_MEM_RESERVATION%.reservation}.max" "$parent_pid" \
-            "$BUILDLOG_TEST_PHASE_FILE" "$BUILDLOG_MEM_RESERVATION" "$@" &
+        buildlog_sample_anon "$BUILDLOG_PEAK.cgroup" "$BUILDLOG_MEM_MAX_PATH" "$parent_pid" \
+            "$BUILDLOG_TEST_PHASE_FILE" "$BUILDLOG_MEM_SAMPLING_CONTEXT" "$@" &
         sampler_pid=$!
     fi
     if [[ -n "${BUILDLOG_START:-}" ]]; then
@@ -409,17 +422,22 @@ SWEEP_EVERY_S=300
 
 sweep_after_step() {
     [[ "${LINT_SKIP_SWEEP:-}" == 1 ]] && return 0
-    local arg now last=0 dir stamp
+    local arg now last=0 parent name=lint-sweep dir stamp
     for arg in "$@"; do
         [[ "$arg" == */sweep.py ]] && return 0
     done
-    dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/lint-sweep"
+    parent="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+    dir="$parent/$name"
     stamp="$dir/${PWD//\//%}"
     now="${EPOCHSECONDS:-$(date +%s)}"
     [[ -r "$stamp" ]] && read -r last < "$stamp"
     [[ "$last" =~ ^[0-9]+$ ]] || last=0
     (( now - last >= SWEEP_EVERY_S )) || return 0
-    mkdir -p "$dir" && printf '%s\n' "$now" > "$stamp" || return 0
+    if [[ ! -d "$dir" ]]; then
+        "${BUILD_FOLDERS_SCRIPT%/*}/py" "$BUILD_FOLDERS_SCRIPT" stable \
+            --parent "$parent" --name "$name" >/dev/null || return 0
+    fi
+    printf '%s\n' "$now" > "$stamp" || return 0
     # Detached work and its descendants do not own verify.sh's foreground step.
     ( trap '' HUP; TOKEN_HELD=0; invoke_sweep </dev/null >/dev/null 2>&1 & )
 }

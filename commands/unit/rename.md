@@ -1,5 +1,5 @@
 ---
-description: Rename a unit; forwards to /showrunner:rename_unit, run from the showrunner session.
+description: Rename a unit through its showrunner.
 ---
 
 # Renamed units go through `/showrunner:rename_unit`

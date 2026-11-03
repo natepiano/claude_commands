@@ -1,5 +1,5 @@
 ---
-description: Report screenshot episode time by method, agent, and project.
+description: Report screenshot times by agent or method.
 ---
 
 `$ARGUMENTS` accepts `--since DATE`, `--until DATE`, and `--project NAME`.

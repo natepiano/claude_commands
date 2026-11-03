@@ -1,45 +1,31 @@
 ---
-description: List every proposal still open for the user in one table - the production's open proposal issues, the plan backlog and the add-ons waiting for a decision.
+description: List pending production proposals.
 ---
 
 # Proposals
 
-Run this in the showrunner session. Run
-`"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/proposals_table.py"`
-and print its output exactly as it comes, with nothing added. It finds the
-production from this session's update timer and prints one Markdown table,
-`| Proposed by | Proposal | Date | State |`, from three sources in this order:
+1. Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/proposals_table.py"` in the showrunner session.
+2. Print its output exactly.
+3. Report an error in one line when the command fails.
 
-- **Issues**: each issue directly in the folder that the `Proposals` line
-  names, while its frontmatter's `status` is `open` and its `tags` hold
-  `proposal`, and its `proposed_by` names this production or one of its units
-  (`unit (production)` names the production). A production below this one
-  lists its own (user, 2026-10-27). Productions share one issues folder, so the others'
-  proposals are left out. The row is the issue's P number and title
-  under its `proposed_by`, dated by its `date_created`. A production with no
-  `Proposals` line has no issue rows.
-  Each style decision is one row for one rule and crate under one rule text.
-  Rule candidates are not proposals: `style_proposals.py candidates` lists them,
-  and `style_proposals.py drop-candidate --idea "<text>"` drops one.
-- **The plan backlog**: each line ending `proposed` or `deferred` of the
-  ledger that the `Improvement queue` line names, under the proposer its file
-  names. A production
-  with no such line has no backlog rows.
-- **Add-ons**: each entry a unit's run holds until it has an answer, under the
-  unit's name. Its date is the day the unit last changed its list.
+The command finds the production through the session's update timer. It reads three sources:
 
-State says what the user can do: `waiting for your review`, `in progress by
-<unit>` (or `in progress`) or `deferred until you ask for it`. The waiting rows
-come first, in the order of `/next` (`commands/next.md`): the value is the
-score of the proposed stars. A waiting issue's level shows after its State,
-such as `waiting for your review · blocks`. An add-on is not the user's to decide, so its State says who
-does: `the showrunner decides: build, save for later, or drop`. The unit sends
-its add-ons to the showrunner, whose answer settles each one
-(`/showrunner:produce` → Throughout → Designs and add-ons).
+1. Open issues tagged `proposal` in the production's `Proposals` folder.
+2. Proposed or deferred entries in the production's `Improvement queue` ledger.
+3. The units' add-ons that need a decision.
 
-The table prints what the units and the issues say. When a row cannot be
-understood as it reads, ask its unit to reword the entry's title as one plain
-sentence; do not reword it here.
+Question records share the issues folder, but they are not proposals. Use `/showrunner:questions` to list questions.
 
-With nothing open it prints `no open proposals`. It reads only and writes
-nothing. When it exits non-zero, report its error in one line.
+An issue belongs here when `proposed_by` names this production or one of its units. Each child production lists its own proposals.
+
+Issue rows show the P number, title, proposer and creation date. Each style decision has one row per rule and crate.
+
+Rule candidates remain outside this table. Use `style_proposals.py candidates` or `drop-candidate --idea "<text>"` to manage them.
+
+The table columns are `Proposed by`, `Proposal`, `Date` and `State`. Waiting rows follow `/next` order and show any urgency level.
+
+State identifies the next action: user review, work in progress, or deferral. An add-on identifies the showrunner as its decision owner.
+
+Ask the owning unit to correct an unclear title. Do not rewrite it in the table.
+
+With no open entries, the command prints `no open proposals`. It changes nothing.

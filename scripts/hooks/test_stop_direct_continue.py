@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 
 import json
 import os
@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 HOOK = Path(__file__).with_name("stop-direct-continue.py")
@@ -45,7 +46,7 @@ class DirectorStopFixture:
         }
         result = subprocess.run(
             [sys.executable, str(HOOK)], input=json.dumps(payload), text=True,
-            capture_output=True, check=True, timeout=10,
+            capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS,
             env=self.environment, cwd=self.root,
         )
         if result.stderr:
@@ -73,14 +74,14 @@ def director_stop_fixture() -> Generator[DirectorStopFixture]:
         active.mkdir()
         marker = active / SESSION
         _ = marker.write_text(str(run), encoding="utf-8")
-        config = root / "agents.conf"
+        config = root / "models.conf"
         _ = write_registry(config, {'claude.context': {'default': '200k'}}, replace_sections=('claude.context',))
         environment = {
             "PATH": os.environ.get("PATH", ""), "HOME": str(root),
             "PYTHONDONTWRITEBYTECODE": "1", "HERDR_BIN": "/nonexistent/herdr",
             "XDG_STATE_HOME": str(root / "state"), "UNIT_ACTIVE_DIR": str(active),
             "UNIT_HISTORY_DIR": str(history.parent), "UNIT_SYNC_WRITES": "0",
-            "CLAUDE_PROBE_SESSION": "0", "AGENTS_CONFIG_FILE": str(config),
+            "CLAUDE_PROBE_SESSION": "0", "MODELS_CONFIG_FILE": str(config),
             "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "200k",
         }
         fixture = DirectorStopFixture(root, run, marker, root / "transcript.jsonl", environment)

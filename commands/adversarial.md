@@ -1,5 +1,5 @@
 ---
-description: Adversarial review of the current topic — two agents take opposing sides (for and against), answer each other once, and a neutral third agent judges. Any role, any time.
+description: Review a topic with opposing agents.
 ---
 
 `$ARGUMENTS` — optional clarifications: the exact question, the sides, the metric, what evidence counts, whether experiments are allowed. Empty means the topic under discussion now.

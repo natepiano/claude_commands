@@ -5,7 +5,7 @@ import copy
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, final
+from typing import final, override
 from urllib.parse import urlsplit
 
 import pins
@@ -13,12 +13,6 @@ import upgrade_check
 import upgrade_record
 import upgrade_report
 import upstream
-
-if TYPE_CHECKING:
-    from typing import override
-else:
-    def override(method: object) -> object:
-        return method
 
 API = "https://crates.io/api/v1/crates"
 NOW = datetime(2026, 10, 12, 19, 8, 41, tzinfo=timezone.utc)
