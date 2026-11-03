@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.test_agents_registry import write_registry
 
 from scripts.lib import names
+from scripts.lib.script_envelope import script_prompt
 from scripts.lib.test_names import fixture_names
 
 import argparse
@@ -460,7 +461,7 @@ class AddUnitTestCase(ShutdownTestCase):
                 herdr.SessionEntry(name=name, running=True, default=False,
                                    session_dir="/fixture", socket_path="/fixture/socket")])))
             after = {**responses, "--session default session list --json": running}
-            responses[f"--session {name} agent prompt w1:p1 {add_unit.prompt_for(request)}"] = CommandResponse(
+            responses[f"--session {name} agent prompt w1:p1 {script_prompt(add_unit.prompt_for(request))}"] = CommandResponse(
                 code=0, stdout="", write_files={str(process / "environ"): "\0".join(f"{key}={value}" for key, value in environment.items()),
                     str(self.state / f"herdr-live-{name}"): "",
                     self.env["FAKE_HERDR_RESPONSES"]: json.dumps(after)})

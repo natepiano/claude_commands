@@ -106,6 +106,7 @@ class Draft:
     body: str
     answerable: bool
     session: NotificationSession = NO_SESSION_LINE
+    due: str = ""
 
 
 @dataclass(frozen=True)
@@ -349,6 +350,7 @@ class MessageRecord(TypedDict):
 
 
 class DraftRecord(MessageRecord):
+    due: NotRequired[str]
     source: str
     priority: str
     answerable: bool
@@ -464,8 +466,11 @@ def message_record(draft: Draft) -> MessageRecord:
 
 
 def draft_record(draft: Draft) -> DraftRecord:
-    return DraftRecord(**message_record(draft), source=draft.source,
-                       priority=draft.priority, answerable=draft.answerable)
+    record = DraftRecord(**message_record(draft), source=draft.source,
+                         priority=draft.priority, answerable=draft.answerable)
+    if draft.due:
+        record["due"] = draft.due
+    return record
 
 
 def _object(value: object) -> dict[str, object]:
@@ -517,7 +522,8 @@ def _draft(value: object) -> Draft:
     if priority not in ("0", "1", "2"):
         raise ValueError("priority")
     return Draft(_text(record, "source"), priority, _text(record, "title"),
-                 _action(record), _text(record, "body"), answerable, _session(record))
+                 _action(record), _text(record, "body"), answerable, _session(record),
+                 _text(record, "due") if "due" in record else "")
 
 
 def length_failures(draft: Draft) -> list[str]:

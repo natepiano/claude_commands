@@ -222,6 +222,8 @@ class UnitFolderMoveTests(FolderMoveFixture):
         backend = self.folder_backend(live=True)
         configuration = self.root / "move-config"
         configuration.mkdir()
+        write_text_atomic(configuration / "script_prompts.conf",
+                          (Path(__file__).resolve().parents[2] / "config/script_prompts.conf").read_text())
         path = configuration / "production.conf"
         _ = path.write_text(folder_move_config(3, 3, 0.01))
         with (mock.patch.dict(os.environ, {"CONF_DIR": str(configuration), "PRODUCTION_CONFIG": str(path)}),
@@ -451,6 +453,7 @@ class UnitFolderMoveTests(FolderMoveFixture):
         if kind == "claude":
             self.assertIn("the session folder moved", command[-1])
             self.assertNotIn("the herdr server restarted", command[-1])
+            self.assertTrue(command[-1].startswith('<system-reminder source="script">'))
         self.assertEqual(backend.cwd, self.new_folder)
         self.assertEqual(backend.startup_observations, startup_delay_polls + 1)
         self.assertFalse(backend.startup_pending)
@@ -463,6 +466,15 @@ class UnitFolderMoveTests(FolderMoveFixture):
 
     def test_live_claude_resumes_current_session_in_the_same_terminal(self) -> None:
         self.assert_live_move("claude")
+
+    def test_enveloped_folder_resume_needs_no_source_record(self) -> None:
+        from scripts.lib import script_prompts
+
+        backend = self.folder_backend("claude", live=True)
+        with mock.patch.object(script_prompts, "record", side_effect=AssertionError("recorded resume")):
+            result = self.move_folder()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(backend.starts)
 
     def test_live_codex_resumes_current_thread_in_the_same_terminal(self) -> None:
         self.assert_live_move("codex")
@@ -978,6 +990,8 @@ class UnitFolderMoveTests(FolderMoveFixture):
         configuration = self.root / "config"
         configuration.mkdir()
         write_text_atomic(configuration / "production.conf", folder_move_config(3, 3, 0.01))
+        write_text_atomic(configuration / "script_prompts.conf",
+                          (Path(__file__).resolve().parents[2] / "config/script_prompts.conf").read_text())
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "CONF_DIR": str(configuration), "PRODUCTION_CONFIG": str(configuration / "production.conf"),
         })))

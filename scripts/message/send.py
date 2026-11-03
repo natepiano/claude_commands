@@ -139,6 +139,7 @@ import process_group
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff, unit_names
 from scripts.lib import conf
+from scripts.notify import decision_priority
 from scripts.message import send_budget
 from scripts.message.send_result import (
     Outcome as Outcome, EXIT as EXIT, OUTCOME_HEADERS as OUTCOME_HEADERS,
@@ -267,7 +268,7 @@ def check_timeout() -> float:
 
 
 Need = Literal["note", "decision", "blocked"]
-CHANNEL_PRIORITY: dict[Need, str] = {"note": "0", "decision": "1", "blocked": "2"}
+CHANNEL_PRIORITY: dict[Need, str] = {"note": "0", "decision": "0", "blocked": "2"}
 _ACKNOWLEDGED_AT = " acknowledged at "
 
 
@@ -709,6 +710,7 @@ class Options(NamedTuple):
     no_accounting: bool = False
     report_recipient: bool = False
     sender_origin: RuntimeSender | ForwardedSender = RuntimeSender()
+    due: str = ""
 
     @property
     def to(self) -> str:
@@ -2052,16 +2054,19 @@ def reviewed_failure(stdout: str, original: FailedPush, *,
     return original
 
 
-def user(message: Message, need: Need, action: UserAction, timeout: float, *, answerable: bool = False, text_id: str = "", values: tuple[str, ...] = ()) -> Result:
+def user(message: Message, need: Need, action: UserAction, timeout: float, *, answerable: bool = False, text_id: str = "", values: tuple[str, ...] = (), due: str = "") -> Result:
     """Reach the user. The channel is this function's business alone."""
     key = ["--key", message.key] if message.key else []
-    command = [sys.executable, str(USER_CHANNEL), "--priority", CHANNEL_PRIORITY[need], "--source", message.sender, *key,
+    selected_priority = decision_priority.priority(need, due)
+    command = [sys.executable, str(USER_CHANNEL), "--priority", selected_priority, "--source", message.sender, *key,
                *(["--answerable"] if answerable else []), *action_arguments(action), message.summary, message.text]
     if text_id:
-        command = [sys.executable, str(USER_CHANNEL), "--priority", CHANNEL_PRIORITY[need], "--source", message.sender, *key,
+        command = [sys.executable, str(USER_CHANNEL), "--priority", selected_priority, "--source", message.sender, *key,
                    "--text-id", text_id]
         for value in values:
             command.extend(["--value", value])
+    if due:
+        command[2:2] = ["--due", due]
     code, out, err = run(command, "", timeout)
     if code == 6:
         failed = reviewed_failure(out, FailedPush(message.summary, action, message.text, need=need, held=True))
@@ -2184,6 +2189,8 @@ def remote(message: Message, host: str, options: Options) -> Result:
         forwarded += ["--key", message.key]
     if message.to == USER:
         forwarded += ["--need", options.need]
+        if options.due:
+            forwarded += ["--due", options.due]
         if options.need == "blocked":
             # This host refused a push with no clear step and keeps its --clears-when record.
             forwarded += ["--self-clearing"]
@@ -2320,7 +2327,7 @@ def reviewed_waits(options: Options) -> Options:
     if not values.get("waits_line") or review.switched_off():
         return options
     rendered = push_texts.render(AUTO_MODE_TEXT, **values)
-    draft = review.Draft(rendered.sender, CHANNEL_PRIORITY[options.need], rendered.title, rendered.action,
+    draft = review.Draft(rendered.sender, decision_priority.priority(options.need, options.due), rendered.title, rendered.action,
                          rendered.body, False, rendered.session)
     outcome = review.review(draft, False, limit=waits_review_seconds())
     if isinstance(outcome, review.Approved):
@@ -2425,6 +2432,7 @@ def parse(argv: list[str]) -> Options:
     _ = parser.add_argument("--priority", choices=("0", "1", "2"), help=argparse.SUPPRESS)
     _ = parser.add_argument("--need", choices=list(CHANNEL_PRIORITY), default="note",
                             help="to `user`: what they must do (default note: nothing)")
+    _ = parser.add_argument("--due", default="", help="decision deadline in ISO 8601 with an explicit offset")
     _ = parser.add_argument("--action", help="to `user`: what the user does")
     _ = parser.add_argument("--no-action", action="store_true", help="to `user`: nothing is needed")
     clears = parser.add_mutually_exclusive_group()
@@ -2498,6 +2506,13 @@ def parse(argv: list[str]) -> Options:
     priority = optional_str(attr(args, "priority"))
     if priority is not None:
         args.need = {"0": "note", "1": "decision", "2": "blocked"}[priority]
+    due = as_str(attr(args, "due"))
+    try:
+        _ = decision_priority.read_due(due)
+    except ValueError as error:
+        parser.error(str(error))
+    if due and (to != USER or attr(args, "need") != "decision"):
+        parser.error("--due needs --to user and --need decision")
     action_text = optional_str(attr(args, "action"))
     no_action = attr(args, "no_action") is True
     if to != USER:
@@ -2549,7 +2564,7 @@ def parse(argv: list[str]) -> Options:
                       human=get["human"] is True, no_accounting=get["no_accounting"] is True,
                       report_recipient=get["report_recipient"] is True,
                       shown_sender=ShownSender(forwarded_sender) if forwarded_sender is not None else SenderNotResolved(),
-                      sender_origin=origin)
+                      sender_origin=origin, due=due)
     if options.to == USER and (options.summary is None or isinstance(options.selection, MeshWorker)):
         parser.error("--to user needs --summary, its title, and takes no --codex")
     if options.to != USER and options.need != "note":
@@ -2797,7 +2812,7 @@ def send(options: Options) -> Result:
     elif isinstance(route, UserDelivery):
         if isinstance(options.action, NoUserRecipient):
             raise AssertionError("a user message must state its action")
-        result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values)
+        result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values, due=options.due)
         if options.text_id == AUTO_MODE_TEXT and result.outcome in ("sent", "kept"):
             _ = rca.open_case(refusal_report(options), defer_owner=True)
     elif isinstance(route, CodexWorkerRecipient):

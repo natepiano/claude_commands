@@ -3481,6 +3481,43 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(send.pending("user"), "")
         self.assertEqual([entry["to"] for entry in self.log()], ["user", "user"])
 
+    def test_decision_due_survives_registry_remote_and_channel_arguments(self) -> None:
+        due = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+        rendered = push_texts.RenderedPush("test", "script", "decision", "Choose retry",
+            ActionRequired("Reply yes or no."), "The build stopped.", {})
+        with mock.patch.object(push_texts, "render", return_value=rendered):
+            options = send.parse(push_texts.user_send_argv(rendered, due=due)[2:])
+        self.assertEqual(options.due, due)
+        message = send.Message("user", "script", rendered.title, rendered.body, None)
+        with mock.patch.object(send, "run", return_value=(0, "SENT: to the user", "")) as run:
+            self.assertEqual(send.remote(message, "mac", options).outcome, "sent")
+            command = cast(list[str], run.call_args.args[0])[-1]
+            forwarded = shlex.split(command)[3:]
+            self.assertEqual(forwarded[forwarded.index("--due") + 1], due)
+        with mock.patch.object(send, "run", return_value=(0, "", "")) as run:
+            self.assertEqual(send.user(message, "decision", rendered.action, 40, due=due).outcome, "sent")
+            command = cast(list[str], run.call_args.args[0])
+            self.assertEqual(command[command.index("--priority") + 1], "1")
+            self.assertEqual(command[command.index("--due") + 1], due)
+
+    def test_decision_priority_one_without_a_due_time_reaches_the_channel_as_normal(self) -> None:
+        options = local_options(["--to", "user", "--from", "test", "--summary", "Choose retry",
+            "--priority", "1", "--action", "Reply yes or no.", "--text", "The build stopped."])
+        with mock.patch.object(send, "run", return_value=(0, "", "")) as run:
+            self.assertEqual(send.send(options).outcome, "sent")
+        command = cast(list[str], run.call_args.args[0])
+        self.assertEqual(command[command.index("--priority") + 1], "0")
+
+    def test_due_requires_an_offset_and_a_user_decision(self) -> None:
+        base = ["--to", "user", "--from", "test", "--summary", "Choose retry", "--need", "decision",
+                "--action", "Reply yes or no.", "--text", "The build stopped."]
+        for due in ("tomorrow", "2026-11-03T12:15:00"):
+            with self.subTest(due=due), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                _ = local_options([*base, "--due", due])
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            _ = local_options(["--to", "bogus", "--from", "test", "--text", "Body",
+                               "--due", "2026-11-03T12:15:00+00:00"])
+
     def test_registry_argv_preserves_values_and_blocked_need_across_remote_rendering(self) -> None:
         rendered = push_texts.RenderedPush("test", "script", "note", "Build stopped", ActionRequired("Choose retry."), "The build stopped.", {"name": "builder=one two"})
         with mock.patch.object(push_texts, "render", return_value=rendered):

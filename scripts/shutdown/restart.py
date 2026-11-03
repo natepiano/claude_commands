@@ -29,6 +29,7 @@ from typing import Literal, Never, Protocol, TypedDict, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.accounts import outage_alerts
+from scripts.lib.script_envelope import SCRIPT_ENVELOPE_START, script_prompt
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 for dependency in ("whoami", "message", "notify", "production", "hooks", "lib", "herdr"):
@@ -623,7 +624,10 @@ def restart_note(
         note += " " + stop_resume.resume_message("", workers=stop_resume.ResumeWorkers(seats, record["session"]["cwd"]))
         note += " Saved workers: " + ", ".join(seat["seat"] + (" (paused mid-turn)" if seat["turn_live"] else "") for seat in seats) + "."
     # A unit renamed while it was stopped learns its new names before anything else it reads.
-    return f"{record['renamed']} {note}" if "renamed" in record else note
+    if "renamed" in record:
+        marker = SCRIPT_ENVELOPE_START
+        note = note.replace(marker, marker + " " + record["renamed"], 1)
+    return note
 
 
 def _stop_note(record: SessionShutdown, restarted_at: str) -> str:
@@ -788,7 +792,7 @@ def _resume_parts(session: Session, prompt: str, target: str = "", *, login: str
     argv = pane_record.resume_arguments(entry)
     if isinstance(conversation, StartFreshConversation):
         del argv[:2]
-    return ResumeParts(session["cwd"], environment, tuple(argv), prompt, account, conversation, entry["name"], names)
+    return ResumeParts(session["cwd"], environment, tuple(argv), script_prompt(prompt), account, conversation, entry["name"], names)
 
 
 def _resume_shell(parts: ResumeParts) -> str:
@@ -934,7 +938,7 @@ def _require_submitted_prompt(record: SessionShutdown, outcome: herdr.PromptSubm
 def _record_scheduled_restart_prompt(
     session_id: str, prompt: str, *, dry_run: bool
 ) -> None:
-    if dry_run:
+    if dry_run or not prompt.lstrip().startswith("/"):
         return
     try:
         recorded = conversation_pause.read_scheduled_prompts(session_id)

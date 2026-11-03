@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.message import send_budget
+from scripts.lib.script_envelope import SCRIPT_ENVELOPE_START
 
 if TYPE_CHECKING:
     from ..lib import script_prompts, unit_runs
@@ -372,6 +373,9 @@ def prompt_source(
     text = prompt.lstrip()
     if not text:
         return PromptSource.NOTICE
+    if text.startswith(SCRIPT_ENVELOPE_START):
+        return PromptSource.SCHEDULED
+    recorded_script = typed_by_script(text)
     if CROSS_SESSION_TAG.match(text) is not None:
         opening_tag = text.partition(">")[0]
         match = FROM_NAME.search(opening_tag)
@@ -384,7 +388,7 @@ def prompt_source(
             or HARNESS_NOTICE.match(text) is not None
             or text.startswith(USAGE_RESET)):
         return PromptSource.NOTICE
-    if _is_recorded_scheduled_prompt(text, scheduled_prompts()) or typed_by_script(text):
+    if _is_recorded_scheduled_prompt(text, scheduled_prompts()) or recorded_script:
         return PromptSource.SCHEDULED
     return PromptSource.TYPED
 
