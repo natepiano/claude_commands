@@ -604,31 +604,41 @@ Remaining gaps include shell command positions, executable Python aliases, and s
 
 ### Phase 4k — A unit files a question with any copy of its production doc  · status: done
 
-Source: sdlc 2026-11-02 18:4x: phases-unit's `update_registration.py ask --production docs/plans/sdlc-production.md --unit phases-unit` exits 2 with "no showrunner staff row", from the unit's worktree copy and from `~/.claude` main's copy. `QuestionStaff.owner` (`update_registration.py:292`) and `question_folder` (`:810`) call `StaffSnapshot.by_doc` (`staff.py:280`), which matches only the exact path of the showrunner's checkout copy.
+#### As-built
+
+- `StaffSnapshot.by_doc(machine, path)` (`scripts/production/staff.py`) is the one doc lookup. It returns the row whose doc is exactly `path` first. Otherwise it matches the same file in another checkout of the same git repository: the same git common directory and the same repo-relative path.
+- `_document_checkout(path) -> CheckoutDocument(common_directory, relative_path) | OutsideGitCheckout` reads `.git`, `gitdir:` and `commondir` with no subprocess. A path outside git matches only exactly.
+- Two rows that match by repository raise `StaffRefused("<doc>: ambiguous production document; staff rows: ...")`.
+- The callers (`QuestionStaff.owner`, `question_folder`) did not change. A unit's `ask` from its own worktree or from `~/.claude` main files into the showrunner's queue.
+- Tests: `test_staff.DocumentLookupTests` (real repo with two linked worktrees and a subprocess guard) and `test_update_registration_questions.test_unit_files_and_lists_questions_from_linked_and_main_checkouts`.
+- Open in Phase 4p: a relative Proposals line resolves from the caller's copy; the consumers do not catch `StaffRefused`; unreadable `.git` metadata reads as outside git.
+
+### Phase 4p — Every checkout files a question in the showrunner's own folder  · status: todo
+
+Source: Phase 4k phase review, 2026-11-02. A follow-up to the 4k fix.
 
 #### Work Order
 
-**Goal:** a unit files a question with any checkout's copy of its production doc (its own worktree, `~/.claude` main, or the showrunner checkout), and the item reaches the showrunner's list.
+**Goal:** a question filed from any checkout of the production doc lands in the folder the showrunner reads, and an ambiguous or unreadable lookup refuses with a message instead of a crash or a silent empty result.
 
 **Spec:**
-1. `StaffSnapshot.by_doc(machine, path)` stays the one doc lookup. It matches a row when `path` is the row's doc or the same file in another checkout of the same git repository: the same git common directory and the same path relative to the checkout top. Add no second path list and no alias records.
-2. An exact path match still wins. A path outside any git checkout matches only exactly. When two rows match the same document by repository identity, the lookup refuses and picks neither.
-3. Read the checkout facts without a subprocess where a `.git` file or folder answers it (`gitdir:` and `commondir`), so the lookup stays fast.
-4. Every `by_doc` caller (`update_registration.py:295`, `:810`) gets the new match with no change at the call.
+1. `question_folder` (`update_registration.py:808`) resolves the Proposals folder from the owner row's doc (`owner.doc.path`), not from the document the caller supplied. A relative Proposals line then gives the same folder from every checkout.
+2. `update_registration.main`, `footer_counts.sources` and `tidy_wrapped` catch `StaffRefused` from `by_doc`. `ask` and the readers print the refusal and exit nonzero. `tidy` changes nothing on a refusal.
+3. `_document_checkout` (`staff.py`) returns a third outcome when `.git` metadata exists but cannot be read. `by_doc` refuses on it after an exact match fails, so a reader never shows an empty queue for an unreadable checkout. A path with no `.git` stays `OutsideGitCheckout` (exact match only).
 
 **Files:**
-- `scripts/production/staff.py` — `by_doc` and its checkout-identity helper.
-- `scripts/production/test_staff.py`, `scripts/production/test_update_registration_questions.py` — regressions.
+- `scripts/production/update_registration.py`, `scripts/production/footer_counts.py`, `scripts/production/tidy_wrapped.py`, `scripts/production/staff.py` — source.
+- `scripts/production/test_update_registration_questions.py`, `scripts/production/test_staff.py`, `scripts/production/test_tidy_wrapped.py` — regressions.
 
 **Workers:** `1 writer + 1 tester`.
-- `impl` — `scripts/production/staff.py`.
-- `test` — the two test files.
+- `impl` — the four source files.
+- `test` — the three test files.
 
-**State:** none; only the lookup changes.
+**State:** none; a refusal writes nothing.
 
-**Constraints from prior phases:** Phase 4j: `question_folder` takes its owner from `by_doc`; a match from another checkout gives the same showrunner row and so the same question folder.
+**Constraints from prior phases:** Phase 4k: `by_doc` matches exactly first, then by git common directory and repo-relative path, and raises `StaffRefused` when two rows match by repository.
 
-**Acceptance gate:** a test with a showrunner row whose doc is in one checkout files a question with `ask` from a second worktree's copy and from the main checkout's copy, and `questions-table` lists it; a doc outside git matches only exactly; two matching rows refuse; basedpyright 0/0/0 on changed files and on `update_registration.py`, `footer_counts.py`, `tidy_wrapped.py`; each changed test file green in its own `discover` run; full merged-tree gate green.
+**Acceptance gate:** a test with a relative Proposals line files from a linked worktree and lists the question from the showrunner checkout; a test per consumer shows the ambiguous-lookup refusal and unchanged state; a test with an unreadable `.git` file refuses; `basedpyright` on the changed files footer `0 errors, 0 warnings, 0 notes`; per-file `unittest discover`; full gate.
 
 ### Phase 4o — A unit folder moves at an open phase  · status: todo
 
@@ -778,7 +788,7 @@ Source: herdr-unit plan Phase 4a, given to devtools-unit by sdlc 2026-11-02. Sta
 
 **State:** timer folders and the progress state move to staff-id keys, once.
 
-**Constraints from prior phases:** Phase 3x migration pattern; Phase 3t reads the doc from the showrunner row.
+**Constraints from prior phases:** Phase 3x migration pattern; Phase 3t reads the doc from the showrunner row. Fast-track `3ac207239`: a worker may work in its own worktree; the staff row keeps only the unit's home worktree, and the worker's location stays in its run record. Derive active-run worktrees from run records, not from staff, and add a test that keeps an external worker's location and thread through the migration.
 - Phase 3h review (2026-11-01): item 1 also covers the active run record and its worktree and branch consumers: the run points at the unit's fixed id, the worktree comes from the row and the branch from git; finished runs keep their paths as history. Run-folder paths stay the same across `/clear`. Keep the native-session and socket resolution that shipped.
 
 **Acceptance gate:** for each of the two stores, its own landing and real proof (Phase 3x rule); every running showrunner's timer fires once after the migration and the dailies and status line show it; a migration stopped after the first timer folder finishes on rerun; full gate green.
