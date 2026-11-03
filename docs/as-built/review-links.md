@@ -89,15 +89,36 @@ A list with no available production document retains its rows with a notice and 
 The page never uses a review list as a production document.
 
 Tabs show each showrunner and its waiting count.
-The staff record supplies each unit's current showrunner.
-Checkpoint messages and production unit tables identify the unit that owns a row.
-The page reads each repository's commit graph once per request.
-The shared Git reader reads all commit parents in one command per repository through standard input.
-The graph tracks checkpoint ancestors without assigning bits to other commits.
+`scripts/production/change_routing.py` owns the routing rule for the page, the status line, and `/next`.
+The router searches every staff repository for the merge checkpoint.
+The Production cell and list hints do not restrict this search.
+A unit checkpoint identifies a staff row, including a qualified path such as `builds/resources-unit`.
+The router follows its staff parent ids to its showrunner.
+A change without a unit checkpoint belongs to its list's showrunner.
+A unit without a staff row appears under `unrouted`.
+The page shows its anomaly note under the change.
+The router prints a named diagnostic with the unit and change id to stderr.
+A verdict on an unrouted row saves without sending a message or recording a delivery failure.
+An unrouted row offers no question control.
+The server refuses its question submissions without saving.
+The Production cell supplies no tab or message recipient.
+The router caches commit history with a key from Git refs, HEAD, and packed-refs.
+The status count watches the same paths that form the graph cache key.
+New, changed, and deleted refs invalidate both caches.
+Concurrent graph writes use separate temporary files before atomic replacement.
+A failed write removes its temporary file.
+The router reads commit parents in one command for each repository that lacks a current cache.
 Production aliases share one document read per request.
 Rows from the same checkpoint share its selection within that request.
-It reads full checkpoint messages only when a merge contains changes from several known units.
-A row without a known staff unit stays with its source list.
+The router reads full checkpoint messages when a merge contains several units.
+Delivery records store fixed staff ids.
+Each send reads `staff.snapshot()` and sends to `session:<current_session>` from the saved staff row.
+An account move changes the next recipient address without changing the stored staff id.
+The status line counts the same staff tabs and shows a separate `unrouted` item.
+The `unrouted` count covers all page lists across independent production roots.
+The page and status line use the same waiting rule.
+Sent validation requests and open delivered questions do not count as waiting changes.
+The showrunner's `/next` keeps a sent validation request pending and places it last.
 Empty lists and showrunners retain their zero-count tabs.
 Tabs with waiting changes precede empty tabs in alphabetical order and keep their positions until the next page load.
 The selected tab uses `outline-offset:-2px` to keep its full outline visible inside the scroll container.
@@ -238,20 +259,21 @@ The feature-log operation still runs before the verdict.
 The request thread flushes the response before it runs the existing `scripts/message/send.py` sender.
 The server starts no detached shell for message delivery.
 The all-list page sends to the row's current staff showrunner.
-Older selected-row pages use the list's `showrunner:` frontmatter.
-The saved verdict alone selects the recipients for the first send and each retry.
+Older selected-row pages use the same staff route.
+The saved verdict selects recipients when a new message attempt begins.
 An exact `works` verdict goes only to the showrunner, including text from Send feedback.
-Every other verdict also goes to the owning unit through the existing checkpoint route.
-The route reads the merge's checkpoints, or the named commit itself when the hash names a checkpoint.
-It matches the checkpoint's branch, plan, unit, or worktree name against the owning production's Units table.
+Every other verdict also goes to the owning unit through the checkpoint route.
+The router resolves qualified staff paths before matching unit names or worktree names.
 An exact change trailer selects among checkpoints.
 A single unit also covers a reworded row.
-An ambiguous merge is refused before the save.
-A change outside a unit goes to the production's configured Showrunner session.
-The owning production's Showrunner checkout locates the commit.
+A change without a unit checkpoint belongs to its list's staff showrunner.
+Retries retain stored staff recipient ids.
+Older records without recipient ids compute the same recipients as a fresh verdict send.
 No agent polls for answers.
 A save shows **Saved: &lt;answer&gt;** from the review record.
 `DeliveryStatus` owns one private delivery record per review list and row under the configured review root.
+`scripts/production/delivery_state.py` owns its typed states and decoder.
+Both the page and waiting-count readers use this decoder.
 The record has separate validation and verdict slots, each with its latest attempt ID and state.
 Its question slot holds the latest question and its answer in the same record.
 `NoQuestion`, `OpenQuestion`, and `AnsweredQuestion` state who must act next.
@@ -269,7 +291,10 @@ Each server tracks its question messages during delivery, so a restart can recov
 Only the validation slot stores feedback.
 Before the verdict write, the server stores a pending intent in the verdict slot with a new attempt ID.
 If this write fails, the server refuses the verdict write.
-The record contains no saved verdict, recipient, or error text.
+The record stores staff recipient ids and no saved verdict.
+An attempt without recipients stores the public failure note `no showrunner to send to`.
+This failure clears the active attempt so a resend can recover after the staff record changes.
+Private transport errors remain outside the record.
 Validate yourself stores its feedback in the validation slot because the review record has no validation answer.
 A GET selects the verdict slot when the review record has a saved verdict.
 Otherwise, a `ValidationRequested` slot or an `OpenQuestion` with `awaiting_answer` removes the row from the page's waiting rows.
