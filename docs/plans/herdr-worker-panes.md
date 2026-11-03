@@ -1139,24 +1139,22 @@ Make no unproved write and create no second row.
 
 ### Phase 4q — A relaunch refuses only a provably live turn  · status: done
 
-**Owner:** herdr-unit (sdlc, 2026-11-02). A herdr restart at 13:01 stopped a models-unit reviewer; its relaunch was refused on a stale live turn with no launcher running, and the unit lost 7.5 hours.
+#### As-built
 
-#### Work Order
-
-**Goal:** a worker relaunch refuses only on proof that the old turn is still driven by a live launcher. Otherwise it reports the stale turn and continues (user rule: report anomalies, never block).
-
-**Spec:**
-1. In `codex_mesh.py` relaunch (about :4428-4448), a thread read that shows a turn in progress is a live turn only when the turn's recorded launcher process is alive (`_pid_alive`, which now treats a zombie as dead).
-2. With a dead launcher, interrupt the orphaned turn once, print one report line that names the worker and thread, and continue the relaunch on the same thread.
-3. An app-server that cannot be reached holds no live turn: report it and continue, never refuse.
-4. A live launcher still refuses, with today's text.
+- `codex_mesh._attach_and_run` refuses a worker relaunch only when the old turn's recorded launcher process is alive (`_pid_alive`). The refusal says "has a live turn", or "thread state unknown (<reason>); recorded launcher is alive; use codex_mesh.py end --to <name> before relaunching" when the thread state cannot be read.
+- With a dead or missing launcher, a turn in progress or an unknown thread state gets one cleanup attempt (`_end_unwatched_turn`) and one stderr line that names the stale turn. The line says "interrupt requested" only when an interrupt was sent, else "cleanup attempted; interrupt not confirmed". The relaunch then continues with a fresh `thread/start`.
+- `RelaunchAllowed` and `RelaunchBlockedByLiveTurn` carry `interrupt_requested: bool`. A failed cleanup log write prints one stderr line and the relaunch continues.
+- `_pid_alive` returns False for a pid of 0 or less, so a missing `launcher_pid` is not live.
 
 **Files:**
-- `scripts/agents/codex_mesh.py`, `scripts/agents/test_codex_mesh.py`
+- `scripts/agents/codex_mesh.py` — the relaunch refusal and the stale-turn cleanup.
+- `scripts/agents/test_codex_mesh.py` — live, dead and missing launcher cases, for an in-progress turn and an unknown thread state.
 
-**Workers:** `1 writer`. Code only.
+**Gotchas:**
+- `os.kill(0, 0)` signals the process group and succeeds, so a pid check without the `pid <= 0` guard counts a missing launcher as live.
+- `thread/resume` hangs every fake-server fixture in `test_codex_mesh.py`; the relaunch starts a fresh thread.
 
-**Acceptance gate:** one test each for items 1-4, including the 13:01 case (dead launcher, thread read shows a turn in progress); `test_codex_mesh.py` passes; basedpyright 0/0. natedev merges the hash with `gm.sh`.
+**Ruled out:** continuing on the same thread after a stale turn — `thread/resume` hangs the fixtures, and the old relaunch flows already start a fresh thread.
 
 ### Phase 4 — Member names come from the staff row  · status: todo
 
