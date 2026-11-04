@@ -32,6 +32,7 @@ from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.lib import conf
 from scripts.production import showrunners
 from scripts.production.production_doc import Refusal
 from issues import Issue
@@ -64,9 +65,6 @@ ADD_ON_STATE = "the showrunner decides: build, save for later, or drop"
 BACKLOG_STATES = {"proposed": REVIEW_STATE, "deferred": "deferred until you ask for it"}
 UNTITLED_ADD_ON = "an add-on with no description"
 NONE = "—"
-# A cell longer than its width is cut, so one long sentence cannot widen the whole table.
-TITLE_WIDTH = 110
-STATE_WIDTH = 140
 
 BACKLOG_LINE = re.compile(r"^- (?P<date>\d{4}-\d{2}-\d{2}) (?P<title>.+) — (?P<state>proposed|deferred)\s*$")
 # The file a backlog line names, as `(file.md)` or `([[file]])`, closes its title.
@@ -308,10 +306,12 @@ def escaped(cell: str, width: int) -> str:
 
 
 def table(rows: list[Row]) -> str:
+    settings = conf.read("proposals_table")
+    title_width, state_width = settings.whole("title_width"), settings.whole("state_width")
     lines = ["| Proposed by | Proposal | Date | State |", "| --- | --- | --- | --- |"]
     for row in rows:
-        cells = (escaped(row.proposer, TITLE_WIDTH), escaped(row.proposal, TITLE_WIDTH), row.date,
-                 escaped(row.state, STATE_WIDTH))
+        cells = (escaped(row.proposer, title_width), escaped(row.proposal, title_width), row.date,
+                 escaped(row.state, state_width))
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
