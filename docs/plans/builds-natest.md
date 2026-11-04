@@ -277,39 +277,21 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - basedpyright reports a name reached through another module's import as private (`reportPrivateLocalImportUsage`). A moved name moves in every importer in the same phase.
 
 ### Phase 9 — Memory admission and the disk sweeper read the build log through the locked reader  · status: done
-**Depends on:** Phase 4
-**Blocked by:** resources P51/P53 and queue 10c reach origin/builds (builds showrunner order, 2026-11-03).
 
-#### Work Order
+#### As-built
 
-**Goal:** `memory_admit.py` and `sweep.py` read build log month files through `store.locked_rows`, so the build log has one locked row reader, and `queue_lines.py` pads through `terminal_cells.py`.
-
-**Spec:**
-
-1. After the director merges origin/builds with resources P51/P53 and queue 10c in it, the `Path` branch of `memory_admit.anonymous_history_rows` (`memory_admit.py:1387` before that merge) and `sweep.build_log_rows` (`sweep.py:1573`) call `store.locked_rows(path, start)` in place of their own open, shared flock and `whole_rows` loop. Behavior does not change. The `BuildLogStore` protocol in `memory_admit.py` (line 72 before that merge) gets a `locked_rows` method so the call type-checks; the locked `BinaryIO` branch stays as it is.
-2. `scripts/build_queue/queue_lines.py` imports `pad_left` and `pad_right` from `scripts/lib/terminal_cells.py` and drops its own copies; every importer of them switches to `terminal_cells.py`.
+- `memory_admit.anonymous_history_rows(path)` returns `store.locked_rows(path)`. `sweep.build_log_rows`, `sweep.trim_row_recorded` and `sweep.read_sweep_removals` read through `store.locked_rows`. A month file that the rebuild enumerated and then cannot open still fails the rebuild report.
+- `memory_admit.py` imports the buildlog modules under `TYPE_CHECKING`, like `sweep.py`; the hand-copied store protocols are gone. `admission_service.py`, `admission_client.py` and their tests import `store` the same way.
+- `memory_admit.current_worktree_steps` keeps its own locked read: it needs the handle under the same lock for `os.fstat` and the file marks, and it raises on a partial tail.
+- `queue_lines.py` and `queue_view.py` pad through `scripts/lib/terminal_cells.py`; the padding cases are in `test_terminal_cells.py`.
 
 **Files:**
-- `scripts/lint/memory_admit.py` — `anonymous_history_rows` calls `locked_rows` (owner resources-unit, moving to queue-unit)
-- `scripts/lint/sweep.py` — `build_log_rows` calls `locked_rows` (owner resources-unit)
-- `scripts/build_queue/queue_lines.py` — imports the padding helpers (owner queue-unit)
-- `scripts/build_queue/queue_view.py` — imports the padding helpers (line 12)
-- `scripts/build_queue/test_queue_lines.py` — imports the padding helpers (line 10)
+- `scripts/lint/memory_admit.py`, `scripts/lint/sweep.py` and their tests — the locked reads
+- `scripts/build_queue/admission_service.py`, `admission_client.py`, `admission_test_support.py`, `queue_lines.py`, `queue_view.py` and their tests
+- `scripts/lib/test_terminal_cells.py` — the padding cases
 
-**Workers:** 1 writer — two short call-site edits; the existing tests prove them
-- `impl` — all three files and the importers of the padding helpers
-- `test` opens as impl — no work
-
-**State:** none
-
-**Constraints from prior phases:**
-- Phase 4: `store.locked_rows(path: Path, start: int = 0)` opens the file, takes a shared flock and yields `whole_rows(handle, start)`; an absent file yields no rows. `record.read_attempt_results` already calls it. `index.read_file` keeps its own unlocked offset read.
-- Owners: the checkpoint notice names resources-unit and queue-unit.
-
-**Acceptance gate:**
-- `scripts/lint/test_memory_admit.py` and `scripts/lint/test_sweep.py` green in the checkpoint gate run
-- `python3 -m unittest discover -s scripts/build_queue` green
-- `basedpyright scripts/lint/memory_admit.py scripts/lint/sweep.py scripts/build_queue/queue_lines.py scripts/build_queue/queue_view.py scripts/build_queue/test_queue_lines.py` prints `0 errors, 0 warnings, 0 notes`
+**Gotchas:**
+- Reading `cgroup.procs` of a cgroup the kernel is removing gives ENODEV, not `FileNotFoundError`. `reservation_lifetime` catches only `FileNotFoundError`; resources-unit owns the fix.
 
 ### Phase 10 — Each schema keeps its own build log index file  · status: todo
 **Depends on:** Phase 8, Phase 9
