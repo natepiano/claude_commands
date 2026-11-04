@@ -298,11 +298,23 @@ def read_deployment_settings(path: Path) -> DeploymentSettings:
                               source_url, commit, source_hash, template)
 
 
+def deployment_price_path(path: Path) -> Path:
+    """Locate the deployment price state outside the public repository."""
+    key = 'deployment_price_file'
+    state_path = Path(_live(conf.read(path), key, str)).expanduser().resolve()
+    if state_path.is_relative_to(Path(__file__).resolve().parents[2]):
+        raise ValueError(f'{key}: {state_path}: the price file must stay outside the public repository')
+    return state_path
+
+
 def deployment_price(path: Path, now: int) -> tuple[int, Decimal]:
-    configuration = conf.read(path)
-    settings = read_settings(configuration)
-    at = _live(configuration, 'deployment_price_at', positive_seconds)
-    price = _live(configuration, 'deployment_price_usd_per_hour', money)
-    if price <= 0 or not 0 <= now - at <= settings.price_max_age_seconds:
-        raise ValueError('deployment requires a fresh public price recorded in live configuration')
+    state_path = deployment_price_path(path)
+    try:
+        state = conf.read(state_path)
+        at = _live(state, 'deployment_price_at', positive_seconds)
+        price = _live(state, 'deployment_price_usd_per_hour', money)
+        if price <= 0 or not 0 <= now - at <= read_settings(path).price_max_age_seconds:
+            raise ValueError('deployment requires a fresh positive public price')
+    except ValueError as error:
+        raise ValueError(f'deployment_price_file: {state_path}: {error}; run deploy.py price') from None
     return at, price

@@ -44,6 +44,7 @@ class CiSliceAdmissionTests(unittest.TestCase):
 
     def test_running_ci_job_uses_the_current_limit_on_every_pass(self) -> None:
         with AdmissionFixture() as fixture:
+            fixture.configure(ci_memory_margin_gib=20)
             ci = fixture.root / "ci.slice"
             _ = (ci / "memory.current").write_text(str(2 * GIB))
             _ = (ci / "memory.max").write_text(str(18 * GIB))
@@ -59,6 +60,27 @@ class CiSliceAdmissionTests(unittest.TestCase):
             _ = (ci / "memory.max").write_text(str(12 * GIB))
             _ = fixture.server.run_pass()
             self.assertIn(request.episode, fixture.server.reservations)
+
+    def test_running_ci_job_uses_live_use_plus_the_current_margin(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(ci_memory_margin_gib=6)
+            ci = fixture.root / "ci.slice"
+            _ = (ci / "memory.current").write_text(str(2 * GIB))
+            (fixture.proc.path / "123").mkdir()
+            _ = (fixture.proc.path / "123/comm").write_text("Runner.Worker\n")
+            _ = (ci / "cgroup.procs").write_text("123\n")
+            request = fixture.request(need=14 * GIB)
+            _ = fixture.server.handle_request(request)
+            self.assertNotIn(request.episode, fixture.server.reservations)
+            result = fixture.server.last_result
+            assert isinstance(result, gate.PassResult)
+            self.assertEqual(result.totals.charged, 8 * GIB)
+            fixture.configure(ci_memory_margin_gib=3)
+            _ = fixture.server.run_pass()
+            self.assertIn(request.episode, fixture.server.reservations)
+            result = fixture.server.last_result
+            assert isinstance(result, gate.PassResult)
+            self.assertEqual(result.totals.charged, 5 * GIB)
 
     def test_missing_ci_limit_refuses_grants_but_keeps_cleanup_and_recovers(self) -> None:
         with AdmissionFixture() as fixture:
@@ -143,6 +165,7 @@ class ServiceTests(unittest.TestCase):
             unowned = fixture.root / "builds.slice/unowned.scope"
             unowned.mkdir(parents=True)
             _ = (unowned / "memory.current").write_text(str(GIB))
+            _ = (unowned / "memory.stat").write_text("inactive_file 0\n")
             _ = (unowned / "cgroup.procs").write_text("")
             _ = fixture.server.run_pass()
             snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
@@ -1624,6 +1647,7 @@ class CutoverServiceTests(unittest.TestCase):
             scope.mkdir(parents=True)
             _ = (scope / "cgroup.procs").write_text("")
             _ = (scope / "memory.current").write_text(str(GIB))
+            _ = (scope / "memory.stat").write_text("inactive_file 0\n")
             _ = fixture.server.run_pass()
             first = fixture.server.handle_request(wire.ViewRequest())[0]
             assert isinstance(first, wire.ViewReply)

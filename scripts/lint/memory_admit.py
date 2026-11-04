@@ -1473,6 +1473,7 @@ def warn_config_fallbacks(fallbacks: tuple[ConfigFallback, ...]) -> None:
 class MemoryConfig:
     policy: AdmissionPolicy
     ci_memory_slice: str
+    ci_memory_margin_bytes: int
     test_phase_margin: float
     build_budget_bytes: int
     running_pass_seconds: float
@@ -1578,6 +1579,7 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
             diagnostics.append(f"warning: {ci_slice.reason}")
         config = MemoryConfig(
             ci_memory_slice=ci_slice.value,
+            ci_memory_margin_bytes=int(settings_read.number("ci_memory_margin_gib") * GIB),
             policy=AdmissionPolicy(timing, pressure, PeakHold(settings_read.whole("peak_hold_seconds"), kinds)),
             test_phase_margin=settings_read.number("test_phase_margin"),
             build_budget_bytes=max(1, int(settings_read.number("build_budget_gib") * GIB)),
@@ -3884,8 +3886,27 @@ def ci_slice_cgroup(name: str) -> Path:
         raise SliceMemoryUnavailable(f"{name}: cannot read ControlGroup: {error}") from error
 
 
+def slice_working_set(directory: Path) -> MeasuredMemory:
+    """Measure resident memory without inactive file cache, plus swap."""
+    current = directory / "memory.current"
+    check_memory_reading(current)
+    amount = int(current.read_text())
+    stat = directory / "memory.stat"
+    check_memory_reading(stat)
+    contents = stat.read_text()
+    try:
+        fields = dict(line.split() for line in contents.splitlines())
+        inactive_file = int(fields["inactive_file"])
+    except (KeyError, ValueError) as error:
+        raise ValueError(f"{stat}: expected inactive_file bytes") from error
+    swap = directory / "memory.swap.current"
+    check_memory_reading(swap)
+    swapped = int(swap.read_text()) if swap.exists() else 0
+    return MeasuredMemory(max(0, amount - inactive_file) + swapped, swap_bytes=swapped)
+
+
 def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessIdentity], proc: Path,
-                         *, ci_memory_slice: str = "") -> tuple[UnownedSliceMemory, ...]:
+                         *, ci_memory_slice: str = "", ci_memory_margin_bytes: int = 0) -> tuple[UnownedSliceMemory, ...]:
     """Count child scopes that no reservation owns, without duplicate process charges."""
     directory = Path(os.environ.get("BUILDLOG_BUILDS_CGROUP",
         f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/builds.slice"))
@@ -3912,15 +3933,12 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
         if not required and (child in owned or child.name == "sccache.service" or not child.is_dir()):
             continue
         try:
-            current = child / "memory.current"
-            check_memory_reading(current)
-            amount = int(current.read_text())
-            swap = child / "memory.swap.current"
-            check_memory_reading(swap)
-            swapped = int(swap.read_text()) if swap.exists() else 0
+            working_set = slice_working_set(child)
+            amount = working_set.bytes
+            swapped = working_set.swap_bytes
             members = {int(pid) for membership in child.rglob("cgroup.procs") for pid in membership.read_text().split()}
             duplicate = process_memory(members & tree_pids, proc).bytes
-            amount = max(0, amount + swapped - duplicate)
+            amount = max(0, amount - duplicate)
             promise: MemoryPromise = NoPromise()
             if required:
                 limit_path = child / "memory.max"
@@ -3937,7 +3955,7 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
                     except FileNotFoundError:
                         continue
                     if program == "Runner.Worker":
-                        promise = LifetimePromise(limit + swapped)
+                        promise = LifetimePromise(min(amount + ci_memory_margin_bytes, limit))
                         break
             if amount or (required and members):
                 result.append(UnownedSliceMemory(amount, promise=promise,
