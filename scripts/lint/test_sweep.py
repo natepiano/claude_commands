@@ -3627,7 +3627,8 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         self.assertIn(f"from {outer}, last used", output)
 
     def locked_floor(self, base: Path, started: float, *, pid: int = 321,
-                     name: str = "floor.lock") -> Path:
+                     name: str = "floor.lock",
+                     command: tuple[str, ...] = ("python3", "sweep.py", "--floor-only")) -> Path:
         """An actual contended flock, with its holder's private process record and config."""
         path = base / name
         guard = sweep.try_lock(str(path))
@@ -3635,24 +3636,43 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         self.addCleanup(os.close, guard)
         _ = path.write_text(json.dumps({"pid": pid, "started_at": started}))
         proc = base / "proc"
-        fake_process(proc, pid, argv=("python3", "sweep.py", "--floor-only"))
+        fake_process(proc, pid, argv=command)
         config = conf.path("lint")
         _ = write_config_fixture(config, "floor_lock_alert_minutes=7\n")
         _ = self.enterContext(mock.patch.object(sweep, "PROC_DIR", str(proc)))
         _ = self.enterContext(mock.patch.object(sweep, "lock_holder", return_value=pid))
         return path
 
-    def test_overdue_floor_lock_alert_is_once_per_hold_and_repeats_for_a_new_hold_by_the_same_pid(self) -> None:
+    def test_live_sweep_holder_past_the_alert_delay_sends_no_alert(self) -> None:
         base = self.base()
         now = time.time()
         path = self.locked_floor(base, now - 8 * 60)
+        with mock.patch.object(time, "time", return_value=now), mock.patch.object(
+                sweep, "send_floor_alert", return_value=True) as send:
+            sweep.alert_floor_lock(str(path), 2 * GIB, 300 * GIB)
+            send.assert_not_called()
+
+    def test_sweep_script_argument_does_not_suppress_another_holders_alert(self) -> None:
+        base = self.base()
+        now = time.time()
+        path = self.locked_floor(base, now - 8 * 60,
+                                 command=("python3", "other_tool.py", "sweep.py"))
+        with mock.patch.object(time, "time", return_value=now), mock.patch.object(
+                sweep, "send_floor_alert", return_value=True) as send:
+            sweep.alert_floor_lock(str(path), 2 * GIB, 300 * GIB)
+            self.assertEqual(send.call_count, 1)
+
+    def test_overdue_floor_lock_alert_is_once_per_hold_and_repeats_for_a_new_hold_by_the_same_pid(self) -> None:
+        base = self.base()
+        now = time.time()
+        path = self.locked_floor(base, now - 8 * 60, command=("python3", "other_tool.py"))
         with mock.patch.object(time, "time", return_value=now), mock.patch.object(
                 sweep, "send_floor_alert", return_value=True) as send:
             for _ in range(2):
                 self.assertEqual(self.hold(base, 300 * GIB, [2 * GIB])[0], 0)
             self.assertEqual(send.call_count, 1)
             message = cast(str, send.call_args.args[0])
-            for text in ("321", "python3 sweep.py --floor-only", "2.0 GiB", "300.0 GiB"):
+            for text in ("321", "python3 other_tool.py", "2.0 GiB", "300.0 GiB"):
                 self.assertIn(text, message)
             self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
             _ = path.write_text(json.dumps({"pid": 321, "started_at": now - 9 * 60}))
@@ -3696,7 +3716,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
 
     def test_overlapping_waiters_deliver_one_alert_for_the_same_hold(self) -> None:
         base = self.base()
-        path = self.locked_floor(base, time.time() - DAY)
+        path = self.locked_floor(base, time.time() - DAY, command=("python3", "other_tool.py"))
 
         messages = self.overlap_floor_alert(path, lambda: sweep.alert_floor_lock(str(path), 2 * GIB, 300 * GIB))
 
@@ -3710,7 +3730,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
     def test_delayed_lock_alert_and_new_measurement_preserve_each_others_records(self) -> None:
         base = self.base()
         now = time.time()
-        path = self.locked_floor(base, now - DAY, name="alert.lock")
+        path = self.locked_floor(base, now - DAY, name="alert.lock", command=("python3", "other_tool.py"))
         record_path = sweep.floor_record_path()
         sweep.write_floor_record(record_path, sweep.FloorRecord(
             now - 100, GIB, 3 * GIB, sweep.DeliveredAlert(now - 80), sweep.DeliveredAlert(now - 70)))
@@ -3735,7 +3755,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
     def test_delayed_lock_alert_does_not_replace_a_newer_holds_receipt(self) -> None:
         base = self.base()
         now = time.time()
-        path = self.locked_floor(base, now - 2 * DAY)
+        path = self.locked_floor(base, now - 2 * DAY, command=("python3", "other_tool.py"))
 
         def newer_hold() -> None:
             _ = path.write_text(json.dumps({"pid": 321, "started_at": now - DAY}))
@@ -3751,7 +3771,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
     def test_recent_floor_lock_uses_its_start_time_and_the_configured_delay(self) -> None:
         base = self.base()
         now = time.time()
-        path = self.locked_floor(base, now - 6 * 60)
+        path = self.locked_floor(base, now - 6 * 60, command=("python3", "other_tool.py"))
         os.utime(path, (now - 10 * DAY, now - 10 * DAY))
         with mock.patch.object(time, "time", return_value=now), mock.patch.object(
                 sweep, "send_floor_alert", return_value=True) as send:
@@ -3765,7 +3785,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
     def test_failed_floor_lock_alert_is_retried_and_unreadable_holders_do_not_alert(self) -> None:
         base = self.base()
         now = time.time()
-        path = self.locked_floor(base, now - DAY)
+        path = self.locked_floor(base, now - DAY, command=("python3", "other_tool.py"))
         with mock.patch.object(time, "time", return_value=now), mock.patch.object(
                 sweep, "send_floor_alert", side_effect=[False, True]) as send:
             self.assertEqual(self.hold(base, 300 * GIB, [2 * GIB])[0], 0)
@@ -3783,7 +3803,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
 
     def test_lock_contention_above_the_floor_and_dry_runs_send_no_lock_alert(self) -> None:
         base = self.base()
-        _ = self.locked_floor(base, time.time() - DAY)
+        _ = self.locked_floor(base, time.time() - DAY, command=("python3", "other_tool.py"))
         with mock.patch.object(sweep, "send_floor_alert") as send:
             self.assertEqual(self.hold(base, 300 * GIB, [301 * GIB])[0], 0)
             self.assertEqual(self.hold(base, 300 * GIB, [2 * GIB, 2 * GIB], dry_run=True)[0], 0)

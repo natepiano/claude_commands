@@ -1014,6 +1014,18 @@ def record_floor_lock(path: str, guard: int, started_at: float) -> None:
         os.fsync(handle.fileno())
 
 
+def _runs_sweep(command: bytes) -> bool:
+    argv = command.rstrip(b"\0").split(b"\0")
+    program = os.path.basename(argv[0])
+    if program == b"sweep.py":
+        return True
+    if re.fullmatch(rb"python(?:\d+(?:\.\d+)*)?", program):
+        for arg in argv[1:]:
+            if not arg.startswith(b"-"):
+                return os.path.basename(arg) == b"sweep.py"
+    return False
+
+
 def alert_floor_lock(path: str, free: int, floor: int, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> None:
@@ -1025,6 +1037,12 @@ def alert_floor_lock(path: str, free: int, floor: int, *,
         holder = floor_lock_holder(path, lint_settings=lint_settings)
         if not isinstance(holder, KnownFloorLockHolder):
             return
+        try:
+            command = (Path(PROC_DIR) / str(holder.pid) / "cmdline").read_bytes()
+            if _runs_sweep(command):
+                return
+        except OSError:
+            pass
         seconds = int(lint_settings.number(FLOOR_LOCK_ALERT_KEY) * 60)
         now = time.time()
         if now - holder.started_at < seconds:
