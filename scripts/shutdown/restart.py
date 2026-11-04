@@ -84,7 +84,10 @@ def session_launch(identity: str) -> tuple[Literal["claude", "codex"], dict[str,
         if kind == "codex":
             home = entry["environment"].get("CODEX_HOME", entry["config_dir"])
             return kind, {"CODEX_HOME": home}, ["resume", identity]
-        return kind, named_account_environment(Path(entry["config_dir"])), ["--resume", identity]
+        arguments = ["--resume", identity]
+        for directory in entry.get("plugin_directories", []):
+            arguments.extend(("--plugin-dir", directory))
+        return kind, named_account_environment(Path(entry["config_dir"])), arguments
     for directory in unit_move.config_dirs():
         if any((directory / "projects").glob(f"*/{identity}.jsonl")):
             return "claude", named_account_environment(directory), ["--resume", identity]
