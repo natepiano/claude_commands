@@ -5,15 +5,17 @@ from scripts.lint.memory_test_support import admission_policy_fixture
 
 from collections.abc import Iterator
 from dataclasses import replace
-import os
 from pathlib import Path
+import os
 import unittest
 from typing import Self, cast, override
 from unittest import mock
 
-from scripts.build_queue import head_facts, queue_card, queue_view
+from scripts.build_queue.scope_activity import ScopeProcesses, NoLiveBuildRun, LiveBuildRun
+from scripts.build_queue import head_facts, queue_card, queue_view, queue_evidence
 from scripts.build_queue import admission_protocol as wire
-from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
+from scripts.build_queue.admission_test_support import AdmissionFixture
+from scripts.build_queue.admission_test_support import only_admitted
 from scripts.build_queue.queue_fixture import (
     ASKING_SESSION, GOLDEN, NOW, QueueFixture, QueueFixtureTests, queue_read_fixture, waiting_rows, with_waiting,
 )
@@ -54,6 +56,204 @@ class QueueViewTests(QueueFixtureTests):
         return replace(self.fixture.model(), reading=reply.reading,
                        facts=head_facts.read_head_facts(reply.reading))
 
+    def test_running_row_marks_only_the_asking_session(self) -> None:
+        model = self.fixture.model()
+        grants = tuple(gate.RunningStep(session, session, "merge-gate", "/gate", 6 * gate.GIB,
+                                        gate.MeasuredMemory(gate.GIB)) for session in ("mine", "other"))
+        reading = queue_read_fixture(replace(model.reading.view, running=grants), policy=admission_policy_fixture())
+        model = replace(model, reading=reading)
+        for you, expected in (("mine", [1, 0]), ("other", [0, 1]), ("", [0, 0])):
+            with self.subTest(you=you):
+                rows = [row for row in queue_view.render_view(model, 100, you=you)
+                        if plain([row]).startswith("run")]
+                self.assertEqual([sum(span.text.count("▸") for span in row if span.tone == "suggestion")
+                                  for row in rows], expected)
+
+    def test_service_records_ended_scope_identity_and_the_view_uses_its_label(self) -> None:
+        with AdmissionFixture() as fixture:
+            owner = fixture.fixture_owner(700001, "100")
+            process = fixture.proc.path / str(owner.pid)
+            _ = (process / "environ").write_bytes(
+                b"CLAUDE_CODE_SESSION_ID=ended-session\0CLAUDE_SESSION_NAME=recorded worker\0")
+            _ = (process / "cmdline").write_bytes(b"python3\0worker.py\0")
+            sidecar = fixture.scope(owner)
+            scope = Path(sidecar.read_text())
+            _ = (scope / "cgroup.procs").write_text(str(owner.pid))
+            builds = fixture.root / "builds.slice"
+            builds.mkdir(exist_ok=True)
+            _ = scope.rename(builds / "ended.scope")
+            _ = fixture.server.run_pass()
+            model = replace(self.service_model(fixture), labels={"ended-session": UnitLabels("named worker")})
+            step, = (step for step in model.reading.view.running if step.session_id == "ended-session")
+            self.assertIsInstance(step.measured, gate.UnownedSliceMemory)
+            assert isinstance(step.measured, gate.UnownedSliceMemory)
+            self.assertIsInstance(step.measured.activity, ScopeProcesses)
+            text = plain(queue_view.render_view(model, 140))
+            self.assertIn("Still running after their build ended (1 process, 1.0 GiB)", text)
+            self.assertIn("named worker · python3", text)
+            self.assertNotIn("ended-session", text)
+
+    def test_ci_slice_processes_never_appear_as_ended_builds(self) -> None:
+        with AdmissionFixture() as fixture:
+            owner = fixture.fixture_owner(700001, "100")
+            process = fixture.proc.path / str(owner.pid)
+            _ = (process / "environ").write_bytes(b"CLAUDE_SESSION_NAME=ci-worker\0")
+            scope = Path(fixture.scope(owner).read_text()).rename(
+                fixture.root / gate.read_memory_config().ci_memory_slice)
+            _ = (scope / "memory.max").write_text(str(8 * gate.GIB))
+            for program in ("bash", "Runner.Listener", "Runner.Worker"):
+                with self.subTest(program=program):
+                    _ = (process / "cmdline").write_bytes(program.encode() + b"\0")
+                    _ = (process / "comm").write_text(program)
+                    with mock.patch.object(gate, "ci_slice_cgroup", return_value=scope):
+                        _ = fixture.server.run_pass()
+                    model = self.service_model(fixture)
+                    self.assertTrue(any(isinstance(step.measured, gate.UnownedSliceMemory)
+                                        for step in model.reading.view.running))
+                    text = plain(queue_view.render_view(model, 140))
+                    self.assertNotIn("Still running after their build ended", text)
+                    self.assertNotIn("ci-worker ·", text)
+
+    def test_live_run_owner_outside_the_scope_keeps_its_processes_live(self) -> None:
+        with AdmissionFixture() as fixture:
+            owner = fixture.fixture_owner(700001, "100")
+            child = fixture.fixture_owner(700002, "200")
+            process = fixture.proc.path / str(child.pid)
+            _ = (process / "environ").write_bytes(b"BUILDLOG_RUN=700001:100\0")
+            _ = (process / "cmdline").write_bytes(b"nextest\0")
+            scope = Path(fixture.scope(child).read_text())
+            builds = fixture.root / "builds.slice"
+            builds.mkdir(exist_ok=True)
+            _ = scope.rename(builds / f"run-p{owner.pid}-iabc.scope")
+            _ = fixture.server.run_pass()
+            model = self.service_model(fixture)
+            step, = (step for step in model.reading.view.running
+                     if isinstance(step.measured, gate.UnownedSliceMemory))
+            assert isinstance(step.measured, gate.UnownedSliceMemory)
+            activity = step.measured.activity
+            self.assertIsInstance(activity, ScopeProcesses)
+            assert isinstance(activity, ScopeProcesses)
+            self.assertIsInstance(activity.run, LiveBuildRun)
+            assert isinstance(activity.run, LiveBuildRun)
+            self.assertEqual((activity.run.pid, activity.run.start_time), (owner.pid, owner.start_time))
+            self.assertNotIn("Still running after their build ended", plain(queue_view.render_view(model, 140)))
+
+    def test_ended_processes_use_session_labels_and_exclude_the_ci_slice(self) -> None:
+        model = self.fixture.model()
+        ended = ScopeProcesses(2, "private-session-id", "recorded worker", "/tree", "python3", NOW - 120,
+                               True, NoLiveBuildRun())
+        live = replace(ended, run=LiveBuildRun(321, "123", NOW - 180))
+        listener = replace(ended, session_id="ci-owner", program="Runner.Listener")
+        rows = tuple(gate.RunningStep(activity.session_id, activity.session_name, "unowned", activity.folder, 0,
+            gate.UnownedSliceMemory(gate.GIB, owner=model.ci_memory_slice if activity is listener else "opaque.scope",
+                                    activity=activity))
+            for activity in (ended, live, listener))
+        reading = queue_read_fixture(replace(model.reading.view, running=rows), policy=admission_policy_fixture())
+        for labels, owner in (({"private-session-id": UnitLabels("named worker", "builds", "queue")}, "named worker"),
+                              ({}, "recorded worker")):
+            with self.subTest(owner=owner):
+                text = plain(queue_view.render_view(replace(model, reading=reading, labels=labels), 140))
+                section = text.split("Still running after their build ended", 1)[1]
+                self.assertIn("2 processes, 1.0 GiB", section)
+                self.assertIn(owner + " · python3 · 2 min · 1.0 GiB", section)
+                self.assertIn("ask the named owner to stop them if no longer needed", section)
+                for hidden in ("private-session-id", "unknown owner", "Runner.Listener", "opaque.scope"):
+                    self.assertNotIn(hidden, section)
+                self.assertEqual(section.count("python3"), 1)
+
+    def test_unowned_scope_stays_outside_the_granted_rows(self) -> None:
+        model = self.fixture.model()
+        grant = gate.RunningStep("gate", "gate", "merge-gate", "/gate", 6 * gate.GIB, gate.MeasuredMemory(gate.GIB))
+        scope = gate.RunningStep("gate", "gate", "unowned", "/gate", 0,
+                                gate.UnownedSliceMemory(2 * gate.GIB, owner="gate.scope"))
+        reading = queue_read_fixture(replace(model.reading.view, running=(grant, scope)), policy=admission_policy_fixture())
+        current = replace(model, reading=reading)
+        row, = queue_view.running_builds(current)
+        self.assertIs(row.step, grant)
+        text = plain(queue_view.render_view(current, 140))
+        self.assertEqual(sum(line.startswith("run") for line in text.splitlines()), 1)
+        self.assertNotIn("gate.scope", text)
+        self.assertEqual(current.reading.explanation.totals.measured, 3 * gate.GIB)
+
+    def test_running_and_waiting_share_one_table_without_merging_grants(self) -> None:
+        model = self.fixture.model()
+        grants = tuple(gate.RunningStep(f"gate-{index}", "gate", "merge-gate", f"/gate-{index}",
+            6 * gate.GIB, gate.MeasuredMemory(gate.GIB), unit="queue-unit") for index in range(3))
+        reading = queue_read_fixture(replace(model.reading.view, running=grants), policy=admission_policy_fixture())
+        explained = tuple(replace(row, admitted_at=NOW - (index + 1) * 60)
+                          for index, row in enumerate(reading.explanation.running))
+        reading = replace(reading, explanation=replace(reading.explanation, running=explained))
+        model = replace(model, reading=reading, labels={**model.labels,
+            **{step.session_id: UnitLabels("gate", "builds", "wrong-unit") for step in grants}})
+        for columns in (60, 100, 140):
+            with self.subTest(columns=columns):
+                lines = queue_view.render_view(model, columns)
+                text = plain(lines)
+                running = [line for line in text.splitlines() if line.startswith("run")]
+                self.assertEqual(len(running), 3)
+                for index, row in enumerate(running):
+                    unit = "queue-…" if columns == 60 else "queue-unit"
+                    self.assertEqual(row.split()[:4], ["run", "builds", unit, "merge-gate"])
+                    self.assertEqual(row.split()[4], str(index + 1))
+                    self.assertIn("6.0", row)
+                    if columns >= 100:
+                        self.assertIn("6.0 / 1.0", row)
+                waiting = waiting_rows(lines)
+                self.assertEqual([int(row.split()[0]) for row in waiting], list(range(1, 33)))
+                self.assertLess(text.index(running[-1]), text.index(waiting[0]))
+                self.assertEqual(sum(line.lstrip().startswith("# ") for line in text.splitlines()), 1)
+                self.assertTrue(all(terminal_width(line) <= columns for line in text.splitlines()))
+
+    def test_unit_override_survives_restart_and_matches_priority(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            first = fixture.request()
+            later = fixture.request(since=first.since + 1)
+            later = replace(later, identity=replace(later.identity, unit="queue-unit"),
+                            sidecar=str(fixture.scope(later.owner)))
+            _ = fixture.server.handle_request(first)
+            _ = fixture.server.handle_request(later)
+            fixture.restart()
+            _ = fixture.server.handle_request(first)
+            _ = fixture.server.handle_request(later)
+            labels = {first.identity.session_id: UnitLabels("first", "builds", "other-unit"),
+                      later.identity.session_id: UnitLabels("gate", "builds", "wrong-unit")}
+            with mock.patch.object(gate, "priority_labels", return_value=labels):
+                refused, = fixture.server.handle_request(wire.PrioritySetRequest("wrong-bump", "wrong-unit", "urgent", "user"))
+                self.assertIsInstance(refused, wire.Refused)
+                replies = fixture.server.handle_request(wire.PrioritySetRequest("bump-unit", "queue-unit", "urgent", "user"))
+                self.assertEqual(replies, [wire.Ok()])
+                model = self.service_model(fixture)
+                self.assertEqual([step.pid for step in model.reading.view.waiting], [later.owner.pid, first.owner.pid])
+                self.assertEqual(model.reading.view.waiting[0].unit, "queue-unit")
+                self.assertEqual(model.reading.view.waiting[1].unit, "")
+                self.assertEqual(queue_evidence.step_labels(model.reading.view.waiting[1], labels).unit, "other-unit")
+                self.assertEqual(queue_evidence.step_labels(model.reading.view.waiting[0], {}).unit, "queue-unit")
+                fixture.free(60 * gate.GIB)
+                _ = fixture.server.run_pass()
+                _ = fixture.server.run_pass()
+                model = self.service_model(fixture)
+                running = next(step for step in model.reading.view.running if step.session_id == later.identity.session_id)
+                self.assertEqual(queue_evidence.step_labels(running, labels).unit, "queue-unit")
+
+    def test_unit_override_view_row_matches_golden(self) -> None:
+        model = self.fixture.model()
+        waiting = model.reading.view.waiting
+        step = replace(waiting[0], unit="queue-unit", step="merge-gate")
+        model = replace(model, labels={**model.labels, step.session_id: UnitLabels("gate", "builds")},
+            reading=replace(model.reading, view=replace(model.reading.view, waiting=(step, *waiting[1:]))))
+        rows = plain(queue_view.render_view(model, 140)).splitlines()
+        row, = [row for row in rows if "queue-unit" in row]
+        self.assertEqual(row + "\n", (GOLDEN / "unit_override_view.txt").read_text())
+
+    def test_showrunner_without_a_unit_keeps_the_empty_unit_label(self) -> None:
+        model = self.fixture.model()
+        model = replace(model, labels={session: UnitLabels("builds", "builds") for session in model.labels})
+        text = plain(queue_view.render_view(model, 140))
+        rows = [line for line in text.splitlines() if line.startswith("run") or line.lstrip().startswith("1 ")]
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(row.split()[1:3], ["builds", "—"])
     def test_merge_gate_grant_has_a_running_row_with_use_and_grant(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request(step="merge-gate")
@@ -68,10 +268,11 @@ class QueueViewTests(QueueFixtureTests):
             for colour in (False, True):
                 lines = queue_view.render_view(model, 140, colour=colour)
                 text = plain(lines)
-                running, queued = text.split("Running\n", 1)[1].split("Queued\n", 1)
+                running = "\n".join(line for line in text.splitlines() if line.startswith("run"))
+                queued = "\n".join(waiting_rows(lines))
                 row, = [line for line in running.splitlines() if "merge-gate" in line]
                 self.assertIn("devtools", row)
-                self.assertIn("1.0 / 6.0", row)
+                self.assertIn("6.0 / 1.0", row)
                 self.assertIn("7", row.split())
                 self.assertEqual(row.count("merge-gate"), 1)
                 queued_row, = waiting_rows(lines)
@@ -99,12 +300,12 @@ class QueueViewTests(QueueFixtureTests):
             _ = fixture.server.run_pass()
             model = replace(self.service_model(fixture), labels={"between-owner": UnitLabels("worker", "hana", "hana")})
             text = plain(queue_view.render_view(model, 140))
-            running = text.split("Running\n", 1)[1].split("Queued\n", 1)[0]
+            running = "\n".join(line for line in text.splitlines() if line.startswith("run"))
             row, = [line for line in running.splitlines() if "between steps" in line]
             self.assertIn("hana", row)
             self.assertIn("1.0", row)
             self.assertIn("12", row.split())
-            self.assertNotIn("/", row)
+            self.assertIn("0.0 / 1.0", row)
             self.assertNotIn("Still running after their build ended", text)
 
     def test_ended_run_scope_names_its_process_owner_program_and_age(self) -> None:
@@ -128,10 +329,10 @@ class QueueViewTests(QueueFixtureTests):
             section = text.split("Still running after their build ended", 1)[1]
             self.assertIn("2 processes", section)
             self.assertIn("1.0 GiB", section)
-            self.assertIn("queue-unit", section)
-            self.assertIn("test fixture", section)
+            self.assertIn("worker · python3", section)
+            self.assertNotIn("ended-owner", section)
             self.assertIn("python3", section)
-            self.assertIn("started 2 days ago", section)
+            self.assertIn("2880 min", section)
             self.assertNotIn("unreadable-run-name.scope", text)
             self.assertNotIn("(unowned)", text)
 
@@ -353,8 +554,8 @@ class QueueViewTests(QueueFixtureTests):
                 self.assertEqual([int(row.split()[0]) for row in rows], list(range(1, 33)))
                 self.assertTrue(all(terminal_width(plain([line])) <= columns for line in rendered))
                 self.assertFalse(any(row.startswith("Session:") for row in rows))
-                self.assertIn("\nRunning\n", plain(rendered))
-                self.assertIn("\nQueued\n", plain(rendered))
+                self.assertEqual(sum(line.startswith("run") for line in plain(rendered).splitlines()), 1)
+                self.assertEqual(sum(line.lstrip().startswith("# ") for line in plain(rendered).splitlines()), 1)
                 self.assertEqual(plain(rendered).count("●"), 3)
                 for removed in ("starts", "moved up:", "#1 waits on"):
                     self.assertNotIn(removed, plain(rendered))
@@ -446,12 +647,12 @@ class BudgetViewTests(QueueFixtureTests):
         rows = waiting_rows(lines)
         self.assertEqual(len(rows), 32)
         self.assertEqual(rows[0][36:], "██████▊ 6.8 ↑ ≤14.2 9:18")
-        self.assertEqual(rows[0][3:13], "tool-base…")
-        self.assertEqual(rows[0][14:23], "●cables  ")
+        self.assertEqual(rows[0][4:14], "tool-base…")
+        self.assertEqual(rows[0][15:23], "●cables ")
         self.assertEqual(rows[0][24:31], "mend   ")
         self.assertEqual(rows[0][32:35], " 36")
-        self.assertIn("\nRunning\n", plain(lines))
-        self.assertIn("\nQueued\n", plain(lines))
+        self.assertEqual(sum(line.startswith("run") for line in plain(lines).splitlines()), 1)
+        self.assertEqual(sum(line.lstrip().startswith("# ") for line in plain(lines).splitlines()), 1)
         self.assertNotIn("moved up", plain(lines))
         self.assertNotIn("starts", plain(lines))
 
@@ -562,7 +763,7 @@ class BudgetViewTests(QueueFixtureTests):
         narrow = queue_view.render_view(model, 53, colour=True)
         first = next(line for line in narrow if plain([line]).lstrip().startswith("1 "))
         self.assertTrue(plain([first]).endswith("…"))
-        self.assertTrue(plain([first]).endswith(" ⊘ …"))
+        self.assertTrue(plain([first]).endswith(" ⊘…"))
         self.assertLessEqual(terminal_width(plain([first])), 53)
         self.assertTrue(all(span.until is None for span in first))
         head_index = narrow.index(first)
@@ -618,7 +819,8 @@ class BudgetViewTests(QueueFixtureTests):
                 self.assertIn("metrics-viewer", rows[0])
                 self.assertNotIn("performance-metrics-viewer", rows[0])
                 self.assertIn("tool-based-ui", rows[1])
-                self.assertIn("other-session", rows[1])
+                self.assertEqual(rows[1].split()[2], "—")
+                self.assertNotIn("other-session", rows[1])
                 self.assertEqual(rows[0].index("nextest"), rows[1].index("nextest"))
 
     def test_showrunner_prefix_is_removed_from_running_and_queued_units(self) -> None:
@@ -629,8 +831,9 @@ class BudgetViewTests(QueueFixtureTests):
         for step in (queued, running):
             labels[step.session_id] = UnitLabels("merge-gate", "builds", "builds-queue")
         text = plain(queue_view.render_view(replace(model, labels=labels), 140))
-        running_text, queued_text = text.split("Running\n", 1)[1].split("Queued\n", 1)
-        for section, offset in ((running_text, 0), (queued_text, 1)):
+        running_text = "\n".join(line for line in text.splitlines() if line.startswith("run"))
+        queued_text = "\n".join(waiting_rows(queue_view.render_view(replace(model, labels=labels), 140)))
+        for section, offset in ((running_text, 1), (queued_text, 1)):
             row, = [line for line in section.splitlines() if "builds" in line]
             self.assertEqual(row.split()[offset:offset + 2], ["builds", "queue"])
             self.assertNotIn("builds-queue", row)
@@ -642,7 +845,7 @@ class BudgetViewTests(QueueFixtureTests):
             with self.subTest(unit=missing_unit):
                 labels = {**model.labels, step.session_id: UnitLabels("builds", "builds", missing_unit)}
                 row = waiting_rows(queue_view.render_view(replace(model, labels=labels), 140))[0]
-                self.assertEqual(row.split()[1:3], ["builds", "builds"])
+                self.assertEqual(row.split()[1:3], ["builds", "—"])
 
     def test_queued_staff_unit_overrides_merge_gate_session_and_folder_names(self) -> None:
         model = self.fixture.budget_model()

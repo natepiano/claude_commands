@@ -33,6 +33,34 @@ GRANTED = admitted_reply("stem", GIB, "new-source", "stem.max", "stem.wave")
 
 
 class ClientTests(unittest.TestCase):
+    def test_unit_override_retries_a_strict_main_service_without_the_new_field(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            request = replace(request, identity=replace(request.identity, unit="queue-unit"))
+            transport = self.use_transport(fixture,
+                Exchange(reply_bytes(wire.Refused("invalid snapshot record fields"))), Exchange(reply_bytes(GRANTED)))
+            self.assertEqual(client.admit(request, lambda _reply: None, lambda: request), GRANTED)
+            first, second = transport.requests
+            assert isinstance(first, wire.AdmitRequest)
+            assert isinstance(second, wire.AdmitRequest)
+            self.assertEqual(first.identity.unit, "queue-unit")
+            self.assertEqual(second.identity.unit, "")
+            self.assertEqual(second.code_version, "")
+            self.assertEqual(replace(first, identity=second.identity, code_version=""), second)
+
+    def test_unit_override_uses_the_shared_request_identity(self) -> None:
+        with AdmissionFixture() as fixture:
+            original = fixture.request()
+            for unit in ("queue-unit", ""):
+                with self.subTest(unit=unit), mock.patch.dict(os.environ, {gate.BUILDLOG_UNIT: unit}):
+                    request = client.step_request(list(original.argv), original.cwd, original.owner,
+                        original.since, original.sidecar, original.episode, original.profile)
+                    self.assertEqual(request.identity.unit, unit)
+                    launch = wire.LaunchRequest(request.episode, request.owner, request.since,
+                                                request.identity, request.profile)
+                    self.assertEqual(launch.identity.unit, unit)
+                    self.assertEqual(gate.waiter_identity("nextest", "tree").get("unit", ""), unit)
+
     def use_transport(self, fixture: AdmissionFixture, *exchanges: Exchange) -> ScriptedTransport:
         transport = ScriptedTransport(fixture.clock, *exchanges)
         _ = self.enterContext(mock.patch.object(client, "CLOCK", fixture.clock))

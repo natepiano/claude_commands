@@ -5,7 +5,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 import os
 from pathlib import Path
-import re
 from typing import Protocol
 
 
@@ -126,13 +125,13 @@ class ScopeActivityReader:
         if not members:
             return EmptyBuildScope()
         oldest = min(members, key=lambda pid: (self.started_at(pid), pid))
-        leader = re.fullmatch(r"run-p([0-9]+)-i[0-9a-f]+\.scope", name)
-        owner = int(leader[1]) if leader else oldest
         session, name, folder = "", "", ""
         fixture = False
-        run = self.run(owner) if owner in members else NoLiveBuildRun()
+        run: LiveBuildRun | NoLiveBuildRun = NoLiveBuildRun()
         program = Path(self.command(oldest)[0]).name if self.command(oldest) else "unknown program"
         for pid in sorted(members):
+            if not isinstance(run, LiveBuildRun):
+                run = self.run(pid)
             for ancestor in self.ancestors(pid):
                 env = self.environment(ancestor)
                 session = session or env.get("CODEX_THREAD_ID") or env.get("CLAUDE_CODE_SESSION_ID", "")
