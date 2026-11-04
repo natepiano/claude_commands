@@ -67,6 +67,11 @@ The target is built and disabled. `offload=off`, and `targets=mac,natedev` does 
 
 ### Deployment: `deploy.py`, `docs/plans/builds-aws/`
 
+- `deploy.py price` reads the current Spot price through the deployment profile.
+  It writes the price and its read time to the state file named by `deployment_price_file`.
+  The default path is `~/.config/aws-build/deployment-price`. The file stays outside the repository and has mode `0600`.
+  `prepare`, `apply`, and `setup-start` read this file. `bootstrap` needs no price file.
+
 - `prepare` and `apply` read the Budget address from the private file named by `notification_email_file`.
   The default path is `~/.config/aws-build/notification-email`.
   The file must stay outside the public repository. `bootstrap` needs no address file.
