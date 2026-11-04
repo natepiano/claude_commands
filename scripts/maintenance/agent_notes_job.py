@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import signal
 import subprocess
 import sys
@@ -27,7 +26,6 @@ class Outcome(str, Enum):
     FAILED = "failed"
     TIMED_OUT = "timed out"
     NOT_DUE = "not due"
-    SKIPPED = "skipped"
 
 
 @dataclass(frozen=True)
@@ -57,7 +55,7 @@ def run_part(part: Part, cadence: Schedule, deadline: float) -> PartResult:
                     pass
                 output, _ = child.communicate()
                 return PartResult(part, Outcome.TIMED_OUT, time.monotonic() - started, 124, output)
-            return PartResult(part, {0: Outcome.SUCCESS, os.EX_TEMPFAIL: Outcome.SKIPPED}.get(child.returncode, Outcome.FAILED),
+            return PartResult(part, Outcome.SUCCESS if child.returncode == 0 else Outcome.FAILED,
                               time.monotonic() - started, child.returncode, output)
     except OSError as error:
         return PartResult(part, Outcome.FAILED, time.monotonic() - started, 1, str(error))
@@ -74,7 +72,7 @@ def run_job() -> list[PartResult]:
 
         def record(result: PartResult) -> None:
             results[result.part] = result
-            if result.outcome in (Outcome.SUCCESS, Outcome.SKIPPED):
+            if result.outcome is Outcome.SUCCESS:
                 history.record(result.part.value, time.time())
 
         # Quota and the pacer read completed notes; the vault follows all writers.
@@ -157,9 +155,6 @@ def _perform(part: Part) -> int:
     elif part is Part.PRUNE:
         from scripts.production.prune_phase_notes import main
         return main()
-    elif part is Part.HIERARCHY:
-        from scripts.maintenance.hana_hierarchy import main
-        return main([], refusal_exit=os.EX_TEMPFAIL)
     else:
         from scripts.maintenance import vault_commit
         vault = Path.home() / "rust/hanadocs"
@@ -167,7 +162,8 @@ def _perform(part: Part) -> int:
         tracked = vault_commit.git(str(vault), "ls-files", "-z", "--", ":(glob)agents/*.md")
         paths = {str(path) for path in notes.glob("*.md")}
         paths.update(str(vault / path) for path in tracked.stdout.split("\0") if path)
-        paths.add(str(vault / "hana hierarchy.md"))
+        if not paths:
+            return 0
         timestamps = (r"^date_modified:", r"^weekly_usage_checked_at:", r"^weekly_remaining_usage:",
                       r"^credit_balance:", r"^resets:", r"^limit_reset:", r"^Snapshot taken ")
         return vault_commit.main(["--job", "agent-notes", *[arg for pattern in timestamps for arg in ("--timestamp", pattern)], "--", *sorted(paths)])

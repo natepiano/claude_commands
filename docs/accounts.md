@@ -157,15 +157,14 @@ A readable credential entry without a token requires a session or manual login.
 
 Natedev's `agent-notes` job runs `scripts/maintenance/agent_notes_job.py`.
 Notes, quota warnings, the Codex pacer, refusal moves, crash recovery, phase-note
-pruning, the hana hierarchy note and the vault commit each run in a separate
-process with a time limit. `config/agent_notes.toml` owns their intervals and
+pruning and the vault commit each run in a separate process.
+Each process has a time limit. `config/agent_notes.toml` owns their intervals and
 limits and is read on each run. A slow or failed part does not stop the other
 parts. Quota warnings and the pacer read after the notes part exits;
 the vault commit runs after the writers exit. A rerun skips completed parts
 until their next interval and retries failed parts.
-A part that leaves its note as it stands is logged as skipped and counts as
-completed for its interval; a source-command failure or timeout still fails
-the job. Completion times and the job lock live in `~/.local/state/agent-notes/job/`.
+A failed or timed-out part fails the job.
+Completion times and the job lock live in `~/.local/state/agent-notes/job/`.
 
 Notes reuse usage reports for less than ten minutes, keeping their original
 reading times. Each notes pass refreshes session counts from the roster. Usage reports without credentials stay in
