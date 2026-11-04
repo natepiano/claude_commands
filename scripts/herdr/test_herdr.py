@@ -261,6 +261,17 @@ class NativePaneSessionTests(StaffTestCase):
 
 
 class CodexAnomalyNameTests(StaffTestCase):
+    def test_codex_managed_daemon_distinguishes_thread_holders(self) -> None:
+        managed = ["/opt/bin/codex", "app-server", "--listen", "unix://",
+                   "--analytics-default-enabled", "--managed-daemon"]
+        wrapped = ["node", "/opt/@openai/codex/bin/codex.js", *managed[1:]]
+        for arguments, expected in ((managed, True), (wrapped, True),
+                (["nodejs", *wrapped[1:]], True), (managed[:-1], False),
+                (["codex", "resume", "thread"], False), ([], False),
+                (["other", "app-server", "--managed-daemon"], False)):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(herdr.codex_managed_daemon(arguments), expected)
+
     def test_daemon_rollouts_prove_threads_without_notes_from_its_tui_clients(self) -> None:
         proc = self.root / "proc"
         process = proc / "42"
@@ -286,6 +297,13 @@ class CodexAnomalyNameTests(StaffTestCase):
             self.assertEqual(output.getvalue(), "")
             with self.assertRaisesRegex(ValueError, "ambiguous"):
                 _ = herdr.codex_rollout_thread(42)
+            _ = (process / "cmdline").write_bytes(b"codex\0app-server\0--managed-daemon\0")
+            live = sorted(identities)[0]
+            (proc / "43" / "fd" / "0").symlink_to(self.root / f"rollout-{live}.jsonl")
+            self.assertEqual(herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon), {live})
+            (proc / "43" / "fd" / "0").unlink()
+            self.assertEqual(herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon), set())
+            self.assertEqual(output.getvalue(), "")
 
     def assert_unknown_codex_note(self, source: Literal["tab", "registry", "pid"]) -> None:
         pid = 998071
