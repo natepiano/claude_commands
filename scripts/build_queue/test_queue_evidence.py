@@ -87,7 +87,8 @@ class QueueEvidenceTests(unittest.TestCase):
         _ = self.running(400, "frame-cost", "clippy", 6.8, 6.1, 60)
         compiler = self.root / "builds.slice/sccache.service"
         compiler.mkdir(parents=True)
-        _ = (compiler / "memory.stat").write_text(f"anon {gib(0.4)}\nfile 0\n")
+        _ = (compiler / "memory.stat").write_text(f"anon {gib(0.4)}\nfile 0\ninactive_file 0\n")
+        _ = (compiler / "memory.current").write_text(str(gib(0.4)))
         self.head_path = self.waiter(500, "inspectors-fix", 11.8, 122)
         self.change_head(need_source="measured", need_runs=7, test_threads=8,
                          test_scope="filtered", package="hana_inspectors",
@@ -158,7 +159,9 @@ class QueueEvidenceTests(unittest.TestCase):
         for pattern in ("*.reservation", "*.max", "*.wave"):
             for path in self.directory.glob(pattern):
                 path.unlink()
-        _ = (self.root / "builds.slice/sccache.service/memory.stat").write_text("anon 0\nfile 0\n")
+        compiler = self.root / "builds.slice/sccache.service"
+        _ = (compiler / "memory.stat").write_text("anon 0\nfile 0\ninactive_file 0\n")
+        _ = (compiler / "memory.current").write_text("0")
         _ = (self.root / "meminfo").write_text(
             f"MemAvailable: {gib(available) // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
         self.change_head(need=gib(need))
@@ -470,7 +473,11 @@ class QueueEvidenceTests(unittest.TestCase):
         with mock.patch.object(gate, "smallest_head_release",
                                side_effect=AssertionError("the card must reuse the release result")):
             lines = plain(queue_card.render_selection(model, "1", 400)).splitlines()
-        self.assertEqual(len(explanation.running), 20)
+        self.assertEqual(len(explanation.running), 21)
+        compiler, = (row for row in explanation.running
+                     if isinstance(row.step.measured, gate.CompilerServiceMemory))
+        self.assertEqual(compiler.charged, 0)
+        self.assertEqual(sum(gate.running_has_reservation(row.step) for row in explanation.running), 20)
         final = " ".join("\n".join(lines).partition("Frees when:")[2].split())
         self.assertNotIn("still leaves", final)
         self.assertIn("end (budget charge drops", final)
@@ -535,8 +542,9 @@ class QueueEvidenceTests(unittest.TestCase):
             self.assertIn(f"promise {promise} GiB, charge {charge} GiB, using now {used} GiB", row)
             self.assertIn(basis, row)
         compiler, = [line for line in rows if "sccache.service" in line]
-        self.assertIn("admission time unknown", compiler)
-        self.assertIn("promise 0.0 GiB, charge 0.4 GiB, using now 0.4 GiB", compiler)
+        self.assertIn("sccache.service: idle; 0.4 GiB RAM; 0.0 GiB swapped", compiler)
+        self.assertIn("promise 0.0 GiB, charge 0.4 GiB", compiler)
+        self.assertNotIn("admission time unknown", compiler)
         self.assertNotIn("stale-widget", output)
         self.assertNotIn("p34-merge", running_section)
 
@@ -659,7 +667,9 @@ class QueueEvidenceTests(unittest.TestCase):
             assert isinstance(reading, gate.QueueRead)
             head = reading.explanation.head
             assert isinstance(head, gate.HeadExplanation)
-            running, = reading.explanation.running
+            self.assertEqual(len(reading.explanation.running), 2)
+            running, = (row for row in reading.explanation.running
+                        if gate.running_has_reservation(row.step))
             lines.append((queue_evidence.need_text(head.need_source, zone=user_zone()), queue_evidence.charge_text(
                 running.basis, user_zone(), reading.explanation.policy, running.step.step)))
             self.assertEqual(running.charged, 6 * GIB)
@@ -779,7 +789,7 @@ class QueueEvidenceTests(unittest.TestCase):
 
     def test_dev_shape_names_its_measured_promise_factor(self) -> None:
         source = gate.RecordedNeed("shape", 2, 14, "full", "", (), gate.WidthNotRecorded(),
-                                   gate.ShapeLargest(2, factor=gate.DevHeadroom()))
+                                   gate.ShapeLargest(2, factor=gate.LegacyDevMultiplierHeadroom()))
         text = queue_evidence.need_text(source, zone=user_zone())
         self.assertEqual(text.split("; ")[2], "dev promise factor × 4.203")
         self.assertNotIn("release headroom", text)

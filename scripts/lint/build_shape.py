@@ -86,38 +86,89 @@ def build_shape(argv: Sequence[str]) -> BuildShape:
     return BuildShape(profile, tuple(sorted(features)), tuple(sorted(targets)) or ("all",))
 
 
-def index_shapes(index_path: Path, host: str, step: str,
-                 cutoff: datetime, before: datetime) -> dict[tuple[str, str], BuildShape]:
-    """Join (call id, step) to shape in [cutoff, before), by index start time.
+@dataclass(frozen=True)
+class CompiledCrates:
+    count: int
 
-    A call id follows one invocation across checkout folders. No index sync
-    runs. A missing or old index supplies no join and is never
-    created. The caller must still check a peak row's own repository and time.
+
+@dataclass(frozen=True)
+class NoCratesCompiled:
+    """The known attempts compiled no crates."""
+
+
+@dataclass(frozen=True)
+class CompileCountUnknown:
+    """The index has no usable compile count."""
+
+
+def combine_compile_counts(first: CompiledCrates | NoCratesCompiled | CompileCountUnknown,
+                           second: CompiledCrates | NoCratesCompiled | CompileCountUnknown
+                           ) -> CompiledCrates | NoCratesCompiled | CompileCountUnknown:
+    """Keep positive counts and preserve uncertainty across attempts."""
+    if isinstance(first, CompiledCrates) or isinstance(second, CompiledCrates):
+        return CompiledCrates((first.count if isinstance(first, CompiledCrates) else 0)
+                              + (second.count if isinstance(second, CompiledCrates) else 0))
+    if isinstance(first, CompileCountUnknown) or isinstance(second, CompileCountUnknown):
+        return CompileCountUnknown()
+    return NoCratesCompiled()
+
+
+@dataclass(frozen=True)
+class StepEvidence:
+    shape: BuildShape | NoBuildShape
+    compilation: CompiledCrates | NoCratesCompiled | CompileCountUnknown
+
+
+def index_step_evidence(index_path: Path, host: str, step: str,
+                        cutoff: datetime, before: datetime) -> dict[tuple[str, str], StepEvidence]:
+    """Read independent shape and compile evidence for each call and step.
+
+    The caller filters the peak row by repository and completion time.
+    Missing columns preserve the facts that the index can supply.
     """
-    shapes: dict[tuple[str, str], BuildShape] = {}
+    evidence: dict[tuple[str, str], StepEvidence] = {}
     try:
         with closing(sqlite3.connect(index_path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+            columns = {row[1] for row in cast(list[tuple[object, ...]],
+                       connection.execute("PRAGMA table_info(steps)").fetchall())}
+            argv_column = "argv" if "argv" in columns else "NULL"
+            count_column = "crates_compiled" if "crates_compiled" in columns else "NULL"
             rows = cast(list[tuple[object, ...]], connection.execute(
-                "SELECT call_id, step, argv, started_at FROM steps WHERE host=? AND step=?",
-                (host, step),
+                f"SELECT call_id, step, {argv_column}, started_at, {count_column} "
+                + "FROM steps WHERE host=? AND step=?", (host, step),
             ).fetchall())
-        for call_id, name, raw_argv, started_at in rows:
-            if not isinstance(call_id, str) or not call_id or not isinstance(raw_argv, str):
+        for call_id, name, raw_argv, started_at, count in rows:
+            if not isinstance(call_id, str) or not call_id or not isinstance(name, str):
                 continue
-            if not isinstance(name, str) or not isinstance(started_at, str):
-                continue
+            dated = False
             try:
-                if not cutoff <= datetime.fromisoformat(started_at) < before:
-                    continue
-                decoded = cast(object, json.loads(raw_argv))
-                if not isinstance(decoded, list) or not decoded:
-                    continue
-                words = cast(list[object], decoded)
-                if not all(isinstance(word, str) for word in words):
-                    continue
-                shapes[call_id, name] = build_shape(cast(list[str], words))
+                if isinstance(started_at, str):
+                    if not cutoff <= datetime.fromisoformat(started_at) < before:
+                        continue
+                    dated = True
             except (ValueError, TypeError):
-                continue
+                pass
+            compilation: CompiledCrates | NoCratesCompiled | CompileCountUnknown = CompileCountUnknown()
+            if dated and isinstance(count, int) and not isinstance(count, bool):
+                if count > 0:
+                    compilation = CompiledCrates(count)
+                elif count == 0:
+                    compilation = NoCratesCompiled()
+            shape: BuildShape | NoBuildShape = NoBuildShape()
+            try:
+                decoded = cast(object, json.loads(raw_argv)) if isinstance(raw_argv, str) else None
+                if isinstance(decoded, list) and decoded:
+                    words = cast(list[object], decoded)
+                    if all(isinstance(word, str) for word in words):
+                        shape = build_shape(cast(list[str], words))
+            except (ValueError, TypeError):
+                pass
+            previous = evidence.get((call_id, name))
+            if previous is not None:
+                compilation = combine_compile_counts(previous.compilation, compilation)
+                if isinstance(shape, NoBuildShape):
+                    shape = previous.shape
+            evidence[call_id, name] = StepEvidence(shape, compilation)
     except (OSError, sqlite3.Error):
         pass
-    return shapes
+    return evidence

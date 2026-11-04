@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.astra import design_roles
 from scripts.direct import workers
+from scripts.astra.design_role_test_support import designer_fixture
 from scripts.production import staff, unit_config
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, unit_membership, StaffTestCase, isolated_source_readers
 from scripts.lib.atomic_file import write_text_atomic
@@ -190,7 +191,7 @@ class FolderMoveFixture(StaffTestCase):
     history: Path = Path()
     records: Path = Path()
     owner: staff.StaffRow = staff.StaffRow(
-        staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "unit", "fixture", None,
+        staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "unit", "fixture", staff.StaffRoot(),
         current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"))
 
     @override
@@ -239,14 +240,12 @@ class FolderMoveFixture(StaffTestCase):
             str(self.root / "neighbour"), {}, ["claude", "-n", "neighbour"])
         pane_record.write("agents", sibling)
         fields: dict[str, object] = {
-            "run_id": "move-run", "working_dir": str(self.old_folder), "worktree": self.old_folder.name,
-            "branch": "unit-branch", "plan_doc": str(self.old_folder / "plan.md"),
+            "run_id": "move-run", "main_agent": {"session_id": self.owner.current_session},
+            "branch": "unit-branch", "plan_doc": "plan.md",
             "history_file": str(self.history), "status": "active", "production": "production", "unit": "kept-name",
         }
         write_text_atomic(self.history, json.dumps({**fields, "event_type": "run_started", "run_started_at": 1}) + "\n")
         write_text_atomic(self.run_dir / STATE_FILENAME, json.dumps(fields) + "\n")
-        write_text_atomic(self.run_dir / "working_dir", str(self.old_folder) + "\n")
-        write_text_atomic(self.run_dir / "director", self.owner.current_session + "\n")
 
     def folder_git(self, checkout: Path, *arguments: str) -> str:
         result = subprocess.run(["git", "-C", str(checkout), *arguments],
@@ -445,7 +444,7 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
         # Failure injection scripts assign these names just as they do in a CLI
         # subprocess. Each call restores them before another test can observe it.
         for module, names in ((os, ("rename", "replace")),
-                              (workers, ("move_unit", "rename_unit", "end_unit", "repoint_unit_worktree"))):
+                              (workers, ("end_unit",))):
             for name in names:
                 _ = scope.enter_context(mock.patch.object(module, name, cast(object, getattr(module, name))))
 
@@ -484,6 +483,10 @@ def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members
     environment.update(STAFF_FILE=str(case.staff_file), STAFF_TEST_OWNER_FILE=str(case.staff_file))
     _ = case.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, environment)))
     _ = case.enterContext(isolated_source_readers())
+    roots = tuple(Path(root) for root in environment.get(
+        "PROGRESS_SESSION_ROOTS", environment.get("UNIT_RUN_ROOT", str(case.root / "runs"))).split(":"))
+    _ = case.enterContext(mock.patch.object(progress_history, "SESSION_ROOTS", roots))
+    _ = case.enterContext(mock.patch("progress_history.SESSION_ROOTS", roots))
     for name, attribute, reader in (
         ("scripts.production.showrunners", "socket_for", FIXTURE_SOCKET_FOR),
         ("unit_lookup", "marked_units", FIXTURE_MARKED_UNITS),
@@ -782,23 +785,25 @@ class ProductionRenameFixture(StaffTestCase):
     def held_design(self, repository_id: str, checkout: Path) -> design_roles.HeldDesign:
         """Save an open design with a private checkout."""
         with mock.patch.dict(os.environ, self.env):
-            design_roles.register_repository(repository_id, {"fixture-host": str(checkout)}, inventory_complete=True)
+            design_roles.register_repository(repository_id, {"fixture-host": str(checkout)})
             placement = design_roles.authority_request("reserve", {"repository_id": repository_id, "document": "design.md",
                                                             "host": "fixture-host", "request_id": repository_id})
+            parent = staff.snapshot().by_worktree("natedev", checkout) or staff.by_path(OLD)
+            assert parent is not None
+            row = designer_fixture(parent.id, f"old-{repository_id}-astra-designer", self.root / "codex-home")
+            self.env["CODEX_HOME"] = str(self.root / "codex-home")
             design = design_roles.HeldDesign(
                 design_roles.DesignPlacement(str(placement["design_id"]), "fixture-host", 1), repository_id, str(checkout),
                 str(checkout / "design.md"), "design", "2026-10-22T12:00:00+00:00", design_roles.DesignUnbound(),
-                (design_roles.RoleInstance("designer", f"old-{repository_id}-astra-designer", design_roles.RoleOpen("designer-thread")),
+                (design_roles.RoleInstance("designer", f"old-{repository_id}-astra-designer", design_roles.RoleOpen(row.id)),
                  design_roles.RoleInstance("reviewer", f"old-{repository_id}-astra-reviewer", design_roles.RoleNotOpened())))
             design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
             self.write(design_roles.mesh_directory(design.placement.design_id) / "mesh_roster.json", json.dumps(
-                {design.roles[0].name: {"thread_id": "designer-thread", "status": "done", "cwd": str(checkout)}}))
+                {design.roles[0].name: {"staff_id": row.id, "status": "done"}}))
         return design
 
     def read_held(self, design: design_roles.HeldDesign) -> tuple[design_roles.HeldDesign, str]:
-        """The design as saved now, and its designer's launch directory."""
+        """Read the current design and its repository."""
         with mock.patch.dict(os.environ, self.env):
             current = design_roles.read_design(design.placement.design_id)
-            roster = cast(dict[str, dict[str, str]], json.loads(
-                (design_roles.mesh_directory(design.placement.design_id) / "mesh_roster.json").read_text()))
-        return current, roster[design.roles[0].name]["cwd"]
+        return current, current.repository

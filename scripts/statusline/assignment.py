@@ -20,7 +20,7 @@ def assignment(record: staff.StaffSnapshot, session_id: str) -> tuple[str, str]:
         return f"{row.name} showrunner", "showrunner"
     if row.kind == "worker":
         return "worker", "worker"
-    parent = record.by_id(row.parent) if row.parent is not None else None
+    parent = record.parent_of(row)
     label = f"{row.name} unit"
     if parent is not None:
         label += f" for {parent.name}"

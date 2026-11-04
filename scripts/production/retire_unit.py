@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 for folder in ("production", "lib", "message", "shutdown", "direct"):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / folder))
 
-from scripts.production import session_staff, staff, staff_sources, unit_config
+from scripts.production import staff, staff_sources, unit_config
 from scripts.shutdown.remote import local_machine
 from scripts.shutdown import stop_resume
 from scripts.message import sessions
@@ -167,12 +167,6 @@ def mac_claims(worktree: Path) -> tuple[MacClaim, ...]:
         if claim.get("worktree") == str(worktree) and isinstance(pid, int) and not isinstance(pid, bool):
             found.append(MacClaim(path, str(claim.get("what", path.stem)), pid, str(claim.get("proc_start", ""))))
     return tuple(found)
-
-
-def transcript_locations(session_id: str) -> list[Path]:
-    """Distinct project folders holding this transcript, including shared account symlinks once."""
-    return sorted({path.resolve() for directory in unit_move.config_dirs()
-                   for path in (directory / "projects").glob(f"*/{session_id}.jsonl")})
 
 
 def terminate(pids: list[int], what: dict[int, str], wait: float | None = None, *, settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[str]:
@@ -406,9 +400,9 @@ def _command_name(pid: int) -> str:
 
 
 def find_unit(slug: str, given: str, *,
-              record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT,
+              record: staff.StaffSnapshot | None = None,
               settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Unit:
-    record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+    record = staff.snapshot() if record is None else record
     production = production_of(slug, record=record)
     member = record.by_id(staff.StaffId(given))
     if member is None or member.kind != "unit":
@@ -499,8 +493,8 @@ def release_reservations(unit: Unit, *, settings: conf.ConfigRead) -> None:
 
 
 def retire(unit: Unit, *, settings: conf.ConfigRead,
-           record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> int:
-    record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+           record: staff.StaffSnapshot | None = None) -> int:
+    record = staff.snapshot() if record is None else record
     row = unit.staff_member
     if unit.retired and not unit.worktree.exists():
         print("unchanged")
@@ -519,6 +513,8 @@ def retire(unit: Unit, *, settings: conf.ConfigRead,
         _ = unit_config.write_parked(row.id, replace(config, retired=facts))
     owned = members(unit, record)
     for member in owned:
+        if isinstance(record.backends.get(member.id), staff.CodexBackend):
+            continue
         try:
             outcome = stop_resume.stop(member.current_session)
             if isinstance(outcome, stop_resume.StopFailed):
