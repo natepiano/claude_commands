@@ -262,3 +262,15 @@ The builds showrunner, 2026-11-03: add-on 1 is current and belongs to report-uni
 Acceptance: tests pin the target folder for each step kind and the explicit none state. A live run of one step shows its folder in the index.
 
 **Files:** `scripts/buildlog/` (writer and index), each caller that records a step (found by search; `scripts/direct/verify.sh` first).
+
+### Phase 12 — A vault stop that waits on the user does not fail buildlog.service  · status: done
+**Depends on:** none (urgent bump from the builds showrunner, 2026-11-03)
+
+The user unit `buildlog.service` on natedev failed from 21:29 EST. The vault step stopped on uncommitted files in `~/rust/hanadocs` on the Mac and returned exit 1 (`vault_pull.py:310` returns 1 for every stop except "Mac unreachable"). The stop already alerts the user to commit or discard the files.
+
+1. A vault stop that waits on a user action, with its alert sent, exits 0 and keeps its printed stop line.
+2. A real failure (`command_failed`) still exits 1.
+
+Acceptance: tests pin exit 0 for `tracked_files_changed` and exit 1 for `command_failed`. The next hourly `buildlog.service` run ends without failure.
+
+**Files:** `scripts/buildlog/vault_pull.py`, `scripts/buildlog/test_vault_pull.py`.
