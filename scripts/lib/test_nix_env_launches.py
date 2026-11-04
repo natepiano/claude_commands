@@ -21,14 +21,13 @@ for dependency in ("lib", "herdr", "production", "message", "shutdown", "notify"
 sys.path.insert(0, str(ROOT))
 if TYPE_CHECKING:
     from scripts.herdr import herdr, herdr_sessions, pane_launch
-    from scripts.production import add_unit, add_showrunner, production_units
+    from scripts.production import add_unit, add_showrunner
     from scripts.shutdown import pane_restore, pane_record
     from scripts.notify import review
     from scripts.notify.user_action import NoActionRequired
 else:
     import herdr
     import add_unit
-    import production_units
     import add_showrunner
     import pane_restore
     import pane_record
@@ -39,6 +38,7 @@ else:
 from scripts.accounts import accounts
 from scripts.lib import nix_env
 from scripts.production import staff
+from scripts.production.production_doc import Production
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 from scripts.shutdown.remote import local_machine
 from scripts.lib.nix_env_test_support import NixFixture
@@ -91,8 +91,8 @@ class HerdrLaunchTests(NixFixture):
         started.assert_called_once()
         _ = self.continued(lambda: herdr.launch_agent("host", "space", "title", str(self.work), {}, "claude", [], herdr.NoOpeningPrompt(), 100, agent="fixture"))
 
-    def production(self) -> production_units.Production:
-        return production_units.Production(self.root / "child-production.md", "child", "merge", self.root / "checkout", self.root / "log", ZoneInfo("UTC"))
+    def production(self) -> Production:
+        return Production(self.root / "child-production.md", "child", "merge", self.root / "checkout", self.root / "log", ZoneInfo("UTC"))
 
     def test_choke_point_keeps_the_new_tab_when_agent_start_fails(self) -> None:
         with (patch.object(nix_env, "ensure", return_value=nix_env.NoEnvrc(self.env)),
@@ -163,8 +163,7 @@ class HerdrLaunchTests(NixFixture):
     def test_add_unit_uses_session_cwd_before_opening(self) -> None:
         request = add_unit.UnitLaunch(production=self.production(), identity=add_unit.UnitIdentity("unit", "worker"),
             branch="fixture", worktree=self.root / "unused-checkout", plan=add_unit.Standby(),
-            port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(), session=add_unit.ResumedSession("sid", self.work),
-            launch_kind=add_unit.NewWorkLaunch(), timeout=1)
+            port=add_unit.OmittedCell(), session=add_unit.ResumedSession("sid", self.work), timeout=1)
         errors = io.StringIO()
         with isolated_staff_file(self.root / "staff.json", self.env), redirect_stderr(errors):
             member = unit_membership("child", "unit")

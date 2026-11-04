@@ -47,6 +47,8 @@ def row_folder(row: staff.StaffRow, record: staff.StaffSnapshot) -> tuple[str, P
     while True:
         if isinstance(member.worktree, (staff.PresentWorktree, staff.RemovedWorktree)):
             return member.worktree.machine, member.worktree.path
+        if member.kind == "unit":
+            raise ValueError(f"{row.name}: the staff worktree is unavailable")
         if isinstance(member.doc, staff.LiveDoc):
             return member.doc.machine, member.doc.path.parent
         parent = record.by_id(member.parent) if member.parent is not None else None

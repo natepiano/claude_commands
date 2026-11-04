@@ -11,7 +11,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import showrunners, staff
 from scripts.shutdown import remote
 import unit_lookup
-from production_units import order_unit_names
 
 
 class LiveUnit(NamedTuple):
@@ -34,7 +33,7 @@ def _production_slug(doc: Path, record: staff.StaffSnapshot,
             else showrunners.production_slug(str(doc)))
 
 
-def production_units(doc: Path) -> list[LiveUnit]:
+def units_of_doc(doc: Path) -> list[LiveUnit]:
     """List recorded unit children with their current panes."""
     record = staff.snapshot()
     sources = unit_lookup.member_sources()
@@ -42,39 +41,27 @@ def production_units(doc: Path) -> list[LiveUnit]:
     metadata = unit_lookup.unit_metadata(record, sources, slug=slug)
     for problem in metadata.problems:
         print(f"live_units: {problem.name}: unavailable: {problem.reason}", file=sys.stderr)
-    every = unit_lookup.every_marked_unit(record=record, sources=sources)
-    return _units_in(doc, every, slug)
+    return _joined(slug, unit_lookup.every_marked_unit(record=record, sources=sources))
 
 
 def units_in(doc: Path, every: unit_lookup.MarkedProductions) -> list[LiveUnit]:
     """Join a production through its recorded document and the caller's pane snapshot."""
     record = staff.snapshot()
     sources = unit_lookup.member_sources()
-    return _units_in(doc, every, _production_slug(doc, record, sources))
+    return _joined(_production_slug(doc, record, sources), every)
 
 
-def _units_in(doc: Path, every: unit_lookup.MarkedProductions, slug: str) -> list[LiveUnit]:
-    members = every.members.get(slug, ())
-    offline = set(members) - every.units.get(slug, {}).keys()
-    try:
-        lines = doc.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError) as error:
-        print(f"live_units: {slug}: {error}", file=sys.stderr)
-        lines = []
-    names = order_unit_names(lines, members, offline=offline)
-    return _joined(slug, names, every)
-
-
-def _joined(slug: str, units: list[str], every: unit_lookup.MarkedProductions) -> list[LiveUnit]:
+def _joined(slug: str, every: unit_lookup.MarkedProductions) -> list[LiveUnit]:
+    """Units in staff row order, each with its pane."""
     if fault := every.production_fault(slug):
         raise OSError(fault)
     marked = every.units.get(slug, {})
-    return [LiveUnit(unit, marked.get(unit)) for unit in units]
+    return [LiveUnit(unit, marked.get(unit)) for unit in every.members.get(slug, ())]
 
 
 def units_of(runner: showrunners.Showrunner) -> list[LiveUnit]:
     """The showrunner's units. A showrunner whose update timer names no doc has none to list."""
-    return production_units(Path(runner["doc"])) if runner["doc"] else []
+    return units_of_doc(Path(runner["doc"])) if runner["doc"] else []
 
 
 def live_unit_names(runner: showrunners.Showrunner) -> list[str]:
@@ -94,7 +81,7 @@ def main(arguments: list[str]) -> int:
     try:
         match arguments:
             case ["--production", doc]:
-                units = production_units(Path(doc))
+                units = units_of_doc(Path(doc))
             # An update prompt written before a production was named by its doc names the showrunner.
             case [showrunner] if not showrunner.startswith("-"):
                 units = units_of(showrunners.named(showrunner))

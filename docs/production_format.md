@@ -58,8 +58,8 @@ must not drift from it:
   to another production's (`/showrunner:attach`). The one at the top of a tree is
   the root: it shows every item that needs the user from the productions below
   it, and the user may still work with any showrunner directly. A child showrunner is never a
-  unit: it keeps its own production doc, merge branch and units, and has no row
-  in its parent's Units table. Which production reports to which is state on the
+  unit: it keeps its own production doc, merge branch and units, and its staff
+  row is a showrunner row. Which production reports to which is state on the
   machine, `~/.local/state/showrunner/<child slug>/parent`, and no line in either
   production doc, so either side attaches without a commit in the other's
   checkout. Look it up with `showrunners.py parent|children|root <slug>`.
@@ -137,43 +137,6 @@ A unit sends to the address `showrunners.py address <slug>` prints, not to the
 name: the address is the showrunner's session on this machine, and `SendMessage`
 refuses a name that another session of the same account also has.
 
-## Units
-
-| Unit | Plan | Worktree | Branch | Port | Owns |
-| --- | --- | --- | --- | --- | --- |
-| <name>-unit | <plan path> | <path> | <branch> | <app port or —> | <dirs/files> |
-
-The Unit value names the unit everywhere: in the log, the dailies, the waits and every
-tool's arguments. A unit's session name is written nowhere, because the user may rename
-a session at any time. The unit's herdr session carries the production's
-slug and the unit's id as marks, set at launch. To reach a unit, look it up at that moment:
-`$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <slug> <unit>`
-prints its pane, and `unit_lookup.py list <slug>` prints every unit's pane and its
-session name now. `<slug>` is this doc's file name without `-production.md`; a former
-slug from the Formerly line also works, and a mark set before a rename is found under
-the current slug.
-
-To rename a unit, run `/showrunner:rename_unit <old> <new>` from the showrunner session,
-between phases. Never edit the Unit, Worktree or Branch cell by hand. The rename stops the unit,
-moves its branch, worktree and state, and commits `chore(<slug>): rename unit <old> to <new>` on
-the merge branch. Merge history follows that commit, so the unit's past merges still count under
-the new id. Then it relaunches the unit and verifies that nothing live still holds the old name.
-`nightly-review-unit` keeps its name.
-
-To retire a unit, run `/showrunner:retire_unit <unit>` from the showrunner session. It refuses
-while the unit has uncommitted work or a checkpoint not merged. It stops everything the unit owns
-(its sessions, Codex workers, reviewers, holds, reservations, Mac claims and processes), marks the row
-retired, and removes the worktree and branch. `--dry-run` lists all of it and changes nothing.
-The retired note names the director's last session. `/showrunner:resume_unit <unit>` makes the
-worktree again at the same path from the merge branch, resumes that session and makes the row live.
-
-A retired unit keeps its row. Its Plan cell begins with `retired`, alone or inside
-an opening parenthesis, as in `(retired by the user 2026-10-07, worktree removed)`.
-The status script, the dailies, the waits and the stall watch then skip it. The word
-anywhere else in the cell changes nothing. A
-unit's plan run ending retires nothing, because the unit's next plan keeps
-the same reviewer.
-
 ## Hub files
 
 | File | Owner unit | Other units that touch it |
@@ -196,6 +159,39 @@ the same reviewer.
   source; omit the section if none>
 ```
 
+A production doc has no list of units. A unit is its staff row and the `.unit.toml` in its
+worktree. The staff row gives the unit's name, parent production, worktree and branch; the
+units of a production are in staff.json row order. `.unit.toml` gives the plan, the app port
+and the files the unit owns.
+
+The unit id (`<name>-unit`) names the unit everywhere: in the log, the dailies, the waits and
+every tool's arguments. A unit's session name is written nowhere, because the user may rename
+a session at any time. The unit's herdr session carries the production's
+slug and the unit's id as marks, set at launch. To reach a unit, look it up at that moment:
+`$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <slug> <unit>`
+prints its pane, and `unit_lookup.py list <slug>` prints every unit's pane and its
+session name now. `<slug>` is this doc's file name without `-production.md`; a former
+slug from the Formerly line also works, and a mark set before a rename is found under
+the current slug.
+
+To rename a unit, run `/showrunner:rename_unit <old> <new>` from the showrunner session,
+between phases. Never edit the staff row or `.unit.toml` by hand. The rename stops the unit,
+moves its branch, worktree and state, and commits `chore(<slug>): rename unit <old> to <new>` on
+the merge branch. Merge history follows that commit, so the unit's past merges still count under
+the new id. Then it relaunches the unit and verifies that nothing live still holds the old name.
+
+To retire a unit, run `/showrunner:retire_unit <unit>` from the showrunner session. It refuses
+while the unit has uncommitted work or a checkpoint not merged. It stops everything the unit owns
+(its sessions, Codex workers, reviewers, holds, reservations, Mac claims and processes), records a
+removed worktree in its staff row, and removes the worktree and branch. `--dry-run` lists all of it
+and changes nothing. The retirement record names the director's last session.
+`/showrunner:resume_unit <unit>` makes the worktree again at the same path from the merge branch,
+resumes that session and records the worktree as present again.
+
+A retired unit keeps its staff row. The status script, the dailies, the waits and the stall watch
+skip it. A unit's plan run ending retires nothing, because the unit's next plan keeps the same
+reviewer.
+
 Each unit plan carries a header line under its status line, preserved verbatim by
 `/plan:to_phased_plan`, `/plan:phase_review` and `/plan:shrink`:
 
@@ -214,14 +210,14 @@ Each gated phase carries its gate directly under the phase heading:
 <ProductionUnit>
 Applies to a `/unit:direct` run whose plan header carries a
 `> **Production:**` line. Read the production doc it names at the start of the
-run and after every compaction. Your row in its **Units** table gives your name,
-branch, port and the files you own.
+run and after every compaction. Your staff row gives your name and branch; the
+`.unit.toml` in your worktree gives your plan, port and the files you own.
 
 A turn with nothing for the user replies with just "—": never "No update for
 you." or the like (user, 2026-10-14).
 
 A unit's run state is written down nowhere and the unit sets nothing. Each reader takes it, when it needs it, from the records `/unit:direct` keeps of the runs in the unit's worktree: no run yet is standing by, a newest run with no finish is running, a newest run that finished is run-finished. A session stays live after its run ends, and its next run reads as running from that run's first record.
-A run that stopped, failed, or waits on a decision has no finish in its record, so it does not read as finished, and nothing asks for `run done` text in the Plan cell.
+A run that stopped, failed, or waits on a decision has no finish in its record, so it does not read as finished.
 
 1. **Your port.** Every app launch for smoke tests and shots uses your port,
    never the user's default port or another unit's.
@@ -289,7 +285,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    line.
 
    The as-built notice's title names what moved: each doc created, amended,
-   moved or deleted, and each link repointed, this doc's **Units** row
+   moved or deleted, and each link repointed, the plan path in `.unit.toml`
    included. The close-out never waits on a reply.
 
    A phase that changes what users see, in the app or in any example,

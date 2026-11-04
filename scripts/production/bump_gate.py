@@ -16,7 +16,7 @@ from merge_checkpoint import (
     Stop, complete_gate, read_record, record_lock,
     run_checkpoint_test_steps, save_record,
 )
-from production_units import Production
+from scripts.production.production_doc import Production
 import sessions
 
 

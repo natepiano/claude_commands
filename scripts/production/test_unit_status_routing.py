@@ -29,7 +29,7 @@ class UnitStatusTests(UnitStatusFixture):
             panes=({"hook": gate, "peer": "— holding: publishing\n"},),
             units=("hook", "peer"),
         )
-        hook_output = outputs[0].partition("== peer")[0]
+        hook_output = self.unit_text(outputs[0], "hook")
         self.assertNotIn("WAITING on you", hook_output)
         self.assertNotIn("=== DECISION", hook_output)
         self.assertNotIn("BLOCK in", hook_output)
@@ -45,9 +45,9 @@ class UnitStatusTests(UnitStatusFixture):
             ),
             units=("writer", "hook"),
         )
-        writer_output = outputs[0].partition("== hook")[0]
+        writer_output = self.unit_text(outputs[0], "writer")
         self.assertIn("=== DECISION for you from writer ===", writer_output)
-        routed_writer_output = outputs[1].partition("== hook")[0]
+        routed_writer_output = self.unit_text(outputs[1], "writer")
         self.assertNotIn("WAITING on you", routed_writer_output)
         self.assertNotIn("=== DECISION", routed_writer_output)
 

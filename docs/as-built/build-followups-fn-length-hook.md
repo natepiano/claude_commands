@@ -182,7 +182,7 @@ Files: `scripts/hooks/pre-tool-use-tool-output-read.py`, `scripts/hooks/test_too
 
 - **fn-length blind spots.** Functions inside `macro_rules!` or `name! { … }` bodies are never measured (clippy sees expanded code the scan cannot expand). Edits made through shell commands (`sed`, heredocs) and growth from rustfmt reflowing a function measured at or under the limit are not seen. A failed `blocks.jsonl` append is silent and never changes the verdict. `cfg(test)` modules in package-root `examples/` targets are skipped because clippy never lints them.
 
-- **basedpyright** exits 3 in every checkout (`pyrightconfig.json` names a `.venv` no checkout has); read its last output line (`0 errors, 0 warnings, 0 notes`), not its exit status. `scripts/hooks` is a pyright execution environment with itself on `extraPaths`, so tests import `fn_length_lib` directly.
+- **basedpyright** exits 0 when clean. Its summary reads `0 errors, 0 warnings, 0 notes`. `scripts/hooks` is a pyright execution environment with itself on `extraPaths`, so tests import `fn_length_lib` directly.
 
 - **Stall watch.** `~/.claude/sessions/` keeps stale `<pid>.json` records carrying a live session's id; the live record is the one whose pid answers `os.kill(pid, 0)`. Idle panes stayed byte-identical for 6.5 minutes in a live probe while a busy pane changed only from real activity. A status file reading `implementing` with no live process counts as idle.
 
