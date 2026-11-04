@@ -316,3 +316,29 @@ Memory-wait check, done 2026-11-04 (`memory_wait_check.md` in the phase folder):
 Each fix returns as a new Change-Review row.
 
 **Files:** `scripts/buildlog/costs.py`, `cli.py`, `charts.py`, their tests, `docs/as-built/` (Definitions).
+
+### Phase 16 — Each build step spends less CPU to write its build-log row  · status: todo
+**Depends on:** none (from next items; showrunner disposition 2026-10-30: next)
+
+verify-unit measured 71 ms of CPU each time `verify.sh` starts `record.py`, on every step.
+
+1. Measure the CPU per call the same way verify-unit did, before any change.
+2. Find where the time goes (imports, config reads, parsing) and cut it.
+3. Report CPU ms per call before and after, measured the same way.
+
+Acceptance: the call costs less CPU, and the rows it writes are unchanged. Do not edit `index.py` or `store.py` (natest-unit owns them until its phase merges).
+
+**Files:** `scripts/buildlog/record.py` and the modules it imports at start, with their tests.
+
+### Phase 17 — The build log stores each memory reading once each minute  · status: done
+**Depends on:** none (from next items; showrunner disposition 2026-10-30: next)
+
+Each tick writes the builds slice fields in both the sample row and the memory_snapshot row, so the log grows faster than it needs to.
+
+1. The slice fields live only in the sample row. memory_snapshot keeps its old fields.
+2. Every reader of the slice fields reads them from the sample row.
+3. A test pins each row's fields.
+
+Acceptance: one tick writes each slice field once; every report that showed slice memory shows the same values. Do not edit `index.py` or `store.py`.
+
+**Files:** `scripts/buildlog/memory.py`, `scripts/buildlog/sample.py`, their readers and tests.

@@ -87,8 +87,9 @@ The index maps each former step and call field name in `index.FORMER_FIELDS` to 
 ### Raw resource readings and hourly use
 
 `cgroup_capture.read_cgroup(path)` supplies `memory.slice_state()` and the sample's
-`slices` with one reading of each file. `sample.SampleTaken.slices` is passed to
-`memory.write_snapshot()` so the sample and snapshot do not reread the slice.
+`slices` with one reading of each file. Only the sample row holds slices during each tick.
+The tick snapshot row holds `kind`, `at`, `host`, and `zram` only.
+The standalone `buildlog snapshot` row keeps slices because it has no sample row beside it.
 The builds and CI slices remain separate. An absent cgroup has `state: absent`;
 an unreadable scalar is `unavailable` and does not discard other readings.
 
