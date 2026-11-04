@@ -452,7 +452,7 @@ def ledger_for_run(run: Path) -> UnitWorkerLedger:
         store = _ledger_for_run(run)
     if store.path.parent.name != "adhoc" and (run / STATE).exists():
         state = worker_lifecycle.read_json_object(run / STATE)
-        if (state.get("production"), state.get("unit")) != (store.path.parent.name, store.path.stem):
+        if not state.get("owner_staff_id") and (state.get("production"), state.get("unit")) != (store.path.parent.name, store.path.stem):
             from scripts.direct import progress_history
             progress_history.set_unit(run, store.path.parent.name, store.path.stem)
     return store
@@ -1601,7 +1601,8 @@ def _apply_move(move: LedgerMigration) -> None:
                 if changed:
                     _write_roster(handle, roster)
         if (run / STATE).exists():
-            progress_history.set_unit(run, move.destination.parent.name, move.destination.stem)
+            if not worker_lifecycle.read_json_object(run / STATE).get("owner_staff_id"):
+                progress_history.set_unit(run, move.destination.parent.name, move.destination.stem)
     move.source.unlink(missing_ok=True)
     move.source.with_suffix(".move.json").unlink(missing_ok=True)
     move.destination.with_suffix(".move.json").unlink(missing_ok=True)
@@ -1751,11 +1752,9 @@ def find_moved_unit_runs(units: tuple[UnitWorktree, ...], former: tuple[str, ...
             if working and Path(working).is_absolute() and not Path(working).exists():
                 old_paths.add(Path(working))
             for old in old_paths:
-                production, unit = _text(state.get("production")), _text(state.get("unit"))
+                production, unit = _run_unit(state)
                 if production == "adhoc":
                     production, unit = "", ""
-                if not production or not unit:
-                    production, unit = _run_unit(state)
                 if production and unit:
                     try:
                         accepted = (unit_names.name(unit) == unit_names.name(current.unit)
@@ -1868,7 +1867,8 @@ def _repoint_worktree_runs(production: str, unit: str, old: Path, new: Path, bra
                     worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_EX)
                 state = worker_lifecycle.read_json_object(run / STATE)
                 updated = dict(state)
-                updated.update({"production": production, "unit": unit})
+                if not state.get("owner_staff_id"):
+                    updated.update({"production": production, "unit": unit})
                 if state.get("working_dir") in (str(old), str(new)):
                     updated.update({"working_dir": str(new), "worktree": new.name, "branch": branch})
                 for key in ("plan_doc", "project_plan_doc"):

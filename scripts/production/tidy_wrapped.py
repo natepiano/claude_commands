@@ -17,6 +17,7 @@ from scripts.production import staff, unit_lookup  # noqa: E402
 from scripts.copies import copies  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.production.production_doc import WRAPPED  # noqa: E402
+from scripts.production import showrunners
 from proposals_folder import ProposalsFolder, ProposalsUnavailable, issues_folder  # noqa: E402
 
 if TYPE_CHECKING:
@@ -102,7 +103,7 @@ def wrapped_slug(doc: Path) -> str:
     status = next((line for line in lines if line.startswith("> **Status:")), "")
     if not status.startswith(WRAPPED):
         raise TidyRefused(f"{doc}: not wrapped")
-    if (NOTIFIER_STATE_DIR / f"showrunner-{slug}").exists():
+    if (NOTIFIER_STATE_DIR / showrunners.timer_name(slug)).exists():
         raise TidyRefused(f"{doc}: {slug} still has an update timer")
     return slug
 

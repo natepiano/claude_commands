@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -193,13 +194,10 @@ def _text(value: object) -> str:
 
 def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot) -> dict[str, object]:
     """Resolve the director's current folder without changing its stored record."""
-    raw_identity = fields.get("main_agent")
-    identity = cast(dict[str, object], raw_identity) if isinstance(raw_identity, dict) else {}
-    session_id = _text(identity.get("session_id")) or _text(fields.get("owner_session"))
-    row = record.by_member_reference(session_id) if session_id else None
-    if row is not None and row.kind == "worker":
-        row = record.by_id(row.parent) if row.parent else None
-    if row is None or row.kind != "unit":
+    if fields.get(unit_runs.OWNER_FIELD) and fields.get("status") and fields["status"] != "active":
+        return fields
+    row = unit_runs.run_owner(fields, record)
+    if isinstance(row, unit_runs.RunOwnerUnrecorded):
         return fields
     previous = _text(fields.get("working_dir"))
     for key in ("plan_doc", "project_plan_doc"):
@@ -211,6 +209,14 @@ def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot) -> d
             del fields[key]
     if not isinstance(row.worktree, staff.WorktreeUnfilled):
         fields.update(working_dir=str(row.worktree.path), worktree=row.worktree.path.name)
+        if fields.get(unit_runs.OWNER_FIELD) and not fields.get("event_type"):
+            branch = subprocess.run(["git", "-C", str(row.worktree.path), "branch", "--show-current"],
+                                    capture_output=True, text=True, check=False)
+            fields["branch"] = branch.stdout.strip()
+            if branch.returncode == 0 and not fields["branch"]:
+                commit = subprocess.run(["git", "-C", str(row.worktree.path), "rev-parse", "--short", "HEAD"],
+                                        capture_output=True, text=True, check=False)
+                fields["branch"] = f"detached@{commit.stdout.strip() or 'unknown'}"
     return fields
 
 

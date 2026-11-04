@@ -1548,7 +1548,7 @@ def staff_units(problems: list[log_records.SourceProblem]) -> list[Unit]:
             except (OSError, ValueError) as error:
                 causes.append(str(error))
                 timer = showrunners.NoTimer(str(error))
-            slug = timer.slug if isinstance(timer, showrunners.Timer) else parent.name
+            slug = timer.slug if isinstance(timer, showrunners.TimerRegistration) else parent.name
             tree = resolver.unit_worktree(row)
             doc = resolver.production_doc(row)
             branch = resolver.unit_branch(row)

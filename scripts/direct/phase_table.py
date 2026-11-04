@@ -68,8 +68,8 @@ def read_production(path: Path, *, resolver: session_staff.RowResolver | None = 
     if Path(production_field(lines, "Log")).is_absolute():
         raise Refusal("production Log must be relative to Showrunner checkout")
     timer = showrunners.timer_for(owner, resolver.record)
-    return Production(doc.path, timer.slug if isinstance(timer, showrunners.Timer) else owner.name,
-                      ZoneInfo(timer.zone) if isinstance(timer, showrunners.Timer) else user_zone())
+    return Production(doc.path, timer.slug if isinstance(timer, showrunners.TimerRegistration) else owner.name,
+                      ZoneInfo(timer.zone) if isinstance(timer, showrunners.TimerRegistration) else user_zone())
 
 
 class ProjectedEta(NamedTuple):
@@ -1683,7 +1683,7 @@ def _production_reference(plan_path: Path, *, resolver: session_staff.RowResolve
     if parent is None:
         return PlanOutsideProduction()
     timer = showrunners.timer_for(parent, resolver.record)
-    slug = timer.slug if isinstance(timer, showrunners.Timer) else parent.name
+    slug = timer.slug if isinstance(timer, showrunners.TimerRegistration) else parent.name
     unit = unit_names.unit_id(member.row.name)
     try:
         text = plan_path.read_text(encoding="utf-8")
@@ -1730,7 +1730,7 @@ def _phase_note_name(production: str, unit: str, *, resolver: session_staff.RowR
     name = unit
     for owner in staff.active(resolver.record, "showrunner"):
         timer = showrunners.timer_for(owner, resolver.record)
-        slug = timer.slug if isinstance(timer, showrunners.Timer) else owner.name
+        slug = timer.slug if isinstance(timer, showrunners.TimerRegistration) else owner.name
         if slug != production:
             continue
         row = next((item for item in resolver.record.find(kind="unit", parent=owner.id)

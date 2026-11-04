@@ -444,7 +444,7 @@ def measure_definitions(terms: tuple[Term, ...], files: tuple[LiveFile, ...]) ->
 def parse_production(slug: str, doc: Path, record: staff.StaffSnapshot) -> ProductionNames:
     row = record.by_doc(remote.local_machine(), doc)
     timer = showrunners.timer_for(row, record) if row is not None else showrunners.NoTimer("no staff row")
-    session = timer.target.removeprefix("session:") if isinstance(timer, showrunners.Timer) else slug
+    session = timer.target.removeprefix("session:") if isinstance(timer, showrunners.TimerRegistration) else slug
     units = tuple(unit_names.unit_id(row.name) for row in unit_lookup.doc_units(doc, record))
     return ProductionNames(slug, str(doc), session, units)
 

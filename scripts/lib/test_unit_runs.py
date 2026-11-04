@@ -9,16 +9,72 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import unit_runs  # noqa: E402
+from scripts.lib import atomic_file, unit_runs  # noqa: E402
+from scripts.production import staff
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 if TYPE_CHECKING:
     from scripts.message import sessions
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
     import sessions
+
+
+class RunOwnerMigrationTests(StaffTestCase):
+    def test_interrupted_owner_migration_repeats_after_clear_without_changing_history_or_finished_runs(self) -> None:
+        owner = fixture_member("showrunner", name="production")
+        row = fixture_member("unit", name="tools", parent=owner.id)
+        runs = self.root / "runs"
+        history = self.root / "history.jsonl"
+        _ = history.write_text('{"production":"former","unit":"tools"}\n')
+        for name, status in (("a", "active"), ("b", "active"), ("old", "completed")):
+            run = runs / name
+            run.mkdir(parents=True)
+            _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({
+                "status": status, "production": "production", "unit": "tools",
+                "main_agent": {"session_id": row.current_session}, "history_file": str(history)}))
+        finished = runs / "old" / unit_runs.STATE_FILE
+        before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in (history, finished)]
+        publish = atomic_file.write_text_atomic
+        changed_session = fixture_runtime_id("run-owner-clear")
+
+        def interrupted(path: Path, text: str) -> None:
+            publish(path, text)
+            _ = staff.update_current_session(row.id, staff.StaffId(changed_session))
+            raise RuntimeError("migration interrupted")
+
+        with (patch.object(atomic_file, "write_text_atomic", side_effect=interrupted),
+              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO())):
+            with self.assertRaisesRegex(RuntimeError, "migration interrupted"):
+                _ = unit_runs.migrate_owners(runs)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(unit_runs.migrate_owners(runs), 0)
+        paths = [runs / name / unit_runs.STATE_FILE for name in ("a", "b")]
+        for path in paths:
+            fields = cast(dict[str, object], json.loads(path.read_text()))
+            self.assertEqual(fields["owner_staff_id"], row.id)
+            self.assertNotIn("production", fields)
+            self.assertNotIn("unit", fields)
+        published = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(unit_runs.migrate_owners(runs), 0)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], published)
+        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in (history, finished)], before)
+
+    def test_unproved_owner_keeps_the_active_run_and_reports_unavailable(self) -> None:
+        run = self.root / "runs/unknown"
+        run.mkdir(parents=True)
+        path = run / unit_runs.STATE_FILE
+        _ = path.write_text('{"status":"active","main_agent":{"session_id":"gone"}}')
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(unit_runs.migrate_owners(run.parent), 1)
+        self.assertIn("run owner is unavailable", errors.getvalue())
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
 
 class UnitRunsTest(unittest.TestCase):

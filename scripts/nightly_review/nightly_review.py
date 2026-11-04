@@ -308,7 +308,7 @@ def nightly_production(*, resolver: RowResolver | None = None) -> NightlyProduct
                 print(f"nightly_review: {reason}", file=sys.stderr)
                 unknown.append(reason)
                 continue
-            slug = timer.slug if isinstance(timer, showrunners.Timer) else parent.name if parent is not None else row.name
+            slug = timer.slug if isinstance(timer, showrunners.TimerRegistration) else parent.name if parent is not None else row.name
             found.append(NightlyProduction(doc.path, slug, NightlyUnit(row, config)))
     except ValueError as error:
         return f"nightly review membership is unavailable: {error}"

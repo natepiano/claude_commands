@@ -35,7 +35,7 @@ class StaffLabels:
         parents: dict[str, staff.StaffRow] = {}
         for row in record.find(kind="showrunner"):
             timer = showrunners.timer_for(row, record, sources=sources)
-            if isinstance(timer, showrunners.Timer):
+            if isinstance(timer, showrunners.TimerRegistration):
                 parents[timer.slug] = row
         return cls(record, productions, parents)
 

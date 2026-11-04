@@ -430,9 +430,7 @@ class MemberSources:
             return MemberFound(row) if row is not None and row.kind == "showrunner" else NoSuchMember(selector)
         owner = record.by_doc(remote.local_machine(), source.timer.doc)
         if owner is not None:
-            timer = showrunners.timer_for(owner, record, sources=self.productions.values())
-            return (MemberFound(owner) if owner.kind == "showrunner" and isinstance(timer, showrunners.Timer)
-                    else NoSuchMember(selector))
+            return MemberFound(owner) if owner.kind == "showrunner" else NoSuchMember(selector)
         return NoSuchMember(selector)
 
     def showrunner_members(self, record: staff.StaffSnapshot) -> dict[str, staff.StaffRow]:
@@ -445,6 +443,7 @@ class MemberSources:
 
 
 def member_sources(*, dependencies: Callable[[Path], None] | None = None,
+                   record: staff.StaffSnapshot | showrunners.DiscoverMembership = showrunners.DISCOVER_MEMBERSHIP,
                    unreadable: showrunners.UnreadableTimerPolicy = showrunners.UnreadableTimerPolicy.SKIP) -> MemberSources:
     import herdr
     from scripts.shutdown import pane_record
@@ -457,7 +456,7 @@ def member_sources(*, dependencies: Callable[[Path], None] | None = None,
     except ValueError as error:
         raise staff.StaffUnreadable(str(error)) from error
     sources = showrunners.read_sources(unreadable=unreadable,
-                                       dependencies=dependencies)
+                                       dependencies=dependencies, record=record)
     return MemberSources({source.timer.slug: source for source in sources}, tuple(launches.values()))
 
 
@@ -519,9 +518,6 @@ class MarkedProductions:
 
 
 def lookup_slug(slug: str) -> str:
-    # A current notifier name needs no scan of Formerly entries or reread of its doc.
-    if (showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}").is_dir():
-        return slug
     return canonical_slug(slug)
 
 

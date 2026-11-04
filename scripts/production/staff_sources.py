@@ -91,7 +91,7 @@ def ensure_staff_showrunner(child: Production, caller: str = "", *, runtime_id: 
 
 def showrunner_members(record: staff.StaffSnapshot) -> dict[str, staff.StaffRow]:
     """Resolve local production slugs to rows with the same launch-first matching rule."""
-    return _member_sources().showrunner_members(record)
+    return _member_sources(record=record).showrunner_members(record)
 
 
 def unit_parent(unit: str, session_id: str = "") -> UnitProduction:
@@ -428,10 +428,14 @@ class _WorkerSources:
         return WorkerOwner(selected.key, staff.NewSeedMember())
 
     def _record_run_owner(self, run: Path) -> WorkerOwner:
+        state = self.read(run / workers.STATE)
+        if state.get(unit_runs.OWNER_FIELD):
+            owner = unit_runs.run_owner(state, self.record)
+            if isinstance(owner, staff.StaffRow):
+                return WorkerOwner(f"staff:{owner.id}", owner)
         director = unit_runs.director(run, dependencies=self.dependencies)
         if director in self.sessions:
             return self.sessions[director]
-        state = self.read(run / workers.STATE)
         slug, unit = _text(state.get("production")), _text(state.get("unit"))
         if slug or unit:
             return self.recorded_owner(production=slug, unit=unit)
@@ -1322,7 +1326,9 @@ def migration_sources(record: staff.StaffSnapshot) -> tuple[_MemberSources, tupl
         try:
             document = location.path.read_text(encoding="utf-8")
             slug = FillDocument(location.path, document, str(location.path)).slug
-            timer = showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}"
+            timer = showrunners.NOTIFIER_STATE_DIR / f"showrunner-{row.id}"
+            if not timer.exists():
+                timer = showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}"
             if timer.exists():
                 source = showrunners.read_bound_source(timer, location.path)
             else:
@@ -1374,7 +1380,10 @@ class _LiveFillSources(_FillSources):
         # The shared membership reader omits unreadable docs. Reuse its timer
         # decoder for omitted instances so failed evidence still identifies a row.
         for instance in sorted(showrunners.NOTIFIER_STATE_DIR.glob("showrunner-*")):
-            slug = instance.name.removeprefix("showrunner-")
+            owner = record.by_id(staff.StaffId(instance.name.removeprefix("showrunner-")))
+            slug = (owner.doc.path.name.removesuffix("-production.md")
+                    if owner is not None and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
+                    else instance.name.removeprefix("showrunner-"))
             if not instance.is_dir() or slug in sources.productions:
                 continue
             # Keep the timer target available to the canonical launch-id join,

@@ -45,8 +45,7 @@ State:
   `chore(<slug>): rename unit <old> to <new>` commit carries the merges under
   `<old>` before it over to `<new>`.
 - `NOTIFIER` — `zsh ~/.claude/scripts/message/notifier.sh`.
-- `UPDATES` — `showrunner-<slug>`, where `<slug>` is the production doc's file
-  name less `-production.md`.
+- `UPDATES` — `showrunner-<staff id>`, where `<staff id>` is the showrunner row id.
 - `PROMPT_FILE` — `~/.local/state/showrunner/<slug>/prompt.txt`.
 - `SHOWRUNNER_STATE` — `<STATE_DIR>/showrunner_state.json`, one JSON object with
   optional `units` rows (`{"unit": "<unit session name>", "phase": "<text>",

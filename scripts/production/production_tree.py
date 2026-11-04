@@ -98,7 +98,9 @@ def showrunner_sessions(*,
         session_id = target.removeprefix("session:") if target.startswith("session:") else ""
         if session_id:
             owner = record.by_id(staff.StaffId(session_id))
-            found[instance.name.removeprefix("showrunner-")] = owner.current_session if owner is not None else session_id
+            if owner is not None:
+                slug = instance.name.removeprefix("showrunner-")
+                found[showrunners.owner_slug(owner) if slug == owner.id else slug] = owner.current_session
     return found
 
 

@@ -25,7 +25,7 @@ class UnitTransfer:
 
 
 def _production(slug: str) -> Production:
-    checked = showrunners.checked_doc(showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}")
+    checked = showrunners.checked_doc(showrunners.NOTIFIER_STATE_DIR / showrunners.timer_name(slug))
     if isinstance(checked, showrunners.NoCheckedDoc):
         raise ValueError(f"{slug}: {checked.reason}")
     return read_production(checked.path)

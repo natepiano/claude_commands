@@ -391,7 +391,8 @@ def resolve(production: str, session: str = "") -> BoardSubtree | NoBoardSubtree
                 continue
             members[timer.slug] = owner
             by_slug[timer.slug] = showrunners.Showrunner(
-                slug=timer.slug, session=owner.name, socket="", doc=str(timer.doc), zone=timer.zone)
+                slug=timer.slug, session=owner.name, socket="", doc=(str(owner.doc.path) if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) else ""),
+                zone=timer.zone)
         if production:
             root = members.get(production)
         else:
@@ -490,7 +491,7 @@ def main(arguments: list[str]) -> int:
     if isinstance(subtree, BoardSubtree):
         for row in staff.active(subtree.record, "showrunner"):
             timer = showrunners.timer_for(row, subtree.record)
-            if isinstance(timer, showrunners.Timer):
+            if isinstance(timer, showrunners.TimerRegistration):
                 watch_sources.add(showrunners.SHOWRUNNER_STATE_DIR / timer.slug)
     watch = existing_sources(watch_sources)
     print(json.dumps({"files": files, "watch": watch}))

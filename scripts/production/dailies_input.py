@@ -885,7 +885,7 @@ def run(args: argparse.Namespace) -> int:
         )
     if isinstance(table_state, PhaseTablesUnavailable):
         report("phase tables", "unavailable", table_state.reason)
-    instance = f"showrunner-{production.slug}"
+    instance = showrunners.timer_name(production.slug)
     blocks = status_blocks(status_path, units)
     report("status", "ok", f"{len(blocks)} units read")
     # A unit whose run is finished has nothing to report: it needs no judgment entry and is left out,

@@ -622,7 +622,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         release_edges(production.slug, record=record)
         notifier = Path.home() / ".claude/scripts/message/notifier.sh"
         # The update timer is the one record of the showrunner, so removing it unregisters it.
-        _ = command("notifier", production.checkout, str(notifier), "remove", f"showrunner-{production.slug}")
+        _ = command("notifier", production.checkout, str(notifier), "remove", showrunners.timer_name(production.slug))
         report("notifier", "ok", "update timer removed")
         archived = command(
             "phase-notes",

@@ -368,7 +368,7 @@ def showrunner_registrations() -> ShowrunnerRegistrations:
             _ = doc.path.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             continue
-        found.append(ShowrunnerRegistration(target[8:], instance.name.removeprefix("showrunner-"), str(doc.path)))
+        found.append(ShowrunnerRegistration(target[8:], showrunners.production_slug(str(doc.path)), str(doc.path)))
     return ShowrunnerRegistrations(tuple(found))
 
 
