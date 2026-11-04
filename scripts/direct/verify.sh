@@ -288,7 +288,29 @@ step_writes_tree() {
     return 1
 }
 
+finish_step_token() {
+    local held_before=$1 status=$2
+    if [[ "${TOKEN_USED:-0}" == 1 ]]; then
+        sync_token_state
+        if [[ "$held_before" == 0 ]] && ! release_token; then
+            (( status != 0 )) || status=1
+        fi
+    fi
+    return "$status"
+}
+
 run() {
+    if [[ "${TOKEN_USED:-0}" == 1 ]]; then sync_token_state; fi
+    local held_before=${TOKEN_HELD:-0} status=0
+    run_step "$@" || status=$?
+    finish_step_token "$held_before" "$status" || status=$?
+    if [[ "$status" != 0 && -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
+        exit "$status"
+    fi
+    return "$status"
+}
+
+run_step() {
     local attempt status started ended step_log monitor=0
     local STEP_WRITES_TREE=0
     if step_writes_tree "$@"; then
@@ -324,7 +346,12 @@ run() {
             if [[ "$CMD" != test && "$STEP_RUNS_ON" != natedev_only && "$STEP_WRITES_TREE" == 0 ]] && buildlog_step_compiles "$@"; then
                 export LINT_QUEUE_LEAVE_HOOK="$(ssh_retry_hook)"
             fi
-            if run_once "$@" 2>&1 | tee "$step_log"; then
+            if (
+                step_token_before=${TOKEN_HELD:-0}
+                # The pipeline shell owns tokens taken during memory admission.
+                trap 'status=$?; finish_step_token "$step_token_before" "$status"; exit $?' EXIT
+                run_once "$@"
+            ) 2>&1 | tee "$step_log"; then
                 exit 0
             else
                 exit "${PIPESTATUS[0]}"
@@ -354,7 +381,7 @@ run() {
         # must end the call even when that tool's caller handles failures.
         if [[ -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
             rm -f "$step_log"
-            exit "$status"
+            return "$status"
         fi
         # A Mac copy that finished first stopped this step: no memory retry.
         if [[ -n "${VERIFY_STEP_INFO_FILE:-}" && -e "$VERIFY_STEP_INFO_FILE.stopped" ]]; then
