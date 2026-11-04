@@ -28,11 +28,12 @@
 - **Completion:** a bevy_brp launch on natedev shows its absolute target folder in the build log index.
 - **Source phase:** 11 (simplify item 24).
 
-## Recorder calls and Mac offload no longer load memory_admit
-- **Starts when:** queue 10z merges to builds. Four units edit `memory_admit.py` now. Showrunner disposition 2026-11-04: next, report-unit owns it as one phase.
-- **Target:** `scripts/buildlog/record.py` (`test_phase_context`, `admission_metadata`), `scripts/mac_test/offload.py` (`repository_identity`), `scripts/lint/memory_admit.py`, a new small shared module.
-- **Need:** `record.py test-phase-context` imports memory_admit on every admitted nextest step (80-100 ms CPU). `offload.repository_identity` imports all of memory_admit and runs 2-3 git processes to read one key.
-- **Completion:** the values both scripts need (`test_threads`, the sampling context with `call_id` as text, the repository key) live in one small module. Neither script loads memory_admit. The phase notice gives the CPU per step before and after.
+## Recorder sampling and Mac offload no longer load memory_admit
+- **Starts when:** queue 10z merges to builds, after natest P10 is on builds. Four units edit `memory_admit.py` now. Showrunner disposition 2026-11-04: next, report-unit owns it as one phase.
+- **Target:** `record.test_phase_context`, `record.admission_metadata`, `memory_admit.sampling_context`, and `offload.repository_identity` (`scripts/mac_test/offload.py`).
+- **Need:** Phase 16 moved width parsing (`parse.test_threads`) and the repository key (`record.remote_identity`) out of memory_admit. Tagged sampling calls still load memory_admit (`record.py` test-phase-context). `offload.repository_identity` imports all of memory_admit and runs 2-3 git processes to read one key.
+- **Constraints:** reuse `parse.test_threads` and `record.remote_identity`. Keep repository keys and the sampling inputs unchanged.
+- **Completion:** neither recorder sampling nor Mac repository identity loads memory_admit. Tests cover sampling output, old tagged calls, missing calls, remote keys and root keys. The recorded rows are unchanged. The phase notice gives the CPU per step before and after.
 - **Source phase:** 16 (simplify items 10 and 13).
 
 ## The recorder takes the build folders from verify.sh

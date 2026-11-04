@@ -190,7 +190,8 @@ The build report is too long for the user and is not used for analysis. Retire i
 **Files:** `scripts/buildlog/moments.py`, `scripts/buildlog/report.py`, `scripts/buildlog/test_moments.py`.
 
 ### Phase 6 — Dylib A/B timing for hana  · status: todo
-**Depends on:** none
+**Depends on:** the user lifts the hana pause (paused 2026-11-04).
+**Workers:** 1 writer (the benchmark runner).
 
 2026-11-03 (the user approved, through the builds showrunner): real-use data cannot isolate the Bevy dylib's effect. Time the same hana commit on the same machine with the dylib on and off. Run each side through verify.sh:
 
@@ -199,7 +200,7 @@ The build report is too long for the user and is not used for analysis. Retire i
 
 The result goes to the showrunner. No repository code changes.
 
-Completion gate: add one row to `docs/plans/builds-report-rounds.md` with the hana commit, the settings of each side, the measured times, the limits and the conclusion. Mark it as a controlled A/B result, not a phase-time measurement over ten hana phases.
+Completion gate: add one row to `docs/plans/builds-report-rounds.md` with the hana commit, the settings of each side, the measured times, the limits and the conclusion. Mark it as a controlled A/B result, not a phase-time measurement over ten hana phases. Record the `record.py` commit of each run: Phase 16 cut its CPU per step. If runs used different versions, say so; do not repeat completed runs for that reason.
 
 ### Phase 7 — The build improvement loop ranks costs and records each round  · status: done
 **Depends on:** none (runs beside Phase 6)
@@ -315,20 +316,27 @@ Memory-wait check, done 2026-11-04 (`memory_wait_check.md` in the phase folder):
 
 Each fix returns as a new Change-Review row.
 
+Acceptance: one page request through queue's feed calls both providers for 7 days in under 1 s total. Interface tests pass `NoDataYet`, `CostUnavailable` and `MacIdleUpperBound` through to the feed unchanged. Phase 16's `test_machine_aliases_read_sync_configuration_once` stays green.
+
+**Constraints from prior phases:** `costs.machine_name` reads `sync_config()` once and calls `record._target_hosts` (Phase 16).
+
+**Workers:** 1 writer (report-unit's providers and their interface tests). queue-unit owns the page and the feed integration test.
+
 **Files:** `scripts/buildlog/costs.py`, `cli.py`, `charts.py`, their tests, `docs/as-built/` (Definitions).
 
 ### Phase 16 — Each build step spends less CPU to write its build-log row  · status: done
 **Depends on:** none (from next items; showrunner disposition 2026-10-30: next)
 
-verify-unit measured 71 ms of CPU each time `verify.sh` starts `record.py`, on every step.
+#### As-built
 
-1. Measure the CPU per call the same way verify-unit did, before any change.
-2. Find where the time goes (imports, config reads, parsing) and cut it.
-3. Report CPU ms per call before and after, measured the same way.
+- `record.py` loads config, target, hash, gzip, json, store and url parsing only on the paths that use them. The pending writer uses `os.open(O_EXCL, 0o600)` and `os.replace`; ids come from `os.urandom`.
+- One owner for each rule: `record.remote_identity` (repository key; admission's `git_identity` calls it), `record.recorded_repository_key` (origin remote, else `git-root:<first root>`), `parse.test_threads` (admission keeps the name `memory_admit.test_threads`), `record._target_hosts` (one `sync_config()` read for all targets).
+- `remote_identity` has an SCP shortcut that skips `urllib.parse`; it builds the path as the urlsplit path does, so keys are unchanged. `test_step_row.py` pins the keys in a table and uses a temporary build log.
+- CPU ms per call, bevy_brp with a real Cargo.toml, before -> after (merged tree 08397569e): terminal 294.8 -> 150.3, tee 289.3 -> 151.4, call 118.2 -> 86.3, step-context 77.2 -> 60.0, test-phase-context 208.2 -> 80.9. The driver is in the phase 18 folder (`cpu_driver.py`).
 
-Acceptance: the call costs less CPU, and the rows it writes are unchanged. Do not edit `index.py` or `store.py` (natest-unit owns them until its phase merges).
+**Files:** `scripts/buildlog/record.py`, `parse.py`, `step_context.py`, `costs.py`, `test_step_row.py`, `test_costs.py`, `scripts/lint/memory_admit.py`, `test_memory_admit.py`, three as-built docs.
 
-**Files:** `scripts/buildlog/record.py` and the modules it imports at start, with their tests.
+**Gotchas:** `memory_admit.py` is edited by several units; the builds merge took builds' direct buildlog imports over phase 16's typed stubs.
 
 ### Phase 17 — The build log stores each memory reading once each minute  · status: done
 **Depends on:** none (from next items; showrunner disposition 2026-10-30: next)
@@ -345,3 +353,20 @@ Acceptance: the call costs less CPU, and the rows it writes are unchanged. Do no
 **Gotchas:** old logs keep slices in `memory_snapshots`, so the reader reads both tables.
 
 **Ruled out:** a join on equal `at` text between the two writers (a miss showed the slice as absent).
+
+### Phase 18 — Each test step's row records the memory charge admission gave its test phase  · status: todo
+**Depends on:** none (from next items; showrunner 2026-11-04: natest P10 is on builds, the index.py freeze has ended, start now)
+
+Admission now saves the charge it gave a test phase: `memory_admit.read_test_phase_charge_use` returns `TestPhaseChargeUse` (`bytes`, `selected_at`, `reservation_id`, `need`) or `NoTestPhaseChargeUse`, and finalization copies it into the admission history row as `test_phase_charge_use`. The step row still writes `test_phase_charge: null` (`record.py` `test_phase_context`), and the index has no column for it.
+
+1. Find where the recorder can read the charge for its own step: the sampling context that `invoke.sh` passes to `record.py test-phase-context`, the reservation's saved file, or the admission history row by `reservation_id`. Quote the code that proves the charge exists at that moment.
+2. Copy the charge into the step row's `test_phase_charge`. Compute nothing. No charge records null.
+3. Add an index column for the charge bytes, so `buildlog query` can rank steps by it.
+
+Acceptance: a step with a charge records it for terminal and tee steps; a step without one records null. The index column holds the bytes or null. CPU per `record.py` call stays at or below the Phase 16 values (terminal 150.3 ms, tee 151.4 ms, test-phase-context 80.9 ms).
+
+**Constraints from prior phases:** `record.py` keeps its imports lazy (Phase 16). Do not import `memory_admit` on the step path. An edit to `memory_admit.py` or `invoke.sh` needs a notice to queue-unit.
+
+**Workers:** 1 writer (rowcpu).
+
+**Files:** `scripts/buildlog/record.py`, `scripts/buildlog/index.py`, their tests, `docs/as-built/buildlog-memory-stalls.md`; `scripts/lint/invoke.sh` and `scripts/lint/memory_admit.py` only if step 1 shows the charge must pass through them.
