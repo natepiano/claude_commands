@@ -16612,6 +16612,7 @@ class WorkersHomeTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(patch.object(codex_mesh, "agent_scope_prefix", return_value=([], "fixture scope unavailable")))
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home = root / "home"
         self.home.mkdir()
@@ -16664,6 +16665,53 @@ class WorkersHomeTests(unittest.TestCase):
         record = cast(dict[str, object], json.loads((self.session_dir / codex_mesh.SERVER_FILE).read_text()))
         self.assertEqual(record["codex_home"], str(home))
         self.assertEqual(record["auto_compact_tokens"], codex_mesh.AUTO_COMPACT_TOKENS)
+
+    def scoped_start(self, *, failure: bool = False, missing: bool = False) -> tuple[list[str], str]:
+        from scripts.lib import agent_scope
+
+        stub = self.home / "systemd-run"
+        _ = stub.write_text("#!/bin/sh\n" + ("echo 'no bus' >&2; exit 1\n" if failure else "exit 0\n"))
+        stub.chmod(0o755)
+        config = self.home / "config"
+        config.mkdir(exist_ok=True)
+        _ = (config / "codex_daemon.conf").write_text("agents_slice=app-test-agents.slice\n")
+        process = MagicMock(spec=subprocess.Popen)
+        process.pid = 99999999
+        cast(MagicMock, process.poll).return_value = None
+        real_popen = subprocess.Popen
+
+        def probe() -> tuple[list[str], str]:
+            with patch.object(subprocess, "Popen", real_popen):
+                return agent_scope.agent_scope_prefix()
+
+        with (patch.dict(os.environ, {"PATH": str(self.home / "absent" if missing else self.home),
+                                      "CONF_DIR": str(config)}),
+              patch.object(codex_mesh, "agent_scope_prefix", side_effect=probe),
+              patch.object(subprocess, "Popen", return_value=process) as launch,
+              patch.object(codex_mesh, "_free_port", return_value=4001),
+              patch.object(codex_mesh, "WebSocket"), patch.object(codex_mesh, "_start_watcher")):
+            self.assertEqual(codex_mesh.ensure_server(str(self.session_dir), self.home), (4001, True))
+        record = cast(dict[str, object], json.loads((self.session_dir / codex_mesh.SERVER_FILE).read_text()))
+        self.assertEqual(record["pid"], 99999999)
+        log = self.session_dir / codex_mesh.SERVER_LOG
+        return cast(list[str], launch.call_args.args[0]), log.read_text() if log.exists() else ""
+
+    def test_server_uses_the_configured_agent_scope(self) -> None:
+        command, log = self.scoped_start()
+        self.assertEqual(command[:8], [str(self.home / "systemd-run"), "--user", "--scope", "--quiet",
+                                       "--collect", "--slice=app-test-agents.slice", "--", "codex"])
+        self.assertIn("app-server", command)
+        self.assertNotIn("agent scope unavailable", log)
+
+    def test_server_starts_without_a_scope_when_the_probe_fails_or_is_absent(self) -> None:
+        for missing in (False, True):
+            with self.subTest(missing=missing):
+                (self.session_dir / codex_mesh.SERVER_LOG).unlink(missing_ok=True)
+                command, log = self.scoped_start(failure=True, missing=missing)
+                self.assertEqual(command[0], "codex")
+                self.assertIn("app-server", command)
+                self.assertEqual(len(log.splitlines()), 1)
+                self.assertIn("agent scope unavailable:", log)
 
     def started_environment(self, caller: dict[str, str]) -> dict[str, str]:
         _ = self.select()
@@ -17070,6 +17118,7 @@ class DevShellServerTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(patch.object(codex_mesh, "agent_scope_prefix", return_value=([], "fixture scope unavailable")))
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.session_dir = root / "runs" / "unit"
         self.session_dir.mkdir(parents=True)
@@ -17547,6 +17596,7 @@ class ServerRecordTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(patch.object(codex_mesh, "agent_scope_prefix", return_value=([], "fixture scope unavailable")))
         private_worker_staff(self)
         self.temporary = tempfile.TemporaryDirectory()
         self.session_dir = Path(self.temporary.name)

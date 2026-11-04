@@ -43,6 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pane_launch
+from scripts.lib.agent_scope import agents_slice, agent_scope_prefix
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
 from scripts.message import sessions as runtime_sessions
@@ -110,19 +111,16 @@ def _tab_labels(record: staff.StaffSnapshot) -> StaffLabels | StaffLabelsRead:
     return StaffLabels.for_record(record)
 
 
-# The slice of the pane scopes. A pane shell in its own scope keeps the agent load out of the server's cgroup.
-PANE_SLICE = "app-agents.slice"
 # The transient server unit gets CPU first and keeps its memory out of swap under the pane load.
 _SERVER_PROPERTIES = ("-p", "CPUWeight=1000", "-p", "MemoryLow=1G", "-p", "MemorySwapMax=0")
-_PANE_SCOPE_PROBE_SECONDS = 5.0
 # The pane shell wrapper. herdr runs $SHELL for a pane; this puts the real shell in its own scope.
 # The scope runs in place of the wrapper, so the pane's shell pid does not change (the scope is run-p<pid>).
 # SHELL is the real shell again, so a tool that reads SHELL does not start a scope on each command.
-_PANE_SHELL_SCRIPT = f"""#!/bin/sh
-real=${{HERDR_PANE_SHELL:-/bin/sh}}
+_PANE_SHELL_SCRIPT = """#!/bin/sh
+real=${HERDR_PANE_SHELL:-/bin/sh}
 unset HERDR_PANE_SHELL
 SHELL=$real; export SHELL
-exec @SYSTEMD_RUN@ --user --scope --quiet --collect --slice={PANE_SLICE} -- "$real" "$@"
+exec @SCOPE_PREFIX@ "$real" "$@"
 """
 
 
@@ -2662,21 +2660,15 @@ def _pane_shell() -> str:
 
 
 def _pane_scopes_unavailable() -> str:
-    """Probe a scope once per server start and write the wrapper; the reason on failure, else ""."""
-    systemd_run = os.environ.get("SYSTEMD_RUN", "systemd-run")
-    try:
-        probe = run_program([systemd_run, "--user", "--scope", "--quiet", "--collect", "--", "true"],
-                            timeout=_PANE_SCOPE_PROBE_SECONDS)
-    except (HerdrFailure, subprocess.TimeoutExpired) as error:
-        return str(error)
-    if probe.returncode != 0:
-        return probe.stderr.strip() or f"exit {probe.returncode}"
+    """Probe a scope and write the wrapper. Return the failure reason, or an empty string."""
+    prefix, unavailable = agent_scope_prefix()
+    if unavailable:
+        return unavailable
     path = _pane_shell_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         staged = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        absolute = shutil.which(systemd_run) or systemd_run
-        _ = staged.write_text(_PANE_SHELL_SCRIPT.replace("@SYSTEMD_RUN@", shlex.quote(absolute)), encoding="utf-8")
+        _ = staged.write_text(_PANE_SHELL_SCRIPT.replace("@SCOPE_PREFIX@", shlex.join(prefix)), encoding="utf-8")
         # The mode is set before the replace: a server that runs now never finds a wrapper it cannot run.
         staged.chmod(0o755)
         _ = staged.replace(path)
@@ -2689,7 +2681,7 @@ def _submit_server(client: Herdr) -> subprocess.CompletedProcess[str]:
     # The shared session's server has a boot unit; a transient unit of its name cannot start beside it.
     if client.session == shared_session() and _installed_server_unit(client.session):
         return run_program([os.environ.get("SYSTEMCTL", "systemctl"), "--user", "start", server_unit(client.session)])
-    # Each pane shell goes into its own scope under PANE_SLICE, so the unit holds only the server.
+    # Each pane shell uses the configured agent slice. The unit holds only the server.
     unavailable = " ".join(_pane_scopes_unavailable().splitlines())
     if unavailable:
         print(f"herdr {client.session}: pane scopes unavailable, panes stay in the server unit: {unavailable}",
@@ -3882,9 +3874,10 @@ def _pane_shell_pids(session: str) -> list[int]:
 
 
 def pane_scopes(groups: list[tuple[str, Path]]) -> list[tuple[str, Path]]:
-    """The pane scopes under PANE_SLICE that hold a process, from its systemd memberships."""
+    """Return the populated pane scopes in the configured agent slice."""
+    slice_name = agents_slice()
     return [(hierarchy, scope) for hierarchy, path in groups
-            for scope in (path, *path.parents) if scope.parent.name == PANE_SLICE]
+            for scope in (path, *path.parents) if scope.parent.name == slice_name]
 
 
 def _add_scope_owners(owners: dict[tuple[str, Path], set[str]], pids: Sequence[int], sessions: dict[int, str]) -> None:

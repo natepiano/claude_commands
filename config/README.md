@@ -62,6 +62,11 @@ context-usage hooks read it to place the auto-compaction trigger they warn
 against; nothing in the hook scripts names a model. A new family, or a family
 whose first 1M release changes, is a row here.
 
+## codex_daemon.conf
+
+`agents_slice` selects the systemd slice for agent panes and Codex app-server processes.
+Both callers read the value when they use it.
+
 ## lint.conf
 
 Which lint checks run, everywhere they run: `cache`, `mend`, `style_review`,
