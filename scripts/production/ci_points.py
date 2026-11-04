@@ -149,7 +149,6 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
         return
     script = Path(os.environ.get("CI_POINTS_VALIDATE_SCRIPT", str(Path.home() / ".claude/scripts/validate_and_push/validate_and_push.sh")))
     tip = branch_tip(production)
-    origin = required(git(production.checkout, "remote", "get-url", "origin"), "ci start")
     push_origin = required(git(production.checkout, "remote", "get-url", "--push", "origin"), "ci start")
     history = merge_branch_history(production.checkout, tip)
     last_code = next((entry for entry in history.entries if isinstance(entry, MergeEntry) and isinstance(entry.kind, CodeCheckpoint)), None)
@@ -158,11 +157,7 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
     state_dir.mkdir(parents=True, exist_ok=True)
     with copies.standing(production.slug, production.checkout, tip) as checkout:
         source_url = required(git(checkout, "config", "--local", "--get", "remote.origin.url"), "ci start")
-        # Remote URLs are multivalued: a command-scoped remote.origin.url adds
-        # another URL instead of replacing the clone's first URL. Rewrite that
-        # URL for validation so both Git transport and remote get-url see origin.
-        settings = [(f"url.{origin}.insteadOf", source_url),
-                    (f"url.{push_origin}.pushInsteadOf", source_url)]
+        settings = [(f"url.{push_origin}.pushInsteadOf", source_url)]
         for key in ("user.name", "user.email"):
             identity = git(production.checkout, "config", "--get", key)
             if identity.returncode == 0:

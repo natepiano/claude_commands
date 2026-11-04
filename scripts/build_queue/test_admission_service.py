@@ -378,7 +378,7 @@ class CiSliceAdmissionTests(unittest.TestCase):
             _ = (ci / "memory.current").write_text(str(2 * GIB))
             _ = (ci / "memory.stat").write_text("inactive_file 0\n")
             _ = (ci / "memory.max").write_text(str(18 * GIB))
-            (fixture.proc.path / "123").mkdir()
+            _ = fixture.fixture_owner(123, "100")
             _ = (fixture.proc.path / "123/comm").write_text("Runner.Worker\n")
             _ = (ci / "cgroup.procs").write_text("123\n")
             request = fixture.request(need=8 * GIB)
@@ -397,7 +397,7 @@ class CiSliceAdmissionTests(unittest.TestCase):
             ci = fixture.root / "ci.slice"
             _ = (ci / "memory.current").write_text(str(2 * GIB))
             _ = (ci / "memory.stat").write_text("inactive_file 0\n")
-            (fixture.proc.path / "123").mkdir()
+            _ = fixture.fixture_owner(123, "100")
             _ = (fixture.proc.path / "123/comm").write_text("Runner.Worker\n")
             _ = (ci / "cgroup.procs").write_text("123\n")
             request = fixture.request(need=14 * GIB)
@@ -2206,7 +2206,7 @@ class CutoverServiceTests(unittest.TestCase):
             _ = Path(grant.wave_path).write_text(f"{5 * GIB} {int(fixture.clock.now())}")
             record = fixture.server.reservations[request.episode]
             scope = Path(Path(record.sidecar).read_text())
-            _ = (scope / "memory.stat").write_text(f"anon {GIB}\n")
+            _ = (scope / "memory.stat").write_text(f"anon {GIB}\ninactive_file 0\n")
             policy = gate.read_memory_config().policy
             fixture.clock.advance(max(policy.timing.ramp_seconds,
                 policy.timing.head_seconds, policy.peak_hold.seconds_for("merge-gate")) + 1)
@@ -2224,7 +2224,9 @@ class CutoverServiceTests(unittest.TestCase):
                 assert isinstance(viewed, wire.ViewReply)
                 assert isinstance(explained, wire.ExplainReply)
                 self.assertEqual(viewed.reading.explanation, explained.explanation)
-                running, = explained.explanation.running
+                self.assertEqual(len(explained.explanation.running), 2)
+                running, = (row for row in explained.explanation.running
+                            if gate.running_has_reservation(row.step))
                 self.assertEqual((running.basis, running.charged), (gate.LifetimePromise(6 * GIB), 6 * GIB))
                 self.assertEqual(gate.growth_headroom(running.step.measured), 5 * GIB)
                 head = explained.explanation.head
@@ -3040,7 +3042,8 @@ class CutoverServiceTests(unittest.TestCase):
             self.assertEqual(gate.read_test_phase_need(evidence["need"]), need)
             inputs = fixture.server.last_inputs
             assert isinstance(inputs, gate.QueueInputs)
-            self.assertEqual(gate.build_charge(inputs.running[0].measured), expected)
+            memory, = (step for step in inputs.running if gate.running_has_reservation(step))
+            self.assertEqual(gate.build_charge(memory.measured), expected)
             fields = wire.parse_record(phase.read_text(), dict[str, object])
             fields["test_phase_peak_bytes"] = 5 * GIB
             _ = phase.write_text(wire.encode_record(fields))
@@ -3049,7 +3052,8 @@ class CutoverServiceTests(unittest.TestCase):
             self.assertEqual(fixture.server.reservations[request.episode].charge_use, evidence)
             inputs = fixture.server.last_inputs
             assert isinstance(inputs, gate.QueueInputs)
-            memory, = inputs.running
+            self.assertEqual(len(inputs.running), 2)
+            memory, = (step for step in inputs.running if gate.running_has_reservation(step))
             self.assertEqual(gate.build_charge(memory.measured), 6 * GIB)
             self.assertFalse(list(fixture.state_dir.glob("*.test-phase-charge.json")))
             self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest("release", grant.reservation, 0)), [wire.Ok()])
@@ -3068,7 +3072,8 @@ class CutoverServiceTests(unittest.TestCase):
                 write_memory_config(fixture.root / "build_admission.conf", test_phase_margin="2")
                 inputs = fixture.server.last_inputs
                 assert isinstance(inputs, gate.QueueInputs)
-                memory, = inputs.running
+                self.assertEqual(len(inputs.running), 2)
+                memory, = (step for step in inputs.running if gate.running_has_reservation(step))
                 self.assertEqual(gate.build_charge(memory.measured), math.ceil(3 * GIB * need.margin))
                 fixture.fault.stage = stage
                 with self.assertRaises(InjectedCrash):
@@ -3088,7 +3093,8 @@ class CutoverServiceTests(unittest.TestCase):
             _ = fixture.server.run_pass()
             inputs = fixture.server.last_inputs
             assert isinstance(inputs, gate.QueueInputs)
-            memory, = inputs.running
+            self.assertEqual(len(inputs.running), 2)
+            memory, = (step for step in inputs.running if gate.running_has_reservation(step))
             self.assertEqual(gate.charge_basis(memory.measured), gate.RampPromise(11 * GIB))
             self.assertIsInstance(fixture.server.reservations[request.episode].charge_use, gate.NoTestPhaseChargeUse)
             fixture.proc.kill(request.owner)
