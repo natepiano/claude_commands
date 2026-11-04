@@ -264,8 +264,39 @@ step_was_killed_for_memory() {
     memory_kill_in_journal "$started" "$ended"
 }
 
+step_writes_tree() {
+    if [[ "${1:-}" == env ]]; then
+        shift
+        while [[ "${1:-}" == *=* || "${1:-}" == -u ]]; do
+            if [[ "$1" == -u ]]; then shift 2; else shift; fi
+        done
+    fi
+    [[ "${1:-}" == cargo ]] || return 1
+    shift
+    if [[ "${1:-}" == +* ]]; then shift; fi
+    case "${1:-}" in
+        fmt) return 0 ;;
+        mend|clippy)
+            shift
+            while (( $# )); do
+                [[ "$1" != -- ]] || break
+                [[ "$1" != --fix ]] || return 0
+                shift
+            done
+            ;;
+    esac
+    return 1
+}
+
 run() {
     local attempt status started ended step_log monitor=0
+    local STEP_WRITES_TREE=0
+    if step_writes_tree "$@"; then
+        STEP_WRITES_TREE=1
+        # Both queue hooks must keep this step in the original tree.
+        local LINT_QUEUE_LEAVE_HOOK=false BUILDLOG_MAC_IDLE_HOOK=false
+        export LINT_QUEUE_LEAVE_HOOK BUILDLOG_MAC_IDLE_HOOK
+    fi
     RUN_LAST_ATTEMPT_KILLED=0
     step_log="$(mktemp)"
     for attempt in 1 2; do
@@ -290,7 +321,7 @@ run() {
         set -m
         (
             set +m
-            if [[ "$CMD" != test && "$STEP_RUNS_ON" != natedev_only ]] && buildlog_step_compiles "$@"; then
+            if [[ "$CMD" != test && "$STEP_RUNS_ON" != natedev_only && "$STEP_WRITES_TREE" == 0 ]] && buildlog_step_compiles "$@"; then
                 export LINT_QUEUE_LEAVE_HOOK="$(ssh_retry_hook)"
             fi
             if run_once "$@" 2>&1 | tee "$step_log"; then
@@ -1716,6 +1747,13 @@ route_compiling_step() {
     STEP_RAN_ON_MAC=0
     step_state waiting_hold
     check_routing_hold || admission=$?
+    if [[ "${STEP_WRITES_TREE:-0}" == 1 ]]; then
+        case "$admission" in
+            0) return 0 ;;
+            10) build_hold_wait_local "$@"; return $? ;;
+            *) return "$admission" ;;
+        esac
+    fi
     case "$admission" in
         0)
             if [[ "$STEP_RUNS_ON" != ssh_allowed && "$STEP_FORCE_MAC" == 0 ]]; then return 0; fi
@@ -1749,7 +1787,7 @@ route_compiling_step() {
         while (( $# )); do
             case "$MAC_VERB:$1" in
                 doc:--no-deps|clippy:--all-targets|mend-check:--all-targets|mend-check:--fail-on-warn) shift ;;
-                clippy:--fix|clippy:--allow-dirty|clippy:--allow-staged|clippy:--allow-no-vcs|mend-check:--fix) shift ;;
+                clippy:--allow-dirty|clippy:--allow-staged|clippy:--allow-no-vcs) shift ;;
                 doc:--jobs) shift 2 ;;
                 *) MAC_VERB_ARGS+=("$1"); shift ;;
             esac
@@ -1871,6 +1909,7 @@ ssh_reserve_hook() {
 }
 
 ssh_retry_hook() {
+    [[ "${STEP_WRITES_TREE:-0}" == 0 ]] || { printf 'false'; return; }
     [[ "$STEP_RUNS_ON" != natedev_only && "$LOCAL_ONLY" == 0 ]] || { printf 'false'; return; }
     local name eligibility reason settings pivot=-1 index
     local names=() candidates=()
@@ -2226,6 +2265,8 @@ user_clock() {
 
 cache_record() {
     local kind=$1 repeat=$2 host=${3:-} key verb=passed other=fail
+    # A lost token gives no verdict about the tree.
+    (( EXIT_STATUS != 125 )) || return 1
     key="$(tree_key)"
     [[ -n "${key}" && -n "${VERDICT_KEY}" ]] || return 1
     if [[ "${key}" != "${VERDICT_KEY}" ]]; then
