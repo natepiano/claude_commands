@@ -201,7 +201,7 @@ class RecordRerunTests(unittest.TestCase):
         fixture.setUp()
         # Keep the recorder's root and two-machine configuration for the launch source.
         point_root_at(self, self.fixture.root)
-        _ = self.enterContext(mock.patch.dict(
+        _ = self.enterContext(mock.patch.dict(  # pyright: ignore[reportAny]
             os.environ, mac_natedev_environment(self.fixture.base / "config")))
         return fixture
 
