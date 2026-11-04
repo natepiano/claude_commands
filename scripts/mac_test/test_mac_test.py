@@ -899,6 +899,21 @@ class MacTestCommandTests(unittest.TestCase):
                                                  environment=environment), 10, "blocked by alice: release work\n")
                 self.assertFalse((self.state_directory / "run.json").exists())
 
+    def test_a_memory_wait_reservation_cannot_transfer_after_another_session_blocks_the_mac(self) -> None:
+        self.write_config(offload="on")
+        waiter = self.start_child()
+        runner = self.start_child()
+        claimed = self.command("claim", "--pid", str(waiter.pid),
+                               "--worktree", str(self.root), "--what", "mend sample")
+        self.assert_command(claimed, 0, "claimed\n")
+        before = self.run_state()
+        _ = self.write_block(session="assembly-session", free_message={"kind": "not_needed"})
+        self.assert_command(self.command("free-now", "--repo-root", str(self.root)), 1, "blocked\n")
+        result = self.command("claim", "--pid", str(runner.pid), "--from-pid", str(waiter.pid),
+                              "--worktree", str(self.root), "--remote", "test-mac", "--what", "mend sample")
+        self.assert_command(result, 10, "blocked by alice: release work\n")
+        self.assertEqual(self.run_state(), before)
+
     def test_free_now_reads_past_own_block_to_free_or_busy(self) -> None:
         self.write_config(offload="on")
         _ = self.write_block(session="session-a", free_message={"kind": "not_needed"})

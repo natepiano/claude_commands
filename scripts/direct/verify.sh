@@ -264,8 +264,39 @@ step_was_killed_for_memory() {
     memory_kill_in_journal "$started" "$ended"
 }
 
+step_writes_tree() {
+    if [[ "${1:-}" == env ]]; then
+        shift
+        while [[ "${1:-}" == *=* || "${1:-}" == -u ]]; do
+            if [[ "$1" == -u ]]; then shift 2; else shift; fi
+        done
+    fi
+    [[ "${1:-}" == cargo ]] || return 1
+    shift
+    if [[ "${1:-}" == +* ]]; then shift; fi
+    case "${1:-}" in
+        fmt) return 0 ;;
+        mend|clippy)
+            shift
+            while (( $# )); do
+                [[ "$1" != -- ]] || break
+                [[ "$1" != --fix ]] || return 0
+                shift
+            done
+            ;;
+    esac
+    return 1
+}
+
 run() {
     local attempt status started ended step_log monitor=0
+    local STEP_WRITES_TREE=0
+    if step_writes_tree "$@"; then
+        STEP_WRITES_TREE=1
+        # Both queue hooks must keep this step in the original tree.
+        local LINT_QUEUE_LEAVE_HOOK=false BUILDLOG_MAC_IDLE_HOOK=false
+        export LINT_QUEUE_LEAVE_HOOK BUILDLOG_MAC_IDLE_HOOK
+    fi
     RUN_LAST_ATTEMPT_KILLED=0
     step_log="$(mktemp)"
     for attempt in 1 2; do
@@ -277,11 +308,6 @@ run() {
         if buildlog_step_compiles "$@"; then
             step_state on_natedev
         else
-            # A Mac step can release the token inside a lint pipeline.
-            # Read its shared mark before starting a local formatter.
-            if [[ -n "${TOKEN_WAIT_FILE:-}" && -e "${TOKEN_WAIT_FILE}.given_back" ]]; then
-                release_token || { status=$?; rm -f "$step_log"; return "$status"; }
-            fi
             acquire_token local || { status=$?; rm -f "$step_log"; return "$status"; }
             if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
                 printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
@@ -295,7 +321,7 @@ run() {
         set -m
         (
             set +m
-            if [[ "$CMD" != test && "$STEP_RUNS_ON" != natedev_only ]] && buildlog_step_compiles "$@"; then
+            if [[ "$CMD" != test && "$STEP_RUNS_ON" != natedev_only && "$STEP_WRITES_TREE" == 0 ]] && buildlog_step_compiles "$@"; then
                 export LINT_QUEUE_LEAVE_HOOK="$(ssh_retry_hook)"
             fi
             if run_once "$@" 2>&1 | tee "$step_log"; then
@@ -1721,6 +1747,13 @@ route_compiling_step() {
     STEP_RAN_ON_MAC=0
     step_state waiting_hold
     check_routing_hold || admission=$?
+    if [[ "${STEP_WRITES_TREE:-0}" == 1 ]]; then
+        case "$admission" in
+            0) return 0 ;;
+            10) build_hold_wait_local "$@"; return $? ;;
+            *) return "$admission" ;;
+        esac
+    fi
     case "$admission" in
         0)
             if [[ "$STEP_RUNS_ON" != ssh_allowed && "$STEP_FORCE_MAC" == 0 ]]; then return 0; fi
@@ -1754,7 +1787,7 @@ route_compiling_step() {
         while (( $# )); do
             case "$MAC_VERB:$1" in
                 doc:--no-deps|clippy:--all-targets|mend-check:--all-targets|mend-check:--fail-on-warn) shift ;;
-                clippy:--fix|clippy:--allow-dirty|clippy:--allow-staged|clippy:--allow-no-vcs|mend-check:--fix) shift ;;
+                clippy:--allow-dirty|clippy:--allow-staged|clippy:--allow-no-vcs) shift ;;
                 doc:--jobs) shift 2 ;;
                 *) MAC_VERB_ARGS+=("$1"); shift ;;
             esac
@@ -1876,6 +1909,7 @@ ssh_reserve_hook() {
 }
 
 ssh_retry_hook() {
+    [[ "${STEP_WRITES_TREE:-0}" == 0 ]] || { printf 'false'; return; }
     [[ "$STEP_RUNS_ON" != natedev_only && "$LOCAL_ONLY" == 0 ]] || { printf 'false'; return; }
     local name eligibility reason settings pivot=-1 index
     local names=() candidates=()
@@ -2231,6 +2265,8 @@ user_clock() {
 
 cache_record() {
     local kind=$1 repeat=$2 host=${3:-} key verb=passed other=fail
+    # A lost token gives no verdict about the tree.
+    (( EXIT_STATUS != 125 )) || return 1
     key="$(tree_key)"
     [[ -n "${key}" && -n "${VERDICT_KEY}" ]] || return 1
     if [[ "${key}" != "${VERDICT_KEY}" ]]; then
@@ -2555,7 +2591,7 @@ token_wait_note() {
     fi
     case "$kind" in
         first) printf 'waiting for the cargo token since %s: %s; calls ahead of this one: %d\n' \
-            "$(TZ="$(buildlog_memory_python "$USER_ZONE_SCRIPT" 2>/dev/null)" date '+%H:%M %Z')" \
+            "$(TZ="$(python3 -S "$(dirname "${BASH_SOURCE[0]}")/../lib/user_zone.py" 2>/dev/null)" date '+%H:%M %Z')" \
             "$who" "$TOKEN_WAITERS_AHEAD" >&2 ;;
         still) printf 'still waiting for the cargo token (%d min): %s; calls ahead of this one: %d\n' \
             "$waited_min" "$who" "$TOKEN_WAITERS_AHEAD" >&2 ;;
@@ -2582,12 +2618,25 @@ token_wait_superseded() {
     note_event superseded "$SECONDS" 0 "" 0 "$VERIFY_SUPERSEDED_STATUS"
     exit "$VERIFY_SUPERSEDED_STATUS"
 }
+# A release stays visible to every shell until an acquisition succeeds.
+sync_token_state() {
+    if [[ -n "${TOKEN_WAIT_FILE:-}" && -e "${TOKEN_WAIT_FILE}.given_back" ]]; then
+        TOKEN_HELD=0
+    fi
+}
+
+token_acquired() {
+    TOKEN_HELD=1
+    [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "${TOKEN_WAIT_FILE}.given_back"
+}
+
 # Waits until this run holds the token, with no time limit: the pid reclaim and
 # the 3600 s hold already free a dead or stuck holder, and the queue above
 # drops a waiter whose verify.sh ended. Sets TOKEN_WAITED to the seconds it
 # waited.
 # The local argument disables remote routing for a local formatter.
 acquire_token() {
+    sync_token_state
     TOKEN_WAITED=0
     [[ "${TOKEN_USED}" -eq 1 && "${TOKEN_HELD}" -eq 0 ]] || return 0
     local started noted=-1 waited pause
@@ -2668,7 +2717,7 @@ acquire_token() {
     done
     phase_wait_finish token
     TOKEN_WAITER_PID=""
-    TOKEN_HELD=1
+    token_acquired
     TOKEN_FIRST_WAIT_DONE=1
     [[ -z "$TOKEN_WAIT_ENTRY" ]] || rm -f "$TOKEN_WAIT_ENTRY"
     TOKEN_WAIT_ENTRY=""
@@ -2783,7 +2832,6 @@ release_token() {
     # A subshell records its release for the parent shell.
     # A killed acquisition can still hold the token, so release that token too.
     if [[ -n "${TOKEN_WAIT_FILE:-}" && -e "${TOKEN_WAIT_FILE}.given_back" ]]; then
-        rm -f "${TOKEN_WAIT_FILE}.given_back"
         if [[ "${TOKEN_HELD}" -eq 1 ]]; then
             bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$ >/dev/null 2>&1 || true
         fi
@@ -2805,12 +2853,13 @@ release_token() {
 # One try for the token, with no wait. Status 0 when it is held. A call that
 # waits ahead of this one in the queue makes it a wait.
 try_token_now() {
+    sync_token_state
     [[ "${TOKEN_USED}" -eq 1 && "${TOKEN_HELD}" -eq 0 ]] || return 0
     count_token_waiters_ahead
     (( TOKEN_WAITERS_AHEAD == 0 )) || return 1
     bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
         --pid $$ --hold 3600 --wait 0 >/dev/null 2>&1 || return 1
-    TOKEN_HELD=1
+    token_acquired
 }
 
 # The token is for natedev cargo only. A step gives it back while it waits for
@@ -2825,9 +2874,7 @@ eval "$(declare -f buildlog_wait_for_memory | sed '1s/buildlog_wait_for_memory/b
 buildlog_wait_for_memory() {
     local memory_wait
     step_state waiting_hold
-    if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
-        : > "${TOKEN_WAIT_FILE}.given_back"
-    fi
+    release_token || return $?
     buildlog_wait_for_memory_only "$@" || return $?
     [[ "$BUILDLOG_MEM_OUTCOME" != LeftQueue ]] || return 0
     TOKEN_WAITED=0
@@ -2840,14 +2887,11 @@ buildlog_wait_for_memory() {
         # The second pass keeps the step's place in the memory queue from its first wait.
         BUILDLOG_MEM_TOKEN_BACK_AT=$token_back_at BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM buildlog_wait_for_memory_only "$@" || return $?
         BUILDLOG_MEM_WAIT_S=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
-            if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
-            if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
-                : > "${TOKEN_WAIT_FILE}.given_back"
-            fi
+        if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
+            release_token || return $?
             return 0
         fi
     fi
-    [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "${TOKEN_WAIT_FILE}.given_back"
     if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
         printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
     fi
@@ -2893,14 +2937,11 @@ build_hold_wait_local() {
         if [[ "$TEST_BUILD_INPUTS_READY" == 1 ]]; then refresh_test_build_inputs; fi
         return 0
     fi
-    if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
-        : > "${TOKEN_WAIT_FILE}.given_back"
-    fi
+    release_token || return $?
     build_hold_wait_local_only "$@" || status=$?
     phase_wait_finish hold
     [[ "$status" == 0 ]] || return "$status"
     acquire_token || return $?
-    [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "${TOKEN_WAIT_FILE}.given_back"
     if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
         printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
     fi
