@@ -1,1 +1,1 @@
-  1 builds            queue-unit        merge-gate  36 ███████▋ 7.6 ⊘ pressure
+  1 builds            queue-unit        merge-gate  36 ███████▋ 7.6 ↑ ≤13.4 10:00 pressure

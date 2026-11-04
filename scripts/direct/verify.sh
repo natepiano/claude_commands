@@ -2568,7 +2568,7 @@ if [[ -z "${BOARD_DIR}" && -z "${BOARD_SLOT}" && -n "${UNIT_SESSION_DIR:-}" ]]; 
     BOARD_SLOT=director
 fi
 # TOKEN_USED: this run takes the token. TOKEN_HELD: it holds the token now. The
-# token is given back for each memory wait, so the two differ between steps.
+# token is released during holds and remote work.
 TOKEN_USED=0
 TOKEN_HELD=0
 # A step routed to the Mac skips its first token acquisition.
@@ -2611,8 +2611,8 @@ token_wait_interrupted() {
 # The same files make one queue: a call tries for the token only while no
 # older call that still runs verify.sh waits. Before, any poller took a freed
 # token, and with about 25 calls on one board two calls waited 3 and 3.5 h
-# behind newer ones (2026-10-22). A call that gives the token back for a memory
-# or hold wait waits again under its first start, in a file with an `.again`
+# behind newer ones (2026-10-22). A call that releases the token during a
+# hold waits again under its first start, in a file with an `.again`
 # suffix: it keeps its place, and a newer call does not supersede it, since it
 # already took the token once.
 VERIFY_SUPERSEDED_STATUS=76
@@ -2685,14 +2685,19 @@ count_token_waiters_ahead() {
     done
 }
 # Prints the token wait to the log: a line when it starts, one every
-# TOKEN_WAIT_NOTE_MIN minutes, and one when the token is taken. Before, a step
-# that gave the token back for memory waited again with no line, and its log
-# ended on "starting anyway" for hours (2026-10-22).
+# TOKEN_WAIT_NOTE_MIN minutes, and one when the token is taken.
 token_wait_note() {
-    local kind=$1 waited_min=$2 holder="" who
-    read -r holder < "${BOARD_DIR}/locks/cargo.d/holder" 2>/dev/null || holder=""
-    if [[ -n "$holder" ]]; then
-        who="$holder holds it"
+    local kind=$1 waited_min=$2 holder="" holder_pid="" who
+    if [[ -r "${BOARD_DIR}/locks/cargo.d/holder" ]]; then
+        holder=$(< "${BOARD_DIR}/locks/cargo.d/holder")
+    fi
+    if [[ -r "${BOARD_DIR}/locks/cargo.d/holder_pid" ]]; then
+        holder_pid=$(< "${BOARD_DIR}/locks/cargo.d/holder_pid")
+    fi
+    if [[ "$holder_pid" == "$$" ]]; then
+        who="this call holds it (pid $holder_pid)"
+    elif [[ -n "$holder" ]]; then
+        who="$holder (pid ${holder_pid:-unknown}) holds it"
     elif (( TOKEN_WAITERS_AHEAD > 0 )); then
         who="it is free and goes to an earlier call"
     else
@@ -2959,50 +2964,33 @@ release_token() {
     fi
 }
 
-# One try for the token, with no wait. Status 0 when it is held. A call that
-# waits ahead of this one in the queue makes it a wait.
-try_token_now() {
-    sync_token_state
-    [[ "${TOKEN_USED}" -eq 1 && "${TOKEN_HELD}" -eq 0 ]] || return 0
-    count_token_waiters_ahead
-    (( TOKEN_WAITERS_AHEAD == 0 )) || return 1
-    bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
-        --pid $$ --hold 3600 --wait 0 >/dev/null 2>&1 || return 1
-    token_acquired
-}
-
-# The token is for natedev cargo only. A step gives it back while it waits for
-# memory, and takes it again once the gate admits it; a step that leaves the
-# wait for the Mac does not. A token that is not free at once means a wait,
-# and a reservation kept through it promises memory that no build uses: the
-# gate then holds every other step back (257 GiB promised on 2026-10-20). So
-# the step gives the reservation back, waits for the token, and passes the
-# gate again with the token held. The step runs in run()'s subshell, so its
-# token wait reaches the call record through TOKEN_WAIT_FILE.
+# A local attempt takes its token before it requests memory.
+# The periodic admission hook renews the token throughout the memory wait.
 eval "$(declare -f buildlog_wait_for_memory | sed '1s/buildlog_wait_for_memory/buildlog_wait_for_memory_only/')"
 buildlog_wait_for_memory() {
-    local memory_wait
+    local status=0 cleanup_status=0 renewal
+    local leave_hook="${LINT_QUEUE_LEAVE_HOOK:-${BUILDLOG_MAC_IDLE_HOOK:-}}"
+    BUILDLOG_MEM_WAIT_S=0
     step_state waiting_hold
-    release_token || return $?
-    buildlog_wait_for_memory_only "$@" || return $?
-    [[ "$BUILDLOG_MEM_OUTCOME" != LeftQueue ]] || return 0
-    TOKEN_WAITED=0
-    if ! try_token_now; then
-        buildlog_token_wait || return $?
-        acquire_token || return $?
-        local token_back_at
-        token_back_at=$(buildlog_memory_python -c 'import time; print(time.time())') || return $?
-        memory_wait=$BUILDLOG_MEM_WAIT_S
-        # The second pass keeps the step's place in the memory queue from its first wait.
-        BUILDLOG_MEM_TOKEN_BACK_AT=$token_back_at BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM buildlog_wait_for_memory_only "$@" || return $?
-        BUILDLOG_MEM_WAIT_S=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
-        if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
-            release_token || return $?
-            return 0
-        fi
-    fi
+    sync_token_state
+    acquire_token || return $?
     if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
         printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
+    fi
+    if [[ "${TOKEN_USED}" == 1 ]]; then
+        # Renew only this call's lease. The execution guard still checks ownership.
+        printf -v renewal 'bash -c %q verify-token %q %q %q %q' \
+            '[[ "$(<"$1/locks/cargo.d/holder_pid")" == "$4" ]] && bash "$2" renew "$1" "$3" cargo --hold 3600 >/dev/null; exit 1' \
+            "$BOARD_DIR" "$BOARD_HELPER" "$BOARD_SLOT" "$$"
+        leave_hook="$renewal; ${leave_hook:-false}"
+    fi
+    local LINT_QUEUE_LEAVE_HOOK="$leave_hook"
+    export LINT_QUEUE_LEAVE_HOOK
+    buildlog_wait_for_memory_only "$@" || status=$?
+    if (( status != 0 )) || [[ "$BUILDLOG_MEM_OUTCOME" != Granted ]]; then
+        release_token || cleanup_status=$?
+        (( status != 0 )) || status=$cleanup_status
+        return "$status"
     fi
     step_state on_natedev
 }

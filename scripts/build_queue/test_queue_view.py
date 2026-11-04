@@ -11,7 +11,7 @@ import unittest
 from typing import Self, cast, override
 from unittest import mock
 
-from scripts.build_queue.scope_activity import ScopeProcesses, NoLiveBuildRun, LiveBuildRun
+from scripts.build_queue.scope_activity import ScopeProcesses, NoLiveBuildRun, LiveBuildRun, IdleService, NotServiceSlice
 from scripts.build_queue import head_facts, queue_card, queue_view, queue_evidence
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture
@@ -80,6 +80,32 @@ class QueueViewTests(QueueFixtureTests):
         return replace(self.fixture.model(), reading=reply.reading,
                        facts=head_facts.read_head_facts(reply.reading))
 
+    def test_first_priority_mark_agrees_in_the_card_overview_and_shell(self) -> None:
+        policy = admission_policy_fixture()
+        inputs = self.fixture.inputs(policy=policy)
+        path, row = inputs.ordered[0]
+        row = {**row, "need": 12 * gate.GIB, "since": NOW - policy.timing.head_seconds - 1,
+               "estimated_at": NOW}
+        if "priority_since" in row:
+            del row["priority_since"]
+        inputs = replace(inputs, ordered=[(path, row)], pressure=gate.NoPressureHold(),
+                         host=gate.HostMemory(60 * gate.GIB, 60 * gate.GIB))
+        limits = gate.AdmissionLimits(21 * gate.GIB, 3 * gate.GIB)
+        result = gate.admission_pass(inputs, NOW, limits, policy)
+        self.assertEqual(len(result.policy.head_marks), 1)
+        reason = result.rows[0].reason
+        assert isinstance(reason, gate.HeadAdmissionStatus)
+        self.assertIsInstance(reason.backfill, gate.StrictUntil)
+        assert isinstance(reason.backfill, gate.StrictUntil)
+        clause = gate.window_clause(reason.backfill, limits.budget, reason.need, self.fixture.model().zone)
+        reading = gate.queue_read_from_pass(inputs, limits, policy, result)
+        model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
+        self.assertIn(clause, gate.head_wait_text(reason, model.zone, policy))
+        self.assertIn(clause, plain(queue_card.render_card(model, [1], 400)))
+        status = queue_view.head_status(model, limits.budget)
+        self.assertIn("↑ ≤9.0", plain([status]))
+        self.assertEqual([span.until for span in status if span.until], [reason.backfill.deadline])
+
     def test_running_row_marks_only_the_asking_session(self) -> None:
         model = self.fixture.model()
         grants = tuple(gate.RunningStep(session, session, "merge-gate", "/gate", 6 * gate.GIB,
@@ -117,6 +143,98 @@ class QueueViewTests(QueueFixtureTests):
             self.assertIn("named worker · python3", text)
             self.assertNotIn("ended-session", text)
 
+    def ci_service_model(self, fixture: AdmissionFixture, *, active: bool) -> queue_view.QueueModel:
+        ticks = int(os.sysconf("SC_CLK_TCK"))
+        boot = int(fixture.clock.now()) - 172801
+        _ = (fixture.proc.path / "stat").write_text(f"btime {boot}\n")
+        listener = fixture.fixture_owner(700001, str(ticks))
+        process = fixture.proc.path / str(listener.pid)
+        _ = (process / "comm").write_text("Runner.Listener\n")
+        _ = (process / "cmdline").write_bytes(b"Runner.Listener\0")
+        scope = Path(fixture.scope(listener).read_text()).rename(
+            fixture.root / gate.read_memory_config().ci_memory_slice)
+        _ = (scope / "memory.max").write_text(str(8 * gate.GIB))
+        _ = (scope / "memory.current").write_text(str(int(0.09 * gate.GIB)))
+        _ = (scope / "memory.swap.current").write_text(str(int(1.98 * gate.GIB)))
+        if active:
+            worker = fixture.fixture_owner(700002, str((172801 - 120) * ticks))
+            process = fixture.proc.path / str(worker.pid)
+            _ = (process / "comm").write_text("Runner.Worker\n")
+            _ = (process / "cmdline").write_bytes(b"Runner.Worker\0")
+            _ = (scope / "cgroup.procs").write_text(f"{listener.pid}\n{worker.pid}\n")
+        with mock.patch.object(gate, "ci_slice_cgroup", return_value=scope):
+            _ = fixture.server.run_pass()
+            return self.service_model(fixture)
+
+    def test_idle_ci_keeps_a_small_ram_row_and_separate_swap_without_runner_age(self) -> None:
+        with AdmissionFixture() as fixture:
+            model = self.ci_service_model(fixture, active=False)
+            self.assertEqual(model.reading.explanation.totals.charged, int(0.09 * gate.GIB))
+            self.assertEqual(model.reading.explanation.totals.measured, int(0.09 * gate.GIB))
+            for source, lines in (("view", queue_view.render_view(model, 240)),
+                                  ("card", queue_card.render_card(model, [], 400))):
+                with self.subTest(source=source):
+                    rows = [line for line in plain(lines).splitlines() if "ci.slice:" in line]
+                    self.assertEqual(len(rows), 1)
+                    row, = rows
+                    self.assertIn("idle", row)
+                    self.assertIn("0.1", row)
+                    self.assertIn("swap", row)
+                    self.assertIn("2.0", row)
+                    self.assertNotIn("min", row)
+                    for hidden in ("2880", "2 days", "admitted", "Runner.Listener"):
+                        self.assertNotIn(hidden, row)
+
+    def test_active_ci_shows_worker_age_instead_of_listener_uptime(self) -> None:
+        with AdmissionFixture() as fixture:
+            model = self.ci_service_model(fixture, active=True)
+            for source, lines in (("view", queue_view.render_view(model, 240)),
+                                  ("card", queue_card.render_card(model, [], 400))):
+                with self.subTest(source=source):
+                    rows = [line for line in plain(lines).splitlines() if "ci.slice:" in line]
+                    self.assertEqual(len(rows), 1)
+                    row, = rows
+                    self.assertIn("job", row)
+                    self.assertIn("2 min", row)
+                    self.assertIn("swap", row)
+                    for hidden in ("idle", "2880", "2 days", "Runner.Listener"):
+                        self.assertNotIn(hidden, row)
+
+    def test_build_swap_has_a_separate_label_and_does_not_enter_ram_values(self) -> None:
+        model = self.fixture.model()
+        step = gate.RunningStep("owner", "worker", "clippy", "/tree", 0,
+            gate.MeasuredMemory(gate.GIB // 10, swap_bytes=2 * gate.GIB), started_at=NOW - 120)
+        reading = queue_read_fixture(replace(model.reading.view, running=(step,)),
+                                     policy=admission_policy_fixture())
+        model = replace(model, reading=reading)
+        view_row, = [line for line in plain(queue_view.render_view(model, 240)).splitlines()
+                     if line.startswith("run")]
+        self.assertIn("0.1", view_row)
+        self.assertIn("2.0 GiB swapped", view_row)
+        self.assertNotIn("2.1", view_row)
+        card_row, = [line for line in plain(queue_card.render_card(model, [], 400)).splitlines()
+                     if "worker, clippy:" in line]
+        self.assertIn("charge 0.1 GiB, using now 0.1 GiB", card_row)
+        self.assertIn("2.0 GiB swapped", card_row)
+
+    def test_small_compiler_service_keeps_its_own_ram_row(self) -> None:
+        for used in (0, gate.GIB // 10):
+            model = self.fixture.model()
+            compiler = gate.RunningStep("", "sccache.service", "compile", "builds.slice", 0,
+                                       gate.CompilerServiceMemory(used, swap_bytes=2 * gate.GIB))
+            reading = queue_read_fixture(replace(model.reading.view, running=(compiler,)),
+                                         policy=admission_policy_fixture())
+            model = replace(model, reading=reading)
+            for source, lines in (("view", queue_view.render_view(model, 240)),
+                                  ("card", queue_card.render_card(model, [], 400))):
+                with self.subTest(used=used, source=source):
+                    rows = [line for line in plain(lines).splitlines() if "sccache" in line]
+                    self.assertEqual(len(rows), 1)
+                    self.assertIn(f"{used / gate.GIB:.1f} GiB RAM", rows[0])
+                    self.assertIn("idle", rows[0])
+                    self.assertIn("2.0 GiB swapped", rows[0])
+                    self.assertNotIn("admission time unknown", rows[0])
+
     def test_ci_slice_processes_never_appear_as_ended_builds(self) -> None:
         with AdmissionFixture() as fixture:
             owner = fixture.fixture_owner(700001, "100")
@@ -151,8 +269,10 @@ class QueueViewTests(QueueFixtureTests):
             _ = scope.rename(builds / f"run-p{owner.pid}-iabc.scope")
             _ = fixture.server.run_pass()
             model = self.service_model(fixture)
+            self.assertEqual(len(model.reading.view.running), 2)
             step, = (step for step in model.reading.view.running
-                     if isinstance(step.measured, gate.UnownedSliceMemory))
+                     if isinstance(step.measured, gate.UnownedSliceMemory)
+                     and isinstance(step.measured.job_state, NotServiceSlice))
             assert isinstance(step.measured, gate.UnownedSliceMemory)
             activity = step.measured.activity
             self.assertIsInstance(activity, ScopeProcesses)
@@ -170,7 +290,8 @@ class QueueViewTests(QueueFixtureTests):
         listener = replace(ended, session_id="ci-owner", program="Runner.Listener")
         rows = tuple(gate.RunningStep(activity.session_id, activity.session_name, "unowned", activity.folder, 0,
             gate.UnownedSliceMemory(gate.GIB, owner=model.ci_memory_slice if activity is listener else "opaque.scope",
-                                    activity=activity))
+                                    activity=activity,
+                                    job_state=IdleService() if activity is listener else NotServiceSlice()))
             for activity in (ended, live, listener))
         reading = queue_read_fixture(replace(model.reading.view, running=rows), policy=admission_policy_fixture())
         for labels, owner in (({"private-session-id": UnitLabels("named worker", "builds", "queue")}, "named worker"),
@@ -196,6 +317,31 @@ class QueueViewTests(QueueFixtureTests):
         text = plain(queue_view.render_view(replace(model, reading=reading, labels={}), 140))
         section = "Still running after their build ended" + text.split("Still running after their build ended", 1)[1]
         self.assertEqual(section + "\n", (GOLDEN / "leftover_ages.txt").read_text())
+
+    def test_joined_running_row_counts_process_swap_once(self) -> None:
+        with AdmissionFixture() as fixture:
+            owner = fixture.fixture_owner(700001, "100")
+            process = fixture.proc.path / str(owner.pid)
+            _ = (process / "status").write_text(
+                f"VmRSS: {gate.GIB // 1024} kB\nVmSwap: {gate.GIB // 1024} kB\n")
+            _ = (process / "environ").write_bytes(
+                f"BUILDLOG_RUN={owner.pid}:{owner.start_time}\0".encode())
+            sidecar = fixture.scope(owner)
+            scope = Path(sidecar.read_text())
+            _ = (scope / "memory.swap.current").write_text(str(gate.GIB))
+            builds = fixture.root / "builds.slice"
+            builds.mkdir(exist_ok=True)
+            _ = scope.rename(builds / "joined.scope")
+            request = fixture.request(owner=owner, run=wire.RunIdentity(owner.pid, owner.start_time))
+            _ = only_admitted(fixture.server.handle_request(request))
+            _ = fixture.server.run_pass()
+            model = self.service_model(fixture)
+            row, = queue_view.running_builds(model)
+            self.assertEqual(row.used, gate.GIB)
+            self.assertEqual(row.swap_bytes, gate.GIB)
+            text = plain(queue_view.render_view(model, 180))
+            rendered, = (line for line in text.splitlines() if line.startswith("run"))
+            self.assertIn("1.0 GiB swapped", rendered)
 
     def test_unowned_scope_stays_outside_the_granted_rows(self) -> None:
         model = self.fixture.model()
@@ -414,8 +560,11 @@ class QueueViewTests(QueueFixtureTests):
                 reading = client.view()
             measured = [step.measured for step in reading.view.running
                         if isinstance(step.measured, gate.UnownedSliceMemory)]
-            self.assertEqual(len(measured), 1)
-            self.assertEqual(measured[0].bytes, amount)
+            self.assertEqual(len(measured), 2)
+            scope, = (memory for memory in measured if isinstance(memory.job_state, NotServiceSlice))
+            idle, = (memory for memory in measured if isinstance(memory.job_state, IdleService))
+            self.assertEqual(idle.bytes, 0)
+            self.assertEqual(scope.bytes, amount)
             head = reading.explanation.head
             assert isinstance(head, gate.HeadExplanation)
             self.assertEqual(head.budget.charged, amount + gate.GIB)
