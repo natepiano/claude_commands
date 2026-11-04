@@ -116,6 +116,10 @@ class UnitWorkerLedgerLocation(Protocol):
     def path(self) -> Path: ...
 
 
+class MeshTitleRenderer(Protocol):
+    def mesh_title(self, session_dir: str, name: str, record: Mapping[str, object]) -> str: ...
+
+
 class UnitWorkerRegistry(Protocol):
     """Ledger operations used by mesh without importing its allocation client."""
 
@@ -9336,11 +9340,11 @@ def _prime_admitted_worker(args: argparse.Namespace, admitted: WorkerStartAllowe
             thread_id = published.row.current_session
             name = published.row.name
             if held_design:
-                from scripts.message import roster
-                title = roster.mesh_shown_name(session_dir, name, {
+                roster = cast(MeshTitleRenderer, cast(object, importlib.import_module("scripts.message.roster")))
+                title = roster.mesh_title(session_dir, name, {
                     "held_design_id": held_design, "held_role": held_role,
                     "staff_id": str(published.row.id),
-                }).render()
+                })
             else:
                 title = unit_workers.shown_name(Path(session_dir), name, role="review")
             _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": title}), "thread/name/set")
