@@ -161,6 +161,18 @@ class QueueViewTests(QueueFixtureTests):
                     self.assertNotIn(hidden, section)
                 self.assertEqual(section.count("python3"), 1)
 
+    def test_leftover_age_ranges_and_edges_match_the_golden(self) -> None:
+        model = self.fixture.model()
+        minutes = (0, 45, 119, 120, 19 * 60, 47 * 60, 48 * 60 - 1, 48 * 60, 3567)
+        rows = tuple(gate.RunningStep("worker", "worker", "unowned", "/tree", 0,
+            gate.UnownedSliceMemory(gate.GIB, owner=f"scope-{value}", activity=ScopeProcesses(
+                1, "worker", "worker", "/tree", "python3", NOW - value * 60, True, NoLiveBuildRun())))
+            for value in minutes)
+        reading = queue_read_fixture(replace(model.reading.view, running=rows), policy=admission_policy_fixture())
+        text = plain(queue_view.render_view(replace(model, reading=reading, labels={}), 140))
+        section = "Still running after their build ended" + text.split("Still running after their build ended", 1)[1]
+        self.assertEqual(section + "\n", (GOLDEN / "leftover_ages.txt").read_text())
+
     def test_unowned_scope_stays_outside_the_granted_rows(self) -> None:
         model = self.fixture.model()
         grant = gate.RunningStep("gate", "gate", "merge-gate", "/gate", 6 * gate.GIB, gate.MeasuredMemory(gate.GIB))
@@ -332,7 +344,7 @@ class QueueViewTests(QueueFixtureTests):
             self.assertIn("worker · python3", section)
             self.assertNotIn("ended-owner", section)
             self.assertIn("python3", section)
-            self.assertIn("2880 min", section)
+            self.assertIn("2 d", section)
             self.assertNotIn("unreadable-run-name.scope", text)
             self.assertNotIn("(unowned)", text)
 
