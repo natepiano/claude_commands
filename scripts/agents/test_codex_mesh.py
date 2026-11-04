@@ -1842,6 +1842,58 @@ class MeshCommandFixture(unittest.TestCase):
 
 
 @final
+class WorkerResumeRecoveryTests(MeshCommandFixture):
+    def prepare_dead_writer(self) -> Path:
+        home = self.home / "old-codex"
+        directory = home / "sessions/2026/11/03"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"rollout-2026-11-03T00-00-00-{THREAD_ID}.jsonl"
+        _ = path.write_text(json.dumps({"type": "session_meta", "payload": {"id": THREAD_ID}}) + "\n"
+                            + json.dumps({"type": "response_item", "payload": {"type": "message",
+                                "role": "user", "content": [{"type": "input_text", "text": "Keep the original history"}]}}) + "\n")
+        _ = (self.session_dir / codex_mesh.RETIRED_FILE).write_text(json.dumps({"servers": [
+            {"pid": 99999999, "port": self.server.port + 1, "codex_home": str(home)}]}))
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "impl",
+                                          "port": self.server.port + 1, "launcher_pid": 0}})
+        return path
+
+    def test_resume_after_dead_writer_keeps_original_thread_and_history(self) -> None:
+        path = self.prepare_dead_writer()
+        before = path.read_bytes()
+        respond = self.respond
+
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/resume":
+                params = _as_test_dict(request["params"])
+                self.assertEqual(params["threadId"], THREAD_ID)
+                if "path" not in params:
+                    return [{"id": request["id"], "error": {"message": "no rollout found for thread id " + THREAD_ID}}]
+                self.assertEqual(params["path"], str(path))
+            return respond(request)
+
+        self.server.respond = reply
+        self.assertEqual(self.run_follow(), (0, ""))
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(len(self.methods("thread/resume")), 2)
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual([_as_test_dict(request["params"])["threadId"]
+                          for request in self.methods("turn/start")], [THREAD_ID])
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_resume_refusal_with_saved_history_never_starts_a_replacement(self) -> None:
+        _ = self.prepare_dead_writer()
+        self.failing_method = "thread/resume"
+        code, errors = self.run_follow()
+        self.assertEqual(code, 1)
+        self.assertIn("scripted request failure", errors)
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(len(self.methods("thread/resume")), 2)
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(self.methods("turn/start"), [])
+        self.assertIn("replacement refused", (self.session_dir / "board.log").read_text())
+
+
+@final
 class StaffAdmissionTests(MeshCommandFixture):
     def test_interrupted_roster_publication_recovers_the_published_backend_without_starting_another(self) -> None:
         from scripts.production import staff
