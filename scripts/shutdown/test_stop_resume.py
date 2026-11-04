@@ -897,6 +897,107 @@ class StopResumeTests(unittest.TestCase):
         self.seed.side_effect = herdr.HerdrFailure("no reply")
         self.assertEqual(stop_resume.stop("019b3a40-4250-7000-8000-000000000102"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
 
+    def test_proof_workspace_refuses_a_stop_outside_its_panes(self) -> None:
+        identity = self.entry["session_id"]
+        self.live.return_value = sessions.LiveSessionProcess(123)
+        self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
+        self.client.rows.append({"pane_id": "w2:p1", "workspace_id": "w2", "label": "proof-TEST"})
+        def read(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            if arguments[:2] == ("pane", "process-info"):
+                self.assertEqual(arguments[-1], "w2:p1")
+                return {"process_info": {"foreground_processes": [{"pid": 456}]}}
+            return self.client_result(*arguments, deadline=deadline)
+        with (patch.dict(os.environ, {"SHUTDOWN_PROOF_WORKSPACE": "w2"}),
+              patch.object(self.client, "result", side_effect=read)):
+            result = stop_resume.stop("alpha")
+        self.assertIsInstance(result, stop_resume.StopFailed)
+        assert isinstance(result, stop_resume.StopFailed)
+        self.assertEqual(result.session_id, identity)
+        self.assertIn("proof workspace w2", result.reason)
+        self.assertIn("pid 123", result.reason)
+        self.kill.assert_not_called()
+
+    def test_proof_workspace_refuses_a_pid_in_no_pane(self) -> None:
+        self.live.return_value = sessions.LiveSessionProcess(123)
+        self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
+        self.client.process_info = {"foreground_processes": [{"pid": 456}]}
+        with (patch.dict(os.environ, {"SHUTDOWN_PROOF_WORKSPACE": "w1"}),
+              patch.object(self.client, "result", side_effect=self.client_result)):
+            result = stop_resume.stop("alpha")
+        self.assertIsInstance(result, stop_resume.StopFailed)
+        assert isinstance(result, stop_resume.StopFailed)
+        self.assertIn("proof workspace w1", result.reason)
+        self.assertIn("pid 123", result.reason)
+        self.kill.assert_not_called()
+
+    def test_proof_workspace_allows_a_pid_in_its_pane(self) -> None:
+        self.live.return_value = sessions.LiveSessionProcess(123)
+        self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
+        self.client.process_info = {"foreground_processes": [{"pid": 123}]}
+        with (patch.dict(os.environ, {"SHUTDOWN_PROOF_WORKSPACE": "w1"}),
+              patch.object(self.client, "result", side_effect=self.client_result)):
+            result = stop_resume.stop("alpha")
+        self.assertEqual(result, stop_resume.Stopped(self.entry["session_id"], 123))
+        self.kill.assert_called_once_with(123, signal.SIGTERM)
+
+    def test_stop_without_a_proof_workspace_reads_no_process_info(self) -> None:
+        self.live.return_value = sessions.LiveSessionProcess(123)
+        self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
+        with patch.dict(os.environ):
+            _ = os.environ.pop("SHUTDOWN_PROOF_WORKSPACE", None)
+            with patch.object(self.client, "result", side_effect=self.client_result) as read:
+                result = stop_resume.stop("alpha")
+        self.assertEqual(result, stop_resume.Stopped(self.entry["session_id"], 123))
+        self.assertFalse(any(item.args[:2] == ("pane", "process-info") for item in read.call_args_list))
+        self.kill.assert_called_once_with(123, signal.SIGTERM)
+
+    def test_proof_workspace_refuses_unreadable_pane_processes(self) -> None:
+        replies: tuple[dict[str, object] | Exception, ...] = (
+            {}, {"process_info": {"foreground_processes": [{"pid": 123.0}]}},
+            herdr.HerdrFailure("pane unavailable"), OSError("herdr unavailable"))
+        for reply in replies:
+            with self.subTest(reply=reply):
+                self.live.return_value = sessions.LiveSessionProcess(123)
+                self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
+                def read(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+                    if arguments[:2] == ("pane", "process-info"):
+                        if isinstance(reply, Exception):
+                            raise reply
+                        return reply
+                    return self.client_result(*arguments, deadline=deadline)
+                with (patch.dict(os.environ, {"SHUTDOWN_PROOF_WORKSPACE": "w1"}),
+                      patch.object(self.client, "result", side_effect=read)):
+                    result = stop_resume.stop("alpha")
+                self.assertIsInstance(result, stop_resume.StopFailed)
+                assert isinstance(result, stop_resume.StopFailed)
+                self.assertIn("proof workspace w1", result.reason)
+                self.kill.assert_not_called()
+
+    def test_proof_workspace_checks_membership_again_before_sigkill(self) -> None:
+        self.live.return_value = sessions.LiveSessionProcess(123)
+        self.client.process_info = {"foreground_processes": [{"pid": 123}]}
+        def move_pane(_pid: int, _number: int) -> None:
+            self.client.rows[0]["workspace_id"] = "w2"
+        self.kill.side_effect = move_pane
+        with (patch.dict(os.environ, {"SHUTDOWN_PROOF_WORKSPACE": "w1"}),
+              patch.object(self.client, "result", side_effect=self.client_result)):
+            result = stop_resume.stop("alpha")
+        self.assertIsInstance(result, stop_resume.StopFailed)
+        self.kill.assert_called_once_with(123, signal.SIGTERM)
+
+    def test_proof_workspace_does_not_guard_signal_zero(self) -> None:
+        with (patch.dict(os.environ, {"SHUTDOWN_PROOF_WORKSPACE": "w2"}),
+              patch.object(herdr, "Herdr", side_effect=AssertionError("unexpected pane read"))):
+            stop_resume._signal_process(123, 0)  # pyright: ignore[reportPrivateUsage]
+        self.kill.assert_called_once_with(123, 0)
+
+    def test_proof_workspace_refuses_an_empty_workspace(self) -> None:
+        self.live.return_value = sessions.LiveSessionProcess(123)
+        with patch.dict(os.environ, {"SHUTDOWN_PROOF_WORKSPACE": ""}):
+            result = stop_resume.stop("alpha")
+        self.assertIsInstance(result, stop_resume.StopFailed)
+        self.kill.assert_not_called()
+
     def test_stop_sends_term_then_kill_to_the_same_claude_and_only_marks_its_launch_ended(self) -> None:
         self.live.return_value = sessions.LiveSessionProcess(123)
         def signal_delivered(_pid: int, sig: int) -> None:
