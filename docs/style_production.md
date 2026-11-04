@@ -398,16 +398,18 @@ keeps a dropped ticket's abandoned commits reachable.
 Create a restricted pilot with repeated `add_style.py --pilot <unit>[=<package>,...]`.
 The selector accepts a family (`names`), its old id (`names-unit`) or its full
 id (`cargo-liner-style-names-unit`). `--check` prints full unit ids.
-Only named units get Units rows; all four standing plans are written. A unit
+`add_style.py` writes the named units to the doc's `- **Pilot units:** <ids>` field.
+The style showrunner launches only those units, or all four when the field is
+absent. All four standing plans are written. A unit
 without a scope covers every crate. Package names map to workspace member
 directories through `rules.workspace_members`.
 
 The plan's Delegation Context carries `- **Pilot scope:** cargo-handler, cargo-port`
 below its Family snapshot. Before first launch, edit the showrunner copy;
-an interrupted bootstrap rewrites only unlaunched units' rows and scope lines.
+an interrupted bootstrap rewrites only the Pilot units field and the scope lines of unlaunched units.
 After launch, only the unit's own copy counts:
 `<main checkout parent>/<style slug>-<family>/docs/style-production/units/<style slug>-<family>-unit.md`.
-Read the plan path from the Units row's Plan cell relative to that worktree;
+Read the plan path from `plan` in the unit's `.unit.toml`, relative to that worktree;
 a unit rename keeps its existing plan filename.
 `next-phase` honors the `--plan` copy it receives for coverage and approved
 proposals. An out-of-scope approved proposal stays approved and unassigned;
@@ -563,8 +565,7 @@ Merge each unit checkpoint into the style merge branch as soon as it arrives;
 the `ticket merge` after it releases its berth reservation. Use the ordinary
 `merge_checkpoint.py --production <style doc> <unit> <phase> <hash> --started …`
 with one `--also <path>` for each entry of the unit's open ticket's `files`
-(`style_ledger.py ticket open --repo <checkout> --unit <unit>`). Its Owns is
-`none — takes what the board leaves free`; paths outside that ticket stay refused.
+(`style_ledger.py ticket open --repo <checkout> --unit <unit>`). Paths outside that ticket stay refused.
 
 A style ticket's checkpoint does not release its berth reservation: the unit's
 reservation record holds it for the ticket, and `ticket checkpoint` keeps the
@@ -920,7 +921,7 @@ Approval sets the decision's stage active (in progress), so it leaves the
 footer's proposal count.
 A rule whose frontmatter says `approval: always` never asks the user: `file`
 creates each new decision under it approved, with the fields a user approval
-writes. The unit and plan are the live family unit's Units row of the standing
+writes. The unit and plan are the live family unit's staff row and its `.unit.toml` plan in the standing
 production, `showrunner` and `approved_in` are the style slug, and `approved_by`
 is `rule <rule id>`. It prints `approved <decision>: rule <rule id> is always
 approved`. With no live unit of the rule's family, `file` prints `skipped

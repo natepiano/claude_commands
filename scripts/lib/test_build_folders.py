@@ -14,7 +14,7 @@ import unittest
 from typing import cast, override
 from unittest import mock
 
-from scripts.lib import build_folders as folders, copy_record, scratch, unit_runs
+from scripts.lib import build_folders as folders, conf, copy_record, scratch, unit_runs
 from scripts.lint.memory_test_support import config_environment
 
 
@@ -277,9 +277,10 @@ assert not loaded, loaded
         self.assertFalse((moved / stage.name).exists())
 
     def test_registered_task_uses_scratch_naming_record_and_task_cleanup(self) -> None:
+        settings = conf.read("scratch")
         with mock.patch.object(scratch, "target", wraps=scratch.target) as naming:
-            path = scratch.new("gate:folder-test", "checkout", False)
-        naming.assert_called_once_with("gate:folder-test", "checkout", False)
+            path = scratch.new("gate:folder-test", "checkout", False, scratch_settings=settings)
+        naming.assert_called_once_with("gate:folder-test", "checkout", False, scratch_settings=settings)
         self.assertEqual(path.parent, copy_record.root())
         self.assertTrue(path.name.startswith("gate-folder-test-checkout-"))
         record = scratch.task_of(path)
@@ -418,6 +419,27 @@ assert not loaded, loaded
         alias.symlink_to(first, target_is_directory=True)
         self.assertNotEqual(folders.repository_key(first), folders.repository_key(second))
         self.assertEqual(folders.repository_key(first), folders.repository_key(alias))
+
+    def test_private_config_without_folder_rules_uses_repository_without_git(self) -> None:
+        config = Path(os.environ["CONF_DIR"]) / "build_folders.conf"
+        original = config.read_text()
+        config.unlink()
+        with mock.patch("scripts.lib.conf.subprocess.run", side_effect=AssertionError("Git must not run")):
+            self.assertEqual(folders.FOLDER_PREFIXES["verify-hold"], "verify-hold.{owner}.")
+            path = folders.create_build_folder(folders.UniqueBuildFolder("private-"))
+        self.assertTrue(path.is_dir())
+        self.assertFalse(config.exists())
+        _ = config.write_text(original.replace("prefixes.verify-hold=verify-hold.{owner}.",
+                                               "prefixes.verify-hold=private.{owner}."))
+        self.assertEqual(folders.FOLDER_PREFIXES["verify-hold"], "private.{owner}.")
+
+    def test_folder_rules_keep_the_live_config_reader_without_a_private_override(self) -> None:
+        settings = conf.read(Path(__file__).resolve().parents[2] / "config" / "build_folders.conf")
+        with mock.patch.dict(os.environ):
+            _ = os.environ.pop("CONF_DIR", None)
+            with mock.patch.object(conf, "read", return_value=settings) as read:
+                self.assertTrue(folders.FOLDER_PREFIXES["verify-hold"])
+            read.assert_called_once_with("build_folders")
 
     def test_naming_reads_changed_configuration_at_use(self) -> None:
         config = Path(os.environ["CONF_DIR"]) / "build_folders.conf"

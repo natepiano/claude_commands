@@ -611,6 +611,33 @@ run_once fixture-step
                 self.assertEqual((root / "peak.cpu.stat").read_text(), "usage_usec 99\n")
                 self.assertEqual((root / "peak.io.stat").read_text(), "")
 
+    def test_linux_target_runs_without_natedev_admission_or_hold(self) -> None:
+        shell = r'''
+buildlog_begin() { BUILDLOG_START="" BUILDLOG_MEM_RESERVATION=""; }
+buildlog_exec() { "$@"; }
+buildlog_end() { :; }
+sweep_after_step() { :; }
+cargo() { printf 'target command ran\n'; }
+buildlog_memory_python() { echo unexpected-admission >&2; return 93; }
+run_once cargo check --workspace
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            holders = root / "holders"
+            holders.mkdir()
+            _ = (holders / "holder.json").write_text('{"holder":"natedev-owner"}')
+            reader = root / "lint_config.sh"
+            _ = reader.write_text("lint_config_enabled() { return 0; }\n")
+            result = self.run_invoke(root, shell, [], environment={
+                "LINT_CONFIG_READER": str(reader),
+                "BUILDLOG_CALLER": "verify-linux", "BUILDLOG_CALL_ID": "remote-step",
+                "BUILD_TARGETS_SCRIPT": "/nonexistent/build_targets.py", "OSTYPE": "linux-gnu",
+            })
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("target command ran\n", result.stdout)
+            self.assertEqual(result.stderr, "")
+            self.assertFalse((root / "buildlog").exists())
+
     def test_taplo_does_not_compile_and_existing_command_classification_is_preserved(self) -> None:
         cases = [
             (["taplo", "fmt", "--check"], 1),

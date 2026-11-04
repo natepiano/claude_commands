@@ -23,7 +23,7 @@ import roster
 import herdr
 import sessions
 import top_level
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.production import staff
 
 NO_SHOWRUNNER = roster.NoShowrunner()
@@ -307,13 +307,16 @@ class TopLevelRunningRecordTests(unittest.TestCase):
         self.socket_path = self.folder / "live.sock"
         listener = self.enterContext(socket.socket(socket.AF_UNIX))
         listener.bind(str(self.socket_path))
-        child = self.enterContext(subprocess.Popen(
+        owned = OwnedTestProcesses()
+        self.addCleanup(owned.finish)
+        child = subprocess.Popen(
             [sys.executable, "-c", "import sys; sys.stdin.read()"],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        ))
+            env=owned.environment(),
+        )
+        owned.track(child)
         self.child_pid = child.pid
         self.process_starts = {}
-        self.addCleanup(child.communicate, timeout=TEST_HANG_GUARD_SECS)
         environment = cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "HOME": str(self.folder), "NOTIFIER_SESSIONS_DIR": str(self.directory),
             "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}", "SSH_RECORD": str(self.folder / "ssh.log"),

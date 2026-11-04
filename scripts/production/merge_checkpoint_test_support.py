@@ -81,19 +81,7 @@ SCRIPT = Path(__file__).with_name("merge_checkpoint.py")
 STARTED = "2026-10-06T12:00:00-07:00"
 TRIAL = ("review trial: ux 2 findings, code 3 findings, review-worker minutes 14, "
          "ux check minutes 4, ux repair minutes 1")
-SIMPLE_OWNS = "`src/alpha.txt`, `crates/alpha/`, `docs/plans/alpha.md`, `docs/plans/alpha-next.md`"
-REAL_OWNS = ("`docs/plans/build-followups-enh-showrunner.md`; `scripts/production/add_unit.py`, "
-             "`test_add_unit.py`, `merge_checkpoint.py`, `test_merge_checkpoint.py`; "
-             "`commands/showrunner/add_unit.md`; after stalls-unit Phase 6 merges: "
-             "`commands/showrunner/produce.md`, `commands/showrunner/promote_unit.md`, "
-             "`scripts/production/showrunners.py`, `scripts/production/stall_watch.py` and their tests "
-             "(hub rows); from its Phase 5 (the user, 2026-10-06 15:25 PDT, the phase-end split): "
-             "`commands/unit/direct.md`, `commands/unit/checkpoint.md`, "
-             "`docs/direct/run_phase_review.md`, `docs/production_format.md`, "
-             "`commands/unit/add_ons.md`, `commands/plan/shrink.md`, "
-             "`commands/plan/phase_review.md`, `docs/direct/phase_end.md`, "
-             "`docs/direct_plan_format.md`, `commands/unit/eta_breakdown.md`, "
-             "`docs/direct/final_gate_commit.md`")
+SIMPLE_OWNS = ("src/alpha.txt", "crates/alpha/", "docs/plans/alpha.md", "docs/plans/alpha-next.md")
 SIMPLE_MERGE_TESTS = "- **Merge tests:** `checkpoint-test`"
 REAL_MERGE_TESTS = ("- **Merge tests:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` "
                     "and `basedpyright scripts/buildlog` (pass is its `0 errors, 0 warnings` line: it exits 3 "
@@ -325,7 +313,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         _ = self.git("config", "user.email", "checkpoint@example.invalid", cwd=self.checkout)
         _ = self.git("remote", "add", "origin", str(self.origin), cwd=self.checkout)
         self.write(self.checkout, "README.md", "base\n")
-        self.write(self.checkout, ".gitignore", "production.log\n")
+        self.write(self.checkout, ".gitignore", "production.log\n.unit.toml\n")
         self.write(self.checkout, "src/alpha.txt", "alpha base\n")
         self.write(self.checkout, "src/beta.txt", "beta base\n")
         _ = self.git("add", ".", cwd=self.checkout)
@@ -378,11 +366,13 @@ class MergeCheckpointFixture(unittest.TestCase):
         _ = path.write_text(content, encoding="utf-8")
         path.chmod(0o755)
 
-    def production_doc(self, *, owns_cell: str = SIMPLE_OWNS,
+    def production_doc(self, *, owns: tuple[str, ...] = SIMPLE_OWNS,
                        merge_tests_line: str | None = SIMPLE_MERGE_TESTS,
                        hub_files: bool = True, change_review: Path | None = None) -> None:
-        for folder in (self.unit, self.other):
+        for folder, plan, responsibilities in ((self.unit, "alpha", owns), (self.other, "beta", ("src/beta.txt",))):
             (folder / "docs/plans").mkdir(parents=True, exist_ok=True)
+            _ = (folder / ".unit.toml").write_text(
+                f'plan = "docs/plans/{plan}.md"\nresponsibilities = {json.dumps(list(responsibilities))}\n', encoding="utf-8")
         rows = [
             "# Production — example", "", "## Production Context", "",
             f"- **Repository:** `{self.checkout}`",
@@ -404,11 +394,6 @@ class MergeCheckpointFixture(unittest.TestCase):
         if self.known_flaky_tests:
             rows.append(f"- **Known flaky tests:** {self.known_flaky_tests}")
         rows.extend([
-            "", "## Units", "",
-            "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
-            f"| `alpha-unit` | `docs/plans/alpha.md` | `{self.unit}` | `alpha-branch` | alpha | — | {owns_cell} |",
-            f"| `beta-unit` | `docs/plans/beta.md` | `{self.other}` | `beta-branch` | beta | — | `src/beta.txt` |",
             "", "## Gates", "",
             "| Gate | Waiting | Waits on | Clears when |",
             "| --- | --- | --- | --- |",
@@ -713,13 +698,6 @@ class MergeCheckpointFixture(unittest.TestCase):
                 self.assertTrue(phase["reason"])
                 self.assertTrue(phase["candidates"])
 
-    def assert_real_owns_path_allowed(self, relative: str) -> None:
-        self.production_doc(owns_cell=REAL_OWNS, hub_files=False)
-        sha = self.checkpoint(relative, relative + "\n", subject="own " + relative)
-        result = self.run_checkpoint(sha)
-        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
-        self.assertIn("scope: ok", result.process.stdout)
-
     def dated_checkpoint(self, message: str) -> str:
         """A checkpoint(...) commit on the unit branch, dated after the Change-Review rule landed."""
         self.write(self.unit, "src/alpha.txt", message)
@@ -748,7 +726,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         _ = doc.write_text("\n".join([
             "# Style production", "- **Kind:** style", "- **Branch point:** production",
             "- **Merge branch:** alpha-branch", f"- **Showrunner checkout:** {self.unit}",
-            "- **Log:** style.log", "", "## Units", "",
+            "- **Log:** style.log", "",
         ]))
         _ = (self.state / "child-parent").write_text(parent)
         registry = self.bin / "showrunners.py"

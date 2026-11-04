@@ -16,7 +16,7 @@ from unittest.mock import patch
 from scripts.lib import atomic_file, git_exclude
 from scripts.lib.git_exclude import ExcludeRefused
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.production import unit_config as config
+from scripts.production import staff, unit_config as config
 from scripts.production.unit_config_test_support import UnitConfigFixture
 from scripts.production.unit_config_format_test_support import (
     check_format, count_taplo, remove_assignment_spacing, require_taplo, write_aligning_config,
@@ -69,8 +69,10 @@ class UnitPortRepairTests(UnitConfigFixture):
         self.park_config()
         saved = config.read_parked(self.unit)
         assert isinstance(saved, config.UnitConfig)
-        removed = self.root / "removed-start-folder"
-        saved = replace(saved, retired=replace(self.retirement(), start_folder=config.RecordedStartFolder(removed)))
+        removed = self.root / "removed-staff-folder"
+        row = staff.snapshot().by_id(self.unit)
+        assert row is not None
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", removed), expected=row.worktree)
         self.parked.unlink()
         _ = config.write_parked(self.unit, saved)
         self.assertFalse(removed.exists())
@@ -410,7 +412,10 @@ class UnitConfigTests(UnitConfigFixture):
         removed = self.root / "removed-worktree"
         _ = self.git("worktree", "add", "-b", "retired", str(removed))
         _ = write_aligning_config(removed)
-        retired = replace(self.retirement(), start_folder=config.RecordedStartFolder(removed))
+        retired = self.retirement()
+        row = staff.snapshot().by_id(self.unit)
+        assert row is not None
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", removed), expected=row.worktree)
         _ = config.write(removed, self.config())
         _ = config.park(self.unit, removed, retired)
         saved = config.read_parked(self.unit)
@@ -472,7 +477,10 @@ class UnitConfigTests(UnitConfigFixture):
         removed = self.root / "removed-worktree"
         _ = self.git("worktree", "add", "-b", "retired", str(removed))
         _ = write_aligning_config(removed)
-        retired = replace(self.retirement(), start_folder=config.RecordedStartFolder(removed))
+        retired = self.retirement()
+        row = staff.snapshot().by_id(self.unit)
+        assert row is not None
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", removed), expected=row.worktree)
         _ = config.write(removed, self.config())
         _ = config.park(self.unit, removed, retired)
         _ = self.git("worktree", "remove", "--force", str(removed))
@@ -499,8 +507,10 @@ class UnitConfigTests(UnitConfigFixture):
         _ = write_aligning_config(self.worktree)
         removed = self.root / "removed-worktree"
         self.assertFalse(removed.exists())
-        value = replace(self.config(), retired=replace(
-            self.retirement(), start_folder=config.RecordedStartFolder(removed)))
+        row = staff.snapshot().by_id(self.unit)
+        assert row is not None
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", removed), expected=row.worktree)
+        value = replace(self.config(), retired=self.retirement())
         _ = config.write_parked(self.unit, value)
         result = check_format(binary, self.parked, self.worktree, defaults=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -565,7 +575,7 @@ class UnitConfigTests(UnitConfigFixture):
         self.assertEqual(self.source.read_bytes(), source)
         facts = cast(dict[str, object], tomllib.loads(self.parked.read_text())["retired"])
         self.assertEqual(facts, {"date": "2026-10-31", "session": "session-before-retire",
-                                 "folder": str(self.worktree), "branch": "feature/worker"})
+                                 "branch": "feature/worker"})
         self.assertEqual(config.place(self.unit, self.worktree), config.Both(self.source, self.parked, True))
         self.source.unlink()
         self.assertEqual(config.place(self.unit, self.worktree), config.Parked(self.parked))
@@ -581,13 +591,18 @@ class UnitConfigTests(UnitConfigFixture):
         config.restore(self.unit, self.worktree)
         self.assertEqual(self.file_versions(), before)
 
-    def test_unrecorded_start_folder_is_retained_without_inventing_a_path(self) -> None:
+    def test_legacy_retirement_folder_is_ignored_and_not_written(self) -> None:
         _ = config.write(self.worktree, self.config())
-        retired = replace(self.retirement(), start_folder=config.UnrecordedStartFolder())
-        _ = config.park(self.unit, self.worktree, retired)
-        self.assertEqual(tomllib.loads(self.parked.read_text())["retired"]["folder"], "")
+        _ = config.park(self.unit, self.worktree, self.retirement())
+        legacy = self.parked.read_text().replace('[retired]', '[retired]\nfolder = "/old/unit"')
+        _ = self.parked.write_text(legacy)
+        saved = config.read_parked(self.unit)
+        self.assertEqual(saved, replace(self.config(), retired=self.retirement()))
+        assert isinstance(saved, config.UnitConfig)
+        _ = config.write_parked(self.unit, saved)
+        self.assertNotIn("folder =", self.parked.read_text())
         before = self.file_versions()
-        _ = config.park(self.unit, self.worktree, retired)
+        _ = config.write_parked(self.unit, saved)
         self.assertEqual(self.file_versions(), before)
 
     def test_park_after_worktree_removal_uses_verified_retirement_and_changes_nothing(self) -> None:

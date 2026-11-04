@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import io
 import os
-import tempfile
 import unittest
 from collections.abc import Generator
 from pathlib import Path
@@ -20,9 +19,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import issues
 import proposals_folder
 import proposals_table
-from scripts.production import showrunners
+from scripts.production import session_staff, showrunners, staff
+from scripts.production.staff_test_support import StaffTestCase, production_membership, recorded_showrunner
 import showrunner_tree
 from proposals_table import ADD_ON_STATE, IN_PROGRESS_STATE, REVIEW_STATE, Row
+from scripts.lib import conf
 
 # Importable once proposals_table has put scripts/direct on the path.
 import phase_table
@@ -30,14 +31,11 @@ from scripts.direct import plan_history
 
 
 @final
-class ProposalsTableTests(unittest.TestCase):
-    root: Path = Path()
-
+class ProposalsTableTests(StaffTestCase):
     @override
     def setUp(self) -> None:
-        folder = tempfile.TemporaryDirectory()
-        self.addCleanup(folder.cleanup)
-        self.root = Path(folder.name)
+        super().setUp()
+        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(Path(__file__).resolve().parents[2] / "config")}))
         # No live update timer names a production below the test's own.
         _ = self.enterContext(mock.patch.object(showrunners, "timer_docs", return_value={}))
         _ = self.enterContext(mock.patch.object(showrunner_tree, "descendants_of", return_value=[]))
@@ -45,7 +43,9 @@ class ProposalsTableTests(unittest.TestCase):
     @contextlib.contextmanager
     def runs_of(self, runs: dict[Path, list[Path]]) -> Generator[None]:
         """Give each plan path the run files named for it, and every other path none."""
-        def plan_runs(plan: Path) -> list[Path]:
+        def plan_runs(plan: Path, *,
+                      record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> list[Path]:
+            del record
             return runs.get(plan, [])
         with mock.patch.object(plan_history, "plan_runs", side_effect=plan_runs):
             yield
@@ -196,7 +196,7 @@ class ProposalsTableTests(unittest.TestCase):
             "  Title: Selecting a new tool frames it the same way as the frame key",
             "  Need: two callers still use their own framing.",
             "- Action: change",
-            "  Target: `scripts/production/units_table.py`",
+            "  Target: `scripts/production/unit_phases.py`",
             "  Proposed: The units table names the phase a unit waits on. It reads the plan.",
             "- **remove**",
             "  - Why: The old footer line repeats the new one! Nothing reads it.",
@@ -253,8 +253,15 @@ class ProposalsTableTests(unittest.TestCase):
         self.assertEqual(lines[2], "| unit \\| one | first second | 2026-10-12 | waiting for your review |")
         cells = lines[3].removesuffix(" |").split(" | ")
         self.assertTrue(cells[1].endswith("…") and cells[3].endswith("…"))
-        self.assertLessEqual(len(cells[1]), proposals_table.TITLE_WIDTH)
-        self.assertLessEqual(len(cells[3]), proposals_table.STATE_WIDTH)
+        settings = conf.read("proposals_table")
+        self.assertLessEqual(len(cells[1]), settings.whole("title_width"))
+        self.assertLessEqual(len(cells[3]), settings.whole("state_width"))
+
+    def test_config_widths_change_where_the_table_cuts_cells(self) -> None:
+        config = self.write("config/proposals_table.conf", "# whole: 1..\ntitle_width=10\n# whole: 1..\nstate_width=15\n")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
+            text = proposals_table.table([Row("word " * 40, "word " * 40, "2026-10-12", "word " * 40)])
+        self.assertEqual(text.splitlines()[2], "| word word… | word word… | 2026-10-12 | word word word… |")
 
     def test_no_state_asks_the_user_a_bare_next(self) -> None:
         states = [ADD_ON_STATE, REVIEW_STATE, *proposals_table.BACKLOG_STATES.values()]
@@ -269,8 +276,9 @@ class ProposalsTableTests(unittest.TestCase):
 
     def test_main_prints_the_three_sources_in_order(self) -> None:
         doc = self.write("trunk/docs/plans/footers-production.md", "# Production\n\n- **Proposals:** `issues`\n"
-                         + f"- **Improvement queue:** {self.root / 'backlog' / 'ledger.md'}\n\n"
-                         + "## Units\n\n| Unit | Plan |\n| --- | --- |\n| footer-unit | `docs/plans/footers.md` |\n")
+                         + f"- **Improvement queue:** {self.root / 'backlog' / 'ledger.md'}\n")
+        _ = recorded_showrunner("footers", doc)
+        production_membership("footers", "footer")
         _ = self.issue("footer colours", "date_created: 2026-10-09", "status: open", "tags: [issue, proposal]",
                        "proposed_by: footer-unit", folder="trunk/issues")
         # Another production's proposal in the same folder is not this one's.

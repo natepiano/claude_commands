@@ -1842,6 +1842,58 @@ class MeshCommandFixture(unittest.TestCase):
 
 
 @final
+class WorkerResumeRecoveryTests(MeshCommandFixture):
+    def prepare_dead_writer(self) -> Path:
+        home = self.home / "old-codex"
+        directory = home / "sessions/2026/11/03"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"rollout-2026-11-03T00-00-00-{THREAD_ID}.jsonl"
+        _ = path.write_text(json.dumps({"type": "session_meta", "payload": {"id": THREAD_ID}}) + "\n"
+                            + json.dumps({"type": "response_item", "payload": {"type": "message",
+                                "role": "user", "content": [{"type": "input_text", "text": "Keep the original history"}]}}) + "\n")
+        _ = (self.session_dir / codex_mesh.RETIRED_FILE).write_text(json.dumps({"servers": [
+            {"pid": 99999999, "port": self.server.port + 1, "codex_home": str(home)}]}))
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "impl",
+                                          "port": self.server.port + 1, "launcher_pid": 0}})
+        return path
+
+    def test_resume_after_dead_writer_keeps_original_thread_and_history(self) -> None:
+        path = self.prepare_dead_writer()
+        before = path.read_bytes()
+        respond = self.respond
+
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/resume":
+                params = _as_test_dict(request["params"])
+                self.assertEqual(params["threadId"], THREAD_ID)
+                if "path" not in params:
+                    return [{"id": request["id"], "error": {"message": "no rollout found for thread id " + THREAD_ID}}]
+                self.assertEqual(params["path"], str(path))
+            return respond(request)
+
+        self.server.respond = reply
+        self.assertEqual(self.run_follow(), (0, ""))
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(len(self.methods("thread/resume")), 2)
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual([_as_test_dict(request["params"])["threadId"]
+                          for request in self.methods("turn/start")], [THREAD_ID])
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_resume_refusal_with_saved_history_never_starts_a_replacement(self) -> None:
+        _ = self.prepare_dead_writer()
+        self.failing_method = "thread/resume"
+        code, errors = self.run_follow()
+        self.assertEqual(code, 1)
+        self.assertIn("scripted request failure", errors)
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(len(self.methods("thread/resume")), 2)
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(self.methods("turn/start"), [])
+        self.assertIn("replacement refused", (self.session_dir / "board.log").read_text())
+
+
+@final
 class StaffAdmissionTests(MeshCommandFixture):
     def test_interrupted_roster_publication_recovers_the_published_backend_without_starting_another(self) -> None:
         from scripts.production import staff
@@ -3370,6 +3422,31 @@ class RecordedTurnSettingsTests(unittest.TestCase):
             with self.subTest(record=record):
                 settings = codex_mesh.recorded_turn_settings(record)
                 self.assertEqual((settings.model, settings.effort), expected)
+
+
+class StaffFolderTurnTests(unittest.TestCase):
+    def test_follow_up_turn_uses_the_changed_staff_folder_without_a_cwd_argument(self) -> None:
+        from scripts.production import staff
+        from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker
+
+        with tempfile.TemporaryDirectory() as scratch, isolated_staff_file(Path(scratch) / "staff.json", {}):
+            old, new = Path(scratch) / "old", Path(scratch) / "new"
+            parent = fixture_member("showrunner", name="folder-production")
+            unit = fixture_member("unit", name="folder-unit", parent=parent.id,
+                                  worktree=staff.PresentWorktree("natedev", old))
+            worker = fixture_worker("impl1", unit.id)
+            args = argparse.Namespace(session_dir=scratch, name="impl1", turn_cwd="")
+            client = cast(codex_mesh.Client, cast(object, MagicMock()))
+            with (patch.object(codex_mesh, "_turn_model_effort", return_value=("fixture-model", "high")),
+                  patch.object(codex_mesh, "_turn_service_tier", return_value="default"),
+                  patch.object(codex_mesh, "_serving_request", return_value={"turn": {"id": "turn"}}) as request):
+                start = codex_mesh._start_turn  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(start(client, args, worker.current_session, codex_mesh.WORKER_SANDBOX, "First task"), "turn")
+                self.assertEqual(request.call_args.args[2]["cwd"], str(old))
+                _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", new), expected=unit.worktree)
+                self.assertEqual(start(client, args, worker.current_session, codex_mesh.WORKER_SANDBOX, "Next task"), "turn")
+                self.assertEqual(request.call_args.args[2]["cwd"], str(new))
+                self.assertEqual(request.call_args.args[2]["threadId"], worker.current_session)
 
 
 @final
@@ -13160,6 +13237,11 @@ class FollowEventRegressionTests(MeshCommandFixture):
 @final
 class DirectorLifetimeTests(MeshCommandFixture):
     def assert_run_end_keeps_directed_workers(self, *, changed_account: bool, loaded: bool = True) -> None:
+        from scripts.production import fake_unit_host
+        from scripts.production.staff_test_support import (
+            fixture_member, isolated_staff_file, production_membership,
+        )
+
         root = self.session_dir.parent
         home = root / "director-home"
         home.mkdir()
@@ -13168,8 +13250,8 @@ class DirectorLifetimeTests(MeshCommandFixture):
         registry.mkdir()
         active = root / "active"
         active.mkdir()
-        old_session = "old-director"
-        current_session = "new-director" if changed_account else old_session
+        old_session = fixture_runtime_id("old-director")
+        current_session = fixture_runtime_id("new-director") if changed_account else old_session
         cwd = root / "repository"
         cwd.mkdir()
         state = {"production": "demo", "unit": "builders", "working_dir": str(cwd), "status": "active"}
@@ -13188,37 +13270,27 @@ class DirectorLifetimeTests(MeshCommandFixture):
         self.addCleanup(endpoint.close)
         address = root / "director.sock"
         endpoint.bind(str(address))
-        _ = (registry / "director.json").write_text(json.dumps({
+        _ = (registry / f"{os.getpid()}.json").write_text(json.dumps({
             "pid": os.getpid(), "procStart": sessions.process_start(os.getpid()),
             "sessionId": current_session, "name": "demo · builders · director",
             "messagingSocketPath": str(address), "updatedAt": 2, "tmux": "", "formerNames": [],
             "entrypoint": "cli"}))
-        shutdown = root / "shutdown"
-        history = shutdown / "old@example.invalid" / "history"
-        history.mkdir(parents=True)
-        _ = (history / "director.json").write_text(json.dumps({
-            "login": "old@example.invalid", "label": "claude1", "machine": "natedev",
-            "requested_at": "2026-10-28T20:00:00+00:00", "request_id": "director-account-move",
-            "requested_by": {"kind": "terminal"}, "hold": "session", "then": "restart",
-            "force": "wait for ready", "alerts": "none", "probe": False,
-            "session": {"kind": "unit", "session_id": old_session, "pid": 99999999,
-                "proc_start": "expired", "name": "demo · builders · director", "cwd": str(cwd),
-                "config_dir": str(home / ".claude1"), "probe": False, "status": "idle", "updated_at": 0,
-                "model": {"kind": "no reply yet"}, "checkout": {"kind": "not a checkout"},
-                "run_dirs": [str(self.session_dir)], "codex_servers": [], "timers": [],
-                "host": {"kind": "unit", "production": "demo", "unit": "builders",
-                    "doc": str(root / "production.md"), "session_name": "demo-builders",
-                    "session_host": "herdr", "plan": {"kind": "no run record"}}},
-            "workers": [], "timers": [], "settle_message": {"kind": "not sent"},
-            "where": {"kind": "not said"}, "progress": {"kind": "restarted", "at": "2026-10-28T20:01:00+00:00"},
-            "trail": [], "stop_issues": []}))
         environment = {"HOME": str(home), "NOTIFIER_SESSIONS_DIR": str(registry),
-            "SHUTDOWN_STATE_DIR": str(shutdown), "UNIT_WORKERS_STATE": str(root / "unit-workers"),
+            "SHUTDOWN_STATE_DIR": str(root / "shutdown"), "UNIT_WORKERS_STATE": str(root / "unit-workers"),
             "UNIT_RUN_ROOT": str(root), "UNIT_ACTIVE_DIR": str(active),
             "CLAUDE_CODE_SESSION_ID": old_session, "FIXTURE_RUN": str(self.session_dir),
             "FIXTURE_REAPS": str(root / "reaps"), "FIXTURE_PORT": str(self.server.port),
             "FIXTURE_SERVER_PID": str(os.getpid()), "SCRATCH_ROOT": str(root / "scratch"),
-            "SCRATCH_VISIBLE_ROOT": str(root / "visible"), "SCRATCH_HOLDS": str(root / "holds.json")}
+            "SCRATCH_VISIBLE_ROOT": str(root / "visible"), "SCRATCH_HOLDS": str(root / "holds.json"),
+            "HERDR_PANE_RECORD_DIR": str(root / "pane-records"), **fake_unit_host.environment(root)}
+        _ = self.patches.enter_context(isolated_staff_file(root / "director-staff.json", environment))
+        owner = fixture_member("showrunner", name="demo")
+        _ = fixture_member("unit", name="builders", parent=owner.id, runtime_id=current_session)
+        production_membership("demo", "builders")
+        fake_unit_host.write(environment, [fake_unit_host.HostedUnit("agents", "w1:p1", {
+            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "builders",
+            "CLAUDE_CODE_SESSION_ID": current_session})])
+        fake_unit_host.place_process(environment, os.getpid(), "w1:p1", session="agents")
         self.patches.enter_context(patch.dict(os.environ, environment))
         roster = {"project-impl": {"thread_id": THREAD_ID, "status": "done", "role": "impl", "launcher_pid": 0},
                   "project-test": {"thread_id": "thread-test", "status": "paused", "role": "test", "launcher_pid": 0}}
@@ -13250,8 +13322,8 @@ class DirectorLifetimeTests(MeshCommandFixture):
         self.server.respond = director_loaded_threads
         shim = home / ".claude" / "scripts" / "lib" / "py"
         shim.parent.mkdir(parents=True)
-        # Only process discovery/signalling and unrelated design-role/Claude cleanup are synthetic.
-        # The shell, stop, sweep, registry, shutdown history and worker ledger execute real code.
+        # The fixture replaces process discovery, signals, and unrelated cleanup.
+        # The shell, stop, sweep, registry, staff membership, and worker ledger execute real code.
         _ = shim.write_text("#!/usr/bin/env python3\n" + "import sys\n"
             + f"sys.path.insert(0, {str(Path(codex_mesh.__file__).resolve().parents[2])!r})\n"
             + '''import os, pathlib, runpy, sys
@@ -13269,7 +13341,7 @@ if script.endswith('remove_workers.py'):
             pathlib.Path(os.environ['FIXTURE_REAPS']).write_text('implicit sweep')
             return remove_workers.subprocess.CompletedProcess(command, 1)
         return invoke(command, *args, **kwargs)
-    with patch.object(remove_workers.subprocess, 'run', no_implicit_sweep), patch.object(remove_workers, 'DEFAULT_ROOTS', (pathlib.Path(os.environ['FIXTURE_RUN']).parent,)), patch.object(remove_workers, 'list_sessions', return_value=[]), patch.object(remove_workers, 'shutdown_held_sessions', return_value={'kind': 'held sessions', 'session_ids': set()}):
+    with patch.object(remove_workers.subprocess, 'run', no_implicit_sweep), patch.object(remove_workers, 'DEFAULT_ROOTS', (pathlib.Path(os.environ['FIXTURE_RUN']).parent,)), patch.object(remove_workers, 'list_sessions', return_value=[]):
         raise SystemExit(remove_workers.main())
 if script.endswith('codex_mesh.py'):
     def reap(pid, *, deadline):

@@ -226,7 +226,7 @@ The second live simplify run (2026-11-02, pass 1 through `review.sh`) raised 25 
 
 **Acceptance gate:** `python3 -m unittest scripts.direct.test_verify_doc` passes 5 runs in a row in one mesh run, and no `lint-sweep` folder is left under the case root; `basedpyright scripts/direct/verify_doc_test_support.py` reports 0 errors, 0 warnings, 0 notes.
 
-### Phase 5 — assertion_guard.py accepts one ruling for a deleted mechanism  · status: in progress
+### Phase 5 — assertion_guard.py accepts one ruling for a deleted mechanism  · status: done
 
 **Depends on:** Phase 4
 

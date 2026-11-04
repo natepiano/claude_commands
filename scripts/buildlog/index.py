@@ -20,25 +20,36 @@ import fcntl
 import json
 import os
 import sqlite3
+import sys
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path, PurePath
-from typing import BinaryIO, cast
+from typing import TYPE_CHECKING, BinaryIO, TypedDict, cast
 from urllib.parse import quote
 
 import store
 import parse
 
-SCHEMA_VERSION = 28
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if TYPE_CHECKING:
+    from ..test_times.gate_record import TYPE_CHECK_JOB
+else:
+    from scripts.test_times.gate_record import TYPE_CHECK_JOB
+
+SCHEMA_VERSION = 31
+
+
 # These indexes extend the current schema without rebuilding the recorded rows.
 COST_INDEXES = (
     "CREATE INDEX IF NOT EXISTS steps_session_previous ON steps (session, started_at_us DESC, id DESC) WHERE step = 'nextest'",
     "CREATE INDEX IF NOT EXISTS steps_execution_end ON steps ((unixepoch(started_at,'subsec') + duration_s)) WHERE duration_s > 0",
     "CREATE INDEX IF NOT EXISTS steps_wait_started ON steps ((unixepoch(started_at,'subsec'))) WHERE mem_wait_s > 0",
     "CREATE INDEX IF NOT EXISTS calls_copy ON calls (copy, id)",
+    "CREATE INDEX IF NOT EXISTS steps_build_group_history ON steps"
+    + " (host, build_history_group, build_base, started_at_us) WHERE finished_s IS NOT NULL",
 )
 # Step and call fields under a former name, read as the current name.
 FORMER_FIELDS = (("seat", "worker"), ("delegate_session", "unit_session"))
@@ -54,6 +65,19 @@ COUNTED_FAILURE = (
 )
 
 Column = tuple[str, str, str]
+
+
+class GateChildContext(TypedDict):
+    run_id: object
+    src: str
+    host: object
+    started_at: object
+
+
+class GateTestOwner(GateChildContext):
+    suite: object
+    module: object
+    attempt: object
 
 
 class JobRunState(StrEnum):
@@ -76,8 +100,8 @@ STEP_COLUMNS: list[Column] = [
     ("build_base", "TEXT", "normalized cargo command, profile, target, package scope and features; NULL for non-cargo"),
     ("build_items", "TEXT", "sorted JSON target selectors; [] for cargo's default selection, NULL for non-cargo"),
     ("cwd", "TEXT", "where it ran"),
-    ("target_dir", "TEXT NOT NULL", "absolute CARGO_TARGET_DIR, unset when absent, unknown for older records"),
-    ("target_folder", "TEXT", "target_dir when an absolute path, else worktree, else cwd"),
+    ("target_dir", "TEXT NOT NULL", "absolute target folder, none, unresolved, or legacy unknown/unset"),
+    ("target_folder", "TEXT", "absolute target_dir, NULL when the folder is not known"),
     ("repo_identity", "TEXT NOT NULL", "admission's repository key, or unknown"),
     ("repo_path", "TEXT", "the repo every worktree shares (parent of the git common dir)"),
     ("repo", "TEXT", "repo_path's folder name: hana, cargo-port, ..."),
@@ -123,6 +147,9 @@ STEP_COLUMNS: list[Column] = [
     ("test_build_key", "TEXT", "verify test Cargo build-input key, excluding nextest run-only selection; NULL for older or changed builds"),
     ("scope_resources", "TEXT", "JSON own-scope CPU (excludes sccache.service compiles) and IO counters"),
     ("target", "TEXT", "the configured build target; NULL for legacy records"),
+    ("target_directory", "TEXT NOT NULL", "resolved Cargo artifact root, or unknown for older records"),
+    ("build_directory", "TEXT NOT NULL", "resolved Cargo intermediate root; artifact root for legacy records"),
+    ("build_history_group", "TEXT", "real folder or legacy checkout group; NULL for none or unresolved"),
 ]
 
 TEST_COLUMNS: list[Column] = [
@@ -138,6 +165,75 @@ TEST_COLUMNS: list[Column] = [
     ("attempts", "INTEGER", "attempts made"),
     ("duration_s", "REAL", "the last attempt's time"),
     ("slow", "INTEGER", "1 when nextest reported it SLOW"),
+]
+
+GATE_RUN_COLUMNS: list[Column] = [
+    ("id", "TEXT PRIMARY KEY", "gate run identity"),
+    ("src", "TEXT", "source file"),
+    ("host", "TEXT", "host"),
+    ("started_at", "TEXT", "UTC ISO start time"),
+    ("ended_at", "TEXT", "UTC ISO end time"),
+    ("wall_s", "REAL", "wall time of the run"),
+    ("hold_wait_s", "REAL", "seconds spent waiting for a build hold"),
+    ("selection", "TEXT", "full, affected, or reused"),
+    ("reason", "TEXT", "reason for the selection"),
+    ("status", "INTEGER", "exit status"),
+    ("max_jobs", "INTEGER", "maximum number of concurrent jobs"),
+    ("peak_mib", "REAL", "peak memory in MiB"),
+    ("cap_mib", "REAL", "memory cap in MiB"),
+    ("checkout", "TEXT", "checkout path"),
+    ("branch", "TEXT", "branch"),
+    ("sha", "TEXT", "commit"),
+    ("tree", "TEXT", "tree identity"),
+    ("source", "TEXT", "tests-only or checkpoint"),
+    ("aborted", "INTEGER", "1 when the run was aborted"),
+    ("dirty", "INTEGER", "1 when the checkout had changes"),
+    ("modules_run", "INTEGER", "distinct test modules; excludes the type job"),
+    ("tests_run", "INTEGER", "tests run in the last attempt of each test module"),
+]
+
+GATE_SUITE_COLUMNS: list[Column] = [
+    ("run_id", "TEXT", "gate_runs.id"),
+    ("src", "TEXT", "source file"),
+    ("host", "TEXT", "host"),
+    ("started_at", "TEXT", "the run's start"),
+    ("suite", "TEXT", "suite name"),
+    ("wall_s", "REAL", "wall time of the suite"),
+    ("status", "INTEGER", "exit status"),
+]
+
+GATE_MODULE_COLUMNS: list[Column] = [
+    ("run_id", "TEXT", "gate_runs.id"),
+    ("src", "TEXT", "source file"),
+    ("host", "TEXT", "host"),
+    ("started_at", "TEXT", "the run's start"),
+    ("suite", "TEXT", "suite name"),
+    ("module", "TEXT", "test module; basedpyright for the types suite"),
+    ("attempt", "INTEGER", "execution number from 1; includes hold restarts and reruns"),
+    ("restart", "TEXT", "hold when a build hold stopped the attempt; empty otherwise"),
+    ("times_missing", "TEXT", "reason test times are missing; empty when present"),
+    ("wall_s", "REAL", "wall time of the module"),
+    ("cpu_s", "REAL", "user and system CPU seconds"),
+    ("peak_mib", "REAL", "peak memory in MiB"),
+    ("status", "INTEGER", "exit status"),
+    ("tests_run", "INTEGER", "tests run"),
+    ("failures", "INTEGER", "test failures"),
+    ("errors", "INTEGER", "test errors"),
+    ("skipped", "INTEGER", "skipped tests"),
+    ("tests_s", "REAL", "sum of all test times"),
+]
+
+GATE_TEST_COLUMNS: list[Column] = [
+    ("run_id", "TEXT", "gate_runs.id"),
+    ("src", "TEXT", "source file"),
+    ("host", "TEXT", "host"),
+    ("started_at", "TEXT", "the run's start"),
+    ("suite", "TEXT", "suite name"),
+    ("module", "TEXT", "test module"),
+    ("attempt", "INTEGER", "module execution number from 1"),
+    ("test", "TEXT", "test identity without the module name"),
+    ("duration_s", "REAL", "test time in seconds"),
+    ("status", "TEXT", "pass, fail, error, skip, expected_failure, or unexpected_success"),
 ]
 
 CALL_COLUMNS: list[Column] = [
@@ -368,6 +464,18 @@ SSH_ATTEMPT_COLUMNS: list[Column] = [
 ]
 
 TABLES: dict[str, tuple[list[Column], str, str]] = {
+    "gate_runs": (
+        GATE_RUN_COLUMNS, "", "one row per merge-gate test run (scripts/production/merge_gate.py)",
+    ),
+    "gate_suites": (GATE_SUITE_COLUMNS, "PRIMARY KEY (run_id, suite)", "one row per gate suite"),
+    "gate_modules": (
+        GATE_MODULE_COLUMNS, "PRIMARY KEY (run_id, suite, module, attempt)", "one row per gate module attempt",
+    ),
+    "gate_tests": (
+        GATE_TEST_COLUMNS,
+        "PRIMARY KEY (run_id, suite, module, attempt, test)",
+        "per-test rows of a gate module, kept only for tests that failed or took at least SLOW_TEST_S (config/test_times.conf)",
+    ),
     "ssh_attempts": (SSH_ATTEMPT_COLUMNS, "", "SSH attempts, including retained capacity after completion"),
     "queue_bumps": (QUEUE_BUMP_COLUMNS, "", "one row per user or session move to the head of the memory queue"),
     "mac_idle": (MAC_IDLE_COLUMNS, "", "one Mac idle case per cause per verify call; actions keep the call as the test owner"),
@@ -490,10 +598,13 @@ def create_schema(connection: sqlite3.Connection) -> None:
     statements.append("CREATE INDEX hold_events_target_at ON hold_events (target, at)")
     statements.append("CREATE INDEX steps_started ON steps (started_at)")
     statements.append("CREATE INDEX steps_host_started ON steps (host, started_at)")
-    statements.append("CREATE INDEX steps_build_history ON steps (host, target_folder, build_base, started_at_us)")
     statements.append("CREATE INDEX steps_tree ON steps (worktree, step, tree_key)")
     statements.append("CREATE INDEX steps_call ON steps (call_id)")
     statements.append("CREATE INDEX tests_step ON tests (step_id)")
+    statements.append("CREATE INDEX gate_runs_started ON gate_runs (started_at)")
+    statements.append("CREATE INDEX gate_suites_suite ON gate_suites (suite, started_at)")
+    statements.append("CREATE INDEX gate_modules_key ON gate_modules (suite, module, started_at)")
+    statements.append("CREATE INDEX gate_tests_key ON gate_tests (suite, module, test, started_at)")
     statements.append("CREATE INDEX calls_started ON calls (started_at)")
     statements.append("CREATE INDEX ci_jobs_run ON ci_jobs (run_id, attempt)")
     statements.append("CREATE INDEX samples_host_at ON samples (host, at)")
@@ -572,6 +683,14 @@ def pick(record: dict[str, object], columns: list[Column]) -> dict[str, object]:
         value = record.get(name)
         row[name] = json.dumps(value) if isinstance(value, list | dict) else value
     return row
+
+
+def entries(record: dict[str, object], field: str) -> list[dict[str, object]]:
+    """Return the dictionary entries of a list field."""
+    value = record.get(field)
+    if not isinstance(value, list):
+        return []
+    return [cast(dict[str, object], item) for item in cast(list[object], value) if isinstance(item, dict)]
 
 
 @dataclass(frozen=True)
@@ -659,7 +778,10 @@ def build_keys(argv: list[str]) -> CargoBuildKey | NonCargoBuild:
 
 def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
     argv = record.get("argv")
-    target_dir = record.get("target_dir")
+    target_dir = record.get("target_dir") or store.UNKNOWN_IDENTITY
+    folder = target_dir if isinstance(target_dir, str) and Path(target_dir).is_absolute() else None
+    target_directory = record.get("target_directory") or folder or store.UNKNOWN_IDENTITY
+    checkout = record.get("worktree") or record.get("cwd")
     key = (build_keys(cast(list[str], argv))
            if isinstance(argv, list) and all(isinstance(word, str) for word in cast(list[object], argv))
            else NonCargoBuild())
@@ -670,21 +792,18 @@ def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str
         "repo": folder_name(record.get("repo_path")),
         "worktree_name": folder_name(record.get("worktree")),
         "target_dir": target_dir or store.UNKNOWN_IDENTITY,
+        "target_directory": target_directory,
+        "build_directory": record.get("build_directory") or target_directory,
         "repo_identity": record.get("repo_identity") or store.UNKNOWN_IDENTITY,
-        "target_folder": (target_dir if isinstance(target_dir, str) and Path(target_dir).is_absolute()
-                          else record.get("worktree") or record.get("cwd")),
+        "target_folder": folder,
+        "build_history_group": ("folder:" + folder if folder else
+                                "legacy:" + str(checkout) if checkout and target_dir in ("unknown", "unset") else None),
         "build_base": key.base if isinstance(key, CargoBuildKey) else None,
         "build_items": list(key.items) if isinstance(key, CargoBuildKey) else None,
     }
     insert(connection, "steps", pick(record, STEP_COLUMNS))
     _ = connection.execute("DELETE FROM tests WHERE step_id = ?", (record.get("id"),))
-    tests = record.get("tests")
-    if not isinstance(tests, list):
-        return
-    for test in cast(list[object], tests):
-        if not isinstance(test, dict):
-            continue
-        row = cast(dict[str, object], test)
+    for row in entries(record, "tests"):
         insert(
             connection,
             "tests",
@@ -701,6 +820,61 @@ def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str
                 TEST_COLUMNS,
             ),
         )
+
+
+@dataclass(frozen=True)
+class LatestGateModuleAttempt:
+    attempt: int
+    tests_run: int
+
+
+def add_gate_run(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
+    """Replace a gate run and all its suite, module, and test rows."""
+    run_id = record.get("id")
+    for table in ("gate_suites", "gate_modules", "gate_tests"):
+        _ = connection.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
+    module_rows = entries(record, "modules")
+    latest_attempts: dict[tuple[str, str], LatestGateModuleAttempt] = {}
+    for module in module_rows:
+        suite = module.get("suite")
+        name = module.get("module")
+        attempt = module.get("attempt")
+        tests_run = module.get("tests_run")
+        if (not isinstance(suite, str) or not isinstance(name, str)
+                or (suite, name) == TYPE_CHECK_JOB
+                or not isinstance(attempt, int) or not isinstance(tests_run, int)):
+            continue
+        key = (suite, name)
+        if key not in latest_attempts or attempt >= latest_attempts[key].attempt:
+            latest_attempts[key] = LatestGateModuleAttempt(attempt, tests_run)
+    insert(connection, "gate_runs", pick({
+        **record,
+        "src": src,
+        "modules_run": len(latest_attempts),
+        "tests_run": sum(last.tests_run for last in latest_attempts.values()),
+    }, GATE_RUN_COLUMNS))
+    parent: GateChildContext = {
+        "run_id": run_id,
+        "src": src,
+        "host": record.get("host"),
+        "started_at": record.get("started_at"),
+    }
+    for suite_row in entries(record, "suites"):
+        insert(connection, "gate_suites", pick({**suite_row, **parent}, GATE_SUITE_COLUMNS))
+    for module in module_rows:
+        insert(connection, "gate_modules", pick({**module, **parent}, GATE_MODULE_COLUMNS))
+        owner: GateTestOwner = {
+            **parent,
+            "suite": module.get("suite"),
+            "module": module.get("module"),
+            "attempt": module.get("attempt"),
+        }
+        for test in entries(module, "tests"):
+            insert(connection, "gate_tests", pick({
+                **test,
+                **owner,
+                "duration_s": test.get("s"),
+            }, GATE_TEST_COLUMNS))
 
 
 def add_call(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
@@ -764,11 +938,7 @@ def add_ci_run(connection: sqlite3.Connection, record: dict[str, object], src: s
             if queue_elapsed is not None and queue_elapsed >= 0:
                 job_row["queued_s"] = round(queue_elapsed, 3)
         insert(connection, "ci_jobs", pick(job_row, CI_JOB_COLUMNS))
-        steps = job.get("steps")
-        for entry in cast(list[object], steps) if isinstance(steps, list) else []:
-            if not isinstance(entry, dict):
-                continue
-            ci_step = cast(dict[str, object], entry)
+        for ci_step in entries(job, "steps"):
             step_row = {
                 **ci_step,
                 "job_id": job.get("job_id"),
@@ -799,7 +969,7 @@ def add_ssh_attempt(connection: sqlite3.Connection, record: dict[str, object], s
     insert(connection, "ssh_attempts", pick({**record, "src": src}, SSH_ATTEMPT_COLUMNS))
 
 
-ADDERS = {"ssh_attempt": add_ssh_attempt, "queue_bump": add_queue_bump, "mac_idle": add_mac_idle, "hold_build": add_hold_build, "hold_event": add_hold_event, "step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample,
+ADDERS = {"gate_run": add_gate_run, "ssh_attempt": add_ssh_attempt, "queue_bump": add_queue_bump, "mac_idle": add_mac_idle, "hold_build": add_hold_build, "hold_event": add_hold_event, "step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample,
           "memory_snapshot": add_memory_snapshot}
 
 

@@ -1258,7 +1258,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
         except (OSError, UnicodeError, ValueError) as error:
             print(f"stall-watch: {configured['slug']}: its units are not watched: {error}", file=sys.stderr)
             continue
-    runs = unit_lookup.HeldRunLookup()
+    runs = unit_lookup.HeldRunLookup(record=record)
     inspection_started = False
     labels_by_session: dict[str, dict[str, str]] = {}
     for slug, configured, zone, members, name, unit, row in inspection_order(work):

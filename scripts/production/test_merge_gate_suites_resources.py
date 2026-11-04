@@ -49,7 +49,7 @@ if __name__ == "__main__":
     Path(sys.argv[2]).write_text(str(spin_cpu(float(sys.argv[1]))))
 '''
 from scripts.lint import memory_admit
-from scripts.lib import copy_record
+from scripts.lib import copy_record, scratch
 
 
 @final
@@ -224,7 +224,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
         admitted = False
 
         def assert_busy() -> None:
-            with (self.checkout / ".claude-busy").open("r") as lock:
+            with scratch.busy_path(self.checkout).open("r") as lock:
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 

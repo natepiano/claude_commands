@@ -7,6 +7,7 @@ from collections import Counter
 from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
+import json
 import os
 from pathlib import Path
 import select
@@ -513,6 +514,28 @@ class AdmissionFixture(ExitStack):
         path = self.state_dir / "anon_peaks.jsonl"
         return list(gate.anonymous_history_rows(path)) if path.exists() else []
 
+    def legacy_token_wait(self) -> tuple[wire.AdmitRequest, Path, gate.Waiter]:
+        """Prepare a scoped legacy reservation with a sampled peak and a token intent."""
+        self.server.close()
+        (self.state_dir / "state.json").unlink()
+        request = self.request()
+        reservation = self.state_dir / "retry.reservation"
+        sidecar = self.scope(request.owner)
+        _ = reservation.with_suffix(".max").write_text(str(GIB))
+        _ = reservation.write_text(json.dumps({
+            "pid": request.owner.pid, "start_time": request.owner.start_time,
+            "need": GIB, "repo": "fixture", "step": "check", "worktree": "tree",
+            "sidecar": str(sidecar), "admitted_at": gate.store.utc_iso(self.clock.now()),
+            "test_threads": None, "call_id": None,
+        }))
+        intent = self.state_dir / "retry.token-wait"
+        waiter: gate.Waiter = {
+            "pid": request.owner.pid, "start_time": request.owner.start_time,
+            "need": GIB, "since": request.since, "token_left_at": self.clock.now(),
+        }
+        _ = intent.write_text(json.dumps({"reservation": str(reservation), "waiter": waiter}))
+        return request, intent, waiter
+
     def state_text(self) -> str:
         return (self.state_dir / "state.json").read_text()
 
@@ -687,7 +710,7 @@ def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str,
     if not launcher.exists():
         launcher.symlink_to(Path(__file__).resolve().parents[1] / "lib/py")
     _ = environment.setdefault("LINT_CONFIG_READER", os.environ["LINT_CONFIG_READER"])
-    for key in ("ADMISSION_SOCKET", "LINT_CONFIG_FILE", "BUILDLOG_PROC", "BUILDLOG_MEMINFO",
+    for key in ("USER_ZONE", "ADMISSION_SOCKET", "LINT_CONFIG_FILE", "BUILDLOG_PROC", "BUILDLOG_MEMINFO",
                 "BUILDLOG_MEMORY_PRESSURE", "BUILDLOG_BUILDS_CGROUP", "BUILDLOG_LIVE_MEMORY_TRIPWIRE"):
         environment[key] = os.environ[key]
     _ = fixture.enter_context(fixture.serving())

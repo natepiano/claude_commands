@@ -30,6 +30,7 @@ for dependency in ("shutdown", "herdr", "message", "whoami", "lib"):
 import herdr
 import pane_record
 from scripts.shutdown.launch_names import LaunchNames
+from scripts.shutdown.codex_trust import trust_arguments
 import pane_launch
 from scripts.lib.resume_message import (
     ResumeWorkers as ResumeWorkers,
@@ -91,6 +92,35 @@ def _same_process(pid: int, started: str) -> bool:
     if isinstance(identity, sessions.SessionLivenessUnknown):
         raise OSError(identity.reason)
     return isinstance(identity, sessions.LiveSessionProcess)
+
+
+def _signal_process(pid: int, number: int) -> None:
+    """Refuse proof signals unless herdr places the process in the selected workspace."""
+    if number != 0 and "SHUTDOWN_PROOF_WORKSPACE" not in os.environ and (
+            "STAFF_FILE" in os.environ or "SHUTDOWN_STATE_DIR" in os.environ):
+        raise PermissionError(
+            f"signal {number} to pid {pid} refused: isolated records require SHUTDOWN_PROOF_WORKSPACE")
+    if number != 0 and "SHUTDOWN_PROOF_WORKSPACE" in os.environ:
+        workspace = os.environ["SHUTDOWN_PROOF_WORKSPACE"]
+        refusal = f"proof workspace {workspace!s}: signal {number} to pid {pid} refused"
+        try:
+            if not workspace or pid <= 0:
+                raise ValueError("expected a workspace id and a positive pid")
+            client = herdr.Herdr(herdr.shared_session())
+            for pane in client.panes():
+                if pane["workspace_id"] != workspace:
+                    continue
+                info = herdr.json_object(client.result(
+                    "pane", "process-info", "--pane", pane["pane_id"]).get("process_info"), "proof process info")
+                if any(isinstance(observed := herdr.json_object(process, "proof pane process").get("pid"), int)
+                       and not isinstance(observed, bool) and observed == pid
+                       for process in herdr.json_items(info.get("foreground_processes"), "proof pane processes")):
+                    break
+            else:
+                raise ValueError("herdr did not place the pid in a workspace pane")
+        except (OSError, ValueError, herdr.HerdrFailure) as error:
+            raise PermissionError(f"{refusal}: {error}") from error
+    os.kill(pid, number)
 
 
 def _record_launches(selected: list[str]) -> None:
@@ -168,12 +198,24 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
         live = sessions.session_liveness(identity)
         if isinstance(live, sessions.SessionNotLive):
             client = herdr.Herdr(herdr.shared_session())
-            for pane in client.panes():
-                if pane["session_id"] == identity and not isinstance(
-                        client.pane_activity(pane["pane_id"]), herdr.PaneAtShell):
-                    if pid := client.codex_launch(pane["pane_id"]).get("pid"):
-                        live, kind = sessions.LiveSessionProcess(pid), "codex"
-                        break
+            for pane in sorted(client.panes(), key=lambda pane: pane["session_id"] != identity):
+                if pane["session_id"] and pane["session_id"] != identity:
+                    continue
+                try:
+                    if isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell):
+                        continue
+                    launch = client.codex_launch(pane["pane_id"], ["resume", identity])
+                    pid = launch.get("pid")
+                    if not pid or launch["session_id"] != identity:
+                        continue
+                    if not pane["session_id"] and herdr.codex_rollout_thread(pid) != identity:
+                        continue
+                except (OSError, ValueError, herdr.HerdrFailure):
+                    if pane["session_id"] == identity:
+                        raise
+                    continue
+                live, kind = sessions.LiveSessionProcess(pid), "codex"
+                break
         if isinstance(live, sessions.SessionNotLive):
             return NotRunning(identity)
         if isinstance(live, sessions.SessionLivenessUnknown):
@@ -186,7 +228,7 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
             return NotRunning(identity)
         if herdr.native_process(live.pid, kind) != proved:
             return StopFailed(identity, "process identity changed; no signal sent")
-        os.kill(live.pid, signal.SIGTERM)
+        _signal_process(live.pid, signal.SIGTERM)
         deadline = monotonic() + STOP_GRACE_SECONDS
         while _same_process(live.pid, started):
             remaining = deadline - monotonic()
@@ -203,7 +245,7 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
             except (OSError, ValueError, herdr.HerdrFailure) as error:
                 print(f"{identity}: stop identity anomaly after SIGTERM: {error}; waiting for exit", file=sys.stderr)
             else:
-                os.kill(live.pid, signal.SIGKILL)
+                _signal_process(live.pid, signal.SIGKILL)
                 last_signal = "SIGKILL"
             deadline = monotonic() + KILL_GRACE_SECONDS
             while _same_process(live.pid, started):
@@ -234,7 +276,7 @@ def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account:
     return ["env", "-u", "HERDR_TAB_ID", "-u", "STAFF_ID", *(f"{key}={value}" for key, value in environment.items()),
             "sh", "-c", 'cd -- "$1" && shift && exec "$@"', "resume", entry["cwd"],
             sys.executable, str(SCRIPTS / "accounts/accounts.py"), "exec", account,
-            *pane_record.resume_arguments(entry)]
+            *trust_arguments(pane_launch.agent_kind(entry), entry["cwd"], pane_record.resume_arguments(entry))]
 
 
 def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,

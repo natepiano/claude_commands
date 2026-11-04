@@ -19,8 +19,8 @@ those to the showrunner as before.
 ## Steps
 
 1. **The production.** Read the `> **Production:**` line of your plan header:
-   it names the production doc. Your unit name is your row's `Unit` cell in that
-   doc's Units table, as written (for example `alpha-unit`). No production line
+   it names the production doc. Your unit name is your staff row name
+   (for example `alpha-unit`). No production line
    means no production: end the turn on `— decision:` as `/unit:direct` says.
 2. **The question in full.** Write it so that it stands alone when the user
    reads it days later, with nothing else in front of them:

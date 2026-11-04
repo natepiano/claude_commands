@@ -499,7 +499,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         _ = transcript.write_text(json.dumps({"type": "session_meta", "payload": {
             "id": self.owner.current_session}}) + "\n")
         (descriptors / "7").symlink_to(transcript)
-        _ = (process / "cmdline").write_bytes(b"codex\0resume\0")
+        _ = (process / "cmdline").write_bytes(f"codex\0resume\0{self.owner.current_session}\0".encode())
         _ = (process / "environ").write_bytes(
             f"CODEX_THREAD_ID={self.owner.id}\0CODEX_HOME={backend.config}\0".encode())
         if rollout == "unreadable":
@@ -516,7 +516,8 @@ class CodexPaneRestoreTests(FolderMoveFixture):
 
         def publish_process_state() -> None:
             publish()
-            _ = (process / "cmdline").write_bytes(b"codex\0resume\0" if backend.live else b"")
+            _ = (process / "cmdline").write_bytes(
+                f"codex\0resume\0{self.owner.current_session}\0".encode() if backend.live else b"")
             if rollout == "current":
                 descriptor = descriptors / "7"
                 descriptor.unlink(missing_ok=True)
@@ -544,7 +545,10 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         proc = self.root / "retirement-proc"
         descriptors = proc / str(backend.pid) / "fd"
         descriptors.mkdir(parents=True, exist_ok=True)
-        _ = (descriptors.parent / "cmdline").write_bytes((backend.kind if not stopped else "zsh").encode() + b"\0")
+        arguments = ["zsh"] if stopped else [backend.kind]
+        if arguments == ["codex"]:
+            arguments.extend(["resume", self.owner.current_session])
+        _ = (descriptors.parent / "cmdline").write_bytes(("\0".join(arguments) + "\0").encode())
         shell_task = proc / str(backend.shell_pid) / "task" / str(backend.shell_pid)
         shell_task.mkdir(parents=True, exist_ok=True)
         _ = (shell_task / "children").write_text("")
@@ -749,7 +753,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
             moved = self.finished_move_rerun()
         self.assertEqual(moved.returncode, 0, moved.stderr)
         owners = [entry for entry in pane_record.read("agents").values() if entry["session_id"] == self.owner.id]
-        self.assertEqual([(entry["pane_id"], entry["cwd"]) for entry in owners], [("w1:p3", str(self.new_folder))])
+        self.assertEqual([(entry["pane_id"], pane_record.resume_launch(entry)["cwd"]) for entry in owners], [("w1:p3", str(self.new_folder))])
 
 
     def moved_codex(self) -> tuple[FolderMoveBackend, Path]:
@@ -762,7 +766,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         moved = invoke_cli(unit_move, lambda: unit_move.main(arguments), arguments,
                            dict(os.environ), self.checkout)
         self.assertEqual(moved.returncode, 0, moved.stderr)
-        self.assertEqual(pane_record.read("agents")["w1:p1"]["cwd"], str(self.new_folder))
+        self.assertEqual(pane_record.resume_launch(pane_record.read("agents")["w1:p1"])["cwd"], str(self.new_folder))
         backend.live = False
         backend.publish_process_state()
         transcript = backend.config / "sessions/2026/11/02" / f"rollout-{self.owner.current_session}.jsonl"
@@ -781,6 +785,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         from scripts.production.fake_unit_host import process
         process({"HERDR_PROC": str(proc)}, 998042, 1, ["zsh"], {})
         proof: list[str] = []
+        held_id = "019b3a40-4250-7000-8000-000000000199" if wrong_identity else self.owner.current_session
         published = False
         publishing = False
         read_rollout = herdr.codex_rollout_thread
@@ -795,11 +800,12 @@ class CodexPaneRestoreTests(FolderMoveFixture):
                   timeout_ms: int) -> herdr.PromptSubmissionNotRequired:
             nonlocal published, publishing
             self.assertEqual(kind, "codex")
-            self.assertEqual(agent_arguments, ["resume", self.owner.current_session, "--model", "fixture-model"])
+            self.assertEqual(agent_arguments, ["-c", 'projects={' + json.dumps(str(self.new_folder))
+                + '={trust_level="trusted"}}', "resume", self.owner.current_session, "--model", "fixture-model"])
             self.assertIsInstance(opening, herdr.NoOpeningPrompt)
             self.assertGreater(timeout_ms, 0)
             (proc / str(backend.pid) / "fd").mkdir(parents=True, exist_ok=True)
-            _ = (proc / str(backend.pid) / "cmdline").write_bytes(b"codex\0")
+            _ = (proc / str(backend.pid) / "cmdline").write_bytes(f"codex\0resume\0{held_id}\0".encode())
             client.started.append((name, pane, agent_arguments.copy()))
             if publish:
                 info: dict[str, object] = {"process_info": {"foreground_processes": [{
@@ -822,7 +828,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
             self.assertEqual(len(client.started), 1)
             proof.append("foreground")
             return subprocess.CompletedProcess(arguments, 0, json.dumps({"result": {"process_info": {
-                "foreground_processes": [{"pid": backend.pid, "argv": ["codex", "resume", self.owner.current_session],
+                "foreground_processes": [{"pid": backend.pid, "argv": ["codex", "resume", held_id],
                                            "cwd": str(self.new_folder)}]}}}), "")
 
         def process_start(pid: int) -> str:
@@ -883,7 +889,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         launches = [entry for entry in pane_record.read("agents").values()
                     if entry["session_id"] in (self.owner.id, self.owner.current_session)]
         self.assertEqual(len(launches), 1)
-        self.assertEqual((launches[0]["pane_id"], launches[0]["cwd"]), ("w1:p3", str(destination)))
+        self.assertEqual((launches[0]["pane_id"], pane_record.resume_launch(launches[0])["cwd"]), ("w1:p3", str(destination)))
         self.assertTrue((destination / ".git").is_file())
 
 
@@ -900,6 +906,8 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         arguments = ["move-folder", "--unit", self.owner.id, "--to", str(self.new_folder)]
         moved = invoke_cli(unit_move, lambda: unit_move.main(arguments), arguments, dict(os.environ), self.checkout)
         self.assertEqual(moved.returncode, 0, moved.stderr)
+        backend.live = False
+        backend.publish_process_state()
         entry = pane_record.read("agents")["w1:p1"]
         entry["ended"] = False
         pane_record.write("agents", entry)

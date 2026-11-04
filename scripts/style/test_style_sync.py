@@ -31,11 +31,13 @@ from scripts.copies import copies
 import scratch
 import style_ledger
 import style_rules
+from scripts.lib import build_folders
 from scripts.lib.process_group import send_process_group
 from scripts.production import showrunners
 from scripts.message import send_budget
 from scripts.direct import test_verify_lint_scope as verify_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 
 
 class RecordedCall(TypedDict):
@@ -122,6 +124,7 @@ class StyleSyncTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(fake_cargo_output_roots(children=True))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="style-sync-test-")))
         self.repo = self.root / "sample"
         self.style = self.root / "sample-style"
@@ -615,7 +618,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
 
     def test_clean_check_mode_records_all_tools_passing_and_returns_zero(self) -> None:
         verify = self.root / "verify.sh"
-        metadata = self.lint_temp / f"{style_sync.LINT_PREFIX}*"
+        metadata = self.lint_temp / f"{style_sync.lint_prefix()}*"
         _ = verify.write_text(f"#!/bin/bash\ncp {metadata}/owner.json {self.root / 'owner-seen'}\n"
                               + f"cp {metadata}/{style_sync.VERIFIER_FILE} {self.root / 'verifier-seen'}\n"
                               + f"echo $$ > {self.root / 'verify-pid'}\ncat <<'OUTPUT'\n" + CLEAN_LINT + "OUTPUT\n")
@@ -658,7 +661,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         return code, output.getvalue()
 
     def stale_dir(self, name: str, owner: int | None, *, registered: bool, verifier_group: int = 0) -> Path:
-        directory = self.lint_temp / f"{style_sync.LINT_PREFIX}{name}"
+        directory = self.lint_temp / f"{style_sync.lint_prefix()}{name}"
         directory.mkdir()
         if owner is not None:
             common_dir = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
@@ -681,6 +684,15 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         self.assertEqual((target / "artifact").read_text(), "previous")
         code, output = self.run_lint('[[ $(cat target/artifact) == previous ]] || exit 2\n')
         self.assertEqual(code, 0, output)
+        self.assertEqual(list(self.lint_temp.iterdir()), [])
+
+    def test_lint_keeps_intermediates_with_the_standing_warm_target(self) -> None:
+        target = self.standing_target()
+        code, output = self.run_lint(
+            '[[ "$CARGO_BUILD_BUILD_DIR" == "$(realpath target)/intermediates" ]] || exit 2\n'
+            + 'printf warm > "$CARGO_BUILD_BUILD_DIR/intermediate"\n')
+        self.assertEqual(code, 0, output)
+        self.assertEqual((target / "intermediates/intermediate").read_text(), "warm")
         self.assertEqual(list(self.lint_temp.iterdir()), [])
 
     def test_lint_keeps_its_own_warm_target_after_metadata_cleanup(self) -> None:
@@ -815,15 +827,15 @@ with Path('.claude-busy').open('r+') as lock:
         self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
 
     def test_a_stop_signal_right_after_the_dir_is_made_still_removes_it(self) -> None:
-        make_dir = tempfile.mkdtemp
+        make_dir = build_folders.create_build_folder
 
-        def make_dir_then_signal(prefix: str, dir: Path) -> str:
-            made = make_dir(prefix=prefix, dir=dir)
+        def make_dir_then_signal(request: build_folders.BuildFolderRequest) -> Path:
+            made = make_dir(request)
             os.kill(os.getpid(), signal.SIGTERM)
             return made
 
         output = io.StringIO()
-        with mock.patch.object(tempfile, "mkdtemp", make_dir_then_signal), \
+        with mock.patch.object(build_folders, "create_build_folder", make_dir_then_signal), \
                 mock.patch.object(style_sync, "VERIFY", self.clean_verify()), \
                 redirect_stdout(output), redirect_stderr(output):
             code = style_sync.main(["lint", "--repo", str(self.repo), "--checkout", str(self.repo), "--tip", self.tip])
@@ -1002,7 +1014,7 @@ with Path('.claude-busy').open('r+') as lock:
         common_dir = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
         style_sync.OwnerRecord(dead, common_dir).write(planted_target)
         _ = (planted_target / "kept").write_text("kept\n")
-        planted = self.lint_temp / f"{style_sync.LINT_PREFIX}planted"
+        planted = self.lint_temp / f"{style_sync.lint_prefix()}planted"
         planted.symlink_to(planted_target)
         with redirect_stdout(io.StringIO()):
             style_sync.sweep_stale_lint_dirs()

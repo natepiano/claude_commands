@@ -27,7 +27,7 @@ sys.path.insert(0, str(SCRIPTS / "lib"))
 import process_group
 
 from add_style import NoStyleProduction, standing_style_production
-from production_units import Refusal
+from scripts.production.production_doc import Refusal
 from scripts.copies import copies
 from scripts.message import send_result
 from scripts.message import send_budget
@@ -46,7 +46,6 @@ LEDGER = SCRIPTS / "style/style_ledger.py"
 TOOLS: tuple[style_ledger.LintTool, ...] = ("clippy", "mend", "rustfmt")
 # Each lint run owns one `style-sync-lint-*` dir here; a later run removes the dir of a run that was killed.
 LINT_TEMP_PARENT: Path | build_folders.InheritedTemporaryParent = build_folders.InheritedTemporaryParent()
-LINT_PREFIX = build_folders.FOLDER_PREFIXES["style-sync-lint"]
 OWNER_FILE = "owner.json"
 # Written by the verifier itself, so a SIGKILL of the owner right after Popen still leaves its group recorded.
 VERIFIER_FILE = "verifier.pgid"
@@ -99,6 +98,11 @@ def notify(repo_dir: Path, branch: str, tip: str) -> None:
     except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
         detail = " ".join(str(error).splitlines()).removeprefix("style_sync: ")
         print("style_sync: notify: " + detail)
+
+
+def lint_prefix() -> str:
+    """Read the current prefix for style lint folders."""
+    return build_folders.FOLDER_PREFIXES["style-sync-lint"]
 
 
 def lint_temp_parent() -> Path:
@@ -263,7 +267,8 @@ def verifier_command(directory: Path, owner: int) -> list[str]:
 def verify_lint(directory: Path) -> tuple[int, str]:
     # Held from Popen until the child stop below is in force; start_new_session makes `$$` the group id.
     with signal_mask(signal.SIG_BLOCK), subprocess.Popen(
-        verifier_command(directory, os.getpid()), cwd=directory / "checkout", env={**os.environ, "UNIT_DETACHED_RUN": "1"},
+        verifier_command(directory, os.getpid()), cwd=directory / "checkout", env={**os.environ, "UNIT_DETACHED_RUN": "1",
+            "CARGO_BUILD_BUILD_DIR": str((directory / "checkout/target").resolve() / "intermediates")},
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         start_new_session=True, preexec_fn=unblock_held_signals,
     ) as child:
@@ -292,7 +297,7 @@ def remove_lint_dir(repo: Path, directory: Path) -> bool:
         if snapshot.is_symlink():
             snapshot.unlink()
         elif snapshot.is_dir():
-            shutil.rmtree(snapshot)
+            scratch.remove_with_cargo_output(snapshot, shutil.rmtree)
         registered = {Path(line.removeprefix("worktree "))
                       for line in git(repo, "worktree", "list", "--porcelain").splitlines()
                       if line.startswith("worktree ")}
@@ -335,7 +340,7 @@ def sweep_stale_lint_dirs() -> None:
     A dir without a readable owner record, or whose owner or verifier group runs, stays: a reused id
     keeps a dir, it never removes a running checkout. A failure prints one line and the run continues.
     """
-    for directory in sorted(lint_temp_parent().glob(f"{LINT_PREFIX}*")):
+    for directory in sorted(lint_temp_parent().glob(f"{lint_prefix()}*")):
         try:
             remove_if_stale(directory)
         # Any failure of one dir's sweep; LintStopped and KeyboardInterrupt are not an Exception.
@@ -362,11 +367,20 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
     # Signals stay held outside the work, so the dir never exists without its record and its cleanup path.
     with stop_signals_raise(), copies.standing(gate_owner(repo), checkout, tip) as snapshot, signal_mask(signal.SIG_BLOCK):
         directory = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
-            LINT_PREFIX, build_folders.ExplicitBuildParent(lint_temp_parent())))
+            lint_prefix(), build_folders.ExplicitBuildParent(lint_temp_parent())))
         try:
             OwnerRecord(os.getpid(), Path(common_dir)).write(directory)
             with signal_mask(signal.SIG_UNBLOCK):
                 (directory / "checkout").symlink_to(snapshot, target_is_directory=True)
+                intermediates = snapshot / "target/intermediates"
+                scratch.mark_cargo_cache(intermediates)
+                saved = subprocess.run(
+                    [str(PYTHON), str(Path(scratch.__file__)), "cargo-save", str(snapshot)],
+                    env={**os.environ, "CARGO_BUILD_BUILD_DIR": str(intermediates)},
+                    capture_output=True, text=True, check=False,
+                )
+                if saved.returncode:
+                    raise Refusal(saved.stderr.strip() or "cannot save Cargo output roots")
                 returncode, output = verify_lint(directory)
                 print(output, end="")
                 # Build outputs are retained; only source changes invalidate coverage.

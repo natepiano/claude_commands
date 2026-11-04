@@ -7,7 +7,6 @@ Each phase runs these checks once at the points named below:
 
 | Check | Runs in | Over |
 | --- | --- | --- |
-| assertion guard (`assertion_guard.py`) | the first stage of every `verify.sh lint`, and the checkpoint commit hook | `.rs` and `.py` changes from the merge base with origin's default branch |
 | cargo mend `--fix` | the workers' last `verify.sh lint` | the workspace |
 | fmt | the same `lint` | the changed members |
 | taplo fmt `--check` | the same `lint` | the workspace TOML |
@@ -15,7 +14,7 @@ Each phase runs these checks once at the points named below:
 | rustdoc `-D warnings` | `verify.sh doc`, run by the unit director as the last command before the checkpoint commit | the workspace |
 | style review | the read-only reviewer assigned by <ReviewPromptContract/>; the runner prepares and captures <StyleReview/> | the phase range selected under <ReviewPromptContract/> |
 
-The five lint checks run wherever the phase's workers run `verify.sh lint`. The checkpoint commit hook runs the assertion guard again on the staged tree, in Rust and Python repositories; an `Assertion-Change: <path>::<test> — <why>` line in a work order or the commit message rules one finding.
+The four lint checks run wherever the phase's workers run `verify.sh lint`.
 Test starts as soon as the code is ready, independently of lint.
 <VerificationContract/> defines when each result counts.
 A phase with no Rust change has no lint run; <StyleReview/> defines the

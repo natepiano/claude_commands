@@ -1,7 +1,7 @@
 """Retain each pane's launch so restore can use its account and conversation.
 
 Each herdr session has one file under `~/.local/state/herdr-panes`.
-The file maps each pane to its account folder, working folder, flags, and retained environment.
+The file keeps the account, flags, and environment for each pane. Staff supplies each unit folder.
 The Claude SessionStart hook records Claude launches.
 The normal herdr start path records Codex launches after it proves the foreground process.
 
@@ -108,11 +108,14 @@ def resume_launch(entry: PaneLaunch) -> PaneLaunch:
     """Resolve a retained member reference to its current conversation for resume."""
     from scripts.production import staff
 
-    owner = staff.initial_snapshot().by_id(staff.StaffId(entry["session_id"]))
-    if owner is None or owner.current_session == entry["session_id"]:
-        return entry
+    record = staff.initial_snapshot()
+    owner = record.by_member_reference(entry["session_id"])
     current = entry.copy()
-    current["session_id"] = owner.current_session
+    if owner is not None:
+        current["session_id"] = owner.current_session
+        unit = record.by_id(owner.parent) if owner.kind == "worker" and owner.parent else owner
+        if unit is not None and unit.kind == "unit" and not isinstance(unit.worktree, staff.WorktreeUnfilled):
+            current["cwd"] = str(unit.worktree.path)
     return current
 
 
@@ -160,32 +163,6 @@ def without_legacy_identity(entry: PaneLaunch) -> PaneLaunch:
 
 def save(session: str, entries: dict[str, PaneLaunch]) -> None:
     pane_launch.save(record_path(session), {pane: without_legacy_identity(entry) for pane, entry in entries.items()})
-
-
-def move_cwd(unit: str, old: Path, new: Path, record: "staff.StaffSnapshot") -> None:
-    """Update only this member's retained launch paths under each session lock."""
-    for path in sorted(record_directory().glob("*.json")):
-        with locked(path.stem):
-            entries = read_strict(path.stem)
-            changed = False
-            for entry in entries.values():
-                owner = record.by_member_reference(entry["session_id"])
-                if owner is None or owner.id != unit:
-                    continue
-                if entry.get("cwd") not in (str(old), str(new)):
-                    print(f"{unit}: retained launch has a different working folder; skipped", file=sys.stderr)
-                    continue
-                if entry["cwd"] != str(new):
-                    if "plugin_directories" in entry:
-                        entry["plugin_directories"] = [
-                            str(new / Path(directory).relative_to(old))
-                            if Path(directory).is_relative_to(old) else directory
-                            for directory in entry["plugin_directories"]
-                        ]
-                    entry["cwd"] = str(new)
-                    changed = True
-            if changed:
-                save(path.stem, entries)
 
 
 def write(session: str, launch: PaneLaunch) -> None:

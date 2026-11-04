@@ -18,34 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.test_times import gate_record
 from scripts.buildlog import record
-from scripts.test_times.gate_record import GateRun, ModuleTimes, TestTime
-
-
-def module_times() -> ModuleTimes:
-    return {
-        "wall_s": 3.0, "cpu_s": 2.0, "tests_s": 1.5, "tests_run": 2,
-        "failures": 1, "errors": 0, "skipped": 0,
-        "tests": [{"test": "Example.test_pass", "s": 1.0, "status": "pass"},
-                  {"test": "Example.test_fail", "s": 0.5, "status": "fail"}],
-    }
-
-
-def gate_run() -> GateRun:
-    times = module_times()
-    return {
-        "started_at": "2026-11-03T12:00:00.000Z", "ended_at": "2026-11-03T12:00:05.000Z",
-        "wall_s": 5.0, "hold_wait_s": 1.0, "selection": "affected", "reason": "fixture change",
-        "status": 1, "max_jobs": 2, "peak_mib": 30.0, "cap_mib": 100.0,
-        "checkout": "/fixture/checkout", "branch": "fixture", "sha": "a" * 40,
-        "tree": "b" * 40, "source": "tests-only", "aborted": False, "dirty": True,
-        "suites": [{"suite": "scripts", "wall_s": 4.0, "status": 1}],
-        "modules": [{"suite": "scripts", "module": "test_example.py", "attempt": 1,
-                     "wall_s": times["wall_s"], "cpu_s": times["cpu_s"], "peak_mib": 30.0,
-                     "status": 1, "tests_run": times["tests_run"], "failures": times["failures"],
-                     "errors": times["errors"], "skipped": times["skipped"],
-                     "tests_s": times["tests_s"], "tests": times["tests"],
-                     "restart": "hold", "times_missing": ""}],
-    }
+from scripts.test_times.gate_record import ModuleTimes, TestTime
+from scripts.test_times.gate_record_test_support import gate_run, module_times
 
 
 class GateRecordTests(unittest.TestCase):
@@ -162,6 +136,60 @@ class GateRecordTests(unittest.TestCase):
         self.assertEqual(gate_record.slow_test_s(), 0.75)
         _ = path.write_text("# range: 0..\nSLOW_TEST_S=1.25\n", encoding="utf-8")
         self.assertEqual(gate_record.slow_test_s(), 1.25)
+
+    def test_module_runs_number_each_module_and_preserve_execution_data(self) -> None:
+        times = module_times()
+        times.update(tests_run=7, errors=2, skipped=3)
+        executions = [
+            gate_record.Execution("hooks", "test_a.py", 4.0, 2.0, 12.0, -15, "hold",
+                                  gate_record.NoModuleTimes("runner stopped")),
+            gate_record.Execution("notify", "test_a.py", 5.0, 3.0, 13.0, 1, "", times),
+            gate_record.Execution(*gate_record.TYPE_CHECK_JOB, 6.0, 4.0, 14.0, 0, "",
+                                  gate_record.TimingNotApplicable()),
+            gate_record.Execution("hooks", "test_a.py", 7.0, 5.0, 15.0, 0, "", times),
+            gate_record.Execution("notify", "test_b.py", 8.0, 6.0, 16.0, 0, "", times),
+            gate_record.Execution("notify", "test_a.py", 9.0, 7.0, 17.0, 0, "", times),
+        ]
+        with mock.patch.object(gate_record, "slow_test_s", return_value=1.25) as threshold:
+            modules = gate_record.module_runs(executions)
+        threshold.assert_called_once_with()
+        self.assertEqual([row["attempt"] for row in modules], [1, 1, 1, 2, 1, 2])
+        self.assertEqual(len(modules), len(executions))
+        for execution, row in zip(executions, modules, strict=True):
+            self.assertEqual((row["suite"], row["module"], row["wall_s"], row["cpu_s"],
+                              row["peak_mib"], row["status"], row["restart"]),
+                             (execution.suite, execution.module, execution.wall_s, execution.cpu_s,
+                              execution.peak_mib, execution.status, execution.restart))
+        for index in (1, 3, 4, 5):
+            row = modules[index]
+            self.assertEqual((row["tests_run"], row["failures"], row["errors"], row["skipped"], row["tests_s"]),
+                             (7, 1, 2, 3, 1.5))
+            self.assertEqual(row["tests"], [{"test": "Example.test_fail", "s": 0.5, "status": "fail"}])
+            self.assertEqual(row["times_missing"], "")
+        for index, reason in ((0, "runner stopped"), (2, "")):
+            row = modules[index]
+            self.assertEqual((row["tests_run"], row["failures"], row["errors"], row["skipped"], row["tests_s"]),
+                             (0, 0, 0, 0, 0.0))
+            self.assertEqual(row["tests"], [])
+            self.assertEqual(row["times_missing"], reason)
+
+    def test_module_runs_do_not_read_the_threshold_without_test_times(self) -> None:
+        executions = [
+            gate_record.Execution("hooks", "test_a.py", 1.0, 0.5, 12.0, 1, "",
+                                  gate_record.NoModuleTimes("missing file")),
+            gate_record.Execution(*gate_record.TYPE_CHECK_JOB, 2.0, 1.0, 13.0, 0, "",
+                                  gate_record.TimingNotApplicable()),
+        ]
+        with mock.patch.object(gate_record, "slow_test_s", side_effect=AssertionError("No threshold is needed")):
+            modules = gate_record.module_runs(executions)
+            self.assertEqual(gate_record.module_runs([]), [])
+        self.assertEqual([row["times_missing"] for row in modules], ["missing file", ""])
+
+    def test_record_warning_replaces_newlines_with_spaces(self) -> None:
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            gate_record.report_not_written(OSError("first line\nsecond line\r\nthird line"))
+        self.assertEqual(stderr.getvalue(), "gate run not written: first line second line third line\n")
 
     def test_gate_write_appends_complete_records_in_the_host_month(self) -> None:
         run = gate_run()

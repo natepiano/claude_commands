@@ -653,13 +653,15 @@ def held_target_waits(connection: sqlite3.Connection, day: str) -> tuple[WaitMea
 
 
 def warm_step_clause() -> str:
-    """Same-folder finished history must cover the selected targets or defaults."""
+    """Match real folders or legacy checkout groups before checking target coverage."""
     # A sweep can delete these outputs without a build-log row. That loss is
     # intentionally invisible until the floor sweeper records its removals.
+    # Legacy checkout groups preserve history without claiming a real folder.
     earlier = (
-        "prior.host = steps.host AND prior.target_folder = steps.target_folder"
-        " AND prior.build_base = steps.build_base AND prior.started_at_us < steps.started_at_us"
-        " AND prior.finished_s IS NOT NULL"
+        "prior.host = steps.host"
+        + " AND prior.build_history_group = steps.build_history_group"
+        + " AND prior.build_base = steps.build_base AND prior.started_at_us < steps.started_at_us"
+        + " AND prior.finished_s IS NOT NULL"
     )
     group_coverage = " OR ".join(
         f"(built.value = '{group}' AND wanted.value LIKE '{member} %')"
@@ -667,7 +669,8 @@ def warm_step_clause() -> str:
                               ("--examples", "--example"), ("--benches", "--bench"))
     )
     return (
-        "(steps.build_base IS NOT NULL AND steps.target_folder IS NOT NULL AND steps.build_items IS NOT NULL AND CASE"
+        "(steps.build_base IS NOT NULL AND steps.build_items IS NOT NULL"
+        + " AND steps.build_history_group IS NOT NULL AND CASE"
         + " WHEN steps.build_items = '[]' THEN EXISTS (SELECT 1 FROM steps AS prior WHERE "
         + earlier + " AND (prior.build_items = '[]' OR EXISTS (SELECT 1 FROM json_each(prior.build_items) AS built"
         + " WHERE built.value = '--all-targets')))"
@@ -1519,7 +1522,7 @@ def moments_section(connection: sqlite3.Connection, day: str) -> list[str]:
     ]
     if any(isinstance(window.moment, moments.MemoryMoment) for window in windows):
         lines += [
-            f"Earlyoom kills/day, builds: oom_score_adj {conf.read("lint").whole("build_oom_score_adj")}, plus any other adjustment whose cmdline program is under /target/; the latter are outside the build gate. Others are every remaining kill; journal unavailable is not zero.",
+            f"Earlyoom kills/day, builds: oom_score_adj {conf.read("lint").whole("build_oom_score_adj")}, plus any other adjustment whose cmdline program is under a resolved Cargo output root; the latter are outside the build gate. Others are every remaining kill; journal unavailable is not zero.",
             "Full memory stall: stall_full_us deltas ÷ sampled elapsed microseconds, natedev's 60 s samples; resets, boot changes and gaps are unknown.",
             "Memory wait p90: nearest-rank 90th percentile of recorded mem_wait_s on natedev steps started in the window, zero waits included.",
             "Memory-kill retries/day: (sum(mem_kills) − sum(mem_kill_stopped)) ÷ window days on natedev calls started in the window; stopped calls are in brackets, per day.", "",
@@ -2266,10 +2269,23 @@ def disk_section() -> list[str]:
     if snapshot is None:
         return []
     rows = [[row["label"], gib(row["bytes"])] for row in snapshot["rows"]]
-    rows.append(["other", gib(max(0, snapshot["used"] - sum(row["bytes"] for row in snapshot["rows"])))])
-    floor = snapshot["floor"]
-    free_label = f"free (floor {gib(floor)})" if floor is not None else "free"
-    rows.append([free_label, gib(snapshot["free"])])
+    capacities = snapshot.get("filesystems", [])
+    if capacities:
+        seen: set[str] = set()
+        for capacity in capacities:
+            if capacity["device"] in seen:
+                continue
+            seen.add(capacity["device"])
+            label = f"{capacity['path']} ({capacity['device']}, {capacity['device_name']})"
+            rows.append([f"{label} used", gib(capacity["used"])])
+            rows.append([f"{label} free", gib(capacity["free"])])
+    else:
+        rows.append(["other", gib(max(0, snapshot["used"] - sum(row["bytes"] for row in snapshot["rows"])))])
+        floor = snapshot["floor"]
+        free_label = f"free (floor {gib(floor)})" if floor is not None else "free"
+        rows.append([free_label, gib(snapshot["free"])])
+    rows.extend([f"Cargo outputs unavailable: {reason}", "unavailable"]
+                for reason in snapshot.get("output_unavailable", []))
     measured = sync.sync_time(snapshot["measured_at"], datetime.now())
     return [
         f"### Disk: {snapshot['host']}",

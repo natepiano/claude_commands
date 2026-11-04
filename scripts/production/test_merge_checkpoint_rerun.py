@@ -1,6 +1,9 @@
 """A killed checkpoint resumes unfinished work using its own merge evidence."""
 from __future__ import annotations
 
+import argparse
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from pathlib import Path
 import shutil
 import sys
@@ -33,6 +36,18 @@ class CheckpointRerunTests(MergeCheckpointFixture):
         self.env["GIT_COMMITTER_DATE"] = "2026-10-29T12:00:00-04:00"
         self.env["GIT_AUTHOR_DATE"] = self.env["GIT_COMMITTER_DATE"]
         return snapshot
+
+    def after_input(self, change: Callable[[Path], object]) -> AbstractContextManager[object]:
+        """Change the staff file after the checkpoint reads its unit from that file."""
+        staff_file = Path(self.env["STAFF_FILE"])
+        read = merge_checkpoint.request_from
+
+        def request_from(args: argparse.Namespace) -> merge_checkpoint.MergeRequest:
+            request = read(args)
+            _ = change(staff_file)
+            return request
+
+        return patch.object(merge_checkpoint, "request_from", side_effect=request_from)
 
     def restore_case(self, snapshot: Path) -> None:
         shutil.rmtree(self.root)
@@ -106,9 +121,8 @@ class CheckpointRerunTests(MergeCheckpointFixture):
         origin = self.git("rev-parse", "production", cwd=self.origin)
         staff_file = Path(self.env["STAFF_FILE"])
         saved_staff = staff_file.read_bytes()
-        _ = staff_file.write_bytes(b"invalid staff JSON\n")
-
-        refused = self.run_checkpoint(checkpoint).process
+        with self.after_input(lambda path: path.write_bytes(b"invalid staff JSON\n")):
+            refused = self.run_checkpoint(checkpoint).process
         self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
         self.assertIn("change review: failed", refused.stdout)
         self.assertIn("the staff record is read before the push", refused.stdout)
@@ -138,10 +152,8 @@ class CheckpointRerunTests(MergeCheckpointFixture):
             _ = self.run_checkpoint(checkpoint)
         self.assertNotEqual(self.git("rev-parse", "HEAD"), baseline)
         self.assertEqual(self.events("checkpoint-test"), [])
-        staff_file = Path(self.env["STAFF_FILE"])
-        _ = staff_file.write_bytes(b"invalid staff JSON\n")
-
-        refused = self.run_checkpoint(checkpoint).process
+        with self.after_input(lambda path: path.write_bytes(b"invalid staff JSON\n")):
+            refused = self.run_checkpoint(checkpoint).process
         self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
         self.assertIn("change review: failed", refused.stdout)
         self.assertIn("the staff record is read before the push", refused.stdout)
@@ -154,8 +166,8 @@ class CheckpointRerunTests(MergeCheckpointFixture):
     def test_a_production_without_a_review_list_pushes_with_an_unreadable_staff_record(self) -> None:
         checkpoint = self.dated_checkpoint(
             "checkpoint(alpha): change\n\nChange-Review: A change | Open it | Result")
-        Path(self.env["STAFF_FILE"]).unlink()
-        result = self.run_checkpoint(checkpoint).process
+        with self.after_input(Path.unlink):
+            result = self.run_checkpoint(checkpoint).process
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("the production doc has no Change review line; no rows written", result.stdout)
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), self.git("rev-parse", "HEAD"))
@@ -167,14 +179,16 @@ class CheckpointRerunTests(MergeCheckpointFixture):
             "checkpoint(alpha): two changes\n\n"
             + "Change-Review: First change | Open first | First result\n"
             + "Change-Review: Second change | Open second | Second result")
-        staff_file = Path(self.env["STAFF_FILE"])
-        document = cast(dict[str, list[dict[str, object]]], json.loads(staff_file.read_text(encoding="utf-8")))
-        document["rows"] = [row for row in document["rows"] if row["name"] != "alpha"]
-        _ = staff_file.write_text(json.dumps(document), encoding="utf-8")
-        result = self.run_checkpoint(checkpoint).process
+        def unregister(staff_file: Path) -> None:
+            document = cast(dict[str, list[dict[str, object]]], json.loads(staff_file.read_text(encoding="utf-8")))
+            document["rows"] = [row for row in document["rows"] if row["name"] != "alpha"]
+            _ = staff_file.write_text(json.dumps(document), encoding="utf-8")
+
+        with self.after_input(unregister):
+            result = self.run_checkpoint(checkpoint).process
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         notes = [line for line in result.stdout.splitlines() if line.startswith("change review: no staff row for unit")]
-        self.assertEqual(notes, ["change review: no staff row for unit alpha-unit; Producer stays empty"])
+        self.assertEqual(notes, ["change review: no staff row for unit alpha; Producer stays empty"])
         self.assertEqual([row["Producer"] for row in change_review.pending(review)], ["", ""])
 
     def test_an_already_pushed_merge_keeps_the_row_failure_report_for_an_unreadable_staff_record(self) -> None:
@@ -186,8 +200,8 @@ class CheckpointRerunTests(MergeCheckpointFixture):
             _ = self.run_checkpoint(checkpoint)
         merge = self.git("rev-parse", "HEAD")
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), merge)
-        _ = Path(self.env["STAFF_FILE"]).write_bytes(b"invalid staff JSON\n")
-        result = self.run_checkpoint(checkpoint).process
+        with self.after_input(lambda path: path.write_bytes(b"invalid staff JSON\n")):
+            result = self.run_checkpoint(checkpoint).process
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("change review: failed", result.stdout)
         self.assertIn("add its rows by hand", result.stdout)
