@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
+import errno
 import io
 import os
 from pathlib import Path
@@ -389,6 +390,31 @@ class ClientTests(unittest.TestCase):
                     (admissions[0].owner, admissions[0].episode, admissions[0].since) for item in admissions))
                 self.doCleanups()
 
+    def test_unreachable_generation_refresh_stops_the_cli_without_checker_retries(self) -> None:
+        for command in ("admit", "launch"):
+            for generation_failure in (b"", b"invalid generation reply\n"):
+                with self.subTest(command=command, failure=generation_failure), AdmissionFixture() as fixture:
+                    fixture.configure(reconnect_seconds=3, unreachable_limit_seconds=5)
+                    original = fixture.request(step="build")
+                    transport = self.use_transport(fixture,
+                        Exchange(reply_bytes(wire.BuildHistoryReply(0))),
+                        Exchange(reply_bytes(EXPIRED), generation_failure),
+                        *(Exchange(connect_error=FileNotFoundError()) for _ in range(3)))
+                    with mock.patch.object(gate, "process_start_time", return_value=original.owner.start_time), \
+                            mock.patch.object(gate, "git_identity", return_value=(gate.UnknownRepository(), str(fixture.root))), \
+                            mock.patch.object(gate, "expected_peak", return_value=gate.ExpectedPeak(12 * GIB, "fallback", 0)), \
+                            redirect_stderr(io.StringIO()) as errors, redirect_stdout(io.StringIO()):
+                        status = client.main([command, "--pid", str(original.owner.pid), "--", "cargo", "build"])
+                    self.assertEqual(status, 2)
+                    self.assertEqual(fixture.clock.monotonic(), 5 if not generation_failure else 8)
+                    self.assertEqual(sum(isinstance(request, wire.BuildHistoryRequest)
+                                         for request in transport.requests), 2)
+                    self.assertEqual(errors.getvalue().count("build queue not reachable; trying for 5 s"), 1)
+                    self.assertEqual(errors.getvalue().count(
+                        "build queue unreachable for 5 s; step stopped; cargo token given back"), 1)
+                    self.assertNotIn("step refused", errors.getvalue())
+                    self.doCleanups()
+
     def test_generation_retries_cannot_extend_the_original_launch_deadline(self) -> None:
         for stage in ("initial", "refresh"):
             for failure in ("connect", "silent"):
@@ -714,6 +740,35 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(transport.attempts, [0, 3, 6, 9])
             self.assertEqual(output.getvalue().count("admission service unavailable:"), 2)
 
+    def test_unreachable_limit_stops_missing_and_refused_connections(self) -> None:
+        for error in (FileNotFoundError(), ConnectionRefusedError()):
+            with self.subTest(error=type(error).__name__), AdmissionFixture() as fixture:
+                fixture.configure(reconnect_seconds=3, unreachable_limit_seconds=5)
+                request = fixture.request()
+                transport = self.use_transport(fixture, *(Exchange(connect_error=error) for _ in range(3)))
+                with redirect_stderr(io.StringIO()) as output:
+                    result = client.admit(request, lambda _wait: None, lambda: request)
+                self.assertIsInstance(result, wire.Refused)
+                self.assertEqual(fixture.clock.monotonic(), 5)
+                self.assertEqual(transport.attempts, [0, 3])
+                self.assertEqual(output.getvalue().count("build queue not reachable; trying for 5 s"), 1)
+                self.assertEqual(output.getvalue().count(
+                    "build queue unreachable for 5 s; step stopped; cargo token given back"), 1)
+                self.doCleanups()
+
+    def test_a_connection_resets_the_unreachable_limit(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(reconnect_seconds=3, unreachable_limit_seconds=5)
+            request = fixture.request()
+            transport = self.use_transport(fixture, Exchange(connect_error=FileNotFoundError()),
+                Exchange(ConnectionResetError(errno.ECONNRESET, "reset")), Exchange(connect_error=FileNotFoundError()),
+                Exchange(reply_bytes(GRANTED)))
+            with redirect_stderr(io.StringIO()) as output:
+                self.assertEqual(client.admit(request, lambda _wait: None, lambda: request), GRANTED)
+            self.assertEqual(transport.attempts, [0, 3, 3, 6])
+            self.assertEqual(output.getvalue().count("build queue not reachable; trying for 5 s"), 2)
+            self.assertNotIn("step stopped", output.getvalue())
+
     def test_silence_notice_uses_the_configured_interval(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.configure(silence_seconds=7)
@@ -784,6 +839,7 @@ class ClientTests(unittest.TestCase):
     def test_no_socket_and_refused_connect_retry_every_two_seconds_from_first_call(self) -> None:
         for error in (FileNotFoundError("missing"), ConnectionRefusedError("refused")):
             with self.subTest(error=type(error).__name__), AdmissionFixture() as fixture:
+                fixture.configure(unreachable_limit_seconds=120)
                 request = fixture.request()
                 failures = [Exchange(connect_error=error) for _ in range(31)]
                 transport = self.use_transport(fixture, *failures, Exchange(reply_bytes(wire.Refused("test stop"))))

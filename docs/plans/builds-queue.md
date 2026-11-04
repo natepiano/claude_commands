@@ -581,7 +581,7 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 **Ruled out:** A version field on each record; per-field shims.
 
-### Phase 10i — A local cargo step takes its token first, then asks for memory once  · status: todo
+### Phase 10i — A local cargo step takes its token first, then asks for memory once  · status: done
 **Why.** Builds showrunner, 2026-11-03: fastest's clippy was admitted at 20:11 EST, gave its grant back to wait 24 min for the cargo token, then waited 5 min for memory again. Cause: `verify.sh` gives back the memory grant before a busy-token wait (the `TokenWaiting` end), then asks again. Showrunner ruling: queue owns the whole change as one phase.
 
 **Outline:**

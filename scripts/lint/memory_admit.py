@@ -1482,6 +1482,7 @@ class MemoryConfig:
     reconnect_seconds: float
     silence_seconds: float
     outage_notice_seconds: float
+    unreachable_limit_seconds: float
     source_check_seconds: float
     source_settle_seconds: float
     override_reconnect_seconds: float
@@ -1557,7 +1558,9 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 wait_reply_seconds=number("wait_reply_seconds"), query_timeout_seconds=number("query_timeout_seconds"),
                 replay_retention_seconds=number("replay_retention_seconds"),
                 reconnect_seconds=number("reconnect_seconds"), silence_seconds=number("silence_seconds"),
-                outage_notice_seconds=number("outage_notice_seconds"), source_check_seconds=number("source_check_seconds"),
+                outage_notice_seconds=number("outage_notice_seconds"),
+                unreachable_limit_seconds=number("unreachable_limit_seconds"),
+                source_check_seconds=number("source_check_seconds"),
                 source_settle_seconds=number("source_settle_seconds"), override_reconnect_seconds=number("override_reconnect_seconds"),
                 request_max_bytes=whole("request_max_bytes"), program_first_peaks=first_peaks,
                 program_sample_seconds=number("program_sample_seconds"), program_stop_seconds=number("program_stop_seconds"),
