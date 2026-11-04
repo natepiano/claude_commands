@@ -97,77 +97,36 @@
 
 ### Phase 3n — Workers on the staff record (call sites)  · status: done
 
-**Owner:** models-unit, after its Phase 4 and 4m (sdlc, 2026-11-02). `staff.py` and `staff_sources.py` keep one writer at a time: herdr-unit and models-unit settle each window on the berth board.
+#### As-built
 
-**Depends on:** 3h, 3l, 3p, 3q (staff storage schema changes with roles; live output remains schema 3), and the models unit's F024 checkpoint 3b67af71 on `origin/natedev-models` (the lock order, `worker_lifecycle.acquire_flock` and the `stop` path): merge it before any edit.
+The staff row is the one record of a worker, per the staff-lifecycle spec (`docs/plans/staff-lifecycle.md` in the sdlc tree, user 2026-11-03: "the simplest possible system"). Rosters, the worker ledger, run records, inboxes and design-role records store no thread id, cwd, owner or family.
 
-Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3l.
-
-#### Work Order
-
-Copied from herdr-worker-panes.md Phase 3n at phase start (2026-11-03). Spec item 7 is dropped and item 6 is handler-unit's work: the handler reads `staff.json` directly (Phase 3s review). Deleting `production_tree.py` stays with Phase 4b.
-
-**Goal:** keep Phase 3h's native-id admission and finish worker roles, permanent end, adoption, backend metadata, deadlines and reader conversion. The handler reads who reports to whom from the 3l staff command. A Codex worker is stopped and resumed by the same path as a Claude session, by name or staff id.
-
-**Spec:**
-
-1. **Remaining call sites.** A worker lives as long as its unit director, across runs (user 2026-10-28). Each call site finds a worker through its staff row, also from a later run of the same director; a finished run never makes the row wrong (sdlc ruling, 2026-11-02 08:44). Preserve the existing shared admission in `worker_admission.py`; do not build a second open path. All starters already switch together in 3h. Integrate its `WorkerStartAllowed` and `PublishedWorker` types with the remaining role, adoption and permanent-end work:
-   - Codex: open `codex_mesh.open_unit_worker` and `start`; permanent end `codex_mesh end` and `workers.end_unit`; a resumable `stop` keeps the row; adoption `workers.adopt` calls the staff adoption below.
-   - Claude workers: their one open point in `implement.sh` / `assign.sh` and their one end point, `remove_workers.py`.
-   - Astra roles: `design_roles.open_role` and `design_roles.end`. A showrunner-held Astra role is a worker row under its showrunner (3l seeds and shows it).
-   **The recorded role is on the worker's staff row.** `staff.WorkerRole` (new: `impl | test | review | fix | astra-designer | astra-reviewer`). `ensure_worker(native_id: StaffId, name: str, parent: StaffId, role: WorkerRole) -> StaffRow` publishes it at the 3h boundary; each admission point passes the role its producer records today (the board role, the ledger entry's `role`, the design role). The role is set once, like the name: an `ensure_worker` of an existing row with another role raises `StaffRefused` and changes nothing. `StaffRow` gains `role: WorkerRole | NotAWorker`, where the singleton `NotAWorker` is the value of every showrunner and unit row. In `staff.json` only a worker row carries a `"role"` key; `from_json` requires it on a worker row and refuses it on any other row, and the conversion happens only there. The record goes to the next schema (the staff file is schema 2 before this role change; `live()` already emits schema 3). The first seed run after this phase reads the 3q schema file, gives each worker row its role from the same producer records in one transaction and writes the next schema; a worker row with no recorded role in any producer stops that seed with one line naming the row and writes nothing. A second seed run changes nothing. `staff_sources.LiveRole` becomes `WorkerRole | Literal["showrunner", "unit"]`, and `live()` takes a worker's role from its row, so `_role` (`staff_sources.py:206`) goes. No code parses a role from a name: `WorkerName.parse` (`staff.py:63`) checks shape only.
-   **Locks (models checkpoint 3b67af71).** The order is "unit ledger, design/pool, membership, lifecycle, server, inbox, roster"; the pool lock goes with the pool in Phase 3p, so the order is "unit ledger, design, membership, ..." from then on. At each admission and retirement point, `ensure_worker` / `retire` run while the run-level membership lock is held, after the lifecycle, server, inbox and roster locks are released, so a bulk stop cannot run between the roster write and the staff row. A staff lock is never held while membership is taken; the lock-order guard in `test_codex_mesh` checks it. Every lock wait uses `worker_lifecycle.acquire_flock` with the operation deadline; `_server_lock(session_dir, *, deadline=NO_LOCK_DEADLINE)` takes it the same way, and in a shutdown an omitted deadline takes the operation deadline (`effective_deadline`). Only `OperationDeadlineExpired` is re-raised; an ordinary socket timeout keeps its recovery.
-   **The staff transaction obeys the deadline.** `staff._record_transaction` (`staff.py:532`) takes `staff.json.lock` with a blocking `fcntl.flock` today (:537); it moves to `worker_lifecycle.acquire_flock` with the operation deadline. Every time limit in `staff.py` moves to `config/staff.conf`, read at each use through `tunables.number`, and each wait uses `min(configured limit, remaining operation deadline)`, so a deadline only shortens a wait: `OPERATION_LOCK_SECONDS` (today `OPERATION_LOCK_TIMEOUT_SECONDS = 30.0`, :28) for `staff.operation()`'s wait (`_wait_for_operation_lock`, :281); `OPERATION_POLL_SECONDS` for that wait's poll interval; `REMOTE_SECONDS` for the Mac's ssh call (`_remote`, :439, `timeout=20` today), which also bounds the ssh connect time. Each value has a changed-config test.
-   **One adoption operation.** `staff.adopt_worker(worker: StaffId, new_parent: StaffId) -> StaffRow` changes only the worker row's parent and keeps its id and name, in one staff transaction, run under both runs' membership locks (`worker_lifecycle.lock_memberships(source, destination)`) with the lock rules above. `staff.move` keeps refusing a worker (`staff.py:624`). A rerun after the parent changed changes nothing, prints `unchanged` and exits 0.
-   **The tunables reader** is `scripts/lib/conf.py` (3q, 3r and 3u read config through it). `STAFF_CONFIG` is the test override for `config/staff.conf`.
-   **Semantic types** (`~/.claude/docs/type_design.md`). `StaffRow.parent` becomes `ReportsTo(id: StaffId) | StaffRoot`, where `StaffRoot` means a top showrunner; `ensure` and `move` take that type where they take `StaffId | None` today; `find(parent=)` keeps its `StaffId` filter. `WorkerObservation.identity` becomes `ClaudeSession(session_id) | CodexThread(thread_id) | BackendUnavailable`. Nulls and dicts convert only at the JSON boundary (`StaffRow.to_json` / `from_json`, `live()`); `live()` keeps its existing schema 3 wire fields and meanings; the staff file schema is a separate contract. Pin both decoders with fixtures before the role change.
-2. **One record holds a worker's backend identity (sdlc showrunner, 2026-10-31).** The backend identities are one `"backends"` section of `staff.json`, keyed by staff id, beside `"rows"`; they cover unit and showrunner-held workers. One file is one atomic publish: `_record_transaction` writes rows and backends in the one `write_text_atomic`, and `staff.snapshot()` reads both from the one file, so no reader sees a row and a backend from two generations. (Two files beside each other cannot be replaced together; a second file would need a generation protocol for no gain.) The section is written only by the staff worker writer (`ensure_worker`, a backend replace for a replaced thread, and `retire`, in the same staff transaction). It holds backend details only: backend kind and Codex home, keyed by the native row id; no second session or thread id value; no name, parent, kind or role, which stay on the row in `staff.json`. The role migration fills it from proved producer evidence under the 3h publication rules; a second run changes nothing. Missing facts stay listed, never inferred from names. When a reader moves to it, no other live copy of the thread id stays in a roster or ledger; history events may keep theirs. The herdr unit switches all callers (holders listed by the models unit):
-   - `staff_sources.live` and the seed: identities from the record.
-   - the unit ledger: keeps `replaced` / `ended` events as history only.
-   - the run roster (`mesh_roster.json`): staff id, server and run details; no thread id.
-   - the held-message inbox (`_pending_for_thread`, one file per thread today; a mismatch drops held messages with no error): one file per staff id.
-   - `mesh_retired.json`: removed. A replaced or ended thread is a `replaced` / `ended` history event in the unit ledger (`note_backend` already logs `replaced`), and run end reads the threads to close from those events.
-   - detached runs (`mesh_runs.py:155` matches `CODEX_THREAD_ID`): the caller's runtime id selects its row directly; no extra identity copy is stored.
-   - the design roles' held threads (`design_roles.py:139-149`, `:1288`): staff id.
-   - the shutdown pause records (`shutdown_record.py:486`): staff id.
-   - the direct readers of a roster entry's `thread_id`: `roster.py:1279` (worker threads of the roster), `hierarchies/worker_owners.py:498` (it reports a missing identity as a problem) and `shutdown/inventory.py:930` (the paused seats of a shutdown): each uses the native row id as the session or thread identity and reads only backend details from the backend section. `roster.py` is the messaging unit's file and `inventory.py` the shutdown unit's; each agrees its change first.
-   **Every consumer moves before any live copy goes.** Before the first roster or ledger copy of a thread id is removed, `grep -rnE "thread_id|CODEX_THREAD_ID|_pending_for_thread|held_thread" scripts --include=*.py` (non-test files) lists every field read and every decoder; each one reads the backend section, or is a history reader that the checkpoint notice names. The copies go in the same landing as the last reader's switch.
-   Two copies stay, both Codex's own and outside these scripts: the app-server's thread store, and the `CODEX_THREAD_ID` that Codex sets in its worker's environment. progress_history and usage keep old thread ids as history, not as a live fact.
-3. **Busy and idle are read live, never stored:** the server pid and the Astra exec pid. `astra_roles.py:248` reads a stored roster status today; that stops.
-4. **Owner fields go.** The rosters and the unit ledger keep thread and run details only. The run `director` file and the Astra record's `manager` stop answering who owns a worker; staff answers it.
-5. **One stop and one resume path, per member.** `shutdown.py stop <name|staff id>` and `resume <name|staff id>` (`stop_resume.stop` :97, `resume` :216) take a worker as they take a Claude session. For a Codex worker, stop pauses its thread and resume follows or reopens it on its account. This replaces the seat commands in `scripts/lib/resume_message.py`'s `resume_message` (`implement.sh --to <seat>`). It also replaces `workers.pause_run`, `pause_unit`, `codex_mesh reopen`, and `resume-account-move --to` as public paths. `move_sessions` (:405) and `move` (:463) go through the same per-member path. The split-tab shutdown record and restore are Phase 10's work, not this phase's. The old commands stay as internals only: no user or skill text names them, no second caller reaches them, and a check fails on any new caller. Each stop and each resume is safe to run twice: the rerun changes nothing, keeps the same tab, pane and terminal, and exits 0 (user, 2026-10-31); the proof shows the rerun.
-6. **Handler switch.** The handler reads `~/.local/state/staff/staff.json` directly (Phase 3s review, 2026-11-02). That switch is handler-unit's work; this unit changes nothing for it.
-
-**Owners:** `codex_mesh.py`, `worker_lifecycle.py` and `workers.py` are the models unit's: herdr workers write the call sites, and models reviews the diff before the merge. `stop` / `_mark_all_roster_ended` overlaps models' F024, so tell models before that function changes. `stop_resume.py` and `shutdown.py` are the shutdown unit's: shutdown writes its side against the herdr resolver (name or staff id → Claude session | Codex worker | not found). The handler reader and its config are handler-unit's.
+- `StaffRow.parent` is `ReportsTo(id: StaffId) | StaffRoot`; `StaffSnapshot.parent_of(row)` reads it. Nulls convert only in `StaffRow.to_json` / `from_json`.
+- `staff.ensure_worker(identity, name, parent) -> StaffRow` publishes a worker at the `worker_admission.py` boundary (`admit`, `publish`, `WorkerStartAllowed`, `PublishedWorker`). A worker is found by its staff row from any run of its unit director.
+- A worker's thread is found from `current_session`; its folder from the staff row's `worktree`. `StaffSnapshot.backends` finds `ClaudeBackend | CodexBackend` from the session that `current_session` finds; nothing stores it.
+- `staff_sources.WorkerObservation.identity` is `ClaudeSession | CodexThread | BackendUnavailable`; `live()` keeps schema 3. The staff storage schema stays 2; no row carries a role.
+- Adoption is one write of the worker row's `parent`. `staff.retire` ends a worker row.
+- `worker_admission.family_switch_context(allowed, family)` reads the prior Codex rollout or Claude transcript of `current_session` when a slot opens in the other family and returns at most 32000 characters of user and assistant messages.
+- The staff transaction and operation lock wait through `worker_lifecycle.acquire_flock` with the operation deadline. `config/staff.conf` holds `OPERATION_LOCK_SECONDS=30` and `REMOTE_SECONDS=20`, read at each use through `scripts/lib/conf.py`; each wait uses the smaller of the configured limit and the remaining deadline.
+- Unexpected cases print one `anomaly:` line and continue; only the spec's section 4 refusals remain.
 
 **Files:**
-- `scripts/production/staff.py` — the deadline, `adopt_worker`, `WorkerRole` and the row's `role`, `ensure_worker(native_id, name, parent, role)`, `ReportsTo | StaffRoot`, the backend-identity record writer, `OPERATION_LOCK_SECONDS` read.
-- `scripts/production/staff_sources.py` — `live()` and the seed read the backend-identity record and the row's role; identity types; partial results.
-- `config/staff.conf` — new (`OPERATION_LOCK_SECONDS=30`, `OPERATION_POLL_SECONDS`, `REMOTE_SECONDS=20`).
-- `scripts/direct/assign.py`, `scripts/direct/implement.sh`, `scripts/direct/remove_workers.py`, `scripts/direct/workers.py` — call sites and readers.
-- `scripts/agents/codex_mesh.py`, `scripts/agents/mesh_runs.py` — call sites and thread holders.
-- `scripts/astra/design_roles.py`, `scripts/astra/astra_roles.py` — call sites, held threads, live busy state.
-- `scripts/message/roster.py`, `scripts/hierarchies/worker_owners.py`, `scripts/shutdown/inventory.py` — `thread_id` readers move to the backend section (messaging and shutdown units agree their parts).
-- `scripts/message/test_roster.py`, `scripts/hierarchies/test_worker_owners.py`, `scripts/shutdown/test_inventory.py` — their tests.
-- `scripts/production/staff_test_support.py`, `scripts/production/test_staff.py`, `scripts/production/test_staff_operation.py`, `scripts/production/test_staff_sources.py`, `scripts/agents/test_codex_mesh.py`, `scripts/direct/test_workers.py`, `scripts/astra/test_design_roles.py` — fixtures and regressions.
-- `scripts/production/worker_admission.py` — integrate 3h permission and publication with role and adoption.
-- `scripts/production/session_staff.py` — current identity join; preserve retained cleanup evidence.
-- `scripts/agents/worker_lifecycle.py` — read only.
-- `scripts/shutdown/stop_resume.py`, `scripts/shutdown/shutdown.py`, `scripts/shutdown/shutdown_record.py` — the shutdown unit's stage-two work; the `cargo-handler` reader and config are handler-unit's.
+- `scripts/production/staff.py` — row types, `ensure_worker`, `retire`, found backends, deadline-bound locks, configured limits.
+- `scripts/production/staff_sources.py` — `live()` and worker observations from staff rows.
+- `scripts/production/worker_admission.py` — the one admission and publish path; `family_switch_context`.
+- `config/staff.conf` — staff time limits.
+- `scripts/agents/codex_mesh.py`, `scripts/agents/mesh_runs.py`, `scripts/agents/worker_lifecycle.py`, `scripts/direct/workers.py`, `scripts/direct/assign.py`, `scripts/direct/implement.sh`, `scripts/direct/remove_workers.py` — call sites read the staff row; no stored thread id or cwd.
+- `scripts/astra/design_roles.py`, `scripts/astra/astra_roles.py` — held roles keyed by staff id; busy state read live.
+- `scripts/message/roster.py`, `scripts/hierarchies/worker_owners.py`, `scripts/shutdown/inventory.py`, `scripts/shutdown/restart.py`, `scripts/accounts/unit_watchdog.py`, `scripts/lint/tmp_sweep.py` — readers of the staff row.
 
-**Workers:** `1 writer + 1 tester` — stage one, this unit.
-- `impl` — source integration: every non-test file above in this repository except the other units' files; hub: `scripts/production/staff.py` (every call site needs its writer API).
-- `test` — fixtures and regressions: `staff_test_support.py` and the `test_*.py` files above.
-- Stage two is other units' work: the shutdown unit's stop and resume side, and handler-unit's reader switch.
+**Binds later work:** the family switch starts a session of the other family in the same slot and writes `current_session`; `id` and `name` stay, and no field records the family. No code stores a thread id, cwd, owner or family beside the staff row.
 
-**Constraints from prior phases:** Phase 3h: native row ids, `WorkerStartAllowed` and `PublishedWorker`, with no copied identity. Phase 3q: `scripts/lib/conf.py`. Phase 3l: worker `retire`, `WorkerName.parse` (shape only), `staff.py show --json --live` (schema 3 with `inputs`; staff storage has its own version before this role change), the seed; `staff_sources.WorkerObservation`, `BackendUnavailable`. Phase 3p: the review pool is gone. Delegation Context → One identity join, No hard-coded config, Lifecycle reruns keep the pane.
-- Phase 3h review (2026-11-01): item 2's roster, hierarchy and shutdown consumers take the runtime session from `current_session`; the fixed `id` stays the `"backends"` key and the inbox key. `ensure_worker` today is `ensure_worker(name, parent, *, runtime_id)` with `id` from the first runtime id; update every signature and line reference against today's `staff.py`. Keep 3h's admission boundary (`worker_admission.py`); do not reopen starters. Test a Codex thread replacement: worker ownership and held messages unchanged.
-- Phase 3s review (2026-11-02): `staff.json` has an outside reader, cargo-liner. The role and backend schema change sends a notice to that reader and adds a representative stored-record fixture to its consumer check. The live-output contract stays separate.
-- Phase 3s review (2026-11-02): the handler reads `staff.json` directly and live pane state from herdr commands. No work on staff read speed (user, 2026-11-02: "herdr shouldn't focus on making staff fast - we should just read the staff page directly").
+**Gotchas:**
+- Staff test fixtures set `CLAUDE_CONFIG_DIR` when it is absent; a standalone launch test that needs the private home account passes an empty `CLAUDE_CONFIG_DIR`.
+- Sibling-import test files run only through `python -m unittest discover -s <dir> -p <file>`.
+- `staff.json` has an outside reader, cargo-liner; a schema change sends it a notice.
 
-**Acceptance gate:** the item 2 search finds no live reader of a roster or ledger thread id; the affected suites pass; basedpyright 0/0 on changed files and every caller module; a test stops a write between rows and backends and shows that the file holds both old or both new, for admission, a backend replace and a retire; a test holds `staff.json.lock` during an interrupted stop and the stop ends at its deadline with `OperationDeadlineExpired`; a changed `OPERATION_LOCK_SECONDS`, `OPERATION_POLL_SECONDS` and `REMOTE_SECONDS` each take effect with no code change, and a deadline shorter than `REMOTE_SECONDS` ends the ssh call at the deadline while a longer one leaves `REMOTE_SECONDS`; `adopt_worker` stopped after its staff write, then rerun, ends as one clean adoption, and a rerun of a finished one changes nothing and exits 0; a launcher name whose recorded role differs from its name suffix (row `impl2` with role `review`) keeps its recorded role in its row and in `live()`; an `ensure_worker` of that row with another role is refused and changes nothing; a schema test reads a worker row with `"role"` and refuses a worker row without it and a unit row with it; a showrunner-held Astra worker keeps its row and identity; a test of a partial hierarchy shows it as incomplete; a real handler test shows busy become idle after a pid exit; watch tests for a remote owner input and a missing input that appears later; the real handler pane shows every session and worker correct after a real unit move and a real new worker; one real Codex worker is stopped and resumed by name and by staff id, and each rerun changes nothing, keeps the same tab, pane and terminal, and exits 0.
-
-**Acceptance gate (admission and observation):** tests keep the exact exit-2 admission refusal and prove no dispatch on failed publication. Preserve `live()` schema 3 and its partial-result surface; do not use its version as the staff storage version. Keep `skipped N not current`; unresolved current workers stay listed with exit 1. A resumable stop keeps the row. Permanent end removes it only after stopped evidence; adoption keeps the native id.
+**Ruled out:** `WorkerRole` and a row `role` field; a `"backends"` section in `staff.json`; `staff.adopt_worker` and the adoption journal; `repair_roster` and the ledger-to-roster check; per-thread inbox and held-role files; readers of legacy identity records.
 
 ### Phase 3o — Transcript handoff when a slot changes family  · status: todo
 
@@ -175,14 +134,109 @@ Copied from herdr-worker-panes.md Phase 3n at phase start (2026-11-03). Spec ite
 
 **User words (via sdlc, 2026-11-03):** "yes we need to be able to switch between claude and codex workers - and ideally they can have the same name and occupy the same slot and they can even read the transcript so they can start with the correct information".
 
-**Depends on:** 3n (a slot changes family in both directions; the worker keeps its name and slot; its staff row changes family in place).
+**Depends on:** 3n (a slot changes family in both directions; the worker keeps its id, name, parent and slot; only `current_session` changes on its staff row).
 
 #### Work Order
 
-1. **One shared extract tool.** One function reads a Codex rollout file or a Claude transcript. It writes a short extract: each assignment, each final reply, and the files changed. It includes no tool output. One function serves both families; there is no copy for each family.
-2. **Opening prompt points at the extract.** When a slot changes family, the new worker's opening prompt names the extract first and the full old transcript second. The worker reads the full transcript only when the extract does not answer its question.
-3. **The workers account move calls the switch.** `accounts.py move workers claudeN` uses the 3n family switch and the extract. models-unit changes that caller too.
-4. **Live proof after 3n merges.** One real Claude worker takes a slot that a Codex worker held, through `implement.sh`, and starts from the extract. Send sdlc the result.
+**Goal:** Switch an existing worker between Claude and Codex while preserving its staff identity, name, parent, and slot. Give the destination worker a usable transcript extract.
+
+**Spec:**
+
+1. Use the fixed staff id to identify the worker throughout the operation.
+2. Read family, transcript, worktree, and ownership from the staff row and its existing resolvers.
+3. Hold the worker row's lock across transcript selection, source-session stop, destination creation, publication, and dispatch.
+4. Stop the source session through the shared lifecycle path before the destination session receives work.
+5. Replace `family_switch_context` with one shared extractor for Claude transcripts and Codex rollouts.
+6. Include every assignment, final reply, and changed-file path in the extract.
+7. Exclude tool output and tool request bodies from the extract.
+8. Identify changed files from transcript evidence; do not claim that the current Git diff proves authorship.
+9. Write the extract as an artifact in the existing run directory.
+10. Put the extract path first and the full source-transcript path second in the opening prompt.
+11. Instruct the worker to read the full transcript only when the extract does not answer its question.
+12. Represent missing or unreadable transcript evidence explicitly and print one anomaly line.
+13. Continue when transcript evidence is unavailable, unless a specification safety refusal applies.
+14. Create the destination session through the existing family launcher.
+15. Publish only `current_session` through `staff.update_current_session`, before dispatch.
+16. Preserve `id`, `name`, `kind`, and `parent`.
+17. Clean up a newly created destination session when publication fails, using the existing safe lifecycle path.
+18. Preserve the fixed staff references used by run records and held messages.
+19. Implement `accounts.py move workers <claudeN|codexN>` through this shared operation.
+20. Select workers from staff rows, including workers held by earlier director runs.
+21. Use existing account validation and selection functions for the target account.
+22. Report each worker's outcome and continue processing other workers after an anomaly.
+23. Make `--dry-run` report intended moves without account, session, staff, or artifact changes.
+24. Make a completed rerun print `unchanged` without starting another session.
+25. Keep same-family account movement on the existing lifecycle path.
+26. Preserve `assign.py`'s Codex restriction; use `implement.sh` for the required bidirectional launcher proof.
+27. Replace domain-level nulls with explicit slot and transcript states.
+28. Use `NewWorkerSlot | ExistingWorkerSlot(row)` for admission.
+29. Use `NoFamilyHandoff | TranscriptHandoff | TranscriptUnavailable(reason)` for handoff results.
+
+**Files:**
+- `scripts/production/worker_admission.py` — shared switch, extractor, and semantic admission states.
+- `scripts/production/staff.py` — existing row lock and session writer; change only where integration requires it.
+- `scripts/production/session_staff.py` — staff-based session, folder, and inbox resolution.
+- `scripts/production/worker_fill.py` — admission and publication command adapter.
+- `scripts/agents/agent_bg.sh` — Claude handoff integration.
+- `scripts/agents/codex_mesh.py` — Codex handoff integration.
+- `scripts/direct/workers.py` — allocation and run integration.
+- `scripts/direct/implement.sh` — same-slot launcher integration.
+- `scripts/accounts/accounts.py` — explicit worker-group account routing.
+- `scripts/production/test_worker_admission.py`
+- `scripts/production/test_staff.py`
+- `scripts/production/test_staff_operation.py`
+- `scripts/production/test_staff_sources.py`
+- `scripts/production/test_retire_unit.py`
+- `scripts/agents/test_agent_bg.py`
+- `scripts/agents/test_codex_mesh.py`
+- `scripts/direct/test_workers.py`
+- `scripts/direct/test_implement_launcher.py`
+- `scripts/direct/test_implement_launcher_claude.py`
+- `scripts/accounts/test_moves.py`
+
+**Workers:** `1 writer + 1 tester`
+
+`impl` — Own all source files above; the shared interface is in `worker_admission.py`.
+
+`test` — Own the listed test files and transcript fixtures within those files; verify the complete caller paths.
+
+**Constraints from prior phases:**
+
+1. Follow `/home/natepiano/worktrees/claude-build-followups-sdlc/docs/plans/staff-lifecycle.md`.
+2. Store worker identity and ownership only in staff.
+3. Derive family from `current_session`; add no stored family, role, backend, thread-id, or worktree copies.
+4. Keep staff storage schema 2 and live-output schema 3.
+5. Preserve admission-before-dispatch and publication-before-dispatch.
+6. Preserve the operation deadline and configuration tunables.
+7. Preserve fixed staff references for ownership and held messages.
+8. Add no adoption journal, repair roster, or second lifecycle implementation.
+9. Apply only the specification's five safety refusals.
+10. Keep the phase net negative in code lines.
+11. Coordinate shared lifecycle interfaces with shutdown and herdr owners.
+12. Do not wait for herdr's later worker-pane implementation.
+
+**Acceptance gate:**
+
+1. Test Claude-to-Codex and Codex-to-Claude through the launcher and account caller.
+2. Assert unchanged `id`, `name`, `kind`, `parent`, slot, and resolved worktree.
+3. Assert that only `current_session` changes in the staff row.
+4. Test two competing switches; prove that only one destination receives work.
+5. Test source-session stop and confirm that unrelated sessions remain running.
+6. Test destination creation failure and publication failure; prove no assignment dispatch.
+7. Test a completed rerun; prove unchanged staff bytes and no second destination session.
+8. Test preserved ownership and held messages across a director-run change.
+9. Test extract contents for both transcript formats, including long histories and malformed records.
+10. Assert complete assignments, final replies, and changed-file evidence, with no tool output.
+11. Assert extract-first and full-transcript-second prompt references.
+12. Test unavailable transcript evidence and the resulting visible anomaly.
+13. Test account dry runs, partial group failures, same-family moves, and both family directions.
+14. Test retained unresolved records and continued healthy allocation after an anomaly.
+15. Preserve live-output incomplete observations, listed workers, diagnostics, and exit status.
+16. Run affected suites with `unittest discover`.
+17. Pass basedpyright with zero errors and warnings on changed Python files and caller modules.
+18. Pass the Delegation Context merge gate.
+19. Prove one real Codex-to-Claude switch through `implement.sh`, with the worker using the extract.
+20. Prove the reverse direction and record the outcomes for sdlc.
 
 ### Phase 5a — Bash reads the resolved model registry in one call  · status: todo
 
@@ -192,4 +246,97 @@ Copied from herdr-worker-panes.md Phase 3n at phase start (2026-11-03). Spec ite
 
 **Order:** after 3o. It runs beside herdr Phase 7 when no file overlaps; it never delays 3n or 3o.
 
-**Source:** herdr-unit has no 5a branch; Phase 5 is on main as 731dd21aa. Start from the herdr plan section "Phase 5a — Bash reads resolved registry values from one call", the Phase 5 review findings F002, F003, F004, F006 and F008, and three architect items: cover every launch reader (review.sh, assign.py, codex_mesh.py, unit_effort.py, agent_exec.sh) with a defined snapshot lifetime; one read returns the text and the parsed values for editors; add test_models_registry_fixture.py and test_models_conf_publish.py to the test files. herdr-unit closes its routed findings when it gets the 5a checkpoint hash.
+#### Work Order
+
+**Goal:** Read the model registry once for each launch operation. Give every reader parsed values from that same read.
+
+**Spec:**
+
+1. Make `models_registry.py shell` read the registry through `registry_path()`.
+2. Return the selected path, exact source text, and parsed section, key, and value arrays from one read.
+3. Preserve empty sections, row order, comments, and editor source text.
+4. Quote generated Bash values safely.
+5. Remove default registry-path selection from `models_config.sh` and `sync_codex_catalog.sh`.
+6. Make Bash lookups compare parsed keys; remove raw registry-row parsing.
+7. Replace both registry-reading awk parsers in `sync_codex_catalog.sh` with parsed-value reads.
+8. Preserve transformations that produce edited text through the existing publication writer.
+9. Define a `LaunchModelConfiguration` lifetime of one launch or assignment operation.
+10. Share that configuration across implementation, review, allocation, and thread creation within the same operation.
+11. Acquire a fresh configuration for the next launch, including the next launch in a long-running process.
+12. Define a `RegistryEditBase` lifetime of one editor operation.
+13. Give editor validation and transformation the exact text and values from that same base.
+14. Preserve the existing locked delta replay against concurrent edits.
+15. Define `unit_effort.py`'s read lifetime as one command invocation.
+16. Cover `implement.sh`, `review.sh`, `assign.py`, `workers.py`, `codex_mesh.py`, `unit_effort.py`, and `agent_exec.sh`.
+17. Count registry snapshot reads across child processes, not only within one shell.
+18. Treat catalog synchronization as a separate edit operation before the launch snapshot.
+19. Preserve task resolution, caller-family behavior, overrides, effort validation, and service tiers.
+20. Make the retired-name check detect sentence punctuation, including `Use /agent.`.
+21. Change publication commit subjects and temporary prefixes from `agents` to `models`.
+22. Use semantic types for command configuration, edit bases, and domain absence states.
+23. Extend the existing parser and fixture tests; do not create a second parser.
+
+**Files:**
+- `scripts/lib/models_registry.py`
+- `scripts/agents/models_config.sh`
+- `scripts/agents/default_models.sh`
+- `scripts/agents/sync_codex_catalog.sh`
+- `scripts/agents/agent_exec.sh`
+- `scripts/agents/codex_mesh.py`
+- `scripts/direct/implement.sh`
+- `scripts/direct/review.sh`
+- `scripts/direct/assign.py`
+- `scripts/direct/workers.py`
+- `scripts/production/unit_effort.py`
+- `commands/default_models.md`
+- `config/models.conf`
+- `scripts/lib/test_models_registry.py`
+- `scripts/lib/test_models_registry_fixture.py`
+- `scripts/lib/test_models_registry.sh`
+- `scripts/agents/test_models_config.sh`
+- `scripts/agents/test_sync_codex_catalog.sh`
+- `scripts/agents/test_models_conf_publish.py`
+- `scripts/agents/test_no_old_model_names.py`
+- `scripts/agents/test_agent_exec.py`
+- `scripts/agents/test_codex_mesh.py`
+- `scripts/direct/test_implement_launcher.py`
+- `scripts/direct/test_review_launcher.py`
+- `scripts/direct/test_assign_launcher.py`
+- `scripts/direct/test_workers.py`
+- `scripts/production/test_unit_effort.py`
+
+**Workers:** `1 writer + 1 tester`
+
+`impl` — Own the source and command files above; the shared interface is in `models_registry.py`.
+
+`test` — Own the listed test files; measure snapshot reads across complete launch paths and child processes.
+
+**Constraints from prior phases:**
+
+1. Follow the Delegation Context and preserve Phase 3o's staff and lifecycle behavior.
+2. Start after Phase 3o lands because both phases change shared launch files.
+3. Run beside herdr Phase 7 only when file ownership does not overlap.
+4. Keep `MODELS_CONFIG_FILE`, `AGENTS_CALLER_FAMILY`, and `AGENTS_CALLER_ASSIGNMENT`.
+5. Keep one parser and the existing atomic publication writer.
+6. Preserve concurrent row replay, additive catalog changes, and unrelated edits.
+7. Add no fallback to retired paths or variable names.
+8. Store no persistent configuration cache.
+9. Extend existing fixtures and publication tests.
+10. Keep staff identity changes outside this phase.
+
+**Acceptance gate:**
+
+1. Test default and overridden registry paths through the Python path resolver.
+2. Test spaced rows, empty sections, comments, and quoted shell content.
+3. Prove that `direct = codex` resolves identically in Python and Bash.
+4. Prove one registry snapshot read for each complete launch operation, including allocation and thread creation.
+5. Prove that a registry edit during launch cannot mix configuration generations.
+6. Prove that the next launch reads the changed registry.
+7. Prove that one editor read supplies matching exact text and parsed values.
+8. Preserve concurrent publication and additive catalog tests.
+9. Prove that `Use /agent.` fails the retired-name check.
+10. Assert `models` publication subjects and temporary prefixes.
+11. Pass affected Python and shell suites.
+12. Pass basedpyright with zero errors and warnings on changed Python files and caller modules.
+13. Pass the Delegation Context merge gate.
+14. Give herdr-unit the checkpoint hash for routed findings F002, F003, F004, F006, and F008.
