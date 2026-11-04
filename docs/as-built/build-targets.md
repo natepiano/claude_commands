@@ -281,13 +281,16 @@ the log does not record that connection. Journal retention also limits the evide
 
 ### Copy records and lifetime
 
-Copies seed their own build folders. The unused per-repository Cargo folder
-helper was removed: the verify-copies measurement (2026-10-30, case D) spent
-68.7 of 69.0 s waiting on that folder's build lock. New copy records do not
-write its path; old records still load and the old field has no effect.
-The `style-sync-target` still outlives its production task and keeps
-`sync.lock` across checkout creation, lint and cleanup. The sweep still reads
-Cargo's general `build.build-dir` templates.
+Standing gate checkouts build cold once and retain their own build folders;
+no target seed is copied. The unused per-repository Cargo folder helper was
+removed: the verify-copies measurement (2026-10-30, case D) spent 68.7 of 69.0 s
+waiting on that folder's build lock. Legacy copy records still load and their
+old shared-folder field has no effect.
+Style lint uses a standing gate checkout with its own real `target/` and holds
+`.claude-busy` through verification and cleanup. The checkout and cache survive
+the run; the floor sweep discovers the configured gates root and may reclaim
+idle marked caches. See `gate-checkouts.md` for configuration and removal.
+The sweep still reads Cargo's general `build.build-dir` templates.
 
 `/tmp/claude/copies` is a kept root, with copies at `<pair>/<copy>`. The tmp sweep judges each copy separately and removes an empty pair; the folder audit and scratch guard keep the root. `scratch.register_copy` writes `.scratch.json` atomically with source path and commit, copy commit, target mode, seed source, borrowed git directory, owner unit, task, land target and copy identity. A phase record also names its run directory and phase id. Registration, renew, hand-over, task end and removal use one read/change/publish path under the copy's record lock. Only `.scratch.json` and `.claude-busy` are excluded in the copy's own Git exclude file; ordinary untracked files keep the copy.
 

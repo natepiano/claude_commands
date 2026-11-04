@@ -116,6 +116,7 @@ The `lists_directory` setting names this folder.
 `CHANGE_REVIEW_DIR` is a test override for the reader folder.
 This override never makes a list real.
 Lists outside this folder print the routing note without sending an alert or writing an alert record.
+It alerts only from the production staff record; a `STAFF_FILE` override never alerts.
 `unrouted_alert_recipient` starts at `natedev` in `config/review_links.conf`.
 A change goes to this root showrunner when its list has no staff showrunner or its production document is gone.
 The page, the verdict and the footer counts use the same owner.

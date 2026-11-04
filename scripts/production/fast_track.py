@@ -29,6 +29,7 @@ import process_group
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scripts.copies import copies
 from scripts.lib import build_folders, conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
@@ -440,7 +441,7 @@ def fast_check(repo: Path, paths: list[str], config: FastTrackLimits) -> None:
 
 
 def drop_recovery_refs(repo: Path, prefix: str) -> None:
-    for name in ("head", "index", "worktree"):
+    for name in ("head", "index", "worktree", "commit"):
         _ = git(repo, "update-ref", "-d", f"{prefix}/{name}")
 
 
@@ -471,7 +472,7 @@ def select_patch(repo: Path, paths: list[str]) -> Generator[SelectedPatch]:
         drop_recovery_refs(repo, prefix)
 
 
-def prepare_attempt(repo: Path, row: PushRecord, selection: SelectedPatch, base: str, production: Path) -> Path:
+def prepare_attempt(repo: Path, row: PushRecord, selection: SelectedPatch, base: str, production: Path, candidate_source: Path) -> Path:
     intent = PushIntent(record=row, worktree_head=selection.worktree_head, worktree_tree=selection.worktree_tree,
                         index_tree=selection.index_tree)
     identity = json.dumps([row["unit"], str(repo.resolve()), row["commit"]]).encode()
@@ -480,6 +481,9 @@ def prepare_attempt(repo: Path, row: PushRecord, selection: SelectedPatch, base:
         # Retrying this candidate must retain its original restore snapshot.
         if not path.exists():
             prefix = f"refs/fast-track/attempts/{path.stem}"
+            # Retain the candidate before the attempt becomes durable.
+            _ = git(repo, "fetch", "--no-tags", str(candidate_source),
+                    f"{row['commit']}:{prefix}/commit")
             for name, target in (("head", selection.worktree_head), ("index", selection.index_tree),
                                  ("worktree", selection.worktree_tree)):
                 _ = git(repo, "update-ref", f"{prefix}/{name}", target)
@@ -676,16 +680,13 @@ def promote(production: Path, repo: Path, commit: str, unit: str) -> None:
     try:
         promotion = production_doc.promotion_from_doc(production.read_text().splitlines())
         if isinstance(promotion, production_doc.PromoteTo) and not promotion.checkouts and isinstance(promotion.mac, production_doc.MacCheckout):
-            # The director stays on its branch. A Mac-only destination still needs
-            # a local main ref at the published commit for the existing pull helper.
-            with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track-promote"])) as temporary:
-                source = temporary / "checkout"
-                _ = git(repo, "clone", "--shared", "--no-checkout", str(repo), str(source))
+            # The pull helper needs a local main ref at the published commit.
+            with copies.standing(unit, repo, commit) as source:
                 _ = git(source, "update-ref", "refs/heads/main", commit)
                 merge_checkpoint.promote_targets(promotion, "main", commit, source=source, label=f"fast-track {unit}")
         else:
             merge_checkpoint.promote_targets(promotion, "main", commit, source=repo, label=f"fast-track {unit}")
-    except merge_checkpoint.Stop as error:
+    except (merge_checkpoint.Stop, copies.CopyError) as error:
         raise PublishedFailure(str(error)) from error
 
 
@@ -696,51 +697,50 @@ def push_patch(repo: Path, production: Path, unit: str, why: str, paths: list[st
     patch = selection.patch
     digest = hashlib.sha256(patch).hexdigest()
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track"])) as temporary:
-        copy = temporary / "checkout"
         fetch_main(repo, settings_read)
-        _ = git(repo, "clone", "--shared", "--no-checkout", str(repo), str(copy))
-        _ = git(copy, "remote", "set-url", "origin", git(repo, "remote", "get-url", "origin").strip())
-        for key in ("user.name", "user.email"):
-            value = git(repo, "config", "--get", key).strip()
-            _ = git(copy, "config", key, value)
-        patch_file = temporary / "fix.patch"
-        _ = patch_file.write_bytes(patch)
-        for _attempt in range(config.max_push_attempts):
-            _ = reconcile(repo, unit, settings_read=settings_read)
-            _ = git(copy, "fetch", "origin", "main")
-            base = git(copy, "rev-parse", "origin/main").strip()
-            _ = git(copy, "checkout", "--detach", "--force", base)
-            _ = git(copy, "clean", "-fdx")
-            _ = git(copy, "apply", "--3way", str(patch_file))
-            fast_check(copy, paths, config)
-            _ = git(copy, "commit", "-m", f"fast-track({unit}): {why}\n\nFast-Track: {unit}")
-            commit = git(copy, "rev-parse", "HEAD").strip()
-            row = PushRecord(patch_sha256=digest, unit=unit, commit=commit, why=why,
-                             time=datetime.now(UTC).isoformat(), review="pending", repo=str(repo),
-                             paths=paths, review_pass="")
-            _ = prepare_attempt(repo, row, selection, base, production)
-            try:
-                with merge_checkpoint.main_push_lock(repo):
-                    _ = git(copy, "fetch", "origin", "main")
-                    if git(copy, "rev-parse", "origin/main").strip() != base:
-                        continue
-                    result = subprocess.run(["git", "-C", str(copy), "push", "origin", "HEAD:main"],
-                                            capture_output=True, text=True, check=False)
-            except merge_checkpoint.Stop as error:
-                raise Refused(str(error)) from error
-            if result.returncode:
-                # A writer outside the shared lock can move origin during push.
+        with copies.standing(unit, repo, "origin/main") as copy:
+            _ = git(copy, "remote", "set-url", "origin", git(repo, "remote", "get-url", "origin").strip())
+            for key in ("user.name", "user.email"):
+                value = git(repo, "config", "--get", key).strip()
+                _ = git(copy, "config", key, value)
+            patch_file = temporary / "fix.patch"
+            _ = patch_file.write_bytes(patch)
+            for _attempt in range(config.max_push_attempts):
+                _ = reconcile(repo, unit, settings_read=settings_read)
                 _ = git(copy, "fetch", "origin", "main")
-                if not is_on_main(copy, commit):
-                    _ = reconcile(repo, unit, settings_read=settings_read)
-                    if git(copy, "rev-parse", "origin/main").strip() != base:
-                        continue
-                    raise Refused(failure_detail(result))
-            try:
-                _ = reconcile(repo, unit, finish=True, paths=tuple(paths), published_commit=commit, settings_read=settings_read)
-            except (Refused, OSError, ValueError, KeyError) as error:
-                raise PublishedFailure(str(error)) from error
-            return commit
+                base = git(copy, "rev-parse", "origin/main").strip()
+                _ = git(copy, "checkout", "--detach", "--force", base)
+                _ = git(copy, "clean", "-ffdq")
+                _ = git(copy, "apply", "--3way", str(patch_file))
+                fast_check(copy, paths, config)
+                _ = git(copy, "commit", "-m", f"fast-track({unit}): {why}\n\nFast-Track: {unit}")
+                commit = git(copy, "rev-parse", "HEAD").strip()
+                row = PushRecord(patch_sha256=digest, unit=unit, commit=commit, why=why,
+                                 time=datetime.now(UTC).isoformat(), review="pending", repo=str(repo),
+                                 paths=paths, review_pass="")
+                _ = prepare_attempt(repo, row, selection, base, production, copy)
+                try:
+                    with merge_checkpoint.main_push_lock(repo):
+                        _ = git(copy, "fetch", "origin", "main")
+                        if git(copy, "rev-parse", "origin/main").strip() != base:
+                            continue
+                        result = subprocess.run(["git", "-C", str(copy), "push", "origin", "HEAD:main"],
+                                                capture_output=True, text=True, check=False)
+                except merge_checkpoint.Stop as error:
+                    raise Refused(str(error)) from error
+                if result.returncode:
+                    # A writer outside the shared lock can move origin during push.
+                    _ = git(copy, "fetch", "origin", "main")
+                    if not is_on_main(copy, commit):
+                        _ = reconcile(repo, unit, settings_read=settings_read)
+                        if git(copy, "rev-parse", "origin/main").strip() != base:
+                            continue
+                        raise Refused(failure_detail(result))
+                try:
+                    _ = reconcile(repo, unit, finish=True, paths=tuple(paths), published_commit=commit, settings_read=settings_read)
+                except (Refused, OSError, ValueError, KeyError) as error:
+                    raise PublishedFailure(str(error)) from error
+                return commit
     _ = reconcile(repo, unit, settings_read=settings_read)
     raise Refused("max_push_attempts exceeded; use the normal path")
 
@@ -789,7 +789,7 @@ def main(argv: list[str] | None = None) -> int:
             commit = push_patch(repo, args.production, args.unit, args.why.strip(), paths, selection, config, settings_read)
         print(f"fast-track {args.unit} pushed main at {commit[:12]}")
         return 0
-    except (Refused, PublishedFailure, OSError, ValueError, KeyError) as error:
+    except (Refused, PublishedFailure, copies.CopyError, OSError, ValueError, KeyError) as error:
         print(f"fast-track: {error}", file=sys.stderr)
         return 1 if isinstance(error, PublishedFailure) else 2
 

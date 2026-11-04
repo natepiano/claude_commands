@@ -60,7 +60,7 @@ class CheckpointBumpTests(MergeCheckpointFixture):
     def finish_gate(self, run: BumpGateObservation) -> None:
         self.release_bump_gate()
         self.wait_bump_gate_exit(run)
-        self.assertFalse(run.checkout.exists(), "the gate must remove its clone after the run")
+        self.assertTrue((run.checkout / ".git").is_dir(), "the gate must retain its standing checkout")
 
     def test_red_gate_reports_both_recipients_after_the_merge_is_pushed(self) -> None:
         self.prepare_bump_gate(red=True)

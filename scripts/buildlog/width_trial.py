@@ -20,7 +20,7 @@ from typing import Literal, NamedTuple, TypedDict, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 
 import store
-from memory_admit import expected_peak, git_identity, test_threads
+from memory_admit import expected_peak, git_identity, test_threads, read_memory_config
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
 
@@ -485,8 +485,11 @@ def report(since: float, until: float, host: str = "natedev", root: Path | None 
     t_values = _value_by_arm(arms, t_stat)
     f_values = _value_by_arm(arms, f_stat)
     repository = git_identity(["cargo", "nextest", "run"], str(Path.home() / "rust/hana"))[0]
+    configuration = read_memory_config()
     r_values: dict[int | None, float | None] = {
-        width: expected_peak(repository, "nextest", host, datetime.fromtimestamp(until, UTC), root, width).bytes / GIB
+        width: expected_peak(repository, "nextest", host, datetime.fromtimestamp(until, UTC), root, width,
+                             first_peak_bytes=configuration.program_first_peaks["cargo"],
+                             budget=configuration.build_budget_bytes).bytes / GIB
         for width in widths
     }
 
