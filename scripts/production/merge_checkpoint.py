@@ -218,6 +218,7 @@ class MergeRequest(NamedTuple):
     merge_defects: int
     excluded: str
     bump: bool = False
+    staff_record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT
 
 
 class Stop(Exception):
@@ -366,7 +367,13 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
     name = cast(str, args.unit)
     record = staff.snapshot()
     resolver = session_staff.RowResolver(record)
-    units = tuple(unit_from_row(row, resolver) for row in unit_lookup.doc_units(production.doc, record)
+    rows = unit_lookup.doc_units(production.doc, record)
+    selected = next((row for row in rows if row.name == unit_names.name(name)), None)
+    selected = selected if selected is not None else unit_lookup.unit_row(name, record)
+    if selected.parent != unit_lookup.doc_owner(production.doc, record).id:
+        parent = record.by_id(selected.parent) if selected.parent is not None else None
+        raise Refusal(f"unit {name}: staff parent is {parent.name if parent else 'unavailable'}; use that production")
+    units = tuple(unit_from_row(row, resolver) for row in rows
                   if not isinstance(row.worktree, staff.RemovedWorktree))
     unit = next((candidate for candidate in units if candidate.name == name), None)
     if unit is None:
@@ -413,7 +420,7 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
                         tuple(cast(list[str], args.trailer)), review_trial, delivers or "",
                         cast(bool, args.cancel_prior), cast(str, args.started),
                         cast(str, args.regime), cast(int, args.holds), cast(int, args.merge_defects),
-                        cast(str | None, args.excluded) or "", bump)
+                        cast(str | None, args.excluded) or "", bump, record)
 
 
 def merge_branch_history(checkout: Path, merge_branch: str) -> MergeBranchHistory:
@@ -534,12 +541,13 @@ def checkpoint_step_record(checkout: Path, merge_head: str, step: str) -> Path:
 
 def record_changes(request: MergeRequest, commits: list[change_review.Commit], merge_head: str,
                    changes: ChangesReadBeforePush | ReadChangesWhenWriting) -> None:
-    record_publication_changes(request.production, commits, merge_head, changes=changes)
+    record_publication_changes(request.production, commits, merge_head, changes=changes, record=request.staff_record)
 
 
 def record_publication_changes(production: Production, commits: list[change_review.Commit], merge_head: str,
                                *, changes: ChangesReadBeforePush | ReadChangesWhenWriting = _READ_CHANGES_WHEN_WRITING,
-                               report_unchanged: bool = True) -> None:
+                               report_unchanged: bool = True,
+                               record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> None:
     """Register each visible change and report merges with missing rows."""
     doc = change_review.list_path(production.doc)
     if doc is None:
@@ -555,7 +563,7 @@ def record_publication_changes(production: Production, commits: list[change_revi
     try:
         # A stop after the list write but before the receipt must not add it twice.
         publication = (changes.changes if isinstance(changes, ChangesReadBeforePush)
-                       else change_review.publication_changes(commits, production.doc))
+                       else change_review.publication_changes(commits, production.doc, record=record))
         existing = change_review.pending(doc) if doc.exists() else []
         held = {row["Change"] for row in existing
                 if any(sha.startswith(merged) or merged.startswith(sha)
@@ -566,7 +574,7 @@ def record_publication_changes(production: Production, commits: list[change_revi
         done.touch()
         drifted = change_review.drift(production.checkout, production.merge_branch,
                                       change_review.read(doc), change_review.LANDED,
-                                      change_review.foreign_units(production.doc))
+                                      change_review.foreign_units(production.doc, record=record))
     except (change_review.ChangeReviewError, OSError) as error:
         report("change review", "failed", f"{doc} not written: {error}; add its rows by hand")
         return
@@ -873,7 +881,7 @@ def run_checkpoint_test_steps(production: Production, paths: tuple[str, ...],
             _ = output.write(f"{name.replace(' ', '_')}_EXIT={result.returncode}\n")
             output.flush()
             stop_cancelled_test(name, result, log)
-            if not test_passed(command, result):
+            if not test_passed(result):
                 failed.append((name, command, failed_tests(result.stdout + result.stderr)))
     unresolved: list[str] = []
     for name, command, tests in failed:
@@ -885,7 +893,7 @@ def run_checkpoint_test_steps(production: Production, paths: tuple[str, ...],
             _ = output.write(f"{name.replace(' ', '_')}_RERUN_EXIT={result.returncode}\n")
         stop_cancelled_test(name, result, log)
         package = name.removeprefix("package ")
-        if test_passed(command, result) and (alone or package in flakes):
+        if test_passed(result) and (alone or package in flakes):
             note = (f"known flaky tests {', '.join(sorted(tests))}: red in {name}, green alone" if alone
                     else f"known flake {package}: red in batch, green alone")
             production.log.parent.mkdir(parents=True, exist_ok=True)
@@ -902,17 +910,9 @@ def run_checkpoint_test_steps(production: Production, paths: tuple[str, ...],
     return ", ".join(name for name, _ in steps) if steps else "no tests"
 
 
-def test_passed(command: list[str], result: subprocess.CompletedProcess[str]) -> bool:
-    """Judge basedpyright as merge_gate.py does: status 0 or 3 and its clean summary line anywhere.
-
-    It exits 3 and prints a `.venv` warning on stderr, after the summary, because pyrightconfig
-    names a `.venv` no checkout has.
-    """
-    if Path(command[0]).name != "basedpyright":
-        return result.returncode == 0
-    output = f"{result.stdout}\n{result.stderr}"
-    clean = re.search(r"^0 errors, 0 warnings(?:, 0 notes)?\s*$", output, re.MULTILINE)
-    return result.returncode in (0, 3) and clean is not None
+def test_passed(result: subprocess.CompletedProcess[str]) -> bool:
+    """Accept only status zero."""
+    return result.returncode == 0
 
 
 def undo_failed_push(production: Production, old_origin: str, before_merge_tip: str) -> None:
@@ -1478,6 +1478,8 @@ def bump_gate_addresses(slug: str, unit: str) -> tuple[str, str]:
 
 def run(request: MergeRequest) -> int:
     try:
+        if isinstance(request.staff_record, session_staff.ReadCurrentStaff):
+            request = request._replace(staff_record=staff.snapshot())
         checkpoint = git(request.production.checkout, "rev-parse", "--verify", f"{request.commit}^{{commit}}")
         if checkpoint.returncode:
             checkpoint = git(request.unit.worktree, "rev-parse", "--verify", f"{request.commit}^{{commit}}")
@@ -1511,7 +1513,7 @@ def run(request: MergeRequest) -> int:
         changes: ChangesReadBeforePush | ReadChangesWhenWriting = _READ_CHANGES_WHEN_WRITING
         if isinstance(pushed, NotYetPushed) and change_review.list_path(request.production.doc) is not None:
             try:
-                changes = ChangesReadBeforePush(change_review.publication_changes(commits, request.production.doc))
+                changes = ChangesReadBeforePush(change_review.publication_changes(commits, request.production.doc, record=request.staff_record))
             except (change_review.ChangeReviewError, OSError) as error:
                 undo_unpushed_merge(request.production, merge_head)
                 raise Stop("change review", "failed", f"{error}: the staff record is read before the push",
@@ -1917,6 +1919,9 @@ def main() -> int:
         request = request_from(args)
         with merge_lock(request.production.checkout, request.production.slug):
             return run(request)
+    except staff.StaffUnreadable as error:
+        report("change review", "failed", f"{error}: the staff record is read before the push")
+        return 1
     except (Refusal, staff.StaffRefused, OSError, ValueError) as error:
         report("input", "failed", str(error))
         print(f"send {cast(str, args.unit)}: correct the checkpoint input and resend it")

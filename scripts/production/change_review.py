@@ -959,10 +959,22 @@ def producer_at(directory: Path) -> staff.StaffId | UnknownProducer:
     return member.id if member is not None and member.kind == "unit" else UnknownProducer()
 
 
-def publication_changes(commits: list[Commit], production: Path) -> list[PublicationChange]:
+def _publication_docs(production: Path, record: staff.StaffSnapshot) -> list[Path]:
+    """Resolve child production documents with the held staff snapshot."""
+    from scripts.production import showrunners
+    import showrunner_tree
+
+    docs = showrunners.timer_docs()
+    children = showrunner_tree.descendants_of(slug_of(production), record=record)
+    return [production, *(docs[child] for child in children if child in docs)]
+
+
+def publication_changes(commits: list[Commit], production: Path, *,
+                        record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT
+                        ) -> list[PublicationChange]:
     """Resolve each visible change's unit and producer in one pass."""
-    record = staff.snapshot()
-    branches = _unit_branches(owner_docs(production), record)
+    record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+    branches = _unit_branches(_publication_docs(production, record), record)
     machine = remote.local_machine()
     changes: list[PublicationChange] = []
     noted: set[UnitSource | str] = set()
@@ -1433,7 +1445,9 @@ def _named_in(commit: Commit, names: Collection[str]) -> bool:
     return found is not None and found["branch"] in names
 
 
-def foreign_units(production: Path) -> set[str]:
+def foreign_units(production: Path, *,
+                  record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT
+                  ) -> set[str]:
     """The checkpoint names of the units of every production outside the tree of `production`'s root.
 
     Empty when the productions cannot be read: drift then counts every checkpoint.
@@ -1442,11 +1456,12 @@ def foreign_units(production: Path) -> set[str]:
     import showrunner_tree
 
     try:
+        record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
         docs = list(showrunners.timer_docs().values())
-        root = showrunner_tree.root_of(slug_of(production))
+        root = showrunner_tree.root_of(slug_of(production), record=record)
         top = next((doc for doc in docs if slug_of(doc) == root), production)
-        return {name for name, source in unit_branches(docs).items()
-                if source.production not in set(owner_docs(top))}
+        return {name for name, source in _unit_branches(docs, record).items()
+                if source.production not in set(_publication_docs(top, record))}
     except (OSError, ValueError, Refusal):
         return set()
 
