@@ -178,7 +178,7 @@ class ControlSettings:
 
 
 def offload_enabled(settings: conf.ConfigRead) -> bool:
-    return settings.text('offload') == 'on'
+    return target_config.aws_routing_enabled(settings)
 
 
 def deployment_record(directory: Path | None = None) -> dict[str, object]:

@@ -193,7 +193,7 @@ Run this command at your terminal:
 AWS_SHARED_CREDENTIALS_FILE="$HOME/.config/aws-build/credentials" python3 scripts/aws_target/deploy.py up --approve-resources
 ```
 
-The command runs four ordered stages: price, bootstrap, stacks, and scaler-key.
+The command runs eleven ordered stages through activation and routing proof.
 It prints `present`, `done`, or `refused` for each stage.
 It stops at the first refusal.
 Correct the reported problem and run the same command again.
@@ -209,8 +209,7 @@ A foundation wait renews preparation only when its inputs remain unchanged.
 A stack in `REVIEW_IN_PROGRESS` has no resources and counts as absent.
 Other incomplete stack states require recovery before deployment.
 Separate `price`, `bootstrap`, `prepare`, `apply`, and `setup-start` commands remain available.
-This phase prepares the stacks and scaler credentials.
-The following checks cover the remaining join and activation procedure.
+The command completes the box setup and records both proofs for the current instance ID.
 
 ## First boot, SSM, and retained data
 
@@ -542,3 +541,21 @@ The service must show `inactive`.
 
 Do not terminate or delete retained resources as an automatic rollback step.
 Any later deletion requires a separate user decision.
+
+## Activation and proof stages
+
+Run `python3 scripts/aws_target/deploy.py up --approve-resources` at your terminal.
+
+1. Allow `idle_stop_minutes` plus `idle_stop_margin_s` for the idle-stop proof.
+   The command observes EC2 while the box stops itself.
+   Active AWS claims prevent this proof.
+   A timeout makes `up` stop the instance and report a refusal.
+2. The activation stage writes `~/.local/state/build-targets/aws/routing.json` and enables `aws-target.service`.
+   The reviewed registry already contains `targets=mac,natedev,aws`, `kind.aws=ssh`, `platform.aws=linux`, and `settings.aws=aws_target.conf`.
+   The command refuses missing rows and edits no tracked file.
+3. The routing proof runs `verify.sh test cargo-berth-test-support --target aws --no-cache` through the normal queue.
+   The command requires a new successful pinned AWS step in the buildlog.
+
+A retry skips proofs recorded for the current instance ID.
+A replacement instance requires new proofs.
+Keep `routing.json`, `deployment.json`, and `up.json` outside the repository.

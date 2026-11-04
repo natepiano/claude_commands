@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import sys
 import os
-from typing import Literal
+import json
+from typing import Literal, cast
 
 
 SCRIPTS = Path(__file__).resolve().parent.parent
@@ -84,3 +85,14 @@ def read_targets(path: Path | None = None) -> tuple[Target, ...]:
     return tuple(targets)
 
 
+def aws_routing_enabled(settings: conf.ConfigRead) -> bool:
+    """Read the external activation record before the legacy configuration value."""
+    path = ssh_target_state_directory('aws') / 'routing.json'
+    if path.exists():
+        value = cast(object, json.loads(path.read_text()))
+        if not isinstance(value, dict):
+            raise ConfigError('routing.json: expected an activation record')
+        record = cast(dict[str, object], value)
+        if record.get('settings') == str(settings.source.resolve()):
+            return record.get('enabled') is True
+    return settings.text('offload') == 'on'

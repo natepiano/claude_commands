@@ -630,3 +630,10 @@ Mac runs read `connect_timeout_s` from `mac_test.conf` and round it up for SSH.
 The OAuth JSON contains `client_id` and `client_secret`.
 `config/aws-build-tailscale.json` holds only the public box access rules and source device names.
 The helper prints policy changes and preserves unrelated rules.
+
+`idle_stop_margin_s=120` allows two extra minutes for the box to finish its idle stop.
+The range is 0 through 600 seconds.
+`routing_proof_package=cargo-berth-test-support` selects the package for the pinned routing test in `box_shell_directory`.
+`deploy.py up` stores routing activation in `~/.local/state/build-targets/aws/routing.json`.
+The controller and sender use this record before the tracked `offload` value.
+The command edits no tracked file.

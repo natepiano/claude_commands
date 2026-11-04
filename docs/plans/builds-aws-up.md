@@ -43,4 +43,4 @@ Each stage checks the live state first. It acts only when the state is not compl
 
 1. **Stack lifecycle.** Stages 1 to 4, `down`, the `up` stage runner and its state record. Fixes: `REVIEW_IN_PROGRESS`, the preparation age, and one settings reader for `price`.
 2. **Box join and configuration.** Stages 5 to 8.
-3. **Activation and proof.** Stages 9 to 11. Then the user runs `down` and `up` once, to prove a rebuild from nothing.
+3. **Activation and proof.** Implementation complete; the user deployment proof remains. Stages 9 to 11. Then the user runs `down` and `up` once, to prove a rebuild from nothing.

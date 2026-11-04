@@ -19,9 +19,11 @@ from urllib.request import Request, urlopen
 from scripts.aws_target import ledger
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command
 from scripts.aws_target.config import deployment_outputs, read_deployment_settings
+from scripts.build_targets import target_config
+from scripts.buildlog import store
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.mac_test import linux_runner, offload
+from scripts.mac_test import linux_runner, offload, mac_test
 
 
 class BoxRefused(ValueError):
@@ -273,6 +275,8 @@ class BoxSetup:
             raise BoxRefused('Tailscale policy did not retain the requested rules')
 
     def join_present(self) -> bool:
+        if self._proved_stopped_setup('box-join'):
+            return True
         self.joined = UnjoinedBox()
         if not self.ssm_online():
             return False
@@ -328,6 +332,8 @@ class BoxSetup:
         return result
 
     def configuration_present(self) -> bool:
+        if self._proved_stopped_setup('box-configuration'):
+            return True
         if not self.join_present():
             return False
         return self._ssh('readlink -f /run/current-system') == self._desired_system() and self._remote_active()
@@ -424,6 +430,8 @@ class BoxSetup:
         return self._ssh(command) == 'healthy'
 
     def checks_present(self) -> bool:
+        if self._proved_stopped_setup('checks'):
+            return True
         if not self._health():
             return False
         directory, selector = self._shell()
@@ -461,6 +469,119 @@ class BoxSetup:
         write_text_atomic(self.directory / 'box-shell.json', json.dumps({'source': paths[0], 'selector': selector}) + '\n')
         if not self._health():
             raise BoxRefused('box health changed during the tool checks')
+
+
+    def _proof_present(self, stage: str) -> bool:
+        path = self.directory / 'up.json'
+        record = json_record(path.read_text()) if path.exists() else {}
+        proof = ledger.mapping(record.get(stage, {}))
+        return proof.get('instance_id') == self._instance() and proof.get('proved_at', 0) != 0
+
+    def _save_proof(self, stage: str, **evidence: object) -> None:
+        path = self.directory / 'up.json'
+        record = json_record(path.read_text()) if path.exists() else {}
+        previous = ledger.mapping(record.get(stage, {}))
+        record[stage] = {**previous, **evidence, 'instance_id': self._instance(), 'proved_at': int(time.time())}
+        write_text_atomic(path, json.dumps(record, sort_keys=True) + '\n')
+
+    def _instance_state(self) -> str:
+        return self._api().observe(self._instance(), int(time.time())).state
+
+    def _proved_stopped_setup(self, stage: str) -> bool:
+        # A stopped instance preserves setup evidence without restarting for a second proof.
+        if not self._proof_present('idle-stop') or self._instance_state() != 'stopped':
+            return False
+        record = json_record((self.directory / 'up.json').read_text())
+        return ledger.mapping(record.get(stage, {})).get('status') in ('done', 'present')
+
+    def idle_stop_present(self) -> bool:
+        return self._proof_present('idle-stop')
+
+    def idle_stop(self) -> None:
+        if self.idle_stop_present():
+            return
+        if mac_test.live_claims(mac_test.state_paths('aws')):
+            raise BoxRefused('idle stop requires no active AWS claims')
+        if not self._health():
+            raise BoxRefused('idle stop requires a healthy running box')
+        values = conf.read(self.settings)
+        duration = values.number('idle_stop_minutes') * 60 + values.whole('idle_stop_margin_s')
+        delay = values.number('box_check_delay_s')
+        # Hold controller actions so only the box can satisfy the self-stop proof.
+        with control_lock(self.directory):
+            if self._instance_state() != 'running':
+                raise BoxRefused('idle stop requires a running instance')
+            deadline = time.monotonic() + duration
+            while True:
+                if mac_test.live_claims(mac_test.state_paths('aws')):
+                    raise BoxRefused('idle stop requires no active AWS claims')
+                state = self._instance_state()
+                if state == 'stopped':
+                    self._save_proof('idle-stop')
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                _ = self.pause(min(delay, remaining))
+            _ = self._api().call('stop-instances', '--instance-ids', self._instance())
+            self._wait(lambda: self._instance_state() == 'stopped', 'idle stop failed; EC2 stop did not confirm')
+        raise BoxRefused('idle stop exceeded its deadline; up stopped the instance')
+
+    def _routing_path(self) -> Path:
+        return target_config.ssh_target_state_directory('aws') / 'routing.json'
+
+    def _registered(self) -> None:
+        if not any(isinstance(target, target_config.SshTarget) and target.name == 'aws'
+                   and target.settings.resolve() == self.settings.resolve() for target in target_config.read_targets()):
+            raise BoxRefused('review registry rows: targets=mac,natedev,aws; kind.aws=ssh; platform.aws=linux; settings.aws=aws_target.conf')
+
+    def activation_present(self) -> bool:
+        self._registered()
+        path = self._routing_path()
+        if not path.exists():
+            return False
+        record = json_record(path.read_text())
+        if record.get('enabled') is not True or record.get('settings') != str(self.settings.resolve()):
+            return False
+        try:
+            return self._run(['systemctl', '--user', 'is-enabled', 'aws-target.service']) == 'enabled' and self._run(
+                ['systemctl', '--user', 'is-active', 'aws-target.service']) == 'active'
+        except BoxRefused:
+            return False
+
+    def activate(self) -> None:
+        self._registered()
+        if self.activation_present():
+            return
+        write_text_atomic(self._routing_path(), json.dumps({'enabled': True, 'settings': str(self.settings.resolve())}) + '\n')
+        _ = self._run(['systemctl', '--user', 'enable', '--now', 'aws-target.service'])
+        if not self.activation_present():
+            raise BoxRefused('activation did not confirm routing and aws-target.service')
+
+    def routing_proof_present(self) -> bool:
+        return self._proof_present('routing-proof')
+
+    def routing_proof(self) -> None:
+        if self.routing_proof_present():
+            return
+        if not self.activation_present():
+            raise BoxRefused('routing proof requires active routing')
+        directory, _ = self._shell()
+        package = conf.read(self.settings).text('routing_proof_package')
+        if not package or any(character.isspace() for character in package):
+            raise BoxRefused('routing_proof_package: expected one package name')
+        before = {path: store.read_last_whole_row_end(path) for path in store.root().glob('*/[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl')}
+        verify = Path(__file__).resolve().parents[1] / 'direct/verify.sh'
+        command = 'cd ' + shlex.quote(directory) + ' && exec ' + shlex.join(
+            ['env', 'UNIT_DETACHED_RUN=1', str(verify), 'test', package, '--target', 'aws', '--no-cache'])
+        _ = self._run(['bash', '-c', command])
+        for path in store.root().glob('*/[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl'):
+            for row in store.locked_rows(path, before.get(path, 0)):
+                if (row.get('kind') == 'step' and row.get('target') == 'aws' and row.get('host') == 'aws-build'
+                        and row.get('package') == package and row.get('status') == 0 and row.get('pinned') is True):
+                    self._save_proof('routing-proof', record_id=row.get('id'), record_file=str(path))
+                    return
+        raise BoxRefused('routing proof has no new successful pinned AWS buildlog step')
 
 
 def re_store_path(value: str) -> bool:

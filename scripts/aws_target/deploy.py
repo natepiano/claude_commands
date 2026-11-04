@@ -557,6 +557,9 @@ class Deployment:
             UpStage('box-join', setup.join_present, setup.join),
             UpStage('box-configuration', setup.configuration_present, setup.configure),
             UpStage('checks', setup.checks_present, setup.checks),
+            UpStage('idle-stop', setup.idle_stop_present, setup.idle_stop),
+            UpStage('activation', setup.activation_present, setup.activate),
+            UpStage('routing-proof', setup.routing_proof_present, setup.routing_proof),
         )
 
     def up(self, *, approve_resources: bool = False) -> bool:
@@ -582,7 +585,9 @@ class Deployment:
                 except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
                     reason = 'scaler credential stage failed' if stage.name == 'scaler-key' else str(error)
                     result = StageResult('refused', started, int(self.clock()), reason)
-                results[stage.name] = {field.name: cast(object, getattr(result, field.name)) for field in fields(result)}
+                results = remote.read_record(path) if path.exists() else results
+                previous = ledger.mapping(results.get(stage.name, {}))
+                results[stage.name] = {**previous, **{field.name: cast(object, getattr(result, field.name)) for field in fields(result)}}
                 write_text_atomic(path, json.dumps(results, sort_keys=True) + '\n')
                 print(f'{stage.name}: {result.status}' + (f': {result.reason}' if result.reason else ''))
                 if result.status == 'refused':

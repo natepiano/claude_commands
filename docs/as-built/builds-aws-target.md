@@ -99,7 +99,7 @@ An interruption marker reports the instance generation.
 
 ### Deployment: `deploy.py`, `docs/plans/builds-aws/`
 
-- `deploy.py up --approve-resources` runs price, bootstrap, stacks, scaler-key, Tailscale policy, box join, box configuration, and checks.
+- `deploy.py up --approve-resources` runs price, bootstrap, stacks, scaler-key, Tailscale policy, box join, box configuration, checks, idle stop, activation, and routing proof.
   Each stage checks live state and records its last result and times in `up.json`.
   A retry continues from incomplete stages. The price stage always refreshes the public price.
   The stacks stage preserves the guard, ledger, and retained-volume checks.
@@ -189,3 +189,25 @@ The controller activation and routing proof remain separate plan stages.
 - An unconfirmed compute request is charged at the Spot maximum price. A historical price is not an upper bound, and the fallback rate under-counts.
 - A stateless per-day floor was ruled out: it over-counts the common uneven case, a $10 bill becoming $17.92 across two days.
 - Refusal cleanup reuses `take_over_kept_claim` and `check_leftovers`, so no second cleanup path exists.
+
+### Activation and proof
+
+1. `idle-stop` observes EC2 until the box stops within `idle_stop_minutes` plus `idle_stop_margin_s`.
+   It holds the controller lock so the controller cannot satisfy the proof.
+   Active AWS claims prevent the proof.
+   A deadline failure requests an EC2 stop, confirms the stop, and refuses the stage.
+2. `activation` writes `routing.json` under `~/.local/state/build-targets/aws`.
+   This record enables routing for the configured AWS settings file.
+   The controller and the sender read the same record before the legacy `offload` value.
+   The stage enables and starts `aws-target.service` with `systemctl --user`.
+   It requires the reviewed AWS registry rows and edits no tracked file.
+3. `routing-proof` runs `verify.sh test cargo-berth-test-support --target aws --no-cache` in `box_shell_directory`.
+   `routing_proof_package` selects the package.
+   The normal queue retains admission, spending, and version checks.
+   The stage requires a new successful pinned buildlog step with `target=aws` and `host=aws-build`.
+
+Both proofs record the current instance ID and completion time in `up.json`.
+A replacement instance invalidates both proofs.
+A later run skips completed proofs without another idle wait or test.
+A stopped instance retains its completed setup evidence for the same instance ID.
+The price stage still refreshes the public price.

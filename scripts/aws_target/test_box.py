@@ -14,6 +14,9 @@ from unittest import mock
 
 from scripts.aws_target import box, deploy
 from scripts.aws_target.ledger import mapping
+from scripts.build_targets import target_config
+from scripts.mac_test import mac_test, offload
+from scripts.lib import conf
 
 SYSTEM = '/nix/store/' + 'a' * 32 + '-nixos-system-aws-build'
 SOURCE = '/nix/store/' + 'b' * 32 + '-source'
@@ -35,7 +38,14 @@ def versions(command, remote=False):
     else: raise AssertionError(command)
 if name == 'aws':
     op = args[5]
-    if op == 'describe-instance-information':
+    if op == 'describe-instances':
+        s['observations'] = s.get('observations', 0) + 1
+        if s.get('self_stop') and s['observations'] >= s.get('stop_after', 2): s['ec2'] = 'stopped'
+        save()
+        output({'Reservations': [{'Instances': [{'InstanceId': 'i-box', 'State': {'Name': s.get('ec2', 'running')}, 'LaunchTime': '2026-11-04T00:00:00Z'}]}]})
+    elif op == 'stop-instances':
+        s['ec2'] = 'stopped'; s['forced_stop'] = True; save(); output({})
+    elif op == 'describe-instance-information':
         output({'InstanceInformationList': [{'InstanceId': 'i-box', 'PingStatus': 'Online'}] if s['online'] else []})
     elif op == 'send-command':
         s['ssm_command'] = json.loads(args[args.index('--parameters') + 1])['commands'][0]
@@ -53,6 +63,18 @@ if name == 'aws':
         if not s['joined']: sys.exit(1)
         print('AWS_JOIN_DONE')
     else: raise AssertionError(args)
+elif name == 'systemctl':
+    if 'enable' in args:
+        if s.get('activation_failure'): sys.exit(1)
+        s['controller'] = True; save()
+    elif 'is-enabled' in args: print('enabled' if s.get('controller') else 'disabled')
+    elif 'is-active' in args: print('active' if s.get('controller') else 'inactive')
+elif name == 'bash':
+    if s.get('proof_failure'): sys.exit(1)
+    if not s.get('missing_record'):
+        log = pathlib.Path(os.environ['BUILDLOG_DIR']) / 'aws-build' / '2026-11.jsonl'
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open('a') as handle: handle.write(json.dumps({'kind': 'step', 'id': 'proof-step', 'target': 'aws', 'host': 'aws-build', 'package': 'cargo-berth-test-support', 'status': 0, 'pinned': True}) + '\n')
 elif name == 'tailscale':
     output({'Self': {'HostName': 'natedev', 'TailscaleIPs': ['100.64.0.1']},
             'Peer': {'mac': {'HostName': 'MacBook-Pro', 'TailscaleIPs': ['100.64.0.2']}}})
@@ -150,19 +172,23 @@ class BoxTests(unittest.TestCase):
         _ = oauth.write_text(json.dumps({'client_id': 'fixture-id', 'client_secret': 'fixture-secret'}))
         oauth.chmod(0o600)
         config = (Path(__file__).resolve().parents[2] / 'config/aws_target.conf').read_text()
-        values = {'tailscale_oauth_file': str(oauth), 'box_check_attempts': '4', 'box_check_delay_s': '0.001',
+        values = {'tailscale_oauth_file': str(oauth), 'box_check_attempts': '4', 'box_check_delay_s': '0.001', 'idle_stop_minutes': '0.001', 'idle_stop_margin_s': '0',
                   'nixos_configuration_directory': str(self.root / 'nixos'), 'box_shell_directory': str(self.root / 'cargo-liner')}
         _ = self.settings.write_text('\n'.join(key + '=' + values[key] if '=' in line and (key := line.partition('=')[0]) in values else line
                                              for line in config.splitlines()) + '\n')
         bin_path = self.root / 'bin'
         bin_path.mkdir()
-        for name in ('aws', 'ssh', 'git', 'nix', 'tailscale'):
+        for name in ('aws', 'ssh', 'git', 'nix', 'tailscale', 'systemctl', 'bash'):
             path = bin_path / name
             _ = path.write_text(f'#!{sys.executable}\n' + FAKE)
             path.chmod(0o700)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {'BOX_FIXTURE': str(self.root),
-                                      'PATH': str(bin_path) + os.pathsep + os.environ['PATH']})))
-        self.save({'online': True, 'joined': False, 'active': True, 'system': '/nix/store/old',
+                                      'BUILDLOG_DIR': str(self.root / 'buildlog'), 'PATH': str(bin_path) + os.pathsep + os.environ['PATH']})))
+        _ = cast(object, self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.directory)))
+        _ = cast(object, self.enterContext(mock.patch('target_config.ssh_target_state_directory', return_value=self.directory)))
+        _ = cast(object, self.enterContext(mock.patch.object(target_config, 'read_targets', return_value=(target_config.SshTarget('aws', 'linux', self.settings),))))
+        _ = cast(object, self.enterContext(mock.patch.object(mac_test, 'live_claims', return_value=())))
+        self.save({'self_stop': True, 'stop_after': 2, 'online': True, 'joined': False, 'active': True, 'system': '/nix/store/old',
                    'desired': SYSTEM, 'source': SOURCE})
         self.tailnet = FakeTailnet()
         self.starts = 0
@@ -221,7 +247,7 @@ class BoxTests(unittest.TestCase):
             later = self.commands()[commands:]
             self.assertFalse(any('systemd-run' in c[-1] or c[0] == 'nix' and 'copy' in c for c in later))
             results = box.json_record((self.directory / 'up.json').read_text())
-            self.assertEqual(len(results), 8)
+            self.assertEqual(len(results), 11)
             self.assertTrue(all(mapping(result)['status'] == 'present' for result in results.values()))
 
     def test_policy_changes_only_box_rules_and_then_reports_present(self) -> None:
@@ -344,6 +370,78 @@ class BoxTests(unittest.TestCase):
                 with self.assertRaises(box.BoxRefused):
                     self.subject.checks()
                 self.assertFalse(any(c[0] == 'nix' and 'develop' in c for c in self.commands()))
+
+
+    def test_idle_stop_records_the_instance_and_never_waits_again(self) -> None:
+        self.change(joined=True)
+        self.assertFalse(self.subject.idle_stop_present())
+        self.subject.idle_stop()
+        count = len(self.commands())
+        self.subject.idle_stop()
+        self.assertEqual(len(self.commands()), count)
+        self.assertTrue(self.subject.idle_stop_present())
+        self.assertFalse(self.live().get('forced_stop', False))
+        self.assertEqual(mapping(box.json_record((self.directory / 'up.json').read_text())['idle-stop'])['instance_id'], 'i-box')
+
+    def test_idle_stop_deadline_stops_the_instance_and_refuses_without_a_proof(self) -> None:
+        self.change(joined=True, self_stop=False)
+        with self.assertRaisesRegex(box.BoxRefused, 'up stopped the instance'):
+            self.subject.idle_stop()
+        self.assertEqual(self.live()['ec2'], 'stopped')
+        self.assertTrue(self.live()['forced_stop'])
+        self.assertFalse(self.subject.idle_stop_present())
+        self.change(ec2='running', self_stop=True, observations=0)
+        self.subject.idle_stop()
+        self.assertTrue(self.subject.idle_stop_present())
+
+    def test_activation_uses_external_state_and_recovers_after_service_failure(self) -> None:
+        _ = self.settings.write_text(self.settings.read_text().replace('offload=on', 'offload=off'))
+        before = self.settings.read_bytes()
+        self.assertFalse(target_config.aws_routing_enabled(conf.read(self.settings)))
+        self.assertFalse(self.subject.activation_present())
+        self.change(activation_failure=True)
+        with self.assertRaises(box.BoxRefused):
+            self.subject.activate()
+        self.assertFalse(self.subject.activation_present())
+        self.change(activation_failure=False)
+        self.subject.activate()
+        self.assertTrue(self.subject.activation_present())
+        commands = len(self.commands())
+        self.subject.activate()
+        self.assertFalse(any('enable' in c for c in self.commands()[commands:]))
+        self.assertEqual(self.settings.read_bytes(), before)
+        self.assertTrue(target_config.aws_routing_enabled(conf.read(self.settings)))
+        self.assertTrue(offload.read_config(self.settings).enabled)
+
+    def test_routing_proof_requires_a_new_successful_aws_step_and_resumes(self) -> None:
+        self.subject.activate()
+        self.assertFalse(self.subject.routing_proof_present())
+        self.change(proof_failure=True)
+        with self.assertRaises(box.BoxRefused):
+            self.subject.routing_proof()
+        self.change(proof_failure=False, missing_record=True)
+        with self.assertRaisesRegex(box.BoxRefused, 'no new successful'):
+            self.subject.routing_proof()
+        self.change(missing_record=False)
+        self.subject.routing_proof()
+        self.assertTrue(self.subject.routing_proof_present())
+        commands = len(self.commands())
+        self.subject.routing_proof()
+        self.assertEqual(len(self.commands()), commands)
+        command = next(c[-1] for c in self.commands() if c[0] == 'bash')
+        self.assertIn('test cargo-berth-test-support --target aws --no-cache', command)
+
+    def test_replacement_instance_invalidates_both_proofs(self) -> None:
+        self.change(joined=True)
+        self.subject.idle_stop()
+        self.subject.activate()
+        self.subject.routing_proof()
+        path = self.directory / 'deployment.json'
+        record = box.json_record(path.read_text())
+        mapping(record['outputs'])['InstanceId'] = 'i-replacement'
+        _ = path.write_text(json.dumps(record))
+        self.assertFalse(self.subject.idle_stop_present())
+        self.assertFalse(self.subject.routing_proof_present())
 
 
 if __name__ == '__main__':

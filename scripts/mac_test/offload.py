@@ -883,7 +883,8 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> Offlo
     config = conf.read(settings)
     values = config.values()
     return OffloadConfig(
-        enabled=config.text("offload") == "on",
+        enabled=(target_config.aws_routing_enabled(config) if settings.name == "aws_target.conf"
+                 else config.text("offload") == "on"),
         connection=connection_settings(config),
         probe_timeout_s=config.number("probe_timeout_s"),
         unreachable_backoff_s=config.number("unreachable_backoff_s"),
