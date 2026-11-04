@@ -36,7 +36,7 @@ def exclusive(path: Path, *, wait: bool = True) -> Generator[LockResult]:
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def lock_holder(lock: str, locks: str = PROC_LOCKS) -> int | None:
+def lock_holder(lock: str, locks: str = PROC_LOCKS, *, reads: int = PROC_LOCKS_READS) -> int | None:
     """Read the flock holder pid. Return None when the holder is not available.
 
     Read again because the kernel can omit a line when another lock ends.
@@ -47,7 +47,7 @@ def lock_holder(lock: str, locks: str = PROC_LOCKS) -> int | None:
         return None
     # A holder line has the pid and device. A waiter line contains "->".
     device = f"{os.major(stat.st_dev):02x}:{os.minor(stat.st_dev):02x}:{stat.st_ino}"
-    for _ in range(PROC_LOCKS_READS):
+    for _ in range(reads):
         try:
             with open(locks, encoding="ascii", errors="replace") as handle:
                 lines = handle.read().splitlines()

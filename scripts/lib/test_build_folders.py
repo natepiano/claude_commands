@@ -277,9 +277,10 @@ assert not loaded, loaded
         self.assertFalse((moved / stage.name).exists())
 
     def test_registered_task_uses_scratch_naming_record_and_task_cleanup(self) -> None:
+        settings = conf.read("scratch")
         with mock.patch.object(scratch, "target", wraps=scratch.target) as naming:
-            path = scratch.new("gate:folder-test", "checkout", False)
-        naming.assert_called_once_with("gate:folder-test", "checkout", False)
+            path = scratch.new("gate:folder-test", "checkout", False, scratch_settings=settings)
+        naming.assert_called_once_with("gate:folder-test", "checkout", False, scratch_settings=settings)
         self.assertEqual(path.parent, copy_record.root())
         self.assertTrue(path.name.startswith("gate-folder-test-checkout-"))
         record = scratch.task_of(path)

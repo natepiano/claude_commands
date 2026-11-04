@@ -14,7 +14,7 @@ from unittest import mock
 
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import conf
-from scripts.issue_score.selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 from scripts.issue_score import apply_labels, blind, client, decide, evaluate, questions, records, score_issues, vault
 
 

@@ -18,7 +18,7 @@ from scripts.production import staff_sources
 from scripts.production.staff_test_support import (
     StaffTestCase, fixture_unit_location, recorded_showrunner,
 )
-from scripts.issue_score.selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import conf
 from scripts.lint.memory_test_support import config_environment
 if TYPE_CHECKING:

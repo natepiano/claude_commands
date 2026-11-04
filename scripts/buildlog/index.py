@@ -32,7 +32,7 @@ from urllib.parse import quote
 import store
 import parse
 
-SCHEMA_VERSION = 29
+SCHEMA_VERSION = 30
 
 
 # These indexes extend the current schema without rebuilding the recorded rows.
@@ -127,6 +127,8 @@ STEP_COLUMNS: list[Column] = [
     ("test_build_key", "TEXT", "verify test Cargo build-input key, excluding nextest run-only selection; NULL for older or changed builds"),
     ("scope_resources", "TEXT", "JSON own-scope CPU (excludes sccache.service compiles) and IO counters"),
     ("target", "TEXT", "the configured build target; NULL for legacy records"),
+    ("target_directory", "TEXT NOT NULL", "resolved Cargo artifact root, or unknown for older records"),
+    ("build_directory", "TEXT NOT NULL", "resolved Cargo intermediate root; artifact root for legacy records"),
     ("build_history_group", "TEXT", "real folder or legacy checkout group; NULL for none or unresolved"),
 ]
 
@@ -665,6 +667,7 @@ def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str
     argv = record.get("argv")
     target_dir = record.get("target_dir") or store.UNKNOWN_IDENTITY
     folder = target_dir if isinstance(target_dir, str) and Path(target_dir).is_absolute() else None
+    target_directory = record.get("target_directory") or folder or store.UNKNOWN_IDENTITY
     checkout = record.get("worktree") or record.get("cwd")
     key = (build_keys(cast(list[str], argv))
            if isinstance(argv, list) and all(isinstance(word, str) for word in cast(list[object], argv))
@@ -676,6 +679,8 @@ def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str
         "repo": folder_name(record.get("repo_path")),
         "worktree_name": folder_name(record.get("worktree")),
         "target_dir": target_dir or store.UNKNOWN_IDENTITY,
+        "target_directory": target_directory,
+        "build_directory": record.get("build_directory") or target_directory,
         "repo_identity": record.get("repo_identity") or store.UNKNOWN_IDENTITY,
         "target_folder": folder,
         "build_history_group": ("folder:" + folder if folder else

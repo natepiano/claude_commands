@@ -109,6 +109,7 @@ class HeadFacts:
     budget: int
     head_need: int
     bump_records: tuple[BumpRecord, ...] = ()
+    priority: gate.QueuePriority | gate.NoQueuePriority = gate.NoQueuePriority()
 
     @cached_property
     def moves_by_step(self) -> Mapping[MoveIdentity, tuple[BumpRecord, ...]]:
@@ -344,7 +345,8 @@ def _read_token_waits(reading: gate.QueueRead) -> RecordedTokenWaits | TokenWait
                 continue
             seen.add(key)
             waits.append(gap)
-            if waiting[0] in matches:
+            head = reading.explanation.head
+            if isinstance(head, gate.HeadExplanation) and head.waiter in matches:
                 head_waits.append(gap)
     except (OSError, ValueError):
         return TokenWaitsNotRecorded()
@@ -354,10 +356,10 @@ def _read_token_waits(reading: gate.QueueRead) -> RecordedTokenWaits | TokenWait
             if has_records else TokenWaitsNotRecorded())
 
 
-def read_head_facts(reading: gate.QueueRead) -> HeadFacts | gate.NoWaiter:
+def read_head_facts(reading: gate.QueueRead) -> HeadFacts | gate.TokenWaitersOnly | gate.NoWaiter:
     """Read optional admission fields and one bounded pass of local bump history."""
     head = reading.explanation.head
-    if isinstance(head, gate.NoWaiter):
+    if not isinstance(head, gate.HeadExplanation):
         return head
     now = reading.explanation.now
     history = _read_bumps(min(step.since for step in reading.view.waiting), now)
@@ -366,7 +368,7 @@ def read_head_facts(reading: gate.QueueRead) -> HeadFacts | gate.NoWaiter:
              if isinstance(history, BumpHistory) else history)
     return HeadFacts(now, head.waiter.since, bumps,
                      head.order, head.has_priority, _read_token_waits(reading),
-                     budget=reading.explanation.limits.budget, head_need=head.waiter.need, bump_records=records)
+                     budget=reading.explanation.limits.budget, head_need=head.waiter.need, bump_records=records, priority=reading.explanation.priority)
 
 
 def clock(instant: float, zone: ZoneInfo, *, seconds: bool = True, zone_name: bool = False) -> str:
@@ -410,10 +412,10 @@ def bump_lines(facts: HeadFacts, zone: ZoneInfo, labels: Mapping[str, unit_label
 
 def priority_text(priority: gate.QueuePriority | gate.NoQueuePriority) -> str:
     return ("" if isinstance(priority, gate.NoQueuePriority) else
-            f"queue priority: {priority['unit']} (the user's bump)")
+            f"queue priority: {priority['unit']} ({priority['why']})")
 
 
-def order_text(facts: HeadFacts, zone: ZoneInfo) -> str:
+def order_rule(facts: HeadFacts, zone: ZoneInfo) -> str:
     if not facts.has_priority:
         text = "no head priority: younger steps that fit may start"
     elif isinstance(facts.order, gate.WindowNotStarted):
@@ -424,6 +426,10 @@ def order_text(facts: HeadFacts, zone: ZoneInfo) -> str:
         text = gate.window_clause(facts.order, facts.budget, facts.head_need, zone)
         text += f" ({minutes} min {seconds} s left)"
     return text
+
+
+def order_text(facts: HeadFacts, zone: ZoneInfo) -> str:
+    return "; ".join(filter(None, [priority_text(facts.priority), order_rule(facts, zone)]))
 
 
 def cargo_token_lines(facts: HeadFacts, zone: ZoneInfo, labels: Mapping[str, unit_labels.UnitLabels]) -> list[str]:
@@ -451,8 +457,8 @@ def cargo_token_text(facts: HeadFacts) -> str:
     return f"cargo token waited {seconds} s"
 
 
-def session_ids(facts: HeadFacts | gate.NoWaiter) -> list[str]:
-    if isinstance(facts, gate.NoWaiter):
+def session_ids(facts: HeadFacts | gate.TokenWaitersOnly | gate.NoWaiter) -> list[str]:
+    if not isinstance(facts, HeadFacts):
         return []
     sessions: set[str] = set()
     if isinstance(facts.bumps, BumpHistory):
@@ -511,24 +517,24 @@ def move_identity(step: gate.WaitingStep | gate.RunningStep) -> MoveIdentity:
     return MoveIdentity(step.session_id or step.session_name, step.step, step.folder)
 
 
-def waiting_moves(facts: HeadFacts | gate.NoWaiter, step: gate.WaitingStep,
+def waiting_moves(facts: HeadFacts | gate.TokenWaitersOnly | gate.NoWaiter, step: gate.WaitingStep,
                   row: gate.Waiter) -> tuple[BumpRecord, ...]:
-    if (isinstance(facts, gate.NoWaiter) or isinstance(facts.bumps, BumpsUnavailable)
-            or row.get("priority_rank", 1) != 0):
+    if (not isinstance(facts, HeadFacts) or isinstance(facts.bumps, BumpsUnavailable)
+            or not isinstance(gate.waiter_priority(row), gate.PriorityUnit)):
         return ()
     return tuple(record for record in facts.moves_by_step.get(move_identity(step), ())
                  if record.at >= step.since)
 
 
-def running_moves(facts: HeadFacts | gate.NoWaiter, step: gate.ExplainedRunningStep) -> tuple[BumpRecord, ...]:
-    if (isinstance(facts, gate.NoWaiter) or isinstance(facts.bumps, BumpsUnavailable)
+def running_moves(facts: HeadFacts | gate.TokenWaitersOnly | gate.NoWaiter, step: gate.ExplainedRunningStep) -> tuple[BumpRecord, ...]:
+    if (not isinstance(facts, HeadFacts) or isinstance(facts.bumps, BumpsUnavailable)
             or isinstance(step.admitted_at, gate.AdmissionTimeNotRecorded)):
         return ()
     return tuple(record for record in facts.moves_by_step.get(move_identity(step.step), ())
                  if record.at <= step.admitted_at)
 
 
-def queue_moves(reading: gate.QueueRead, facts: HeadFacts | gate.NoWaiter) -> QueueMoves:
+def queue_moves(reading: gate.QueueRead, facts: HeadFacts | gate.TokenWaitersOnly | gate.NoWaiter) -> QueueMoves:
     return QueueMoves(
         tuple(waiting_moves(facts, step, reading.ordered[index][1])
               for index, step in enumerate(reading.view.waiting)),
