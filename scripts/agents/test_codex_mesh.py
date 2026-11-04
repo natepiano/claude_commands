@@ -3425,7 +3425,7 @@ class RecordedTurnSettingsTests(unittest.TestCase):
 
 
 class StaffFolderTurnTests(unittest.TestCase):
-    def test_follow_up_turn_uses_the_changed_staff_folder_without_a_cwd_argument(self) -> None:
+    def test_follow_up_turn_keeps_the_thread_folder_without_a_cwd_argument(self) -> None:
         from scripts.production import staff
         from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker
 
@@ -3442,10 +3442,10 @@ class StaffFolderTurnTests(unittest.TestCase):
                   patch.object(codex_mesh, "_serving_request", return_value={"turn": {"id": "turn"}}) as request):
                 start = codex_mesh._start_turn  # pyright: ignore[reportPrivateUsage]
                 self.assertEqual(start(client, args, worker.current_session, codex_mesh.WORKER_SANDBOX, "First task"), "turn")
-                self.assertEqual(request.call_args.args[2]["cwd"], str(old))
+                self.assertNotIn("cwd", cast(dict[str, object], request.call_args.args[2]))
                 _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", new), expected=unit.worktree)
                 self.assertEqual(start(client, args, worker.current_session, codex_mesh.WORKER_SANDBOX, "Next task"), "turn")
-                self.assertEqual(request.call_args.args[2]["cwd"], str(new))
+                self.assertNotIn("cwd", cast(dict[str, object], request.call_args.args[2]))
                 self.assertEqual(request.call_args.args[2]["threadId"], worker.current_session)
 
 
@@ -14017,6 +14017,30 @@ class WorkerAdoptionTests(MeshCommandFixture):
         self.assertEqual(len(starts), 1)
         self.assertEqual(_as_test_dict(starts[0]["params"]).get("serviceTier"), "fast")
         self.assertEqual(self.methods("turn/start"), [], "allocating an idle worker submitted work")
+
+    def test_new_seat_uses_the_requested_cwd_instead_of_the_staff_folder(self) -> None:
+        from scripts.production import staff
+
+        self.configure_allocation()
+        requested = self.session_dir / "requested"
+        requested.mkdir()
+        parent = staff.by_current_session(os.environ["CODEX_THREAD_ID"])
+        assert parent is not None
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.session_dir.parent),
+                               expected=parent.worktree)
+        _ = (self.session_dir / "director").write_text(parent.current_session)
+        arguments = ["workers.py", "resolve", "--session-dir", str(self.session_dir),
+                     "--role", "impl", "--new-worker", "item20", "--owner-pid", str(os.getpid()),
+                     "--working-dir", str(requested)]
+        with patch.object(sys, "argv", arguments), contextlib.redirect_stdout(io.StringIO()) as output:
+            code = unit_workers.main()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output.getvalue().strip(), "item20")
+        starts = self.methods("thread/start")
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(_as_test_dict(starts[0]["params"])["cwd"], str(requested))
+        self.assertEqual(_as_test_dict(self.adoption_roster(self.session_dir)["item20"])["thread_id"], THREAD_ID)
 
     def test_bulk_stop_waits_for_an_unpublished_creator_before_reaping_its_server(self) -> None:
         self.configure_allocation()

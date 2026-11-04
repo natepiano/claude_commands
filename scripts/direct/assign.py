@@ -673,7 +673,7 @@ def main(exec_review: ReviewExec = os.execvpe) -> int:
     reservation: dict[str, object] = {}
     if not worker:
         command = [PYTHON, str(SCRIPTS / "workers.py"), "resolve", "--session-dir", str(run), "--role", role,
-                   "--owner-pid", str(os.getpid())]
+                   "--owner-pid", str(os.getpid()), "--working-dir", str(cwd)]
         if args.model or args.effort:
             command += ["--model", model, "--effort", effort]
         if args.new_worker:

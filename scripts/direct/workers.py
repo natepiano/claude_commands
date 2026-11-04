@@ -1257,7 +1257,8 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
             if new_name in ledger.workers or new_name in roster:
                 raise WorkerUnavailable(f"{new_name}: worker name already exists")
             name = new_name
-        record = codex_mesh.open_unit_worker(str(run), name, role, model=model, effort=effort)
+        record = codex_mesh.open_unit_worker(str(run), name, role, model=model, effort=effort,
+                                            cwd=str(working_dir) if isinstance(working_dir, Path) else "")
         ledger.workers[name] = _worker_from_record(name, run, record)
         ledger.workers[name].events = [_event("opened", "no idle worker for role", run)]
         _reserve(run, name, store, owner_pid)
@@ -1899,7 +1900,7 @@ def main() -> int:
     command = commands.add_parser("resolve")
     _ = command.add_argument("--session-dir", type=Path, required=True)
     _ = command.add_argument("--role", choices=ROLES, required=True)
-    _ = command.add_argument("--working-dir", default="", help="reviewer naming fallback when progress state has no working_dir")
+    _ = command.add_argument("--working-dir", default="", help="working directory for a new worker")
     _ = command.add_argument("--owner-pid", type=int, default=0)
     _ = command.add_argument("--model", default="")
     _ = command.add_argument("--effort", default="")
