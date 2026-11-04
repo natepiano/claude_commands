@@ -34,7 +34,7 @@ from scripts.lint.build_shape import build_shape
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service
 from scripts.build_queue import admission_code, queue_snapshot, queue_view
 from scripts.build_queue.queue_fixture import write_memory_config
-from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, only_admitted
+from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, caller_admission, only_admitted
 
 
 class CiSliceAdmissionTests(unittest.TestCase):
@@ -116,6 +116,25 @@ class CiSliceAdmissionTests(unittest.TestCase):
 
 
 class ServiceTests(unittest.TestCase):
+    def test_caller_admission_sets_the_child_zone(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        environment = {"BUILDLOG_DIR": str(root / "log"), "USER_ZONE": "Pacific/Pago_Pago"}
+        _ = caller_admission(self, root, environment)
+        self.assertEqual(environment["USER_ZONE"], "UTC")
+        self.assertEqual(environment["USER_ZONE"], os.environ["USER_ZONE"])
+
+    def test_fixture_uses_utc_and_restores_the_callers_zone(self) -> None:
+        for zone in ("Pacific/Pago_Pago", ""):
+            with self.subTest(zone=zone), mock.patch.dict(os.environ):
+                if zone:
+                    os.environ["USER_ZONE"] = zone
+                else:
+                    _ = os.environ.pop("USER_ZONE", None)
+                with AdmissionFixture():
+                    self.assertEqual(os.environ["USER_ZONE"], "UTC")
+                self.assertEqual(os.environ.get("USER_ZONE", ""), zone)
+                self.assertEqual("USER_ZONE" in os.environ, bool(zone))
+
     def test_each_pass_publishes_captured_readings_and_remaining_waiters(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)

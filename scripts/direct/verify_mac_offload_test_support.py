@@ -775,8 +775,6 @@ class VerifyMacOffloadFixture(unittest.TestCase):
                 }
             ],
         }
-        assertion_guard = self.root / "assertion-guard.py"
-        self.write_executable(assertion_guard, "raise SystemExit(0)\n")
         self.environment = {
             **config_environment(self.root),
             **{
@@ -813,7 +811,6 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "XDG_STATE_HOME": str(self.root / "state"),
             "XDG_CACHE_HOME": str(self.root / "cache"),
             "VERIFY_STEPS_DIR": str(self.root / "verify-steps"),
-            "VERIFY_ASSERTION_GUARD_SCRIPT": str(assertion_guard),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_BUILDS_CGROUP": str(self.root / "cgroup"),
             "BUILDLOG_CI_CGROUP": str(self.root / "cgroup"),
@@ -964,7 +961,8 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         library.unlink()
         library.mkdir()
         self.write_executable(library / "py", ROUTING_CLOCK_SHIM)
-        (library / "build_folders.py").symlink_to(VERIFY.parent.parent / "lib/build_folders.py")
+        for name in ("build_folders.py", "conf.py", "process_group.py", "unit_runs.py"):
+            _ = shutil.copy2(VERIFY.parent.parent / "lib" / name, library / name)
         self.environment["TEST_ROUTING_CLOCK"] = str(clock)
         return clock
 

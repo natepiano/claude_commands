@@ -120,6 +120,8 @@ class BuildFolderSpec:
 def _settings() -> ConfigRead:
     from scripts.lib import conf
 
+    if "CONF_DIR" in os.environ and not conf.path("build_folders").exists():
+        return conf.read(Path(__file__).resolve().parents[2] / "config" / "build_folders.conf")
     return conf.read("build_folders")
 
 
@@ -255,6 +257,7 @@ def run_build(owner: str, name: str, command: Sequence[str]) -> int:
     import json
     import signal
     import subprocess
+    from scripts.lib.process_group import send_process_group
 
     if not command:
         raise ValueError("run needs a command after --")
@@ -306,7 +309,7 @@ def run_build(owner: str, name: str, command: Sequence[str]) -> int:
                 for number in watched:
                     _ = signal.signal(number, signal.SIG_IGN)
                 try:
-                    os.killpg(child.pid, signal.SIGKILL)
+                    send_process_group(child.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
                 _ = child.wait()

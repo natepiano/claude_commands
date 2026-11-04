@@ -153,14 +153,14 @@ class AuditUnitPortsTests(StaffTestCase):
               patch.object(unit_config, "read_parked", wraps=unit_config.read_parked) as parked_reads):
             results = self.results()
         self.assertEqual(results[web.id].config_port, unit_config.AppPort(8211))
-        self.assertEqual(results[retired.id].config_port, unit_config.AppPort(8212))
+        self.assertNotIn(retired.id, results)
         self.assertGreater(active_reads.call_count, 0)
-        self.assertGreater(parked_reads.call_count, 0)
+        parked_reads.assert_not_called()
         for call in (*active_reads.call_args_list, *parked_reads.call_args_list):
             self.assertIs(call.kwargs.get("cleanup"), False)
         self.assertEqual(self.versions(), before)
 
-    def test_retired_unit_uses_the_parked_file_instead_of_a_stray_worktree_file(self) -> None:
+    def test_retired_unit_is_skipped_despite_a_stray_worktree_file(self) -> None:
         retired = self.write_configuration("retired", unit_config.AppPort(8212))
         folder = self.source_root / "worktrees" / "retired"
         facts = unit_config.RetiredSession("2026-10-31", "retired-session",
@@ -172,10 +172,35 @@ class AuditUnitPortsTests(StaffTestCase):
         retired = self.unit("retired", removed=True)
         self.document_port("retired", "`8212`")
         before = self.versions()
-        result = self.results()[retired.id]
-        self.assertEqual(result.config_port, unit_config.AppPort(8212))
-        self.assertEqual(result.config_source, production_units.DocumentSource("natedev", unit_config.parked_path(retired.id)))
-        self.assertEqual(result.gap, "")
+        self.assertNotIn(retired.id, self.results())
+        self.assertEqual(self.versions(), before)
+
+    def test_retired_unit_with_missing_configuration_prints_no_gap(self) -> None:
+        for name in ("web", "tools"):
+            _ = self.unit(name, removed=True)
+        retired = self.unit("retired", removed=True)
+        before = self.versions()
+        code, output, errors = self.cli_output()
+        self.assertEqual((code, output, errors), (0, "", ""))
+        self.assertNotIn(retired.id, self.results())
+        code, output, errors = self.cli_output("--json")
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(json.loads(output), [])
+        self.assertEqual(self.versions(), before)
+
+    def test_live_unit_gap_names_its_parent_production(self) -> None:
+        for name in ("tools", "retired"):
+            _ = self.unit(name, removed=True)
+        _ = self.other_document("cargo-liner", ("web", 8211))
+        parent = staff.local_snapshot().by_path("cargo-liner")
+        assert parent is not None
+        web = self.write_configuration("web", unit_config.NoAppPort())
+        _ = staff.move(web.id, parent.id)
+        before = self.versions()
+        code, output, errors = self.cli_output()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertIn("gap for cargo-liner:", output)
+        self.assertNotIn("gap for sdlc:", output)
         self.assertEqual(self.versions(), before)
 
     def test_document_evidence_comes_only_from_the_bound_parent_document(self) -> None:
@@ -508,7 +533,7 @@ class AuditUnitPortsTests(StaffTestCase):
         self.assertEqual(self.results()[web.id].gap, "")
         self.assertEqual(self.cli_output(), first)
         self.assertEqual(self.versions(), before)
-    def test_remote_active_and_parked_files_use_the_recorded_machine_and_keep_source_evidence(self) -> None:
+    def test_remote_active_file_keeps_source_evidence_and_skips_the_removed_unit(self) -> None:
         web = self.unit("web", machine="mac")
         retired = self.unit("retired", removed=True, machine="mac")
         active = self.source_root / "worktrees/web/.unit.toml"
@@ -526,12 +551,11 @@ class AuditUnitPortsTests(StaffTestCase):
         with self.remote_files() as calls:
             results = self.results()
         self.assertEqual(results[web.id].config_source, production_units.DocumentSource("mac", active))
-        self.assertEqual(results[retired.id].config_source, production_units.DocumentSource("mac", parked))
+        self.assertNotIn(retired.id, results)
         self.assertEqual(results[web.id].config_port, unit_config.AppPort(8211))
-        self.assertEqual(results[retired.id].config_port, unit_config.AppPort(8212))
         self.assertEqual(results[web.id].document_source, production_units.DocumentSource("mac", document))
-        self.assertEqual(results[retired.id].document_cell, "`8212`")
-        self.assertEqual((results[web.id].gap, results[retired.id].gap), ("", ""))
+        self.assertEqual(results[web.id].gap, "")
+        self.assertFalse(any("parked_path" in call[4] for call in calls))
         document_reads = [call for call in calls if shlex.split(call[4])[-1] == str(document)]
         self.assertEqual(len(document_reads), 1)
         self.assertTrue(all(call[3] == "mac" for call in calls))
