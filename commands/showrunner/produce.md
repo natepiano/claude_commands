@@ -24,11 +24,12 @@ When `PRODUCTION_DOC` carries `**Kind:** style`, read
 
 State:
 
-- `PRODUCTION_DOC`, `MERGE_BRANCH`, `LOG`, `UNITS` — from the production doc.
+- `PRODUCTION_DOC`, `MERGE_BRANCH`, `LOG` — from the production doc.
   After a `/showrunner:rename apply` succeeds, read them again from the
   renamed doc, along with `UPDATES` and `PROMPT_FILE`, which come from its
   slug: apply moves the doc, the update timer and the state directory, and
   switches `CHECKOUT` to the new merge branch.
+- `UNITS` — the production's staff rows with a present worktree. A retired row has a `RemovedWorktree`.
 - `ZONE` — the user's zone setting, which
   `python3 ~/.claude/scripts/lib/user_zone.py` prints. It is one setting for
   every production; a doc's own **User zone** line is not read.
@@ -129,7 +130,7 @@ State:
   - packaging;
   - cargo-berth overlap answers, incursion resolves, orphan retirement and
     releases (<Dependencies/> rule 3);
-  - whether a unit edits files outside its `.unit.toml` duties, another unit's crate
+  - whether a unit edits files outside its `.unit.toml` responsibilities, another unit's crate
     included: settle it by who holds the files on the berth board and when
     each holder merges, as <Dependencies/> rule 3 settles a file wait. No
     rule needs the user's OK for this (user, 2026-10-04).
