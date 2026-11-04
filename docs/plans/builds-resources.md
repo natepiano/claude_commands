@@ -1412,33 +1412,22 @@ Tests: `scripts/lint/test_memory_admit.py`: a large dev build with 1 to 9 earlie
 ### Phase 55 — The merge gate of phases 41-54 is green: build kills, example metadata reads and the ssh stop event  · status: done
 **Depends on:** Phase 54
 
-**Approved:** builds showrunner ask 2026-11-03 ~20:00 EST: fix the reds that are ours on this branch, with parallel repair workers by file, and send one new hash.
+#### As-built
 
-#### Work Order
-
-**Goal:** Every test module that is red only on this branch (merge gate of 4138a1f77; tip 9ab69f6d8; merged tree b35db6d96) passes, and no accepted behavior of phases 49-54 is lost.
-
-**Cause (measured by the director, 2026-11-03):**
-1. Phase 51 made `EarlyoomKill.is_build` and `outside_build_gate` (`scripts/buildlog/memory.py`, `build_output_program`) match a program only under Cargo output roots read from the step index and `cargo metadata`. Fixtures in `scripts/buildlog/test_memory_window.py` (:197, :221) and `scripts/buildlog/test_moments.py` (:578, :632) name `.../target/...` programs under no known root, so build kills read as other kills. The function also runs a sqlite read and one `cargo metadata` per checkout for each kill, with no cache.
-2. Phase 53 made `scripts/direct/tree_watch.py` call `read_cargo_output_roots` (:231), one more `cargo metadata` per verify run. `metadata_count()` in `scripts/direct/verify_examples_test_support.py` counts every call, so `test_verify_example_cache.py` (:26), `test_verify_example_acceptance.py` (:19) and `test_verify_untested_examples.py` (:32) read one more call than they pin.
-3. `scripts/direct/test_verify_ssh_targets.py` `test_sigterm_runner_output_preserves_the_sender_interruption_result` (:755) finds no ssh event. Suspect: Phase 49's `step_stopped_by_hold` line `(( status > 128 )) || return 1` in `scripts/direct/verify.sh`. Find the cause before the edit.
-4. The gate's rerun was refused: `memory admission check failed (invalid snapshot variant)` (`parse_snapshot_value`, `scripts/lint/memory_admit.py`). Phases 41-42 changed the waiter shapes in the admission snapshot (`QueuedWaiter | TokenWaitingWaiter`, `PriorityUnit | NormalOrder`). Suspect: the branch's reader rejects a snapshot that the installed service (`~/.claude` main) writes. Prove it before the edit.
-
-**Spec:**
-1. A program under a Cargo output root is a build kill. The roots are read once for each process (or each report), not once for each kill. The test fixtures give their programs real roots (an index step row or a checkout the fixture makes); do not weaken an assertion.
-2. Each verify run reads `cargo metadata` once where one read can serve the example scan and the tree key; otherwise the example tests count only the example scan's reads, with a comment that names the tree-key read. Keep each test's intent: a cached pass does not hide a new example test.
-3. A SIGTERM from the ssh runner still writes one `InterruptedTargetRun` event with its generation and remote output. A step that a hold stopped still goes the hold path.
-4. While the installed service and a newer reader run side by side, admission works: the reader accepts the snapshot the installed service writes, or the deploy path restarts the service before a new reader runs. A test writes the installed shape and reads it with the new reader.
-
-**Acceptance:** each listed module passes alone on the branch tip; `scripts/lint/test_sweep.py`, `scripts/buildlog/test_memory_records.py`, `scripts/buildlog/test_report.py`, `scripts/direct/test_tree_watch.py`, `scripts/direct/test_verify_hold_wait.py` stay green; basedpyright 0/0/0 on each changed Python file.
+- A program under a Cargo output root is a build kill (`EarlyoomKill.is_build`, `outside_build_gate`, `scripts/buildlog/memory.py`). The roots are read once for each process (`build_output_roots`, cached), not once for each kill.
+- Each verify run's example tests count only the example scan's `cargo metadata` reads; `tree_watch`'s tree-key read is named apart.
+- A SIGTERM from the ssh runner writes one `InterruptedTargetRun` event with its generation and remote output; a step that a hold stopped still goes the hold path (`scripts/direct/verify.sh`).
+- The branch's admission reader accepts the snapshot shapes that the installed service writes (`installed_snapshot_record`, `scripts/lint/memory_admit.py`). It refuses a `BehindHead` record that carries both `head_since` and `joined_at` (ValueError).
+- Test Hana clones come from `copies.py clone <source> --task gate:<id>` (`scripts/copies/copies.py`). The task folder is claimed first, the checkout is built with `initialize_git`, a failed clone leaves the partial folder owned, and the checkout keeps no `BUSY` mark. `scratch.clone` and `scratch.py clone` are gone; `scripts/production/mac_run.sh` calls `copies.py clone`.
+- `scratch.py` does not import `copies.py` (copies imports scratch; basedpyright `reportImportCycles`). A raw `git clone` in a script fails `scripts/copies/test_copy_guard.py`.
+- Tests that read Cargo output roots use one helper: `fake_cargo_output_roots` (`scripts/lib/cargo_output_test_support.py`); `children=True` puts the same mapping into Python child processes.
+- The buildlog index (schema 30) keeps `target_directory` and `build_directory` (resolved Cargo roots) beside `build_history_group` and the step-context target folder.
+- Ruled out: adding `scratch.py` to the copy-guard allow-list; a function-local import of `copies` in `scratch.py`.
 
 **Files:**
-- `scripts/buildlog/memory.py`, `scripts/buildlog/test_memory_window.py`, `scripts/buildlog/test_moments.py` — item 1.
-- `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/test_admission_service.py` — item 4.
-- `scripts/mac_test/test_offload.py` — Phase 50 added `/.mac-test-mirror` to the offload exclude; `test_probe_copy_and_run_arguments_preserve_nextest_words` (:751) now expects it (builds' correction 2026-11-03; director's one-line edit, 47 OK).
-- `scripts/direct/tree_watch.py`, `scripts/direct/verify_examples_test_support.py`, `scripts/direct/test_verify_example_cache.py`, `scripts/direct/test_verify_example_acceptance.py`, `scripts/direct/test_verify_untested_examples.py`, `scripts/direct/verify.sh`, `scripts/direct/test_verify_ssh_targets.py` — items 2-3.
-
-**Workers:** `3 fix workers by file`
-- `impl` — item 1 files.
-- `test` — items 2-3 files.
-- `fix2` — item 4 files.
+- `scripts/buildlog/memory.py`, `scripts/buildlog/test_memory_window.py`, `scripts/buildlog/test_moments.py` — build-kill roots
+- `scripts/direct/tree_watch.py`, `scripts/direct/verify_examples_test_support.py`, `scripts/direct/verify.sh`, `scripts/direct/test_verify_ssh_targets.py` — metadata reads, ssh stop event
+- `scripts/lint/memory_admit.py`, `scripts/build_queue/test_admission_service.py` — installed snapshot reader
+- `scripts/copies/copies.py`, `scripts/copies/test_copies.py`, `scripts/lib/scratch.py`, `scripts/production/mac_run.sh` — test clone owner
+- `scripts/lib/cargo_output_test_support.py` — shared Cargo output fixture
+- `scripts/buildlog/index.py`, `scripts/buildlog/record.py` — index schema 30
