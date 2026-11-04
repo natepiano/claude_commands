@@ -1,6 +1,7 @@
 """Check launch refusal before backend access and verify the actual parent route."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 import json
 import os
@@ -13,7 +14,9 @@ from scripts.astra import design_roles
 from scripts.direct import assign, assign_gate
 from scripts.direct.assign_launcher_test_support import ASSIGN, AssignLauncherFixture, read_object
 from scripts.lib.test_models_registry import write_registry
-from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.usage import agents_log
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_runtime_id, fixture_worker
 
 ROOT = Path(__file__).resolve().parents[2]
 PYTHON = ROOT / 'scripts/lib/py'
@@ -45,6 +48,15 @@ class AssignGateTests(unittest.TestCase):
         with patch.object(subprocess, 'run', return_value=result):
             self.assertTrue(assign_gate.called_by_assign())
 
+    def test_worker_fill_and_exec_hops_reach_the_assign_parent(self) -> None:
+        for launcher, interpreter in ((ROOT / 'scripts/agents/agent_exec.sh', 'bash'),
+                                      (ROOT / 'scripts/production/worker_fill.py', 'python3')):
+            with self.subTest(launcher=launcher):
+                replies = [subprocess.CompletedProcess([], 0, f'2 {interpreter} {launcher}\n', ''),
+                           subprocess.CompletedProcess([], 0, f'1 python3 {assign_gate.ASSIGN}\n', '')]
+                with patch.object(subprocess, 'run', side_effect=replies):
+                    self.assertTrue(assign_gate.called_by_assign())
+
     def test_worker_between_assign_and_caller_refuses(self) -> None:
         result = subprocess.CompletedProcess([], 0, '1 codex exec worker\n', '')
         with patch.object(subprocess, 'run', return_value=result):
@@ -61,7 +73,6 @@ class AssignmentFormsTests(AssignLauncherFixture):
             'from scripts.direct import assign',
             'from scripts.astra import design_roles',
             'from scripts.production import staff',
-            'design_roles.resolve_holder = lambda holder: design_roles.HolderReach(staff.runtime_id())',
             'original_call = assign.call',
             'def call(command, env, **options):',
             '    result = original_call(command, env, **options)',
@@ -98,15 +109,17 @@ class AssignmentFormsTests(AssignLauncherFixture):
     def held_form(self, operation: str, held_role: str = 'designer', *, claim: str = 'creation-token') -> list[str]:
         design_id = fixture_runtime_id('assign-held-design')
         name = 'held-designer' if held_role == 'designer' else 'held-reviewer'
-        lifecycle = ({'kind': 'RoleNotOpened', 'claim': claim} if operation == 'prime'
-                     else {'kind': 'RoleOpen', 'thread_id': mesh_fixture.THREAD_ID})
+        owner = staff.by_current_session(os.environ['CODEX_THREAD_ID'])
+        assert owner is not None
+        worker = fixture_worker(name, owner.id, runtime_id=mesh_fixture.THREAD_ID) if operation == 'follow' else None
+        lifecycle = ({'kind': 'RoleNotOpened', 'claim': claim} if worker is None
+                     else {'kind': 'RoleOpen', 'staff_id': worker.id})
         directory = design_roles.design_directory(design_id)
         directory.mkdir(parents=True)
         fields = {
             'schema': 1, 'placement': {'design_id': design_id, 'host': design_roles.local_host(), 'generation': 1},
             'repository_id': 'fixture-repository', 'repository': str(self.project),
             'document': str(self.project / 'design.md'), 'area': 'assignment', 'created_at_utc': '2026-11-04T00:00:00Z',
-            'holder': {'kind': 'UnitHolder', 'production_slug': 'fixture-production', 'unit_name': 'fixture-unit'},
             'binding': {'kind': 'DesignBoundToPhase', 'run_directory': str(self.session_dir), 'phase': '7',
                         'repository': str(self.project), 'output_paths': ['src/worker.py']},
             'roles': [{'role': role, 'name': 'held-' + role,
@@ -118,7 +131,8 @@ class AssignmentFormsTests(AssignLauncherFixture):
         mesh.mkdir()
         _ = (mesh / 'progress_history_state.json').write_text((self.session_dir / 'progress_history_state.json').read_text())
         if operation == 'follow':
-            _ = (mesh / 'mesh_roster.json').write_text(json.dumps({name: {'thread_id': mesh_fixture.THREAD_ID}}))
+            assert worker is not None
+            _ = (mesh / 'mesh_roster.json').write_text(json.dumps({name: {'staff_id': worker.id}}))
         return ['--role', 'implement' if held_role == 'designer' else 'review', '--operation', operation,
                 '--session-dir', str(mesh), '--phase', '7', '--cwd', str(self.project), '--prompt', str(self.prompt),
                 '--new-worker' if operation == 'prime' else '--to', name,
@@ -138,8 +152,7 @@ class AssignmentFormsTests(AssignLauncherFixture):
         args.role, args.operation = 'implement', assign.AssignmentOperation.PRIME
         args.held_design, args.held_role = design.placement.design_id, 'designer'
         args.new_worker, args.cwd, args.session_dir = 'held-designer', str(self.project), str(operation['session_dir'])
-        with patch.object(design_roles, 'resolve_holder', return_value=design_roles.HolderReach(os.environ['CODEX_THREAD_ID'])):
-            held = assign.held_assignment(args)
+        held = assign.held_assignment(args)
         self.assertIsInstance(held, assign.HeldAssignment)
         assert isinstance(held, assign.HeldAssignment)
         self.assertEqual(held.claim, assign.ReservedHeldCreation('creation-token'))
@@ -170,13 +183,21 @@ class AssignmentFormsTests(AssignLauncherFixture):
         self.assertEqual(operation['resident'], 'True')
         self.assertEqual(operation['task'], 'ask_a_friend.consultation')
 
+    def recovery_record(self) -> dict[str, object]:
+        owner = staff.by_current_session(os.environ['CODEX_THREAD_ID'])
+        assert owner is not None
+        worker = fixture_worker('existing', owner.id, runtime_id=mesh_fixture.THREAD_ID,
+                                backend=staff.CodexBackend(Path(os.environ['CODEX_HOME'])))
+        agents_log.append(worker.current_session, 'review', None, datetime.now(timezone.utc))
+        return {'staff_id': worker.id, 'instructions_file': str(self.prompt), 'cwd': str(self.project)}
+
     def test_recovery_operations_reach_the_door_with_the_existing_identity(self) -> None:
         for operation, handler in (('adopt', 'command_adopt'), ('resume-account-move', 'command_resume_account_move')):
             with self.subTest(operation=operation):
                 trace = self.capture_operation(handler)
                 source = self.session_dir.parent / (operation + '-source')
                 source.mkdir()
-                record = {'thread_id': mesh_fixture.THREAD_ID, 'role': 'review', 'instructions_file': str(self.prompt)}
+                record = self.recovery_record()
                 _ = (source / 'mesh_roster.json').write_text(json.dumps({'existing': record}))
                 options = ['--from-session-dir', str(source)] if operation == 'adopt' else []
                 if operation != 'adopt':
@@ -190,8 +211,7 @@ class AssignmentFormsTests(AssignLauncherFixture):
 
     def test_recovery_uses_the_recorded_context_without_extra_launch_arguments(self) -> None:
         trace = self.capture_operation('command_resume_account_move')
-        record = {'thread_id': mesh_fixture.THREAD_ID, 'role': 'review', 'instructions_file': str(self.prompt),
-                  'cwd': str(self.project)}
+        record = self.recovery_record()
         _ = (self.session_dir / 'mesh_roster.json').write_text(json.dumps({'existing': record}))
         result = self.run_launcher(['bash', str(ASSIGN), '--role', 'review', '--operation', 'resume-account-move',
                                     '--session-dir', str(self.session_dir), '--to', 'existing'])

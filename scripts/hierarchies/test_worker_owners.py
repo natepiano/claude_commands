@@ -1,9 +1,10 @@
 """Worker ownership checks using temporary rosters and history records."""
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, redirect_stdout
+from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import datetime, timezone
+import argparse
 import io
 import json
 import os
@@ -15,6 +16,7 @@ import unittest
 from unittest.mock import patch
 from typing import Literal, cast, override
 
+from scripts.agents import codex_mesh
 from scripts.hierarchies import worker_owners as owners
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message import roster
@@ -150,7 +152,11 @@ class WorkerOwnersTest(StaffTestCase):
 
     def mesh_command(self, worker: owners.Worker, action: Literal["reopen", "end"],
                      *options: str) -> subprocess.CompletedProcess[str]:
-        """Run reopen or the explicit parser argv supplied by a test."""
+        """Call recovery directly and keep parser checks in a child process."""
+        if action == "reopen":
+            with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error:
+                code = codex_mesh.command_reopen(argparse.Namespace(session_dir=worker.run, to=worker.name, quiet=False))
+            return subprocess.CompletedProcess([action, worker.name], code, output.getvalue(), error.getvalue())
         return subprocess.run([sys.executable, str(owners.SCRIPTS / "agents/codex_mesh.py"), action,
                                "--session-dir", worker.run, "--to", worker.name, *options],
                               check=False, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)

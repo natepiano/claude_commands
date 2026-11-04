@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import override
 from zoneinfo import ZoneInfo
 
-import log_backup
+from scripts.production import log_backup, staff
+from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -30,6 +31,7 @@ class LogBackupTests(unittest.TestCase):
         self.doc: Path = Path()
         self.state: Path = Path()
         self.backups: Path = Path()
+        self.owner_id: staff.StaffId = staff.StaffId("")
 
     @override
     def setUp(self) -> None:
@@ -41,6 +43,8 @@ class LogBackupTests(unittest.TestCase):
         self.backups = self.state / "demo" / "log-backups"
         self.doc = self.root / "demo-production.md"
         self.write_doc("running")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        self.owner_id = recorded_showrunner("demo", self.doc).id
 
     def write_doc(self, status: str, *, log_field: bool = True) -> None:
         fields = [
@@ -119,14 +123,14 @@ class LogBackupTests(unittest.TestCase):
         for status, code, copied in (("wrapped", 2, 0), ("paused", 1, 0), ("running", 0, 1)):
             with self.subTest(status=status):
                 self.write_doc(status)
-                result = self.run_script(["zsh", str(CHECK), str(self.doc)])
+                result = self.run_script(["zsh", str(CHECK), str(self.owner_id)])
                 self.assertEqual(result.returncode, code, result.stderr)
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(len(self.names()), copied)
 
     def test_a_failed_copy_never_changes_the_check_s_answer(self) -> None:
         self.write_doc("running", log_field=False)
-        result = self.run_script(["zsh", str(CHECK), str(self.doc)])
+        result = self.run_script(["zsh", str(CHECK), str(self.owner_id)])
         self.assertEqual(result.returncode, 0)
         self.assertIn("log_backup: production doc lacks Log", result.stderr)
         self.assertEqual(self.names(), [])

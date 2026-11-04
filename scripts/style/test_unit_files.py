@@ -165,7 +165,7 @@ class UnitWorktreeAvailabilityTests(StaffTestCase):
         doc = self.source_root / 'style-production.md'
         _ = doc.write_text('# Style\n')
         owner = recorded_showrunner('style', doc)
-        owner = staff.move(owner.id, parent.id)
+        owner = staff.move(owner.id, staff.ReportsTo(parent.id))
         with mock.patch.object(unit_files, '_unit_file_sources', return_value=()) as sources:
             ledger = cast(style_ledger.Ledger, mock.create_autospec(style_ledger.Ledger, instance=True))
             self.assertEqual(unit_files.unit_file_holders(self.source_root, doc, ledger), {})

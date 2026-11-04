@@ -8,9 +8,11 @@ import os
 import subprocess
 import sys
 import tempfile
-from scripts.production import showrunners
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production import showrunners
 
 if TYPE_CHECKING:
     from ..hooks import showrunner_footer as showrunner_footer

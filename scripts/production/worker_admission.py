@@ -98,16 +98,14 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
     if row is not None and row.kind in ("unit", "showrunner"):
         return row
     if run is not None:
-        director = unit_runs.director(run)
-        row = record.by_member_reference(director) if director else None
-        if row is not None and row.kind in ("unit", "showrunner"):
-            return row
-    if run is not None:
         try:
             state = worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE)
         except (OSError, ValueError) as error:
             print(f"anomaly: {error}".replace("\n", " "), file=sys.stderr)
             state = {}
+        owner = unit_runs.run_owner(state, record)
+        if isinstance(owner, staff.StaffRow) and owner.kind in ("unit", "showrunner"):
+            return owner
         production = value if isinstance(value := state.get("production"), str) else ""
         unit = value if isinstance(value := state.get("unit"), str) else ""
     if unit:

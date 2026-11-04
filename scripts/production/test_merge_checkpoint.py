@@ -101,7 +101,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
             parent = recorded_showrunner("receiving", self.root / "receiving-production.md")
             unit = unit_membership("example", "alpha-unit")
-            _ = staff.move(unit.id, parent.id)
+            _ = staff.move(unit.id, staff.ReportsTo(parent.id))
         before = self.git("show-ref"), self.git("status", "--porcelain")
         origin = self.git("show-ref", cwd=self.origin)
         document = self.doc.read_bytes()

@@ -331,7 +331,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             before = (stall_watch.stretch_path("showrunner", "unit-one"),
                       stall_watch.prompt_path("showrunner", "unit-one"), PROMPT_KEY)
             _ = staff.rename(row.id, "renamed")
-            _ = staff.move(row.id, parent.id)
+            _ = staff.move(row.id, staff.ReportsTo(parent.id))
             self.assertEqual((stall_watch.stretch_path("receiver", "renamed-unit"),
                               stall_watch.prompt_path("receiver", "renamed-unit"),
                               stall_watch.prompt_key("receiver", "renamed-unit")), before)

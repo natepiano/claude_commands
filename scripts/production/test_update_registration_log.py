@@ -66,10 +66,12 @@ class RegistrationTests(RegistrationFixture):
 
     def test_the_first_call_moves_the_scratchpad_state_and_rewrites_the_tick_prompt(self) -> None:
         slug = self.doc.name.removesuffix("-production.md")
-        timer = self.state / "notifier" / f"showrunner-{slug}"
+        owner = staff.by_id(self.fixture_staff_id())
+        assert owner is not None
+        timer = self.state / "notifier" / f"showrunner-{owner.id}"
         timer.mkdir(parents=True)
-        _ = (timer / "conf").write_text("TARGET=session:old-showrunner\n", encoding="utf-8")
-        scratch = self.root / "tmp" / "claude-1000" / "-project" / "old-showrunner" / "scratchpad"
+        _ = (timer / "conf").write_text(f"TARGET=session:{owner.id}\n", encoding="utf-8")
+        scratch = self.root / "tmp" / "claude-1000" / "-project" / owner.current_session / "scratchpad"
         (scratch / "unit_status").mkdir(parents=True)
         _ = (scratch / "unit_status" / "blocks_open").write_text("alpha-unit\n", encoding="utf-8")
         _ = (scratch / "showrunner_state.json").write_text('{"merges_held": ["from scratch"]}\n', encoding="utf-8")

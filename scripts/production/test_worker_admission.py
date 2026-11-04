@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Literal
 from unittest import mock
 
+from scripts.lib import unit_runs
 from scripts.production import session_staff, staff, worker_admission, showrunners
 from scripts.production.staff_test_support import (
     CHECKOUT, StaffTestCase, fixture_runtime_id, fixture_session, fixture_worker, transcript_fixture,
@@ -22,6 +23,15 @@ from scripts.shutdown import stop_resume
 
 
 class RecordedDirectorAdmissionTests(StaffTestCase):
+    def test_run_without_owner_staff_id_resolves_its_known_unit(self) -> None:
+        production, unit, _ = self.tree()
+        run = self.root / "run-without-owner"
+        run.mkdir()
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({
+            "production": production.name, "unit": unit.name,
+        }))
+        self.assertEqual(worker_admission.parent(staff.snapshot(), run=run), unit)
+
     def test_worker_caller_resolves_its_fixed_parent_after_session_replacement(self) -> None:
         _, unit, worker = self.tree()
         current = staff.native_id(fixture_runtime_id("dispatching-worker-current-session"))

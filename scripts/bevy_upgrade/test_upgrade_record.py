@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import pins
 import upgrade_record
 from scripts.production.production_doc import Production, read_production

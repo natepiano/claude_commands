@@ -27,8 +27,8 @@ from importlib import import_module
 from typing import TYPE_CHECKING, NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.production import staff  # noqa: E402
-from scripts.lib import atomic_file  # noqa: E402
+if TYPE_CHECKING:
+    from scripts.production import staff
 
 RUN_TEMP_NAME = "tmp"
 # SCRATCH_ROOT also selects the parent folder for temporary unit runs.
@@ -68,6 +68,8 @@ class RunOwnerUnrecorded:
 
 def run_owner(fields: Mapping[str, object], record: staff.StaffSnapshot) -> staff.StaffRow | RunOwnerUnrecorded:
     """Resolve a fixed owner first; older runs can still name their director."""
+    from scripts.production import staff
+
     reference = fields.get(OWNER_FIELD)
     if isinstance(reference, str) and reference:
         row = record.by_id(staff.StaffId(reference))
@@ -161,6 +163,8 @@ def marker_must_stay(path: Path) -> bool:
 
 def director(run: Path, *, dependencies: Callable[[Path], None] | None = None) -> str:
     """Read the run owner's current session from staff."""
+    from scripts.production import staff
+
     if dependencies is not None:
         dependencies(staff.record_path())
         dependencies(run / STATE_FILE)
@@ -236,6 +240,9 @@ def _json_object(text: str) -> dict[str, object]:
 
 def migrate_owners(root: Path, *, dry_run: bool = False) -> int:
     """Replace active run names with proved staff ids; keep history files unchanged."""
+    from scripts.lib import atomic_file
+    from scripts.production import staff
+
     unavailable = False
     for path in sorted(root.glob(f"*/{STATE_FILE}")):
         try:

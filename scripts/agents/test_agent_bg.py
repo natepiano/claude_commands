@@ -12,6 +12,7 @@ import sys
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.direct.assign_launcher_test_support import backend_fixture_command
 from scripts.message import sessions
 from scripts.production import staff
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_runtime_id, fixture_worker, transcript_fixture, stopped_worker_module
@@ -114,9 +115,12 @@ class NativeClaudeWorkerTests(StaffTestCase):
 
     def launch(self, **environment: str) -> subprocess.CompletedProcess[str]:
         self.fixture.sent.unlink(missing_ok=True)
-        return subprocess.run(["bash", str(CHECKOUT / "scripts/agents/agent_bg.sh"), "--run", str(self.fixture.run_dir), "fresh-impl", str(self.fixture.work),
-                               str(self.fixture.prompt), str(self.root / "summary"), str(self.root / "log")],
-                              cwd=self.fixture.work, env={**self.fixture.environment, **environment}, capture_output=True, text=True,
+        command, launch_environment = backend_fixture_command(
+            self.root / "assign-parent",
+            ["bash", str(CHECKOUT / "scripts/agents/agent_bg.sh"), "--run", str(self.fixture.run_dir),
+             "fresh-impl", str(self.fixture.work), str(self.fixture.prompt), str(self.root / "summary"), str(self.root / "log")],
+            {**self.fixture.environment, **environment})
+        return subprocess.run(command, cwd=self.fixture.work, env=launch_environment, capture_output=True, text=True,
                               check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def backend_calls(self) -> list[dict[str, object]]:

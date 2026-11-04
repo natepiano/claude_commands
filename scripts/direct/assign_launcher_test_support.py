@@ -24,6 +24,28 @@ ROOT = Path(__file__).resolve().parents[2]
 ASSIGN = ROOT / "scripts/direct/assign.sh"
 
 
+
+def backend_fixture_command(directory: Path, command: list[str],
+                            environment: dict[str, str]) -> tuple[list[str], dict[str, str]]:
+    """Test a backend beneath the actual assign process."""
+    directory.mkdir(parents=True, exist_ok=True)
+    startup = directory / "sitecustomize.py"
+    _ = startup.write_text("\n".join((
+        "import os, subprocess, sys",
+        "def enter(frame, event, argument):",
+        f"    if event == 'call' and frame.f_code.co_filename == {str(ASSIGN.with_suffix('.py'))!r} and frame.f_code.co_name == 'main':",
+        "        sys.setprofile(None)",
+        "        environment = dict(os.environ)",
+        "        environment['PYTHONPATH'] = environment.pop('FIXTURE_ASSIGN_PYTHONPATH')",
+        f"        raise SystemExit(subprocess.call({command!r}, env=environment))",
+        f"if sys.argv[0] == {str(ASSIGN.with_suffix('.py'))!r}: sys.setprofile(enter)",
+    )) + "\n")
+    child_environment = dict(environment)
+    child_environment["FIXTURE_ASSIGN_PYTHONPATH"] = environment.get("PYTHONPATH", str(ROOT))
+    child_environment["PYTHONPATH"] = os.pathsep.join((str(directory), str(ROOT)))
+    return ["bash", str(ASSIGN)], child_environment
+
+
 def read_object(path: Path) -> dict[str, object]:
     with path.open() as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_SH)

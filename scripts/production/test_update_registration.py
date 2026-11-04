@@ -36,9 +36,9 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertIn("register: ok", first.stdout)
         initial_calls = self.notifier_calls()
-        self.assertEqual(len([call for call in initial_calls if call[:2] == ["new", "showrunner-example"]]), 1)
-        updates = next(call for call in initial_calls if call[:2] == ["new", "showrunner-example"])
-        self.assertEqual(updates[updates.index("--to") + 1], "session:current-session-id")
+        self.assertEqual(len([call for call in initial_calls if call[:2] == ["new", f"showrunner-{self.fixture_staff_id()}"]]), 1)
+        updates = next(call for call in initial_calls if call[:2] == ["new", f"showrunner-{self.fixture_staff_id()}"])
+        self.assertEqual(updates[updates.index("--to") + 1], f"session:{self.fixture_staff_id()}")
         self.assertIn("next_due", first.stdout)
         for instance in ("stall-watch",):
             self.assertEqual(len([call for call in initial_calls if call[:2] == ["new", instance]]), 1)
@@ -53,10 +53,10 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(self.doc.read_bytes(), doc_bytes)
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
         calls = self.notifier_calls()
-        self.assertEqual(len([call for call in calls if call[:2] == ["new", "showrunner-example"]]), 3)
-        updates = [call for call in calls if call[:2] == ["new", "showrunner-example"]]
+        self.assertEqual(len([call for call in calls if call[:2] == ["new", f"showrunner-{self.fixture_staff_id()}"]]), 3)
+        updates = [call for call in calls if call[:2] == ["new", f"showrunner-{self.fixture_staff_id()}"]]
         self.assertEqual([call[call.index("--to") + 1] for call in updates],
-                         ["session:current-session-id", "session:resume-session-id", "session:resume-session-id"])
+                         [f"session:{self.fixture_staff_id()}"] * 3)
         for instance in ("stall-watch",):
             self.assertEqual(len([call for call in calls if call[:2] == ["new", instance]]), 1)
 
@@ -70,26 +70,26 @@ class RegistrationTests(RegistrationFixture):
         before = len(self.notifier_calls())
         resumed = self.run_command("register")
         self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
-        self.assertIn("register: ok — showrunner-example on demand: no scheduled dailies", resumed.stdout)
+        self.assertIn(f"register: ok — showrunner-{self.fixture_staff_id()} on demand: no scheduled dailies", resumed.stdout)
         calls = self.notifier_calls()[before:]
-        self.assertIn(["new", "showrunner-example"], [call[:2] for call in calls])
-        self.assertIn(["stop", "showrunner-example"], calls)
-        self.assertNotIn(["remove", "showrunner-example"], calls)
-        self.assertEqual((self.state / "instance-showrunner-example").read_text(encoding="utf-8"), "stopped")
+        self.assertIn(["new", f"showrunner-{self.fixture_staff_id()}"], [call[:2] for call in calls])
+        self.assertIn(["stop", f"showrunner-{self.fixture_staff_id()}"], calls)
+        self.assertNotIn(["remove", f"showrunner-{self.fixture_staff_id()}"], calls)
+        self.assertEqual((self.state / f"instance-showrunner-{self.fixture_staff_id()}").read_text(encoding="utf-8"), "stopped")
         again = self.run_command("register")
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         # A re-register retargets the timer and stops it again, so it stays stopped.
         self.assertEqual([call[0] for call in self.notifier_calls()[before + len(calls):]],
                          ["new", "stop", "status"])
-        self.assertEqual((self.state / "instance-showrunner-example").read_text(encoding="utf-8"), "stopped")
+        self.assertEqual((self.state / f"instance-showrunner-{self.fixture_staff_id()}").read_text(encoding="utf-8"), "stopped")
 
     def test_a_new_production_with_no_updates_line_starts_quiet(self) -> None:
         self.without_updates_line()
         first = self.run_command("register")
 
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        self.assertIn("register: ok — showrunner-example on demand: no scheduled dailies", first.stdout)
-        self.assertEqual((self.state / "instance-showrunner-example").read_text(encoding="utf-8"), "stopped")
+        self.assertIn(f"register: ok — showrunner-{self.fixture_staff_id()} on demand: no scheduled dailies", first.stdout)
+        self.assertEqual((self.state / f"instance-showrunner-{self.fixture_staff_id()}").read_text(encoding="utf-8"), "stopped")
         self.assertNotIn("footer", first.stdout)
 
     def test_a_line_asking_for_a_schedule_still_schedules(self) -> None:
@@ -100,9 +100,9 @@ class RegistrationTests(RegistrationFixture):
         result = self.run_command("register")
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        updates = next(call for call in self.notifier_calls() if call[:2] == ["new", "showrunner-example"])
+        updates = next(call for call in self.notifier_calls() if call[:2] == ["new", f"showrunner-{self.fixture_staff_id()}"])
         self.assertEqual(updates[updates.index("--every") + 1], "20")
-        self.assertNotIn(["stop", "showrunner-example"], self.notifier_calls())
+        self.assertNotIn(["stop", f"showrunner-{self.fixture_staff_id()}"], self.notifier_calls())
         self.assertIn("next_due", result.stdout)
 
     def test_register_requires_the_environment_session_id(self) -> None:

@@ -13,7 +13,9 @@ LAUNCHERS = {
     ROOT / 'scripts/direct/review.sh',
     ROOT / 'scripts/ask_a_friend/launch_friend.sh',
     ROOT / 'scripts/agents/agent_bg.sh',
+    ROOT / 'scripts/agents/agent_exec.sh',
 }
+PYTHON_HOPS = {ROOT / 'scripts/production/worker_fill.py'}
 REFUSAL = 'Start workers through assign.sh from the director session.'
 
 
@@ -31,7 +33,9 @@ def called_by_assign() -> bool:
             script = Path(words[1]).resolve() if len(words) > 1 else Path()
             if script == ASSIGN and Path(words[0]).name.startswith('python'):
                 return True
-            if script not in LAUNCHERS or Path(words[0]).name not in ('bash', 'zsh', 'sh'):
+            shell_hop = script in LAUNCHERS and Path(words[0]).name in ('bash', 'zsh', 'sh')
+            python_hop = script in PYTHON_HOPS and Path(words[0]).name.startswith('python')
+            if not shell_hop and not python_hop:
                 return False
             pid = int(parent)
         except (OSError, ValueError, subprocess.CalledProcessError):

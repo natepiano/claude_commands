@@ -18,6 +18,7 @@ from unittest import mock
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import change_review
 import footer_counts
@@ -84,7 +85,7 @@ class NextItemTests(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {**source_environment(self.root / "sources"),
                 "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr"})))
         _ = self.enterContext(isolated_source_readers())
-        _ = fixture_member("showrunner", name="fixture", doc=staff.LiveDoc("natedev", PRODUCTION))
+        _ = fixture_member("showrunner", name="demo", doc=staff.LiveDoc("natedev", PRODUCTION))
         with contextlib.ExitStack() as stack:
             _ = cast(object, stack.enter_context(mock.patch.dict(
                 os.environ, {"NEXT_STATE_DIR": str(self.root / "next"), "NIGHTLY_REVIEW_NOTE": str(self.root / "note.md")})))
@@ -120,9 +121,9 @@ class NextItemTests(unittest.TestCase):
         directory = self.root / "next"
         directory.mkdir()
         values: dict[str, dict[str, object]] = {
-            "next-fixture": {"source": "question-fixture", "current": "fixture: Choose", "ended": {}},
-            "question-fixture-all-below": {"current": "fixture: Choose", "ended": {"fixture: Later": 1}},
-            "proposal-fixture": {"current": "P2", "ended": {"P1": 1}},
+            "next-demo": {"source": "question-demo", "current": "demo: Choose", "ended": {}},
+            "question-demo-all-below": {"current": "demo: Choose", "ended": {"demo: Later": 1}},
+            "proposal-demo": {"current": "P2", "ended": {"P1": 1}},
         }
         for name, fields in values.items():
             _ = (directory / f"{name}.json").write_text(json.dumps(fields))
@@ -166,7 +167,11 @@ class NextItemTests(unittest.TestCase):
         }
         for name, fields in values.items():
             _ = (directory / f"{name}.json").write_text(json.dumps(fields))
-        with mock.patch.object(session_staff, "member_sources", return_value=sources):
+        journal = self.root / "showrunner/new/rename.json"
+        journal.parent.mkdir(parents=True)
+        _ = journal.write_text(json.dumps({"old": "old", "new": "new"}))
+        with (mock.patch.object(session_staff, "member_sources", return_value=sources),
+              mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.root / "showrunner")):
             self.assertEqual(migrate_next_pins.migrate(stop_after=1), 75)
             self.assertEqual(migrate_next_pins.migrate(), 0)
             expected: dict[str, dict[str, object]] = {
@@ -379,7 +384,7 @@ class NextItemTests(unittest.TestCase):
         _ = fixture_member("showrunner", name="natedev", doc=staff.LiveDoc("natedev", PRODUCTION))
         with mock.patch.object(change_review, "production_list", the_list):
             self.assertEqual(run("show", "--kind", "change", "--production", str(PRODUCTION)), (0, "\n".join([
-                "change", "C1 Panels keep shields", "  How to check: Run `hana`. You see: Each panel has its shield",
+                "change", "natedev/C1 Panels keep shields", "  How to check: Run `hana`. You see: Each panel has its shield",
                 "  Merged: 2026-10-15", "  Production: demo", ""]), ""))
 
     def test_each_kind_shows_its_own_production_and_with_all_below_each_lower_one_never_above(self) -> None:

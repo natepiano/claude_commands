@@ -286,7 +286,7 @@ class QuestionStaff:
                    sources: session_staff.MemberSources | None = None) -> QuestionStaff:
         if sources is None:
             dependencies = staff.RecordInputs()
-            sources = session_staff.member_sources(dependencies=dependencies)
+            sources = session_staff.member_sources(dependencies=dependencies, record=record)
         return cls(record, sources, StaffLabels(record, sources.productions, sources.showrunner_members(record)))
 
     def owner(self, document: Path) -> staff.StaffRow:
@@ -567,7 +567,7 @@ def scheduled_prompt(minutes: int, zone: str, doc: Path, slug: str) -> str:
     return prompt
 
 
-def adopt_moved_state(production: Production) -> list[str]:
+def adopt_moved_state(production: Production, record: staff.StaffSnapshot | None = None) -> list[str]:
     """Copy the scratchpad state the state directory lacks and rewrite a tick prompt that differs.
 
     Every registration and dailies call runs this first, so a showrunner started before the state
@@ -575,7 +575,7 @@ def adopt_moved_state(production: Production) -> list[str]:
     """
     done: list[str] = []
     try:
-        copied = showrunners.adopt_session_state(production.slug)
+        copied = showrunners.adopt_session_state(production.slug, record)
         if copied:
             done.append(f"copied {', '.join(copied)} to {showrunners.session_state_dir(production.slug)}")
         prompt_file = showrunners.SHOWRUNNER_STATE_DIR / production.slug / "prompt.txt"
@@ -1536,7 +1536,7 @@ def main() -> int:
             if document is None:
                 raise RegistrationFailure(action, "this session is no production's showrunner; pass --production <doc>")
         production = read_production(document)
-        for line in adopt_moved_state(production):
+        for line in adopt_moved_state(production, identities.record if identities is not None else None):
             report("state-dir", "ok", line)
         if action == "register":
             register(production)

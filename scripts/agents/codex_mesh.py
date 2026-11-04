@@ -1805,6 +1805,8 @@ def _claim_follow_locked(
     with worker_lifecycle.locked_state(path) as handle:
         roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
+        if entry.get("adopted_to"):
+            return False
         if not _validate_held_claim(name, entry, thread_id):
             return False
         current = _roster_thread(entry)
@@ -2317,11 +2319,24 @@ class CurrentDetachedRuns:
 
 def worker_run_history(session_dir: str, name: str) -> tuple[str, ...]:
     """Return the runs that contain the worker's staff identity."""
-    roster = _read_json_object(_session_path(session_dir, ROSTER_FILE))
+    roster = worker_lifecycle.read_worker_state(_session_path(session_dir, ROSTER_FILE))
     entry = _as_dict(roster.get(name))
-    reference = staff.StaffId(_as_str(entry.get("staff_id")))
-    runs = session_staff.worker_run_index(staff.local_snapshot()).get(reference, ()) if reference else ()
-    return tuple(dict.fromkeys((session_dir, *(str(run) for run in runs))))
+    reference = _as_str(entry.get("staff_id"))
+    runs = [session_dir]
+    ledger_path = _as_str(entry.get("unit_ledger"))
+    if reference and ledger_path:
+        ledger = worker_lifecycle.read_worker_state(Path(ledger_path))
+        worker = _as_dict(_as_dict(ledger.get("workers")).get(reference))
+        for events in (worker.get("events"), _as_dict(ledger.get("history")).get(reference)):
+            if isinstance(events, list):
+                for event in cast(list[object], events):
+                    run = _as_str(_as_dict(event).get("run"))
+                    if run:
+                        runs.append(run)
+    source = _as_str(entry.get("adopted_from"))
+    if source:
+        runs.append(source)
+    return tuple(dict.fromkeys(runs))
 
 
 @dataclass
@@ -6171,7 +6186,7 @@ def _start_turn(
             for path in cast("list[object]", images) if isinstance(path, str)
         )
     params: dict[str, object] = {"threadId": thread_id, "input": inputs}
-    cwd = _as_str(_attr(args, "turn_cwd"))
+    cwd = _as_str(_attr(args, "turn_cwd")) or _as_str(_attr(args, "cwd"))
     if cwd:
         params["cwd"] = cwd
     # Every turn names its policy: the app-server keeps a thread's last turn policy, so a
@@ -6957,13 +6972,25 @@ def _open_admitted_worker(session_dir: str, role: str, admitted: WorkerStartAllo
         return opened
 
 
+def adopt_unit_worker(source: Path, destination: Path, name: str) -> str:
+    """Transfer worker routes through the unit ledger."""
+    adopt = cast(Callable[[Path, Path, str], str],
+                 importlib.import_module("scripts.hierarchies.worker_adoption").adopt_unit_worker)
+    try:
+        return adopt(source, destination, name)
+    except staff.StaffRefused as error:
+        raise unit_workers.WorkerUnavailable(str(error)) from error
+
+
 def command_adopt(args: argparse.Namespace) -> int:
-    source = _as_str(_attr(args, "from_run"))
-    destination = _as_str(_attr(args, "session_dir"))
+    source = Path(_as_str(_attr(args, "from_run")))
+    destination = Path(_as_str(_attr(args, "session_dir")))
     name = _as_str(_attr(args, "name"))
-    record = _lookup(source, name)
-    parent = worker_admission.admit(name, Path(destination), role=_as_str(session_staff.worker_name(record)))
-    _ = staff.move(staff.StaffId(_as_str(record.get("staff_id"))), staff.ReportsTo(parent.parent))
+    try:
+        _ = adopt_unit_worker(source, destination, name)
+    except unit_workers.WorkerUnavailable as error:
+        print(f"codex_mesh: {error}", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -8822,7 +8849,8 @@ class WorkersRunMove:
 
 def _account_move_command(session_dir: str, name: str) -> str:
     record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
-    role = _as_str(record.get("role"))
+    assignment = task_role(session_staff.worker_session(record))
+    role = assignment.role if isinstance(assignment, AssignedWorkerRole) else ""
     return shlex.join(["bash", str(Path(__file__).resolve().parents[1] / "direct/assign.sh"),
                        "--role", "implement" if role == "impl" else role, "--operation", "resume-account-move",
                        "--session-dir", session_dir, "--to", name])
@@ -9485,6 +9513,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = start.add_argument("--effort", default="")
     _ = start.add_argument("--service-tier", default="")
     _ = start.add_argument("--task", default="")
+    _ = start.add_argument("--cwd", default="")
     _ = start.add_argument("--sandbox", choices=SANDBOX_MODES, default=WORKER_SANDBOX)
     _ = start.add_argument("--timeout", type=float, default=86400.0)
     _ = start.add_argument(
@@ -9529,6 +9558,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = prime.add_argument("--effort", default="")
     _ = prime.add_argument("--service-tier", default="")
     _ = prime.add_argument("--task", default="")
+    _ = prime.add_argument("--cwd", default="")
     _ = prime.add_argument("--sandbox", choices=SANDBOX_MODES, default=READ_ONLY_SANDBOX)
     _ = prime.add_argument("--held-design", default="")
     _ = prime.add_argument("--held-role", default="")

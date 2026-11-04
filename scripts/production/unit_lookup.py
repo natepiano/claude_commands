@@ -514,7 +514,7 @@ def every_marked_unit(*, record: staff.StaffSnapshot | None = None,
 def marked_units(slug: str, *, record: staff.StaffSnapshot | None = None,
                  sources: MemberSources | None = None) -> dict[str, MarkedUnit]:
     """Every unit of the production. Unreadable herdr, or any unit's mark on two sessions, raises OSError."""
-    slug = _lookup_slug(slug)
+    slug = _lookup_slug(slug, record=record)
     found = every_marked_unit(record=record, sources=sources)
     if fault := found.production_fault(slug):
         raise OSError(fault)
@@ -525,9 +525,9 @@ def marked_unit(slug: str, name: str, *, record: staff.StaffSnapshot | None = No
                 sources: MemberSources | None = None,
                 running: Sequence[SessionRecord] | None = None) -> MarkedUnit | None:
     """One unit of the production. Unreadable herdr, or this unit's mark on two sessions, raises OSError."""
-    slug = _lookup_slug(slug)
+    slug = _lookup_slug(slug, record=record)
     record = record if record is not None else staff.snapshot()
-    sources = sources if sources is not None else member_sources()
+    sources = sources if sources is not None else member_sources(record=record)
     selected = sources.member(UnitMember(slug, name), record)
     marked = observed_staff_marks(running=running)
     if isinstance(selected, MemberFound):

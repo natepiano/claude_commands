@@ -218,7 +218,7 @@ class MergeRequest(NamedTuple):
     merge_defects: int
     excluded: str
     bump: bool = False
-    staff_record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT
+    staff_record: staff.StaffSnapshot | None = None
 
 
 class Stop(Exception):
@@ -536,7 +536,7 @@ def record_changes(request: MergeRequest, commits: list[change_review.Commit], m
 def record_publication_changes(production: Production, commits: list[change_review.Commit], merge_head: str,
                                *, changes: ChangesReadBeforePush | ReadChangesWhenWriting = _READ_CHANGES_WHEN_WRITING,
                                report_unchanged: bool = True,
-                               record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> None:
+                               record: staff.StaffSnapshot | None = None) -> None:
     """Register each visible change and report merges with missing rows."""
     doc = change_review.list_path(production.doc, record=record)
     if doc is None:
@@ -551,7 +551,7 @@ def record_publication_changes(production: Production, commits: list[change_revi
     merged = good(git(production.checkout, "rev-parse", f"--short={change_review.SHORT}", merge_head), "push")
     try:
         # A stop after the list write but before the receipt must not add it twice.
-        record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+        record = staff.snapshot() if record is None else record
         publication = (changes.changes if isinstance(changes, ChangesReadBeforePush)
                        else change_review.publication_changes(commits, production.doc, record=record))
         existing = change_review.pending(doc) if doc.exists() else []
@@ -1470,7 +1470,7 @@ def bump_gate_addresses(slug: str, unit: str) -> tuple[str, str]:
 
 def run(request: MergeRequest) -> int:
     try:
-        if isinstance(request.staff_record, session_staff.ReadCurrentStaff):
+        if request.staff_record is None:
             request = request._replace(staff_record=staff.snapshot())
         checkpoint = git(request.production.checkout, "rev-parse", "--verify", f"{request.commit}^{{commit}}")
         if checkpoint.returncode:

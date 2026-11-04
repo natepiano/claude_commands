@@ -22,6 +22,7 @@ from scripts.lib.nix_env_test_support import NixFixture, ROOT
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.process_group import send_process_group
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id, fixture_member, isolated_staff_file
@@ -53,6 +54,22 @@ class SimplifyDispatchTests(NixFixture):
                          "UNIT_SYNC_WRITES": "0", "PYTHONPATH": str(ROOT),
                          "CODEX_THREAD_ID": fixture_runtime_id("simplify-director"),
                          "TZ": "UTC", "USER_ZONE": "UTC"})
+        # Call the function with a review runner that preserves the assign parent.
+        startup = self.root / "assignment-startup"
+        startup.mkdir()
+        _ = (startup / "sitecustomize.py").write_text("\n".join((
+            "import os, subprocess, sys",
+            "def enter(frame, event, argument):",
+            f"    if event == 'call' and frame.f_code.co_filename == {str(ROOT / 'scripts/direct/assign.py')!r} and frame.f_code.co_name == 'main':",
+            "        sys.setprofile(None)",
+            f"        os.environ['PYTHONPATH'] = {str(ROOT)!r}",
+            "        frame.f_globals['require_live_director'] = lambda: None",
+            "        def review(file, command, environment):",
+            "            raise SystemExit(subprocess.call(command, env=environment))",
+            "        raise SystemExit(frame.f_globals['main'](exec_review=review))",
+            f"if sys.argv[0] == {str(ROOT / 'scripts/direct/assign.py')!r}: sys.setprofile(enter)",
+        )) + "\n")
+        self.env["PYTHONPATH"] = os.pathsep.join((str(startup), str(ROOT)))
         self.env["AGENT_NOTES_DIR"] = str(self.root / "notes")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.env))
         owner = fixture_member("showrunner", name="simplify-owner")
@@ -120,7 +137,7 @@ raise SystemExit(int(os.environ.get("SIMPLIFY_TEST_EXIT", "0")))
 
     def stop_review(self, process: subprocess.Popen[str]) -> None:
         if process.poll() is None:
-            process.terminate()
+            send_process_group(process.pid, signal.SIGTERM)
         _ = communicate_launcher(process)
 
     def stop_orphan_review(self, pid: int) -> None:
@@ -542,8 +559,9 @@ os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
 
     def test_stopping_the_launcher_stops_claude_and_closes_its_pass(self) -> None:
         process, _ = self.start_blocked_review()
-        self.assertEqual(int(self.phase_file("review_pid_simplify").read_text()), process.pid)
-        process.terminate()
+        review_pid = int(self.phase_file("review_pid_simplify").read_text())
+        self.assertEqual(os.getpgid(review_pid), process.pid)
+        os.kill(review_pid, signal.SIGTERM)
         _ = communicate_launcher(process)
         self.assertEqual(process.returncode, 143)
         self.assertEqual(self.status(), "error")
@@ -557,7 +575,8 @@ os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
         process, gate = self.start_blocked_review()
         child_pid = cast(int, self.claude_calls()[0]["pid"])
         self.addCleanup(self.stop_orphan_review, child_pid)
-        process.kill()
+        review_pid = int(self.phase_file("review_pid_simplify").read_text())
+        os.kill(review_pid, signal.SIGKILL)
         _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
         retry = self.launch()
         self.assertIn("busy", retry.stderr)

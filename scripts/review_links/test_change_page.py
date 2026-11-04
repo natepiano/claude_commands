@@ -188,7 +188,7 @@ class ChangePageTests(unittest.TestCase):
         owner = fixture_member("showrunner", name="destination", doc=staff.LiveDoc("natedev", doc))
         before = self.review_list.read_bytes()
         row = change_review.pending(self.review_list)[0]
-        _ = staff.move(self.unit.id, owner.id)
+        _ = staff.move(self.unit.id, staff.ReportsTo(owner.id))
         self.assertEqual(change_page.row_production(self.page, row), doc)
         self.assertEqual(self.review_list.read_bytes(), before)
 
@@ -1085,7 +1085,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(set(forms.save_urls), {"page-owner/C1", "page-owner/C2", "page-owner/C3"})
 
     def test_an_unrouted_row_refuses_a_question_without_saving_and_still_accepts_a_verdict(self) -> None:
-        assert self.unit.parent is not None
+        assert isinstance(self.unit.parent, staff.ReportsTo)
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Unknown", "Read", "Proof")],
                                       date(2026, 11, 2), "abcdef12", self.production, producers=[staff.StaffId("missing-producer")], record=staff.snapshot())
         path, forms, body = self.browser()
