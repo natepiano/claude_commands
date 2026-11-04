@@ -103,22 +103,33 @@ OPENING_ROLE="${AGENT_BG_ROLE:-${UNIT_TEAM_ROLE:-}}"
 "$PY" "$WORKER_FILL" admit --name "$MESH_NAME" --run "$ADMISSION_RUN" --role "$OPENING_ROLE" || exit 2
 
 publish_worker() {
-  # The CLI returns a short backend id. Require one exact, live registry match.
-  NATIVE_ID="$(BG_ID="$BG_ID" "$PY" - "$NIX_ENV_LIB/../.." <<'PYREG'
+  # The banner can precede the registry record. Wait only while no record matches.
+  source "$NIX_ENV_LIB/conf.sh"
+  local register_wait
+  register_wait="$(conf_value direct CLAUDE_WORKER_REGISTER_WAIT_SECS)" || return 2
+  NATIVE_ID="$(BG_ID="$BG_ID" "$PY" - "$NIX_ENV_LIB/../.." "$register_wait" <<'PYREG'
 import sys
 import os
-from pathlib import Path
+import time
 sys.path.insert(0, sys.argv[1])
 from scripts.message import sessions
 from scripts.production import staff
-registry = sessions.read_registry()
-if registry.unreadable:
-    raise SystemExit("staff: registry is incomplete; native identity not published")
-found = [item.record for item in registry.entries
-         if item.record["sessionId"].startswith(os.environ["BG_ID"])
-         and sessions.running_session(item.record)]
+wait_seconds = int(sys.argv[2])
+deadline = time.monotonic() + wait_seconds
+while True:
+    registry = sessions.read_registry()
+    if registry.unreadable:
+        raise SystemExit("staff: registry is incomplete; native identity not published")
+    found = [item.record for item in registry.entries
+             if item.record["sessionId"].startswith(os.environ["BG_ID"])
+             and sessions.running_session(item.record)]
+    remaining = deadline - time.monotonic()
+    if found or remaining <= 0:
+        break
+    time.sleep(min(0.1, remaining))
 if len(found) != 1:
-    raise SystemExit("staff: backend has no unique live registry identity")
+    waited = f" (waited {wait_seconds}s)" if not found else ""
+    raise SystemExit("staff: backend has no unique live registry identity" + waited)
 row = found[0]
 if staff.runtime_id(row["pid"]) != row["sessionId"]:
     raise SystemExit("staff: Claude process changed during publication")
@@ -272,6 +283,7 @@ env = {name: value for name, value in loaded.env.items()
        and name not in {"CLAUDE_CODE_BRIDGE_SESSION_ID", "TMUX", "TMUX_PANE"}}
 env.update({name: "" for name in os.environ if name not in loaded.env})
 env.update({name: os.environ.get(name, "") for name in sys.argv[3:]})
+env.pop("CLAUDE_CODE_CHILD_SESSION", None)
 print(json.dumps({"sandbox": {"enabled": False}, "env": env}))
 PY
 )" || exit 1
@@ -292,7 +304,7 @@ fi
 
 banner="$(cd "${WORKING_DIR}" \
             && env -u UNIT_RUN_DIR -u UNIT_TEAM_ROLE -u MODELS_CONFIG_FILE \
-                   -u UNIT_RESOLVES_ROUND -u AGENT_BG_WORKERS \
+                   -u UNIT_RESOLVES_ROUND -u AGENT_BG_WORKERS -u CLAUDE_CODE_CHILD_SESSION \
                    "${PY}" "$NIX_ENV_LIB/nix_env.py" exec "${CLAUDE_BIN}" "${launch_args[@]}" \
             2>&1 || true)"
 
