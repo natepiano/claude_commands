@@ -80,6 +80,32 @@ class QueueViewTests(QueueFixtureTests):
         return replace(self.fixture.model(), reading=reply.reading,
                        facts=head_facts.read_head_facts(reply.reading))
 
+    def test_first_priority_mark_agrees_in_the_card_overview_and_shell(self) -> None:
+        policy = admission_policy_fixture()
+        inputs = self.fixture.inputs(policy=policy)
+        path, row = inputs.ordered[0]
+        row = {**row, "need": 12 * gate.GIB, "since": NOW - policy.timing.head_seconds - 1,
+               "estimated_at": NOW}
+        if "priority_since" in row:
+            del row["priority_since"]
+        inputs = replace(inputs, ordered=[(path, row)], pressure=gate.NoPressureHold(),
+                         host=gate.HostMemory(60 * gate.GIB, 60 * gate.GIB))
+        limits = gate.AdmissionLimits(21 * gate.GIB, 3 * gate.GIB)
+        result = gate.admission_pass(inputs, NOW, limits, policy)
+        self.assertEqual(len(result.policy.head_marks), 1)
+        reason = result.rows[0].reason
+        assert isinstance(reason, gate.HeadAdmissionStatus)
+        self.assertIsInstance(reason.backfill, gate.StrictUntil)
+        assert isinstance(reason.backfill, gate.StrictUntil)
+        clause = gate.window_clause(reason.backfill, limits.budget, reason.need, self.fixture.model().zone)
+        reading = gate.queue_read_from_pass(inputs, limits, policy, result)
+        model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
+        self.assertIn(clause, gate.head_wait_text(reason, model.zone, policy))
+        self.assertIn(clause, plain(queue_card.render_card(model, [1], 400)))
+        status = queue_view.head_status(model, limits.budget)
+        self.assertIn("↑ ≤9.0", plain([status]))
+        self.assertEqual([span.until for span in status if span.until], [reason.backfill.deadline])
+
     def test_running_row_marks_only_the_asking_session(self) -> None:
         model = self.fixture.model()
         grants = tuple(gate.RunningStep(session, session, "merge-gate", "/gate", 6 * gate.GIB,

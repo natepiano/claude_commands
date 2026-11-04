@@ -193,19 +193,18 @@ def countdown(until: float, now: float) -> str:
     return f"{minutes}:{seconds:02d}"
 
 
-def head_status(model: QueueModel, budget: int) -> Line:
+def head_status(model: QueueModel, budget: int, *, show_deadline: bool = True) -> Line:
     head = model.reading.explanation.head
     if not isinstance(head, gate.HeadExplanation):
         return ()
-    recorded = any(row["pid"] == head.waiter.pid and "priority_since" in row
-                   for _, row in model.reading.ordered)
-    strict = head.has_priority and (not recorded or isinstance(head.order, gate.StrictUntil))
+    strict = head.has_priority and not isinstance(head.order, gate.BackfillUntil)
     room = gate.strict_room(budget, head.waiter.need)
-    allows_room = strict and recorded and isinstance(head.order, gate.StrictUntil) and room > 0
+    allows_room = strict and isinstance(head.order, gate.StrictUntil) and room > 0
     tone = "error" if strict and not allows_room else "success"
     state = f" ↑ ≤{room / gate.GIB:.1f}" if allows_room else " ⊘" if strict else " ↑"
     result = (Span(state, tone),)
-    if recorded and not isinstance(head.order, gate.WindowNotStarted):
+    if (show_deadline and not isinstance(head.order, gate.WindowNotStarted)
+            and (head.has_priority or isinstance(head.order, gate.BackfillUntil))):
         result += (Span(" "), Span(countdown(head.order.deadline, model.reading.explanation.now),
                                    tone, until=head.order.deadline))
     reason = head.waiter.reason
@@ -331,6 +330,12 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
         max((terminal_width(row.step.step) for row in running), default=7),
         max((terminal_width(step.step) for step in waiting), default=7))))
     fixed = place_width + step_width + minutes_width + 5
+    if isinstance(head, gate.HeadExplanation):
+        head_tail = len(size_bar(head.waiter.need / gate.GIB, budget)) + len(f" {head.waiter.need / gate.GIB:.1f}")
+        if (status and status[-1].until is None
+                and fixed + 6 + head_tail + terminal_width(plain([status])) > columns):
+            # Keep the full diagnostic when the deadline would clip it.
+            status = head_status(model, budget_bytes, show_deadline=False)
     tail = max(terminal_width(plain([labels])), (bar_eighths(budget, budget) + 7) // 8,
                max((len(bar) + len(f" {step.need / gate.GIB:.1f}") +
                     (terminal_width(plain([status]))

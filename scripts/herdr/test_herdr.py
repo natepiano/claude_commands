@@ -94,6 +94,11 @@ def codex_launch_evidence(root: Path, argv: list[str]) -> Generator[dict[str, ob
     identity = fixture_runtime_id("herdr-codex-launch")
     proc = root / "codex-launch-proc"
     (proc / str(pid) / "fd").mkdir(parents=True, exist_ok=True)
+    _ = (proc / str(pid) / "cmdline").write_bytes("\0".join(argv).encode())
+    if "resume" not in argv:
+        rollout = root / "rollout-launch.jsonl"
+        write_text_atomic(rollout, json.dumps({"type": "session_meta", "payload": {"id": identity}}) + "\n")
+        (proc / str(pid) / "fd" / "7").symlink_to(rollout)
 
     def environment(observed_pid: int) -> dict[str, str]:
         if observed_pid != pid:
@@ -125,6 +130,40 @@ def startup_shell(workspace_id: str) -> tuple[dict[str, object], dict[str, objec
 
 
 class NativePaneSessionTests(StaffTestCase):
+    def test_codex_native_process_refuses_an_unheld_thread_from_environment(self) -> None:
+        identity = fixture_runtime_id("unheld-thread")
+        proc = self.root / "unheld-proc"
+        process = proc / "998079"
+        (process / "fd").mkdir(parents=True)
+        for arguments in (["codex"], ["codex", "app-server", "--managed-daemon"],
+                          ["codex", "exec", "resume", identity],
+                          ["codex", "-c", "resume", identity]):
+            _ = (process / "cmdline").write_bytes("\0".join(arguments).encode())
+            with (self.subTest(arguments=arguments),
+                  patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
+                  patch.object(herdr, "_PLATFORM", "linux"),
+                  patch.object(sessions, "process_start", return_value="same-process"),
+                  patch.object(herdr, "process_environment", return_value={"CODEX_THREAD_ID": identity})):
+                with self.assertRaisesRegex(ValueError, "Codex launch identity is unavailable"):
+                    _ = herdr.native_process(998079, "codex")
+
+    def test_codex_native_process_accepts_only_the_thread_in_its_resume_arguments(self) -> None:
+        identity = fixture_runtime_id("argv-thread")
+        wrong = fixture_runtime_id("wrong-thread")
+        proc = self.root / "resume-proc"
+        process = proc / "998079"
+        (process / "fd").mkdir(parents=True)
+        for arguments in (["codex", "resume", identity],
+                          ["node", "/opt/@openai/codex/bin/codex.js", "resume", identity],
+                          ["codex", "-m", "model", "resume", identity]):
+            _ = (process / "cmdline").write_bytes("\0".join(arguments).encode())
+            with (self.subTest(arguments=arguments),
+                  patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
+                  patch.object(herdr, "_PLATFORM", "linux"),
+                  patch.object(sessions, "process_start", return_value="same-process"),
+                  patch.object(herdr, "process_environment", return_value={"CODEX_THREAD_ID": wrong})):
+                self.assertEqual(herdr.native_process(998079, "codex").identity, identity)
+
     def test_codex_daemon_client_uses_resume_id_without_rollout_or_exported_thread(self) -> None:
         identity = fixture_runtime_id("daemon-client-resume")
         arguments = ["resume", identity]
@@ -160,7 +199,7 @@ class NativePaneSessionTests(StaffTestCase):
             self.assertIsInstance(startup.activity, herdr.AgentProcessPresent)
             launch = client.codex_launch("w1:p1")
             self.assertEqual(launch["session_id"], identity)
-        self.assertEqual(native.call_args_list, [call(998075, "codex"), call(998075, "codex", resume_id="")])
+        self.assertEqual(native.call_args_list, [call(998075, "codex")] * 2)
 
     def test_native_pane_process_returns_the_proved_account_and_launch_identity_for_the_exact_codex_pid(self) -> None:
         current = fixture_runtime_id("pane-current-thread")
@@ -198,6 +237,7 @@ class NativePaneSessionTests(StaffTestCase):
         launch = fixture_runtime_id("native-fallback-launch")
         proc = self.root / "fallback-proc"
         (proc / "998076" / "fd").mkdir(parents=True)
+        _ = (proc / "998076" / "cmdline").write_bytes(f"codex\0resume\0{launch}\0".encode())
         environment = {"CODEX_THREAD_ID": launch, "CODEX_HOME": str(self.root / ".codex2")}
         payload = {"result": {"process_info": {"foreground_processes": [
             {"pid": 998076, "argv": ["codex", "resume", launch]}]}}}
