@@ -1401,24 +1401,10 @@ Tests: `scripts/lint/test_memory_admit.py`: a large dev build with 1 to 9 earlie
 ### Phase 54 — The floor dry run prints the free size above the floor  · status: done
 **Depends on:** Phase 53
 
-**Approved:** natedev 2026-11-03, change row C210 returned: "Make the dry-run print the free size, so an empty result is never ambiguous."
+#### As-built
 
-#### Work Order
-
-**Goal:** `sweep.py --floor-only --dry-run` never prints an empty result.
-
-**Spec:**
-
-1. When free space is at or above the floor, a dry run prints one line: `lint sweep: <path>: <N> GiB free, at or above the <F> GiB floor; nothing to remove`. A real run (the 2-minute timer) prints nothing new.
-
-Tests: `scripts/lint/test_sweep.py`: a dry run above the floor prints that line and removes nothing.
-
-**Acceptance:** `scripts/lint/test_sweep.py` and `basedpyright` on the changed files pass from the worktree.
+- A floor dry run at or above the floor prints `lint sweep: <path>: <N> GiB free, at or above the <F> GiB floor; nothing to remove` (`_hold_floor_pass`, `scripts/lint/sweep.py`). A real run prints nothing new.
 
 **Files:**
-- `scripts/lint/sweep.py` — the line.
-- `scripts/lint/test_sweep.py` — the test.
-
-**Workers:** `1 writer + 1 tester`
-- `impl` — `scripts/lint/sweep.py`.
-- `test` — `scripts/lint/test_sweep.py`.
+- `scripts/lint/sweep.py` — the dry-run line
+- `scripts/lint/test_sweep.py` — `test_floor_dry_run_above_the_floor_prints_the_free_size`
