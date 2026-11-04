@@ -24,7 +24,7 @@ from typing import NoReturn, cast, override
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.lib import conf, scratch
+from scripts.lib import conf, copy_record, scratch
 from scripts.lib.atomic_file import remove_dead_temporary_files, write_text_atomic
 
 GATE_RECORD = ".gate.json"
@@ -32,6 +32,7 @@ OWNER = re.compile(r"[a-z0-9][a-z0-9-]*")
 CLONE_STAGE = ".gate-clone"
 GATE_SUFFIXES = ("", "-2")
 COMMAND_LOCKS: ContextVar[tuple[int, ...]] = ContextVar("gate_command_locks", default=())
+ACTIVE_GATES: ContextVar[tuple[Path, ...]] = ContextVar("active_gate_checkouts", default=())
 
 
 class CopyError(Exception):
@@ -159,6 +160,11 @@ def commit_at(repo: Path, revision: str) -> str:
 
 
 def repository_name(source: Path) -> str:
+    record = scratch.task_of(source)
+    if isinstance(record, copy_record.Registered):
+        original = record.fields.get("source_path")
+        if isinstance(original, str) and Path(original) != source:
+            source = Path(original)
     common = Path(git(source, "rev-parse", "--path-format=absolute", "--git-common-dir").decode().strip())
     # Linked unit worktrees share the main repository's name, including .claude.
     return common.parent.name if common.name == ".git" else source.name
@@ -285,6 +291,11 @@ def initialize(tree: Path, source: Path, owner: str, repo: str, base: str) -> No
     write_record(tree, owner, repo, source, base)
     if replace_git and (tree / ".git").is_dir() and not (tree / ".git").is_symlink():
         shutil.rmtree(tree / ".git")
+    initialize_git(tree, source)
+
+
+def initialize_git(tree: Path, source: Path) -> None:
+    """Create private Git metadata while the caller holds the busy mark."""
     if not (tree / ".git").exists():
         # clone needs an empty destination; the tree already holds scratch's busy mark.
         # Stage only Git metadata, so first creation never has an unlocked checkout.
@@ -399,6 +410,138 @@ def prepare(tree: Path, source: Path, owner: str, name: str, base: str,
         raise CopyError(str(error)) from error
 
 
+def workspace_path(owner: str, repo: str | Path, name: str) -> Path:
+    """Locate a named editable copy in the existing scratch registry."""
+    owner = checked_owner(owner)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+        raise CopyError(f"{name!r}: invalid workspace name")
+    source = Path(repo).expanduser().resolve()
+    return copy_record.copies_root() / f"{repository_name(source)}-{owner}" / name
+
+
+@contextmanager
+def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: str,
+              task: str = "", path: Path | None = None) -> Generator[Path]:
+    """Hold a registered editable copy without resetting edits during recovery."""
+    source = Path(repo).expanduser().resolve()
+    base = commit_at(source, commit)
+    owner = checked_owner(owner)
+    tree = path.resolve() if path is not None else workspace_path(owner, source, name)
+    legacy = copy_record.copy_folder(tree) != tree
+    if legacy and not tree.is_dir():
+        raise CopyError(f"{tree}: a legacy workspace must already exist")
+    branch = branch.removeprefix("refs/heads/")
+    _ = git(source, "check-ref-format", f"refs/heads/{branch}")
+    common = git(source, "rev-parse", "--path-format=absolute", "--git-common-dir").decode().strip()
+    descriptors: list[int] = []
+    with claim_tree(tree, create=True, inherited_fds=descriptors) as state:
+        if state is not ClaimState.ACQUIRED:
+            raise CopyError(f"{tree}: workspace is busy")
+        token = COMMAND_LOCKS.set(tuple(descriptors))
+        try:
+            record = scratch.task_of(tree)
+            task = scratch.task_or_default(task or (record.task if isinstance(record, copy_record.Registered) else ""), time.time())
+
+            def register(copy_commit: str) -> None:
+                if legacy:
+                    _ = scratch.hold(tree, task, "legacy crate worker")
+                    fields: dict[str, object] = dict(owner_unit=owner, source_path=str(source),
+                        source_commit=base, copy_commit=copy_commit, target_mode="none",
+                        seed_source="", borrows_from=common)
+                    _ = scratch.update_record(tree, lambda _: scratch.fields_for_task(fields, task))
+                    scratch.exclude_copy_metadata(tree)
+                else:
+                    scratch.register_copy(tree, task=task, owner_unit=owner, source_path=str(source),
+                                          source_commit=base, copy_commit=copy_commit, target_mode="none",
+                                          seed_source="", borrows_from=common)
+
+            if isinstance(record, copy_record.Registered):
+                expected = {"owner_unit": owner, "source_path": str(source), "source_commit": base}
+                if any(record.fields.get(key) != value for key, value in expected.items()):
+                    raise CopyError(f"{tree}: workspace belongs to another request")
+            elif legacy:
+                if not isinstance(record, copy_record.NotRegistered):
+                    raise CopyError(f"{tree}: unreadable legacy workspace")
+                origin = git(tree, "remote", "get-url", "origin").decode().strip()
+                if Path(origin).resolve() != source:
+                    raise CopyError(f"{tree}: legacy workspace source differs")
+                _ = git(tree, "merge-base", "--is-ancestor", base, "HEAD")
+                if git(tree, "symbolic-ref", "HEAD").decode().strip() != f"refs/heads/{branch}":
+                    raise CopyError(f"{tree}: workspace branch changed")
+                if (tree / ".git").is_symlink() or not (tree / ".git").is_dir():
+                    raise CopyError(f"{tree}: workspace must own its Git directory")
+                register(commit_at(tree, "HEAD"))
+                record = scratch.task_of(tree)
+            else:
+                if not isinstance(record, copy_record.NotRegistered) or any(
+                        child.name != scratch.BUSY for child in tree.iterdir()):
+                    raise CopyError(f"{tree}: refusing an unregistered workspace")
+                register("")
+                record = scratch.task_of(tree)
+            assert isinstance(record, copy_record.Registered)
+            if record.fields.get("copy_commit"):
+                if (tree / ".git").is_symlink() or not (tree / ".git").is_dir():
+                    raise CopyError(f"{tree}: workspace must own its Git directory")
+                if git(tree, "symbolic-ref", "HEAD").decode().strip() != f"refs/heads/{branch}":
+                    raise CopyError(f"{tree}: workspace branch changed")
+                if record.task != task:
+                    register(str(record.fields["copy_commit"]))
+                else:
+                    scratch.renew(tree)
+            else:
+                initialize_git(tree, source)
+                _ = git(tree, "checkout", "-q", "-B", branch, base)
+                for key in ("user.name", "user.email"):
+                    _ = git(tree, "config", key, git(source, "config", key).decode().strip())
+                register(base)
+            try:
+                yield tree
+            finally:
+                caller_error = sys.exception()
+                try:
+                    _ = git(tree, "fetch", "-q", "--prune", "--", str(source),
+                            "+refs/heads/*:refs/remotes/origin/*")
+                    mark_target(tree)
+                    register(commit_at(tree, "HEAD"))
+                except (OSError, scratch.ScratchError, CopyError) as error:
+                    raise PostUseError(f"{tree}: workspace refresh failed: {error}",
+                                       caller_error=caller_error) from error
+        except (OSError, scratch.ScratchError) as error:
+            raise CopyError(str(error)) from error
+        finally:
+            COMMAND_LOCKS.reset(token)
+
+
+def end_workspaces(task: str, paths: list[Path]) -> None:
+    """End native copies for the sweep and remove adopted workers through guarded cleanup."""
+    holds = scratch.holds()
+    changed = False
+    for hold in holds.values():
+        if hold["task"] == task:
+            hold["ended"] = time.time()
+            changed = True
+    if changed:
+        scratch.write_holds(holds)
+    for tree in paths:
+        if copy_record.copy_folder(tree) != tree.resolve():
+            if (not tree.exists() and isinstance(scratch.pending_removal(tree), copy_record.NotRegistered)
+                    or scratch.end_copy(tree, task, time.time())):
+                hold = scratch.holds().get(str(tree.resolve()))
+                if hold is not None and hold["task"] == task:
+                    _ = scratch.release(tree)
+            continue
+        if not tree.exists():
+            continue
+        with claim_tree(tree, create=False) as state:
+            if state is not ClaimState.ACQUIRED:
+                raise CopyError(f"{tree}: workspace is busy during task completion")
+            def ended(record: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
+                if not isinstance(record, copy_record.Registered) or record.task != task:
+                    raise CopyError(f"{tree}: workspace task differs")
+                return {**record.fields, "ended": time.time(), "ended_task": task}
+            _ = scratch.update_record(tree, ended)
+
+
 @contextmanager
 def standing(owner: str, repo: str | Path, commit: str, *, apply_uncommitted: str | Path | None = None,
              merge: str | None = None) -> Generator[Path]:
@@ -410,9 +553,14 @@ def standing(owner: str, repo: str | Path, commit: str, *, apply_uncommitted: st
         base = commit_at(source, commit)
     except OSError as error:
         raise CopyError(str(error)) from error
+    if (source in ACTIVE_GATES.get() and read_record(source).owner == owner
+            and commit_at(source, "HEAD") == base and apply_uncommitted is None and merge is None):
+        yield source
+        return
     with available_tree(owner, name, load_config()) as lease:
         tree = lease.tree
         token = COMMAND_LOCKS.set(lease.descriptors)
+        active = ACTIVE_GATES.set((*ACTIVE_GATES.get(), tree))
         try:
             prepare(tree, source, owner, name, base, apply_uncommitted, merge)
             try:
@@ -426,6 +574,7 @@ def standing(owner: str, repo: str | Path, commit: str, *, apply_uncommitted: st
                     raise PostUseError(f"{tree}: post-use refresh failed: {error}",
                                        caller_error=caller_error) from error
         finally:
+            ACTIVE_GATES.reset(active)
             COMMAND_LOCKS.reset(token)
 
 

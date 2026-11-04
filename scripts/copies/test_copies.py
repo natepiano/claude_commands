@@ -13,13 +13,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from threading import Event
 import unittest
 from typing import TextIO, cast, override
 from unittest import mock
 
 from scripts.copies import copies
-from scripts.lib import scratch
+from scripts.lib import copy_record, scratch
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 
 
@@ -65,6 +66,7 @@ class StandingTests(unittest.TestCase):
             "GIT_AUTHOR_EMAIL": "gate-tests@example.invalid", "GIT_COMMITTER_NAME": "Gate Tests",
             "GIT_COMMITTER_EMAIL": "gate-tests@example.invalid",
             "SCRATCH_ROOT": str(self.base / "scratch"),
+            "SCRATCH_HOLDS": str(self.base / "holds.json"),
             "SCRATCH_COPIES_ROOT": str(self.base / "old-copies"),
             "COPIES_CONFIG": str(self.configuration),
         })
@@ -238,6 +240,136 @@ class StandingTests(unittest.TestCase):
             self.assertEqual(tree, self.gates / "verify-unit-gate")
             self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.published)
             self.assertTrue((tree / ".git").is_dir())
+
+    def test_workspace_records_ownership_and_preserves_edits_on_resume(self) -> None:
+        name = "crate-run-package"
+        branch = "style-crate/run/package"
+        with copies.workspace("verify-unit", self.source, self.head, name=name, branch=branch) as tree:
+            record = scratch.task_of(tree)
+            self.assertIsInstance(record, copy_record.Registered)
+            assert isinstance(record, copy_record.Registered)
+            self.assertEqual(record.fields["owner_unit"], "verify-unit")
+            self.assertEqual(record.fields["source_commit"], self.head)
+            self.assertEqual(record.fields["borrows_from"], str(self.source / ".git"))
+            self.assertEqual(self.git(tree, "rev-parse", "--absolute-git-dir"), str(tree / ".git"))
+            self.assertEqual(self.git(tree, "status", "--porcelain"), "")
+            _ = (tree / "tracked.txt").write_text("pending recovery\n")
+            _ = self.git(tree, "add", "tracked.txt")
+            _ = (tree / "untracked.txt").write_text("pending file\n")
+            with scratch.busy_locks(tree, create=False) as idle:
+                self.assertFalse(idle)
+            with self.assertRaisesRegex(copies.CopyError, "busy"):
+                with copies.workspace("verify-unit", self.source, self.head, name=name, branch=branch):
+                    self.fail("a concurrent caller entered the workspace")
+        with copies.workspace("verify-unit", self.source, self.head, name=name, branch=branch) as resumed:
+            self.assertEqual(resumed, tree)
+            self.assertEqual((resumed / "tracked.txt").read_text(), "pending recovery\n")
+            self.assertEqual(self.git(resumed, "diff", "--cached", "--name-only"), "tracked.txt")
+            self.assertTrue((resumed / "untracked.txt").is_file())
+        self.assertEqual(self.git(self.source, "rev-parse", "HEAD"), self.head)
+
+    def test_workspace_retries_each_initialization_boundary_without_resetting_finished_edits(self) -> None:
+        for boundary in ("registration", "clone", "checkout", "config"):
+            with self.subTest(boundary=boundary):
+                tree = copies.workspace_path("verify-unit", self.source, boundary)
+                original_git = copies.git
+                original_register = scratch.register_copy
+                interrupted = False
+                def register(path: Path, **fields: str) -> None:
+                    nonlocal interrupted
+                    original_register(path, **fields)
+                    if boundary == "registration" and not interrupted:
+                        interrupted = True
+                        raise RuntimeError("interrupted init")
+                def git(repo: Path, *arguments: str, data: bytes | None = None) -> bytes:
+                    nonlocal interrupted
+                    result = original_git(repo, *arguments, data=data)
+                    match = ((boundary == "clone" and "clone" in arguments)
+                             or (boundary == "checkout" and "checkout" in arguments)
+                             or (boundary == "config" and repo == tree and len(arguments) == 3
+                                 and arguments[:2] == ("config", "user.email")))
+                    if match and not interrupted:
+                        interrupted = True
+                        raise RuntimeError("interrupted init")
+                    return result
+                with mock.patch.object(scratch, "register_copy", side_effect=register), mock.patch.object(copies, "git", side_effect=git):
+                    with self.assertRaisesRegex(RuntimeError, "interrupted init"):
+                        with copies.workspace("verify-unit", self.source, self.head, name=boundary, branch="worker"):
+                            self.fail("initialization reached the caller")
+                record = scratch.task_of(tree)
+                assert isinstance(record, copy_record.Registered)
+                self.assertEqual(record.fields["copy_commit"], "")
+                with copies.workspace("verify-unit", self.source, self.head, name=boundary, branch="worker") as resumed:
+                    self.assertEqual(self.git(resumed, "rev-parse", "HEAD"), self.head)
+                    _ = (resumed / "tracked.txt").write_text("finished workspace edit\n")
+                with copies.workspace("verify-unit", self.source, self.head, name=boundary, branch="worker") as resumed:
+                    self.assertEqual((resumed / "tracked.txt").read_text(), "finished workspace edit\n")
+
+    def test_legacy_workspace_keeps_commits_index_and_journal_and_ends_through_holds(self) -> None:
+        tree = self.base / "old-run/worker"
+        tree.mkdir(parents=True)
+        copies.initialize_git(tree, self.source)
+        _ = self.git(tree, "checkout", "-q", "-B", "worker", self.head)
+        _ = (tree / "stable.txt").write_text("legacy commit\n")
+        _ = self.git(tree, "commit", "-qam", "legacy worker commit")
+        tip = self.git(tree, "rev-parse", "HEAD")
+        _ = (tree / "tracked.txt").write_text("legacy index\n")
+        _ = self.git(tree, "add", "tracked.txt")
+        journal = tree / ".git/style-batch-intent.json"
+        _ = journal.write_text("journal\n")
+        _ = (tree / "pending.txt").write_text("pending\n")
+        with copies.workspace("verify-unit", self.source, self.head, name="legacy", branch="worker",
+                              task="gate:legacy-run", path=tree) as resumed:
+            self.assertEqual(resumed, tree)
+            self.assertEqual(self.git(tree, "rev-parse", "HEAD"), tip)
+            self.assertEqual(self.git(tree, "diff", "--cached", "--name-only"), "tracked.txt")
+            self.assertEqual(journal.read_text(), "journal\n")
+            self.assertEqual((tree / "pending.txt").read_text(), "pending\n")
+        _ = self.git(self.source, "fetch", "-q", str(tree), "worker:refs/heads/legacy")
+        _ = self.git(tree, "reset", "--hard", self.head)
+        (tree / "pending.txt").unlink()
+        with copies.workspace("verify-unit", self.source, self.head, name="legacy", branch="worker",
+                              task="gate:legacy-run", path=tree):
+            pass
+        copies.end_workspaces("gate:legacy-run", [tree])
+        self.assertNotIn(str(tree), scratch.holds())
+        self.assertFalse(tree.exists())
+
+    def test_workspace_uses_the_existing_copy_sweep(self) -> None:
+        with copies.workspace("verify-unit", self.source, self.published,
+                              name="sweep-package", branch="worker") as tree:
+            self.assertIn(tree, list(scratch.copy_paths()))
+            record = scratch.task_of(tree)
+            assert isinstance(record, copy_record.Registered)
+            self.assertFalse(scratch.end_copy(tree, record.task, time.time()))
+        record = scratch.task_of(tree)
+        assert isinstance(record, copy_record.Registered)
+        self.assertTrue(scratch.end_copy(tree, record.task, time.time()))
+        self.assertFalse(tree.exists())
+
+    def test_workspace_refuses_another_base_or_branch_without_resetting(self) -> None:
+        with copies.workspace("verify-unit", self.source, self.head, name="reserved", branch="worker") as tree:
+            _ = (tree / "tracked.txt").write_text("keep these edits\n")
+        for revision, branch in ((self.published, "worker"), (self.head, "other")):
+            with self.subTest(revision=revision, branch=branch):
+                with self.assertRaises(copies.CopyError):
+                    with copies.workspace("verify-unit", self.source, revision, name="reserved", branch=branch):
+                        self.fail("a different request entered the workspace")
+                self.assertEqual((tree / "tracked.txt").read_text(), "keep these edits\n")
+
+    def test_proof_reuses_its_held_standing_checkout(self) -> None:
+        with copies.standing("verify-unit", self.source, self.head) as tree:
+            with copies.standing("verify-unit", tree, self.head) as proof:
+                self.assertEqual(proof, tree)
+                with scratch.busy_locks(proof, create=False) as idle:
+                    self.assertFalse(idle)
+            self.assertEqual(list(self.gates.iterdir()), [tree])
+
+    def test_worker_proof_uses_the_source_repository_gate_pool(self) -> None:
+        with copies.standing("verify-unit", self.source, self.head) as frozen:
+            with copies.workspace("verify-unit", self.source, self.head, name="package", branch="worker") as worker:
+                with copies.standing("verify-unit", worker, self.head) as proof:
+                    self.assertEqual(proof, frozen.with_name("verify-unit-gate-2"))
 
     def test_apply_uncommitted_captures_staged_unstaged_and_untracked(self) -> None:
         _ = (self.source / "tracked.txt").write_text("staged edit\n")

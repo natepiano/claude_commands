@@ -1041,8 +1041,8 @@ def require_test_tree(repo: Path, tree: str) -> None:
         raise bulk.BulkRenameError("workspace tests require an unchanged clean checkout of the tested tree")
 
 
-def test_tree(repo: Path, commit: str, tree: str, runner: Runner, times: dict[str, float]) -> CommandResult:
-    with copies.standing(style_sync.gate_owner(repo), repo, commit) as checkout:
+def test_tree(repo: Path, commit: str, tree: str, runner: Runner, times: dict[str, float], *, owner: str = "") -> CommandResult:
+    with copies.standing(owner or style_sync.gate_owner(repo), repo, commit) as checkout:
         require_test_tree(checkout, tree)
         result = tested_tree_proof(checkout, tree, runner, times)
         require_test_tree(checkout, tree)

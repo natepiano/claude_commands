@@ -726,6 +726,7 @@ class PythonPolicy:
         self.static: bool = static
         self.path: Path = path
         self.found: list[TreeCreation] = []
+        self.git_modules: set[str] = set()
         # Verified public signature: copies.git(repo, *arguments) forwards
         # ["git", "-C", str(repo), *arguments]. Local definitions override it.
         self.standard_git: GitForwarder = GitForwarder(("repo",), "arguments", cast(ast.List,
@@ -741,8 +742,11 @@ class PythonPolicy:
             if isinstance(outcome, ForbiddenOperation):
                 return ForbiddenOperation("copytree of repository")
             return outcome
-        if isinstance(node.func, ast.Name) and name in helpers:
-            signature = helpers[name]
+        qualified_git = (isinstance(node.func, ast.Attribute) and name == "git"
+                         and isinstance(node.func.value, ast.Name) and node.func.value.id in self.git_modules
+                         and node.func.value.id not in bindings)
+        if isinstance(node.func, ast.Name) and name in helpers or qualified_git:
+            signature = self.standard_git if qualified_git else helpers[name]
             values = dict(bindings)
             for index, parameter in enumerate(signature.parameters):
                 value = next((keyword.value for keyword in node.keywords if keyword.arg == parameter), None)
@@ -791,8 +795,17 @@ class PythonPolicy:
                 for part in _scope_nodes(statement):
                     if isinstance(part, ast.Name) and isinstance(part.ctx, ast.Store):
                         local[part.id] = ScalarValue(UnknownArgument(part.id))
+                    elif part is not statement and isinstance(part, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        local[part.name] = ScalarValue(UnknownArgument(part.name))
+                    elif isinstance(part, ast.alias):
+                        alias = part.asname or part.name.split(".")[0]
+                        local[alias] = ScalarValue(UnknownArgument(alias))
+                    elif isinstance(part, ast.ExceptHandler) and part.name is not None:
+                        local[part.name] = ScalarValue(UnknownArgument(part.name))
                 for parameter in (*statement.args.posonlyargs, *statement.args.args, *statement.args.kwonlyargs):
                     local[parameter.arg] = ScalarValue(UnknownArgument(parameter.arg))
+                if statement.args.kwarg is not None:
+                    local[statement.args.kwarg.arg] = ScalarValue(UnknownArgument(statement.args.kwarg.arg))
                 if statement.args.vararg is not None:
                     local[statement.args.vararg.arg] = ArgumentVector((ForwardedArguments(statement.args.vararg.arg),))
                 for parameter in (*statement.args.posonlyargs, *statement.args.args, *statement.args.kwonlyargs):
@@ -853,6 +866,13 @@ class PythonPolicy:
                 self.expression(statement, bindings, helpers)
 
     def scan(self, tree: ast.Module) -> list[TreeCreation]:
+        self.git_modules = {
+            alias.asname or alias.name for statement in tree.body if isinstance(statement, ast.Import)
+            for alias in statement.names if alias.name in {"bulk_run", "scripts.style.bulk_run"}
+        }
+        self.git_modules.update(
+            alias.asname or alias.name for statement in tree.body if isinstance(statement, ast.ImportFrom)
+            and statement.module == "scripts.copies" for alias in statement.names if alias.name == "copies")
         self.statements(tree.body, {}, {"git": self.standard_git})
         return self.found
 

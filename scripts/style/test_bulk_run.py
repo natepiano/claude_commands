@@ -344,7 +344,10 @@ class WorkspaceRunTests(CargoProjectTests):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root / "gate-home")}))
+        self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root / "gate-home"),
+            "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
+        }))
         _ = self.enterContext(mock.patch.object(style_sync, "gate_owner", return_value="sample-style"))
 
         _ = (self.repo / "Cargo.toml").write_text((self.repo / "Cargo.toml").read_text() + '\n[workspace]\nmembers=[".", "beta"]\n')
@@ -795,13 +798,13 @@ class WorkspaceRunTests(CargoProjectTests):
                       mock.patch.object(run, "claim", side_effect=AssertionError("restart claimed tickets"))):
                     authority = fresh
                     def test_tree(repo: Path, _commit: str, _tree: str, runner: run.Runner,
-                                  times: dict[str, float]) -> run.CommandResult:
+                                  times: dict[str, float], *, owner: str = "") -> run.CommandResult:
                         self.assertNotEqual(run.git(repo, "rev-parse", "HEAD"), self.base)
                         self.assertFalse(intent.retry_eligible())
                         self.assertEqual(journal_owner(), ownership)
                         if case == "tested_interrupt":
                             raise KeyboardInterrupt()
-                        return original_test_tree(repo, _commit, _tree, runner, times)
+                        return original_test_tree(repo, _commit, _tree, runner, times, owner=owner)
                     original_test_tree = run.test_tree
                     with mock.patch.object(run, "test_tree", new=test_tree):
                         if case == "tested_interrupt":

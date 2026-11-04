@@ -355,6 +355,43 @@ class CopyGuardTests(unittest.TestCase):
         self.assertTrue(all(finding.line >= 1 for finding in findings))
         self.assertTrue(all("copies.py run" in str(finding) for finding in findings))
 
+    def test_scan_finds_qualified_style_git_makers_without_refusing_git_reads(self) -> None:
+        scripts = self.root / "scripts"
+        scripts.mkdir()
+        _ = (scripts / "crate_worker.py").write_text(
+            'import bulk_run as run\n'
+            + 'run.git(repo, "clone", "--shared", str(repo), str(checkout))\n'
+            + 'run.git(repo, "worktree", "add", str(checkout), "HEAD")\n'
+            + 'run.git(repo, "show", "clone")\n')
+        findings = copy_guard.scan_scripts(scripts, allow_list={})
+        self.assertEqual([(finding.line, finding.operation) for finding in findings],
+                         [(2, "git clone"), (3, "git worktree add")])
+
+    def test_scan_respects_parameters_and_local_bindings_that_shadow_git_imports(self) -> None:
+        scripts = self.root / "scripts"
+        scripts.mkdir()
+        _ = (scripts / "calls.py").write_text(
+            'import bulk_run as run\n'
+            + 'run.git(repo, "clone", "a", "b")\n'
+            + 'def parameter(run):\n    run.git(repo, "clone", "a", "b")\n'
+            + 'def local():\n    run.git(repo, "clone", "a", "b")\n    run = unrelated\n'
+            + 'def imported():\n    run.git(repo, "clone", "a", "b")\n')
+        findings = copy_guard.scan_scripts(scripts, allow_list={})
+        self.assertEqual([(finding.line, finding.operation) for finding in findings],
+                         [(2, "git clone"), (9, "git clone")])
+
+    def test_scan_respects_exception_variables_that_shadow_git_imports(self) -> None:
+        scripts = self.root / "scripts"
+        scripts.mkdir()
+        _ = (scripts / "calls.py").write_text(
+            'import bulk_run as run\n'
+            + 'run.git(repo, "clone", "a", "b")\n'
+            + 'def caught():\n'
+            + '    try:\n        operation()\n'
+            + '    except Problem as run:\n        run.git(repo, "clone", "a", "b")\n')
+        findings = copy_guard.scan_scripts(scripts, allow_list={})
+        self.assertEqual([(finding.line, finding.operation) for finding in findings], [(2, "git clone")])
+
     def test_scan_honors_only_configured_originals_and_isolated_test_inputs(self) -> None:
         scripts = self.root / "scripts"
         allowed = scripts / "production/add_unit.py"
