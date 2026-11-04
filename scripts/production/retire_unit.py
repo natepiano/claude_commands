@@ -23,7 +23,6 @@ from scripts.shutdown.remote import local_machine
 from scripts.shutdown import stop_resume
 from scripts.message import sessions
 from scripts.lib import process_group, conf
-from scripts.lib.atomic_file import write_text_atomic
 from scripts.issue_score.selection import UseConfiguredValue
 from scripts.agents import worker_lifecycle
 import berth_board
@@ -552,18 +551,6 @@ def retire(unit: Unit, *, settings: conf.ConfigRead,
         print("\n".join(f"anomaly: {reason}" for reason in failed))
         return 1
     _ = staff.set_worktree(row.id, staff.RemovedWorktree(local_machine(), unit.worktree), expected=row.worktree)
-    lines = unit.production.doc.read_text(encoding="utf-8").splitlines(keepends=True)
-    in_units = False
-    kept: list[str] = []
-    for line in lines:
-        if line.startswith("## "):
-            in_units = line.strip() == "## Units"
-        cells = line.split("|")
-        if in_units and len(cells) > 2 and cells[1].strip().strip("`") in (row.name, unit.name):
-            continue
-        kept.append(line)
-    if kept != lines:
-        write_text_atomic(unit.production.doc, "".join(kept))
     print(f"{unit.name} retired")
     return 0
 
