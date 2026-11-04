@@ -1757,6 +1757,10 @@ def matching_recipients(
     member = resolve_staff_recipient(to, membership, observed=observed.entries)
     if isinstance(member, RecipientLookupFailed):
         return RecipientSearchFailed(member.reason, [member.reason])
+    if isinstance(member, staff.StaffRow):
+        for anomaly in observed.row_anomalies:
+            if anomaly.row.id == member.id:
+                return RecipientSearchFailed(anomaly.diagnostic, observed.diagnostics)
     matches = (_staff_transport_matches(member, observed.entries) if isinstance(member, staff.StaffRow)
                else _sender_label_matches(to, observed.entries))
     if matches or isinstance(scope, LocalOnly):
@@ -1792,6 +1796,10 @@ def resolve_recipient(
     member = resolve_staff_recipient(to, membership, observed=observed.entries)
     if isinstance(member, RecipientLookupFailed):
         usage_error(member.reason)
+    if isinstance(member, staff.StaffRow):
+        for anomaly in observed.row_anomalies:
+            if anomaly.row.id == member.id:
+                usage_error(anomaly.diagnostic)
     if isinstance(scope, NamedMachine):
         return RemoteDelivery(scope.host, (f"codex:{member.current_session}" if to.startswith("codex:")
                                           else to if to.startswith("worker:") else f"session:{member.current_session}")
