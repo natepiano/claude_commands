@@ -25,8 +25,10 @@ from cgroup_test_support import CPU, write_cgroup
 from test_index import use_test_log
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
+    from ..lib.cargo_output_test_support import fake_cargo_output_roots
 else:
     from scripts.lib import test_hang_guard
+    from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 
 use_test_log()
 
@@ -39,6 +41,7 @@ class SampleTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(fake_cargo_output_roots())
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())) / "buildlog"
         proc = self.root / "proc"
         proc.mkdir(parents=True, exist_ok=True)
@@ -51,6 +54,22 @@ class SampleTests(unittest.TestCase):
         for name, filename in (("CPU_PRESSURE", "cpu_pressure"), ("IO_PRESSURE", "io_pressure"), ("STAT", "stat")):
             _ = self.enterContext(patch.object(sample, name, proc / filename))
         _ = self.enterContext(patch.object(sample, "POWER_PROFILE_STATE", self.root / "absent-profile"))
+
+    def test_default_filesystem_uses_resolved_intermediate_root(self) -> None:
+        import filesystem
+        from cargo_output import CargoOutputRoots
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            output = root / "intermediates"
+            output.mkdir()
+            roots = CargoOutputRoots(root, root / "target", output)
+            with patch.dict(os.environ, {}, clear=True), \
+                 patch.object(sample, "read_cargo_output_roots", return_value=roots), \
+                 patch.object(filesystem, "filesystem_usage", return_value=filesystem.FilesystemUsage(20, 80, 100, "2:1")) as usage:
+                result = sample.filesystem_reading()
+            self.assertEqual(result["state"], "measured")
+            usage.assert_called_once_with(str(output))
 
     def test_filesystem_reading_does_not_import_disk_or_sweep(self) -> None:
         command = (
@@ -70,6 +89,16 @@ class SampleTests(unittest.TestCase):
             timeout=30,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_failed_output_mapping_reports_unavailable(self) -> None:
+        import filesystem
+        from cargo_output import CargoOutputUnavailable
+
+        with patch.dict(os.environ, {}, clear=True), \
+             patch.object(sample, "read_cargo_output_roots", return_value=CargoOutputUnavailable("no metadata")), \
+             patch.object(filesystem, "filesystem_usage") as usage:
+            self.assertEqual(sample.filesystem_reading(), {"state": "unavailable"})
+        usage.assert_not_called()
 
     def test_pool_token_readings_use_read_only_commands_and_short_timeouts(self) -> None:
         with patch.object(subprocess, "run", side_effect=[
@@ -406,6 +435,8 @@ class SampleTests(unittest.TestCase):
             "sample.BOOT_ID = proc / 'boot_id'; "
             "from unittest.mock import patch; from contextlib import ExitStack; "
             "stack = ExitStack(); "
+            "from scripts.lib.cargo_output_test_support import fake_cargo_output_roots; "
+            "stack.enter_context(fake_cargo_output_roots()); "
             "stack.enter_context(patch.object(sample, 'CPU_PRESSURE', proc / 'cpu_pressure')); "
             "stack.enter_context(patch.object(sample, 'IO_PRESSURE', proc / 'io_pressure')); "
             "stack.enter_context(patch.object(sample, 'STAT', proc / 'stat')); "

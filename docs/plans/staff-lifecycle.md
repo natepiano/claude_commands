@@ -63,8 +63,8 @@ Anything else unexpected prints one anomaly line and the operation continues.
 
 | Unit | Deletes |
 |---|---|
-| devtools | every other refusal in `unit_move.py`, `rename_unit.py`, `transfer_unit.py`, `retire_unit.py`; their journals; the retired note and saved branch ref; the rename sweep that classifies files; every stored folder-path copy (4v, 4w) |
-| herdr | `production_tree.py` (4b); the Production header and Gates table (4o); the Units table and the plan's `> **Production:**` header, copies of `parent` (4c; the plan path is in `.unit.toml`; until 4c lands, a transfer also moves the Units row and a retire deletes it); the seed importer (4d); legacy pane marks (4e); stop, resume and restart refusals |
+| devtools | every other refusal in `unit_move.py`, `rename_unit.py`, `transfer_unit.py`, `retire_unit.py`; their journals; the retired note and saved branch ref; the rename sweep that classifies files; every stored folder-path copy (4v, 4w); the Units tables: every reader reads staff (4d, on main 3ffe2193f), and 4u deletes the writers and the tables (until 4u lands, a retire deletes the unit's row) |
+| herdr | `production_tree.py` (4b); the Production header and Gates table (4o); the plan's `> **Production:**` header, a copy of `parent` (4c; the plan path is in `.unit.toml`); the seed importer (4d); legacy pane marks (4e); stop, resume and restart refusals |
 | models | the worker ledger's adoption journal; repair-roster; the ledger-to-roster check; legacy identity readers (one migration run); per-thread records in `design_roles`; any seat-to-thread map other than staff |
 | shutdown | refusals in `restart.py` and `shutdown_record.py`; the restore record keeps only the list of row ids that were live. Done: the `launch_permission.py` and `folder_trust.py` gates (deleted in b9fd6ada4) |
 | accounts | `cutover-home` (after the Mac cutover); the Mac session counts fetch; the resume retry loop |

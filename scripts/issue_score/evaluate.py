@@ -13,7 +13,7 @@ import sys
 from typing import Literal, cast
 
 from scripts.lib import conf
-from .selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 
 from . import client, decide, questions, vault
 from .records import ScoredIssue, state_dir as configured_state_dir

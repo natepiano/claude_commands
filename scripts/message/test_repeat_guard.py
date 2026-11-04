@@ -27,7 +27,8 @@ import send
 import repeat_guard as guard
 import repeats
 from scripts.message.repeat_guard_test_support import (
-    NoticeAttemptTrace, NoticeDrainClock, install_guard_test_budget, run_ready_notice_attempt,
+    NoticeAttemptTrace, NoticeDrainClock, install_guard_test_budget, install_notice_test_config, run_ready_notice_attempt,
+    wait_for_notice_readiness,
 )
 
 
@@ -100,6 +101,8 @@ class RepeatGuardTests(unittest.TestCase):
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(patch.dict(os.environ, {"HOME": str(self.home), "XDG_STATE_HOME": str(self.home / "state")}))
+        config = install_notice_test_config(self.home)
+        self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config)}))
         limits = guard.configuration()
         if isinstance(limits, guard.GuardUnavailable):
             raise AssertionError(limits.reason)
@@ -130,6 +133,26 @@ class RepeatGuardTests(unittest.TestCase):
         # Storage and notice fixtures use the real worker without depending on
         # interpreter startup scheduling. Public deadline tests still use check.
         return guard._stored_check(self.root, attempt)  # pyright: ignore[reportPrivateUsage]
+
+    def test_notice_config_needs_no_repository_or_git_recovery(self) -> None:
+        config = self.home / ".claude/config"
+        self.assertTrue((config / "send.conf").is_file())
+        with patch.object(subprocess, "Popen", side_effect=AssertionError("configuration started a process")):
+            self.assertGreater(send.delivery_timeout(), 0)
+            self.assertGreater(send.kill_grace(), 0)
+
+    def test_notice_readiness_patch_leaves_other_module_launchers_unchanged(self) -> None:
+        launcher = subprocess.Popen
+        cleanup_budget = send.kill_grace
+
+        def read_cleanup_budget() -> float:
+            self.assertIs(subprocess.Popen, launcher)
+            return cleanup_budget()
+
+        with patch.object(send, "kill_grace", read_cleanup_budget):
+            code, output, errors = run_ready_notice_attempt(
+                send.run, [sys.executable, "-c", "print('ready')"], "", TEST_HANG_GUARD_SECS, "")
+        self.assertEqual((code, output, errors), (0, "ready\n", ""))
 
     def test_first_two_copies_pass_and_the_third_is_held_and_recorded(self) -> None:
         self.assertEqual([self.apply(at=index).held for index in range(1, 6)], [False, False, True, True, True])
@@ -725,23 +748,41 @@ os.kill(os.getpid(), signal.SIGSTOP)
         runner = "import sys; import send; send.run(sys.argv[1:], '', 60)"
         command = [sys.executable, "-c", runner, sys.executable, "-c", child_program, str(marker), grandchild, str(ready)]
         # Start the deadline check only after the delivery descendants exist.
-        with os.fdopen(os.open(ready, os.O_RDWR), "r") as readiness:
-            child = subprocess.Popen(command, start_new_session=True,
-                env=self.owned.environment({**os.environ, "PYTHONPATH": str(Path(guard.__file__).parent), "SEND_REPEAT_NOTICE_JOB": "1"}))
-            self.owned.track(child, group=True)
-            try:
-                with LauncherHangGuard("delivery descendants").protect():
-                    if readiness.readline() != "ready\n":
-                        raise AssertionError("delivery descendants did not become ready")
+        child = subprocess.Popen(command, start_new_session=True,
+            env=self.owned.environment({**os.environ, "PYTHONPATH": str(Path(guard.__file__).parent), "SEND_REPEAT_NOTICE_JOB": "1"}))
+        self.owned.track(child, group=True)
+        try:
+            wait_for_notice_readiness(ready, child)
+            started = time.monotonic()
+            with patch.object(guard, "Popen", return_value=child):
+                guard.notice_job(command, 1)
+            self.assertLess(time.monotonic() - started, 1.4)
+            for pid in marker.read_text().split():
+                status = subprocess.run(["ps", "-p", pid, "-o", "stat="], text=True, capture_output=True, check=False)
+                self.assertTrue(not status.stdout.strip() or status.stdout.strip().startswith("Z"), status.stdout)
+        finally:
+            self.owned.finish()
+
+    def test_notice_readiness_fails_fast_when_the_runner_exits(self) -> None:
+        for opens_fifo in (False, True):
+            with self.subTest(opens_fifo=opens_fifo):
+                ready = self.home / f"early-exit-{opens_fifo}"
+                os.mkfifo(ready)
+                program = "import sys; "
+                if opens_fifo:
+                    program += "open(sys.argv[1], 'w').close(); "
+                program += "sys.exit(7)"
+                child = subprocess.Popen([sys.executable, "-c", program, str(ready)],
+                                         env=self.owned.environment())
+                self.owned.track(child)
                 started = time.monotonic()
-                with patch.object(guard, "Popen", return_value=child):
-                    guard.notice_job(command, 1)
-                self.assertLess(time.monotonic() - started, 1.4)
-                for pid in marker.read_text().split():
-                    status = subprocess.run(["ps", "-p", pid, "-o", "stat="], text=True, capture_output=True, check=False)
-                    self.assertTrue(not status.stdout.strip() or status.stdout.strip().startswith("Z"), status.stdout)
-            finally:
-                self.owned.finish()
+                try:
+                    with self.assertRaisesRegex(AssertionError, "runner exited 7 before readiness"):
+                        wait_for_notice_readiness(ready, child)
+                    self.assertLess(time.monotonic() - started, TEST_HANG_GUARD_SECS / 10)
+                    self.assertEqual(child.returncode, 7)
+                finally:
+                    self.owned.finish()
 
     def test_direct_events_report_observed_outcomes_and_replay_uses_independent_labels(self) -> None:
         receiver = guard.recipient_identity("", thread_id="thread-1")
