@@ -159,10 +159,9 @@ refuses a name that another session of the same account also has.
   source; omit the section if none>
 ```
 
-A production doc has no list of units. A unit is its staff row and the `.unit.toml` in its
-worktree. The staff row gives the unit's name, parent production, worktree and branch; the
-units of a production are in staff.json row order. `.unit.toml` gives the plan, the app port
-and the files the unit owns.
+A production doc has no Units table. The staff row holds the unit's name, parent production and worktree.
+Git holds its branch. `.unit.toml` holds its plan, app port and responsibilities.
+List a production's units in staff row order. Staff holds no port.
 
 The unit id (`<name>-unit`) names the unit everywhere: in the log, the dailies, the waits and
 every tool's arguments. A unit's session name is written nowhere, because the user may rename
