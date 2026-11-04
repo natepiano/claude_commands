@@ -5716,6 +5716,25 @@ def _refuse_taken_follow_up(client: Client, replacement: str, session_dir: str) 
     raise SystemExit("name was taken while the follow-up ran; follow-up did not start")
 
 
+def _worker_rollout_path(session_dir: str, thread_id: str, home: Path) -> Path | None:
+    """Find the saved history in the worker and recorded server homes."""
+    homes = {home, *(server_record_home(record) for record in _recorded_run_servers(session_dir) if record)}
+    paths: set[Path] = set()
+    for source in homes:
+        for directory in ("sessions", "archived_sessions"):
+            paths.update(path.resolve() for path in (source / directory).glob(f"**/rollout-*-{thread_id}.jsonl"))
+    if len(paths) > 1:
+        raise SystemExit(f"RoleNeedsRecovery: multiple saved histories for {thread_id}; replacement refused")
+    path = next(iter(paths), None)
+    if path is not None:
+        try:
+            with path.open("rb") as history:
+                _ = history.read(1)
+        except OSError as error:
+            raise SystemExit(f"RoleNeedsRecovery: saved history is unreadable at {path}: {error}; replacement refused") from error
+    return path
+
+
 def _resume_worker_thread(
     args: argparse.Namespace, session_dir: str, name: str, thread_id: str, client: Client,
     workers_home: Path, *, staff_admission: WorkerStartAllowed,
@@ -5730,6 +5749,14 @@ def _resume_worker_thread(
     own_reviewer = previous_record.get("role") == "review" and bool(previous_record.get("unit_ledger"))
     sandbox = _worker_sandbox(args, session_dir, name)
     resumed = client.call("thread/resume", params)
+    if resumed.get("error"):
+        path = _worker_rollout_path(session_dir, thread_id, workers_home)
+        if path is not None:
+            resumed = client.call("thread/resume", {**params, "path": str(path)})
+            if resumed.get("error"):
+                _post_board_status(session_dir, name,
+                    f"saved history for {thread_id} could not resume from {path}: {json.dumps(resumed.get('error'))}; replacement refused")
+                _ = _require(resumed, "thread/resume")
     if not resumed.get("error"):
         result = _require(resumed, "thread/resume")
         if _as_str(_as_dict(result.get("thread")).get("id")) != thread_id:
@@ -5767,7 +5794,8 @@ def _resume_worker_thread(
     _ = client.call("thread/name/set", {"threadId": replacement, "name": unit_workers.shown_name(Path(session_dir), name)})
     _post_board_status(
         session_dir, name,
-        f"{codex_home_display(workers_home)} refused to resume {thread_id}; worker continues as new thread {replacement}",
+        f"{codex_home_display(workers_home)} refused to resume {thread_id}; worker continues as new thread {replacement}; "
+        + f"no saved rollout found; resume error: {json.dumps(resumed.get('error'))}",
     )
     return _WorkerThreadForHome(replacement, True)
 
