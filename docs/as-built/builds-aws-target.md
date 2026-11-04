@@ -37,6 +37,9 @@ The target is live. The user approved go-live on 2026-11-03. The stacks exist in
 
 ### Routing: `scripts/direct/verify.sh`, `scripts/build_targets/build_targets.py`
 
+- `verify.sh test PACKAGE --target aws` pins one step to AWS. `check` and staged `doc` also accept `--target`.
+  A pin keeps admission, spending, and version checks. It takes no natedev grant or cargo token.
+  A refusal ends the step with a nonzero status. Remote step records include `target=aws`, `host=aws-build`, and `pinned=true`.
 - Queued `test`, `check` and staged `doc` steps try eligible SSH targets in configured order. `ssh_target_eligibility` checks configuration, backoff, capacity and reachability, with no shell evaluation.
 - `build_targets.py reserve` returns 0 (reserved or recovered), 11 (busy macOS target) or 1 (no reservation). `--recover-only` recovers only an existing claim. `MacClaimFromWait` moves ownership from the wait to the claim with no unclaimed interval.
 - `BUILDLOG_MEM_WAIT_SINCE` and `BUILDLOG_MEM_WAIT_FIRST_FILE` keep the first queue time across remote loss and local fallback. Local fallback needs admission. A confirmed remote failure does not cause a local rerun.
@@ -56,7 +59,8 @@ The target is live. The user approved go-live on 2026-11-03. The stacks exist in
 ### Control: `aws_target.py`, `remote.py`
 
 - `aws_target.py tick|start|stop|serve` runs `Controller` under `control_lock`. `AwsCli` is the one AWS CLI adapter. `controller.json` holds the state (`off`, `refused`, `stopped`, `starting`, `running`, `draining`, `stopping`), `generation`, `permitted_generation`, the drain deadline and the capacity backoff.
-- `tick` reads `admission/queue.json` and starts the box only for enough eligible waiting rows, guard permission and an ended backoff. A drain keeps its deadline (`drain_max_minutes`). The tick also runs `refresh_charges`.
+- `tick` starts the box for one live pinned waiting step or enough eligible rows in `admission/queue.json`.
+  Both paths require guard permission and an ended backoff. Unpinned steps keep their queue thresholds. A drain keeps its deadline (`drain_max_minutes`). The tick also runs `refresh_charges`.
 - `remote.py` publishes an `AdmissionEnvelope` (target, purpose, generation, decision time, expiry) only after a confirmed guard write. The runner checks it before and after shell preparation. Other Linux targets use `IndependentLinuxExecution` and need no AWS permission.
 - On the box, `RemoteAgent` stops the instance after `idle_stop_minutes` idle and polls IMDSv2 every `interruption_poll_s`. An interrupted slot prints `aws_interrupted=<generation>` once, after `mac_exit` and `mac_cleanup`, and exits with the child status. Offload reads it as `InterruptedTargetRun` and records `ON_NATEDEV` before local work.
 - `release_stopped_claims` releases only claims bound to the stopped host and generation, and writes `release-evidence/`.

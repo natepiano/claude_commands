@@ -56,7 +56,11 @@ Every command checks holds through `target_state`. The sole holder may run its o
 
 ### Where a job runs: `scripts/direct/verify.sh`
 
-- `check`, `build`, `lint`, `doc`, `example` and `final` run on natedev only. Only `test` routes.
+- `test`, `check`, and staged `doc` can use configured SSH targets. Other steps run on natedev.
+- `verify.sh test PACKAGE --target aws` pins one step to AWS. `check` and `doc` also accept `--target`.
+  A pin keeps admission, spending, and version checks. It takes no natedev grant or cargo token.
+  A refusal ends the step with a nonzero status. The step never returns to natedev.
+  Remote step records include `target=aws`, `host=aws-build`, and `pinned=true`.
 - `route_test` runs after the per-call wait files and cleanup trap exist, and before the per-call `wait-local` and the cargo token. It reads the `eligible` table and records an excluded Mac at once (`BUILDLOG_MAC=declined`, and its reason in `BUILDLOG_MAC_REASON` and `BUILDLOG_LOCAL_REASON` unless `--local` was given), also when `offload.py` is never called. It then visits the eligible targets in config order:
   - natedev: `check_routing_hold` (`register-local`). Exit 0 sends the test to natedev. Exit 10 or 12 goes on to the next target, so a filtered test can still pass on the Mac when natedev's hold state cannot be read.
   - an `ssh` target: `try_mac_test <settings>` runs `offload.py run --settings <path>`. A pass or failure ends the call with the Mac's status. A pass prints `verify.sh: PASS on the Mac (macOS), so nothing ran on natedev.` and records `passed_full` or `passed_filter` with `host=mac`. A temporary decline or a lost run keeps the target on the retry list. Permanent exclusions (`no_tests`, `off`, `repo`, `linux_only`, `local_flag`) stop retries for that target.
