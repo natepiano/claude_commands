@@ -20,6 +20,7 @@ import fake_fmt
 from style_child_test_support import style_cli_command
 import mechanical_classes
 import style_ledger
+from style_plan_test_support import unit_staff_id
 import style_rules
 from scripts.production import unit_config
 from scripts.production.staff_test_support import fixture_unit_location, isolated_staff_file, recorded_showrunner
@@ -178,7 +179,7 @@ class StandingCheckpointTests(unittest.TestCase):
                 finding = ledger.hold(self.rule, path, 2, "1", "type", "1", "2", rule_blob, "outside")
                 ledger.file_held(finding.finding_id, issue)
         _ = issue.write_text('---\nstatus: open\nstage: backlog\ntags: [issue, proposal, style]\n'
-                             + f'unit: names-unit\nplan: "{self.plan} Phase 1"\nstyle_rule: {self.rule}\nstyle_crate: alpha\n'
+                             + f'unit: {unit_staff_id("names-unit")}\nplan: "{self.plan} Phase 1"\nstyle_rule: {self.rule}\nstyle_crate: alpha\n'
                              + f'style_rule_blob: {rule_blob}\nstyle_count: 1\n---\n')
         _ = self.doc.write_text(self.doc.read_text() + f"- **Proposals:** {issue.parent}\n")
         result = self.refill()

@@ -620,10 +620,6 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     held = retire_wrap_rows(rows, record, runner.row) or held
     if isinstance(status, ProductionRunning):
         release_edges(production.slug, record=record)
-        notifier = Path.home() / ".claude/scripts/message/notifier.sh"
-        # The update timer is the one record of the showrunner, so removing it unregisters it.
-        _ = command("notifier", production.checkout, str(notifier), "remove", f"showrunner-{production.slug}")
-        report("notifier", "ok", "update timer removed")
         archived = command(
             "phase-notes",
             production.checkout,
@@ -641,6 +637,9 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
             if count
             else "no phase notes to archive",
         )
+        notifier = Path.home() / ".claude/scripts/message/notifier.sh"
+        _ = command("notifier", production.checkout, str(notifier), "remove", f"showrunner-{production.slug}")
+        report("notifier", "ok", "update timer removed")
         updated = [line.replace("**Status: PRODUCTION — running.**", "**Status: PRODUCTION — wrapped.**")
                    for line in lines]
         write_text_atomic(production.doc, "\n".join(updated) + "\n")

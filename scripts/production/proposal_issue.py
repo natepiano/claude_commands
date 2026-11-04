@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import urgency  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 from issues import PROPOSAL_TAG, Issue, frontmatter, open_issues
-from scripts.production import staff
+from scripts.production import staff, unit_names
 
 FENCE = "---"
 # Values the vault writes bare; every other value is written double-quoted.
@@ -266,7 +266,11 @@ def staff_reference(reference: str, kind: staff.Kind) -> staff.StaffRow:
     record = staff.snapshot()
     row = record.by_id(staff.StaffId(reference)) or record.by_path(reference)
     if row is None:
-        matches = [member for member in record.rows if member.kind == kind and member.name == reference]
+        try:
+            name = unit_names.name(reference) if kind == "unit" else reference
+        except unit_names.BadName:
+            raise Refusal(f"{reference}: no unique {kind} staff row") from None
+        matches = [member for member in record.rows if member.kind == kind and member.name == name]
         row = matches[0] if len(matches) == 1 else None
     if row is None or row.kind != kind:
         raise Refusal(f"{reference}: no unique {kind} staff row")
@@ -277,6 +281,12 @@ def staff_name(identity: str) -> str:
     """Read the current name for a stored staff id."""
     row = staff.snapshot().by_id(staff.StaffId(identity))
     return row.name if row is not None else f"unavailable staff {identity}"
+
+
+def proposal_unit(issue: Issue) -> str:
+    """Read the unit id from the proposal's stored staff id."""
+    identity = issue.value("unit")
+    return unit_names.unit_id(staff_reference(identity, "unit").name) if identity else ""
 
 
 def calling_showrunner() -> str:

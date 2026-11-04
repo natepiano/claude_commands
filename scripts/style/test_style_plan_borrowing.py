@@ -22,7 +22,7 @@ import style_proposals
 import rules
 import style_ledger
 
-from style_plan_test_support import StylePlanFixture
+from style_plan_test_support import StylePlanFixture, unit_staff_id
 from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner
 
 
@@ -94,7 +94,7 @@ class StylePlanTests(StylePlanFixture):
         source, destination = self.sources[:2]
         self.commit_files({source: "pub struct Parent {\n    old: u32,\n}\n"})
         issue, (finding,) = self.judged_findings(values, ((source, 2, "old: u32,"),))
-        _ = issue.write_text(issue.read_text().replace("unit: names-unit", "unit: values-unit"))
+        _ = issue.write_text(issue.read_text().replace(f"unit: {unit_staff_id('names-unit')}", f"unit: {unit_staff_id('values-unit')}"))
         self.write_generated_body(issue)
         _ = self.git("rm", "-q", source)
         self.commit_files({destination: "pub struct Parent {\n    old: u32,\n}\n"})
@@ -315,7 +315,7 @@ class StylePlanTests(StylePlanFixture):
                           style_plan.FamilySelection.BORROW):
             with self.subTest(selection=selection), redirect_stdout(io.StringIO()):
                 owner = "names-unit" if selection == style_plan.FamilySelection.OWN else "values-unit"
-                _ = issue.write_text(re.sub(r"unit: .*", "unit: " + owner, issue.read_text()))
+                _ = issue.write_text(re.sub(r"unit: .*", "unit: " + unit_staff_id(owner), issue.read_text()))
                 result = style_plan._select_phase(  # pyright: ignore[reportPrivateUsage]
                     ledger, "names-unit", "demo-style-names", self.plan, self.repo, self.doc, self.plan.read_text(),
                     unit_plans.AllCrates(), busy, frozenset(), definitions, style_plan.MainChanges(self.tip),

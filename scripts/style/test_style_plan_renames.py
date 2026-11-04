@@ -17,7 +17,7 @@ import style_plan
 import mechanical_classes
 import rules
 
-from style_plan_test_support import StylePlanFixture
+from style_plan_test_support import StylePlanFixture, unit_staff_id
 
 
 @final
@@ -178,8 +178,7 @@ class StylePlanTests(StylePlanFixture):
                                 "outside").finding_id for line, held_rule in enumerate((rule, uncovered), start=1))
         for finding_id in ids:
             ledger.file_held(finding_id, issue)
-        _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
-                             + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
+        _ = issue.write_text(f"---\nstatus: open\ntags: [proposal, style]\nunit: {unit_staff_id('names-unit')}\nplan: approved\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
         ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "crates/alpha", [self.sources[0]],
                           [rule, uncovered], proposal=str(issue), finding_ids=ids)
         ticket = ledger.queued_tickets("names-unit")[0]
@@ -203,8 +202,7 @@ class StylePlanTests(StylePlanFixture):
                     for path in (self.sources[0], "docs/notes.md"))
         for finding_id in ids:
             ledger.file_held(finding_id, issue)
-        _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
-                             + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
+        _ = issue.write_text(f"---\nstatus: open\ntags: [proposal, style]\nunit: {unit_staff_id('names-unit')}\nplan: approved\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
         ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "crates/alpha", [self.sources[0], "docs/notes.md"],
                           [rule], proposal=str(issue), finding_ids=ids)
         ticket = ledger.queued_tickets("names-unit")[0]

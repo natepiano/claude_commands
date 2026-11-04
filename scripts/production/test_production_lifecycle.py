@@ -1140,9 +1140,9 @@ class LifecycleTests(LifecycleFixture):
         _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
         _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
         _ = self.git("push", "origin", "production")
-        owned = self.write_phase_note("alpha", "example", "alpha-unit")
+        owned = self.write_phase_note("alpha", "example", next(row.id for row in staff.find(kind="unit") if row.name == "alpha"))
         owned_bytes = owned.read_bytes()
-        other = self.write_phase_note("other", "other", "alpha-unit")
+        other = self.write_phase_note("other", "other", unit_membership("other", "alpha-unit").id)
         other_bytes = other.read_bytes()
         handwritten = self.phase_table_vault / "showrunner" / "notes.md"
         self.write(handwritten, "kept by a person\n")
@@ -1168,7 +1168,7 @@ class LifecycleTests(LifecycleFixture):
         _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
         _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
         _ = self.git("push", "origin", "production")
-        note = self.write_phase_note("alpha", "example", "alpha-unit")
+        note = self.write_phase_note("alpha", "example", next(row.id for row in staff.find(kind="unit") if row.name == "alpha"))
         archive = self.phase_table_vault.parent / "archive"
         self.write(archive, "blocks the archive directory\n")
 
@@ -1179,7 +1179,8 @@ class LifecycleTests(LifecycleFixture):
         self.assertIn("cannot archive phase note", result.stdout)
         self.assertTrue(note.is_file())
         self.assertIn("**Status: PRODUCTION — running.**", self.doc.read_text())
-        self.assertIn("notifier.sh remove", self.calls())
+        self.assertNotIn("notifier.sh remove", self.calls())
+        self.assertTrue((self.state / "notifier/showrunner-example/conf").is_file())
 
 
 if __name__ == "__main__":

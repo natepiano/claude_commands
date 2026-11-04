@@ -20,6 +20,7 @@ import unit_lookup
 import display_cells
 from herdr import HerdrPlace
 from scripts.direct import plan_history
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
 
 NOW = datetime(2026, 10, 28, 12, tzinfo=UTC)
@@ -42,6 +43,7 @@ class StyleUnitsTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp/claude")))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.database = self.root / "ledger.sqlite"
         with closing(sqlite3.connect(self.database)) as connection:
             _ = connection.executescript("""
@@ -53,6 +55,7 @@ class StyleUnitsTests(unittest.TestCase):
                     finding_id INTEGER PRIMARY KEY, proposal TEXT, state TEXT, build_ticket TEXT,
                     built_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT ''
                 );
+                CREATE TABLE rule_texts (blob TEXT PRIMARY KEY, text BLOB NOT NULL);
                 CREATE TABLE refill_results (
                     unit TEXT PRIMARY KEY, at TEXT NOT NULL, outcome TEXT NOT NULL,
                     split_at TEXT NOT NULL DEFAULT '', ready INTEGER NOT NULL DEFAULT 0,
@@ -75,9 +78,14 @@ class StyleUnitsTests(unittest.TestCase):
 
     def decision(self, name: str, unit: str, answer: str = "approved") -> Path:
         path = self.root / (name + ".md")
-        fields = {"approved": f"unit: {unit}\nplan: approved\n", "unanswered": f"unit: {unit}\n",
+        family = unit.removesuffix("-unit").split("-")[-1]
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            _ = connection.execute("INSERT OR IGNORE INTO rule_texts VALUES (?,?)",
+                                   (family, f"---\nfamily: {family}\n---\n".encode()))
+        unit = unit_membership("style", unit).id
+        fields = {"approved": f"unit: {unit}\nplan: approved\n", "unanswered": "",
                   "declined": f"unit: {unit}\nplan: approved\nstyle_answer: declined\n"}
-        _ = path.write_text("---\nstatus: open\n" + fields[answer] + "---\n", encoding="utf-8")
+        _ = path.write_text(f"---\nstatus: open\nstyle_rule_blob: {family}\n" + fields[answer] + "---\n", encoding="utf-8")
         return path
 
     def findings(self, proposal: Path, state: str, count: int = 1, *, ticket: str = "",

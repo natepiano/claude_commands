@@ -37,7 +37,7 @@ import proposals_table
 from issues import Issue, frontmatter, open_issues
 from style_proposals import FilingResult
 from scripts.production.staff_test_support import isolated_staff_file, recorded_unit, fixture_member
-from scripts.production import staff
+from scripts.production import staff, unit_names
 
 # Each crate declares the new name of the fixture rename, so a merge finds it applied, and still declares
 # Size and Rate, so the renames of those variants are not applied.
@@ -149,7 +149,7 @@ class StyleProposalsTests(unittest.TestCase):
             owner = fixture_member("showrunner", name=name)
             if name == "sample-style":
                 for unit in ("names-unit", "types-unit", "modules-unit"):
-                    _ = fixture_member("unit", name=unit, parent=owner.id)
+                    _ = fixture_member("unit", name=unit_names.name(unit), parent=owner.id)
         self.calls = []
         _ = self.enterContext(mock.patch.object(style_proposals, "proposal_command", side_effect=self.issue_command))
         _ = self.enterContext(mock.patch.object(style_proposals, "renumber"))
@@ -431,7 +431,7 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertEqual(len(decisions), 1)
             decision = decisions[0]
             self.assertEqual(len(ledger.proposal_findings(decision)), 3)
-            self.assertEqual(proposal_issue.staff_name(frontmatter(decision)["unit"][0]), "names-unit")
+            self.assertEqual(proposal_issue.staff_name(frontmatter(decision)["unit"][0]), "names")
             self.assertTrue(all(frontmatter(path)["status"] == ["closed"] for path in old))
             snapshot = {path: path.read_bytes() for path in self.proposals.glob("*.md")}
             with redirect_stdout(io.StringIO()):
@@ -749,7 +749,7 @@ class StyleProposalsTests(unittest.TestCase):
             _ = self.hold(ledger, line=2)
             self.assertEqual(self.file(ledger), (issue,))
             self.assertEqual(frontmatter(issue)["status"], ["open"])
-            self.assertEqual(proposal_issue.staff_name(frontmatter(issue)["unit"][0]), "names-unit")
+            self.assertEqual(proposal_issue.staff_name(frontmatter(issue)["unit"][0]), "names")
             self.assertEqual(frontmatter(issue)["style_count"], ["2"])
             style_proposals.complete(ledger)
             self.assertEqual(frontmatter(issue)["status"], ["open"])

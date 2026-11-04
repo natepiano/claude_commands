@@ -637,6 +637,9 @@ class StopResumeTests(unittest.TestCase):
 
     def prompt_retirement_fixture(self, *, alerted: bool) -> Path:
         """Publish cancellation requests for the watcher with an isolated send.py recorder."""
+        from scripts.production.staff_test_support import unit_membership
+
+        _ = unit_membership("production", "alpha")
         self.entry["environment"].update({"SHOWRUNNER_UNIT": "production", "SHOWRUNNER_UNIT_ID": "alpha"})
         pane_record.write("agents", self.entry)
         state = self.root / "stall-watch"

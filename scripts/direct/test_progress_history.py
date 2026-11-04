@@ -7077,21 +7077,12 @@ with patch.object(fcntl, "flock", admission):
 
         note = vault_root / "example-showrunner" / "unit-a.md"
         self.assertTrue(note.is_file(), self.last_recorder_stderr)
-        self.assertEqual(
-            note.read_text(encoding="utf-8").splitlines()[:10],
-            [
-                "---",
-                "phase_table: true",
-                "showrunner: example-showrunner",
-                f'production_file: "{production_doc.resolve().as_uri()}"',
-                "unit: unit-a",
-                'now: "Phase 3 of 1 — Retry handling"',
-                "---",
-                "",
-                "# unit-a",
-                "",
-            ],
-        )
+        unit = staff.snapshot().by_path("Example/unit-a")
+        assert unit is not None
+        self.assertEqual(note.read_text(encoding="utf-8").splitlines()[:8], [
+            "---", "phase_table: true", f"unit: {unit.id}",
+            'now: "Phase 3 of 1 — Retry handling"', "---", "", "# unit-a", "",
+        ])
         self.assertIn("**Phase 3 of 1 — Retry handling**", note.read_text(encoding="utf-8"))
         self.assertIn("| Phase 3 |", report)
         self.assertEqual(

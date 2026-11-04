@@ -20,7 +20,7 @@ import rules
 import style_ledger
 import display_cells
 from issues import Issue, frontmatter
-from proposal_issue import ApprovedDecision, decision_answer
+from proposal_issue import ApprovedDecision, decision_answer, proposal_unit
 from scripts.direct import plan_history
 from scripts.lib.user_zone import user_zone
 
@@ -99,14 +99,16 @@ def clock(value: str, zone: tzinfo) -> str:
     return at.astimezone(zone).strftime("%H:%M") if isinstance(at, datetime) else display_cells.NONE
 
 
-def decision_family(path: Path) -> DecisionFamily | DecisionFileMissing:
+def decision_family(path: Path, rule_families: Mapping[str, rules.Family]) -> DecisionFamily | DecisionFileMissing:
     if not path.is_file():
         return DecisionFileMissing()
     try:
         issue = Issue(path, frontmatter(path))
     except (OSError, UnicodeError):
         return DecisionFileMissing()
-    return DecisionFamily(rules.style_family(issue.value("unit")), isinstance(decision_answer(issue), ApprovedDecision))
+    family = (rules.style_family(proposal_unit(issue)) if issue.value("unit")
+              else rule_families.get(issue.value("style_rule_blob"), rules.NotStyleUnit()))
+    return DecisionFamily(family, isinstance(decision_answer(issue), ApprovedDecision))
 
 
 def columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
@@ -148,6 +150,11 @@ def read_snapshot(database: Path, now: datetime, decision_folder: Path,
             }
         if not finding_columns:
             return snapshot
+        pinned = cast(list[tuple[str, bytes]], connection.execute("SELECT blob,text FROM rule_texts").fetchall())
+        rule_families: dict[str, rules.Family] = {
+            blob: family for blob, text in pinned
+            if isinstance(family := rules.pinned_family(text.decode(errors="replace")), str)
+        }
         built_at = "h.built_at" if "built_at" in finding_columns else "h.updated_at"
         if "built_at" not in finding_columns and ticket_columns and "build_ticket" in finding_columns:
             built_at = style_ledger.legacy_built_at_sql("h")
@@ -166,7 +173,7 @@ def read_snapshot(database: Path, now: datetime, decision_folder: Path,
                 snapshot.total_filed += finding.findings
             path = (decision_folder / Path(finding.proposal).expanduser()).resolve()
             if path not in decisions:
-                decisions[path] = decision_family(path)
+                decisions[path] = decision_family(path, rule_families)
             decision = decisions[path]
             if isinstance(decision, DecisionFamily):
                 family = decision.family

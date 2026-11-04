@@ -46,7 +46,7 @@ from scripts.production.production_doc import Refusal
 from scripts.message import unit_labels
 from scripts.shutdown import remote
 from scripts.production import unit_lookup
-from scripts.production.proposal_issue import proposal_progress, AwaitingApproval
+from scripts.production.proposal_issue import proposal_progress, proposal_unit, AwaitingApproval
 from scripts.production.proposals_table import backlog_rows, REVIEW_STATE
 from scripts.nightly_review import candidates
 from scripts.usage import collect, usage_report
@@ -1496,7 +1496,7 @@ def rank_coverage(found: Sequence[issues.Issue], rankings: Sequence[IssueRank], 
 
 
 def unit_names_issue(unit: Unit, issue: issues.Issue) -> bool:
-    if issue.value("unit") == unit.name and issue.value("showrunner") in (unit.production, unit.showrunner, ""):
+    if proposal_unit(issue).removesuffix("-unit") == unit.name and issue.value("showrunner") in (unit.production, unit.showrunner, ""):
         return True
     cell = unit.issue.strip().strip("`")
     wiki = re.fullmatch(r"\[\[([^]|]+)(?:\|[^]]+)?\]\]", cell)

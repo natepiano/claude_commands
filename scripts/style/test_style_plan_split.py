@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import re
 import signal
 import sqlite3
 import subprocess
@@ -23,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import approved_renames
 import declarations
 import style_plan
-from scripts.production.staff_test_support import isolated_staff_file, production_membership, recorded_showrunner, recorded_unit
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file, production_membership, recorded_showrunner, recorded_unit
 import live_units
 import unit_plans
 import style_proposals
@@ -33,7 +34,7 @@ import rules
 import style_ledger
 import style_units
 
-from style_plan_test_support import StylePlanFixture
+from style_plan_test_support import StylePlanFixture, unit_staff_id
 
 
 @final
@@ -74,9 +75,10 @@ class StylePlanTests(StylePlanFixture):
             if excluded == "declined":
                 text = text.replace("plan: approved", "plan: approved\nstyle_answer: declined")
             elif excluded == "unanswered":
-                text = text.replace("plan: approved\n", "")
+                text = re.sub(r"unit: [^\n]*\n", "", text)
             elif excluded == "types":
-                text = text.replace("unit: names-unit", "unit: types-unit")
+                _ = fixture_member("unit", name="types", parent=recorded_showrunner("sample-style", self.doc).id)
+                text = text.replace(f"unit: {unit_staff_id('names-unit')}", f"unit: {unit_staff_id('types-unit')}")
             _ = decision.write_text(text)
             finding = ledger.hold(rule, paths["free"], index, excluded, "type", "before", "after",
                                   findings[0].rule_blob, "outside")

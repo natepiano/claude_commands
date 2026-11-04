@@ -27,7 +27,7 @@ from scripts.production.cli_fixture import production_paths
 from scripts.production import fake_showrunner, staff, session_staff
 from scripts.production.staff_test_support import (
     fixture_member, isolated_staff_file, isolated_source_readers, source_environment,
-    recorded_showrunner, recorded_unit,
+    recorded_showrunner, recorded_unit, unit_membership,
 )
 from scripts.shutdown import remote
 
@@ -294,7 +294,14 @@ class MeasuresTest(unittest.TestCase):
     window: log_records.Window = log_records.Window(start, start + timedelta(days=7))
     at: str = start.isoformat()
 
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(isolated_staff_file(root / "staff.json", {}))
+
     def issue(self, name: str, **fields: str) -> Issue:
+        if unit := fields.get("unit"):
+            fields["unit"] = unit_membership("hana", unit).id
         return Issue(Path(name + ".md"), {key: [value] for key, value in fields.items()})
 
     def test_capacity_groups_units_and_counts_workers_without_running_directors(self) -> None:

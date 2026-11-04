@@ -23,7 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import proposal_issue
-from scripts.production import staff
+from issues import Issue
+from scripts.production import staff, unit_names
 from scripts.production.staff_test_support import fixture_runtime_id
 from user_zone import user_zone
 
@@ -73,11 +74,25 @@ class ProposalIssueTests(unittest.TestCase):
         members: tuple[tuple[str, staff.Kind], ...] = (
             ("hana", "showrunner"), ("build-report", "unit"), ("u", "unit"),
             ("names-unit", "unit"), ("style", "showrunner"), ("sample-style", "showrunner"))
-        rows = tuple(staff.StaffRow(staff.StaffId(fixture_runtime_id(name)), kind, name, None,
+        rows = tuple(staff.StaffRow(staff.StaffId(fixture_runtime_id(name)), kind,
+                                    unit_names.name(name) if kind == "unit" else name, None,
                                     current_session=staff.StaffId(fixture_runtime_id(name)))
                      for name, kind in members)
         _ = self.enterContext(mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(rows)))
         _ = self.enterContext(mock.patch.object(proposal_issue, "calling_showrunner", return_value=fixture_runtime_id("hana")))
+
+    def test_unit_staff_reference_accepts_the_short_name_and_unit_id(self) -> None:
+        row = next(member for member in staff.snapshot().rows if member.name == "names")
+        for reference in ("names-unit", "names", row.id):
+            with self.subTest(reference=reference):
+                self.assertEqual(proposal_issue.staff_reference(reference, "unit"), row)
+        with self.assertRaises(proposal_issue.Refusal):
+            _ = proposal_issue.staff_reference("names unit", "unit")
+
+    def test_proposal_unit_reads_the_unit_id_from_staff(self) -> None:
+        row = next(member for member in staff.snapshot().rows if member.name == "names")
+        self.assertEqual(proposal_issue.proposal_unit(Issue(self.issue, {"unit": [row.id]})), "names-unit")
+        self.assertEqual(proposal_issue.proposal_unit(Issue(self.issue, {})), "")
 
     def test_urgency_and_mark_important_set_the_review_fields_and_normal_removes_them(self) -> None:
         code, out, _ = self.run_cli("urgency", str(self.issue), "--level", "soon", "--due", "2026-10-22")
@@ -560,7 +575,7 @@ class ProposalIssueTests(unittest.TestCase):
                 self.assertFalse(issue.exists())
         self.assertEqual(self.run_cli(*arguments, '{"unit": "names-unit"}')[0], 0)
         from issues import frontmatter
-        self.assertEqual(proposal_issue.staff_name(frontmatter(issue)["unit"][0]), "names-unit")
+        self.assertEqual(proposal_issue.staff_name(frontmatter(issue)["unit"][0]), "names")
         self.assertNotIn("plan", frontmatter(issue))
 
     def test_a_decision_created_with_an_inherited_approval_starts_in_progress(self) -> None:
