@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import errno
 import hashlib
 import json
 import os
@@ -512,6 +513,12 @@ class FastTrackTests(MergeCheckpointFixture):
                 stdout, stderr = beta.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(beta.returncode, 2, stdout + stderr)
             finally:
+                try:
+                    with os.fdopen(os.open(release, os.O_WRONLY | os.O_NONBLOCK), "w") as output:
+                        _ = output.write("continue\n")
+                except OSError as error:
+                    if error.errno != errno.ENXIO:
+                        raise
                 if beta.poll() is None:
                     beta.kill()
                     _ = beta.communicate(timeout=TEST_HANG_GUARD_SECS)

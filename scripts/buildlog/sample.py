@@ -11,6 +11,9 @@ from typing import Literal, NamedTuple, TypedDict
 import store
 import cgroup_capture
 import filesystem
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from cargo_output import CargoOutputRoots, read_cargo_output_roots
 from cgroup_capture import (Unmeasured as Unmeasured, StallTotals as StallTotals,
                             PartialStallTotals as PartialStallTotals, read_pressure as read_pressure,
                             parse_pressure as parse_pressure)
@@ -150,7 +153,16 @@ class FilesystemMeasured(TypedDict):
 
 
 def filesystem_reading() -> FilesystemMeasured | cgroup_capture.ReadingUnavailable:
-    path = os.environ.get("BUILDLOG_TARGET_FILESYSTEM", os.environ.get("CARGO_TARGET_DIR", str(Path.home() / "rust")))
+    path = os.environ.get("BUILDLOG_TARGET_FILESYSTEM", "")
+    if not path:
+        roots = read_cargo_output_roots(Path(os.environ.get("BUILDLOG_WORKSPACE", os.getcwd())))
+        if not isinstance(roots, CargoOutputRoots):
+            return {"state": "unavailable"}
+        path = str(roots.build_directory)
+    existing = Path(path)
+    while not existing.exists() and existing != existing.parent:
+        existing = existing.parent
+    path = str(existing)
     try:
         reading = filesystem.filesystem_usage(path)
         return {"state": "measured", "path": path, "total": reading.total, "used": reading.used,

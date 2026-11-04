@@ -2,7 +2,7 @@
 """Show resident PSS and swap by process kind from /proc.
 
 Ownership is loaded once from the adjacent working_set_owners.json snapshot.
-Regenerate it when production Units / Owns cells change. The command writes
+Regenerate it when a unit's staff row or .unit.toml responsibilities change. The command writes
 nothing. Unknown ownership is printed as unassigned.
 PSS shares resident pages between the processes that map them. It excludes
 kernel memory and unmapped cache, so it is not the machine's used memory.

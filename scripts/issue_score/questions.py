@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Literal, NotRequired, TypedDict
 
 from scripts.lib import conf
-from .selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 
 
 @dataclass(frozen=True)

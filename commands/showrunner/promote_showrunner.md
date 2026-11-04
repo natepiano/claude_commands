@@ -43,16 +43,14 @@ What it does:
 2. **Stops** the unit: it types `/exit` into the unit's pane and waits until its
    Claude is gone, then ends its session on its host, herdr. Two processes on one session
    corrupt it, so nothing restarts while the old one runs.
-3. **Restarts** it with `/showrunner:add_showrunner`'s launcher, resuming the
+3. **Promotes** its staff row to the showrunner row of the new production doc.
+4. **Restarts** it with `/showrunner:add_showrunner`'s launcher, resuming the
    same session in the unit's worktree: in its own herdr session named for the
    new production, with no unit mark, on the unit's own account, attached to your production.
-4. **Retires** the unit's Units row in your doc, `(retired <date>: promoted to
-   showrunner of <slug>)`, and commits it in your checkout. Its branch stays as
-   it is; the new production merges to the branch its own doc names.
+   Its branch stays as it is; the new production merges to the branch its own doc names.
 
 The last line says whether the account changed: `moved from <unit account> to
 the showrunner account`, or `same account, no move`. If the restart fails after
 the stop, the output gives the one command that brings the session back as the
-unit it was, and the Units row is unchanged. If the session opens but its
-prompt is not proven to have run, the Units row is retired all the same, and
+unit it was. If the session opens but its prompt is not proven to have run,
 the output names the prompt to type into it.

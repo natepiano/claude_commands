@@ -691,7 +691,7 @@ def main(argv: list[str]) -> int:
     _ = approving.add_argument("--by", required=True, choices=APPROVERS,
                              help="user when the user approved, showrunner when a showrunner approved without the user")
     _ = approving.add_argument("--showrunner", required=True, help="the showrunner's session name")
-    _ = approving.add_argument("--unit", required=True, help="the unit, as in the production's Units table")
+    _ = approving.add_argument("--unit", required=True, help="the unit, as its staff row names it")
     _ = approving.add_argument("--plan", required=True, help="'<plan path> Phase N–M'")
     unapproving = verbs.add_parser("unapprove", help="set an approved proposal back to waiting for approval")
     _ = unapproving.add_argument("--dry-run", action="store_true", help="print the change and write nothing")

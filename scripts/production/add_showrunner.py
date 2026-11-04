@@ -37,8 +37,7 @@ from scripts.production.staff_sources import ensure_staff_showrunner as ensure_s
 
 from scripts.production import showrunners
 import showrunner_tree
-from production_units import Production, read_production
-from production_units import Refusal
+from scripts.production.production_doc import Production, Refusal, read_production
 import herdr
 
 if TYPE_CHECKING:
@@ -269,8 +268,7 @@ def _main(argv: list[str]) -> int:
             fields = saved.fields
             if ((isinstance(saved, completion_receipt.UnpublishedReceipt) or saved.owner.kind == "showrunner")
                     and fields.get("doc") == str(child.doc)
-                    and fields.get("caller") == caller and fields.get("resume") == resume
-                    and fields.get("cwd") == str(where)):
+                    and fields.get("caller") == caller and fields.get("resume") == resume):
                 identity = ShowrunnerLaunch.from_receipt(fields)
                 if identity.config_dir != selected.dir:
                     raise Refusal(f"{child.slug}: unfinished launch belongs to {identity.config_dir}")
@@ -310,7 +308,7 @@ def _main(argv: list[str]) -> int:
                     raise Refusal(f"{child.slug}: unfinished launch owner changed")
                 existing = staff.update_current_session(retained.current_session, native)
         owner = existing.id if existing is not None else native
-        completion_receipt.write_receipt(receipt, owner, {"doc": str(child.doc), "caller": caller, "resume": resume, "cwd": str(where),
+        completion_receipt.write_receipt(receipt, owner, {"doc": str(child.doc), "caller": caller, "resume": resume,
                                   "session_id": transcript.session_id, "config_dir": str(identity.config_dir),
                                   "started_at": identity.started_at.isoformat()})
         _ = ensure_staff_showrunner(child, caller, runtime_id=native)

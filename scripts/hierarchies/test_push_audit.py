@@ -74,8 +74,7 @@ class PushAuditTest(unittest.TestCase):
         instance = self.home / ".local/state/notifier" / f"showrunner-{slug}"
         instance.mkdir(parents=True)
         doc = self.home / f"{slug}.md"
-        rows = "".join(f"| {name} | {plan} |\n" for name, plan in units)
-        _ = doc.write_text("# Production\n\n## Units\n\n| Unit | Plan |\n|---|---|\n" + rows, encoding="utf-8")
+        _ = doc.write_text("# Production\n", encoding="utf-8")
         owner = recorded_showrunner(slug + "-owner", doc)
         _ = fake_showrunner.write_timer(instance.parent, slug, owner.current_session, "UTC", doc)
         for name, plan in units:

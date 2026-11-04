@@ -130,7 +130,7 @@ class CopiedTree:
 
 @dataclass(frozen=True)
 class TreeCopyFailed:
-    pass
+    detail: str = ""
 
 
 def read_tree_key(directory: Path) -> TreeKey:
@@ -166,6 +166,7 @@ class LostMacRun:
     """A Mac run whose final test status was not received."""
 
     seconds: float
+    detail: str = 'runner sent no final status'
 
 
 @dataclass(frozen=True)
@@ -552,8 +553,11 @@ class ToolVersionMismatch:
     reason: str
 
 
+@dataclass(frozen=True)
 class MissingMacStatus:
     """The remote command ended without a usable test status."""
+
+    detail: str = 'runner sent no final status'
 
 
 @dataclass(frozen=True)
@@ -645,6 +649,7 @@ class ProcessController:
     def __init__(self) -> None:
         self.active: ActiveProcess = IDLE_PROCESS
         self.attempt_evidence: AttemptEvidence = AttemptEvidence()
+        self.copy_failure_detail: str = ""
 
     def stop(self) -> None:
         active = self.active
@@ -720,6 +725,20 @@ class ProcessController:
         finally:
             self.active = IDLE_PROCESS
 
+    def capture_copy(
+        self, arguments: Sequence[str], deadline: CommandDeadline = NO_COMMAND_TIME_LIMIT,
+    ) -> CapturedCommandResult:
+        """Keep command errors for the copy refusal."""
+        result = self.capture(arguments, deadline)
+        if isinstance(result, CommandOutput):
+            if result.status != 0 and result.stderr.strip():
+                error = "; ".join(result.stderr.strip().splitlines())
+                self.copy_failure_detail = f"copy: {arguments[0]}: {error}"
+        else:
+            error = "timed out" if isinstance(result, CommandTimedOut) else "could not start"
+            self.copy_failure_detail = f"copy: {arguments[0]}: {error}"
+        return result
+
     def stream_mac_run(self, arguments: Sequence[str]) -> RemoteRunStatus:
         try:
             process = subprocess.Popen(
@@ -784,7 +803,7 @@ class ProcessController:
                 status = MISSING_MAC_STATUS
                 cleanup = CleanupUnconfirmed()
                 print(line, end="", flush=True)
-            _ = process.wait()
+            exit_status = process.wait()
         finally:
             self.active = IDLE_PROCESS
             output.close()
@@ -794,7 +813,7 @@ class ProcessController:
             return ReportedMacStatus(status.status, cleanup)
         if isinstance(status, (UnresolvedSlotStartup, InterruptedTargetStatus)):
             return status
-        return MISSING_MAC_STATUS
+        return MissingMacStatus(f"runner exited with status {exit_status} without a final status")
 
 
 def parse_cleanup(value: str) -> CleanupOutcome:
@@ -952,9 +971,12 @@ def write_result(
             print("mac_test: this ran on the Mac (macOS). Treat the failure as real and fix it; " + advice)
     elif isinstance(result, (LostMacRun, InterruptedTargetRun)):
         mac = "lost"
-        reason = "interrupted" if isinstance(result, InterruptedTargetRun) else ""
+        reason = "interrupted" if isinstance(result, InterruptedTargetRun) else result.detail if target else ""
         status = 75
-        print(f"mac_test: the link to the {label} dropped; running on natedev instead")
+        if isinstance(result, InterruptedTargetRun):
+            print(f"mac_test: the {label} instance was interrupted (generation {result.generation})")
+        else:
+            print(f"mac_test: the {label} {result.detail}; local fallback requires admission")
     else:
         mac = "declined"
         reason = result.detail if isinstance(result, DeclinedMacRun) and result.detail else result.reason
@@ -1059,6 +1081,7 @@ def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1
     return "\n".join(
         (
             f'mkdir -p "$HOME"/{mirror} || exit 1',
+            f'printf "mac-test mirror\\n" > "$HOME"/{mirror}/.mac-test-mirror || exit 1',
             "free_gib=$(df -g \"$HOME\" | awk 'NR == 2 {print $4}')",
             "printf 'free_gib=%s\\nhost=%s\\nrc=0\\n' "
             + '"$free_gib" "$(hostname -s)"',
@@ -1183,6 +1206,10 @@ class UnavailableToolParity:
 
 def expected_linux_parity(controller: ProcessController, config: OffloadConfig) -> PublicToolParity | UnavailableToolParity:
     """Compare public tools with configured pins or the sender's versions."""
+    if TYPE_CHECKING:
+        from .linux_runner import normalize_tool_version
+    else:
+        from linux_runner import normalize_tool_version
     expected: dict[str, str] = {}
     commands = (("rustc", ["rustc", "-V"]),
                 ("nextest", ["cargo", "nextest", "--version"]),
@@ -1195,15 +1222,16 @@ def expected_linux_parity(controller: ProcessController, config: OffloadConfig) 
             if not isinstance(result, CommandOutput) or result.status != 0 or not result.stdout.strip():
                 return UnavailableToolParity()
             value = result.stdout.strip()
-        expected[key] = value
+        expected[key] = normalize_tool_version(value)
     return {"rustc": expected["rustc"], "nextest": expected["nextest"],
             "mend": expected["mend"], "scripts_commit": expected["scripts_commit"]}
 
 
 def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -> bool:
     """Send every tracked script and config file without Git metadata."""
+    controller.copy_failure_detail = ""
     root = Path(__file__).resolve().parents[2]
-    listing = controller.capture(["git", "-C", str(root), "ls-files", "-z", "scripts", "config"])
+    listing = controller.capture_copy(["git", "-C", str(root), "ls-files", "-z", "scripts", "config"])
     if not isinstance(listing, CommandOutput) or listing.status != 0:
         return False
     paths = [path for path in listing.stdout.split("\0") if path]
@@ -1214,32 +1242,32 @@ def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -
         path = root / name
         if not path.is_file() or path.is_symlink():
             return False
-    clean = controller.capture(["git", "-C", str(root), "diff", "HEAD", "--quiet", "--", *paths])
+    clean = controller.capture_copy(["git", "-C", str(root), "diff", "HEAD", "--quiet", "--", *paths])
     if not isinstance(clean, CommandOutput) or clean.status != 0:
         return False
     expected = expected_linux_parity(controller, config)
     if isinstance(expected, UnavailableToolParity):
         return False
-    commit = controller.capture(["git", "-C", str(root), "rev-parse", "HEAD"],
+    commit = controller.capture_copy(["git", "-C", str(root), "rev-parse", "HEAD"],
                                 CommandTimeLimit(config.probe_timeout_s))
     if not isinstance(commit, CommandOutput) or commit.status != 0 or commit.stdout.strip() != expected["scripts_commit"]:
         return False
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="target-scripts-") as manifest:
         _ = manifest.write("\n".join(paths) + "\n")
         manifest.flush()
-        result = controller.capture(["rsync", "-rlpc", f"--files-from={manifest.name}",
+        result = controller.capture_copy(["rsync", "-rlpc", f"--files-from={manifest.name}",
                                      "-e", shlex.join(["ssh", *ssh_options(config.connection)]),
                                      f"{root}/", f"{config.host}:.claude/"])
     if not isinstance(result, CommandOutput) or result.status != 0:
         return False
-    clean = controller.capture(["git", "-C", str(root), "diff", "HEAD", "--quiet", "--", *paths])
-    current_commit = controller.capture(["git", "-C", str(root), "rev-parse", "HEAD"],
+    clean = controller.capture_copy(["git", "-C", str(root), "diff", "HEAD", "--quiet", "--", *paths])
+    current_commit = controller.capture_copy(["git", "-C", str(root), "rev-parse", "HEAD"],
                                        CommandTimeLimit(config.probe_timeout_s))
     if (not isinstance(clean, CommandOutput) or clean.status != 0
             or not isinstance(current_commit, CommandOutput) or current_commit.status != 0
             or current_commit.stdout != commit.stdout):
         return False
-    stamp = controller.capture([*ssh_prefix(config),
+    stamp = controller.capture_copy([*ssh_prefix(config),
         "printf '%s\\n' " + shlex.quote(commit.stdout.strip())
         + ' > "$HOME/.claude/.build-target-script-commit"'])
     return isinstance(stamp, CommandOutput) and stamp.status == 0
@@ -1316,7 +1344,7 @@ def probe_mac(
 def ignored_paths(
     controller: ProcessController, repo_root: Path
 ) -> IgnoredPathListingResult:
-    result = controller.capture(
+    result = controller.capture_copy(
         [
             "git",
             "-C",
@@ -1349,35 +1377,43 @@ def copy_tree(
     request: OffloadRequest,
     repository: KnownRepository,
 ) -> bool:
+    controller.copy_failure_detail = ""
     ignored = () if isinstance(request.source, StagedDocSnapshot) else ignored_paths(controller, request.repo_root)
     if isinstance(ignored, IgnoredPathListingFailed):
         return False
+    mirror = remote_mirror(repository, request.target, request.slot)
+    receiver = []
+    if not target_config.uses_legacy_mac_layout(configured_ssh_target(request.target or "mac").platform):
+        # The first copy needs the repository and slot directories before rsync starts.
+        receiver = [f"--rsync-path=mkdir -p -- {shlex.quote(mirror)} && exec rsync"]
     try:
         with tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", prefix="mac-test-exclude-", delete=False
         ) as exclude_file:
             exclude_path = Path(exclude_file.name)
             try:
-                _ = exclude_file.write("/.git\n/target/\n")
+                _ = exclude_file.write("/.git\n/target/\n/.mac-test-mirror\n")
                 for path in ignored:
                     _ = exclude_file.write(f"/{escape_rsync_filter_path(path)}\n")
                 exclude_file.flush()
-                result = controller.capture(
+                result = controller.capture_copy(
                     [
                         "rsync",
                         "-rlpc",
                         "--delete",
+                        *receiver,
                         f"--exclude-from={exclude_path}",
                         "-e",
                         shlex.join(["ssh", *ssh_options(config.connection)]),
                         f"{request.source_root}/",
-                        f"{config.host}:{shlex.quote(remote_mirror(repository, request.target, request.slot))}/",
+                        f"{config.host}:{shlex.quote(mirror)}/",
                     ]
                 )
                 return isinstance(result, CommandOutput) and result.status == 0
             finally:
                 exclude_path.unlink(missing_ok=True)
-    except OSError:
+    except OSError as error:
+        controller.copy_failure_detail = f"copy: {error}"
         return False
 
 
@@ -1389,7 +1425,7 @@ def copy_tree_with_key(
 ) -> CopiedTree | TreeCopyFailed:
     before = read_tree_key(request.source_root)
     if not copy_tree(controller, config, request, repository):
-        return TreeCopyFailed()
+        return TreeCopyFailed(controller.copy_failure_detail)
     after = read_tree_key(request.source_root)
     if isinstance(before, KnownTreeKey) and isinstance(after, KnownTreeKey) and before == after:
         return CopiedTree(before)
@@ -1679,11 +1715,11 @@ def claimed_run(
                 return declined("state", started)
             config = replace(config, values={**config.values, **{f"parity.{key}": value for key, value in expected.items()}})
             if not copy_tracked_scripts(controller, config):
-                return declined("copy", started)
+                return DeclinedMacRun("copy", elapsed_seconds(started), controller.copy_failure_detail)
             copy_started = time.monotonic()
             copied = copy_tree_with_key(controller, config, request, repository)
             if isinstance(copied, TreeCopyFailed):
-                return declined("copy", started)
+                return DeclinedMacRun("copy", elapsed_seconds(started), copied.detail)
             copy_seconds = elapsed_seconds(copy_started)
             release_allowed = False
             probe = probe_mac(controller, config, repository, request.target, request.slot)
@@ -1728,7 +1764,7 @@ def claimed_run(
             copy_started = time.monotonic()
             copied = copy_tree_with_key(controller, config, request, repository)
             if isinstance(copied, TreeCopyFailed):
-                return declined("copy", started)
+                return DeclinedMacRun("copy", elapsed_seconds(started), copied.detail)
             copy_seconds = elapsed_seconds(copy_started)
         running = (
             f"running a copy on the Mac while natedev compiles (host {probe.hostname})"
@@ -1759,7 +1795,9 @@ def claimed_run(
                 return DeclinedMacRun("state", elapsed_seconds(started), remote_status.reason)
             if linux and isinstance(remote_status, UnresolvedSlotStartup):
                 return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-            return LostMacRun(elapsed_seconds(started))
+            detail = (remote_status.detail if isinstance(remote_status, MissingMacStatus)
+                      else "runner sent no final status")
+            return LostMacRun(elapsed_seconds(started), detail)
         evidence.completion = "confirmed"
         report_cleanup(remote_status.cleanup, request.target)
         if isinstance(remote_status.cleanup, CleanupUnconfirmed):
@@ -2049,6 +2087,8 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
         "unresolved_count": evidence.unresolved_count if isinstance(evidence.unresolved_count, int) else None,
         "evidence_at": evidence.evidence_at or time.time(),
     }
+    if isinstance(result, LostMacRun):
+        attempt["reason"] = result.detail
     if isinstance(result, (DeclinedMacRun, BusyMacDecline)):
         attempt["reason"] = result.detail if isinstance(result, DeclinedMacRun) and result.detail else result.reason
     record.ssh_attempt(attempt)

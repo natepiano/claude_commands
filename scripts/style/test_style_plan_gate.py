@@ -1024,7 +1024,7 @@ class StylePlanTests(StylePlanFixture):
             ledger.file_held(finding.finding_id, issue)
         _ = issue.write_text('---\nstatus: open\nstage: backlog\ntags: [issue, proposal, style]\n'
                              + f'unit: names-unit\nplan: "{self.plan} Phase 1"\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n')
-        _ = self.doc.write_text(self.doc.read_text().replace("## Units", f"- **Proposals:** {folder}\n\n## Units"))
+        self.proposals_field(folder)
         with (mock.patch.object(berth_board, "read_board", return_value=self.board(self.sources[0])),
               mock.patch.object(style_proposals, "proposal_command") as start,
               mock.patch.object(style_ledger.Ledger, "cells", autospec=True, side_effect=style_ledger.Ledger.cells) as coverage):

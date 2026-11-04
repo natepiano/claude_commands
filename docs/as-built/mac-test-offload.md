@@ -80,6 +80,26 @@ A pending or active block is one footer item after the build-hold lines: `Mac bl
 
 ### The offload runner — `scripts/mac_test/offload.py`
 
+Tool parity uses one form for the sender, the probe, execution, and refusal messages.
+The normalizer strips each version line and joins nonempty lines with one space.
+This includes all lines from `cargo nextest --version`.
+
+Linux cleanup reads the real UID from `/proc/<pid>/status` before it reads process ownership evidence.
+It excludes processes from other users.
+Cleanup excludes processes that started before the recorded run and ancestors of the checking process.
+It also excludes direct children of another user, except children of PID 1.
+Slot processes keep their user, but an orphan can acquire PID 1 as its parent.
+Other same-user processes with unreadable evidence keep the slot busy.
+
+`verify-linux` steps use the target slots and build budget for admission.
+They do not contact natedev's admission service or obey natedev's hold.
+The controller still checks spending before AWS admission.
+
+A missing completion marker reports the runner exit status when available.
+It does not prove a link failure.
+The attempt record keeps the reason.
+An interruption marker reports the instance generation.
+
 - `offload.py run --repo-root DIR [--package PKG] [--verb nextest|check|clippy|mend-check|doc] --call-id ID [--settings FILE] [--last-decline busy|blocked] [--filter-run] [--result FILE] -- <verb arguments>` exits 0 on a Mac pass, 75 for local fallback, and the step's own status on a Mac failure. The default verb is `nextest`. Claims use `--what "<verb> <package or workspace>"`. `lint check` runs Cargo check; `lint mend-check` runs mend with `--fail-on-warn`; remote doc sets `LINT_CONFIG_FORCE=1`. Workspace verbs use the same manifest-based Linux-only check as `eligible --kind`. `--settings` selects that target's config. `--last-decline` suppresses an unchanged retry notice. `write_result` writes `mac=`, `reason=`, `seconds=` from `PassedOnMac | FailedOnMac | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun | BusyMacDecline`. A busy result alone adds `holder=`: the claim's `what`, `leftovers`, or `unreadable`; `KnownMacJob | LostRunLeftovers | UnreadableMacHolder` gives that value its meaning. Missing or contradictory results are unusable. Declined, lost and invalid results return the record to `waiting_mac` before the next wait.
 - Declines print `mac_test: not running on the Mac (<reason>)`: `off`, `repo`, `linux_only`, `backoff`; claim `blocked`, `busy`, `state`; probe `unreachable` (with backoff), `disk`; then `copy`. The claim gates work; the probe has no process-count, load or power check: a Mac on battery runs tests (user, 2026-10-18). An app open on the Mac does not exclude a test.
 - The probe reads the hostname and free GiB against `free_floor_gib`, with no power or process check. Coordination records decide whether the Mac is held or busy.
@@ -161,7 +181,7 @@ A new block writes one `hold_event` `began`; record removal in `expire_block` or
 - Offloaded Mac nextest rows in the build log have an empty `repo`; filter them with `coalesce(repo,'')=''` and `host <> 'natedev'`. The log carries two Mac host names (`Mac` and `Nates-MacBook-Pro-2023`), so Mac selection is `host <> 'natedev'`, never one name.
 - A `gh` set that times out after GitHub applied it reads `still_on`, then `off_before` at the next settle. Turning the switch back on after `off_unconfirmed` can undo a hand-made switch-off in between.
 - `world_panel_words_match_drawn_pixels` fails only on the Mac, cause not found; it is excluded there, so only natedev runs and CI cover it.
-- `basedpyright scripts/mac_test` exits 3 on a clean pass (no `.venv`); the result is its last line.
+- `basedpyright scripts/mac_test` exits 0 when clean. Its summary reads `0 errors, 0 warnings, 0 notes`.
 
 ## Why
 

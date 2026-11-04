@@ -26,8 +26,8 @@ from typing import Literal, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import production_units
-from scripts.production import showrunners
+from scripts.production import showrunners, staff, unit_lookup, unit_names
+from scripts.production.production_doc import cell_value
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from code_kind import is_test_code  # noqa: E402
@@ -441,23 +441,17 @@ def measure_definitions(terms: tuple[Term, ...], files: tuple[LiveFile, ...]) ->
     return tuple(result)
 
 
-def parse_production(slug: str, path: str, text: str) -> ProductionNames:
-    lines = text.splitlines()
-    units = tuple(production_units.cell_value(row.get("Unit", ""))
-                  for row in production_units.unit_table(lines))
+def parse_production(slug: str, doc: Path, text: str, record: staff.StaffSnapshot) -> ProductionNames:
     prefix = "- **Showrunner session:** "
-    session = next((production_units.cell_value(line[len(prefix):]) for line in lines
-                    if line.startswith(prefix)), slug)
-    return ProductionNames(slug, path, session, units)
+    session = next((cell_value(line[len(prefix):]) for line in text.splitlines() if line.startswith(prefix)), slug)
+    units = tuple(unit_names.unit_id(row.name) for row in unit_lookup.doc_units(doc, record))
+    return ProductionNames(slug, str(doc), session, units)
 
 
 def measure_production_names(productions: tuple[ProductionNames, ...]) -> tuple[ProductionNameFinding, ...]:
     result: list[ProductionNameFinding] = []
     uses: dict[str, set[int]] = defaultdict(set)
     for index, production in enumerate(productions):
-        for unit in production.units:
-            if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*-unit", unit) is None:
-                result.append(ProductionNameFinding("unit format", unit, (production.slug,), (production.doc,)))
         for name in {production.slug, production.showrunner, *production.units}:
             uses[name].add(index)
     for name, indices in sorted(uses.items()):
@@ -977,11 +971,7 @@ def report(terms: tuple[Term, ...], files: tuple[LiveFile, ...], productions: tu
             summary.append(f"Definition: {finding.term!r} has no declared definition.")
         else:
             summary.append(f"Definition: {finding.term!r} has definitions in {', '.join(finding.files)}.")
-    for finding in production_names:
-        if finding.kind == "unit format":
-            summary.append(f"Name: {finding.name!r} has an invalid unit format in {', '.join(finding.productions)}.")
-        else:
-            summary.append(f"Name: {finding.name!r} is shared by {', '.join(finding.productions)}.")
+    summary.extend(f"Name: {finding.name!r} is shared by {', '.join(finding.productions)}." for finding in production_names)
     summary.extend(f"Warning: {issue}" for issue in dict.fromkeys(issues))
     summary.extend(f"Fix: {issue}" for issue in source_result.issues if issue not in issues)
     short = "\n".join(summary)
@@ -1013,7 +1003,7 @@ def report(terms: tuple[Term, ...], files: tuple[LiveFile, ...], productions: tu
         table("Definitions (declared sources plus explicit **Name** — definitions; other-meaning files excluded)",
               ("Term", "Finding", "Files", "Files (n)", "File set"),
               definition_rows or [("none", "none", "none", "0", definition_set)]),
-        table("Unit and session names — natedev only; all Units rows, including retired rows",
+        table("Unit and session names — natedev only; all unit staff rows, including retired rows",
               ("Finding", "Name", "Productions", "Files", "Docs (n)", "File set"),
               production_rows or [("none", "none", "none", "none", "0", docs)]),
         table("Sent contacts — natedev only; request intent not recorded",
@@ -1050,10 +1040,11 @@ def baseline(root: Path, window: AuditWindow, *, tables: bool = False) -> str:
     productions: list[ProductionNames] = []
     unread_production_docs: list[UnreadSource] = []
     # This is the same timer/doc reader as `showrunners.py list`, without session/socket probes.
+    record = staff.snapshot()
     for slug, doc in sorted(showrunners.timer_docs().items()):
         try:
-            productions.append(parse_production(slug, str(doc), doc.read_text(encoding="utf-8")))
-        except (OSError, UnicodeError, production_units.Refusal) as error:
+            productions.append(parse_production(slug, doc, doc.read_text(encoding="utf-8"), record))
+        except (OSError, UnicodeError, staff.StaffUnreadable) as error:
             unread_production_docs.append(UnreadSource(str(doc), str(error)))
             issues.append(f"{doc}: {error}")
     path = Path.home() / ".local/state/message/log.jsonl"

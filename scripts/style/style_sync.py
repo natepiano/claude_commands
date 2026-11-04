@@ -27,7 +27,7 @@ sys.path.insert(0, str(SCRIPTS / "lib"))
 import process_group
 
 from add_style import NoStyleProduction, standing_style_production
-from production_units import Refusal
+from scripts.production.production_doc import Refusal
 from scripts.copies import copies
 from scripts.message import send_result
 from scripts.message import send_budget
@@ -267,7 +267,8 @@ def verifier_command(directory: Path, owner: int) -> list[str]:
 def verify_lint(directory: Path) -> tuple[int, str]:
     # Held from Popen until the child stop below is in force; start_new_session makes `$$` the group id.
     with signal_mask(signal.SIG_BLOCK), subprocess.Popen(
-        verifier_command(directory, os.getpid()), cwd=directory / "checkout", env={**os.environ, "UNIT_DETACHED_RUN": "1"},
+        verifier_command(directory, os.getpid()), cwd=directory / "checkout", env={**os.environ, "UNIT_DETACHED_RUN": "1",
+            "CARGO_BUILD_BUILD_DIR": str((directory / "checkout/target").resolve() / "intermediates")},
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         start_new_session=True, preexec_fn=unblock_held_signals,
     ) as child:
@@ -296,7 +297,7 @@ def remove_lint_dir(repo: Path, directory: Path) -> bool:
         if snapshot.is_symlink():
             snapshot.unlink()
         elif snapshot.is_dir():
-            shutil.rmtree(snapshot)
+            scratch.remove_with_cargo_output(snapshot, shutil.rmtree)
         registered = {Path(line.removeprefix("worktree "))
                       for line in git(repo, "worktree", "list", "--porcelain").splitlines()
                       if line.startswith("worktree ")}
@@ -371,6 +372,15 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
             OwnerRecord(os.getpid(), Path(common_dir)).write(directory)
             with signal_mask(signal.SIG_UNBLOCK):
                 (directory / "checkout").symlink_to(snapshot, target_is_directory=True)
+                intermediates = snapshot / "target/intermediates"
+                scratch.mark_cargo_cache(intermediates)
+                saved = subprocess.run(
+                    [str(PYTHON), str(Path(scratch.__file__)), "cargo-save", str(snapshot)],
+                    env={**os.environ, "CARGO_BUILD_BUILD_DIR": str(intermediates)},
+                    capture_output=True, text=True, check=False,
+                )
+                if saved.returncode:
+                    raise Refusal(saved.stderr.strip() or "cannot save Cargo output roots")
                 returncode, output = verify_lint(directory)
                 print(output, end="")
                 # Build outputs are retained; only source changes invalidate coverage.

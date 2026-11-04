@@ -43,7 +43,9 @@
 # UNIT_SESSION_DIR set, a `test` or `lint` that exits 0 is recorded in
 # <session>/verify_cache/, keyed by the working tree its verdict was judged on,
 # the arguments, rustc -vV, lint.conf, verify.sh, invoke.sh and the
-# RUST*/CARGO_*/NEXTEST_* environment. A plain `lint <package>` leaves the package out of the key:
+# RUST*/CARGO_*/NEXTEST_* environment. Lint keys also include the versions
+# of mend, nightly rustfmt, clippy and Taplo.
+# A plain `lint <package>` leaves the package out of the key:
 # every lint stage but fmt covers the workspace, and fmt covers every member
 # that differs from HEAD, so one lint record answers for each package. A
 # `test` key holds only the part of the tree its package is built from
@@ -353,7 +355,7 @@ run_step() {
         set -m
         (
             set +m
-            if [[ "$CMD" != test && "$STEP_RUNS_ON" != natedev_only && "$STEP_WRITES_TREE" == 0 ]] && buildlog_step_compiles "$@"; then
+            if [[ "$CMD" != test && "$STEP_WRITES_TREE" == 0 ]] && step_can_retry && buildlog_step_compiles "$@"; then
                 export LINT_QUEUE_LEAVE_HOOK="$(ssh_retry_hook)"
             fi
             if (
@@ -398,7 +400,7 @@ run_step() {
             rm -f "$step_log"
             return "$status"
         fi
-        if buildlog_step_compiles "$@" && { [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" && "$CMD" != test && "$STEP_RUNS_ON" != natedev_only ]] || step_stopped_by_hold; }; then
+        if buildlog_step_compiles "$@" && { { [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" && "$CMD" != test ]] && step_can_retry; } || step_stopped_by_hold; }; then
             if [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" ]]; then
                 STEP_FORCE_MAC=1
             else
@@ -963,6 +965,12 @@ if [[ "${1:-}" == "--session-dir" ]]; then
     fi
 fi
 
+CMD="${1:-}"
+case "$CMD" in
+    check|test|lint|doc|build|example|final|example-test) ;;
+    *) usage; exit 2 ;;
+esac
+
 # A Codex mesh worker's command dies with its turn, and a worker that waits on
 # one spends a model call per wait. So a worker's call detaches: mesh_runs.py
 # runs this same call under a supervisor outside the worker's process group,
@@ -992,11 +1000,6 @@ if [[ "${OSTYPE:-}" != darwin* && -z "${BUILDLOG_RUN+x}" ]]; then
     fi
 fi
 
-CMD="${1:-}"
-if [[ -z "$CMD" ]]; then
-    usage
-    exit 2
-fi
 shift
 if [[ "$CMD" == final ]]; then
     FINAL_PASS_START="$("$PY" "$FINAL_PASS_SCRIPT" start "${BASH_SOURCE[0]}")"
@@ -1237,6 +1240,9 @@ tree_key() {
         # Keyed on the package's own build, read from the call's metadata.
         scope=(--package "${ARGS[0]}")
     fi
+    if [[ "$CMD" == lint && -z "${CACHE_DIR:-}" ]]; then
+        key_options+=(--without-lint-versions)
+    fi
     VERIFY_TEST_BUILD_INPUTS_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/test-build-inputs}" \
     "$PY" "$TREE_WATCH_SCRIPT" --key ${key_options[@]+"${key_options[@]}"} ${scope[@]+"${scope[@]}"} "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
         "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}" -- "${words[@]}" \
@@ -1283,7 +1289,9 @@ cancel_tree_run() {
     fi
     [[ -z "${MAC_LOG_FILE:-}" ]] || rm -f "$MAC_LOG_FILE"
     [[ -z "${MAC_RESULT_FILE:-}" ]] || rm -f "$MAC_RESULT_FILE"
-    printf 'verify.sh: cancelled — the tree changed while %s ran, so this result would be stale. Resubmit the %s when your edits are done.\n' "$CMD" "$CMD" >&2
+    local changed_path=""
+    if [[ -s "$TREE_WATCH_DIR/fired.path" ]]; then changed_path=" ($(< "$TREE_WATCH_DIR/fired.path"))"; fi
+    printf 'verify.sh: cancelled — the tree changed while %s ran%s, so this result would be stale. Resubmit the %s when your edits are done.\n' "$CMD" "$changed_path" "$CMD" >&2
     note_event cancelled "${RUN_STARTED}" "$(( SECONDS - RUN_STARTED ))" "" 0 "$TREE_CHANGED_STATUS"
     rm -rf "$TREE_WATCH_DIR"
     TREE_WATCH_DIR=""
@@ -1473,8 +1481,24 @@ COPY_WORD="" COPY_MAC="" COPY_REASON="" COPY_SECONDS="" COPY_RUNNER_STATUS="" CO
 MAC_RESULT_FILE=""
 MAC_LOG_FILE=""
 MAC_RUNNER_PID=""
-# A waiting local test can still leave for this eligible Mac. Non-busy
-# declines set a retry deadline; busy and blocked use the normal poll.
+# A waiting local test can leave for this Mac after a temporary decline.
+# Busy, blocked, and disk declines use the normal poll interval.
+SSH_RETRYABLE_REASON='^(busy|blocked|disk|backoff|unreachable|state|copy|mac_busy|spending_limit|spending_unavailable|state unreadable: .*)$'
+
+step_can_retry() {
+    [[ "${STEP_WRITES_TREE:-0}" == 0 && "$LOCAL_ONLY" == 0 ]] || return 1
+    case "$CMD" in test|check|lint|doc) ;; *) return 1 ;; esac
+    local name eligibility reason settings
+    while IFS=$'\t' read -r name eligibility reason settings; do
+        if [[ "$settings" != - && -n "$settings" && ( "$eligibility" == eligible ||
+              ( "$eligibility" == excluded && ( "$reason" =~ $SSH_RETRYABLE_REASON ||
+                ( -n "${PINNED_TARGET:-}" && "$reason" == starting ) ) ) ) ]]; then
+            return 0
+        fi
+    done <<< "$STEP_TARGET_TABLE"
+    return 1
+}
+
 MAC_LEAVE_SETTINGS=""
 MAC_LEAVE_REASON=""
 MAC_RETRY_AFTER=0
@@ -1734,8 +1758,8 @@ initialize_step_record() {
             printf 'verify.sh: target eligibility check returned invalid targets; step refused\n' >&2
             exit 2
         fi
-        if [[ "$settings" != - && ( "$eligibility" == eligible || ( "$STEP_RUNS_ON" != natedev_only && "$reason" =~ ^(busy|blocked)$ ) || ( -n "$PINNED_TARGET" && "$reason" == starting ) ) ]]; then
-            if [[ "$STEP_RUNS_ON" == natedev_only ]]; then
+        if [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ $SSH_RETRYABLE_REASON || ( -n "$PINNED_TARGET" && "$reason" == starting ) ) ]]; then
+            if [[ "$eligibility" == eligible && "$STEP_RUNS_ON" == natedev_only && "$decision_reason" != disk ]]; then
                 printf 'verify.sh: target eligibility answer differs from its targets; step refused\n' >&2
                 exit 2
             fi
@@ -1744,8 +1768,6 @@ initialize_step_record() {
             if [[ "$(target_platform "$name")" == macos ]]; then mac_names+="${mac_names:+,}$name"; fi
         elif [[ "$eligibility" == eligible && "$settings" == - ]]; then
             eligible_names+="${eligible_names:+,}$name"
-        elif [[ "$eligibility" == excluded && "$settings" != - ]]; then
-            decision_reason=$reason
         fi
     done <<< "$table"
     if [[ "$STEP_RUNS_ON" != natedev_only && "$mac_targets" == 0 ]]; then
@@ -1756,9 +1778,9 @@ initialize_step_record() {
     if [[ -n "$PINNED_TARGET" ]]; then
         STEP_DEFER_LOCAL=1
     fi
-    if [[ "$STEP_RUNS_ON" != natedev_only ]]; then
+    if step_can_retry; then
         while IFS=$'\t' read -r name eligibility reason settings; do
-            if [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ ^(busy|blocked)$ ) ]]; then
+            if [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ $SSH_RETRYABLE_REASON ) ]]; then
                 MAC_LEAVE_SETTINGS="$settings"
                 break
             fi
@@ -1780,9 +1802,9 @@ initialize_step_record() {
     fi
     export BUILDLOG_MEM_WAIT_SINCE="$(< "$BUILDLOG_MEM_WAIT_FIRST_FILE")"
     export BUILDLOG_CALL_ID
-    if [[ "$STEP_RUNS_ON" != natedev_only ]]; then
+    if step_can_retry; then
         while IFS=$'\t' read -r name eligibility reason settings; do
-            if [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ ^(busy|blocked)$ )
+            if [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ $SSH_RETRYABLE_REASON )
                   && "$(target_platform "$name")" == macos ]]; then
                 MAC_LEAVE_SETTINGS=$settings
                 register_mac_wait "$settings" 0
@@ -1813,7 +1835,7 @@ route_compiling_step() {
         *) return "$admission" ;;
     esac
     step_state waiting_hold
-    if [[ "$STEP_RUNS_ON" != natedev_only && "$CMD" != test ]]; then
+    if [[ "$CMD" != test ]] && step_can_retry; then
         if [[ "$CMD" == lint && "$admission" == 10 ]]; then
             HOLD_LINT=1
             : > "$HOLD_WAIT_DIR/lint-held"
@@ -1860,6 +1882,7 @@ route_compiling_step() {
 }
 
 step_stopped_by_hold() {
+    (( status > 128 )) || return 1
     local admission=0
     env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" stopped --call-id "$BUILDLOG_CALL_ID" \
         --consumed "$HOLD_WAIT_DIR/stops" || admission=$?
@@ -1903,7 +1926,7 @@ remember_mac_retry() {
         SSH_RETRY_SETTINGS+=("$1") SSH_RETRY_DEADLINES+=(0)
         return 0
     fi
-    if [[ "${LAST_TARGET_OUTCOME:-$BUILDLOG_MAC}" != declined || ( "$MAC_LEAVE_REASON" != busy && "$MAC_LEAVE_REASON" != blocked ) ]]; then
+    if [[ "${LAST_TARGET_OUTCOME:-$BUILDLOG_MAC}" != declined || ! "$MAC_LEAVE_REASON" =~ ^(busy|blocked|disk)$ ]]; then
         MAC_RETRY_AFTER="$("$PY" -c 'import time; print(time.monotonic() + 180)')"
         if [[ "$MAC_RETRY_NOTICE_SHOWN" == 0 ]]; then
             echo "verify.sh: Mac attempt ended ($BUILDLOG_MAC${BUILDLOG_MAC_REASON:+: $BUILDLOG_MAC_REASON}); waiting 180 s before each retry while natedev waits." >&2
@@ -1960,12 +1983,11 @@ ssh_reserve_hook() {
 }
 
 ssh_retry_hook() {
-    [[ "${STEP_WRITES_TREE:-0}" == 0 ]] || { printf 'false'; return; }
-    [[ "$STEP_RUNS_ON" != natedev_only && "$LOCAL_ONLY" == 0 ]] || { printf 'false'; return; }
+    step_can_retry || { printf 'false'; return; }
     local name eligibility reason settings pivot=-1 index
     local names=() candidates=()
     while IFS=$'\t' read -r name eligibility reason settings; do
-        [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ ^(busy|blocked)$ ) ]] || continue
+        [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ $SSH_RETRYABLE_REASON ) ]] || continue
         names+=("$name") candidates+=("$settings")
         if [[ "$settings" == "$SSH_RETRY_AFTER_SETTINGS" ]]; then pivot=$((${#candidates[@]} - 1)); fi
     done <<< "$STEP_TARGET_TABLE"
@@ -2066,12 +2088,12 @@ route_test() {
                     *) return "$admission" ;;
                 esac
             fi
-            [[ "$STEP_RUNS_ON" != natedev_only ]] || continue
             if [[ -n "$PINNED_TARGET" && "$reason" == starting ]]; then
                 remote_candidates=1
                 continue
             fi
-            if [[ "$eligibility" == excluded && ! "$reason" =~ ^(busy|blocked)$ ]]; then continue; fi
+            step_can_retry || continue
+            if [[ "$eligibility" == excluded && ! "$reason" =~ $SSH_RETRYABLE_REASON ]]; then continue; fi
             [[ -f "$MAC_RUNNER" ]] || continue
             if [[ "$(ssh_reserve_hook "$name" "$settings")" == false ]]; then continue; fi
             remote_candidates=1
@@ -2244,7 +2266,7 @@ finish_copy_win() {
 # in the memory wait leaves once mac_test.py free-now says that Mac is free,
 # and its Mac result counts as one from route_test: a failure or a pass ends
 # the call. Other results keep the hook unless the Mac excludes this test.
-# Non-busy declines wait for the retry deadline. Once the step compiles,
+# Other temporary declines wait for the retry deadline. Once the step compiles,
 # copy_watch.py may run a copy on the Mac; a copy result that finishes first
 # ends the call (finish_copy_win).
 run_local_test() {
@@ -2252,7 +2274,7 @@ run_local_test() {
     while true; do
         hook=""
         copy_watch=0
-        if [[ "$STEP_RUNS_ON" != natedev_only ]]; then
+        if step_can_retry; then
             hook="$(ssh_retry_hook)"
             if [[ -n "$MAC_LEAVE_SETTINGS" && "$(target_platform "$(target_for_settings "$MAC_LEAVE_SETTINGS")")" == macos && -f "$MAC_COPY_WATCH" && -f "$MAC_RUNNER" ]]; then
                 copy_watch=1
@@ -2451,6 +2473,11 @@ if [[ "$CMD" == test && -z "${GATE_METADATA}" ]]; then
 fi
 
 HOLD_WAIT_DIR="$("$PY" "$BUILD_FOLDERS_SCRIPT" unique --kind verify-hold --owner "$$")"
+if [[ "$CMD" == lint ]]; then
+    # The call owns these files. Cleanup removes them with the wait directory.
+    export VERIFY_LINT_VERSIONS_FILE="$HOLD_WAIT_DIR/lint-versions"
+    export VERIFY_LINT_RUSTFMT_VERSION_FILE="$HOLD_WAIT_DIR/rustfmt-version"
+fi
 export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds"
 export BUILDLOG_HOLD_WAITER_FILE="$HOLD_WAIT_DIR/waiter"
 export BUILDLOG_CHECK_FAILED_FILE="$HOLD_WAIT_DIR/check-failed"
@@ -2479,7 +2506,7 @@ if [[ "$CMD" == test ]]; then
 fi
 while [[ -z "$PINNED_TARGET" ]] && ! build_hold_nothing_held; do
     step_state waiting_hold
-    if [[ "$CMD" != test && "$STEP_RUNS_ON" != natedev_only ]]; then
+    if [[ "$CMD" != test ]] && step_can_retry; then
         HOLD_WAIT_STATUS=0
         check_routing_hold || HOLD_WAIT_STATUS=$?
         case "$HOLD_WAIT_STATUS" in
@@ -2780,7 +2807,7 @@ acquire_token() {
         if [[ "${1:-}" != local && "$CMD" == test && -n "$MAC_LEAVE_SETTINGS" ]] \
               && eval "$(ssh_retry_hook)" >/dev/null 2>&1; then
             try_reserved_target
-        elif [[ "${1:-}" != local && "$CMD" != test && "$STEP_RUNS_ON" != natedev_only ]] \
+        elif [[ "${1:-}" != local && "$CMD" != test ]] && step_can_retry \
               && eval "$(ssh_retry_hook)" >/dev/null 2>&1; then
             STEP_FORCE_MAC=1
             return "$LINT_LEFT_QUEUE_STATUS"
@@ -2990,9 +3017,10 @@ refresh_test_build_inputs() {
     # buildlog_begin takes its source key after that wait.
     rm -f "$HOLD_WAIT_DIR/test-build-inputs"
     VERDICT_KEY="$(VERIFY_COMPUTE_TEST_BUILD=1 tree_key)"
-    export BUILDLOG_TEST_BUILD_KEY="" BUILDLOG_TEST_TARGET_DIR=""
+    export BUILDLOG_TEST_BUILD_KEY="" BUILDLOG_TEST_TARGET_DIR="" BUILDLOG_TEST_BUILD_DIR=""
     if [[ -f "$HOLD_WAIT_DIR/test-build-inputs" ]]; then
-        { IFS= read -r BUILDLOG_TEST_BUILD_KEY; IFS= read -r BUILDLOG_TEST_TARGET_DIR; } \
+        { IFS= read -r BUILDLOG_TEST_BUILD_KEY; IFS= read -r BUILDLOG_TEST_TARGET_DIR;
+          IFS= read -r BUILDLOG_TEST_BUILD_DIR; } \
             < "$HOLD_WAIT_DIR/test-build-inputs"
     fi
     # A hold can also arrive during memory admission, after buildlog_begin.

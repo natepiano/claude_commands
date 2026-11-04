@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.direct import remove_run_scratch, workers
+from scripts.lib import scratch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).parent / "remove_run_scratch.py"
@@ -44,6 +45,34 @@ class RemoveRunScratchTests(unittest.TestCase):
         (outside / ".git").mkdir(parents=True)
         (run / "scratch" / "linked").symlink_to(outside)
         return run, outside
+
+    def test_a_bad_cargo_removal_mark_does_not_stop_other_folder_removals(self) -> None:
+        run, _ = self.make_run()
+        checkout = run / "phases" / "p4" / "gate"
+        mark = scratch.cargo_removal_mark(checkout)
+        _ = mark.write_text("{broken")
+        with (mock.patch.object(workers, "protected_working_directories", return_value=()),
+              mock.patch.object(sys, "argv", [str(SCRIPT), str(run)])):
+            self.assertEqual(remove_run_scratch.main(), 1)
+        self.assertTrue(checkout.exists())
+        self.assertEqual(mark.read_text(), "{broken")
+        self.assertFalse((run / "scratch" / "export").exists())
+        self.assertFalse((run / "p26_before").exists())
+        self.assertFalse((run / "verify_cache").exists())
+
+    def test_run_checkout_cleanup_uses_the_saved_cargo_output_guard(self) -> None:
+        run, _ = self.make_run()
+        checkout = run / "phases" / "p4" / "gate"
+        events: list[str] = []
+        def clean(path: Path, saved: tuple[scratch.SavedCargoOutput, ...]) -> None:
+            self.assertEqual(path, checkout)
+            self.assertEqual(saved, ())
+            self.assertTrue((path / ".git").exists())
+            events.append("guard")
+        with mock.patch.object(scratch, "clean_cargo_outputs", side_effect=clean):
+            remove_run_scratch.remove(checkout)
+        self.assertEqual(events, ["guard"])
+        self.assertFalse(checkout.exists())
 
     def test_cleanup_keeps_the_checkout_holding_a_paused_workers_live_command(self) -> None:
         run, _ = self.make_run()
