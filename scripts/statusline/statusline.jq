@@ -112,7 +112,7 @@ def usage($config; $label; $window; $fmt):
 | ((.model.display_name // "")
    + (if (.effort.level // "") == "" then "" else " " + .effort.level end)) as $m
 | ([
-     ($ARGS.named.assignment | color($colors; "role." + $ARGS.named.role)),
+     ($ARGS.named.assignment // "" | select(. != "") | color($colors; "role." + $ARGS.named.role)),
      $path
    ] | join(" | ")) as $first_line
 | ([

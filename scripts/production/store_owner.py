@@ -27,6 +27,10 @@ def showrunner_id(reference: str, *, record: staff.StaffSnapshot | None = None,
         sources = session_staff.member_sources() if sources is None else sources
         found = sources.member(session_staff.ShowrunnerMember(reference), record)
         if isinstance(found, session_staff.NoSuchMember):
+            current = sources.canonical_slug(reference)
+            if current != reference:
+                found = sources.member(session_staff.ShowrunnerMember(current), record)
+        if isinstance(found, session_staff.NoSuchMember):
             raise staff.StaffRefused(f"{reference}: showrunner ownership evidence is unavailable")
         row = found.row
     if row.kind != "showrunner":

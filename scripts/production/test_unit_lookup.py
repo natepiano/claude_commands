@@ -32,7 +32,7 @@ from sessions import SessionRecord
 from unit_lookup import ClaudeNotRunning, ClaudeUnknown, LiveClaude, UnitState
 from scripts.production import staff, session_staff, unit_config
 from scripts.shutdown import remote
-from scripts.production.staff_test_support import fixture_member, isolated_staff_file, unit_membership, showrunner_relationship, fixture_runtime_id, fixture_worker, StaffTestCase
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file, unit_membership, showrunner_relationship, fixture_runtime_id, fixture_worker, recorded_showrunner, StaffTestCase
 
 SCRIPT = Path(__file__).with_name("unit_lookup.py")
 
@@ -365,6 +365,9 @@ print(observed.row.id)
         from scripts.message import unit_labels
         import session_pane
 
+        doc = self.root / "production.md"
+        _ = doc.write_text("# show\n")
+        _ = recorded_showrunner("show", doc)
         owner = unit_membership("show", "alpha-unit")
         fake_unit_host.write(self.environment, [HostedUnit("agents", "w4:p1", {})])
         self.claude("alpha", "w4:p1", session_id=owner.id)
@@ -419,6 +422,9 @@ print(observed.row.id)
         from scripts.message import unit_labels
         from scripts.shutdown import pane_record
 
+        doc = self.root / "production.md"
+        _ = doc.write_text("# show\n")
+        _ = recorded_showrunner("show", doc)
         owner = unit_membership("show", "alpha-unit")
         _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), self.root), expected=owner.worktree)
         fake_unit_host.write(self.environment, [HostedUnit("agents", "w4:p1", {})])

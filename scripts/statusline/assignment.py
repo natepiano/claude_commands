@@ -1,4 +1,4 @@
-"""Read the session's production or plan from its staff row and unit configuration."""
+"""Read the session's assignment from its staff row."""
 from __future__ import annotations
 
 import json
@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.production import staff, unit_config
+from scripts.production import staff
 
 
 def assignment(record: staff.StaffSnapshot, session_id: str) -> tuple[str, str]:
@@ -21,12 +21,7 @@ def assignment(record: staff.StaffSnapshot, session_id: str) -> tuple[str, str]:
     if row.kind == "worker":
         return "worker", "worker"
     parent = record.parent_of(row)
-    label = "unit"
-    if isinstance(row.worktree, staff.PresentWorktree):
-        config = unit_config.parse((row.worktree.path / ".unit.toml").read_text(encoding="utf-8"))
-        plan = (config.plan.path.stem if isinstance(config.plan, unit_config.PlanFile)
-                else "standby" if isinstance(config.plan, unit_config.StandbyPlan) else "permanent")
-        label = f"{plan} unit"
+    label = f"{row.name} unit"
     if parent is not None:
         label += f" for {parent.name}"
     return label, "unit-director"

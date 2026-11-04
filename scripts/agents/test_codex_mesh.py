@@ -65,7 +65,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import BinaryIO, Callable, Literal, TextIO, TypedDict, cast, final, override
 from unittest.mock import MagicMock, call, patch
 
-from scripts.agents import codex_mesh, worker_lifecycle
+from scripts.agents import codex_mesh, mesh_runs, worker_lifecycle
 from scripts.direct import assign, plan_history, progress_history, worker_state, workers as unit_workers
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.lib import atomic_file, nix_env
@@ -1722,7 +1722,8 @@ class MeshCommandFixture(unittest.TestCase):
         return result, errors.getvalue()
 
     def run_follow(
-        self, message: str = "Repair the open finding", role: str = "impl", lens: str = ""
+        self, message: str = "Repair the open finding", role: str = "impl", lens: str = "",
+        *, claim_pid: int = 0,
     ) -> tuple[int, str]:
         message_file = self.session_dir / "follow-up.txt"
         _ = message_file.write_text(message, encoding="utf-8")
@@ -1730,6 +1731,7 @@ class MeshCommandFixture(unittest.TestCase):
         args.to = "worker"
         args.role = role
         args.lens = lens or None
+        args.claim_pid = claim_pid
         args.message_file = str(message_file)
         with contextlib.redirect_stderr(io.StringIO()) as errors:
             result = codex_mesh.command_follow(args)
@@ -10536,8 +10538,14 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         more.assert_not_called()
 
     def test_hold_closes_inbox_and_keeps_matching_messages_under_one_lock(self) -> None:
+        self.assert_hold_closes_inbox(codex_mesh.RosterActiveLauncher(THREAD_ID, (os.getpid(),)))
+
+    def test_parent_claim_closes_inbox_and_preserves_matching_messages(self) -> None:
+        self.assert_hold_closes_inbox(codex_mesh.RosterActiveLauncher(THREAD_ID, (os.getppid(), os.getpid())))
+
+    def assert_hold_closes_inbox(self, launcher: codex_mesh.RosterActiveLauncher) -> None:
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "running",
-            "launcher_pid": os.getpid(), "port": self.server.port}})
+            "launcher_pid": launcher.launcher_pids[0], "port": self.server.port}})
         pending = session_staff.worker_inbox_path(str(self.session_dir), "worker")
         for messages, kept in (
             (["first message", "second message"], 2),
@@ -10548,13 +10556,31 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                     "messages": messages, "accepting_messages": True,
                 }))
                 with patch.object(codex_mesh, "_pending_file", wraps=codex_mesh._pending_file) as lock, patch.object(codex_mesh, "_write_pending", wraps=codex_mesh._write_pending) as write:  # pyright: ignore[reportPrivateUsage]
-                    count = codex_mesh._close_messages_and_keep_pending(str(self.session_dir), "worker", THREAD_ID)  # pyright: ignore[reportPrivateUsage]
+                    count = codex_mesh._close_messages_and_keep_pending(  # pyright: ignore[reportPrivateUsage]
+                        str(self.session_dir), "worker", launcher)
                 self.assertEqual(count, kept)
                 lock.assert_called_once_with(str(self.session_dir), "worker")
                 write.assert_called_once()
                 self.assertEqual(cast(dict[str, object], json.loads(pending.read_text())), {
                     "messages": messages if kept else [], "accepting_messages": False,
                 })
+
+    def test_inbox_closing_helpers_refuse_another_launchers_record(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "running",
+            "launcher_pid": os.getpid(), "port": self.server.port}})
+        pending = session_staff.worker_inbox_path(str(self.session_dir), "worker")
+        _ = pending.write_text(json.dumps({
+            "messages": ["owner's message"], "accepting_messages": True,
+        }))
+        before = pending.read_bytes()
+        launcher = codex_mesh.RosterActiveLauncher(THREAD_ID, (os.getppid(),))
+        with patch.object(codex_mesh, "_pending_file", wraps=codex_mesh._pending_file) as lock:  # pyright: ignore[reportPrivateUsage]
+            self.assertTrue(codex_mesh._close_messages_if_empty(  # pyright: ignore[reportPrivateUsage]
+                str(self.session_dir), "worker", launcher))
+            self.assertEqual(codex_mesh._close_messages_and_keep_pending(  # pyright: ignore[reportPrivateUsage]
+                str(self.session_dir), "worker", launcher), 0)
+        lock.assert_not_called()
+        self.assertEqual(pending.read_bytes(), before)
 
     def test_completed_start_holds_two_messages_with_plural_wording_and_finishes_done(self) -> None:
         messages = ("first peer message", "second peer message")
@@ -12480,12 +12506,38 @@ class FollowEventRegressionTests(MeshCommandFixture):
         self.assertTrue(run.exists(), "run discovery removed a lookup record")
 
     def test_last_detached_run_result_turn_is_watched_not_interrupted(self) -> None:
+        self.assert_last_detached_run_result_turn_is_watched(claim_pid=0)
+
+    def test_implement_and_assign_parent_claims_keep_the_last_run_result_attached(self) -> None:
+        # Both launchers reserve their PID before a separate follower starts.
+        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                              stdin=subprocess.PIPE) as launcher:
+            try:
+                self.assert_last_detached_run_result_turn_is_watched(claim_pid=launcher.pid)
+            finally:
+                _ = launcher.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+    def assert_last_detached_run_result_turn_is_watched(self, *, claim_pid: int) -> None:
         self.start_args_timeout = TEST_HANG_GUARD_SECS
         self.assertEqual(self.run_start(), (0, ""))
+        if claim_pid:
+            self.assertNotEqual(claim_pid, os.getpid())
+            code, _output, errors = self.run_mesh([
+                "can-follow", "--to", "worker", "--claim-pid", str(claim_pid), "--role", "impl",
+            ])
+            self.assertEqual((code, errors), (0, ""))
         self.outcomes = ["completed", "listed_before_notices"]
         run = self.session_dir / codex_mesh.DETACHED_RUNS_DIR / "last.json"
         run.parent.mkdir()
         atomic_file.write_text_atomic(run, json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
+        result = self.session_dir / "detached-result.txt"
+        _ = result.write_text("detached run result")
+        record = mesh_runs.RunRecord(
+            run_id=run.stem, status="running", session_dir=str(self.session_dir), worker="worker",
+            staff_id=self.inbox_staff_id(THREAD_ID), label="last detached run", command=["fixture"],
+            log=str(self.session_dir / "detached.log"), started_at=time.time(), pid=os.getpid(),
+            director_dir=str(self.session_dir), done_message_file=str(result),
+        )
         held_on_run = threading.Event()
         polled_result_turn = threading.Event()
         steps: list[codex_mesh.StreamStep | codex_mesh.FailedWithThread] = []
@@ -12512,24 +12564,28 @@ class FollowEventRegressionTests(MeshCommandFixture):
 
         with (patch.object(codex_mesh, "_waiting_on_detached_run", note_wait),
               patch.object(codex_mesh, "_on_quiet_poll", note_result_turn_poll),
+              patch.object(mesh_runs, "send_to_director", side_effect=AssertionError("result left its launcher")),
               ThreadPoolExecutor(max_workers=1) as executor):
-            future = executor.submit(self.run_follow)
+            future = executor.submit(self.run_follow, claim_pid=claim_pid)
+            future.add_done_callback(lambda _future: held_on_run.set())
             try:
                 LauncherHangGuard("launcher never waited on the live run").event(held_on_run)
+                self.assertFalse(future.done(), "follower left while its detached run was live")
+                self.assertEqual(self.worker_record()["status"], "running")
+                self.assertEqual(self.worker_record()["launcher_pid"], claim_pid or os.getpid())
                 self.server.hold_turn_completion = True
                 self.server.answer_requests_during_held_turn = True
                 self.server.held_turn_completes_successfully = True
-                held = codex_mesh.hold_message(str(self.session_dir), "worker", "detached run result",
-                                               without_launcher=False)
-                # Match mesh_runs.command_supervise: hold the result while the
-                # run still owns the inbox, then publish its finished record.
+                held = mesh_runs.deliver(record, 0)
+                # Deliver the result before the run releases the inbox.
                 atomic_file.write_text_atomic(run, json.dumps({"worker": "worker", "status": "finished", "pid": os.getpid()}))
-                self.assertIsInstance(held, codex_mesh.HeldForLauncher)
+                self.assertEqual(held, f"held for worker's attached launcher on thread {THREAD_ID}")
                 LauncherHangGuard("the held result opened no turn").event(self.server.held_turn_ready)
                 LauncherHangGuard("no lifecycle check ran on the result turn").event(polled_result_turn)
                 self.assertNotIn(codex_mesh.StreamStep.FINISH, steps)
                 self.assertFalse(future.done(), "launcher left the result turn before its completion")
             finally:
+                atomic_file.write_text_atomic(run, json.dumps({"worker": "worker", "status": "finished"}))
                 self.server.release_held_turn.set()
             code, errors = LauncherHangGuard('test_last_detached_run_result_turn_is_watched_not_interrupted').result(future)
         self.assertEqual((code, errors), (0, ""))
@@ -13630,7 +13686,7 @@ class DetachedRunWatchTests(StaffTestCase):
                 _ = record.write_text(json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
                 if decision == "close":
                     self.assertFalse(codex_mesh._close_messages_if_empty(  # pyright: ignore[reportPrivateUsage]
-                        str(session), "worker", THREAD_ID, watch))
+                        str(session), "worker", codex_mesh.RosterActiveLauncher(THREAD_ID, (os.getpid(),)), watch))
                 elif decision == "wait":
                     self.assertTrue(codex_mesh._waiting_on_detached_run(  # pyright: ignore[reportPrivateUsage]
                         str(session), "worker", watch))

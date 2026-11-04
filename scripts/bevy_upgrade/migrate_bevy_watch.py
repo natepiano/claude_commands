@@ -14,15 +14,34 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.lib.atomic_file import sync_folder, write_bytes_atomic, write_text_atomic
-from scripts.production import staff
-from scripts.production.store_owner import document_id
+from scripts.production import showrunners, staff, store_owner
+from scripts.shutdown.remote import local_machine
 import upgrade_record
 import upgrade_schedule
 
 
 def _owner(document: Path) -> staff.StaffId:
     # Read current ownership again for each file, including after a clear.
-    return document_id(document, record=staff.snapshot())
+    record = staff.snapshot()
+    try:
+        return store_owner.document_id(document, record=record)
+    except staff.StaffRefused:
+        pass
+    machine = local_machine()
+    matches: list[staff.StaffId] = []
+    for candidate in record.find(kind="showrunner"):
+        doc = candidate.doc
+        if isinstance(doc, staff.DocUnfilled) or doc.machine != machine:
+            continue
+        if doc.path.parent.resolve() != document.parent.resolve():
+            continue
+        former = showrunners.former_slugs(doc.path.read_text(encoding="utf-8"))
+        if any(doc.path.with_name(f"{name}-production.md").resolve() == document.resolve() for name in former):
+            matches.append(candidate.id)
+    if len(matches) != 1:
+        reason = "ambiguous former production document" if matches else "showrunner ownership evidence is unavailable"
+        raise staff.StaffRefused(f"{document}: {reason}")
+    return matches[0]
 
 
 def _record(source: Path) -> bool:
@@ -30,21 +49,22 @@ def _record(source: Path) -> bool:
     if not isinstance(value, dict):
         raise ValueError(f"{source}: expected a record object")
     fields = cast(dict[str, object], value)
+    reference = fields.get("staff_id")
+    # Keep the target version in each closed archive's file name.
+    suffix = f".{fields.get('target')}.closed.json" if source.name.endswith(".closed.json") else ".json"
+    if isinstance(reference, str) and "slug" not in fields and source.name == f"{reference}{suffix}":
+        _ = upgrade_record.validate(fields)
+        return False
     document = fields.get("production")
     if not isinstance(document, str):
         raise ValueError(f"{source}: production document evidence is unavailable")
     identity = _owner(Path(document))
-    reference = fields.get("staff_id")
     if reference is not None and reference != identity:
         raise staff.StaffRefused(f"{source}: the recorded owner differs from the document owner")
-    legacy = fields.pop("slug", None)
+    _ = fields.pop("slug", None)
     fields["staff_id"] = identity
-    record = upgrade_record.validate(fields)
-    # Keep the target version in each closed archive's file name.
-    suffix = f".{record['target']}.closed.json" if source.name.endswith(".closed.json") else ".json"
+    _ = upgrade_record.validate(fields)
     target = source.with_name(f"{identity}{suffix}")
-    if source == target and legacy is None and reference == identity:
-        return False
     if _owner(Path(document)) != identity:
         raise staff.StaffRefused(f"{source}: ownership evidence changed")
     if target != source and target.exists():
@@ -166,7 +186,7 @@ def migrate(*, stop_after: int = 0) -> int:
                 if stop_after and completed >= stop_after:
                     return 75
     for problem in missing:
-        print(f"unavailable: {problem}", file=sys.stderr)
+        print(f"anomaly: {problem}", file=sys.stderr)
     print(f"moved {completed}; unavailable {len(missing)}")
     return 1 if missing else 0
 

@@ -292,8 +292,6 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
     client = herdr.Herdr(herdr.shared_session())
     command = _pane_command(tab, entry, account)
     launched_at = datetime.now(timezone.utc)
-    if not isinstance(client.pane_activity(tab.pane_id), herdr.PaneAtShell):
-        raise herdr.HerdrFailure(f"{entry['session_id']}: target pane has live work")
     client.run_in_pane(tab.pane_id, command)
     deadline = monotonic() + START_SECONDS
     live = sessions.session_liveness(entry["session_id"])
@@ -451,6 +449,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         from scripts.accounts import accounts
         from scripts.whoami.account import named_account_environment
 
+        if to is None and row is not None and row.kind in ("unit", "showrunner") and pane_launch.agent_kind(entry) == "claude":
+            to = accounts.role_account(row.kind).label
         source = Path(entry["config_dir"])
         source_label = accounts.claude_config_label(source)
         target_dir = (accounts.account_dir(to) if to is not None else
@@ -720,6 +720,19 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                         outcomes.append(ResumePending(identity, target, resumed.reason))
                 except Exception as error:
                     outcomes.append(ResumePending(identity, target, str(error)))
+            record = staff.initial_snapshot()
+            for index, (session, outcome) in enumerate(zip(selected, outcomes)):
+                identity = outcome.name if isinstance(outcome, SessionNotFound) else outcome.session_id
+                running = _running_on_account(identity, "")
+                if isinstance(running, ClaudeUp) and running.account == target:
+                    continue
+                member = record.by_member_reference(identity)
+                name = member.name if member is not None else session
+                line = (f"{name}: not running on {target} after the move; resume it with: "
+                        + f"accounts.py move {identity} {target}")
+                print(line, file=sys.stderr)
+                if isinstance(outcome, ClaudeUp):
+                    outcomes[index] = ResumePending(identity, target, line)
             return outcomes
 
 

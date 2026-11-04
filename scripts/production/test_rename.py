@@ -255,47 +255,48 @@ class ProductionRenameTests(support.ProductionRenameFixture):
             "---", "date_created: 2026-10-27", "date_modified: 2026-10-27", "---", "",
             "# old showrunner: changes to review", "", "## To review", "", *rows, "",
             "## Reviewed", "", "| # | Change | Verdict | Date |", "| --- | --- | --- | --- |", ""]))
+        owner = self.production_row()
         pins = self.home / ".local/state/next"
-        question = {"current": "old: first", "ended": {"old: earlier": "2026-10-27T01:00:00"}, "moved": ["oldish: kept"]}
-        self.write(pins / "question-old.json", json.dumps(question))
-        self.write(pins / "next-old-all-below.json", json.dumps({"current": "C1", "source": "change-old"}))
+        question = {"current": f"{owner.id}: first", "ended": {f"{owner.id}: earlier": "2026-10-27T01:00:00"},
+                    "moved": ["oldish: kept"]}
+        pin = pins / f"question-{owner.id}.json"
+        aggregate = pins / f"next-{owner.id}-all-below.json"
+        self.write(pin, json.dumps(question))
+        self.write(aggregate, json.dumps({"current": "C1", "source": "change-old"}))
         child_doc = self.root / "child/docs/child-production.md"
         self.write(child_doc, f"# Child\n\n## Production Context\n\n- **Parent production:** {self.doc}\n")
         self.write(self.notifier / "showrunner-child/conf",
                    "EVERY=15\nTARGET=session:test-child\nCHECK="
                    + shlex.join(["zsh", "/scripts/production_check.sh", str(child_doc)]) + "\n")
         bevy = self.home / ".local/state/bevy-upgrade"
-        self.write(bevy / "old.json", json.dumps({"slug": OLD, "production": str(self.doc), "entries": 3}))
-        self.write(bevy / "old.lock", "")
-        self.write(self.notifier / "bevy-upgrade-old/conf", "EVERY=240\nRUN=py bevy_upgrade.py --production "
-                   + shlex.quote(str(self.doc)) + " check --scheduled\nFROM=bevy-upgrade-old\n")
+        watch = bevy / f"{owner.id}.json"
+        lock = bevy / f"{owner.id}.lock"
+        job = self.notifier / f"bevy-upgrade-{owner.id}/conf"
+        self.write(watch, json.dumps({"staff_id": owner.id, "entries": 3}))
+        self.write(lock, "")
+        self.write(job, f"EVERY=240\nRUN=py bevy_upgrade.py --staff-id {owner.id} check --scheduled\n"
+                       + f"FROM=bevy-upgrade-{owner.id}\n")
+        fixed = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in (pin, aggregate, watch, lock, job)}
         board = self.root / "state/unit-board/old.json"
         self.write(board, "{}\n")
         planned = self.run_rename("plan")
         self.assert_success(planned)
-        for expected in ("/next pin", "change review", "in 1 rows", f"Parent production {child_doc}",
-                         "bevy upgrade watch", "remove derived unit board", "production log"):
+        for expected in ("change review", "in 1 rows", f"Parent production {child_doc}",
+                         "remove derived unit board", "production log"):
             self.assertIn(expected, planned.stdout)
         self.assert_success(self.run_rename("apply"))
-        self.assertFalse((pins / "question-old.json").exists())
-        self.assertEqual(json.loads((pins / "question-new.json").read_text()),
-                         {"current": "new: first", "ended": {"new: earlier": "2026-10-27T01:00:00"},
-                          "moved": ["oldish: kept"]})
-        self.assertEqual(json.loads((pins / "next-new-all-below.json").read_text()),
-                         {"current": "C1", "source": "change-old"})
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in fixed}, fixed)
+        self.assertEqual(json.loads(pin.read_text()), question)
+        self.assertEqual(json.loads(aggregate.read_text()), {"current": "C1", "source": "change-old"})
         text = listed.read_text()
         self.assertIn("| C1 | own | m | try | new |", text)
         self.assertIn("| C2 | child's | m | try | child |", text)
         self.assertRegex(text, r"\| C3 \| root's \| m \| try \| *\|")
         self.assertIn(f"- **Parent production:** {self.new_doc}\n", child_doc.read_text())
-        self.assertFalse((bevy / "old.json").exists())
-        self.assertFalse((bevy / "old.lock").exists())
-        self.assertEqual(json.loads((bevy / "new.json").read_text()),
-                         {"slug": NEW, "production": str(self.new_doc), "entries": 3})
-        self.assertFalse((self.notifier / "bevy-upgrade-old").exists())
-        conf = (self.notifier / "bevy-upgrade-new/conf").read_text()
-        self.assertIn(f"--production {shlex.quote(str(self.new_doc))} check", conf)
-        self.assertIn("FROM=bevy-upgrade-new\n", conf)
+        self.assertEqual(json.loads(watch.read_text()), {"staff_id": owner.id, "entries": 3})
+        self.assertEqual(lock.read_text(), "")
+        self.assertIn(f"--staff-id {owner.id} check", job.read_text())
+        self.assertIn(f"FROM=bevy-upgrade-{owner.id}\n", job.read_text())
         self.assertFalse(board.exists())
         self.assertFalse((self.checkout / "docs/plans/old-log.md").exists())
         self.assertEqual((self.checkout / "docs/plans/new-log.md").read_text(), "one line per event\n")
