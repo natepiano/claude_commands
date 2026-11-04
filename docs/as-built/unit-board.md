@@ -2,7 +2,13 @@
 
 ## What it is
 
-A production runs several `/unit:direct` units at once, and `/unit:report` used to answer "where is this unit" with long recorder tables in the terminal. The unit board gives that answer three ways. Every ETA a unit director states is recorded against the phase it names, and the phase chain predicts later phases from that stated ETA, so a phase's first promise, its moves and its latest promise are all on disk. A Claude Code mod, `mods/unit-board/`, draws those records in a pane the user opens on demand: `/showrunner:unit_board` shows the board of the showrunner's production and every production below it (every unit's phase strip, ETA, gate, finish and workers) or one unit's detail, `/accounts-board` shows the accounts table that `accounts.py` reports from stored readings, with no login addresses, and `/build:queue` shows the free/taken budget and one waiting row per step with a size bar and the head’s window state. `/unit:report` prints a short report (phase, stage, one ETA line, the summary table, workers, summary sentences), and adds the recorder's round table only when asked with `tables`.
+The mod in `mods/unit-board/` draws three panes on demand.
+`/showrunner:unit_board` shows the production, its child productions, or one unit.
+It shows phases, ETAs, gates, finish times, and workers.
+`/showrunner:accounts` shows stored account readings without login addresses.
+`/build:queue` shows the memory budget and waiting steps.
+The recorder keeps each phase's stated ETA and predicts later phases from it.
+`/unit:report` prints a short report; `tables` adds the recorder's round table.
 
 ## How it works
 
@@ -17,7 +23,7 @@ director states an ETA ──► progress_history.py eta ──► eta_stated ev
             (short report / --tables)              writes <slug>.json, prints {files, watch}
                                                            │
                                        mod: /showrunner:unit_board ── reads JSON, stats sources while open
-                                       mod: /accounts-board ── runs accounts.py status --json --stored
+                                       mod: /showrunner:accounts ── runs accounts.py status --json --stored
                                        mod: /build:queue ── runs build_queue.py --json
 ```
 
@@ -105,12 +111,15 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 
 - `/showrunner:unit_board [<unit>|close]` opens pane `unit-board` (title `Units`, closes on Escape), stores `loading`, runs the generator once with `--session <$.session.id()>` (the open pane keeps the session id for each refresh), reads each listed file and stores the unit view for `<unit>` (the first board holding that key), else the board view. With no files the pane shows `This session is not on the staff list.`; it replies `Unit board opened.` Pressing a unit name on the board and the `board` button on a unit switch views. `close` replies `Unit board closed.`
 - A mod command name allows only letters, digits, `_` and `-`, so [`commands/showrunner/unit_board.md`](../../commands/showrunner/unit_board.md) gives the name. The mod answers it with a `command.run` hook on `{ command: 'showrunner:unit_board' }` that returns `{ text }` and never calls `next`, so no model turn starts. In a session without the mod, the file's body makes the model reply one line naming `unit-board@nate-local`.
-- `/accounts-board [close]` resolves the user zone, opens pane `accounts-board` (title `Accounts`), stores `loading`, runs `[~/.claude/scripts/lib/py, ~/.claude/scripts/accounts/accounts.py, "status", "--json", "--stored"]` once and replies `Accounts opened.`; `close` replies `Accounts closed.` Every open and refresh runs exactly that argv; the text table is never parsed.
+- `/showrunner:accounts [close]` opens pane `accounts`, titled `Accounts`, without a model turn.
+  It resolves the user zone and stores `loading`.
+  Each open and refresh runs `[~/.claude/scripts/lib/py, ~/.claude/scripts/accounts/accounts.py, "status", "--json", "--stored"]`.
+  It replies `Accounts opened.`; `close` replies `Accounts closed.`.
 - `/build:queue [<position|session|folder>]` is intercepted by `command.run` without a model turn. It opens `build-queue` (title `Build queue`, Escape closes), stores `loading`, runs `[~/.claude/scripts/lib/py, ~/.claude/scripts/build_queue/build_queue.py, "--json", "--columns", <last bodyColumns>, "--you", <session id>, <optional selector>]` and replies `Build queue opened.`. The width starts at 100. A pane-width change requests one forced refresh; the shared busy guard joins repeated requests. A selector shows the full queue, one blank line, and the matching cards on one page. `mine` uses the same layout. The selection survives the 10 s refresh and reload. `close` replies `Build queue closed.`. Bump retains its existing refusal handling and refreshes an open pane. Bump is off; nothing can move a waiting step.
 - `queue_lines.py` defines `Span {text, tone, bold, background, until?}`, terminal-cell widths, padding, clipping, hanging-indent wrap, text output and `QueueLines {columns, as_of, lines}` JSON. Tone names include blue `suggestion`. JSON omits fields at their `Span` defaults: `tone` and `background` `default`, `bold` false, and no `until`. The pane accepts missing fields as those defaults; older explicit fields remain valid. An `until` span contains only the countdown text and its epoch deadline; the pane computes `max(0, until − now)` on every draw. One `$.clock.every(1000, …)` timer invalidates the drawing while a countdown is active, without a script run; it stops on expiry, a page without a countdown, or close. The 10 s script refresh stays.
 - `build_queue.py` reads admission with the lock-free, bounded `queue_read()`, then resolves labels through one file-only `unit_labels_for` lookup. The no-selector view skips bump/token history and pace reads. It draws a budget bar from admission’s charged total and budget, then aligned waiting rows with showrunner, unit (without its showrunner prefix), step, minutes and need bars at one cell per GiB. Plain output uses `░` for free budget and `█` for taken; colour uses green and blue with an eighth-block boundary. Name columns grow above 60 cells, shrink together when needed, then clip at the edge. `--you` carries `$.session.id()`; inline falls back to the calling session environment. Matching rows have a blue `▸`. Row 1 ends with `↑` for backfill, `↑ ≤N.N` for positive strict-window room or `⊘` when no room remains, a recorded window countdown when known, and red host-hold words. The view has no running rows, moves or start estimates.
 - Selector cards retain their order, checks and history behavior. An older fitting step fails the queue-order check with `behind #<k>, an older step that fits`, or `behind an older step that fits` when it is absent from the reading. `queue_view.render_view` and `queue_card.render_card` share a model and admission check formatter. Every waiting step's card shows its recorded budget and free checks from admission. A failed refresh or malformed reply keeps the last successful page. A failed first query shows only `Build queue could not be read.`. Times use the user’s zone; `as_of` is the admission reading’s epoch.
-- `session.start` only registers `accounts-board` and, if `$.ui.panes()` shows a pane already open (a reload), restarts that pane's refresh. A colon command keeps its name in `commands/build/queue.md`; its body still runs the script without the mod. Sessions started before these hooks need `/reload-plugins`.
+- `session.start` restores refresh timers for open panes. Command files supply the colon names; mod hooks open the panes without a model turn. Without the mod, `/showrunner:accounts` names the required plugin. `/build:queue` runs its script. Run `/reload-plugins` in sessions that need the updated hooks.
 
 **State.** Plugin state `unit-board` holds the board and accounts records, each keyed by pane id; a missing entry is a closed pane.
 

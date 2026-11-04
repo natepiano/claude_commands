@@ -885,7 +885,7 @@ function tablePaneLifetimeHost() {
 
 for (const pane of [
   { id: 'build-queue', command: 'build:queue', key: 'queuePanes', ready: 'queue' },
-  { id: 'accounts-board', command: 'accounts-board', key: 'accountsPanes', ready: 'accounts' },
+  { id: 'accounts', command: 'showrunner:accounts', key: 'accountsPanes', ready: 'accounts' },
 ]) {
   test(`${pane.id}: an older close cannot erase state written by a reopened pane`, async () => {
     const host = tablePaneLifetimeHost();
@@ -906,7 +906,7 @@ for (const pane of [
 
 test('reload reads and schedules the queue while the resumed accounts read is held', async () => {
   const host = tablePaneLifetimeHost();
-  host.panes.add('accounts-board');
+  host.panes.add('accounts');
   host.panes.add('build-queue');
   const held = host.pauseAccountsRead();
   const resuming = host.dispatch('session.start', start);

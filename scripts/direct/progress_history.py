@@ -1417,13 +1417,23 @@ def _start_phase(args: argparse.Namespace) -> None:
     state = _read_state(session_dir)
     now = plan_history.now_epoch()
     phase_id = _arg_string(args, "phase_id", "ad hoc")
-    # Starting a phase that is already open does nothing. Starting any other
-    # leaves every open phase open: each closes only by its own finish-phase.
-    if _open_phase_named(state, phase_id) is not None:
+    phase_dir = phase_reservation.phase_directory(session_dir, phase_id)
+    # An unchanged retry keeps the open phase, regardless of the caller's worktree.
+    open_phase = _open_phase_named(state, phase_id)
+    if open_phase is not None:
+        same_title = _arg_string(args, "phase_title", "Ad hoc work") == _string(open_phase.get("title"))
+        same_start = (not _optional_arg(args, "started_at")
+                      or _optional_epoch(args, "started_at", "--started-at", now)
+                      == _number(open_phase.get("started_at")))
+        if same_title and same_start:
+            return
+        worktree = phase_reservation.phase_worktree(phase_dir)
+        if isinstance(worktree, phase_reservation.KnownPhaseWorktree):
+            root = phase_reservation.repository_root(Path.cwd())
+            if root is not None and root.resolve() != worktree.root.resolve():
+                raise SystemExit(f"Phase {phase_id} is already open in {worktree.root}; "
+                                 + f"finish it before restarting in {root}.")
         return
-    # A finished phase reopened for repair rounds gets its reservation state back from its kept
-    # /sync board answer, so its edits pass the berth hook with no hand-written state.
-    _ = phase_reservation.restore(phase_reservation.phase_directory(session_dir, phase_id), phase_id)
     # The phase count reads the plan's headings, so a phase the plan lacks makes
     # every later report disagree with its own phase number.
     missing_from = _phase_missing_from_plan(state, phase_id)
@@ -1433,6 +1443,12 @@ def _start_phase(args: argparse.Namespace) -> None:
             + f"`### Phase {phase_id} — <title>  · status: todo` under ## Phases, then start it."
         )
     started_at = _optional_epoch(args, "started_at", "--started-at", now)
+    # A new instance gets its worktree and baselines from its first dispatch, not the run's working_dir.
+    try:
+        phase_reservation.reset_for_start(phase_dir, phase_id)
+        _ = phase_reservation.restore(phase_dir, phase_id)
+    except phase_reservation.StateRefused as refused:
+        raise SystemExit(str(refused)) from refused
     if _string(state.get("status")) != "active" and "finished_at" in state:
         previous_status = _string(state.get("status"))
         state["status"] = "active"

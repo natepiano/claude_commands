@@ -1148,6 +1148,28 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         entry = self.log()[0]
         self.assertEqual((entry["via"], entry["postmaster"], entry["seconds"], entry["text"]), ("postmaster", "delivered", 0.125, "body"))
 
+    def test_twenty_kilobytes_use_the_postmaster_outbox_whole_without_a_model_relay(self) -> None:
+        clock = self.postmaster_clock()
+        self.session("recipient", "Recipient")
+        self.session("worker", "Postmaster")
+        self.session("sender", "Sender")
+        self.postmaster_heartbeat(clock)
+        texts: list[str] = []
+        self.postmaster_mod(clock, texts)
+        body = "Large result: " + "x" * (20_000 - len("Large result: "))
+        started = time.perf_counter()
+        with mock.patch.object(send, "relay", side_effect=AssertionError("No model relay")) as relay:
+            result = send.send(local_options(["--to", "session:recipient", "--from", "Sender",
+                "--summary", "Build result", "--text", body]))
+        elapsed = time.perf_counter() - started
+        self.assertEqual(result, send.Result("sent", "postmaster; verbatim; session:recipient"))
+        self.assertEqual(len(texts), 1)
+        self.assertEqual(texts[0].split("\n\n", 1)[1].encode(), body.encode())
+        self.assertEqual(len(body.encode()), 20_000)
+        relay.assert_not_called()
+        self.assertLess(elapsed, send.delivery_timeout() / 4)
+        self.assertEqual((self.log()[0]["via"], self.log()[0]["postmaster"]), ("postmaster", "delivered"))
+
     def test_postmaster_shows_sender_job_and_keeps_reply_and_log_identity(self) -> None:
         clock = self.postmaster_clock()
         self.session("recipient", "Recipient")
