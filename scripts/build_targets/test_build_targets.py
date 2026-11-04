@@ -549,12 +549,44 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         self.assertEqual(self.kind_answer("test", "portable"), "mac_allowed\n")
         self.assertEqual(self.kind_answer("test", "linux-part"), "natedev_only linux_only\n")
 
-    def test_off_backoff_and_disk_floor_refuse_mac_steps(self) -> None:
+    def test_temporary_refusals_keep_mac_retries_and_off_refuses_mac_steps(self) -> None:
         self.assertEqual(self.kind_answer("check", free_gib=59), "natedev_only disk\n")
         offload.write_backoff(time.time() + 60)
-        self.assertEqual(self.kind_answer("doc"), "natedev_only backoff\n")
+        self.assertEqual(self.kind_answer("doc"), "mac_allowed\n")
         _ = write_config_fixture(self.settings, "offload=off\nlinux_only.hana=\n", template="mac_test")
         self.assertEqual(self.kind_answer("lint"), "natedev_only off\n")
+
+    def test_temporary_mac_exclusions_keep_the_leave_route_available(self) -> None:
+        target = targets.SshTarget("mac", "macos", self.settings)
+        for reason in ("busy", "blocked", "disk", "backoff", "unreachable", "state", "copy", "mac_busy",
+                       "spending_limit", "spending_unavailable",
+                       "state unreadable: temporary read failure"):
+            with self.subTest(reason=reason), mock.patch.object(
+                build_targets, "ssh_target_eligibility", return_value=targets.ExcludedTarget(target, reason),
+            ):
+                decision = "natedev_only disk" if reason == "disk" else "mac_allowed"
+                self.assertEqual(self.kind_output("test", "portable"),
+                                 decision + "\nmac\texcluded\t" + reason + f"\t{self.settings}\n"
+                                 + "natedev\teligible\t-\t-\n")
+
+    def test_disk_decision_preserves_evidence_in_every_target_order(self) -> None:
+        mac = targets.SshTarget("mac", "macos", self.settings)
+        linux = targets.SshTarget("linux", "linux", self.settings.with_name("linux.conf"))
+        cases = (
+            ((mac, "disk"),),
+            ((linux, "disk"),),
+            ((mac, "disk"), (linux, "off")),
+            ((mac, "off"), (linux, "disk")),
+            ((mac, "disk"), (linux, "-")),
+        )
+        for exclusions in cases:
+            for ordered in (exclusions, tuple(reversed(exclusions))):
+                results = {target.name: targets.EligibleTarget(target) if reason == "-"
+                           else targets.ExcludedTarget(target, reason) for target, reason in ordered}
+                with (self.subTest(targets=[(target.name, reason) for target, reason in ordered]),
+                      mock.patch.object(build_targets, "read_targets", return_value=tuple(target for target, _ in ordered)),
+                      mock.patch.object(build_targets, "ssh_target_eligibility", side_effect=list(results.values()))):
+                    self.assertEqual(self.kind_answer("test", "portable"), "natedev_only disk\n")
 
     def test_unresolved_probe_excludes_target_as_busy(self) -> None:
         target = targets.SshTarget("mac", "macos", self.settings)

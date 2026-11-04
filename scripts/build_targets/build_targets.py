@@ -249,6 +249,14 @@ class NatedevOnly:
     reason: str
 
 
+def target_can_retry(result: EligibleTarget | ExcludedTarget) -> bool:
+    """Keep temporary refusals available for a later reservation."""
+    return (isinstance(result, EligibleTarget)
+            or result.reason in {"busy", "blocked", "disk", "backoff", "unreachable", "state", "copy", "mac_busy",
+                                 "spending_limit", "spending_unavailable"}
+            or result.reason.startswith("state unreadable: "))
+
+
 def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
                            package: str, kind: StepKind, routing: Routing
                            ) -> EligibleTarget | ExcludedTarget:
@@ -493,16 +501,22 @@ def command_kind_eligible(repo_root: Path, package: str, kind: StepKind, routing
         decision = NatedevOnly("full gate runs on natedev")
     elif isinstance(routing, LocalRequired):
         decision = NatedevOnly(routing.reason)
-    for result in eligibility:
-        if not isinstance(result.target, SshTarget):
-            continue
-        if isinstance(result, EligibleTarget):
+    retry_allowed = kind in ("test", "check", "lint", "doc") and not isinstance(routing, LocalRequired)
+    remote_results = tuple(result for result in eligibility if isinstance(result.target, SshTarget))
+    disk_declined = any(isinstance(result, ExcludedTarget) and result.reason == "disk" for result in remote_results)
+    linux_allowed = False
+    if retry_allowed:
+        if disk_declined:
+            # Keep disk evidence independent of target order and retry permission.
+            decision = NatedevOnly("disk")
+        elif any(target_can_retry(result) for result in remote_results):
             decision = MacAllowed()
-            break
-        decision = NatedevOnly(result.reason)
-    linux_allowed = any(isinstance(result.target, SshTarget) and result.target.platform == "linux"
-                        and (isinstance(result, EligibleTarget) or result.reason in ("busy", "blocked"))
-                        for result in eligibility)
+            linux_allowed = any(isinstance(result.target, SshTarget) and result.target.platform == "linux"
+                                and target_can_retry(result) for result in remote_results)
+        else:
+            reasons = sorted(result.reason for result in remote_results if isinstance(result, ExcludedTarget))
+            if reasons:
+                decision = NatedevOnly(reasons[0])
     print("ssh_allowed" if linux_allowed else "mac_allowed" if isinstance(decision, MacAllowed)
           else f"natedev_only {display_field(decision.reason)}")
     for result in eligibility:

@@ -82,8 +82,8 @@ config = offload.read_config(Path(args.settings))
 controller = offload.ProcessController()
 root = Path(os.environ["TEST_RUNNER_STATE"])
 mode = json.loads(os.environ.get("TEST_SSH_MODES", "{}" )).get(request.target, "passed")
-if mode == "disk-once":
-    mode = "passed" if (root / "ssh-events.jsonl").exists() else "disk"
+if mode in ("disk-once", "lost-once"):
+    mode = "passed" if (root / "ssh-events.jsonl").exists() else mode.removesuffix("-once")
 actions = []
 initial = mac_test.read_claims(mac_test.state_paths(request.target))
 before = {claim.path: claim.record for claim in initial}
@@ -572,7 +572,7 @@ steps_path.write_text(json.dumps(steps))
         self.enable_mac()
         _ = self.control_routing_clock()
         self.release_memory_after_polls(advance_clock=True)
-        result = self.verify("test", "sample", "--no-cache", extra={"TEST_SSH_MODES": '{"mac":"disk-once"}'})
+        result = self.verify("test", "sample", "--no-cache", extra={"TEST_SSH_MODES": '{"mac":"lost-once"}'})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         first, second = self.ssh_events()
         self.assertEqual((first["clock"], second["clock"]), ("100", "281"))

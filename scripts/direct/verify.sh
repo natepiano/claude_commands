@@ -286,7 +286,7 @@ run() {
         set -m
         (
             set +m
-            if [[ "$CMD" != test && "$STEP_RUNS_ON" != natedev_only ]] && buildlog_step_compiles "$@"; then
+            if [[ "$CMD" != test ]] && step_can_retry && buildlog_step_compiles "$@"; then
                 export LINT_QUEUE_LEAVE_HOOK="$(ssh_retry_hook)"
             fi
             if run_once "$@" 2>&1 | tee "$step_log"; then
@@ -326,7 +326,7 @@ run() {
             rm -f "$step_log"
             return "$status"
         fi
-        if buildlog_step_compiles "$@" && { [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" && "$CMD" != test && "$STEP_RUNS_ON" != natedev_only ]] || step_stopped_by_hold; }; then
+        if buildlog_step_compiles "$@" && { { [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" && "$CMD" != test ]] && step_can_retry; } || step_stopped_by_hold; }; then
             if [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" ]]; then
                 STEP_FORCE_MAC=1
             else
@@ -1392,8 +1392,23 @@ COPY_WORD="" COPY_MAC="" COPY_REASON="" COPY_SECONDS="" COPY_RUNNER_STATUS="" CO
 MAC_RESULT_FILE=""
 MAC_LOG_FILE=""
 MAC_RUNNER_PID=""
-# A waiting local test can still leave for this eligible Mac. Non-busy
-# declines set a retry deadline; busy and blocked use the normal poll.
+# A waiting local test can leave for this Mac after a temporary decline.
+# Busy, blocked, and disk declines use the normal poll interval.
+SSH_RETRYABLE_REASON='^(busy|blocked|disk|backoff|unreachable|state|copy|mac_busy|spending_limit|spending_unavailable|state unreadable: .*)$'
+
+step_can_retry() {
+    [[ "$LOCAL_ONLY" == 0 ]] || return 1
+    case "$CMD" in test|check|lint|doc) ;; *) return 1 ;; esac
+    local name eligibility reason settings
+    while IFS=$'\t' read -r name eligibility reason settings; do
+        if [[ "$settings" != - && -n "$settings" && ( "$eligibility" == eligible ||
+              ( "$eligibility" == excluded && "$reason" =~ $SSH_RETRYABLE_REASON ) ) ]]; then
+            return 0
+        fi
+    done <<< "$STEP_TARGET_TABLE"
+    return 1
+}
+
 MAC_LEAVE_SETTINGS=""
 MAC_LEAVE_REASON=""
 MAC_RETRY_AFTER=0
@@ -1652,8 +1667,8 @@ initialize_step_record() {
             printf 'verify.sh: target eligibility check returned invalid targets; step refused\n' >&2
             exit 2
         fi
-        if [[ "$settings" != - && ( "$eligibility" == eligible || ( "$STEP_RUNS_ON" != natedev_only && "$reason" =~ ^(busy|blocked)$ ) ) ]]; then
-            if [[ "$STEP_RUNS_ON" == natedev_only ]]; then
+        if [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ $SSH_RETRYABLE_REASON ) ]]; then
+            if [[ "$eligibility" == eligible && "$STEP_RUNS_ON" == natedev_only && "$decision_reason" != disk ]]; then
                 printf 'verify.sh: target eligibility answer differs from its targets; step refused\n' >&2
                 exit 2
             fi
@@ -1662,8 +1677,6 @@ initialize_step_record() {
             if [[ "$(target_platform "$name")" == macos ]]; then mac_names+="${mac_names:+,}$name"; fi
         elif [[ "$eligibility" == eligible && "$settings" == - ]]; then
             eligible_names+="${eligible_names:+,}$name"
-        elif [[ "$eligibility" == excluded && "$settings" != - ]]; then
-            decision_reason=$reason
         fi
     done <<< "$table"
     if [[ "$STEP_RUNS_ON" != natedev_only && "$mac_targets" == 0 ]]; then
@@ -1671,9 +1684,9 @@ initialize_step_record() {
         exit 2
     fi
     STEP_TARGET_TABLE=$table
-    if [[ "$STEP_RUNS_ON" != natedev_only ]]; then
+    if step_can_retry; then
         while IFS=$'\t' read -r name eligibility reason settings; do
-            if [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ ^(busy|blocked)$ ) ]]; then
+            if [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ $SSH_RETRYABLE_REASON ) ]]; then
                 MAC_LEAVE_SETTINGS="$settings"
                 break
             fi
@@ -1694,9 +1707,9 @@ initialize_step_record() {
     fi
     export BUILDLOG_MEM_WAIT_SINCE="$(< "$BUILDLOG_MEM_WAIT_FIRST_FILE")"
     export BUILDLOG_CALL_ID
-    if [[ "$STEP_RUNS_ON" != natedev_only ]]; then
+    if step_can_retry; then
         while IFS=$'\t' read -r name eligibility reason settings; do
-            if [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ ^(busy|blocked)$ )
+            if [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ $SSH_RETRYABLE_REASON )
                   && "$(target_platform "$name")" == macos ]]; then
                 MAC_LEAVE_SETTINGS=$settings
                 register_mac_wait "$settings" 0
@@ -1720,7 +1733,7 @@ route_compiling_step() {
         *) return "$admission" ;;
     esac
     step_state waiting_hold
-    if [[ "$STEP_RUNS_ON" != natedev_only && "$CMD" != test ]]; then
+    if [[ "$CMD" != test ]] && step_can_retry; then
         if [[ "$CMD" == lint && "$admission" == 10 ]]; then
             HOLD_LINT=1
             : > "$HOLD_WAIT_DIR/lint-held"
@@ -1810,7 +1823,7 @@ remember_mac_retry() {
         SSH_RETRY_SETTINGS+=("$1") SSH_RETRY_DEADLINES+=(0)
         return 0
     fi
-    if [[ "${LAST_TARGET_OUTCOME:-$BUILDLOG_MAC}" != declined || ( "$MAC_LEAVE_REASON" != busy && "$MAC_LEAVE_REASON" != blocked ) ]]; then
+    if [[ "${LAST_TARGET_OUTCOME:-$BUILDLOG_MAC}" != declined || ! "$MAC_LEAVE_REASON" =~ ^(busy|blocked|disk)$ ]]; then
         MAC_RETRY_AFTER="$("$PY" -c 'import time; print(time.monotonic() + 180)')"
         if [[ "$MAC_RETRY_NOTICE_SHOWN" == 0 ]]; then
             echo "verify.sh: Mac attempt ended ($BUILDLOG_MAC${BUILDLOG_MAC_REASON:+: $BUILDLOG_MAC_REASON}); waiting 180 s before each retry while natedev waits." >&2
@@ -1867,11 +1880,11 @@ ssh_reserve_hook() {
 }
 
 ssh_retry_hook() {
-    [[ "$STEP_RUNS_ON" != natedev_only && "$LOCAL_ONLY" == 0 ]] || { printf 'false'; return; }
+    step_can_retry || { printf 'false'; return; }
     local name eligibility reason settings pivot=-1 index
     local names=() candidates=()
     while IFS=$'\t' read -r name eligibility reason settings; do
-        [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ ^(busy|blocked)$ ) ]] || continue
+        [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ $SSH_RETRYABLE_REASON ) ]] || continue
         names+=("$name") candidates+=("$settings")
         if [[ "$settings" == "$SSH_RETRY_AFTER_SETTINGS" ]]; then pivot=$((${#candidates[@]} - 1)); fi
     done <<< "$STEP_TARGET_TABLE"
@@ -1965,8 +1978,8 @@ route_test() {
                     *) return "$admission" ;;
                 esac
             fi
-            [[ "$STEP_RUNS_ON" != natedev_only ]] || continue
-            if [[ "$eligibility" == excluded && ! "$reason" =~ ^(busy|blocked)$ ]]; then continue; fi
+            step_can_retry || continue
+            if [[ "$eligibility" == excluded && ! "$reason" =~ $SSH_RETRYABLE_REASON ]]; then continue; fi
             [[ -f "$MAC_RUNNER" ]] || continue
             if [[ "$(ssh_reserve_hook "$name" "$settings")" == false ]]; then continue; fi
             remote_candidates=1
@@ -2119,7 +2132,7 @@ finish_copy_win() {
 # in the memory wait leaves once mac_test.py free-now says that Mac is free,
 # and its Mac result counts as one from route_test: a failure or a pass ends
 # the call. Other results keep the hook unless the Mac excludes this test.
-# Non-busy declines wait for the retry deadline. Once the step compiles,
+# Other temporary declines wait for the retry deadline. Once the step compiles,
 # copy_watch.py may run a copy on the Mac; a copy result that finishes first
 # ends the call (finish_copy_win).
 run_local_test() {
@@ -2127,7 +2140,7 @@ run_local_test() {
     while true; do
         hook=""
         copy_watch=0
-        if [[ "$STEP_RUNS_ON" != natedev_only ]]; then
+        if step_can_retry; then
             hook="$(ssh_retry_hook)"
             if [[ -n "$MAC_LEAVE_SETTINGS" && "$(target_platform "$(target_for_settings "$MAC_LEAVE_SETTINGS")")" == macos && -f "$MAC_COPY_WATCH" && -f "$MAC_RUNNER" ]]; then
                 copy_watch=1
@@ -2352,7 +2365,7 @@ if [[ "$CMD" == test ]]; then
 fi
 while ! build_hold_nothing_held; do
     step_state waiting_hold
-    if [[ "$CMD" != test && "$STEP_RUNS_ON" != natedev_only ]]; then
+    if [[ "$CMD" != test ]] && step_can_retry; then
         HOLD_WAIT_STATUS=0
         check_routing_hold || HOLD_WAIT_STATUS=$?
         case "$HOLD_WAIT_STATUS" in
@@ -2639,7 +2652,7 @@ acquire_token() {
         if [[ "$CMD" == test && -n "$MAC_LEAVE_SETTINGS" ]] \
               && eval "$(ssh_retry_hook)" >/dev/null 2>&1; then
             try_reserved_target
-        elif [[ "$CMD" != test && "$STEP_RUNS_ON" != natedev_only ]] \
+        elif [[ "$CMD" != test ]] && step_can_retry \
               && eval "$(ssh_retry_hook)" >/dev/null 2>&1; then
             STEP_FORCE_MAC=1
             return "$LINT_LEFT_QUEUE_STATUS"
