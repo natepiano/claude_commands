@@ -11,7 +11,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 
-from unit_staff_test_support import unit_host, legacy_unit_host
 import copy
 import io
 from types import SimpleNamespace
@@ -19,6 +18,7 @@ import json
 from datetime import datetime, tzinfo
 import os
 import shlex
+import shutil
 import subprocess
 import syslog
 import tempfile
@@ -33,6 +33,7 @@ from unittest.mock import call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from unit_staff_test_support import unit_host, legacy_unit_host
 from test_support import linux_process_fixture, registry_confirmation, ShutdownSendLeaf, ShutdownTestCase
 import inventory
 import pane_record
@@ -58,6 +59,7 @@ from scripts.accounts import accounts, outage_alerts
 import quota_alert
 from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.production.fake_unit_host import private_process_registry, process as write_process
 from scripts.whoami.account import Account, UnknownAccountName, UnreadableAccount
 from shutdown_record import SessionShutdown, SessionProgress, TimerRestore, Where
 
@@ -1738,43 +1740,61 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual([row for row in calls if row[2:4] == ["workspace", "close"]], [closed])
         self.assertLess(calls.index(focus), calls.index(closed))
 
-    def configure_startup_shell(self, responses: Path, name: str) -> None:
+    def configure_startup_shell(self, responses: Path, name: str, *, failed: str = "") -> None:
         replies = cast(dict[str, CommandResponse | list[CommandResponse]], json.loads(responses.read_text()))
         workspace, pane = startup_shell("w9")
-        replies[f"--session {name} workspace list"] = [
-            {"stdout": json.dumps({"result": {"workspaces": []}}), "code": 0},
-            {"stdout": json.dumps({"result": {"workspaces": [
+        replies[f"--session {name} workspace list"] = {
+            "stdout": json.dumps({"result": {"workspaces": [
                 workspace,
-                dict(workspace_id="w2", label=name)]}}), "code": 0}]
+                dict(workspace_id="w2", label=name)]}}), "code": 0}
         replies[f"--session {name} pane list"] = {"stdout": json.dumps({"result": {"panes": [pane]}}), "code": 0}
+        replies[f"--session {name} pane process-info --pane w9:p1"] = {"code": 0, "stdout": json.dumps({
+            "result": {"process_info": {"shell_pid": 42, "foreground_process_group_id": 42,
+                "foreground_processes": [{"pid": 42, "name": "zsh", "argv": ["zsh"]}]}}})}
+        replies["-axo pid=,ppid=,state=,lstart="] = {
+            "code": 0, "stdout": "42 1 S Tue Nov 3 00:00:00 2026\n"}
+        replies["-o tpgid= -p 42"] = {"code": 0, "stdout": "42\n"}
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PS": os.environ["HERDR_BIN"]})))
+        if failed:
+            after_prompt = dict(replies)
+            after_prompt[f"--session {name} workspace list"] = {"code": 0, "stdout": json.dumps({"result": {
+                "workspaces": [workspace, {"workspace_id": "w2", "label": name}]}})}
+            after_prompt[f"--session {name} pane list"] = {"code": 0, "stdout": json.dumps({"result": {
+                "panes": [pane, {"pane_id": "w2:p1", "workspace_id": "w2"}]}})}
+            after_prompt[f"--session {name} {failed}"] = {
+                "stdout": "", "code": 1, "stderr": "cleanup refused"}
+            replies[f"--session {name} agent prompt w2:p1 restart"] = {
+                "stdout": "{}", "code": 0, "write_files": {str(responses): json.dumps(after_prompt)}}
         _ = responses.write_text(json.dumps(replies))
 
     def test_window_restore_survives_startup_workspace_read_or_close_failure_with_one_session_issue(self) -> None:
+        from scripts.production.staff_test_support import fixture_member
+
         owner, responses, log = self.herdr_restart_fixture()
+        row = fixture_member("showrunner", name=owner["name"],
+                             runtime_id=fixture_runtime_id(owner["session_id"]))
+        owner["session_id"] = row.id
         for failed in ("workspace list", "pane list", "workspace close w9"):
             with self.subTest(failed=failed):
                 self.configure_mac_bootstrap(responses, "writing")
-                self.configure_startup_shell(responses, "writing")
-                replies = cast(dict[str, CommandResponse | list[CommandResponse]], json.loads(responses.read_text()))
-                failure = CommandResponse(stdout="", code=1, stderr="cleanup refused")
-                if failed in {"workspace list", "pane list"}:
-                    field = "workspaces" if failed == "workspace list" else "panes"
-                    replies[f"--session writing {failed}"] = [
-                        CommandResponse(stdout=json.dumps({"result": {field: []}}), code=0), failure]
-                else:
-                    replies[f"--session writing {failed}"] = failure
-                _ = responses.write_text(json.dumps(replies))
+                self.configure_startup_shell(responses, "writing", failed=failed)
                 log.unlink(missing_ok=True)
                 state = restart.DesktopLaunchState(session_kind=herdr.NonDesktopSession())
                 with (patch.object(sys, "platform", "darwin"), patch.object(herdr, "_PLATFORM", "darwin"),
                       patch.object(herdr, "stop_session", side_effect=AssertionError("running agent stopped")),
-                      redirect_stdout(io.StringIO()) as output):
+                      redirect_stdout(io.StringIO()) as output,
+                      redirect_stderr(io.StringIO()) as errors):
                     result = restart._launch_session(entry(owner), "restart", state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
                 self.assertIsInstance(result, restart.SessionLaunched)
                 issues = [line for line in output.getvalue().splitlines() if "restart issue:" in line]
-                self.assertEqual(len(issues), 1)
-                self.assertIn("writing", issues[0])
-                self.assertIn("cleanup refused", issues[0])
+                if failed == "workspace close w9":
+                    self.assertEqual(issues, [])
+                    self.assertEqual(errors.getvalue().splitlines(), [
+                        "herdr writing: workspace w9 retained: herdr workspace close: stderr: cleanup refused"])
+                else:
+                    self.assertEqual(len(issues), 1)
+                    self.assertIn("writing", issues[0])
+                    self.assertIn("cleanup refused", issues[0])
                 calls = self.herdr_calls(log)
                 self.assertIn(["--session", "writing", "workspace", "focus", "w2"], calls)
                 self.assertEqual(len([row for row in calls if row[2:4] == ["agent", "start"]]), 1)
@@ -1834,15 +1854,18 @@ class RestartTests(ShutdownTestCase):
               patch.object(herdr, "security_session", return_value=herdr.NonDesktopSession()) as query,
               patch.object(restart, "_live_session_ids", return_value=EMPTY_SESSION_IDS),
               patch.object(restart, "_retire"),
-              patch.object(restart, "wait_for_confirmation", side_effect=AssertionError("refused launch confirmed"))):
+              patch.object(restart, "wait_for_confirmation", side_effect=AssertionError("refused launch confirmed")),
+              redirect_stderr(io.StringIO()) as errors):
             peer = restart.up_result(LOGIN)
         query.assert_called_once_with()
         self.assertEqual(peer["outcome"], "partial")
-        self.assertEqual(peer["lines"].count("the Mac desktop is locked or signed out: unlock it and restart"), 2)
+        self.assertEqual(sum("desktop start is incomplete: open Mac desktop window: stderr: desktop locked" in line
+                             for line in errors.getvalue().splitlines()), 2)
+        self.assertEqual(sum("restart failed: refused launch confirmed" in line for line in peer["lines"]), 2)
         restored = shutdown_record.session_records(LOGIN)
         self.assertEqual(len(restored), 2)
         self.assertTrue(all(saved["progress"]["kind"] == "restart failed" for saved in restored))
-        self.assertFalse(any(row[2:4] in (["workspace", "create"], ["agent", "start"]) for row in self.herdr_calls(log)))
+        self.assertEqual(sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls(log)), 2)
         self.assertEqual(restart.parse_peer_result(json.dumps(peer))["lines"], peer["lines"])
 
 
@@ -2104,10 +2127,11 @@ class RestartTests(ShutdownTestCase):
         launch = next(argv for argv in commands if any(part.endswith("/add_unit.py") for part in argv))
         self.assertEqual(launch[launch.index("--host-session") + 1], "writing")
 
-    def herdr_restart_fixture(self) -> tuple[inventory.TopLevelSession, Path, Path]:
+    def herdr_restart_fixture(self, *, running: bool = False) -> tuple[inventory.TopLevelSession, Path, Path]:
         def submitted(client: herdr.Herdr, pane: str, opening: herdr.OpeningPrompt,
                       _at: datetime, _timeout_ms: int) -> herdr.PromptSubmitted:
-            client.prompt(pane, opening.text)
+            assert isinstance(opening.transcript, herdr.SessionTranscript)
+            client.prompt(pane, opening.text, target=opening.transcript.session_id)
             return SUBMITTED_PROMPT
 
         _ = self.enterContext(patch.object(herdr.Herdr, "submit_opening_prompt", submitted))
@@ -2124,6 +2148,14 @@ class RestartTests(ShutdownTestCase):
                     else fixture_runtime_id("fresh-restart-backend"))
 
         _ = self.enterContext(patch.object(herdr.Herdr, "native_session", observed_native))
+        def native_process(pid: int, kind: str) -> herdr.NativeAgentProcess:
+            self.assertEqual(kind, "claude")
+            arguments = (self.root / "proc" / str(pid) / "cmdline").read_bytes().decode().split("\0")
+            identity = (arguments[arguments.index("--resume") + 1] if "--resume" in arguments
+                        else fixture_runtime_id("fresh-restart-backend"))
+            return herdr.NativeAgentProcess(identity, "1", {})
+        _ = self.enterContext(patch.object(herdr, "native_process", side_effect=native_process))
+        _ = self.enterContext(patch.object(herdr.Herdr, "composer", return_value=herdr.ComposerInput("")))
         _ = self.enterContext(patch.object(restart, "_heal_folder_trust", HEAL_FOLDER_TRUST))
         cwd = self.root / "trusted folder"
         cwd.mkdir()
@@ -2138,7 +2170,36 @@ class RestartTests(ShutdownTestCase):
             host=inventory.HerdrHost(kind="herdr", herdr_session="writing", pane_id="w1:p1", presentation="detached"))
         owner["config_dir"] = str(config)
         fake = self.root / "fake-herdr"
-        _ = fake.write_bytes((restart.SCRIPTS / "herdr" / "fake_herdr.py").read_bytes())
+        source = (restart.SCRIPTS / "herdr" / "fake_herdr.py").read_text()
+        hook = r'''def started_main(argv):
+    status = main(argv)
+    if status == 0 and argv[2:4] == ["agent", "start"]:
+        from zlib import crc32
+        sys.path.insert(0, FIXTURE_REPO_ROOT)
+        from scripts.production.fake_unit_host import process
+        pane = argv[argv.index("--pane") + 1]
+        pid = 1_000_000 + crc32(f"{argv[1]}:{pane}".encode()) % 1_000_000_000
+        command = ["claude", *argv[argv.index("--") + 1:]]
+        process(os.environ, pid, 998042, command,
+                {"HERDR_SESSION": argv[1], "HERDR_PANE_ID": pane})
+        path = Path(os.environ["FAKE_HERDR_RESPONSES"])
+        replies = json.loads(path.read_text())
+        key = f"--session {argv[1]} pane list"
+        panes = json.loads(replies[key]["stdout"])["result"]["panes"]
+        panes = [row for row in panes if row["pane_id"] != pane]
+        panes.append({"pane_id": pane, "workspace_id": pane.split(":")[0]})
+        replies[key] = {"code": 0, "stdout": json.dumps({"result": {"panes": panes}})}
+        replies[f"--session {argv[1]} pane process-info --pane {pane}"] = {
+            "code": 0, "stdout": json.dumps({"result": {"process_info": {
+                "shell_pid": 998042, "foreground_process_group_id": pid,
+                "foreground_processes": [{"pid": pid, "name": "claude", "argv": command}]}}})}
+        path.write_text(json.dumps(replies))
+    return status
+
+'''.replace("FIXTURE_REPO_ROOT", repr(str(restart.SCRIPTS.parent)))
+        source = source.replace('if __name__ == "__main__":', hook + 'if __name__ == "__main__":')
+        source = source.replace('raise SystemExit(main(sys.argv[1:]))', 'raise SystemExit(started_main(sys.argv[1:]))')
+        _ = fake.write_text(source)
         fake.chmod(0o755)
         responses = self.root / "herdr-responses.json"
         log = self.root / "herdr-log.jsonl"
@@ -2146,7 +2207,18 @@ class RestartTests(ShutdownTestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HERDR_BIN": str(fake), "SYSTEMD_RUN": str(fake), "SYSTEMCTL": str(fake),
             "FAKE_HERDR_RESPONSES": str(responses), "FAKE_HERDR_LOG": str(log),
+            "HERDR_PROC": str(self.root / "proc"),
         })))
+        write_process(os.environ, 998042, 1, ["zsh"], {}, cwd=cwd)
+        write_process(os.environ, 42, 1, ["zsh"], {}, cwd=self.root)
+        if running:
+            _ = self.enterContext(private_process_registry())
+            write_process(os.environ, 998044, 1, ["claude"], {}, cwd=cwd)
+            registry = Path(os.environ["NOTIFIER_SESSIONS_DIR"])
+            registry.mkdir(parents=True, exist_ok=True)
+            _ = (registry / "998044.json").write_text(json.dumps({
+                "pid": 998044, "procStart": "1", "sessionId": owner["session_id"],
+                "name": owner["name"], "updatedAt": 1, "messagingSocketPath": "", "tmux": ""}))
         _ = cast(object, self.enterContext(patch.object(herdr, "server_environment", return_value={})))
         _ = cast(object, self.enterContext(patch.object(herdr.Herdr, "pane_activity", return_value=herdr.PaneAtShell())))
         # The fake server records a tab as a workspace it creates; workspace layout is herdr's own test.
@@ -2281,6 +2353,12 @@ class RestartTests(ShutdownTestCase):
 
     def write_herdr_responses(self, path: Path, agents: list[herdr.AgentOccupant],
                               *, not_ready: bool = False, pane_present: bool = False) -> None:
+        proc = self.root / "proc"
+        for child in proc.glob("[0-9]*/stat"):
+            if child.read_text().rsplit(")", 1)[1].split()[1] == "998042":
+                shutil.rmtree(child.parent)
+        if (proc / "998042/stat").exists():
+            write_process({"HERDR_PROC": str(proc)}, 998042, 1, ["zsh"], {})
         responses: dict[str, CommandResponse | list[CommandResponse]] = {
             "--session writing status server": {"stdout": "status: running\n", "code": 0},
             "--session writing agent list": {"stdout": json.dumps({"result": {"agents": agents}}), "code": 0},
@@ -2292,6 +2370,10 @@ class RestartTests(ShutdownTestCase):
             "--user show -p FragmentPath --value herdr-writing.service": {"stdout": "\n", "code": 0},
             "default": {"stdout": json.dumps({"result": {"root_pane": {"pane_id": "w2:p1"}}}), "code": 0},
         }
+        responses["--session writing pane process-info --pane w1:p1"] = {
+            "code": 0, "stdout": json.dumps({"result": {"process_info": {
+                "shell_pid": 998042, "foreground_process_group_id": 998042,
+                "foreground_processes": [{"pid": 998042, "name": "zsh", "argv": ["zsh"]}]}}})}
         if not_ready:
             start_argv = ["--session", "writing", "agent", "start", "kept-name", "--kind", "claude",
                           "--pane", "w2:p1", "--timeout", "90000", "--", "--resume", "resume-id",
@@ -2879,14 +2961,14 @@ class RestartTests(ShutdownTestCase):
         self.assertIn("focus refused", issues[0])
 
     def test_herdr_restart_does_not_open_a_replacement_when_the_stale_pane_will_not_close(self) -> None:
-        owner, responses, log = self.herdr_restart_fixture()
+        owner, responses, log = self.herdr_restart_fixture(running=True)
         self.write_herdr_responses(responses, [], pane_present=True)
         replies = cast(dict[str, CommandResponse | list[CommandResponse]], json.loads(responses.read_text()))
         replies["--session writing pane close w1:p1"] = {
             "stdout": "", "code": 1, "stderr": "fixture pane close refused",
         }
         _ = responses.write_text(json.dumps(replies))
-        with self.assertRaisesRegex(OSError, "fixture pane close refused"):
+        with self.assertRaisesRegex(OSError, "would start a second copy of running session resume-id"):
             _ = restart._herdr_launch(restart._resume_parts(owner, "restart"), restart.RecordedHerdrPane("writing", "w1:p1"), owner, dry_run=False)  # pyright: ignore[reportPrivateUsage]
         calls = self.herdr_calls(log)
         self.assertEqual(calls[-1], ["--session", "writing", "pane", "close", "w1:p1"])
@@ -2920,17 +3002,18 @@ class RestartTests(ShutdownTestCase):
                 calls = self.herdr_calls(log)
                 self.assertEqual([row for row in calls if row in (transient, ["--user", "start", "herdr-writing.service"])],
                                  [started])
-                close = ["--session", "writing", "workspace", "close", "w1"]
-                opened = next(row for row in calls if row[2:4] == ["workspace", "create"])
-                self.assertLess(calls.index(close), calls.index(opened))
+                self.assertTrue(any(row[2:4] == ["workspace", "create"] for row in calls))
+                self.assertFalse(any(row[2:4] == ["workspace", "close"] for row in calls))
                 self.assertFalse(any(row[2:4] == ["pane", "close"] for row in calls))
 
 
     def test_herdr_restart_not_ready_reports_the_screen_without_sending_input(self) -> None:
         owner, responses, log = self.herdr_restart_fixture()
         self.write_herdr_responses(responses, [], not_ready=True)
-        with self.assertRaisesRegex(OSError, "Do you trust this folder"):
-            _ = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        result = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(result, restart.SessionLaunched)
+        assert isinstance(result, restart.SessionLaunched)
+        self.assertIsInstance(result.prompt_outcome, herdr.PromptNotSubmitted)
         calls = self.herdr_calls(log)
         self.assertIn(["--session", "writing", "pane", "read", "w2:p1", "--source", "visible"], calls)
         self.assertFalse(any("send-keys" in row or "send-text" in row or "prompt" in row for row in calls))
@@ -2959,8 +3042,7 @@ class RestartTests(ShutdownTestCase):
         owner, responses, log = self.herdr_restart_fixture()
         self.write_herdr_responses(responses, [], not_ready=True)
         with (patch.object(herdr, "start_server", return_value=herdr.ServerCreated()),
-              patch.object(herdr, "stop_session") as stop,
-              self.assertRaisesRegex(OSError, "Do you trust this folder")):
+              patch.object(herdr, "stop_session") as stop):
             _ = restart._herdr_launch(restart._resume_parts(owner, "restart"),  # pyright: ignore[reportPrivateUsage]
                 restart.RecordedHerdrPane("writing", "w1:p1"), owner, dry_run=False)
         stop.assert_not_called()
@@ -3004,7 +3086,7 @@ class RestartTests(ShutdownTestCase):
         def ensure(_directory: Path, base_env: dict[str, str]) -> herdr.nix_env.Refused:
             for variable in conductor:
                 self.assertFalse(variable in base_env, variable)
-            return herdr.nix_env.Refused("fixture ends before launch")
+            raise OSError("fixture ends before launch")
 
         with (patch.dict(os.environ, conductor), patch.object(herdr.nix_env, "ensure", side_effect=ensure),
               self.assertRaisesRegex(OSError, "fixture ends before launch")):

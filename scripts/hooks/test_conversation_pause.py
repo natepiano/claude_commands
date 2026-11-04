@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
 import session_pane
+import herdr
 from scripts.message.relay_identity import relay_session_name
 from unit_lookup import Place
 from scripts.hooks import hook_dispatch
@@ -238,9 +239,16 @@ class ConversationPauseTests(ConversationPauseFixture):
                   "Paused 03:10; resumed 03:12. This was an account move, not a stop. Continue where you stopped.")
         relay = "From the user (via the showrunner): go on"
         with patch.dict(os.environ, {"CONVERSATION_PAUSE_STATE_DIR": str(self.pause_root),
-                                     "HERDR_BIN": shutil.which("true") or "/bin/true"}):
+                                     "HERDR_BIN": shutil.which("true") or "/bin/true"}), \
+                patch.object(herdr.Herdr, "panes", return_value=[{
+                    "pane_id": pane, "workspace_id": "w1", "session_id": SESSION}]), \
+                patch.object(herdr.Herdr, "result", return_value={"process_info": {
+                    "shell_pid": 998041, "foreground_process_group_id": 998042,
+                    "foreground_processes": [{"pid": 998042, "argv": ["claude"]}]}}), \
+                patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(SESSION, "fixture-start", {})), \
+                patch.object(herdr.Herdr, "composer", return_value=herdr.ComposerInput("")):
             conversation_pause.record_scheduled_prompts(SESSION, (resume,))
-            session_pane.type_place(Place("demo", pane), relay)
+            session_pane.type_place(Place("demo", pane), relay, target=SESSION)
         for prompt in (resume, relay, cross_session("natedev", "continue"), IDLE_NOTICE):
             with self.subTest(prompt=prompt):
                 self.assertEqual(self.run_prompt(prompt).returncode, 0)

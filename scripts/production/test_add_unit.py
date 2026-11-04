@@ -111,7 +111,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
         registry = sessions.read_session(Path(self.env["NOTIFIER_SESSIONS_DIR"]) / f"{pid}.json")
         assert not isinstance(registry, sessions.UnreadableSessionRecord)
         self.assertEqual(registry["sessionId"], self.env["FAKE_CLAUDE_SESSION_ID"])
-        self.assertEqual(registry.get("procStart"), sessions.process_start(pid))
+        with patch.dict(os.environ, self.env):
+            self.assertEqual(registry.get("procStart"), sessions.process_start(pid))
         self.assertEqual((row.id, row.current_session), (registry["sessionId"], registry["sessionId"]))
 
     def pin_launch_clock(self) -> None:
@@ -316,14 +317,6 @@ class AddUnitLaunchTests(AddUnitTestCase):
 
     def test_add_unit_rerun(self) -> None:
         original = add_unit.ensure_staff_unit
-        process = self.root / "proc" / str(os.getpid())
-        process.mkdir(parents=True, exist_ok=True)
-        fields = Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(")", 1)[1].split()
-        fields[1] = "102"
-        _ = (process / "stat").write_text(f"{os.getpid()} (claude) " + " ".join(fields))
-        _ = (process / "cmdline").write_bytes(b"claude\0")
-        _ = (process / "environ").write_bytes(b"HERDR_PANE_ID=w1:p1\0")
-        _ = (process / "status").write_text(f"Uid:\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\n")
 
         for after in (False, True):
             before = self.staff.staff_file.read_bytes()
@@ -432,7 +425,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.herdr_overrides[f"--session {SHARED} pane read w1:p1 --source visible"] = CommandResponse(code=0, stdout=screen)
         result = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("add_unit: the session is not ready:\n" + screen, result.stderr)
+        self.assertIn("opening prompt not submitted:", result.stderr)
+        self.assertIn(screen, result.stderr)
         self.assertFalse(any(row[2:4] == ["server", "stop"] for row in self.herdr_calls()))
         self.assertFalse(any(row[2:4] in (["agent", "prompt"], ["pane", "send-keys"], ["pane", "send-text"])
                              for row in self.herdr_calls()))

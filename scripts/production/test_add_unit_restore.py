@@ -182,7 +182,8 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertIn(f"session 62ccbd64-f22e-5647-b20e-7899aa39d766 already runs as pid {os.getpid()}", result.stderr)
         self.assert_no_launch_change(document, head)
-        self.assertEqual([row for row in self.herdr_calls() if row[2:4] != ["session", "list"]], [])
+        self.assertEqual([row for row in self.herdr_calls()
+                          if row[2:4] not in (["session", "list"], ["pane", "list"])], [])
         self.assertEqual(self.recorded_prompts("62ccbd64-f22e-5647-b20e-7899aa39d766"), ())
 
     def test_restart_restore_is_allowed_for_its_restarting_unit(self) -> None:
@@ -931,6 +932,9 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertEqual(request("feature-log-unit"), expected)
         self.assertEqual(request("feature_log_unit"), request("feature_log"))
         self.assertEqual(request("unit")[0], "unit-unit")
+
+
+
 
 
 if __name__ == "__main__":
