@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import io
+from contextlib import redirect_stderr
 import math
 import os
 import sys
@@ -16,8 +18,6 @@ from scripts.production.fake_unit_host import PaneShellFixture
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import unit_move
 import herdr
-import rename_unit
-import retire_unit
 import unit_lookup
 from rename_state import RenameRefused
 
@@ -49,30 +49,8 @@ class UnitOperationPaneTests(unittest.TestCase):
                                       env={"XDG_CONFIG_HOME": os.environ["XDG_CONFIG_HOME"]})
         self.enterContext(mock.patch.dict(os.environ, {'SHUTDOWN_STATE_DIR': str(self.root / 'shutdown')}))
 
-    def target(self) -> rename_unit.UnitRename:
-        return rename_unit.UnitRename('demo','alpha-unit','gamma-unit','','','','','',str(self.worktree),'','','')
 
-    def stop(self) -> None:
-        def cleanup(_target: rename_unit.StopTarget) -> None:
-            self.pane.lifecycle.append('workers cleaned')
-        with (mock.patch.object(rename_unit, '_refuse_detached_worktree'),
-              mock.patch.object(rename_unit, '_stop_runs', side_effect=cleanup)):
-            rename_unit.stop_unit(self.target(), lambda: None)
 
-    def test_clean_stop_closes_only_the_exact_session_pane_after_worker_cleanup(self) -> None:
-        self.pane.add_occupant(991555, unit='beta-unit', session='other')
-        self.assertEqual([row.place for row in herdr.herdr_processes() if row.pid == 991555],
-                         [herdr.HerdrPlace('other', 'w1:p1')])
-        run = herdr.Herdr.run
-        def close_after_cleanup(client: herdr.Herdr, *arguments: str, deadline: float = math.inf) -> str:
-            if arguments[:2] == ('pane', 'close'):
-                self.assertEqual(self.pane.lifecycle, ['workers cleaned'])
-            return run(client, *arguments, deadline=deadline)
-        with mock.patch.object(herdr.Herdr, 'run', close_after_cleanup):
-            self.stop()
-        self.assertEqual(self.pane.close_calls(), [['--session','agents','pane','close','w1:p1']])
-        self.assertEqual(self.pane.lifecycle, ['workers cleaned'])
-        self.assertTrue((self.root / 'proc/991555').exists(), 'another session reuses this pane id')
 
 
     def test_claude_execing_the_pane_shell_needs_no_close(self) -> None:
@@ -81,16 +59,6 @@ class UnitOperationPaneTests(unittest.TestCase):
         self.assertIsNone(unit_move.unit_pane(self.pane.found, 'demo'))
         self.assertEqual(self.pane.close_calls(), [])
 
-    def test_unmarked_work_remains_a_raw_process_blocker(self) -> None:
-        self.pane.parent(self.pane.shell)
-        with (mock.patch.object(unit_lookup, 'marked_units', return_value={}),
-              mock.patch.object(rename_unit, '_refuse_detached_worktree'),
-              mock.patch.object(rename_unit, '_retained_command_sessions', return_value=set()),
-              mock.patch.object(retire_unit, 'run_processes', return_value={}),
-              mock.patch.object(os, 'getsid', return_value=123)):
-            with self.assertRaisesRegex(RenameRefused, f'processes {self.pane.director}, {self.pane.shell} work inside'):
-                rename_unit.check_stoppable(self.target())
-        self.assertEqual(self.pane.close_calls(), [])
 
 
     def test_no_unit_pane_needs_no_close(self) -> None:
@@ -103,8 +71,9 @@ class UnitOperationPaneTests(unittest.TestCase):
         self.pane.add_occupant(991551, unit='beta-unit')
         with mock.patch.object(herdr, 'herdr_processes', side_effect=AssertionError('no occupant scan')):
             pane = unit_move.unit_pane(self.pane.found, 'demo')
-            unit_move.close_unit_pane(pane)
-        self.assertEqual(self.pane.close_calls(), [['--session', 'agents', 'pane', 'close', 'w1:p1']])
+            with self.assertRaisesRegex(RenameRefused, 'other live work'):
+                unit_move.close_unit_pane(pane)
+        self.assertEqual(self.pane.close_calls(), [])
 
     def test_close_uses_saved_place_without_record_launch_or_generation_rechecks(self) -> None:
         pane = unit_move.unit_pane(self.pane.found, 'demo')
@@ -123,10 +92,14 @@ class UnitOperationPaneTests(unittest.TestCase):
               mock.patch.object(herdr.Herdr, 'run', side_effect=[
                 json.dumps({"result": {"panes": [
                     {"pane_id": "w1:p1", "terminal_id": "unit-terminal", "tab_id": "w1:t1", "workspace_id": "w1"}]}}),
+                json.dumps({"result": {"process_info": {
+                    "shell_pid": self.pane.shell, "foreground_process_group_id": self.pane.shell,
+                    "foreground_processes": [{"pid": self.pane.shell, "name": "zsh", "argv": ["zsh"]}]}}}),
                 gone]) as close):
             unit_move.close_unit_pane(pane)
         self.assertEqual(close.call_args_list, [
-            mock.call('pane', 'list'), mock.call('pane', 'close', 'w1:p1')])
+            mock.call('pane', 'list'), mock.call('pane', 'process-info', '--pane', 'w1:p1'),
+            mock.call('pane', 'close', 'w1:p1')])
 
     def test_herdr_close_error_is_reported_for_the_units_exact_place(self) -> None:
         pane = unit_move.unit_pane(self.pane.found, 'demo')
@@ -137,7 +110,9 @@ class UnitOperationPaneTests(unittest.TestCase):
                 raise failure
             return run(client, *arguments, deadline=deadline)
         with mock.patch.object(herdr.Herdr, 'run', autospec=True, side_effect=fail_close) as close:
-            with self.assertRaisesRegex(RenameRefused, 'alpha-unit: pane close failed: fixture close failed'):
+            with redirect_stderr(io.StringIO()) as errors:
                 unit_move.close_unit_pane(pane)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn('fixture close failed', errors.getvalue())
         close.assert_called_with(mock.ANY, 'pane', 'close', 'w1:p1')
         self.assertEqual(close.call_args_list.count(mock.call(mock.ANY, 'pane', 'close', 'w1:p1')), 1)

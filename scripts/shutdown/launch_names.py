@@ -122,6 +122,11 @@ class LaunchNames:
             return current
         current["session_id"] = owner.current_session
         current["name"] = owner.name
+        from scripts.production import staff
+
+        unit = self.record.parent_of(owner) if owner.kind == "worker" else owner
+        if unit is not None and unit.kind == "unit" and not isinstance(unit.worktree, staff.WorktreeUnfilled):
+            current["cwd"] = str(unit.worktree.path)
         return current
 
     def resume_proof(self, original: PaneLaunch, current: PaneLaunch) -> pane_launch.VerifiedResume:

@@ -14,16 +14,14 @@ from pathlib import Path
 from typing import Callable, NamedTuple, TypeVar, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import build_folders
+from scripts.copies import copies
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 
-import unit_lookup
+from scripts.production import session_staff, staff, unit_lookup, unit_names
+from scripts.production.production_doc import Production, Refusal, read_production
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
-from production_units import Production, read_production
-from production_units import Refusal, cell_value
-from unit_lookup import live_unit_table, retired_units
 from merge_checkpoint import MergeEntry, NoMerge, Stop, git, merge_branch_history, report as merge_report
 
 JsonMap = dict[str, object]
@@ -105,14 +103,6 @@ class LogEvent(NamedTuple):
     moment: datetime
 
 
-class CleanupClean(NamedTuple):
-    pass
-
-
-class CleanupFailed(NamedTuple):
-    detail: str
-
-
 class BerthOverlap(NamedTuple):
     scopes: tuple[str, ...]
     blocker: str
@@ -153,21 +143,30 @@ def report(step: str, state: str, message: str) -> None:
 
 
 def units_from_doc(production: Production) -> tuple[Unit, ...]:
-    lines = production.doc.read_text(encoding="utf-8").splitlines()
+    """The active units in staff row order; a unit with no readable folder or branch is reported and left out."""
     try:
-        marked = unit_lookup.marked_units(production.slug)
-    except OSError as error:
+        record = staff.snapshot()
+        rows = unit_lookup.doc_units(production.doc, record)
+        marked = unit_lookup.marked_units(production.slug, record=record)
+    except (OSError, staff.StaffRefused) as error:
         raise WaitingFailure("production", f"the unit sessions could not be looked up: {error}") from error
+    resolver = session_staff.RowResolver(record)
     units: list[Unit] = []
-    for cells in live_unit_table(lines, production.slug):
-        row = {heading: cell_value(cell) for heading, cell in cells.items()}
-        if not all(row.get(heading) for heading in ("Unit", "Worktree", "Branch")):
-            raise WaitingFailure("production", f"invalid Units row: {cells}")
-        found = marked.get(row["Unit"])
+    for row in rows:
+        name = unit_names.unit_id(row.name)
+        if isinstance(row.worktree, staff.WorktreeUnfilled):
+            print(f"waiting: {name}: unavailable: the worktree is not recorded", file=sys.stderr)
+        if not isinstance(row.worktree, staff.PresentWorktree):
+            continue
+        branch = resolver.unit_branch(row)
+        if not isinstance(branch, session_staff.Branch):
+            print(f"waiting: {name}: unavailable: {branch.reason}", file=sys.stderr)
+            continue
+        found = marked.get(name)
         claude = found.claude if found is not None else None
         live = isinstance(claude, unit_lookup.LiveClaude)
-        units.append(Unit(row["Unit"], claude.name if live else "", row["Branch"],
-                          Path(row["Worktree"]).expanduser(), claude.pid if live else None))
+        units.append(Unit(name, claude.name if live else "", branch.name, row.worktree.path,
+                          claude.pid if live else None))
     return tuple(units)
 
 
@@ -270,40 +269,30 @@ def scratch_test(production: Production, name: str, tests: str, state_dir: Path)
     state_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(production.zone).strftime("%Y%m%d-%H%M%S-%f")
     log = state_dir / f"scratch-test-{unit.name}-{stamp}.log"
-    cleanup: CleanupClean | CleanupFailed = CleanupClean()
-    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["production-scratch"])) as parent:
-        worktree = parent / "checkout"
-        added = False
-        try:
-            add = git(production.checkout, "worktree", "add", "--detach", str(worktree), unit.branch)
-            if add.returncode:
-                raise WaitingFailure("scratch-test", detail(add))
-            added = True
-            merge = git(worktree, "merge", "--no-commit", "--no-ff", production.merge_branch)
-            if merge.returncode:
-                _ = log.write_text(merge.stdout + merge.stderr, encoding="utf-8")
-                state: ScratchGreen | ScratchRed | ScratchConflict = ScratchConflict(
-                    f"{detail(merge)} ({log})")
-            else:
-                try:
-                    with log.open("w", encoding="utf-8") as output:
-                        test = subprocess.run(["sh", "-c", tests], cwd=worktree, stdout=output,
-                                              stderr=subprocess.STDOUT, text=True, check=False)
-                    tail = tail_lines(log, 4) or f"exit {test.returncode}"
-                    state = ScratchGreen(log) if test.returncode == 0 else ScratchRed(tail, log)
-                except OSError as error:
-                    _ = log.write_text(f"{error}\n", encoding="utf-8")
-                    state = ScratchRed(str(error), log)
-        finally:
-            if added:
-                _ = git(worktree, "merge", "--abort")
-                removed = git(production.checkout, "worktree", "remove", "--force", str(worktree))
-                if removed.returncode:
-                    cleanup = CleanupFailed(detail(removed))
-    passed = scratch_verdict(state)
-    if isinstance(cleanup, CleanupFailed):
-        report("scratch-test", "failed", f"temporary worktree cleanup: {cleanup.detail}")
-    if not passed or isinstance(cleanup, CleanupFailed):
+    passed = False
+    try:
+        with copies.standing(production.slug, production.checkout, unit.branch,
+                             merge=production.merge_branch) as worktree:
+            try:
+                with log.open("w", encoding="utf-8") as output:
+                    test = subprocess.run(["sh", "-c", tests], cwd=worktree, stdout=output,
+                                          stderr=subprocess.STDOUT, text=True, check=False)
+                tail = tail_lines(log, 4) or f"exit {test.returncode}"
+                state: ScratchGreen | ScratchRed | ScratchConflict = (
+                    ScratchGreen(log) if test.returncode == 0 else ScratchRed(tail, log))
+            except OSError as error:
+                _ = log.write_text(f"{error}\n", encoding="utf-8")
+                state = ScratchRed(str(error), log)
+            passed = scratch_verdict(state)
+    except copies.PreparationError as error:
+        _ = log.write_text(f"{error}\n", encoding="utf-8")
+        _ = scratch_verdict(ScratchConflict(f"{error} ({log})"))
+        raise WaitingFailure("scratch-test", "") from error
+    except copies.PostUseError as error:
+        raise WaitingFailure("scratch-test", f"post-use step: {error}") from error
+    except copies.CopyError as error:
+        raise WaitingFailure("scratch-test", str(error)) from error
+    if not passed:
         raise WaitingFailure("scratch-test", "")
 
 
@@ -401,7 +390,8 @@ def waits(production: Production) -> None:
     board = run_command("waits", ["cargo-berth", "board", "--json"])
     overlaps = berth_board(board)
     now = datetime.now(production.zone)
-    retired = retired_units(production.doc.read_text(encoding="utf-8").splitlines(), production.slug)
+    retired = {unit_names.unit_id(row.name) for row in unit_lookup.doc_units(production.doc, staff.snapshot())
+               if isinstance(row.worktree, staff.RemovedWorktree)}
     active: dict[str, WaitOpen | WaitCleared] = {}
     clears: dict[str, str] = {}
     for event in log_events(production, now):

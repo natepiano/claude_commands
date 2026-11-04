@@ -2,7 +2,7 @@
 
 ## What it is
 
-`verify.sh test` tries the first free eligible build target: the Mac first; a Mac pass or failure ends the call. It waits when every eligible target is held or full. The Mac takes one claim per repository: a hana run and a cargo-liner run can share it, two runs of one repository never do. A block is the Mac's hold: it admits its holder session's own claims and refuses other sessions' new claims for every repository, turns off hana's CI use of the Mac, names skipped macOS runs on release, and sends its holder one free message when existing work ends. Expiry attempts to remove the block; a failed CI restore leaves it in force. A claim whose Mac has run nothing for 15 minutes is released and its holder told. Each offloaded run removes the mirror's build output afterwards only when the Mac is below its free-space floor. Both reports show coordination state now and recorded hold intervals; `/build:report` gives the Mac's own steps a section apart from natedev's.
+`verify.sh test` tries the first free eligible build target: the Mac first; a Mac pass or failure ends the call. It waits when every eligible target is held or full. The Mac takes one claim per repository: a hana run and a cargo-liner run can share it, two runs of one repository never do. A block is the Mac's hold: it admits its holder session's own claims and refuses other sessions' new claims for every repository, turns off hana's CI use of the Mac, names skipped macOS runs on release, and sends its holder one free message when existing work ends. Expiry attempts to remove the block; a failed CI restore leaves it in force. A claim whose Mac has run nothing for 15 minutes is released and its holder told. Each offloaded run removes the mirror's build output afterwards only when the Mac is below its free-space floor. `buildlog costs` ranks costs by machine. The `buildlog` CLI retains coordination state, hold intervals, and detailed Mac step tables.
 
 During a natedev build hold, `verify.sh check`, `doc` and the read-only `lint` judgment can use the Mac. Outside a hold they keep their local path. `build_targets.py eligible --repo-root DIR --kind check|lint|doc|test|build|example|final [--package PKG]` is the decision point: its first line is `mac_allowed` or `natedev_only <reason>`, followed by the ordered tab-separated target rows (name, eligible/excluded, reason, settings path) for that kind. Tests use the package rule; check, lint and doc require every workspace member to permit macOS. This includes in-tree path dependencies, target dependencies and inherited workspace dependencies. An unreadable member keeps the step on natedev. Offload must be on for the repository, its backoff must be clear, and the Mac must meet the disk floor. Build and example keep `makes natedev artifacts`; final keeps `full gate runs on natedev`. Calls without `--kind` keep the existing test-target table. The live record in `${VERIFY_STEPS_DIR:-~/.local/state/verify-steps}` carries this answer and the route state for the call guard, hold enforcer and idle watch.
 
@@ -79,6 +79,26 @@ tests; test claim, session, process and buildlog roots are private too.
 A pending or active block is one footer item after the build-hold lines: `Mac block: <holder> since HH:MM ZZZ, for <reason> - lifts Ddd HH:MM ZZZ` (or `Mac block pending: …`), ending ` - CI can still use the Mac` while `ci_may_still_be_on`. The renderer reads `block.json` through `read_block(state_paths().block)` alone: no lock, no `gh`, no message. An unreadable file shows as `Mac block: its state file cannot be read (<path>)`.
 
 ### The offload runner — `scripts/mac_test/offload.py`
+
+Tool parity uses one form for the sender, the probe, execution, and refusal messages.
+The normalizer strips each version line and joins nonempty lines with one space.
+This includes all lines from `cargo nextest --version`.
+
+Linux cleanup reads the real UID from `/proc/<pid>/status` before it reads process ownership evidence.
+It excludes processes from other users.
+Cleanup excludes processes that started before the recorded run and ancestors of the checking process.
+It also excludes direct children of another user, except children of PID 1.
+Slot processes keep their user, but an orphan can acquire PID 1 as its parent.
+Other same-user processes with unreadable evidence keep the slot busy.
+
+`verify-linux` steps use the target slots and build budget for admission.
+They do not contact natedev's admission service or obey natedev's hold.
+The controller still checks spending before AWS admission.
+
+A missing completion marker reports the runner exit status when available.
+It does not prove a link failure.
+The attempt record keeps the reason.
+An interruption marker reports the instance generation.
 
 - `offload.py run --repo-root DIR [--package PKG] [--verb nextest|check|clippy|mend-check|doc] --call-id ID [--settings FILE] [--last-decline busy|blocked] [--filter-run] [--result FILE] -- <verb arguments>` exits 0 on a Mac pass, 75 for local fallback, and the step's own status on a Mac failure. The default verb is `nextest`. Claims use `--what "<verb> <package or workspace>"`. `lint check` runs Cargo check; `lint mend-check` runs mend with `--fail-on-warn`; remote doc sets `LINT_CONFIG_FORCE=1`. Workspace verbs use the same manifest-based Linux-only check as `eligible --kind`. `--settings` selects that target's config. `--last-decline` suppresses an unchanged retry notice. `write_result` writes `mac=`, `reason=`, `seconds=` from `PassedOnMac | FailedOnMac | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun | BusyMacDecline`. A busy result alone adds `holder=`: the claim's `what`, `leftovers`, or `unreadable`; `KnownMacJob | LostRunLeftovers | UnreadableMacHolder` gives that value its meaning. Missing or contradictory results are unusable. Declined, lost and invalid results return the record to `waiting_mac` before the next wait.
 - Declines print `mac_test: not running on the Mac (<reason>)`: `off`, `repo`, `linux_only`, `backoff`; claim `blocked`, `busy`, `state`; probe `unreachable` (with backoff), `disk`; then `copy`. The claim gates work; the probe has no process-count, load or power check: a Mac on battery runs tests (user, 2026-10-18). An app open on the Mac does not exclude a test.
@@ -161,7 +181,7 @@ A new block writes one `hold_event` `began`; record removal in `expire_block` or
 - Offloaded Mac nextest rows in the build log have an empty `repo`; filter them with `coalesce(repo,'')=''` and `host <> 'natedev'`. The log carries two Mac host names (`Mac` and `Nates-MacBook-Pro-2023`), so Mac selection is `host <> 'natedev'`, never one name.
 - A `gh` set that times out after GitHub applied it reads `still_on`, then `off_before` at the next settle. Turning the switch back on after `off_unconfirmed` can undo a hand-made switch-off in between.
 - `world_panel_words_match_drawn_pixels` fails only on the Mac, cause not found; it is excluded there, so only natedev runs and CI cover it.
-- `basedpyright scripts/mac_test` exits 3 on a clean pass (no `.venv`); the result is its last line.
+- `basedpyright scripts/mac_test` exits 0 when clean. Its summary reads `0 errors, 0 warnings, 0 notes`.
 
 ## Why
 

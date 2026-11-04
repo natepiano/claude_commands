@@ -1,7 +1,7 @@
 """Retain each pane's launch so restore can use its account and conversation.
 
 Each herdr session has one file under `~/.local/state/herdr-panes`.
-The file maps each pane to its account folder, working folder, flags, and retained environment.
+The file keeps the account, flags, and environment for each pane. Staff supplies each unit folder.
 The Claude SessionStart hook records Claude launches.
 The normal herdr start path records Codex launches after it proves the foreground process.
 
@@ -22,10 +22,10 @@ import json
 import os
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 if TYPE_CHECKING:
     from scripts.production import staff
@@ -48,7 +48,6 @@ from pane_launch import (
     NAME_FLAGS as NAME_FLAGS,
     RESUME_FLAGS as RESUME_FLAGS,
     ClaudeArguments as ClaudeArguments,
-    launch as launch,
     parse_claude_arguments as parse_claude_arguments,
 )
 
@@ -109,12 +108,26 @@ def resume_launch(entry: PaneLaunch) -> PaneLaunch:
     """Resolve a retained member reference to its current conversation for resume."""
     from scripts.production import staff
 
-    owner = staff.initial_snapshot().by_id(staff.StaffId(entry["session_id"]))
-    if owner is None or owner.current_session == entry["session_id"]:
-        return entry
+    record = staff.initial_snapshot()
+    owner = record.by_member_reference(entry["session_id"])
     current = entry.copy()
-    current["session_id"] = owner.current_session
+    if owner is not None:
+        current["session_id"] = owner.current_session
+        unit = record.parent_of(owner) if owner.kind == "worker" else owner
+        if unit is not None and unit.kind == "unit" and not isinstance(unit.worktree, staff.WorktreeUnfilled):
+            current["cwd"] = str(unit.worktree.path)
     return current
+
+
+def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, str],
+           arguments: Sequence[str], *, kind: Literal["claude", "codex"] = "claude") -> PaneLaunch:
+    """Retain plugin paths only in the shutdown restore record."""
+    entry = pane_launch.launch(pane_id, session_id, cwd, environment, arguments, kind=kind)
+    if kind == "claude":
+        plugins = parse_claude_arguments(arguments).plugin_directories
+        if plugins:
+            entry["plugin_directories"] = [str((Path(cwd) / directory).resolve()) for directory in plugins]
+    return entry
 
 
 def resume_arguments(entry: PaneLaunch) -> list[str]:
@@ -131,6 +144,8 @@ def resume_arguments(entry: PaneLaunch) -> list[str]:
         arguments.extend(("--remote-control", entry["name"]) if entry["name"] else ("--remote-control",))
     if entry["model"]:
         arguments.extend(("--model", entry["model"]))
+    for directory in entry.get("plugin_directories", []):
+        arguments.extend(("--plugin-dir", directory))
     arguments.extend(("--settings", '{"disableAgentView": true}'))
     return arguments
 
@@ -148,26 +163,6 @@ def without_legacy_identity(entry: PaneLaunch) -> PaneLaunch:
 
 def save(session: str, entries: dict[str, PaneLaunch]) -> None:
     pane_launch.save(record_path(session), {pane: without_legacy_identity(entry) for pane, entry in entries.items()})
-
-
-def move_cwd(unit: str, old: Path, new: Path, record: "staff.StaffSnapshot") -> None:
-    """Update only this member's retained launch paths under each session lock."""
-    for path in sorted(record_directory().glob("*.json")):
-        with locked(path.stem):
-            entries = read_strict(path.stem)
-            changed = False
-            for entry in entries.values():
-                owner = record.by_member_reference(entry["session_id"])
-                if owner is None or owner.id != unit:
-                    continue
-                if entry.get("cwd") not in (str(old), str(new)):
-                    print(f"{unit}: retained launch has a different working folder; skipped", file=sys.stderr)
-                    continue
-                if entry["cwd"] != str(new):
-                    entry["cwd"] = str(new)
-                    changed = True
-            if changed:
-                save(path.stem, entries)
 
 
 def write(session: str, launch: PaneLaunch) -> None:

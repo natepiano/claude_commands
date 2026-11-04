@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-from scripts.production.staff_test_support import without_worktree_column, isolated_staff_file, unit_membership
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 from scripts.production import staff
 
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
 from typing import cast, final
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -20,16 +22,92 @@ import merge_checkpoint
 from scripts.production import showrunners
 from scripts.production import production_doc
 from merge_checkpoint import check_parallel
-from production_units import Refusal
+from scripts.production.production_doc import Refusal
 
 # Importable once merge_checkpoint has put scripts/lib on the path.
 import scratch
 
-from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, REAL_MERGE_TESTS, REAL_OWNS, STUB, TRIAL, configure_test_environment
+from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, REAL_MERGE_TESTS, STUB, TRIAL, configure_test_environment
 
 
 def setUpModule() -> None:
     configure_test_environment()
+
+
+class CheckpointTestFolderTests(unittest.TestCase):
+    def test_package_step_uses_the_manifest_name_and_package_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            package = checkout / "scripts/aws_target/proof_crate"
+            package.mkdir(parents=True)
+            _ = (package / "Cargo.toml").write_text('[package]\nname = "aws-routing-proof"\nversion = "0.1.0"\n')
+            production = production_doc.Production(checkout / "production.md", "fixture", "merge", checkout,
+                                                  checkout / "production.log", ZoneInfo("UTC"))
+            steps = merge_checkpoint.test_steps(production, ("scripts/aws_target/proof_crate/src/lib.rs",), ())
+            self.assertEqual(len(steps), 1)
+            self.assertEqual(steps[0].label, "package aws-routing-proof")
+            self.assertEqual(steps[0].command[-2:], ["test", "aws-routing-proof"])
+            self.assertEqual(steps[0].folder, package)
+
+    def test_example_step_uses_the_manifest_name_and_checkout_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            package = checkout / "crates/proof_crate"
+            package.mkdir(parents=True)
+            _ = (package / "Cargo.toml").write_text('[package]\nname = "aws-routing-proof"\nversion = "0.1.0"\n')
+            production = production_doc.Production(checkout / "production.md", "fixture", "merge", checkout,
+                                                  checkout / "production.log", ZoneInfo("UTC"))
+            steps = merge_checkpoint.test_steps(production, ("crates/proof_crate/examples/demo.rs",), ())
+            self.assertEqual(len(steps), 2)
+            self.assertEqual(steps[1].label, "example aws-routing-proof/demo")
+            self.assertEqual(steps[1].command[-3:], ["example", "aws-routing-proof", "demo"])
+            self.assertEqual(steps[1].folder, checkout)
+
+    def test_example_without_a_manifest_has_no_step(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            _ = (checkout / "Cargo.toml").write_text('[workspace]\nmembers = []\n')
+            production = production_doc.Production(checkout / "production.md", "fixture", "merge", checkout,
+                                                  checkout / "production.log", ZoneInfo("UTC"))
+            steps = merge_checkpoint.test_steps(production, ("crates/proof_crate/examples/demo.rs",), ())
+            self.assertEqual(steps, [])
+
+    def test_package_commands_and_retries_use_the_package_folder(self) -> None:
+        for workspace in (False, True):
+            for retry in (False, True):
+                with self.subTest(workspace=workspace, retry=retry), tempfile.TemporaryDirectory() as temporary:
+                    checkout = Path(temporary)
+                    relative = ("crates/proof_crate/examples/demo.rs" if workspace
+                                else "scripts/aws_target/proof_crate/src/lib.rs")
+                    package = checkout / Path(relative).parents[1]
+                    source = checkout / relative
+                    source.parent.mkdir(parents=True)
+                    _ = source.write_text("fn main() {}\n" if workspace else "pub fn proof() {}\n")
+                    _ = (package / "Cargo.toml").write_text('[package]\nname = "proof_crate"\nversion = "0.1.0"\n')
+                    if workspace:
+                        _ = (checkout / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/proof_crate"]\n')
+                    verify = checkout / "verify.sh"
+                    _ = verify.write_text(
+                        f"#!{sys.executable}\nfrom pathlib import Path\nimport sys\n"
+                        + "print(f'{sys.argv[1]}={Path.cwd()}')\n"
+                        + ("if sys.argv[1] == 'test' and not Path('retried').exists():\n"
+                           + "    Path('retried').touch()\n    sys.exit(1)\n" if retry else ""))
+                    verify.chmod(0o755)
+                    production = production_doc.Production(checkout / "production.md", "fixture", "merge", checkout,
+                                                          checkout / "production.log", ZoneInfo("UTC"))
+                    log = checkout / "test.log"
+                    merge_tests = ((sys.executable, "-c", "from pathlib import Path; print(f'merge={Path.cwd()}')"),)
+                    with mock.patch.dict(os.environ, {"MERGE_CHECKPOINT_VERIFY": str(verify)}):
+                        _ = merge_checkpoint.run_checkpoint_test_steps(
+                            production, (relative,), merge_tests, frozenset({"proof_crate"}), frozenset(), log)
+                    output = log.read_text()
+                    self.assertEqual(output.count(f"test={package}\n"), 2 if retry else 1)
+                    self.assertIn("package_proof_crate_EXIT=" + ("1" if retry else "0"), output)
+                    if retry:
+                        self.assertIn("package_proof_crate_RERUN_EXIT=0", output)
+                    if workspace:
+                        self.assertIn(f"example={checkout}\n", output)
+                    self.assertIn(f"merge={checkout}\n", output)
 
 
 class ReviewNumbersTests(unittest.TestCase):
@@ -57,12 +135,6 @@ class ReviewNumbersTests(unittest.TestCase):
 class MergeCheckpointTests(MergeCheckpointFixture):
     def test_checkpoint_ignores_unavailable_worktrees_of_other_units(self) -> None:
         checkpoint = self.checkpoint()
-        rows = (
-            "| retired-unit | retired | /stale | retired-branch | — | — | src/retired.txt |\n"
-            "| standby-unit | standby | /stale | standby-branch | — | — | src/standby.txt |\n"
-            "| absent-unit | docs/absent.md | /stale | absent-branch | — | — | src/absent.txt |\n"
-        )
-        _ = self.doc.write_text(self.doc.read_text().replace("| `alpha-unit`", rows + "| `alpha-unit`"))
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
             row = unit_membership("example", "retired-unit")
             _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "removed"), expected=row.worktree)
@@ -70,25 +142,6 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         result = self.run_checkpoint(checkpoint)
         self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
         self.assertEqual(self.git("rev-parse", "HEAD^2"), checkpoint)
-
-    def test_checkpoint_uses_the_plan_worktree_when_the_director_runs_elsewhere(self) -> None:
-        plan = self.unit / "docs/plans/alpha.md"
-        plan.parent.mkdir(parents=True, exist_ok=True)
-        _ = plan.write_text("# Unit plan\n")
-        checkpoint = self.checkpoint("docs/plans/alpha.md", "# Approved unit plan\n")
-        _ = self.doc.write_text(self.doc.read_text().replace("`docs/plans/alpha.md`", f"`{plan}`"))
-        _ = self.doc.write_text(self.doc.read_text().replace("`src/alpha.txt`", "`src/alpha.txt`, `docs/plans/alpha.md`"))
-        without_worktree_column(self.doc)
-        director = self.root / "director-folder"
-        director.mkdir()
-        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
-            row = unit_membership("example", "alpha-unit")
-            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", director), expected=row.worktree)
-        result = self.run_checkpoint(checkpoint)
-        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
-        self.assertEqual(self.git("rev-parse", "HEAD^2"), checkpoint)
-        self.assertTrue((self.checkout / "docs/plans/alpha.md").is_file())
-
 
     def test_record_passes_separate_simplify_fields_when_the_trial_contains_them(self) -> None:
         trial = TRIAL + ", simplify 0 findings, simplify minutes 2.5"
@@ -142,7 +195,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
             with mock.patch.object(change_review, "reviewed_merge_refs", return_value=[]):
                 held = self.run_checkpoint(sha)
-            self.assert_stopped_before_merge(held, "held", "scope: held — outside Owns: outside/imported.txt, outside/second.txt")
+            self.assert_stopped_before_merge(held, "held", "scope: held — outside responsibilities: outside/imported.txt, outside/second.txt")
             accepted = self.run_checkpoint(sha)
         self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
         self.assertIn("scope: ok — 1 changed paths are allowed; 2 came from origin merge branches", accepted.process.stdout)
@@ -154,7 +207,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         sha = self.checkpoint("outside/imported.txt", "unit changed this\n")
         with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
             held = self.run_checkpoint(sha)
-        self.assert_stopped_before_merge(held, "held", "scope: held — outside Owns: outside/imported.txt\n")
+        self.assert_stopped_before_merge(held, "held", "scope: held — outside responsibilities: outside/imported.txt\n")
         self.assertNotIn("outside/second.txt", held.process.stdout)
 
     def test_scope_holds_only_unit_outside_paths_then_allows_also(self) -> None:
@@ -162,7 +215,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         sha = self.checkpoint("outside/unit.txt", "unit's outside work\n")
         with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
             held = self.run_checkpoint(sha)
-            self.assert_stopped_before_merge(held, "held", "scope: held — outside Owns: outside/unit.txt\n")
+            self.assert_stopped_before_merge(held, "held", "scope: held — outside responsibilities: outside/unit.txt\n")
             self.assertNotIn("outside/imported.txt", held.process.stdout)
             self.assertNotIn("outside/second.txt", held.process.stdout)
             accepted = self.run_checkpoint(sha, "--also", "outside/unit.txt")
@@ -187,7 +240,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         sha = self.checkpoint()
         with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
             held = self.run_checkpoint(sha)
-            self.assert_stopped_before_merge(held, "held", "scope: held — outside Owns: outside/imported.txt, outside/second.txt")
+            self.assert_stopped_before_merge(held, "held", "scope: held — outside responsibilities: outside/imported.txt, outside/second.txt")
             _ = doc.write_text(doc.read_text() + f"- **Change review:** `{self.root / 'other-review.md'}`\n")
             accepted = self.run_checkpoint(sha)
         self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
@@ -267,17 +320,16 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                                  "+refs/heads/*:refs/remotes/origin/*")
         self.assertEqual(self.git("for-each-ref", "refs/remotes/origin/alpha-phase"), "")
 
-    def test_second_origin_branch_is_accepted_when_units_row_branch_was_deleted(self) -> None:
-        _ = self.git("checkout", "-b", "alpha-phase", cwd=self.unit)
+    def test_second_origin_branch_is_accepted_when_the_unit_branch_was_deleted(self) -> None:
         sha = self.checkpoint(push=False)
-        _ = self.git("push", "origin", "alpha-phase", cwd=self.unit)
+        _ = self.git("push", "origin", "HEAD:refs/heads/alpha-phase", cwd=self.unit)
         _ = self.git("push", "origin", "--delete", "alpha-branch", cwd=self.unit)
         result = self.run_checkpoint(sha)
         self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
         self.assertIn("is on origin/alpha-phase", result.process.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD^2"), sha)
 
-    def test_units_row_origin_branch_uses_the_fast_path(self) -> None:
+    def test_unit_branch_on_origin_uses_the_fast_path(self) -> None:
         sha = self.checkpoint()
         with mock.patch.object(merge_checkpoint, "git", wraps=merge_checkpoint.git) as commands:
             result = self.run_checkpoint(sha)
@@ -309,25 +361,6 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertIn("scratch: ok — removed 2 folder(s) of phase:alpha-unit/2: ", result.process.stdout)
         self.assertFalse(any(path.exists() for path in done))
         self.assertTrue(later.is_dir())
-    def test_real_owns_cell_allows_produce_path_after_commentary(self) -> None:
-        self.assert_real_owns_path_allowed("commands/showrunner/produce.md")
-    def test_real_owns_cell_allows_explicit_add_unit_path_in_second_group(self) -> None:
-        self.assert_real_owns_path_allowed("scripts/production/add_unit.py")
-    def test_real_owns_cell_reads_a_bare_name_beside_the_path_before_it(self) -> None:
-        self.assert_real_owns_path_allowed("scripts/production/merge_checkpoint.py")
-    def test_real_owns_cell_reads_a_second_bare_name_beside_the_same_path(self) -> None:
-        self.assert_real_owns_path_allowed("scripts/production/test_merge_checkpoint.py")
-    def test_real_owns_cell_still_reads_a_bare_name_as_a_root_file(self) -> None:
-        self.assert_real_owns_path_allowed("merge_checkpoint.py")
-    def test_real_owns_cell_allows_a_path_in_the_last_group(self) -> None:
-        self.assert_real_owns_path_allowed("commands/unit/direct.md")
-    def test_real_owns_cell_holds_an_outside_path(self) -> None:
-        self.production_doc(owns_cell=REAL_OWNS, hub_files=False)
-        outside = self.checkpoint("scripts/other/outside.py", "outside\n")
-        held = self.run_checkpoint(outside)
-        self.assertEqual(held.process.returncode, 1)
-        self.assertIn("scope: held", held.process.stdout)
-        self.assertIn("scripts/other/outside.py", held.process.stdout)
     def test_real_merge_tests_run_only_the_two_commands_before_commentary(self) -> None:
         self.production_doc(merge_tests_line=REAL_MERGE_TESTS)
         for name in ("python3", "basedpyright"):

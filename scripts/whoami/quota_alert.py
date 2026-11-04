@@ -1280,11 +1280,12 @@ def notify_blocked_next_move(group: str, target: str, entry_id: str, reason: Blo
 
 
 def workers_entry_pending() -> bool:
-    """An unreadable next list cannot prove workers have no account move."""
+    """Read the queued workers entries for this pass."""
     try:
         return any(isinstance(entry, next_moves.WorkersMove) for entry in next_moves.read_next_moves())
-    except (OSError, next_moves.NextMoveError):
-        return True
+    except (OSError, next_moves.NextMoveError) as error:
+        print(f"account moves: anomaly: cannot read workers entries: {error}")
+        return False
 
 
 def _workers_head_blocked(entry: next_moves.WorkersMove, reason: BlockedHeadReason,

@@ -146,6 +146,7 @@ class ProfileNotesPassTests(unittest.TestCase):
             self.assertTrue(any(Path(file).name == "unit_watchdog.py" and name == "run"
                                 for file, _, name in functions))
             self.assertEqual(measured.calls["agent_notes.write_note"], 1)
+            self.assertEqual(measured.calls["agent_notes.write_sessions_seen"], 1)
             self.assertEqual(measured.calls["codex_pacer.write_atomic"], 3)
             self.assertEqual(measured.calls[timer_save_name], 0)
             self.assertGreater(measured.calls["scripts.accounts.refusal_watch._watch_lock"], 0)
@@ -229,6 +230,24 @@ class ProfileNotesPassTests(unittest.TestCase):
         self.assertFalse(profile.readonly_child(("claude", "--resume", "session-id")))
         self.assertFalse(profile.readonly_child(("codex", "app-server")))
         self.assertFalse(profile.readonly_child(("py", str(Path(__file__).resolve().parents[1] / "message/sessions.py"), "socket", "target")))
+
+    def test_child_policy_allows_inherited_session_label_removal_without_allowing_other_changes(self) -> None:
+        inherited = {"SHOWRUNNER_UNIT": "legacy", "SHOWRUNNER_PRIVATE_TEST": "private",
+                     "NIX_HEAL_PREPARED_SESSION": "session", "NIX_HEAL_PREPARED_DIRECTORY": "/private",
+                     "PRIVATE_UNRELATED": "keep"}
+        with patch.dict(os.environ, inherited):
+            policy = profile.child_policy()
+            environment = dict(os.environ)
+        removed = {key: value for key, value in environment.items() if key not in inherited or key == "PRIVATE_UNRELATED"}
+        for command in (("ps", "-eo", "pid=,ppid=,comm=,args="),
+                        ("lsof", "-a", "-p", "4242", "-Fn"), ("herdr", "pane", "list")):
+            with self.subTest(command=command):
+                for supplied in (environment, removed):
+                    _ = profile.checked_child(policy, command, supplied)
+                for supplied in ({**environment, "SHOWRUNNER_PRIVATE_TEST": "changed"},
+                                 {key: value for key, value in environment.items() if key != "PRIVATE_UNRELATED"}):
+                    with self.assertRaises(OSError):
+                        _ = profile.checked_child(policy, command, supplied)
 
     def test_private_scratch_accepts_a_resolved_symlink_root(self) -> None:
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:

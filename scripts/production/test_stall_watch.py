@@ -127,8 +127,8 @@ class StallWatchTests(unittest.TestCase):
         self.panes: dict[str, dict[str, str | int]] = {}
         self.process_rows: list[str] = []
         self.children: list[subprocess.Popen[bytes]] = []
-        # A unit's Plan cell and the state mark on its herdr pane, where a test sets one.
-        self.plans: dict[str, str] = {}
+        # The retired units and the state mark on a unit's herdr pane, where a test sets one.
+        self.retired: set[str] = set()
         self.states: dict[str, str] = {}
         self.run_records: dict[str, list[dict[str, object]]] = {}
         self.unheld_runs: set[str] = set()
@@ -263,29 +263,24 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         return path
 
     def configure(self, runners: dict[str, list[str]], *, stall_minutes: int = 5) -> None:
-        """Give each showrunner an update timer and a production doc that lists its units. The slug is its name."""
+        """Give each showrunner an update timer, a production doc and staff rows for its units. The slug is its name."""
         _ = self.config.write_text(json.dumps({
             "threshold_percent": 1, "repeat_minutes": 30, "stall_minutes": stall_minutes,
             "faults_to": "natedev", "always": ["natedev"],
         }))
         for session, units in runners.items():
             parent = showrunner_relationship(session)
-            live_units = [unit for unit in units if "retired" not in self.plans.get(unit, "").lower()]
+            live_units = [unit for unit in units if unit not in self.retired]
             intended = {fixture_member("unit", name=unit_names.name(unit), parent=parent.id,
-                                       runtime_id=unit_session(unit)).id for unit in live_units}
+                                       runtime_id=unit_session(unit), worktree=staff.PresentWorktree(
+                                           local_machine(), self.root / "worktrees" / unit)).id for unit in live_units}
             for row in staff.snapshot().find(kind="unit", parent=parent.id):
                 if row.id not in intended:
                     _ = staff.set_worktree(row.id, staff.RemovedWorktree(
                         local_machine(), Path(f"/tmp/no-worktree-of-{row.name}")), expected=row.worktree)
             # A showrunner is recorded by its update timer alone, addressed to its Claude session id.
             self.production(session, tuple(units), doc=self.root / f"{session}-production.md")
-            rows = [f"| {unit} | {self.plans.get(unit, '`docs/plan.md`')} | /tmp/no-worktree-of-{unit} | {unit} | — | — |"
-                    for unit in units]
-            _ = (self.root / f"{session}-production.md").write_text("\n".join((
-                "- **User zone:** America/Los_Angeles",
-                "",
-                "## Units", "", "| Unit | Plan | Worktree | Branch | Port | Owns |",
-                "| --- | --- | --- | --- | --- | --- |", *rows, "")))
+            _ = (self.root / f"{session}-production.md").write_text("- **User zone:** America/Los_Angeles\n")
 
     def configure_registered(self, runners: dict[str, list[tuple[str, str]]],
                              *, stall_minutes: int = 5) -> None:
@@ -321,12 +316,6 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                               + f"America/Los_Angeles {' '.join(units)} | cut -c1-400`.\n")
         check = f"CHECK=zsh /scripts/production/production_check.sh {doc}\n" if doc is not None else ""
         _ = (directory / "conf").write_text(f"TARGET={target}\nPROMPT_FILE={prompt}\n{check}")
-
-    def production_plan(self, plan: str) -> Path:
-        """Give `unit-one` this Plan cell in the showrunner's production doc."""
-        self.plans["unit-one"] = plan
-        self.configure({"showrunner": ["unit-one"]})
-        return self.root / "showrunner-production.md"
 
     def unit(self, name: str) -> tuple[int, Path]:
         child = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -390,9 +379,22 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             if history.stem in self.unheld_runs:
                 continue
             folder.mkdir(parents=True, exist_ok=True)
-            _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"history_file": str(history)}))
-            if history.stem in self.director_overrides:
-                unit_runs.record_director(folder, self.director_overrides[history.stem])
+            events = self.run_records.get(history.stem, [])
+            first = events[0] if events else {}
+            main_agent = first.get("main_agent", {})
+            session = self.director_overrides.get(history.stem, unit_session(history.stem))
+            if history.stem not in self.director_overrides and isinstance(main_agent, dict):
+                candidate = cast(dict[str, object], main_agent).get("session_id")
+                if isinstance(candidate, str):
+                    session = candidate
+            membership = staff.local_snapshot()
+            owner = membership.by_current_session(session)
+            run_state: dict[str, object] = {"history_file": str(history)}
+            if owner is not None and isinstance(owner.parent, staff.ReportsTo):
+                parent = membership.by_id(owner.parent.id)
+                assert parent is not None
+                run_state.update(production=parent.name, unit=owner.name)
+            _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps(run_state))
         environment = {**self.environment, "STALL_WATCH_NOW_EPOCH": str(at),
                        "STALL_TEST_SEND_TOGETHER": str(together)}
         if subprocess_cli:
@@ -678,10 +680,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         marked: dict[str, dict[str, lookup.MarkedUnit]] = {}
         for slug in ("first", "second"):
             doc = self.root / f"{slug}-production.md"
-            _ = doc.write_text("\n".join(("# Production", f"- **Production slug:** {slug}", "## Units",
-                               "| Unit | Plan | Worktree |", "| --- | --- | --- |",
-                               f"| alpha | docs/alpha.md | {self.root / 'alpha'} |",
-                               f"| beta | docs/beta.md | {self.root / 'beta'} |", "")))
+            _ = doc.write_text(f"# Production\n- **Production slug:** {slug}\n")
             runners.append(showrunners.Showrunner(session=slug, socket="/fixture.sock",
                             slug=slug, zone="UTC", doc=str(doc)))
             marked[slug] = {}
@@ -1147,7 +1146,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.configure({"showrunner": ["unit-one"], "receiver": []})
         row = unit_membership("showrunner", "unit-one")
         receiver = showrunner_relationship("receiver")
-        _ = staff.move(row.id, receiver.id)
+        _ = staff.move(row.id, staff.ReportsTo(receiver.id))
         launches = self.root / "launches"
         with (mock.patch.dict(os.environ, self.environment),
               mock.patch.object(pane_record, "RECORD_DIR", launches),
@@ -1200,6 +1199,8 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
               mock.patch.object(stop_resume, "_record_launches"),
               mock.patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning("204f532d-a97a-59e7-a6a7-caf86af3f5ee")),
               mock.patch.object(stop_resume, "resume", side_effect=resumed),
+              mock.patch.object(stop_resume, "_running_on_account",
+                                return_value=stop_resume.ClaudeUp("204f532d-a97a-59e7-a6a7-caf86af3f5ee", "w1:p1", "claude2")),
               mock.patch.object(stall_watch, "read_place", side_effect=resume_during_inspection)):
             self.assertEqual(self.tick(START).returncode, 0)
         prompt = cast(stall_watch.PromptWait, json.loads(self.prompt_state().read_text()))
@@ -2597,15 +2598,6 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()},
                          {"bump", "tell"})
 
-    def test_run_done_words_in_live_plan_do_not_stop_watching(self) -> None:
-        import stall_watch
-        _ = self.production_plan("run done appears here only as a description")
-        self.assertEqual(self.tick(START).returncode, 0)
-        self.assertEqual(self.tick(START + 600).returncode, 0)
-        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()},
-                         {"bump", "tell"})
-        self.assertTrue((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
-
     def test_finished_registry_unit_has_no_notice_or_stretch(self) -> None:
         import stall_watch
         self.configure_registered({"showrunner": [("unit-one", "run-finished")]})
@@ -2614,9 +2606,10 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(self.sent(), [])
         self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
 
-    def test_retired_plan_without_run_done_is_skipped(self) -> None:
+    def test_a_retired_unit_is_skipped(self) -> None:
         import stall_watch
-        _ = self.production_plan("(retired by the user 2026-10-07, worktree removed)")
+        self.retired.add("unit-one")
+        self.configure({"showrunner": ["unit-one"]})
         first = self.tick(START)
         second = self.tick(START + 600)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -2636,7 +2629,6 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
 
     def test_finished_units_are_skipped_while_a_running_unit_is_bumped(self) -> None:
         import stall_watch
-        self.plans["build-report-unit"] = "`docs/as-built/build-report-session.md` (run done; as-built 2b4d952)"
         self.configure_registered({"showrunner": [
             ("build-report-unit", "run-finished"),
             ("hook-unit", "running"),

@@ -12,13 +12,9 @@ port_lint.py writes its own call records through write_call() here.
       the original row and sources for collect() to finish after a failed
       save. BUILDLOG_TEST_PHASE_FILE names the step's sampled test-phase
       sidecar, retained with those sources; missing observations are unknown.
-      BUILDLOG_TREE_START is the tree key `key` printed
+      BUILDLOG_TREE_START is the tree key step_context.py printed
       before the step; the key taken here, after it, decides tree_key and
       tree_changed.
-  record.py key ARGV...
-      From invoke.sh's run(), before every step: print the tree key
-      (treekey.py) of the worktree the step would be recorded under, or
-      nothing.
   record.py test-phase-context SAMPLING_CONTEXT ARGV...
       Before release, print the reservation's repository and filter metadata
       with the actual post-share argv's test width. The sampler adds its window.
@@ -56,6 +52,7 @@ from __future__ import annotations
 import gzip
 import fcntl
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -68,7 +65,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from test_phase import (
@@ -82,15 +79,18 @@ from test_phase import (
 )
 
 if __package__:
-    from . import cgroup_capture, store
+    from . import cgroup_capture, store, step_context
 else:
     import cgroup_capture
     import store
+    import step_context
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-import memory_admit
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if TYPE_CHECKING:
+    from ..lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
+else:
+    from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
 if TYPE_CHECKING:
     from ..aws_target.config import MeasurementUnavailable
 else:
@@ -106,6 +106,24 @@ else:
 if TYPE_CHECKING:
     import sample
 
+
+class RecordedCall(Protocol):
+    call_id: str
+
+
+class AdmissionMetadata(Protocol):
+    Call: object
+    CallRecord: type[RecordedCall]
+
+    def parse_snapshot_value(self, value: object, schema: object) -> object: ...
+    def test_threads(self, argv: list[str]) -> int | None: ...
+    def recorded_repository_key(self, argv: list[str], cwd: str) -> str: ...
+
+
+def admission_metadata() -> AdmissionMetadata:
+    """Load admission only when recording needs its metadata, after initialization."""
+    return cast(AdmissionMetadata, cast(object, importlib.import_module("memory_admit")))
+
 RECORD_VERSION = 1
 TARGET_DIR_UNSET = "unset"
 GIT_TIMEOUT_S = 5
@@ -113,6 +131,30 @@ RUSTC_TIMEOUT_S = 10
 LEDGER = Path.home() / ".local/state/verify/events.jsonl"
 LAUNCH_LOCK_NAME = "launches.lock"
 CPU_SIDECAR, IO_SIDECAR = ".cpu.stat", ".io.stat"
+
+
+def git_directory(argv: list[str], cwd: str) -> str:
+    """Keep the directory helper available to memory admission callers."""
+    return step_context.git_directory(argv, cwd)
+
+
+def transcript_target_folder(metadata: Mapping[str, object], parameters: Mapping[str, object]) -> step_context.StepTargetFolder:
+    """Use saved build facts without the collector's current Cargo settings."""
+    target = metadata.get("target_directory")
+    if isinstance(target, str) and Path(target).is_absolute():
+        return step_context.CargoTargetFolder(Path(target))
+    binary, profile = metadata.get("binary_path"), metadata.get("profile") or parameters.get("profile")
+    if isinstance(binary, str) and Path(binary).is_absolute() and profile in ("debug", "release"):
+        path = Path(binary)
+        if metadata.get("launched_as") == "example" and path.parent.name == "examples":
+            path = path.parent
+        if path.parent.name == profile:
+            folder = path.parent.parent
+            if folder.name == "target":
+                return step_context.CargoTargetFolder(folder)
+    return step_context.UnresolvedTargetFolder()
+
+
 def sync_config() -> dict[str, str]:
     """Read peer settings when a sync or report needs them."""
     path = Path(os.environ.get("BUILD_TARGETS_CONFIG", str(Path(__file__).resolve().parents[2]
@@ -208,6 +250,7 @@ class LaunchStep(GitFacts):
     ended_at: str
     duration_s: None
     step: Literal["launch"]
+    target_dir: str
     argv: list[str]
     cwd: str
     caller: Literal["hana-shot"]
@@ -292,7 +335,7 @@ def hana_launch_record(fields: Mapping[str, object], directory: str) -> LaunchSt
         started_at=started, ended_at=started, duration_s=None, step="launch", argv=[binary], cwd=directory,
         **facts, caller="hana-shot", session=identity["session"], worker=identity["worker"],
         unit_session=identity["unit_session"], mem_wait_s=None,
-        slice="none", tty=False, status=0,
+        slice="none", tty=False, status=0, target_dir="none",
     )
 
 
@@ -472,18 +515,6 @@ def git_facts(directory: str) -> GitFacts:
     return facts
 
 
-def git_directory(argv: list[str], cwd: str) -> str:
-    """The manifest's folder when the step names one, so a cargo-port run from elsewhere still finds its repo."""
-    import parse
-
-    manifest = parse.manifest_path(argv) or os.environ.get("MANIFEST_PATH")
-    if manifest:
-        folder = (Path(cwd) / manifest).parent
-        if folder.is_dir():
-            return str(folder)
-    return cwd
-
-
 def caller(tty: bool) -> str:
     env = os.environ
     explicit = env.get("BUILDLOG_CALLER")
@@ -609,14 +640,15 @@ def test_phase_context(sampling_context: str, argv: list[str]) -> dict[str, obje
     fields = cast(dict[str, object], loaded)
     call = fields.get("call_id")
     if isinstance(call, dict):
-        recorded_call = memory_admit.parse_snapshot_value(cast(dict[str, object], call), memory_admit.Call)
-        fields["call_id"] = recorded_call.call_id if isinstance(recorded_call, memory_admit.CallRecord) else None
+        metadata = admission_metadata()
+        recorded_call = metadata.parse_snapshot_value(cast(dict[str, object], call), metadata.Call)
+        fields["call_id"] = recorded_call.call_id if isinstance(recorded_call, metadata.CallRecord) else None
     # Admission's parser returns the first width. Supplying nextest's environment
     # default last preserves an explicit flag, including a nonnumeric one.
     width_argv = argv
     if "NEXTEST_TEST_THREADS" in os.environ:
         width_argv = [*argv, "--test-threads", os.environ["NEXTEST_TEST_THREADS"]]
-    context = _test_phase_context({**fields, "test_threads": memory_admit.test_threads(width_argv)})
+    context = _test_phase_context({**fields, "test_threads": admission_metadata().test_threads(width_argv)})
     return {
         **context,
         # Admission has no entry-charge record (bytes, cutoff, form, widths).
@@ -872,7 +904,7 @@ def step(args: list[str]) -> None:
             return
         tty = tty_text == "1"
         directory = git_directory(argv, cwd)
-        repository = memory_admit.git_identity(argv, cwd)[0]
+        repository_key = admission_metadata().recorded_repository_key(argv, cwd)
         tree = tree_facts(os.environ.get("BUILDLOG_TREE_START"), treekey.tree_key(directory))
         step_caller = caller(tty)
         sent_key = sent_tree_key()
@@ -890,6 +922,7 @@ def step(args: list[str]) -> None:
                 store.note_error(f"parse {name} {held}")
             if status != 0:
                 log = _log_relative_path(host, start, record_id)
+        output_roots = read_cargo_output_roots(Path(directory)) if name != "sweep" else CargoOutputUnavailable("sweep step")
         memory = peak_and_stall(peak)
         step_slice = "none" if not peak else "builds" if Path(peak).is_file() else "fallback"
         phase = read_test_phase(phase_file)
@@ -899,6 +932,7 @@ def step(args: list[str]) -> None:
             "id": record_id,
             "host": host,
             "target": recorded_target(host),
+            "pinned": bool(os.environ.get("BUILDLOG_PINNED_TARGET")),
             "started_at": started_at,
             "ended_at": ended_at,
             "duration_s": round(end - start, 3),
@@ -907,9 +941,12 @@ def step(args: list[str]) -> None:
             "step": name,
             "argv": argv,
             "cwd": cwd,
-            "target_dir": str((Path(cwd) / os.environ["CARGO_TARGET_DIR"]).resolve())
-                          if "CARGO_TARGET_DIR" in os.environ else TARGET_DIR_UNSET,
-            "repo_identity": repository.key if isinstance(repository, memory_admit.RepositoryIdentity) else store.UNKNOWN_IDENTITY,
+            "target_dir": step_context.target_folder_text(
+                step_context.captured_target_folder(os.environ.get("BUILDLOG_TARGET_FOLDER", ""))),
+            **({"target_directory": str(output_roots.target_directory),
+                "build_directory": str(output_roots.build_directory)}
+               if isinstance(output_roots, CargoOutputRoots) else {}),
+            "repo_identity": repository_key,
             **git_facts(directory),
             **tree,
             # A reusable test build needs verify's Cargo inputs as well as
@@ -1010,6 +1047,7 @@ def call(args: list[str]) -> None:
         "local_reason": os.environ.get("BUILDLOG_LOCAL_REASON", ""),
         "mac_s": optional_nonnegative_number(os.environ.get("BUILDLOG_MAC_S", "")),
         "target": os.environ.get("BUILDLOG_TARGET", ""),
+        "pinned": bool(os.environ.get("BUILDLOG_PINNED_TARGET")),
         "hold_wait_s": optional_nonnegative_number(os.environ.get("BUILDLOG_HOLD_WAIT_S", "")),
         "copy": os.environ.get("BUILDLOG_MAC_COPY", ""),
         "copy_s": optional_nonnegative_number(os.environ.get("BUILDLOG_MAC_COPY_S", "")),
@@ -1038,6 +1076,7 @@ class HoldEventRecord(TypedDict):
 
 
 class SshAttempt(TypedDict):
+    reason: NotRequired[str]
     call_id: str
     target: str
     repo_identity: str
@@ -1057,6 +1096,7 @@ def ssh_attempt(attempt: SshAttempt) -> None:
     at = time.time()
     store.append_line(store.host_file(host, at), {
         **attempt, "kind": "ssh_attempt", "v": RECORD_VERSION,
+        "pinned": bool(os.environ.get("BUILDLOG_PINNED_TARGET")),
         "id": f"{host}-{time.time_ns()}-{secrets.token_hex(4)}", "host": host,
         "at": store.utc_iso(at),
     })
@@ -1077,23 +1117,21 @@ def read_attempt_results(target: str) -> tuple[AttemptResult, ...]:
     """Read the latest repository slot results from host month files."""
     latest: dict[tuple[str, int], AttemptResult] = {}
     for path in sorted(store.root().glob('*/[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl')):
-        with path.open('rb') as handle:
-            fcntl.flock(handle, fcntl.LOCK_SH)
-            for row in store.whole_rows(handle, 0):
-                if row.get('kind') != 'ssh_attempt' or row.get('target') != target:
-                    continue
-                count = row.get('unresolved_count')
-                at = float(str(row.get('evidence_at')))
-                slot = int(str(row.get('slot')))
-                if not math.isfinite(at) or at < 0 or slot < 0:
-                    raise ValueError('invalid attempt evidence')
-                result = AttemptResult(str(row.get('repo_identity', 'unknown')), slot,
-                                       str(row.get('outcome', 'unavailable')), str(row.get('completion', 'missing')),
-                                       str(row.get('cleanup', 'unconfirmed')),
-                                       count if type(count) is int and count >= 0 else MeasurementUnavailable('process count is unavailable'), at)
-                key = result.repo_identity, result.slot
-                if key not in latest or latest[key].evidence_at <= at:
-                    latest[key] = result
+        for row in store.locked_rows(path):
+            if row.get('kind') != 'ssh_attempt' or row.get('target') != target:
+                continue
+            count = row.get('unresolved_count')
+            at = float(str(row.get('evidence_at')))
+            slot = int(str(row.get('slot')))
+            if not math.isfinite(at) or at < 0 or slot < 0:
+                raise ValueError('invalid attempt evidence')
+            result = AttemptResult(str(row.get('repo_identity', 'unknown')), slot,
+                                   str(row.get('outcome', 'unavailable')), str(row.get('completion', 'missing')),
+                                   str(row.get('cleanup', 'unconfirmed')),
+                                   count if type(count) is int and count >= 0 else MeasurementUnavailable('process count is unavailable'), at)
+            key = result.repo_identity, result.slot
+            if key not in latest or latest[key].evidence_at <= at:
+                latest[key] = result
     return tuple(latest[key] for key in sorted(latest))
 
 def hold_event(args: list[str]) -> None:
@@ -1131,13 +1169,13 @@ def head_admission(action: Literal["set", "admitted", "lapsed"], unit: str, step
 
 
 def queue_priority(action: Literal["set", "clear"], unit: str,
-                   why: str, set_by: str, at: float, *, transition_id: str = "") -> None:
+                   why: str, set_by: str, at: float, *, transition_id: str = "", start: int = 0) -> None:
     host = store.host_name()
     _ = append_row_once(store.host_file(host, at), {
         "kind": "queue_priority", "v": RECORD_VERSION,
         "id": transition_id or f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
         "action": action, "unit": unit, "why": why, "set_by": set_by,
-    })
+    }, start)
 
 
 class IdleFloorTarget(TypedDict):
@@ -1148,13 +1186,15 @@ class IdleFloorTarget(TypedDict):
     reason: NotRequired[str]
 
 
-def floor_scan(free_after_scan: int, floor: int, idle_targets: list[IdleFloorTarget], at: float) -> None:
+def floor_scan(free_after_scan: int, floor: int, idle_targets: list[IdleFloorTarget], at: float,
+               *, filesystem: str = "") -> None:
     host = store.host_name()
     store.append_line(store.host_file(host, at), {
         "kind": "floor_scan", "v": RECORD_VERSION,
         "id": f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
         "free_after_scan": free_after_scan, "floor": floor, "shortfall": floor - free_after_scan,
         "idle_targets": idle_targets,
+        **({"filesystem": filesystem} if filesystem else {}),
     })
 
 
@@ -1282,12 +1322,6 @@ def main(argv: list[str]) -> int:
         if command == "step":
             detach()
             step(rest)
-        elif command == "key":
-            import treekey
-
-            found = treekey.tree_key(git_directory(rest, os.getcwd()))
-            if found:
-                print(found)
         elif command == "test-phase-context":
             print(json.dumps(test_phase_context(rest[0], rest[1:]), separators=(",", ":")))
         elif command == "hold-event":

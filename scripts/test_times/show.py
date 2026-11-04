@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""Show gate, module and kept test times for the current host."""
+from __future__ import annotations
+
+import argparse
+from collections import defaultdict
+from collections.abc import Iterator, Sequence
+from contextlib import closing
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+import sqlite3
+import statistics
+import sys
+from typing import TYPE_CHECKING, Literal, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
+if TYPE_CHECKING:
+    from ..buildlog import index as index, store
+else:
+    import index
+    import store
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import conf
+from scripts.lib.terminal_cells import pad_right, terminal_width
+from scripts.lib.user_zone import user_zone
+from scripts.production.gate_modules import discover_test_modules, test_module_name
+from scripts.test_times.gate_record import TYPE_CHECK_JOB
+
+
+def query(connection: sqlite3.Connection, sql: str,
+          parameters: Sequence[object] = ()) -> list[dict[str, object]]:
+    return list(query_rows(connection, sql, parameters))
+
+
+def query_rows(connection: sqlite3.Connection, sql: str,
+               parameters: Sequence[object] = ()) -> Iterator[dict[str, object]]:
+    """Name the columns at the SQLite boundary."""
+    cursor = connection.execute(sql, parameters)
+    columns = cast(list[tuple[str, ...]], cursor.description)
+    names = [column[0] for column in columns]
+    try:
+        for row in cast(Iterator[tuple[object, ...]], cursor):
+            yield dict(zip(names, row, strict=True))
+    finally:
+        cursor.close()
+
+
+@dataclass(frozen=True)
+class ModuleAttempt:
+    run_id: str
+    started_at: str
+    suite: str
+    module: str
+    attempt: int
+    restart: str
+    times_missing: str
+    wall_s: float
+    cpu_s: float
+    peak_mib: float
+    status: int
+    tests_run: int
+    tests_s: float
+    aborted: bool
+
+    @classmethod
+    def from_row(cls, row: dict[str, object]) -> ModuleAttempt:
+        return cls(str(row["run_id"]), str(row["started_at"]), str(row["suite"]), str(row["module"]),
+                   int(str(row["attempt"])), str(row["restart"]), str(row["times_missing"]),
+                   float(str(row["wall_s"])), float(str(row["cpu_s"])), float(str(row["peak_mib"])),
+                   int(str(row["status"])), int(str(row["tests_run"])), float(str(row["tests_s"])),
+                   bool(row["aborted"]))
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return self.suite, self.module
+
+    @property
+    def name(self) -> str:
+        return f"{self.suite}/{self.module}"
+
+
+@dataclass(frozen=True)
+class KeptTest:
+    test: str
+    duration_s: float
+
+
+def kept_tests(connection: sqlite3.Connection, attempt: ModuleAttempt) -> list[KeptTest]:
+    return [KeptTest(str(row["test"]), float(str(row["duration_s"])))
+            for row in query(connection, """
+                SELECT test, duration_s FROM gate_tests
+                WHERE run_id = ? AND suite = ? AND module = ? AND attempt = ?
+                ORDER BY duration_s DESC, test
+            """, (attempt.run_id, attempt.suite, attempt.module, attempt.attempt))]
+
+
+def local_time(value: str) -> str:
+    return datetime.fromisoformat(value).astimezone(user_zone()).strftime("%m-%d %H:%M")
+
+
+def seconds(value: float) -> str:
+    return f"{value:.3f}"
+
+
+def verdict(status: int) -> str:
+    return "PASS" if status == 0 else "RED"
+
+
+def run_mark(aborted: bool) -> str:
+    return "aborted" if aborted else ""
+
+
+def mebibytes(value: float) -> str:
+    return f"{value:.3f}"
+
+
+def print_table(headers: Sequence[str], rows: Sequence[Sequence[str]],
+                empty_message: str = "no gate runs recorded yet") -> None:
+    if not rows:
+        print(empty_message)
+        return
+    widths = [max(terminal_width(header), *(terminal_width(row[column]) for row in rows))
+              for column, header in enumerate(headers)]
+    for row in [headers, *rows]:
+        print("  ".join(pad_right(value, width)
+                        for value, width in zip(row, widths, strict=True)).rstrip())
+
+
+def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> None:
+    live = {(suite, test_module_name(repo, suite, path))
+            for suite, path in discover_test_modules(repo)}
+    live.add(TYPE_CHECK_JOB)
+    count = conf.read("test_times").whole("TOP_RUNS")
+    histories: list[list[ModuleAttempt]] = []
+    for folder, filename in sorted(live):
+        history: list[ModuleAttempt] = []
+        seen: set[str] = set()
+        for row in query_rows(connection, """
+            SELECT m.*, r.aborted FROM gate_modules m JOIN gate_runs r ON r.id = m.run_id
+            WHERE m.suite = ? AND m.module = ? AND m.host = ? AND m.restart = ''
+            ORDER BY m.started_at DESC, m.run_id DESC, m.attempt ASC
+        """, (folder, filename, host)):
+            attempt = ModuleAttempt.from_row(row)
+            if attempt.run_id in seen:
+                continue
+            seen.add(attempt.run_id)
+            history.append(attempt)
+            if len(history) == count:
+                break
+        if history:
+            histories.append(history)
+    ranked = sorted(((statistics.median(attempt.wall_s for attempt in history), history)
+                     for history in histories), key=lambda item: (-item[0], item[1][0].name))[:limit]
+    output: list[list[str]] = []
+    for rank, (median, history) in enumerate(ranked, 1):
+        last = history[0]
+        tests_run = str(last.tests_run)
+        slowest = ""
+        if last.key == TYPE_CHECK_JOB:
+            tests_run = ""
+        elif last.times_missing:
+            tests_run = slowest = "times missing"
+        else:
+            tests = kept_tests(connection, last)
+            if tests:
+                slowest = f"{tests[0].test} {seconds(tests[0].duration_s)} s"
+        output.append([str(rank), last.name, seconds(median), seconds(last.wall_s),
+                       seconds(statistics.median(attempt.cpu_s for attempt in history)),
+                       tests_run, slowest, str(len(history))])
+    print_table(["rank", "suite/module", "median s", "last s", "median CPU s", "tests run",
+                 "slowest kept test", "runs counted"], output, "no modules recorded yet")
+    if output:
+        print(f"{len(output)} modules; sum of medians {seconds(sum(item[0] for item in ranked))} s")
+
+
+def cutoff(days: int) -> str:
+    return store.utc_iso((datetime.now(UTC) - timedelta(days=days)).timestamp())
+
+
+def suites(connection: sqlite3.Connection, host: str, days: int) -> None:
+    rows = query(connection, """
+        SELECT r.*, (
+            SELECT m.suite || '/' || m.module FROM gate_modules m
+            WHERE m.run_id = r.id ORDER BY m.wall_s DESC, m.suite, m.module LIMIT 1
+        ) AS slowest FROM gate_runs r
+        WHERE r.host = ? AND r.started_at >= ? ORDER BY r.started_at DESC, r.id DESC
+    """, (host, cutoff(days)))
+    print_table(["start", "host", "selection", "modules run", "wall s", "status", "slowest module", "run"], [
+        [local_time(str(row["started_at"])), str(row["host"]), str(row["selection"]),
+         str(row["modules_run"]), seconds(float(str(row["wall_s"]))), verdict(int(str(row["status"]))),
+         str(row["slowest"] or ""), run_mark(bool(row["aborted"]))] for row in rows])
+
+
+def suite(connection: sqlite3.Connection, host: str, folder: str, days: int) -> None:
+    rows = query(connection, """
+        SELECT s.*, r.aborted FROM gate_suites s JOIN gate_runs r ON r.id = s.run_id
+        WHERE s.host = ? AND s.suite = ? AND s.started_at >= ?
+        ORDER BY s.started_at DESC, s.run_id DESC
+    """, (host, folder, cutoff(days)))
+    print_table(["start", "suite", "wall s", "status", "run"], [
+        [local_time(str(row["started_at"])), str(row["suite"]), seconds(float(str(row["wall_s"]))),
+         verdict(int(str(row["status"]))), run_mark(bool(row["aborted"]))] for row in rows],
+        f"no gate runs recorded for suite {folder}")
+
+
+def module(connection: sqlite3.Connection, host: str, name: str, runs: int) -> None:
+    folder, filename = name.split("/", 1)
+    attempts = [ModuleAttempt.from_row(row) for row in query(connection, """
+        SELECT m.*, r.aborted FROM gate_modules m JOIN gate_runs r ON r.id = m.run_id
+        WHERE m.host = ? AND m.suite = ? AND m.module = ?
+        ORDER BY m.started_at DESC, m.run_id DESC, m.attempt DESC LIMIT ?
+    """, (host, folder, filename, runs))]
+    output: list[list[str]] = []
+    for attempt in attempts:
+        if attempt.key == TYPE_CHECK_JOB:
+            tests_run = tests_s = overhead = slowest = ""
+        elif attempt.times_missing:
+            tests_run = "times missing"
+            tests_s = overhead = slowest = f"times missing: {attempt.times_missing}"
+        else:
+            tests_run = str(attempt.tests_run)
+            tests_s = seconds(attempt.tests_s)
+            overhead = seconds(attempt.wall_s - attempt.tests_s)
+            slowest = "; ".join(f"{test.test} {seconds(test.duration_s)} s"
+                                for test in kept_tests(connection, attempt)[:3])
+        output.append([local_time(attempt.started_at), str(attempt.attempt) + (" hold" if attempt.restart else ""),
+                       seconds(attempt.wall_s), seconds(attempt.cpu_s), mebibytes(attempt.peak_mib),
+                       verdict(attempt.status), tests_run, tests_s, overhead, slowest,
+                       run_mark(attempt.aborted)])
+    print_table(["start", "attempt", "wall s", "CPU s", "peak MiB", "status", "tests run", "tests s",
+                 "import and fixture s", "slowest kept tests", "run"], output,
+                f"no gate runs recorded for module {name}")
+
+
+def test(connection: sqlite3.Connection, host: str, text: str, runs: int) -> None:
+    # instr treats the search text as a literal substring.
+    identities: dict[tuple[str, str], dict[str, str]] = defaultdict(dict)
+    for row in query(connection, """
+        SELECT suite, module, test, min(started_at) AS first_at FROM gate_tests
+        WHERE host = ? AND instr(test, ?) > 0 GROUP BY suite, module, test
+    """, (host, text)):
+        identities[str(row["suite"]), str(row["module"])][str(row["test"])] = str(row["first_at"])
+    candidates: list[ModuleAttempt] = []
+    for (folder, filename), names in identities.items():
+        seen: set[str] = set()
+        for row in query_rows(connection, """
+            SELECT m.*, r.aborted FROM gate_modules m JOIN gate_runs r ON r.id = m.run_id
+            WHERE m.suite = ? AND m.module = ? AND m.host = ? AND m.started_at >= ?
+            ORDER BY m.started_at DESC, m.run_id DESC, m.attempt DESC
+        """, (folder, filename, host, min(names.values()))):
+            attempt = ModuleAttempt.from_row(row)
+            if attempt.run_id not in seen and len(seen) == runs:
+                break
+            seen.add(attempt.run_id)
+            candidates.append(attempt)
+    newest = sorted({(attempt.started_at, attempt.run_id) for attempt in candidates}, reverse=True)[:runs]
+    selected = {item[1] for item in newest}
+    output: list[list[str]] = []
+    for attempt in sorted(candidates, key=lambda item: (
+            item.started_at, item.run_id, item.attempt), reverse=True):
+        if attempt.run_id not in selected:
+            continue
+        kept = {str(row["test"]): row for row in query(connection, """
+            SELECT test, duration_s, status FROM gate_tests
+            WHERE run_id = ? AND suite = ? AND module = ? AND attempt = ?
+        """, (attempt.run_id, attempt.suite, attempt.module, attempt.attempt))}
+        for name, first_at in sorted(identities[attempt.key].items()):
+            if attempt.started_at < first_at:
+                continue
+            duration = ""
+            status = "not kept"
+            if attempt.times_missing:
+                status = "times missing"
+            elif name in kept:
+                row = kept[name]
+                duration, status = seconds(float(str(row["duration_s"]))), str(row["status"])
+            output.append([local_time(attempt.started_at), attempt.name, name, duration, status,
+                           run_mark(attempt.aborted)])
+    print_table(["start", "suite/module", "test", "duration s", "status", "run"],
+                output, f"no tests recorded matching {text}")
+
+
+def positive(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("use a positive whole number")
+    return number
+
+
+ReportCommand = Literal["top", "suites", "suite", "module", "test"]
+
+
+@dataclass(init=False)
+class ReportRequestArguments(argparse.Namespace):
+    command: ReportCommand
+    limit: int
+    repo: Path
+    days: int
+    runs: int
+    subject: str
+
+
+def arguments(argv: list[str]) -> ReportRequestArguments:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subcommands = parser.add_subparsers(dest="command", required=True)
+    top_parser = subcommands.add_parser("top", help="rank live modules by their median wall time")
+    _ = top_parser.add_argument("--limit", type=positive, default=20)
+    _ = top_parser.add_argument("--repo", type=Path, default=Path("~/.claude"))
+    suites_parser = subcommands.add_parser("suites", help="show gate runs")
+    _ = suites_parser.add_argument("--days", type=positive, default=7)
+    suite_parser = subcommands.add_parser("suite", help="show one folder suite")
+    _ = suite_parser.add_argument("subject", metavar="folder")
+    _ = suite_parser.add_argument("--days", type=positive, default=7)
+    module_parser = subcommands.add_parser("module", help="show each execution of one module")
+    _ = module_parser.add_argument("subject", metavar="folder/file")
+    _ = module_parser.add_argument("--runs", type=positive, default=20)
+    test_parser = subcommands.add_parser("test", help="find kept test names by substring")
+    _ = test_parser.add_argument("subject", metavar="text")
+    _ = test_parser.add_argument("--runs", type=positive, default=20)
+    if not argv or argv[0].startswith("--") and argv[0] != "--help":
+        argv = ["top", *argv]
+    request = parser.parse_args(argv, namespace=ReportRequestArguments())
+    if request.command == "module" and ("/" not in request.subject or not all(request.subject.split("/", 1))):
+        parser.error("module needs <folder>/<file>")
+    return request
+
+
+def open_report_index() -> sqlite3.Connection:
+    """Update the index and check the report tables before returning the connection."""
+    _ = index.update()
+    connection = index.read_only()
+    try:
+        connection.execute(f"SELECT 1 FROM {', '.join(index.GATE_TABLES)} LIMIT 0").close()
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
+def main(argv: list[str] | None = None) -> int:
+    request = arguments(sys.argv[1:] if argv is None else argv)
+    try:
+        connection = open_report_index()
+    except sqlite3.OperationalError as error:
+        if not str(error).startswith("no such table: gate_"):
+            raise
+        print(f"test times unavailable: {error}; run `buildlog reindex`", file=sys.stderr)
+        return 1
+    with closing(connection):
+        host = store.host_name()
+        match request.command:
+            case "top":
+                top(connection, host, request.limit, request.repo.expanduser().resolve())
+            case "suites":
+                suites(connection, host, request.days)
+            case "suite":
+                suite(connection, host, request.subject, request.days)
+            case "module":
+                module(connection, host, request.subject, request.runs)
+            case "test":
+                test(connection, host, request.subject, request.runs)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

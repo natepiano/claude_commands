@@ -2,7 +2,19 @@
 
 Stop, resume and account move use `scripts/shutdown/stop_resume.py`.
 
-`stop(session)` ends only the selected local session's Claude process. It reads identity through `sessions.session_liveness`, keeps the pid and start time, checks that identity before each signal, sends TERM, and checks exit every 0.1 seconds and sends KILL after two seconds if the same process survives. After exit, `stall_watch.retire_session_prompt(session_id)` atomically publishes only `{session_id, at}` with no launch, pane or parent lookup. It takes no watcher lock and sends nothing; stall-watch finds saved prompts by their owning session id and retires their stored keys on its next pass, even after launch deletion. Any cancellation exception prints a separate warning and does not prevent intentional-stop bookkeeping or change the stop result. It waits up to five seconds after KILL. It waits for that pid and start time to leave. Registry removal alone does not prove exit. A surviving process returns `StopFailed`. Workers keep their threads. No stopping record, ready mark, account hold or conductor is created.
+`stop(session)` ends only the selected local session's process.
+It reads the session identity, pid, and start time before TERM.
+It checks the current conversation before each signal.
+It checks exit every 0.1 seconds and sends KILL after two seconds when the conversation proof remains valid.
+If TERM removes that proof, stop prints an anomaly and waits up to five more seconds without another signal.
+It waits up to five seconds after KILL.
+Registry removal alone does not prove exit.
+A surviving process returns `StopFailed` and does not resume.
+After exit, `stall_watch.retire_session_prompt(session_id)` publishes only `{session_id, at}`.
+It takes no watcher lock and sends no message.
+Stall-watch retires the saved prompt keys on its next pass, even after launch deletion.
+A cancellation error prints a separate warning and does not change the stop result.
+Workers keep their threads.
 
 `resume NAME [--why TEXT] [--to ACCOUNT]` works from any directory.
 The executable is `scripts/shutdown/resume`.
@@ -20,6 +32,9 @@ Resume does not stop or move a running session.
 The default reason is `resumed by name`.
 
 The shared resume path reads the saved account, environment, arguments, and folder.
+Claude units and showrunners use their group's configured account unless `--to` supplies an account.
+This rule also applies when no pane launch record exists.
+Ad hoc sessions keep their saved account.
 It restores a closed tab when a saved launch exists.
 An explicit CLI resume can restore an intentionally stopped session.
 Automatic recovery preserves an intentional stop.
@@ -49,6 +64,8 @@ A detached check watches its pid and start generation for ten seconds.
 The watchdog owns later recovery.
 A missing tab or unreadable liveness returns a named error.
 All batch stops finish before any resume.
+Pane input waits up to ten seconds for the target shell to finish its startup work.
+The move checks each member's live account after all resumes and prints a recovery command for each unconfirmed member.
 Launch seeding reads process information only for selected panes.
 
 The shared session registry reader skips a file that vanishes during the scan. It retries a transient unreadable file up to three times, 50 milliseconds apart. Other unreadable evidence remains visible.

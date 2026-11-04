@@ -25,7 +25,7 @@ registration = update_registration
 from scripts.production import showrunners as showrunners
 from scripts.production import staff, unit_names
 import dailies_render as dailies_render
-from production_units import read_production as read_production
+from scripts.production.production_doc import read_production as read_production
 from scripts.production.cli_fixture import invoke_cli, production_paths
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -129,7 +129,7 @@ class RegistrationFixture(unittest.TestCase):
         self.config = self.root / "showrunners.json"
         self.doc = self.checkout / "docs/plans/example-production.md"
         bin_dir = self.root / "bin"
-        self.env = {**os.environ, "HOME": str(self.home), "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+        self.env = {**os.environ, "HOME": str(self.home), "USER_ZONE": "America/Los_Angeles", "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
                     "REGISTRATION_TEST_STATE": str(self.state), "SHOWRUNNER_STATE_DIR": str(self.state / "showrunner"),
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"), "SHOWRUNNERS_CONFIG": str(self.config),
                     "USAGE_STATE_DIR": str(self.state / "usage"),
@@ -172,11 +172,7 @@ class RegistrationFixture(unittest.TestCase):
             "- **Merge branch:** `production`", f"- **Showrunner checkout:** `{self.checkout}`",
             "- **Showrunner session:** first-showrunner", "- **Log:** `production.log`",
             "- **User zone:** America/Los_Angeles", "- **Updates:** every 15 minutes",
-            f"- **Proposals:** `{self.root / 'issues'}`", "",
-            "## Units", "", "| Unit | Plan | Worktree | Branch | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- |",
-            f"| `alpha-unit` | `docs/alpha.md` | `{alpha}` | `alpha` | — | — |",
-            "", "## Gates", "",
+            f"- **Proposals:** `{self.root / 'issues'}`", "", "## Gates", "",
         )), encoding="utf-8")
         runner = recorded_showrunner(fixture_showrunner_name("example", self.doc), self.doc)
         _ = fixture_member("unit", name="alpha", parent=runner.id,
@@ -225,11 +221,10 @@ class RegistrationFixture(unittest.TestCase):
         return path
 
     def build_command_copy(self, tree: Path) -> None:
-        _ = shutil.copytree(SCRIPT.parent, tree / "scripts/production")
-        for name in ("agents", "astra", "build_hold", "build_targets", "buildlog", "direct", "herdr", "lib", "lint", "mac_test", "message", "shutdown", "usage", "whoami"):
-            _ = shutil.copytree(SCRIPT.parent.parent / name, tree / "scripts" / name)
+        _ = shutil.copytree(SCRIPT.parent.parent, tree / "scripts",
+                            ignore=shutil.ignore_patterns("__pycache__"))
         hooks = tree / "scripts/hooks"
-        hooks.mkdir(parents=True)
+        hooks.mkdir(parents=True, exist_ok=True)
         _ = shutil.copy2(SCRIPT.parent.parent / "hooks/showrunner_footer.py", hooks)
         template = tree / "commands/showrunner/produce.md"
         template.parent.mkdir(parents=True)

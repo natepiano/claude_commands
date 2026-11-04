@@ -120,7 +120,7 @@ class OffloadCommandTests(SeededCleanupFixture):
         self.assertEqual(result.returncode, 75, result.stdout)
         self.assertIn("partial output\n", result.stdout)
         self.assertIn(
-            "mac_test: the link to the Mac dropped; running on natedev instead\n",
+            "mac_test: the Mac runner exited with status 0 without a final status; local fallback requires admission\n",
             result.stdout,
         )
         wire = self.wire_result()
@@ -148,7 +148,7 @@ class OffloadCommandTests(SeededCleanupFixture):
                 result = self.command_with_cleanup_clock(separate_stderr=True)
                 self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
                 self.assert_wire("lost", "")
-                self.assertIn("mac_test: the link to the Mac dropped; running on natedev instead\n", result.stdout)
+                self.assertIn("mac_test: the Mac runner exited with status 0 without a final status; local fallback requires admission\n", result.stdout)
                 self.assert_leftover_diagnostic(result.stderr, outcome)
                 self.assert_claim_is_kept()
                 self.assertEqual(len(self.leftover_events()), 1)

@@ -106,22 +106,22 @@ def attach_parent(child: str, parent: str = "") -> None:
             recorded_parent = path.read_text(encoding="utf-8").strip()
         except FileNotFoundError:
             recorded_parent = ""
-        finished = (child_row.parent == parent_row.id and recorded_parent == parent
+        finished = (child_row.parent == staff.ReportsTo(parent_row.id) and recorded_parent == parent
                     and isinstance(pending, NoPendingParentNotice))
         if finished:
             print(f"{child} already reports to {parent}; done")
             return
         if isinstance(pending, NoPendingParentNotice):
             _save_notice(child, PendingParentNotice("attach", parent))
-        if child_row.parent != parent_row.id:
-            _ = staff.move(child_row.id, parent_row.id)
+        if child_row.parent != staff.ReportsTo(parent_row.id):
+            _ = staff.move(child_row.id, staff.ReportsTo(parent_row.id))
         attach(child, parent, record=record)
         top = showrunner_tree.root_of(parent, record=record)
         print(f"{child} now reports to {parent}")
         _tell(child, {
             child: f"{child} now reports to {parent}. The root is {top}: send it each item for the user. {showrunners.RULES}",
-            parent: f"{child} now reports to {parent}. It is a child showrunner, never a unit: it has no Units "
-                    + f"row, and no broadcast is passed on to it. {showrunners.RULES}",
+            parent: f"{child} now reports to {parent}. It is a child showrunner, never a unit: "
+                    + f"no broadcast is passed on to it. {showrunners.RULES}",
         })
 
 
@@ -138,8 +138,8 @@ def detach_parent(child: str) -> None:
         row = _row(child, record)
         if parent and isinstance(pending, NoPendingParentNotice):
             _save_notice(child, PendingParentNotice("detach", parent))
-        if row.parent is not None:
-            _ = staff.move(row.id, None)
+        if isinstance(row.parent, staff.ReportsTo):
+            _ = staff.move(row.id, staff.StaffRoot())
         _ = detach(child, record=record)
         if not parent:
             print(f"{child} reports to no one; done")

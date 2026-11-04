@@ -18,11 +18,13 @@ from threading import Event, current_thread
 from typing import cast, override
 from unittest import mock
 
-from scripts.lib import copy_record, scratch
+from scripts.copies import copies
+from scripts.production.cli_fixture import ImmutableGitSeed
+from scripts.lib import cargo_output, copy_record, scratch
 from scripts.lint import sweep
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "style"))
-from scripts.style import style_sync
 
+from scripts.lib import conf
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.message import sessions
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id
@@ -31,6 +33,11 @@ MAKER_ID = fixture_runtime_id("scratch-Claude-session")
 
 RUN = "run:2a858b68-0f9a-4af2-b3cf-a776e6b180cb"
 ROW = "row:cargo-liner-C54"
+
+
+def setUpModule() -> None:
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, config_environment(root))))
 
 
 class ScratchTests(unittest.TestCase):
@@ -77,19 +84,180 @@ class ScratchTests(unittest.TestCase):
                               source_commit="a" * 40, copy_commit="b" * 40, target_mode="none",
                               seed_source="", borrows_from="", **details)
 
-    def test_style_build_folder_helper_creates_a_stamped_cache_the_sweep_accepts(self) -> None:
+    def test_checkout_removal_saves_outputs_before_source_deletion_and_keeps_retry_evidence(self) -> None:
+        checkout = self.base / "cargo-checkout"
+        checkout.mkdir()
+        manifest = checkout / "Cargo.toml"
+        _ = manifest.write_text("private manifest")
+        cache = self.base / "outside-cache"
+        roots = cargo_output.CargoOutputRoots(checkout, checkout / "target", cache)
+        calls: list[str] = []
+        def clean(path: Path, saved: tuple[scratch.SavedCargoOutput, ...]) -> None:
+            self.assertEqual(path, checkout)
+            self.assertEqual(saved[0].roots, roots)
+            self.assertTrue(scratch.cargo_removal_mark(checkout).exists())
+            calls.append("cache")
+        def interrupted(path: Path) -> None:
+            self.assertEqual(calls, ["cache"])
+            (path / "Cargo.toml").unlink()
+            raise OSError("stopped source deletion")
+        with (mock.patch.object(cargo_output, "read_cargo_output_roots", return_value=roots),
+              mock.patch.object(scratch, "cargo_checkout_peers", return_value=()),
+              mock.patch.object(scratch, "clean_cargo_outputs", side_effect=clean)):
+            with self.assertRaisesRegex(OSError, "stopped source"):
+                scratch.remove_with_cargo_output(checkout, interrupted)
+            self.assertTrue(scratch.cargo_removal_mark(checkout).exists())
+            with mock.patch.object(cargo_output, "read_cargo_output_roots", side_effect=AssertionError("lost source")):
+                scratch.remove_with_cargo_output(checkout, lambda path: path.rmdir())
+        self.assertEqual(calls, ["cache", "cache"])
+        self.assertFalse(checkout.exists())
+        self.assertFalse(scratch.cargo_removal_mark(checkout).exists())
+
+    def test_invalid_cargo_removal_marks_report_an_oserror_and_keep_the_source(self) -> None:
+        checkout = self.base / "invalid-mark-checkout"
+        checkout.mkdir()
+        mark = scratch.cargo_removal_mark(checkout)
+        for contents in (b"{broken", b"\xff"):
+            with self.subTest(contents=contents):
+                _ = mark.write_bytes(contents)
+                with mock.patch.object(scratch, "remove", side_effect=AssertionError("source must remain")):
+                    with self.assertRaisesRegex(OSError, "invalid Cargo removal record"):
+                        scratch.remove_with_cargo_output(checkout, scratch.remove)
+                self.assertTrue(checkout.exists())
+                self.assertEqual(mark.read_bytes(), contents)
+
+    def test_contained_cargo_output_needs_no_external_cleanup(self) -> None:
+        checkout = self.base / "cargo-checkout"
+        (checkout / "target" / "debug").mkdir(parents=True)
+        _ = (checkout / "Cargo.toml").write_text("private manifest")
+        roots = cargo_output.CargoOutputRoots(checkout, checkout / "target", checkout / "target")
+        with (mock.patch.object(cargo_output, "read_cargo_output_roots", return_value=roots),
+              mock.patch.object(scratch, "cargo_checkout_peers", return_value=()),
+              mock.patch.object(subprocess, "run", side_effect=AssertionError("external guard was unnecessary"))):
+            scratch.remove_with_cargo_output(checkout, scratch.remove)
+        self.assertFalse(checkout.exists())
+
+    def test_a_test_clone_and_its_build_output_end_with_the_task(self) -> None:
         source = self.base / "source"
         source.mkdir()
         self.git(source, "init", "-q")
+        _ = (source / "asset").write_text("saved source")
+        self.git(source, "add", "asset")
+        self.git(source, "commit", "-qm", "source")
+
+        with mock.patch.object(copies, "initialize_git", wraps=copies.initialize_git) as initialize:
+            checkout = copies.clone(source, "gate:hana-view", "camera")
+        initialize.assert_called_once_with(checkout, source.resolve())
+
+        self.assertTrue(checkout.is_relative_to(self.base / "scratch"))
+        self.assertEqual((checkout / "asset").read_text(), "saved source")
+        self.assertTrue((checkout / ".git").is_dir())
+        self.assertFalse((checkout / scratch.BUSY).exists())
+        record = scratch.task_of(checkout.parent)
+        assert isinstance(record, copy_record.Registered)
+        self.assertEqual(record.task, "gate:hana-view")
+        self.assertEqual(record.fields["source_path"], str(source.resolve()))
+        self.assertIs(record.fields["test_hana_clone"], True)
+        target = checkout / "target"
+        target.mkdir()
+        _ = (target / "build").write_text("disposable build output")
+        self.assertEqual(scratch.end("gate:hana-view"), [checkout.parent])
+        self.assertFalse(checkout.parent.exists())
+        self.assertEqual((source / "asset").read_text(), "saved source")
+        self.assertEqual(scratch.end("gate:hana-view"), [])
+
+    def test_a_failed_clone_still_has_a_task_that_removes_its_partial_files(self) -> None:
+        def interrupted_clone(checkout: Path, source: Path) -> None:
+            self.assertEqual(source, self.base / "source")
+            with scratch.judgment_lock(checkout) as available:
+                self.assertFalse(available)
+            _ = (checkout / "partial").write_text("partial clone")
+            record = scratch.task_of(checkout.parent)
+            assert isinstance(record, copy_record.Registered)
+            self.assertEqual(record.task, "gate:clone-failure")
+            raise copies.CopyError("interrupted clone")
+
+        with mock.patch.object(copies, "initialize_git", side_effect=interrupted_clone):
+            with self.assertRaisesRegex(copies.CopyError, "clone failed"):
+                _ = copies.clone(self.base / "source", "gate:clone-failure")
+        paths = [item.path for item in scratch.folders() if item.task == "gate:clone-failure"]
+        self.assertEqual(len(paths), 1)
+        self.assertTrue((paths[0] / "checkout" / "partial").exists())
+        self.assertEqual(scratch.end("gate:clone-failure"), paths)
+        self.assertFalse(paths[0].exists())
+
+    def test_standing_checkout_creates_a_stamped_cache_the_sweep_accepts(self) -> None:
+        seed = ImmutableGitSeed.create(self.base, "main", "Scratch tests", "scratch@example.invalid",
+                                       {"source.txt": "style source\n"})
         started = time.time()
-        target = style_sync.lint_target(source / ".git")
-        # Supply build output, but let the helper supply every cache marker.
-        fingerprint = target / "debug" / ".fingerprint" / "sample-0123456789abcdef"
-        fingerprint.mkdir(parents=True)
-        _ = (fingerprint / "bin-sample.json").write_text("{}")
-        self.assertFalse((target / sweep.RUSTC_INFO).exists())
-        self.assertTrue(sweep.is_cargo_target(str(target)), "The sweep must accept the helper's cache")
-        self.assertGreaterEqual((target / sweep.USE_STAMP).stat().st_mtime, started)
+        with mock.patch.dict(os.environ, {"HOME": str(self.base)}):
+            with copies.standing("style-unit", seed.checkout, "HEAD") as checkout:
+                target = checkout / "target"
+            # Supply build output, but let copies supply every cache marker.
+            fingerprint = target / "debug" / ".fingerprint" / "sample-0123456789abcdef"
+            fingerprint.mkdir(parents=True)
+            _ = (fingerprint / "bin-sample.json").write_text("{}")
+            self.assertFalse((target / sweep.RUSTC_INFO).exists())
+            self.assertTrue(sweep.is_cargo_target(str(target)), "The sweep must accept the standing cache")
+            self.assertGreaterEqual((target / sweep.USE_STAMP).stat().st_mtime, started)
+
+    def test_exported_busy_descriptors_keep_checkout_locked_in_command(self) -> None:
+        path = self.base / "held-checkout"
+        path.mkdir()
+        descriptors: list[int] = []
+        with scratch.busy_locks(path, create=True, inherited_fds=descriptors) as acquired:
+            self.assertTrue(acquired)
+            self.assertTrue(descriptors)
+            refused: list[int] = []
+            with scratch.busy_locks(path, create=False, inherited_fds=refused) as idle:
+                self.assertFalse(idle)
+                self.assertEqual(refused, [])
+            process = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"],
+                                       stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.PIPE, pass_fds=descriptors)
+        try:
+            with scratch.busy_locks(path, create=False) as idle:
+                self.assertFalse(idle)
+        finally:
+            _, errors = process.communicate(input=b"x", timeout=10)
+        self.assertEqual(process.returncode, 0, errors)
+        with scratch.busy_locks(path, create=False) as idle:
+            self.assertTrue(idle)
+
+    def test_blocking_busy_acquisition_waits_then_takes_released_mark(self) -> None:
+        path = self.base / "held-checkout"
+        path.mkdir()
+        attempted, acquired = Event(), Event()
+
+        def take() -> bool:
+            attempted.set()
+            with scratch.busy_locks(path, create=False, wait=True) as idle:
+                acquired.set()
+                return idle
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            with scratch.busy_locks(path, create=True) as idle:
+                self.assertTrue(idle)
+                future = executor.submit(take)
+                self.assertTrue(attempted.wait(timeout=10))
+                self.assertFalse(acquired.wait(timeout=0.02))
+            self.assertTrue(future.result(timeout=10))
+
+    def test_target_uses_the_loaded_namer_after_import_access_ends(self) -> None:
+        probe = """import builtins, sys
+from scripts.lib import scratch
+original_import = builtins.__import__
+def load(name, *args, **kwargs):
+    if name == 'scripts.lib.build_folders':
+        raise ImportError('helper imports are closed after startup')
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = load
+print(scratch.target('gate:proof', 'tree', False))
+"""
+        result = subprocess.run([sys.executable, "-c", probe], text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(result.stdout.strip()).parent, copy_record.root())
+        self.assertRegex(Path(result.stdout.strip()).name, r"^gate-proof-tree-[a-z0-9]{6}$")
 
     def test_copy_record_with_a_legacy_shared_target_still_loads(self) -> None:
         path = self.copy()
@@ -315,7 +483,7 @@ class ScratchTests(unittest.TestCase):
             self.assertEqual(scratch.end("gate:copy"), [])
         program = ("import fcntl,sys; f=open(sys.argv[1],'a'); fcntl.flock(f,fcntl.LOCK_SH); "
                    "print('ready',flush=True); sys.stdin.read()")
-        process: subprocess.Popen[str] = subprocess.Popen([sys.executable, "-c", program, str(path / ".claude-busy")],
+        process: subprocess.Popen[str] = subprocess.Popen([sys.executable, "-c", program, str(scratch.busy_path(path))],
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         try:
             assert process.stdout is not None
@@ -369,7 +537,7 @@ class ScratchTests(unittest.TestCase):
             self.assertEqual(copy_record.copy_folder(linked), path)
             scratch.register_copy(linked, task="gate:copy", owner_unit="maker-unit", source_path=str(self.base),
                                   source_commit="a", copy_commit="b", target_mode="none", seed_source="", borrows_from="")
-            with scratch.copy_lock(linked), (path / scratch.BUSY).open("r") as probe:
+            with scratch.copy_lock(linked), scratch.busy_path(path).open("r") as probe:
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
@@ -398,8 +566,8 @@ class ScratchTests(unittest.TestCase):
         path = self.copy(task="gate:old")
         snapshot = scratch.folders()
 
-        def transfer() -> list[scratch.Folder]:
-            scratch.hand_over(path, "next-unit", "gate:next")
+        def transfer(*, scratch_settings: conf.ConfigRead) -> list[scratch.Folder]:
+            scratch.hand_over(path, "next-unit", "gate:next", scratch_settings=scratch_settings)
             return snapshot
 
         with mock.patch.object(scratch, "folders", side_effect=transfer):
@@ -497,14 +665,14 @@ class ScratchTests(unittest.TestCase):
         path = self.copy()
         (path / copy_record.RECORD).unlink()
         self.assertIsInstance(scratch.lifetime(path), scratch.Unknown)
-        self.assertFalse((path / scratch.BUSY).exists())
+        self.assertFalse(scratch.busy_path(path).exists())
 
     def test_removal_claims_an_absent_busy_mark_before_a_late_holder_can_start(self) -> None:
         path = self.copy()
-        self.assertFalse((path / scratch.BUSY).exists())
+        self.assertFalse(scratch.busy_path(path).exists())
         with scratch.removal_lock(path) as idle:
             self.assertTrue(idle)
-            with (path / scratch.BUSY).open("a") as late_holder:
+            with scratch.busy_path(path).open("a") as late_holder:
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(late_holder, fcntl.LOCK_SH | fcntl.LOCK_NB)
             scratch.remove_marked(path, scratch.remove)
@@ -514,7 +682,7 @@ class ScratchTests(unittest.TestCase):
         path = self.copy()
 
         def remove_after_late_holder_attempt(folder: Path) -> None:
-            (folder / scratch.BUSY).unlink()
+            scratch.busy_path(folder).unlink()
             with self.assertRaises(scratch.ScratchError):
                 with scratch.copy_lock(folder):
                     self.fail("a holder entered a copy whose removal had started")
@@ -706,16 +874,52 @@ class ScratchTests(unittest.TestCase):
         self.assertIsInstance(record, copy_record.Registered)
         assert isinstance(record, copy_record.Registered)
         task = record.task
-        deadline = scratch.task_end(task, 1_000_000.0 + scratch.DEFAULT_LIFE_SECONDS)
+        deadline = scratch.task_end(task, 1_000_000.0 + conf.read("scratch").whole("default_life_seconds"))
         self.assertIsInstance(deadline, scratch.Ended)
         assert isinstance(deadline, scratch.Ended)
-        self.assertEqual(deadline.at, 1_000_000.0 + scratch.DEFAULT_LIFE_SECONDS - 40)
+        self.assertEqual(deadline.at, 1_000_000.0 + conf.read("scratch").whole("default_life_seconds") - 40)
         self.assertFalse(scratch.ended(task, 1_000_000.0))
-        self.assertTrue(scratch.ended(task, 1_000_000.0 + scratch.DEFAULT_LIFE_SECONDS))
+        self.assertTrue(scratch.ended(task, 1_000_000.0 + conf.read("scratch").whole("default_life_seconds")))
         self.assertFalse(scratch.ended(RUN, 9e12))
         self.assertTrue(scratch.parsed_until("2026-10-28 09:30").startswith("until:2026-10-28T"))
         with self.assertRaises(scratch.ScratchError):
             _ = scratch.parsed_until("tomorrow")
+
+    def test_default_task_lifetime_reads_the_private_config_at_use(self) -> None:
+        with mock.patch.dict(os.environ, config_environment(self.base / "config")):
+            for lifetime in (3600, 7200):
+                with self.subTest(lifetime=lifetime):
+                    _ = write_config_fixture(conf.path("scratch"), f"default_life_seconds={lifetime}\n")
+                    path = scratch.new(now=1_000_020.0)
+                    record = scratch.task_of(path)
+                    self.assertIsInstance(record, copy_record.Registered)
+                    assert isinstance(record, copy_record.Registered)
+                    self.assertFalse(scratch.ended(record.task, 1_000_020.0 + lifetime - 1))
+                    self.assertTrue(scratch.ended(record.task, 1_000_020.0 + lifetime))
+
+    def test_repository_scan_reads_each_setting_once_across_recursive_folders(self) -> None:
+        root = self.base / "repos"
+        repositories = [root / name / "nested" for name in ("first", "second")]
+        for repo in repositories:
+            (repo / ".git").mkdir(parents=True)
+        with (
+            mock.patch.dict(os.environ, config_environment(self.base / "config")),
+            mock.patch("scratch.conf.ConfigRead.whole", side_effect=conf.read("scratch").whole) as whole,
+            mock.patch("scratch.conf.ConfigRead.words", side_effect=conf.read("scratch").words) as words,
+        ):
+            self.assertEqual(scratch.repos(root), repositories)
+        self.assertEqual(whole.call_args_list, [mock.call("repo_depth")])
+        self.assertEqual(words.call_args_list, [mock.call("repo_skip")])
+
+    def test_repository_scan_depth_reads_the_private_config_at_use(self) -> None:
+        root = self.base / "repos"
+        nested = root / "first/second"
+        (nested / ".git").mkdir(parents=True)
+        with mock.patch.dict(os.environ, config_environment(self.base / "config")):
+            _ = write_config_fixture(conf.path("scratch"), "repo_depth=1\n")
+            self.assertEqual(scratch.repos(root), [])
+            _ = write_config_fixture(conf.path("scratch"), "repo_depth=2\n")
+            self.assertEqual(scratch.repos(root), [nested])
 
     def test_a_held_folder_goes_with_its_task_unless_a_repo_in_it_has_unsaved_work(self) -> None:
         saved, unsaved = self.base / "saved", self.base / "unsaved" / "repo"

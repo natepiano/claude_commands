@@ -25,8 +25,7 @@ from scripts.lib.process_failure import failure_detail
 from scripts.agents import codex_mesh
 from scripts.direct import phase_reservation, workers
 from scripts.direct.worker_state import worker_claim_lock, worker_record_path
-from scripts.astra import design_roles
-from scripts.production import staff, worker_admission
+from scripts.production import staff, session_staff, worker_admission
 from scripts.lib import conf, unit_runs
 from scripts.lint import style_review
 from scripts.usage.agents_log import LENSES
@@ -81,7 +80,8 @@ def read_object(path: Path) -> dict[str, object]:
 
 def read_roster(run: Path, name: str) -> dict[str, object]:
     with worker_lifecycle.locked_state(run / "mesh_roster.json", mode=fcntl.LOCK_SH) as state:
-        return object_map(state.read_object().get(name))
+        entry = object_map(state.read_object().get(name))
+        return entry if entry else {}
 
 
 def refuse(message: str) -> NoReturn:
@@ -189,7 +189,6 @@ def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -
         title = identity.group(2).strip() if identity else text(stored_phase.get("title")) or "Assignment"
         _ = call([PYTHON, PROGRESS, "start-phase", "--session-dir", str(run), "--phase-id", phase,
                   "--phase-title", title], env)
-    unit_runs.record_director(run, director)
     return run, phase
 
 
@@ -359,9 +358,9 @@ class Dispatch:
                 if read_object(claim_path).get("pid") == os.getpid():
                     claim_path.unlink(missing_ok=True)
                 record = read_roster(self.run, self.worker)
-                if not record.get("adopted_to") and record.get("thread_id"):
+                if session_staff.worker_session(record):
                     identity = read_object(self.claim.identity_path)
-                    identity["worker_id"] = record["thread_id"]
+                    identity["staff_id"] = record["staff_id"]
                     worker_lifecycle.WorkerStateFile(self.claim.identity_path).publish(json.dumps(identity))
         workers.release_allocation(self.run, self.worker, self.reservation)
         self.capture_style(1)  # An interrupted dispatch never settles an assigned style pass.
@@ -371,17 +370,13 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
     """Port the durable identity, stale-claim, role and compaction checks of worker_record claim."""
     with worker_claim_lock(dispatch.run):
         record = read_roster(dispatch.run, dispatch.worker)
-        if not record or record.get("adopted_to"):
-            refuse(f"{dispatch.worker}: worker is missing or adopted")
+        if not record:
+            refuse(f"{dispatch.worker}: worker is missing")
         identity_path = worker_record_path(dispatch.run, dispatch.worker, dispatch.worker, role=dispatch.role)
         identity = read_object(identity_path)
         slot = text(identity.get("slot")) or dispatch.worker
         model = text(identity.get("model")) or dispatch.model
-        expected = {"name": dispatch.worker, "slot": slot, "family": dispatch.family,
-                    "model": model, "worker_id": record.get("thread_id")}
-        _ = identity.pop("role", None)
-        if (identity and identity != expected) or not record.get("thread_id"):
-            refuse(f"{dispatch.worker} has no matching durable worker identity for slot {slot}")
+        expected = {"staff_id": record.get("staff_id"), "slot": slot, "model": model}
         if not identity:
             worker_lifecycle.WorkerStateFile(identity_path).publish(json.dumps(expected))
         claim_path = dispatch.run / f"impl_claim_{slot}.json"
@@ -407,9 +402,6 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
                 else:
                     refuse(f"{dispatch.worker} is already implementing")
             _ = status_path.write_text("error\n")
-        if record.get("transferring_role") or record.get("role_redirect") or design_roles.transfer_route(
-                text(record.get("thread_id")), text(record.get("held_design_id"))):
-            refuse(f"{dispatch.worker}: TransferringRole; use its destination holder")
         if record.get("held_design_id"):
             refuse(f"{dispatch.worker}: held roles resume through design_roles.py")
         try:
@@ -469,7 +461,7 @@ def record_review(dispatch: Dispatch, completed: bool, summary: Path) -> None:
         "arm": "own", "pool": store.path.parent.name, "unit": store.path.stem,
         "phase": dispatch.phase, "phase_instance_id": phase.get("instance_id", ""),
         "history_file": state.get("history_file", ""), "reviewer": dispatch.worker,
-        "thread_id": record.get("thread_id", ""), "lens": dispatch.args.lens,
+        "thread_id": session_staff.worker_session(record), "lens": dispatch.args.lens,
         "kind": "ux" if dispatch.args.lens == "ux" else "broad" if dispatch.args.pass_number == 1 and dispatch.args.lens else "closure",
         "pass": dispatch.args.pass_number, "started_at": int(dispatch.started_at),
         "finished_at": time.time(), "status": "reviewed" if completed else "error",
@@ -491,17 +483,9 @@ def record_review(dispatch: Dispatch, completed: bool, summary: Path) -> None:
 def settle_dispatch(dispatch: Dispatch, code: int, completed: bool, shown: str,
                     status: Path, summary: Path, reply: Path) -> int:
     """Completed work wins; otherwise ownership loss precedes refusal or failure."""
-    record = read_roster(dispatch.run, dispatch.worker)
     if dispatch.args.early_ready:
         lens_suffix = f"_{dispatch.args.lens}" if dispatch.args.lens else ""
         _ = (status.parent / f"review_status{lens_suffix}").write_text("reviewed\n" if completed else "error\n")
-    if not completed and record.get("adopted_to"):
-        destination = text(record["adopted_to"])
-        _ = status.write_text("handed_off\n")
-        record_review(dispatch, False, summary)
-        _ = summary.write_text(f"{shown}: handed off to {destination}; completion unknown\n")
-        print(f"handed off: {dispatch.worker} to {destination}; completion unknown")
-        return 4
     if not completed and code == 0:
         print("assign.sh: Stage 2 was not submitted by this launcher; review incomplete", file=sys.stderr)
         code = 1
@@ -604,14 +588,11 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
         needs_follow = False
         try:
             with worker_claim_lock(dispatch.run):
-                record = read_roster(dispatch.run, dispatch.worker)
-                if record.get("adopted_to"):
-                    code = 2
-                elif dispatch.stage_errors:
+                if dispatch.stage_errors:
                     print("assign.sh: " + dispatch.stage_errors[0], file=sys.stderr)
                     code = 1
                 else:
-                    pending_path = dispatch.run / f"{dispatch.worker}.pending.json"
+                    pending_path = session_staff.worker_inbox_path(dispatch.run, dispatch.worker)
                     with worker_lifecycle.locked_state(pending_path, mode=fcntl.LOCK_SH) as inbox:
                         pending = inbox.read_object()
                     needs_follow = dispatch.stage_message in cast(list[object], pending.get("messages", []))
@@ -663,7 +644,9 @@ def main() -> int:
              "--phase-id", phase, "--prompt-file", str(prompt), "--fix-cause", args.fix_cause]
     if args.lens:
         check += ["--lens", args.lens]
-    _ = call(check, env)
+    checked = call(check, env, check=False)
+    if checked.returncode:
+        return 3 if checked.returncode == 3 else 2
     family, model, effort, tier = resolve_model(args, role, env)
     worker = args.to
     reservation: dict[str, object] = {}

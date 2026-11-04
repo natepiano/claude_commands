@@ -5,7 +5,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 import re
 from typing import Literal, NotRequired, TypedDict
-from scripts.lib.terminal_cells import terminal_width as terminal_width
+from scripts.lib.terminal_cells import terminal_width
 
 Tone = Literal["default", "success", "error", "warning", "inactive", "suggestion"]
 
@@ -36,16 +36,12 @@ class QueueLines(TypedDict):
     lines: list[list[JsonSpan]]
 
 
+def field(text: str) -> str:
+    return " ".join(text.split())
+
+
 def age(since: float, now: float) -> int:
     return max(0, int((now - since) // 60))
-
-
-def pad_left(text: str, cells: int) -> str:
-    return " " * max(0, cells - terminal_width(text)) + text
-
-
-def pad_right(text: str, cells: int) -> str:
-    return text + " " * max(0, cells - terminal_width(text))
 
 
 def cut_tail(text: str, cells: int) -> str:

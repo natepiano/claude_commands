@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import io
 import os
+from contextlib import redirect_stderr
 from pathlib import Path
 import subprocess
 import sys
@@ -18,6 +20,46 @@ if TYPE_CHECKING:
 
 
 class FileOnlyLabelTests(unittest.TestCase):
+    def test_docless_holder_labels_stay_silent_across_repeated_reads(self) -> None:
+        from scripts.message import unit_labels
+        from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+
+        with tempfile.TemporaryDirectory() as directory, isolated_staff_file(Path(directory) / "staff.json", {}):
+            owner = fixture_member("showrunner", name="docless")
+            record: SessionRecord = {
+                "pid": 123, "sessionId": owner.current_session, "name": "recorded-holder",
+                "messagingSocketPath": "", "updatedAt": 1, "tmux": "", "formerNames": [],
+            }
+            errors = io.StringIO()
+            with (mock.patch.object(unit_labels, "newest_sessions", return_value=[record]),
+                  redirect_stderr(errors)):
+                for _ in range(2):
+                    self.assertEqual(unit_labels.unit_labels_for([owner.current_session], {}), {
+                        owner.current_session: unit_labels.UnitLabels("recorded-holder"),
+                    })
+            self.assertEqual(errors.getvalue(), "")
+
+    def test_recorded_fact_anomalies_are_deduplicated_across_readers(self) -> None:
+        from scripts.message import unit_labels
+        from scripts.production import session_staff
+        from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+
+        with tempfile.TemporaryDirectory() as directory, isolated_staff_file(Path(directory) / "staff.json", {}):
+            owner = fixture_member("showrunner", name="docless")
+            child = fixture_member("unit", name="child", parent=owner.id)
+            record = staff.snapshot()
+            self.assertEqual(record, staff.initial_snapshot())
+            self.assertEqual(record.inputs, (str(Path(directory) / "staff.json"),))
+            resolver = session_staff.RowResolver(record)
+            diagnostics = unit_labels.StaffDiagnostics()
+            for _ in range(2):
+                self.assertEqual(unit_labels.registered_showrunners(diagnostics, known_sessions={}, resolver=resolver), [])
+                self.assertEqual(unit_labels.production_places([], set(), diagnostics, record=record, resolver=resolver), {})
+        self.assertEqual(diagnostics.problems, [])
+        self.assertEqual(diagnostics.warnings, ["docless: the production document is not recorded",
+                                               "child: the production document is not recorded"])
+        self.assertEqual(diagnostics.excluded_sessions, {owner.current_session, child.current_session})
+
     def test_failed_discovery_keeps_healthy_rows_and_reports_each_problem_once(self) -> None:
         from scripts.message import unit_labels
         from scripts.production import fake_showrunner, session_staff, showrunners
@@ -29,10 +71,10 @@ class FileOnlyLabelTests(unittest.TestCase):
             doc = root / "healthy-production.md"
             _ = doc.write_text("# Healthy production\n")
             identity = staff.StaffId(fixture_runtime_id("healthy-owner"))
-            healthy_owner = staff.StaffRow(identity, "showrunner", "healthy-owner", None,
+            healthy_owner = staff.StaffRow(identity, "showrunner", "healthy-owner", staff.StaffRoot(),
                                            current_session=identity, doc=staff.LiveDoc("natedev", doc))
             missing_id = staff.StaffId(fixture_runtime_id("missing-owner"))
-            missing = staff.StaffRow(missing_id, "showrunner", "missing-owner", None,
+            missing = staff.StaffRow(missing_id, "showrunner", "missing-owner", staff.StaffRoot(),
                                      current_session=missing_id,
                                      doc=staff.LiveDoc("natedev", root / "missing-production.md"))
             _ = fake_showrunner.write_timer(root, "healthy-alias", identity, "UTC", doc)
@@ -47,7 +89,7 @@ class FileOnlyLabelTests(unittest.TestCase):
             with (mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", root),
                   mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}),
                   mock.patch.object(remote, "local_machine", return_value="natedev")):
-                rows = unit_labels.registered_showrunners(problems,
+                rows = unit_labels.registered_showrunners(unit_labels.StaffDiagnostics(problems),
                                                          known_sessions={identity: record}, resolver=resolver)
             self.assertEqual(rows, [healthy])
             self.assertEqual(len(problems), 1, problems)
@@ -67,10 +109,10 @@ class FileOnlyLabelTests(unittest.TestCase):
                 document = root / f"{name}.md"
                 _ = document.write_text("# Production\n")
                 owner_id = staff.StaffId(fixture_runtime_id(name + "-owner"))
-                rows.append(staff.StaffRow(owner_id, "showrunner", name + "-owner", None,
+                rows.append(staff.StaffRow(owner_id, "showrunner", name + "-owner", staff.StaffRoot(),
                                           current_session=owner_id, doc=staff.LiveDoc("natedev", document)))
                 unit_id = staff.StaffId(fixture_runtime_id(name + "-unit"))
-                rows.append(staff.StaffRow(unit_id, "unit", name, owner_id, current_session=unit_id,
+                rows.append(staff.StaffRow(unit_id, "unit", name, staff.ReportsTo(owner_id), current_session=unit_id,
                                           worktree=staff.PresentWorktree("natedev", root / name)))
             snapshot = staff.StaffSnapshot(tuple(rows))
 
@@ -87,10 +129,10 @@ class FileOnlyLabelTests(unittest.TestCase):
                         problems: list[str] = []
                         resolver = session_staff.RowResolver(snapshot)
                         if reader == "registrations":
-                            registered = unit_labels.registered_showrunners(problems, known_sessions={}, resolver=resolver)
+                            registered = unit_labels.registered_showrunners(unit_labels.StaffDiagnostics(problems), known_sessions={}, resolver=resolver)
                             self.assertEqual([row["slug"] for row in registered], ["healthy-alias"])
                         else:
-                            places = unit_labels.production_places([], set(), problems, record=snapshot, resolver=resolver)
+                            places = unit_labels.production_places([], set(), unit_labels.StaffDiagnostics(problems), record=snapshot, resolver=resolver)
                             self.assertEqual(set(places), {rows[3].current_session})
                             self.assertEqual(places[rows[3].current_session].director, unit_labels.DirectsUnit("healthy"))
                         self.assertEqual(len(problems), 1, problems)
@@ -111,10 +153,10 @@ class FileOnlyLabelTests(unittest.TestCase):
                 document = root / f"{name}.md"
                 _ = document.write_text("# Production\n")
                 owner_id = staff.StaffId(fixture_runtime_id(name + "-owner"))
-                rows.append(staff.StaffRow(owner_id, "showrunner", name + "-owner", None,
+                rows.append(staff.StaffRow(owner_id, "showrunner", name + "-owner", staff.StaffRoot(),
                                           current_session=owner_id, doc=staff.LiveDoc("natedev", document)))
                 unit_id = staff.StaffId(fixture_runtime_id(name + "-unit"))
-                rows.append(staff.StaffRow(unit_id, "unit", name, owner_id, current_session=unit_id,
+                rows.append(staff.StaffRow(unit_id, "unit", name, staff.ReportsTo(owner_id), current_session=unit_id,
                                           worktree=staff.PresentWorktree("natedev", root / name)))
                 _ = fake_showrunner.write_timer(timers, name + "-alias", owner_id, "UTC", document)
             unreadable = timers / "showrunner-broken-alias/conf"
@@ -129,10 +171,10 @@ class FileOnlyLabelTests(unittest.TestCase):
                         problems: list[str] = []
                         resolver = session_staff.RowResolver(snapshot)
                         if reader == "registrations":
-                            registered = unit_labels.registered_showrunners(problems, known_sessions={}, resolver=resolver)
+                            registered = unit_labels.registered_showrunners(unit_labels.StaffDiagnostics(problems), known_sessions={}, resolver=resolver)
                             self.assertIn("healthy-alias", [row["slug"] for row in registered])
                         else:
-                            places = unit_labels.production_places([], set(), problems, record=snapshot, resolver=resolver)
+                            places = unit_labels.production_places([], set(), unit_labels.StaffDiagnostics(problems), record=snapshot, resolver=resolver)
                             self.assertIn(rows[3].current_session, places)
                             self.assertEqual(places[rows[3].current_session].director, unit_labels.DirectsUnit("healthy"))
                         self.assertEqual(len(problems), 1, problems)
@@ -154,16 +196,16 @@ class FileOnlyLabelTests(unittest.TestCase):
                 owner_id = staff.StaffId(fixture_runtime_id(name + "-owner"))
                 document_state = (staff.WrappedDoc("natedev", document) if name == "wrapped"
                                   else staff.LiveDoc("natedev", document))
-                rows.append(staff.StaffRow(owner_id, "showrunner", name, None,
+                rows.append(staff.StaffRow(owner_id, "showrunner", name, staff.StaffRoot(),
                                           current_session=owner_id, doc=document_state))
                 unit_id = staff.StaffId(fixture_runtime_id(name + "-unit"))
-                rows.append(staff.StaffRow(unit_id, "unit", name + "-child", owner_id, current_session=unit_id,
+                rows.append(staff.StaffRow(unit_id, "unit", name + "-child", staff.ReportsTo(owner_id), current_session=unit_id,
                                           worktree=staff.PresentWorktree("natedev", root / name)))
             snapshot = staff.StaffSnapshot(tuple(rows))
             problems: list[str] = []
             with (mock.patch.object(showrunners, "timer_for", return_value=showrunners.NoTimer("private fixture")),
                   mock.patch.object(remote, "local_machine", return_value="natedev")):
-                places = unit_labels.production_places([], set(), problems, record=snapshot,
+                places = unit_labels.production_places([], set(), unit_labels.StaffDiagnostics(problems), record=snapshot,
                                                        resolver=session_staff.RowResolver(snapshot))
             self.assertEqual(set(places), {rows[3].current_session})
             self.assertEqual(places[rows[3].current_session].director, unit_labels.DirectsUnit("healthy-child"))

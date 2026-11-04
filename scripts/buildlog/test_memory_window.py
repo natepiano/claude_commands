@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,7 @@ else:
 
 import index
 import memory
+from cargo_output import CargoOutputRoots
 from cgroup_test_support import CPU, GIB, IO_LINES, slice_reading, write_cgroup
 import store
 from test_index import Record, call, encode, point_root_at, sample, step
@@ -140,6 +142,13 @@ class MemoryWindowTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_bytes(b"".join(encode(record) for record in records))
 
+    def index_output_roots(self, *roots: Path) -> None:
+        self.write(store.root() / "natedev" / "output-roots.jsonl", *(
+            step(f"output-root-{number}", target_directory=str(root), build_directory=str(root), cwd="", worktree="")
+            for number, root in enumerate(roots)
+        ))
+        _ = index.update()
+
     def stub_journal(self, *, early: list[Record] | None = None,
                      kernel: list[Record] | None = None, exit_code: int = 0) -> None:
         default_early = journal_entry(datetime.fromisoformat("2026-10-05T06:59:00+00:00"),
@@ -169,6 +178,7 @@ class MemoryWindowTests(unittest.TestCase):
             return memory.earlyoom_kills(datetime.fromisoformat(START_UTC), datetime.fromisoformat(END_UTC))
 
     def test_earlyoom_reader_classifies_gate_target_programs_and_other_kills(self) -> None:
+        self.index_output_roots(Path("/work/hana/target"))
         at = datetime.fromisoformat(START_UTC)
         messages = [
             earlyoom_message(101, cmdline="/usr/bin/rustc --crate-name hana"),
@@ -211,6 +221,7 @@ class MemoryWindowTests(unittest.TestCase):
         self.assertEqual((self.base / "journal-args.jsonl").read_bytes(), before)
 
     def test_target_program_with_unquoted_apostrophe_arguments_is_a_build_kill(self) -> None:
+        self.index_output_roots(Path("/work/hana/target"))
         at = datetime.fromisoformat(START_UTC)
         self.stub_journal(early=[journal_entry(at, earlyoom_message(
             105, adj=200, cmdline="/work/hana/target/debug/deps/test-abc --case O'Reilly"))], kernel=[])
@@ -221,6 +232,29 @@ class MemoryWindowTests(unittest.TestCase):
         self.assertTrue(kills[0].is_build)
         self.assertTrue(kills[0].outside_build_gate)
         self.assertEqual(kills[0].cmdline, "/work/hana/target/debug/deps/test-abc --case O'Reilly")
+
+    def test_kill_classification_reads_index_and_metadata_once_for_the_process(self) -> None:
+        indexed = self.base / "indexed-output"
+        self.index_output_roots(indexed)
+        _ = (self.base / "Cargo.toml").write_text("[workspace]\n")
+        outputs = CargoOutputRoots(self.base, self.base / "artifacts", self.base / "intermediates")
+        at = datetime.fromisoformat(START_UTC)
+        self.stub_journal(early=[journal_entry(at, earlyoom_message(pid, adj=200, cmdline=str(program)))
+            for pid, program in enumerate((indexed / "app", outputs.build_directory / "test",
+                                           self.base / "target/unrelated"), start=100)], kernel=[])
+        with (
+            patch.object(Path, "cwd", return_value=self.base),
+            patch.object(memory, "read_cargo_output_roots", return_value=outputs) as metadata,
+            patch.object(sqlite3, "connect", wraps=sqlite3.connect) as connections,
+        ):
+            for _ in range(2):
+                kills = self.earlyoom()
+                if not isinstance(kills, list):
+                    self.fail("the fixture journal was unavailable")
+                self.assertEqual([kill.is_build for kill in kills], [True, True, False])
+                self.assertEqual([kill.outside_build_gate for kill in kills], [True, True, False])
+            self.assertEqual(metadata.call_count, 1)
+            self.assertEqual(connections.call_count, 1)
 
     def test_snapshot_cli_prints_and_appends_exactly_one_record_from_fake_cgroups(self) -> None:
         builds = self.base / "builds.slice"
@@ -261,7 +295,7 @@ class MemoryWindowTests(unittest.TestCase):
         files = list(self.root.glob("*/*.jsonl"))
         self.assertEqual(len(files), 1)
         self.assertEqual([json.loads(line) for line in files[0].read_text().splitlines()], [recorded])
-        self.assertFalse((self.root / "index.sqlite").exists())
+        self.assertFalse(index.index_path_in(self.root).exists())
 
     def test_missing_or_unreadable_slice_pressure_has_named_unavailable_state(self) -> None:
         builds = self.base / "builds.slice"
@@ -296,7 +330,7 @@ class MemoryWindowTests(unittest.TestCase):
         row = next(line for line in result.stdout.splitlines() if "2026-10-02 05:00 -0700" in line)
         self.assertIn("12.0 (1)", row)
         self.assertIn("3.0 (1)", row)
-        self.assertTrue((self.root / "index.sqlite").is_file())
+        self.assertTrue(index.index_path_in(self.root).is_file())
 
     def test_slice_capture_keeps_whole_charge_components_and_stacked_devices_separate(self) -> None:
         builds = self.base / "builds.slice"

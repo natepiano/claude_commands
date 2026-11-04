@@ -11,7 +11,7 @@ from scripts.lib import conf
 from scripts.production import change_routing, staff
 import proposals_folder
 import proposals_table
-from production_units import Refusal, production_field
+from scripts.production.production_doc import Refusal, production_field
 
 if TYPE_CHECKING:
     from update_registration import QuestionStaff
@@ -97,11 +97,11 @@ def read_counts(doc: Path, *, questions: int = 0, record: staff.StaffSnapshot | 
 
 
 def routing_sources(record: staff.StaffSnapshot | None = None) -> list[Path]:
-    """Watch staff, all review lists, and delivery records for tab count changes."""
+    """Watch configuration, staff, review lists, and delivery records for count changes."""
     root = change_routing.review_root()
     record = record if record is not None else staff.snapshot()
     lists = change_review.lists_directory()
-    return [conf.path("change_review"), lists, *lists.glob(change_review.PREFIX + "*.md"),
+    return [conf.path("change_review"), conf.path("review_links"), lists, *lists.glob(change_review.PREFIX + "*.md"),
             *(Path(path) for path in record.inputs), root, *root.glob(".review-link-delivery-*")]
 
 

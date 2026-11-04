@@ -21,6 +21,8 @@ from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader
 from scripts.agents import codex_mesh
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 from scripts.whoami import agent_accounts
 
 send_role_map_command = role_map.ssh_role_map
@@ -101,6 +103,18 @@ class RoleMapTests(unittest.TestCase):
             self.assertIsInstance(role_map.read_role_map().workers_claude, role_map.DefaultWorkersClaudeAccount)
         server_config = self.server_home / ".claude/config/accounts.json"
         self.assertNotIn("workers_claude", cast(dict[str, object], json.loads(server_config.read_text())))
+
+    def test_stale_transition_metadata_reports_anomalies_and_keeps_the_account(self) -> None:
+        for change in ({"move_id": None}, {"reset": "old"}, {"why": 1}):
+            with self.subTest(change=change):
+                output = io.StringIO()
+                selected = {"label": "claude2", "move_id": "move", "cause": "by hand", "window": "unknown"}
+                text = json.dumps({"groups": {"units": {**selected, **change}}, "workers": "codex1"})
+                with redirect_stderr(output):
+                    result = role_map.decode_role_map(text)
+                self.assertEqual(result.groups.get("units"), "claude2" if "move_id" in change else selected)
+                self.assertEqual(len(output.getvalue().splitlines()), 1)
+                self.assertIn("anomaly:", output.getvalue())
 
     def test_workers_launch_refuses_an_unreadable_map_without_a_cache(self) -> None:
         self.seed(self.home, groups={})
@@ -710,12 +724,16 @@ class RoleMapTests(unittest.TestCase):
         prompt = run / "prompt.txt"
         _ = prompt.write_text("Scratch worker task")
         output, error = io.StringIO(), io.StringIO()
-        with (patch.object(role_map, "ssh_role_map", side_effect=self.remote),
+        with (isolated_staff_file(self.home / "staff.json", {}),
+              patch.object(role_map, "ssh_role_map", side_effect=self.remote),
               patch.object(codex_mesh, "_start_server") as start,
               redirect_stdout(output), redirect_stderr(error)):
-            code = codex_mesh.main(["start", "--session-dir", str(run), "--name", "scratch-test",
-                "--role", "test", "--cwd", str(run), "--prompt-file", str(prompt),
-                "--summary-file", str(run / "summary.txt"), "--log-file", str(run / "mesh.log")])
+            owner = unit_membership("fixture", "scratch")
+            _ = staff.set_worktree(owner.id, staff.PresentWorktree("mac", run), expected=owner.worktree)
+            with patch.dict(os.environ, {"CODEX_THREAD_ID": owner.current_session}):
+                code = codex_mesh.main(["start", "--session-dir", str(run), "--name", "scratch-test",
+                    "--role", "test", "--prompt-file", str(prompt),
+                    "--summary-file", str(run / "summary.txt"), "--log-file", str(run / "mesh.log")])
         self.assertEqual((code, output.getvalue(), error.getvalue()), (1, "",
             "accounts: workers is on codex1, which is not set up on this machine; run accounts.py setup codex1\n"))
         start.assert_not_called()

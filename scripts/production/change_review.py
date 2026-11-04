@@ -13,7 +13,6 @@
     change_review.py list-path [--production DOC]
     change_review.py showrunner [--production DOC]
     change_review.py backfill-production [--list L] [--write]
-    change_review.py backfill-producer [--list L] [--write]
 
 A checkpoint(...) commit tells a person with no context what changed, how to try it and what they
 see, one line each: `Change-Review: <what changed for you> | <how to try it: where and what to type> |
@@ -34,8 +33,8 @@ date, and removes the row's scratch folders and held folders (task `row:<showrun
 scripts/lib/scratch.py) whichever way the verdict goes; `add --hold <folder>` holds a folder the user
 checks the row in, where it is, until that verdict; `mark-important` marks a row the user called important.
 
-Each row's Production cell names the production whose change it is: the production whose Units
-table names the branch of the checkpoint that carries the row's line (`publication_changes`), else the
+Each row's Production cell names the production whose change it is: the production with a unit staff
+row on the branch of the checkpoint that carries the row's line (`publication_changes`), else the
 merging one. `backfill-production` fills the empty cells of older rows under To review, in the list
 --list names or in every list, from the row's merge hash: the checkpoint that names the row's
 change, else the one production of every checkpoint the merge brought in. It prints each cell it
@@ -88,9 +87,9 @@ from user_zone import user_zone  # noqa: E402
 # The merge gate imports this module as scripts.production.change_review; its siblings still resolve.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import issues  # noqa: E402
-from production_units import Refusal, cell_value, production_field, unit_table  # noqa: E402
 from proposals_folder import owner_docs, scope_docs, slug_of  # noqa: E402
-from scripts.production import change_routing, staff, staff_sources, unit_lookup
+from scripts.production import change_routing, session_staff, staff, unit_config, unit_lookup, unit_names
+from scripts.production.production_doc import Refusal, production_field
 from scripts.shutdown import remote
 
 TRAILER = "Change-Review"
@@ -882,52 +881,43 @@ class UnitSource:
 
 
 def unit_branches(docs: Iterable[Path]) -> dict[str, UnitSource]:
-    """Resolve exact Branch names before Plan, Unit, and worktree aliases."""
+    """Resolve exact branch names before plan, unit and folder aliases."""
     try:
         record = staff.snapshot()
     except staff.StaffUnreadable as error:
         print(f"change review: {error}", file=sys.stderr)
         record = staff.StaffSnapshot(())
-    return _unit_branches(docs, record, unit_lookup.member_sources())
+    return _unit_branches(docs, record)
 
 
-def _unit_branches(docs: Iterable[Path], record: staff.StaffSnapshot,
-                   sources: unit_lookup.MemberSources) -> dict[str, UnitSource]:
-    """Resolve branch names and aliases with one staff context."""
+def _unit_branches(docs: Iterable[Path], record: staff.StaffSnapshot) -> dict[str, UnitSource]:
+    """Resolve branch names and aliases from the unit staff rows of each document."""
     found: dict[str, UnitSource] = {}
     aliases: list[tuple[UnitSource, tuple[str, ...]]] = []
+    resolver = session_staff.RowResolver(record)
+    machine = remote.local_machine()
     for doc in docs:
         try:
-            rows = unit_table(doc.read_text(encoding="utf-8").splitlines())
-        except (Refusal, OSError) as error:
-            print(f"change review: {doc}: {error}", file=sys.stderr)
+            rows = unit_lookup.doc_units(doc, record)
+        except staff.StaffUnreadable as error:
+            print(f"change review: {error}", file=sys.stderr)
             continue
-        worktrees: dict[str, Path] = {}
-        producers: dict[str, staff.StaffId] = {}
-        try:
-            slug = unit_lookup.production_slug_for_document(doc, record, sources)
-        except (staff.StaffUnreadable, staff.StaffRefused) as error:
-            print(f"change review: {doc}: {error}", file=sys.stderr)
-        else:
-            for row in rows:
-                unit = cell_value(row.get("Unit", ""))
-                try:
-                    selected = sources.member(staff_sources.UnitMember(slug, unit), record)
-                    if isinstance(selected, staff_sources.MemberFound):
-                        producers[unit] = selected.row.id
-                    worktrees[unit] = unit_lookup.plan_worktree(row, selected)
-                except (staff.StaffUnreadable, staff.StaffRefused) as error:
-                    print(f"change review: {unit}: {error}", file=sys.stderr)
         for row in rows:
-            unit = cell_value(row.get("Unit", ""))
-            worktree = worktrees.get(unit, MissingUnitWorktree())
-            source = UnitSource(doc, worktree, unit, producers.get(unit, UnknownProducer()))
-            branch = cell_value(row.get("Branch", ""))
-            if branch:
-                _ = found.setdefault(branch, source)
-            names = (Path(cell_value(row.get("Plan", ""))).stem, source.name,
-                     worktree.name if isinstance(worktree, Path) else "")
-            aliases.append((source, names))
+            tree = row.worktree
+            worktree = (tree.path if isinstance(tree, staff.PresentWorktree) and tree.machine == machine
+                        else MissingUnitWorktree())
+            source = UnitSource(doc, worktree, unit_names.unit_id(row.name), row.id)
+            branch = resolver.unit_branch(row)
+            if isinstance(branch, session_staff.Branch):
+                _ = found.setdefault(branch.name, source)
+            try:
+                config = resolver.unit_config(row)
+            except unit_config.ConfigRefused as error:
+                print(f"change review: {source.name}: {error}", file=sys.stderr)
+                config = unit_config.ConfigMissing(str(error))
+            plan = (config.plan.path.stem if isinstance(config, unit_config.UnitConfig)
+                    and isinstance(config.plan, unit_config.PlanFile) else "")
+            aliases.append((source, (plan, source.name, worktree.name if isinstance(worktree, Path) else "")))
     for source, names in aliases:
         for name in names:
             if name:
@@ -972,8 +962,7 @@ def producer_at(directory: Path) -> staff.StaffId | UnknownProducer:
 def publication_changes(commits: list[Commit], production: Path) -> list[PublicationChange]:
     """Resolve each visible change's unit and producer in one pass."""
     record = staff.snapshot()
-    sources = unit_lookup.member_sources()
-    branches = _unit_branches(owner_docs(production), record, sources)
+    branches = _unit_branches(owner_docs(production), record)
     machine = remote.local_machine()
     changes: list[PublicationChange] = []
     noted: set[UnitSource | str] = set()
@@ -1616,14 +1605,6 @@ def _run(options: CommandLine) -> int:
             print(production_list(options.production))
         case "showrunner":
             print(showrunner_of(production_doc(options.production)))
-        case "backfill-producer":
-            from importlib import import_module
-
-            documents, lists = _backfill_targets(options)
-            # Load the one-time backfill only for this action.
-            run_lists = cast(Callable[[list[Path], list[Path], staff.StaffSnapshot, bool], int],
-                             import_module("scripts.production.producer_backfill").run_lists)
-            return run_lists(lists, documents, staff.snapshot(), options.write)
         case "backfill-production":
             docs, lists = _backfill_targets(options)
             for path in lists:
@@ -1661,7 +1642,7 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     _ = parser.add_argument("action", choices=("check", "append", "drift", "add", "edit", "show", "verdict",
                                                    "mark-important", "set-kind", "list-path", "showrunner",
-                                                   "backfill-production", "backfill-producer"))
+                                                   "backfill-production"))
     _ = parser.add_argument("--repo", default=".")
     for name in ("checkpoint", "previous", "merge-branch", "list", "merged", "since", "change", "check", "see",
                  "row", "verdict", "production", "urgency", "due", "after", "kind"):

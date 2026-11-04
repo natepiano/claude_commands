@@ -18,8 +18,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from production_units import read_production
-from production_units import Refusal
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production.production_doc import Refusal, read_production  # noqa: E402
 
 STATE_DIR = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
 BACKUPS = "log-backups"

@@ -40,6 +40,14 @@ if TYPE_CHECKING:
 else:
     from scripts.lib import test_hang_guard
 
+SHIPPED_STATUS = "\n".join((
+    "mac: free",
+    "natedev: free",
+    "aws: unavailable; evidence unavailable; month unavailable / $400.00",
+    "  spending unavailable; decision unavailable; no controller evidence; a priced resource inventory is required before spending",
+    "",
+))
+
 REAL_SUBPROCESS_RUN = subprocess.run
 REAL_SUBPROCESS_POPEN = subprocess.Popen
 REAL_PROCESS_START_TIME = build_hold.process_start_time
@@ -72,10 +80,6 @@ class IsolatedBuildTargetTest(IsolatedTargetTest):
     @override
     def setUp(self) -> None:
         super().setUp()
-        folder = self.root / ".claude/config"
-        folder.mkdir(parents=True, exist_ok=True)
-        _ = (folder / "build_targets.conf").write_text(SHIPPED_CONFIG.read_text())
-        _ = (folder / "mac_test.conf").write_text(self.settings.read_text())
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILDLOG_DIR": str(self.root / "buildlog"),
         })))
@@ -354,7 +358,7 @@ class StatusTests(IsolatedBuildTargetTest):
     def test_shipped_config_prints_one_line_per_target_without_probe(self) -> None:
         with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(SHIPPED_CONFIG).parent)}):
             with mock.patch.object(build_targets, "probe_target", side_effect=AssertionError("Probe not requested")):
-                self.assertEqual(self.capture_status(), (0, "mac: free\nnatedev: free\n", ""))
+                self.assertEqual(self.capture_status(), (0, SHIPPED_STATUS, ""))
 
     def test_command_uses_config_order_and_recorded_hold(self) -> None:
         config = self.write_config(
@@ -388,9 +392,11 @@ class StatusTests(IsolatedBuildTargetTest):
         self.assertEqual(output.getvalue(), (
             "mac: unreachable — ssh timed out\n"
             "natedev: held by hana since 13:05 PDT — render checks\n"
+            "aws: unreachable — ssh timed out\n"
         ))
         self.assertEqual(errors.getvalue(), "")
-        self.assertEqual(probed, [targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf"))])
+        self.assertEqual(probed, [targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf")),
+                                  targets.SshTarget("aws", "linux", SHIPPED_CONFIG.with_name("aws_target.conf"))])
 
     def test_status_argument_defaults_to_recorded_state(self) -> None:
         output = io.StringIO()
@@ -400,7 +406,7 @@ class StatusTests(IsolatedBuildTargetTest):
                 with mock.patch.object(sys, "argv", ["build_targets.py", "status"]):
                     with redirect_stdout(output), redirect_stderr(errors):
                         code = build_targets.main()
-        self.assertEqual((code, output.getvalue(), errors.getvalue()), (0, "mac: free\nnatedev: free\n", ""))
+        self.assertEqual((code, output.getvalue(), errors.getvalue()), (0, SHIPPED_STATUS, ""))
 
     def test_failed_mac_probe_becomes_unreachable_status(self) -> None:
         calls: list[str] = []
@@ -549,12 +555,44 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         self.assertEqual(self.kind_answer("test", "portable"), "mac_allowed\n")
         self.assertEqual(self.kind_answer("test", "linux-part"), "natedev_only linux_only\n")
 
-    def test_off_backoff_and_disk_floor_refuse_mac_steps(self) -> None:
+    def test_temporary_refusals_keep_mac_retries_and_off_refuses_mac_steps(self) -> None:
         self.assertEqual(self.kind_answer("check", free_gib=59), "natedev_only disk\n")
         offload.write_backoff(time.time() + 60)
-        self.assertEqual(self.kind_answer("doc"), "natedev_only backoff\n")
+        self.assertEqual(self.kind_answer("doc"), "mac_allowed\n")
         _ = write_config_fixture(self.settings, "offload=off\nlinux_only.hana=\n", template="mac_test")
         self.assertEqual(self.kind_answer("lint"), "natedev_only off\n")
+
+    def test_temporary_mac_exclusions_keep_the_leave_route_available(self) -> None:
+        target = targets.SshTarget("mac", "macos", self.settings)
+        for reason in ("busy", "blocked", "disk", "backoff", "unreachable", "state", "copy", "mac_busy",
+                       "spending_limit", "spending_unavailable",
+                       "state unreadable: temporary read failure"):
+            with self.subTest(reason=reason), mock.patch.object(
+                build_targets, "ssh_target_eligibility", return_value=targets.ExcludedTarget(target, reason),
+            ):
+                decision = "natedev_only disk" if reason == "disk" else "mac_allowed"
+                self.assertEqual(self.kind_output("test", "portable"),
+                                 decision + "\nmac\texcluded\t" + reason + f"\t{self.settings}\n"
+                                 + "natedev\teligible\t-\t-\n")
+
+    def test_disk_decision_preserves_evidence_in_every_target_order(self) -> None:
+        mac = targets.SshTarget("mac", "macos", self.settings)
+        linux = targets.SshTarget("linux", "linux", self.settings.with_name("linux.conf"))
+        cases = (
+            ((mac, "disk"),),
+            ((linux, "disk"),),
+            ((mac, "disk"), (linux, "off")),
+            ((mac, "off"), (linux, "disk")),
+            ((mac, "disk"), (linux, "-")),
+        )
+        for exclusions in cases:
+            for ordered in (exclusions, tuple(reversed(exclusions))):
+                results = {target.name: targets.EligibleTarget(target) if reason == "-"
+                           else targets.ExcludedTarget(target, reason) for target, reason in ordered}
+                with (self.subTest(targets=[(target.name, reason) for target, reason in ordered]),
+                      mock.patch.object(build_targets, "read_targets", return_value=tuple(target for target, _ in ordered)),
+                      mock.patch.object(build_targets, "ssh_target_eligibility", side_effect=list(results.values()))):
+                    self.assertEqual(self.kind_answer("test", "portable"), "natedev_only disk\n")
 
     def test_unresolved_probe_excludes_target_as_busy(self) -> None:
         target = targets.SshTarget("mac", "macos", self.settings)

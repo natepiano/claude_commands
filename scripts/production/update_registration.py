@@ -24,11 +24,10 @@ from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production.production_units import Production, read_production
-from production_units import Refusal, cell_value, unit_table
+from scripts.production.production_doc import Production, Refusal, read_production
 from merge_checkpoint import NoMerge, merge_branch_history, report
 
-from scripts.production import showrunners, session_staff, showrunner_tree, staff
+from scripts.production import showrunners, session_staff, showrunner_tree, staff, unit_lookup, unit_names
 from scripts.production.session_labels import StaffLabels
 from proposals_folder import issues_folder, slug_of
 from issues import Issue, frontmatter
@@ -303,7 +302,7 @@ class QuestionStaff:
             return parent
         row = self.record.by_member_reference(unit)
         if row is not None:
-            if row.kind != "unit" or row.parent != parent.id:
+            if row.kind != "unit" or row.parent != staff.ReportsTo(parent.id):
                 raise RegistrationFailure("ask", f"{unit} is not a unit of {production.slug}")
             return row
         selector = session_staff.UnitMember(production.slug, unit)
@@ -381,7 +380,7 @@ def relay_line(production: Production, slug: str, asker: QuestionAsker,
                 return "relay: none; this showrunner asked it"
             loaded = names.runtime_names()
             label = loaded.job("showrunner") if isinstance(loaded, names.Names) else "requesting role (display name unavailable)"
-        elif row.parent == current_owner.id:
+        elif row.parent == staff.ReportsTo(current_owner.id):
             current_slug = production.slug
         if current_slug != production.slug:
             return f"relay: to the showrunner of {current_slug}, for {label} (staff {row.id})"
@@ -1106,9 +1105,10 @@ class OpenLists(NamedTuple):
     unreadable: list[str]
 
 
-def question_queue(production: Production, below: bool = False) -> str:
+def question_queue(production: Production, below: bool = False, *, identities: QuestionStaff | None = None) -> str:
     """The name urgency.py pins the question /next showed under."""
-    return urgency.scope_queue(f"question-{production.slug}", below)
+    identities = identities if identities is not None else QuestionStaff.read()
+    return urgency.scope_queue(f"question-{identities.owner(production.doc).id}", below)
 
 
 def item_key(slug: str, text: str) -> str:
@@ -1122,7 +1122,12 @@ def open_lists(production: Production, below: bool = False, *, identities: Quest
     due: list[urgency.Entry[OpenItem]] = []
     deferred: list[OpenItem] = []
     unreadable: list[str] = []
+    documents = identities.documents()
     for slug in identities.slugs(production.slug, below):
+        if slug not in documents:
+            print(f"questions: {slug}: ownership evidence is unavailable", file=sys.stderr)
+            unreadable.append(slug)
+            continue
         try:
             items = read_open_items(outstanding_file(slug),
                                     production=production if slug == production.slug else None, identities=identities)
@@ -1138,10 +1143,11 @@ def open_lists(production: Production, below: bool = False, *, identities: Quest
             if isinstance(item.timing, DeferredUntil) and item.timing.at > now:
                 deferred.append(opened)
             else:
-                due.append(urgency.Entry(item_key(slug, item.text), opened, item.rank.urgency,
-                                         item.since, after=item_key(slug, item.rank.follows) if item.rank.follows else ""))
+                owner = identities.owner(documents[slug]).id
+                due.append(urgency.Entry(item_key(owner, item.text), opened, item.rank.urgency,
+                                         item.since, after=item_key(owner, item.rank.follows) if item.rank.follows else ""))
     deferred.sort(key=lambda found: (cast(DeferredUntil, found.item.timing).at, found.slug))
-    return OpenLists(urgency.queue_order(due, question_queue(production, below)), deferred, unreadable)
+    return OpenLists(urgency.queue_order(due, question_queue(production, below, identities=identities)), deferred, unreadable)
 
 
 def open_items(production: Production) -> None:
@@ -1296,8 +1302,8 @@ def state_block(production: Production, state: ShowrunnerState, timestamp: str) 
     history = merge_branch_history(production.checkout, production.merge_branch)
     judgments = {unit.unit: unit for unit in state.units}
     unit_lines: list[str] = []
-    for cells in unit_table(production.doc.read_text(encoding="utf-8").splitlines()):
-        name = cell_value(cells.get("Unit", ""))
+    for row in unit_lookup.doc_units(production.doc, staff.snapshot()):
+        name = unit_names.unit_id(row.name)
         judgment = judgments.get(name)
         merged = history.last_code_for_unit(name)
         last = "none" if isinstance(merged, NoMerge) else f"phase {merged.phase} ({merged.short})"

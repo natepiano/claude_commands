@@ -154,6 +154,7 @@ if TYPE_CHECKING:
     from ..accounts import accounts
     from ..whoami.account import named_account_environment
 import push_texts  # noqa: E402
+import push_reference
 import rca  # noqa: E402
 import repeat_guard  # noqa: E402
 import review  # noqa: E402
@@ -711,6 +712,7 @@ class Options(NamedTuple):
     report_recipient: bool = False
     sender_origin: RuntimeSender | ForwardedSender = RuntimeSender()
     due: str = ""
+    reference: push_reference.PushReference = push_reference.NO_REFERENCE
 
     @property
     def to(self) -> str:
@@ -1598,9 +1600,45 @@ def pending(to: str | None) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _print_roster_problems(problems: list[str]) -> None:
+def _recipient_roster_problems(
+    to: str, problems: list[str], observed: roster.Roster, membership: staff.StaffSnapshot,
+) -> list[str]:
+    """Use staff identities for anomalies and text for diagnostics without typed owners."""
+    member = resolve_staff_recipient(to, membership, observed=observed.entries)
+    references = {to, to.split(":", 1)[-1]}
+    if isinstance(member, staff.StaffRow):
+        references.update((member.name, str(member.id), str(member.current_session)))
+    typed: dict[str, bool] = {}
+    for anomaly in observed.row_anomalies:
+        owner = anomaly.row
+        matches = (owner.id == member.id if isinstance(member, staff.StaffRow)
+                   else to.casefold() in (owner.name.casefold(), owner.id, owner.current_session,
+                                          f"session:{owner.current_session}", f"codex:{owner.current_session}"))
+        for text in (anomaly.diagnostic, f"warning: {anomaly.diagnostic}"):
+            typed[text] = typed.get(text, False) or matches
+    related: list[str] = []
     for problem in problems:
+        if problem in typed:
+            matches = typed[problem]
+        else:
+            matches = any(reference and re.search(
+                rf"(?<![\w-]){re.escape(reference)}(?![\w-])", problem, re.IGNORECASE)
+                for reference in references)
+        if matches:
+            related.append(problem)
+    return related
+
+
+def _print_roster_problems(
+    to: str, problems: list[str], observed: roster.Roster, membership: staff.StaffSnapshot,
+) -> None:
+    related = _recipient_roster_problems(to, problems, observed, membership)
+    for problem in related:
         print(f"send.py: roster: {problem}", file=sys.stderr)
+    omitted = len(problems) - len(related)
+    if omitted:
+        print(f"send.py: roster problems omitted: {omitted}; "
+              + "run ~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py", file=sys.stderr)
 
 
 def _messageable_recipient(entry: roster.RosterEntry) -> SessionRecipient:
@@ -1685,8 +1723,8 @@ def resolve_staff_recipient(
         chain = [candidate.name]
         parent = candidate
         visited = {candidate.id}
-        while parent.kind != "showrunner" and parent.parent is not None:
-            ancestor = membership.by_id(parent.parent)
+        while parent.kind != "showrunner" and isinstance(parent.parent, staff.ReportsTo):
+            ancestor = membership.by_id(parent.parent.id)
             if ancestor is None or ancestor.id in visited:
                 break
             visited.add(ancestor.id)
@@ -1755,6 +1793,10 @@ def matching_recipients(
     member = resolve_staff_recipient(to, membership, observed=observed.entries)
     if isinstance(member, RecipientLookupFailed):
         return RecipientSearchFailed(member.reason, [member.reason])
+    if isinstance(member, staff.StaffRow):
+        for anomaly in observed.row_anomalies:
+            if anomaly.row.id == member.id:
+                return RecipientSearchFailed(anomaly.diagnostic, observed.diagnostics)
     matches = (_staff_transport_matches(member, observed.entries) if isinstance(member, staff.StaffRow)
                else _sender_label_matches(to, observed.entries))
     if matches or isinstance(scope, LocalOnly):
@@ -1785,40 +1827,61 @@ def resolve_recipient(
 ) -> DeliveryRoute:
     """Resolve locally first; a remote row supplies the address sent to its machine."""
     membership = staff.snapshot() if membership is None else membership
-    if to.startswith("uds:"):
-        return socket_recipient(to, sessions.live_sessions() if records is None else records, {}, membership=membership)
-    member = resolve_staff_recipient(to, membership, observed=observed.entries)
-    if isinstance(member, RecipientLookupFailed):
-        usage_error(member.reason)
-    if isinstance(scope, NamedMachine):
-        return RemoteDelivery(scope.host, (f"codex:{member.current_session}" if to.startswith("codex:")
-                                          else to if to.startswith("worker:") else f"session:{member.current_session}")
-                              if isinstance(member, staff.StaffRow) else to)
-    if to.startswith("codex:"):
-        thread_id = to.removeprefix("codex:")
-        if not thread_id:
-            usage_error("codex: needs a thread id")
-    result = matching_recipients(to, scope, observed, membership=membership)
-    _print_roster_problems(result.problems)
-    if isinstance(result, LocalRosterIncomplete):
-        usage_error(f"absence of {to} here is not proven; use an address or --machine")
-    if isinstance(result, RecipientSearchFailed):
-        return RecipientLookupFailed(result.reason)
-    if result.entries:
-        return _matched_recipient(to, result.entries, result.destination)
-    if to.startswith("worker:"):
-        usage_error(f"no roster session has address {to}")
-    if to.startswith("codex:"):
-        from scripts.whoami.agent_accounts import codex_home_display
+    problems = observed.diagnostics
 
-        checked = ", ".join(codex_home_display(daemon.home) for daemon in codex_daemon.daemons(os.environ))
-        return RecipientLookupFailed(
-            f"no live Codex daemon has thread {to.removeprefix('codex:')} loaded; checked {checked}")
-    if isinstance(member, staff.StaffRow):
-        return ClaudeRecipient(f"session:{member.current_session}")
-    if to.startswith("session:"):
-        return ClaudeRecipient(to)
-    usage_error(f"no staff row or live session for {to!r}")
+    def lookup() -> DeliveryRoute:
+        nonlocal problems
+        if to.startswith("uds:"):
+            return socket_recipient(to, sessions.live_sessions() if records is None else records, {}, membership=membership)
+        member = resolve_staff_recipient(to, membership, observed=observed.entries)
+        if isinstance(member, RecipientLookupFailed):
+            usage_error(member.reason)
+        if isinstance(member, staff.StaffRow):
+            for anomaly in observed.row_anomalies:
+                if anomaly.row.id == member.id:
+                    usage_error(anomaly.diagnostic)
+        if isinstance(scope, NamedMachine):
+            return RemoteDelivery(scope.host, (f"codex:{member.current_session}" if to.startswith("codex:")
+                                              else to if to.startswith("worker:") else f"session:{member.current_session}")
+                                  if isinstance(member, staff.StaffRow) else to)
+        if to.startswith("codex:"):
+            thread_id = to.removeprefix("codex:")
+            if not thread_id:
+                usage_error("codex: needs a thread id")
+        result = matching_recipients(to, scope, observed, membership=membership)
+        problems = result.problems
+        if isinstance(result, LocalRosterIncomplete):
+            usage_error(f"absence of {to} here is not proven; use an address or --machine")
+        if isinstance(result, RecipientSearchFailed):
+            related = _recipient_roster_problems(to, problems, observed, membership)
+            reason = (f"recipient lookup failed for {to!r}"
+                      if any(problem in result.reason for problem in problems if problem not in related)
+                      else result.reason)
+            return RecipientLookupFailed(reason)
+        if result.entries:
+            return _matched_recipient(to, result.entries, result.destination)
+        if to.startswith("worker:"):
+            usage_error(f"no roster session has address {to}")
+        if to.startswith("codex:"):
+            from scripts.whoami.agent_accounts import codex_home_display
+
+            checked = ", ".join(codex_home_display(daemon.home) for daemon in codex_daemon.daemons(os.environ))
+            return RecipientLookupFailed(
+                f"no live Codex daemon has thread {to.removeprefix('codex:')} loaded; checked {checked}")
+        if isinstance(member, staff.StaffRow):
+            return ClaudeRecipient(f"session:{member.current_session}")
+        if to.startswith("session:"):
+            return ClaudeRecipient(to)
+        usage_error(f"no staff row or live session for {to!r}")
+
+    failed = True
+    try:
+        route = lookup()
+        failed = isinstance(route, RecipientLookupFailed)
+        return route
+    finally:
+        if failed:
+            _print_roster_problems(to, problems, observed, membership)
 
 
 def run(command: list[str], stdin: str, timeout: float, env: dict[str, str] | None = None,
@@ -2056,7 +2119,7 @@ def reviewed_failure(stdout: str, original: FailedPush, *,
     return original
 
 
-def user(message: Message, need: Need, action: UserAction, timeout: float, *, answerable: bool = False, text_id: str = "", values: tuple[str, ...] = (), due: str = "") -> Result:
+def user(message: Message, need: Need, action: UserAction, timeout: float, *, answerable: bool = False, text_id: str = "", values: tuple[str, ...] = (), due: str = "", reference: push_reference.PushReference = push_reference.NO_REFERENCE, remote_forward: bool = False) -> Result:
     """Reach the user. The channel is this function's business alone."""
     key = ["--key", message.key] if message.key else []
     selected_priority = decision_priority.priority(need, due)
@@ -2069,6 +2132,10 @@ def user(message: Message, need: Need, action: UserAction, timeout: float, *, an
             command.extend(["--value", value])
     if due:
         command[2:2] = ["--due", due]
+    if reference["kind"] != "none":
+        command[2:2] = ["--push-reference", json.dumps(reference)]
+    if remote_forward:
+        command[2:2] = ["--ssh-forwarded-reference"]
     code, out, err = run(command, "", timeout)
     if code == 6:
         failed = reviewed_failure(out, FailedPush(message.summary, action, message.text, need=need, held=True, text_id=text_id, sender=message.sender))
@@ -2191,6 +2258,8 @@ def remote(message: Message, host: str, options: Options) -> Result:
         forwarded += ["--key", message.key]
     if message.to == USER:
         forwarded += ["--need", options.need]
+        if options.reference["kind"] != "none":
+            forwarded += ["--push-reference", json.dumps(options.reference)]
         if options.due:
             forwarded += ["--due", options.due]
         if options.need == "blocked":
@@ -2435,6 +2504,8 @@ def parse(argv: list[str]) -> Options:
     _ = parser.add_argument("--priority", choices=("0", "1", "2"), help=argparse.SUPPRESS)
     _ = parser.add_argument("--need", choices=list(CHANNEL_PRIORITY), default="note",
                             help="to `user`: what they must do (default note: nothing)")
+    _ = parser.add_argument("--question", default="", help="the open question record for decision.choices")
+    _ = parser.add_argument("--push-reference", default="", help=argparse.SUPPRESS)
     _ = parser.add_argument("--due", default="", help="decision deadline in ISO 8601 with an explicit offset")
     _ = parser.add_argument("--action", help="to `user`: what the user does")
     _ = parser.add_argument("--no-action", action="store_true", help="to `user`: nothing is needed")
@@ -2457,8 +2528,26 @@ def parse(argv: list[str]) -> Options:
     _ = body.add_argument("--text")
     _ = body.add_argument("--file")
     args = parser.parse_args(argv)
+    forwarded_stamp = optional_str(attr(args, "forwarded_sender_stamp"))
+    origin: RuntimeSender | ForwardedSender = RuntimeSender()
+    if forwarded_stamp is not None:
+        if attr(args, "here") is not True:
+            parser.error("--forwarded-sender-stamp needs --here")
+        if "SSH_CONNECTION" not in os.environ:
+            parser.error("--forwarded-sender-stamp needs an SSH receive environment (SSH_CONNECTION)")
+        try:
+            origin = ForwardedSender(read_sender_stamp(forwarded_stamp))
+        except ValueError as error:
+            parser.error(str(error))
     to = as_str(attr(args, "to"))
     text_id = as_str(attr(args, "text_id"))
+    try:
+        reference = push_reference.admission_reference(text_id, as_str(attr(args, "question")), as_str(attr(args, "push_reference")),
+            remote_forward=isinstance(origin, ForwardedSender))
+    except (OSError, ValueError) as error:
+        usage_error(str(error).replace("\n", " "))
+    if reference["kind"] == "question" and attr(args, "key") is None:
+        args.key = "question:" + reference["path"]
     raw_values = cast(list[str], attr(args, "value"))
     # Only auto_mode.refused repeats a key: one command value for each refused command.
     commands: list[str] = []
@@ -2540,23 +2629,12 @@ def parse(argv: list[str]) -> Options:
     forwarded_sender = optional_str(attr(args, "forwarded_shown_sender"))
     if forwarded_sender is not None and (attr(args, "here") is not True or not forwarded_sender):
         parser.error("--forwarded-shown-sender needs --here and nonempty sending-machine display text")
-    forwarded_stamp = optional_str(attr(args, "forwarded_sender_stamp"))
-    origin: RuntimeSender | ForwardedSender = RuntimeSender()
-    if forwarded_stamp is not None:
-        if attr(args, "here") is not True:
-            parser.error("--forwarded-sender-stamp needs --here")
-        if "SSH_CONNECTION" not in os.environ:
-            parser.error("--forwarded-sender-stamp needs an SSH receive environment (SSH_CONNECTION)")
-        try:
-            origin = ForwardedSender(read_sender_stamp(forwarded_stamp))
-        except ValueError as error:
-            parser.error(str(error))
     scope: RecipientResolutionScope = (
         NamedMachine(host) if host is not None else
         LocalOnly() if attr(args, "here") is True else LocalThenPeer()
     )
     get = {name: attr(args, name) for name in Options._fields
-           if name not in {"action", "selection", "scope", "values", "commands", "shown_sender", "sender_origin"}}
+           if name not in {"action", "selection", "scope", "values", "commands", "shown_sender", "sender_origin", "reference"}}
     options = Options(selection=selection, sender=optional_str(get["sender"]), summary=optional_str(get["summary"]),
                       key=optional_str(get["key"]), repeat_minutes=optional_float(get["repeat_minutes"]),
                       scope=scope, timeout=optional_float(get["timeout"]) or delivery_timeout(),
@@ -2567,7 +2645,7 @@ def parse(argv: list[str]) -> Options:
                       human=get["human"] is True, no_accounting=get["no_accounting"] is True,
                       report_recipient=get["report_recipient"] is True,
                       shown_sender=ShownSender(forwarded_sender) if forwarded_sender is not None else SenderNotResolved(),
-                      sender_origin=origin, due=due)
+                      sender_origin=origin, due=due, reference=reference)
     if options.to == USER and (options.summary is None or isinstance(options.selection, MeshWorker)):
         parser.error("--to user needs --summary, its title, and takes no --codex")
     if options.to != USER and options.need != "note":
@@ -2817,7 +2895,7 @@ def send(options: Options) -> Result:
     elif isinstance(route, UserDelivery):
         if isinstance(options.action, NoUserRecipient):
             raise AssertionError("a user message must state its action")
-        result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values, due=options.due)
+        result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values, due=options.due, reference=options.reference, remote_forward=isinstance(options.sender_origin, ForwardedSender))
         if options.text_id == AUTO_MODE_TEXT and result.outcome in ("sent", "kept"):
             _ = rca.open_case(refusal_report(options), defer_owner=True)
     elif isinstance(route, CodexWorkerRecipient):
@@ -2912,10 +2990,10 @@ def repeat_notice_owner(sender: str) -> str:
         usage_error(member.reason)
     visited: set[staff.StaffId] = set()
     while member.kind != "showrunner":
-        if member.parent is None or member.id in visited:
+        if isinstance(member.parent, staff.StaffRoot) or member.id in visited:
             usage_error(f"missing showrunner staff row for {sender!r}")
         visited.add(member.id)
-        parent = membership.by_id(member.parent)
+        parent = membership.by_id(member.parent.id)
         if parent is None:
             usage_error(f"missing showrunner staff row for {sender!r}")
         member = parent

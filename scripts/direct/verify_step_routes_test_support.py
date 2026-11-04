@@ -71,7 +71,7 @@ class VerifyStepRouteTools(VerifyMacOffloadFixture):
         reader = root / "enabled.sh"
         _ = reader.write_text("lint_config_enabled() { return 0; }\nlint_config_skip_notice() { :; }\n")
         self.environment["LINT_CONFIG_READER"] = str(reader)
-        self.write_executable(self.bin_directory / "taplo", 'raise SystemExit(0)\n')
+        self.write_executable(self.bin_directory / "taplo", "import sys\nif sys.argv[1:] == ['--version']:\n    print('taplo fixture 1.0')\n")
 
 
 class VerifyStepRoutesFixture(unittest.TestCase):

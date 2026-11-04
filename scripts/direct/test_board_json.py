@@ -26,7 +26,7 @@ from scripts.production import fake_showrunner, showrunner_parent, staff, showru
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import isolated_staff_file, production_membership, showrunner_launch
 from scripts.shutdown import pane_record
-import unit_table_cells
+import display_cells
 
 
 CONTRACT = Path(__file__).resolve().parents[2] / "mods/unit-board/types/board.d.ts"
@@ -135,7 +135,6 @@ class BoardJsonTests(unittest.TestCase):
         worktree = self.root / f"{slug}-unit"
         checkout.mkdir()
         worktree.mkdir()
-        # live_unit_table retains a linked worktree without querying session marks.
         _ = subprocess.run(["git", "init", "-b", "branch", "--separate-git-dir", str(self.root / f"{slug}-unit-git"), str(worktree)], check=True, capture_output=True)
         plan = worktree / "plan.md"
         document = checkout / f"{slug}-production.md"
@@ -143,10 +142,7 @@ class BoardJsonTests(unittest.TestCase):
             f"# Production — {slug}", "", "## Production Context", "",
             "- **Merge branch:** main",
             f"- **Showrunner checkout:** {checkout}",
-            "- **Log:** show.log", "- **User zone:** UTC", "", "## Units", "",
-            "| Unit | Plan | Worktree | Branch | Owns |",
-            "| --- | --- | --- | --- | --- |",
-            f"| {unit_name} | {plan} | {worktree} | branch | fixture.py |", "",
+            "- **Log:** show.log", "- **User zone:** UTC", "",
         )), encoding="utf-8")
         fixture = ProductionFixture(slug, checkout, worktree, plan, document)
         self.plan(fixture)
@@ -190,7 +186,7 @@ class BoardJsonTests(unittest.TestCase):
 
     def move_parent(self, child: str, parent: str = "") -> None:
         rows = {row.name: row.id for row in staff.find(kind="showrunner")}
-        _ = staff.move(rows[child], rows[parent] if parent else None)
+        _ = staff.move(rows[child], staff.ReportsTo(rows[parent]) if parent else staff.StaffRoot())
 
     def staff_launch(self, row: staff.StaffRow, session: str, *,
                      pane: str = "unit", at: str = "2026-10-31T10:00:00+00:00") -> None:
@@ -273,8 +269,11 @@ class BoardJsonTests(unittest.TestCase):
     def write_run(self, fixture: ProductionFixture, events: list[dict[str, object]],
                   *, name: str = "current", started: int = NOW - 7_200) -> Path:
         path = self.history / "runs" / f"{name}.jsonl"
+        member = next(row for row in staff.find(kind="unit")
+                      if isinstance(row.worktree, staff.PresentWorktree) and row.worktree.path == fixture.worktree)
         first: dict[str, object] = {
             "event_type": "run_started", "working_dir": str(fixture.worktree),
+            "main_agent": {"session_id": member.current_session},
             "plan_doc": str(fixture.plan), "project_plan_doc": str(fixture.plan),
             "timestamp_epoch": started, "run_started_at": started,
         }
@@ -497,7 +496,7 @@ class BoardJsonTests(unittest.TestCase):
         other = self.unit_member(second.slug)
         _ = staff.rename(other.id, "unrelated")
         _ = staff.set_worktree(other.id, staff.RemovedWorktree("natedev", second.worktree), expected=other.worktree)
-        moved = staff.move(unit.id, second_parent.id)
+        moved = staff.move(unit.id, staff.ReportsTo(second_parent.id))
         self.staff_launch(moved, moved.id, pane="newer")
 
         _, documents = self.generate("--session", moved.id)
@@ -522,7 +521,7 @@ class BoardJsonTests(unittest.TestCase):
 
     def test_missing_staff_id_and_launch_records_have_no_showrunner_board(self) -> None:
         _ = self.production(running=False)
-        missing = staff.StaffRow(staff.native_id(fixture_runtime_id("absent-board-unit")), "unit", "alpha", None, current_session=staff.native_id(fixture_runtime_id("absent-board-unit")))
+        missing = staff.StaffRow(staff.native_id(fixture_runtime_id("absent-board-unit")), "unit", "alpha", staff.StaffRoot(), current_session=staff.native_id(fixture_runtime_id("absent-board-unit")))
         self.staff_launch(missing, missing.id, pane="missing")
 
         for session in ("no-launch-session", missing.id):
@@ -533,7 +532,7 @@ class BoardJsonTests(unittest.TestCase):
 
     def test_unit_without_a_showrunner_ancestor_has_no_board(self) -> None:
         _ = self.production(running=False)
-        orphan = staff.StaffRow(staff.native_id(fixture_runtime_id("orphan-board-unit")), "unit", "orphan", None, current_session=staff.native_id(fixture_runtime_id("orphan-board-unit")))
+        orphan = staff.StaffRow(staff.native_id(fixture_runtime_id("orphan-board-unit")), "unit", "orphan", staff.StaffRoot(), current_session=staff.native_id(fixture_runtime_id("orphan-board-unit")))
         self.staff_launch(orphan, orphan.id)
         # The writer forbids orphan units; pin the reader's defensive boundary
         # with the same snapshot shape should an incomplete ancestry reach it.
@@ -728,10 +727,6 @@ class BoardJsonTests(unittest.TestCase):
         fixture.plan.unlink()
         as_built = fixture.worktree / "as-built.md"
         _ = as_built.write_text("# Delivered feature\n", encoding="utf-8")
-        _ = fixture.document.write_text(
-            fixture.document.read_text(encoding="utf-8").replace(str(fixture.plan), str(as_built)),
-            encoding="utf-8",
-        )
 
         _ = recorded_unit(fixture.slug, "alpha-unit", fixture.worktree, fixture.document, plan="as-built.md")
         _, unit = self.unit(fixture)
@@ -1205,8 +1200,8 @@ class BoardJsonTests(unittest.TestCase):
             self.event("progress_reported", NOW - 100, activity="delivery ready for review"),
         ])
 
-        with (patch.object(unit_table_cells, "open_step", wraps=unit_table_cells.open_step) as open_step,
-              patch.object(unit_table_cells, "run_events", wraps=unit_table_cells.run_events) as run_events):
+        with (patch.object(display_cells, "open_step", wraps=display_cells.open_step) as open_step,
+              patch.object(display_cells, "run_events", wraps=display_cells.run_events) as run_events):
             _, unit = self.unit(fixture)
 
         self.assertTrue(open_step.called)

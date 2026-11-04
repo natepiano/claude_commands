@@ -1,4 +1,4 @@
-"""Stop a session's Claude, or resume it on its account in its herdr tab."""
+"""Stop a session, or resume it on its account in its herdr tab."""
 
 from __future__ import annotations
 
@@ -16,9 +16,10 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, redirect_stdout
 from io import StringIO
+from importlib import import_module
 from threading import Event
 from time import monotonic
-from typing import TYPE_CHECKING, Never, cast
+from typing import TYPE_CHECKING, Never, Protocol, cast
 from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -29,6 +30,7 @@ for dependency in ("shutdown", "herdr", "message", "whoami", "lib"):
 import herdr
 import pane_record
 from scripts.shutdown.launch_names import LaunchNames
+from scripts.shutdown.codex_trust import trust_arguments
 import pane_launch
 from scripts.lib.resume_message import (
     ResumeWorkers as ResumeWorkers,
@@ -46,7 +48,12 @@ import sessions
 from scripts.shutdown.stop_results import shutdown_state_root
 
 if TYPE_CHECKING:
-    from scripts.production.staff import StaffRow
+    from scripts.production.staff import StaffRow, StaffSnapshot
+
+
+class RowStarter(Protocol):
+    def start_row(self, row: StaffRow, record: StaffSnapshot, client: herdr.Herdr, *,
+                  target_account: str) -> str: ...
 
 STOP_GRACE_SECONDS = 2.0
 KILL_GRACE_SECONDS = 5.0
@@ -79,12 +86,41 @@ def _tab_of(session: str) -> herdr.TabSession | SessionNotFound:
     return matches[0] if matches and matches[0].session_id else SessionNotFound(session)
 
 
-def _same_claude(pid: int, started: str) -> bool:
-    """Registry removal is not exit: only the saved pid and start time say the Claude is gone."""
+def _same_process(pid: int, started: str) -> bool:
+    """Check the saved process and start time after registry removal."""
     identity = sessions.process_liveness(pid, started)
     if isinstance(identity, sessions.SessionLivenessUnknown):
         raise OSError(identity.reason)
     return isinstance(identity, sessions.LiveSessionProcess)
+
+
+def _signal_process(pid: int, number: int) -> None:
+    """Refuse proof signals unless herdr places the process in the selected workspace."""
+    if number != 0 and "SHUTDOWN_PROOF_WORKSPACE" not in os.environ and (
+            "STAFF_FILE" in os.environ or "SHUTDOWN_STATE_DIR" in os.environ):
+        raise PermissionError(
+            f"signal {number} to pid {pid} refused: isolated records require SHUTDOWN_PROOF_WORKSPACE")
+    if number != 0 and "SHUTDOWN_PROOF_WORKSPACE" in os.environ:
+        workspace = os.environ["SHUTDOWN_PROOF_WORKSPACE"]
+        refusal = f"proof workspace {workspace!s}: signal {number} to pid {pid} refused"
+        try:
+            if not workspace or pid <= 0:
+                raise ValueError("expected a workspace id and a positive pid")
+            client = herdr.Herdr(herdr.shared_session())
+            for pane in client.panes():
+                if pane["workspace_id"] != workspace:
+                    continue
+                info = herdr.json_object(client.result(
+                    "pane", "process-info", "--pane", pane["pane_id"]).get("process_info"), "proof process info")
+                if any(isinstance(observed := herdr.json_object(process, "proof pane process").get("pid"), int)
+                       and not isinstance(observed, bool) and observed == pid
+                       for process in herdr.json_items(info.get("foreground_processes"), "proof pane processes")):
+                    break
+            else:
+                raise ValueError("herdr did not place the pid in a workspace pane")
+        except (OSError, ValueError, herdr.HerdrFailure) as error:
+            raise PermissionError(f"{refusal}: {error}") from error
+    os.kill(pid, number)
 
 
 def _record_launches(selected: list[str]) -> None:
@@ -139,7 +175,7 @@ def _retire_prompt(session_id: str) -> None:
 
 
 def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
-    """Signal only the Claude identified by the session registry; leave workers alone."""
+    """Signal only the process that proves the current conversation."""
     identity = session
     tab: herdr.TabSession | SessionNotFound = SessionNotFound(session)
     try:
@@ -158,37 +194,64 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
                 identity = tab.session_id
             else:
                 return SessionNotFound(session)
+        kind = "claude"
         live = sessions.session_liveness(identity)
         if isinstance(live, sessions.SessionNotLive):
-            return tab if member is None and isinstance(tab, SessionNotFound) else NotRunning(identity)
+            client = herdr.Herdr(herdr.shared_session())
+            for pane in sorted(client.panes(), key=lambda pane: pane["session_id"] != identity):
+                if pane["session_id"] and pane["session_id"] != identity:
+                    continue
+                try:
+                    if isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell):
+                        continue
+                    launch = client.codex_launch(pane["pane_id"], ["resume", identity])
+                    pid = launch.get("pid")
+                    if not pid or launch["session_id"] != identity:
+                        continue
+                    if not pane["session_id"] and herdr.codex_rollout_thread(pid) != identity:
+                        continue
+                except (OSError, ValueError, herdr.HerdrFailure):
+                    if pane["session_id"] == identity:
+                        raise
+                    continue
+                live, kind = sessions.LiveSessionProcess(pid), "codex"
+                break
+        if isinstance(live, sessions.SessionNotLive):
+            return NotRunning(identity)
         if isinstance(live, sessions.SessionLivenessUnknown):
             return StopFailed(identity, live.reason)
-        proved = herdr.native_process(live.pid, "claude")
+        proved = herdr.native_process(live.pid, kind)
         if proved.identity != identity:
             return StopFailed(identity, "process runs another conversation; no signal sent")
         started = proved.started
-        if not _same_claude(live.pid, started):
+        if not _same_process(live.pid, started):
             return NotRunning(identity)
-        if herdr.native_process(live.pid, "claude") != proved:
+        if herdr.native_process(live.pid, kind) != proved:
             return StopFailed(identity, "process identity changed; no signal sent")
-        os.kill(live.pid, signal.SIGTERM)
+        _signal_process(live.pid, signal.SIGTERM)
         deadline = monotonic() + STOP_GRACE_SECONDS
-        while _same_claude(live.pid, started):
+        while _same_process(live.pid, started):
             remaining = deadline - monotonic()
             if remaining <= 0:
                 break
             _ = Event().wait(min(0.1, remaining))
         else:
             return Stopped(identity, live.pid)
-        if _same_claude(live.pid, started):
-            if herdr.native_process(live.pid, "claude") != proved:
-                return StopFailed(identity, "process identity changed; no signal sent")
-            os.kill(live.pid, signal.SIGKILL)
+        if _same_process(live.pid, started):
+            last_signal = "SIGTERM"
+            try:
+                if herdr.native_process(live.pid, kind) != proved:
+                    return StopFailed(identity, "process identity changed; no signal sent")
+            except (OSError, ValueError, herdr.HerdrFailure) as error:
+                print(f"{identity}: stop identity anomaly after SIGTERM: {error}; waiting for exit", file=sys.stderr)
+            else:
+                _signal_process(live.pid, signal.SIGKILL)
+                last_signal = "SIGKILL"
             deadline = monotonic() + KILL_GRACE_SECONDS
-            while _same_claude(live.pid, started):
+            while _same_process(live.pid, started):
                 remaining = deadline - monotonic()
                 if remaining <= 0:
-                    return StopFailed(identity, f"pid {live.pid} is still running after SIGKILL")
+                    return StopFailed(identity, f"pid {live.pid} is still running after {last_signal}")
                 _ = Event().wait(min(0.1, remaining))
         return Stopped(identity, live.pid)
     except ProcessLookupError:
@@ -213,7 +276,7 @@ def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account:
     return ["env", "-u", "HERDR_TAB_ID", "-u", "STAFF_ID", *(f"{key}={value}" for key, value in environment.items()),
             "sh", "-c", 'cd -- "$1" && shift && exec "$@"', "resume", entry["cwd"],
             sys.executable, str(SCRIPTS / "accounts/accounts.py"), "exec", account,
-            *pane_record.resume_arguments(entry)]
+            *trust_arguments(pane_launch.agent_kind(entry), entry["cwd"], pane_record.resume_arguments(entry))]
 
 
 def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
@@ -229,8 +292,6 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
     client = herdr.Herdr(herdr.shared_session())
     command = _pane_command(tab, entry, account)
     launched_at = datetime.now(timezone.utc)
-    if not isinstance(client.pane_activity(tab.pane_id), herdr.PaneAtShell):
-        raise herdr.HerdrFailure(f"{entry['session_id']}: target pane has live work")
     client.run_in_pane(tab.pane_id, command)
     deadline = monotonic() + START_SECONDS
     live = sessions.session_liveness(entry["session_id"])
@@ -328,6 +389,19 @@ def _resume(session: str, *, why: str = "resumed by name", to: str | None = None
     return result
 
 
+def heal_account_trust(
+    folder: Path, target: Path, source: Path, name: str,
+) -> herdr.Trusted | herdr.TrustCopied | herdr.Untrusted | herdr.UnreadableTrustFile:
+    from scripts.accounts import accounts
+
+    trust = herdr.heal_claude_trust(folder, target / ".claude.json",
+        accounts.trust_sources(target, source), dry_run=False)
+    if isinstance(trust, (herdr.Untrusted, herdr.UnreadableTrustFile)):
+        reason = str(trust) if isinstance(trust, herdr.UnreadableTrustFile) else f"Claude has not trusted {folder}"
+        print(f"{name}: trust anomaly: {reason}", file=sys.stderr)
+    return trust
+
+
 def _resume_once(session: str, *, why: str, to: str | None = None, requester: str = "",
                  names: LaunchNames) -> ResumeResult:
     began = monotonic()
@@ -337,13 +411,14 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
     try:
         tab = _tab_of(session)
         client = herdr.Herdr(herdr.shared_session())
+        row = names.tab_record.by_current_session(identity)
         if isinstance(tab, SessionNotFound):
             original = pane_record.publication_for_session(session, record=names.tab_record)
-            if original is None:
+            if original is None and row is None:
                 return tab
-            if any(pane["pane_id"] == original.entry["pane_id"] for pane in client.panes()):
+            if original is not None and any(pane["pane_id"] == original.entry["pane_id"] for pane in client.panes()):
                 return tab
-            entry = original.entry
+            entry = original.entry if original is not None else None
         else:
             identity = tab.session_id or identity
             entry = pane_record.read_strict(client.session).get(tab.pane_id)
@@ -357,7 +432,14 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         if not isinstance(running, sessions.SessionNotLive):
             return running
         if entry is None:
-            return SessionNotFound(session)
+            if row is None:
+                return SessionNotFound(session)
+            restart = cast(RowStarter, cast(object, import_module("scripts.shutdown.restart")))
+            pane = restart.start_row(row, names.tab_record, client, target_account=to or "")
+            result = _running_on_account(identity, pane)
+            if isinstance(result, ClaudeUp):
+                return replace(result, elapsed_seconds=monotonic() - began, start_state=ClaudeStartState.STARTED)
+            return ResumeFailed(identity, "session did not start") if isinstance(result, sessions.SessionNotLive) else result
         entry = entry.copy()
         entry["session_id"] = identity
         entry["environment"] = names.environment(entry)
@@ -367,17 +449,15 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         from scripts.accounts import accounts
         from scripts.whoami.account import named_account_environment
 
+        if to is None and row is not None and row.kind in ("unit", "showrunner") and pane_launch.agent_kind(entry) == "claude":
+            to = accounts.role_account(row.kind).label
         source = Path(entry["config_dir"])
         source_label = accounts.claude_config_label(source)
         target_dir = (accounts.account_dir(to) if to is not None else
                       Path(entry["environment"].get("CLAUDE_CONFIG_DIR", str(source))))
         label = to if to is not None else accounts.claude_config_label(target_dir)
         account_environment = named_account_environment(target_dir)
-        trust = herdr.heal_claude_trust(Path(entry["cwd"]), target_dir / ".claude.json",
-            accounts.trust_sources(target_dir, source), dry_run=False)
-        if isinstance(trust, (herdr.Untrusted, herdr.UnreadableTrustFile)):
-            reason = str(trust) if isinstance(trust, herdr.UnreadableTrustFile) else f"Claude has not trusted {entry['cwd']}"
-            print(f"{entry['name']}: trust anomaly: {reason}", file=sys.stderr)
+        trust = heal_account_trust(Path(entry["cwd"]), target_dir, source, entry["name"])
         entry["config_dir"] = str(target_dir)
         entry["environment"] = {**entry["environment"], **account_environment}
         if to is not None and original is not None and Path(original.entry["config_dir"]) != target_dir:
@@ -491,7 +571,7 @@ def _check_stay(identity: str, pane: str, account: str, pid: int, generation: st
                 requester: str = "", why: str = "") -> str:
     """Observe the started generation after the command returns; recovery belongs to the watchdog."""
     began = monotonic()
-    while _same_claude(pid, generation):
+    while _same_process(pid, generation):
         remaining = STAY_SECONDS - (monotonic() - began)
         if remaining <= 0:
             return ""
@@ -640,6 +720,19 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                         outcomes.append(ResumePending(identity, target, resumed.reason))
                 except Exception as error:
                     outcomes.append(ResumePending(identity, target, str(error)))
+            record = staff.initial_snapshot()
+            for index, (session, outcome) in enumerate(zip(selected, outcomes)):
+                identity = outcome.name if isinstance(outcome, SessionNotFound) else outcome.session_id
+                running = _running_on_account(identity, "")
+                if isinstance(running, ClaudeUp) and running.account == target:
+                    continue
+                member = record.by_member_reference(identity)
+                name = member.name if member is not None else session
+                line = (f"{name}: not running on {target} after the move; resume it with: "
+                        + f"accounts.py move {identity} {target}")
+                print(line, file=sys.stderr)
+                if isinstance(outcome, ClaudeUp):
+                    outcomes[index] = ResumePending(identity, target, line)
             return outcomes
 
 

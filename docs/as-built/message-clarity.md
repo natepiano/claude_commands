@@ -67,7 +67,7 @@ The headless relay uses the session name `relay/<sender>`. Session lookups ident
 
 - A tag filter always includes `all`. That gives 11 rules for `push,all`, 8 for `question,all` and 7 for `reply,all`.
 - The loader is `zsh ~/.claude/scripts/ux_style/load-ux-style.sh --guide <dir> [--tags t1,t2] [--checklist]`, the same loader the UX guide uses. It prints each rule body, then a `=== UX_CHECKLIST ===` block with one `stem — title — test` line per rule. The header name only matters for display.
-- `commands/message_style.md` runs the loader on the whole guide and confirms the rule count. `/alert_user`, `/message`, `/message_review`, `/build:report` and the `<Notify>` section of `commands/showrunner/produce.md` load it before their first message to the user in a session.
+- `commands/message_style.md` runs the loader on the whole guide and confirms the rule count. `/alert_user`, `/message`, `/message_review` and the `<Notify>` section of `commands/showrunner/produce.md` load it before their first message to the user in a session.
 - Push form:
   - The first line is `Action: <what the user does>` or `No action needed.`, with an optional `Session: <name>` line above it. Every order rule in the guide applies after these lines.
   - The title is under 45 characters, names what is at stake and has no fixed prefix.
@@ -264,6 +264,9 @@ Sends no longer create holds: in production code, nothing calls `review.hold()`.
 
 Every new phone push requires `--text-id` before review, credentials, claims, or posting.
 Use `decision.choices`, `alert.blocked`, or `nate.adhoc` when no specific template fits.
+
+For `decision.choices`, file the question with `/unit:question` or `/showrunner:question`, then pass its record path with `--question`.
+Filing a question alone never sends a push.
 Decisions use structured choices. Agent-written values receive live review.
 Both send.py and pushover.py enforce admission.
 A legacy free-text push already kept during silence still releases.
@@ -520,3 +523,13 @@ Registered alerts and delivery footer (2026-11-01):
 
 A decision uses priority 1 only before an explicit deadline within the configured decision window.
 The channel recalculates this priority when it releases a kept push.
+
+A kept decision carries its question path and opening time (`since`).
+At release, a closed question drops its push.
+An open question with a different `since` also drops its push.
+A same-minute reopening keeps `since`, so release sends the push because the question is open again.
+A missing or unreadable question record permits delivery and adds an anomaly to `pushover.jsonl`.
+A kept `review_watch.acknowledge` push drops when `review_regime.acknowledged()` reports acknowledgment.
+Legacy kept pushes without a reference still release.
+The release output counts delivered pushes and dropped pushes separately.
+Immediate delivery does not apply these release checks.

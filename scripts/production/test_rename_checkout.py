@@ -52,8 +52,8 @@ class MoveTest(unittest.TestCase):
         doc = self.old / "docs/demo-production.md"
         doc.parent.mkdir(parents=True)
         _ = doc.write_text(f"# demo\n\n## Production Context\n\n- **Formerly:** `old`\n- **Merge branch:** `work`\n"
-                           + f"- **Showrunner checkout:** `{self.old}`\n- **Log:** `docs/demo-log.md`\n"
-                           + "\n## Units\n\n| Unit | Plan |\n| --- | --- |\n", encoding="utf-8")
+                           + f"- **Showrunner checkout:** `{self.old}`\n- **Log:** `docs/demo-log.md`\n",
+                           encoding="utf-8")
         _ = self.git(self.old, "add", "docs")
         _ = self.git(self.old, "commit", "-q", "-m", "doc")
         _ = self.git(self.old, "push", "-q", "origin", "work")
@@ -91,14 +91,13 @@ class MoveTest(unittest.TestCase):
         self.assertFalse(self.old.exists())
         self.assertIn(str(self.new), self.git(self.new, "worktree", "list"))
         home = Path.home()
-        self.assertTrue((home / ".claude/projects" / unit_move.project_folder(str(self.new))).is_dir())
+        self.assertTrue((home / ".claude/projects" / unit_move.project_folder(str(self.old))).is_dir())
+        self.assertFalse((home / ".claude/projects" / unit_move.project_folder(str(self.new))).exists())
         trust = cast(dict[str, dict[str, object]], json.loads((home / ".claude.json").read_text()))
         self.assertIn(str(self.new), trust["projects"])
         conf = (showrunners.NOTIFIER_STATE_DIR / "showrunner-demo/conf").read_text()
         self.assertIn(f"{self.new}/docs/demo-production.md", conf)
         self.assertIn(f"{self.new}/docs/demo-production.md", (self.root / "child-production.md").read_text())
-        panes = cast(dict[str, dict[str, str]], json.loads((home / ".local/state/herdr-panes/s.json").read_text()))
-        self.assertEqual(panes["p1"]["cwd"], str(self.new))
         self.assertIn(f"- **Showrunner checkout:** `{self.new}`", self.git(self.new, "show", "HEAD:docs/demo-production.md"))
         self.assertEqual(self.git(self.new, "status", "--porcelain"), "")
 

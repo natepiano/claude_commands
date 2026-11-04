@@ -18,10 +18,12 @@ from unittest.mock import patch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
+from scripts.copies.test_copy_guard import argv_policy_cases, repair_policy_cases, shell_policy_cases, unresolved_policy_cases
+
 HOOKS = Path(__file__).resolve().parent
 DISPATCH = HOOKS / "hook_dispatch.py"
 ROOT = HOOKS.parents[1]
-# The registrations before dispatch was introduced: order, matcher, timeout.
+# The synchronous hooks: order, matcher, timeout.
 LEGACY: dict[str, tuple[tuple[str, str, float], ...]] = {
     "pre_tool_use": (
         ("pre-tool-use-heredoc-guard.py", "Bash", 600),
@@ -38,9 +40,9 @@ LEGACY: dict[str, tuple[tuple[str, str, float], ...]] = {
         ("post-tool-use-banned-words.py", "", 600),
     ),
     "stop": (
-        ("stop-direct-continue.py", "", 600),
         ("stop-conversation-pause.py", "", 600),
         ("stop-assistant-prose-banned-words.py", "", 600),
+        ("stop-context-deferral.py", "", 10),
         ("herdr_tab_title.py", "", 600),
     ),
 }
@@ -179,6 +181,17 @@ class IsolatedHookTests(unittest.TestCase):
 
 
 class RealHookEquivalenceTests(IsolatedHookTests):
+    def test_context_deferral_block_reaches_the_caller(self) -> None:
+        config = self.root / "config"
+        config.mkdir()
+        _ = (config / "context_deferral.conf").write_bytes((ROOT / "config/context_deferral.conf").read_bytes())
+        self.environment["CONF_DIR"] = str(config)
+        result = self.run_python([str(DISPATCH), "stop"], {
+            "last_assistant_message": "I will do it after the context reset.",
+        })
+        self.assertEqual((result.returncode, result.stdout), (2, ""))
+        self.assertEqual(result.stderr, "Compaction runs by itself mid-work; do the work now.\n")
+
     def compare(self, event: str, payload: dict[str, object]) -> EventOutcome:
         state = self.home / ".claude/state"
         legacy_state = self.root / "legacy-counter-state"
@@ -283,7 +296,7 @@ class RealHookEquivalenceTests(IsolatedHookTests):
                 else:
                     self.assertEqual(outcome.output, {})
 
-    def test_stop_direct_continue_blocks_active_run_near_compaction(self) -> None:
+    def test_dispatcher_allows_stop_during_an_active_run_near_compaction(self) -> None:
         session_id = "dispatcher-active-director"
         run = self.root / "unit-run"
         run.mkdir()
@@ -307,8 +320,7 @@ class RealHookEquivalenceTests(IsolatedHookTests):
             "session_id": session_id, "transcript_path": str(transcript),
             "last_assistant_message": "The checks passed.",
         })
-        self.assertEqual(outcome.output["decision"], "block")
-        self.assertIn("/unit:direct run active, 170,000", str(outcome.output["reason"]))
+        self.assertEqual(outcome, EventOutcome(0, {}, ""))
 
     def test_stop_matches_separate_hooks_and_logs_last_assistant_prose(self) -> None:
         transcript = self.root / "transcript.jsonl"
@@ -570,6 +582,7 @@ class SettingsRegistrationTests(IsolatedHookTests):
         expected = {
             event: [list(row) for row in rows] for event, rows in LEGACY.items()
         }
+        expected["pre_tool_use"][-1][0] = "../copies/copy_guard.py"
         expected["post_tool_use"].append(["post-tool-use-push-delivered.py", "PushNotification", 600])
         expected["post_tool_use"].append(["post-tool-use-sendmessage-miss.py", "SendMessage", 600])
         self.assertEqual(parsed_output(result.stdout), expected)
@@ -599,6 +612,18 @@ class SettingsRegistrationTests(IsolatedHookTests):
                             self.assertEqual(group.get("matcher", ""), matcher)
                             dispatchers.append(hook)
                 self.assertEqual(len(dispatchers), 1)
+
+    def test_direct_continuation_has_one_separate_async_rewake_entry(self) -> None:
+        settings = object_fields(cast(object, json.loads((ROOT / "settings.json").read_text(encoding="utf-8"))))
+        registrations = object_fields(settings["hooks"])
+        hooks = [object_fields(hook) for group in cast(list[object], registrations["Stop"])
+                 for hook in cast(list[object], object_fields(group)["hooks"])]
+        continuation = [hook for hook in hooks if "stop-direct-continue.py" in str(hook.get("command", ""))]
+        self.assertEqual(continuation, [{
+            "type": "command",
+            "command": '\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-direct-continue.py\"',
+            "asyncRewake": True, "rewakeSummary": "Continuing the unit run", "timeout": 60,
+        }])
 
 
 class DispatcherRepairTests(IsolatedHookTests):
@@ -733,6 +758,111 @@ class DispatcherRepairTests(IsolatedHookTests):
         self.assertIn("ValueError: root cause", message)
         self.assertIn("The above exception was the direct cause", message)
         self.assertTrue(message.endswith("RuntimeError: outer failure\nlater hook ran"))
+
+
+class CopyGuardDispatchTests(IsolatedHookTests):
+    def test_copy_guard_failure_preserves_a_later_hooks_refusal(self) -> None:
+        later = self.root / "later-guard.py"
+        marker = self.root / "later-ran"
+        _ = later.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n"
+                             + "import sys\nprint('later refusal', file=sys.stderr)\nraise SystemExit(2)\n")
+        driver = (
+            f"import sys\nsys.path.insert(0, {str(ROOT)!r})\n"
+            + "from scripts.hooks import hook_dispatch as dispatch\n"
+            + "original = dispatch._execute\n"
+            + "def execute(path):\n"
+            + "    if path.name == 'copy_guard.py':\n"
+            + "        raise RuntimeError('guard crashed')\n"
+            + "    original(path)\n"
+            + "dispatch._execute = execute\n"
+            + f"dispatch.EVENTS['pre_tool_use'] = (dispatch.CopyPolicyHook(), dispatch.HookSpec({str(later)!r}, None))\n"
+            + "sys.argv = ['hook_dispatch.py', 'pre_tool_use']\ndispatch.main()\n"
+        )
+        result = self.run_python(["-c", driver], {"tool_name": "Bash", "tool_input": {"command": "true"}})
+        self.assertEqual((result.returncode, result.stderr), (2, "later refusal\n"))
+        self.assertTrue(marker.exists())
+
+    def test_copy_guard_deadline_is_enforced_by_the_normal_runner(self) -> None:
+        completion = self.root / "timed-body-completed"
+        later = self.root / "later-hook-ran"
+        driver = (
+            f"import sys, time\nsys.path.insert(0, {str(ROOT)!r})\n"
+            + "from pathlib import Path\n"
+            + "from scripts.hooks import hook_dispatch as dispatch\n"
+            + "from scripts.copies import copy_guard\n"
+            + "copy_guard.hook_timeout = lambda: 0.01\n"
+            + "def execute(path):\n"
+            + "    if path.name == 'copy_guard.py':\n"
+            + "        time.sleep(60)\n"
+            + f"        Path({str(completion)!r}).touch()\n"
+            + "    else:\n"
+            + f"        Path({str(later)!r}).touch()\n"
+            + "dispatch._execute = execute\n"
+            + "dispatch.EVENTS['pre_tool_use'] = (dispatch.CopyPolicyHook(), dispatch.HookSpec('later.py', None))\n"
+            + "sys.argv = ['hook_dispatch.py', 'pre_tool_use']\ndispatch.main()\n"
+        )
+        result = self.run_python(["-c", driver], {"tool_name": "Bash", "tool_input": {"command": "true"}})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertFalse(completion.exists())
+        self.assertTrue(later.exists())
+
+    def test_registered_dispatch_distinguishes_literal_and_executable_substitutions(self) -> None:
+        for case in shell_policy_cases():
+            with self.subTest(command=case.command):
+                result = self.run_python([str(DISPATCH), "pre_tool_use"], {
+                    "tool_name": "Bash", "tool_input": {"command": case.command}, "cwd": str(self.root)})
+                self.assertEqual(result.returncode, 2 if case.operation else 0, result.stderr)
+                if case.operation:
+                    self.assertTrue(result.stderr.startswith(case.operation + ":"), result.stderr)
+                else:
+                    self.assertNotIn("copies.py run", result.stderr)
+
+    def test_pre_tool_use_refuses_repository_creation_through_dispatcher(self) -> None:
+        result = self.run_python([str(DISPATCH), "pre_tool_use"], {
+            "tool_name": "Bash", "tool_input": {"command": "git clone source destination"},
+            "cwd": str(self.root),
+        })
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("copies.py run", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_interpreter_vectors_and_unresolved_programs_reach_the_dispatcher_policy(self) -> None:
+        for command, operation in argv_policy_cases():
+            with self.subTest(command=command):
+                result = self.run_python([str(DISPATCH), "pre_tool_use"], {
+                    "tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(self.root)})
+                self.assertEqual(result.returncode, 2 if operation else 0, result.stderr)
+                self.assertEqual(result.stderr.split(":", 1)[0] if result.stderr else "", operation)
+        for command, reason in unresolved_policy_cases():
+            with self.subTest(command=command):
+                result = self.run_python([str(DISPATCH), "pre_tool_use"], {
+                    "tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(self.root)})
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertTrue(result.stderr.startswith("unresolved relevant operation: " + reason + ":"), result.stderr)
+
+    def test_recorded_commands_and_interpreter_descriptor_context_matrix(self) -> None:
+        for case in repair_policy_cases():
+            with self.subTest(case=case.name, provenance=case.provenance):
+                result = self.run_python([str(DISPATCH), "pre_tool_use"], {
+                    "tool_name": "Bash", "tool_input": {"command": case.command}, "cwd": str(self.root)})
+                self.assertEqual(result.returncode, 2 if case.expected else 0, result.stderr)
+                if case.expected:
+                    self.assertTrue(result.stderr.startswith(case.expected + ":"), result.stderr)
+                else:
+                    self.assertNotIn("copies.py run", result.stderr)
+
+    def test_service_command_and_other_events_pass_without_guard_refusal(self) -> None:
+        for event, command in (
+            ("pre_tool_use", "python3 ~/.claude/scripts/copies/copies.py run --owner verify-unit --repo . --commit HEAD -- true"),
+            ("post_tool_use", "git clone source destination"),
+        ):
+            with self.subTest(event=event):
+                result = self.run_python([str(DISPATCH), event], {
+                    "tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(self.root),
+                })
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("copies.py run", result.stderr)
 
 
 if __name__ == "__main__":

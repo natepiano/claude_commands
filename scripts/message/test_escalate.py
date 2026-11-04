@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import escalate
 import push_texts
+import push_reference
 import send
 import sessions
 from scripts.production import staff
@@ -327,7 +328,8 @@ class EscalateTests(unittest.TestCase):
     def test_registered_hold_keeps_its_template_and_structured_values(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
         values = entry.examples[0].values
-        arguments = ["hold", "choice", "--text-id", entry.id, "--minutes", "0",
+        question = self.question_file()
+        arguments = ["hold", "choice", "--text-id", entry.id, "--question", str(question), "--minutes", "0",
                      *(item for key, value in values.items() for item in ("--value", f"{key}={value}"))]
         done = self.run_script(*arguments)
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -336,10 +338,73 @@ class EscalateTests(unittest.TestCase):
         assert isinstance(held, escalate.RegisteredHold)
         self.assertEqual(held.text_id, entry.id)
         self.assertEqual(dict(held.values), values)
+        self.assertEqual(held.reference, {"kind": "question", "path": str(question), "since": "opening"})
         delivered = self.run_script("due")
         self.assertEqual((delivered.returncode, delivered.stdout), (0, "choice: sent to the user\n"))
         self.assertIn("--text-id decision.choices", self.log())
+        self.assertIn("--question " + str(question), self.log())
         self.assertIn("--value choices=" + values["choices"], self.log())
+
+    def question_file(self, status: str = "open", since: str = "opening") -> Path:
+        path = self.root / "question.md"
+        _ = path.write_text("---\nrecord_type: question\nstatus: " + status
+                            + "\nregistration: " + json.dumps({"since": since}) + "\n---\n")
+        return path
+
+    def decision_push(self) -> push_texts.RenderedPush:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
+        return push_texts.render(entry.id, **entry.examples[0].values)
+
+    def test_decision_hold_requires_an_open_question_before_scheduling(self) -> None:
+        for status in ("missing flag", "absent", "closed"):
+            with self.subTest(status=status):
+                path = self.question_file("closed")
+                if status == "absent":
+                    path.unlink()
+                with (patch.object(escalate, "STATE", self.root / "state"),
+                      patch.object(escalate, "schedule") as schedule, self.assertRaises(ValueError)):
+                    _ = escalate.hold("choice", self.decision_push(),
+                                      question="" if status == "missing flag" else str(path))
+                schedule.assert_not_called()
+                self.assertFalse((self.root / "state/held/choice.json").exists())
+
+    def test_question_hold_delivery_passes_real_send_admission(self) -> None:
+        path = self.question_file()
+        admitted: list[send.Options] = []
+        def admit(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            options = send.parse(command[2:])
+            admitted.append(options)
+            return subprocess.CompletedProcess(command, 0, "SENT: admission checked\n", "")
+        with (patch.object(escalate, "STATE", self.root / "state"), patch.object(escalate, "schedule")):
+            self.assertTrue(escalate.hold("choice", self.decision_push(), 0, question=str(path)))
+            held = escalate.read(escalate.held_path("choice"))
+            assert isinstance(held, escalate.RegisteredHold)
+            with patch.object(subprocess, "run", side_effect=admit):
+                self.assertEqual(escalate.deliver(held, "choice"), "")
+        self.assertEqual(len(admitted), 1)
+        self.assertEqual(admitted[0].reference,
+            push_reference.QuestionReference(kind="question", path=str(path), since="opening"))
+        self.assertEqual(admitted[0].text_id, "decision.choices")
+
+    def test_question_hold_closes_once_when_the_question_closes_or_reopens(self) -> None:
+        for status, since, reason in (("closed", "opening", "question closed"),
+                                      ("open", "new opening", "question reopened")):
+            with self.subTest(reason=reason):
+                path = self.question_file()
+                with (patch.object(escalate, "STATE", self.root / "state"), patch.object(escalate, "schedule"),
+                      patch.object(escalate, "codex_account", return_value=UnknownCodexAccount(self.root, "offline"))):
+                    self.assertTrue(escalate.hold("choice", self.decision_push(), 0, question=str(path)))
+                    _ = self.question_file(status, since)
+                    with patch.object(subprocess, "run", side_effect=AssertionError("settled hold delivered")):
+                        settled = escalate.due(10**12)
+                        self.assertEqual(len(settled), 1)
+                        self.assertIn(reason, settled[0].line)
+                        self.assertFalse(settled[0].failed)
+                        self.assertEqual(escalate.due(10**12), [])
+                    self.assertIsInstance(escalate.read(escalate.held_path("choice")), escalate.NoHeld)
+                records = [cast(dict[str, object], json.loads(line)) for line in
+                           (self.root / "state/log.jsonl").read_text().splitlines()]
+                self.assertEqual(sum(record["reason"] == reason for record in records), 1)
 
     def test_written_action_reads_back_as_the_domain_type(self) -> None:
         _ = self.hold("15")

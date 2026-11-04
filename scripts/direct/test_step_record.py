@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import tempfile
 import socket
+import subprocess
+import sys
 from typing import cast
 import unittest
 from unittest.mock import patch
@@ -15,6 +17,31 @@ from scripts.direct import step_record as steps
 
 
 class StepRecordTests(unittest.TestCase):
+    def test_start_command_prints_the_process_start_field_as_text(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            process = Path(folder) / "42"
+            process.mkdir()
+            _ = (process / "stat").write_text("42 (verify (nested) name) S " + "0 " * 18 + "987654321012345 99\n")
+            result = subprocess.run([sys.executable, str(Path(steps.__file__)), "start", "42"],
+                env={**os.environ, "VERIFY_PROC_ROOT": folder}, capture_output=True, text=True, timeout=3)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "987654321012345\n")
+            self.assertEqual(result.stderr, "")
+
+    def test_start_command_refuses_missing_ended_or_incomplete_process_records(self) -> None:
+        for state in ("missing", "ended", "incomplete"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as folder:
+                process = Path(folder) / "42"
+                process.mkdir()
+                if state != "missing":
+                    content = "42 (verify) Z " + "0 " * 18 + "123 0\n" if state == "ended" else "42 (verify) S 0\n"
+                    _ = (process / "stat").write_text(content)
+                result = subprocess.run([sys.executable, str(Path(steps.__file__)), "start", "42"],
+                    env={**os.environ, "VERIFY_PROC_ROOT": folder}, capture_output=True, text=True, timeout=3)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("step refused", result.stderr)
+
     def test_ssh_record_keeps_target_order_and_selection_through_state_changes(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

@@ -1,6 +1,8 @@
 """Derive upgrade states and print current pins with the user's recorded words."""
 from __future__ import annotations
 
+from pathlib import Path
+
 from datetime import datetime, timedelta
 from typing import Literal
 from zoneinfo import ZoneInfo
@@ -152,7 +154,7 @@ def _row(name: str, entry: Entry, target: str) -> str:
 
 def table(record: Record, zone: ZoneInfo, now: datetime) -> str:
     lines = [
-        f"Bevy {record['target']} upgrade for {record['slug']}: {record['checkout']}, on Bevy {' and '.join(record['bevy'])}.",
+        f"Bevy {record['target']} upgrade for {Path(record['production']).name.removesuffix('-production.md')}: {record['checkout']}, on Bevy {' and '.join(record['bevy'])}.",
         _upstream_line(record, zone, now),
         "",
         "| Dependency | Our pin | crates.io | Git | State | Next |",

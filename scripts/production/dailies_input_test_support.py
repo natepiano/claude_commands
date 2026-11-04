@@ -27,7 +27,7 @@ from unit_lookup import UnitState
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff, unit_names
 from scripts.production.staff_test_support import (
-    fixture_showrunner_name, isolated_staff_file, showrunner_launch, showrunner_relationship,
+    fixture_showrunner_name, isolated_staff_file, recorded_unit, showrunner_launch, showrunner_relationship,
     unit_membership,
 )
 
@@ -228,7 +228,7 @@ class DailiesInputFixture(unittest.TestCase):
         self.showrunner_state = self.root / "showrunner-state"
         upgrade = self.root / "bevy upgrade stub.py"
         _ = upgrade.write_text(BEVY_UPGRADE_STUB, encoding="utf-8")
-        self.env = {**os.environ, "HOME": str(self.home), "BUILD_HOLD_DIR": str(self.holders),
+        self.env = {**os.environ, "HOME": str(self.home), "USER_ZONE": "America/Los_Angeles", "BUILD_HOLD_DIR": str(self.holders),
                     "DAILIES_BEVY_UPGRADE": str(upgrade),
                     "DAILIES_BEVY_EVENTS": str(self.root / "bevy-events.json"),
                     "DAILIES_BEVY_OUTPUT": "", "DAILIES_BEVY_STDERR": "",
@@ -313,10 +313,6 @@ class DailiesInputFixture(unittest.TestCase):
         return result.stdout.strip()
 
     def production_doc(self, *, beta: bool = False) -> None:
-        for name in ("alpha", "beta"):
-            # A linked worktree, where `.git` is a file: its unit is never taken for a removed one.
-            (self.root / name).mkdir(exist_ok=True)
-            _ = (self.root / name / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
         rows = [
             "# Production — example", "", "## Production Context", "",
             "- **Merge branch:** `production`",
@@ -324,19 +320,13 @@ class DailiesInputFixture(unittest.TestCase):
             "- **Showrunner session:** test-showrunner",
             "- **Log:** `production.log`",
             "- **User zone:** America/Los_Angeles",
-            "- **Updates:** every 15 minutes", "",
-            "## Units", "",
-            "| Unit | Plan | Worktree | Branch | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- |",
-            f"| `{ALPHA}` | `docs/alpha.md` | `{self.root / 'alpha'}` | `alpha` | — | — |",
+            "- **Updates:** every 15 minutes", "", "## Gates", "",
         ]
-        if beta:
-            rows.append(f"| `{BETA}` | `docs/beta.md` | `{self.root / 'beta'}` | `beta` | — | — |")
-        rows.extend(["", "## Gates", ""])
         _ = self.doc.write_text("\n".join(rows), encoding="utf-8")
         self.timer("example")
-        for unit in (ALPHA, BETA) if beta else (ALPHA,):
-            _ = unit_membership(fixture_showrunner_name("example", self.doc), unit)
+        for unit, name in ((ALPHA, "alpha"), (BETA, "beta")) if beta else ((ALPHA, "alpha"),):
+            _ = recorded_unit(fixture_showrunner_name("example", self.doc), unit, self.root / name, self.doc,
+                              plan=f"docs/{name}.md")
 
     def status_lines(self, *lines: str) -> None:
         _ = self.status.write_text("\n".join((STAMP, *lines)) + "\n", encoding="utf-8")
@@ -491,7 +481,7 @@ class DailiesInputFixture(unittest.TestCase):
     def rename_unit(self, name: str) -> None:
         row = unit_membership(fixture_showrunner_name("example", self.doc), ALPHA)
         _ = staff.rename(row.id, unit_names.name(name))
-        for path in (self.doc, self.status, self.judgment):
+        for path in (self.status, self.judgment):
             _ = path.write_text(path.read_text(encoding="utf-8").replace(ALPHA, name), encoding="utf-8")
 
     def parsed_block(self) -> tuple[Running | SessionGone | ClaudeNotRunning,
@@ -515,6 +505,9 @@ class DailiesInputFixture(unittest.TestCase):
         events: list[dict[str, object]] = [
             {"event_type": "run_started", "working_dir": str(worktree.resolve()), "run_started_at": 1.0},
             {"event_type": "run_finished"}]
+        member = next(row for row in staff.snapshot().rows
+                      if isinstance(row.worktree, staff.PresentWorktree) and row.worktree.path == worktree)
+        events[0]["main_agent"] = {"session_id": member.current_session}
         _ = (runs / f"{worktree.name}.jsonl").write_text(
             "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
         self.env["UNIT_HISTORY_DIR"] = str(self.root / "history")

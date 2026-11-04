@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 import sys
+import fcntl
 import json
 import shlex
 import subprocess
 import tomllib
+from importlib import import_module
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
-from enum import Enum
 from pathlib import Path
-from typing import NamedTuple, cast
+from typing import TYPE_CHECKING, NamedTuple, cast
+
+if TYPE_CHECKING:
+    from scripts.agents.worker_lifecycle import WorkerStateFile
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 for directory in (SCRIPTS / "message", SCRIPTS / "production", SCRIPTS / "herdr", SCRIPTS.parent):
@@ -27,9 +31,7 @@ from pane_launch import PaneLaunch
 import unit_names
 
 
-class ReadCurrentStaff(Enum):
-    CURRENT = "current"
-
+WORKER_FACT_KEYS = ("thread_id", "session_id", "codex_home", "manager", "role", "previous_role", "family", "cwd")
 
 PRODUCTION_MARK = "SHOWRUNNER_UNIT"
 
@@ -42,6 +44,121 @@ RemovedWorktree = staff.RemovedWorktree
 WorktreeUnfilled = staff.WorktreeUnfilled
 UnitConfig = configuration.UnitConfig
 ConfigMissing = configuration.ConfigMissing
+
+
+@dataclass(frozen=True)
+class RecordedWorker:
+    """The worker and its backend come from the same staff generation."""
+
+    row: staff.StaffRow
+    backend: staff.ClaudeBackend | staff.CodexBackend
+
+
+@dataclass(frozen=True)
+class WorkerBackendUnavailable:
+    reason: str
+
+
+def worker_backend(record: staff.StaffSnapshot, identity: staff.StaffId
+                   ) -> RecordedWorker | WorkerBackendUnavailable:
+    row = record.by_id(identity)
+    if row is None or row.kind != "worker":
+        return WorkerBackendUnavailable(f"{identity}: no worker staff row")
+    backend = record.backends.get(row.id)
+    if backend is None:
+        return WorkerBackendUnavailable(f"{row.id} {row.name}: backend is unavailable")
+    return RecordedWorker(row, backend)
+
+
+def worker_family(record: staff.StaffSnapshot, reference: staff.StaffId) -> str:
+    backend = record.backends.get(reference)
+    return "codex" if isinstance(backend, staff.CodexBackend) else "claude" if isinstance(backend, staff.ClaudeBackend) else ""
+
+
+def codex_thread(entry: Mapping[str, object], record: staff.StaffSnapshot | None = None) -> str:
+    record = record if record is not None else staff.local_snapshot()
+    row = worker_row(entry, record)
+    return row.current_session if row is not None and worker_family(record, row.id) == "codex" else ""
+
+
+def worker_row(entry: Mapping[str, object], record: staff.StaffSnapshot | None = None) -> staff.StaffRow | None:
+    record = record if record is not None else staff.local_snapshot()
+    return record.by_id(staff.StaffId(str(entry.get("staff_id", ""))))
+
+
+def worker_session(entry: Mapping[str, object], record: staff.StaffSnapshot | None = None) -> str:
+    member = worker_row(entry, record)
+    return member.current_session if member is not None else ""
+
+
+def worker_run_index(record: staff.StaffSnapshot) -> dict[staff.StaffId, tuple[Path, ...]]:
+    """Read fixed staff references from each run once."""
+    from scripts.lib import unit_runs
+    marked: dict[Path, list[staff.StaffId]] = {}
+    for row in record.find(kind="worker"):
+        owner = record.parent_of(row)
+        marker = unit_runs.marker(owner.current_session) if owner is not None else None
+        if marker is not None and marker.is_file():
+            marked.setdefault(Path(marker.read_text().strip()), []).append(row.id)
+    paths = [*marked]
+    if current := unit_runs.environ("RUN_DIR"):
+        paths.append(Path(current))
+    paths.extend(path for root in unit_runs.run_roots() if root.is_dir()
+                 for path in root.iterdir() if path.is_dir())
+    found: dict[staff.StaffId, list[Path]] = {}
+    for run in sorted(dict.fromkeys(paths), key=lambda run: run.stat().st_mtime if run.exists() else 0):
+        try:
+            entries = [*read_worker_roster(run / "mesh_roster.json").values()]
+            entries.extend(cast(object, json.loads(path.read_text())) for path in run.glob("impl_worker_*.json"))
+            identities = {staff.StaffId(value) for entry in entries if isinstance(entry, dict)
+                          and isinstance(value := cast(dict[str, object], entry).get("staff_id"), str)}
+            for identity in identities | set(marked.get(run, ())):
+                found.setdefault(identity, []).append(run)
+        except (OSError, ValueError) as error:
+            print(f"anomaly: {run}: {error}".replace("\n", " "), file=sys.stderr)
+    return {identity: tuple(runs) for identity, runs in found.items()}
+
+
+def worker_name(entry: Mapping[str, object], record: staff.StaffSnapshot | None = None) -> str:
+    member = worker_row(entry, record)
+    return member.name if member is not None else ""
+
+
+def worker_home(entry: Mapping[str, object], record: staff.StaffSnapshot | None = None) -> str:
+    record = record if record is not None else staff.local_snapshot()
+    backend = record.backends.get(staff.StaffId(str(entry.get("staff_id", ""))))
+    return str(backend.codex_home) if isinstance(backend, staff.CodexBackend) else ""
+
+
+def stored_worker_records(entries: Mapping[str, object]) -> dict[str, object]:
+    """Store fixed references and run details without copying staff facts."""
+    return {name: {key: value for key, value in cast(dict[str, object], raw).items()
+                   if key not in WORKER_FACT_KEYS}
+            for name, raw in entries.items() if isinstance(raw, dict)}
+
+
+def publish_worker_roster(handle: WorkerStateFile, roster: Mapping[str, object]) -> None:
+    handle.publish(json.dumps(stored_worker_records(roster), indent=2, sort_keys=True))
+
+
+def read_worker_roster(path: Path) -> dict[str, object]:
+    from scripts.agents import worker_lifecycle
+    with worker_lifecycle.locked_state(path, mode=fcntl.LOCK_SH) as handle:
+        return handle.read_object()
+
+
+def worker_directory(record: staff.StaffSnapshot, reference: staff.StaffId) -> Path:
+    row = record.by_id(reference)
+    if row is not None:
+        owner = record.parent_of(row) if row.kind == "worker" else row
+        if owner is not None and owner.kind == "showrunner" and isinstance(owner.doc, staff.LiveDoc):
+            from scripts.production.production_doc import read_production
+            return read_production(owner.doc.path).checkout
+        tree = RowResolver(record).unit_worktree(row)
+        if isinstance(tree, PresentWorktree):
+            return tree.path
+    print(f"anomaly: {reference}: staff worktree is unavailable", file=sys.stderr)
+    return Path.cwd()
 
 
 @dataclass(frozen=True)
@@ -129,7 +246,7 @@ class RowResolver:
     def _holder(self, row: staff.StaffRow) -> staff.StaffRow:
         if row.kind != "worker":
             return row
-        parent = self.record.by_id(row.parent) if row.parent is not None else None
+        parent = self.record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
         if parent is None:
             raise staff.StaffUnreadable(f"{row.name}: staff parent is unavailable")
         return parent
@@ -146,8 +263,8 @@ class RowResolver:
             elif isinstance(tree, RemovedWorktree) and tree.machine == machine:
                 requests.add(("file", str(configuration.parked_path(self._holder(row).id, home=Path("~")))))
             owner = self._holder(row)
-            if owner.kind == "unit" and owner.parent is not None:
-                owner = self.record.by_id(owner.parent) or owner
+            if owner.kind == "unit" and isinstance(owner.parent, staff.ReportsTo):
+                owner = self.record.by_id(owner.parent.id) or owner
             if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) and owner.doc.machine == machine:
                 requests.update((("file", str(owner.doc.path)), ("git", str(owner.doc.path.parent))))
         return sorted(requests)
@@ -248,7 +365,7 @@ class RowResolver:
     def production_doc(self, row: staff.StaffRow) -> ProductionDoc | DocumentUnavailable | LocationUnfilled:
         owner = self._holder(row)
         if owner.kind == "unit":
-            parent = self.record.by_id(owner.parent) if owner.parent is not None else None
+            parent = self.record.by_id(owner.parent.id) if isinstance(owner.parent, staff.ReportsTo) else None
             if parent is None or parent.kind != "showrunner":
                 return DocumentUnavailable(f"{owner.name}: no showrunner staff parent")
             owner = parent
@@ -362,7 +479,7 @@ def unit_match(selector: UnitMember | ObservedUnit, record: staff.StaffSnapshot,
     else:
         matches = [row for row in record.find(kind="unit") if row.name == unit_names.name(selector.unit)]
     if isinstance(selector, UnitMember):
-        matches = [row for row in matches if isinstance(parent, RequiredParent) and row.parent == parent.row.id]
+        matches = [row for row in matches if isinstance(parent, RequiredParent) and row.parent == staff.ReportsTo(parent.row.id)]
     if len(matches) > 1:
         raise staff.StaffUnreadable(f"{selector.unit}: no unique staff entry")
     return MemberFound(matches[0]) if matches else NoSuchMember(selector)
@@ -533,7 +650,7 @@ def production_members(record: staff.StaffSnapshot, sources: MemberSources) -> d
     mapped = {row.id for row in runners.values()}
     runners.update({row.name: row for row in staff.active(record, "showrunner")
                     if row.id not in mapped and row.name not in runners})
-    return {slug: tuple(unit for unit in staff.active(record, "unit") if unit.parent == row.id)
+    return {slug: tuple(unit for unit in staff.active(record, "unit") if unit.parent == staff.ReportsTo(row.id))
             for slug, row in runners.items()}
 
 
@@ -546,7 +663,7 @@ def group_marked_units(marked: Iterable[tuple[str, MarkedUnit]], *,
     return _group_marked_units(marked, record, sources, production_members(record, sources))
 
 
-def retained_unit_marks(marked: Iterable[tuple[str, MarkedUnit]], row: staff.StaffRow, slug: str, *,
+def retained_session_labels(marked: Iterable[tuple[str, MarkedUnit]], row: staff.StaffRow, slug: str, *,
                         record: staff.StaffSnapshot, sources: MemberSources) -> MarkedProductions:
     """Keep pane evidence for a retained identity during stop and cleanup checks."""
     membership = production_members(record, sources)
@@ -579,7 +696,7 @@ def _group_marked_units(marked: Iterable[tuple[str, MarkedUnit]], record: staff.
             row = selected.row
             slug = parents.get(row.id)
             if slug is None:
-                parent = record.by_id(row.parent) if row.parent is not None else None
+                parent = record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
                 if (isinstance(row.worktree, staff.RemovedWorktree)
                         or (parent is not None and parent.kind == "showrunner"
                             and isinstance(parent.doc, staff.WrappedDoc))):
@@ -763,6 +880,28 @@ def main(arguments: list[str] | None = None) -> int:
     if not repaired:
         print("nothing to repair")
     return 0
+
+
+
+def inbox_path(identity: staff.StaffId) -> Path:
+    return staff.record_path().parent / "inbox" / f"{identity}.pending.json"
+
+
+def worker_inbox_path(session_dir: str | Path, name: str) -> Path:
+    """Select the fixed staff inbox or the unpublished admission inbox."""
+    from scripts.agents import worker_lifecycle
+    folder = Path(session_dir)
+    roster = worker_lifecycle.read_worker_state(folder / "mesh_roster.json")
+    raw = roster.get(name)
+    if isinstance(raw, dict):
+        entry = cast(dict[str, object], raw)
+        reference = entry.get("staff_id")
+        if isinstance(reference, str) and reference:
+            return inbox_path(staff.native_id(reference))
+    find_member = cast(Callable[[Path, str], staff.StaffRow | None],
+                       import_module("scripts.production.worker_admission").member)
+    member = find_member(folder, name)
+    return inbox_path(member.id) if member is not None else folder / f"{name}.pending.json"
 
 
 if __name__ == "__main__":

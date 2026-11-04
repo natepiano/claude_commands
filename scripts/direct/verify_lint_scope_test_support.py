@@ -16,7 +16,6 @@ import sys
 import tempfile
 from typing import ClassVar, TypedDict, cast, override
 import unittest
-from scripts.direct.verify_assertion_guard_test_support import write_guard
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -71,8 +70,22 @@ from pathlib import Path
 import sys
 
 arguments = sys.argv[1:]
-with Path(os.environ["TEST_CARGO_EVENTS"]).open("a", encoding="utf-8") as output:
-    output.write(json.dumps({"args": arguments}) + "\n")
+version_tools = {
+    ("mend", "--version"): "MEND",
+    ("+nightly", "fmt", "--version"): "RUSTFMT",
+    ("clippy", "--version"): "CLIPPY",
+}
+version_tool = version_tools.get(tuple(arguments))
+# Existing scope tests also record the rustfmt availability check.
+if not version_tool or version_tool == "RUSTFMT":
+    with Path(os.environ["TEST_CARGO_EVENTS"]).open("a", encoding="utf-8") as output:
+        output.write(json.dumps({"args": arguments}) + "\n")
+if version_tool:
+    if "TEST_VERSION_EVENTS" in os.environ:
+        with Path(os.environ["TEST_VERSION_EVENTS"]).open("a", encoding="utf-8") as output:
+            output.write(version_tool + "\n")
+    print(os.environ.get("TEST_VERSION_" + version_tool, version_tool + " fixture"))
+    raise SystemExit(0)
 if arguments[:1] == ["metadata"]:
     print(os.environ["TEST_METADATA"])
 elif arguments[:1] not in (["mend"], ["clippy"], ["doc"], ["+nightly"]):
@@ -122,6 +135,12 @@ import os
 from pathlib import Path
 import sys
 
+if sys.argv[1:] == ["--version"]:
+    if "TEST_VERSION_EVENTS" in os.environ:
+        with Path(os.environ["TEST_VERSION_EVENTS"]).open("a", encoding="utf-8") as output:
+            output.write("TAPLO\n")
+    print(os.environ.get("TEST_VERSION_TAPLO", "taplo fixture"))
+    raise SystemExit(0)
 with Path(os.environ["TEST_TAPLO_EVENTS"]).open("a", encoding="utf-8") as output:
     output.write(json.dumps({"args": sys.argv[1:], "cwd": str(Path.cwd())}) + "\n")
 status = int(os.environ["TEST_TAPLO_STATUS"])
@@ -221,8 +240,6 @@ class VerifyLintScopeFixture(unittest.TestCase):
         self.write_shell(bin_directory / "rustc", 'printf "rustc fixture\\n"\n')
         targets = self.root / "build-targets.py"
         self.write_executable(targets, 'import sys\nif sys.argv[1] == "eligible": print("natedev_only test target\\nnatedev\\teligible\\t-\\t-")\n')
-        assertion_guard = self.root / "assertion-guard.py"
-        write_guard(assertion_guard)
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_shell(bin_directory / name, "exit 99\n")
         for directory in ("tmp", "state", "cache", "runtime", "target", "cargo-home", ".git", "cgroup"):
@@ -299,7 +316,6 @@ class VerifyLintScopeFixture(unittest.TestCase):
             "BUILDLOG_ZRAM": str(self.root / "zram"),
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "BUILD_TARGETS_SCRIPT": str(targets),
-            "VERIFY_ASSERTION_GUARD_SCRIPT": str(assertion_guard),
             "LINT_CONFIG_READER": str(SCRIPTS / "lint" / "lint_config.sh"),
             "LINT_CONFIG_FILE": str(self.config), **config_environment(self.root),
         })

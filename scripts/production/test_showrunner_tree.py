@@ -73,7 +73,7 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
         child = record.by_path("child")
         parent = record.by_path("new")
         assert child is not None and parent is not None
-        _ = staff.move(child.id, parent.id)
+        _ = staff.move(child.id, staff.ReportsTo(parent.id))
         write_text_atomic(self.state / "child" / "parent", "old\n")
         record = staff.snapshot()
         expected = {"child": "new", "leaf": "child"}
@@ -125,7 +125,7 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
         self.assertEqual(sockets, [f"uds:{self.root / f'{slug}-id.sock'}" for slug in ("mid", "top", "mid")])
         to_child, to_parent, to_leafs_parent = (text for _, text in self.messages())
         self.assertIn("mid now reports to top. The root is top: send it each item for the user.", to_child)
-        self.assertIn("never a unit: it has no Units row", to_parent)
+        self.assertIn("never a unit", to_parent)
         self.assertIn("leaf now reports to mid. It is a child showrunner", to_leafs_parent)
 
     def test_tree_commands_accept_former_slugs_and_answer_with_current_slugs(self) -> None:

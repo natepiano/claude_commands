@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import json
 import math
 import os
@@ -10,7 +9,6 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from contextlib import redirect_stderr
 from typing import cast, final, override
 from unittest import mock
 
@@ -69,6 +67,51 @@ class PaneRecordTests(unittest.TestCase):
 
     def entries(self) -> dict[str, dict[str, object]]:
         return cast(dict[str, dict[str, object]], json.loads((self.records / "agents.json").read_text()))
+
+    def test_plugin_directories_survive_hook_capture_and_resume(self) -> None:
+        directories = ["/fixture/postmaster", "/fixture/second plugin"]
+        started = self.start("w1:p2", "plugin-session", "--plugin-dir", directories[0],
+                             "--plugin-dir=" + directories[1], "-n", "postmaster")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        with mock.patch.object(pane_record, "RECORD_DIR", self.records):
+            entry = pane_record.read_strict("agents")["w1:p2"]
+        self.assertEqual(entry.get("plugin_directories"), directories)
+        arguments = pane_record.resume_arguments(entry)
+        parsed = pane_record.parse_claude_arguments(["claude", *arguments])
+        self.assertEqual(parsed.plugin_directories, tuple(directories))
+        self.assertFalse(parsed.has_prompt)
+        self.assertEqual(arguments.count("--plugin-dir"), 2)
+
+    def test_relative_plugin_paths_keep_their_target_after_a_folder_move(self) -> None:
+        original = self.root / "work/unit"
+        moved = self.root / "elsewhere/unit"
+        entry = pane_record.launch("w1:p2", "plugin-session", str(original), {},
+                                   ["claude", "--plugin-dir", "../shared/postmaster"])
+        entry["cwd"] = str(moved)
+        arguments = pane_record.resume_arguments(entry)
+        self.assertEqual(arguments[arguments.index("--plugin-dir") + 1],
+                         str(self.root / "work/shared/postmaster"))
+        self.assertEqual(entry.get("plugin_directories"), [str(self.root / "work/shared/postmaster")])
+
+    def test_plugin_options_after_the_terminator_are_only_prompt_text(self) -> None:
+        arguments = ["claude", "--plugin-dir", "/wanted", "--", "--plugin-dir=/unwanted"]
+        parsed = pane_record.parse_claude_arguments(arguments)
+        self.assertTrue(parsed.has_prompt)
+        self.assertEqual(parsed.plugin_directories, ("/wanted",))
+        entry = pane_record.launch("w1:p2", "plugin-session", "/fixture", {}, arguments)
+        self.assertEqual(entry.get("plugin_directories"), ["/wanted"])
+        self.assertNotIn("/unwanted", pane_record.resume_arguments(entry))
+
+    def test_plugin_directories_require_nonempty_paths_in_launch_records(self) -> None:
+        entry = pane_record.launch("w1:p2", "plugin-session", "/fixture", {}, ["claude"])
+        self.records.mkdir()
+        for invalid in ("/not-a-list", [""], [1]):
+            with self.subTest(invalid=invalid):
+                document: dict[str, object] = {**entry, "plugin_directories": invalid}
+                _ = (self.records / "agents.json").write_text(json.dumps({"w1:p2": document}))
+                with mock.patch.object(pane_record, "RECORD_DIR", self.records):
+                    with self.assertRaisesRegex(ValueError, "plugin_directories"):
+                        _ = pane_record.read_strict("agents")
 
     def test_moved_session_uses_newest_launch_across_accounts_and_record_files(self) -> None:
         old = pane_record.launch("old-pane", "moved", "/old", {"CLAUDE_CONFIG_DIR": "/accounts/.claude4"},
@@ -198,7 +241,7 @@ class PaneRecordTests(unittest.TestCase):
               mock.patch.dict(os.environ, source_environment(self.root / "sources")),
               isolated_source_readers()):
             parent = staff.ensure("showrunner", name="demo", runtime_id="019b3a40-4250-7000-8000-000000000101")
-            owner = staff.ensure("unit", name="alpha", parent=parent.id, runtime_id="019b3a40-4250-7000-8000-000000000102")
+            owner = staff.ensure("unit", name="alpha", parent=staff.ReportsTo(parent.id), runtime_id="019b3a40-4250-7000-8000-000000000102")
             current = staff.native_id("019b3a40-4250-7000-8000-000000000103")
             _ = staff.update_current_session(owner.current_session, current)
             retained = pane_record.launch("w1:p2", owner.id, "/work/alpha", {}, ["claude"])
@@ -226,6 +269,27 @@ class PaneRecordTests(unittest.TestCase):
             self.assertEqual(pane_record.read("agents")["w1:p2"]["config_dir"], entry["config_dir"])
         self.assertEqual(entry["environment"]["STAFF_ID"], "parent")
 
+    def test_worker_resume_uses_the_typed_parent_for_its_folder(self) -> None:
+        from scripts.shutdown import launch_names, session_types
+
+        location = staff.PresentWorktree("natedev", self.root / "unit")
+        unit = staff.StaffRow(staff.StaffId("unit"), "unit", "alpha", staff.StaffRoot(),
+                             current_session=staff.StaffId("unit-session"),
+                             worktree=location)
+        for parent in (staff.ReportsTo(unit.id), staff.StaffRoot()):
+            with self.subTest(parent=parent):
+                worker = staff.StaffRow(staff.StaffId("worker"), "worker", "impl", parent,
+                                       current_session=staff.StaffId("worker-session"))
+                record = staff.StaffSnapshot((unit, worker))
+                retained = pane_record.launch("w1:p2", worker.id, "/saved", {}, ["claude"])
+                expected = str(location.path) if isinstance(parent, staff.ReportsTo) else "/saved"
+                with (mock.patch.object(staff, "initial_snapshot", return_value=record),
+                      mock.patch.object(staff, "snapshot", return_value=record)):
+                    self.assertEqual(pane_record.resume_launch(retained)["cwd"], expected)
+                    self.assertEqual(launch_names.LaunchNames(record).resume(retained)["cwd"], expected)
+                    self.assertEqual(session_types.unit_worktree(worker.id),
+                                     location if isinstance(parent, staff.ReportsTo) else staff.WORKTREE_UNFILLED)
+
     def current_owner(self) -> tuple[staff.StaffRow, staff.StaffId, Path]:
         from scripts.production.staff_test_support import isolated_staff_file, isolated_source_readers, source_environment
 
@@ -236,7 +300,7 @@ class PaneRecordTests(unittest.TestCase):
         _ = self.enterContext(isolated_source_readers())
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.records))
         parent = staff.ensure("showrunner", name="demo", runtime_id="019b3a40-4250-7000-8000-000000000101")
-        owner = staff.ensure("unit", name="alpha", parent=parent.id, runtime_id="019b3a40-4250-7000-8000-000000000102")
+        owner = staff.ensure("unit", name="alpha", parent=staff.ReportsTo(parent.id), runtime_id="019b3a40-4250-7000-8000-000000000102")
         current = staff.native_id("019b3a40-4250-7000-8000-000000000103")
         _ = staff.update_current_session(owner.current_session, current)
         return owner, current, path
@@ -258,60 +322,8 @@ class PaneRecordTests(unittest.TestCase):
         pane_record.write("agents", observed)
         self.assertEqual((record_path.read_bytes(), record_path.stat().st_mtime_ns), retained)
 
-    def test_folder_move_updates_only_owner_cwd_with_the_supplied_snapshot_and_reruns_without_writes(self) -> None:
-        owner, current, path = self.current_owner()
-        old, new = self.root / "old-folder", self.root / "new-folder"
-        fixed = pane_record.launch("w1:p2", owner.id, str(old), {}, ["claude", "-n", "alpha"])
-        live = pane_record.launch("w2:p1", current, str(old), {}, ["claude", "-n", "alpha"])
-        other = pane_record.launch("w1:p3", "019b3a40-4250-7000-8000-000000000104", str(old), {}, ["claude"])
-        fixed["ended"] = True
-        pane_record.write("agents", fixed)
-        pane_record.write("agents", other)
-        with pane_record.locked("retained"):
-            pane_record.save("retained", {"w2:p1": live})
-        record = staff.snapshot()
-        before = path.read_bytes()
 
-        with mock.patch.object(staff, "snapshot", side_effect=AssertionError("reuse the supplied snapshot")):
-            pane_record.move_cwd(owner.id, old, new, record)
-            self.assertEqual(pane_record.read("agents"), {"w1:p2": {**fixed, "cwd": str(new)}, "w1:p3": other})
-            self.assertEqual(pane_record.read("retained"), {"w2:p1": {**live, "cwd": str(new)}})
-            paths = [self.records / name for name in ("agents.json", "retained.json")]
-            moved = [(entry.read_bytes(), entry.stat().st_mtime_ns) for entry in paths]
-            pane_record.move_cwd(owner.id, old, new, record)
-            self.assertEqual([(entry.read_bytes(), entry.stat().st_mtime_ns) for entry in paths], moved)
-        self.assertEqual(path.read_bytes(), before)
 
-    def test_folder_move_skips_an_owner_launch_from_an_unrelated_folder(self) -> None:
-        owner, _current, path = self.current_owner()
-        retained = pane_record.launch("w1:p2", owner.id, str(self.root / "unrelated"), {}, ["claude"])
-        pane_record.write("agents", retained)
-        record_path = self.records / "agents.json"
-        before = path.read_bytes(), record_path.read_bytes(), record_path.stat().st_mtime_ns
-        output = io.StringIO()
-        with redirect_stderr(output):
-            pane_record.move_cwd(owner.id, self.root / "old", self.root / "new", staff.snapshot())
-        self.assertEqual(len(output.getvalue().splitlines()), 1)
-        self.assertIn("different working folder", output.getvalue())
-        self.assertEqual((path.read_bytes(), record_path.read_bytes(), record_path.stat().st_mtime_ns), before)
-
-    def test_folder_move_updates_later_records_after_a_different_folder_is_skipped(self) -> None:
-        owner, current, path = self.current_owner()
-        old, new = self.root / "old", self.root / "new"
-        skipped = pane_record.launch("w1:p1", owner.id, str(self.root / "elsewhere"), {}, ["claude"])
-        selected = pane_record.launch("w2:p1", current, str(old), {}, ["claude"])
-        pane_record.write("agents", skipped)
-        with pane_record.locked("later"):
-            pane_record.save("later", {"w2:p1": selected})
-        before = path.read_bytes()
-        output = io.StringIO()
-        with redirect_stderr(output):
-            pane_record.move_cwd(owner.id, old, new, staff.snapshot())
-        self.assertEqual(len(output.getvalue().splitlines()), 1)
-        self.assertIn("different working folder", output.getvalue())
-        self.assertEqual(pane_record.read("agents")["w1:p1"], skipped)
-        self.assertEqual(pane_record.read("later")["w2:p1"], {**selected, "cwd": str(new)})
-        self.assertEqual(path.read_bytes(), before)
 
     def test_current_conversation_lookup_projects_only_its_exact_retained_pane_without_writing(self) -> None:
         owner, current, path = self.current_owner()
@@ -451,24 +463,23 @@ class PaneRecordTests(unittest.TestCase):
             self.assertEqual(hook.returncode, 0, hook.stderr)
             self.assertEqual(self.entries()["w1:p2"]["environment"], {"ENABLE_TOOL_SEARCH": "true"})
 
-    def test_restored_unit_id_comes_from_the_productions_units_table(self) -> None:
+    def test_restored_unit_id_comes_from_the_staff_row(self) -> None:
         from scripts.production import staff, session_staff, showrunners
 
-        parent = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "showrunner", "demo", None, current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"))
-        owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "unit", "alpha", parent.id, current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
-        document = "# Production — demo\n\n## Units\n\n| Unit | Plan |\n| --- | --- |\n| `alpha` | standby |\n"
+        parent = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "showrunner", "demo", staff.StaffRoot(), current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"))
+        owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "unit", "alpha", staff.ReportsTo(parent.id), current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
         source = showrunners.ShowrunnerSource(
-            showrunners.Timer("demo", "session:runner", self.root / "demo.md", "UTC"), document)
+            showrunners.Timer("demo", "session:runner", self.root / "demo.md", "UTC"), "# Production — demo\n")
         entry = pane_record.launch("new", "019b3a40-4250-7000-8000-000000000102", "/fixture", {"CLAUDE_CODE_SESSION_ID": owner.current_session}, ["claude"])
         membership = session_staff.LaunchMembership(staff.StaffSnapshot((parent, owner)),
             session_staff.MemberSources({"demo": source}, ()))
         self.assertEqual(membership.environment(entry), {"CLAUDE_CODE_SESSION_ID": owner.current_session,
-            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha"})
+            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
 
     def test_staff_owner_supersedes_a_promoted_showrunners_old_session_staff(self) -> None:
         from scripts.production import staff, session_staff, showrunners
 
-        owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "showrunner", "demo", None, current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
+        owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "showrunner", "demo", staff.StaffRoot(), current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
         source = showrunners.ShowrunnerSource(
             showrunners.Timer("demo", "session:019b3a40-4250-7000-8000-000000000102", self.root / "demo.md", "UTC"), "# demo\n")
         entry = pane_record.launch("new", "019b3a40-4250-7000-8000-000000000102", "/fixture", {

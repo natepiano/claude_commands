@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import closing
 from datetime import datetime
@@ -19,17 +20,23 @@ from unittest import mock
 import index
 from cgroup_test_support import CPU, GIB, slice_reading
 import parse
+import report
 import record as recorder
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
+    from ..lint.memory_test_support import write_config_fixture
+    from ..test_times.gate_record_test_support import gate_run
 else:
     from scripts.lib import test_hang_guard
+    from scripts.lint.memory_test_support import write_config_fixture
+    from scripts.test_times.gate_record_test_support import gate_run
 from record import TARGET_DIR_UNSET
 from store import UNKNOWN_IDENTITY
 
 CLI = Path(__file__).with_name("cli.py")
 TESTDATA = Path(__file__).with_name("testdata")
 STAMP = "2026-10-02T12:00:00.000Z"
+FIXTURE_INDEX_SQL = "CREATE INDEX IF NOT EXISTS fixture_index ON steps (status)"
 Record = dict[str, object]
 _TEST_LOG = tempfile.TemporaryDirectory(prefix="buildlog-tests-")
 _TEST_ROOT = Path(_TEST_LOG.name) / "buildlog"
@@ -184,6 +191,19 @@ def point_root_at(test: unittest.TestCase, root: Path) -> None:
     test.addCleanup(restore)
 
 
+def rows(sql: str, *parameters: object) -> list[tuple[object, ...]]:
+    with closing(index.read_only()) as connection:
+        return cast(list[tuple[object, ...]], connection.execute(sql, parameters).fetchall())
+
+
+def table_rows(table: str, where: str = "", *parameters: object) -> list[Record]:
+    with closing(index.read_only()) as connection:
+        connection.row_factory = sqlite3.Row
+        records = cast(list[sqlite3.Row],
+                       connection.execute(f"SELECT * FROM {table} {where} ORDER BY 1", parameters).fetchall())
+        return [{name: cast(object, row[name]) for name in row.keys()} for row in records]
+
+
 class LogIsolationTests(unittest.TestCase):
     def test_each_module_uses_a_temporary_log(self) -> None:
         environment = {key: value for key, value in os.environ.items() if key != "BUILDLOG_DIR"}
@@ -225,13 +245,105 @@ class IndexTests(unittest.TestCase):
         self.host_file = self.root / "natedev" / "2026-10.jsonl"
         self.host_file.parent.mkdir(parents=True)
 
+    def test_schema_files_keep_independent_rows_and_offsets(self) -> None:
+        _ = self.configure_cleanup()
+        self.write(self.host_file, step("retained"))
+        self.assertEqual(index.update(), 1)
+        original_path = index.index_path()
+        with closing(sqlite3.connect(original_path)) as connection, connection:
+            _ = connection.execute("UPDATE steps SET duration_s=123 WHERE id='retained'")
+        original_bytes = original_path.read_bytes()
+        alternate = {"fixture_rows": ([("src", "TEXT", "source"), ("value", "TEXT", "fixture value")], "", "fixture")}
+        with mock.patch.dict(index.TABLES, alternate):
+            alternate_path = index.index_path()
+            self.assertNotEqual(alternate_path, original_path)
+            self.assertEqual(index.update(), 1)
+            self.assertEqual(self.rows("SELECT duration_s FROM steps"), [(10.0,)])
+            self.assertEqual(index.update(), 0)
+        self.assertEqual(index.index_path(), original_path)
+        self.assertEqual(index.update(), 0)
+        self.assertEqual(original_path.read_bytes(), original_bytes)
+        self.assertEqual(self.rows("SELECT duration_s FROM steps"), [(123,)])
+        self.assertTrue(alternate_path.is_file())
+
+    def test_schema_path_changes_with_columns_and_indexes(self) -> None:
+        original_path = index.index_path()
+        columns, key, description = index.TABLES["steps"]
+        without_group = [column for column in columns if column[0] != "build_history_group"]
+        without_history = tuple(statement for statement in index.COST_INDEXES
+                                if "steps_build_group_history" not in statement)
+        with mock.patch.dict(index.TABLES, {"steps": (without_group, key, description)}):
+            self.assertNotEqual(index.index_path(), original_path)
+        with mock.patch.object(index, "COST_INDEXES", without_history):
+            self.assertNotEqual(index.index_path(), original_path)
+
+    def test_cleanup_reads_the_unused_schema_age_from_config_at_use(self) -> None:
+        config = self.configure_cleanup()
+        self.write(self.host_file, step("retained"))
+        self.assertEqual(index.update(), 1)
+        active_path = index.index_path()
+        alternate = {"fixture_rows": ([("src", "TEXT", "source")], "", "fixture")}
+        with mock.patch.dict(index.TABLES, alternate):
+            self.assertEqual(index.update(), 1)
+            old_path = index.index_path()
+        with mock.patch.object(index, "COST_INDEXES", (*index.COST_INDEXES, FIXTURE_INDEX_SQL)):
+            self.assertEqual(index.update(), 1)
+            recent_path = index.index_path()
+        now = time.time()
+        old = now - 10 * 86400
+        os.utime(old_path, (old, old))
+        os.utime(recent_path, (old, now))
+        self.assertEqual(index.update(), 0)
+        self.assertTrue(old_path.is_file())
+        _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=7")
+        os.utime(active_path, (old, old))
+        self.assertEqual(index.update(), 0)
+        self.assertFalse(old_path.exists())
+        self.assertTrue(recent_path.is_file())
+        os.utime(recent_path, (now, old))
+        self.assertEqual(index.update(), 0)
+        self.assertTrue(recent_path.is_file())
+        self.assertEqual(self.ids(), ["retained"])
+
+    def test_missing_tables_rebuild_records_before_the_saved_offsets(self) -> None:
+        self.write(self.host_file, step("retained"), call("retained-call"))
+        self.assertEqual(index.update(), 2)
+        original = self.host_file.read_bytes()
+        for table in (next(iter(index.TABLES)), "files"):
+            with self.subTest(table=table):
+                with closing(sqlite3.connect(index.index_path())) as connection:
+                    _ = connection.execute(f"DROP TABLE {table}")
+                self.assertEqual(index.update(), 2)
+                self.assertEqual(self.ids(), ["retained"])
+                self.assertEqual(self.rows("SELECT id FROM calls"), [("retained-call",)])
+                self.assertEqual(index.update(), 0)
+                self.assertEqual(self.host_file.read_bytes(), original)
+
+    def configure_cleanup(self) -> Path:
+        config = self.root.parent / "config"
+        _ = write_config_fixture(config / "buildlog.conf")
+        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))
+        return config
+
+    def test_update_preserves_an_old_index_during_other_schema_cleanup(self) -> None:
+        _ = self.configure_cleanup()
+        self.write(self.host_file, step("retained"))
+        self.assertEqual(index.update(), 1)
+        retained_path = index.index_path()
+        old = time.time() - 40 * 86400
+        os.utime(retained_path, (old, old))
+        self.assertEqual(index.update(), 0)
+        self.assertGreater(retained_path.stat().st_mtime, old)
+        with mock.patch.object(index, "COST_INDEXES", (*index.COST_INDEXES, FIXTURE_INDEX_SQL)):
+            self.assertEqual(index.update(), 1)
+        self.assertTrue(retained_path.is_file())
+
     def write(self, path: Path, *records: Record) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_bytes(b"".join(encode(record) for record in records))
 
     def rows(self, sql: str, *parameters: object) -> list[tuple[object, ...]]:
-        with closing(index.read_only()) as connection:
-            return cast(list[tuple[object, ...]], connection.execute(sql, parameters).fetchall())
+        return rows(sql, *parameters)
 
     def ids(self) -> list[object]:
         return [row[0] for row in self.rows("SELECT id FROM steps ORDER BY id")]
@@ -425,17 +537,33 @@ class IndexTests(unittest.TestCase):
         decoded = [(identifier, json.loads(cast(str, names)) if names is not None else None, target_dir, repository, folder)
                    for identifier, names, target_dir, repository, folder in rows]
         self.assertEqual(decoded, [
-            ("cwd", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, "/r/subdirectory"),
-            ("null", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, "/r/feature"),
+            ("cwd", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, None),
+            ("null", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, None),
             ("target", ["hana", "dependency", "hana"], "/shared/target", "https://example.com/hana", "/shared/target"),
-            ("unknown", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, "/r/unknown"),
-            ("unset", None, TARGET_DIR_UNSET, "git-root:fixture-root", "/r/feature"),
-            ("worktree", [], UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, "/r/feature"),
+            ("unknown", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, None),
+            ("unset", None, TARGET_DIR_UNSET, "git-root:fixture-root", None),
+            ("worktree", [], UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, None),
         ])
         columns = [(column[1], column[2], column[3]) for column in self.rows("PRAGMA table_info(steps)")
                    if column[1] in ("target_dir", "repo_identity")]
         self.assertCountEqual(columns, [("target_dir", "TEXT", 1), ("repo_identity", "TEXT", 1)])
         self.assertEqual(self.host_file.read_bytes(), original)
+
+    def test_output_roots_survive_indexing_and_legacy_steps_stay_readable(self) -> None:
+        self.write(self.host_file,
+                   step("split", target_dir="/artifacts", target_directory="/artifacts",
+                        build_directory="/intermediates"),
+                   step("same", target_directory="/output", build_directory="/output"),
+                   step("legacy", target_dir="/legacy-output"),
+                   step("unknown"))
+        self.assertEqual(index.update(), 4)
+        self.assertEqual(self.rows(
+            "SELECT id, target_directory, build_directory FROM steps ORDER BY id"), [
+                ("legacy", "/legacy-output", "/legacy-output"),
+                ("same", "/output", "/output"),
+                ("split", "/artifacts", "/intermediates"),
+                ("unknown", UNKNOWN_IDENTITY, UNKNOWN_IDENTITY),
+            ])
 
     def test_schema_twenty_three_rebuilds_history_build_keys_without_rewriting_logs(self) -> None:
         self.write(self.host_file, step("legacy", seat="impl", argv=["cargo", "nextest", "run", "--workspace", "--bin", "hana"]))
@@ -448,10 +576,75 @@ class IndexTests(unittest.TestCase):
         self.assertGreater(index.SCHEMA_VERSION, 23)
         self.assertEqual(self.rows("PRAGMA user_version"), [(index.SCHEMA_VERSION,)])
         row = self.rows("SELECT worker, compiled_crate_names, target_dir, repo_identity, target_folder, build_base, build_items FROM steps")[0]
-        self.assertEqual(row[:5], ("impl", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, "/r/feature"))
+        self.assertEqual(row[:5], ("impl", None, UNKNOWN_IDENTITY, UNKNOWN_IDENTITY, None))
         self.assertIsInstance(row[5], str)
         self.assertNotEqual(json.loads(cast(str, row[6])), [])
         self.assertEqual(self.host_file.read_bytes(), original)
+
+    def test_unknown_and_none_folders_never_use_the_worktree_after_schema_rebuild(self) -> None:
+        self.write(self.host_file, step("none", target_dir="none"), step("empty", target_dir=""),
+                   step("unknown", target_dir="unknown"), step("unset", target_dir="unset"),
+                   step("absolute", target_dir="/shared/actual-target"))
+        with closing(sqlite3.connect(index.index_path())) as connection:
+            connection.execute("CREATE TABLE steps (id TEXT)").close()
+            connection.execute(f"PRAGMA user_version = {index.SCHEMA_VERSION - 1}").close()
+            connection.commit()
+        self.assertEqual(index.update(), 5)
+        self.assertEqual(self.rows("SELECT id, target_dir, target_folder FROM steps ORDER BY id"), [
+            ("absolute", "/shared/actual-target", "/shared/actual-target"),
+            ("empty", "unknown", None), ("none", "none", None),
+            ("unknown", "unknown", None), ("unset", "unset", None),
+        ])
+
+    def test_report_history_keeps_legacy_groups_separate_from_real_folders(self) -> None:
+        cases: tuple[tuple[str, Record, Record, bool], ...] = (
+            ("legacy worktree", {"target_dir": "unset"}, {}, True),
+            ("legacy cwd", {"worktree": None}, {"worktree": None}, True),
+            ("other legacy checkout", {"worktree": "/old"}, {"worktree": "/new"}, False),
+            ("known shared folder", {"target_dir": "/shared/output", "worktree": "/old"},
+             {"target_dir": "/shared/output", "worktree": "/new"}, True),
+            ("different real folders", {"target_dir": "/old/output"}, {"target_dir": "/new/output"}, False),
+            ("legacy to known", {}, {"target_dir": "/shared/output"}, False),
+            ("known to legacy", {"target_dir": "/shared/output"}, {}, False),
+            ("explicit none", {"target_dir": "none"}, {"target_dir": "none"}, False),
+            ("unresolved to unresolved", {"target_dir": "unresolved"}, {"target_dir": "unresolved"}, False),
+            ("unresolved to legacy", {"target_dir": "unresolved"}, {}, False),
+            ("legacy to unresolved", {}, {"target_dir": "unresolved"}, False),
+        )
+        for name, previous, current, expected in cases:
+            with self.subTest(history=name):
+                self.write(self.host_file,
+                           step("previous", started_at="2026-09-01T00:00:00Z", finished_s=1.0, **previous),
+                           step("current", finished_s=1.0, **current))
+                _ = index.reindex()
+                self.assertEqual(self.rows("SELECT " + report.warm_step_clause() + " FROM steps WHERE id = 'current'"),
+                                 [(int(expected),)])
+
+    def test_history_query_limits_reads_to_its_folder_or_checkout_group(self) -> None:
+        size = 800
+        self.write(self.host_file, *[
+            step(str(number), worktree=f"/checkout/{number}",
+                 target_dir=f"/output/{number}" if number % 2 else "unknown",
+                 started_at=f"2026-09-01T00:{number // 60:02d}:{number % 60:02d}Z", finished_s=1.0)
+            for number in range(size)
+        ])
+        _ = index.reindex()
+        with closing(index.read_only()) as connection:
+            sql = "SELECT " + report.warm_step_clause() + " FROM steps"
+            plan = str(connection.execute("EXPLAIN QUERY PLAN " + sql).fetchall())
+            self.assertIn("steps_build_group_history", plan)
+            self.assertIn("build_history_group=? AND build_base=? AND started_at_us<?", plan)
+            batches = 0
+
+            def count_instructions() -> int:
+                nonlocal batches
+                batches += 1
+                return 0
+
+            connection.set_progress_handler(count_instructions, 1000)
+            rows = connection.execute(sql).fetchall()
+            self.assertEqual(rows, [(0,)] * size)
+            self.assertLessEqual(batches * 1000, size * 150)
 
     def test_warm_history_lookup_has_the_folder_base_time_index(self) -> None:
         self.write(self.host_file, step("history"))
@@ -460,14 +653,14 @@ class IndexTests(unittest.TestCase):
             [column[2] for column in self.rows(f'PRAGMA index_info("{name}")')]
             for name, in self.rows("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'steps'")
         ]
-        self.assertIn(["host", "target_folder", "build_base", "started_at_us"], indexed_columns)
+        self.assertIn(["host", "build_history_group", "build_base", "started_at_us"], indexed_columns)
         base, started_at_us = self.rows("SELECT build_base, started_at_us FROM steps")[0]
         plan = str(self.rows(
-            "EXPLAIN QUERY PLAN SELECT id FROM steps WHERE host = ? AND target_folder = ?"
-            + " AND build_base = ? AND started_at_us < ?",
-            "natedev", "/r/feature", base, started_at_us,
+            "EXPLAIN QUERY PLAN SELECT id FROM steps WHERE host = ? AND build_history_group = ?"
+            + " AND build_base = ? AND started_at_us < ? AND finished_s IS NOT NULL",
+            "natedev", "legacy:/r/feature", base, started_at_us,
         ))
-        self.assertIn("steps_build_history", plan)
+        self.assertIn("steps_build_group_history", plan)
         self.assertIn("started_at_us<?", plan)
 
     def test_indexed_start_instants_preserve_microseconds_and_normalize_offsets(self) -> None:
@@ -574,6 +767,51 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(self.rows("SELECT name FROM sqlite_master WHERE name = 'leftover'"), [])
         self.assertEqual(self.ids(), ["s0", "s1"])
 
+    def test_legacy_schema_recovers_gate_history_before_the_saved_offset(self) -> None:
+        run: Record = {**gate_run(), "kind": "gate_run", "v": 1, "id": "recovered-gate", "host": "natedev"}
+        before = step("before-gate", duration_s=12.5)
+        after = call("after-gate", wall_s=6.0)
+        source = self.host_file.relative_to(self.root).as_posix()
+        for legacy_version in (29, 30):
+            with self.subTest(legacy_version=legacy_version):
+                index.index_path().unlink(missing_ok=True)
+                self.write(self.host_file, before, run, after)
+                original = self.host_file.read_bytes()
+                with closing(sqlite3.connect(index.index_path())) as connection:
+                    index.create_schema(connection)
+                    for table in ("gate_tests", "gate_modules", "gate_suites", "gate_runs"):
+                        _ = connection.execute(f"DROP TABLE {table}")
+                    index.add_step(connection, before, source)
+                    index.add_call(connection, after, source)
+                    with self.host_file.open("rb") as handle:
+                        stored_marks = index.marks(handle, len(original))
+                    _ = connection.execute(
+                        "INSERT INTO files (path, offset, marks) VALUES (?, ?, ?)",
+                        (source, len(original), stored_marks),
+                    )
+                    _ = connection.execute(f"PRAGMA user_version = {legacy_version}")
+                    connection.commit()
+
+                self.assertEqual(index.update(), 3)
+                self.assertEqual(self.rows(
+                    "SELECT id, selection, status, modules_run, tests_run FROM gate_runs"),
+                    [("recovered-gate", "affected", 1, 1, 2)])
+                self.assertEqual(self.rows(
+                    "SELECT run_id, suite, wall_s, status FROM gate_suites"),
+                    [("recovered-gate", "scripts", 4.0, 1)])
+                self.assertEqual(self.rows(
+                    "SELECT run_id, suite, module, attempt, tests_run, tests_s FROM gate_modules"),
+                    [("recovered-gate", "scripts", "test_example.py", 1, 2, 1.5)])
+                self.assertEqual(self.rows(
+                    "SELECT run_id, suite, module, attempt, test, duration_s, status FROM gate_tests ORDER BY test"),
+                    [("recovered-gate", "scripts", "test_example.py", 1, "Example.test_fail", 0.5, "fail"),
+                     ("recovered-gate", "scripts", "test_example.py", 1, "Example.test_pass", 1.0, "pass")])
+                self.assertEqual(self.rows("SELECT id, duration_s FROM steps"), [("before-gate", 12.5)])
+                self.assertEqual(self.rows("SELECT id, wall_s FROM calls"), [("after-gate", 6.0)])
+                self.assertEqual(self.host_file.read_bytes(), original)
+                self.assertEqual(index.update(), 0)
+                self.assertEqual(self.host_file.read_bytes(), original)
+
     def test_schema_five_rebuilds_with_memory_admission_columns(self) -> None:
         self.write(self.host_file, step("s0", mem_wait_s=12))
         _ = index.update()
@@ -632,7 +870,7 @@ class IndexTests(unittest.TestCase):
             _ = connection.execute("PRAGMA user_version = 25")
             connection.commit()
         self.assertEqual(index.update(), 3)
-        self.assertEqual(self.rows("PRAGMA user_version"), [(28,)])
+        self.assertEqual(self.rows("PRAGMA user_version"), [(index.SCHEMA_VERSION,)])
         self.assertEqual(path.read_bytes(), original)
         self.assertEqual(json.loads(cast(str, self.rows("SELECT slices FROM samples ORDER BY at")[1][0])), slices)
 
@@ -1000,7 +1238,7 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(self.rows("SELECT count(*) FROM queue_bumps"), [(1,)])
         schema = subprocess.run([sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False)
         self.assertIn("TABLE queue_bumps", schema.stdout)
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as connection:
+        with closing(sqlite3.connect(index.index_path_in(self.root))) as connection:
             _ = connection.execute("PRAGMA user_version = 1")
         _ = index.update()
         self.assertEqual(self.rows("SELECT old_position FROM queue_bumps"), [(3,)])

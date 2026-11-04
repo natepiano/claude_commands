@@ -49,6 +49,22 @@ sdlc corrected its rerun figure: 46% → 16% (same folder, next start 0–10 min
 
 Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's number beside it. For phases, use natedev only and say so. The fail-then-fail gap (ours 80 h against 50–55) goes on the report as a note.
 
+2026-11-03 15:3x EST (the user, to report-unit, after an interview)
+
+The build report is too long for the user and is not used for analysis. Retire it. Keep all the data. report-unit's job is now a loop like the test improvement work. Each round has five steps:
+
+1. Rank the largest build cost.
+2. State a prediction.
+3. Fix the cost where it lives.
+4. Measure the result.
+5. Repeat.
+1. Score: phase time, the wall time of each finished phase. Build hours per phase are the second view.
+2. Scope: all build capacity (natedev, the Mac, CI, and the AWS build machine when it opens), every repository and production. Rank by cost only.
+3. Authority: report-unit fixes buildlog code itself and owns every hypothesis and measurement. A fix in another unit's code goes through the showrunner, and that unit edits. Money (AWS hours), machine changes and worker rule changes go to the user first.
+4. Speed: one or two rounds open. A round is measured after at least 10 finished hana phases, plus one more day if the result is not clear. This is a starting point.
+5. Reports: keep the showrunner informed; the showrunner and report-unit agree when the user hears. The user always hears a measured change, up or down.
+6. Later, lower priority: a way to see the build history as charts, not tables.
+
 ## Delegation Context
 
 - **Project:** `~/.claude` — the build log and its report.
@@ -77,7 +93,7 @@ Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's n
 **Files:**
 - `scripts/lint/memory_admit.py` — the admission reader, with `queue_rows()` and `write_head_since()`
 - `scripts/lint/memory_gate.sh` — cargo-token left and back times
-- `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_build_queue.py`, `scripts/build_queue/test_build_why.py` — both sides' tests
+- `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_build_queue.py`, `scripts/build_queue/test_queue_evidence.py` — both sides' tests
 - `docs/as-built/build-memory-admission.md`, `docs/as-built/unit-board.md` — the merged as-built text
 
 ### Phase 1 — The build report compares build rates before and after each build moment  · status: done
@@ -172,3 +188,131 @@ Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's n
 - Not added: rates per landed commit. A move of the note to one place per report is not made; the note stays under each table.
 
 **Files:** `scripts/buildlog/moments.py`, `scripts/buildlog/report.py`, `scripts/buildlog/test_moments.py`.
+
+### Phase 6 — Dylib A/B timing for hana  · status: todo
+**Depends on:** none
+
+2026-11-03 (the user approved, through the builds showrunner): real-use data cannot isolate the Bevy dylib's effect. Time the same hana commit on the same machine with the dylib on and off. Run each side through verify.sh:
+
+1. Run one cold build.
+2. Run three incremental test runs.
+
+The result goes to the showrunner. No repository code changes.
+
+Completion gate: add one row to `docs/plans/builds-report-rounds.md` with the hana commit, the settings of each side, the measured times, the limits and the conclusion. Mark it as a controlled A/B result, not a phase-time measurement over ten hana phases.
+
+### Phase 7 — The build improvement loop ranks costs and records each round  · status: done
+**Depends on:** none (runs beside Phase 6)
+
+#### As-built
+
+- `buildlog costs [--days N]` (`scripts/buildlog/costs.py`) prints one ranked list of build hours lost by machine and cause, as h/day and h/finished phase. Causes: memory wait, cold rebuilds (50+ crates), failed runs, reruns after a pass, cancelled CI, and Mac idle while natedev waits. It runs in 0.45–0.70 s.
+- The machine comes from `steps.target`, else from `record.target_hosts()`. No host list is copied.
+- Mac idle = candidate waits minus Mac execution and complete Mac holds. Holds with no recorded end make the row an upper bound, with its unknown part beside it (`MacIdleEstimate`, `RankedCost.unknown_seconds`).
+- Phase time reads only `phase_finished` events (wall time = finish minus `phase_started_at`). It prints the median and p90 for hana phases and for all phases.
+- `moments.py` holds the shared `window_bounds`, `nextest_outcome`, `previous_nextest` and `nearest_rank`. `number_option.py` parses `--days` and `--hours`. `holds.py` and `mac_outcome.py` import coordination and recorder modules only where a reader needs them.
+- `docs/plans/builds-report-rounds.md` holds the round record, with four round-1 rows.
+- `/build:report` (`commands/build/report.md`) is retired. `buildlog report`, the index and every collector remain.
+
+**Files:** `scripts/buildlog/costs.py`, `scripts/buildlog/number_option.py`, `scripts/buildlog/cli.py`, `scripts/buildlog/moments.py`, `scripts/buildlog/report.py`, `scripts/buildlog/holds.py`, `scripts/buildlog/mac_report.py`, `scripts/buildlog/mac_outcome.py`, `scripts/buildlog/test_costs.py`, `scripts/buildlog/test_moments.py`, `scripts/buildlog/test_report.py`, `docs/plans/builds-report-rounds.md`.
+
+### Phase 8 — Build history as charts  · status: done
+**Depends on:** Phase 7
+
+The user, 2026-11-03: tables do not work for them. Lower priority. Design a chart view of the build history (costs and phase time over time, each build change marked). Design first; the build waits for the user's go.
+
+#### As-built
+
+- Design: `docs/plans/builds-report-charts-design.md`. The user said "go" on 2026-11-03, relayed by builds.
+- `buildlog charts [--days 7|30] [--no-open]` (`scripts/buildlog/charts.py`) writes `~/.cache/buildlog/charts/latest.html` and opens it. The page is inline SVG with no server or external library. It has light, dark and Auto themes and daily buckets in the user's zone.
+- Charts: hana phase time (daily median and p90), costs by cause as small multiples, and costs by machine. Each has numbered moment lines, a crosshair tooltip and a table view.
+- `costs.py` is the shared cost reader for `buildlog costs` and `buildlog charts`. It pairs reruns and Mac runs in one pass, then splits at bucket edges. A missing applicable memory wait stays `CostUnavailable`, never 0. Mac idle is classified by coverage intervals; its unknown part is shown.
+- `index.py` `COST_INDEXES` (made in `create_schema` and `open_for_update`) give indexed window reads instead of whole-table scans.
+- Speed, as process CPU time (user+sys): 7 days 0.60–0.71 s (limit 1.5 s); 30 days 1.76–1.82 s (limit 3 s).
+- The fresh design check found two label defects; Phase 10 fixes them.
+
+**Files:** `scripts/buildlog/charts.py`, `scripts/buildlog/costs.py`, `scripts/buildlog/index.py`, `scripts/buildlog/cli.py`, `scripts/buildlog/test_charts.py`, `scripts/buildlog/test_costs.py`, `scripts/buildlog/test_index.py`, `docs/plans/builds-report-charts-design.md`.
+
+### Phase 9 — Round 1: find why natedev rebuilds cold  · status: done
+**Depends on:** Phase 7
+
+Cold rebuilds (50+ crates) cost natedev 0.32 h per finished phase, the second largest cost. Find the cause before a fix. Query the index for cold steps: worktree, target folder, and the event before each (new clone, branch switch, toolchain or flag change, sweep deletion). Write the cause with counts and hours to `docs/plans/builds-report-rounds.md`, then send it to the showrunner, which names the owner. No code changes.
+
+### Phase 10 — Chart labels do not collide  · status: done
+**Depends on:** Phase 8
+
+#### As-built
+
+- Moment numbers sit in their own rows below each panel title. Numbers closer than 26 px go to the next row, and the plot top moves down to make room.
+- End labels stay at their own line ends. Ends with the same bucket and value share one label, which names each series and the value.
+- A label that does not fit, or that sits on another series' end, is dropped; the legend names that series. Gap notes yield to end labels.
+- Coincident line segments alternate dashed strokes. A point shared by several series shows one sector per series.
+- `test_charts.py` pins both rules: no moment number box overlaps a panel title box, and each end label is nearest its own line end.
+
+**Files:** `scripts/buildlog/charts.py`, `scripts/buildlog/test_charts.py`.
+
+### Phase 11 — Every build step records its real target folder  · status: done
+**Depends on:** none (runs beside Phase 10)
+
+#### As-built
+
+- Cause (Phase 9): 1,399 of 1,517 cold natedev steps in 7 days had no absolute target folder (678 `unknown`, 721 unset).
+- `scripts/buildlog/step_context.py` gives the shell each step's tree key and target folder in 0.08 s. It applies the command's `env` wrapper (options, `--`, `-u`, `-C`, assignments), Cargo config and workspace default. It does not start `cargo locate-project`. It works as a script, as a package module and with `python3 -m`.
+- Caller metadata and known-folder hints are used only when the command does not change `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR`, `CARGO_HOME`, `HOME` or the working folder.
+- Target states: an absolute folder, `none` (not a Cargo step), or `unresolved` (the folder is not known). A missing captured folder records `unresolved`; the detached writer never resolves late. Old `unknown` and `unset` rows stay as they are.
+- `index.py` schema 29 stores `build_history_group` once: `folder:<path>`, `legacy:<checkout>` for old unknown/unset rows only, or NULL. NULL rows never read or make warm history. Index `steps_build_group_history` replaces `steps_build_history`. `report.py` compares the stored column.
+- `scripts/lib/cargo_target_config.py` is the one Cargo config and workspace reader for the recorder and `scripts/lint/sweep.py` (`CargoConfigPolicy`).
+- `scripts/lint/invoke.sh` writes each step through one `buildlog_write_step` function. verify-unit has the new line ranges.
+- The live index check runs after the merge (Change-Review line in the checkpoint).
+
+**Files:** `scripts/buildlog/step_context.py`, `parse.py`, `record.py`, `index.py`, `report.py`, `launches.py`, `scripts/lib/cargo_target_config.py`, `scripts/lib/shell_test_support.py`, `scripts/lint/invoke.sh`, `scripts/lint/sweep.py`, `scripts/direct/verify.sh`, and their tests.
+
+### Phase 12 — A vault stop that waits on the user does not fail buildlog.service  · status: done
+**Depends on:** none (urgent bump from the builds showrunner, 2026-11-03)
+
+The user unit `buildlog.service` on natedev failed from 21:29 EST. The vault step stopped on uncommitted files in `~/rust/hanadocs` on the Mac and returned exit 1 (`vault_pull.py:310` returns 1 for every stop except "Mac unreachable"). The stop already alerts the user to commit or discard the files.
+
+1. A vault stop that waits on a user action, with its alert sent, exits 0 and keeps its printed stop line.
+2. A real failure (`command_failed`) still exits 1.
+
+Acceptance: tests pin exit 0 for `tracked_files_changed` and exit 1 for `command_failed`. The next hourly `buildlog.service` run ends without failure.
+
+**Files:** `scripts/buildlog/vault_pull.py`, `scripts/buildlog/test_vault_pull.py`.
+
+### Phase 13 — Buildlog tests import their own modules  · status: done
+
+Bump for builds: the bump gate on main be390f93c runs without this unit's PYTHONPATH. test_costs subprocess tests fail with no module cli or costs; test_vault_pull fails to import conf. Each test sets its own import path.
+
+### Phase 14 — Build history charts open and show every machine's costs  · status: done
+**Depends on:** Phase 8, Phase 10
+
+#### As-built
+
+- Cause (C950, C951 "not works", 2026-11-04): the aws-build target was configured with no build log, and "All machines" needed every configured machine, so every cost chart was unavailable. `buildlog` is also not on the terminal PATH; that fix is in `/etc/nixos` and goes through the builds showrunner.
+- `costs.first_source_times` gives each machine's first indexed event. Empty and eventless monthly files do not count. `CostReading.first_sources` carries the mapping; `build_series` joins it with observations.
+- `cost_value` returns `NoDataYet` for each day before a machine's first event. JS sums (All machines and grouped "Other") skip those cells. The chart, table, tooltip and detail line read the same cell. A machine with no data in the window shows one line, and the selector names it "no data yet".
+- A machine with recorded data that misses a day still makes the day unavailable. A missing applicable wait stays unavailable.
+- Page CPU: 7 days about 0.6 s, 30 days about 1.8 s.
+- The checkpoint's Change-Review rows re-check C950 and C951 with the full path.
+
+**Files:** `scripts/buildlog/charts.py`, `scripts/buildlog/costs.py`, `scripts/buildlog/test_charts.py`, `scripts/buildlog/test_costs.py`.
+
+### Phase 15 — The build page ranks the top costs with the action that cuts each  · status: todo
+**Depends on:** Phase 14; the builds showrunner names the build page
+
+The user, 2026-11-04, change review C948 (`buildlog costs`): "send this to builds to review - i'm not sure about this". The builds showrunner ran it. The data is useful: memory wait is 236 step-hours a day, eight times the next cost. The output does not tell the user what to do. Ruling:
+
+1. Delete the `buildlog costs` command. The ranking moves onto the one build page the user uses. builds names that page.
+2. Show at most the top 3 costs. Each line gives the cost in plain words and hours, then the action that cuts it and its owner. The action text lives in config, not code.
+3. Show hours in the user's zone. No seconds, no UTC, no microseconds.
+4. Move the Definitions block into the as-built doc.
+5. Check the memory-wait number first. 236 h a day means about 10 steps wait at all times. queue-unit's 10l bug (on main now) made a waiting step with the AWS hook hold its grant and never start. Say how many of the 236 h came from that bug.
+6. The build history charts (C950) go on the same page. No second page.
+
+The page is queue-unit's Build Memory page (`memory_live.html`, fed by `memory_feed.py`); queue's 10m moves it into the repo. Agreed with queue-unit 2026-11-04: report-unit gives typed data, no HTML, from `charts.page_section(days)` and `costs.top_costs(n=3)`. queue's feed calls them and its page draws them. A 7-day read stays under 1 s. Send queue-unit the signatures and types when they land.
+
+Memory-wait check, done 2026-11-04 (`memory_wait_check.md` in the phase folder): the 236 h/day is a 7-day average that old days drive. Oct 29-31 had 347-533 h/day; Nov 1-3 had 7-90 h/day. The 10l bug adds at most 125 h in total (Nov 2-4). `costs.py` counts each wait correctly. builds ruling: the top 3 rank the last 2 days, so a fixed cost does not stay on top. Each line shows one number. It shows the 7-day value beside it only when the two differ by more than half. The window length lives in config.
+
+Each fix returns as a new Change-Review row.
+
+**Files:** `scripts/buildlog/costs.py`, `cli.py`, `charts.py`, their tests, `docs/as-built/` (Definitions).

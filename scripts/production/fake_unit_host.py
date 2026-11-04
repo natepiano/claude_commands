@@ -9,7 +9,8 @@ import sys
 import threading
 import time
 import unittest
-from collections.abc import Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,10 +29,43 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 PANE_RESULT = herdr.Herdr.result
 
 
-def native_claude(environment: Mapping[str, str], pid: int) -> None:
+@contextmanager
+def private_process_registry() -> Generator[None]:
+    """Read private process generations and retain normal reads for other processes."""
+    import sessions
+    from scripts.message import sessions as runtime_sessions
+
+    original_start = runtime_sessions.process_start
+    original_running = runtime_sessions.running_session
+
+    def started(pid: int) -> str | None:
+        root = os.environ.get("HERDR_PROC", "")
+        path = Path(root) / str(pid) / "stat"
+        if root and path.is_file() and not (path.parent / "kernel-process").exists():
+            fields = path.read_text().rsplit(")", 1)[1].split()
+            return fields[19] if len(fields) > 19 else None
+        return original_start(pid)
+
+    def running(record: runtime_sessions.SessionRecord) -> bool:
+        root = os.environ.get("HERDR_PROC", "")
+        directory = Path(root) / str(record["pid"])
+        if root and (directory / "stat").is_file() and not (directory / "kernel-process").exists():
+            return record.get("procStart", started(record["pid"])) == started(record["pid"])
+        return original_running(record)
+
+    with (mock.patch.object(sessions, "process_start", side_effect=started),
+          mock.patch.object(runtime_sessions, "process_start", side_effect=started),
+          mock.patch.object(sessions, "running_session", side_effect=running),
+          mock.patch.object(runtime_sessions, "running_session", side_effect=running)):
+        yield
+
+
+def native_claude(environment: Mapping[str, str], pid: int, *, kernel_process: bool = False) -> None:
     """Publish the private process files needed for registry and liveness reads."""
     directory = Path(environment["HERDR_PROC"]) / str(pid)
     directory.mkdir(parents=True, exist_ok=True)
+    if kernel_process:
+        (directory / "kernel-process").touch()
     for name, content in (("environ", b""), ("cmdline", b"claude\0")):
         if not (directory / name).exists():
             _ = (directory / name).write_bytes(content)
@@ -78,17 +112,31 @@ def environment(root: Path) -> dict[str, str]:
     }
 
 
+def _write_children(root: Path) -> None:
+    """Update thread child lists from the private process parent facts."""
+    parents = {
+        int(path.parent.name): int(path.read_text().rsplit(")", 1)[1].split()[1])
+        for path in root.glob("[0-9]*/stat")
+    }
+    for pid in parents:
+        task = root / str(pid) / "task" / str(pid)
+        task.mkdir(parents=True, exist_ok=True)
+        children = sorted(child for child, parent in parents.items() if parent == pid)
+        _ = (task / "children").write_text(" ".join(str(child) for child in children))
+
+
 def process(env: Mapping[str, str], pid: int, parent: int, argv: Sequence[str], marks: Mapping[str, str], *, started: str = "1",
             session: int | None = None, cwd: Path | None = None) -> None:
     directory = Path(env["HERDR_PROC"]) / str(pid)
     directory.mkdir(parents=True, exist_ok=True)
-    _ = (directory / "stat").write_text(f"{pid} (fixture) S {parent} {pid} {session or pid} {session or pid} 0 " + "0 " * 13 + started)
+    _ = (directory / "stat").write_text(f"{pid} (fixture) S {parent} {pid} {session or pid} 0 {session or pid} " + "0 " * 13 + started)
     _ = (directory / "cmdline").write_bytes(("\0".join(argv) + "\0").encode())
     _ = (directory / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in marks.items()).encode())
     link = directory / "cwd"
     link.unlink(missing_ok=True)
     link.symlink_to(cwd or directory.parent.parent)
     _ = (directory / "cgroup").write_text("")
+    _write_children(directory.parent)
 
 
 def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
@@ -119,7 +167,7 @@ def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
             responses[f"--session {name} pane process-info --pane {unit.pane}"] = {
                 "code": 0, "stdout": json.dumps({"result": {"process_info": {
                     "shell_pid": shell, "foreground_process_group_id": shell,
-                    "foreground_processes": [{"name": "zsh"}]}}})}
+                    "foreground_processes": [{"name": "zsh", "argv": ["zsh"], "pid": shell}]}}})}
             responses[f"--session {name} pane close {unit.pane}"] = {
                 "code": 0, "stdout": "", "remove_paths": [str(Path(env["HERDR_PROC"]) / str(shell))]}
             for source in ("recent", "recent-unwrapped"):
@@ -139,6 +187,17 @@ def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
     _ = responses_file.write_text(json.dumps(responses))
 
 
+def pane_foreground(env: Mapping[str, str], session: str, pane: str, shell: int, pid: int, command: str) -> None:
+    """Update only the selected pane's foreground reply."""
+    responses_file = Path(env["FAKE_HERDR_RESPONSES"])
+    responses = cast(dict[str, CommandResponse], json.loads(responses_file.read_text()))
+    responses[f"--session {session} pane process-info --pane {pane}"] = {
+        "code": 0, "stdout": json.dumps({"result": {"process_info": {
+            "shell_pid": shell, "foreground_process_group_id": pid,
+            "foreground_processes": [{"name": command, "argv": [command], "pid": pid}]}}})}
+    _ = responses_file.write_text(json.dumps(responses))
+
+
 def place_process(env: Mapping[str, str], pid: int, pane: str, *, session: str = "", exec_shell: bool = False) -> None:
     """Put a registry process below the fixture shell owning this pane."""
     matches: list[tuple[Path, dict[str, str]]] = []
@@ -154,16 +213,13 @@ def place_process(env: Mapping[str, str], pid: int, pane: str, *, session: str =
     if len(matches) != 1:
         raise AssertionError(f"expected one hosted pane {session}:{pane}, found {len(matches)}")
     directory, marks = matches[0]
-    parent = int((directory / "stat").read_text().split()[3])
+    parent = int((directory / "stat").read_text().split()[3]) if exec_shell else int(directory.name)
     process(env, pid, parent, ["claude"], marks)
+    pane_foreground(env, marks["HERDR_SESSION"], pane, pid if exec_shell else int(directory.name), pid, "claude")
     if exec_shell:
         # Generic launch fixtures use exec; pane-shell scenarios keep both processes.
-        responses_file = Path(env["FAKE_HERDR_RESPONSES"])
-        responses = cast(dict[str, CommandResponse], json.loads(responses_file.read_text()))
-        responses[f"--session {marks['HERDR_SESSION']} pane process-info --pane {pane}"] = {
-            "code": 0, "stdout": json.dumps({"result": {"process_info": {"shell_pid": pid}}})}
-        _ = responses_file.write_text(json.dumps(responses))
         shutil.rmtree(directory)
+        _write_children(directory.parent)
 
 
 def calls(env: Mapping[str, str]) -> list[list[str]]:
@@ -215,11 +271,19 @@ class PaneShellFixture:
             if live else unit_lookup.ClaudeNotRunning(), self.place)
         write(self.environment, [HostedUnit(self.place.session, self.place.pane,
               {unit_lookup.PRODUCTION_MARK: slug, unit_lookup.UNIT_MARK: unit})])
+        _ = case.enterContext(private_process_registry())
+        if live:
+            from scripts.production.staff_test_support import record_fixture_claude_start
+            place_process(self.environment, self.director, self.place.pane)
+            with mock.patch.dict(os.environ, {**self.environment, "FAKE_CLAUDE_PID": str(self.director),
+                                             "FAKE_CLAUDE_SESSION_ID": self.native_id}):
+                record_fixture_claude_start([])
         process(self.environment, self.shell, 991000, ["arbitrary-shell-name"],
                 self.marks(), session=self.shell, cwd=worktree)
         self.parent(self.shell)
         if not live:
             shutil.rmtree(process_root / str(self.director))
+            _write_children(process_root)
         case.enterContext(mock.patch.dict(os.environ, self.environment))
         _ = case.enterContext(mock.patch.object(herdr.Herdr, "result", PANE_RESULT))
         _ = case.enterContext(mock.patch.object(unit_move, "processes_inside", side_effect=self.inside_pids))
@@ -246,6 +310,8 @@ class PaneShellFixture:
         import unit_lookup
         self.lifecycle.append("director exited")
         shutil.rmtree(Path(self.environment["HERDR_PROC"]) / str(self.director), ignore_errors=True)
+        _write_children(Path(self.environment["HERDR_PROC"]))
+        pane_foreground(self.environment, self.place.session, self.place.pane, self.shell, self.shell, "arbitrary-shell-name")
         self._found = unit_lookup.MarkedUnit(self.unit, unit_lookup.ClaudeNotRunning(), self.place)
 
     def marked_unit(self, slug: str, unit: str) -> unit_lookup.MarkedUnit | None:

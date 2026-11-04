@@ -22,11 +22,10 @@ from scripts.production import showrunners
 import showrunner_tree
 import unit_lookup
 from scripts.production import staff, unit_names
-from production_units import Production, read_production
-from production_units import Refusal, cell_value, production_field
-from unit_lookup import live_unit_table
+from scripts.production.production_doc import Production, Refusal, production_field, read_production
 from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
 from dailies_counts import CountsFailure, production_counts
+from scripts.production.store_owner import document_id
 from dailies_render import (LENGTHS, InputError, ReportsEvery, ReportsOnDemand, StateRefused, StyleSummary,
                             as_list, as_map, check_render_state, due, last_report,
                             local_now, parse_child_report, parse_range_end, parse_report, parse_time,
@@ -304,35 +303,28 @@ def bounded_bevy_update(text: str) -> str:
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
-def units_from_doc(lines: list[str], slug: str, *, record: staff.StaffSnapshot | None = None) -> tuple[UnitRow, ...]:
-    record = record if record is not None else staff.snapshot()
-    sources = unit_lookup.member_sources()
-    live_rows = live_unit_table(lines, slug, record=record, sources=sources)
-    if unit_lookup.retired_units(lines, slug, record=record, sources=sources) and not live_rows:
-        raise DailiesFailure("production", "no live units: every Units row is retired")
+def report_units(doc: Path, slug: str, record: staff.StaffSnapshot) -> tuple[UnitRow, ...]:
+    rows = unit_lookup.doc_units(doc, record)
+    live = [row for row in rows if not isinstance(row.worktree, staff.RemovedWorktree)]
+    if rows and not live:
+        raise DailiesFailure("production", "no live units: every unit is retired")
     try:
         marked = {unit_names.name(name): place
-                  for name, place in unit_lookup.marked_units(slug, record=record, sources=sources).items()}
+                  for name, place in unit_lookup.marked_units(slug, record=record).items()}
     except OSError as error:
         raise DailiesFailure("production", f"the unit sessions could not be looked up: {error}") from error
     try:
         runs = unit_lookup.read_run_states()
     except OSError as error:
         raise DailiesFailure("production", f"the run records of {slug} could not be read: {error}") from error
-    members = {row.name: row
-               for row in unit_lookup.production_members(record, sources).get(showrunners.canonical_slug(slug), ())}
     units: list[UnitRow] = []
-    for cells in live_rows:
-        name = cell_value(cells.get("Unit", ""))
-        if not name:
-            raise DailiesFailure("production", f"invalid Units row: {cells}")
-        key = unit_names.name(name)
-        found = marked.get(key)
+    for row in live:
+        found = marked.get(row.name)
         claude = found.claude if found is not None else None
-        tree = members[key].worktree
-        run = (runs.state(tree.path) if isinstance(tree, staff.PresentWorktree)
+        run = (runs.state(row.worktree.path) if isinstance(row.worktree, staff.PresentWorktree)
                else UnitRunUnavailable("the unit has no present worktree"))
-        units.append(UnitRow(name, claude.name if isinstance(claude, unit_lookup.LiveClaude) else "", run))
+        units.append(UnitRow(unit_names.unit_id(row.name),
+                             claude.name if isinstance(claude, unit_lookup.LiveClaude) else "", run))
     return tuple(units)
 
 
@@ -885,7 +877,7 @@ def run(args: argparse.Namespace) -> int:
         print(f"state-dir: ok — {line}", file=sys.stderr)
     now, _ = local_now(str(production.zone), "--zone", at)
     lines = production.doc.read_text(encoding="utf-8").splitlines()
-    units = units_from_doc(lines, production.slug, record=staff_record)
+    units = report_units(production.doc, production.slug, staff_record)
     table_state = phase_tables(production.doc, production.zone)
     if isinstance(table_state, PhaseTablesAvailable):
         table_state = PhaseTablesAvailable(
@@ -930,6 +922,7 @@ def run(args: argparse.Namespace) -> int:
     judgment = as_map(raw, str(judgment_path))
     supplied_units = as_list(judgment.get("units"), f"{judgment_path}.units")
     by_session: dict[str, JsonMap] = {}
+    owner_id = document_id(production.doc, record=staff_record)
     for index, supplied in enumerate(supplied_units):
         fields = as_map(supplied, f"{judgment_path}.units[{index}]")
         unit_name = fields.get("unit")
@@ -1079,8 +1072,8 @@ def run(args: argparse.Namespace) -> int:
         report("children", "ok", f"{len(children)} below: {', '.join(children)}")
     # A bad config line costs only the counts line, never the report.
     try:
-        counts = production_counts(production.slug)
-    except CountsFailure as failure:
+        counts = production_counts(owner_id)
+    except (CountsFailure, staff.StaffRefused, staff.StaffUnreadable) as failure:
         report("counts", "unavailable", str(failure))
     else:
         if counts:

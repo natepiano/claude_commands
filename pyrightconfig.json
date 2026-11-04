@@ -1,6 +1,4 @@
 {
-  "venvPath": ".",
-  "venv": ".venv",
   "exclude": [
     "**/node_modules",
     "**/__pycache__",
@@ -144,6 +142,7 @@
     {
       "root": "scripts/build_targets",
       "extraPaths": [
+        ".",
         "scripts/build_targets",
         "scripts/build_hold",
         "scripts/mac_test",

@@ -29,10 +29,8 @@ sys.path.insert(0, str(PRODUCTION_SCRIPTS))
 from scripts.direct import plan_history
 from scripts.lib.user_zone import user_zone
 from scripts.production import showrunners, session_staff, staff, unit_config, unit_names
-from scripts.production.unit_table import Refusal, cell_value
-from scripts.production.production_units import production_field
+from scripts.production.production_doc import PromoteTo, Refusal, cell_value, production_field, promotion_from_doc
 from scripts.shutdown import remote
-from scripts.production.production_doc import PromoteTo, promotion_from_doc
 
 # The finding_opened event schema uses these severities. Importing findings to
 # read its SEVERITIES also validates command-only convergence configuration.
@@ -1114,7 +1112,7 @@ def build_plan(plan_path: Path, *, resolver: session_staff.RowResolver | None = 
     except (OSError, UnicodeError) as error:
         raise NoPlan(f"Unable to read plan {plan_path}") from error
 
-    run_events = [_events(path) for path in plan_history.plan_runs(plan_path)]
+    run_events = [_events(path) for path in plan_history.plan_runs(plan_path, record=resolver.record)]
     instances = _phase_instances(run_events)
     open_instance = _newest_open_instance(run_events)
     return _build_phase_record(
@@ -1633,7 +1631,7 @@ def _production_unit_plans(production: Production, *, resolver: session_staff.Ro
         raise Refusal(f"{production.doc}: no staff owner binds the document")
     plans: list[ProductionUnitPlan | UnitPlanUnavailable] = []
     for row in staff.active(resolver.record, "unit"):
-        if row.parent != owner.id:
+        if not row.reports_to(owner.id):
             continue
         tree = resolver.unit_worktree(row)
         try:
@@ -1681,7 +1679,7 @@ def _production_reference(plan_path: Path, *, resolver: session_staff.RowResolve
     if not isinstance(doc, session_staff.ProductionDoc):
         print(f"phase_table: {member.row.name}: {doc.reason}", file=sys.stderr)
         return PlanOutsideProduction()
-    parent = resolver.record.by_id(member.row.parent) if member.row.parent is not None else None
+    parent = resolver.record.parent_of(member.row)
     if parent is None:
         return PlanOutsideProduction()
     timer = showrunners.timer_for(parent, resolver.record)
@@ -1749,9 +1747,15 @@ def _phase_note_name(production: str, unit: str, *, resolver: session_staff.RowR
 
 def _note_ownership(path: Path) -> NoteOwnership | NoteWithoutPhaseTableOwnership:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         return NoteWithoutPhaseTableOwnership()
+    return phase_note_ownership(text)
+
+
+def phase_note_ownership(text: str) -> NoteOwnership | NoteWithoutPhaseTableOwnership:
+    """Read the writer's ownership marker and identity from note content."""
+    lines = text.splitlines()
     if not lines or lines[0] != "---":
         return NoteWithoutPhaseTableOwnership()
     fields: dict[str, str] = {}
@@ -1881,8 +1885,17 @@ def _note_text(
     production_file: str,
     unit: str,
     record: PhaseRecord,
-    zone: ZoneInfo,
 ) -> str:
+    """Keep phase changes in the vault without clocks or progress updates."""
+    rows = ["| Phase | What it delivers | Status |", "| --- | --- | --- |"]
+    for row in reversed(record.phases):
+        if isinstance(row, DonePhase):
+            status = "done"
+        elif isinstance(row, OpenPhase):
+            status = "running"
+        else:
+            status = "todo" if isinstance(row.gate, NoGate) else "gated"
+        rows.append(f"| {row.phase} | {_cell_text(row.title)} | {status} |")
     return "\n".join(
         (
             "---",
@@ -1895,41 +1908,12 @@ def _note_text(
             "",
             f"# {name}",
             "",
-            render(record, zone),
+            f"**{_heading_text(record)}**",
+            "",
+            *rows,
             "",
         )
     )
-
-
-def _ensure_showrunners_excluded(vault_root: Path) -> None:
-    try:
-        checkout = Path(
-            _git_output(vault_root.parent, "rev-parse", "--show-toplevel")
-        ).resolve()
-    except Refusal:
-        return
-    try:
-        relative = vault_root.resolve().relative_to(checkout)
-    except ValueError:
-        return
-    if relative == Path():
-        return
-    exclude_line = f"{relative.as_posix()}/"
-    git_path = Path(
-        _git_output(checkout, "rev-parse", "--git-path", "info/exclude")
-    )
-    exclude = git_path if git_path.is_absolute() else checkout / git_path
-    try:
-        before = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
-        if exclude_line in before.splitlines():
-            return
-        exclude.parent.mkdir(parents=True, exist_ok=True)
-        with exclude.open("a", encoding="utf-8") as handle:
-            if before and not before.endswith("\n"):
-                _ = handle.write("\n")
-            _ = handle.write(f"{exclude_line}\n")
-    except OSError as error:
-        raise Refusal(f"cannot update {exclude}: {error}") from error
 
 
 @contextmanager
@@ -1957,6 +1941,8 @@ def _write_note(target: Path, content: str, production: ProductionIdentity, unit
                     "phase note target is not owned by "
                     + f"{production.slug}/{unit}: {target}"
                 )
+            if target_existed and target.read_text(encoding="utf-8") == content:
+                return
             with tempfile.NamedTemporaryFile(
                 "w",
                 encoding="utf-8",
@@ -2214,7 +2200,6 @@ def refresh(session_dir: Path) -> None:
             "phase note target is not owned by "
             + f"{production.slug}/{reference.unit}: {target}"
         )
-    _ensure_showrunners_excluded(vault_root)
     _write_note(
         target,
         _note_text(
@@ -2223,7 +2208,6 @@ def refresh(session_dir: Path) -> None:
             _production_file_link(production.doc, vault_root.parent),
             reference.unit,
             record,
-            production.zone,
         ),
         identity,
         reference.unit,

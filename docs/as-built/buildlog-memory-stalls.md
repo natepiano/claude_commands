@@ -196,7 +196,7 @@ Each host with a counted pair gets one line, `<host>: CPU some X%, full Y%; IO s
   - `require_both=False` leaves a missing or invalid counter `Unmeasured`, while the default raises.
   - The boot id is trimmed, and an empty one is rejected.
   - Without `/proc`, `sample` prints exactly `buildlog sample is Linux only (requires /proc).` to stderr, exits nonzero and writes nothing.
-  - A real `cli.py sample` appends a sample record and its memory snapshot to `<host>/samples-YYYY-MM.jsonl`, with the memory and stall counters integers ≥ 0, and creates no `index.sqlite`.
+  - A real `cli.py sample` appends a sample record and its memory snapshot to `<host>/samples-YYYY-MM.jsonl`, with the memory and stall counters integers ≥ 0, and creates no index file at `index_path()`.
   - The power profile reads its name and mtime from one open file; a state file replaced by rename after the open keeps the open file's profile and mtime; a missing, unreadable, sectionless or valueless file is `Unmeasured`; a sample writes `power_profile` with a UTC `power_profile_since`, or two `null` fields with no state file.
 - `test_store.py`: `sample_file` is `<root>/<host>/samples-YYYY-MM.jsonl` and is not `host_file`.
 - `test_record.py`:
@@ -222,7 +222,7 @@ Each host with a counted pair gets one line, `<host>: CPU some X%, full Y%; IO s
 
 ## Invariants
 
-- **The sampler never opens the SQLite index.** `buildlog sample` appends one JSON line and exits; the index ingests that line on the next query. A test pins that no `index.sqlite` appears.
+- **The sampler never opens the SQLite index.** `buildlog sample` appends one JSON line and exits; the index ingests that line on the next query. A test checks that no file appears at `index_path()`.
 - **A test never writes the real log at `~/.local/state/buildlog`.** Every test module imports `test_index`, whose import calls `use_test_log()` and points `BUILDLOG_DIR` at a temp dir for the whole suite. `point_root_at()` moves it for a single test. Subprocess tests also pass `BUILDLOG_DIR` explicitly. The real `cli.py sample` test runs against a temp root.
 - **Nothing sits directly under a report table but its one `Source:` line.** That line carries any explanation of the table; a table without one ends at the next blank line. This section's `Source:` line sits under the heading, so its stall table ends at the blank line (`docs/as-built/build-followups.md` lists which tables carry the line).
 - **`report.py` has one style.** Cells are formatted through `table()`, `seconds()`, `count()` and `gib()`, with no new formatters.
@@ -235,7 +235,7 @@ Each host with a counted pair gets one line, `<host>: CPU some X%, full Y%; IO s
 - **The power profile never stops a sample.** `read_power_profile` never raises; an unreadable profile is two `null` fields. The power-profile read never forks a process or opens D-Bus; jobserver readings use their required bounded `stevie` calls.
 - **Old samples stay as written.** A sample line without the profile fields indexes as NULL; nothing infers or backfills a profile for it.
 - **Units differ by table, deliberately.** `steps` stores stall in seconds (`REAL`, the scope's own total). `samples` stores the raw counters since boot in microseconds (`INTEGER`).
-- **Any column change bumps `SCHEMA_VERSION`.** `open_for_update` deletes an index at another version and rebuilds it from the JSON lines.
+- **The file name hashes the schema SQL.** Bump `SCHEMA_VERSION` only when the way rows are derived changes.
 - **`sample.py` has no import side effects.** `record.py` imports it after every step for `parse_pressure` and `Unmeasured`.
 - **The build-log modules import without a cycle.** `record.py` imports `memory_admit`, `memory_admit` imports `index`, and `scripts/lint/sweep.py` imports `record`. So `index.py` imports only `store` and `parse` of the buildlog modules, never `record`, and `sample.py` takes `FilesystemUsage` from `filesystem.py`, never from `disk.py` (which imports `sweep`). Check import cycles on a trial merge with builds; one branch alone may not hold every edge.
 - **The index never writes a source log.** A source `.jsonl` file is appended and never edited. To rewrite a month file by hand, truncate and write it in place under its flock; never rename a new file over it, since an appender that waits on the lock holds the old inode. Fix a bad line in a Mac host folder on the Mac: `sync.py` pulls those folders with `rsync -rt`, so a natedev edit is lost at the next sync.
@@ -256,9 +256,9 @@ Each host with a counted pair gets one line, `<host>: CPU some X%, full Y%; IO s
 - **`power_profile_since` is the last write, not the last switch.** The daemon can rewrite its file with the same profile and a newer mtime. The report counts a change only when the profile name differs from the previous profiled sample.
 - **A subprocess test reads live `/proc` unless told otherwise.** A test that runs `sample()` in a subprocess must point `CPU_PRESSURE`, `IO_PRESSURE` and `STAT` at scratch paths, as `test_memory_records.py` does.
 - **The `(of …)` duration counts PSI pairs only.** It is the time of pairs where any PSI counter counted, so a host with only tick readings shows `0.0 s` sampled beside valid idle and iowait shares.
-- **A `SCHEMA_VERSION` raise changes `test_index.py`'s schema expectation**, which needs its own `Assertion-Change:` line at checkpoint.
+- **A `SCHEMA_VERSION` raise changes `test_index.py`'s schema expectation.**
 - **The cgroup path assumes cgroup v2.** The scope string reads the unified `0::` line of `/proc/self/cgroup`.
-- **basedpyright exits 3 in every checkout.** `pyrightconfig.json` names an absent `.venv`. The lint result is the error and warning counts line, not the exit code.
+- **basedpyright** exits 0 when clean. Its summary reads `0 errors, 0 warnings, 0 notes`.
 
 ## Why it is this way
 

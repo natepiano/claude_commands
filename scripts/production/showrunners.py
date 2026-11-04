@@ -52,7 +52,7 @@ class Showrunner(TypedDict):
     slug: str
     # The user's zone setting. A production doc's own User zone line is no longer read.
     zone: str
-    # The production doc, whose Units table says which units the showrunner has.
+    # The production doc. The staff rows whose parent is this showrunner are its units.
     doc: str
 
 

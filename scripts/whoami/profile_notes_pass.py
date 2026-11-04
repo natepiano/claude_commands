@@ -164,7 +164,7 @@ def patch_list(pass_: NotesPass) -> tuple[PassCallPatch, ...]:
         PassCallPatch(n, "rename_legacy_notes", "links and unlinks vault notes", []),
         PassCallPatch(n, "write_note", "replaces vault note text", False),
         PassCallPatch(n, "append_readings", "replaces the usage readings log"),
-        PassCallPatch(n, "write_sessions_seen", "replaces session observation state"),
+        PassCallPatch(n, "write_sessions_seen", "writes machine observation times"),
         PassCallPatch(u, "save", "writes usage and account-label readings"),
         PassCallPatch(u, "save_timer_usage", "writes timer reports"),
         PassCallPatch(u, "write", "writes usage read claims and outcomes"),
@@ -227,10 +227,9 @@ def patch_list(pass_: NotesPass) -> tuple[PassCallPatch, ...]:
 def state_copies(pass_: NotesPass) -> tuple[StateCopy, ...]:
     """Only side-effect state is copied. Notes, transcripts, registry and rosters stay live."""
     account_patterns = ("refusal_watch.json", "login_renewals.json",
-                        "assumed_refusals/*.json", "unit-watchdog-results/*.json")
+                        "unit-watchdog-results/*.json")
     return (
         StateCopy(pass_.usage, "store_file", state_path(pass_.usage, "store_file", True), True),
-        StateCopy(pass_.notes, "SESSIONS_SEEN", state_path(pass_.notes, "SESSIONS_SEEN").expanduser()),
         StateCopy(pass_.notes, "READINGS_LOG", state_path(pass_.notes, "READINGS_LOG")),
         StateCopy(pass_.run_out, "READINGS_LOG", state_path(pass_.run_out, "READINGS_LOG")),
         StateCopy(pass_.accounts, "readings_file", state_path(pass_.accounts, "readings_file", True), True),
@@ -341,8 +340,6 @@ def replacement(entry: PassCallPatch, measurements: Measurements) -> Callable[..
             if not any(flag in mode for flag in "wax+"):
                 return original(*args, **kwargs)
             measurements.count(entry.name)
-            if "x" in mode and Path(cast(str, args[0] if args else kwargs["file"])).exists():
-                raise FileExistsError("profile: existing marker")
             content: str | bytes = b"" if "b" in mode else ""
             if "+" in mode or mode.startswith("r"):
                 read_args, read_kwargs = list(args), dict(kwargs)
@@ -447,7 +444,8 @@ def command_words(arguments: object) -> tuple[str, ...]:
     if isinstance(arguments, Sequence):
         return tuple(os.fsdecode(cast(str | bytes | os.PathLike[str], item))
                      for item in arguments)
-    raise OSError("profile: child argv is not readable")
+    print("profile: anomaly: child argv is not readable", file=sys.stderr)
+    return ()
 
 
 @dataclass(frozen=True)
@@ -502,7 +500,6 @@ def herdr_read(args: tuple[str, ...]) -> bool:
                 and tail[1] in {"recent", "recent-unwrapped"} and tail[2] == "--lines"
                 and tail[3].isdecimal() and (len(tail) == 4 or tail[4:] == ("--format", "ansi")))
     return False
-
 
 
 def ps_read(args: tuple[str, ...]) -> bool:
@@ -562,7 +559,10 @@ def child_policy(peer_python: Mapping[str, str] = NO_PEER_PYTHON) -> tuple[Trust
         return ("-o", "StrictHostKeyChecking=yes", "-o", "UpdateHostKeys=no",
                 "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "PermitLocalCommand=no",
                 "-o", "ProxyCommand=none", *args[:5], command)
-    unmarked = ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID", "NIX_HEAL_PREPARED_SESSION", "NIX_HEAL_PREPARED_DIRECTORY")
+    unmarked = (
+        *(name for name in environment if name.startswith("SHOWRUNNER_")),
+        "NIX_HEAL_PREPARED_SESSION", "NIX_HEAL_PREPARED_DIRECTORY",
+    )
     specs: tuple[tuple[str, Callable[[tuple[str, ...]], bool], Callable[[tuple[str, ...]], tuple[str, ...]], tuple[tuple[str, str], ...], tuple[str, ...]], ...] = (
         ("ps", ps_read, identity, (("LC_ALL", "C"), ("TZ", "UTC")), unmarked),
         ("lsof", lsof_read, lambda args: ("-Di", *args), (), unmarked),

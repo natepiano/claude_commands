@@ -112,12 +112,79 @@ class MacIdleTests(unittest.TestCase):
         cwd.symlink_to(self.root)
 
     def rows(self) -> list[dict[str, object]]:
-        return [cast(dict[str, object], json.loads(line)) for path in (self.root / "buildlog").glob("*/*.jsonl")
-                for line in path.read_text().splitlines()]
+        """Read Mac idle cases from the shared build log."""
+        records = [cast(dict[str, object], json.loads(line)) for path in (self.root / "buildlog").glob("*/*.jsonl")
+                   for line in path.read_text().splitlines()]
+        return [row for row in records if row.get("kind") == "mac_idle"]
 
     def two_passes(self) -> None:
         mac_idle.watch_once(self.paths, 1180, 100)
         mac_idle.watch_once(self.paths, 1240, 160)
+
+    def test_tree_writing_lint_wait_is_local_and_next_judgment_counts_again(self) -> None:
+        verify = mac_idle.SCRIPTS / "direct/verify.sh"
+        source = verify.read_text()
+        functions: list[str] = []
+        for name in ("step_state", "step_writes_tree", "finish_step_token", "run", "run_step"):
+            start = source.index(f"\n{name}() {{") + 1
+            end = source.index("\n}\n", start) + 2
+            functions.append(source[start:end])
+        script = "\n".join(functions) + r'''
+set -uo pipefail
+STEP_RECORD_ACTIVE=1; STEP_RUNS_ON=mac_allowed; CMD=lint
+TOKEN_USED=0; TOKEN_HELD=0; TOKEN_WAITED=0; LINT_LEFT_QUEUE_STATUS=75
+STEP_RECORD_ARGS=(write --call-id "$BUILDLOG_CALL_ID" --pid 123 --repo "$TEST_REPO"
+    --kind lint --runs-on mac_allowed --state waiting_hold)
+buildlog_step_compiles() { return 0; }
+route_compiling_step() {
+    STEP_RAN_ON_MAC=0
+    step_state waiting_hold
+    cp "$TEST_RECORD" "$TEST_REPO/$stage.route"
+}
+run_once() {
+    step_state waiting_hold
+    cp "$TEST_RECORD" "$TEST_REPO/$stage.memory"
+    return 0
+}
+for stage in mend fmt fix judgment; do
+    case "$stage" in
+        mend) run cargo mend --fix ;;
+        fmt) run cargo +nightly fmt ;;
+        fix) run cargo clippy --fix ;;
+        judgment) run cargo clippy -- -D warnings ;;
+    esac || exit $?
+done
+'''
+        Path(self.call.repo).mkdir()
+        result = subprocess.run(["bash", "-c", script], env={**os.environ,
+            "PY": sys.executable, "STEP_RECORD_SCRIPT": str(verify.with_name("step_record.py")),
+            "BUILDLOG_CALL_ID": self.call.call_id, "TEST_REPO": self.call.repo,
+            "TEST_RECORD": str(step_record.record_path(self.call.call_id))},
+            capture_output=True, text=True, check=False, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        live = mac_idle.processes(self.paths.proc)
+        for stage in ("mend", "fmt", "fix", "judgment"):
+            for wait in ("route", "memory"):
+                with self.subTest(stage=stage, wait=wait):
+                    snapshot = Path(self.call.repo) / f"{stage}.{wait}"
+                    _ = step_record.record_path(self.call.call_id).write_bytes(snapshot.read_bytes())
+                    record = step_record.read(self.call.call_id)
+                    self.assertIsInstance(record, step_record.StepRecord)
+                    assert isinstance(record, step_record.StepRecord)
+                    if stage == "judgment":
+                        self.assertIsInstance(record.runs_on, step_record.MacAllowed)
+                        self.assertEqual(len(mac_idle.waiting_calls(self.paths, live)), 1)
+                        mac_idle.call_path(self.paths, self.call.call_id).with_suffix(".cases").unlink(missing_ok=True)
+                        with mock.patch.object(mac_idle, "record_case") as report:
+                            mac_idle.watch_once(self.paths, 1180, 100)
+                        self.assertTrue(report.called)
+                    else:
+                        self.assertIsInstance(record.runs_on, step_record.NatedevOnly)
+                        self.assertEqual(mac_idle.waiting_calls(self.paths, live), ())
+                        with mock.patch.object(mac_idle, "notify_director") as send:
+                            mac_idle.watch_once(self.paths, 1180, 100)
+                        send.assert_not_called()
+                        self.assertEqual(self.rows(), [])
 
     def test_idle_eligible_wait_gets_one_marker_and_one_row(self) -> None:
         with mock.patch.object(mac_idle, "notify_director") as send:

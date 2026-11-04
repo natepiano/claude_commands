@@ -38,7 +38,7 @@ class StylePlanTests(StylePlanFixture):
             ledger.file_held(finding.finding_id, issue)
         _ = issue.write_text('---\nstatus: open\nstage: backlog\ntags: [issue, proposal, style]\n'
                              + f'unit: names-unit\nplan: "{self.plan} Phase 1"\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n')
-        _ = self.doc.write_text(self.doc.read_text().replace("## Units", f"- **Proposals:** {folder}\n\n## Units"))
+        self.proposals_field(folder)
         def start(*args: str) -> None:
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(proposal_issue.main(list(args)), 0)

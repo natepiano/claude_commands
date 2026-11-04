@@ -22,8 +22,7 @@ from scripts.lib.git_exclude import ensure_excluded
 import showrunner_tree
 from add_showrunner import NoEndingTab, herdr_tab_open
 import herdr
-from production_units import Production, read_production
-from production_units import Refusal, cell_value, production_field, unit_table
+from scripts.production.production_doc import Production, Refusal, production_field, read_production
 
 import rules
 import style_ledger
@@ -183,15 +182,7 @@ def _check_existing(style: StyleProduction) -> bool:
     return style.doc.exists() and style.slug in showrunners.timer_slugs()
 
 
-def _unit_row(style: StyleProduction, family: rules.Family) -> str:
-    return (
-        f"| {style.slug}-{family}-unit | {PLAN_DIRECTORY}/{style.slug}-{family}-unit.md | {style.repository.parent / (style.slug + '-' + family)} "
-        + f"| {style.slug}-{family} | — | none — takes what the board leaves free |"
-    )
-
-
 def _production_text(style: StyleProduction) -> str:
-    rows = [_unit_row(style, family) for family in FAMILIES]
     return "\n".join([
         f"# Production — {style.slug}", "",
         "> **Status: PRODUCTION — running.** Standing style coverage and mechanical fixes.", "",
@@ -205,9 +196,6 @@ def _production_text(style: StyleProduction) -> str:
         f"- **Log:** {style.log}",
         f"- **Proposals:** {style.proposals}",
         "- **Updates:** on demand", "- **Push:** git", *style.merge_tests, "",
-        "## Units", "",
-        "| Unit | Plan | Worktree | Branch | Port | Owns |",
-        "| --- | --- | --- | --- | --- | --- |", *rows, "",
     ])
 
 
@@ -247,38 +235,12 @@ def _configure_pilot(style: StyleProduction, pilot: PilotUnits) -> None:
         family for family in FAMILIES
         if (style.repository.parent / f"{style.slug}-{family}").exists()
     }
-    previous = style.doc.read_text()
-    plan_paths: dict[rules.Family, Path] = {}
-    for row in unit_table(previous.splitlines()):
-        family = rules.style_family(cell_value(row["Unit"]))
-        if not isinstance(family, rules.NotStyleUnit):
-            plan_paths[family] = style.checkout / Path(cell_value(row["Plan"]))
-    lines = previous.splitlines(keepends=True)
-    start = next(index for index, line in enumerate(lines) if line.rstrip() == "## Units") + 1
-    end = next((index for index in range(start, len(lines)) if lines[index].startswith("## ")), len(lines))
-    rows: list[str] = []
-    present: set[rules.Family] = set()
-    for line in lines[start:end]:
-        unit = line.split("|")[1].strip() if line.startswith("|") else ""
-        row_family = rules.style_family(unit)
-        if isinstance(row_family, rules.NotStyleUnit) or row_family in launched:
-            rows.append(line)
-        elif row_family in selected:
-            rows.append(line)
-        if not isinstance(row_family, rules.NotStyleUnit):
-            present.add(row_family)
-    additions = [_unit_row(style, family) + "\n" for family in FAMILIES
-                 if family in selected and family not in launched and family not in present]
-    if additions:
-        last_row = max((index for index, line in enumerate(rows) if line.startswith("|")), default=-1)
-        rows[last_row + 1:last_row + 1] = additions
-    updated = "".join([*lines[:start], *rows, *lines[end:]])
-    if updated != previous:
-        write_text_atomic(style.doc, updated)
+    units = ", ".join(f"{style.slug}-{family}-unit" for family in FAMILIES if family in launched or family in selected)
+    _set_fields(style, {"Pilot units": units})
     for family in FAMILIES:
         if family in launched:
             continue
-        path = plan_paths.get(family, style.checkout / PLAN_DIRECTORY / f"{style.slug}-{family}-unit.md")
+        path = style.checkout / PLAN_DIRECTORY / f"{style.slug}-{family}-unit.md"
         original = path.read_text()
         plan = original.splitlines(keepends=True)
         context = plan.index("## Delegation Context\n") + 1
@@ -330,12 +292,16 @@ def _open_session_guidance(style: StyleProduction, reason: str) -> str:
     )
 
 
-def _attach(style: StyleProduction) -> None:
+def _attach_parent(style: StyleProduction) -> None:
     current_parent = showrunner_tree.parent_of(style.slug)
     if current_parent != style.parent.slug:
         if current_parent:
             _run_script(SHOWRUNNERS, "detach", style.slug)
         _run_script(SHOWRUNNERS, "attach", style.slug, style.parent.slug)
+
+
+def _attach(style: StyleProduction) -> None:
+    _attach_parent(style)
     _update_destination(style)
     _run_script(SCRIPTS / "style/style_sync.py", "resume", "--repo", str(style.checkout),
                 "--slug", style.slug, "--branch-point", style.branch_point,
@@ -343,8 +309,11 @@ def _attach(style: StyleProduction) -> None:
 
 
 def _update_destination(style: StyleProduction) -> None:
+    _set_fields(style, {"Parent production": str(style.parent.doc), "Proposals": style.proposals})
+
+
+def _set_fields(style: StyleProduction, replacements: dict[str, str]) -> None:
     previous = style.doc.read_text()
-    replacements = {"Parent production": str(style.parent.doc), "Proposals": style.proposals}
     lines = previous.splitlines()
     for field, value in replacements.items():
         prefix = f"- **{field}:** "
@@ -436,6 +405,7 @@ def main(argv: list[str]) -> int:
             return result.returncode
         if result.returncode:
             raise Refusal(f"{LAUNCHER.name} exited {result.returncode}; rerun add_style to continue")
+        _attach_parent(style)
         return 0
     except (Refusal, rules.RuleValidationError, style_ledger.LedgerError, OSError, ValueError, sqlite3.Error) as error:
         print("add_style: " + " ".join(str(error).splitlines()), file=sys.stderr)

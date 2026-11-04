@@ -36,10 +36,10 @@ import change_review
 import proposals_folder
 import proposals_table
 from footer_counts import efficiency_ledger
-from production_units import read_production
-from production_units import Refusal
-from proposals_folder import slug_of
-from update_registration import RegistrationFailure, open_lists, question_queue
+from scripts.production.store_owner import document_id
+from scripts.production import staff
+from scripts.production.production_doc import Refusal, read_production
+from update_registration import QuestionStaff, RegistrationFailure, open_lists, question_queue
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import urgency  # noqa: E402
@@ -106,7 +106,8 @@ def efficiency_queue(doc: Path, below: bool = False) -> Queue:
     return Queue(urgency.scope_queue(candidates.QUEUE, below), _as_text(candidates.entries(lines), lambda entry: entry.item.line))
 
 
-def read_queue(kind: str, production: Path | None, below: bool = False) -> Queue:
+def read_queue(kind: str, production: Path | None, below: bool = False, *,
+               record: staff.StaffSnapshot | None = None) -> Queue:
     """The waiting items of one list."""
     try:
         match kind:
@@ -115,11 +116,12 @@ def read_queue(kind: str, production: Path | None, below: bool = False) -> Queue
             case "proposal":
                 doc = _doc(production)
                 waiting, _ = proposals_table.waiting_entries(doc, below)
-                return Queue(urgency.scope_queue(proposals_table.queue(doc), below), _as_text(waiting, proposals_table.proposal_text))
+                return Queue(urgency.scope_queue(proposals_table.queue(doc, record=record), below), _as_text(waiting, proposals_table.proposal_text))
             case "question":
                 found = read_production(_doc(production))
-                due = open_lists(found, below).due
-                return Queue(question_queue(found, below), _as_text(due, lambda entry: entry.item.line()))
+                identities = QuestionStaff.read() if record is None else QuestionStaff.for_record(record)
+                due = open_lists(found, below, identities=identities).due
+                return Queue(question_queue(found, below, identities=identities), _as_text(due, lambda entry: entry.item.line()))
             case _:
                 return efficiency_queue(_doc(production), below)
     except (change_review.ChangeReviewError, RegistrationFailure, Refusal, OSError, ValueError) as error:
@@ -128,8 +130,9 @@ def read_queue(kind: str, production: Path | None, below: bool = False) -> Queue
 
 def show(kind: str, order: str, production: Path | None, below: bool = False) -> str:
     """The one item /next shows, led by its kind; it is pinned."""
+    record = None if kind == EFFICIENCY else staff.snapshot()
     if kind:
-        queue = read_queue(kind, production, below)
+        queue = read_queue(kind, production, below, record=record)
         shown = urgency.top(queue.entries, queue.name, order)
         return f"{kind}\n{shown.item}" if shown is not None else f"no {kind} is waiting for you"
     doc = _doc(production)
@@ -137,13 +140,13 @@ def show(kind: str, order: str, production: Path | None, below: bool = False) ->
     kinds: dict[str, str] = {}
     for each in KINDS:
         try:
-            queue = read_queue(each, doc, below)
+            queue = read_queue(each, doc, below, record=record)
         except NextError as error:
             print(f"next_item: {error}", file=sys.stderr)
             continue
         queues[queue.name] = queue.entries
         kinds[queue.name] = each
-    found = urgency.top_across(queues, urgency.scope_queue(f"next-{slug_of(doc)}", below), order)
+    found = urgency.top_across(queues, urgency.scope_queue(f"next-{document_id(doc, record=record)}", below), order)
     if found is None:
         return "nothing is waiting for you"
     name, shown = found
@@ -186,7 +189,7 @@ def main(arguments: list[str]) -> int:
         else:
             print(move_to_end(cast(str, args.kind), production, below))
         return 0
-    except NextError as error:
+    except (NextError, staff.StaffRefused, staff.StaffUnreadable) as error:
         print(f"next_item: {error}", file=sys.stderr)
         return 2
 

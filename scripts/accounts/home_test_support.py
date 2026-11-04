@@ -24,12 +24,10 @@ def clear_notes_directory_cache() -> None:
 
 def write_account_settings(
     path: Path, *, folders: tuple[str, ...] = (),
-    retries: tuple[float, ...] = (0.2, 0.4), stale_seconds: float = 10.0,
 ) -> None:
     """A complete scratch configuration, independent of the repository settings."""
     _ = path.write_text(
         f"[trust]\nfolders = {json.dumps(folders)}\n"
-        + f"[claude_config_lock]\nretries = {json.dumps(retries)}\nstale_seconds = {stale_seconds}\n"
     )
 
 

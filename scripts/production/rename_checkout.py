@@ -5,18 +5,18 @@ The git move comes first, so a refusal before it keeps the old checkout whole, a
 safe to repeat:
 
 - git: `git worktree move`, then `git worktree repair`.
-- Claude: the project folder moves (unit_move.move_configs) and each account's folder trust is copied.
+- Claude: transcripts stay in place. Each account receives folder trust.
 - timers: each update timer whose CHECK names a doc under the old path names it under the new one.
 - children: a child doc's Parent production line naming a doc under the old path.
 - bevy upgrade watch: a job's RUN line naming a doc under the old path.
-- herdr pane records: a pane cwd under the old path.
 - the production doc: its Showrunner checkout line names the new path, committed on the merge branch.
 
 A rerun after the move pushes the doc commit.
 """
 from __future__ import annotations
 
-import json
+from scripts.message import sessions
+
 import os
 import re
 import shlex
@@ -28,8 +28,7 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from production_units import Production, read_production  # noqa: E402
-import production_units  # noqa: E402
+from scripts.production.production_doc import Production, cell_value, read_production  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
 import unit_move  # noqa: E402
 from rename_state import RenameRefused, write_text  # noqa: E402
@@ -38,12 +37,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 
 PARENT_LINE = "- **Parent production:** "
 CHECKOUT_LINE = "- **Showrunner checkout:** "
-
-
-def _under(path: str, old: Path, new: Path) -> str:
-    """`path` with the leading folder `old` replaced by `new`; any other path as it is."""
-    text = str(old)
-    return str(new) + path[len(text):] if path == text or path.startswith(text + "/") else path
 
 
 def _git(where: Path, *arguments: str) -> str:
@@ -73,8 +66,7 @@ def _trust_file(directory: Path) -> Path:
 
 
 def _move_claude(old: Path, new: Path) -> None:
-    unit_move.move_configs(str(old), str(new))
-    for directory in unit_move.config_dirs():
+    for directory in sessions.config_dirs():
         trust = _trust_file(directory)
         if trust.exists():
             unit_move.copy_trust(trust, str(old), str(new))
@@ -103,27 +95,6 @@ def _rewrite_children(old: Path, new: Path) -> None:
             _rewrite_lines(doc, PARENT_LINE, old, new)
 
 
-def _rewrite_panes(old: Path, new: Path) -> None:
-    state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
-    for path in (state / "herdr-panes").glob("*.json"):
-        try:
-            panes = cast(object, json.loads(path.read_text(encoding="utf-8")))
-        except (OSError, ValueError):
-            continue
-        updated = _moved_cwds(panes, old, new)
-        if updated != panes:
-            write_text(path, json.dumps(updated, indent=2) + "\n")
-
-
-def _moved_cwds(value: object, old: Path, new: Path) -> object:
-    if isinstance(value, dict):
-        return {key: (_under(item, old, new) if key == "cwd" and isinstance(item, str) else _moved_cwds(item, old, new))
-                for key, item in cast(dict[str, object], value).items()}
-    if isinstance(value, list):
-        return [_moved_cwds(item, old, new) for item in cast(list[object], value)]
-    return value
-
-
 def _message(doc: Path, checkout: Path) -> str:
     return f"chore({doc.name.removesuffix('-production.md')}): move showrunner checkout to {checkout}"
 
@@ -133,7 +104,7 @@ def _with_checkout(text: str, checkout: Path) -> str:
     lines = text.splitlines(keepends=True)
     for index, line in enumerate(lines):
         if line.startswith(CHECKOUT_LINE):
-            raw = production_units.cell_value(line[len(CHECKOUT_LINE):])
+            raw = cell_value(line[len(CHECKOUT_LINE):])
             home = Path.home()
             named = (f"~/{checkout.relative_to(home)}" if raw.startswith("~") and checkout.is_relative_to(home)
                      else str(checkout))
@@ -167,7 +138,6 @@ def move(old: Path, new: Path) -> None:
     _move_claude(old, new)
     _rewrite_timers(old, new)
     _rewrite_children(old, new)
-    _rewrite_panes(old, new)
     _commit_docs(new)
 
 
