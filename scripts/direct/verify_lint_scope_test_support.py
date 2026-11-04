@@ -70,8 +70,22 @@ from pathlib import Path
 import sys
 
 arguments = sys.argv[1:]
-with Path(os.environ["TEST_CARGO_EVENTS"]).open("a", encoding="utf-8") as output:
-    output.write(json.dumps({"args": arguments}) + "\n")
+version_tools = {
+    ("mend", "--version"): "MEND",
+    ("+nightly", "fmt", "--version"): "RUSTFMT",
+    ("clippy", "--version"): "CLIPPY",
+}
+version_tool = version_tools.get(tuple(arguments))
+# Existing scope tests also record the rustfmt availability check.
+if not version_tool or version_tool == "RUSTFMT":
+    with Path(os.environ["TEST_CARGO_EVENTS"]).open("a", encoding="utf-8") as output:
+        output.write(json.dumps({"args": arguments}) + "\n")
+if version_tool:
+    if "TEST_VERSION_EVENTS" in os.environ:
+        with Path(os.environ["TEST_VERSION_EVENTS"]).open("a", encoding="utf-8") as output:
+            output.write(version_tool + "\n")
+    print(os.environ.get("TEST_VERSION_" + version_tool, version_tool + " fixture"))
+    raise SystemExit(0)
 if arguments[:1] == ["metadata"]:
     print(os.environ["TEST_METADATA"])
 elif arguments[:1] not in (["mend"], ["clippy"], ["doc"], ["+nightly"]):
@@ -121,6 +135,12 @@ import os
 from pathlib import Path
 import sys
 
+if sys.argv[1:] == ["--version"]:
+    if "TEST_VERSION_EVENTS" in os.environ:
+        with Path(os.environ["TEST_VERSION_EVENTS"]).open("a", encoding="utf-8") as output:
+            output.write("TAPLO\n")
+    print(os.environ.get("TEST_VERSION_TAPLO", "taplo fixture"))
+    raise SystemExit(0)
 with Path(os.environ["TEST_TAPLO_EVENTS"]).open("a", encoding="utf-8") as output:
     output.write(json.dumps({"args": sys.argv[1:], "cwd": str(Path.cwd())}) + "\n")
 status = int(os.environ["TEST_TAPLO_STATUS"])
