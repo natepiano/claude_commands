@@ -166,6 +166,7 @@ class LostMacRun:
     """A Mac run whose final test status was not received."""
 
     seconds: float
+    detail: str = 'runner sent no final status'
 
 
 @dataclass(frozen=True)
@@ -552,8 +553,11 @@ class ToolVersionMismatch:
     reason: str
 
 
+@dataclass(frozen=True)
 class MissingMacStatus:
     """The remote command ended without a usable test status."""
+
+    detail: str = 'runner sent no final status'
 
 
 @dataclass(frozen=True)
@@ -799,7 +803,7 @@ class ProcessController:
                 status = MISSING_MAC_STATUS
                 cleanup = CleanupUnconfirmed()
                 print(line, end="", flush=True)
-            _ = process.wait()
+            exit_status = process.wait()
         finally:
             self.active = IDLE_PROCESS
             output.close()
@@ -809,7 +813,7 @@ class ProcessController:
             return ReportedMacStatus(status.status, cleanup)
         if isinstance(status, (UnresolvedSlotStartup, InterruptedTargetStatus)):
             return status
-        return MISSING_MAC_STATUS
+        return MissingMacStatus(f"runner exited with status {exit_status} without a final status")
 
 
 def parse_cleanup(value: str) -> CleanupOutcome:
@@ -967,9 +971,12 @@ def write_result(
             print("mac_test: this ran on the Mac (macOS). Treat the failure as real and fix it; " + advice)
     elif isinstance(result, (LostMacRun, InterruptedTargetRun)):
         mac = "lost"
-        reason = "interrupted" if isinstance(result, InterruptedTargetRun) else ""
+        reason = "interrupted" if isinstance(result, InterruptedTargetRun) else result.detail if target else ""
         status = 75
-        print(f"mac_test: the link to the {label} dropped; running on natedev instead")
+        if isinstance(result, InterruptedTargetRun):
+            print(f"mac_test: the {label} instance was interrupted (generation {result.generation})")
+        else:
+            print(f"mac_test: the {label} {result.detail}; local fallback requires admission")
     else:
         mac = "declined"
         reason = result.detail if isinstance(result, DeclinedMacRun) and result.detail else result.reason
@@ -1199,6 +1206,10 @@ class UnavailableToolParity:
 
 def expected_linux_parity(controller: ProcessController, config: OffloadConfig) -> PublicToolParity | UnavailableToolParity:
     """Compare public tools with configured pins or the sender's versions."""
+    if TYPE_CHECKING:
+        from .linux_runner import normalize_tool_version
+    else:
+        from linux_runner import normalize_tool_version
     expected: dict[str, str] = {}
     commands = (("rustc", ["rustc", "-V"]),
                 ("nextest", ["cargo", "nextest", "--version"]),
@@ -1211,7 +1222,7 @@ def expected_linux_parity(controller: ProcessController, config: OffloadConfig) 
             if not isinstance(result, CommandOutput) or result.status != 0 or not result.stdout.strip():
                 return UnavailableToolParity()
             value = result.stdout.strip()
-        expected[key] = value
+        expected[key] = normalize_tool_version(value)
     return {"rustc": expected["rustc"], "nextest": expected["nextest"],
             "mend": expected["mend"], "scripts_commit": expected["scripts_commit"]}
 
@@ -1784,7 +1795,9 @@ def claimed_run(
                 return DeclinedMacRun("state", elapsed_seconds(started), remote_status.reason)
             if linux and isinstance(remote_status, UnresolvedSlotStartup):
                 return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-            return LostMacRun(elapsed_seconds(started))
+            detail = (remote_status.detail if isinstance(remote_status, MissingMacStatus)
+                      else "runner sent no final status")
+            return LostMacRun(elapsed_seconds(started), detail)
         evidence.completion = "confirmed"
         report_cleanup(remote_status.cleanup, request.target)
         if isinstance(remote_status.cleanup, CleanupUnconfirmed):
@@ -2074,6 +2087,8 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
         "unresolved_count": evidence.unresolved_count if isinstance(evidence.unresolved_count, int) else None,
         "evidence_at": evidence.evidence_at or time.time(),
     }
+    if isinstance(result, LostMacRun):
+        attempt["reason"] = result.detail
     if isinstance(result, (DeclinedMacRun, BusyMacDecline)):
         attempt["reason"] = result.detail if isinstance(result, DeclinedMacRun) and result.detail else result.reason
     record.ssh_attempt(attempt)

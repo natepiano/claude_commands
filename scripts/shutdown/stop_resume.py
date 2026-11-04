@@ -96,6 +96,10 @@ def _same_process(pid: int, started: str) -> bool:
 
 def _signal_process(pid: int, number: int) -> None:
     """Refuse proof signals unless herdr places the process in the selected workspace."""
+    if number != 0 and "SHUTDOWN_PROOF_WORKSPACE" not in os.environ and (
+            "STAFF_FILE" in os.environ or "SHUTDOWN_STATE_DIR" in os.environ):
+        raise PermissionError(
+            f"signal {number} to pid {pid} refused: isolated records require SHUTDOWN_PROOF_WORKSPACE")
     if number != 0 and "SHUTDOWN_PROOF_WORKSPACE" in os.environ:
         workspace = os.environ["SHUTDOWN_PROOF_WORKSPACE"]
         refusal = f"proof workspace {workspace!s}: signal {number} to pid {pid} refused"
@@ -216,13 +220,13 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
             return NotRunning(identity)
         if isinstance(live, sessions.SessionLivenessUnknown):
             return StopFailed(identity, live.reason)
-        proved = herdr.native_process(live.pid, kind, resume_id=identity)
+        proved = herdr.native_process(live.pid, kind)
         if proved.identity != identity:
             return StopFailed(identity, "process runs another conversation; no signal sent")
         started = proved.started
         if not _same_process(live.pid, started):
             return NotRunning(identity)
-        if herdr.native_process(live.pid, kind, resume_id=identity) != proved:
+        if herdr.native_process(live.pid, kind) != proved:
             return StopFailed(identity, "process identity changed; no signal sent")
         _signal_process(live.pid, signal.SIGTERM)
         deadline = monotonic() + STOP_GRACE_SECONDS
@@ -234,7 +238,7 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
         else:
             return Stopped(identity, live.pid)
         if _same_process(live.pid, started):
-            if herdr.native_process(live.pid, kind, resume_id=identity) != proved:
+            if herdr.native_process(live.pid, kind) != proved:
                 return StopFailed(identity, "process identity changed; no signal sent")
             _signal_process(live.pid, signal.SIGKILL)
             deadline = monotonic() + KILL_GRACE_SECONDS

@@ -4350,6 +4350,30 @@ class ShellTests(unittest.TestCase):
         self.assertEqual(self.admission.readings.counts, before)
         self.assertEqual(self.admission.server.reservations, {})
 
+    def test_linux_target_admission_never_uses_the_local_service(self) -> None:
+        before = self.admission.readings.counts.copy()
+        result = self.shell('buildlog_memory_python() { echo unexpected-client >&2; return 93; }; '
+            + 'buildlog_wait_for_memory "$@"; printf "%s|%s|%s\\n" '
+            + '"$?" "$BUILDLOG_MEM_OUTCOME" "$BUILDLOG_MEM_RESERVATION"',
+            BUILDLOG_CALLER="verify-linux", BUILDLOG_CALL_ID="remote-step", OSTYPE="linux-gnu")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "0|Granted|\n")
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(self.admission.readings.counts, before)
+        self.assertEqual(self.admission.server.reservations, {})
+
+    def test_linux_target_ignores_natedev_hold_checks(self) -> None:
+        holder = self.admission.root / "holders/holder.json"
+        holder.parent.mkdir(parents=True)
+        _ = holder.write_text('{"holder":"natedev-owner"}')
+        result = self.shell('build_hold_wait_local; build_hold_check_local; '
+            + 'if build_hold_applies; then exit 94; fi; printf "target-admitted\\n"',
+            BUILDLOG_CALLER="verify-linux", BUILDLOG_CALL_ID="remote-step",
+            BUILD_TARGETS_SCRIPT="/nonexistent/build_targets.py", OSTYPE="linux-gnu")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "target-admitted\n")
+        self.assertEqual(result.stderr, "")
+
     def test_shape_without_earlier_builds_names_the_fallback(self) -> None:
         text = self.formatted(gate.ExpectedPeak(17_000_000_000, "shape", 0, gate.ShapeFallback(gate.UnderBudget())))
         self.assertIn("fallback", text)
