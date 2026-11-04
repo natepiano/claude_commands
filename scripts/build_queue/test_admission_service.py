@@ -44,6 +44,7 @@ class CiSliceAdmissionTests(unittest.TestCase):
 
     def test_running_ci_job_uses_the_current_limit_on_every_pass(self) -> None:
         with AdmissionFixture() as fixture:
+            fixture.configure(ci_memory_margin_gib=20)
             ci = fixture.root / "ci.slice"
             _ = (ci / "memory.current").write_text(str(2 * GIB))
             _ = (ci / "memory.max").write_text(str(18 * GIB))
@@ -59,6 +60,26 @@ class CiSliceAdmissionTests(unittest.TestCase):
             _ = (ci / "memory.max").write_text(str(12 * GIB))
             _ = fixture.server.run_pass()
             self.assertIn(request.episode, fixture.server.reservations)
+
+    def test_running_ci_job_uses_live_use_plus_the_current_margin(self) -> None:
+        with AdmissionFixture() as fixture:
+            ci = fixture.root / "ci.slice"
+            _ = (ci / "memory.current").write_text(str(2 * GIB))
+            (fixture.proc.path / "123").mkdir()
+            _ = (fixture.proc.path / "123/comm").write_text("Runner.Worker\n")
+            _ = (ci / "cgroup.procs").write_text("123\n")
+            request = fixture.request(need=14 * GIB)
+            _ = fixture.server.handle_request(request)
+            self.assertNotIn(request.episode, fixture.server.reservations)
+            result = fixture.server.last_result
+            assert isinstance(result, gate.PassResult)
+            self.assertEqual(result.totals.charged, 8 * GIB)
+            fixture.configure(ci_memory_margin_gib=3)
+            _ = fixture.server.run_pass()
+            self.assertIn(request.episode, fixture.server.reservations)
+            result = fixture.server.last_result
+            assert isinstance(result, gate.PassResult)
+            self.assertEqual(result.totals.charged, 5 * GIB)
 
     def test_missing_ci_limit_refuses_grants_but_keeps_cleanup_and_recovers(self) -> None:
         with AdmissionFixture() as fixture:
