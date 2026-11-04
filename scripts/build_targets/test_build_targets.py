@@ -40,6 +40,14 @@ if TYPE_CHECKING:
 else:
     from scripts.lib import test_hang_guard
 
+SHIPPED_STATUS = "\n".join((
+    "mac: free",
+    "natedev: free",
+    "aws: unavailable; evidence unavailable; month unavailable / $400.00",
+    "  spending unavailable; decision unavailable; no controller evidence; a priced resource inventory is required before spending",
+    "",
+))
+
 REAL_SUBPROCESS_RUN = subprocess.run
 REAL_SUBPROCESS_POPEN = subprocess.Popen
 REAL_PROCESS_START_TIME = build_hold.process_start_time
@@ -72,10 +80,6 @@ class IsolatedBuildTargetTest(IsolatedTargetTest):
     @override
     def setUp(self) -> None:
         super().setUp()
-        folder = self.root / ".claude/config"
-        folder.mkdir(parents=True, exist_ok=True)
-        _ = (folder / "build_targets.conf").write_text(SHIPPED_CONFIG.read_text())
-        _ = (folder / "mac_test.conf").write_text(self.settings.read_text())
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILDLOG_DIR": str(self.root / "buildlog"),
         })))
@@ -354,7 +358,7 @@ class StatusTests(IsolatedBuildTargetTest):
     def test_shipped_config_prints_one_line_per_target_without_probe(self) -> None:
         with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(SHIPPED_CONFIG).parent)}):
             with mock.patch.object(build_targets, "probe_target", side_effect=AssertionError("Probe not requested")):
-                self.assertEqual(self.capture_status(), (0, "mac: free\nnatedev: free\n", ""))
+                self.assertEqual(self.capture_status(), (0, SHIPPED_STATUS, ""))
 
     def test_command_uses_config_order_and_recorded_hold(self) -> None:
         config = self.write_config(
@@ -388,9 +392,11 @@ class StatusTests(IsolatedBuildTargetTest):
         self.assertEqual(output.getvalue(), (
             "mac: unreachable — ssh timed out\n"
             "natedev: held by hana since 13:05 PDT — render checks\n"
+            "aws: unreachable — ssh timed out\n"
         ))
         self.assertEqual(errors.getvalue(), "")
-        self.assertEqual(probed, [targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf"))])
+        self.assertEqual(probed, [targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf")),
+                                  targets.SshTarget("aws", "linux", SHIPPED_CONFIG.with_name("aws_target.conf"))])
 
     def test_status_argument_defaults_to_recorded_state(self) -> None:
         output = io.StringIO()
@@ -400,7 +406,7 @@ class StatusTests(IsolatedBuildTargetTest):
                 with mock.patch.object(sys, "argv", ["build_targets.py", "status"]):
                     with redirect_stdout(output), redirect_stderr(errors):
                         code = build_targets.main()
-        self.assertEqual((code, output.getvalue(), errors.getvalue()), (0, "mac: free\nnatedev: free\n", ""))
+        self.assertEqual((code, output.getvalue(), errors.getvalue()), (0, SHIPPED_STATUS, ""))
 
     def test_failed_mac_probe_becomes_unreachable_status(self) -> None:
         calls: list[str] = []
