@@ -10,6 +10,14 @@ import subprocess
 import sys
 import time
 from typing import TYPE_CHECKING, cast, override
+
+if TYPE_CHECKING:
+    from ..lib import process_start as process_identity
+    from ..lib.process_start_test_support import process_reader
+else:
+    from scripts.lib import process_start as process_identity
+    from scripts.lib.process_start_test_support import process_reader
+
 from unittest import mock
 import unittest
 
@@ -42,7 +50,7 @@ class AwsStatusTests(MeasurementFixture):
         _ = cast(object, self.enterContext(mock.patch.object(subprocess, "run", side_effect=private_history)))
         _ = cast(object, self.enterContext(mock.patch.object(subprocess, "Popen", side_effect=AssertionError("status must not start commands"))))
         _ = cast(object, self.enterContext(mock.patch.object(time, "time", return_value=float(NOW))))
-        _ = cast(object, self.enterContext(mock.patch.object(mac_test, "process_start_time", side_effect=self.process_start)))
+        _ = cast(object, self.enterContext(mock.patch.object(process_identity, "process_start", side_effect=process_reader(self.process_start))))
         self.controller("running")
 
     @staticmethod
