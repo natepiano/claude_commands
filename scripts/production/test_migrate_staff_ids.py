@@ -60,8 +60,7 @@ class NativeMigrationTests(StaffTestCase):
         target = showrunners.read_bound_source(timer.parent, document).timer.target
         _ = timer.write_text(timer.read_text().replace("TARGET=" + target, "TARGET=session:" + native_owner))
         configuration = unit_config.UnitConfig(unit_config.StandbyPlan(), unit_config.AppPort(8123), ("nightly",),
-            unit_config.RetiredSession("2026-10-31", native_unit,
-                                      unit_config.RecordedStartFolder(self.root / "original"), unit_config.Branch("models")))
+            unit_config.RetiredSession("2026-10-31", native_unit, unit_config.Branch("models")))
         _ = unit_config.write_parked(old_unit, configuration)
         reference = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / "demo" / "rename.json"
         self.write_json(reference, {"old": "former", "new": "demo", "owner": old_owner, "unit": old_unit})
@@ -191,7 +190,8 @@ class NativeMigrationTests(StaffTestCase):
         self.assertEqual(self.fixture_git(self.fixture.repository, "rev-parse", "refs/retired/" + self.fixture.old_unit), self.fixture.tip)
 
     def remote_unit_record(self) -> staff.StaffSnapshot:
-        remote_unit = replace(self.fixture.unit, worktree=staff.RemovedWorktree("mac", Path("/private/retained/models")))
+        remote_unit = replace(self.fixture.unit, current_session=self.fixture.native_unit,
+                              worktree=staff.RemovedWorktree("mac", Path("/private/retained/models")))
         _ = self.write_document({"schema": 2, "rows": [self.fixture.owner.to_json(), remote_unit.to_json()]})
         unit_config.parked_path(self.fixture.old_unit).unlink()
         return staff.snapshot()
@@ -229,7 +229,9 @@ class NativeMigrationTests(StaffTestCase):
     def test_conflicting_peer_sessions_withhold_the_remote_unit(self) -> None:
         record = self.remote_unit_record()
         before = self.staff_file.read_bytes()
-        entries = [self.peer_unit(self.fixture.native_unit), self.peer_unit(fixture_runtime_id("conflicting-peer"))]
+        matching = self.peer_unit(self.fixture.native_unit)
+        conflicting = replace(matching, session=roster.ClaudeSession(fixture_runtime_id("conflicting-peer")))
+        entries = [matching, conflicting]
         with mock.patch.object(roster, "peer_snapshot", return_value=roster.Roster(entries, [])):
             migration = migrate_staff_ids.plan(record)
         self.assertNotIn(self.fixture.old_unit, migration.identities)
@@ -777,93 +779,3 @@ class LiveMigrationEvidenceTests(unittest.TestCase):
         detail = "\n".join(result.missing)
         self.assertIn(self.fixture.native_unit, detail)
         self.assertIn(self.other, detail)
-
-
-class RetiredNativeMigrationTests(StaffTestCase):
-    def test_native_launch_of_a_legacy_owner_publishes_its_missing_retired_child_in_the_same_graph(self) -> None:
-        _ = self.enterContext(mock.patch.object(showrunners, "SCRATCH_ROOT", self.root / "scratch"))
-        document = self.retired_fill_production("demo", "models-unit")
-        native_owner = staff.StaffId(fixture_runtime_id("native-launch-legacy-owner"))
-        native_unit = staff.StaffId(fixture_runtime_id("missing-retired-Claude"))
-        legacy_owner = staff.StaffRow(staff.StaffId("s00000000001"), "showrunner", "demo", None,
-                                     doc=staff.LiveDoc("natedev", document), current_session=staff.StaffId("s00000000001"))
-        _ = self.write_document({"schema": 2, "rows": [legacy_owner.to_json()]})
-        _ = document.write_text(document.read_text().replace("session session-models-unit", "session " + native_unit))
-        timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / "showrunner-demo" / "conf"
-        target = showrunners.read_bound_source(timer.parent, document).timer.target
-        _ = timer.write_text(timer.read_text().replace("TARGET=" + target, "TARGET=session:" + native_owner))
-        self.pane("w1:owner", session_id=native_owner, environment={})
-        before = self.staff_file.read_bytes()
-        with redirect_stdout(io.StringIO()) as output:
-            preview = migrate_staff_ids.migrate(dry_run=True)
-        self.assertEqual(preview, 0, output.getvalue())
-        self.assertIn(f"would add retired {native_unit}", output.getvalue())
-        self.assertEqual(self.staff_file.read_bytes(), before)
-        self.assertFalse(unit_config.parked_path(native_unit).exists())
-        publish = staff.publish_native_ids
-        snapshots: list[staff.StaffSnapshot] = []
-
-        def observe(expected: staff.StaffSnapshot, identities: dict[staff.StaffId, staff.StaffId],
-                    additions: tuple[staff.StaffRow, ...] = ()) -> staff.StaffSnapshot:
-            snapshots.append(staff.snapshot())
-            self.assertEqual(self.staff_file.read_bytes(), before)
-            return publish(expected, identities, additions)
-
-        with mock.patch.object(staff, "publish_native_ids", side_effect=observe), redirect_stdout(io.StringIO()) as output:
-            code = migrate_staff_ids.migrate()
-        self.assertEqual(code, 0, output.getvalue())
-        self.assertEqual(snapshots, [staff.StaffSnapshot((legacy_owner,))])
-        self.assertEqual(staff.by_id(native_owner), replace(legacy_owner, id=native_owner, current_session=native_owner))
-        child = staff.by_id(native_unit)
-        assert child is not None
-        self.assertEqual((child.name, child.parent), ("models", native_owner))
-        self.assertIsInstance(child.worktree, staff.RemovedWorktree)
-        self.assertIsInstance(unit_config.read_parked(native_unit, cleanup=False), unit_config.UnitConfig)
-        self.assertIsNone(staff.by_id(legacy_owner.id))
-        saved = self.staff_file.read_bytes()
-        with redirect_stdout(io.StringIO()) as output:
-            code = migrate_staff_ids.migrate()
-        self.assertEqual((code, output.getvalue()), (0, "unchanged\n"))
-        self.assertEqual(self.staff_file.read_bytes(), saved)
-
-    def test_proved_retired_members_finish_while_missing_history_stays_unfilled_and_rerun_finishes(self) -> None:
-        _ = self.enterContext(mock.patch.object(showrunners, "SCRATCH_ROOT", self.root / "scratch"))
-        document = self.retired_fill_production("demo", "first-unit", "second-unit")
-        owner = next(row for row in staff.find(kind="showrunner") if row.name == "demo")
-        owner = staff.set_doc(owner.id, staff.LiveDoc("natedev", document))
-        old_units = staff.find(kind="unit", parent=owner.id)
-        self.forget_rows(*(row.id for row in old_units))
-        first_id = staff.StaffId(fixture_runtime_id("retired-first-Claude"))
-        second_id = staff.StaffId(fixture_runtime_id("retired-second-Claude"))
-        full_text = document.read_text().replace("session session-first-unit", "session " + first_id)
-        full_text = full_text.replace("session session-second-unit", "session " + second_id)
-        _ = document.write_text(full_text.replace(", session " + second_id, ""))
-        timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / "showrunner-demo" / "conf"
-        target = showrunners.read_bound_source(timer.parent, document).timer.target
-        _ = timer.write_text(timer.read_text().replace("TARGET=" + target, "TARGET=session:" + owner.id))
-        with redirect_stdout(io.StringIO()) as output:
-            code = migrate_staff_ids.migrate()
-        self.assertEqual(code, 1, output.getvalue())
-        self.assertIn("second-unit", output.getvalue())
-        first = staff.by_id(first_id)
-        assert first is not None
-        self.assertEqual((first.id, first.name, first.parent), (first_id, "first", owner.id))
-        self.assertIsInstance(first.worktree, staff.RemovedWorktree)
-        self.assertIsInstance(unit_config.read_parked(first_id, cleanup=False), unit_config.UnitConfig)
-        self.assertIsNone(staff.by_id(second_id))
-        self.assertEqual(staff.find(kind="unit"), [first])
-        _ = document.write_text(full_text)
-        with redirect_stdout(io.StringIO()) as output:
-            code = migrate_staff_ids.migrate()
-        self.assertEqual(code, 0, output.getvalue())
-        self.assertEqual(staff.by_id(first_id), first)
-        second = staff.by_id(second_id)
-        assert second is not None
-        self.assertEqual((second.id, second.name, second.parent), (second_id, "second", owner.id))
-        self.assertIsInstance(second.worktree, staff.RemovedWorktree)
-        self.assertIsInstance(unit_config.read_parked(second_id, cleanup=False), unit_config.UnitConfig)
-        before = self.staff_file.read_bytes()
-        with redirect_stdout(io.StringIO()) as output:
-            code = migrate_staff_ids.migrate()
-        self.assertEqual((code, output.getvalue()), (0, "unchanged\n"))
-        self.assertEqual(self.staff_file.read_bytes(), before)

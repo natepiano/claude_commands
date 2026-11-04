@@ -119,6 +119,22 @@ class StandingTests(unittest.TestCase):
         return subprocess.run([sys.executable, "-c", program, *arguments],
                               capture_output=True, text=True, timeout=10)
 
+    def test_clone_cli_creates_a_task_owned_checkout_without_a_root_busy_mark(self) -> None:
+        result = self.cli("clone", str(self.source), "--task", "gate:camera", "--name", "camera")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        checkout = Path(result.stdout.strip())
+        self.assertTrue(checkout.is_relative_to(self.base / "scratch"))
+        self.assertEqual((checkout / "tracked.txt").read_text(), "source HEAD\n")
+        self.assertFalse((checkout / scratch.BUSY).exists())
+        record = scratch.task_of(checkout.parent)
+        assert isinstance(record, copy_record.Registered)
+        self.assertEqual(record.task, "gate:camera")
+        self.assertIs(record.fields["test_hana_clone"], True)
+        self.assertEqual(record.fields["source_path"], str(self.source))
+        self.assertEqual(scratch.end("gate:camera"), [checkout.parent])
+        self.assertFalse(checkout.parent.exists())
+        self.assertEqual((self.source / "tracked.txt").read_text(), "source HEAD\n")
+
     def test_first_use_owns_git_and_never_changes_source_branch(self) -> None:
         _ = self.git(self.source, "status", "--porcelain")
         before = self.snapshot(self.source)

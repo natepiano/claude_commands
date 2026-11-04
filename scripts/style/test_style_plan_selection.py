@@ -36,8 +36,7 @@ class StylePlanTests(StylePlanFixture):
         plan = worktree / "docs/style-production/units/values-unit.md"
         plan.parent.mkdir(parents=True)
         _ = plan.write_text(self.plan_header().replace("names-unit", "values-unit"))
-        _ = self.doc.write_text(self.doc.read_text() +
-                                f"| values-unit | docs/style-production/units/values-unit.md | {worktree} | demo-style-values |\n")
+        self.unit_plan_config(worktree, "values-unit.md")
         _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "values-unit", worktree)
         return plan
 
@@ -337,9 +336,8 @@ class StylePlanTests(StylePlanFixture):
         _ = self.git("add", "--all", cwd=product)
         _ = self.git("commit", "-qm", "Product", cwd=product)
         _ = (product / self.sources[2]).write_text("dirty\n")
-        parent = self.repo / "docs/product-production.md"
-        _ = parent.write_text(parent.read_text() + f"| product-unit | docs/product.md | {product} | product-change |\n")
-        _ = fixture_unit_location(recorded_showrunner("sample", parent), "product-unit", product)
+        _ = fixture_unit_location(recorded_showrunner("sample", self.repo / "docs/product-production.md"), "product-unit", product)
+        _ = self.modules_unit()
         ledger = self.ledger()
         ledger.ticket_add("modules-unit-1", "modules-unit", "read", "names", "crates/beta", [self.sources[3]], [rule])
         ledger.ticket_assign("modules-unit-1", "demo-style-modules")

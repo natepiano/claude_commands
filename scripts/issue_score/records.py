@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Literal, TypedDict
 
 from scripts.lib import conf
-from .selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 
 from . import client, questions
 

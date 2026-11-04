@@ -233,7 +233,7 @@ class AddShowrunnerFixture(unittest.TestCase):
                 f"# {slug}", "", f"- **Merge branch:** `{slug}`",
                 f"- **Showrunner checkout:** `{self.root / f'{slug}-checkout'}`",
                 f"- **Log:** `docs/plans/{slug}-log.md`", "- **User zone:** America/Los_Angeles",
-                "- **Updates:** every 15 minutes", "", "## Units", "", "| Unit | Plan |", "| --- | --- |", ""]),
+                "- **Updates:** every 15 minutes", ""]),
                 encoding="utf-8")
         return path
 

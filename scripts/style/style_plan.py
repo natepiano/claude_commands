@@ -34,7 +34,6 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "lib"))
 sys.path.insert(0, str(SCRIPTS / "production"))
 
-from process_failure import failure_detail
 import berth_board
 import coverage_report
 import bulk_rename
@@ -46,16 +45,12 @@ from approved_renames import (BindingProof, AppliedInCode, AppliedCheck, Approve
                               file_rename, inline_modules)
 from add_style import StandingStyleProduction, standing_style_production
 import rules
-from scripts.build_queue import queue_place
-from scripts.production import showrunners
 import style_ledger
 import approved_renames
 import style_footprint
 import style_proposals
 from issues import Issue, frontmatter
-from scripts.build_hold import build_hold
-from production_units import Refusal, cell_value, production_field
-from unit_lookup import live_unit_table
+from scripts.production.production_doc import Refusal, production_field
 from proposal_issue import ApprovedDecision, decision_answer, require_generated_body
 from unit_files import changed_files, git, unit_file_holders, unit_worktrees
 from unit_plans import (AllCrates, PilotScope, crate_in_scope, delegation_context, family_plan_texts, family_pilot_scopes,
@@ -2913,8 +2908,8 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
     doc = style_document(repo)
     row = next((row for row in unit_worktrees(doc) if row.unit == unit), None)
     if row is None:
-        raise style_ledger.LedgerError(f"{unit}: no Units row in {doc}")
-    expected = unit_plan_path(doc, unit, row.worktree).resolve()
+        raise style_ledger.LedgerError(f"{unit}: no staff row under {doc}")
+    expected = unit_plan_path(unit, row.worktree).resolve()
     if plan != expected:
         raise style_ledger.LedgerError(f"--plan must be the unit worktree's own copy: {expected}")
     original = plan.read_text()
@@ -3216,8 +3211,8 @@ def split(unit: str, repo: Path, timeout_minutes: float = 90) -> style_ledger.Re
         doc = style_document(repo)
         row = next((row for row in unit_worktrees(doc) if row.unit == unit), None)
         if row is None:
-            raise style_ledger.LedgerError(f"{unit}: no Units row in {doc}")
-        plan = unit_plan_path(doc, unit, row.worktree)
+            raise style_ledger.LedgerError(f"{unit}: no staff row under {doc}")
+        plan = unit_plan_path(unit, row.worktree)
         scope = unit_plan_settings(plan.read_text(), repo).pilot_scope
         board = berth_board.read_board(repo)
         if isinstance(board, berth_board.BoardUnavailable):
@@ -3235,75 +3230,6 @@ def split(unit: str, repo: Path, timeout_minutes: float = 90) -> style_ledger.Re
 
 def split_line(unit: str, result: style_ledger.RecordedSplit, minutes: float) -> str:
     return f"{unit}: {result.ready}/{result.changed}/{result.structure}/{result.other} in {minutes:.2f} min"
-
-
-def split_all(production: Path) -> int:
-    """Run the live style units one at a time, each in a low-priority child."""
-    production = production.expanduser().resolve()
-    rows = [row for row in live_unit_table(production.read_text().splitlines(),
-                                          production.stem.removesuffix("-production"))
-            if not isinstance(rules.style_family(cell_value(row["Unit"])), rules.NotStyleUnit)]
-    if not rows:
-        print("no style units")
-        return 0
-    with redirect_stdout(io.StringIO()):
-        prefix = queue_place.suite_scope_prefix()
-    failed = False
-    for row in rows:
-        unit = cell_value(row["Unit"])
-        try:
-            worktree = Path(cell_value(row["Worktree"])).expanduser()
-            if not worktree.is_absolute():
-                worktree = production.parent.parent / worktree
-            plan = unit_plan_path(production, unit, worktree)
-            if not plan.is_file():
-                raise style_ledger.LedgerError(f"no unit plan: {plan}")
-            child = subprocess.run([*prefix, "nice", "-n", "19", sys.executable, str(Path(__file__).resolve()),
-                                    "split", "--unit", unit, "--repo", str(worktree)],
-                                   capture_output=True, text=True, check=False)
-            if child.returncode:
-                cause = failure_detail(child)
-                raise style_ledger.LedgerError(cause.removeprefix(f"split {unit}: "))
-            print(child.stdout.strip())
-        except Exception as error:
-            failed = True
-            print(f"{unit}: failed: {' '.join(str(error).split())}")
-    return int(failed)
-
-
-def split_all_running() -> int:
-    """Run every running style production, yielding to a natedev build hold."""
-    if build_hold.natedev_holds(build_hold.holder_directory()).in_force:
-        print("split-all: natedev build hold in force; skipped")
-        return 0
-    found = False
-    runners = showrunners.registered_showrunners()
-    for runner in runners:
-        if not runner["session"]:
-            continue
-        try:
-            production = Path(runner["doc"]).expanduser()
-            lines = production.read_text().splitlines()
-            try:
-                kind = production_field(lines, "Kind")
-            except Refusal:
-                continue
-            if kind != "style":
-                continue
-            found = True
-            if build_hold.natedev_holds(build_hold.holder_directory()).in_force:
-                print("split-all: natedev build hold in force; skipped")
-                _ = showrunners.require_complete(runners)
-                return 0
-            code = split_all(production)
-            if code:
-                print(f"split-all: {runner['slug']}: failed: exit {code}")
-        except Exception as error:
-            print(f"split-all: {runner['slug']}: failed: {' '.join(str(error).split())}")
-    if not found:
-        print("no running style productions")
-    _ = showrunners.require_complete(runners)
-    return 0
 
 
 def refill_outcome(result: NextPhase) -> str:
@@ -3333,10 +3259,6 @@ def main(argv: list[str]) -> int:
     _ = scan.add_argument("--unit", required=True)
     _ = scan.add_argument("--repo", type=Path, required=True)
     _ = scan.add_argument("--timeout-minutes", type=float, default=90)
-    scans = sub.add_parser("split-all")
-    targets = scans.add_mutually_exclusive_group(required=True)
-    _ = targets.add_argument("--production", type=Path)
-    _ = targets.add_argument("--all", action="store_true")
     refill = sub.add_parser("next-phase")
     _ = refill.add_argument("--unit", required=True)
     _ = refill.add_argument("--plan", type=Path, required=True)
@@ -3366,12 +3288,6 @@ def main(argv: list[str]) -> int:
             return 1
         print(split_line(args.unit, result, (time.monotonic() - began) / 60))
         return 0
-    if args.command == "split-all":
-        try:
-            return split_all_running() if args.all else split_all(args.production)
-        except Exception as error:
-            print(f"split-all: {error}", file=sys.stderr)
-            return 1
     try:
         if args.command == "gate":
             return gate(args.repo, args.ticket)
@@ -3451,8 +3367,6 @@ class PlanArguments(argparse.Namespace):
     reason: str = ""
     by: str = ""
     timeout_minutes: float = 90
-    production: Path = Path()
-    all: bool = False
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 Build queue · 10:46
 
-queue priority: cables (the user's bump)
+queue priority: cables (captured priority)
                                                     free 9.9 │ taken 11.1
 budget 21.0                                         ░░░░░░░░░░███████████
 
@@ -43,12 +43,14 @@ Head: free 24.5 GiB; reserve 3.0 GiB; need 7.6 GiB
 #4 of 32 · tool-based-ui · hana-migration · mend · 7.6 GiB
 Folder /tmp/hana_catalyst-hana-migration. Queue arrival 10:07; waiting 39 min. Likely start ~10:51.
 
-Next? No. 3 steps are ahead of it: 3 moved up, 0 joined earlier.
-  #1 ↑  tool-based-ui · cables · work-pan mend  joined 10:10, 3 min after it
-  #2 ↑  tool-based-ui · cables · work-lead nextest  from #27 by work-lead at 10:40; from #1 by
-      work-lead at 10:46
-  #3 ↑  tool-based-ui · cables · work-lead nextest  from #27 by work-lead at 10:40
-  Moved-up steps go first, then the longest wait. It joined 1st of the steps waiting now.
+Next? No. 3 steps are ahead of it: 3 of cables (queue priority), 0 joined earlier.
+  #1 ↑  tool-based-ui · cables · work-pan mend  joined 10:10, 3 min after it; cables (queue
+      priority)
+  #2 ↑  tool-based-ui · cables · work-lead nextest  joined 10:40, 32 min after it; cables (queue
+      priority)
+  #3 ↑  tool-based-ui · cables · work-lead nextest  joined 10:40, 32 min after it; cables (queue
+      priority)
+  Queue-priority steps go first, then the longest wait. It joined 1st of the steps waiting now.
 
 Waits on
   ✓ queue order
@@ -58,11 +60,12 @@ Waits on
     pass
 
 Likely start ~10:51: 4th in line at 44 steps an hour, an estimate.
-  Each step moved up ahead of it adds about 1 min.
+  Each queue-priority step ahead of it adds about 1 min.
 
 Host: available RAM 24.5 GiB; total RAM 60.0 GiB
 ✗ memory pressure: full avg10 7.7%, some avg10 0.0%, swap used 0.0%; starts below full avg10 5.0%
 Host load: unavailable
+queue priority: cables (captured priority)
 Running:
 tool-based-ui / widget / widget-enhancements-title, nextest: admitted 10:45 (0 min ago); promise
   11.1 GiB, charge 11.1 GiB, using now 5.1 GiB; ramp promise: first 2 min after admission

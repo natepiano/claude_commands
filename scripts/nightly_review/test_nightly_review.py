@@ -298,9 +298,7 @@ class TonightTests(NightlyReviewTests):
 class NightlyProductionTests(NightlyReviewTests):
     def doc(self, name: str, plan: str) -> str:
         path = self.root / f"{name}.md"
-        _ = path.write_text("\n".join(["# production", "", "## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
-                                       "| --- | --- | --- | --- | --- | --- |",
-                                       f"| nightly-review-unit | {plan} | `/w/{name}` | `{name}` | 0 | nightly |", ""]))
+        _ = path.write_text("# production\n")
         tree = self.root / (name + "-unit")
         unit = recorded_unit(name + "-owner", "nightly-review", tree, path, plan=plan)
         responsibilities = '["nightly-review"]' if plan == "permanent" else "[]"
@@ -315,7 +313,7 @@ class NightlyProductionTests(NightlyReviewTests):
     def runners(self, *docs: tuple[str, str]) -> list[showrunners.Showrunner]:
         return [showrunners.Showrunner(session="", socket="", slug=slug, zone="", doc=doc) for slug, doc in docs]
 
-    def test_configuration_responsibility_wins_over_the_permanent_table_row(self) -> None:
+    def test_configuration_responsibility_wins_over_the_permanent_plan(self) -> None:
         _ = self.doc("old-alias", "permanent")
         destination = Path(self.doc("new-alias", "standby"))
         _ = (self.root / "old-alias-unit/.unit.toml").write_text('plan = "permanent"\nresponsibilities = []\n')

@@ -108,7 +108,7 @@ State directory files: `turns.jsonl`, `compactions.jsonl`, `extract.json`, `comp
 - `trunk` and `organon` drop many requests as `before_director` because their start is found through `/unit:delegate` in a human prompt.
 - `results` at 300,000 JSON bytes exits 4; compact encoding keeps `compare` plus `phases` near 150 KB (default indentation is about 207 KB). Any line added to `message` counts toward its 60.
 - A legacy migration attributes residual drop counts to the first carried id; with several carried ids the split is an attribution, not a measurement. `extract` never reads `<id>/subagents/*.jsonl`.
-- `basedpyright scripts/model_study` exits 3 in every checkout; judge it by the last line, `0 errors, 0 warnings, 0 notes`.
+- `basedpyright scripts/model_study` exits 0 when clean. Its summary reads `0 errors, 0 warnings, 0 notes`.
 
 ## Why
 

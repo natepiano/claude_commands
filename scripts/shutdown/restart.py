@@ -20,6 +20,7 @@ import sessions
 from scripts.production import staff, unit_move
 from scripts.lib import nix_env
 from scripts.shutdown import shutdown_record, stop_resume, pane_record
+from scripts.shutdown.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
 from scripts.whoami.account import named_account_environment
 
@@ -47,6 +48,8 @@ def row_folder(row: staff.StaffRow, record: staff.StaffSnapshot) -> tuple[str, P
     while True:
         if isinstance(member.worktree, (staff.PresentWorktree, staff.RemovedWorktree)):
             return member.worktree.machine, member.worktree.path
+        if member.kind == "unit":
+            raise ValueError(f"{row.name}: the staff worktree is unavailable")
         if isinstance(member.doc, staff.LiveDoc):
             return member.doc.machine, member.doc.path.parent
         parent = record.by_id(member.parent) if member.parent is not None else None
@@ -126,7 +129,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         _ = stop_resume.heal_account_trust(folder, target_dir,
             Path(environment.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"), row.name)
         environment = named_account_environment(target_dir)
-    if kind == "codex" and row.current_session in herdr.running_codex_threads(thread_host=lambda _arguments: False):
+    if kind == "codex" and row.current_session in herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon):
         print(f"{row.name}: unchanged")
         return ""
     destination = client.saved_row_tab(str(row.id), row.name)
@@ -148,13 +151,13 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
             print(f"{row.name}: unchanged")
             return ""
         raise OSError(live.reason)
-    if kind == "codex" and row.current_session in herdr.running_codex_threads(thread_host=lambda _arguments: False):
+    if kind == "codex" and row.current_session in herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon):
         print(f"{row.name}: unchanged")
         return ""
     if kind == "claude":
         arguments.extend(["--name", row.name])
     result = herdr.launch_prepared_agent(client.session, target, prepared, kind,
-        arguments, herdr.NoOpeningPrompt(),
+        trust_arguments(kind, str(folder), arguments), herdr.NoOpeningPrompt(),
         int(herdr.PROGRAM_TIMEOUT_SECONDS * 1000), agent=row.name)
     try:
         client.remember_row_tab(str(row.id), result.pane)
@@ -187,7 +190,7 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
         print(f"restart: Claude liveness anomaly: {error}", file=sys.stderr)
         live = {}
     try:
-        codex_live = herdr.running_codex_threads(thread_host=lambda _arguments: False)
+        codex_live = herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon)
     except (OSError, ValueError, herdr.HerdrFailure) as error:
         print(f"restart: Codex liveness anomaly: {error}", file=sys.stderr)
         codex_live = set[str]()
