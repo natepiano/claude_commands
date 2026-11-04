@@ -21,6 +21,7 @@ from typing import cast, override
 
 import unittest.mock
 
+from scripts.copies import copies
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lint import tmp_sweep, folder_audit, sweep
 from scripts.lib import build_folders, cargo_output, conf, copy_record, scratch
@@ -273,7 +274,7 @@ class FolderAuditTests(unittest.TestCase):
             _ = (source / ".gitignore").write_text("target/\n")
             git(source, "add", "asset", ".gitignore")
             git(source, "commit", "-qm", "source")
-        checkout = scratch.clone(source, f"gate:{name}", name)
+        checkout = copies.clone(source, f"gate:{name}", name)
         if dirty:
             _ = (checkout / "asset").write_text("unsaved source")
         (checkout / "target").mkdir()

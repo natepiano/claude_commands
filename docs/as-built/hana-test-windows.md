@@ -8,7 +8,7 @@ starting a process. `mac_run.sh` and `smoke_launch.sh` take the same labels
 from the caller's environment. The Mac command keeps both labels when it
 starts from Terminal.
 
-Test clones on either machine use `scratch.py clone <source> --task gate:<id>`
+Test clones on either machine use `copies.py clone <source> --task gate:<id>`
 (or a real `phase:<unit>/<id>` or `--until <when>`). The command records the
 task before Git starts and prints the checkout inside its scratch folder.
 `scratch.py end --task gate:<id>` removes the clone. A failed clone remains

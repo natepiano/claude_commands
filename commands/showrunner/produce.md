@@ -821,7 +821,7 @@ Mac is unreachable: skip it. Exit 9 means the Mac is blocked, busy with a test,
 or its coordination state cannot be read: skip the run; it is not an outage.
 It never gates a merge; a failure (7 hana, 8 an example) goes to the unit whose
 merge it was. Never skip it. For a separate test clone on either machine,
-use `scratch.py clone <source> --task gate:<id>` and `scratch.py end --task gate:<id>`
+use `copies.py clone <source> --task gate:<id>` and `scratch.py end --task gate:<id>`
 when the test ends; a phase task must name a real phase.
 </CIPoint>
 

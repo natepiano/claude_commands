@@ -102,7 +102,7 @@ if "scratch.py end " in remote:
         raise SystemExit(98)
     print("mac_exit=0")
     raise SystemExit(0)
-if "scratch.py clone " in remote:
+if "copies.py clone " in remote:
     print(os.environ["MAC_RUN_CHECKOUT"])
     print("mac_exit=0")
     raise SystemExit(0)
@@ -529,7 +529,7 @@ class MacRunTests(unittest.TestCase):
                 })
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 remote = [event for event in self.events() if event["command"] == "ssh"]
-                creation = next(event for event in remote if "scratch.py clone " in event["args"][-1])
+                creation = next(event for event in remote if "copies.py clone " in event["args"][-1])
                 create_words = shlex.split(creation["args"][-1])
                 task = create_words[create_words.index("--task") + 1]
                 self.assertRegex(task, rf"^gate:mac-run-{SHA}-\d+$")

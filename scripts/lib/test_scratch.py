@@ -146,7 +146,7 @@ class ScratchTests(unittest.TestCase):
         self.git(source, "commit", "-qm", "source")
 
         with mock.patch.object(copies, "initialize_git", wraps=copies.initialize_git) as initialize:
-            checkout = scratch.clone(source, "gate:hana-view", "camera")
+            checkout = copies.clone(source, "gate:hana-view", "camera")
         initialize.assert_called_once_with(checkout, source.resolve())
 
         self.assertTrue(checkout.is_relative_to(self.base / "scratch"))
@@ -178,8 +178,8 @@ class ScratchTests(unittest.TestCase):
             raise copies.CopyError("interrupted clone")
 
         with mock.patch.object(copies, "initialize_git", side_effect=interrupted_clone):
-            with self.assertRaisesRegex(scratch.ScratchError, "clone failed"):
-                _ = scratch.clone(self.base / "source", "gate:clone-failure")
+            with self.assertRaisesRegex(copies.CopyError, "clone failed"):
+                _ = copies.clone(self.base / "source", "gate:clone-failure")
         paths = [item.path for item in scratch.folders() if item.task == "gate:clone-failure"]
         self.assertEqual(len(paths), 1)
         self.assertTrue((paths[0] / "checkout" / "partial").exists())

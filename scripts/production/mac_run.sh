@@ -124,7 +124,7 @@ sha=$(git -C $repo rev-parse --verify "$sha^{commit}") || exit 2
 # The Mac cannot fetch from GitHub over ssh, so the commits go as a bundle.
 # When the source already holds the commit, no bundle is needed.
 clone_task=gate:mac-run-${sha}-$$
-clone=$(on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py clone $source_arg --task $clone_task --name hana") || exit 4
+clone=$(on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py clone $source_arg --task $clone_task --name hana") || exit 4
 [[ $clone == /* && $clone != *$'\n'* ]] || { print -u2 'mac_run: scratch clone returned no absolute checkout'; exit 4 }
 clone_arg=${(q)clone}
 base=$(ssh $host "git -C $clone_arg rev-parse HEAD")

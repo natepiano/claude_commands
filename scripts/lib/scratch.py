@@ -635,33 +635,6 @@ def new(task: str = "", word: str = "", visible: bool = False, now: float | None
     return path
 
 
-def clone(source: Path, task: str = "", word: str = "hana", now: float | None = None, *,
-    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
-) -> Path:
-    """Make a task-owned test clone. Publish its task before Git can leave a partial copy."""
-    from scripts.copies import copies
-
-    if isinstance(scratch_settings, UseConfiguredValue):
-        scratch_settings = conf.read("scratch")
-    path = new(task, word, now=now, scratch_settings=scratch_settings)
-    _ = update_record(path, lambda record: {
-        **(record.fields if isinstance(record, copy_record.Registered) else {}),
-        "test_hana_clone": True, "source_path": str(source.resolve()),
-    }, scratch_settings=scratch_settings)
-    checkout = path / "checkout"
-    try:
-        # The task folder keeps one lock path while its checkout gains Git metadata.
-        with copies.claim_tree(path, create=False) as state:
-            if state is not copies.ClaimState.ACQUIRED:
-                raise copies.CopyError(f"{path}: task folder is busy")
-            checkout.mkdir()
-            copies.initialize_git(checkout, source.resolve())
-            _ = copies.git(checkout, "reset", "--hard", "--quiet")
-    except (OSError, copies.CopyError) as error:
-        raise ScratchError(f"clone failed; its task still owns the partial folder {path}: {error}") from error
-    return checkout
-
-
 def adopt(source: Path, task: str, word: str = "", visible: bool = False, now: float | None = None, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Path:
@@ -1394,7 +1367,7 @@ def main(argv: list[str]) -> int:
     scratch_settings = conf.read("scratch")
     parser = argparse.ArgumentParser(prog="scratch.py", description="Scratch folders that belong to a task.")
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("new", "clone", "adopt", "hold"):
+    for name in ("new", "adopt", "hold"):
         command = commands.add_parser(name)
         if name != "new":
             _ = command.add_argument("path")
@@ -1429,8 +1402,6 @@ def main(argv: list[str]) -> int:
                 cargo_removal_mark(path).unlink(missing_ok=True)
         elif command == "new":
             print(new(chosen_task(arguments), cast(str, arguments.name), cast(bool, arguments.visible), scratch_settings=scratch_settings))
-        elif command == "clone":
-            print(clone(Path(cast(str, arguments.path)), chosen_task(arguments), cast(str, arguments.name), scratch_settings=scratch_settings))
         elif command == "adopt":
             print(adopt(Path(cast(str, arguments.path)), chosen_task(arguments), cast(str, arguments.name),
                         cast(bool, arguments.visible), scratch_settings=scratch_settings))
