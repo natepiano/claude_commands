@@ -238,14 +238,20 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
         else:
             return Stopped(identity, live.pid)
         if _same_process(live.pid, started):
-            if herdr.native_process(live.pid, kind) != proved:
-                return StopFailed(identity, "process identity changed; no signal sent")
-            _signal_process(live.pid, signal.SIGKILL)
+            last_signal = "SIGTERM"
+            try:
+                if herdr.native_process(live.pid, kind) != proved:
+                    return StopFailed(identity, "process identity changed; no signal sent")
+            except (OSError, ValueError, herdr.HerdrFailure) as error:
+                print(f"{identity}: stop identity anomaly after SIGTERM: {error}; waiting for exit", file=sys.stderr)
+            else:
+                _signal_process(live.pid, signal.SIGKILL)
+                last_signal = "SIGKILL"
             deadline = monotonic() + KILL_GRACE_SECONDS
             while _same_process(live.pid, started):
                 remaining = deadline - monotonic()
                 if remaining <= 0:
-                    return StopFailed(identity, f"pid {live.pid} is still running after SIGKILL")
+                    return StopFailed(identity, f"pid {live.pid} is still running after {last_signal}")
                 _ = Event().wait(min(0.1, remaining))
         return Stopped(identity, live.pid)
     except ProcessLookupError:

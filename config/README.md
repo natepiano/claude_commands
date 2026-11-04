@@ -58,9 +58,33 @@ advertises a model alias that `[claude.agents]` does not yet list.
 
 `[claude.context]` is the fourth layer: `default=<window>` plus one
 `<family>=<first version>:<window>` row per Claude family (`opus=4.7:1m`). The
-context-usage hooks read it to place the auto-compaction trigger they warn
-against; nothing in the hook scripts names a model. A new family, or a family
+context-usage hooks read it to calculate the auto-compaction trigger.
+The per-call message uses `context_usage.conf`. A new family, or a family
 whose first 1M release changes, is a row here.
+
+## context_usage.conf
+
+`message = off` disables the per-call context message for main threads and subagents.
+`on` enables the existing thresholds and messages.
+A missing file, missing key, or invalid value means `on`.
+The hook reads the file on each call through `scripts.lib.conf`.
+Tests select a temporary config folder with `CONF_DIR`.
+The hook still reads the transcript and writes its debug log.
+Compaction runs by itself during work.
+
+## context_deferral.conf
+
+Each non-comment line uses `kind: value`; `#` starts a comment.
+`window` sets the maximum region length in characters, after whitespace is collapsed.
+`action`, `marker`, `state`, `later`, and `exclude` hold case-insensitive regular expressions.
+The hook joins the expressions of each kind with `|`.
+It blocks an `action` with a `marker`, or an `action` with both a `state` and a `later` phrase.
+Each region must fit the window and contain no `exclude` match.
+`window`, `action`, and `exclude` are required; absent `marker`, `state`, or `later` entries disable their rule.
+`stop-context-deferral.py` reads this file at each stop through the same `CONF_DIR` folder selection.
+The hook removes code, paired quotations, and block quotes, including continuation lines, before it collapses whitespace.
+It blocks once with exit 2 and permits a stop with `stop_hook_active` set.
+A missing file, invalid entry, or hook error permits the stop without output.
 
 ## lint.conf
 

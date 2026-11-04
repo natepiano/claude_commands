@@ -13,7 +13,7 @@
 - **Log:** `docs/plans/natedev-log.md` — git-excluded; one line per event
 - **Change review:** `~/rust/hanadocs/change-review/change-review - natedev.md` — changes for the user to check, read only when the user asks; never open questions
 - **Proposals:** `~/rust/hanadocs/issues`
-- **User zone:** America/Curacao (AST) — every time the showrunner reports is in this zone only (user, 2026-10-21: "My time zone is Curacao- I think that's ast. Please adjust"; EDT from 2026-10-12, PDT from 2026-10-04). user_zone.conf is the setting; this line only records it
+- **User zone:** read it with `python3 ~/.claude/scripts/lib/user_zone.py`. user_zone.conf is the one setting, and every time a report gives is in that zone. This doc stores no zone, because a stored copy goes stale when the user moves (it read AST after the move to EST).
 - **Updates:** on demand (user, 2026-10-10: dailies only when the user asks); each dailies lists every unit; a simple dailies gives each waiting, idle unit one line
 - **Merge tests:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` and `basedpyright scripts/buildlog` (exits 0 when clean, with `0 errors, 0 warnings, 0 notes`), run in the showrunner checkout
 - **Push:** git
