@@ -63,6 +63,7 @@ class CiSliceAdmissionTests(unittest.TestCase):
 
     def test_running_ci_job_uses_live_use_plus_the_current_margin(self) -> None:
         with AdmissionFixture() as fixture:
+            fixture.configure(ci_memory_margin_gib=6)
             ci = fixture.root / "ci.slice"
             _ = (ci / "memory.current").write_text(str(2 * GIB))
             (fixture.proc.path / "123").mkdir()
