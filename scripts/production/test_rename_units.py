@@ -106,7 +106,6 @@ class ProductionRenameTests(support.ProductionRenameFixture):
             _ = self.seed_unit_config(directory, "alpha-unit")
         self.marked_unit("alpha-unit")
         self.assert_success(self.run_rename("apply"))
-        base = self.git("rev-parse", NEW)
         moved = self.run_command("unit", NEW, "alpha-unit")
         self.assert_success(moved)
         self.assertIn("herdr mark", moved.stdout)
@@ -124,12 +123,6 @@ class ProductionRenameTests(support.ProductionRenameFixture):
             self.assertEqual(projects[str(new)], {"hasTrustDialogAccepted": True, "allowedTools": ["Read"]})
             self.assertEqual(projects[str(self.root / "unrelated")], {"hasTrustDialogAccepted": False})
             self.assertEqual(fields["theme"], "dark")
-        self.assertEqual(self.git("rev-parse", "HEAD^"), base)
-        self.assertEqual(self.git("log", "-1", "--format=%s"), "chore(new): rename unit alpha-unit from old")
-        self.assertEqual(self.git("diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"),
-                         "docs/plans/new-production.md")
-        self.assertEqual(self.git("ls-remote", "origin", "refs/heads/new"),
-                         f"{self.git('rev-parse', NEW)}\trefs/heads/new")
         self.assertTrue(self.unit_worktree(OLD, "beta-unit").exists())
         marks = (self.root / "proc/991001/environ").read_text().split("\0")
         self.assertIn(f"SHOWRUNNER_UNIT={OLD}", marks)
@@ -149,38 +142,6 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertIn("herdr", refused.stderr)
         self.assertEqual(self.snapshot(), before)
 
-    def test_unit_resume_uses_current_merge_tip_after_an_unrelated_commit(self) -> None:
-        self.prepare_unit_moves()
-        self.assert_success(self.run_rename("apply"))
-        failed = self.run_command("unit", NEW, "alpha-unit", wrapper=INTERRUPT_UNIT_GIT,
-                                  RENAME_TEST_REFUSE="unit-doc")
-        self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
-        self.assertIn("simulated unit-doc failure", failed.stderr)
-        moves = cast(dict[str, dict[str, object]], self.journal()["unit_moves"])
-        self.assertEqual(moves["alpha-unit"]["step"], 3)
-        self.write(self.checkout / "README.md", "Unrelated progress on merge branch.\n")
-        _ = self.git("add", "README.md")
-        _ = self.git("commit", "-m", "Merge unrelated progress")
-        base = self.git("rev-parse", "HEAD")
-        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
-        self.assert_unit_moved("alpha-unit")
-        self.assertEqual(self.git("rev-parse", "HEAD^"), base)
-
-    def test_unit_resume_recognizes_a_committed_row_after_later_merge_progress(self) -> None:
-        self.prepare_unit_moves()
-        self.assert_success(self.run_rename("apply"))
-        failed = self.run_command("unit", NEW, "alpha-unit", wrapper=INTERRUPT_UNIT_GIT,
-                                  RENAME_TEST_REFUSE="merge-push")
-        self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
-        self.assertIn("simulated merge-push failure", failed.stderr)
-        self.write(self.checkout / "README.md", "More merge progress after row commit.\n")
-        _ = self.git("add", "README.md")
-        _ = self.git("commit", "-m", "Merge after unit row commit")
-        tip = self.git("rev-parse", "HEAD")
-        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
-        self.assert_unit_moved("alpha-unit")
-        self.assertEqual(self.git("rev-parse", "HEAD"), tip)
-
     def test_unit_retry_refuses_an_advanced_old_branch_before_changing_the_worktree(self) -> None:
         self.prepare_unit_moves()
         self.assert_success(self.run_rename("apply"))
@@ -197,22 +158,6 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertIn("old-alpha-unit moved", refused.stderr)
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(self.git("-C", str(old), "branch", "--show-current"), "old-alpha-unit")
-
-    def test_unit_resume_refuses_a_missing_branch_column_without_a_traceback(self) -> None:
-        self.prepare_unit_moves()
-        self.assert_success(self.run_rename("apply"))
-        failed = self.run_command("unit", NEW, "alpha-unit", wrapper=INTERRUPT_UNIT_GIT,
-                                  RENAME_TEST_REFUSE="unit-doc")
-        self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
-        lines = self.new_doc.read_text().splitlines(keepends=True)
-        self.write(self.new_doc, "".join(line.rsplit("|", 2)[0] + "|\n" if line.startswith("|") else line
-                                        for line in lines))
-        _ = self.git("add", str(self.new_doc))
-        _ = self.git("commit", "-m", "Remove Branch column")
-        refused = self.run_command("unit", NEW, "alpha-unit")
-        self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
-        self.assertIn("Units table lacks Branch column", refused.stderr)
-        self.assertNotIn("Traceback", refused.stderr)
 
     def test_unit_refuses_live_and_unknown_claude_then_moves_when_stopped(self) -> None:
         self.prepare_unit_moves()
@@ -250,7 +195,6 @@ class ProductionRenameTests(support.ProductionRenameFixture):
     def test_unit_retry_repairs_a_worktree_already_moved_before_interruption(self) -> None:
         self.prepare_unit_moves()
         self.assert_success(self.run_rename("apply"))
-        base = self.git("rev-parse", NEW)
         failed = self.run_command("unit", NEW, "alpha-unit", wrapper=INTERRUPT_UNIT_GIT,
                                   RENAME_TEST_REFUSE="repair")
         self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
@@ -262,7 +206,6 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertIn("refs/heads/new-alpha-unit", self.git("ls-remote", "origin", "refs/heads/new-alpha-unit"))
         self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
         self.assert_unit_moved("alpha-unit")
-        self.assertEqual(self.git("rev-list", "--count", f"{base}..HEAD"), "1")
         tip = self.git("rev-parse", NEW)
         self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
         self.assertEqual(self.git("rev-parse", NEW), tip)

@@ -22,16 +22,6 @@ from scripts.production.rename_test_support import CHECK_TIMER_HANDOFF, FAIL_GIT
 
 @final
 class ProductionRenameTests(support.ProductionRenameFixture):
-    def test_production_rename_uses_staff_without_a_worktree_column(self) -> None:
-        from scripts.production.staff_test_support import without_worktree_column
-        without_worktree_column(self.doc)
-        _ = self.git("add", str(self.doc))
-        _ = self.git("commit", "-m", "Remove the display column")
-        self.assert_success(self.run_rename("apply"))
-        self.assertTrue(self.new_doc.is_file())
-        self.assertFalse(self.doc.exists())
-
-
     def test_document_rename_updates_a_wrapped_location_without_reactivating_its_row(self) -> None:
         row = self.production_row()
         _ = staff.set_doc(row.id, staff.WrappedDoc("natedev", self.doc))
@@ -219,6 +209,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.new_doc = self.doc.with_name("new-production.md")
         _ = self.git("worktree", "repair")
         self.write(self.new_doc, self.new_doc.read_text().replace(str(old), str(self.checkout)))
+        _ = self.git("commit", "-m", "Record the moved checkout", "--", str(self.new_doc))
         row = next(row for row in staff.find(kind="showrunner") if row.name == NEW)
         _ = staff.set_doc(row.id, staff.LiveDoc("natedev", self.new_doc))
         conf = self.notifier / "showrunner-new/conf"
@@ -227,40 +218,6 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assert_unit_moved("alpha-unit")
         self.assert_success(self.run_command("repair-workers", NEW))
         self.assertNotIn("new_doc", self.journal())
-
-    def test_plan_ignores_as_built_paths_and_prose_in_plan_cells(self) -> None:
-        text = self.doc.read_text()
-        for unit, prose in zip(UNITS, (
-            "docs/as-built/agent-registry.md and docs/as-built/session-notifier.md (runs done 2026-10-08)",
-            "`docs/as-built/agent-registry.md` and `docs/as-built/session-notifier.md` (runs done 2026-10-08)",
-        ), strict=True):
-            text = text.replace(f"docs/plans/{unit}.md", prose)
-        self.write(self.doc, text)
-        before = self.snapshot()
-        planned = self.run_rename("plan")
-        self.assert_success(planned)
-        self.assertIn("2. Production headers: no unit plans", planned.stdout)
-        self.assertEqual(self.snapshot(), before)
-
-    def test_plan_selects_multiple_quoted_plans_and_apply_rewrites_both_headers(self) -> None:
-        self.write(self.doc, self.doc.read_text().replace(
-            "docs/plans/alpha-unit.md",
-            "`docs/plans/alpha-unit.md` and `docs/plans/beta-unit.md` "
-            + "(see `README.md` and `docs/as-built/history.md`; runs done 2026-10-08)"
-        ).replace("| beta-unit | docs/plans/beta-unit.md |", "| beta-unit | permanent |"))
-        _ = self.git("add", str(self.doc))
-        _ = self.git("commit", "-m", "Record several plans in one cell")
-        planned = self.run_rename("plan")
-        self.assert_success(planned)
-        headers = [line for line in planned.stdout.splitlines() if line.startswith("2.")]
-        self.assertEqual(len(headers), 2, planned.stdout)
-        for unit in UNITS:
-            self.assertTrue(any(str(self.plan_path(unit)) in line for line in headers))
-        self.assert_success(self.run_rename("apply"))
-        for unit in UNITS:
-            self.assertRegex(self.plan_path(unit).read_text(),
-                             r"(?m)^> \*\*Production:(?: new\*\*|\*\* new) — unit")
-        self.assertEqual(self.git("status", "--porcelain"), "")
 
     def test_plan_and_apply_skip_plans_removed_from_git(self) -> None:
         untracked = self.plan_path("alpha-unit")
@@ -286,18 +243,6 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         headers = [line for line in planned.stdout.splitlines() if line.startswith("2.")]
         self.assertEqual(len(headers), 1, planned.stdout)
         self.assertIn(str(self.plan_path("beta-unit")), headers[0])
-
-    def test_plan_accepts_absolute_and_home_relative_quoted_plan_paths(self) -> None:
-        self.env["HOME"] = str(self.checkout)
-        self.write(self.doc, self.doc.read_text().replace(
-            "docs/plans/alpha-unit.md", f"`{self.plan_path('alpha-unit')}`"
-        ).replace("| beta-unit | docs/plans/beta-unit.md |", "| beta-unit | `~/docs/plans/beta-unit.md` |"))
-        planned = self.run_rename("plan")
-        self.assert_success(planned)
-        headers = [line for line in planned.stdout.splitlines() if line.startswith("2.")]
-        self.assertEqual(len(headers), 2, planned.stdout)
-        for unit in UNITS:
-            self.assertTrue(any(str(self.plan_path(unit)) in line for line in headers))
 
     def test_plan_lists_every_production_move_without_writing(self) -> None:
         before = self.snapshot()
@@ -438,21 +383,16 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertEqual(production_docs, ["docs/plans/new-production.md"])
         self.assert_applied()
 
-    def test_retired_plan_prose_is_skipped_but_its_stall_state_moves(self) -> None:
-        retired = "| retired-unit | (retired; use `/unit:report` for history) | — | — |\n"
-        self.write(self.doc, self.doc.read_text().replace(
-            "\n## Production rules", retired + "\n## Production rules"))
+    def test_a_retired_unit_has_no_plan_but_its_stall_state_moves(self) -> None:
+        _ = fixture_member("unit", name="retired", parent=self.production_row().id,
+                           worktree=staff.RemovedWorktree("natedev", self.worktrees / "retired"))
         self.write(self.stall_path(OLD, "retired-unit"), '{"stretch": 23}\n')
-        _ = self.git("add", str(self.doc))
-        _ = self.git("commit", "-m", "Record a retired unit with a quoted command")
         before = self.snapshot()
         planned = self.run_rename("plan")
         self.assert_success(planned)
         self.assertEqual(self.snapshot(), before)
         self.assertIn(str(self.stall_path(NEW, "retired-unit")), planned.stdout)
-        self.assertNotIn("/unit:report", planned.stdout)
         self.assert_success(self.run_rename("apply"))
-        self.assertIn(retired, self.new_doc.read_text())
         self.assertFalse(self.stall_path(OLD, "retired-unit").exists())
         self.assertEqual(self.stall_path(NEW, "retired-unit").read_text(), '{"stretch": 23}\n')
         committed = self.git("diff-tree", "--no-commit-id", "--name-only", "-r", NEW).splitlines()
@@ -485,7 +425,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
 
     def test_formerly_is_inserted_without_splitting_the_context_list(self) -> None:
         self.assert_success(self.run_rename("apply"))
-        context = self.new_doc.read_text().split("## Production Context", 1)[1].split("## Units", 1)[0]
+        context = self.new_doc.read_text().split("## Production Context", 1)[1].split("## Production rules", 1)[0]
         self.assertEqual(context, "\n\n- **Formerly:** `old`\n- **Merge branch:** `new`\n"
                          + f"- **Showrunner checkout:** `{self.checkout}`\n- **Log:** `production.log`\n\n")
 
@@ -592,28 +532,6 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertIn(f"changed worker {run}/w7", fixed.stdout)
         state = cast(dict[str, object], json.loads((run / workers.STATE).read_text()))
         self.assertEqual(state["working_dir"], str(self.unit_worktree(NEW, "alpha-unit")))
-
-    def test_repair_skips_a_run_that_matches_two_units(self) -> None:
-        self.prepare_unit_moves()
-        self.assert_success(self.run_rename("apply"))
-        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
-        run = self.seed_paused_unit_worker()
-        state = cast(dict[str, object], json.loads((run / workers.STATE).read_text()))
-        state["plan_doc"] = ""
-        self.write(run / workers.STATE, json.dumps(state))
-        journal = self.journal()
-        del journal["unit_moves"]
-        self.write(self.state / "new/rename.json", json.dumps(journal))
-        self.write(self.new_doc, self.new_doc.read_text().replace(
-            str(self.unit_worktree(OLD, "beta-unit")), str(self.unit_worktree(NEW, "alpha-unit"))))
-        beta = next(row for row in staff.find(kind="unit") if row.name == "beta")
-        _ = staff.set_worktree(beta.id, staff.RemovedWorktree("natedev", self.unit_worktree(NEW, "alpha-unit")), expected=beta.worktree)
-        before = self.snapshot()
-        fixed = self.run_command("repair-workers", NEW)
-        self.assert_success(fixed)
-        self.assertIn(f"run {run}: ambiguous unit", fixed.stdout)
-        self.assertIn("skipped", fixed.stdout)
-        self.assertEqual(self.snapshot(), before)
 
     def test_repair_reports_why_no_move_was_found(self) -> None:
         self.assert_success(self.run_rename("apply"))

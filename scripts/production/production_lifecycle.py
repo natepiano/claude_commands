@@ -14,7 +14,7 @@ from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import session_staff, staff, staff_sources, unit_config
+from scripts.production import session_staff, staff, staff_sources, unit_config, unit_names
 from scripts.shutdown.remote import local_machine
 from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_untracked_ignored
 
@@ -22,8 +22,7 @@ from scripts.production import showrunners
 import showrunner_tree
 import tidy_wrapped
 import unit_lookup
-from production_units import Production, read_production
-from production_units import Refusal, cell_value, production_field, unit_table
+from scripts.production.production_doc import Production, Refusal, production_field, read_production
 from merge_checkpoint import (CodeCheckpoint, MergeEntry, NoMerge,
                               PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed,
                               Stop,
@@ -70,7 +69,7 @@ class CommitVerdict(NamedTuple):
 
 class UnitRow(NamedTuple):
     name: str
-    plan: Path
+    member: staff.StaffRow
     worktree: Path
     branch: str
 
@@ -118,24 +117,30 @@ def production_name(lines: list[str]) -> str:
     return name.value
 
 
-def units(lines: list[str], production: Production, sources: unit_lookup.MemberSources, *,
-          record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> tuple[UnitRow, ...]:
-    record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
-    parsed: list[UnitRow] = []
-    rows = unit_table(lines)
-    permanent = [cell_value(cells["Unit"]) for cells in rows if cell_value(cells.get("Plan", "")) == "permanent"]
+def units(runner: staff.StaffRow, record: staff.StaffSnapshot) -> tuple[UnitRow, ...]:
+    """The runner's unit rows in staff order; a parked retirement names the branch, else git does."""
+    resolver = session_staff.RowResolver(record)
+    rows = record.find(kind="unit", parent=runner.id)
+    permanent = [unit_names.unit_id(row.name) for row in rows
+                 if isinstance(config := resolver.unit_config(row), unit_config.UnitConfig)
+                 and isinstance(config.plan, unit_config.PermanentPlan)]
     if permanent:
         raise LifecycleStop("wrap", "held", "; ".join(
             f"permanent child {name}: transfer it before wrapping" for name in permanent))
-    for cells in rows:
-        row = {heading: cell_value(cell) for heading, cell in cells.items()}
-        if not all(heading in row for heading in ("Unit", "Plan", "Branch", "Port", "Owns")):
-            raise LifecycleStop("input", "failed", f"invalid Units row: {cells}")
-        location = unit_lookup.local_worktree(sources.member(
-            staff_sources.UnitMember(production.slug, row["Unit"]), record))
-        plan = Path(row["Plan"]).expanduser()
-        parsed.append(UnitRow(row["Unit"], plan if plan.is_absolute() else location.path / plan,
-                              location.path, row["Branch"]))
+    parsed: list[UnitRow] = []
+    for row in rows:
+        name = unit_names.unit_id(row.name)
+        if isinstance(row.worktree, staff.WorktreeUnfilled):
+            raise LifecycleStop("retire", "held", f"{name}: worktree is unfilled")
+        parked = unit_config.read_parked(row.id, cleanup=False)
+        if isinstance(parked, unit_config.UnitConfig) and isinstance(parked.retired, unit_config.RetiredSession):
+            branch = parked.retired.branch.value
+        else:
+            found = resolver.unit_branch(row)
+            if not isinstance(found, session_staff.Branch):
+                raise LifecycleStop("retire", "held", f"{name}: {found.reason}")
+            branch = found.name
+        parsed.append(UnitRow(name, row, row.worktree.path, branch))
     return tuple(parsed)
 
 
@@ -187,8 +192,8 @@ def load(production: Production, lines: list[str], resume: bool, scratch: Path |
         marked = unit_lookup.marked_units(production.slug)
     except OSError as error:
         raise LifecycleStop("session", "failed", str(error)) from error
-    for cells in unit_table(lines):
-        name = cell_value(cells["Unit"])
+    for row in unit_lookup.doc_units(production.doc, staff.snapshot()):
+        name = unit_names.unit_id(row.name)
         last: MergeEntry | NoMerge = history.last_code_for_unit(name) if history else NoMerge()
         detail = (f"phase {last.phase} at {last.merge_hash}" if isinstance(last, MergeEntry)
                   else "no code checkpoint")
@@ -208,7 +213,9 @@ def open_production(production: Production, lines: list[str]) -> None:
     status = doc_status(lines)
     if isinstance(status, ProductionWrapped):
         raise LifecycleStop("open", "held", "production is already wrapped")
-    rows = unit_table(lines)
+    record = staff.snapshot()
+    rows = unit_lookup.doc_units(production.doc, record)
+    resolver = session_staff.RowResolver(record)
     state = checkout_ready(production)
     if isinstance(state, PlanPending):
         _ = checked(production.checkout, "branch", "switch", "-c", production.merge_branch)
@@ -223,14 +230,19 @@ def open_production(production: Production, lines: list[str]) -> None:
         write_text_atomic(production.doc, "\n".join(updated) + "\n")
     report("doc", "ok", "running")
     paths = [doc_path_in_checkout(production, production.doc)]
-    for cells in rows:
-        name = cell_value(cells["Unit"])
-        plan = Path(cell_value(cells["Plan"])).expanduser()
-        plan = plan if plan.is_absolute() else production.checkout / plan
-        if plan.exists():
-            paths.append(doc_path_in_checkout(production, plan))
-        else:
-            report("plan", "ok", f"{name}: no plan yet at {plan}; not committed")
+    for row in rows:
+        name = unit_names.unit_id(row.name)
+        match resolver.unit_config(row):
+            case unit_config.UnitConfig(plan=unit_config.PlanFile(path=relative)):
+                plan = production.checkout / relative
+                if plan.exists():
+                    paths.append(doc_path_in_checkout(production, plan))
+                else:
+                    report("plan", "ok", f"{name}: no plan yet at {plan}; not committed")
+            case unit_config.UnitConfig():
+                pass
+            case _:
+                report("plan", "ok", f"{name}: no .unit.toml yet; no plan committed")
     subject = f"production({production_name(updated)}): plans for {len(rows)} units"
     subjects = checked(production.checkout, "commit", "log", "--format=%s", production.merge_branch)
     committed_paths = checked(production.checkout, "commit", "ls-tree", "-r", "--name-only", "HEAD", "--", *paths)
@@ -455,46 +467,33 @@ def release_edges(slug: str, *, record: staff.StaffSnapshot | None = None) -> No
 
 class PreparedWrapUnit(NamedTuple):
     unit: UnitRow
-    member: staff.StaffRow
     config: unit_config.UnitConfig
 
 
-def prepare_wrap_units(production: Production, lines: list[str], rows: tuple[UnitRow, ...],
-                       members: tuple[staff_sources.MemberFound | staff_sources.NoSuchMember, ...]) -> tuple[PreparedWrapUnit, ...]:
+def prepare_wrap_units(production: Production, rows: tuple[UnitRow, ...]) -> tuple[PreparedWrapUnit, ...]:
     """Validate all retirement evidence before the first worktree is removed."""
     prepared: list[PreparedWrapUnit] = []
-    cells_by_name = {cell_value(cells.get("Unit", "")): cells for cells in unit_table(lines)}
-    for unit, found in zip(rows, members, strict=True):
-        if isinstance(found, staff_sources.NoSuchMember):
-            raise LifecycleStop("retire", "held", f"{unit.name}: no staff row")
-        location = found.row.worktree
-        if isinstance(location, staff.WorktreeUnfilled):
-            raise LifecycleStop("retire", "held", f"{unit.name}: worktree is unfilled")
-        if location.machine != local_machine() or location.path != unit.worktree:
-            raise LifecycleStop("retire", "held", f"{unit.name}: staff worktree conflicts with Units row")
-        pair = unit_config.place(found.row.id, unit.worktree, cleanup=False)
+    for unit in rows:
+        location = unit.member.worktree
+        if isinstance(location, staff.WorktreeUnfilled) or location.machine != local_machine():
+            raise LifecycleStop("retire", "held", f"{unit.name}: staff worktree is not on {local_machine()}")
+        pair = unit_config.place(unit.member.id, unit.worktree, cleanup=False)
         if isinstance(pair, unit_config.Both) and not pair.same:
             raise LifecycleStop("retire", "held", f"{pair.worktree} and {pair.parked}: configurations differ; no file was changed")
-        saved = unit_config.read_parked(found.row.id, cleanup=False)
+        saved = unit_config.read_parked(unit.member.id, cleanup=False)
         current = unit_config.read(unit.worktree, cleanup=False)
         if isinstance(saved, unit_config.UnitConfig):
             if not isinstance(saved.retired, unit_config.RetiredSession):
                 raise LifecycleStop("retire", "held", f"{unit.name}: parked retirement facts are incomplete")
             config = saved
+        elif isinstance(current, unit_config.ConfigMissing):
+            raise LifecycleStop("retire", "held", current.reason)
+        elif not unit.member.current_session:
+            raise LifecycleStop("retire", "held", f"{unit.name}: the staff row has no director session for retirement")
         else:
-            if isinstance(current, unit_config.ConfigMissing):
-                raise LifecycleStop("retire", "held", current.reason)
-            try:
-                config = staff_sources.prepare_retirement(cells_by_name[unit.name], found,
-                            date=datetime.now(production.zone).date().isoformat())
-            except ValueError as error:
-                raise LifecycleStop("retire", "held", str(error)) from error
-            config = replace(config, responsibilities=current.responsibilities)
-            if replace(config, retired=unit_config.NoRetiredSession()) != current:
-                raise LifecycleStop("retire", "held", f"{unit.name}: .unit.toml conflicts with Units row")
-        assert isinstance(config.retired, unit_config.RetiredSession)
-        if config.retired.branch.value != unit.branch:
-            raise LifecycleStop("retire", "held", f"{unit.name}: parked branch conflicts with Units row")
+            config = replace(current, retired=unit_config.RetiredSession(
+                datetime.now(production.zone).date().isoformat(), unit.member.current_session,
+                unit_config.Branch(unit.branch)))
         if unit.worktree.exists():
             if isinstance(location, staff.RemovedWorktree):
                 raise LifecycleStop("retire", "held", f"{unit.name}: removed worktree path is occupied")
@@ -502,29 +501,23 @@ def prepare_wrap_units(production: Production, lines: list[str], rows: tuple[Uni
             actual = checked(unit.worktree, "retire", "symbolic-ref", "--quiet", "--short", "HEAD")
             if actual != unit.branch:
                 raise LifecycleStop("retire", "held", f"{unit.name}: worktree branch {actual} conflicts with {unit.branch}")
-        prepared.append(PreparedWrapUnit(unit, found.row, config))
+        prepared.append(PreparedWrapUnit(unit, config))
     return tuple(prepared)
 
 
-def retire_wrap_rows(rows: tuple[UnitRow, ...], record: staff.StaffSnapshot,
-                     members: tuple[staff_sources.MemberFound | staff_sources.NoSuchMember, ...],
-                     runner: staff_sources.MemberFound | staff_sources.NoSuchMember) -> bool:
+def retire_wrap_rows(rows: tuple[UnitRow, ...], record: staff.StaffSnapshot, runner: staff.StaffRow) -> bool:
     """Keep worker and parent rows; removal is proved by the wrap's file step."""
     pending: list[staff.StaffId] = []
-    for unit, found in zip(rows, members, strict=True):
-        if isinstance(found, staff_sources.NoSuchMember):
-            raise LifecycleStop("staff", "held", f"{unit.name}: no staff row")
+    for unit in rows:
         if unit.worktree.exists():
             raise LifecycleStop("staff", "held", f"{unit.name}: worktree has not been removed")
-        workers = record.find(kind="worker", parent=found.row.id)
+        workers = record.find(kind="worker", parent=unit.member.id)
         for worker in workers:
             print(f"kept worker {worker.id} {worker.name} under {unit.name}")
         if workers:
-            pending.append(found.row.id)
-    if isinstance(runner, staff_sources.NoSuchMember):
-        raise LifecycleStop("staff", "held", "no showrunner staff row")
-    if record.find(kind="worker", parent=runner.row.id):
-        pending.append(runner.row.id)
+            pending.append(unit.member.id)
+    if record.find(kind="worker", parent=runner.id):
+        pending.append(runner.id)
     if pending:
         staff.defer_retire(pending)
     return bool(pending)
@@ -561,17 +554,16 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     productions[production.slug] = showrunners.ShowrunnerSource(
         showrunners.Timer(production.slug, "session:unrecorded", production.doc, ""), "\n".join(lines))
     sources = replace(sources, productions=productions)
-    rows = units(lines, production, sources, record=record)
     runner = sources.member(staff_sources.ShowrunnerMember(production.slug), record)
     if isinstance(runner, staff_sources.NoSuchMember):
         raise LifecycleStop("staff", "held", "no showrunner staff row")
-    members = tuple(sources.member(staff_sources.UnitMember(production.slug, row.name), record) for row in rows)
+    rows = units(runner.row, record)
     if isinstance(status, ProductionRunning):
         for item in close_out_items(lines):
             if item not in done:
                 raise LifecycleStop("close-out", "held", f'{item} is not recorded done; finish it or get the owner\'s OK, then pass --close-out-done "{item}"')
             report("close-out", "ok", f"{item} (recorded done)")
-    prepared = prepare_wrap_units(production, lines, rows, members)
+    prepared = prepare_wrap_units(production, rows)
     tip = checked(production.checkout, "wrap", "rev-parse", "HEAD")
     commit_count = "0"
     if isinstance(status, ProductionRunning):
@@ -608,13 +600,13 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     for item in prepared:
         unit = item.unit
         assert isinstance(item.config.retired, unit_config.RetiredSession)
-        _ = unit_config.park(item.member.id, unit.worktree, item.config.retired)
+        _ = unit_config.park(unit.member.id, unit.worktree, item.config.retired)
         if unit.worktree.exists():
             retire_reservations(unit.worktree)
             _ = checked(production.checkout, "retire", "worktree", "remove", str(unit.worktree))
             report("retire", "ok", f"removed {unit.name} worktree")
-        _ = staff.set_worktree(item.member.id, staff.RemovedWorktree(local_machine(), unit.worktree),
-                               expected=item.member.worktree)
+        _ = staff.set_worktree(unit.member.id, staff.RemovedWorktree(local_machine(), unit.worktree),
+                               expected=unit.member.worktree)
         if git(production.checkout, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}").returncode == 0:
             _ = checked(production.checkout, "retire", "branch", "-d", unit.branch)
             report("retire", "ok", f"deleted local {unit.branch}")
@@ -624,7 +616,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
             report("retire", "ok", f"deleted origin/{unit.branch}")
         elif remote.returncode != 2:
             raise LifecycleStop("retire", "failed", remote.stderr.strip() or f"ls-remote exited {remote.returncode}")
-    held = retire_wrap_rows(rows, record, members, runner) or held
+    held = retire_wrap_rows(rows, record, runner.row) or held
     if isinstance(status, ProductionRunning):
         release_edges(production.slug, record=record)
         notifier = Path.home() / ".claude/scripts/message/notifier.sh"

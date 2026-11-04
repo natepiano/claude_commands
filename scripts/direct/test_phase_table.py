@@ -23,7 +23,7 @@ from scripts.message import sessions
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_showrunner, fake_unit_host, showrunners, staff
-from scripts.production.production_units import read_production
+from scripts.production.production_doc import read_production
 from scripts.production.staff_test_support import (
     isolated_staff_file, production_membership, showrunner_relationship, recorded_showrunner, recorded_unit,
 )
@@ -166,8 +166,6 @@ class PhaseTableTests(unittest.TestCase):
                 f"- **Showrunner checkout:** {self.working_dir}",
                 "- **Log:** docs/show.log",
                 "- **User zone:** UTC",
-                "",
-                "## Units",
             ),
             encoding="utf-8",
         )
@@ -181,10 +179,6 @@ class PhaseTableTests(unittest.TestCase):
     ) -> Path:
         path = self.working_dir / "docs" / "show-production.md"
         checkout_path = checkout or self.working_dir
-        table_rows = [
-            f"| {unit} | {plan} | {worktree} | branch | file.py |"
-            for unit, plan, worktree in rows
-        ]
         _ = path.write_text(
             plan_text(
                 "# Production — show",
@@ -195,19 +189,14 @@ class PhaseTableTests(unittest.TestCase):
                 f"- **Showrunner checkout:** {checkout_path}",
                 "- **Log:** docs/show.log",
                 "- **User zone:** America/Los_Angeles",
-                "",
-                "## Units",
-                "",
-                "| Unit | Plan | Worktree | Branch | Owns |",
-                "| --- | --- | --- | --- | --- |",
-                *table_rows,
             ),
             encoding="utf-8",
         )
         _ = recorded_showrunner("show", path)
         for unit, plan, worktree in rows:
-            if not plan.startswith("retired"):
-                _ = recorded_unit("show", unit, worktree, path, plan=plan.split()[0])
+            row = recorded_unit("show", unit, worktree, path, plan=plan.split()[0])
+            if plan.startswith("retired"):
+                _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", worktree), expected=row.worktree)
         return path
 
     def make_live_worktree(self, name: str) -> Path:
@@ -3662,8 +3651,6 @@ class PhaseTableTests(unittest.TestCase):
                 f"- **Showrunner checkout:** {self.working_dir}",
                 "- **Log:** docs/other.log",
                 "- **User zone:** UTC",
-                "",
-                "## Units",
             ),
             encoding="utf-8",
         )

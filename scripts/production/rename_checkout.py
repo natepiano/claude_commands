@@ -26,8 +26,7 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from production_units import Production, read_production  # noqa: E402
-import production_units  # noqa: E402
+from scripts.production.production_doc import Production, cell_value, read_production  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
 import unit_move  # noqa: E402
 from rename_state import RenameRefused, write_text  # noqa: E402
@@ -103,7 +102,7 @@ def _with_checkout(text: str, checkout: Path) -> str:
     lines = text.splitlines(keepends=True)
     for index, line in enumerate(lines):
         if line.startswith(CHECKOUT_LINE):
-            raw = production_units.cell_value(line[len(CHECKOUT_LINE):])
+            raw = cell_value(line[len(CHECKOUT_LINE):])
             home = Path.home()
             named = (f"~/{checkout.relative_to(home)}" if raw.startswith("~") and checkout.is_relative_to(home)
                      else str(checkout))

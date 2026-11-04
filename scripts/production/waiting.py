@@ -18,12 +18,10 @@ from scripts.lib import build_folders
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 
-import unit_lookup
+from scripts.production import session_staff, staff, unit_lookup, unit_names
+from scripts.production.production_doc import Production, Refusal, read_production
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
-from production_units import Production, read_production
-from production_units import Refusal, cell_value
-from unit_lookup import live_unit_table, retired_units
 from merge_checkpoint import MergeEntry, NoMerge, Stop, git, merge_branch_history, report as merge_report
 
 JsonMap = dict[str, object]
@@ -153,21 +151,30 @@ def report(step: str, state: str, message: str) -> None:
 
 
 def units_from_doc(production: Production) -> tuple[Unit, ...]:
-    lines = production.doc.read_text(encoding="utf-8").splitlines()
+    """The active units in staff row order; a unit with no readable folder or branch is reported and left out."""
     try:
-        marked = unit_lookup.marked_units(production.slug)
-    except OSError as error:
+        record = staff.snapshot()
+        rows = unit_lookup.doc_units(production.doc, record)
+        marked = unit_lookup.marked_units(production.slug, record=record)
+    except (OSError, staff.StaffRefused) as error:
         raise WaitingFailure("production", f"the unit sessions could not be looked up: {error}") from error
+    resolver = session_staff.RowResolver(record)
     units: list[Unit] = []
-    for cells in live_unit_table(lines, production.slug):
-        row = {heading: cell_value(cell) for heading, cell in cells.items()}
-        if not all(row.get(heading) for heading in ("Unit", "Worktree", "Branch")):
-            raise WaitingFailure("production", f"invalid Units row: {cells}")
-        found = marked.get(row["Unit"])
+    for row in rows:
+        name = unit_names.unit_id(row.name)
+        if isinstance(row.worktree, staff.WorktreeUnfilled):
+            print(f"waiting: {name}: unavailable: the worktree is not recorded", file=sys.stderr)
+        if not isinstance(row.worktree, staff.PresentWorktree):
+            continue
+        branch = resolver.unit_branch(row)
+        if not isinstance(branch, session_staff.Branch):
+            print(f"waiting: {name}: unavailable: {branch.reason}", file=sys.stderr)
+            continue
+        found = marked.get(name)
         claude = found.claude if found is not None else None
         live = isinstance(claude, unit_lookup.LiveClaude)
-        units.append(Unit(row["Unit"], claude.name if live else "", row["Branch"],
-                          Path(row["Worktree"]).expanduser(), claude.pid if live else None))
+        units.append(Unit(name, claude.name if live else "", branch.name, row.worktree.path,
+                          claude.pid if live else None))
     return tuple(units)
 
 
@@ -401,7 +408,8 @@ def waits(production: Production) -> None:
     board = run_command("waits", ["cargo-berth", "board", "--json"])
     overlaps = berth_board(board)
     now = datetime.now(production.zone)
-    retired = retired_units(production.doc.read_text(encoding="utf-8").splitlines(), production.slug)
+    retired = {unit_names.unit_id(row.name) for row in unit_lookup.doc_units(production.doc, staff.snapshot())
+               if isinstance(row.worktree, staff.RemovedWorktree)}
     active: dict[str, WaitOpen | WaitCleared] = {}
     clears: dict[str, str] = {}
     for event in log_events(production, now):

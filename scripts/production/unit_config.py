@@ -18,7 +18,8 @@ from typing import cast
 
 from scripts.lib import atomic_file, git_exclude
 from scripts.production.staff import StaffId
-from scripts.production import staff, unit_table
+from scripts.production import staff
+from scripts.production.production_doc import cell_value
 
 
 class ConfigRefused(ValueError):
@@ -46,6 +47,17 @@ class PermanentPlan:
     pass
 
 
+def plan_arguments(plan: PlanFile | StandbyPlan | PermanentPlan) -> list[str]:
+    """The add_unit launch mode for a plan."""
+    match plan:
+        case PlanFile(path):
+            return ["--plan", str(path)]
+        case StandbyPlan():
+            return ["--standby"]
+        case PermanentPlan():
+            return ["--permanent"]
+
+
 @dataclass(frozen=True)
 class AppPort:
     number: int
@@ -62,7 +74,7 @@ class NoAppPort:
 
 def parse_port_cell(raw: str) -> AppPort | NoAppPort:
     """Read a raw Port cell and keep its text in each refusal."""
-    value = unit_table.cell_value(raw)
+    value = cell_value(raw)
     if value.casefold() in ("", "—", "-", "none"):
         return NoAppPort()
     match = re.fullmatch(r"([0-9]+)(?:\s+\([^()]*\))?", value)
@@ -137,9 +149,10 @@ class UnitConfig:
     formatting: RepositoryTaploConfig | DefaultTaploConfig = field(default_factory=DefaultTaploConfig, compare=False)
 
     def __post_init__(self) -> None:
+        # A responsibility is a short name (`nightly-review`) or an owned repository path (the old Owns cell).
         for name in self.responsibilities:
-            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name) is None:
-                raise ConfigRefused(f"responsibilities: invalid short name {name!r}")
+            if re.fullmatch(r"[A-Za-z0-9._-][A-Za-z0-9._/-]*", name) is None or ".." in name.split("/"):
+                raise ConfigRefused(f"responsibilities: invalid name or repository path {name!r}")
 
 
 @dataclass(frozen=True)

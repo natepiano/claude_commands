@@ -13,12 +13,16 @@ import sys
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff, staff_sources, unit_lookup, showrunners
-from scripts.production import production_units
 from scripts.lib import unit_runs
 from scripts.message import process_table
 from scripts.shutdown import remote
 import herdr
 import sessions
+
+
+def worktree_is_linked(worktree: str) -> bool:
+    """A main checkout, where `.git` is a directory, is shared and is no unit's own worktree."""
+    return bool(worktree) and (Path(worktree) / ".git").is_file()
 
 
 @dataclass(frozen=True)
@@ -223,12 +227,6 @@ def wrong_rows(record: staff.StaffSnapshot, evidence: CheckEvidence) -> list[str
             owner = record.by_member_reference(source.timer.target.removeprefix("session:"))
         if owner is not None and owner.kind == "showrunner":
             timer_documents[owner.id].add(source.timer.doc)
-        try:
-            _ = production_units.unit_table(source.document.splitlines())
-        except production_units.Refusal as error:
-            if owner is not None:
-                row_wrong(owner, f"uncertain: document unit table could not be read: {error}")
-            continue
     for row in record.rows:
         if row.kind == "unit":
             location = row.worktree
@@ -242,7 +240,7 @@ def wrong_rows(record: staff.StaffSnapshot, evidence: CheckEvidence) -> list[str
                 continue
             if not location.path.is_dir():
                 row_wrong(row, f"worktree does not exist: {location.path}")
-            elif not production_units.worktree_is_linked(str(location.path)):
+            elif not worktree_is_linked(str(location.path)):
                 row_wrong(row, f"not a linked git worktree: {location.path}")
 
         elif row.kind == "showrunner":

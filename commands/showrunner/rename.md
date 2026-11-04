@@ -30,10 +30,10 @@ Show the output. On a nonzero exit, show the refusal and stop. Use this order:
    finishing is not the end: unit branches and worktrees still have their old
    names, and a renamed old merge branch stays until `finish`.
 3. For each non-retired unit, between its runs, run `unit <new> <unit>` with
-   its exact Units-row name. Keep it stopped until the command succeeds.
+   its exact staff row name. Keep it stopped until the command succeeds.
    The command pushes its new branch, moves and repairs its worktree, moves
-   account transcripts and copies trust entries, commits the new Worktree and
-   Branch cells, then retires its old branch. It updates the stopped shutdown
+   account transcripts and copies trust entries, sets the new worktree on the
+   staff row, then retires its old branch. It updates the stopped shutdown
    record, run worktree and plan paths, worker launch paths and unit ledger;
    paused workers keep their threads, Codex homes and paused state.
    It prints `shutdown.py restart --only <session-id>`; relaunch the unit
@@ -79,7 +79,7 @@ it is archival state, not a recovery command.
 
 For units moved before worker path repair was added, run
 `repair-workers <production> --dry-run`, then `repair-workers <production>`.
-It reads journaled moves and current Units rows with saved run or worker paths,
+It reads journaled moves and current unit staff rows with saved run or worker paths,
 including moves with no journal record. It prints each change or that a unit has nothing
 to change, and can be repeated. Dry run changes nothing.
 

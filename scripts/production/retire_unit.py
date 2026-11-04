@@ -4,8 +4,8 @@
 Usage: retire_unit.py <slug> <unit> [--dry-run] [--wait-minutes N]
 
 Staff supplies the unit folder and session id. Run ownership uses the director's session id.
-Claude transcripts remain in place. The retired note retains the session id and any saved branch ref.
-The parked configuration retains the plan, branch, retirement date, and formatting settings.
+Claude transcripts remain in place. The parked configuration retains the plan, branch, session id,
+retirement date, and formatting settings. Origin's refs/retired/<staff id> retains unmerged commits.
 
 Uncommitted work refuses retirement. Unmerged commits remain under a confirmed retirement ref.
 Retirement stops the unit's sessions, workers, build claims, and timers before it removes the worktree.
@@ -19,7 +19,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -43,10 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
-from atomic_file import write_text_atomic  # noqa: E402
-import add_unit  # noqa: E402
 import berth_board  # noqa: E402
-import production_units  # noqa: E402
 import progress_history  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
 import unit_lookup  # noqa: E402
@@ -54,7 +50,7 @@ import unit_move  # noqa: E402
 import unit_names  # noqa: E402
 import unit_runs  # noqa: E402
 import pane_record  # noqa: E402
-from production_units import Production, read_production  # noqa: E402
+from scripts.production.production_doc import Production, Refusal, read_production  # noqa: E402
 
 if TYPE_CHECKING:
     from scripts.message import sessions
@@ -72,9 +68,6 @@ MAC_CLAIMS = Path.home() / ".local/state/mac-test/claims"
 WAIT_MINUTES = 20.0
 # A run's folder of detached-run records (codex_mesh.DETACHED_RUNS_DIR).
 DETACHED_RUNS = "mesh_runs"
-RETIRED_NOTE = "(retired {date}, worktree removed{session})"
-# The note names the unit director's last session, which /showrunner:resume_unit resumes.
-SESSION_NOTE = ", session {id}"
 
 
 class Refused(Exception):
@@ -93,18 +86,6 @@ class NoSavedBranch:
 
 
 NO_SAVED_BRANCH = NoSavedBranch()
-
-
-def saved_branch_in_note(plan: str) -> SavedBranch | NoSavedBranch:
-    note = re.match(r"^\s*\(retired ([^)]*)\)", plan)
-    if note is None:
-        return NoSavedBranch()
-    saved = re.search(r", ref (refs/retired/[^, ]+), tip ([0-9a-f]{40}(?:[0-9a-f]{24})?)(?=,|$)", note[1])
-    if saved:
-        return SavedBranch(saved[1], saved[2])
-    if ", ref " in note[1] or ", tip " in note[1]:
-        raise Refused("retired note has an invalid saved branch ref or tip")
-    return NoSavedBranch()
 
 
 @dataclass(frozen=True)
@@ -187,32 +168,26 @@ def find_unit(slug: str, given: str, *,
               record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> Unit:
     record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
     production = production_of(slug)
-    rows = production_units.unit_table(production.doc.read_text(encoding="utf-8").splitlines())
-    ids = [production_units.cell_value(row.get("Unit", "")) for row in rows]
-    name = given if given in ids else unit_names.unit_id(given)
-    matching = [row for row, unit in zip(rows, ids, strict=True) if unit == name]
-    if len(matching) != 1:
-        raise Refused(f"{name}: expected one Units row, found {len(matching)}")
-    row = matching[0]
+    name = unit_names.unit_id(given)
     selected = staff_sources.member(staff_sources.UnitMember(production.slug, name), record)
     if isinstance(selected, staff_sources.NoSuchMember):
         raise Refused(f"{production.slug}/{name}: no matching staff member")
     location = unit_lookup.local_worktree(selected)
-    if isinstance(location, staff.RemovedWorktree):
-        if location.path.exists():
-            raise Refused(f"{name}: removed staff worktree still exists: {location.path}")
-        worktree = location.path
-    else:
-        plan_row = dict(row)
-        plan_row["Plan"] = re.sub(r"^\s*\(retired [^)]*\)\s*", "", row.get("Plan", ""))
-        try:
-            worktree = unit_lookup.plan_worktree(plan_row, selected)
-        except staff.StaffUnreadable:
-            if not production_units.plan_cell_is_retired(row.get("Plan", "")) or location.path.exists():
-                raise
-            worktree = location.path
-    return Unit(production, name, worktree, production_units.cell_value(row.get("Branch", "")),
-                production_units.plan_cell_is_retired(row.get("Plan", "")), selected.row)
+    retired = isinstance(location, staff.RemovedWorktree)
+    if retired and location.path.exists():
+        raise Refused(f"{name}: removed staff worktree still exists: {location.path}")
+    return Unit(production, name, location.path, unit_branch(selected.row, location.path), retired, selected.row)
+
+
+def unit_branch(row: staff.StaffRow, worktree: Path) -> str:
+    """The parked branch once retirement starts; before it, the worktree's branch."""
+    parked = unit_config.read_parked(row.id, cleanup=False)
+    if isinstance(parked, unit_config.UnitConfig) and isinstance(parked.retired, unit_config.RetiredSession):
+        return parked.retired.branch.value
+    result = run(["git", "-C", str(worktree), "branch", "--show-current"])
+    if result.returncode or not result.stdout.strip():
+        raise Refused(f"{row.name}: cannot read the branch of {worktree}: {failure(result)}")
+    return result.stdout.strip()
 
 
 def _git(unit: Unit, *arguments: str, settings: conf.ConfigRead) -> subprocess.CompletedProcess[str]:
@@ -241,11 +216,23 @@ def branch_refs(unit: Unit, *, read_only: bool = False, settings: conf.ConfigRea
     return refs
 
 
-def unit_plan(unit: Unit) -> str:
-    for row in production_units.unit_table(unit.production.doc.read_text(encoding="utf-8").splitlines()):
-        if production_units.cell_value(row.get("Unit", "")) == unit.name:
-            return row.get("Plan", "")
-    raise Refused(f"{unit.name}: Units row is missing")
+def staff_id(unit: Unit) -> staff.StaffId:
+    member = (staff_sources.MemberFound(unit.staff_member) if isinstance(unit.staff_member, staff.StaffRow) else
+              staff_sources.member(staff_sources.UnitMember(unit.production.slug, unit.name), staff.snapshot()))
+    if not isinstance(member, staff_sources.MemberFound):
+        raise Refused(f"{unit.name}: no staff id for the retired ref")
+    return member.row.id
+
+
+def recorded_saved_branch(checkout: Path, member: staff.StaffId) -> SavedBranch | NoSavedBranch:
+    """The retired ref that an earlier run pushed; origin holds its only record."""
+    ref = f"refs/retired/{member}"
+    remote = run(["git", "-C", str(checkout), "ls-remote", "--exit-code", "origin", ref])
+    if remote.returncode == 2:
+        return NoSavedBranch()
+    if remote.returncode:
+        raise Refused(f"cannot read {ref}: {failure(remote)}")
+    return SavedBranch(ref, remote.stdout.split()[0])
 
 
 def confirm_saved_branch(unit: Unit, saved: SavedBranch, *, settings: conf.ConfigRead) -> None:
@@ -258,7 +245,7 @@ def plan_saved_branch(unit: Unit, saved: SavedBranch | NoSavedBranch = NO_SAVED_
                       *, read_only: bool = False, settings: conf.ConfigRead) -> SavedBranch | NoSavedBranch:
     """Choose one tip that retains the local, origin and previously saved work."""
     if isinstance(saved, NoSavedBranch):
-        saved = saved_branch_in_note(unit_plan(unit))
+        saved = recorded_saved_branch(unit.production.checkout, staff_id(unit))
     recorded_tip = saved.tip if isinstance(saved, SavedBranch) else ""
     tip = recorded_tip
     for ref in branch_refs(unit, read_only=read_only, settings=settings):
@@ -274,14 +261,9 @@ def plan_saved_branch(unit: Unit, saved: SavedBranch | NoSavedBranch = NO_SAVED_
     if isinstance(saved, NoSavedBranch):
         if not tip or _git(unit, "merge-base", "--is-ancestor", tip, unit.production.merge_branch, settings=settings).returncode == 0:
             return NoSavedBranch()
-        member = (staff_sources.MemberFound(unit.staff_member) if isinstance(unit.staff_member, staff.StaffRow) else
-                  staff_sources.member(staff_sources.UnitMember(unit.production.slug, unit.name), staff.snapshot()))
-        if not isinstance(member, staff_sources.MemberFound):
-            raise Refused(f"{unit.name}: no staff id for the retired ref")
-        saved = SavedBranch(f"refs/retired/{member.row.id}", tip)
+        saved = SavedBranch(f"refs/retired/{staff_id(unit)}", tip)
     remote = _git(unit, "ls-remote", "--exit-code", "origin", saved.ref, settings=settings)
     if remote.returncode == 0:
-        # A previous push may have finished before the note was updated.
         if remote.stdout.splitlines() == [f"{saved.tip}\t{saved.ref}"]:
             remote_tip = saved.tip
         else:
@@ -309,7 +291,7 @@ def plan_saved_branch(unit: Unit, saved: SavedBranch | NoSavedBranch = NO_SAVED_
 
 
 def preserve_branch(unit: Unit, saved: SavedBranch | NoSavedBranch = NO_SAVED_BRANCH, *, settings: conf.ConfigRead) -> SavedBranch | NoSavedBranch:
-    """Refresh and confirm the saved tip before the note or any removal."""
+    """Refresh and confirm the saved tip before any removal."""
     updated = plan_saved_branch(unit, saved, settings=settings)
     if isinstance(updated, NoSavedBranch):
         return updated
@@ -579,17 +561,6 @@ def director_session(unit: Unit) -> DirectorSession | NoDirectorSession:
     return DirectorSession(session_id, director_resume_folder(session_id))
 
 
-def retired_note(unit: Unit, director: DirectorSession | NoDirectorSession,
-                 saved: SavedBranch | NoSavedBranch = NO_SAVED_BRANCH, *, date: str = "") -> str:
-    date = date or datetime.now(unit.production.zone).strftime("%Y-%m-%d")
-    session = ""
-    if isinstance(director, DirectorSession):
-        session = SESSION_NOTE.format(id=director.session_id)
-    if isinstance(saved, SavedBranch):
-        session += f", ref {saved.ref}, tip {saved.tip}"
-    return RETIRED_NOTE.format(date=date, session=session)
-
-
 def describe_session(item: SessionRecord) -> str:
     return f"Claude session {item['name'] or item['sessionId']} ({item['sessionId']}, pid {item['pid']})"
 
@@ -629,8 +600,6 @@ def dry_run(unit: Unit, *, settings: conf.ConfigRead) -> int:
     saved = plan_saved_branch(unit, read_only=True, settings=settings)
     if isinstance(saved, SavedBranch):
         print(f"would save: {saved.tip} to origin {saved.ref}")
-    if not unit.retired:
-        print(f"would mark: the Units row {retired_note(unit, director_session(unit), saved)}, committed on {unit.production.merge_branch}")
     if unit_move.exists(unit.worktree):
         print(f"would remove: worktree {unit.worktree}")
     print(f"would delete: branch {unit.branch} here and on origin")
@@ -840,44 +809,9 @@ def stop_rest(unit: Unit, found: Found, recorded_session_id: str = "", *, settin
     return left
 
 
-def mark_retired(unit: Unit, director: DirectorSession | NoDirectorSession,
-                 saved: SavedBranch | NoSavedBranch = NO_SAVED_BRANCH, *, date: str = "") -> bool:
-    """Put the retired note in front of the Units row's Plan cell and commit the doc on the merge branch."""
-    doc = unit.production.doc
-    lines = doc.read_text(encoding="utf-8").split("\n")
-    headings = production_units.unit_headings(lines)
-    _, rows = production_units.unit_rows(lines)
-    plan_at = headings.index("Plan") + 1
-    for index, line in enumerate(lines):
-        parts = line.split("|")
-        if line in rows and production_units.cell_value(parts[headings.index("Unit") + 1].strip()) == unit.name:
-            plan = parts[plan_at].strip()
-            if production_units.plan_cell_is_retired(plan):
-                if isinstance(saved, SavedBranch):
-                    previous = saved_branch_in_note(plan)
-                    if isinstance(previous, SavedBranch):
-                        plan = plan.replace(f", ref {previous.ref}, tip {previous.tip}",
-                                            f", ref {saved.ref}, tip {saved.tip}", 1)
-                    else:
-                        plan = plan.replace(")", f", ref {saved.ref}, tip {saved.tip})", 1)
-            else:
-                plan = f"{retired_note(unit, director, saved, date=date)} {plan}"
-            if plan != parts[plan_at].strip():
-                parts[plan_at] = f" {plan} "
-                lines[index] = "|".join(parts)
-                write_text_atomic(doc, "\n".join(lines))
-            break
-    committed = add_unit.commit_paths(unit.production, [doc], f"production({unit.production.slug}): retire {unit.name}")
-    if committed:
-        print(f"marked: the retired Units row, committed on {unit.production.merge_branch}")
-    return committed
-
-
 def remove(unit: Unit, *, settings: conf.ConfigRead) -> list[str]:
     """Remove the worktree, the local branch and the origin branch; a failure comes back."""
-    saved = preserve_branch(unit, settings=settings)
-    if saved != saved_branch_in_note(unit_plan(unit)):
-        _ = mark_retired(unit, NoDirectorSession(), saved)
+    _ = preserve_branch(unit, settings=settings)
     failed: list[str] = []
     if unit_move.exists(unit.worktree):
         result = _git(unit, "worktree", "remove", str(unit.worktree), settings=settings)
@@ -930,13 +864,11 @@ def prepare_retirement(unit: Unit, row: staff.StaffRow, *, settings: conf.Config
     if unit.worktree.exists():
         actual = run(["git", "-C", str(unit.worktree), "branch", "--show-current"], settings=settings)
         if actual.returncode or actual.stdout.strip() != unit.branch:
-            raise Refused(f"{unit.name}: Units branch {unit.branch} conflicts with worktree branch {actual.stdout.strip()}")
+            raise Refused(f"{unit.name}: parked branch {unit.branch} conflicts with worktree branch {actual.stdout.strip()}")
     saved = unit_config.read_parked(row.id, cleanup=False)
     if isinstance(saved, unit_config.UnitConfig):
         if not isinstance(saved.retired, unit_config.RetiredSession):
             raise Refused(f"{unit.name}: parked retirement facts are incomplete")
-        if saved.retired.branch.value != unit.branch:
-            raise Refused(f"{unit.name}: parked branch {saved.retired.branch.value} conflicts with Units branch {unit.branch}")
         return saved.retired
     director = director_session(unit)
     if not isinstance(director, DirectorSession):
@@ -961,7 +893,6 @@ def retire(unit: Unit, wait_minutes: float, *, settings: conf.ConfigRead,
     _ = unit_config.park(member.row.id, location.path, facts)
     saved = preserve_branch(unit, settings=settings)
     pane = unit_move.unit_pane(unit_lookup.marked_unit(unit.production.slug, unit.name), unit.production.slug)
-    director = DirectorSession(facts.session_id, location.path)
     session_id = facts.session_id
     found = gather(unit)
     ids = {item["sessionId"] for item in found.claude}
@@ -1000,9 +931,7 @@ def retire(unit: Unit, wait_minutes: float, *, settings: conf.ConfigRead,
         print(f"{unit.name} is not retired: rerun once these stop")
         return 1
     # All writers are stopped; include commits made during shutdown.
-    saved = preserve_branch(unit, saved, settings=settings)
-    # The note may have reached disk before its commit; finish it before removal.
-    committed = mark_retired(unit, director, saved, date=facts.date)
+    _ = preserve_branch(unit, saved, settings=settings)
     failed = remove(unit, settings=settings)
     if failed:
         print("\n".join(f"not removed: {reason}" for reason in failed))
@@ -1014,7 +943,7 @@ def retire(unit: Unit, wait_minutes: float, *, settings: conf.ConfigRead,
     if not failed:
         _ = staff.set_worktree(member.row.id, staff.RemovedWorktree(local_machine(), location.path),
                                expected=member.row.worktree)
-        print(f"{unit.name} already retired" if already_retired and not committed else f"{unit.name} retired")
+        print(f"{unit.name} already retired" if already_retired else f"{unit.name} retired")
     return 1 if failed else 0
 
 
@@ -1035,7 +964,7 @@ def _main(argv: list[str], *, settings: conf.ConfigRead) -> int:
             return retire(unit, cast(float, options.wait_minutes), settings=settings, record=record)
     except (staff.StaffRefused, staff.StaffUnreadable):
         raise
-    except (Refused, production_units.Refusal, unit_names.BadName, WorkerUnavailable, OSError,
+    except (Refused, Refusal, unit_names.BadName, WorkerUnavailable, OSError,
             conf.Unusable, unit_config.ConfigRefused, subprocess.SubprocessError) as error:
         print(f"refused: {error}")
         return 1

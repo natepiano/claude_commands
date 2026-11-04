@@ -48,7 +48,6 @@ class LogBackupTests(unittest.TestCase):
             "- **Merge branch:** `demo`",
             f"- **Showrunner checkout:** `{self.root / 'checkout'}`",
             "- **User zone:** America/Los_Angeles — demo",
-            "## Units",
         ]
         if log_field:
             fields.insert(2, "- **Log:** `docs/plans/demo-log.md`")

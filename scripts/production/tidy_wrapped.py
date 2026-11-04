@@ -16,9 +16,10 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import production_units
-from scripts.production import staff
-from proposals_folder import issues_folder
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production import staff  # noqa: E402
+from scripts.production.production_doc import WRAPPED  # noqa: E402
+from proposals_folder import issues_folder  # noqa: E402
 
 if TYPE_CHECKING:
     from update_registration import QuestionStaff
@@ -86,7 +87,7 @@ def wrapped_slug(doc: Path) -> str:
         raise TidyRefused(f"{doc}: production doc name must end in -production.md")
     lines = doc.read_text(encoding="utf-8").splitlines()
     status = next((line for line in lines if line.startswith("> **Status:")), "")
-    if not status.startswith(production_units.WRAPPED):
+    if not status.startswith(WRAPPED):
         raise TidyRefused(f"{doc}: not wrapped")
     if (NOTIFIER_STATE_DIR / f"showrunner-{slug}").exists():
         raise TidyRefused(f"{doc}: {slug} still has an update timer")

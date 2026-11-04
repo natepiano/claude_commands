@@ -141,13 +141,8 @@ class UnitTransferFixture(StaffTestCase):
                            ("gc.auto", "0"), ("maintenance.auto", "false")):
             _ = self.git("config", key, value)
         _ = self.git("remote", "add", "origin", str(origin))
-        self.write(self.giving / "docs/plans/demo-production.md", self.production_doc(
-            "demo", self.giving, "| Unit | Plan | Worktree | Branch |", "| --- | --- | --- | --- |",
-            f"| alpha-unit | docs/plans/alpha.md | `{self.unit}` | demo-alpha |",
-            f"| beta-unit | docs/plans/beta.md | `{self.rust / 'claude-demo-beta'}` | demo-beta |"))
-        self.write(self.giving / "docs/plans/other-production.md", self.production_doc(
-            "other", self.receiving, "| Unit | Plan | Worktree | Branch | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- |", "| gamma-unit | docs/plans/gamma.md | `/x` | other-gamma | — | — |"))
+        self.write(self.giving / "docs/plans/demo-production.md", self.production_doc("demo", self.giving))
+        self.write(self.giving / "docs/plans/other-production.md", self.production_doc("other", self.receiving))
         self.write(self.giving / "docs/plans/alpha.md",
                    "# alpha\n\n> **Production: demo** — unit `alpha-unit`; production doc "
                    + "`docs/plans/demo-production.md`\n\nalpha prose stays.\n")
@@ -165,11 +160,10 @@ class UnitTransferFixture(StaffTestCase):
                                  str(self.giving / "docs/plans/demo-production.md")]) + "\n")
         self.write(self.stall_path("demo", "alpha-unit"), '{"stretch": 17}\n')
 
-    def production_doc(self, slug: str, checkout: Path, *table: str) -> str:
+    def production_doc(self, slug: str, checkout: Path) -> str:
         return "\n".join(["# Production — " + slug, "", "## Production Context", "",
                           f"- **Merge branch:** `{slug}`", f"- **Showrunner checkout:** `{checkout}`",
-                          "- **Log:** `production.log`", "", "## Units", "", *table, "",
-                          "## Production rules", "", "Rules.", ""])
+                          "- **Log:** `production.log`", "", "## Production rules", "", "Rules.", ""])
 
     def write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -31,8 +31,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import add_unit
-import production_units
-from scripts.production import staff, unit_config
+from scripts.production import staff, staff_check, unit_config
 from cli_fixture import ImmutableGitSeed, invoke_cli
 import conversation_pause
 import unit_lookup
@@ -40,7 +39,7 @@ import sessions
 import inventory
 import restart
 from herdr import HerdrPlace
-from production_units import Refusal, cell_value
+from scripts.production.production_doc import Refusal, read_production
 from scripts.accounts import accounts
 from scripts.whoami.note_file import NumberedAccountLabel, note_name, parse_account_label
 import herdr
@@ -52,14 +51,12 @@ from test_support import registry_confirmation, ShutdownTestCase
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("add_unit.py")
-REAL_WORKTREE_IS_LINKED = production_units.worktree_is_linked
+REAL_WORKTREE_IS_LINKED = staff_check.worktree_is_linked
 REAL_HERDR_RUN_PROGRAM = herdr.run_program
 MARKED_HERDR_PLACE = HerdrPlace("marked-herdr", "w7:p1")
 SHARED = herdr.SHARED_SESSION
 NO_LAUNCH_FIXTURE = add_unit.NoMarkedUnit()
 SUBMITTED_PROMPT = herdr.PromptSubmitted(datetime(2026, 10, 17, tzinfo=timezone.utc))
-OLD_HEADER = ["## Units", "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
-              "| --- | --- | --- | --- | --- | --- | --- |"]
 STUB = r'''#!/usr/bin/env python3
 import json
 import os
@@ -180,7 +177,7 @@ class AddUnitTestCase(ShutdownTestCase):
         _ = self.enterContext(patch.object(herdr.Herdr, "submit_opening_prompt", submitted))
         # Rows read in this process name worktrees that exist nowhere: answer for them here, so no
         # test asks the real disk, and a row with a worktree never asks herdr. RetiredRowTests covers the rule.
-        _ = self.enterContext(patch.object(production_units, "worktree_is_linked", return_value=True))
+        _ = self.enterContext(patch.object(staff_check, "worktree_is_linked", return_value=True))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         home_context = cast(object, self.enterContext(
             patch.dict(os.environ, {"HOME": str(self.root / "home")})
@@ -368,17 +365,13 @@ class AddUnitTestCase(ShutdownTestCase):
             overrides["production.codex"] = {"director": "gpt-test:high"}
         _ = write_registry(self.agent_config, overrides)
 
-    def production_doc(self, merge_branch: str = "build-followups", *, session_column: bool = False) -> str:
-        columns = ["Unit", "Plan", "Worktree", "Branch", *(["Session"] if session_column else []), "Port", "Owns"]
+    def production_doc(self, merge_branch: str = "build-followups") -> str:
         return ("# Production\n\n"
                 f"- **Merge branch:** `{merge_branch}` — unit checkpoints merge here\n"
                 f"- **Showrunner checkout:** `{self.checkout}`\n"
                 "- **Showrunner session:** director\n"
                 "- **Log:** `docs/plans/build-followups-log.md` — git-excluded\n"
                 "- **User zone:** America/Los_Angeles — reports use PDT\n\n"
-                "## Units\n\n"
-                f"| {' | '.join(columns)} |\n"
-                f"| {' | '.join('---' for _ in columns)} |\n\n"
                 "## Gates\n")
 
     def git(self, *args: str, cwd: Path | None = None) -> str:
@@ -478,7 +471,7 @@ class AddUnitTestCase(ShutdownTestCase):
     def prepare_herdr_launch(self, *args: str) -> None:
         parser = argparse.ArgumentParser()
         _ = parser.add_argument("name")
-        for flag in ("plan", "brief", "port", "owns", "resume", "attach", "cwd", "restart-note", "session-name", "host-session", "account", "config-dir", "model", "autocompact"):
+        for flag in ("plan", "brief", "port", "resume", "attach", "cwd", "restart-note", "session-name", "host-session", "account", "config-dir", "model", "autocompact"):
             _ = parser.add_argument("--" + flag, type=int if flag == "port" else str)
         _ = parser.add_argument("--standby", action="store_true")
         _ = parser.add_argument("--permanent", action="store_true")
@@ -492,8 +485,8 @@ class AddUnitTestCase(ShutdownTestCase):
         try:
             requested = add_unit.launch_request(parsed)
             launch = add_unit.UnitLaunch(production=requested.production, branch=requested.branch,
-                worktree=requested.worktree, plan=requested.plan, port=requested.port, owns=requested.owns,
-                session=requested.session, launch_kind=requested.launch_kind, timeout=requested.timeout,
+                worktree=requested.worktree, plan=requested.plan, port=requested.port,
+                session=requested.session, timeout=requested.timeout, responsibilities=requested.responsibilities,
                 identity=add_unit.UnitIdentity(requested.unit, requested.requested_name))
             self.configure_herdr(launch)
         except (Refusal, OSError, ValueError):
@@ -507,7 +500,7 @@ class AddUnitTestCase(ShutdownTestCase):
                                   env=self.env, capture_output=True, text=True, check=False, timeout=timeout)
         # The row-reader fixture patch never reached the old CLI child. Preserve
         # the real worktree check on this command boundary too.
-        with patch.object(production_units, "worktree_is_linked", REAL_WORKTREE_IS_LINKED):
+        with patch.object(staff_check, "worktree_is_linked", REAL_WORKTREE_IS_LINKED):
             return invoke_cli(add_unit, lambda: add_unit.main(arguments), arguments,
                               self.env, self.checkout, production_state=True)
 
@@ -564,31 +557,6 @@ class AddUnitTestCase(ShutdownTestCase):
         if effort is None:
             self.assertNotIn("--effort", command)
 
-    def unit_row(self, name: str = "alpha", *, branch: str = "build-followups-alpha",
-                 worktree: Path | None = None, plan: str = "docs/plans/given.md",
-                 port: str = "—", owns: str = "—") -> str:
-        target = worktree or self.root / "project-alpha"
-        return f"| {name}-unit | {plan} | {target} | {branch} | {port} | {owns} |"
-
-    def prepared_row(self, *, name: str = "alpha", plan: str = "docs/plans/given.md",
-                     worktree: Path | None = None, branch: str = "build-followups-alpha") -> str:
-        target = worktree or self.root / "project-alpha"
-        return (f"| `{name}-unit` | `{plan}` (ready to launch) | `{target}` | "
-                f"`{branch}` | 8123 | `src/alpha` — assigned files |")
-
-    def commit_prepared_row(self, row: str) -> None:
-        _ = self.doc.write_text(self.production_doc().replace("## Gates", row + "\n\n## Gates"),
-                                encoding="utf-8")
-        _ = self.git("add", "docs/plans/build-followups-production.md")
-        _ = self.git("commit", "-m", "prepare unit rows")
-        _ = self.git("push", "origin", "build-followups")
-        cells = production_units.unit_table(self.doc.read_text().splitlines())[0]
-        member = unit_membership(fixture_showrunner_name("build-followups", self.doc), cell_value(cells["Unit"]))
-        location = (staff.RemovedWorktree("natedev", self.root / "project-alpha")
-                    if production_units.plan_cell_is_retired(cells["Plan"])
-                    else staff.PresentWorktree("natedev", self.root / "project-alpha"))
-        _ = staff.set_worktree(member.id, location, expected=member.worktree)
-
     def assert_no_launch_change(self, document: str, head: str) -> None:
         self.assertEqual(self.doc.read_text(), document)
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
@@ -604,10 +572,9 @@ class AddUnitTestCase(ShutdownTestCase):
                 self.git("worktree", "list", "--porcelain"))
 
     def commit_row_off_the_naming_pattern(self) -> Path:
-        """Unit `trunk` as seen live: neither its worktree nor its branch is what the naming pattern gives."""
+        """Unit `trunk` as seen live: neither its staff worktree nor its branch is what the naming pattern gives."""
         worktree = self.root / "tool-based-ui-trunk"
         _ = self.git("worktree", "add", str(worktree), "-b", "init/catalyst-trunk")
-        self.commit_prepared_row(self.unit_row("trunk", branch="init/catalyst-trunk", worktree=worktree))
         _ = self.prepare_restored_worktree("trunk", worktree)
         return worktree
 
@@ -630,7 +597,6 @@ class AddUnitTestCase(ShutdownTestCase):
 
     def run_with_marked_unit(
         self,
-        launch_kind: add_unit.NewWorkLaunch,
         claude: unit_lookup.Claude,
         *,
         already_marked: bool = True,
@@ -638,15 +604,13 @@ class AddUnitTestCase(ShutdownTestCase):
         outcome: herdr.PromptSubmitOutcome = SUBMITTED_PROMPT,
     ) -> tuple[int, str, list[list[str]], int, int]:
         request = add_unit.UnitLaunch(
-            production=production_units.read_production(self.doc),
+            production=read_production(self.doc),
             identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
             branch="build-followups-alpha",
             worktree=self.root / "project-alpha",
             plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
             port=add_unit.OmittedCell(),
-            owns=add_unit.OmittedCell(),
             session=add_unit.NewSession(),
-            launch_kind=launch_kind,
             timeout=1.0,
         )
         marked = unit_lookup.MarkedUnit("alpha-unit", claude, place)
@@ -654,8 +618,7 @@ class AddUnitTestCase(ShutdownTestCase):
         ready = add_unit.ReadyToLaunch(
             request,
             # A rerun or restore reuses a row. Only a fresh launch has no row.
-            add_unit.ExistingUnitRow("docs/plans/given.md", str(request.worktree), request.branch,
-                                     "—", "—", add_unit.ActiveUnitRow())
+            add_unit.ExistingUnitRow("docs/plans/given.md", request.worktree, request.branch)
             if already_marked else add_unit.NoUnitRow(),
             add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
         )
@@ -698,7 +661,6 @@ class AddUnitTestCase(ShutdownTestCase):
             ),
             patch.object(herdr, "live_sessions", return_value=[]),
             patch.object(add_unit, "write_stub") as write_stub,
-            patch.object(add_unit, "append_row"),
             patch.object(add_unit, "commit_unit"),
             patch.object(add_unit, "ensure_worktree"),
             patch.object(add_unit, "launch_session", side_effect=ObservedUnitLaunch(self, launch)),
@@ -770,7 +732,6 @@ class AddUnitTestCase(ShutdownTestCase):
         return prior, trace
 
     def persist_herdr_unit(self, name: str, cwd: Path) -> None:
-        _ = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
         for pid, parent, arguments in ((201, 1, ["herdr", "--session", name, "server"]), (202, 201, ["zsh"])):
             process = self.root / "proc" / str(pid)
             process.mkdir(parents=True)
@@ -792,35 +753,3 @@ class AddUnitTestCase(ShutdownTestCase):
         prior.mkdir(exist_ok=True)
         return self.successful("trunk", "--plan", "docs/plans/other.md", "--resume", "3001165e-ca76-59c2-9490-878224585fad",
                                "--cwd", str(prior), "--autocompact", value, *flags)
-
-    def assert_named_unit_launch_and_restart(self, unit: str) -> None:
-        self.doc = self.checkout / "docs/plans/sample-production.md"
-        row = self.unit_row(unit, branch="sample-" + unit, worktree=self.root / ("project-" + unit))
-        row = row.replace(f"| {unit}-unit |", f"| `{unit}` |")
-        _ = self.doc.write_text(self.production_doc().replace("## Gates", row + "\n\n## Gates"), encoding="utf-8")
-        _ = self.git("add", str(self.doc.relative_to(self.checkout)))
-        _ = self.git("commit", "-m", "Add sample fixture production")
-        _ = self.git("push", "origin", "build-followups")
-        _ = self.staff.record_production("sample", self.doc)
-
-        result = self.successful(unit, "--plan", "docs/plans/given.md")
-        self.assertIn(f"{unit} started", result.stdout)
-        rows = list(production_units.unit_table(self.doc.read_text().splitlines()))
-        self.assertEqual([cell_value(row["Unit"]) for row in rows], [unit])
-        self.assertEqual(self.pane_environment()["SHOWRUNNER_UNIT_ID"], unit)
-        self.assertEqual(self.pane_environment()["SHOWRUNNER_UNIT"], "sample")
-        with patch.dict(os.environ, self.env):
-            marked = unit_lookup.marked_unit("sample", unit)
-            self.assertIsNotNone(marked)
-            if marked is not None:
-                self.assertEqual(marked.unit, unit)
-                self.assertEqual(marked.place.session, "agents")
-            self.assertIsNone(unit_lookup.marked_unit("sample", unit + "-unit"))
-
-        before = self.doc.read_bytes()
-        resumed = self.cli(unit, "--plan", "docs/plans/given.md")
-        self.assertEqual(resumed.returncode, 0, resumed.stderr)
-        self.assertEqual(self.doc.read_bytes(), before)
-        self.assertEqual(sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls()), 1)
-
-

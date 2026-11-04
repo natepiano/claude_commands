@@ -1316,7 +1316,8 @@ def production_merge_branch(repo: Path) -> ProductionMergeBranch | NoProductionB
         repository_root = Path(__file__).resolve().parents[2]
         sys.path.insert(0, str(repository_root))
         sys.path.insert(0, str(repository_root / "scripts" / "production"))
-        from scripts.production import production_units, session_staff, staff, unit_lookup
+        from scripts.production import session_staff, staff, unit_lookup
+        from scripts.production.production_doc import Refusal, production_field
         from scripts.shutdown import remote
     except ImportError:
         return NoProductionBase()
@@ -1347,31 +1348,26 @@ def production_merge_branch(repo: Path) -> ProductionMergeBranch | NoProductionB
     documents = {source.timer.doc: source.document for source in sources.productions.values()}
     for doc, text in documents.items():
         try:
-            lines = text.splitlines()
-            slug = unit_lookup.production_slug_for_document(doc, record, sources)
-            rows: list[dict[str, str]] = []
             worktree_matches = False
-            for row in production_units.unit_table(lines):
-                try:
-                    selected = sources.member(unit_lookup.UnitMember(
-                        slug, production_units.cell_value(row.get("Unit", ""))), record)
-                    location = unit_lookup.local_worktree(selected)
-                    if isinstance(location, staff.RemovedWorktree):
-                        continue
-                    branch_tree = unit_lookup.plan_worktree(row, selected)
-                    rows.append(row)
-                    worktree_matches |= branch_tree.resolve() == worktree
-                except (staff.StaffUnreadable, staff.StaffRefused) as error:
-                    print(f"assertion_guard: {error}", file=sys.stderr)
-            branch_matches = bool(branch) and any(
-                production_units.cell_value(row.get("Branch", "")) == branch for row in rows)
+            branch_matches = False
+            for row in unit_lookup.doc_units(doc, record):
+                location = row.worktree
+                if isinstance(location, staff.RemovedWorktree):
+                    continue
+                if isinstance(location, staff.WorktreeUnfilled) or location.machine != remote.local_machine():
+                    print(f"assertion_guard: {row.name}: no local staff worktree", file=sys.stderr)
+                    continue
+                worktree_matches |= location.path.resolve() == worktree
+                if branch and not branch_matches:
+                    found = resolver.unit_branch(row)
+                    branch_matches = isinstance(found, session_staff.Branch) and found.name == branch
             if worktree_matches or branch_matches:
-                match = ProductionMergeBranch(production_units.production_field(lines, "Merge branch"))
+                match = ProductionMergeBranch(production_field(text.splitlines(), "Merge branch"))
                 if worktree_matches:
                     return match
                 if isinstance(branch_match, NoProductionBase):
                     branch_match = match
-        except (OSError, UnicodeError, production_units.Refusal, staff.StaffRefused) as error:
+        except (OSError, UnicodeError, Refusal, staff.StaffRefused) as error:
             print(f"assertion_guard: {error}", file=sys.stderr)
             continue
     return branch_match

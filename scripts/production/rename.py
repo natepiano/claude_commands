@@ -15,8 +15,7 @@ from typing import Literal, TypedDict, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from production_units import read_production  # noqa: E402
-import production_units  # noqa: E402
+from scripts.production.production_doc import Production, Refusal, cell_value, read_production  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
 import showrunner_tree
 import stall_watch  # noqa: E402
@@ -31,7 +30,7 @@ import rename_unit  # noqa: E402
 from rename_state import RenameRefused, read_json, write_json, write_text  # noqa: E402
 
 from scripts.astra import design_roles  # noqa: E402
-from scripts.production import staff, staff_sources
+from scripts.production import staff, staff_sources, unit_config, unit_names
 from scripts.lib import git_exclude
 
 
@@ -156,7 +155,7 @@ def _merge_line(text: str, branch: str) -> str:
         if lines[index].startswith("- **Merge branch:**"):
             prefix = "- **Merge branch:**"
             raw = lines[index][len(prefix):]
-            value = production_units.cell_value(raw.strip())
+            value = cell_value(raw.strip())
             updated = raw.replace(f"`{value}`", f"`{branch}`", 1) if "`" in raw else raw.replace(value, branch, 1)
             lines[index] = prefix + updated
             return "".join(lines)
@@ -209,34 +208,33 @@ def _build(old: str, new: str) -> RenamePlan:
     _ = unit_move.git(production.checkout, "check-ref-format", "--branch", new)
     if showrunners.production_slug(str(production.doc)) != old:
         raise RenameRefused(f"{old}'s timer names a different production doc: {production.doc}")
-    lines = production.doc.read_text(encoding="utf-8").splitlines()
-    units: list[str] = []
-    plans: list[Path] = []
-    for row in production_units.unit_table(lines):
-        unit = production_units.cell_value(row.get("Unit", ""))
-        if not unit:
-            raise RenameRefused("Units row has no unit name")
-        units.append(unit)
-        raw = row.get("Plan", "")
-        if production_units.plan_cell_is_retired(raw):
-            continue
-        if raw.strip() in ("", "—", "-", "permanent"):
-            continue
-        for path in unit_move.plan_paths(raw, production.checkout):
-            if path not in plans:
-                plans.append(path)
+    staff_id = _staff_id(old)
+    rows = staff.snapshot().find(kind="unit", parent=staff_id)
+    units = tuple(unit_names.unit_id(row.name) for row in rows)
     result = RenamePlan(
         old, new, production.doc, production.doc.with_name(f"{new}-production.md"), production.checkout,
         production.merge_branch, unit_move.git(production.checkout, "rev-parse", f"refs/heads/{production.merge_branch}"),
-        tuple(units), tuple(plans), PathMove(instance, instance.with_name(f"showrunner-{new}")),
+        units, _plans(rows, production.checkout), PathMove(instance, instance.with_name(f"showrunner-{new}")),
         tuple(PathMove(source, destination) for source, destination in
               zip(tidy_wrapped.owned_paths(old), tidy_wrapped.owned_paths(new), strict=True)),
         tuple(PathMove(stall_watch.stretch_path(old, unit), stall_watch.stretch_path(new, unit)) for unit in units),
-        _staff_id(old))
+        staff_id)
     for path in (result.old_doc, *result.plans):
         _ = unit_move.git(result.checkout, "ls-files", "--error-unmatch", "--", _relative(result, path))
         _ = path.read_text(encoding="utf-8")
     return result
+
+
+def _plans(rows: list[staff.StaffRow], checkout: Path) -> tuple[Path, ...]:
+    """The tracked plan files that the active units' `.unit.toml` files name."""
+    plans: list[Path] = []
+    for row in rows:
+        if not isinstance(row.worktree, staff.PresentWorktree):
+            continue
+        config = unit_config.read(row.worktree.path, cleanup=False)
+        if isinstance(config, unit_config.UnitConfig) and isinstance(config.plan, unit_config.PlanFile):
+            plans.extend(path for path in unit_move.plan_paths(str(config.plan.path), checkout) if path not in plans)
+    return tuple(plans)
 
 
 def _staff_id(slug: str) -> staff.StaffId:
@@ -309,7 +307,7 @@ def _completed_steps(fields: dict[str, object]) -> tuple[str, ...] | None:
     return COUNTED_APPLY_STEP_NAMES[:step - (step >= 6)]
 
 
-def _current_production(old: str, new: str, completed: tuple[str, ...]) -> production_units.Production:
+def _current_production(old: str, new: str, completed: tuple[str, ...]) -> Production:
     slug = new if "_rename_timer" in completed else old
     step = next((name for name in APPLY_STEP_NAMES if name not in completed), "apply complete")
     # The timer move may have completed before its journal save. Only that pending
@@ -329,7 +327,7 @@ def _current_production(old: str, new: str, completed: tuple[str, ...]) -> produ
         if not production.checkout.is_dir():
             raise RenameRefused(f"checkout does not exist: {production.checkout}")
         _ = production.doc.relative_to(production.checkout)
-    except (production_units.Refusal, RenameRefused, OSError, ValueError) as error:
+    except (Refusal, RenameRefused, OSError, ValueError) as error:
         raise RenameRefused(f"{context}: {error}") from error
     return production
 
@@ -352,11 +350,9 @@ def _load(path: Path, old: str, new: str) -> tuple[RenamePlan, tuple[str, ...]]:
     units = _strings(fields, "units")
     relative_plans = _strings(fields, "plans")
     if any(Path(item).is_absolute() for item in relative_plans):
-        # Old journals stored absolute plans. Ignore them and read the current doc.
-        plans = tuple(dict.fromkeys(path for row in production_units.unit_table(
-            production.doc.read_text(encoding="utf-8").splitlines())
-            if not production_units.plan_cell_is_retired(row.get("Plan", ""))
-            for path in unit_move.plan_paths(row.get("Plan", ""), production.checkout)))
+        # Old journals stored absolute plans. Ignore them and read the current unit configs.
+        plans = _plans(staff.snapshot().find(kind="unit", parent=staff.StaffId(_string(fields, "staff_id"))),
+                       production.checkout)
     else:
         if any(".." in Path(item).parts for item in relative_plans):
             raise RenameRefused(f"{path}: plan must be relative to the current checkout")
@@ -403,7 +399,7 @@ def _describe(plan: RenamePlan) -> list[str]:
             *(f"4. parent {path}: {plan.old} -> {plan.new}" for path in parents),
             f"4. held design roles: holder {plan.old} showrunner -> {plan.new} showrunner",
             *rename_outside.describe(plan.old, plan.new, plan.old_doc, plan.new_doc),
-            *(stretches or ["5. stall-watch: no Units rows"]),
+            *(stretches or ["5. stall-watch: no units"]),
             (f"6. merge branch {plan.merge_branch} -> {plan.new}; commit {plan.message!r}; push origin {plan.new}; "
              + f"keep {plan.merge_branch} until finish" if plan.renames_branch else
              f"6. merge branch {plan.merge_branch} kept (not named for the production); commit {plan.message!r}; "
@@ -666,12 +662,11 @@ def _rename_journal(new: str) -> Generator[tuple[RenamePlan, dict[str, object]]]
         yield result, _object(read_json(path))
 
 
-def _unit_row(plan: RenamePlan, name: str) -> dict[str, str]:
-    rows = [row for row in production_units.unit_table(plan.new_doc.read_text(encoding="utf-8").splitlines())
-            if production_units.cell_value(row.get("Unit", "")) == name]
+def _unit_row(plan: RenamePlan, name: str, members: staff.StaffSnapshot) -> staff.StaffRow:
+    rows = [row for row in members.find(kind="unit", parent=plan.staff_id) if row.name == unit_names.name(name)]
     if len(rows) != 1:
-        raise RenameRefused(f"{name}: expected one Units row")
-    if production_units.plan_cell_is_retired(rows[0].get("Plan", "")):
+        raise RenameRefused(f"{name}: expected one unit staff row")
+    if isinstance(rows[0].worktree, staff.RemovedWorktree):
         raise RenameRefused(f"{name} is retired and has no live worktree")
     return rows[0]
 
@@ -705,29 +700,18 @@ def _saved_restore(record: dict[str, object]) -> UnitRestore:
     return StoppedUnitRestore(kind="stopped", session_id=_string(restore, "session_id"))
 
 
-def _prepare_unit(plan: RenamePlan, name: str, row: dict[str, str], members: staff.StaffSnapshot) -> dict[str, object]:
-    for field in ("Branch",):
-        if field not in row:
-            raise RenameRefused(f"{name}: Units table lacks {field} column")
-    branch = production_units.cell_value(row.get("Branch", ""))
-    if not branch.startswith(plan.old + "-"):
-        raise RenameRefused(f"{name}: branch {branch} does not start with {plan.old}-")
-    stem = branch[len(plan.old) + 1:]
-    selected = staff_sources.member(staff_sources.UnitMember(plan.new, name), members)
-    if isinstance(selected, staff_sources.NoSuchMember):
-        selected = staff_sources.member(staff_sources.UnitMember(plan.old, name), members)
-    worktree = unit_lookup.local_worktree(selected).path
+def _prepare_unit(plan: RenamePlan, name: str, row: staff.StaffRow) -> dict[str, object]:
+    worktree = unit_lookup.local_worktree(staff_sources.MemberFound(row)).path
     if not (worktree / ".git").is_file():
         raise RenameRefused(f"{name}: no linked worktree at {worktree}")
-    new_branch = f"{plan.new}-{stem}"
+    branch = unit_move.git(worktree, "branch", "--show-current")
+    if not branch.startswith(plan.old + "-"):
+        raise RenameRefused(f"{name}: branch {branch} does not start with {plan.old}-")
+    new_branch = f"{plan.new}-{branch[len(plan.old) + 1:]}"
     if unit_move.branch_tip(plan.checkout, new_branch) or unit_move.remote_tip(plan.checkout, new_branch):
         raise RenameRefused(f"branch {new_branch} already exists")
-    if unit_move.git(worktree, "branch", "--show-current") != branch:
-        raise RenameRefused(f"{worktree} is not on {branch}")
-    if unit_move.git(plan.checkout, "branch", "--show-current") != plan.branch or _dirty(plan):
-        raise RenameRefused(f"showrunner checkout must be clean and on the merge branch {plan.branch}")
     return {"old_branch": branch, "new_branch": new_branch, "tip": unit_move.git(worktree, "rev-parse", "HEAD"),
-            "base": unit_move.git(plan.checkout, "rev-parse", "HEAD"), "step": 0}
+            "step": 0}
 
 
 def _unit_folders(plan: RenamePlan, record: dict[str, object], members: staff.StaffSnapshot) -> PathMove:
@@ -746,56 +730,6 @@ def _unit_folders(plan: RenamePlan, record: dict[str, object], members: staff.St
     return PathMove(source, source.with_name(f"{repository}-{plan.new}-{stem}"))
 
 
-def _unit_doc(plan: RenamePlan, name: str, record: dict[str, object]) -> None:
-    lines = plan.new_doc.read_text(encoding="utf-8").splitlines(keepends=True)
-    headings = production_units.unit_headings([line.rstrip("\n") for line in lines])
-    for field in ("Branch",):
-        if field not in headings:
-            raise RenameRefused(f"{name}: Units table lacks {field} column")
-    in_units = False
-    for index, line in enumerate(lines):
-        if line.startswith("## "):
-            in_units = line.strip() == "## Units"
-        if not in_units or not line.startswith("|"):
-            continue
-        cells = production_units.row_cells(line)
-        if cells and production_units.cell_value(cells[0]) == name:
-            for field, value in (("Worktree", "—"),
-                                 ("Branch", _string(record, "new_branch"))):
-                if field not in headings:
-                    continue
-                column = headings.index(field)
-                cells[column] = value if field == "Worktree" else f"`{value}`"
-            lines[index] = "| " + " | ".join(cells) + " |\n"
-            write_text(plan.new_doc, "".join(lines))
-            return
-    raise RenameRefused(f"{name}: Units row disappeared")
-
-
-def _commit_unit(plan: RenamePlan, name: str, record: dict[str, object]) -> None:
-    _check_unit_tip(plan, record)
-    message = f"chore({plan.new}): rename unit {name} from {plan.old}"
-    if unit_move.git(plan.checkout, "branch", "--show-current") != plan.branch:
-        raise RenameRefused(f"showrunner checkout switched away from the merge branch {plan.branch}")
-    path = _relative(plan, plan.new_doc)
-    rows = production_units.unit_table(unit_move.git(plan.checkout, "show", f"HEAD:{path}").splitlines())
-    matching = [row for row in rows if production_units.cell_value(row.get("Unit", "")) == name]
-    committed = (len(matching) == 1
-                 and production_units.cell_value(matching[0].get("Branch", "")) == _string(record, "new_branch"))
-    changed = set(unit_move.git(plan.checkout, "diff", "--name-only", "-z", "HEAD").split("\0")) - {""}
-    changed.update(set(unit_move.git(plan.checkout, "diff", "--cached", "--name-only", "-z", "HEAD").split("\0")) - {""})
-    untracked = [path for path in unit_move.git(plan.checkout, "ls-files", "--others", "--exclude-standard").splitlines()
-                 if path not in rename_outside.log_paths(plan.old, plan.new, plan.new_doc)]
-    if changed - {path} or untracked or (committed and changed):
-        raise RenameRefused("unrelated checkout changes during unit rename")
-    if not committed:
-        _unit_doc(plan, name, record)
-        _ = unit_move.git(plan.checkout, "add", "--", path)
-        _ = unit_move.git(plan.checkout, "commit", "-m", message)
-    _check_unit_tip(plan, record)
-    _ = unit_move.git(plan.checkout, "push", "origin", f"{plan.branch}:refs/heads/{plan.branch}")
-
-
 def _repoint_unit_workers(plan: RenamePlan, name: str, record: dict[str, object], folders: PathMove, *, dry_run: bool = False) -> None:
     from scripts.direct import workers
     changes = workers.repoint_unit_worktree(
@@ -808,7 +742,7 @@ def _repoint_unit_workers(plan: RenamePlan, name: str, record: dict[str, object]
 
 
 def repair_workers(new: str, *, dry_run: bool = False) -> None:
-    """Repair saved worker paths from journaled moves or current Units rows."""
+    """Repair saved worker paths from journaled moves or current unit staff rows."""
     from scripts.direct import workers
     new = showrunners.canonical_slug(new)
     _validate_slug(new)
@@ -821,24 +755,25 @@ def repair_workers(new: str, *, dry_run: bool = False) -> None:
                 _save(resolved, completed)
                 journal = _object(read_json(path))
             doc = resolved.new_doc if "_rename_doc" in completed else resolved.old_doc
+            owner = resolved.staff_id
         else:
             checked = showrunners.checked_doc(showrunners.NOTIFIER_STATE_DIR / f"showrunner-{new}")
             if isinstance(checked, showrunners.NoCheckedDoc):
                 raise RenameRefused(f"{new}: no production doc: {checked.reason}")
             doc = checked.path
+            owner = _staff_id(new)
         text = doc.read_text(encoding="utf-8")
         former_names = [_string(journal, "old")] if journal else []
         for line in text.splitlines():
             if line.startswith("- **Formerly:**"):
                 former_names.extend(cast(list[str], re.findall(r"`([^`]+)`", line)))
         former = tuple(dict.fromkeys(former_names))
-        members = staff.snapshot()
-        units = tuple(workers.UnitWorktree(new, production_units.cell_value(row.get("Unit", "")),
-            unit_lookup.local_worktree(staff_sources.member(staff_sources.UnitMember(
-                new, production_units.cell_value(row.get("Unit", ""))), members)).path,
-            production_units.cell_value(row.get("Branch", "")))
-            for row in production_units.unit_table(text.splitlines())
-            if not production_units.plan_cell_is_retired(row.get("Plan", "")))
+        worktrees = [(row, unit_lookup.local_worktree(staff_sources.MemberFound(row)).path)
+                     for row in staff.snapshot().find(kind="unit", parent=owner)
+                     if not isinstance(row.worktree, staff.RemovedWorktree)]
+        units = tuple(workers.UnitWorktree(new, unit_names.unit_id(row.name), path,
+                                           unit_move.git(path, "branch", "--show-current"))
+                      for row, path in worktrees)
         found = workers.find_moved_unit_runs(units, former)
         for skipped in found.skipped:
             print(skipped)
@@ -853,7 +788,7 @@ def repair_workers(new: str, *, dry_run: bool = False) -> None:
             reported.add(name)
         if not reported:
             print(f"{new}: no moved unit was found: no unit run names an old worktree"
-                  + (" with one matching Units row" if found.skipped else ""))
+                  + (" with one matching unit" if found.skipped else ""))
         for current in units:
             if current.unit not in reported:
                 print(f"{current.unit}: workers have nothing to change")
@@ -863,7 +798,7 @@ def unit(new: str, name: str) -> None:
     """Move one stopped unit, resuming recorded branch, worktree and configuration steps."""
     with _rename_journal(new) as (result, journal), design_roles.record_operation():
         members = staff.initial_snapshot()
-        row = _unit_row(result, name)
+        row = _unit_row(result, name, members)
         records = _object(journal.get("unit_moves", {}))
         if name in records:
             record = _object(records[name])
@@ -874,7 +809,7 @@ def unit(new: str, name: str) -> None:
                 raise RenameRefused("complete interrupted unit moves before starting another unit")
             _stopped_unit(result, name)
             restore = _stopped_restore(result, name)
-            record = _prepare_unit(result, name, row, members)
+            record = _prepare_unit(result, name, row)
             record["restore"] = restore
             records[name] = record
             journal["unit_moves"] = records
@@ -916,10 +851,6 @@ def unit(new: str, name: str) -> None:
                              str(folders.source), str(folders.destination))
             record["step"] = 3
             write_json(result.journal, journal)
-        if completed < 4:
-            _commit_unit(result, name, record)
-            record["step"] = 4
-            write_json(result.journal, journal)
         if completed < 5:
             _check_unit_tip(result, record)
             if unit_move.remote_tip(result.checkout, _string(record, "new_branch")) != _string(record, "tip"):
@@ -939,10 +870,10 @@ def finish(new: str) -> None:
     with _rename_journal(new) as (result, journal):
         if journal["done"]:
             return
-        rows = production_units.unit_table(result.new_doc.read_text(encoding="utf-8").splitlines())
-        remaining = [production_units.cell_value(row.get("Unit", "")) for row in rows
-                     if not production_units.plan_cell_is_retired(row.get("Plan", ""))
-                     and production_units.cell_value(row.get("Branch", "")).startswith(result.old + "-")]
+        remaining = [unit_names.unit_id(row.name) for row in staff.snapshot().find(kind="unit", parent=result.staff_id)
+                     if not isinstance(row.worktree, staff.RemovedWorktree)
+                     and unit_move.git(unit_lookup.local_worktree(staff_sources.MemberFound(row)).path,
+                                       "branch", "--show-current").startswith(result.old + "-")]
         if remaining:
             raise RenameRefused("units still use old branches: " + ", ".join(remaining))
         records = _object(journal.get("unit_moves", {}))
@@ -1024,7 +955,7 @@ def _main(argv: list[str]) -> int:
                 print(f"{result.old} is now {result.new}; " + (f"keep {result.merge_branch} until finish" if result.renames_branch else f"merge branch {result.merge_branch} kept"))
     except (staff.StaffRefused, staff.StaffNotFound, staff.StaffUnreadable):
         raise
-    except (RenameRefused, production_units.Refusal, tidy_wrapped.TidyRefused, WorkerUnavailable,
+    except (RenameRefused, Refusal, tidy_wrapped.TidyRefused, WorkerUnavailable,
             git_exclude.ExcludeRefused, OSError, UnicodeError) as error:
         print(f"rename: {error}", file=sys.stderr)
         return 1

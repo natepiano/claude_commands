@@ -25,7 +25,7 @@ registration = update_registration
 from scripts.production import showrunners as showrunners
 from scripts.production import staff, unit_names
 import dailies_render as dailies_render
-from production_units import read_production as read_production
+from scripts.production.production_doc import read_production as read_production
 from scripts.production.cli_fixture import invoke_cli, production_paths
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -172,11 +172,7 @@ class RegistrationFixture(unittest.TestCase):
             "- **Merge branch:** `production`", f"- **Showrunner checkout:** `{self.checkout}`",
             "- **Showrunner session:** first-showrunner", "- **Log:** `production.log`",
             "- **User zone:** America/Los_Angeles", "- **Updates:** every 15 minutes",
-            f"- **Proposals:** `{self.root / 'issues'}`", "",
-            "## Units", "", "| Unit | Plan | Worktree | Branch | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- |",
-            f"| `alpha-unit` | `docs/alpha.md` | `{alpha}` | `alpha` | — | — |",
-            "", "## Gates", "",
+            f"- **Proposals:** `{self.root / 'issues'}`", "", "## Gates", "",
         )), encoding="utf-8")
         runner = recorded_showrunner(fixture_showrunner_name("example", self.doc), self.doc)
         _ = fixture_member("unit", name="alpha", parent=runner.id,
