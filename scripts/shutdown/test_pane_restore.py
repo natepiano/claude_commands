@@ -499,7 +499,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         _ = transcript.write_text(json.dumps({"type": "session_meta", "payload": {
             "id": self.owner.current_session}}) + "\n")
         (descriptors / "7").symlink_to(transcript)
-        _ = (process / "cmdline").write_bytes(b"codex\0resume\0")
+        _ = (process / "cmdline").write_bytes(f"codex\0resume\0{self.owner.current_session}\0".encode())
         _ = (process / "environ").write_bytes(
             f"CODEX_THREAD_ID={self.owner.id}\0CODEX_HOME={backend.config}\0".encode())
         if rollout == "unreadable":
@@ -516,7 +516,8 @@ class CodexPaneRestoreTests(FolderMoveFixture):
 
         def publish_process_state() -> None:
             publish()
-            _ = (process / "cmdline").write_bytes(b"codex\0resume\0" if backend.live else b"")
+            _ = (process / "cmdline").write_bytes(
+                f"codex\0resume\0{self.owner.current_session}\0".encode() if backend.live else b"")
             if rollout == "current":
                 descriptor = descriptors / "7"
                 descriptor.unlink(missing_ok=True)
@@ -544,7 +545,10 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         proc = self.root / "retirement-proc"
         descriptors = proc / str(backend.pid) / "fd"
         descriptors.mkdir(parents=True, exist_ok=True)
-        _ = (descriptors.parent / "cmdline").write_bytes((backend.kind if not stopped else "zsh").encode() + b"\0")
+        arguments = ["zsh"] if stopped else [backend.kind]
+        if arguments == ["codex"]:
+            arguments.extend(["resume", self.owner.current_session])
+        _ = (descriptors.parent / "cmdline").write_bytes(("\0".join(arguments) + "\0").encode())
         shell_task = proc / str(backend.shell_pid) / "task" / str(backend.shell_pid)
         shell_task.mkdir(parents=True, exist_ok=True)
         _ = (shell_task / "children").write_text("")
@@ -715,6 +719,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         self.assertNotIn("w1:p1", pane_record.read("agents"))
 
     def test_missing_pane_recovery_retires_its_source_before_the_next_folder_move(self) -> None:
+        from scripts.accounts import accounts
         from scripts.shutdown import stop_resume
 
         backend = self.folder_backend("claude", live=False)
@@ -735,7 +740,9 @@ class CodexPaneRestoreTests(FolderMoveFixture):
             pane_record.write("agents", replacement)
             return runtime_sessions.LiveSessionProcess(backend.pid)
 
-        with (mock.patch.object(herdr, "Herdr", return_value=client),
+        with (mock.patch.object(accounts, "group_accounts", return_value=accounts.GroupAccounts(units="claude4")),
+              mock.patch.object(accounts, "claude_account_dir", return_value=backend.config),
+              mock.patch.object(herdr, "Herdr", return_value=client),
               mock.patch.object(client, "open_tab", side_effect=open_tab),
               mock.patch.object(stop_resume, "_tab_of", return_value=stop_resume.SessionNotFound(self.owner.current_session)),
               mock.patch.object(stop_resume, "_start_session", side_effect=start),
@@ -781,6 +788,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         from scripts.production.fake_unit_host import process
         process({"HERDR_PROC": str(proc)}, 998042, 1, ["zsh"], {})
         proof: list[str] = []
+        held_id = "019b3a40-4250-7000-8000-000000000199" if wrong_identity else self.owner.current_session
         published = False
         publishing = False
         read_rollout = herdr.codex_rollout_thread
@@ -800,7 +808,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
             self.assertIsInstance(opening, herdr.NoOpeningPrompt)
             self.assertGreater(timeout_ms, 0)
             (proc / str(backend.pid) / "fd").mkdir(parents=True, exist_ok=True)
-            _ = (proc / str(backend.pid) / "cmdline").write_bytes(b"codex\0")
+            _ = (proc / str(backend.pid) / "cmdline").write_bytes(f"codex\0resume\0{held_id}\0".encode())
             client.started.append((name, pane, agent_arguments.copy()))
             if publish:
                 info: dict[str, object] = {"process_info": {"foreground_processes": [{
@@ -823,7 +831,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
             self.assertEqual(len(client.started), 1)
             proof.append("foreground")
             return subprocess.CompletedProcess(arguments, 0, json.dumps({"result": {"process_info": {
-                "foreground_processes": [{"pid": backend.pid, "argv": ["codex", "resume", self.owner.current_session],
+                "foreground_processes": [{"pid": backend.pid, "argv": ["codex", "resume", held_id],
                                            "cwd": str(self.new_folder)}]}}}), "")
 
         def process_start(pid: int) -> str:

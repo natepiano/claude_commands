@@ -1,6 +1,14 @@
 """Remote permission, interruption, and stop evidence protect AWS work."""
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..lib import process_start as process_identity
+else:
+    from scripts.lib import process_start as process_identity
+
+
 from collections.abc import Callable, Sequence
 from contextlib import nullcontext, redirect_stdout
 import io
@@ -170,6 +178,7 @@ class RemoteAgentTests(ControlFixture):
         process.mkdir(parents=True)
         fields = ["S", "1", "321", *(["0"] * 16), "999"]
         _ = (process / "stat").write_text("321 (new cargo) " + " ".join(fields))
+        _ = (process / "status").write_text(f"Uid:\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\n")
         environment = process / "environ"
         _ = environment.write_bytes(b"BUILD_TARGET_RUN_TOKEN=new-run\0")
         read_bytes = Path.read_bytes
@@ -449,7 +458,7 @@ class RunnerPermissionTests(ControlFixture):
         arguments.pid, arguments.what, arguments.remote = 700, "check hana", "aws-build"
         scope = mac_test.RepositoryScope("hana", "https://example.invalid/team/hana", 1)
         with mock.patch.object(mac_test, "target_claim_scope", return_value=scope), \
-             mock.patch.object(mac_test, "process_start_time", return_value="fixture-process"), \
+             mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("fixture-process")), \
              redirect_stdout(io.StringIO()):
             self.assertEqual(mac_test.command_claim(arguments, paths, watch_claim=False), 0)
         claim = mac_test.claim_path(paths, scope)
@@ -614,6 +623,7 @@ class RetainedMarkerTests(ControlFixture):
         _ = boot_file.write_text(boot + "\n")
         fields = ["S", "1", "321", *(["0"] * 16), "123"]
         _ = (process / "stat").write_text("321 (new cargo) " + " ".join(fields))
+        _ = (process / "status").write_text(f"Uid:\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\n")
         _ = (process / "cmdline").write_bytes(b"cargo\0check\0")
         _ = (process / "environ").write_bytes(b"BUILD_TARGET_RUN_TOKEN=new-run\0")
         (process / "cwd").symlink_to(mirror)
@@ -661,6 +671,7 @@ class RetainedMarkerTests(ControlFixture):
         self.assertEqual(selected, (321,))
         self.assertTrue(marker.exists())
         (proc / "321/stat").unlink()
+        (proc / "321/status").unlink()
         (proc / "321/environ").unlink()
         (proc / "321/cmdline").unlink()
         (proc / "321/cwd").unlink()

@@ -1105,9 +1105,10 @@ class OpenLists(NamedTuple):
     unreadable: list[str]
 
 
-def question_queue(production: Production, below: bool = False) -> str:
+def question_queue(production: Production, below: bool = False, *, identities: QuestionStaff | None = None) -> str:
     """The name urgency.py pins the question /next showed under."""
-    return urgency.scope_queue(f"question-{production.slug}", below)
+    identities = identities if identities is not None else QuestionStaff.read()
+    return urgency.scope_queue(f"question-{identities.owner(production.doc).id}", below)
 
 
 def item_key(slug: str, text: str) -> str:
@@ -1121,7 +1122,12 @@ def open_lists(production: Production, below: bool = False, *, identities: Quest
     due: list[urgency.Entry[OpenItem]] = []
     deferred: list[OpenItem] = []
     unreadable: list[str] = []
+    documents = identities.documents()
     for slug in identities.slugs(production.slug, below):
+        if slug not in documents:
+            print(f"questions: {slug}: ownership evidence is unavailable", file=sys.stderr)
+            unreadable.append(slug)
+            continue
         try:
             items = read_open_items(outstanding_file(slug),
                                     production=production if slug == production.slug else None, identities=identities)
@@ -1137,10 +1143,11 @@ def open_lists(production: Production, below: bool = False, *, identities: Quest
             if isinstance(item.timing, DeferredUntil) and item.timing.at > now:
                 deferred.append(opened)
             else:
-                due.append(urgency.Entry(item_key(slug, item.text), opened, item.rank.urgency,
-                                         item.since, after=item_key(slug, item.rank.follows) if item.rank.follows else ""))
+                owner = identities.owner(documents[slug]).id
+                due.append(urgency.Entry(item_key(owner, item.text), opened, item.rank.urgency,
+                                         item.since, after=item_key(owner, item.rank.follows) if item.rank.follows else ""))
     deferred.sort(key=lambda found: (cast(DeferredUntil, found.item.timing).at, found.slug))
-    return OpenLists(urgency.queue_order(due, question_queue(production, below)), deferred, unreadable)
+    return OpenLists(urgency.queue_order(due, question_queue(production, below, identities=identities)), deferred, unreadable)
 
 
 def open_items(production: Production) -> None:

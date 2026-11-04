@@ -24,11 +24,12 @@ When `PRODUCTION_DOC` carries `**Kind:** style`, read
 
 State:
 
-- `PRODUCTION_DOC`, `MERGE_BRANCH`, `LOG`, `UNITS` — from the production doc.
+- `PRODUCTION_DOC`, `MERGE_BRANCH`, `LOG` — from the production doc.
   After a `/showrunner:rename apply` succeeds, read them again from the
   renamed doc, along with `UPDATES` and `PROMPT_FILE`, which come from its
   slug: apply moves the doc, the update timer and the state directory, and
   switches `CHECKOUT` to the new merge branch.
+- `UNITS` — the production's staff rows with a present worktree. A retired row has a `RemovedWorktree`.
 - `ZONE` — the user's zone setting, which
   `python3 ~/.claude/scripts/lib/user_zone.py` prints. It is one setting for
   every production; a doc's own **User zone** line is not read.
@@ -91,6 +92,7 @@ State:
   `/showrunner:produce PRODUCTION_DOC resume` and act first on what was in
   flight and the `Next:` line. The production doc, `LOG` and `STATE_DIR` are
   the whole state.
+  Compaction runs by itself during work. The per-call context message is off in `config/context_usage.conf`.
 - **Unit worktrees.** Never `cd` into one; use `git -C`. Never commit, reset or
   edit files there.
 - **A unit's pane** is looked up each time it is needed, never remembered:
@@ -129,7 +131,7 @@ State:
   - packaging;
   - cargo-berth overlap answers, incursion resolves, orphan retirement and
     releases (<Dependencies/> rule 3);
-  - whether a unit edits files outside its `.unit.toml` duties, another unit's crate
+  - whether a unit edits files outside its `.unit.toml` responsibilities, another unit's crate
     included: settle it by who holds the files on the berth board and when
     each holder merges, as <Dependencies/> rule 3 settles a file wait. No
     rule needs the user's OK for this (user, 2026-10-04).
@@ -403,7 +405,8 @@ When the production doc's **Production rules** say CI does not apply, pass
 For a planned production, run
 `python3 ~/.claude/scripts/production/production_lifecycle.py open
 --production PRODUCTION_DOC`. The command creates and pushes the merge
-branch, records the running doc and plans, and initializes `LOG`. Rerun it
+branch, records the running doc, finds the plans from staff rows and
+`.unit.toml`, and initializes `LOG`. Rerun it
 after a failed step; it resumes at the first unfinished step.
 </OpenMergeBranch>
 

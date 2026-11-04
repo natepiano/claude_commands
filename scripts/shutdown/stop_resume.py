@@ -96,6 +96,10 @@ def _same_process(pid: int, started: str) -> bool:
 
 def _signal_process(pid: int, number: int) -> None:
     """Refuse proof signals unless herdr places the process in the selected workspace."""
+    if number != 0 and "SHUTDOWN_PROOF_WORKSPACE" not in os.environ and (
+            "STAFF_FILE" in os.environ or "SHUTDOWN_STATE_DIR" in os.environ):
+        raise PermissionError(
+            f"signal {number} to pid {pid} refused: isolated records require SHUTDOWN_PROOF_WORKSPACE")
     if number != 0 and "SHUTDOWN_PROOF_WORKSPACE" in os.environ:
         workspace = os.environ["SHUTDOWN_PROOF_WORKSPACE"]
         refusal = f"proof workspace {workspace!s}: signal {number} to pid {pid} refused"
@@ -216,13 +220,13 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
             return NotRunning(identity)
         if isinstance(live, sessions.SessionLivenessUnknown):
             return StopFailed(identity, live.reason)
-        proved = herdr.native_process(live.pid, kind, resume_id=identity)
+        proved = herdr.native_process(live.pid, kind)
         if proved.identity != identity:
             return StopFailed(identity, "process runs another conversation; no signal sent")
         started = proved.started
         if not _same_process(live.pid, started):
             return NotRunning(identity)
-        if herdr.native_process(live.pid, kind, resume_id=identity) != proved:
+        if herdr.native_process(live.pid, kind) != proved:
             return StopFailed(identity, "process identity changed; no signal sent")
         _signal_process(live.pid, signal.SIGTERM)
         deadline = monotonic() + STOP_GRACE_SECONDS
@@ -234,14 +238,20 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
         else:
             return Stopped(identity, live.pid)
         if _same_process(live.pid, started):
-            if herdr.native_process(live.pid, kind, resume_id=identity) != proved:
-                return StopFailed(identity, "process identity changed; no signal sent")
-            _signal_process(live.pid, signal.SIGKILL)
+            last_signal = "SIGTERM"
+            try:
+                if herdr.native_process(live.pid, kind) != proved:
+                    return StopFailed(identity, "process identity changed; no signal sent")
+            except (OSError, ValueError, herdr.HerdrFailure) as error:
+                print(f"{identity}: stop identity anomaly after SIGTERM: {error}; waiting for exit", file=sys.stderr)
+            else:
+                _signal_process(live.pid, signal.SIGKILL)
+                last_signal = "SIGKILL"
             deadline = monotonic() + KILL_GRACE_SECONDS
             while _same_process(live.pid, started):
                 remaining = deadline - monotonic()
                 if remaining <= 0:
-                    return StopFailed(identity, f"pid {live.pid} is still running after SIGKILL")
+                    return StopFailed(identity, f"pid {live.pid} is still running after {last_signal}")
                 _ = Event().wait(min(0.1, remaining))
         return Stopped(identity, live.pid)
     except ProcessLookupError:
@@ -282,8 +292,6 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
     client = herdr.Herdr(herdr.shared_session())
     command = _pane_command(tab, entry, account)
     launched_at = datetime.now(timezone.utc)
-    if not isinstance(client.pane_activity(tab.pane_id), herdr.PaneAtShell):
-        raise herdr.HerdrFailure(f"{entry['session_id']}: target pane has live work")
     client.run_in_pane(tab.pane_id, command)
     deadline = monotonic() + START_SECONDS
     live = sessions.session_liveness(entry["session_id"])
@@ -441,6 +449,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         from scripts.accounts import accounts
         from scripts.whoami.account import named_account_environment
 
+        if to is None and row is not None and row.kind in ("unit", "showrunner") and pane_launch.agent_kind(entry) == "claude":
+            to = accounts.role_account(row.kind).label
         source = Path(entry["config_dir"])
         source_label = accounts.claude_config_label(source)
         target_dir = (accounts.account_dir(to) if to is not None else
@@ -710,6 +720,19 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                         outcomes.append(ResumePending(identity, target, resumed.reason))
                 except Exception as error:
                     outcomes.append(ResumePending(identity, target, str(error)))
+            record = staff.initial_snapshot()
+            for index, (session, outcome) in enumerate(zip(selected, outcomes)):
+                identity = outcome.name if isinstance(outcome, SessionNotFound) else outcome.session_id
+                running = _running_on_account(identity, "")
+                if isinstance(running, ClaudeUp) and running.account == target:
+                    continue
+                member = record.by_member_reference(identity)
+                name = member.name if member is not None else session
+                line = (f"{name}: not running on {target} after the move; resume it with: "
+                        + f"accounts.py move {identity} {target}")
+                print(line, file=sys.stderr)
+                if isinstance(outcome, ClaudeUp):
+                    outcomes[index] = ResumePending(identity, target, line)
             return outcomes
 
 

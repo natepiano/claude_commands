@@ -25,6 +25,7 @@ from scripts.production import staff, unit_names
 from scripts.production.production_doc import Production, Refusal, production_field, read_production
 from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
 from dailies_counts import CountsFailure, production_counts
+from scripts.production.store_owner import document_id
 from dailies_render import (LENGTHS, InputError, ReportsEvery, ReportsOnDemand, StateRefused, StyleSummary,
                             as_list, as_map, check_render_state, due, last_report,
                             local_now, parse_child_report, parse_range_end, parse_report, parse_time,
@@ -921,6 +922,7 @@ def run(args: argparse.Namespace) -> int:
     judgment = as_map(raw, str(judgment_path))
     supplied_units = as_list(judgment.get("units"), f"{judgment_path}.units")
     by_session: dict[str, JsonMap] = {}
+    owner_id = document_id(production.doc, record=staff_record)
     for index, supplied in enumerate(supplied_units):
         fields = as_map(supplied, f"{judgment_path}.units[{index}]")
         unit_name = fields.get("unit")
@@ -1070,8 +1072,8 @@ def run(args: argparse.Namespace) -> int:
         report("children", "ok", f"{len(children)} below: {', '.join(children)}")
     # A bad config line costs only the counts line, never the report.
     try:
-        counts = production_counts(production.slug)
-    except CountsFailure as failure:
+        counts = production_counts(owner_id)
+    except (CountsFailure, staff.StaffRefused, staff.StaffUnreadable) as failure:
         report("counts", "unavailable", str(failure))
     else:
         if counts:

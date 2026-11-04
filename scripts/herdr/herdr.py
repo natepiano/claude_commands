@@ -53,6 +53,8 @@ import nix_env as nix_env
 from place import HerdrPlace as HerdrPlace
 from pane_launch import MEMBER_MARKS as MEMBER_MARKS, UNIT_MARKS as UNIT_MARKS, RecordedLabels, StaffLabelsRead
 
+NATIVE_ID_MARKS = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
+
 if TYPE_CHECKING:
     from scripts.production.session_labels import StaffLabels
 
@@ -1176,9 +1178,21 @@ class Herdr:
 
     def run_in_pane(self, pane: str, command: list[str], *, terminal: str = "") -> None:
         """Run a command only when the selected pane contains its empty shell."""
-        if not check_target("", action="keys", place=HerdrPlace(self.session, pane), terminal=terminal,
-                            pane_info=_pane_row(self, pane), client=self):
-            raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of the selected shell")
+        deadline = time.monotonic() + PROGRAM_TIMEOUT_SECONDS
+        while True:
+            try:
+                if check_target("", action="keys", place=HerdrPlace(self.session, pane), terminal=terminal,
+                                pane_info=_pane_row(self, pane), client=self):
+                    break
+                failure = HerdrFailure(f"{pane}: would send keys to an unproved target instead of the selected shell")
+            except HerdrFailure as error:
+                if error.code != "wrong_target":
+                    raise
+                failure = error
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise failure
+            time.sleep(min(0.1, remaining))
         _ = self.run("pane", "run", pane, shlex.join(command))
 
     def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
@@ -1759,8 +1773,6 @@ class Herdr:
 
     def _codex_launch(self, pane: str, info: dict[str, object],
                       arguments: Sequence[str]) -> pane_launch.PaneLaunch:
-        resume_id = next((arguments[index + 1] for index, argument in enumerate(arguments[:-1])
-                          if argument == "resume"), "")
         matches: list[pane_launch.PaneLaunch] = []
         for value in json_items(info.get("foreground_processes"), "Codex launch processes"):
             process = json_object(value, "Codex launch process")
@@ -1770,7 +1782,7 @@ class Herdr:
             pid = process.get("pid")
             if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
                 raise ValueError("Codex launch has no process id")
-            observed = native_process(pid, "codex", resume_id=resume_id)
+            observed = native_process(pid, "codex")
             cwd = json_text(process.get("cwd"), "Codex launch cwd")
             if not Path(cwd).is_absolute():
                 raise ValueError("Codex launch working folder is unavailable")
@@ -1970,6 +1982,12 @@ class Herdr:
             ready = False
         return {"agent_status": status, "interactive_ready": ready}
 
+    @staticmethod
+    def _remote_control_turn(row: dict[str, object]) -> bool:
+        """Identify a system turn that confirms Remote Control."""
+        return row.get("type") == "system" and (
+            row.get("subtype") == "bridge_status" or "/remote-control is active" in _turn_text(row))
+
     def prompt_input_state(self, pane: str, transcript: SessionTranscript | UnspecifiedPromptTranscript,
                            launched_at: datetime, *,
                            cursor: TranscriptCursor | UnspecifiedPromptTranscript = UNSPECIFIED_PROMPT_TRANSCRIPT,
@@ -1983,8 +2001,7 @@ class Herdr:
             pass
         if not ready and isinstance(transcript, SessionTranscript):
             reader = cursor if isinstance(cursor, TranscriptCursor) else TranscriptCursor(transcript, launched_at)
-            ready = any(row.get("type") == "system" and "/remote-control is active" in _turn_text(row)
-                        for _, row in reader.read_turns())
+            ready = any(self._remote_control_turn(row) for _, row in reader.read_turns())
         if not ready:
             return PromptInputNotReady("destination session is still loading")
         raw = self.run("pane", "read", pane, "--source", "visible", "--format", "ansi")
@@ -3105,7 +3122,34 @@ def codex_rollout_thread(pid: int) -> str:
     return next(iter(identities))
 
 
-def native_process(pid: int, kind: str, *, resume_id: str = "") -> NativeAgentProcess:
+def _codex_resume_thread(pid: int) -> str:
+    if _platform() == "darwin":
+        process = next((process for process in _darwin_processes() if process.pid == pid), None)
+        if process is None or isinstance(process.arguments, UnreadableProcessArguments):
+            raise ValueError(f"pid {pid}: Codex launch identity is unavailable")
+        arguments = list(process.arguments.argv)
+    else:
+        arguments = _process_arguments(_proc_root() / str(pid))
+    if is_codex_process(arguments):
+        options = iter(arguments[2:] if Path(arguments[0]).name in {"node", "nodejs"} else arguments[1:])
+        for option in options:
+            if option in {"-c", "--config", "--enable", "--disable", "-m", "--model",
+                          "-C", "--cd", "-p", "--profile", "-s", "--sandbox", "-a", "--ask-for-approval",
+                          "--local-provider", "-i", "--image", "--add-dir", "--remote", "--remote-auth-token-env"}:
+                _ = next(options, "")
+            elif option == "--":
+                break
+            elif not option.startswith("-"):
+                if option == "resume":
+                    try:
+                        return staff.native_id(next(options, ""))
+                    except staff.StaffRefused:
+                        pass
+                break
+    raise ValueError(f"pid {pid}: Codex launch identity is unavailable")
+
+
+def native_process(pid: int, kind: str) -> NativeAgentProcess:
     """Bind the current identity and account to one unchanged process."""
     started = _process_birth(pid)
     environment = process_environment(pid)
@@ -3113,10 +3157,7 @@ def native_process(pid: int, kind: str, *, resume_id: str = "") -> NativeAgentPr
         try:
             identity = codex_rollout_thread(pid)
         except NoOpenCodexRollout:
-            try:
-                identity = staff.native_id(environment.get("CODEX_THREAD_ID") or resume_id)
-            except staff.StaffRefused as error:
-                raise ValueError(f"pid {pid}: Codex launch identity is unavailable") from error
+            identity = _codex_resume_thread(pid)
     elif kind == "claude":
         try:
             identity = staff.runtime_id(pid)

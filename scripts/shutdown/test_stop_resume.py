@@ -41,6 +41,31 @@ class ResumeClock(local):
 
 @final
 class StopResumeTests(unittest.TestCase):
+    def test_resume_uses_the_group_account_unless_the_target_is_explicit(self) -> None:
+        identity = staff.StaffId(self.entry["session_id"])
+        for kind in ("unit", "showrunner", "agent"):
+            for target in (None, "claude3"):
+                with self.subTest(kind=kind, target=target):
+                    pane_record.save("agents", {self.entry["pane_id"]: self.entry})
+                    row = staff.StaffRow(identity, kind, "alpha", None, current_session=identity)
+                    expected = target or ("claude4" if kind != "agent" else "claude3")
+                    with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+                          patch.object(accounts, "role_account", return_value=accounts.NamedAccount(
+                              "claude4", self.root / ".claude4")) as selection,
+                          patch.object(stop_resume, "_start_session", return_value=sessions.LiveSessionProcess(456)) as start):
+                        result = stop_resume.resume(str(identity), to=target)
+                    self.assertIsInstance(result, stop_resume.ClaudeUp)
+                    assert isinstance(result, stop_resume.ClaudeUp)
+                    self.assertEqual(result.account, expected)
+                    self.assertEqual(start.call_args.args[2], expected)
+                    entry = cast(pane_record.PaneLaunch, start.call_args.args[1])
+                    self.assertEqual(entry["config_dir"], str(self.root / f".{expected}"))
+                    self.assertEqual(entry["environment"]["CLAUDE_CONFIG_DIR"], entry["config_dir"])
+                    if target is None and kind != "agent":
+                        selection.assert_called_once_with(kind)
+                    else:
+                        selection.assert_not_called()
+
     def test_resume_without_a_pane_record_starts_the_staff_row(self) -> None:
         identity = self.entry["session_id"]
         row = staff.StaffRow(staff.StaffId("fixed-row"), "unit", "alpha", None,
@@ -79,7 +104,8 @@ class StopResumeTests(unittest.TestCase):
     def test_batch_without_a_tab_reaches_the_shared_restore(self) -> None:
         up = stop_resume.ClaudeUp("saved", "new-pane", "claude4")
         with (patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning("saved")),
-              patch.object(stop_resume, "resume", return_value=up) as resumed):
+              patch.object(stop_resume, "resume", return_value=up) as resumed,
+              patch.object(stop_resume, "_running_on_account", return_value=up)):
             results = stop_resume.move_sessions(["saved"], "claude4", why="limit")
         self.assertEqual(results, [up])
         resumed.assert_called_once_with("saved", why="limit", to="claude4")
@@ -163,10 +189,20 @@ class StopResumeTests(unittest.TestCase):
 
 
     def test_resume_does_not_type_into_a_pane_with_other_work(self) -> None:
-        with patch.object(self.client, "pane_activity", return_value=herdr.PaneRunning(("other work",))):
+        self.client.process_info["foreground_process_group_id"] = 998043
+        pane_result = self.client.result
+
+        def observe(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            if arguments[:2] == ("pane", "process-info"):
+                return {"process_info": self.client.process_info}
+            return pane_result(*arguments, deadline=deadline)
+
+        with (patch.object(self.client, "result", side_effect=observe),
+              patch.object(time, "monotonic", lambda: self.clock.elapsed)):
             result = stop_resume.resume("alpha")
         self.assertEqual(result, stop_resume.ResumeFailed(
-            self.entry["session_id"], f"{self.entry['session_id']}: target pane has live work"))
+            self.entry["session_id"], "would send keys to a pane with other live work instead of the selected shell"))
+        self.assertEqual(self.clock.elapsed, herdr.PROGRAM_TIMEOUT_SECONDS)
         self.start.assert_not_called()
         self.assertEqual(self.client.prompts, [])
 
@@ -336,6 +372,7 @@ class StopResumeTests(unittest.TestCase):
         self.live = Mock(return_value=sessions.SessionNotLive())
         self.process = Mock(return_value=sessions.LiveSessionProcess(123))
         self.kill = Mock()
+        self.signal_guard = patch.object(stop_resume, "_signal_process", self.kill)
         self.wait = Mock()
         self.start = Mock(return_value="")
         self.seed = Mock(return_value=0)
@@ -348,6 +385,8 @@ class StopResumeTests(unittest.TestCase):
     def setUp(self) -> None:
         _ = self.enterContext(redirect_stderr(io.StringIO()))
         _ = self.enterContext(patch.object(accounts, "accounts_home", return_value=self.root))
+        _ = self.enterContext(patch.object(accounts, "role_account", return_value=accounts.NamedAccount(
+            "claude3", self.root / ".claude3")))
         _ = self.enterContext(patch.object(account, "process_config_dir", side_effect=self.process_account))
         _ = self.enterContext(patch.object(herdr, "repository_root", return_value=self.root))
         _ = self.enterContext(patch.object(herdr, "repository_trust_key", return_value=self.root))
@@ -369,6 +408,9 @@ class StopResumeTests(unittest.TestCase):
             "019b3a40-4250-7000-8000-000000000102", "generation-1", {})))
         _ = self.enterContext(patch.object(sessions, "process_liveness", self.process))
         _ = self.enterContext(patch.object(os, "kill", self.kill))
+        # Stop tests supply signals; guard tests restore the shared function.
+        _ = self.signal_guard.start()
+        self.addCleanup(self.signal_guard.stop)
         _ = self.enterContext(patch.object(stop_resume, "Event", self.wait))
         cast(Mock, cast(Mock, self.wait.return_value).wait).side_effect = self.advance
         _ = self.enterContext(patch.object(self.client, "run", self.pane_run))
@@ -898,6 +940,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(stop_resume.stop("019b3a40-4250-7000-8000-000000000102"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
 
     def test_proof_workspace_refuses_a_stop_outside_its_panes(self) -> None:
+        self.signal_guard.stop()
         identity = self.entry["session_id"]
         self.live.return_value = sessions.LiveSessionProcess(123)
         self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
@@ -918,6 +961,7 @@ class StopResumeTests(unittest.TestCase):
         self.kill.assert_not_called()
 
     def test_proof_workspace_refuses_a_pid_in_no_pane(self) -> None:
+        self.signal_guard.stop()
         self.live.return_value = sessions.LiveSessionProcess(123)
         self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
         self.client.process_info = {"foreground_processes": [{"pid": 456}]}
@@ -931,6 +975,7 @@ class StopResumeTests(unittest.TestCase):
         self.kill.assert_not_called()
 
     def test_proof_workspace_allows_a_pid_in_its_pane(self) -> None:
+        self.signal_guard.stop()
         self.live.return_value = sessions.LiveSessionProcess(123)
         self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
         self.client.process_info = {"foreground_processes": [{"pid": 123}]}
@@ -941,17 +986,47 @@ class StopResumeTests(unittest.TestCase):
         self.kill.assert_called_once_with(123, signal.SIGTERM)
 
     def test_stop_without_a_proof_workspace_reads_no_process_info(self) -> None:
+        self.signal_guard.stop()
         self.live.return_value = sessions.LiveSessionProcess(123)
         self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
         with patch.dict(os.environ):
             _ = os.environ.pop("SHUTDOWN_PROOF_WORKSPACE", None)
+            _ = os.environ.pop("STAFF_FILE", None)
+            _ = os.environ.pop("SHUTDOWN_STATE_DIR", None)
             with patch.object(self.client, "result", side_effect=self.client_result) as read:
                 result = stop_resume.stop("alpha")
         self.assertEqual(result, stop_resume.Stopped(self.entry["session_id"], 123))
         self.assertFalse(any(item.args[:2] == ("pane", "process-info") for item in read.call_args_list))
         self.kill.assert_called_once_with(123, signal.SIGTERM)
 
+    def test_proof_workspace_unset_refuses_staff_file_signals(self) -> None:
+        self.signal_guard.stop()
+        self.live.return_value = sessions.LiveSessionProcess(123)
+        self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
+        with patch.dict(os.environ):
+            _ = os.environ.pop("SHUTDOWN_PROOF_WORKSPACE", None)
+            _ = os.environ.pop("SHUTDOWN_STATE_DIR", None)
+            result = stop_resume.stop("alpha")
+        self.assertIsInstance(result, stop_resume.StopFailed)
+        assert isinstance(result, stop_resume.StopFailed)
+        self.assertIn("SHUTDOWN_PROOF_WORKSPACE", result.reason)
+        self.kill.assert_not_called()
+
+    def test_proof_workspace_unset_refuses_shutdown_state_signals(self) -> None:
+        self.signal_guard.stop()
+        self.live.return_value = sessions.LiveSessionProcess(123)
+        self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
+        with patch.dict(os.environ):
+            _ = os.environ.pop("SHUTDOWN_PROOF_WORKSPACE", None)
+            _ = os.environ.pop("STAFF_FILE", None)
+            result = stop_resume.stop("alpha")
+        self.assertIsInstance(result, stop_resume.StopFailed)
+        assert isinstance(result, stop_resume.StopFailed)
+        self.assertIn("SHUTDOWN_PROOF_WORKSPACE", result.reason)
+        self.kill.assert_not_called()
+
     def test_proof_workspace_refuses_unreadable_pane_processes(self) -> None:
+        self.signal_guard.stop()
         replies: tuple[dict[str, object] | Exception, ...] = (
             {}, {"process_info": {"foreground_processes": [{"pid": 123.0}]}},
             herdr.HerdrFailure("pane unavailable"), OSError("herdr unavailable"))
@@ -974,6 +1049,7 @@ class StopResumeTests(unittest.TestCase):
                 self.kill.assert_not_called()
 
     def test_proof_workspace_checks_membership_again_before_sigkill(self) -> None:
+        self.signal_guard.stop()
         self.live.return_value = sessions.LiveSessionProcess(123)
         self.client.process_info = {"foreground_processes": [{"pid": 123}]}
         def move_pane(_pid: int, _number: int) -> None:
@@ -986,12 +1062,14 @@ class StopResumeTests(unittest.TestCase):
         self.kill.assert_called_once_with(123, signal.SIGTERM)
 
     def test_proof_workspace_does_not_guard_signal_zero(self) -> None:
+        self.signal_guard.stop()
         with (patch.dict(os.environ, {"SHUTDOWN_PROOF_WORKSPACE": "w2"}),
               patch.object(herdr, "Herdr", side_effect=AssertionError("unexpected pane read"))):
             stop_resume._signal_process(123, 0)  # pyright: ignore[reportPrivateUsage]
         self.kill.assert_called_once_with(123, 0)
 
     def test_proof_workspace_refuses_an_empty_workspace(self) -> None:
+        self.signal_guard.stop()
         self.live.return_value = sessions.LiveSessionProcess(123)
         with patch.dict(os.environ, {"SHUTDOWN_PROOF_WORKSPACE": ""}):
             result = stop_resume.stop("alpha")
@@ -1034,9 +1112,10 @@ class StopResumeTests(unittest.TestCase):
         self.process.side_effect = self.alive_until_kill
         self.client.process_info = {"foreground_processes": [
             {"pid": 123, "argv": ["codex", "resume", identity], "cwd": str(self.root)}]}
-        def native_process(pid: int, kind: str, *, resume_id: str = "") -> herdr.NativeAgentProcess:
+        def native_process(pid: int, kind: str) -> herdr.NativeAgentProcess:
             self.assertEqual((pid, kind), (123, "codex"))
-            if resume_id != identity:
+            processes = herdr.json_items(self.client.process_info["foreground_processes"], "fixture foreground processes")
+            if herdr.json_object(processes[0], "fixture Codex process")["argv"] != ["codex", "resume", identity]:
                 raise ValueError(f"pid {pid}: Codex launch identity is unavailable")
             return herdr.NativeAgentProcess(identity, "generation-1", {})
         def pane_activity(pane: str) -> herdr.PaneRunning:
@@ -1048,7 +1127,7 @@ class StopResumeTests(unittest.TestCase):
               patch.object(herdr, "native_process", side_effect=native_process) as native):
             self.assertEqual(stop_resume.stop("stable-row"), stop_resume.Stopped(identity, 123))
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM), call(123, signal.SIGKILL)])
-        self.assertEqual(native.call_args_list, [call(123, "codex", resume_id=identity)] * 4)
+        self.assertEqual(native.call_args_list, [call(123, "codex")] * 4)
 
     def test_stop_finds_an_unnamed_resumed_codex_pane(self) -> None:
         identity = self.entry["session_id"]
@@ -1129,6 +1208,46 @@ class StopResumeTests(unittest.TestCase):
         self.assertGreater(self.process.call_count, 4)
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM), call(123, signal.SIGKILL)])
 
+    def test_move_waits_for_exit_when_term_removes_the_registry_before_cleanup_finishes(self) -> None:
+        identity = self.entry["session_id"]
+        for exits, error in ((True, ValueError("pid 123: native registry identity is unavailable")),
+                             (True, PermissionError("process read denied during exit")),
+                             (False, ValueError("pid 123: native registry identity is unavailable"))):
+            with self.subTest(exits=exits, error=error):
+                self.clock.elapsed = 0
+                self.launched.clear()
+                self.kill.reset_mock()
+                self.start.reset_mock()
+                def registry(_session: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
+                    return sessions.SessionNotLive() if self.kill.called else sessions.LiveSessionProcess(123)
+
+                self.live.side_effect = registry
+
+                def process(_pid: int, _started: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
+                    return sessions.SessionNotLive() if exits and self.clock.elapsed >= 3 else sessions.LiveSessionProcess(123)
+
+                def native(_pid: int, _kind: str) -> herdr.NativeAgentProcess:
+                    if self.kill.called:
+                        raise error
+                    return herdr.NativeAgentProcess(identity, "generation-1", {})
+
+                def start(*_command: str) -> str:
+                    self.assertGreaterEqual(self.clock.elapsed, 3)
+                    return ""
+
+                self.process.side_effect = process
+                self.start.side_effect = start
+                with patch.object(herdr, "native_process", side_effect=native), redirect_stderr(io.StringIO()) as output:
+                    result = stop_resume.move("alpha", "claude4", why="limit")
+                self.kill.assert_called_once_with(123, signal.SIGTERM)
+                self.assertIn("stop identity anomaly after SIGTERM:", output.getvalue())
+                if exits:
+                    self.assertEqual(result, stop_resume.ClaudeUp(identity, "w1:p2", "claude4"))
+                    self.start.assert_called_once()
+                else:
+                    self.assertEqual(result, stop_resume.StopFailed(identity, "pid 123 is still running after SIGTERM"))
+                    self.start.assert_not_called()
+
     def test_a_process_still_alive_after_kill_fails_and_never_resumes(self) -> None:
         self.live.return_value = sessions.LiveSessionProcess(123)
         result = stop_resume.move("alpha", "claude4", why="limit")
@@ -1170,7 +1289,7 @@ class StopResumeTests(unittest.TestCase):
     def test_detached_batch_uses_the_same_moves_and_logs_each_member(self) -> None:
         log = self.root / "batch.log"
         self.live.side_effect = [sessions.LiveSessionProcess(123), sessions.LiveSessionProcess(123),
-                                 sessions.SessionNotLive(), sessions.SessionNotLive()]
+                                 sessions.SessionNotLive(), sessions.SessionNotLive(), sessions.SessionNotLive()]
         self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
         with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "019b3a40-4250-7000-8000-000000000102"}), patch.object(subprocess, "run") as run, patch.object(subprocess, "Popen") as popen:
             result = stop_resume.main(["batch", "--target", "claude4", "--why", "limit", "--log", str(log), "alpha", "missing"])
@@ -1560,12 +1679,30 @@ class StopResumeTests(unittest.TestCase):
                 raise OSError("cannot run")
             if session == "gone-tab":
                 return stop_resume.SessionNotFound(session)
+            self.launched.add(session)
             return stop_resume.ClaudeUp(session, "own-pane", to)
         with patch.object(stop_resume, "_stop", side_effect=stop_one), patch.object(stop_resume, "resume", side_effect=resume_one):
             results = stop_resume.move_sessions(["stop-error", "resume-error", "gone-tab", "good"], "claude4", why="limit")
         self.assertEqual(results, [stop_resume.StopFailed("stop-error", "cannot signal"),
             stop_resume.ResumePending("resume-error", "claude4", "cannot run"),
             stop_resume.ResumePending("gone-tab", "claude4", "session has no tab after stop"), stop_resume.ClaudeUp("good", "own-pane", "claude4")])
+
+    def test_move_confirms_each_member_runs_on_the_target_after_resume(self) -> None:
+        identity = self.entry["session_id"]
+        row = staff.StaffRow(staff.StaffId(identity), "unit", "alpha", None,
+                             current_session=staff.StaffId(identity))
+        line = ("alpha: not running on claude4 after the move; resume it with: "
+                + f"accounts.py move {identity} claude4")
+        for live in (sessions.SessionNotLive(), sessions.LiveSessionProcess(123)):
+            with (self.subTest(live=live),
+                  patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+                  patch.object(stop_resume, "_stop", return_value=stop_resume.Stopped(identity, 123)),
+                  patch.object(stop_resume, "resume", return_value=stop_resume.ClaudeUp(identity, "w1:p2", "claude4")),
+                  redirect_stderr(io.StringIO()) as output):
+                self.live.return_value = live
+                results = stop_resume.move_sessions([identity], "claude4", why="limit")
+            self.assertEqual(output.getvalue(), line + "\n")
+            self.assertEqual(results, [stop_resume.ResumePending(identity, "claude4", line)])
 
 
     def test_cli_prints_one_line_and_uses_the_result_exit_status(self) -> None:

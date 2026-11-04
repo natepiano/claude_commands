@@ -76,7 +76,7 @@ class CheckTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.current: upgrade_record.Record = {
-            "slug": "demo", "production": "", "checkout": "", "target": "0.20",
+            "staff_id": "fixture-owner", "production": "", "checkout": "", "target": "0.20",
             "started": OLD.isoformat(), "closed": None, "bevy": ["0.19.1"],
             "pins_read": OLD.isoformat(), "dependencies": {}, "target_bevy": {"status": "unread"},
             "target_error": "", "checked": None, "announced": None,

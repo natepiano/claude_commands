@@ -18,6 +18,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_roles  # noqa: E402
 from scripts.astra import design_roles  # noqa: E402
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership, fixture_worker, fixture_runtime_id
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("astra_roles.py")
@@ -40,6 +42,8 @@ class AstraRolesTests(unittest.TestCase):
                             "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
                             "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership")}
         _ = self.environment.pop("CLAUDE_CODE_SESSION_ID", None)
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        self.environment.update({"STAFF_FILE": str(self.root / "staff.json"), "HERDR_BIN": "/nonexistent/herdr"})
         self.roster("running")
         _ = (self.mesh_run / "mesh_server.json").write_text(json.dumps({"codex_home": str(self.home)}))
 
@@ -65,29 +69,31 @@ class AstraRolesTests(unittest.TestCase):
         design_id = "00000000-0000-4000-8000-000000000066"
         design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 2), "fixture-repo",
             str(self.root), str(self.root / "design.md"), "design", "2026-10-21T12:00:00+00:00",
-            design_roles.UnitHolder("demo", "design-unit"), design_roles.DesignUnbound(),
-            (design_roles.RoleInstance("designer", "lasting-alias", design_roles.RoleNeedsRecovery("thread-lasting", "server gone")),
+            design_roles.DesignUnbound(),
+            (design_roles.RoleInstance("designer", "lasting-alias", design_roles.RoleNeedsRecovery(fixture_runtime_id("thread-lasting"), "server gone")),
              design_roles.RoleInstance("reviewer", "unused-reviewer", design_roles.RoleNotOpened())))
-        with mock.patch.dict(os.environ, self.environment), \
-                mock.patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach("restarted-holder")):
+        with mock.patch.dict(os.environ, self.environment):
+            parent = unit_membership("demo", "design-unit")
+            parent = staff.update_current_session(parent.current_session, staff.native_id(fixture_runtime_id("restarted-holder")))
+            _ = fixture_worker("lasting-alias", parent.id, runtime_id=fixture_runtime_id("thread-lasting"))
             design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
             mesh = design_roles.mesh_directory(design_id)
             mesh.mkdir(parents=True)
             _ = (mesh / "mesh_roster.json").write_text(json.dumps({"lasting-alias": {
-                "thread_id": "thread-lasting", "status": "failed"}}))
-            held = astra_roles.hold("designer", "thread-lasting", str(self.home), manager="old-holder",
+                "thread_id": fixture_runtime_id("thread-lasting"), "status": "failed"}}))
+            held = astra_roles.hold("designer", fixture_runtime_id("thread-lasting"), str(self.home), manager="old-holder",
                                     design_id=design_id, role_id="designer")
             self.assertEqual(held["lifetime"], astra_roles.HeldDesignRole(design_id, "designer"))
-            record = cast(dict[str, object], json.loads((self.state / "thread-lasting.json").read_text()))
+            record = cast(dict[str, object], json.loads((self.state / f"{fixture_runtime_id('thread-lasting')}.json").read_text()))
             self.assertEqual({key: record[key] for key in ("design_id", "role_id", "session_dir", "worker", "pid")},
                              {"design_id": design_id, "role_id": "designer", "session_dir": None, "worker": None, "pid": None})
             live = astra_roles.live_roles()
             self.assertEqual([(entry["thread_id"], entry["manager"], entry["state"]) for entry in live],
-                             [("thread-lasting", "restarted-holder", "idle")])
-            ended = replace(design, roles=(replace(design.roles[0], lifecycle=design_roles.RoleEnded("thread-lasting")), design.roles[1]))
+                             [(fixture_runtime_id("thread-lasting"), parent.current_session, "idle")])
+            ended = replace(design, roles=(replace(design.roles[0], lifecycle=design_roles.RoleEnded(fixture_runtime_id("thread-lasting"))), design.roles[1]))
             design_roles._save(ended)  # pyright: ignore[reportPrivateUsage]
             self.assertEqual(astra_roles.live_roles(), [])
-            self.assertFalse((self.state / "thread-lasting.json").exists())
+            self.assertFalse((self.state / f"{fixture_runtime_id('thread-lasting')}.json").exists())
 
     def test_durable_record_refuses_mixed_lifetimes_wrong_role_and_unknown_keys(self) -> None:
         with mock.patch.dict(os.environ, self.environment):

@@ -384,7 +384,7 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/hook_dispatch.py\" stop",
-            "timeout": 1830
+            "timeout": 1840
           },
           {
             "type": "command",

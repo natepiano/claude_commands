@@ -1604,11 +1604,14 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False, accou
     for name in prepared.remove:
         _ = environment.pop(name, None)
     environment.update(prepared.variables)
+    for name in tuple(environment):
+        if name.startswith("SHOWRUNNER_"):
+            _ = environment.pop(name, None)
     if probe:
-        from scripts.herdr.herdr import UNIT_MARKS
+        from scripts.herdr.herdr import NATIVE_ID_MARKS
 
         environment[PROBE_ENV] = "1"
-        for name in UNIT_MARKS:
+        for name in NATIVE_ID_MARKS:
             _ = environment.pop(name, None)
     try:
         program = resolve_program("claude", environment=environment)
@@ -2922,11 +2925,19 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
         if len(matches) != 1:
             return MoveRefused(f"{session} names multiple live sessions: " + ", ".join(item.session_id for item in matches))
         owner = matches[0]
+        group = session_group(owner)
+        return_notice: tuple[str, ...] = ()
+        if group != "ungrouped":
+            selected = group_label(group_accounts(), group)
+            if isinstance(selected, str) and selected != target:
+                return_notice = (f"{owner.name} returns to {selected} at its next resume; "
+                                 + f"to keep {target}, run: accounts.py move {group} {target}",)
         reason = why or f"{session_account_label(owner)} is out of usage"
         if dry_run:
-            return MoveDryRun(owner.session_id, (*checked.notices, move_preview_line(owner, target)))
+            return MoveDryRun(owner.session_id, (*checked.notices, move_preview_line(owner, target), *return_notice))
         results = move_sessions((owner.session_id,), target, why=reason, account_config=account_config)
         stdout, stderr, code = _move_output(results, checked.notices)
+        stdout += "".join(line + "\n" for line in return_notice)
         outcome = MoveStartFailed if code else MoveStarted
         return outcome(owner.session_id, target, stdout, stderr, code)
     except (AccountsError, inventory.InvalidInventory, OSError, ValueError) as error:
@@ -4710,7 +4721,9 @@ def _local_session_counts() -> tuple[dict[tuple[Path, str], dict[str, str]], tup
                 launches[launch["session_id"]] = launch
     try:
         membership = staff.local_snapshot()
-    except staff.StaffUnreadable:
+    except staff.StaffUnreadable as error:
+        if not isinstance(error.__cause__, FileNotFoundError):
+            print(f"accounts: unit counts are incomplete: {error}", file=sys.stderr)
         membership = staff.StaffSnapshot(())
     inputs.update(Path(path) for path in membership.inputs)
     runners = inventory.showrunner_registrations()
@@ -4726,15 +4739,15 @@ def _local_session_counts() -> tuple[dict[tuple[Path, str], dict[str, str]], tup
                       if owner is not None and reference in (owner.id, owner.current_session)]
         launch = max(candidates, key=lambda launch: launch["written_at"]) if candidates else launches.get(identity)
         role = "showrunners" if identity in runner_ids else ""
-        if not role and launch is not None:
-            unit = launch["environment"].get("SHOWRUNNER_UNIT_ID", "")
+        if not role:
             try:
-                # The live session id joins first; an older launch keeps its unit mark.
-                member = session_staff.unit_match(session_staff.ObservedUnit(unit), membership,
+                member = session_staff.unit_match(session_staff.ObservedUnit(""), membership,
                                                  session_staff.LiveSession(identity))
-                if isinstance(member, session_staff.NoSuchMember) and unit:
-                    member = session_staff.unit_match(session_staff.ObservedUnit(unit), membership)
-            except (staff.StaffUnreadable, ValueError):
+                if isinstance(member, session_staff.NoSuchMember) and launch is not None:
+                    member = session_staff.unit_match(session_staff.ObservedUnit(""), membership,
+                                                     session_staff.StoredReference(launch["session_id"]))
+            except (staff.StaffUnreadable, ValueError) as error:
+                print(f"accounts: unit {identity}: {error}", file=sys.stderr)
                 continue
             if isinstance(member, session_staff.MemberFound):
                 role = "units"

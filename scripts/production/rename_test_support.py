@@ -44,6 +44,71 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 SCRIPT = Path(__file__).with_name("rename.py")
 
 
+class RenameDisplays:
+    """Keep private display state while the real retitle methods run."""
+
+    def __init__(self, row: staff.StaffRow, *, live: bool = True, backend: str = "claude") -> None:
+        self.row: staff.StaffRow = row
+        self.live: bool = live
+        self.backend: str = backend
+        self.pane: str = "previous"
+        self.tab: str = "previous"
+        self.workspace: str = "previous"
+        self.commands: list[tuple[str, ...]] = []
+
+    def listed(self, kind: str, *_arguments: str, **_keywords: object) -> list[dict[str, object]]:
+        if kind == "pane":
+            return ([{"pane_id": "probe-pane", "tab_id": "probe-tab", "workspace_id": "probe-space",
+                      "terminal_id": "probe-terminal", "label": self.pane,
+                      "agent_session": {"value": self.row.current_session}}] if self.live else [])
+        if kind == "tab":
+            return [{"tab_id": "probe-tab", "workspace_id": "probe-space", "label": self.tab}]
+        if kind == "workspace":
+            return [{"workspace_id": "probe-space", "label": self.workspace}]
+        raise AssertionError(f"unexpected listing: {kind}")
+
+    def run(self, *arguments: str, **_keywords: object) -> str:
+        self.commands.append(arguments)
+        if len(arguments) == 4 and arguments[1] == "rename":
+            if arguments[0] == "pane":
+                self.pane = arguments[3]
+            elif arguments[0] == "tab":
+                self.tab = arguments[3]
+            elif arguments[0] == "workspace":
+                self.workspace = arguments[3]
+            else:
+                raise AssertionError(arguments)
+            return ""
+        raise AssertionError(arguments)
+
+    def result(self, *arguments: str, **_keywords: object) -> dict[str, object]:
+        if arguments[:2] != ("pane", "process-info"):
+            raise AssertionError(arguments)
+        return {"process_info": {"shell_pid": 998040, "foreground_process_group_id": 998041,
+                "foreground_processes": [{"pid": 998041, "name": self.backend, "argv": [self.backend]}]}}
+
+    def native_result(self, arguments: list[str], **_keywords: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(arguments, 0, json.dumps({"result": self.result(*arguments[3:])}), "")
+
+    @contextmanager
+    def installed(self) -> Generator[None]:
+        """Replace backend reads and writes, and retain the real retitle behavior."""
+        from scripts.herdr import herdr
+
+        with (mock.patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}),
+              mock.patch.object(herdr.Herdr, "listed", side_effect=self.listed),
+              mock.patch.object(herdr.Herdr, "run", side_effect=self.run),
+              mock.patch.object(herdr.Herdr, "result", side_effect=self.result),
+              mock.patch.object(herdr, "run_program", side_effect=self.native_result),
+              mock.patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                  self.row.current_session, "probe-generation", {})),
+              mock.patch.object(herdr, "_LayoutLock"),
+              mock.patch.object(herdr.Herdr, "order_tabs", return_value=False),
+              mock.patch.object(herdr.Herdr, "save_layout")):
+            yield
+
+
+
 class FolderMoveBackend:
     """A private backend keeps the terminal while its session stops and resumes."""
 
@@ -63,7 +128,8 @@ class FolderMoveBackend:
         """Expose the private process and an empty rollout descriptor directory."""
         process = self.fixture.root / "folder-processes" / str(self.pid)
         (process / "fd").mkdir(parents=True, exist_ok=True)
-        _ = (process / "cmdline").write_bytes(self.kind.encode() + b"\0" if self.live else b"")
+        arguments = [self.kind] if self.kind == "claude" else [self.kind, "resume", self.fixture.owner.current_session]
+        _ = (process / "cmdline").write_bytes("\0".join(arguments).encode() + b"\0" if self.live else b"")
 
     def panes(self) -> list[herdr.PaneIdentity]:
         return [
@@ -713,15 +779,15 @@ class ProductionRenameFixture(StaffTestCase):
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/old"), f"{self.old_tip}\trefs/heads/old")
         self.assertEqual(self.git("status", "--porcelain"), "")
 
-    def held_design(self, repository_id: str, checkout: Path, holder: design_roles.Holder) -> design_roles.HeldDesign:
-        """A design `holder` holds, with an open designer whose roster entry runs in `checkout`."""
+    def held_design(self, repository_id: str, checkout: Path) -> design_roles.HeldDesign:
+        """Save an open design with a private checkout."""
         with mock.patch.dict(os.environ, self.env):
             design_roles.register_repository(repository_id, {"fixture-host": str(checkout)}, inventory_complete=True)
             placement = design_roles.authority_request("reserve", {"repository_id": repository_id, "document": "design.md",
                                                             "host": "fixture-host", "request_id": repository_id})
             design = design_roles.HeldDesign(
                 design_roles.DesignPlacement(str(placement["design_id"]), "fixture-host", 1), repository_id, str(checkout),
-                str(checkout / "design.md"), "design", "2026-10-22T12:00:00+00:00", holder, design_roles.DesignUnbound(),
+                str(checkout / "design.md"), "design", "2026-10-22T12:00:00+00:00", design_roles.DesignUnbound(),
                 (design_roles.RoleInstance("designer", f"old-{repository_id}-astra-designer", design_roles.RoleOpen("designer-thread")),
                  design_roles.RoleInstance("reviewer", f"old-{repository_id}-astra-reviewer", design_roles.RoleNotOpened())))
             design_roles._save(design)  # pyright: ignore[reportPrivateUsage]

@@ -14,7 +14,8 @@ from typing import TypedDict, cast
 
 from scripts.production.production_doc import Production, Refusal, read_production
 import pins
-from scripts.production import showrunners
+from scripts.production import session_staff, staff
+from scripts.production.store_owner import document_id
 import upstream
 import upgrade_check
 import upgrade_record
@@ -31,7 +32,9 @@ class UpgradeUpdate(TypedDict):
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bevy_upgrade")
-    _ = parser.add_argument("--production", type=Path)
+    owner = parser.add_mutually_exclusive_group()
+    _ = owner.add_argument("--production", type=Path)
+    _ = owner.add_argument("--staff-id")
     verbs = parser.add_subparsers(dest="verb")
     _ = verbs.add_parser("status")
     line = verbs.add_parser("line")
@@ -53,10 +56,24 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _production(args: argparse.Namespace) -> Production:
+def _production(args: argparse.Namespace, record: staff.StaffSnapshot) -> Production:
+    identity = cast(str | None, args.staff_id)
+    if identity is not None:
+        row = record.by_id(staff.StaffId(identity))
+        if row is None or row.kind != "showrunner":
+            raise Refusal(f"{identity}: showrunner ownership evidence is unavailable")
+        document = session_staff.RowResolver(record).production_doc(row)
+        if not isinstance(document, session_staff.ProductionDoc):
+            raise Refusal(f"{identity}: the production document is unavailable")
+        return read_production(document.path)
     doc = cast(Path | None, args.production)
     if doc is None:
-        doc = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+        runtime = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+        row = record.by_current_session(runtime)
+        if row is not None and row.kind == "showrunner":
+            document = session_staff.RowResolver(record).production_doc(row)
+            if isinstance(document, session_staff.ProductionDoc):
+                doc = document.path
     if doc is None:
         raise Refusal("this session runs no production; pass --production <doc>")
     return read_production(doc)
@@ -67,8 +84,8 @@ def _baseline(record: upgrade_record.Record) -> None:
                            for name, entry in record["dependencies"].items()}
 
 
-def _line(production: Production, now: datetime, as_json: bool) -> int:
-    current = upgrade_record.load(production.slug)
+def _line(production: Production, now: datetime, as_json: bool, identity: str) -> int:
+    current = upgrade_record.load(identity)
     if current is None or current["closed"] is not None:
         return 0
     pins_error = ""
@@ -80,7 +97,7 @@ def _line(production: Production, now: datetime, as_json: bool) -> int:
         current = upgrade_record.apply_pins(current, latest, now)
     upgrade_schedule.ensure_job(current)
     sentence = upgrade_report.line(current, production.zone, now,
-                                   upgrade_schedule.next_check(production.slug), pins_error)
+                                   upgrade_schedule.next_check(identity), pins_error)
     if as_json:
         print(json.dumps(UpgradeUpdate(update=sentence, needs_user=upgrade_report.waiting(current) > 0)))
     else:
@@ -102,11 +119,11 @@ def _scheduled(record: upgrade_record.Record, production: Production,
         summary = f"Bevy {record['target']} upgrade: {count} change{'s' if count != 1 else ''}"
         text = "\n".join([*differences,
                           upgrade_report.line(record, production.zone, now,
-                                              upgrade_schedule.next_check(record["slug"]), ""),
+                                              upgrade_schedule.next_check(record["staff_id"]), ""),
                           "Full table: /showrunner:bevy_upgrade"])
     else:
         return False
-    if not upgrade_schedule.tell_showrunner(record["slug"], summary, text):
+    if not upgrade_schedule.tell_showrunner(record["staff_id"], summary, text):
         return False
     _baseline(record)
     if complete:
@@ -119,10 +136,10 @@ def _closed_sentence(record: upgrade_record.Record) -> str:
             "The watch is closed.")
 
 
-def _run(args: argparse.Namespace, production: Production, now: datetime) -> int:
+def _run(args: argparse.Namespace, production: Production, now: datetime, identity: str) -> int:
     verb = cast(str | None, args.verb) or "status"
     if verb == "line":
-        return _line(production, now, cast(bool, args.json))
+        return _line(production, now, cast(bool, args.json), identity)
     scheduled = verb == "check" and cast(bool, args.scheduled)
     pins_error = ""
     exit_code = 0
@@ -130,19 +147,19 @@ def _run(args: argparse.Namespace, production: Production, now: datetime) -> int
     differences: list[str] = []
     closing = ""
     latest: pins.Pins | None = None  # None means no successful lockfile read in this run.
-    with upgrade_record.locked(production.slug):
+    with upgrade_record.locked(identity):
         if verb == "start":
             latest = pins.read_pins(production.checkout)
-            current = upgrade_record.start(production, cast(str, args.target), latest, now)
+            current = upgrade_record.start(production, cast(str, args.target), latest, now, staff_id=identity)
         else:
-            current = upgrade_record.load(production.slug)
+            current = upgrade_record.load(identity)
             if current is None:
                 if not scheduled:
                     print(f"no Bevy upgrade is tracked for {production.slug}; start one with /showrunner:bevy_upgrade start <version>")
                 return 0
             if verb == "check" and current["closed"] is not None:
                 if scheduled:
-                    upgrade_schedule.remove_job(production.slug)
+                    upgrade_schedule.remove_job(identity)
                     return 0
                 raise upgrade_record.RecordFailure("the watch is closed; start a new one")
             try:
@@ -191,11 +208,11 @@ def _run(args: argparse.Namespace, production: Production, now: datetime) -> int
             _baseline(current)
         upgrade_record.save(current)
         if remove:
-            upgrade_schedule.remove_job(production.slug)
+            upgrade_schedule.remove_job(identity)
         elif current["closed"] is None and verb in ("start", "status", "check"):
             upgrade_schedule.ensure_job(current)
         if not scheduled:
-            upgrade_schedule.retire_message(production.slug)
+            upgrade_schedule.retire_message(identity)
     if scheduled:
         return exit_code
     if pins_error:
@@ -217,8 +234,11 @@ def main(argv: list[str] | None = None) -> int:
     """None uses the process arguments."""
     args = _parser().parse_args(argv)
     try:
-        return _run(args, _production(args), datetime.now(timezone.utc))
-    except (upgrade_record.RecordFailure, pins.PinsFailure, Refusal) as error:
+        record = staff.snapshot()
+        production = _production(args, record)
+        identity = document_id(production.doc, record=record)
+        return _run(args, production, datetime.now(timezone.utc), identity)
+    except (upgrade_record.RecordFailure, pins.PinsFailure, Refusal, staff.StaffRefused, staff.StaffUnreadable) as error:
         print(f"bevy_upgrade: {error}", file=sys.stderr)
         return 2
 
