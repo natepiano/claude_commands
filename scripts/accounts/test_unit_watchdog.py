@@ -312,8 +312,8 @@ class UnitWatchdogTests(unittest.TestCase):
             return (sessions.LiveSessionProcess(pid) if any(entry["pid"] == pid for entry in self.fixture.live)
                     else sessions.SessionNotLive())
 
-        def native_process(pid: int, kind: str) -> herdr.NativeAgentProcess:
-            self.assertEqual(kind, "claude")
+        def native_process(pid: int, kind: str, *, resume_id: str = "") -> herdr.NativeAgentProcess:
+            self.assertEqual((kind, resume_id), ("claude", "alpha"))
             owner = next(entry for entry in self.fixture.live if entry["pid"] == pid)
             return herdr.NativeAgentProcess(owner["sessionId"], "fixture-start", {})
 
