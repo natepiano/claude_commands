@@ -22,10 +22,10 @@ import json
 import os
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 if TYPE_CHECKING:
     from scripts.production import staff
@@ -48,7 +48,6 @@ from pane_launch import (
     NAME_FLAGS as NAME_FLAGS,
     RESUME_FLAGS as RESUME_FLAGS,
     ClaudeArguments as ClaudeArguments,
-    launch as launch,
     parse_claude_arguments as parse_claude_arguments,
 )
 
@@ -117,6 +116,17 @@ def resume_launch(entry: PaneLaunch) -> PaneLaunch:
     return current
 
 
+def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, str],
+           arguments: Sequence[str], *, kind: Literal["claude", "codex"] = "claude") -> PaneLaunch:
+    """Retain plugin paths only in the shutdown restore record."""
+    entry = pane_launch.launch(pane_id, session_id, cwd, environment, arguments, kind=kind)
+    if kind == "claude":
+        plugins = parse_claude_arguments(arguments).plugin_directories
+        if plugins:
+            entry["plugin_directories"] = [str((Path(cwd) / directory).resolve()) for directory in plugins]
+    return entry
+
+
 def resume_arguments(entry: PaneLaunch) -> list[str]:
     """Build backend arguments from a launch with its current conversation id."""
     if pane_launch.agent_kind(entry) == "codex":
@@ -131,6 +141,8 @@ def resume_arguments(entry: PaneLaunch) -> list[str]:
         arguments.extend(("--remote-control", entry["name"]) if entry["name"] else ("--remote-control",))
     if entry["model"]:
         arguments.extend(("--model", entry["model"]))
+    for directory in entry.get("plugin_directories", []):
+        arguments.extend(("--plugin-dir", directory))
     arguments.extend(("--settings", '{"disableAgentView": true}'))
     return arguments
 
@@ -160,9 +172,16 @@ def move_cwd(unit: str, old: Path, new: Path, record: "staff.StaffSnapshot") -> 
                 owner = record.by_member_reference(entry["session_id"])
                 if owner is None or owner.id != unit:
                     continue
-                if entry["cwd"] not in (str(old), str(new)):
-                    raise ValueError(f"{unit}: retained launch has a different working folder")
+                if entry.get("cwd") not in (str(old), str(new)):
+                    print(f"{unit}: retained launch has a different working folder; skipped", file=sys.stderr)
+                    continue
                 if entry["cwd"] != str(new):
+                    if "plugin_directories" in entry:
+                        entry["plugin_directories"] = [
+                            str(new / Path(directory).relative_to(old))
+                            if Path(directory).is_relative_to(old) else directory
+                            for directory in entry["plugin_directories"]
+                        ]
                     entry["cwd"] = str(new)
                     changed = True
             if changed:

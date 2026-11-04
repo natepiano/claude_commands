@@ -24,11 +24,9 @@ import offload
 import mac_test
 import targets
 if TYPE_CHECKING:
-    from ..buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert
     from ..message import roster
     from ..buildlog import record, store
 else:
-    from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert
     from scripts.message import roster
     import record
     import store
@@ -41,6 +39,14 @@ if TYPE_CHECKING:
     from ..lib import test_hang_guard
 else:
     from scripts.lib import test_hang_guard
+
+SHIPPED_STATUS = "\n".join((
+    "mac: free",
+    "natedev: free",
+    "aws: unavailable; evidence unavailable; month unavailable / $400.00",
+    "  spending unavailable; decision unavailable; no controller evidence; a priced resource inventory is required before spending",
+    "",
+))
 
 REAL_SUBPROCESS_RUN = subprocess.run
 REAL_SUBPROCESS_POPEN = subprocess.Popen
@@ -59,17 +65,7 @@ def pacific_zone() -> Generator[None, None, None]:
         time.tzset()
 
 
-class FolderInvocationTests(NotificationGuardedTestCase):
-    def test_clean_target_import_loads_mac_test_once(self) -> None:
-        environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
-        result = REAL_SUBPROCESS_RUN([sys.executable, "-c",
-            "import sys; import build_targets; "
-            + "names=[n for n,m in list(sys.modules.items()) if getattr(m,'__file__','') "
-            + "and m.__file__.endswith('/mac_test/mac_test.py')]; "
-            + "assert len(names)==1, names"], cwd=Path(__file__).parent, env=environment,
-            capture_output=True, text=True, timeout=30, check=False)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
+class FolderInvocationTests(unittest.TestCase):
     def test_folder_invocation_records_hold_events(self) -> None:
         result = subprocess.run(
             [sys.executable, "-m", "unittest",
@@ -80,17 +76,12 @@ class FolderInvocationTests(NotificationGuardedTestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
-class IsolatedBuildTargetTest(NotificationGuardedTestCase, IsolatedTargetTest):
+class IsolatedBuildTargetTest(IsolatedTargetTest):
     @override
     def setUp(self) -> None:
         super().setUp()
-        folder = self.root / ".claude/config"
-        folder.mkdir(parents=True, exist_ok=True)
-        _ = (folder / "build_targets.conf").write_text(SHIPPED_CONFIG.read_text())
-        _ = (folder / "mac_test.conf").write_text(self.settings.read_text())
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILDLOG_DIR": str(self.root / "buildlog"),
-            "MAC_IDLE_STATE_DIR": str(self.root / "mac-idle"),
         })))
 
 
@@ -108,37 +99,6 @@ class StatusTests(IsolatedBuildTargetTest):
         with redirect_stdout(output), redirect_stderr(errors):
             code = build_targets.command_status(probe)
         return code, output.getvalue(), errors.getvalue()
-
-    def test_mac_idle_alert_prints_first_with_red_only_on_a_terminal(self) -> None:
-        _ = write_idle_alert(self.root / "mac-idle", NOW.timestamp())
-        config = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
-        expected = ("MAC IDLE 10 min: 7 steps wait for the Mac. Blocked by research since "
-                    "13:50 (P15 F11 L0 run); /build:mac unblock clears it.")
-        with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
-             mock.patch.object(time, "time", return_value=NOW.timestamp()):
-            for terminal in (False, True):
-                with self.subTest(terminal=terminal):
-                    output, errors = io.StringIO(), io.StringIO()
-                    with redirect_stdout(output), redirect_stderr(errors), \
-                         mock.patch.object(output, "isatty", return_value=terminal):
-                        code = build_targets.command_status()
-                    first = f"\033[1;31m{expected}\033[0m" if terminal else expected
-                    self.assertEqual((code, errors.getvalue()), (0, ""))
-                    self.assertEqual(output.getvalue(), first + "\nnatedev: free\n")
-
-    def test_stale_mac_reading_prints_before_target_status(self) -> None:
-        _ = write_idle_alert(self.root / "mac-idle", NOW.timestamp(), written_age=301)
-        config = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
-        with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
-             mock.patch.object(time, "time", return_value=NOW.timestamp()):
-            code, output, errors = self.capture_status()
-        self.assertEqual((code, errors), (0, ""))
-        self.assertEqual(output.splitlines(), [
-            "MAC IDLE WATCH: no reading since 13:54; check buildlog-sample.timer.", "natedev: free",
-        ])
-
-    def test_status_fields_remove_control_characters(self) -> None:
-        self.assertEqual(build_targets.format_state("ma\x1bc\n", targets.Free()), "mac: free")
 
     def test_free_line(self) -> None:
         self.assertEqual(build_targets.format_state("natedev", targets.Free()), "natedev: free")
@@ -398,7 +358,7 @@ class StatusTests(IsolatedBuildTargetTest):
     def test_shipped_config_prints_one_line_per_target_without_probe(self) -> None:
         with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(SHIPPED_CONFIG).parent)}):
             with mock.patch.object(build_targets, "probe_target", side_effect=AssertionError("Probe not requested")):
-                self.assertEqual(self.capture_status(), (0, "mac: free\nnatedev: free\n", ""))
+                self.assertEqual(self.capture_status(), (0, SHIPPED_STATUS, ""))
 
     def test_command_uses_config_order_and_recorded_hold(self) -> None:
         config = self.write_config(
@@ -432,9 +392,11 @@ class StatusTests(IsolatedBuildTargetTest):
         self.assertEqual(output.getvalue(), (
             "mac: unreachable — ssh timed out\n"
             "natedev: held by hana since 13:05 PDT — render checks\n"
+            "aws: unreachable — ssh timed out\n"
         ))
         self.assertEqual(errors.getvalue(), "")
-        self.assertEqual(probed, [targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf"))])
+        self.assertEqual(probed, [targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf")),
+                                  targets.SshTarget("aws", "linux", SHIPPED_CONFIG.with_name("aws_target.conf"))])
 
     def test_status_argument_defaults_to_recorded_state(self) -> None:
         output = io.StringIO()
@@ -444,7 +406,7 @@ class StatusTests(IsolatedBuildTargetTest):
                 with mock.patch.object(sys, "argv", ["build_targets.py", "status"]):
                     with redirect_stdout(output), redirect_stderr(errors):
                         code = build_targets.main()
-        self.assertEqual((code, output.getvalue(), errors.getvalue()), (0, "mac: free\nnatedev: free\n", ""))
+        self.assertEqual((code, output.getvalue(), errors.getvalue()), (0, SHIPPED_STATUS, ""))
 
     def test_failed_mac_probe_becomes_unreachable_status(self) -> None:
         calls: list[str] = []

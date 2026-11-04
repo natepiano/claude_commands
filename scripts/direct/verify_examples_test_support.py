@@ -97,6 +97,7 @@ class ExampleWorkspaceFixture(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.calls = self.root / "cargo-calls"
         self.metadata_calls = self.root / "metadata-calls"
@@ -215,10 +216,6 @@ esac
             "UNIT_SESSION_DIR": str(self.root / "session"),
         }
 
-    @override
-    def tearDown(self) -> None:
-        self.temporary.cleanup()
-
     def package(self, name: str = "sample", *, manifest_extra: str = "", root: Path | None = None) -> Path:
         package_root = root or self.root
         package_root.mkdir(parents=True, exist_ok=True)
@@ -305,7 +302,7 @@ class SeededExampleWorkspaceFixture(ExampleWorkspaceFixture):
     def setUpClass(cls) -> None:
         builder = ExampleWorkspaceFixture()
         builder.setUp()
-        cls.addClassCleanup(builder.tearDown)
+        cls.addClassCleanup(builder.doCleanups)
         cls.fixture_root = builder.root
         seed = cls.enterClassContext(tempfile.TemporaryDirectory(prefix="example-workspace-seed-"))
         cls.fixture_seed = Path(seed) / "seed"
@@ -335,11 +332,6 @@ class SeededExampleWorkspaceFixture(ExampleWorkspaceFixture):
         self.metadata_calls = self.root / "metadata-calls"
         self.environment = self.fixture_environment.copy()
         _ = caller_admission(self, self.root, self.environment)
-
-    @override
-    def tearDown(self) -> None:
-        if not self.seeded:
-            super().tearDown()
 
     def side_by_side_phases(self, edited: str) -> subprocess.CompletedProcess[str]:
         """Test alpha, which depends on gamma, while another phase edits `edited`."""

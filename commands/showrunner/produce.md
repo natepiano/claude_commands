@@ -686,8 +686,7 @@ message.
    ~/.claude/scripts/production/ci_points.py watch --production PRODUCTION_DOC
    --state-dir DAILIES_STATE_DIR` after each code checkpoint. Give the user its
    table on the first alert. A shrink adds no review-ledger row or CI count. While the
-   watch exits 3, the dailies `Review watch` topic needs the user, and every
-   build report (`/build:report`) carries it and pushes again. Run
+   watch exits 3, the dailies `Review watch` topic needs the user. Run
    `review_regime.py ack` only on the user's own acknowledgment. Pass `--no-ci`
    to `due` when the production rules say CI does not apply.
 </MergeCheckpoint>
@@ -1028,22 +1027,16 @@ it needs. Every other wait is yours to clear, and fast.
 <Notify>
 Load `/message_style` before the first message to the user in a session.
 
-Phone alerts use the one message path, which reaches the phone through
-Pushover (user's pick, 2026-10-03), because the user often ignores ordinary
-push notifications:
+Message the user with `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id ID --value KEY=VALUE`. Use `decision.choices` for choices, `alert.blocked` for emergencies, and `nate.adhoc` for notes without an action. Each template supplies its need and action. Emergency pushes also need `--clears-when "<check>"`. A decision uses normal priority unless its explicit-offset `--due` falls inside the configured window. Use a specific registered template when one fits. Run `review.py show ID` for its values. For `decision.choices`, pass `choices` as a JSON list of objects with `label` and `effect`. Also supply `sender`, `title`, `session`, `machine`, `situation`, `recommended_choice`, and `recommendation_reason`.
 
-`python3 ~/.claude/scripts/message/send.py --to user --need note|decision|blocked (--action "<what the user does>" | --no-action) --summary "<what is at stake, under 45 characters>" --text "<message>"`
+For `decision.choices`, file the question with `/unit:question` or `/showrunner:question`, then pass its record path with `--question`.
+Filing a question alone never sends a push.
 
-On the Mac, add `--machine natedev`; the keys exist only on natedev. The
-message is the one action or fact, under 500 characters, per the message guide. Every message says
-what the user does with `--action`, or says nothing is needed with
-`--no-action`. An update to an earlier user push on the same subject reuses that
-push's `--key`, so silence keeps only the newest. Emergency (`--need blocked`) is
-only for an action the user must take now. A `--need blocked` push also takes `--clears-when "<command that exits 0 when fixed>"`, such as `--clears-when github-warm-status`: send.py cancels the push when that command exits 0. Without it, send.py refuses the push (`REFUSED`, exit 2). With no such command, send the push at its own need. A repeat with the key of a live emergency
-push is skipped; to send an update, first `send.py retire --to user --from <sender> --key <key>`. Exit 0 means sent. On `FAILED` (exit 3), fall back to PushNotification
-with the `fallback text:` that `send.py` printed, and say so in the log. Never
-read or print `~/.config/pushover/env`. Every attempt is logged in
-`~/.local/state/message/log.jsonl`.
+On the Mac, add `--machine natedev`.
+Reuse the same `--key` for updates to one subject.
+Use an emergency only when the user must act now.
+On a send failure, report the failure. Use no other phone path.
+Never read the credential file.
 
 **Push whenever work waits on the user.** When the production or any unit is
 blocked on something only the user can do (a rebuild, `github-warmup`, an
@@ -1058,7 +1051,7 @@ on it, with `--need decision`: the user wants a text for every rebuild needed (u
 | Need | When |
 | --- | --- |
 | `blocked` (priority 2; repeats every 5 min until the user taps Acknowledge) | Work has stopped, and only the user can restart it: a block under <Dependencies/> rule 6, after steps 1–2, carrying the exact action; a cold gpg-agent stopping every push (the user runs `github-warmup`). Send once per block. |
-| `decision` (priority 1) | The user is needed, but nothing has stopped: a product decision only they can make while units have other work; main's CI red after <PromoteMain/>; a block still open an hour after they acknowledged it. That last one says what changed, never the same text again. |
+| `decision` (priority 0; 1 only with an in-window `--due`, per `config/send.conf`) | Ask for a product decision while units have other work. Report main's red CI after <PromoteMain/>. Report a block still open one hour after acknowledgement, with the changed facts. |
 | `note` (priority 0) | A unit's whole plan finished and merged; before/after shots ready for the user's review. |
 
 Never sent: dailies, ETAs, routine merges, green CI, flakes rerun, and hardware

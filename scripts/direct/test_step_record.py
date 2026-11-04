@@ -17,49 +17,31 @@ from scripts.direct import step_record as steps
 
 
 class StepRecordTests(unittest.TestCase):
-    def test_cli_updates_records_without_importing_argument_or_dataclass_machinery(self) -> None:
+    def test_start_command_prints_the_process_start_field_as_text(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
-            proc = root / "proc/42"
-            proc.mkdir(parents=True)
-            _ = (proc / "stat").write_text("42 (verify) S " + "0 " * 18 + "123 0\n")
-            boot = root / "proc/sys/kernel/random"
-            boot.mkdir(parents=True)
-            _ = (boot / "boot_id").write_text("boot")
-            environment = {**os.environ, "VERIFY_STEPS_DIR": folder,
-                           "VERIFY_PROC_ROOT": str(root / "proc"), "BUILDLOG_DIR": str(root / "log")}
-            launcher = """import runpy, sys
+            process = Path(folder) / "42"
+            process.mkdir()
+            _ = (process / "stat").write_text("42 (verify (nested) name) S " + "0 " * 18 + "987654321012345 99\n")
+            result = subprocess.run([sys.executable, str(Path(steps.__file__)), "start", "42"],
+                env={**os.environ, "VERIFY_PROC_ROOT": folder}, capture_output=True, text=True, timeout=3)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "987654321012345\n")
+            self.assertEqual(result.stderr, "")
 
-def reject_optional_import(event, arguments):
-    if event == "import" and arguments[0] in ("argparse", "dataclasses", "inspect"):
-        raise RuntimeError("unnecessary CLI import: " + arguments[0])
+    def test_start_command_refuses_missing_ended_or_incomplete_process_records(self) -> None:
+        for state in ("missing", "ended", "incomplete"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as folder:
+                process = Path(folder) / "42"
+                process.mkdir()
+                if state != "missing":
+                    content = "42 (verify) Z " + "0 " * 18 + "123 0\n" if state == "ended" else "42 (verify) S 0\n"
+                    _ = (process / "stat").write_text(content)
+                result = subprocess.run([sys.executable, str(Path(steps.__file__)), "start", "42"],
+                    env={**os.environ, "VERIFY_PROC_ROOT": folder}, capture_output=True, text=True, timeout=3)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("step refused", result.stderr)
 
-sys.addaudithook(reject_optional_import)
-sys.argv = sys.argv[1:]
-runpy.run_path(sys.argv[0], run_name="__main__")
-"""
-            operations = (
-                (["write", "--call-id", "cli", "--pid", "42", "--repo", folder, "--kind", "lint",
-                  "--runs-on", "natedev_only", "--reason", "local lint", "--state", "waiting_hold"], 0),
-                (["state", "--call-id", "cli", "on_natedev"], 0),
-                (["stopped", "--call-id", "cli", "--consumed", str(root / "consumed")], 1),
-                (["remove", "--call-id", "cli"], 0),
-            )
-            for arguments, expected_status in operations:
-                with self.subTest(command=arguments[0]):
-                    result = subprocess.run([sys.executable, "-c", launcher, str(Path(steps.__file__)),
-                                             *arguments], env=environment, capture_output=True, text=True,
-                                            timeout=30)
-                    self.assertEqual(result.returncode, expected_status, result.stderr)
-                    self.assertEqual(result.stdout, "")
-                    self.assertEqual(result.stderr, "")
-                    if arguments[0] == "write":
-                        row = cast(dict[str, object], json.loads((root / "cli.json").read_text()))
-                        self.assertEqual(row["runs_on"], {"kind": "natedev_only", "reason": "local lint"})
-                        self.assertEqual(row["package"], None)
-                    elif arguments[0] == "state":
-                        self.assertEqual(cast(dict[str, object], json.loads((root / "cli.json").read_text()))["state"], "on_natedev")
-            self.assertFalse((root / "cli.json").exists())
     def test_ssh_record_keeps_target_order_and_selection_through_state_changes(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

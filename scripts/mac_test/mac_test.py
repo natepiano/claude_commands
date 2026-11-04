@@ -42,13 +42,6 @@ else:
     from target_config import ConfigError
 
 
-if TYPE_CHECKING:
-    from ..buildlog.mac_idle_alert import MacIdleConfig, MacIdleConfigError, idle_config
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.buildlog.mac_idle_alert import MacIdleConfig, MacIdleConfigError, idle_config
-
-
 MESSAGE_TIMEOUT_S = 30.0
 
 
@@ -74,7 +67,6 @@ class ClaimOwnerRecord(TypedDict):
     since: str
     holder_session: NotRequired[str]
     idle_since: NotRequired[str]
-    work_idle_since: NotRequired[str]
     copy: NotRequired[bool]
     repo_key: NotRequired[str]
     repo_name: NotRequired[str]
@@ -372,7 +364,6 @@ NO_EXPIRED_BLOCK_LIFT_FAILURE = NoExpiredBlockLiftFailure()
 class MacTestConfig:
     """Mac claim, block and CI settings."""
 
-    idle: MacIdleConfig
     ci_repo: str
     ci_variable: str
     ci_workflow: str
@@ -392,7 +383,6 @@ class MacActive:
     """The user's Mac processes seen by the activity check."""
 
     count: int
-    work: int
 
 
 @dataclass(frozen=True)
@@ -508,7 +498,6 @@ def read_config(target: str = "") -> MacTestConfig:
                  for key in ("ci_variable", "ci_workflow", "ci_job")}
 
     return MacTestConfig(
-        idle=idle_config(config),
         ci_repo=ci_repo,
         ci_variable=ci_fields["ci_variable"],
         ci_workflow=ci_fields["ci_workflow"],
@@ -593,14 +582,10 @@ def read_run(path: Path) -> RunState:
         if not holder_session.strip():
             raise StateReadError(f"{path} has an invalid holder_session")
         record["holder_session"] = holder_session
-    for field in ("idle_since", "work_idle_since"):
-        if field in values:
-            idle_since = values[field]
-            _ = aware_timestamp(idle_since, path, field)
-            if field == "idle_since":
-                record["idle_since"] = cast(str, idle_since)
-            else:
-                record["work_idle_since"] = cast(str, idle_since)
+    if "idle_since" in values:
+        idle_since = values["idle_since"]
+        _ = aware_timestamp(idle_since, path, "idle_since")
+        record["idle_since"] = cast(str, idle_since)
     if "copy" in values:
         if values["copy"] is not True:
             raise StateReadError(f"{path} has an invalid copy")
@@ -769,6 +754,19 @@ def read_block(path: Path) -> MacBlockState:
 def read_claim_block(paths: StatePaths) -> MacBlockState:
     """Read the block that refuses new claims until its record is removed."""
     return read_block(paths.block)
+
+
+def blocking_claim_block(paths: StatePaths) -> MacBlockState:
+    """Return the block that prevents this session from starting new work."""
+    block = read_claim_block(paths)
+    if isinstance(block, NoMacBlock) or block_belongs_to(block, build_hold.owning_session()):
+        return NO_MAC_BLOCK
+    return block
+
+
+def blocked_claim(block: PendingMacBlock | ActiveMacBlock) -> ClaimFinished:
+    print(f"blocked by {block.holder}: {block.reason}")
+    return ClaimFinished(10)
 
 
 def timestamp(value: datetime) -> str:
@@ -1635,25 +1633,17 @@ def mac_activity_script() -> str:
 mirror_pids=$(select_leftovers) || exit 1
 process_records=$(ps -axww -o pid=,uid=,comm=) || exit 1
 activity_user=$(id -u) || exit 1
-executable_records=$(printf '%s\n' "$process_records" | awk -v user="$activity_user" '
+executable_pids=$(printf '%s\n' "$process_records" | awk -v user="$activity_user" '
     $2 == user {
         executable = $0
         sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/, "", executable)
         name = executable
         sub(/^.*\//, "", name)
-        compiler = name == "cargo" || name == "rustc" || name == "cargo-nextest"
-        if (compiler || executable ~ /\/target\//)
-            print $1, (!compiler && executable ~ /\/target\// && executable !~ /\/deps\//) ? "app" : "work"
+        if (name == "cargo" || name == "rustc" || name == "cargo-nextest" || executable ~ /\/target\//)
+            print $1
     }') || exit 1
-executable_pids=$(printf '%s\n' "$executable_records" | awk '{ print $1 }') || exit 1
-app_pids=$(printf '%s\n' "$executable_records" | awk '$2 == "app" { print $1 }') || exit 1
-active_pids=$(printf '%s\n%s\n' "$mirror_pids" "$executable_pids" | awk '/^[0-9]+$/ && !seen[$0]++ { print $0 }') || exit 1
-work_count=$(printf '%s\n' "$app_pids" '--active--' "$active_pids" | awk '
-    $0 == "--active--" { active=1; next }
-    /^[0-9]+$/ { if (!active) app[$0]=1; else if (!app[$0]) count++ }
-    END { print count+0 }') || exit 1
-active_count=$(printf '%s\n' "$active_pids" | awk '/^[0-9]+$/ { count++ } END { print count+0 }') || exit 1
-printf 'active=%s\nwork=%s\nrc=0\n' "$active_count" "$work_count"
+active_count=$(printf '%s\n%s\n' "$mirror_pids" "$executable_pids" | awk '/^[0-9]+$/ && !seen[$0]++ { count++ } END { print count+0 }') || exit 1
+printf 'active=%s\nrc=0\n' "$active_count"
 '''
 
 
@@ -1675,19 +1665,16 @@ def check_mac_activity(config: MacTestConfig, host: str) -> MacActivity:
         reason = " ".join(result.stderr.split()) or f"SSH exited {result.returncode}"
         return ActivityCheckFailed(reason)
     lines = result.stdout.splitlines()
-    if (len(lines) != 3 or lines[2] != "rc=0" or not lines[0].startswith("active=")
-            or not lines[1].startswith("work=")):
+    if len(lines) != 2 or lines[1] != "rc=0" or not lines[0].startswith("active="):
         return ActivityCheckFailed("the activity check answer could not be read")
-    counts = [lines[0].removeprefix("active="), lines[1].removeprefix("work=")]
-    if any(not text.isascii() or not text.isdecimal() for text in counts):
+    count_text = lines[0].removeprefix("active=")
+    if not count_text.isascii() or not count_text.isdecimal():
         return ActivityCheckFailed("the activity check answer could not be read")
     try:
-        count, work = (int(text) for text in counts)
+        count = int(count_text)
     except ValueError:
         return ActivityCheckFailed("the activity check answer could not be read")
-    if work > count:
-        return ActivityCheckFailed("the activity check work count exceeds its active count")
-    return MacActive(count, work) if count else MacIdle()
+    return MacActive(count) if count else MacIdle()
 
 
 def claim_idle_clause(run: RunRecord) -> str:
@@ -1745,27 +1732,15 @@ def watch_claim(
         if isinstance(activity, ActivityCheckFailed):
             print(f"Mac claim activity check failed: {activity.reason}", flush=True)
             return True
-        changed = False
-        if isinstance(activity, MacActive) and activity.work > 0:
-            if "work_idle_since" in current:
-                del current["work_idle_since"]
-                changed = True
-        elif "work_idle_since" not in current:
-            current["work_idle_since"] = timestamp(now)
-            changed = True
         if isinstance(activity, MacActive):
             if "idle_since" in current:
                 del current["idle_since"]
-                changed = True
-            if changed:
                 write_json(claim.path, current)
             return True
         if "idle_since" not in current:
             current["idle_since"] = timestamp(now)
             write_json(claim.path, current)
             return True
-        if changed:
-            write_json(claim.path, current)
         idle_since = aware_timestamp(current["idle_since"], claim.path, "idle_since")
         if now - idle_since < timedelta(minutes=config.claim_idle_minutes):
             return True
@@ -2072,7 +2047,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         return ClaimFinished(12)
     overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, scope))
     try:
-        block = read_claim_block(paths)
+        block = blocking_claim_block(paths)
     except (OSError, StateReadError):
         print(f"state unreadable: {paths.block}")
         return ClaimFinished(12)
@@ -2094,7 +2069,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         for claim in overlapping:
             if (claim.record["pid"] == args.pid and claim.record["worktree"] == args.worktree
                     and not run_is_kept(claim.record) and "slot" in claim.record
-                    and (isinstance(block, NoMacBlock) or block_belongs_to(block, build_hold.owning_session()))):
+                    and isinstance(block, NoMacBlock)):
                 print(f"claimed\nslot: {claim.record['slot']}")
                 return ClaimFinished(0)
         for slot in slots:
@@ -2108,10 +2083,9 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
             record = claim.record
             if scopes_overlap(claim.scope, scope) and run_is_kept(record):
                 return take_over_kept_claim(args, claim, record)
+    if not isinstance(block, NoMacBlock):
+        return blocked_claim(block)
     owner = build_hold.owning_session()
-    if not isinstance(block, NoMacBlock) and not block_belongs_to(block, owner):
-        print(f"blocked by {block.holder}: {block.reason}")
-        return ClaimFinished(10)
     if overlapping:
         # A test copy gives way to any new step; a copy never replaces a copy.
         if not args.copy and all(copy_gives_way(claim.record) for claim in overlapping):
@@ -2184,6 +2158,16 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope) -
     if len(owners) != 1 or not isinstance(args.remote, str):
         return ClaimFinished(12)
     claim = owners[0]
+    # A reservation grants capacity. A later block still prevents new work.
+    # Retained remote work keeps its cleanup path.
+    if "remote_host" not in claim.record:
+        try:
+            block = blocking_claim_block(paths)
+        except (OSError, StateReadError):
+            print(f"state unreadable: {paths.block}")
+            return ClaimFinished(12)
+        if not isinstance(block, NoMacBlock):
+            return blocked_claim(block)
     record: RemoteJobClaim
     if "remote_host" in claim.record:
         record = {**claim.record}
@@ -2295,8 +2279,8 @@ def free_now(
         return "backoff"
     scope = target_claim_scope(paths, str(repo_root))
     try:
-        block = read_claim_block(paths)
-        if not isinstance(block, NoMacBlock) and not block_belongs_to(block, build_hold.owning_session()):
+        block = blocking_claim_block(paths)
+        if not isinstance(block, NoMacBlock):
             return "blocked"
         claims = read_claims(paths)
     except (OSError, StateReadError):
@@ -2662,6 +2646,7 @@ def parser() -> argparse.ArgumentParser:
     _ = claim.add_argument("--wait", type=float, default=0.0)
     _ = claim.add_argument("--remote", type=remote_host_argument, default=NO_REMOTE_JOB)
     _ = claim.add_argument("--copy", action="store_true")
+
     _ = claim.add_argument("--from-pid", type=int, default=0)
     wait_claim = commands.add_parser("claim-wait")
     _ = wait_claim.add_argument("--pid", type=int, required=True)
@@ -2720,11 +2705,7 @@ def dispatch_command(args: CliArguments, paths: StatePaths) -> int:
         return command_free_now(args, paths)
     if args.command == "status" and args.target:
         return command_target_status(paths)
-    try:
-        config = read_config(args.target)
-    except MacIdleConfigError as error:
-        print(f"mac_test: {error}", file=sys.stderr)
-        return 2
+    config = read_config(args.target)
     if args.command == "block":
         return command_block(args, paths, config)
     if args.command == "unblock":

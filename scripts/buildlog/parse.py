@@ -12,8 +12,11 @@ than 0: None means "not measured", never "zero".
 
 from __future__ import annotations
 
+import os
 import re
-from pathlib import PurePath
+import shlex
+from collections.abc import Mapping
+from pathlib import Path, PurePath
 from typing import TypedDict
 
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
@@ -103,20 +106,49 @@ def no_facts() -> LogFacts:
     }
 
 
-def command_words(argv: list[str]) -> list[str]:
-    """argv without a leading `env` and its options and NAME=VALUE words."""
-    if not argv or PurePath(argv[0]).name != "env":
-        return argv
-    index = 1
-    while index < len(argv):
-        word = argv[index]
-        if word in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string"):
-            index += 2
-        elif word.startswith("-") or "=" in word:
-            index += 1
+def command_context(argv: list[str], cwd: str, environment: Mapping[str, str]) -> tuple[list[str], str, dict[str, str]]:
+    """Apply env options and assignments before identifying the command."""
+    words, effective = list(argv), dict(environment)
+    if not words or PurePath(words[0]).name != "env":
+        return words, cwd, effective
+    position, options = 1, True
+    while position < len(words):
+        word = words[position]
+        if options and word == "--":
+            options = False
+        elif options and word in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string"):
+            if position + 1 >= len(words):
+                return [], cwd, effective
+            value = words[position + 1]
+            if word in ("-u", "--unset"):
+                _ = effective.pop(value, None)
+            elif word in ("-C", "--chdir"):
+                cwd = str((Path(cwd) / value).resolve())
+            else:
+                words[position:position + 2] = shlex.split(value)
+                continue
+            position += 1
+        elif options and word.startswith("--unset="):
+            _ = effective.pop(word.partition("=")[2], None)
+        elif options and word.startswith("--chdir="):
+            cwd = str((Path(cwd) / word.partition("=")[2]).resolve())
+        elif options and word in ("-i", "--ignore-environment", "-"):
+            effective.clear()
+        elif options and word in ("-v", "--debug"):
+            pass
+        elif "=" in word and not word.startswith("-"):
+            name, _, value = word.partition("=")
+            effective[name] = value
+            options = False
         else:
             break
-    return argv[index:]
+        position += 1
+    return words[position:], cwd, effective
+
+
+def command_words(argv: list[str]) -> list[str]:
+    """Return the command after its env options and assignments."""
+    return command_context(argv, os.getcwd(), {})[0]
 
 
 def step_name(argv: list[str]) -> str:

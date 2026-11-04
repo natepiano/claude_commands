@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
 import re
@@ -29,7 +28,9 @@ import process_group
 
 from add_style import NoStyleProduction, standing_style_production
 from production_units import Refusal
+from scripts.copies import copies
 from scripts.message import send_result
+from scripts.message import send_budget
 from scripts.production import showrunners
 import style_ledger
 from process_failure import failure_detail
@@ -37,10 +38,7 @@ import scratch
 
 PYTHON = SCRIPTS / "lib/py"
 SEND = SCRIPTS / "message/send.py"
-# send.py delivers for up to --timeout, then may spend its KILL_GRACE (10 s) stopping a relay, then logs.
-# Its own run is the bound: stopping it sooner reports a send it delivered as failed.
 SEND_SECONDS = 10
-SEND_RUN_SECONDS = SEND_SECONDS + 10 + 15
 ROSTER = SCRIPTS / "message/roster.py"
 SHOWRUNNERS = SCRIPTS / "production/showrunners.py"
 VERIFY = SCRIPTS / "direct/verify.sh"
@@ -48,7 +46,6 @@ LEDGER = SCRIPTS / "style/style_ledger.py"
 TOOLS: tuple[style_ledger.LintTool, ...] = ("clippy", "mend", "rustfmt")
 # Each lint run owns one `style-sync-lint-*` dir here; a later run removes the dir of a run that was killed.
 LINT_TEMP_PARENT: Path | build_folders.InheritedTemporaryParent = build_folders.InheritedTemporaryParent()
-LINT_PREFIX = build_folders.FOLDER_PREFIXES["style-sync-lint"]
 OWNER_FILE = "owner.json"
 # Written by the verifier itself, so a SIGKILL of the owner right after Popen still leaves its group recorded.
 VERIFIER_FILE = "verifier.pgid"
@@ -89,7 +86,7 @@ def notify(repo_dir: Path, branch: str, tip: str) -> None:
             "--text", f"From {caller}: branch point {branch} moved to {tip[:7]}; sync.",
             "--key", f"style-sync:{standing.slug}",
             "--timeout", str(SEND_SECONDS),
-        ], capture_output=True, text=True, check=False, timeout=SEND_RUN_SECONDS)
+        ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
         outcome = send_result.send_outcome(sent.returncode, sent.stdout)
         if isinstance(outcome, send_result.ConfirmedSendOutcome):
             match outcome.header.outcome:
@@ -101,6 +98,11 @@ def notify(repo_dir: Path, branch: str, tip: str) -> None:
     except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
         detail = " ".join(str(error).splitlines()).removeprefix("style_sync: ")
         print("style_sync: notify: " + detail)
+
+
+def lint_prefix() -> str:
+    """Read the current prefix for style lint folders."""
+    return build_folders.FOLDER_PREFIXES["style-sync-lint"]
 
 
 def lint_temp_parent() -> Path:
@@ -337,7 +339,7 @@ def sweep_stale_lint_dirs() -> None:
     A dir without a readable owner record, or whose owner or verifier group runs, stays: a reused id
     keeps a dir, it never removes a running checkout. A failure prints one line and the run continues.
     """
-    for directory in sorted(lint_temp_parent().glob(f"{LINT_PREFIX}*")):
+    for directory in sorted(lint_temp_parent().glob(f"{lint_prefix()}*")):
         try:
             remove_if_stale(directory)
         # Any failure of one dir's sweep; LintStopped and KeyboardInterrupt are not an Exception.
@@ -345,21 +347,13 @@ def sweep_stale_lint_dirs() -> None:
             print(f"style_sync: sweep {directory}: " + " ".join(str(error).splitlines()))
 
 
-def lint_target(common_dir: Path) -> Path:
-    """One Cargo target per main repo, retained across style production tasks."""
-    target = common_dir / scratch.STYLE_TARGET_NAME
-    scratch.mark_cargo_cache(target)
-    _ = scratch.release(target)
-    return target
-
-
-@contextmanager
-def locked_lint_target(common_dir: Path) -> Generator[Path]:
-    """Serialize checkout creation through cleanup, so source times postdate prior fingerprints."""
-    target = lint_target(common_dir)
-    with (target / scratch.STYLE_LOCK_NAME).open("a") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        yield target
+def gate_owner(repo: Path) -> str:
+    """Use the registered style production, or the calling production."""
+    standing = standing_style_production(repo)
+    if not isinstance(standing, NoStyleProduction):
+        return standing.slug
+    owner = showrunners.own_slug()
+    return owner or copies.fallback_owner("style")
 
 
 def lint(repo: Path, checkout: Path, tip: str) -> int:
@@ -370,21 +364,18 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
         raise Refusal("--repo and --checkout must belong to the same repository")
     sweep_stale_lint_dirs()
     # Signals stay held outside the work, so the dir never exists without its record and its cleanup path.
-    with stop_signals_raise(), locked_lint_target(Path(common_dir)) as target, signal_mask(signal.SIG_BLOCK):
+    with stop_signals_raise(), copies.standing(gate_owner(repo), checkout, tip) as snapshot, signal_mask(signal.SIG_BLOCK):
         directory = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
-            LINT_PREFIX, build_folders.ExplicitBuildParent(lint_temp_parent())))
-        snapshot = directory / "checkout"
+            lint_prefix(), build_folders.ExplicitBuildParent(lint_temp_parent())))
         try:
             OwnerRecord(os.getpid(), Path(common_dir)).write(directory)
             with signal_mask(signal.SIG_UNBLOCK):
-                _ = git(checkout, "worktree", "add", "--detach", str(snapshot), tip)
-                target_link = snapshot / "target"
-                target_link.symlink_to(target, target_is_directory=True)
+                (directory / "checkout").symlink_to(snapshot, target_is_directory=True)
                 returncode, output = verify_lint(directory)
                 print(output, end="")
-                # The generated target link is ours, including in a repo without a target ignore rule.
+                # Build outputs are retained; only source changes invalidate coverage.
                 rewritten = bool(git(snapshot, "status", "--porcelain", "--", ".", ":(exclude)target"))
-                rewritten = rewritten or not target_link.is_symlink() or target_link.readlink() != target
+                rewritten = rewritten or (snapshot / "target").is_symlink()
                 records = lint_records(output, snapshot)
                 for record in records:
                     passed = record.passed and not rewritten
@@ -423,7 +414,7 @@ def handoff_notice(slug: str, parent: str, checkpoint: str) -> HandoffDelivery:
         str(PYTHON), str(SEND), "--to", address, "--from", slug,
         "--text", f"From the showrunner of {slug}: hand-off {checkpoint}",
         "--timeout", str(SEND_SECONDS),
-    ], capture_output=True, text=True, check=False, timeout=SEND_RUN_SECONDS)
+    ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
     outcome = send_result.send_outcome(result.returncode, result.stdout)
     if isinstance(outcome, send_result.ConfirmedSendOutcome):
         if outcome.header.outcome in {"queued", "kept"}:
@@ -501,7 +492,7 @@ def wake_waiters(repo: Path, ticket_id: str) -> None:
                     str(PYTHON), str(SEND), "--to", addresses[0], "--from", standing.slug,
                     "--text", f"From the showrunner of {standing.slug}: ticket {ticket_id} merged; refill.",
                     "--timeout", str(SEND_SECONDS),
-                ], capture_output=True, text=True, check=False, timeout=SEND_RUN_SECONDS)
+                ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
                 if result.returncode:
                     raise Refusal(f"send.py: {failure_detail(result)}")
             except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
@@ -608,7 +599,7 @@ def main(argv: list[str] | None = None) -> int:
     except LintStopped as stopped:
         print(f"style_sync: {stopped}", file=sys.stderr)
         return 128 + stopped.signum
-    except (Refusal, style_ledger.LedgerError, scratch.ScratchError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+    except (copies.CopyError, Refusal, style_ledger.LedgerError, scratch.ScratchError, OSError, ValueError, subprocess.TimeoutExpired) as error:
         print("style_sync: " + " ".join(str(error).splitlines()), file=sys.stderr)
         return 2
 

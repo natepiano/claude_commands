@@ -1,6 +1,6 @@
 """Script phone texts and named cases reviewed before delivery."""
 from gpu_xid import XID_MEANINGS
-from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, SessionTemplate
+from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, SessionTemplate, decision_values
 
 # Codex usage destination: https://learn.chatgpt.com/docs/pricing (read 2026-10-14).
 # Real quota case: notify/review.jsonl, 2026-10-13T22:30:22.569264-04:00.
@@ -8,34 +8,27 @@ from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, Se
 # typical cases use existing test facts or the Nix thresholds, never invented log citations.
 
 
-def mac_idle_reservation(holder: str, detail: str) -> str:
-    """The optional reservation sentence used as a catalog value."""
-    return (f'The Mac reservation lists holder "{holder}" and label "{detail}".'
-            if holder not in ("", "none") else "")
-
-
 ENTRIES = (
-    PushText("mac_idle.blocked", "Mac idle watch", "blocked", "{holder} blocks waiting Mac tests",
-        ActionTemplate("On natedev, in the {holder} session, ask it to finish its Mac work and run /build:mac unblock"),
-        "No natedev build or test has run on the Mac for {minutes} minutes, since {since}. "
-        + "{waiting} steps wait behind the {holder} session's block. It labeled the reservation \"{detail}\". "
-        + "Waiting work can use the Mac after {clears}.",
-        (PushExample("research_block", {"minutes": "10", "waiting": "7", "holder": "research",
-            "detail": "P15 F11 L0 run", "since": "07:47 EDT", "clears": "/build:mac unblock by research"}),
-         PushExample("three_waiting", {"minutes": "12", "waiting": "3", "holder": "research",
-            "detail": "P15 F11 L0 run", "since": "07:47 EDT", "clears": "/build:mac unblock by research"})),
-        purpose="A Mac block holds up eligible steps past the configured threshold."),
-    PushText("mac_idle.stuck", "Mac idle watch", "decision", "Waiting tests are not using the Mac",
-        ActionTemplate("On natedev, ask the builds showrunner to get the waiting steps onto the Mac"),
-        "No natedev build or test has run on the Mac for {minutes} minutes, since {since}. "
-        + "{waiting} steps wait. {reservation} "
-        + "To restore Mac work: {clears}.",
-        (PushExample("idle_research_claim", {"minutes": "10", "waiting": "3",
-            "reservation": mac_idle_reservation("research", "P15 F11 L0 run"), "since": "07:50 EDT", "clears": "release of the idle claim P15 F11 L0 run"}),
-         PushExample("free_mac", {"minutes": "10", "waiting": "7",
-            "reservation": mac_idle_reservation("none", ""), "since": "07:47 EDT",
-            "clears": "the builds showrunner checks why the waiting steps do not take the Mac"})),
-        purpose="Eligible steps wait while the Mac has no build or test."),
+    PushText("decision.choices", "{sender}", "decision", "{title}",
+        ActionTemplate("On {machine}, reply in the {session} terminal: {choice_labels}."),
+        "Situation: {situation}\n\nChoices:\n{choices}\n\n"
+        + "Recommendation: {recommended_choice}. {recommendation_reason}",
+        (PushExample("hana", {
+            "sender": "hana", "title": "Assembly opening stalls on cable routes", "session": "hana", "machine": "natedev",
+            "situation": "Opening an Assembly stalls for several seconds because each animation frame recalculates all 26 cable routes.",
+            "choices": '[{"label":"Fix now","effect":"cables-unit makes this small fix, then returns to its hold. Assemblies open without this stall."},{"label":"Wait","effect":"cables-unit remains on hold. The stall remains until its cable work resumes."}]',
+            "recommended_choice": "Fix now",
+            "recommendation_reason": "The small fix removes the stall without resuming the rest of the held cable work."}),),
+        purpose="A decision with structured choices and a recommendation.", session=SessionTemplate("{session}"),
+        agent_written=True, expand_values=decision_values),
+    PushText("review_watch.acknowledge", "{session}", "decision", "Review report needs your acknowledgment",
+        ActionTemplate("In the {session} terminal on {machine}, acknowledge the review report."),
+        "Situation: {report}\n\nChoices:\n"
+        + "Acknowledge: You confirm that you read the report. Later build reports stop showing this reminder.\n"
+        + "Wait: The reminder remains in later build reports.\n\n"
+        + "Recommendation: Acknowledge after you read the report.",
+        (PushExample("report", {"session": "natedev", "machine": "natedev", "report": "12 of 12 phases that change the screen merged without the extra code reviewer: report ready, waiting for your acknowledgment"}),),
+        purpose="A build report reminds you to acknowledge its review report.", session=SessionTemplate("{session}"), agent_written=True),
     PushText("build_admission.down", "build-admission", "note", "Build admission service is down",
         NoActionNeeded(), "build admission service is down; builds wait",
         (PushExample("down", {}),), purpose="The service has not answered for two minutes."),

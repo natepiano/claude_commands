@@ -60,11 +60,11 @@ import build_hold
 import override_guard
 from user_zone import user_zone
 if TYPE_CHECKING:
-    from ..buildlog import mac_idle_alert
+    from ..direct.step_record import Pinned, ROUTED, TargetSelection
     from ..message import roster
     from ..aws_target import config as aws_config, ledger as cost_ledger, measurement
 else:
-    from scripts.buildlog import mac_idle_alert
+    from scripts.direct.step_record import Pinned, ROUTED, TargetSelection
     from scripts.message import roster
     from scripts.aws_target import config as aws_config, ledger as cost_ledger, measurement
 
@@ -101,7 +101,8 @@ def local_time(instant: datetime) -> str:
     return instant.astimezone(user_zone()).strftime("%H:%M %Z")
 
 
-display_field = mac_idle_alert.display_field
+def display_field(value: str) -> str:
+    return " ".join(value.split())
 
 
 def unit_label_suffix(state: RunningJob | Held, labels: Mapping[RunningJob | Held, roster.UnitLabels]) -> str:
@@ -211,9 +212,6 @@ def command_status(probe: bool = False) -> int:
     except Exception:
         identities = {}
     labels = {state: identities[session_id] for state, session_id in holders.items() if session_id in identities}
-    alert = mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", time.time(), user_zone())
-    if alert is not None:
-        print(f"\033[1;31m{alert}\033[0m" if sys.stdout.isatty() else alert)
     for name, state in states:
         print(format_state(name, state, labels))
     return 0
@@ -284,7 +282,8 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
 
 
 def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
-                           kind: StepKind, routing: Routing) -> EligibleTarget | ExcludedTarget:
+                           kind: StepKind, routing: Routing, *, selection: TargetSelection = ROUTED
+                           ) -> EligibleTarget | ExcludedTarget:
     """Read Linux policy and capacity without evaluating a development shell."""
     if target.platform == "macos":
         return mac_target_eligibility(target, repo_root, package, kind, routing)
@@ -300,6 +299,12 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
     if isinstance(policy, offload.IneligibleMacStep):
         return ExcludedTarget(target, policy.reason)
     paths = mac_test.state_paths(target.name)
+    if isinstance(selection, Pinned) and is_aws_target(target):
+        control = mac_test.read_json_object(paths.directory / "controller.json") or {}
+        if control.get("state") in ("stopped", "starting", "pending", "stopping"):
+            return ExcludedTarget(target, "starting")
+        if control.get("state") == "refused":
+            return ExcludedTarget(target, str(control.get("reason", "controller refused")))
     answer = mac_test.free_now(paths, target.settings, repo_root)
     if answer != "free":
         return ExcludedTarget(target, answer)
@@ -335,6 +340,25 @@ def ssh_target_config(target: SshTarget) -> offload.OffloadConfig | ExcludedTarg
         return ExcludedTarget(target, "spending_unavailable")
 
 
+def command_pinned_eligible(args: CliArguments, routing: Routing) -> int:
+    """Use normal eligibility, but wait for stopped AWS capacity before its reachability check."""
+    try:
+        target = offload.configured_ssh_target(args.target)
+        if args.kind not in ("test", "check", "doc"):
+            raise ValueError("--target supports test, check, and doc only")
+        kind = cast(StepKind, args.kind)
+        result = ssh_target_eligibility(target, Path(args.repo_root), args.package, kind, routing,
+                                        selection=Pinned(target.name))
+        if isinstance(result, ExcludedTarget) and result.reason not in ("busy", "blocked", "starting"):
+            raise ValueError(f"target {target.name} refused: {result.reason}")
+        print("ssh_allowed")
+        print_eligible_target(result)
+        return 0
+    except (ConfigError, OSError, UnicodeError, ValueError) as error:
+        print(f"build targets: {error}", file=sys.stderr)
+        return 2
+
+
 def owns_wait_claim(paths: mac_test.StatePaths, repo_root: str, pid: int) -> bool:
     """Find the same process's reservation, including retained cleanup ownership."""
     start = mac_test.process_start_time(pid)
@@ -342,9 +366,11 @@ def owns_wait_claim(paths: mac_test.StatePaths, repo_root: str, pid: int) -> boo
         return False
     scope = mac_test.target_claim_scope(paths, repo_root)
     with mac_test.locked(paths.lock):
+        block = mac_test.blocking_claim_block(paths)
         return any(mac_test.scopes_overlap(claim.scope, scope)
                    and claim.record["pid"] == pid and claim.record["proc_start"] == start
                    and ("remote_host" not in claim.record or claim.record.get("cleanup_pending"))
+                   and (isinstance(block, mac_test.NoMacBlock) or "remote_host" in claim.record)
                    for claim in mac_test.read_claims(paths))
 
 
@@ -802,6 +828,7 @@ def parser() -> argparse.ArgumentParser:
     _ = eligible.add_argument("--package", default="")
     _ = eligible.add_argument("--kind", choices=("check", "lint", "doc", "test", "build", "example", "final"), default="")
     _ = eligible.add_argument("--local", dest="local_reason", default="")
+    _ = eligible.add_argument("--target", default="")
     register = commands.add_parser("register-local")
     _ = register.add_argument("--call-id", required=True)
     _ = register.add_argument("--pid", type=positive_pid, required=True)
@@ -830,6 +857,8 @@ def main() -> int:
         return command_release_wait(args.pid)
     if args.command == "eligible":
         routing = LocalRequired(args.local_reason) if args.local_reason else ANY_ELIGIBLE_TARGET
+        if args.target:
+            return command_pinned_eligible(args, routing)
         if args.kind:
             return command_kind_eligible(Path(args.repo_root).resolve(), args.package, cast(StepKind, args.kind), routing)
         return command_eligible(Path(args.repo_root).resolve(), args.package, routing)

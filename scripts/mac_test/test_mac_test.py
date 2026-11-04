@@ -40,12 +40,10 @@ else:
     from scripts.lib import test_hang_guard
 
 if TYPE_CHECKING:
-    from ..buildlog.mac_idle_test_support import NotificationGuardedTestCase
     from ..production.cli_fixture import invoke_cli
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
     from cli_fixture import invoke_cli
-    from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase
 
 
 SCRIPT = Path(__file__).with_name("mac_test.py")
@@ -329,7 +327,7 @@ class HoldEventRecord(TypedDict):
 
 
 @final
-class MacTestCommandTests(NotificationGuardedTestCase):
+class MacTestCommandTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
@@ -353,7 +351,6 @@ class MacTestCommandTests(NotificationGuardedTestCase):
 
     @override
     def setUp(self) -> None:
-        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.state_directory = self.root / "state"
         self.stub_directory = self.root / "stubs"
@@ -902,6 +899,21 @@ class MacTestCommandTests(NotificationGuardedTestCase):
                                                  environment=environment), 10, "blocked by alice: release work\n")
                 self.assertFalse((self.state_directory / "run.json").exists())
 
+    def test_a_memory_wait_reservation_cannot_transfer_after_another_session_blocks_the_mac(self) -> None:
+        self.write_config(offload="on")
+        waiter = self.start_child()
+        runner = self.start_child()
+        claimed = self.command("claim", "--pid", str(waiter.pid),
+                               "--worktree", str(self.root), "--what", "mend sample")
+        self.assert_command(claimed, 0, "claimed\n")
+        before = self.run_state()
+        _ = self.write_block(session="assembly-session", free_message={"kind": "not_needed"})
+        self.assert_command(self.command("free-now", "--repo-root", str(self.root)), 1, "blocked\n")
+        result = self.command("claim", "--pid", str(runner.pid), "--from-pid", str(waiter.pid),
+                              "--worktree", str(self.root), "--remote", "test-mac", "--what", "mend sample")
+        self.assert_command(result, 10, "blocked by alice: release work\n")
+        self.assertEqual(self.run_state(), before)
+
     def test_free_now_reads_past_own_block_to_free_or_busy(self) -> None:
         self.write_config(offload="on")
         _ = self.write_block(session="session-a", free_message={"kind": "not_needed"})
@@ -1245,44 +1257,6 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         reaper.join(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertEqual(copy.returncode, -15)
         self.assertEqual(self.repository_claim("hana")["pid"], taker.pid)
-
-    def test_queued_test_stops_a_copy_before_claiming_the_mac(self) -> None:
-        hana = self.repository("hana")
-        self.write_config(offload="on", ci_repo="", **{"linux_only.hana": ""})
-        copy, taker = self.start_child(), self.start_child()
-        self.assert_command(self.copy_claim(copy.pid, hana), 0, "claimed\n")
-        reaper = threading.Thread(target=copy.wait)
-        reaper.start()
-        try:
-            result = self.command("claim-wait", "--pid", str(taker.pid),
-                                  "--repo-root", str(hana), "--package", "hana")
-            self.assert_command(result, 0, "claimed\n")
-            reaper.join(timeout=10)
-            self.assertEqual(copy.returncode, -15)
-            self.assertEqual(self.repository_claim("hana")["pid"], taker.pid)
-        finally:
-            if copy.poll() is None:
-                copy.kill()
-            reaper.join(timeout=10)
-
-    def test_queued_test_keeps_waiting_when_a_copy_does_not_yield(self) -> None:
-        hana = self.repository("hana")
-        self.write_config(offload="on", ci_repo="", **{"linux_only.hana": ""})
-        copy = self.start_script_child("import signal\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)")
-        taker = self.start_child()
-        try:
-            self.assert_command(self.copy_claim(copy.pid, hana), 0, "claimed\n")
-            held = self.repository_claim("hana")
-            started = time.monotonic()
-            result = self.command("claim-wait", "--pid", str(taker.pid),
-                                  "--repo-root", str(hana), "--package", "hana",
-                                  environment={**self.environment, "MAC_TEST_COPY_YIELD_S": "0.5"})
-            self.assertEqual(result.returncode, 11, result.stdout + result.stderr)
-            self.assertGreaterEqual(time.monotonic() - started, 0.5)
-            self.assertIsNone(copy.poll())
-            self.assertEqual(self.repository_claim("hana"), held)
-        finally:
-            copy.kill()
 
     def test_copy_that_does_not_stop_leaves_the_new_test_busy(self) -> None:
         hana = self.repository("hana")
@@ -2862,34 +2836,17 @@ subprocess.run = expire_gh
         self.assertEqual(status.returncode, 0, stdout + stderr)
 
 
-class MacActivityScriptTests(NotificationGuardedTestCase):
-    def test_app_is_active_without_work_but_deps_and_compilers_are_work(self) -> None:
-        for executable, work in (("/mirror/target/debug/hana", 0),
-                                 ("/mirror/target/debug/deps/hana-abc", 1),
-                                 ("/toolchain/bin/cargo", 1), ("/toolchain/bin/rustc", 1),
-                                 ("/toolchain/bin/cargo-nextest", 1)):
-            with self.subTest(executable=executable):
-                # Shell functions supply the Mac process snapshot; execute the actual selector and awk.
-                setup = ("id() { echo 501; }\npgrep() { echo 42; }\nlsof() { printf 'p42\nn/mirror\\n'; }\n"
-                         + f"ps() {{ printf '42 501 {executable}\\n'; }}\n")
-                result = subprocess.run(["bash", "-c", setup + mac_test.mac_activity_script()],
-                                        capture_output=True, text=True, timeout=10, check=False)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout, f"active=1\nwork={work}\nrc=0\n")
-
-
 class ClaimPassEnded(Exception):
     """Stop the test after one claim watcher pass."""
 
 
-class ClaimWatchTests(NotificationGuardedTestCase):
+class ClaimWatchTests(unittest.TestCase):
     root: Path = Path()
     paths: mac_test.StatePaths = mac_test.StatePaths(Path())
     now: datetime = datetime(2026, 10, 13, 12, 30, tzinfo=timezone.utc)
 
     @override
     def setUp(self) -> None:
-        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.paths = mac_test.StatePaths(self.root / "state")
         self.paths.directory.mkdir()
@@ -2905,13 +2862,6 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         _ = self.enterContext(mock.patch.object(mac_test, "process_start_time", return_value="owner-start"))
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=AssertionError("Unexpected external command")))
         _ = self.enterContext(mock.patch.object(subprocess, "Popen", side_effect=AssertionError("Unexpected external command")))
-
-    def test_complete_idle_config_is_read_once_by_mac_test(self) -> None:
-        selected = Path(os.environ["MAC_TEST_CONFIG"])
-        _ = selected.write_text((SCRIPT.parents[1].parent / "config/mac_test.conf").read_text())
-        with mock.patch.object(Path, "read_text", autospec=True, side_effect=Path.read_text) as opened:
-            _ = mac_test.read_config()
-        self.assertEqual([call.args[0] for call in opened.call_args_list], [selected])
 
     def write_claim(self, **changes: object) -> dict[str, object]:
         record: dict[str, object] = {
@@ -2944,7 +2894,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
             with self.paths.lock.open("a+") as state_lock:
                 fcntl.flock(state_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 fcntl.flock(state_lock.fileno(), fcntl.LOCK_UN)
-            return mac_test.MacActive(3, 3)
+            return mac_test.MacActive(3)
 
         with mock.patch.object(mac_test, "check_mac_activity", side_effect=check) as activity, \
              mock.patch.object(mac_test, "send_message") as send:
@@ -2952,19 +2902,6 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         activity.assert_called_once()
         send.assert_not_called()
         _ = record.pop("idle_since")
-        self.assertEqual(self.read_claim(), record)
-
-    def test_parked_app_sets_work_idle_without_releasing_claim_and_test_clears_it(self) -> None:
-        record = self.write_claim(idle_since="2026-10-13T12:00:00+00:00")
-        with mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacActive(1, 0)), \
-             mock.patch.object(mac_test, "send_message") as send:
-            _ = self.watch_once()
-            _ = self.watch_once()
-        _ = record.pop("idle_since")
-        self.assertEqual(self.read_claim(), {**record, "work_idle_since": mac_test.timestamp(self.now)})
-        send.assert_not_called()
-        with mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacActive(1, 1)):
-            _ = self.watch_once()
         self.assertEqual(self.read_claim(), record)
 
     def test_first_idle_pass_records_now_and_process_claim_uses_config_host(self) -> None:
@@ -2976,8 +2913,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
             _ = self.watch_once()
         self.assertEqual(activity.call_args.args[1], "config-mac")
         send.assert_not_called()
-        self.assertEqual(self.read_claim(), {**record, "idle_since": mac_test.timestamp(self.now),
-                          "work_idle_since": mac_test.timestamp(self.now)})
+        self.assertEqual(self.read_claim(), {**record, "idle_since": mac_test.timestamp(self.now)})
 
     def test_dead_process_claim_ends_pass_without_activity_write_or_message(self) -> None:
         record = self.write_claim()
@@ -3010,15 +2946,8 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         send.assert_not_called()
         self.assertEqual(self.paths.run.read_bytes(), before)
 
-    def test_legacy_idle_claim_gains_work_idle_since_on_next_pass(self) -> None:
-        record = self.write_claim(idle_since=mac_test.timestamp(self.now - timedelta(minutes=1)))
-        with mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()):
-            _ = self.watch_once()
-        self.assertEqual(self.read_claim(), {**record, "work_idle_since": mac_test.timestamp(self.now)})
-
     def test_idle_pass_before_fifteen_minutes_keeps_claim(self) -> None:
-        record = self.write_claim(idle_since=mac_test.timestamp(self.now - timedelta(minutes=15) + timedelta(seconds=1)),
-                                  work_idle_since=mac_test.timestamp(self.now - timedelta(minutes=15) + timedelta(seconds=1)))
+        record = self.write_claim(idle_since=mac_test.timestamp(self.now - timedelta(minutes=15) + timedelta(seconds=1)))
         with mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()), \
              mock.patch.object(mac_test, "send_message") as send:
             _ = self.watch_once()
@@ -3117,8 +3046,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         send.assert_not_called()
         for name, record in records.items():
             with self.subTest(name=name):
-                self.assertEqual(self.read_repository_claim(name), {**record, "idle_since": mac_test.timestamp(self.now),
-                          "work_idle_since": mac_test.timestamp(self.now)})
+                self.assertEqual(self.read_repository_claim(name), {**record, "idle_since": mac_test.timestamp(self.now)})
 
     def test_idle_release_removes_only_that_repository_claim(self) -> None:
         records = self.write_repository_claims(idle_since=mac_test.timestamp(self.now - timedelta(minutes=15)))
@@ -3128,8 +3056,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         activity.assert_called_once()
         self.assertFalse((self.paths.claims / "hana.json").exists())
         self.assertEqual(self.read_repository_claim("cargo-liner"),
-                         {**records["cargo-liner"], "idle_since": mac_test.timestamp(self.now),
-                          "work_idle_since": mac_test.timestamp(self.now)})
+                         {**records["cargo-liner"], "idle_since": mac_test.timestamp(self.now)})
         send.assert_called_once()
         self.assertTrue(cast(str, send.call_args.args[4]).endswith(
             "claim --pid $$ --what 'hana tests' --worktree '/work/hana' --remote 'claim-mac' (see /build:mac)."))
@@ -3151,7 +3078,6 @@ class ClaimWatchTests(NotificationGuardedTestCase):
                 record = self.write_claim()
                 if idle_recorded:
                     record["idle_since"] = mac_test.timestamp(self.now - timedelta(hours=1))
-                    record["work_idle_since"] = mac_test.timestamp(self.now - timedelta(hours=1))
                     _ = self.paths.run.write_text(json.dumps(record))
                 with mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.ActivityCheckFailed("ssh timed out")), \
                      mock.patch.object(mac_test, "send_message") as send:
@@ -3210,7 +3136,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
 
     def test_activity_check_requires_readable_success_and_uses_one_bounded_ssh(self) -> None:
         config = mac_test.read_config()
-        for answer, expected in (("active=0\nwork=0\nrc=0\n", mac_test.MacIdle()), ("active=3\nwork=3\nrc=0\n", mac_test.MacActive(3, 3))):
+        for answer, expected in (("active=0\nrc=0\n", mac_test.MacIdle()), ("active=3\nrc=0\n", mac_test.MacActive(3))):
             with self.subTest(answer=answer), mock.patch.object(
                 subprocess, "run", return_value=subprocess.CompletedProcess([], 0, answer, ""),
             ) as run:
@@ -3219,8 +3145,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
                 self.assertEqual(run.call_args.args[0][0], "ssh")
                 self.assertEqual(run.call_args.args[0][-2], "claim-host")
                 self.assertEqual(run.call_args.kwargs["timeout"], 10)
-        for answer in ("active=0\n", "rc=0\n", "active=-1\nrc=0\n", "active=x\nrc=0\n", "active=0\nrc=1\n",
-                       "active=3\nwork=x\nrc=0\n", "active=0\nwork=1\nrc=0\n", "active=3\nwork=-1\nrc=0\n"):
+        for answer in ("active=0\n", "rc=0\n", "active=-1\nrc=0\n", "active=x\nrc=0\n", "active=0\nrc=1\n"):
             with self.subTest(answer=answer), mock.patch.object(
                 subprocess, "run", return_value=subprocess.CompletedProcess([], 0, answer, ""),
             ):
@@ -3230,19 +3155,6 @@ class ClaimWatchTests(NotificationGuardedTestCase):
                 self.assertIsInstance(mac_test.check_mac_activity(config, "claim-host"), mac_test.ActivityCheckFailed)
         with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 255, "active=0\nrc=0\n", "unreachable")):
             self.assertIsInstance(mac_test.check_mac_activity(config, "claim-host"), mac_test.ActivityCheckFailed)
-
-    def test_idle_alert_config_reads_values_and_refuses_invalid_values_without_history(self) -> None:
-        path = self.root / "mac_test.conf"
-        _ = write_config_fixture(path, "alert_seconds=7\npush_seconds=11\nstale_seconds=13\n"
-                                 + "repeat_minutes=17\nsend_timeout_s=19\n")
-        configured = mac_test.read_config().idle
-        self.assertEqual((configured.alert_seconds, configured.push_seconds, configured.stale_seconds,
-                          configured.repeat_minutes, configured.send_timeout_s), (7, 11, 13, 17, 19))
-        _ = write_config_fixture(path, "alert_seconds=nan\npush_seconds=0\nstale_seconds=-1\n"
-                                 + "repeat_minutes=bad\nsend_timeout_s=inf\n")
-        with mock.patch.object(conf, "_committed_files", return_value=iter(())), \
-             self.assertRaises(conf.Unusable):
-            _ = mac_test.read_config()
 
     def test_claim_idle_settings_read_configured_values(self) -> None:
         path = self.root / "mac_test.conf"

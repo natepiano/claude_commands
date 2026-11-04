@@ -14,12 +14,11 @@ from typing import Literal, TypedDict, cast, final, override
 from unittest.mock import patch
 
 from test_support import ShutdownSendLeaf, ShutdownTestCase
-from test_restart import entry, showrunner, top_level, unit
 import remote_control
 import herdr
 import sessions
 import session_pane
-import restart_support
+from scripts.whoami import quota_alert
 import remote
 import detached
 from push_texts import RenderedPush
@@ -111,7 +110,8 @@ class RemoteControlTests(ShutdownTestCase):
     def read_screen(self, _place: HerdrPlace) -> str:
         return self.screen
 
-    def type_command(self, place: HerdrPlace, text: str) -> None:
+    def type_command(self, place: HerdrPlace, text: str, *, target: str) -> None:
+        self.assertEqual(target, "owner")
         self.assertEqual(place, self.place)
         current = cast(dict[str, object], json.loads((self.registry / "321.json").read_text()))
         self.assertEqual(current["status"], "idle", "busy registry must never authorize input")
@@ -120,7 +120,7 @@ class RemoteControlTests(ShutdownTestCase):
 
     def run_fix(self) -> tuple[remote_control.RemoteControlOutcome, str, list[RenderedPush]]:
         output = io.StringIO()
-        with patch.object(restart_support, "alert_user") as alert, redirect_stdout(output):
+        with patch.object(quota_alert, "tell_user") as alert, redirect_stdout(output):
             outcome = remote_control.fix("owner", 321, "original", "trunk unit", "Owner", clock=self.clock)
         lines = output.getvalue().splitlines()
         self.assertEqual(len(lines), 1, output.getvalue())
@@ -310,11 +310,11 @@ class RemoteControlTests(ShutdownTestCase):
                 self.fields["bridgeSessionId"] = ""
                 self.write()
                 attempted: list[float] = []
-                def input_with_failure(place: HerdrPlace, text: str) -> None:
+                def input_with_failure(place: HerdrPlace, text: str, *, target: str) -> None:
                     attempted.append(self.clock.at)
                     if not recover or len(attempted) == 1:
                         raise OSError("temporary pane transport failure")
-                    self.type_command(place, text)
+                    self.type_command(place, text, target=target)
                     self.fields["bridgeSessionId"] = "bridge"
                     self.write()
                 with patch.object(session_pane, "type_place", side_effect=input_with_failure):
@@ -325,7 +325,8 @@ class RemoteControlTests(ShutdownTestCase):
                 self.assertEqual(pushes, [])
 
     def test_blocked_herdr_input_is_not_counted_as_a_successful_attempt(self) -> None:
-        def blocked(_place: object, _text: str) -> None:
+        def blocked(_place: object, _text: str, *, target: str) -> None:
+            self.assertEqual(target, "owner")
             raise AgentBlocked("busy")
         with patch.object(session_pane, "type_place", side_effect=blocked):
             outcome, _text, pushes = self.run_fix()
@@ -334,12 +335,6 @@ class RemoteControlTests(ShutdownTestCase):
         self.assertEqual(self.typed, [])
         self.assertEqual(pushes, [])
 
-    def test_who_names_the_unit_production_or_plain_session(self) -> None:
-        for saved, expected in ((entry(unit("trunk")), "trunk unit"),
-                                (entry(showrunner("director")), "demo showrunner"),
-                                (entry(top_level("plain", name="Workspace")), "Workspace")):
-            with self.subTest(expected=expected):
-                self.assertEqual(remote_control.remote_control_who(saved), expected)
 
     def test_detached_launch_carries_process_identity_unbuffered_python_and_who(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER)

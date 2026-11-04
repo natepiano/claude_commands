@@ -3,27 +3,49 @@
 from __future__ import annotations
 
 import os
-import json
 import shlex
 import sqlite3
 import sys
 import unittest
 from contextlib import closing
 from pathlib import Path
-from typing import cast, final
+from typing import final
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "style"))
+import style_ledger
+from scripts.style import unit_files
+from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import rename_unit
-
 
 from scripts.production.rename_unit_test_support import UnitRenameFixture, SLUG
-from scripts.production.staff_test_support import unit_membership
 
 
 @final
 class UnitRenameStyleTests(UnitRenameFixture):
+
+    def test_held_files_follow_staff_locations_when_worktree_cells_disagree(self) -> None:
+        fixture = self.style_production()
+        worktree, database = fixture[0], fixture[2]
+        stale = self.root / "stale-names"
+        _ = self.git("worktree", "add", "-b", "stale-names", str(stale), SLUG)
+        self.write(worktree / "staff-held.txt", "The staff location holds this file.\n")
+        self.write(stale / "cell-held.txt", "The stale cell holds this file.\n")
+        parent = self.root / "parent-production.md"
+        self.write(parent, "# Parent\n- **Merge branch:** demo\n\n## Units\n\n"
+                   + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n")
+        self.write(self.doc, self.doc.read_text().replace(f"`{worktree}`", f"`{stale}`")
+                   + f"\n- **Parent production:** `{parent}`\n")
+        with mock.patch.dict(os.environ, self.env):
+            _ = recorded_showrunner("parent", parent)
+            owner = recorded_showrunner(SLUG, self.doc)
+            _ = fixture_unit_location(owner, "names-unit", worktree)
+            with style_ledger.Ledger(self.checkout, database) as ledger:
+                holders = unit_files.unit_file_holders(self.checkout, self.doc, ledger)
+        self.assertIn("staff-held.txt", holders["names-unit"])
+        self.assertNotIn("cell-held.txt", holders["names-unit"])
 
     def test_style_rename_keeps_git_paths_plan_names_and_ticket_ids(self) -> None:
         worktree, plan, database = self.style_production()
@@ -60,6 +82,9 @@ class UnitRenameStyleTests(UnitRenameFixture):
                    + f"- **Proposals:** `{self.root / 'issues'}`\n\n## Units\n\n"
                    + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
                    + "| names-unit | docs/style-production/units/names-unit.md | /other/names | other-names |\n")
+        with mock.patch.dict(os.environ, self.env):
+            other_owner = recorded_showrunner("other-style", other_doc)
+            _ = fixture_unit_location(other_owner, "names-unit", self.root / "other/names")
         owned = self.root / "issues/style.md"
         other = self.root / "issues/other-style.md"
         self.write(other, owned.read_text().replace("proposed_by: demo", "proposed_by: other-style"))
@@ -94,6 +119,9 @@ class UnitRenameStyleTests(UnitRenameFixture):
                    "EVERY=15\nTARGET=session:test-showrunner\nCHECK="
                    + shlex.join(["zsh", "/scripts/production_check.sh", str(doc)]) + "\n")
         self.env["STYLE_LEDGER_STATE_DIR"] = str(self.root / "state/style")
+        with mock.patch.dict(os.environ, self.env):
+            owner = recorded_showrunner(slug, doc)
+            _ = fixture_unit_location(owner, f"{slug}-names-unit", worktree)
         before = self.snapshot()
 
         result = self.invoke(
@@ -104,41 +132,6 @@ class UnitRenameStyleTests(UnitRenameFixture):
         self.assertIn(f"branch {slug}-names -> {slug}-words-names; worktree {worktree} -> "
                       + str(self.rust / f"{slug}-words-names"), result.stdout)
         self.assertEqual(self.snapshot(), before)
-
-    def test_restart_record_keeps_one_prefix_for_a_full_style_id(self) -> None:
-        slug = "cargo-liner-style"
-        _ = self.seed_record(name="names", host_session=f"{slug}-names", unit="names-unit", slug=slug)
-        self.write(self.doc, self.doc.read_text().replace("| alpha-unit |", "| names-unit |"))
-        identity = unit_membership(slug, "names-unit").current_session
-        worktree = str(self.rust / "claude-demo-alpha")
-        rename = rename_unit.UnitRename(
-            slug, "names-unit", f"{slug}-names-unit", str(self.doc), str(self.checkout), SLUG,
-            f"{slug}-names", f"{slug}-names", worktree, worktree, "", str(self.root / "scratch"),
-            account="owner@example.com", session_id=identity)
-
-        with mock.patch.dict(os.environ, self.env):
-            rename_unit._restart_record(rename, lambda: None)  # pyright: ignore[reportPrivateUsage]
-
-        path = self.home / ".local/state/shutdown/owner@example.com/sessions" / f"{identity}.json"
-        document = cast(dict[str, object], json.loads(path.read_text()))
-        session = cast(dict[str, object], document["session"])
-        host = cast(dict[str, object], session["host"])
-        self.assertEqual(host["session_name"], "cargo-liner-style-names")
-        self.assertEqual((host["unit"], session["name"]), ("cargo-liner-style-names-unit", "cargo-liner-style-names"))
-
-    def test_restart_record_moves_a_feature_host_to_its_new_stem(self) -> None:
-        _ = self.seed_record()
-        rename = rename_unit.UnitRename(
-            SLUG, "alpha-unit", "beta-unit", str(self.doc), str(self.checkout), SLUG,
-            "demo-alpha", "demo-beta", str(self.rust / "claude-demo-alpha"),
-            str(self.rust / "claude-demo-beta"), "", str(self.root / "scratch"),
-            account="owner@example.com", session_id="5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
-
-        with mock.patch.dict(os.environ, self.env):
-            rename_unit._restart_record(rename, lambda: None)  # pyright: ignore[reportPrivateUsage]
-
-        session = cast(dict[str, object], self.record()["session"])
-        self.assertEqual(cast(dict[str, object], session["host"])["session_name"], "demo-beta")
 
 
 if __name__ == "__main__":

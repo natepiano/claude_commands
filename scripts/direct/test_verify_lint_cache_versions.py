@@ -75,7 +75,6 @@ class LintVersionKeyTests(TreeWatchFixture):
                  mock.patch.object(tree_watch, "lint_tool_versions", side_effect=error):
                 inputs = tree_watch.TreeInputs(["--", "lint"], metadata)
                 self.assertEqual(inputs.keys(), ("", watched))
-                self.assertEqual(inputs.tree_content_key, "")
 
     def test_test_keys_and_input_watches_skip_lint_tool_queries(self) -> None:
         metadata = json.dumps(self.metadata)

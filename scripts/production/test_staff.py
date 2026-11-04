@@ -8,6 +8,7 @@ import io
 import json
 import multiprocessing
 import os
+import pwd
 import stat
 import subprocess
 import sys
@@ -68,6 +69,24 @@ def concurrent_ensure(
 
 
 class NativeRuntimeIdentityTests(StaffTestCase):
+    def test_guarded_cli_adds_an_agent_without_a_parent_and_reads_its_locations(self) -> None:
+        identity = fixture_runtime_id("morty-agent")
+        for field, state in (("worktree", "present"), ("doc", "live")):
+            with self.subTest(field=field):
+                self.staff_file.unlink(missing_ok=True)
+                result = self.cli("ensure", "agent", "--name", "morty", "--runtime-id", identity,
+                                  "--" + field, "natedev", str(self.root / "morty"), state, "--json")
+                payload = cast(object, json.loads(result.stdout))
+                row = staff.StaffRow.from_json(payload)
+                self.assertEqual((row.id, row.current_session, row.kind, row.name, row.parent),
+                                 (identity, identity, "agent", "morty", None))
+                self.assertEqual(staff.snapshot().rows, (row,))
+                self.assertEqual(staff.by_path("morty"), row)
+                shown = self.cli("show", "--kind", "agent")
+                self.assertIn("morty", shown.stdout)
+                self.assertIn("agent", shown.stdout)
+                self.assertEqual(staff.StaffRow.from_json(row.to_json()), row)
+
     def test_repeated_id_lookups_scan_the_staff_rows_at_most_once(self) -> None:
         _, unit, _ = self.tree()
         expected = tuple(replace(unit, id=staff.StaffId(fixture_runtime_id(f"indexed-{number}")))
@@ -337,6 +356,125 @@ class DocumentLookupTests(StaffTestCase):
 
 
 class StaffTests(StaffTestCase):
+    def test_snapshots_keep_their_production_record_source(self) -> None:
+        value: dict[str, object] = {"schema": 2, "rows": []}
+        _ = self.write_document(value)
+        self.assertFalse(staff.snapshot().production)
+        self.assertFalse(staff.local_snapshot().production)
+        self.assertFalse(staff.initial_snapshot().production)
+        production_file = self.root / "production-staff.json"
+        _ = production_file.write_text(json.dumps(value), encoding="utf-8")
+        with (mock.patch.dict(os.environ),
+              mock.patch.object(staff, "_default_file", return_value=production_file)):
+            del os.environ["STAFF_FILE"]
+            self.assertTrue(staff.snapshot().production)
+            self.assertFalse(staff.local_snapshot().production)
+            self.assertFalse(staff.initial_snapshot().production)
+            self.assertEqual(staff.snapshot().inputs, (str(production_file.absolute()),))
+            with (mock.patch.object(staff, "is_owner", return_value=False),
+                  mock.patch.object(staff, "_remote", return_value=value)):
+                self.assertTrue(staff.snapshot().production)
+
+    def test_gate_module_writes_keep_the_real_staff_and_launch_folders_unchanged(self) -> None:
+        from scripts.herdr import pane_launch
+        from scripts.production import merge_gate
+
+        real_state = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/state"
+        real_staff = real_state / "staff"
+        real_launches = real_state / "herdr-panes"
+
+        def folder_bytes(folder: Path) -> dict[Path, bytes]:
+            return {path.relative_to(folder): path.read_bytes()
+                    for path in folder.rglob("*") if path.is_file()}
+
+        before = folder_bytes(real_staff), folder_bytes(real_launches)
+        module_root = self.root / "gate-module"
+        module_root.mkdir()
+        environment = merge_gate.test_module_environment(module_root, {
+            **os.environ,
+            "STAFF_FILE": str(real_staff / "staff.json"),
+            "HERDR_PANE_RECORD_DIR": str(real_launches),
+        })
+        self.assertEqual(environment["STAFF_FILE"], str(module_root / "staff.json"))
+        self.assertEqual(environment["HERDR_PANE_RECORD_DIR"], str(module_root / "herdr-panes"))
+        with mock.patch.dict(os.environ, environment):
+            owner = fixture_member("showrunner", name="gate-private")
+            launch = pane_launch.launch("w1:p1", owner.id, str(module_root), {}, ["claude"])
+            path = pane_launch.record_directory() / "agents.json"
+            pane_launch.write(path, launch)
+            self.assertEqual(staff.snapshot().by_id(owner.id), owner)
+            self.assertEqual(pane_launch.read_strict(path)["w1:p1"]["session_id"], owner.id)
+        self.assertTrue((module_root / "staff.json").is_file())
+        self.assertEqual((folder_bytes(real_staff), folder_bytes(real_launches)), before)
+
+    def test_stopped_test_owner_removal_is_unchanged_on_a_second_run(self) -> None:
+        row = fixture_member("showrunner", name="fixture",
+            doc=staff.LiveDoc("natedev", self.root / "merge-gate-fixture/production.md"))
+        with mock.patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()):
+            self.assertEqual(staff._remove_test_fixture(row.id), staff.FixtureRemoved(row))  # pyright: ignore[reportPrivateUsage]
+            self.assertIsNone(staff.snapshot().by_id(row.id))
+            before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+            self.assertEqual(staff._remove_test_fixture(row.id), staff.FixtureAlreadyAbsent())  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_primary_staff_write_refuses_test_root_documents_and_worktrees(self) -> None:
+        runner, unit, _ = self.tree()
+        before = self.staff_file.read_bytes()
+        primary_home = self.root / "primary-home"
+        primary_file = primary_home / ".local/state/staff/staff.json"
+        primary_file.parent.mkdir(parents=True)
+        _ = primary_file.write_bytes(before)
+        for field in ("doc", "worktree"):
+            path = Path("/dev/shm/merge-gate-fixture") / field
+            with (self.subTest(field=field),
+                  mock.patch.dict(os.environ, {"STAFF_FILE": "", "HOME": str(primary_home)}),
+                  mock.patch.object(staff, "_file", return_value=primary_file)):
+                with self.assertRaises(staff.StaffRefused) as refusal:
+                    if field == "doc":
+                        _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", path))
+                    else:
+                        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path), expected=unit.worktree)
+                self.assertIn(str(path), str(refusal.exception))
+            self.assertEqual(primary_file.read_bytes(), before)
+
+    def test_primary_staff_write_refuses_generic_linux_and_mac_temporary_roots(self) -> None:
+        runner, unit, _ = self.tree()
+        before = self.staff_file.read_bytes()
+        primary_home = self.root / "primary-home"
+        primary_file = primary_home / ".local/state/staff/staff.json"
+        primary_file.parent.mkdir(parents=True)
+        _ = primary_file.write_bytes(before)
+        mac_temp = "/var/folders/fixture/T"
+        for root in (Path("/tmp/lint-scope-test-case/case"), Path(mac_temp) / "tmp-fixture"):
+            for field in ("doc", "worktree"):
+                path = root / field
+                with (self.subTest(path=path),
+                      mock.patch.dict(os.environ, {"STAFF_FILE": "", "HOME": str(primary_home)}),
+                      mock.patch.object(staff, "_file", return_value=primary_file),
+                      mock.patch("tempfile.gettempdir", return_value=mac_temp),
+                      self.assertRaises(staff.StaffRefused) as refusal):
+                    if field == "doc":
+                        _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", path))
+                    else:
+                        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path), expected=unit.worktree)
+                self.assertIn(str(path), str(refusal.exception))
+                self.assertEqual(primary_file.read_bytes(), before)
+
+    def test_primary_staff_update_keeps_unchanged_test_root_rows(self) -> None:
+        runner = fixture_member("showrunner", name="stray",
+            doc=staff.LiveDoc("natedev", Path("/dev/shm/merge-gate-existing/production.md")))
+        unrelated = fixture_member("showrunner", name="other")
+        primary_home = self.root / "primary-home"
+        primary_file = primary_home / ".local/state/staff/staff.json"
+        primary_file.parent.mkdir(parents=True)
+        _ = primary_file.write_bytes(self.staff_file.read_bytes())
+        with (mock.patch.dict(os.environ, {"STAFF_FILE": "", "HOME": str(primary_home)}),
+              mock.patch.object(staff, "_file", return_value=primary_file)):
+            changed = staff.rename(unrelated.id, "renamed")
+            self.assertEqual(changed.name, "renamed")
+            self.assertEqual(staff.snapshot().by_id(runner.id), runner)
+        self.assertIn("/dev/shm/merge-gate-existing/production.md", primary_file.read_text())
+
     def test_worktree_guard_changes_only_the_recorded_expected_location(self) -> None:
         _, unit, _ = self.tree()
         initial = staff.PresentWorktree("natedev", self.root / "initial")
@@ -515,12 +653,17 @@ class StaffTests(StaffTestCase):
         self.assertEqual(record.by_path("unfilled/removed"), units[2])
         self.assertCountEqual(record.find(), [*runners, *units])
 
-    def test_local_and_remote_retire_refuse_owners_and_remove_only_the_selected_worker(self) -> None:
+    def test_local_and_remote_retire_keep_owners_and_remove_selected_workers_and_agents(self) -> None:
         runner, unit, worker = self.tree()
         for machine in ("natedev", "mac"):
             with self.subTest(machine=machine), self.machine(machine):
                 for row in (runner, unit):
                     self.assert_refused(lambda: staff.retire(row.id))
+        for machine in ("natedev", "mac"):
+            with self.subTest(machine=machine), self.machine(machine):
+                agent = fixture_member("agent", name="test-agent-" + machine)
+                self.assertEqual(staff.retire(agent.id), agent)
+                self.assertIsNone(staff.by_id(agent.id))
         self.assertEqual(staff.retire(worker.id), worker)
         self.assertEqual(staff.by_id(unit.id), unit)
         self.assertEqual(staff.by_id(runner.id), runner)
@@ -1058,6 +1201,23 @@ class StaffTests(StaffTestCase):
         )
         for index, document in enumerate([*malformed, "unparseable"]):
             before = self.write_document(document)
+            if index == 3:
+                child = replace(worker, parent=showrunner.id)
+                unknown = {**valid, "kind": "visitor", "current_session": fixture_runtime_id("unknown-session")}
+                _ = self.write_document({"schema": 2, "rows": [unknown, child.to_json()]})
+                with redirect_stderr(io.StringIO()) as output:
+                    self.assertEqual(staff.snapshot().rows, (child,))
+                    created = staff.ensure("showrunner", name="new", runtime_id=fixture_runtime_id("new"))
+                    self.assertCountEqual(staff.snapshot().rows, (child, created))
+                self.assertEqual(output.getvalue(), f"staff anomaly: row {showrunner.id}: unknown kind visitor; skipped\n" * 3)
+                self.assertEqual(cast(dict[str, object], json.loads(self.staff_file.read_text()))["rows"],
+                    [row.to_json() for row in sorted((child, created), key=lambda row: row.id)] + [unknown])
+                before = self.staff_file.read_bytes()
+                for runtime_id, reason in ((str(showrunner.id), "staff id"), (unknown["current_session"], "current session")):
+                    with redirect_stderr(io.StringIO()), self.assertRaisesRegex(staff.StaffRefused, "duplicate " + reason):
+                        _ = staff.ensure("showrunner", name="duplicate", runtime_id=str(runtime_id))
+                    self.assertEqual(self.staff_file.read_bytes(), before)
+                continue
             if document == "unparseable":
                 before = b"{truncated"
                 _ = self.staff_file.write_bytes(before)

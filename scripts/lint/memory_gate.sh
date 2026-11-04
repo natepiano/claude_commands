@@ -9,12 +9,6 @@ UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
 BUILDLOG_MEM_ADMIT_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_queue" && pwd)/admission_client.py"
-USER_ZONE_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/user_zone.py"
-
-# Queue identity belongs to this caller.
-# Callers set rejoin values after sourcing this file.
-BUILDLOG_MEM_WAIT_SINCE="" BUILDLOG_MEM_WAIT_FIRST_FILE=""
-export -n BUILDLOG_MEM_WAIT_SINCE BUILDLOG_MEM_WAIT_FIRST_FILE
 
 buildlog_memory_python() {
     if [[ -x "$HOME/.claude/scripts/lib/py" ]]; then
@@ -166,26 +160,13 @@ buildlog_wait_for_memory() {
         return 2
     }
     BUILDLOG_MEM_WAIT_FROM="${BUILDLOG_MEM_WAIT_SINCE:-${EPOCHSECONDS:-$(date +%s)}}"
-    if [[ -n "${BUILDLOG_MEM_WAIT_FIRST_FILE:-}" && -s "$BUILDLOG_MEM_WAIT_FIRST_FILE" ]]; then
-        read -r BUILDLOG_MEM_WAIT_FROM < "$BUILDLOG_MEM_WAIT_FIRST_FILE"
-    fi
-    [[ "$BUILDLOG_MEM_WAIT_FROM" =~ ^[0-9]+$ ]] || {
-        rm -f "$grant"
-        buildlog_memory_refuse 'invalid first wait time'
-        return 2
-    }
     (( $# > 0 )) || action=launch
     LINT_QUEUE_LEAVE_HOOK="${LINT_QUEUE_LEAVE_HOOK:-}" \
     BUILDLOG_MAC_IDLE_HOOK="${BUILDLOG_MAC_IDLE_HOOK:-}" \
     buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" "$action" --pid "$owner" \
         --since "$BUILDLOG_MEM_WAIT_FROM" --sidecar "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" \
         --shell-state "$grant" --wait-events -- "$@" |
-        while IFS= read -r event; do
-            if [[ "$event" == first && -n "${BUILDLOG_MEM_WAIT_FIRST_FILE:-}" && ! -s "$BUILDLOG_MEM_WAIT_FIRST_FILE" ]]; then
-                printf '%s\n' "$BUILDLOG_MEM_WAIT_FROM" > "$BUILDLOG_MEM_WAIT_FIRST_FILE"
-            fi
-            buildlog_memory_event "$event"
-        done || status=$?
+        while IFS= read -r event; do buildlog_memory_event "$event"; done || status=$?
     source "$grant"
     if (( status == 75 )); then
         BUILDLOG_MEM_OUTCOME=LeftQueue
@@ -198,11 +179,6 @@ buildlog_wait_for_memory() {
         fi
         BUILDLOG_MEM_OUTCOME=Refused
     fi
-    # Rejoined steps retain their first wait age without repeating admission checks.
-    if [[ -n "${BUILDLOG_MEM_WAIT_SINCE:-}" || -s "${BUILDLOG_MEM_WAIT_FIRST_FILE:-}" ]]; then
-        BUILDLOG_MEM_WAIT_S=$(( ${EPOCHSECONDS:-$(date +%s)} - BUILDLOG_MEM_WAIT_FROM ))
-        (( BUILDLOG_MEM_WAIT_S >= 0 )) || BUILDLOG_MEM_WAIT_S=0
-    fi
     rm -f "$grant"
     return "$status"
 }
@@ -210,6 +186,7 @@ buildlog_wait_for_memory() {
 buildlog_release_memory() {
     local reservation="${BUILDLOG_MEM_RESERVATION:-}"
     BUILDLOG_MEM_RESERVATION=""
+    export BUILDLOG_MEM_CLEANUP_TIMING
     [[ -n "$reservation" ]] || return 0
     buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" release "$reservation" "${1:-0}" >/dev/null 2>&1 || true
 }
@@ -217,6 +194,7 @@ buildlog_release_memory() {
 buildlog_token_wait() {
     local reservation="${BUILDLOG_MEM_RESERVATION:-}" status=0
     [[ -n "$reservation" ]] || return 0
+    export BUILDLOG_MEM_CLEANUP_TIMING
     buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" token-wait "$reservation" >/dev/null || status=$?
     if (( status != 0 )); then
         buildlog_memory_refuse "cannot enter token wait (exit $status)"

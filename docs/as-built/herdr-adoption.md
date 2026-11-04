@@ -13,7 +13,6 @@ Every showrunner, unit director and standalone Claude session uses a tab in the 
 | `scripts/herdr/herdr.py` | The library: `Herdr` client, session names, server start and stop per platform, panes and agents, process placement, attached clients, server environment, Claude trust. |
 | `scripts/herdr/herdr_sessions.py` | CLI: `list`, `attach`, `focus`, `start`, `resume`, `list --on`, `attach-remote`. |
 | `scripts/herdr/test_one_session.py` | The check that fails when code outside `herdr.py` starts a herdr session or names one other than `agents`. |
-| `scripts/herdr/trust_survey.py` | Read-only survey of trust keys in every account file. |
 | `scripts/herdr/detection_rules.py` | The local override of herdr's Claude detection rules and its reload receipt (herdr behavior, below). |
 | `scripts/herdr/fake_herdr.py` | Test double for the herdr CLI. |
 | `scripts/production/unit_lookup.py` | Units found by marks on herdr panes. |
@@ -62,7 +61,7 @@ Direct starts outside the desktop (`herdr_sessions.py start` and `resume`) refus
 **Panes and agents.**
 
 - `open_tab(name, space, title, cwd, environment) -> pane_id` opens a tab in the workspace `space`, then renames its pane to the title. Every pane also gets `HERDR_AGENT_PANE=1`. herdr 0.9.0 sets these variables in each pane: `HERDR_PANE_ID`, `HERDR_SESSION`, `HERDR_SOCKET_PATH`, `HERDR_TAB_ID`, `HERDR_WORKSPACE_ID`, `HERDR_BIN_PATH`, `HERDR_ENV=1`.
-- `start_agent(name, pane, kind, agent_arguments, opening: OpeningPrompt | NoOpeningPrompt, timeout_ms, *, agent)` exists as a module function, which names the agent `agent`, and as a `Herdr` method. Its limit is `timeout_ms` times `load_factor()`, the one-minute load per CPU from 1 to 6 (2026-10-18: values-unit missed its 90 s limit at load 125). The limit covers the start and the opening prompt; `agent start --timeout` takes at most herdr's 300000. A `PromptNotSubmitted` that the launcher never typed has `never_typed` set, and add_unit then closes that new session (`close_untyped_session`): its Units row and worktree stay, and the same command starts it again. It runs `agent start <agent name> --kind <kind> --pane <pane> --timeout <ms> -- <agent_arguments>`. herdr adds the binary itself, so an `agent_arguments` whose first element equals `kind` raises `ValueError` before any herdr call. Agent names are lowercased, other characters become `-`, `a-` is added in front when the name does not start with a letter, and the result is cut to 32 characters.
+- `start_agent(name, pane, kind, agent_arguments, opening: OpeningPrompt | NoOpeningPrompt, timeout_ms, *, agent)` exists as a module function, which names the agent `agent`, and as a `Herdr` method. Its limit is `timeout_ms`. The limit covers the start and the opening prompt; each `agent start --timeout` attempt takes at most herdr's 300000. A `PromptNotSubmitted` that the launcher never typed has `never_typed` set, and add_unit then closes that new session (`close_untyped_session`): its Units row and worktree stay, and the same command starts it again. It runs `agent start <agent name> --kind <kind> --pane <pane> --timeout <ms> -- <agent_arguments>`. herdr adds the binary itself, so an `agent_arguments` whose first element equals `kind` raises `ValueError` before any herdr call. Agent names are lowercased, other characters become `-`, `a-` is added in front when the name does not start with a letter, and the result is cut to 32 characters.
 - `agent_pane_busy` is retried every 0.1 s against one shared deadline. A retry never passes a per-try timeout at or below `_AGENT_START_TIMEOUT_MINIMUM_MS` (3000).
 - While the CLI waits, the library finds the pane shell (`pane process-info`) and walks its process tree on Linux (per-thread `children`). It follows the agent by pid plus start ticks across exec and reparenting. An agent that was seen and is gone, or herdr's `agent_start_failed` with `process exited`, raises `AgentExited`. When `/proc` cannot be read it falls back to herdr observations at most twice a second.
 - `agent_not_ready` reads the visible screen and raises `AgentNotReady(screen)`. No key is sent.
@@ -123,7 +122,6 @@ A Claude session started in a folder the account has not trusted stops at the tr
   - `restart._herdr_launch`, on the trust file in the launch environment's `CLAUDE_CONFIG_DIR`, before any server starts.
   - The nightly review launches through `add_unit.py --permanent` on the units account, so `preflight` covers it.
 - Launchers use the configured group account. Each check reads `<CLAUDE_CONFIG_DIR>/.claude.json` in that numbered folder. `~/.claude.json` stays the seed and MCP baseline.
-- `scripts/herdr/trust_survey.py` is a read-only survey. For the seed and each account file (`~/.claude.json` and every `~/.claude[0-9]/.claude.json`) it prints `<account> <key> <accepted> <kind>`. The kind is main checkout, worktree of `<main>`, plain folder, or ancestor of `<n>` repositories (nested repositories included). Then, for each `~/worktrees` folder, it prints whether its own, toplevel or main-checkout key is accepted.
 - `pyrightconfig.json` gives `scripts/herdr` an environment with `.` and the message, production and lib paths. It puts `scripts/herdr` in the production, message, shutdown and nightly review environments.
 
 ### Pane access
@@ -168,7 +166,7 @@ Before starting the agent, add_unit saves its exact opening, conversation id, ac
 - A plain `--resume` of an existing Units row, active or retired, continues its transcript without requiring a Production header in the row’s own plan document, so a condensed as-built remains usable; new units and attaches still require the header, and a resume with a different plan still refuses.
 - A plain `--resume` of a retired Units row may use `--cwd` outside its worktree: the raw Plan cell supplies the retired state, the row keeps its worktree and branch, and the launch creates neither and leaves the row for resume_unit to unmark; other cwd mismatches retain their refusal.
 - On a resume of a unit with session labels, `ClaudeUnknown` refuses, and `ClaudeNotRunning` closes that place's tab with `close_agent` before the relaunch.
-- A restore records its prompt as scheduled (`record_scheduled_restore_prompt`). The resumed model is the transcript's last real assistant model unless `--model` is given.
+- A restore's prompt carries the script envelope, which marks it as a script prompt; it writes no scheduled-prompt record. The resumed model is the transcript's last real assistant model unless `--model` is given.
 - A new unit waits until `read_place` shows `/remote-control is active`.
 - It prints `<unit> started: <attach_hint>` or `<unit> restore launched: <attach_hint>`, the unit's tab in its production's workspace.
 - Exit 1 on `AgentNotReady` (prints the screen), 2 on a refusal, 1 on other failures.
@@ -368,4 +366,4 @@ Run these suites on the Mac with a scratch home. Run the command from the root o
 - **Server environment check.** Panes inherit the server's environment. An adopted server started from a shell with another account's variables would launch Claude on the wrong account.
 - **No client window from Linux launchers.** Launchers start only the server, as a systemd user unit, and print the attach command. Restart opens a window only for a session that had one and has no client now.
 - **The Mac starts servers from the desktop.** The keychain is only readable in the Aqua session. Outside it, the Ghostty window starts the server, or the restart refuses with an instruction rather than bringing Claude back signed out.
-- **Legacy records stay parseable.** A crash or an old shutdown record can still name a tmux host. Turning it into a manual command keeps the conversation recoverable without bringing tmux back as a host.
+- Shutdown restart reads staff row IDs. It does not read old host records.

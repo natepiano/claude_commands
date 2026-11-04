@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.message.process_test_support import OwnedTestProcesses
 import push_texts  # noqa: E402
 import rca  # noqa: E402
 import review  # noqa: E402
@@ -88,6 +89,21 @@ def flags(argv: list[str]) -> dict[str, str]:
 
 
 class RcaTests(unittest.TestCase):
+    def test_owner_send_uses_the_current_configured_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory)
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
+                for seconds in (12, 18):
+                    _ = (config / "rca.conf").write_text(f"# range: 0.001..\nsend_seconds={seconds}\n")
+                    result = subprocess.CompletedProcess([], 0, "SENT: fixture", "")
+                    with mock.patch.object(subprocess, "run", return_value=result) as run:
+                        self.assertEqual(rca.send(["--text", "body"]), (True, "SENT: fixture"))
+                    self.assertEqual(run.call_args.kwargs["timeout"], seconds)
+
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.owned: OwnedTestProcesses = OwnedTestProcesses()
+
     root: Path = Path()
     log: Path = Path()
     owner_processes: list[bool] = []
@@ -131,6 +147,8 @@ class RcaTests(unittest.TestCase):
             return SHOWRUNNER.removeprefix("uds:") if target.removeprefix("session:") == owner.current_session else None
 
         _ = self.enterContext(mock.patch.object(showrunners, "socket_for", side_effect=live_socket))
+        self.owned = OwnedTestProcesses()
+        self.addCleanup(self.owned.finish)
         self.owner_processes = []
         _ = self.enterContext(mock.patch.object(subprocess, "Popen", self.popen))
 
@@ -138,8 +156,10 @@ class RcaTests(unittest.TestCase):
               text: bool = False, start_new_session: bool = False) -> subprocess.Popen[str]:
         """Record whether send.py was detached, while running the real isolated sender."""
         self.owner_processes.append(start_new_session)
-        return REAL_POPEN(argv, stdin=stdin, stdout=stdout, stderr=stderr, text=text,
-                          start_new_session=start_new_session)
+        child = REAL_POPEN(argv, stdin=stdin, stdout=stdout, stderr=stderr, text=text,
+                           start_new_session=start_new_session, env=self.owned.environment())
+        self.owned.track(child, group=start_new_session)
+        return child
 
     def review(self, draft: review.Draft, revision: bool, *, limit: float = 0) -> review.ReviewOutcome:
         del revision, limit
@@ -214,6 +234,8 @@ class RcaTests(unittest.TestCase):
         socket_root = Path(self.enterContext(short_socket_directory()))
         sender = self.root / "socket-send.py"
         _ = sender.write_text("""import json, os, pathlib, socket, sys
+with pathlib.Path(os.environ['OWNER_TEST_PIDS']).open('a') as marker:
+    marker.write(str(os.getpid()) + '\\n')
 with socket.socket(socket.AF_UNIX) as client:
     client.settimeout(10)
     client.connect(os.environ['OWNER_TEST_SOCKET'])
@@ -222,6 +244,7 @@ with socket.socket(socket.AF_UNIX) as client:
 pathlib.Path(os.environ['OWNER_TEST_RECEIPT']).write_text('delivered')
 print('SENT: fake owner socket')
 """)
+        descendants = self.root / "owner-pids"
         caller = """import json, math, os, pathlib, subprocess, sys
 from scripts.production import stall_watch
 rca = stall_watch.rca
@@ -264,10 +287,13 @@ subprocess.run([sys.executable, '-c',
                     "XDG_STATE_HOME": str(self.root / "state"), "RCA_SEND": str(sender),
                     "STALL_WATCH_SEND": str(sender), "STALL_WATCH_STATE_DIR": str(self.root / "stall"),
                     "OWNER_TEST_SOCKET": str(address), "OWNER_TEST_RECEIPT": str(receipt),
-                    "OWNER_TEST_RETURN": str(returned), "OWNER_TEST_CASE_DIR": str(rca.STATE)}
+                    "OWNER_TEST_RETURN": str(returned), "OWNER_TEST_CASE_DIR": str(rca.STATE),
+                    "OWNER_TEST_PIDS": str(descendants)}
+                self.owned.markers.append(descendants)
                 with REAL_POPEN([sys.executable, "-c", caller, mode], cwd=Path(__file__).resolve().parents[2],
-                                env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                env=self.owned.environment(environment), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, start_new_session=True) as process:
+                    self.owned.track(process, group=True)
                     try:
                         with receiver.accept()[0] as connection:
                             connection.settimeout(10)
@@ -276,8 +302,7 @@ subprocess.run([sys.executable, '-c',
                             connection.sendall(b"delivered")
                         out, err = process.communicate(timeout=10)
                     finally:
-                        if process.poll() is None:
-                            process.kill()
+                        self.owned.finish()
                 self.assertEqual(process.returncode, -signal.SIGTERM, out + err)
                 self.assertEqual(json.loads(returned.read_text()), {"failure": "", "delivered": True})
                 self.assertEqual(receipt.read_text(), "delivered")

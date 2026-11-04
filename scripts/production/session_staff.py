@@ -8,6 +8,7 @@ import subprocess
 import tomllib
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from pathlib import Path
 from typing import NamedTuple, cast
 
@@ -24,6 +25,10 @@ from sessions import SessionRecord
 from place import HerdrPlace
 from pane_launch import PaneLaunch
 import unit_names
+
+
+class ReadCurrentStaff(Enum):
+    CURRENT = "current"
 
 
 PRODUCTION_MARK = "SHOWRUNNER_UNIT"
@@ -541,7 +546,7 @@ def group_marked_units(marked: Iterable[tuple[str, MarkedUnit]], *,
     return _group_marked_units(marked, record, sources, production_members(record, sources))
 
 
-def retained_unit_marks(marked: Iterable[tuple[str, MarkedUnit]], row: staff.StaffRow, slug: str, *,
+def retained_session_labels(marked: Iterable[tuple[str, MarkedUnit]], row: staff.StaffRow, slug: str, *,
                         record: staff.StaffSnapshot, sources: MemberSources) -> MarkedProductions:
     """Keep pane evidence for a retained identity during stop and cleanup checks."""
     membership = production_members(record, sources)

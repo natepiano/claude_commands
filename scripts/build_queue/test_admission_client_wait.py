@@ -38,9 +38,10 @@ def wait_client_main() -> int:
     clock.epoch = time.time()
     def estimate(argv: list[str], cwd: str, profile: gate.InferFromArgv | gate.StepProfile | gate.ProgramProfile,
                  now: datetime | Callable[[], datetime], root: Path, policy: gate.AdmissionPolicy, *,
+                 first_peak_bytes: int, budget: int,
                  build_history_generation: Callable[[], gate.BuildHistoryGeneration | gate.NoBuildHistoryGeneration]
                  = gate.no_build_history_generation) -> gate.StepEstimate:
-        _ = argv, cwd, profile, now, root, policy, build_history_generation
+        _ = argv, cwd, profile, now, root, policy, first_peak_bytes, budget, build_history_generation
         previous = calls.read_text().splitlines() if calls.exists() else []
         action = actions[min(len(previous), len(actions) - 1)]
         owner = int(sys.argv[sys.argv.index("--pid") + 1])
@@ -87,7 +88,7 @@ class AdmissionClientWaitTests(unittest.TestCase):
             "UNIT_ACTIVE_DIR": str(self.root / "active"), "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "HOME": str(self.root)}
         from scripts.lint.test_memory_admit import write_memory_config
-        write_memory_config(self.root / "lint.conf", reconnect_seconds="1", waiting_pass_seconds="0.01")
+        write_memory_config(self.root / "build_admission.conf", reconnect_seconds="1", waiting_pass_seconds="0.01")
         def reply_filter(reply: wire.Reply) -> wire.Reply:
             calls = self.root / "calls.jsonl"
             if isinstance(reply, (wire.Wait, wire.Admitted)) and calls.exists():
@@ -105,10 +106,8 @@ class AdmissionClientWaitTests(unittest.TestCase):
         self.admission.server.reply_filter = reply_filter
         _ = self.enterContext(self.admission.serving())
 
-    def run_wait(self, actions: str, *, launch: bool = False, rejoin: bool = False) -> subprocess.CompletedProcess[str]:
-        command = ('set -e; source "$1"; '
-            + ('BUILDLOG_MEM_WAIT_SINCE=$TEST_QUEUE_WAIT_SINCE; ' if rejoin else '')
-            + 'buildlog_memory_python() { '
+    def run_wait(self, actions: str, *, launch: bool = False) -> subprocess.CompletedProcess[str]:
+        command = ('set -e; source "$1"; buildlog_memory_python() { '
             + 'if [[ "$1" == "$BUILDLOG_MEM_ADMIT_SCRIPT" ]]; then '
             + 'shift; python3 "$TEST_WAIT_CLIENT" --wait-client "$@"; else python3 "$@"; fi; }; '
             + 'shift; if (( $# == 0 )); then '
@@ -117,8 +116,7 @@ class AdmissionClientWaitTests(unittest.TestCase):
         return subprocess.run(["bash", "-c", command, "test",
             str(Path(__file__).parents[1] / "lint/memory_gate.sh"), *([] if launch else ["/bin/true"])],
             env={**self.environment, "TEST_CHECKER_ACTIONS": actions,
-                 "TEST_WAIT_CLIENT": str(Path(__file__).resolve()),
-                 "TEST_QUEUE_WAIT_SINCE": str(int(time.time()) - 1200)},
+                 "TEST_WAIT_CLIENT": str(Path(__file__).resolve())},
             cwd=self.root, text=True, capture_output=True, check=False, timeout=30)
 
     def calls(self) -> list[CheckerCall]:
@@ -142,7 +140,7 @@ class AdmissionClientWaitTests(unittest.TestCase):
                 self.assertNotIn("fallback", output.getvalue())
 
     def test_unknown_source_and_failed_poll_preserve_the_real_waiting_row(self) -> None:
-        result = self.run_wait("unknown,fail,hold,admit", rejoin=True)
+        result = self.run_wait("unknown,fail,hold,admit")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "Granted\n")
         self.assertNotIn("step refused", result.stderr)
@@ -202,24 +200,6 @@ class AdmissionClientWaitTests(unittest.TestCase):
         self.assertEqual(result.stderr.count("trying again, the step keeps its place"), 4)
         self.assertNotIn("step refused", result.stderr)
         self.assertEqual(len(self.calls()), 7)
-
-    def test_parent_queue_identity_does_not_age_a_new_launch_or_step(self) -> None:
-        parent_start = int(time.time()) - 1200
-        parent_wait = self.root / "parent-first-wait"
-        _ = parent_wait.write_text(f"{parent_start}\n")
-        self.environment.update({"BUILDLOG_MEM_WAIT_SINCE": str(parent_start),
-                                 "BUILDLOG_MEM_WAIT_FIRST_FILE": str(parent_wait),
-                                 "BUILDLOG_MEM_WAIT_LIMIT_S": "1"})
-        launch = self.run_wait("hold,fail", launch=True)
-        self.assertEqual(launch.returncode, 2, launch.stderr)
-        self.assertIn("wait elapsed: 1\n", launch.stderr)
-        (self.root / "calls.jsonl").unlink()
-        step = self.run_wait("hold,admit")
-        self.assertEqual(step.returncode, 0, step.stderr)
-        first, _ = self.calls()
-        row, = first["rows"].values()
-        self.assertGreater(row["since"], parent_start)
-        self.assertEqual(parent_wait.read_text(), f"{parent_start}\n")
 
     def test_empty_checker_error_uses_the_retry_fallback(self) -> None:
         result = self.run_wait("hold,silent-fail,admit")

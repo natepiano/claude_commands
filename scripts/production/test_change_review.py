@@ -151,7 +151,7 @@ class ProducerFixture(unittest.TestCase):
         _ = self.git("config", "user.email", "producer@example.invalid")
         _ = self.git("commit", "--allow-empty", "-m", "Initial")
         runner = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", self.doc))
-        self.unit = fixture_member("unit", name="new-unit", parent=runner.id,
+        self.unit = fixture_member("unit", name="new", parent=runner.id,
             worktree=staff.PresentWorktree("natedev", self.root / "unit"))
         _ = self.doc.write_text(f"# Top\n- **Repository:** `{self.repo}`\n"
             + f"- **Showrunner checkout:** `{self.repo}`\n- **Change review:** `{self.listing}`\n"
@@ -170,18 +170,11 @@ class ProducerFixture(unittest.TestCase):
         _ = self.git("merge", "--no-ff", name, "-m", f"Merge {name}")
         return self.git("rev-parse", "HEAD")
 
-    def old_row(self, merge: str, change: str = "A visible change", *, reviewed: bool = False) -> None:
-        _ = change_review.append_rows(self.listing, [change_review.Visible(change, "Read", "Proof")],
-                                     date(2026, 11, 2), merge, self.doc)
-        if reviewed:
-            _ = change_review.record_verdict(self.listing, "C1", "not works", date(2026, 11, 2), self.doc)
-
-
 class ProducerWriterTests(ProducerFixture):
     def colliding_units(self) -> staff.StaffRow:
         runner = staff.snapshot().by_path("top")
         assert runner is not None
-        second = fixture_member("unit", name="second-unit", parent=runner.id,
+        second = fixture_member("unit", name="second", parent=runner.id,
                                 worktree=staff.PresentWorktree("natedev", self.root / "second"))
         _ = self.doc.write_text(f"- **Repository:** `{self.repo}`\n- **Change review:** `{self.listing}`\n"
             + "## Units\n| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
@@ -190,10 +183,10 @@ class ProducerWriterTests(ProducerFixture):
         return second
 
     def test_an_exact_branch_wins_over_an_earlier_unit_alias(self) -> None:
-        second = self.colliding_units()
+        _ = self.colliding_units()
         source = change_review.unit_branches([self.doc])["branch-b"]
         self.assertEqual(source.worktree, self.root / "second")
-        self.assertEqual(source.name, second.name)
+        self.assertEqual(source.name, "second-unit")
 
     def test_merge_publication_uses_the_exact_branch_producer_before_an_alias(self) -> None:
         second = self.colliding_units()
@@ -1294,6 +1287,9 @@ class ProductionMergeCommitsTest(unittest.TestCase):
         self.assertEqual([item.split()[0] for item in change_review.missing(commits)], [self.foreign[:8]])
 
 
+from scripts.production.staff_test_support import recorded_unit
+
+
 class RepositoryTest(unittest.TestCase):
     """A unit branch with its own checkpoints and a merge from the merge branch."""
 
@@ -1318,6 +1314,7 @@ class RepositoryTest(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.repo = Path(directory.name)
+        _ = self.enterContext(isolated_staff_file(self.repo / "staff.json", {}))
         _ = self.git("init", "-q", "-b", "merge")
         self.previous = self.commit("base.py", "checkpoint(u): base\n\nChange-Review: none — base")
         _ = self.git("checkout", "-q", "-b", "unit")
@@ -1375,6 +1372,46 @@ class RepositoryTest(unittest.TestCase):
         refused = change_review.missing(change_review.unit_commits(self.repo, "HEAD", self.previous, "merge"))
         self.assertEqual(len(refused), 1)
         self.assertIn("checkpoint(u): grid: no Change-Review line", refused[0])
+
+    def test_incoming_merge_trailers_refuse_but_reviewed_history_stays_excluded(self) -> None:
+        _ = self.commit("a.py", "plain change")
+        _ = self.git("checkout", "-qb", "side")
+        _ = self.commit("b.md", "side change")
+        _ = self.git("checkout", "-q", "unit")
+        for trailer in (SEE, change_review.COVERS + ": malformed"):
+            _ = self.git("merge", "-q", "--no-ff", "-m", "Merge side\n\n" + trailer, "side")
+            with self.assertRaisesRegex(change_review.ChangeReviewError, "Put the lines on a plain commit after the merge"):
+                _ = change_review.unit_commits(self.repo, "HEAD", self.previous, "merge")
+            _ = self.git("reset", "--hard", "HEAD^1")
+        _ = self.git("merge", "-q", "--no-ff", "-m", "Merge side\n\n" + SEE, "side")
+        merged = self.git("rev-parse", "HEAD")
+        _ = self.git("update-ref", "refs/remotes/origin/merge", merged)
+        plain = self.commit("repair.py", "checkpoint(u): repair\n\n" + SEE)
+        self.assertEqual([commit.sha for commit in change_review.unit_commits(self.repo, plain, self.previous, "merge")], [plain])
+
+    def test_incoming_merge_with_a_none_line_is_left_out(self) -> None:
+        plain = self.commit("a.py", "plain change")
+        _ = self.git("checkout", "-qb", "side")
+        side = self.commit("b.md", "side change")
+        _ = self.git("checkout", "-q", "unit")
+        _ = self.git("merge", "-q", "--no-ff", "-m", "checkpoint(u): merge",
+                     "-m", "Change-Review: none — merge only", "side")
+        commits = change_review.unit_commits(self.repo, "HEAD", self.previous, "merge")
+        self.assertEqual({commit.sha for commit in commits}, {plain, side})
+
+    def test_drift_leaves_out_a_visible_merge_line_but_keeps_a_plain_checkpoint(self) -> None:
+        _ = self.commit("a.py", "plain change")
+        _ = self.git("checkout", "-qb", "side")
+        _ = self.commit("b.md", "side change")
+        _ = self.git("checkout", "-q", "unit")
+        _ = self.git("merge", "-q", "--no-ff", "-m", "checkpoint(u): merge\n\n" + SEE, "side")
+        _ = self.merged("unit", "Merge unit")
+        self.assertEqual(change_review.drift(self.repo, "merge", LIST, "2026-10-01"), [])
+        _ = self.git("checkout", "-q", "unit")
+        _ = self.commit("c.py", "checkpoint(u): grid\n\n" + SEE)
+        short = self.merged("unit", "Merge grid")
+        self.assertEqual(change_review.drift(self.repo, "merge", LIST, "2026-10-01"),
+                         [f"{short}: 1 visible change(s) and no row in the list"])
 
     def test_a_later_checkpoint_covers_one_pushed_without_its_line(self) -> None:
         early = self.commit("a.py", "checkpoint(u): grid")
@@ -1441,6 +1478,7 @@ class RepositoryTest(unittest.TestCase):
                             + "| C3 | no hash | 2026-10-15 | x |\n\n"
                             + "## Reviewed\n\n| # | Change | Verdict | Date |\n| --- | --- | --- | --- |\n", encoding="utf-8")
         before = path.read_text(encoding="utf-8")
+        _ = recorded_unit("kid", "u-unit", self.repo, kid, plan="docs/u-plan.md")
         tree = change_review.Tree([top, kid])
         expected = ({"C1": "kid", "C2": "top"}, {"C3": "no merge hash"})
         self.assertEqual(change_review.backfill(path, tree, write=False), expected)
@@ -1478,9 +1516,24 @@ class RepositoryTest(unittest.TestCase):
         _ = top.write_text("## Units\n\n", encoding="utf-8")
         commits = [change_review.Commit("1", "checkpoint(u-plan): grid", f"checkpoint(u-plan): grid\n\n{SEE}", ()),
                    change_review.Commit("2", "checkpoint(own): grid", f"checkpoint(own): grid\n\n{SEE}", ())]
+        _ = recorded_unit("kid", "u-unit", self.repo, kid, plan="docs/u-plan.md")
         with mock.patch.object(change_review, "owner_docs", return_value=[top, kid]):
             self.assertEqual([change.source.production if change.source is not None else top
                               for change in change_review.publication_changes(commits, top)], [top, kid])
+
+
+
+
+from scripts.production.staff_test_support import StaffTestCase, without_worktree_column
+
+
+class BranchOwnerLocationTests(StaffTestCase):
+    def test_checkpoint_folder_alias_uses_the_plan_worktree_without_the_worktree_column(self) -> None:
+        fixture = self.separated_unit_folders()
+        without_worktree_column(fixture.doc)
+        owners = change_review.unit_branches([fixture.doc])
+        self.assertEqual(owners[fixture.worktree.name].production, fixture.doc)
+        self.assertNotIn("director", owners)
 
 
 if __name__ == "__main__":

@@ -193,6 +193,24 @@ class CopyTests(TmpSweepCase):
         self.assertFalse(child.exists())
         self.assertFalse(parent.exists())
 
+    def test_failed_resumed_removal_keeps_its_borrowed_parent(self) -> None:
+        parent = self.copy("parent")
+        child = self.copy("child", borrows_from=str(parent / ".git"))
+
+        def stopped_removal(folder: str) -> None:
+            (Path(folder) / copy_record.RECORD).unlink()
+            raise OSError("stopped after record unlink")
+
+        with mock.patch.object(tmp_sweep, "delete_tree", side_effect=stopped_removal):
+            self.assertTrue(self.sweep().failed)
+        with mock.patch.object(tmp_sweep, "delete_tree", side_effect=OSError("still stopped")) as remove:
+            result = self.sweep()
+        remove.assert_called_once_with(str(child))
+        self.assertTrue(result.failed)
+        self.assertTrue(child.exists())
+        self.assertTrue(parent.exists())
+        self.assertIn(str(parent), result.kept[f"borrowed: {child} still uses its git objects"])
+
     def test_reused_path_with_unsaved_work_does_not_resume_the_old_copys_removal(self) -> None:
         path = self.copy("reused")
         descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
@@ -646,6 +664,25 @@ class TempParentTests(TmpSweepCase):
 
 
 class TempFolderTests(TmpSweepCase):
+    def test_verify_prefix_changes_after_import(self) -> None:
+        config = self.tmp / "config"
+        config.mkdir()
+        source = Path(build_folders.__file__).resolve().parents[2] / "config/build_folders.conf"
+        settings = source.read_text()
+        name = "changed-hold.123.abcdefgh"
+        folder = self.tmp / name
+        _ = write(folder / "content")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}), os.scandir(self.tmp) as entries:
+            entry = next(entry for entry in entries if entry.name == name)
+            _ = write(config / "build_folders.conf", settings)
+            roots = self.roots()
+            self.assertFalse(roots.judged_temp(str(self.tmp), entry))
+            _ = write(config / "build_folders.conf", settings.replace(
+                "prefixes.verify-hold=verify-hold.{owner}.",
+                "prefixes.verify-hold=changed-hold.{owner}."))
+            self.assertFalse(roots.judged_temp(str(self.tmp), entry))
+            self.assertTrue(self.roots().judged_temp(str(self.tmp), entry))
+
     def test_every_common_prefix_keeps_its_sweep_classification(self) -> None:
         pairs: list[tuple[str, Path, Path]] = []
         parents: list[str] = []

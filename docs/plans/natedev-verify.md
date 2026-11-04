@@ -27,7 +27,8 @@ i need changes to verify
   - `scripts/direct/final_pass.py`, `step_record.py`, `local_release_wait.py`, `progress_history.py` — helpers `verify.sh` starts
   - `scripts/direct/test_verify_*.py` — verify pipeline tests
   - `scripts/mac_test/` — Mac offload: `mac_test.py`, `offload.py`, `copy_watch.py`, `audit.py` and tests
-  - `scripts/buildlog/record.py`, `scripts/buildlog/mac_idle.py`, `scripts/build_targets/build_targets.py` — helpers `verify.sh` starts, owned by other units (read, do not edit without the owner)
+  - `scripts/buildlog/record.py`, `scripts/build_targets/build_targets.py` — helpers `verify.sh` starts, owned by other units (read, do not edit without the owner)
+  - `scripts/buildlog/mac_idle.py` — a helper `verify.sh` starts; this unit owns it (production doc Units row)
   - `scripts/lib/py` — interpreter shim; caches the resolved path, so it adds no Python start of its own on a warm cache
 - **Key files:**
   - `scripts/direct/verify.sh` — a `VERIFY_PY_TRACE=<file>` run writes one line per helper start (name, wall ms, CPU ms); every inline helper runs as `VERIFY_PY_HELPER=<NAME> "$PY" …`
@@ -40,7 +41,7 @@ i need changes to verify
   - `verify.sh` output, exit codes, cache records and build-log records stay the same for every verb (`check`, `test`, `lint`, `doc`, `final`), local and on the Mac.
   - Every Python call goes through `$PY` (the shim), never plain `python3`: the Mac's `python3` on PATH is Apple 3.9.
   - Before any run that builds or tests, check `build_hold.py status`; while a natedev hold that is not ours is in force, run nothing (memory: no work during a build hold).
-  - Helpers owned by other units (`scripts/buildlog/`, `scripts/build_targets/`) change only through their owner, or with the owner named in the checkpoint notice.
+  - Helpers owned by other units (`scripts/buildlog/` except `mac_idle.py`, `scripts/build_targets/`) change only through their owner, or with the owner named in the checkpoint notice.
 
 ## Phases
 
@@ -78,6 +79,8 @@ i need changes to verify
 
 #### Work Order
 
+**Constraints from the phase 20, 23 and 24 review:** Phase 23 cancellation behavior stays: a group TERM of a lint run exits 143, repeated INT/TERM/HUP during cleanup are ignored, and no verify process, admission place or step record remains. The acceptance gate keeps the `test_verify_tree_cancel_lint.py` checks green.
+
 **Goal:** a refused step makes `verify.sh` exit non-zero on every host, and every process-start reader in this unit's code reads a start on the Mac as it does on Linux, through one shared reader.
 
 **Defect:** on the Mac, `verify.sh`'s step recorder (`step_record.py process_start`) reads `/proc/<pid>/stat`, which Darwin does not have. The step is refused, but the wrapper exits 0, so the failure reads as a pass.
@@ -92,16 +95,19 @@ i need changes to verify
 - `Gone` — no such process.
 - `Unreadable(reason)` — the start cannot be read, but the process may exist (a read error other than not-found, a field that does not parse, a `ps` failure other than no such process).
 
+Results of different kinds never compare equal: a `Started` never equals a `Zombie` with the same start. Tests check the exact type of each result, not only its value.
+
 `start` has one stored form per host, the same text that every writer stores and every reader compares: the field-22 digits on Linux, the `LC_ALL=C TZ=UTC` `lstart` text on Darwin. A match is a start equal to the stored one; a different start is PID reuse. Every reader in this unit's code uses the shared reader, and its policy is now explicit:
 - `scripts/direct/step_record.py` `process_start` — `write` stores a `Started` start. `_read_fields` reads `Gone`, `Zombie` and a different start as `stale`, and `Unreadable` as `unreadable`.
 - `scripts/direct/verify.sh` `STEP_OWNER_PY` `identity(pid)` — writes the `start` of the `owned` record.
 - `scripts/direct/board.sh` `owned_group_matches` — a `Started` match keeps an expired hold. `Unreadable` also keeps it, so a live owner keeps its token. `Gone` and a different start free it.
 - `scripts/direct/board.sh` `cleanup_owned_group` `identity(pid)` — a `Zombie` leader with live children in its group still matches. `Gone`, `Unreadable` and a different start take the existing mismatch branch (refuse while the group has live members, else done).
-- `scripts/mac_test/mac_test.py` `process_start_time` — removed. `run_is_live`, `run_is_kept`, `copy_gives_way`, the claim writes and `adopt_wait_claim` read the shared result and keep their outcomes: only a match is live, and an adoption refuses (exit 12) unless the from-pid start matches the stored `proc_start` and the runner's start reads as `Started`.
+- `scripts/mac_test/mac_test.py` `process_start_time` — removed. `run_is_live`, `run_is_kept`, `copy_gives_way`, `stop_copy`, the claim writes and `adopt_wait_claim` read the shared result and keep their outcomes: only a match is live, `stop_copy` sends TERM only to a match, and an adoption refuses (exit 12) unless the from-pid start matches the stored `proc_start` and the runner's start reads as `Started`.
+- `scripts/mac_test/copy_watch.py` — `StepProgress` reads its group leader's start once, and `leader_alive` is true only for a `Started` start that still matches with the same group. `newest_candidate` removes a candidate whose start does not match. `Watch` writes its own `Started` start to a new candidate record, else an empty start.
 
-The writer (`STEP_OWNER_PY`), both board.sh readers and mac_test.py change in one commit and keep one stored start form. A reader with another form reclaims a live hold on the Mac (Phase 7 Spec 5).
+The writer (`STEP_OWNER_PY`), both board.sh readers, mac_test.py and copy_watch.py change in one commit and keep one stored start form. A reader with another form reclaims a live hold on the Mac (Phase 7 Spec 5).
 
-`scripts/lib/` and `scripts/direct/board.sh` belong to natedev. builds approved `scripts/lib/` as outside this unit's Owns (03:5x), and the showrunner ruled board.sh into this phase (2026-10-30). The checkpoint notice names both in also-touches lines (owner natedev), tested against `origin/natedev` after a trial merge (production contract item 9). The other copies (`message/sessions.py`, `build_hold/build_hold.py`, `lint/memory_admit.py`, `lint/tmp_sweep.py`, `production/retire_unit.py`) go to their owners through builds after 1b merges: build_hold, memory_admit and tmp_sweep to resources; sessions.py and retire_unit.py to natedev. `step_record.py stopped` (`consume_stopped_build`) also reads `/proc/sys/kernel/random/boot_id`, which Darwin does not have; the Darwin test covers it too.
+`scripts/lib/` and `scripts/direct/board.sh` belong to natedev. builds approved `scripts/lib/` as outside this unit's Owns (03:5x), and the showrunner ruled board.sh into this phase (2026-10-30). The checkpoint notice names both in also-touches lines (owner natedev), tested against `origin/natedev` after a trial merge (production contract item 9). The other copies (`message/sessions.py`, `build_hold/build_hold.py`, `lint/memory_admit.py`, `lint/tmp_sweep.py`, `production/retire_unit.py`, `herdr/herdr.py` `darwin_process_identity`, `prioritize/runner_lock.py`, `shutdown/inventory.py`) go to their owners through builds after 1b merges: build_hold, memory_admit and tmp_sweep to resources; sessions.py and retire_unit.py to natedev; herdr.py to herdr-unit; runner_lock.py and inventory.py to the owners builds names. `step_record.py stopped` (`consume_stopped_build`) also reads `/proc/sys/kernel/random/boot_id`, which Darwin does not have; the Darwin test covers it too.
 
 (3) Test-local Bash function extractors use the shared `shell_functions(path, *names)` in `scripts/direct/shell_function_test_support.py` (each named top-level definition, in the order given; `ValueError` for a missing name). It extracts every function named here byte-equal to the old extractors, so it needs no change; write no second extractor. In `scripts/direct/test_verify_step_owner.py`, delete `shell_function` and call `shell_functions(VERIFY, "token_wait_note")`, `shell_functions(INVOKE, "buildlog_exec")` and `shell_functions(INVOKE, "sweep_after_step")`. In `scripts/direct/test_verify_assertion_guard.py`, `VerifyAssertionGuardTests.lint` replaces the `read_metadata() {` … `require_taplo() {` text slice with `shell_functions(VERIFY, "read_metadata", "load_metadata", "require_member")` plus a `METADATA_READY=0` line in its script (the slice carried that line). It replaces the `assertion_rulings_args() {` slice with `shell_functions(VERIFY, "assertion_rulings_args")` plus an `assertion_rulings_args` call line after it: the old slice carried that call (Phase 1 `verify.sh:841`), and without it the `with_session` cases lose their rulings. No assertion changes; the session-ruling assertions stay as they are.
 
@@ -113,6 +119,9 @@ The writer (`STEP_OWNER_PY`), both board.sh readers and mac_test.py change in on
 - `scripts/direct/board.sh` — `owned_group_matches`, `cleanup_owned_group` `identity(pid)` (owner natedev; also-touches line)
 - `scripts/mac_test/mac_test.py` — `process_start_time` replaced by the shared reader
 - `scripts/mac_test/test_mac_test.py` — patches of `mac_test.process_start_time` move to the shared reader; Darwin claim adoption
+- `scripts/mac_test/copy_watch.py` — the Spec (2) readers on the shared reader
+- `scripts/mac_test/test_copy_watch.py`, `scripts/mac_test/offload_test_support.py` — candidate and claim fixtures read their start through the shared reader; a gone run reads as `Gone`
+- `scripts/build_targets/test_targets.py`, `scripts/build_targets/test_build_targets.py` — patches of `mac_test.process_start_time` move to the shared reader (owner resources-unit; trial-merge against `origin/builds-resources`; the notice carries `also touches scripts/build_targets/test_targets.py, scripts/build_targets/test_build_targets.py (owner resources-unit), tested against <origin/builds-resources tip>`)
 - `scripts/direct/test_step_record.py`
 - `scripts/direct/test_verify_token_ownership.py` — board cases: unreadable start keeps the hold, PID reuse frees it, zombie leader with live children
 - `scripts/direct/test_verify_step_owner.py` — Spec (3): shared extractor in place of `shell_function`
@@ -126,6 +135,9 @@ The writer (`STEP_OWNER_PY`), both board.sh readers and mac_test.py change in on
 - Phase 7 owner record. `STEP_OWNER_PY` writes `{"group": <pid>, "start": <identity>}` to `cargo.d/owned` under the `cargo.guard` lock. `lock_stale_reason` keeps an expired hold while `owned_group_matches` succeeds; a dead `holder_pid` is still freed. `cleanup_owned_group` checks the group with `live_group` (`ps -A -o pgid= -o stat=`). Today `STEP_OWNER_PY.identity` and both board.sh readers fall back to `ps -p <pid> -o lstart=` with no `LC_ALL` or `TZ`, so their Darwin text changes with locale and zone. board.sh starts its readers with plain `python3` (Apple 3.9 on the Mac), so `process_start.py` imports and runs under Python 3.9.
 - Phase 7 Mac claims. `mac_test.py process_start_time(pid) -> str | None` reads `/proc` only and gives `None` for every failure. `adopt_wait_claim` (`claim --from-pid`) moves a wait claim to the runner only when `record["pid"] == from_pid` and the from-pid start equals `proc_start`; else it exits 12.
 - Phase 1. In `step_record.py`, `process_start(pid)` reads `$VERIFY_PROC_ROOT` (default `/proc`) and treats a zombie (`Z`) as ended; `write` stores it as `proc_start`, and `_read_fields` calls a record stale on `FileNotFoundError`, `ProcessLookupError` or a different start. The CLI path (`write`, `state`, `remove`, `stopped`) runs before `argparse`, `dataclasses` and `inspect` load; `StepRecordTests.test_cli_updates_records_without_importing_argument_or_dataclass_machinery` fails if the helper import brings any of them, so the shared reader loads none of them (its named results are not dataclasses). A CLI error prints `step record: <error>; step refused` and exits 2; `verify.sh` takes the `write` status at `VERIFY_MONOTONIC_OFFSET_US="$(… write … --clock-offset)" || exit 2`. The `verify.sh` inline reader is `identity(pid)` in `STEP_OWNER_PY`, run as `"$PY" -c`, so `scripts/lib/` is not on its `sys.path` unless it is given.
+- Phases 9 and 10 (branch `natedev-verify-cancel`; a merge of origin/builds brings them once they land). The token renewer's delay is Bash `sleep`. The `sleep` stub in `VerifyTokenWaitFixture` (`verify_token_wait_test_support.py`) ends only the zero-memory poll at once and passes every other delay to the real `sleep`, so a board case in `test_verify_token_ownership.py` that writes an expired lease stops the renewer first, or its heartbeat writes a new expiry. `user_clock` in `verify.sh` runs `python3 -S` outside the `VERIFY_PY_TRACE` runner; `test_verify_python_starts` expects 40 traced rows.
+- Phase 13 (checkpoint be7ffc50, shrink 17a556b7, on `natedev-verify-cancel`). `copy_watch.py` `Wakeup(read_fd, parent_pid)`, its required `--parent-pid` argument and `verify.sh` `start_copy_watch` stay as Phase 13 left them; 1b changes only the start readers in `copy_watch.py` and `test_copy_watch.py`.
+- Phase 14 (checkpoint 404a4ea0, merge 10424e70 on `natedev-verify-cancel`). Its `verify.sh` hunks are the header, the flag parse loop, `CACHE_DIR`/`cache_lookup`, `try_mac_test`, the body of `route_test_without_renewal`, `mac_only_refuse` and the main flow after `route_test`; it also edits `offload.py`, `offload_test_commands.py` and `verify_mac_offload_test_support.py`, and in `offload_test_support.py` only `OffloadCommandFixture`'s run helper (`runner_options`, `call_id`). None of these overlap 1b's regions; take both sides at the merge.
 
 **Acceptance gate:**
 - `test_verify_step_owner` and `test_verify_assertion_guard` pass with no assertion change.
@@ -320,17 +332,19 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 
 #### Work Order
 
+**Constraints from the phase 20, 23 and 24 review:** Phase 20 replaced the `memory_admit.py check` loop: `scripts/direct/memory_gate.sh` (near line 155) now uses one admission client with wait events. Agree the holder event contract with queue-unit before dispatch, then use one writer and one tester. Phase 23 cancellation behavior stays: a group TERM of a lint run exits 143, repeated INT/TERM/HUP during cleanup are ignored, and no verify process, admission place or step record remains. The acceptance gate keeps the `test_verify_tree_cancel_lint.py` checks green.
+
 **Source:** sdlc hand-off, approved by builds 2026-10-29.
 
 **Goal:** every wait verify.sh records names who holds what it waits on.
 
-**Starting point:** checkpoint 4fa7a873 on `natedev-verify-holder` (reviewed before Phase 7) holds this work on the older base: `buildlog_memory_poll_hook` in `memory_gate.sh`, the holder lookups in `verify.sh` and 23 tests in `test_verify_wait_holder.py`. It has not landed. Port it to this Spec on the Phase 1 + Phase 7 tree: keep what fits, and change the hook to the form in Spec 5.
+**Starting point:** checkpoint 4fa7a873 on `natedev-verify-holder` (reviewed before Phase 7) holds this work on the older base: `buildlog_memory_poll_hook` in `memory_gate.sh`, the holder lookups in `verify.sh` and 23 tests in `test_verify_wait_holder.py`. It has not landed. Port it to this Spec on the tree of Phase 1b plus `natedev-verify-cancel`: keep what fits, change the hook to the form in Spec 5, and drop its background `hold-watch` poller and inline Python holder lookup (Spec 3).
 
 **Spec:**
 
-1. `phase_wait_start` passes the holder to `progress_history.py start-wait`: `--holder-resource-kind slot|memory --holder-resource <slot name | memory pool> --holder-session <session id>`, or `--holder-unit <unit>` when only the unit is known. All flags or none; none records `HolderNotNamed`.
-2. The holder is: for a slot, the board token owner; for memory, the blocker that the gate's `check` poll reports (spec 5); for a build hold, the hold's holder.
-3. When the holder changes during the same wait, call `progress_history.py wait-holder --session-dir <dir> --wait-id <id>` with the same flags. A holder that goes away calls `wait-holder` with no flags (`HolderNotNamed`).
+1. `phase_wait_start` passes the holder to `progress_history.py start-wait`: `--holder-resource-kind slot|memory --holder-resource <slot name | build target | memory pool> --holder-session <session id>`, or `--holder-unit <unit>` when only the unit is known. All flags or none; none records `HolderNotNamed`.
+2. The holder is: for a slot, the board token owner; for memory, the blocker that the gate's `check` poll reports (spec 5); for a build hold, the hold's holder, with kind `slot` and the held target as the resource; for the Mac-only busy wait (Phase 14, `phase_wait_start hold "Mac busy"` in `route_test_without_renewal`), the session that holds the Mac claim, with kind `slot` and resource `mac`, named again on each poll of that wait.
+3. When the holder changes during the same wait, call `progress_history.py wait-holder --session-dir <dir> --wait-id <id>` with the same flags. A holder that goes away calls `wait-holder` with no flags (`HolderNotNamed`). For a slot and a build hold, verify.sh names the holder at `start-wait` and again on each pass of its hold loop, in the loop's own shell. No watcher process runs beside the wait; a change while one blocking wait call runs shows at the next pass.
 4. Tests: see the Acceptance gate.
 5. Observation hook in `scripts/lint/memory_gate.sh` (owner resources-unit; showrunner ruling 2026-10-30; the edit goes through cargo-berth's normal flow). Keep it small:
    - `memory_gate.sh` defines `buildlog_memory_holder() { :; }` beside `buildlog_memory_line`, an override point of the same kind. `verify.sh` defines its own after it sources invoke.sh.
@@ -354,6 +368,9 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 - Phase 7: `buildlog_memory_line` in `verify.sh` opens the memory wait on `first` and closes it on `done` or `left`; the names `phase_wait_start`, `phase_wait_finish` and `buildlog_memory_line` are unchanged. `run_local_test` reads `$HOLD_WAIT_DIR/memory-wait-first` and passes it as `BUILDLOG_MEM_WAIT_SINCE` and `BUILDLOG_MEM_WAIT_FIRST_FILE`, so `mem_wait_s` counts from the first start. Each rejoin after a refused or declined Mac claim opens a new memory wait record at its `first` line. A step leaves the memory wait only when `mac_test.py claim-wait` holds the Mac; a refused claim keeps waiting in place.
 - memory_gate.sh: `buildlog_wait_for_memory` calls `check` with `BUILDLOG_MEM_DETAIL=1`, accepts 14 or 17 `|` separators and reads 18 named fields with `IFS='|' read`; an extra field would join `head_label`. Per poll: the live-memory tripwire, the `check` call, admission validation, the cache update, then admit, `first`, the leave hook or a periodic line. Phase 7's edits (`buildlog_memory_wait_time`, `BUILDLOG_MEM_WAIT_FIRST_FILE`) are the base for the hook.
 - `progress_history.py`: holder flags are `--holder-resource-kind {account,slot,memory} --holder-resource <text>` and exactly one of `--holder-session` or `--holder-unit`; all or none. Only the wait kinds `WaitingForQuotaRefusal`, `WaitingForMemoryOrSlot` and `ReadyWithoutCapacity` take holders (verify uses `WaitingForMemoryOrSlot`). `wait-holder` exits 2 for a wait that is not open or a time before its last holder observation. `phase_wait_start` keeps each wait id in `$HOLD_WAIT_DIR/phase-wait.<BASHPID>.<key>`.
+- Phase 9 (on `natedev-verify-cancel`). `verify.sh` starts no new Python: the holder lookups add no Python start, and `test_verify_python_starts` keeps 40 traced rows.
+- Phase 14 (checkpoint 404a4ea0, merge 10424e70 on `natedev-verify-cancel`). A `--mac "<why>"` call waits in `route_test_without_renewal` under `phase_wait_start hold "Mac busy"` with a Bash `sleep` held in `HOLD_WAITER_PID`; each poll's free-now answer decides, so a Mac that turns blocked, off or unreadable during the wait refuses the call. It never enters the memory wait or takes the cargo token. `hold_interrupted` ends the poll `sleep` for TERM, INT and HUP.
+- Phase 10 (on `natedev-verify-cancel`). A TERM, INT or HUP to the run's process group goes through `verify_interrupted` only: it stops the step group, frees the memory-queue place and exits 143, 130 or 129. The holder lookups add no second stop path. Both run-log tees run `run_log_tee` (ignores INT, TERM and HUP, `tee -i`, reads to EOF). The three group-stop tests in `test_verify_hold_signals.py` pass unchanged. `VerifyHoldWaitFixture` has `start_memory_queued_lint()` (a real `verify.sh lint` parked in the memory queue: the real checker, `MemAvailable: 0`, `BUILDLOG_MEM_POLL_S=3600`), `memory_queue_pids()`, `owned_process_snapshot()` and `wait_for_owned_exit(timeout)`; `wait_for_marker_exit(marker, timeout)` in `verify_mac_offload_test_support.py` is the one process-exit waiter. Reuse them for a parked memory wait; write no second starter or waiter.
 
 **Acceptance gate:**
 - Real-loop tests (real `verify.sh` and the real memory gate loop, fake checker answers) for: one holder per resource kind (slot, memory, build hold); a holder change mid-wait; a holder that goes away; a failed `start-wait` or `wait-holder` and the retry on the next poll; a rejoin, which opens a new interval with its own holder while `mem_wait_s` still counts from the first start; immediate admission, with no interval and no holder call; the no-holder case.
@@ -508,13 +525,52 @@ Checkpoint 404a4ea0 on `natedev-verify-cancel`.
 
 **Ruled out:** forwarded names, values or the fetched folder in the build log; an order among Mac-only waiters; a natedev fallback for any Mac answer.
 
-### Phase 16 — Raise a red alert when the Mac takes no work while steps wait  · status: done
+### Phase 15 — Keep the branch side a base after a merge from trunk  · status: todo
+
+**Origin:** builds showrunner, 2026-10-31 06:xx EDT, wrong result ahead of Phase 14. Branch `natedev-verify-base`, worktree `/home/natepiano/worktrees/claude-build-followups-verify-base` (49e6cc86: Phases 11 and 12, origin/builds 4082a52b).
+
+**Depends on:** Phases 11 and 12 (same guard, same branch). Held, sdlc ruling 2026-10-31 07:33: sdlc devtools-unit Phase 7's `comparison_bases` in `assertion_guard.py` is the one base selector and covers all three parts of this Spec. When its hash is on main, merge it into this branch, run this phase's tests against it and keep only what still fails. Add no second selector.
+
+#### Work Order
+
+**Constraints from the phase 20, 23 and 24 review:** The base selector is now `commit_bases` in `scripts/direct/assertion_guard.py` (near line 1387), with merge regression tests; `default_base` and `comparison_bases` no longer exist. Reproduce each Spec part against `commit_bases` first and implement only what still fails.
+
+**Source:** builds, 2026-10-31. tool-based-ui-inspectors merged trunk init/catalyst 489bcff1a5 into HEAD 6236e6f419. `default_base` picks one of the upstream merge-base and the production merge-base, the side with fewer commits; after the merge that is 489bcff1a5, also the merge's second parent. `commit_bases` then adds only merged-in parents, so the branch side (upstream merge-base b45c99b672) is never a base. Lint blocked on 26 removals (db889600), 6 on 48859c93; all but one are old branch-versus-trunk differences, present on trunk and absent on the branch since before the phase. Reproduction: `/tmp/claude/unit/bf5b8d4c-77ff-4f7b-9318-afb6114ad8f2/guard26_repro.md`.
+
+**Goal:** after a merge from trunk, the guard still judges against the branch side, so an old branch-versus-trunk difference never blocks and a real removal in the phase still does.
+
+**Spec:**
+
+1. Reproduce first: a fixture repository where trunk is merged into HEAD so the production merge-base is the merge's second parent, with one assertion present on trunk and absent on the branch since before the phase, and one assertion removed in the working diff. On 49e6cc86 the old difference blocks.
+2. With no explicit `--base`, the starting bases are every distinct one of the production merge-base and the upstream merge-base that resolves, not the fewer-commits pick. Merged-in parents are then added and ancestors dropped as today. One place decides the starting bases; if `default_base` has no other caller, its fewer-commits rule goes.
+3. An explicit `--base` (or `VERIFY_ASSERTION_BASE`) still replaces the starting bases. A branch with no upstream keeps the production merge-base alone; a repository with neither keeps today's behavior.
+4. A finding blocks only when it holds against every base, as today. No new setting, no skip.
+
+**Files:**
+- `scripts/direct/assertion_guard.py` — `default_base`, `commit_bases`
+- `scripts/direct/test_assertion_guard_revisions.py` — the merge fixture tests
+- `docs/as-built/phase-checks.md` — guard row, if it states the base rule
+
+**Workers:** 1 writer.
+
+**State:** none.
+
+**Constraints from prior phases:** Phase 11's merge-commit rule (judge a merge against both parents) and Phase 12's binding-rename pairing stay as they are.
+
+**Acceptance gate:**
+- The fixture test fails on 49e6cc86 and passes after the change; the real case (repro file, last command without `--base`) blocks exactly 1 finding (`modulation_affordance_pixels.rs` jack-to-label gap, a real phase change), where 48859c93 blocks 6.
+- `scripts.direct.test_assertion_guard*` modules pass; basedpyright `0 errors, 0 warnings, 0 notes` on changed Python; the merge gate passes.
+- When on main: tell inspectors and lfo the rule: a unit passes nothing; after a merge from trunk the guard judges against both the trunk and the branch merge-base.
+
+### Phase 16 — Raise a red alert when the Mac takes no work while steps wait  · status: todo
 
 **Origin:** builds showrunner, 2026-10-31 07:47 EDT, with the user's words: "you should have some kind of red alert that occurs when you have nothing running on the mac as is the case right now - it is a major failure when the mac is available and not taking work". Built on branch `natedev-verify-cancel`, worktree `/home/natepiano/worktrees/claude-build-followups-verify-cancel` (HEAD e6f8540f, Phase 14 shrink).
 
 **Depends on:** Phase 14 (same branch). Nothing else. This unit owns `scripts/buildlog/mac_idle.py` (production doc Units row). The two views belong to queue-unit (`/build:queue`, `/build:status`); this phase adds only the small read of the saved result there and names those paths in the checkpoint's also-touches line.
 
 #### Work Order
+
+**Constraints from the phase 20, 23 and 24 review:** The Phase 16 alert code (reader, watcher, views, notification recovery and tests) shipped on the Phase 20 branch (natedev-verify-cancel 41a3ce6d4). Phase 24 (verify-idle-disk 4b0e023bf) adds the disk exclusion and the admission-query-error cause, and supersedes this Work Order's exclusion rule and constants-based timing. This phase is now closure with one writer: check the shipped code against the acceptance gate, and add the two view checks (`/build:queue`, `/build:status` read the saved alert) and the admission-error recovery check.
 
 **Source:** builds showrunner ruling, 2026-10-31 07:47 EDT (binding). Cause today: `mac_idle.watch_once` (`scripts/buildlog/mac_idle.py:257-337`) returns at lines 277-280 when a claim, `run.json` or `block.json` exists, and at 287-289 for a future `unreachable_until`. It reads only steps in `waiting_hold`/`waiting_mac`, never reaches the user, and `notify_director` (lines 220-246) sends only to the `builds-unit` director of production `build-followups` (line 235), which no longer directs. At 07:47 EDT research held a block (`~/.local/state/mac-test/block.json`, holder `research`, for `P15 F11 L0 run`), no natedev job ran on the Mac, and live `mac_allowed` test steps waited in `waiting_hold` on natedev (7 at 07:49). The watch saw nothing. From 07:50 to about 07:57 the second idle stretch was a live research claim with only a parked hana app on the Mac: no compile or test ran while 7 test runs waited. The claim watcher counts the app as Mac activity, so it wrote no `idle_since`.
 
@@ -576,9 +632,7 @@ Checkpoint 404a4ea0 on `natedev-verify-cancel`.
 - `docs/as-built/mac-test-offload.md` — the idle Mac watch section
 - `docs/as-built/build-targets.md` — idle watch lines
 
-**Workers:** 2 writers (no test lane: Python tests sit beside their modules).
-- `impl` — `scripts/buildlog/mac_idle.py`, `scripts/buildlog/test_mac_idle.py`, `scripts/buildlog/index.py`, `scripts/mac_test/mac_test.py`, `scripts/mac_test/test_mac_test.py`, `scripts/notify/push_texts.py`, `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, both as-built docs; hub: `scripts/buildlog/mac_idle_alert.py` (both views read it; `impl` writes it first, from Spec 6, and the other writer asks for any change).
-- `test` — opens as impl — `scripts/build_queue/build_queue.py`, `scripts/build_queue/test_build_queue.py`, `scripts/build_targets/build_targets.py`, `scripts/build_targets/test_build_targets.py`, `commands/build/queue.md`, `commands/build/status.md`; codes against the Spec 6 API and writes a fixture `alert.json` for its tests.
+**Workers:** 1 writer, `impl`, for the closure checks: compare the shipped code with the acceptance gate, then add the two view checks and the admission-error recovery check. The Spec and Files above describe the code that shipped on the Phase 20 branch.
 
 **State:** `~/.local/state/mac-idle/alert.json` (rewritten each pass), `idle.json` (outage `since`), the `messaged`/`pushed` marks, the send keys `mac-idle-showrunner-<since>` and `mac-idle-<since>` in send.py state, and the `emergencies.json` record that `--clears-when` adds. A rerun of a pass with the same files sends nothing more and writes the same result.
 
@@ -590,28 +644,6 @@ Checkpoint 404a4ea0 on `natedev-verify-cancel`.
 - Phase 14: a `--mac` step waits in `route_test_without_renewal` in state `waiting_mac`; it counts as a waiting step.
 - Memory rules: no second copy of the line text or the path (Spec 6 is the one place); a push that asks nothing is held by review, so both texts name an action; the 3 minutes and 10 minutes come from the user's ruling and live as named constants.
 - Build rules: fix every visible failure before a rerun; no rerun after a pass until the edits are done; while editing, run the quick unittest modules (`verify.sh check` for any Rust); lint (basedpyright) once, at the phase gate only.
-
-**Director rulings after review pass 1.**
-- Spec 6 is amended. The times are config, not constants: `[mac_idle]` keys `alert_seconds`, `push_seconds`, `stale_seconds`, `repeat_minutes` and `send_timeout_s` in `config/mac_test.conf`, read at use (user rule: no hard-coded config). Spec 8's 3 minutes and Spec 9's 10 minutes are the shipped defaults. No text, doc or message states a time as a fixed number; each renders from config or says "default". The import bound stays: the views (`build_queue.py`, `build_why.py`, `build_targets.py`) must start with `PYTHONPATH` unset, so the hub must not import `mac_test`. There is one reader for the `[mac_idle]` keys, in a module that the views and `mac_test` can both import; `mac_test` uses it and keeps no second copy.
-
-**Assertion changes (director rulings after review pass 1).** Each line below is approved: it follows Spec 8 (the notifier takes text and goes to the builds showrunner) or Spec 12 (`work` and `work_idle_since`). The change to `test_live_record_without_retry_registration_sends_one_message` is not approved: its substring checks no longer prove the package is empty. Fix round 1 restores an exact check of the rendered message.
-- Assertion-Change: scripts/buildlog/test_mac_idle.py::test_unknown_cause_sends_once_for_the_call — old: send.assert_called_once_with(replace(call, wait_state=…), "idle_with_waiter") and actions ["message_builds_unit"] — new: send.assert_called_once_with(mac_idle.repair_message(replace(call, wait_state=…), "idle_with_waiter")) and actions ["message_showrunner"] — why: Spec 8 sends text to the showrunner.
-- Assertion-Change: scripts/buildlog/test_mac_idle.py::test_message_resolves_only_builds_unit_in_build_followups — old: roster --json lookup, recipient session:builds, "verify.sh lint" in the body — new: replaced by test_message_resolves_builds_showrunner_address: exact showrunners.py address builds argv, the uds: recipient, the text passed through, no user recipient — why: Spec 8 resolves the showrunner address.
-- Assertion-Change: scripts/mac_test/test_mac_test.py::test_first_idle_pass_records_now_and_process_claim_uses_config_host — old: {**record, "idle_since": now} — new: adds "work_idle_since": now — why: Spec 12.
-- Assertion-Change: scripts/mac_test/test_mac_test.py::test_one_activity_check_per_host_serves_every_repository_claim — old: {**record, "idle_since": now} — new: adds "work_idle_since": now — why: Spec 12.
-- Assertion-Change: scripts/mac_test/test_mac_test.py::test_idle_release_removes_only_that_repository_claim — old: cargo-liner record with "idle_since" — new: adds "work_idle_since" — why: Spec 12.
-- Assertion-Change: scripts/mac_test/test_mac_test.py::test_activity_check_requires_readable_success_and_uses_one_bounded_ssh — old: ("active=0\nrc=0\n", MacIdle()), ("active=3\nrc=0\n", MacActive(3)) — new: answers add work=0 / work=3; the second expects MacActive(3, 3) — why: Spec 12.
-- Assertion-Change: scripts/mac_test/test_mac_test.py::test_active_pass_clears_idle_since_with_state_lock_released — old: MacActive(3) — new: MacActive(3, 3) — why: Spec 12.
-- Assertion-Change: scripts/mac_test/test_mac_test.py::test_idle_pass_before_fifteen_minutes_keeps_claim — old: fixture with idle_since only — new: fixture also has work_idle_since — why: Spec 12; fix round 1 adds a case for a claim with idle_since and no work_idle_since.
-- Assertion-Change: scripts/mac_test/test_mac_test.py::test_failed_activity_check_keeps_claim_and_idle_time — old: record without work_idle_since — new: record with work_idle_since, kept unchanged — why: Spec 12; the test now covers both keys.
-- Assertion-Change: scripts/buildlog/test_mac_idle.py::test_live_record_without_retry_registration_sends_one_message — old: assertEqual((reported.kind, reported.repo, reported.package), ("doc", repo, "")) — new: assertIn(f"Repo {repo}", reported) and assertIn("verify.sh doc , pid 123", reported) — why: Spec 8 passes text; the exact "doc , pid" text still proves the package is empty (fix round 1 ruling).
-- Assertion-Change: scripts/buildlog/test_mac_idle.py::test_dead_process_claim_is_free_and_remote_claim_is_always_live — old: assertEqual(mac_work(...), MacIdle("free")) — new: assertIsInstance(mac_work(...), FreeMac) — why: F011 makes a free Mac its own variant with no fields (fix round 1 ruling).
-- Assertion-Change: scripts/mac_test/test_offload_cleanup.py::MacActivityShellTests.test_activity_text_has_zero_for_only_shells_in_clones_under_sh_and_zsh — old: (0, "active=0\nrc=0\n", "") — new: (0, "active=0\nwork=0\nrc=0\n", "") — why: Spec 12 adds the work= line (fix round 1 ruling).
-- Assertion-Change: scripts/mac_test/test_offload_cleanup.py::MacActivityShellTests.test_activity_text_counts_each_matching_user_pid_once_under_sh_and_zsh — old: (0, "active=7\nrc=0\n", "") — new: (0, "active=7\nwork=5\nrc=0\n", "") — why: Spec 12; two app processes are active but not work (fix round 1 ruling).
-- Assertion-Change: scripts/buildlog/test_mac_idle.py::test_notification_marks_survive_stop_after_delivery_before_return — old: self.assertEqual(send.call_count, 1) — new: self.assertEqual(delivered, [expected]) through check_interrupted_delivery — why: the list of delivered texts proves exactly one delivery and its text, which the call count did not (fix round 2 ruling, F016).
-- Assertion-Change: scripts/buildlog/test_mac_idle.py::test_notification_marks_survive_stop_after_delivery_before_return — old: claim-based helper, delivered == [expected] — new: real send.send with a private acceptance file; acceptance count 1 at the cut, watcher mark False, count still 1 after two passes, final mark True — why: a claim does not prove delivery (fix round 3 ruling, F014).
-- Assertion-Change: scripts/buildlog/test_mac_idle.py::test_stop_before_transport_retries_and_delivers_once — old: claim-based helper, len(delivered)==0 then delivered == [expected] — new: real sender stopped before transport; count 0 and mark False, then count 1 across two passes and mark True — why: the sender owns delivery; no mocked claim counts as delivered (fix round 3 ruling, F014).
-- Assertion-Change: scripts/message/test_send.py::test_a_failed_send_does_not_clear_a_later_runs_window — old: the overlapping same-key send returns "sent"; log ["sent", "failed", "skipped"] — new: the overlapping send returns "retry"; a later send after the failed owner releases returns "sent"; log ["retry", "failed", "sent", "skipped"]; the final "skipped" is kept — why: per-key delivery exclusion forbids two transports of one key at once (fix round 3 ruling, F014).
 
 **Acceptance gate:**
 - Reproduce first, in `test_mac_idle.py`: `block.json` held by `research`, no claim (and a second case with one claim that has `idle_since`), 3 live `mac_allowed` test records in `waiting_hold`, one with a memory-queue admission file. On e6f8540f the watch writes nothing and sends nothing; after the change, the pass at 3 minutes writes `alert.json` (`idle`, `blocked`, holder `research`, `waiting` 3) and sends one message to the address that a stubbed `showrunners.py address builds` returns, and no push.
@@ -630,6 +662,8 @@ Checkpoint 404a4ea0 on `natedev-verify-cancel`.
 **Depends on:** Phase 16, and it runs after Phase 16 on the same branch. It cannot run beside Phase 16: the files overlap. The cause is in `scripts/build_targets/build_targets.py` (`mac_target_eligibility`, `command_kind_eligible`), and its tests are in `scripts/build_targets/test_build_targets.py`. Phase 16 also edits both files (its `test` worker owns them; `command_status` and its tests), and it owns `docs/as-built/mac-test-offload.md` and `docs/as-built/build-targets.md`, which this phase also changes. `scripts/direct/verify.sh` is not a Phase 16 file. Start this phase when Phase 16's checkpoint is on the branch.
 
 #### Work Order
+
+**Constraints from the phase 20, 23 and 24 review:** Phase 27 lands first: it changes Mac eligibility and the retry hooks (`target_can_retry`) and gives a disk decline the same leave hook as busy, with no 180-second delay. After Phase 27, reduce this phase to the cases Phase 27 does not cover, with one integration writer and one tester. Phases 17 and 27 share one acceptance test: a disk decline keeps the Phase 24 Mac disk alert (`mac_idle.py` counts `NatedevOnly("disk")`) through retry eligibility and local execution.
 
 **Source:** builds showrunner ruling, 2026-10-31 ~07:57 EDT (binding). Cause at e6f8540f:
 - `initialize_step_record` (`scripts/direct/verify.sh:1697-1773`) runs `build_targets.py eligible --kind` once. Its first line becomes the step's `runs_on` (`step_record.py write --runs-on`, lines 1741-1745).
@@ -679,9 +713,7 @@ Start reasons, by class (evidence at e6f8540f):
 - `docs/as-built/mac-test-offload.md` — the decision point text
 - `docs/as-built/build-targets.md` — the routing and leave lines
 
-**Workers:** 2 writers (no test lane: Python tests sit beside their modules; shell tests are `scripts/direct/test_verify_*.py`). No hub file: the Spec 3 row form is the interface.
-- `impl` — `scripts/build_targets/build_targets.py`, `scripts/build_targets/test_build_targets.py`, `docs/as-built/mac-test-offload.md`, `docs/as-built/build-targets.md`.
-- `test` — opens as impl — `scripts/direct/verify.sh`, `scripts/direct/test_verify_mac_start_decline.py`; codes against the Spec 3 row form. Its tests use the real `build_targets.py`, so they pass only when `impl` is done.
+**Workers:** 1 integration writer (`impl`) and 1 tester (`test`). Before dispatch, cut Spec 2-5 to the start declines that Phase 27 does not cover. Phase 27 removes the 180 s delay for a disk decline, so `RetryTarget` and the 180 s start deadline are not built unless a case still needs them.
 
 **State:** the step record `runs_on` in `~/.local/state/verify-steps/<call>.json` (now `mac_allowed` for a short-term decline) and the `mac_idle.py register` record with its retry deadline. Each is written once per call, as for an `eligible` row now. No new file, lock or mark. A rerun is a new call with a new record.
 
@@ -702,154 +734,378 @@ Start reasons, by class (evidence at e6f8540f):
 - basedpyright `0 errors, 0 warnings, 0 notes` on every changed Python file and its callers (`scripts/build_hold/hold_applies.py`, `scripts/direct/local_release_wait.py`, `scripts/production/merge_gate.py`); `bash -n scripts/direct/verify.sh`; `shellcheck scripts/direct/verify.sh` with no new findings.
 - Merge gate `--tests-only` green on a tree merged with `origin/natedev`. The checkpoint notice names the also-touches paths `scripts/build_targets/build_targets.py` and `scripts/build_targets/test_build_targets.py`, owner queue-unit.
 
-### Phase 18 — Make named, registered copies with copies.py  · status: todo
+### Phase 18 — One standing gate checkout per unit, made only by copies.py  · status: done
 
-**Origin:** builds showrunner, 2026-10-31 08:1x EDT, after the user asked: "when will we have the service that names and copies things correctly?". The showrunner's go: "If a phase can start now, start it." This phase and Phase 19 are Phase 3 ("The helper") of the copies plan `docs/plans/verify-copies.md` (branch `verify-copies`, tip bbf4dbae). This phase makes, lists, removes and hands over copies with an empty target. Phase 19 adds the seed target, the `verify.sh` busy lock and the live gate copy. Built on branch `verify-copies`, worktree `/home/natepiano/worktrees/claude-build-followups-verify-copies`.
+#### As-built
 
-**Depends on:** nothing that is not on origin/main (5e08bd6e). The name join (report-unit, `UnitLabels.folder_name()`) and the copies lifetime (resources-unit Phase 21: copies root, `register_copy`, `hand_over`, `end_copy`, the `.git/info/exclude` entries) are there (Source). It shares no file with Phases 16 and 17.
+Checkpoint `f8a20f368` on `verify-copies`.
 
-#### Work Order
-
-**Source:** copies plan `verify-copies.md`: Naming, Cleanup, Survey changes (Name and Source; of Target only mode `none`), the Phase 1 verdict, Phase 2 and the Phase 3 Spec; the builds showrunner's go, 2026-10-31 08:1x EDT (binding). The APIs, read on origin/main 5e08bd6e with `git -C ~/.claude show origin/main:<path>`:
-- `scripts/message/unit_labels.py:83-100`: `UnitLabels(session, showrunner, unit)` and `folder_name()`, which gives `<showrunner>-<unit>`, drops a unit name's leading showrunner name and drops a missing part (`—`). `:331-367`: `unit_labels_for(session_ids, environment) -> dict[str, UnitLabels]` reads files only; it returns `{}` on any error and has no key for an unknown session. `scripts/message/roster.py:103` re-exports it.
-- `scripts/build_hold/build_hold.py:345-368`: `owning_session(environment) -> OwningSession | NoOwningSession` (classes at `:53` and `:58`). It gives the unit director of `UNIT_RUN_DIR` first, then `CLAUDE_CODE_SESSION_ID`.
-- `scripts/lib/scratch.py`:
-  - `copies_root()` (`:155-157`): `SCRATCH_COPIES_ROOT`, else `<SCRATCH_ROOT parent>/copies`, which is `/tmp/claude/copies`. `copy_folder(path)` (`:160-168`): a copy is exactly `<root>/<pair>/<copy>`.
-  - `register_copy(path, *, task, owner_unit, source_path, source_commit, copy_commit, target_mode, seed_source, borrows_from, land_target="", run_dir="", phase_id="")` (`:210-225`) writes `<copy>/.scratch.json` through `update_record` (`:386-412`), the one record-write path. When `<copy>/.git` is a folder, `update_record` also adds `/.scratch.json` and `/.claude-busy` to the copy's `.git/info/exclude` (`exclude_copy_metadata`, `:188-207`). A second call keeps `created`.
-  - `fields_for_task` (`:368-383`): a `phase:<unit>/<phase>` task adds `run_dir` and `phase_id` (the phase id comes from the task); a `landed:` task adds `land_target`, default `origin/main`. `TASK` (`:85`) accepts `run:`, `phase:`, `gate:`, `until:`, `landed:` and `row:`; `task_or_default` (`:508`) gives `until:` 24 h.
-  - `hand_over(path, owner, task, *, run_dir="", land_target="")` (`:354-365`) is the function behind `scratch.py hand-over` (parser `:1060-1065`, handler `:1082-1086`). It keeps the path and writes owner and task in one atomic record write under `copy_lock`. The owner must match `WORD` (`:92`).
-  - `copy_paths()` (`:636-645`), `task_of` (`:623`), `renew` (`:779`), `lifetime` (`:753-757`).
-  - `end_copy(path, task, now, *, require_task=True)` (`:1001-1022`) writes end evidence, then removes the copy only when no `.claude-busy` lock is held, its lifetime is `Ended` (no open phase, no borrowing child, the land rule met; `record_lifetime`, `:648-745`) and `unsaved_work` (`:933-939`) is `None`. `repo_problem` (`:912-930`) counts uncommitted changes and untracked files, and, outside a linked worktree, a stash and local branches with commits on no remote.
-- `scripts/production/merge_checkpoint.py:1039-1050` `end_phase_scratch` ends task `phase:<Units-row unit>/<phase>` with `scratch.end` when a code checkpoint merges.
-
-**Goal:** `copies.py make` makes a copy of any git repository at `/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`, with its own git and a full scratch record, and prints its path. `copies.py list`, `remove` and `hand-over` work on these copies. The target is empty: target mode `none`.
-
-**Spec:**
-
-1. **Commands.** New `scripts/copies/copies.py` (stdlib plus `scripts.lib.scratch`, `scripts.message.unit_labels` and `scripts.build_hold.build_hold`):
-   - `make --source <repo> [--commit <rev>] --phase <label> --purpose <word> [--suffix <word>] [--unit <unit>] [--branch <branch>] [--task <task>] [--run-dir <dir>] [--land-target <ref>] [--with-diff] [--new]` prints the copy path on one line.
-   - `list` prints one line per copy: path, task, owner unit, source path, source commit (12 characters), target mode, size (`du -sh`).
-   - `remove <path>` ends one copy through `scratch.end_copy`.
-   - `hand-over <path> --to <unit> --task <task> [--run-dir <dir>] [--land-target <ref>]` moves the cleanup owner.
-   - Python API `make_copy(...) -> Path`, with the arguments of `make`; the CLI calls it. A refusal raises `CopyError`; the CLI prints `copies: <reason>` to stderr and exits 2. Success exits 0.
-2. **Name.** Read the session with `build_hold.owning_session(os.environ)`; `NoOwningSession` refuses. Read the labels with `unit_labels_for([session id], os.environ)`; a missing key refuses with `no roster labels for this session`. A session id is never part of a name. The pair is `labels.folder_name()`. `--unit <unit>` (a showrunner makes a copy for another unit) uses `UnitLabels(labels.session, labels.showrunner, <unit without -unit>).folder_name()`. The phase label is a slug `[a-z0-9][a-z0-9-]*` (`54b`, `adhoc`, `sync-test`); a slash or any other character refuses. The purpose is one of `gate`, `review`, `merge`, `land`, `before`, `after`, `test`, `work`. `--suffix <word>` (`[a-z0-9]+`) gives `<phase>-<purpose>-<suffix>` (`34-before-beeece8b`). The folder is `scratch.copies_root() / <pair> / <name>`, made with one `os.mkdir` (the pair folder with `exist_ok`).
-3. **Same name.** When the folder exists and its record has the same source path and source commit, a non-empty `copy_commit` and no diff, `make` reuses it: it renews the record (`scratch.renew`), prints the path and changes nothing else. Another source or commit refuses and names `copies.py remove <path>`; `make` never builds into it. A record with an empty `copy_commit` refuses: another `make` fills it, or it stopped and needs `remove`. `--new` makes a parallel copy in the first free folder of `<name>`, `<name>-2`, `<name>-3`, …, each tried with `os.mkdir`.
-4. **Record first.** Right after `mkdir`, `make` calls `register_copy` with every field of Spec 7 and `copy_commit=""`. A stop at any later step so leaves a registered copy that `remove` ends. When the git step is done, `make` calls `register_copy` again with the copy commit.
-5. **Own git.**
-   - Git dir: `git -C <source> rev-parse --path-format=absolute --git-common-dir`. It is the `.git` folder of a plain repository, the main repository's git dir for a linked worktree (its `<source>/.git` is a file), and `<sibling>/.git` for a copy source. Commit: `git -C <source> rev-parse --verify <rev>^{commit}` (default `HEAD`).
-   - `git clone --shared --no-checkout --quiet <git dir> <copy>/.copies-stage`, move `<copy>/.copies-stage/.git` to `<copy>/.git`, remove the stage. `make` only reads the source and writes nothing into it (`review.sh` fails on a source change).
-   - `git -C <copy> rev-parse --absolute-git-dir` must equal `<copy>/.git`; else refuse. A copied `.git` pointer moves the real branch (memory `gate-copy-needs-own-git`).
-   - Origin: `git -C <copy> remote set-url origin <url>`, with `<url>` from `git -C <source> remote get-url origin`. A source with no origin refuses. The copy's `refs/remotes/origin/*` and `refs/remotes/origin/HEAD` are set equal to the source's (a fetch from the git dir, with `+refs/remotes/origin/*:refs/remotes/origin/*` and `--prune`, and `git symbolic-ref`), so the merge target ref is the source's (a stale `origin/HEAD` once gave the assertion guard 116 changes that were not the phase's).
-   - Checkout: `git -C <copy> checkout --quiet --detach <commit>`, then delete the copy's local branches, so `repo_problem` finds no unpushed branch. Purpose `work` needs `--branch <branch>` and runs `git -C <copy> switch --quiet -c <branch> <commit>` in place of the detached checkout. Unpushed source commits come with the copy through the alternates file.
-   - `~/.claude` guard: when `<url>` equals the origin URL of `~/.claude`, a commit that does not contain `b8ef1b37` (`git merge-base --is-ancestor`) refuses: an older tree's test deletes every session folder. The marker commit and the `~/.claude` path are module constants.
-   - Pruned objects: before a reuse (Spec 3), `git -C <copy> rev-list --objects --no-walk <copy commit>` must exit 0; else refuse loudly and name the record's `borrows_from`.
-6. **Diff.** `--with-diff` (only with the source's `HEAD`) applies `git -C <source> diff --binary HEAD` in the copy with `git apply --index`, copies in each untracked, not ignored file (`git -C <source> ls-files --others --exclude-standard -z`), and commits on the detached HEAD with `git -c user.name=copies.py -c user.email=copies@localhost commit --quiet --no-verify -m "copies: working-tree diff of <source> at <commit>, sha256 <hash>"`. The hash is the sha256 of the diff and of each untracked path and its bytes. The record keeps `source_commit` = the source's `HEAD` and `copy_commit` = the new commit: two different commits mean "HEAD + diff", and the commit message names the hash. The commit is on no branch, so `unsaved_work` does not keep the copy.
-7. **Record fields.** `register_copy(path, task=…, owner_unit=…, source_path=<absolute --source>, source_commit=…, copy_commit=…, target_mode="none", seed_source="", borrows_from=<git dir of Spec 5>, land_target=…, run_dir=…)`.
-   - `owner_unit`: the short unit label (`labels.unit`, or the `--unit` value); the showrunner label when the unit is `—`.
-   - `borrows_from` for a copy source is `<sibling>/.git`, the path that `record_lifetime` matches against a parent copy (`scratch.py:674-679`).
-   - Task: `--task` when given. Else purpose `work` or `land`: `landed:<owner unit>/<branch>` (needs `--branch`), with `land_target` from `--land-target`, default `origin/main`. The caller passes `origin/<merge branch>` when its unit is in a production; `copies.py` reads no production doc. Else the scratch default, `until:` 24 h.
-   - A `phase:<unit>/<phase>` task needs `--run-dir` (default `UNIT_RUN_DIR`), else refuse; scratch sets `phase_id` from the task. The task's unit is the Units-row unit name that `merge_checkpoint.py:1043` uses.
-   - Target mode in this phase is `none` for every source, hana too: no `target/`, no `CARGO_TARGET_DIR`, no seed. `make` writes nothing to `.git/info/exclude`; `update_record` adds the entries.
-8. **remove.** The path must be a copy (`copy_folder(path)` equals it); a path that does not exist prints `<path>: no copy` and exits 0. Read the record with `task_of` and call `end_copy(path, <record task>, time.time())`. True: print `removed <path>`, exit 0. False: print `copies: <path> kept: <reason>`, the reason from `scratch.lifetime(path)` or `unsaved_work(path)`, and exit 2. An empty pair folder stays for `tmp_sweep.py`.
-9. **list.** From `scratch.copy_paths()` and `task_of`, sorted by path. An unreadable record shows its reason in the line.
-10. **hand-over.** Call `scratch.hand_over(path, <to>, <task>, run_dir=…, land_target=…)`. It keeps the path; `copies.py` renames no folder and writes no record field itself. `--to` is a short unit label (`WORD`). A rerun with the same owner and task writes the same fields and exits 0.
-11. **Doc.** New `docs/as-built/frozen-copies.md`: the path form and name rules, the record fields with one example `.scratch.json`, the four commands with their exits, the task rules and mode `none`. One line says that Phase 19 adds the seed target and the busy lock.
+- `copies.standing(owner, repo, commit, *, apply_uncommitted=None, merge=None)` supplies two checkouts with separate Git directories and retained targets.
+- The configured root contains `<repo>/<owner>-gate` and `<owner>-gate-2`. A third caller waits; linked sources use the canonical repository name.
+- Each use fetches, detaches and cleans untracked files without deleting ignored output. Uncommitted changes precede the optional merge.
+- `run`, `list` and `remove` share this implementation. Commands receive `{tree}` substitution; refusals exit 2, apply or merge failures exit 3.
+- Existing busy flocks protect preparation and use. Commands inherit their descriptors, so wrapper death cannot release a surviving command's lock.
+- Atomic `.gate.json` publication and `.removing` directories permit retries. A replacement source rebuilds Git metadata without deleting the target.
+- `PostUseError` preserves a caller's error separately from cache or record failures. Applied untracked files receive current modification times.
+- `config/copies.conf`, read through `scripts.lib.conf`, supplies `root`, `wait_seconds`, `git_timeout_seconds`, `guard_timeout_seconds`, fallback owners and creator exceptions.
+- The shipped secondary recheck interval is one second. Primary release wakes acquisition immediately; the checkout count is fixed at two.
+- CI, nightly, scratch, style and toolchain callers use the service. Both agent hook fronts and the repository scanner use the copy guard.
+- Crate frozen bases and integration proofs use standing checkouts. Editable package workers use `copies.workspace()` and caller-owned `gate:` tasks.
+- Worker names are `crate-<run>.<package>`. One canonical owner reaches nested proofs; initialized workers retain edits during resume.
+- Legacy manifest paths remain authoritative. Adoption validates source, branch and base; terminal cleanup preserves busy or unsaved workers and external result evidence.
 
 **Files:**
-- `scripts/copies/copies.py` — new: the CLI, `make_copy`, `CopyError`
-- `scripts/copies/test_copies.py` — new: the tests of the Acceptance gate
-- `docs/as-built/frozen-copies.md` — new: names, record, commands
 
-**Workers:** 1 writer + 1 tester, disjoint files (tests sit beside the module).
-- `impl` — `scripts/copies/copies.py`, `docs/as-built/frozen-copies.md`.
-- `test` — opens as impl — `scripts/copies/test_copies.py`; writes the tests against the Spec 1 commands and the `make_copy` API first, with a fake roster (patched `owning_session` and `unit_labels_for`), a fake source repository with a bare `origin`, and `SCRATCH_ROOT` and `SCRATCH_COPIES_ROOT` set to private temporary folders.
+- `scripts/copies/{copies,copy_guard,shell_syntax}.py`, their tests and `config/copies.conf` — checkout lifetimes, creation policy and configuration.
+- `scripts/lib/scratch.py`, `scripts/lint/sweep.py` and their tests — inherited busy descriptors, task cleanup and configured cache discovery.
+- `scripts/production/{ci_points,merge_gate,waiting}.py`, `scripts/buildlog/rust_release.py` and tests — standing callers and verdict preservation.
+- `scripts/style/{bulk_run,style_sync,crate_run}.py` and tests — retained targets, canonical ownership and editable worker recovery.
+- `scripts/hooks/{hook_dispatch,codex_hooks}.py` and tests — the combined copy and scratch guard.
+- `docs/as-built/gate-checkouts.md`, caller documentation and command recipes — checkout use, original-worktree exceptions and non-Git reproduction.
 
-**State:** each copy folder `/tmp/claude/copies/<pair>/<copy>`, its record `<copy>/.scratch.json`, and the `/.scratch.json` and `/.claude-busy` lines in its `.git/info/exclude` (written by `scratch.py`). No other file, lock or mark. A rerun of `make` with the same arguments reuses the copy (Spec 3); a rerun of `remove` or `hand-over` changes nothing and exits 0.
+**Binds later work:** The checkout APIs own repository creation. Broader guard import coverage remains in `docs/plans/natedev-verify-next.md`.
 
-**Constraints from prior phases:**
-- Copies plan Phase 1 verdict: target mode seed, without `incremental/`, sources copied with `cp -a`; no shared build-dir. This phase builds mode `none` only; Phase 19 adds the seed.
-- Copies plan Phase 2 (on origin/main): resources-unit Phase 21 owns the lifetime code, and this phase only calls `scratch.py`. report-unit owns `folder_name()`; the name join stays in `unit_labels.py`.
-- Copies plan Delegation Context invariants: a copy has its own git dir, never a copied `.git` pointer; its origin is the source's origin URL, not the source path; roster labels are the one name source.
-- Phase 9: `verify.sh` starts no new Python. This phase does not change `verify.sh`.
-- Memory rules: one place for each thing (the name join in `unit_labels.py`, the record write in `scratch.py`); lifecycle commands are safe to rerun.
-- Build rules: fix every visible failure before a rerun; no rerun after a pass until the edits are done; while editing, run the quick test modules; lint once, at the phase gate only.
+**Gotchas:** Standing targets can be swept while idle. Run workers need task completion evidence, not a fixed deadline. Guard coverage has documented syntax limits.
 
-**Acceptance gate:**
-- `env -u PYTHONPATH -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY -u STAFF_OPERATION_FD python3 -m unittest discover -s scripts/copies -p test_copies.py` passes. The tests:
-  - Fake roster: labels `hana` + `lfo` give `<root>/hana-lfo/54b-gate`; a showrunner alone gives `<root>/builds/…`; `--unit`, `--suffix` and `--new` (`-2`, `-3`) give their names; no owning session, no labels, a bad phase label or a bad purpose exit 2 and make no folder.
-  - Fake source repository with a bare origin and one unpushed commit: the copy has the commit; `rev-parse --absolute-git-dir` is `<copy>/.git`; `remote get-url origin` is the source's origin URL; `refs/remotes/origin/*` and `origin/HEAD` equal the source's; no local branch (a `work` copy has only its `--branch`); `git status --porcelain` in the copy is empty; the source's files, refs and status are the same after `make`.
-  - The linked-worktree `.git` case: a source made with `git worktree add` (its `.git` is a file) gives a copy whose `.git` is a folder, at the worktree's commit, with `borrows_from` the main repository's git dir.
-  - Record fields: `source_path`, `source_commit`, `copy_commit`, `target_mode` `none`, `seed_source` `""`, `borrows_from`, `owner_unit`, `task`; a `phase:` record also has `run_dir` and `phase_id`; a `work` copy has `landed:<unit>/<branch>` and `land_target` (`origin/main` by default, and a given one); `.git/info/exclude` holds `/.scratch.json` and `/.claude-busy`.
-  - `--with-diff`: `copy_commit` differs from `source_commit`, its tree has the tracked change and the untracked file but not the ignored file, its message names the hash, and `remove` still removes the copy.
-  - Same name and commit: reused, exit 0. Another commit: exit 2, nothing changed. Pruned borrowed objects: exit 2, the message names `borrows_from`. The `~/.claude` guard (patched constants): a commit without the marker exits 2.
-  - `hand-over` to another unit keeps the path and changes `owner_unit` and `task` in one record write; a rerun exits 0.
-  - `remove`: an `until:` copy goes, exit 0, and a rerun exits 0; a copy with an uncommitted change, a parent copy that a child borrows from, and a copy with a held `.claude-busy` lock are each kept with exit 2 and a reason.
-  - `list` shows each copy with task, owner, source, commit, mode `none` and size, and the reason of an unreadable record.
-- basedpyright `0 errors, 0 warnings, 0 notes` on `scripts/copies/copies.py` and `scripts/copies/test_copies.py`.
-- Live check on natedev, from the unit director's session, with no build: `copies.py make --source ~/rust/hana --phase 18 --purpose test` prints `/tmp/claude/copies/<showrunner>-<unit>/18-test` with the readable pair from the roster; `copies.py list` shows it with its `until:` task and mode `none`; `copies.py remove <path>` deletes it, and the path is gone.
-- Merge gate `--tests-only` green on a tree merged with `origin/natedev`.
+**Ruled out:** Named frozen gate copies, seeded targets, shared target directories, a third standing checkout, and a creator exception for crate runs.
 
-### Phase 19 — Seed a copy's target, hold a copy busy in verify.sh, and prove a live gate copy  · status: todo
+**Assertion-Change:** Checkout-retention, target-ownership, registration and cleanup assertions use the new lifetimes. The changed tests are:
 
-**Origin:** builds showrunner, 2026-10-31 08:1x EDT, after the user asked: "when will we have the service that names and copies things correctly?". It is the second part of Phase 3 ("The helper") of the copies plan `docs/plans/verify-copies.md` (branch `verify-copies`, tip bbf4dbae); Phase 18 is the first part. Built on branch `verify-copies`, worktree `/home/natepiano/worktrees/claude-build-followups-verify-copies`, after Phase 18.
-
-**Depends on:** seed3, the copies plan's next seed case ("Next case" under Decision), which runs when resources-unit Phase 37 (floor order: empty idle targets first) is on main. Its verdict sets the seed rule of Spec 1; refresh this Work Order with its numbers before the phase starts. Also Phase 18 (same branch), and efficiency-unit's `scripts/lib/nix_env.py` change (copies plan Phase 2) that trusts a copy's `.envrc` from its record. That change is not on origin/main 5e08bd6e: `trusted_envrc` (`nix_env.py:90-96`) trusts only `~/rust`, `~/worktrees`, `~/.claude*` (`trusted_root`, `:52-59`) and registered worktrees, so `verify.sh` in a copy fails with `direnv: .envrc is blocked`.
-
-#### Work Order
-
-**Source:** copies plan `verify-copies.md`: the Phase 1 verdict and the seed rerun (Decision), the candidate ordered seed rule, the Phase 3 Spec items on the seed and `verify.sh`, the Cleanup busy lock, Survey changes Target; the builds ruling of 2026-10-31 on seeds and the disk floor. The APIs on origin/main 5e08bd6e:
-- `scripts/lib/scratch.py:144-152` `mark_cargo_cache(target)` writes `CACHEDIR.TAG` and touches `.lint-sweep-used` (`USE_STAMP`, `:99`). `BUSY = ".claude-busy"` (`:96`). `copy_lock(path)` (`:227-254`) holds a shared `flock` on `<copy>/.claude-busy`; `busy_locks` (`:325-351`) is the readers' non-blocking exclusive try.
-- `scripts/lint/sweep.py:219` `LOCK_NAMES` (`.cargo-lock`, `.cargo-build-lock`, `.cargo-artifact-lock`); `target_last_use` (`:1854-1860`) reads the stamp.
-- `scripts/direct/verify.sh:2624` `buildlog_wait_for_memory`.
-- `scripts/production/merge_checkpoint.py:1039-1050` `end_phase_scratch` ends `phase:<unit>/<phase>`.
-
-**Goal:** `copies.py make` fills a hana copy's target with a `cp -a` seed when the seed rule picks a source; a `verify.sh` run in a copy holds the copy busy from before its memory wait to its end; one live hana gate copy is made, built and removed by `merge_checkpoint.py`.
-
-**Spec:**
-
-1. **Seed rule.** Only for a source with a `Cargo.toml`. In order: (1) a registered copy of the same repository at the same commit whose target was built with the same `Cargo.lock` and toolchain (`rustc -vV`), the newest landed gate copy first (measured 9% of a cold build); (2) only if seed3 adopts the candidate rule: a source whose last step kind matches the copy's step kind (test, for gate and review copies), then the fewest changed files against the copy's commit; (3) else no seed, mode `none`. A before/after pair gets the same seed from the same base build. The seed caps at 5 GiB net over a cold build; the sweep floor (`sweep_free_floor_gib`, `config/lint.conf`) stays the only disk limit. Where the `Cargo.lock`, toolchain and step-kind facts are read comes from seed3's report.
-2. **Seed copy.** Hold the source target's three `LOCK_NAMES` files with `flock` for the whole copy. Copy the source tree with `cp -a` (less `.git` and `target/`), then `cp -a <source>/target <copy>/target` less `incremental/` (it cut no build time, Phase 1). Never hard-link (`cp -al` is refused): cargo writes outputs in place, and a hard-linked floor take frees nothing (`sweep.py:1446`) but still deletes the copy (`:1526`). Then run the Phase 18 git step with `git reset -q` before `git checkout --force --detach <commit>` and `git clean -fdq`, so unchanged files keep their times (a fresh checkout rebuilt 25 crates, Phase 1). Then `scratch.mark_cargo_cache(<copy>/target)`: `cp -a` keeps file times, so without a fresh stamp the floor has no use record before the first build (`sweep.py:1854-1860`) and can take the seed early. The record gets `target_mode` `seed` and `seed_source` = the source target path.
-3. **Busy lock in `verify.sh`.** In a tree under the copies root (`SCRATCH_COPIES_ROOT`, else `/tmp/claude/copies`, resolved in bash), open `<copy>/.claude-busy` (the copy folder is the first two levels under the root) on a file descriptor and take a shared `flock` before the first `buildlog_wait_for_memory` call (`verify.sh:2624`), so a queued run is busy too. Hold it until the run ends; it ends with the process, so a crash leaves no stale mark. No new Python start (Phase 9). Out of a copy, nothing changes.
-4. **Live gate copy.** In this phase: `copies.py make --source <hana worktree> --phase 19 --purpose gate --task phase:<unit>/19 --run-dir <run>`, seeded by the rule, built and tested with `verify.sh` in the copy, and removed by `end_phase_scratch` when this phase's checkpoint merges.
-5. **Doc.** `docs/as-built/frozen-copies.md` final form: the seed rule, the seed copy order and locks, the stamp, the busy lock, the live proof.
-
-**Files:**
-- `scripts/copies/copies.py` — the seed rule and the seed copy
-- `scripts/copies/test_copies.py` — the seed tests
-- `scripts/direct/verify.sh` — the busy lock
-- `scripts/direct/test_verify_copy_busy.py` — new: the busy lock tests
-- `docs/as-built/frozen-copies.md` — final form
-
-**Workers:** 2 writers, disjoint files (tests sit beside their modules).
-- `impl` — `scripts/copies/copies.py`, `scripts/copies/test_copies.py`, `docs/as-built/frozen-copies.md`.
-- `shell` — opens as impl — `scripts/direct/verify.sh`, `scripts/direct/test_verify_copy_busy.py`.
-
-**State:** a seed copy's `target/` (about 10.3 GiB for hana, Phase 1) with its `.lint-sweep-used` stamp; the record fields `target_mode` `seed` and `seed_source`; the shared lock on `<copy>/.claude-busy`, held by an open file descriptor. A rerun of `make` reuses a same-commit copy and copies no target again.
-
-**Constraints from prior phases:**
-- Phase 18: `copies.py`, its record and its commands. This phase adds only the target, the busy lock and the live proof.
-- Copies plan Phase 1 verdict: seed without `incremental/`, sources copied with `cp -a`; no shared build-dir. Risk 1: each live copy holds about 10.3 GiB, so copies end on time. Risk 2: the first edit after a `cp -a` seed takes 75.5 s.
-- Builds ruling 2026-10-31: the seed copies files and never hard-links them, and writes a fresh stamp at make; judge floor behavior against resources-unit Phase 37's order.
-- Phase 9: `verify.sh` starts no new Python.
-- Build rules: fix every visible failure before a rerun; no rerun after a pass until the edits are done; while editing, run the quick test modules; lint once, at the phase gate only.
-
-**Acceptance gate:**
-- `env -u PYTHONPATH -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY -u STAFF_OPERATION_FD python3 -m unittest discover -s scripts/copies -p test_copies.py` passes: a seed copy holds no hard link to its source (no file shares an inode with the source), has no `incremental/`, has a `.lint-sweep-used` stamp newer than the make start, and keeps the source's file times; while a test holds one source lock file exclusively, the seed copy waits; the seed rule picks per Spec 1 and falls back to `none`; the record has `target_mode` `seed` and `seed_source`.
-- `scripts.direct.test_verify_copy_busy`: a run in a copy under a test copies root holds a shared lock on `<copy>/.claude-busy` from before the memory wait (a non-blocking exclusive try fails while the run waits in the memory queue) to its end (the try succeeds after exit); a run outside the root makes no lock file. `scripts.direct.test_verify_python_starts` passes.
-- basedpyright `0 errors, 0 warnings, 0 notes` on every changed Python file and its callers; `bash -n scripts/direct/verify.sh`; `shellcheck scripts/direct/verify.sh` with no new findings.
-- Live: one hana gate copy with task `phase:<unit>/19`, seeded, built and tested with `verify.sh` in it, and removed by `merge_checkpoint.py` when this phase's checkpoint merges (its line `removed 1 folder(s) of phase:<unit>/19`).
-- Merge gate `--tests-only` green on a tree merged with `origin/natedev`.
+- `scripts/buildlog/test_rust_release.py`: `test_finished_trial_records_counts_sizes_and_one_result_text`, `test_next_trial_resets_sources_and_keeps_its_build_cache`, `test_mend_nonzero_finishes_and_text_says_does_not_build`, `test_failed_clippy_step_records_first_error_and_is_not_retried`, `test_killed_trial_waits_and_retries_next_night`, `test_hold_arriving_mid_trial_leaves_pending_before_checkout`, `test_timeout_releases_checkout_and_records_failed_step`, `test_hold_after_nonzero_clippy_keeps_trial_waiting_and_checkout`.
+- `scripts/production/test_ci_points.py`: `test_a_contained_validated_commit_passes_after_the_branch_moves_without_pushing`, `test_a_validation_fix_fast_forwards_an_unchanged_remote_branch`, `test_rerun_after_a_pushed_fix_with_no_handoff_reuses_the_fix_commit`, `test_retry_after_a_failed_push_publishes_the_existing_fix_without_a_sibling_commit`, `test_a_merge_landing_while_ci_publish_waits_for_the_lock_is_preserved`, `test_a_validation_fix_cannot_overwrite_a_branch_that_moves_during_validation`, `test_validation_uses_a_private_copy_and_leaves_the_production_checkout_unchanged`, `test_a_failed_validation_keeps_its_private_checkout_without_pushing`.
+- `scripts/production/test_merge_gate_ledger.py`: `test_nightly_reuses_a_standing_checkout_and_marks_and_notifies_only_red`.
+- `scripts/style/test_bulk_run.py`: `test_workspace_validation_runs_once_and_one_clean_test_commit_merges_all_decisions`, `test_tested_tree_proof_rejects_drift_after_each_command`, `test_hidden_untracked_test_output_never_publishes_or_keeps_the_batch_commit`.
+- `scripts/style/test_style_sync.py`: `test_clean_check_mode_records_all_tools_passing_and_returns_zero`, `test_standing_target_survives_task_end_and_reuses_artifacts`, `test_lint_keeps_its_own_warm_target_after_metadata_cleanup`, `test_a_missing_or_swept_target_runs_cold`, `test_redirecting_the_target_cannot_grant_successful_lint_coverage`, `test_the_owner_record_exists_before_the_checkout_is_added` (removed), `test_standing_checkout_has_no_registration_in_the_source`, `test_a_git_failure_in_cleanup_keeps_metadata_until_the_next_sweep`, `test_lint_takes_second_checkout_when_first_is_busy`.
+- `scripts/lib/test_scratch.py`: `test_standing_checkout_creates_a_stamped_cache_the_sweep_accepts`.
+- `scripts/lint/test_sweep.py`: `test_floor_keeps_a_standing_target_only_while_its_checkout_is_busy`, `test_floor_finds_and_reclaims_an_idle_retained_standing_target`.
+- `scripts/copies/test_copies.py`: `test_configured_root_contains_only_the_two_standing_checkouts`, `test_missing_or_invalid_required_configuration_refuses_before_clone`, `test_legacy_workspace_keeps_commits_index_and_journal_and_ends_through_holds`.
+- `scripts/hooks/test_codex_hooks.py`: installation tests using `GUARD_COMMAND` and `GUARD_GROUP`.
+- `scripts/hooks/test_hook_dispatch.py`: `test_dispatch_tables_equal_legacy_files_matchers_and_timeouts`.
+- `scripts/production/test_waiting.py`: `test_scratch_uses_no_worktree_cleanup_and_reuses_the_checkout`.
+- `scripts/copies/test_copy_guard.py`: `test_scan_resolves_keyword_variable_and_multiline_argv_without_losing_git_options`, `test_shell_script_scan_retains_the_same_literal_and_executable_distinction`.
+- `scripts/style/test_crate_run.py`: `test_combined_test_failure_retains_pending_claims_for_resume`, `test_moved_destination_invalidates_prepared_combined_proof`, `test_other_crate_refresh_cannot_publish_stale_tested_candidate`.
 
 ### Phase 20 — Run clippy judgment first, fix only on a finding, and send Mac-allowed lint to a free Mac  · status: done
 
-**Origin:** builds showrunner, 2026-10-31 15:17 EDT, the user's order for more build capacity: in 24 h, 278 of 537 natedev clippy runs repeated a tree that had already passed the same command (169 h queue wait, 10 h run). Also the builds report of 15:10: the Mac was free while 17 natedev steps waited.
+#### As-built
+
+Checkpoint 41a3ce6d4 on `natedev-verify-cancel`.
+
+- `verify.sh lint` runs mend, fmt and Taplo before workspace clippy judgment with all targets, all features and `--keep-going`. A clean judgment ends the stage without clippy fixes.
+- Any Cargo status 101 permits clippy fixes unless a lint hold or kill report prevents repair. Compile errors, mixed failures and unknown 101 diagnostics also permit repair; no lint-finding classifier exists.
+- Fixes and fmt repeat until the tree stops changing or reaches `clippy_fix_pass_limit`, then another judgment supplies the result. `config/lint.conf` supplies the limit at repair time; integers 1–9999 are valid, with 3 for missing or invalid values.
+- Mac-allowed lint, check and doc steps use the same `free-now` decision as tests during the token wait. A free Mac triggers reservation and routing without an idle marker; unavailable capacity leaves the step waiting locally.
+- The Mac idle watcher and alert display also ship on this branch. They read `config/mac_test.conf` through `conf.py`, query admission waiters, display the saved alert in build views, and notify the builds showrunner.
+
+**Files:**
+
+- `scripts/direct/verify.sh`, `config/lint.conf` — judgment order, bounded repairs, verdict keys, tree watches and Mac routing.
+- `scripts/direct/test_verify_lint_judgment.py`, `scripts/direct/test_verify_mac_lint_token.py` — judgment, kill, hold, limit and shared-routing contracts.
+- `scripts/direct/verify_tree_cancel_test_support.py`, `scripts/direct/test_verify_tree_cancel_lint.py` — the first stub judgment exits 101; rewrites retain cancellation coverage.
+- `scripts/buildlog/mac_idle.py`, `scripts/buildlog/mac_idle_alert.py`, `scripts/buildlog/test_mac_idle_alert.py` — the idle watcher, saved alert and config contract.
+- `scripts/mac_test/offload.py`, `scripts/mac_test/test_offload_forward.py`, `scripts/build_targets/test_build_targets.py` — fetch connection settings and isolated alert configuration.
+
+**Binds later work:** Repair eligibility uses status, hold and kill evidence. Mac routing uses the existing availability decision and admission reservation.
+
+**Gotchas:** A kill flag or Cargo signal report vetoes repair independently. A final changing fix prevents a cached lint failure. The stub must return 101 to exercise repairs.
+
+**Ruled out:** A lint-finding classifier; an idle-marker prerequisite for Mac routing; splitting whole-workspace hana lint between Mac and Linux. A workspace containing configured Linux-only members remains ineligible for Mac lint.
+
+### Phase 21 — Pair a skipUnless decorator with the test it decorates  · status: todo
+
+**Origin:** builds showrunner, 2026-11-03 08:5x EST, held item 1: the assertion guard reported a change at `scripts/lib/test_build_folders.py:122` against the test above it.
+
+**Depends on:** none. Its tree takes the Phase 20 test stub repair 41a3ce6d4 only to pass the merge gate.
 
 #### Work Order
 
-**Source:** the worker prompts `phases/20/impl_prompt.md` and `phases/20/test_prompt.md` in the run directory.
+1. `scripts/direct/assertion_guard.py` attributes a `@unittest.skipUnless(...)` decorator, and any decorator line, to the test function it decorates, not to the test that ends above it.
 
-1. `verify.sh lint` runs clippy judgment first. A pass ends the stage with no fix pass. A clippy finding runs `--fix`, fmt, then judgment once more. Any other failure exits with its status and runs no fix. The fix-pass limit (default 3) is read from the lint config.
-2. A mac_allowed lint step leaves the natedev queue for the Mac whenever the Mac can take it now, by the one decision the test steps use, not only after the Mac-idle marker appears.
-3. A whole-workspace hana clippy can run on the Mac with its Linux-only members (`hana_video`, `hana_clerestory`) excluded, and those members stay linted on natedev; or the cause and size are reported if the change is large.
+**Acceptance gate:** a regression test in the assertion guard tests fails on the old code and passes on the new; the assertion guard suites pass; basedpyright 0/0/0 on changed Python; merge gate `--tests-only` green on a tree merged with origin/builds.
 
-**Acceptance gate:** the verify lint tests show one clippy call and no `--fix` on a passing tree, the fix loop only after a finding, no fix on a non-lint failure, and the limit from config; Mac routing and eligibility regression tests fail on the old code; basedpyright 0/0/0 on changed Python; `bash -n` and shellcheck on verify.sh; merge gate `--tests-only` green on a tree merged with origin/builds.
+### Phase 22 — Refuse an unknown verify verb, and key the lint cache by tool versions  · status: todo
+
+**Origin:** builds showrunner, 2026-11-03 08:5x EST, held items 2 and 3.
+
+**Depends on:** none. Its tree takes the Phase 20 test stub repair 41a3ce6d4 only to pass the merge gate.
+
+#### Work Order
+
+**Constraints from the phase 20, 23 and 24 review:** Phase 23 cancellation behavior stays: a group TERM of a lint run exits 143, repeated INT/TERM/HUP during cleanup are ignored, and no verify process, admission place or step record remains. The acceptance gate keeps the `test_verify_tree_cancel_lint.py` checks green. This tree still has the outer mend pipeline (`verify.sh` near line 3554) that Phase 23 removes; its merge with Phase 23 keeps the removal.
+
+1. `verify.sh` refuses an unknown verb (for example `fmt`) right after `CMD=` is set: it prints the usage text and exits 2, before any step record or target query. Log: `/tmp/claude/delegate/fc206247-76c0-4607-b268-025299592a62/mesh_runs/20261103T002337-2080568-f123.log`.
+2. The lint result cache key includes the version of each lint tool (mend, rustfmt, clippy, taplo). A cached result made by another tool version never replays. Log: `/tmp/claude/delegate/fc206247-76c0-4607-b268-025299592a62/mesh_runs/20261103T021458-742941-b3cb.log` (mend 0.22.3 replayed a 0.23.0-dev failure).
+
+**Acceptance gate:** a test for each item fails on the old code; the verify and lint cache suites pass; `bash -n` and shellcheck on verify.sh; basedpyright 0/0/0 on changed Python; merge gate `--tests-only` green on a tree merged with origin/builds.
+
+### Phase 23 — A cancelled lint run leaves no verify process and no queue place  · status: done
+
+#### As-built
+
+Checkpoint 353e00511 on `verify-lint-cancel`.
+
+- The lint mend stage calls `invoke_mend` directly. The parent verifier retains `RUN_STEP_PID` and stops the active step group during interruption cleanup.
+- The existing `run()` tee captures mend diagnostics through `MEND_LOG`; the mend stage reads its command status directly.
+- A group TERM ends the verifier and its step, releases admission and token resources, removes the step record, and records status 143. Cancellation creates no cached verdict.
+- `verify_interrupted` and `hold_interrupted` ignore repeated INT, TERM and HUP signals until cleanup completes.
+
+**Files:**
+
+- `scripts/direct/verify.sh` — parent-owned mend execution, shared diagnostic capture and signal-safe cleanup.
+- `scripts/direct/test_verify_tree_cancel_lint.py` — cancellation during memory admission, mend, clippy and repeated TERM; `CompletedLintRun` types the recorded exit status.
+- `scripts/direct/verify_tree_cancel_test_support.py` — an optional real `mesh_runs.py` supervisor with private result delivery.
+- `scripts/direct/verify_token_ownership_test_support.py` — bounded group-exit observation with the existing default retained.
+
+**Binds later work:** Lint execution retains the active step PID in the parent verifier. Interruption cleanup retains ownership until admission, token and step records are removed.
+
+**Gotchas:** An outer shell pipeline can place the step PID in a subshell. A supervisor can forward TERM after a group TERM reaches the verifier; cleanup must tolerate both signals.
+
+**Ruled out:** A separate cancellation service; a cleanup sweep; reliance on admission-service cleanup alone.
+
+### Phase 24 — Raise the Mac idle alert on a disk exclusion, and survive an admission query error  · status: done
+
+#### As-built
+
+Checkpoint 23aa6712f on `verify-idle-disk`.
+
+- The Mac idle watcher counts `NatedevOnly("disk")` steps in `WAITING_HOLD`, `WAITING_MAC` and `ON_NATEDEV`. Other natedev-only reasons retain their existing behavior.
+- The saved alert includes the disk exclusion and displays “Mac disk exclusion”. Its push names sufficient Mac disk space as the clearing condition; excluded calls receive no retry marker.
+- `admission_waiters()` returns `AdmissionWaiters` or `AdmissionQueryFailed`. A failed query records its reason in the saved alert and stderr; the watcher continues independent checks.
+- `SavedAlert.admission_error` stores the query failure when present. A later successful sample removes it.
+- The admission decoder converts arithmetic decode errors, including numeric overflow, into an invalid-message error. The client reports that error as `AdmissionUnavailable`.
+
+**Files:**
+
+- `scripts/buildlog/mac_idle.py` — disk-exclusion counting, typed admission results, continued checks and disk-specific notification text.
+- `scripts/buildlog/mac_idle_alert.py` — the `disk` cause, optional admission error and display validation.
+- `scripts/buildlog/test_mac_idle.py` — disk states, query failures, recovery and an overflowing reply through `watch_once`.
+- `scripts/build_queue/admission_protocol.py` — arithmetic decode errors become invalid admission messages.
+
+**Binds later work:** Mac disk exclusions use `NatedevOnly("disk")`. The idle alert preserves that reason and does not retry an excluded call.
+
+**Gotchas:** A huge integer can overflow during numeric validation. The watcher catches `AdmissionUnavailable`; the decoder converts malformed replies at the protocol boundary. The Mac disk minimum remains unchanged.
+
+**Ruled out:** Lowering the disk minimum to restore routing; treating every natedev-only reason as a Mac exclusion; catching all exceptions in the watcher.
+
+### Phase 25 — Run the Mac floor sweep on a disk exclusion, then check again  · status: todo
+
+**Origin:** builds showrunner ruling, 2026-11-03 15:0x EST: a disk exclusion runs the existing floor sweep, then checks again; no second sweeper. resources-unit owns `sweep.py` and adds the Mac entry point and the mac_test claim check (their Phase 50, checkpoint d70f1dedf).
+
+#### Work Order
+
+**Constraints from the phase 20, 23 and 24 review:** Safe call sites: disk checks are in `scripts/build_targets/build_targets.py` (near line 280) and `scripts/mac_test/offload.py` (near line 1869); `mac_test.free_now` reads local state only and stays so. Resources' `floor_claims.py` (near line 104) holds claim locks during the sweep, so run the sweep with no claim lock held. Test concurrent sweeps, cancellation, a failed sweep and a fresh disk read after the sweep. The acceptance gate also owns the disk alert's recovery and clearing checks.
+
+1. When admission finds the Mac under its disk minimum, mac_test runs resources' entry point once (`ssh mac '~/.claude/scripts/lib/py ~/.claude/scripts/lint/sweep.py --floor-only --host mac'`), then reads Mac free space again and admits the step when it is above the minimum. One sweep at a time; a run that finds a sweep running waits for its result.
+
+**Pending decision:** none.
+
+**Depends on:** Phase 24 (the disk exclusion read), and resources Phase 50 (checkpoint d70f1dedf, the Mac floor sweep) landed in origin/builds.
+
+2. The Mac test mirror root is spelled in one place: one key in `config/mac_test.conf` (value `~/.local/state/mac-test/mirror`, no move), read at use by `scripts/mac_test/offload.py` and by resources' `sweep.py`. No other literal of that path stays in code. Builds ruling 2026-11-03 (this replaces the dropped mirror-move phase).
+
+**Acceptance gate:** a test with a fake Mac that is under the minimum before the sweep and over it after, which admits the step; one with a sweep that frees too little, which keeps the step on natedev; a scan that finds the mirror root only in `config/mac_test.conf`; merge gate `--tests-only` green on a tree merged with origin/builds.
+
+### Phase 27 — A step sent to natedev after a Mac disk decline goes back to a free Mac  · status: todo
+
+**Origin:** builds showrunner, 2026-11-03 14:4x EST, RED Mac idle again: queue-unit found that verify.sh gives the leave hook only to `busy` and `blocked` declines, so a step sent to natedev after a `disk` decline never checks the Mac again. Two hana nextest steps waited for natedev memory while the Mac had 213 GiB free. Hotfix checkpoint, branched from origin/builds, merged ahead of Phase 20 and Phase 24.
+
+**Depends on:** none (hotfix from origin/builds).
+
+#### Work Order
+
+**Constraints from the phase 20, 23 and 24 review:** Phase 24's disk alert needs `NatedevOnly("disk")` evidence (`scripts/buildlog/mac_idle.py` near line 230). A disk decline must keep that evidence while it gains the leave hook; the acceptance gate adds that check (shared with Phase 17). Phase 23 cancellation behavior stays: a group TERM of a lint run exits 143, repeated INT/TERM/HUP during cleanup are ignored, and no verify process, admission place or step record remains. The acceptance gate keeps the `test_verify_tree_cancel_lint.py` checks green.
+
+1. A `disk` decline gets the same leave hook as `busy`: the waiting step leaves for the Mac when free-now says the Mac is free.
+2. Every other decline reason is checked for the same gap. Each reason that can clear while a step waits gets the hook; each that cannot is named with its reason in the summary.
+
+**Acceptance gate:** a test that declines a step for disk, then frees the Mac, and sees the step leave for the Mac; it fails on the old code; the verify suites that cover routing pass; merge gate `--tests-only` green on the hotfix tree.
+
+### Phase 28 — Keep the cargo token from a Mac step to the next local step  · status: done
+
+#### As-built
+
+Checkpoint `3a005d504` on `verify-token-keep`.
+
+- `release_token()` writes `.given_back` when a shell releases the token. The parent formatter reads the mark and acquires the token again.
+- `acquire_token local` prevents a local formatter from entering remote routing.
+- `test_local_fmt_starts_after_mend_passes_on_the_mac` covers mend on the Mac followed by local fmt through the build-hold route.
+
+**Files:**
+
+- `scripts/direct/verify.sh` — shared release evidence and local formatter acquisition.
+- `scripts/direct/test_verify_token_mac_step.py` — Mac-to-local ownership through a build hold.
+
+**Binds later work:** Every release must remain visible across shells until acquisition succeeds.
+
+**Gotchas:** This checkpoint still consumes an existing release mark during a second release. The memory-wait route can still exit 125 at fmt.
+
+**Ruled out:** Blaming the original local-only token policy; the later direct Mac release introduced the missing evidence.
+
+### Phase 29 — A lint step that writes the tree stays on natedev, and a lost token is never cached  · status: done
+
+#### As-built
+
+Checkpoint `1a2800ef6`, merged to builds as `d1d655a94`.
+
+- A lint step that writes the tree (`cargo mend --fix`, fmt, `clippy --fix`) never moves to the Mac. verify.sh `step_writes_tree` keeps it on natedev, where it waits in the natedev queue. A read-only step (`mend --fail-on-warn`, `fmt --check`) can still go to the Mac.
+- The lint result cache never records status 125 (a lost cargo token). The next run does the step again.
+
+**Files:**
+- `scripts/direct/verify.sh` — `step_writes_tree` routing and the 125 cache rule.
+- `scripts/direct/test_verify_lint_local_writes.py`, `test_verify_lint_cache_token_loss.py` — the two regressions.
+- `scripts/direct/test_verify_token_mac_step.py` — the Mac step in its fixtures is `mend --fail-on-warn`, not `mend --fix`.
+
+**Binds later work:** a tree-writing step stays on natedev with both remote hooks off.
+
+### Phase 31 — A lint step that leaves the memory wait for the Mac keeps the token for its next local step · status: done
+
+#### As-built
+
+Checkpoint `b076a291e` on `verify-token-mac-wait`.
+
+- `release_token()` keeps `.given_back` across repeated releases. `sync_token_state()` updates shell ownership before both acquisition paths.
+- Only `token_acquired()` removes the mark after successful acquisition. Memory and build-hold waits use the same release rule.
+- A memory wait can leave for the Mac, record its retry note, and then run local fmt with the token.
+- `blocking_claim_block()` reuses the existing Mac block reader. Foreign blocks prevent local reservation reuse and transfer under the existing locks.
+- Existing remote work retains its cleanup route. A reservation does not override a later block.
+
+**Files:**
+
+- `scripts/direct/verify.sh` and `test_verify_token_mac_step.py` — shared ownership state and memory-to-Mac regressions.
+- `scripts/mac_test/mac_test.py` and `test_mac_test.py` — one block ownership rule and transfer refusal.
+- `scripts/build_targets/build_targets.py` and `test_ssh_eligibility.py` — block checks for published and unpublished reservation reuse.
+
+**Binds later work:** A release mark persists until acquisition succeeds. All new Mac work observes the shared block rule.
+
+**Gotchas:** Pipeline shells do not share variable changes. Both reservation reuse and transfer need block checks; ordinary free-now routing alone cannot protect them.
+
+**Ruled out:** A formatter-only workaround, separate release marks in wait wrappers, and a second Mac block reader.
+
+### Phase 32 — The cargo token wait line reads the user zone without an unset variable · status: done
+
+#### As-built
+
+Checkpoint `ce0d0cc6b` on `verify-zone-token`; builds integration `647ae6bbb`.
+
+- `token_wait_note()` calls `scripts/lib/user_zone.py` directly through `python3 -S` for its first wait timestamp.
+- The wait no longer requires `USER_ZONE_SCRIPT`. The handoff test removes that variable and checks the UTC wait line and successful continuation.
+
+**Files:**
+
+- `scripts/direct/verify.sh` — direct user-zone lookup for the token wait timestamp.
+- `scripts/direct/test_verify_token_handoff.py` — unset-variable coverage and the visible wait line.
+
+**Binds later work:** Token wait timestamps use the user-zone helper without a variable supplied by the memory module.
+
+**Gotchas:** An inherited test variable can hide a production failure under `set -u`. `fast_track.py` refuses changes to `verify.sh`.
+
+**Ruled out:** Restoring a dependency on `memory_gate.sh` to define `USER_ZONE_SCRIPT`.
+
+### Phase 33 — Two verify test files pass on the builds tip again · status: done
+
+#### As-built
+
+Checkpoint `d8b1b0c3c` on `verify-red-tests`.
+
+- The memory-kill fixture extracts `buildlog_step_compiles()` from `scripts/lint/invoke.sh` with the functions it extracts from `verify.sh`.
+- The fixture supplies routing and hold helpers outside its classification scope. Token tests cover admission; existing memory-kill assertions remain unchanged.
+
+**Files:**
+
+- `scripts/direct/test_verify_memory_kill.py` — complete dependencies for the extracted shell functions.
+
+**Binds later work:** Fixtures that extract `run()` must provide its current helper dependencies from their owning modules.
+
+**Gotchas:** Missing fixture helpers produce shell status 127. The offload exclusion mismatch belongs to builds-resources `d70f1dedf`; this checkpoint changes no offload code.
+
+**Ruled out:** Changing production memory-kill behavior or changing offload expectations for an unrelated branch.
+
+### Phase 34 — Remove an owner's standing checkouts when the owner retires or wraps · status: done
+
+#### As-built
+
+Checkpoint `ce12a797f` on `verify-copies-owner-end` (with Phase 18), merged to builds as `d1fc65123`.
+
+- `copies.py remove --owner O` with no `--repo` removes every tree the owner holds, in every repository and kind; `--repo` narrows it. The Python API takes a `RepositoryScope` with the same two forms.
+- `retire_unit.py` removes the unit's standing checkouts after it stops the unit's processes and before it writes the retired note. A busy tree refuses the retirement and names the holder's session (a pid only when no name exists) and the tree path.
+- `tidy_wrapped.py` removes the standing checkouts of the wrapped production and of each of its units.
+- A retry finishes an interrupted removal; a rerun after a full removal changes nothing and exits 0. An adopted borrower keeps its source.
+- `lock_holder` lives in `scripts/lib/file_lock.py`, shared by `copies.py` and `sweep.py`.
+- `bump_gate.py` sets `BUILDLOG_UNIT` from the bump record, so the build queue names the unit of a bump gate.
+
+**Files:**
+- `scripts/copies/copies.py`, `test_copies.py` — owner-wide removal and `RepositoryScope`.
+- `scripts/production/retire_unit.py`, `tidy_wrapped.py` and their tests — removal at retire and at wrap.
+- `scripts/lib/file_lock.py`, `scripts/lib/scratch.py`, `scripts/lint/sweep.py` — the shared lock holder reader.
+- `scripts/production/bump_gate.py` — the unit name for a bump gate.
+- `docs/as-built/gate-checkouts.md` — the removal rules.
+
+**Binds later work:** owner removal covers local trees only. Remote mirrors carry no owner yet; the owner removal for remote mirrors uses the same `RepositoryScope` and order.
+
+**Gotchas:** a test that mocks the holder's line read patches `file_lock.open`, not `sweep.open`.
+
+### Phase 35 — Every build copy maker left outside copies.py moves onto it · status: todo
+
+> Builds ruling, 2026-11-03 21:0x EST: copies.py is the one way to copy a repository for a build. When this plan ends, copies.py passes to queue-unit as the build-folder owner.
+
+**Today.** `config/copies.conf` allows three build copy makers outside copies.py: `mac_test/offload.py` and `production/mac_run.sh` (Mac mirrors, including `~/.local/state/mac-test/mirror`) and `direct/verify.sh` (its documentation checkout). The copy guard also misses some import forms (next item "Copy guard: refuse tree-making git calls through every import form", F037), so a copy maker can pass the guard unseen.
+
+**Depends on:** Phase 18; Phase 25 (one mirror root key in mac_test.conf); resources Phase 50 (checkpoint `d70f1dedf`, owner resources-unit) landed in origin/builds. That checkpoint adds `scripts/mac_test/floor_claims.py` and changes `offload.py`, `mac_run.sh` and `retire_unit.py`, the files this phase changes. On 2026-11-04 it is on origin/builds-resources only. `offload.remote_mirror` still builds the legacy Mac path in code until Phase 25 item 2 lands.
+
+**Workers:** one integration writer for the copies API and its callers (`copies.py`, `offload.py`, `mac_run.sh`, `linux_runner.py`, `verify.sh`, `retire_unit.py`, `tidy_wrapped.py` and their tests). One guard writer for `scripts/copies/copy_guard.py` and its tests. The integration writer fixes the copies API (items 1, 7 and 9) before it moves a caller. An independent test lane runs the acceptance tests before the hand-over in item 8.
+
+**Constraints from the phase 29, 34, 36 and 37 review:**
+
+- Keep the Phase 36 token boundary: verify.sh `run()` wraps `run_step` and releases each token it takes when the step ends; the sweep in invoke.sh `sweep_after_step` takes no board token. Keep pre-held tokens, the `.given_back` mark, the memory re-acquire, retry attempt 2 and the pipeline EXIT trap.
+- Keep the Phase 29 local repair rule and the Phase 37 step record: a tree-writing step stays on natedev with both remote hooks off, records `natedev_only` for its lifetime, and gives the call its own decision back before the next read-only step.
+- The acceptance run adds the verify token, memory-kill and Mac-step suites, `test_verify_lint_local_writes.py`, `scripts/buildlog/test_mac_idle.py` and the Phase 23 cancellation tests (`test_verify_tree_cancel_lint.py`).
+- One lock order for remote mirrors: the mirror lease first, then the floor claim lock, then the copy-record lock. Mirror refresh, claim adoption, owner removal and the sweep take them in that order. No sweep starts while a process holds an admission or claim lock.
+
+#### Work Order
+
+1. Add a copies.py kind for a Mac mirror (named, registered, swept like the others). `offload.py` and `mac_run.sh` make and reuse Mac mirrors only through it. Remove their allow-list entries.
+2. `verify.sh` makes its documentation checkout through `copies.standing`. Remove its allow-list entry.
+3. Fold the F037 next item into this phase: the guard finds tree-making git calls through every import form named there. Remove the item from `docs/plans/natedev-verify-next.md`.
+4. The allow list keeps only original work trees (`add_unit.py`, `resume_unit.py`, `add_style.py`, `make_worktree.sh`, `berth_fix/launch.sh`), the external upstream clone (`bevy_migration_ensure_repo.sh`) and copies.py.
+5. The remote mirror kind covers every configured remote target, not only the Mac. `offload.remote_mirror` and `offload.copy_tree` also serve Linux and AWS slots, and `linux_runner.probe_script` makes their folders.
+6. A remote copy has a lease for its lifetime. `copy_tree --delete` and the sweep never remove a mirror that a live remote run uses, and they keep its metadata.
+7. The documentation checkout is a staged tree: verify.sh `doc_tree` writes the index tree, and `copies.commit_at` needs a commit. Add a staged-source form to `copies.standing`. It copies only staged content and leaves the source index and file mtimes unchanged. Name the source and merge policies with types first (architect review finding 7; this replaces the next item "Name copies.py source and merge policies with semantic types"): `CommittedSource`, `WorktreeSource`, `StagedSource`, `NoMerge` and `MergeRevision`. Convert the CLI flags at the boundary; callers and tests change in the same edit. No bare `None` policy argument stays in the copies API. Remove that item from `docs/plans/natedev-verify-next.md`.
+8. Hand-over: queue-unit takes ownership of copies.py, its cleanup and the floor interfaces. Queue-unit's separate warm-target copy work is removed.
+9. Owner removal reaches remote mirrors. Each remote mirror records its owner (the `RepositoryScope` and owner that Phase 34 uses for local trees); `OffloadRequest` carries it. `copies.py remove --owner O` and the retire and tidy paths remove that owner's remote mirrors in the same order as its local trees. A mirror that a live run holds refuses the removal and names the holder's session and the mirror path.
+
+**Acceptance gate:** the repository scan test finds no build copy maker outside copies.py; one test per item that fails on the old code; tests for a cancelled remote copy, a surviving remote child, kept metadata and a sweep of a busy mirror; concurrent sweep, admission and owner-removal tests in the lock order above, with a cancelled sweep; retire and tidy tests that keep another owner's mirrors and refuse a busy mirror with the holder named; tests for staged-only content, an unchanged source index, kept mtimes, target reuse, recovery and correct pass records. `test_verify_doc_checkout.py` (the `target/verify-doc` path) and `test_verify_doc_recovery.py` (the private index beside the checkout) change only their layout assertions, each named by an `Assertion-Change:` line. Queue-unit confirms the hand-over; the copies, offload, Mac run, Linux runner and verify suites pass.
+
+### Phase 36 — A verify call never waits on its own cargo token · status: done
+
+#### As-built
+
+Checkpoint `272005ed6` on `verify-token-self`, merged to builds as `d79fe5488`.
+
+- invoke.sh `sweep_after_step` runs the detached sweep with `run() { run_once "$@"; }`, so the sweep never takes the board token. Cargo's own locks protect its scan.
+- verify.sh `run()` wraps `run_step` and `finish_step_token`. Each token that `run()` takes for a step is released when the step ends: on success, failure, each early return and the check-failed exit. A hold the call had before the step stays.
+
+**Files:**
+- `scripts/direct/verify.sh` — the `run()` / `run_step` split and `finish_step_token`.
+- `scripts/lint/invoke.sh` — the token-free sweep.
+- `scripts/direct/test_verify_token_self_hold.py` — the next local step starts at once after a sweep; no step leaves a hold behind.
+
+**Binds later work:** keep pre-held tokens, the `.given_back` mark, the memory re-acquire, retry attempt 2 and the pipeline EXIT trap across the `run()` boundary.
+
+**Gotchas:** `test_verify_memory_kill.py` copies verify.sh functions into its fixture by name; a new helper that `run()` calls goes on that copy list.
+
+**Ruled out:** a take-over of a hold the call already has (it hides a leak instead of removing it).
+
+### Phase 37 — A tree-writing lint step that stays on natedev is not counted as a waiting Mac step · status: done
+
+#### As-built
+
+Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`.
+
+- A tree-writing step records `natedev_only` ("step writes the tree") before routing, token and memory waits, and keeps it for its whole lifetime. verify.sh `STEP_RECORD_ARGS` saves the call's record arguments; after the step, `run()` gives the call its own decision back, so a later read-only step can go to the Mac again.
+- `mac_idle.py` already skips `natedev_only` records, so a local repair raises no false Mac idle alert. `mac_idle.py` has no change.
+
+**Files:**
+- `scripts/direct/verify.sh` — `STEP_RECORD_ARGS` and the record restore after `run_step`.
+- `scripts/buildlog/test_mac_idle.py` — `test_tree_writing_lint_wait_is_local_and_next_judgment_counts_again`.
+
+**Binds later work:** a tree-writing step records `natedev_only` for its lifetime; the call's decision comes back before the next read-only step.

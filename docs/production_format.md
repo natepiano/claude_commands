@@ -12,8 +12,7 @@ must not drift from it:
 - `/showrunner:produce` — runs the production from the showrunner session.
 - `/showrunner:dailies` — reports the production to the executive producer.
 - `/showrunner:report_interval` — changes how often the scheduled updates come.
-- `/showrunner:accounts` — shows every Claude and Codex account in one table; sets up a
-  Claude folder or swaps the unit account.
+- `/showrunner:accounts` — opens the accounts board.
 - `/unit:direct` — a unit's run; it applies <ProductionUnit/> below.
 
 ---
@@ -465,7 +464,4 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     `Change-Review:` line in its checkpoint (`/unit:checkpoint`). A change
     outside a checkpoint goes on the list through `/change_review add`. Never
     ask the user to check something directly.
-18. **Builds for the user.** Before a build goes to the user's machine, run
-    `assertion_guard.py --base main` in that repository (`/unit:direct`
-    <UserBuildGuard/>). Exit 1 or 2 stops the hand-off.
 </ProductionUnit>

@@ -24,11 +24,8 @@ from unittest import mock
 
 from scripts.build_hold import build_hold
 from scripts.direct.recorder_fixture import invoke_recorder
-from scripts.direct.verify_mac_offload_test_support import (
-    VerifyMacOffloadFixture, CallRecord, CARGO_STUB, processes_carrying, reap, wait_for_marker_exit,
-)
+from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, CallRecord, CARGO_STUB
 from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
-from scripts.lint import memory_admit
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -155,10 +152,11 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        # Create the tools once. Each test must start its own admission service.
+        # Copy files before starting the admission server for each test.
         builder = VerifyMacOffloadFixture()
         cls.addClassCleanup(builder.doCleanups)
-        builder.setUp()
+        builder.root = Path(builder.enterContext(tempfile.TemporaryDirectory(prefix="verify-hold-tools-")))
+        builder.build_fixture()
         cls.fixture_root = builder.root
         seed_directory = cls.enterClassContext(tempfile.TemporaryDirectory(prefix="verify-hold-seed-"))
         cls.fixture_seed = Path(seed_directory) / "seed"
@@ -179,8 +177,7 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
             "BUILDLOG_BUILD_BUDGET_GIB": "64",
         }
         _ = shutil.copytree(cls.fixture_root, cls.fixture_seed, symlinks=True)
-        if not builder.doCleanups():
-            raise AssertionError("the seed fixture did not close its admission service")
+        shutil.rmtree(cls.fixture_root)
 
     @override
     def setUp(self) -> None:
@@ -275,45 +272,6 @@ class VerifyHoldWaitFixture(unittest.TestCase):
 
     def stop_process(self, process: subprocess.Popen[str]) -> None:
         self.fixture.stop_verify(process)
-
-    def start_memory_queued_lint(self) -> subprocess.Popen[str]:
-        """Use the real checker and ledger with memory that never permits a step."""
-        _ = Path(self.fixture.environment["BUILDLOG_MEMINFO"]).write_text(
-            "MemTotal: 67108864 kB\nMemAvailable: 0 kB\n")
-        _ = Path(self.fixture.environment["LINT_CONFIG_READER"]).write_text(
-            # Trace to a dedicated copy of the run-log pipe so command
-            # substitutions can still capture the real checker's protocol.
-            'lint_config_enabled() {\n'
-            + '    [[ "$1" == clippy ]] || return 1\n'
-            + '    exec {trace_fd}>&2; BASH_XTRACEFD=$trace_fd; set -x\n'
-            + '}\n'
-            + 'lint_config_skip_notice() { :; }\n')
-        self.fixture.environment.update({
-            "UNIT_RUN_DIR": str(self.fixture.board), "BUILDLOG_SYNC": "1",
-            "BUILDLOG_MEM_POLL_S": "3600", "LINT_SKIP_SWEEP": "1",
-        })
-        process = self.start("lint", "sample")
-        # A deliberately red signal test must still reap its leaked children.
-        self.addCleanup(reap, self.fixture.child_marker())
-        self.wait_for_call(process, "waiting for memory since")
-        return process
-
-    def memory_queue_pids(self) -> set[int]:
-        with mock.patch.dict(os.environ, self.fixture.environment):
-            return {step.pid for step in memory_admit.queue_view().waiting}
-
-    def owned_process_snapshot(self) -> str:
-        pids = processes_carrying(self.fixture.child_marker())
-        if not pids:
-            return "<none>"
-        result = subprocess.run(
-            ["ps", "-o", "pid,ppid,pgid,sid,stat,ignored,args", "-p", ",".join(map(str, sorted(pids)))],
-            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
-        )
-        return result.stdout
-
-    def wait_for_owned_exit(self, timeout: float) -> set[int]:
-        return wait_for_marker_exit(self.fixture.child_marker(), timeout)
 
     def wait_for_call(self, process: subprocess.Popen[str], announcement: str = VERIFY_WAITING) -> None:
         self.wait_for_waiting_diagnostic(process, announcement)
@@ -468,9 +426,6 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         observer = self.fixture.root / "python-observer"
         self.fixture.write_executable(observer, '''import json, os, sys
 from pathlib import Path
-if os.environ.get("TEST_PYTHON_STARTS"):
-    with Path(os.environ["TEST_PYTHON_STARTS"]).open("a") as output:
-        output.write(json.dumps(sys.argv[1:]) + chr(10))
 if len(sys.argv) > 2 and sys.argv[1].endswith("/buildlog/record.py") and sys.argv[2] == "step":
     with Path(os.environ["TEST_STEP_OBSERVATIONS"]).open("a") as output:
         output.write(json.dumps({"start": sys.argv[4], "mem_wait": os.environ.get("BUILDLOG_MEM_WAIT_S", ""), "arguments": sys.argv[9:]}) + chr(10))

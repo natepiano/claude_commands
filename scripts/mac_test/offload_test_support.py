@@ -342,8 +342,6 @@ class OffloadCommandFixture(unittest.TestCase):
         verb: offload.MacVerb = "nextest",
         package: str = "hana",
         source: offload.MacSource = WORKING_TREE_SOURCE,
-        runner_options: tuple[str, ...] = (),
-        call_id: str = "call-17",
     ) -> subprocess.CompletedProcess[str]:
         self.result_path.unlink(missing_ok=True)
         arguments = [
@@ -353,7 +351,7 @@ class OffloadCommandFixture(unittest.TestCase):
             "--repo-root",
             str(self.repository if repository is None else repository),
             "--call-id",
-            call_id,
+            "call-17",
         ]
         if isinstance(source, offload.StagedDocSnapshot):
             arguments.extend(["--source-root", str(source.root)])
@@ -368,7 +366,7 @@ class OffloadCommandFixture(unittest.TestCase):
             arguments.extend(["--settings", str(settings)])
         if last_decline:
             arguments.extend(["--last-decline", last_decline])
-        arguments.extend(["--result", str(self.result_path), *runner_options, "--"])
+        arguments.extend(["--result", str(self.result_path), "--"])
         arguments.extend(nextest_arguments)
         if subprocess_cli:
             return subprocess.run(arguments, cwd=self.root, env=self.environment, stdout=subprocess.PIPE,
@@ -444,8 +442,6 @@ raise SystemExit(offload.main())
         extra: dict[str, str] | None = None,
         ignore_interrupt: bool = False,
         start_new_session: bool = False,
-        runner_options: tuple[str, ...] = (),
-        call_id: str = "call-signal",
     ) -> subprocess.Popen[str]:
         self.result_path.unlink(missing_ok=True)
         arguments = [
@@ -457,10 +453,9 @@ raise SystemExit(offload.main())
             "--package",
             "hana",
             "--call-id",
-            call_id,
+            "call-signal",
             "--result",
             str(self.result_path),
-            *runner_options,
             "--",
             *nextest_arguments,
         ]

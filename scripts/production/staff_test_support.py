@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fcntl
+import io
 import json
 import os
 import shlex
@@ -13,10 +14,10 @@ import sys
 import tempfile
 import unittest
 from collections.abc import Generator
-from contextlib import AbstractContextManager, ExitStack, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from io import IOBase
 from datetime import UTC, datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast, override
 from unittest import mock
@@ -34,6 +35,39 @@ SOURCES_SCRIPT = Path(__file__).with_name("staff_sources.py")
 FixtureMachine = Literal["natedev", "mac"]
 UNFILLED_WORKTREE = staff.WorktreeUnfilled()
 UNFILLED_DOC = staff.DocUnfilled()
+
+
+@contextmanager
+def production_staff_record() -> Generator[None, None, None]:
+    """Mark each fixture snapshot as production within one alert test."""
+    read_snapshot = staff.snapshot
+
+    def snapshot() -> staff.StaffSnapshot:
+        return replace(read_snapshot(), production=True)
+
+    with mock.patch.object(staff, "snapshot", side_effect=snapshot):
+        yield
+
+
+def without_worktree_column(document: Path) -> None:
+    """Remove only the Units Worktree cell from a private fixture document."""
+    lines = document.read_text().splitlines()
+    in_units = False
+    column = -1
+    for index, line in enumerate(lines):
+        if line.startswith("## "):
+            in_units = line.strip() == "## Units"
+            column = -1
+        if not in_units or not line.lstrip().startswith("|"):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if column < 0:
+            if "Worktree" not in cells:
+                continue
+            column = cells.index("Worktree")
+        del cells[column]
+        lines[index] = "| " + " | ".join(cells) + " |"
+    _ = document.write_text("\n".join(lines) + "\n")
 
 
 def fixture_runtime_id(label: str) -> str:
@@ -134,6 +168,14 @@ def recorded_showrunner(name: str, doc: Path, parent: str = "") -> staff.StaffRo
     """Record the document that identifies one private production owner."""
     row = showrunner_relationship(name, parent)
     return staff.set_doc(row.id, staff.LiveDoc("natedev", doc))
+
+
+def fixture_unit_location(owner: staff.StaffRow, unit: str, location: Path) -> staff.StaffRow:
+    """Record a canonical unit and its explicit local location without changing files."""
+    from scripts.production import unit_names
+
+    row = fixture_member("unit", name=unit_names.name(unit), parent=owner.id)
+    return staff.set_worktree(row.id, staff.PresentWorktree("natedev", location), expected=row.worktree)
 
 
 def recorded_unit(showrunner: str, unit: str, worktree: Path, doc: Path, *,
@@ -252,7 +294,6 @@ def isolated_source_readers() -> Generator[None]:
             ("showrunners", {
                 "NOTIFIER_STATE_DIR": Path(os.environ["NOTIFIER_STATE_DIR"]),
                 "SHOWRUNNER_STATE_DIR": Path(os.environ["SHOWRUNNER_STATE_DIR"]),
-                "SESSIONS_DIR": Path(os.environ["NOTIFIER_SESSIONS_DIR"]),
             }),
             ("pane_record", {"RECORD_DIR": Path(os.environ["HERDR_PANE_RECORD_DIR"])}),
         ):
@@ -330,6 +371,8 @@ class StaffTestCase(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(redirect_stdout(io.StringIO()))
+        _ = self.enterContext(redirect_stderr(io.StringIO()))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.staff_file = self.root / "owner" / "staff.json"
         self.mac_file = self.root / "mac" / ".local/state/staff/staff.json"
@@ -542,6 +585,25 @@ class StaffTestCase(unittest.TestCase):
         write_text_atomic(timer, f"TARGET=session:{runner.id}\n"
                           + f"CHECK=zsh /fixture/production_check.sh {shlex.quote(str(doc))}\n")
         return RowProductionFixture(runner, unit, worker, doc, folder, slug)
+
+    def separated_unit_folders(self) -> RowProductionFixture:
+        """Give the director and the branch distinct private folders."""
+        fixture = self.row_production()
+        plan = fixture.worktree / "docs/plans/branch-plan.md"
+        plan.parent.mkdir(parents=True)
+        _ = plan.write_text("# Unit plan\n")
+        repository = fixture.doc.parents[1]
+        text = fixture.doc.read_text().replace("wrong-plan.md", str(plan))
+        text = text.replace("# Production\n", "# Production\n"
+                            + f"- **Repository:** `{repository}`\n"
+                            + f"- **Showrunner checkout:** `{repository}`\n"
+                            + "- **Merge branch:** `merge-from-git`\n"
+                            + "- **Log:** `production.log`\n")
+        _ = fixture.doc.write_text(text)
+        director = self.source_root / "director"
+        director.mkdir()
+        _ = staff.set_worktree(fixture.unit.id, staff.PresentWorktree("natedev", director), expected=fixture.unit.worktree)
+        return fixture
 
     def retired_fill_production(self, slug: str, *units: str, wrapped: bool = False) -> Path:
         """Keep the live fill's repository, but replace its units with complete retired evidence."""

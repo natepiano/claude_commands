@@ -30,7 +30,7 @@ from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import completion_receipt, staff, staff_sources
+from scripts.production import completion_receipt, staff, staff_sources, session_staff
 from scripts.shutdown import remote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
@@ -119,7 +119,8 @@ def _committed(doc: Path) -> None:
         raise Refusal(f"{doc} is not committed; the unit commits it first")
 
 
-def checked(name: str, child_doc: Path) -> Promotion:
+def checked(name: str, child_doc: Path, *,
+            record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> Promotion:
     """Everything the promotion needs. Raises Refusal naming what is in the way."""
     parent_doc = showrunners.production_of(staff.runtime_id())
     if parent_doc is None:
@@ -127,16 +128,34 @@ def checked(name: str, child_doc: Path) -> Promotion:
     parent = read_production(parent_doc)
     unit = name if name.replace("_", "-").endswith("-unit") else f"{name}-unit"
     pending = promotion_record(parent, unit)
+    record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
     if pending.exists():
         fields = cast(dict[str, str], json.loads(pending.read_text(encoding="utf-8")))
         if Path(fields["child_doc"]).resolve() != child_doc.expanduser().resolve():
             raise Refusal(f"{unit} has an unfinished promotion to {fields['child_doc']}")
+        owner = record.by_current_session(fields["session_id"])
+        if owner is None:
+            raise Refusal(f"{unit}: no staff row for the saved promotion session")
+        if (owner.kind == "showrunner" and isinstance(owner.worktree, staff.WorktreeUnfilled)
+                and owner.doc == staff.LiveDoc(remote.local_machine(), child_doc.expanduser().resolve())):
+            # Promotion clears the location before child registration publishes it.
+            worktree = Path(fields["worktree"])
+        else:
+            location = unit_lookup.local_worktree(staff_sources.MemberFound(owner))
+            if not isinstance(location, staff.PresentWorktree):
+                raise Refusal(f"{unit}: staff worktree is removed")
+            worktree = location.path
         child = read_production(child_doc)
         claude = unit_lookup.LiveClaude(fields["session"], fields["session_id"], fields["socket"], int(fields["pid"]))
         marked = unit_lookup.MarkedUnit(unit, claude, herdr.HerdrPlace(fields["session"], fields["pane"]))
-        return Promotion(unit, parent, child, marked, claude, Path(fields["worktree"]), fields["plan"])
+        return Promotion(unit, parent, child, marked, claude, worktree, fields["plan"])
     try:
         cells = _unit_row(parent.doc.read_text(encoding="utf-8").splitlines(), unit)
+        selected = staff_sources.member(staff_sources.UnitMember(parent.slug, unit), record)
+        location = unit_lookup.local_worktree(selected)
+        if not isinstance(location, staff.PresentWorktree):
+            raise Refusal(f"{unit}: staff worktree is removed")
+        worktree = location.path
         marked = unit_lookup.marked_unit(parent.slug, unit)
     except (OSError, UnicodeError) as error:
         raise Refusal(str(error)) from error
@@ -144,7 +163,6 @@ def checked(name: str, child_doc: Path) -> Promotion:
         raise Refusal(f"{unit} has no live session under {parent.slug}")
     claude = marked.claude
     _quiet(unit, marked, claude)
-    worktree = Path(cell_value(cells.get("Worktree", ""))).expanduser()
     _settled(unit, claude, worktree)
     child = read_production(child_doc)
     _committed(child.doc)
@@ -216,7 +234,7 @@ def stop(promotion: Promotion) -> bool:
     """
     place = promotion.marked.place
     try:
-        type_place(place, "/exit")
+        type_place(place, "/exit", target=promotion.claude.session_id)
     except (OSError, HerdrFailure) as error:
         raise Refusal(f"cannot type /exit into {promotion.unit}'s pane: {error}") from error
     deadline = time.monotonic() + STOP_WAIT_S
@@ -284,7 +302,7 @@ def _main(argv: list[str]) -> int:
     _ = parser.add_argument("--effort", required=True, help="pass your own effort level")
     _ = parser.add_argument("--check", action="store_true", help="run every refusal and stop nothing")
     args = parser.parse_args(argv)
-    record = staff.initial_snapshot()
+    record = staff.snapshot()
     try:
         parent_doc = showrunners.production_of(staff.runtime_id())
         if parent_doc is not None:
@@ -304,7 +322,7 @@ def _main(argv: list[str]) -> int:
                              or isinstance(old.row.worktree, staff.RemovedWorktree))):
                     print(f"{unit_name} already promoted")
                     return 0
-        promotion = checked(cast(str, args.unit), cast(Path, args.production))
+        promotion = checked(cast(str, args.unit), cast(Path, args.production), record=record)
         pending = promotion_record(promotion.parent, promotion.unit)
         target_directory = (Path(cast(dict[str, str], json.loads(pending.read_text(encoding="utf-8")))["target"])
                             if pending.exists() else showrunner_account_directory())

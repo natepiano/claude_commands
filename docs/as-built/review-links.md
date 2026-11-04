@@ -116,7 +116,15 @@ The `lists_directory` setting names this folder.
 `CHANGE_REVIEW_DIR` is a test override for the reader folder.
 This override never makes a list real.
 Lists outside this folder print the routing note without sending an alert or writing an alert record.
+It alerts only from the production staff record; a `STAFF_FILE` override never alerts.
 `unrouted_alert_recipient` starts at `natedev` in `config/review_links.conf`.
+A change goes to this root showrunner when its list has no staff showrunner or its production document is gone.
+The page, the verdict and the footer counts use the same owner.
+The router keeps an available document, including a document that an earlier verdict added to the list.
+Otherwise, the router uses the root showrunner's current document.
+If neither document is available, the page shows the unavailable message.
+If the root showrunner is unavailable, the router keeps the original owner.
+The router reads the root setting once when it first needs this rule.
 `unrouted_alert_retry_seconds` starts at 60 and accepts 5 through 3600 seconds.
 The router reads both keys when it uses them.
 A private record stores the last attempt time and accepted alert for each row and reason.
@@ -128,12 +136,12 @@ A new reason permits one new alert.
 A crash between acceptance and the durable mark can repeat an alert.
 Routed rows and rows that need no user answer send no routing alert.
 
-The status count watches the staff record, review lists, and delivery records.
+The status count watches the routing configuration, staff record, review lists, and delivery records.
 The owner's staff document supplies the production document when the file exists.
 The supplied production document for that showrunner is the fallback.
 A missing document reference in the source list does not block a row with an available owner document.
 An unrouted row retains verdict controls when its list's staff showrunner has an available document.
-Its owner remains unrouted and receives no message.
+In that case, its owner remains unrouted and receives no message.
 
 `merge_checkpoint`, `merge_gate`, and `change_review.py append` store each checkpoint unit's Producer id.
 `merge_gate` reads the staff record before the merge.
@@ -148,24 +156,6 @@ An unregistered unit writes an empty cell and one named note.
 `change_review.py add --repo <directory>` stores the unit id of that worktree.
 A showrunner directory or an unowned directory stores an empty cell.
 A verdict retains the Producer cell in Reviewed.
-
-Use `change_review.py backfill-producer [--list <path>]` to report older rows with no Producer id.
-Add `--write` to fill mapped rows in To review and Reviewed.
-The command copies each changed list to `<name>.backup-<timestamp>` before the locked write.
-It finds historical checkpoints in the production repositories.
-For a merge with several units, an exact Change-Review text selects the checkpoint.
-If no included checkpoint names the change, the command checks the merge commit's own checkpoint subject.
-It maps the old Branch, Plan, or Unit name through the Units Worktree path to the retained staff id.
-When that lookup fails, the command removes `build-followups-` from the checkpoint name.
-Exactly one staff unit with the remaining name supplies the id. Retired units count.
-Zero or several matches leave Producer empty. A valid Worktree result wins.
-It reports each unmapped row by list, row id, and old name.
-A failed list prints its name and error; the command continues and returns 1 after all lists.
-A rerun retries an unfinished commit.
-A completed list keeps its bytes and commit.
-After the lists are filled, remove `scripts/production/producer_backfill.py`, including its adapter.
-Remove the `backfill-producer` CLI case and argparse choice from `change_review.py`.
-Remove `scripts/production/test_producer_backfill.py`.
 Delivery records store fixed staff ids.
 Each send reads `staff.snapshot()` and sends to `session:<current_session>` from the saved staff row.
 An account move changes the next recipient address without changing the stored staff id.
@@ -204,7 +194,12 @@ The short URL ends in `/changes.html`.
 The page retains the plain, narrow layout and fits a phone.
 Each row shows its kind, description once, proof, and answer controls.
 The user can select Works, Not works, Validate yourself, Send feedback, or Ask a question.
-The feedback field accepts one line, which matches the verdict command's table-cell format.
+The feedback box is a textarea with `feedback_rows` rows.
+The setting starts at 5.
+The box accepts line breaks for every outcome.
+The server converts CRLF, CR, and Unicode line separators to newline characters.
+The verdict cell joins stripped, nonblank lines with one space.
+The message and a question keep the normalized line breaks.
 Works with text saves `works: <text>`.
 Not works with text saves `not works: <text>`.
 Send feedback saves the user's text without a prefix.
@@ -223,9 +218,8 @@ The CLI keeps its current form and still moves the pinned item.
 An unknown key raises `NextError` before the queue changes.
 Rows from an earlier list use their qualified keys.
 
-**Ask a question** uses the one-line feedback field.
-The server refuses empty questions.
-It refuses every line break in the feedback field for every outcome, including trailing Unicode separators.
+**Ask a question** uses the feedback box.
+The server refuses empty questions and questions that contain only whitespace.
 It saves no verdict and runs no feature-log command.
 The server stores the question before it sends one message to the tab's showrunner.
 The message names the row, list, production, change, and question.
@@ -259,7 +253,7 @@ The request cannot select a local path, command, or recipient.
 The server never serves private manifests.
 Each form contains only row, token, outcome, and feedback.
 Each browser form names its page as the save URL.
-Unknown rows, extra fields, wrong tokens, POST queries, invalid outcomes, and multiline feedback receive 4xx.
+Unknown rows, extra fields, wrong tokens, POST queries, and invalid outcomes receive 4xx.
 Path fields, command fields, and non-ASCII tokens also receive 4xx.
 
 Older selected-row links still work with their existing plain HTML forms and 303 responses.
@@ -342,6 +336,7 @@ The page shows **Saved: <answer>**, **The showrunner will validate this**, or **
 The page shows no delivery state, attention links, or resend buttons.
 
 The server reads `config/review_links.conf` through `scripts/lib/conf.py` when delivery starts.
+Each page render reads `feedback_rows` once to set every feedback box's height.
 `delivery_tries` starts at 3; `delivery_pause_seconds` starts at 5.
 Tests use a zero pause.
 Each round sends once to every recipient that has not succeeded.
@@ -466,7 +461,7 @@ Both machines import `/etc/nixos/modules/common/review-links.nix`. It defines th
 - **Atomic per file, not per bundle.** During a refresh of several files, a reader can see one new file next to one old file.
 - **A bad index stops all publishing.** If `.index.json` is not valid JSON or is not a JSON object, every run exits 2 until someone repairs or removes the file.
 - **`REVIEW_LINKS_ROOT` in a session.** A session that sets it publishes to a folder that the service does not serve, and its links return 404. The `curl` check finds this.
-- **Code changes need a restart.** A running server keeps its imported code. Restart the service after a change to `serve.py` or `private_name` in `review_link.py`. Restart it after a change to the temporary-name shape in `atomic_file.py`. Other publisher changes take effect at the next publisher run. These changes need no rebuild.
+- **Code changes need a restart.** A running server keeps its imported code. Restart the service after changes to `serve.py`, `change_page.py`, `change_browser.py`, or `private_name` in `review_link.py`. Restart it after a change to the temporary-name shape in `atomic_file.py`. Other publisher changes take effect at the next publisher run. These changes need no rebuild.
 - **Sweep and refresh at the same moment.** The sweep takes no lock. A refresh of the folder that the sweep deletes at that moment can fail, or can print a link that returns 404. The `curl` check finds this, and a second run gets a new ID.
 
 ## Why
@@ -521,7 +516,10 @@ The scripts read `config/review_links.conf` through `scripts/lib/conf.py` when e
 `snapshot_sweep_seconds` and `tailscale_check_seconds` control the server checks.
 `snapshot_allocation_tries` limits folder allocation attempts.
 `delivery_tries` and `delivery_pause_seconds` control message attempts.
-`unrouted_alert_recipient` selects the alert recipient.
+`feedback_rows` sets the textarea height from 1 to 20 rows and starts at 5.
+`unrouted_alert_recipient` selects the alert recipient and the root showrunner for changes that nobody can take.
+This rule applies when the list has no staff showrunner or its production document is gone.
+If no document is available for the change or the root showrunner, the page shows the unavailable message.
 `unrouted_alert_retry_seconds` controls repeated alerts.
 
 The routing scripts read `config/change_review.conf` when they need a folder.
@@ -530,7 +528,7 @@ The routing scripts read `config/change_review.conf` when they need a folder.
 `CHANGE_REVIEW_DIR` overrides the reader folder for tests.
 Each publication uses one delivery root for the HTML and its manifest.
 Each router resolves the configured alert folder once, when an unsaved unrouted row needs it.
-The status line watches `change_review.conf` so folder changes invalidate its counts.
+The status line watches `change_review.conf` and `review_links.conf` so folder and root showrunner changes invalidate its counts.
 The alert guard uses only the configured folder.
 `REVIEW_LINKS_ROOT` overrides the delivery folder.
 The page, the footer and `/next` use these same folder readers.

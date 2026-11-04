@@ -55,7 +55,6 @@ def stub_build_tool_path(directory: Path) -> str:
         "flock", "timeout", "seq", "tail", "realpath", "perl", "nproc", "getconf",
         "lscpu", "du", "df", "journalctl", "which", "setsid", "ln", "printf",
         "cmp", "rmdir", "true", "false", "install", "readelf", "file",
-        "sha256sum", "shasum",
     ):
         target = directory / name
         source = shutil.which(name)
@@ -97,37 +96,6 @@ def processes_carrying(marker: str) -> set[int]:
         except OSError:
             continue
     return found
-
-
-def wait_for_marker_exit(marker: str, timeout: float) -> set[int]:
-    """Wait for every marked process to exit, returning survivors without killing any."""
-    deadline = time.monotonic() + timeout
-    while children := processes_carrying(marker):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return children
-        descriptors: list[int] = []
-        poll_exits = False
-        try:
-            for pid in children:
-                try:
-                    descriptors.append(os.pidfd_open(pid))
-                except ProcessLookupError:
-                    pass
-                except AttributeError:
-                    poll_exits = True
-                except OSError as error:
-                    if error.errno not in (errno.ENOSYS, errno.ENOTSUP, errno.EPERM):
-                        raise
-                    poll_exits = True
-            if descriptors:
-                _ = select.select(descriptors, [], [], min(0.01, remaining) if poll_exits else remaining)
-            elif poll_exits:
-                time.sleep(min(0.01, remaining))
-        finally:
-            for descriptor in descriptors:
-                os.close(descriptor)
-    return set()
 
 
 def reap(marker: str) -> set[int]:
@@ -284,10 +252,6 @@ raise SystemExit(0)
 
 GIT_STUB = r'''#!/bin/bash
 has() { local word; for word in "$@"; do [[ "$word" == "$wanted" ]] && return 0; done; return 1; }
-wanted=check-ignore
-if has "$@"; then
-    case "${!#}" in target/*) exit 0 ;; *) exit 1 ;; esac
-fi
 wanted=rev-parse
 if has "$@"; then
     wanted='HEAD^{tree}'
@@ -398,8 +362,6 @@ event = {
 with (root / "runner-events.jsonl").open("a", encoding="utf-8") as output:
     output.write(json.dumps(event) + "\n")
 (root / "runner-started").write_text("started\n", encoding="utf-8")
-forwarded_names = [arguments[index + 1] for index, word in enumerate(arguments) if word == "--env"]
-(root / "forwarded-environment.json").write_text(json.dumps({name: os.environ.get(name) for name in forwarded_names}))
 
 attempt = len((root / "runner-events.jsonl").read_text().splitlines())
 last_decline = arguments[arguments.index("--last-decline") + 1] if "--last-decline" in arguments else ""
@@ -454,8 +416,7 @@ else:
     result.write_text(
         "mac=" + mode + "\n"
         + "reason=" + reason + "\n"
-        + "seconds=" + os.environ.get("TEST_RUNNER_SECONDS", "3.25") + "\n"
-        + ("fetch=" + os.environ["TEST_RUNNER_FETCH"] + "\n" if "TEST_RUNNER_FETCH" in os.environ else ""),
+        + "seconds=" + os.environ.get("TEST_RUNNER_SECONDS", "3.25") + "\n",
         encoding="utf-8",
     )
 if mode == "declined":
@@ -604,15 +565,6 @@ import os
 from pathlib import Path
 import sys
 
-# The routing simulator shares its availability schedule with the new
-# claim-wait hook. Real claim locking and transfer are tested separately.
-if sys.argv[1] == "release":
-    raise SystemExit(0)
-if sys.argv[1] == "claim-wait":
-    assert sys.argv[-4] == "--pid" and sys.argv[-2] == "--package", sys.argv
-    assert int(sys.argv[-3]) > 0, sys.argv
-    sys.argv = [sys.argv[0], "free-now", *sys.argv[2:-4]]
-
 root = Path(os.environ["TEST_RUNNER_STATE"])
 with (root / "free-now-roots").open("a") as output:
     output.write(" ".join(sys.argv[4:]) + "\n")
@@ -661,21 +613,30 @@ runpy.run_path(os.environ["TEST_REAL_RECORD"], run_name="__main__")
 '''
 
 
-ROUTING_CLOCK_BASH = r'''
-# Only the disposable verify copy uses fixture time. Export the probe because
-# local wait helpers evaluate the retry hook in a child Bash.
-fixture_routing_clock() {
-    local now
-    read -r now < "$TEST_ROUTING_CLOCK" || [[ -n "$now" ]]
-    printf '%s.000000\n' "$now"
-}
-fixture_routing_probe() {
-    local now
-    read -r now < "$TEST_ROUTING_CLOCK" || [[ -n "$now" ]]
-    printf '%s\n' "$now" >> "$TEST_RUNNER_STATE/retry-probes"
-    printf '%s000000\n' "$now"
-}
-export -f fixture_routing_clock fixture_routing_probe
+ROUTING_CLOCK_SHIM = r'''#!/bin/sh
+# Only verify's four clock expressions use fixture time. Forward every other
+# invocation directly, preserving argv and the interpreter's exit/signal status.
+if [ "${1:-}" = -c ] && [ -n "${TEST_ROUTING_CLOCK:-}" ]; then
+    read -r now < "$TEST_ROUTING_CLOCK"
+    case "$2" in
+        'import time; print(time.monotonic())')
+            printf '%s\n' "$now"
+            exit 0 ;;
+        'import time; print(time.monotonic() + 180)')
+            awk -v now="$now" 'BEGIN { print now + 180 }'
+            exit $? ;;
+        'import sys, time; sys.exit(time.monotonic() < float(sys.argv[1]))')
+            printf '%s\n' "$now" >> "$TEST_RUNNER_STATE/retry-probes"
+            awk -v now="$now" -v deadline="$3" 'BEGIN { exit (now < deadline) }'
+            exit $? ;;
+        'import sys, time
+with open(sys.argv[2], "a") as output:
+    output.write("%.6f\n" % max(0, time.monotonic() - float(sys.argv[1])))')
+            awk -v now="$now" -v started="$3" 'BEGIN { d = now - started; printf "%.6f\n", (d > 0 ? d : 0) }' >> "$4"
+            exit $? ;;
+    esac
+fi
+exec "$TEST_REAL_PYTHON" "$@"
 '''
 
 
@@ -692,7 +653,6 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         self.runner_state: Path = Path()
         self.cargo_events_path: Path = Path()
         self.environment: dict[str, str] = {}
-        self.verify_script: Path = VERIFY
 
     fixture_root: ClassVar[Path]
     fixture_seed: ClassVar[Path]
@@ -818,8 +778,6 @@ class VerifyMacOffloadFixture(unittest.TestCase):
                 }
             ],
         }
-        assertion_guard = self.root / "assertion-guard.py"
-        self.write_executable(assertion_guard, "raise SystemExit(0)\n")
         self.environment = {
             **config_environment(self.root),
             **{
@@ -856,7 +814,6 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "XDG_STATE_HOME": str(self.root / "state"),
             "XDG_CACHE_HOME": str(self.root / "cache"),
             "VERIFY_STEPS_DIR": str(self.root / "verify-steps"),
-            "VERIFY_ASSERTION_GUARD_SCRIPT": str(assertion_guard),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_BUILDS_CGROUP": str(self.root / "cgroup"),
             "BUILDLOG_CI_CGROUP": str(self.root / "cgroup"),
@@ -925,7 +882,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         self, *arguments: str, extra: dict[str, str] | None = None
     ) -> subprocess.Popen[str]:
         return subprocess.Popen(
-            ["bash", str(self.verify_script), *arguments],
+            ["bash", str(VERIFY), *arguments],
             cwd=self.root,
             env={**self.environment, **(extra or {})},
             stdout=subprocess.PIPE,
@@ -1003,26 +960,12 @@ class VerifyMacOffloadFixture(unittest.TestCase):
     def control_routing_clock(self) -> Path:
         clock = self.runner_state / "routing-clock"
         _ = clock.write_text("100")
-        # Preserve verify's relative helper paths while replacing only its
-        # clock expressions; the production script needs no fixture hooks.
-        scripts = self.root / "clock-scripts"
-        direct = scripts / "direct"
-        direct.mkdir(parents=True)
-        for sibling in VERIFY.parent.parent.iterdir():
-            if sibling.name != "direct":
-                (scripts / sibling.name).symlink_to(sibling, target_is_directory=sibling.is_dir())
-        for helper in VERIFY.parent.iterdir():
-            if helper.name != "verify.sh":
-                (direct / helper.name).symlink_to(helper, target_is_directory=helper.is_dir())
-        source = VERIFY.read_text()
-        source = source.replace("local now=$EPOCHREALTIME", "local now=$(fixture_routing_clock)")
-        source = source.replace("ROUTING_WAIT_STARTED=$EPOCHREALTIME", "ROUTING_WAIT_STARTED=$(fixture_routing_clock)")
-        source = source.replace("${EPOCHREALTIME/./}", "$(fixture_routing_probe)")
-        # Fixture time already represents monotonic seconds, so its offset is zero.
-        source = source.replace(" - VERIFY_MONOTONIC_OFFSET_US", "")
-        source = source.replace('"$VERIFY_MONOTONIC_OFFSET_US" "${deadline/./}"', '0 "${deadline/./}"')
-        self.verify_script = direct / "verify.sh"
-        _ = self.verify_script.write_text(source.replace("set -euo pipefail", ROUTING_CLOCK_BASH + "\nset -euo pipefail", 1))
+        library = self.home / ".claude" / "scripts" / "lib"
+        library.unlink()
+        library.mkdir()
+        self.write_executable(library / "py", ROUTING_CLOCK_SHIM)
+        for name in ("build_folders.py", "conf.py", "process_group.py", "unit_runs.py"):
+            _ = shutil.copy2(VERIFY.parent.parent / "lib" / name, library / name)
         self.environment["TEST_ROUTING_CLOCK"] = str(clock)
         return clock
 
@@ -1102,7 +1045,32 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         # as a cargo run for as long as it lives.
         # Lint recorders intentionally detach from their caller. Wait for their
         # exit events; a two-second grace period races their work under load.
-        _ = wait_for_marker_exit(self.child_marker(), TEST_HANG_GUARD_SECS)
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+        while children := processes_carrying(self.child_marker()):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            descriptors: list[int] = []
+            poll_exits = False
+            try:
+                for pid in children:
+                    try:
+                        descriptors.append(os.pidfd_open(pid))
+                    except ProcessLookupError:
+                        pass
+                    except AttributeError:
+                        poll_exits = True
+                    except OSError as error:
+                        if error.errno not in (errno.ENOSYS, errno.ENOTSUP, errno.EPERM):
+                            raise
+                        poll_exits = True
+                if descriptors:
+                    _ = select.select(descriptors, [], [], min(0.01, remaining) if poll_exits else remaining)
+                elif poll_exits:
+                    time.sleep(min(0.01, remaining))
+            finally:
+                for descriptor in descriptors:
+                    os.close(descriptor)
         survivors = reap(self.child_marker())
         if survivors:
             self.fail(f"processes outlived the test: {sorted(survivors)}")

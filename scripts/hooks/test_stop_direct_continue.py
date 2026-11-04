@@ -14,7 +14,6 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -39,19 +38,16 @@ class DirectorStopFixture:
             },
         }) + "\n", encoding="utf-8")
 
-    def call(self, **fields: object) -> str:
+    def call(self, **fields: object) -> subprocess.CompletedProcess[str]:
         payload: dict[str, object] = {
             "session_id": SESSION, "transcript_path": str(self.transcript),
             "background_tasks": [], **fields,
         }
-        result = subprocess.run(
+        return subprocess.run(
             [sys.executable, str(HOOK)], input=json.dumps(payload), text=True,
-            capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS,
+            capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS,
             env=self.environment, cwd=self.root,
         )
-        if result.stderr:
-            raise AssertionError(result.stderr)
-        return result.stdout
 
 
 @contextmanager
@@ -90,11 +86,12 @@ def director_stop_fixture() -> Generator[DirectorStopFixture]:
 
 
 class DirectorStopTests(unittest.TestCase):
-    def assert_blocked(self, output: str) -> None:
-        self.assertTrue(output, "the hook allowed a stop with no live wake source")
-        response = cast(dict[str, object], json.loads(output))
-        self.assertEqual(response["decision"], "block")
-        self.assertIn("compaction fires on the next request", str(response["reason"]))
+    def assert_blocked(self, result: subprocess.CompletedProcess[str]) -> None:
+        self.assertEqual((result.returncode, result.stdout), (2, ""))
+        self.assertIn("Compaction runs on the next request", result.stderr)
+
+    def assert_allowed(self, result: subprocess.CompletedProcess[str]) -> None:
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
 
     def test_finished_worker_heartbeat_does_not_allow_a_full_context_stop(self) -> None:
         with director_stop_fixture() as fixture:
@@ -104,7 +101,7 @@ class DirectorStopTests(unittest.TestCase):
 
     def test_running_background_task_allows_a_full_context_stop(self) -> None:
         with director_stop_fixture() as fixture:
-            self.assertEqual(fixture.call(background_tasks=[{"id": "launcher", "status": "running"}]), "")
+            self.assert_allowed(fixture.call(background_tasks=[{"id": "launcher", "status": "running"}]))
 
     def test_finished_background_tasks_do_not_allow_a_full_context_stop(self) -> None:
         with director_stop_fixture() as fixture:
@@ -124,50 +121,55 @@ class DirectorStopTests(unittest.TestCase):
     def test_context_below_handoff_threshold_allows_stop(self) -> None:
         with director_stop_fixture() as fixture:
             fixture.write_usage(THRESHOLD - 1)
-            self.assertEqual(fixture.call(), "")
+            self.assert_allowed(fixture.call())
 
     def test_unmeasurable_transcript_allows_stop(self) -> None:
         with director_stop_fixture() as fixture:
             fixture.transcript.unlink()
-            self.assertEqual(fixture.call(), "")
+            self.assert_allowed(fixture.call())
 
     def test_unconfigured_context_window_allows_stop(self) -> None:
         with director_stop_fixture() as fixture:
             del fixture.environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]
-            self.assertEqual(fixture.call(), "")
+            self.assert_allowed(fixture.call())
 
     def test_subagent_allows_stop_even_with_full_context(self) -> None:
         with director_stop_fixture() as fixture:
             own = fixture.transcript.with_suffix("") / "subagents" / "agent-worker.jsonl"
             own.parent.mkdir(parents=True)
             _ = own.write_bytes(fixture.transcript.read_bytes())
-            self.assertEqual(fixture.call(agent_id="worker"), "")
+            self.assert_allowed(fixture.call(agent_id="worker"))
 
     def test_missing_session_id_allows_stop(self) -> None:
         with director_stop_fixture() as fixture:
-            self.assertEqual(fixture.call(session_id=""), "")
+            self.assert_allowed(fixture.call(session_id=""))
+
+    def test_exception_allows_stop_without_output(self) -> None:
+        with director_stop_fixture() as fixture:
+            _ = fixture.marker.write_bytes(b"\xff")
+            self.assert_allowed(fixture.call())
 
     def test_no_active_run_allows_stop(self) -> None:
         with director_stop_fixture() as fixture:
             fixture.marker.unlink()
-            self.assertEqual(fixture.call(), "")
+            self.assert_allowed(fixture.call())
 
     def test_declared_user_wait_is_recorded_and_allows_stop(self) -> None:
         with director_stop_fixture() as fixture:
-            self.assertEqual(fixture.call(last_assistant_message="decision: approve the checkpoint"), "")
+            self.assert_allowed(fixture.call(last_assistant_message="decision: approve the checkpoint"))
             self.assertTrue((fixture.run / "turn_wait.json").is_file())
             self.assertIn('"WaitingForUser"', (fixture.root / "history/run.jsonl").read_text())
 
     def test_declared_supplier_wait_is_recorded_and_allows_stop(self) -> None:
         with director_stop_fixture() as fixture:
-            self.assertEqual(fixture.call(last_assistant_message="blocked: waiting on session:supplier"), "")
+            self.assert_allowed(fixture.call(last_assistant_message="blocked: waiting on session:supplier"))
             self.assertTrue((fixture.run / "turn_wait.json").is_file())
             self.assertIn('"WaitingForSupplier"', (fixture.root / "history/run.jsonl").read_text())
 
     def test_continuation_after_a_block_allows_stop(self) -> None:
         with director_stop_fixture() as fixture:
             self.assert_blocked(fixture.call())
-            self.assertEqual(fixture.call(stop_hook_active=True), "")
+            self.assert_allowed(fixture.call(stop_hook_active=True))
 
 
 if __name__ == "__main__":

@@ -253,7 +253,7 @@ class MacActivityShellTests(unittest.TestCase):
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             with self.subTest(shell=shell):
                 answer = self.run_activity(shell, responses)
-                self.assertEqual((answer.returncode, answer.stdout, answer.stderr), (0, "active=0\nwork=0\nrc=0\n", ""))
+                self.assertEqual((answer.returncode, answer.stdout, answer.stderr), (0, "active=0\nrc=0\n", ""))
 
     def test_activity_text_counts_each_matching_user_pid_once_under_sh_and_zsh(self) -> None:
         responses = {
@@ -267,7 +267,7 @@ class MacActivityShellTests(unittest.TestCase):
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             with self.subTest(shell=shell):
                 answer = self.run_activity(shell, responses)
-                self.assertEqual((answer.returncode, answer.stdout, answer.stderr), (0, "active=7\nwork=5\nrc=0\n", ""))
+                self.assertEqual((answer.returncode, answer.stdout, answer.stderr), (0, "active=7\nrc=0\n", ""))
                 calls = [cast(SelectorEvent, json.loads(line)) for line in (self.root / "commands.jsonl").read_text().splitlines()]
                 pgrep = [call for call in calls if call["command"] == "pgrep"]
                 lsof = [call for call in calls if call["command"] == "lsof"]

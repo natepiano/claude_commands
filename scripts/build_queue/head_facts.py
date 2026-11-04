@@ -1,9 +1,9 @@
-"""Recorded head history shared by the queue and build-why; no admission decisions."""
+"""Read bounded head history for the queue page without making admission decisions."""
 
 from __future__ import annotations
 
 from collections.abc import Generator, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import cached_property
 import json
@@ -106,10 +106,9 @@ class HeadFacts:
     order: gate.StrictUntil | gate.BackfillUntil | gate.WindowNotStarted
     has_priority: bool
     token_waits: TokenWaitsNotRecorded | RecordedTokenWaits
+    budget: int
+    head_need: int
     bump_records: tuple[BumpRecord, ...] = ()
-    budget: int = field(default_factory=gate.build_budget_bytes)
-    head_need: int = 0
-    priority: gate.QueuePriority | gate.NoQueuePriority = gate.NO_QUEUE_PRIORITY
 
     @cached_property
     def moves_by_step(self) -> Mapping[MoveIdentity, tuple[BumpRecord, ...]]:
@@ -366,13 +365,13 @@ def read_head_facts(reading: gate.QueueRead) -> HeadFacts | gate.NoWaiter:
     bumps = (group_bumps(tuple(record for record in records if record.at >= head.waiter.since))
              if isinstance(history, BumpHistory) else history)
     return HeadFacts(now, head.waiter.since, bumps,
-                     head.order, head.has_priority, _read_token_waits(reading), records,
-                     budget=head.decision.budget, head_need=head.waiter.need,
-                     priority=reading.explanation.priority)
+                     head.order, head.has_priority, _read_token_waits(reading),
+                     budget=reading.explanation.limits.budget, head_need=head.waiter.need, bump_records=records)
 
 
-def clock(instant: float, zone: ZoneInfo, *, seconds: bool = True) -> str:
-    return datetime.fromtimestamp(instant, zone).strftime("%H:%M:%S" if seconds else "%H:%M")
+def clock(instant: float, zone: ZoneInfo, *, seconds: bool = True, zone_name: bool = False) -> str:
+    form = "%H:%M:%S" if seconds else "%H:%M"
+    return datetime.fromtimestamp(instant, zone).strftime(form + (" %Z" if zone_name else ""))
 
 
 def bump_text(facts: HeadFacts, zone: ZoneInfo, *, short: bool = False) -> str:
@@ -394,23 +393,19 @@ def _session_label(session: str, labels: Mapping[str, unit_labels.UnitLabels]) -
     return labels[session].session if session in labels else session or "unknown"
 
 
-def bump_rows(facts: HeadFacts, zone: ZoneInfo, labels: Mapping[str, unit_labels.UnitLabels]) -> list[list[str]]:
+def bump_lines(facts: HeadFacts, zone: ZoneInfo, labels: Mapping[str, unit_labels.UnitLabels]) -> list[str]:
     if isinstance(facts.bumps, BumpsUnavailable):
         return []
-    return [[group.step, _session_label(group.session, labels), group.folder, str(group.count),
-             ", ".join(_session_label(actor, labels) for actor in group.actors), clock(group.last_at, zone)]
-            for group in facts.bumps.groups[:BUMP_TABLE_ROWS]]
-
-
-def bump_remainder(facts: HeadFacts) -> str:
-    if isinstance(facts.bumps, BumpsUnavailable):
-        return ""
+    lines = [f"  {_session_label(group.session, labels)} {group.step}, {group.folder}: {group.count} bumps; "
+             + f"by {', '.join(_session_label(actor, labels) for actor in group.actors)}; "
+             + f"last bump {clock(group.last_at, zone)}"
+             for group in facts.bumps.groups[:BUMP_TABLE_ROWS]]
     remaining = facts.bumps.groups[BUMP_TABLE_ROWS:]
-    if not remaining:
-        return ""
-    count = sum(group.count for group in remaining)
-    noun = "bump" if count == 1 else "bumps"
-    return f"and {len(remaining)} more steps with {count} {noun}"
+    if remaining:
+        count = sum(group.count for group in remaining)
+        noun = "bump" if count == 1 else "bumps"
+        lines.append(f"and {len(remaining)} more steps with {count} {noun}")
+    return lines
 
 
 def priority_text(priority: gate.QueuePriority | gate.NoQueuePriority) -> str:
@@ -428,7 +423,7 @@ def order_text(facts: HeadFacts, zone: ZoneInfo) -> str:
         minutes, seconds = divmod(remaining, 60)
         text = gate.window_clause(facts.order, facts.budget, facts.head_need, zone)
         text += f" ({minutes} min {seconds} s left)"
-    return "; ".join(filter(None, [priority_text(facts.priority), text]))
+    return text
 
 
 def cargo_token_lines(facts: HeadFacts, zone: ZoneInfo, labels: Mapping[str, unit_labels.UnitLabels]) -> list[str]:
