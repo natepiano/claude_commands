@@ -442,19 +442,18 @@ class PaneRecordTests(unittest.TestCase):
             self.assertEqual(hook.returncode, 0, hook.stderr)
             self.assertEqual(self.entries()["w1:p2"]["environment"], {"ENABLE_TOOL_SEARCH": "true"})
 
-    def test_restored_unit_id_comes_from_the_productions_units_table(self) -> None:
+    def test_restored_unit_id_comes_from_the_staff_row(self) -> None:
         from scripts.production import staff, session_staff, showrunners
 
         parent = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "showrunner", "demo", None, current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"))
         owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "unit", "alpha", parent.id, current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
-        document = "# Production — demo\n\n## Units\n\n| Unit | Plan |\n| --- | --- |\n| `alpha` | standby |\n"
         source = showrunners.ShowrunnerSource(
-            showrunners.Timer("demo", "session:runner", self.root / "demo.md", "UTC"), document)
+            showrunners.Timer("demo", "session:runner", self.root / "demo.md", "UTC"), "# Production — demo\n")
         entry = pane_record.launch("new", "019b3a40-4250-7000-8000-000000000102", "/fixture", {"CLAUDE_CODE_SESSION_ID": owner.current_session}, ["claude"])
         membership = session_staff.LaunchMembership(staff.StaffSnapshot((parent, owner)),
             session_staff.MemberSources({"demo": source}, ()))
         self.assertEqual(membership.environment(entry), {"CLAUDE_CODE_SESSION_ID": owner.current_session,
-            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha"})
+            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
 
     def test_staff_owner_supersedes_a_promoted_showrunners_old_session_staff(self) -> None:
         from scripts.production import staff, session_staff, showrunners

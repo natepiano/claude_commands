@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import unit_files
 from git_process import GitReadFailed
 from scripts.production import staff
-from scripts.production.staff_test_support import StaffTestCase, fixture_member
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, recorded_showrunner, recorded_unit
 
 
 class UnitFilesTests(unittest.TestCase):
@@ -56,29 +56,20 @@ class UnitFilesTests(unittest.TestCase):
 class UnitWorktreeAvailabilityTests(StaffTestCase):
     def test_unavailable_rows_keep_the_live_unit_and_report_each_skipped_row(self) -> None:
         doc = self.source_root / 'style-production.md'
-        _ = doc.write_text(
-            '# Style production\n- **Merge branch:** main\n\n## Units\n\n'
-            + '| Unit | Branch | Plan |\n| --- | --- | --- |\n'
-            + '| standby-unit | standby-branch | standby |\n'
-            + '| missing-unit | missing-branch | docs/missing.md |\n'
-            + '| live-unit | live-branch | docs/live.md |\n')
-        owner = fixture_member('showrunner', name='style', doc=staff.LiveDoc('natedev', doc))
-        live_folder = self.root / 'live'
-        live_folder.mkdir()
+        _ = doc.write_text('# Style production\n- **Merge branch:** main\n')
+        owner = recorded_showrunner('style', doc)
         _ = fixture_member('unit', name='standby', parent=owner.id)
-        _ = fixture_member('unit', name='live', parent=owner.id,
-                           worktree=staff.PresentWorktree('natedev', live_folder))
+        live_folder = self.root / 'live'
+        _ = recorded_unit('style', 'live', live_folder, doc)
+        _ = subprocess.run(['git', '-C', str(live_folder), 'checkout', '-q', '-b', 'live-branch'], check=True)
         errors = io.StringIO()
         with redirect_stderr(errors):
             result = unit_files.unit_worktrees(doc)
         self.assertEqual(result, (unit_files.UnitWorktree('live-unit', 'live-branch', live_folder, 'main'),))
         messages = errors.getvalue().splitlines()
-        self.assertEqual(len(messages), 2)
+        self.assertEqual(len(messages), 1)
         self.assertIn('standby-unit', messages[0])
         self.assertIn('staff worktree is unfilled', messages[0])
-        self.assertIn('missing-unit', messages[1])
-        self.assertIn('no matching staff member', messages[1])
-
 
 if __name__ == '__main__':
     _ = unittest.main()

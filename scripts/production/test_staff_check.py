@@ -16,7 +16,7 @@ import unittest
 
 from scripts.lib import unit_runs
 from scripts.production import staff, staff_check, staff_sources, unit_lookup, showrunners
-from scripts.production.staff_test_support import StaffTestCase, without_worktree_column
+from scripts.production.staff_test_support import StaffTestCase
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import process_table, roster
 from scripts.message.relay_test_support import write_relay_record
@@ -47,8 +47,7 @@ class DocumentOwnerTests(unittest.TestCase):
         second = staff.StaffRow(second_id, "showrunner", "second", None, current_session=second_id,
                                 doc=staff.LiveDoc("natedev", second_doc))
         record = staff.StaffSnapshot((first, second))
-        document = "\n".join(("## Units", "| Unit | Worktree | Branch | Plan |",
-                              "| --- | --- | --- | --- |"))
+        document = ""
         sources = unit_lookup.MemberSources({
             "first": showrunners.ShowrunnerSource(
                 showrunners.Timer("first", "session:" + second.id, first_doc, "UTC"), document),
@@ -89,11 +88,6 @@ class StaffCheckTests(StaffTestCase):
         evidence = staff_check.CheckEvidence(
             unit_lookup.member_sources(), live, staff_sources.WorkerEvidence((observation,), {}, ()))
         return StaffCheckFixture(runner, unit, worker, doc, folder, live, evidence)
-
-    def test_staff_audit_accepts_a_document_without_the_worktree_column(self) -> None:
-        without_worktree_column(self.fixture.doc)
-        evidence = replace(self.fixture.evidence, sources=unit_lookup.member_sources())
-        self.assertEqual(self.check(evidence), (0, "checked 3 rows; 0 wrong\n"))
 
     def test_branch_and_configuration_failures_are_visible_without_diagnostic_capture(self) -> None:
         folder = self.fixture.folder

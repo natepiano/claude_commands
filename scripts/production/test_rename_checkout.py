@@ -52,8 +52,8 @@ class MoveTest(unittest.TestCase):
         doc = self.old / "docs/demo-production.md"
         doc.parent.mkdir(parents=True)
         _ = doc.write_text(f"# demo\n\n## Production Context\n\n- **Formerly:** `old`\n- **Merge branch:** `work`\n"
-                           + f"- **Showrunner checkout:** `{self.old}`\n- **Log:** `docs/demo-log.md`\n"
-                           + "\n## Units\n\n| Unit | Plan |\n| --- | --- |\n", encoding="utf-8")
+                           + f"- **Showrunner checkout:** `{self.old}`\n- **Log:** `docs/demo-log.md`\n",
+                           encoding="utf-8")
         _ = self.git(self.old, "add", "docs")
         _ = self.git(self.old, "commit", "-q", "-m", "doc")
         _ = self.git(self.old, "push", "-q", "origin", "work")

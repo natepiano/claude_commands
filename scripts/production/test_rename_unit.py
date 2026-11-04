@@ -7,24 +7,14 @@ from typing import final
 from unittest import mock
 
 from scripts.herdr import herdr
-from scripts.production import production_units, staff, unit_config
-from scripts.production.staff_test_support import fixture_member, without_worktree_column
+from scripts.production import staff, unit_config
+from scripts.production.staff_test_support import fixture_member
 from scripts.production.rename_rerun_test_support import final_files
 from scripts.production.rename_unit_test_support import UnitRenameFixture
 
 
 @final
 class UnitRenameTests(UnitRenameFixture):
-    def test_rename_updates_the_units_name_and_branch_displays(self) -> None:
-        self.assert_ok(self.rename("apply"))
-        rows = production_units.unit_table(self.doc.read_text().splitlines())
-        renamed = next(row for row in rows if production_units.cell_value(row["Unit"]) == "gamma-unit")
-        self.assertEqual(production_units.cell_value(renamed["Branch"]), "gamma")
-        self.assertFalse(any(production_units.cell_value(row["Unit"]) == "alpha-unit" for row in rows))
-        before = final_files(self.root)
-        self.assert_ok(self.rename("apply"))
-        self.assertEqual(final_files(self.root), before)
-
     def test_rename_continues_when_the_removed_worktree_is_absent(self) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         source = self.rust / "claude-demo-alpha"
@@ -43,14 +33,6 @@ class UnitRenameTests(UnitRenameFixture):
         before = final_files(self.root)
         self.assert_ok(self.rename("apply"))
         self.assertEqual(final_files(self.root), before)
-
-    def test_unit_rename_uses_staff_without_a_worktree_column(self) -> None:
-        without_worktree_column(self.doc)
-        _ = self.git("add", str(self.doc), cwd=self.checkout)
-        _ = self.git("commit", "-m", "Remove the display column", cwd=self.checkout)
-        self.assert_ok(self.rename("apply"))
-        self.assertTrue((self.home / "worktrees/gamma").is_dir())
-        self.assertFalse((self.rust / "claude-demo-alpha").exists())
 
     def test_worktree_rename_updates_a_removed_location_without_reactivating_its_row(self) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
@@ -146,10 +128,6 @@ class UnitRenameTests(UnitRenameFixture):
         self.write(source / "work.md", "phase work\nmore, not committed\n")
         self.write(source / "draft.md", "a new file\n")
         plan = (source / "docs/plans/alpha.md").read_bytes()
-        document = self.doc.read_text().replace(
-            f"| alpha-unit | docs/plans/alpha.md | `{source}` | demo-alpha |",
-            "| gamma-unit | docs/plans/alpha.md | — | `gamma` |",
-        ).encode()
         self.assert_ok(self.rename("apply"))
         destination = self.home / "worktrees/gamma"
         self.assertEqual(self.git("branch", "--show-current", cwd=destination), "gamma")
@@ -157,7 +135,6 @@ class UnitRenameTests(UnitRenameFixture):
         self.assertEqual((destination / "work.md").read_text(), "phase work\nmore, not committed\n")
         self.assertEqual((destination / "draft.md").read_text(), "a new file\n")
         self.assertEqual((destination / "docs/plans/alpha.md").read_bytes(), plan)
-        self.assertEqual(self.doc.read_bytes(), document)
 
 
 if __name__ == "__main__":

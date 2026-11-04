@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import change_review
 import footer_counts
 import next_item
-from production_units import Production
+from scripts.production.production_doc import Production
 import proposals_folder
 from scripts.production import showrunners
 import showrunner_tree

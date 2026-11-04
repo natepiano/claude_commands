@@ -56,23 +56,22 @@ class RowUnitReadingTests(unittest.TestCase):
 
     def production(self, name: str, slug: str) -> tuple[staff.StaffRow, Path]:
         doc = self.root / f"{slug}-production.md"
-        _ = doc.write_text("# Production\n\n- **Repository:** fixture\n\n## Units\n"
-                           + "| Unit | Worktree |\n| --- | --- |\n| decoy | /wrong |\n")
+        _ = doc.write_text("# Production\n\n- **Repository:** fixture\n")
         owner = recorded_showrunner(name, doc)
         _ = fake_showrunner.write_timer(Path(self.environment["NOTIFIER_STATE_DIR"]),
                                          slug, owner.current_session, "UTC", doc)
         return owner, doc
 
-    def read_units(self) -> tuple[list[m.Unit], list[log_records.SourceProblem]]:
+    def staff_units(self) -> tuple[list[m.Unit], list[log_records.SourceProblem]]:
         problems: list[log_records.SourceProblem] = []
-        units = m.read_units(problems)
+        units = m.staff_units(problems)
         return units, problems
 
-    def test_prefixed_folder_and_conflicting_table_keep_the_recorded_unit(self) -> None:
+    def test_prefixed_folder_keeps_the_recorded_unit(self) -> None:
         _, doc = self.production("tools", "timer-alias")
         tree = self.root / "unrelated-prefix-renderer"
         _ = recorded_unit("tools", "renderer", tree, doc)
-        units, problems = self.read_units()
+        units, problems = self.staff_units()
         self.assertEqual([(unit.production, unit.name, unit.worktree) for unit in units],
                          [("timer-alias", "renderer", str(tree))])
         self.assertEqual(problems, [])
@@ -83,17 +82,17 @@ class RowUnitReadingTests(unittest.TestCase):
         wrapped, wrapped_doc = self.production("wrapped-owner", "wrapped-alias")
         _ = recorded_unit("wrapped-owner", "old-child", self.root / "old-child", wrapped_doc)
         _ = staff.set_doc(wrapped.id, staff.WrappedDoc("natedev", wrapped_doc))
-        units, problems = self.read_units()
+        units, problems = self.staff_units()
         self.assertEqual([(unit.production, unit.name) for unit in units], [("healthy-alias", "healthy")])
         self.assertEqual(problems, [])
 
-    def test_transferred_unit_uses_the_new_parent_with_both_tables_unchanged(self) -> None:
+    def test_transferred_unit_uses_the_new_parent(self) -> None:
         _, old_doc = self.production("old-owner", "old-alias")
         destination, _ = self.production("new-owner", "new-alias")
         tree = self.root / "old-prefix-renderer"
         unit = recorded_unit("old-owner", "renderer", tree, old_doc)
         _ = staff.move(unit.id, destination.id)
-        units, problems = self.read_units()
+        units, problems = self.staff_units()
         self.assertEqual([(unit.production, unit.name, unit.worktree) for unit in units],
                          [("new-alias", "renderer", str(tree))])
         self.assertEqual(problems, [])
@@ -102,7 +101,7 @@ class RowUnitReadingTests(unittest.TestCase):
         owner, doc = self.production("tools", "timer-alias")
         _ = recorded_unit("tools", "healthy", self.root / "healthy", doc)
         _ = fixture_member("unit", name="missing-tree", parent=owner.id)
-        units, problems = self.read_units()
+        units, problems = self.staff_units()
         self.assertIn("healthy", [unit.name for unit in units])
         lines = [problem.reason for problem in problems if "missing-tree" in problem.source + problem.reason]
         self.assertEqual(len(lines), 1, problems)
@@ -117,7 +116,7 @@ class RowUnitReadingTests(unittest.TestCase):
         unfilled = replace(record, rows=tuple(replace(row, doc=staff.DocUnfilled()) if row.id == owner.id else row
                                                for row in record.rows))
         with patch.object(staff, "snapshot", return_value=unfilled):
-            units, problems = self.read_units()
+            units, problems = self.staff_units()
         self.assertIn("healthy", [unit.name for unit in units])
         lines = [problem.reason for problem in problems if "missing-doc" in problem.source + problem.reason]
         self.assertEqual(len(lines), 1, problems)
@@ -129,7 +128,7 @@ class RowUnitReadingTests(unittest.TestCase):
         _, doc = self.production("tools", "timer-alias")
         _ = recorded_unit("tools", "unreadable-doc", self.root / "unreadable-doc", doc)
         _ = doc.write_bytes(b"\xff")
-        units, problems = self.read_units()
+        units, problems = self.staff_units()
         self.assertIn("healthy", [unit.name for unit in units])
         lines = [problem.reason for problem in problems if "unreadable-doc" in problem.source + problem.reason]
         self.assertEqual(len(lines), 1, problems)
@@ -174,7 +173,7 @@ class RowUnitReadingTests(unittest.TestCase):
             return read_config(resolver, row)
 
         with patch.object(session_staff.RowResolver, "unit_config", configuration):
-            units, problems = self.read_units()
+            units, problems = self.staff_units()
         self.assertIn("healthy", [unit.name for unit in units])
         lines = [problem.reason for problem in problems if "missing-location" in problem.source + problem.reason]
         self.assertEqual(len(lines), 1, problems)
@@ -2249,7 +2248,7 @@ class ComparisonTest(unittest.TestCase):
                 patch.object(audit, "SESSION_CONFIG", home / "config/hierarchies/sessions.toml"), \
                 patch.object(m, "COVERAGE_CONFIG", home / "config/hierarchies/coverage.toml"), \
                 patch.object(audit, "read_owners", return_value=audit.ProductionOwnership({}, {})), \
-                patch.object(m, "read_units", return_value=[]), \
+                patch.object(m, "staff_units", return_value=[]), \
                 patch.object(m, "read_workers", return_value=([], [])), \
                 patch.object(collect, "store_path", return_value=home / "usage.sqlite"), \
                 patch.object(unit_runs, "history_root", return_value=home / "history"):

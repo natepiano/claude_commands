@@ -34,10 +34,11 @@ class MergeGateCheckpointTests(MergeGateFixture):
         _ = self.enterContext(isolated_source_readers())
 
     def review_producer(self, doc: Path) -> staff.StaffId:
-        """Give the checkpoint unit a private staff record and a Units row."""
-        self.write(doc, doc.read_text() + "\n## Units\n\n"
-                   + "| Unit | Branch | Worktree |\n| --- | --- | --- |\n"
-                   + f"| fixture | unit-phase | {self.unit} |\n")
+        """Give the checkpoint unit a private staff record and a `.unit.toml` whose plan names its checkpoints."""
+        self.write(self.unit / ".unit.toml", 'plan = "docs/plans/fixture.md"\nresponsibilities = []\n')
+        exclude = Path(self.git(self.unit, "rev-parse", "--git-path", "info/exclude"))
+        exclude = exclude if exclude.is_absolute() else self.unit / exclude
+        self.write(exclude, (exclude.read_text() if exclude.exists() else "") + ".unit.toml\n")
         path = Path(self.environment["HOME"]) / ".local/state/staff/staff.json"
         with isolated_staff_file(path, self.environment):
             runner = recorded_showrunner("fixture-showrunner", doc)
@@ -496,4 +497,4 @@ class MergeGateProducerTests(ProducerFixture):
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], "")
         notes = [line for line in output.getvalue().splitlines() if line.startswith("change review: no staff row")]
         self.assertEqual(len(notes), 1)
-        self.assertIn("new-unit", notes[0])
+        self.assertIn("old-branch", notes[0])

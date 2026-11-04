@@ -7008,11 +7008,6 @@ with patch.object(fcntl, "flock", admission):
                     "- **Log:** logs/showrunner.md",
                     "- **User zone:** UTC",
                     "",
-                    "## Units",
-                    "",
-                    "| Unit | Plan | Worktree | Branch | Port | Owns |",
-                    "| --- | --- | --- | --- | --- | --- |",
-                    "",
                 )
             ),
             encoding="utf-8",
@@ -7100,11 +7095,6 @@ with patch.object(fcntl, "flock", admission):
                     f"- **Showrunner checkout:** {self.working_dir}",
                     "- **Log:** logs/showrunner.md",
                     "- **User zone:** UTC",
-                    "",
-                    "## Units",
-                    "",
-                    "| Unit | Plan | Worktree | Branch | Port | Owns |",
-                    "| --- | --- | --- | --- | --- | --- |",
                     "",
                 )
             ),

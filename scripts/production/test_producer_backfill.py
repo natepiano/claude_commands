@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import io
+import os
 from contextlib import redirect_stdout, redirect_stderr
 from datetime import date
 from pathlib import Path
 from unittest import mock
 
-from scripts.production import change_review, change_routing, producer_backfill, staff
+from scripts.production import change_review, change_routing, producer_backfill, staff, unit_config
 from scripts.production.test_change_review import ProducerFixture
 from scripts.production.staff_test_support import fixture_member
 
@@ -31,6 +32,9 @@ class ProducerBackfillTests(ProducerFixture):
 
     def test_a_retired_unit_maps_through_its_removed_worktree(self) -> None:
         self.old_row(self.merge(), reviewed=True)
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root / "home")}))
+        _ = unit_config.park(self.unit.id, self.root / "unit",
+                             unit_config.RetiredSession("2026-11-02", "retired-session", unit_config.Branch("old-branch")))
         _ = staff.set_worktree(self.unit.id, staff.RemovedWorktree("natedev", self.root / "unit"),
                                    expected=self.unit.worktree)
         self.assertEqual(self.backfill().filled, {"C1": self.unit.id})
@@ -96,7 +100,7 @@ class ProducerBackfillTests(ProducerFixture):
         self.old_row(self.merge("build-followups-new-unit"))
         other = fixture_member("unit", name="hierarchies", parent=self.unit.parent,
             worktree=staff.PresentWorktree("natedev", self.root / "hierarchies"))
-        _ = self.doc.write_text(self.doc.read_text().replace("| old-branch |", "| build-followups-hierarchies |"))
+        _ = self.branch_unit("new-unit", "unit", "build-followups-hierarchies", "old-plan.md")
         self.old_row(self.merge("build-followups-hierarchies"))
         self.assertEqual(self.backfill().filled, {"C1": self.unit.id, "C2": self.unit.id})
         rows = change_review.pending(self.listing)
@@ -104,7 +108,8 @@ class ProducerBackfillTests(ProducerFixture):
         self.assertNotEqual(rows[1]["Producer"], other.id)
 
     def test_a_name_without_the_old_prefix_stays_unmapped_despite_a_matching_unit(self) -> None:
-        _ = fixture_member("unit", name="legacy-style", parent=self.unit.parent,
+        runner = fixture_member("showrunner", name="other")
+        _ = fixture_member("unit", name="legacy-style", parent=runner.id,
             worktree=staff.PresentWorktree("natedev", self.root / "legacy-style"))
         self.assert_name_fallback_keeps_other_checkpoint_unmapped("legacy-style")
 
@@ -205,13 +210,8 @@ class ProducerBackfillTests(ProducerFixture):
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], "")
 
     def test_an_exact_branch_wins_over_an_earlier_alias_during_backfill(self) -> None:
-        runner = staff.snapshot().by_path("top")
-        assert runner is not None
-        second = fixture_member("unit", name="second", parent=runner.id,
-                                worktree=staff.PresentWorktree("natedev", self.root / "second"))
-        _ = self.doc.write_text(self.doc.read_text().replace("| new-unit |", "| branch-b |")
-            .replace("| old-branch |", "| branch-a |")
-            + f"| second-unit | second.md | {self.root / 'second'} | branch-b |\n")
+        _ = self.branch_unit("new-unit", "unit", "branch-a", "branch-b.md")
+        second = self.branch_unit("second-unit", "second", "branch-b", "second.md")
         self.old_row(self.merge("branch-b"))
         self.assertEqual(self.backfill().filled, {"C1": second.id})
 

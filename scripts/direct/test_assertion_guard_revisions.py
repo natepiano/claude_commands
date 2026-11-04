@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.production import staff
-from scripts.production.staff_test_support import unit_membership, without_worktree_column
+from scripts.production.staff_test_support import unit_membership
 
 import os
 import resource
@@ -1305,18 +1305,6 @@ class DivergedBases(NamedTuple):
 
 class ProductionBaseTests(SeededGitRepositoryFixture):
     repo: Path = Path()
-
-    def test_plan_worktree_selects_the_base_when_the_director_runs_elsewhere(self) -> None:
-        tip = self.refill_from_production("builds")
-        document = self.register_production("builds")
-        _ = document.write_text(document.read_text().replace("`README.md`", f"`{self.repo}/README.md`"))
-        without_worktree_column(document)
-        director = self.root / "director"
-        director.mkdir()
-        member = unit_membership("fixture", "fixture")
-        _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", director), expected=member.worktree)
-        self.assertEqual(commit_bases(self.repo, (), staged=False)[0], tip)
-
 
     def test_retired_production_rows_never_win_over_live_rows(self) -> None:
         tip = self.refill_from_production("builds")

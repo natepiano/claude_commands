@@ -12,8 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 for directory in ("production", "shutdown", "herdr", "direct", "lib", "style"):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / directory))
 
-from scripts.production import production_units, staff, staff_sources, unit_names, unit_move
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.production import staff, staff_sources, unit_names, unit_move
 from scripts.shutdown import remote
 from scripts.herdr import herdr
 from scripts.production.rename_state import RenameRefused
@@ -49,39 +48,6 @@ def relocate_staff_worktree(member_id: staff.StaffId, worktree: Path) -> None:
     _ = staff.set_worktree(row.id, replace(row.worktree, path=worktree), expected=row.worktree)
 
 
-def _units_display(row: staff.StaffRow, old: str) -> bool:
-    """Set the Units display cells from the renamed staff row."""
-    parent = staff.by_id(row.parent) if row.parent else None
-    if parent is None or isinstance(parent.doc, staff.DocUnfilled):
-        print(f"anomaly: {row.name}: the parent has no production document", file=sys.stderr)
-        return False
-    document = parent.doc.path
-    text = document.read_text(encoding="utf-8")
-    lines = text.splitlines()
-    headings = production_units.unit_headings(lines)
-    end, _ = production_units.unit_rows(lines)
-    for index in range(lines.index("## Units") + 1, end):
-        if not lines[index].startswith("|"):
-            continue
-        cells = production_units.row_cells(lines[index])
-        displayed = production_units.cell_value(cells[0])
-        if displayed in {"Unit", "---"} or set(displayed) <= {"-", ":"}:
-            continue
-        if unit_names.name(displayed) not in {unit_names.name(old), row.name}:
-            continue
-        for field, value in (("Unit", unit_names.unit_id(row.name)), ("Branch", f"`{row.name}`"), ("Worktree", "—")):
-            if field in headings:
-                cells[headings.index(field)] = value
-        lines[index] = "| " + " | ".join(cells) + " |"
-        updated = "\n".join(lines) + "\n"
-        if updated != text:
-            write_text_atomic(document, updated)
-            return True
-        return False
-    print(f"anomaly: {row.name}: no Units display row", file=sys.stderr)
-    return False
-
-
 def apply(slug: str, old: str, new: str) -> UnitRename:
     with staff.operation():
         request = plan(slug, old, new)
@@ -108,10 +74,6 @@ def apply(slug: str, old: str, new: str) -> UnitRename:
                 changed = True
         else:
             print(f"anomaly: folder is absent: {request.destination}", file=sys.stderr)
-        try:
-            changed = _units_display(row, old) or changed
-        except (OSError, ValueError, production_units.Refusal) as error:
-            print(f"anomaly: Units display: {error}", file=sys.stderr)
         try:
             client = herdr.Herdr(herdr.shared_session())
             for pane in client.panes():

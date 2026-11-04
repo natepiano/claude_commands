@@ -35,6 +35,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(tickets[0].kind, "structure")
         self.assertEqual(tickets[0].rules, (structure,))
         self.assertTrue(tickets[0].sites)
+        _ = self.modules_unit()
         preview = io.StringIO()
         with mock.patch.object(berth_board, "read_board", return_value=self.board(self.sources[0])):
             with redirect_stdout(preview):
@@ -230,8 +231,8 @@ class StylePlanTests(StylePlanFixture):
         _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
         template = self.style / "docs/style-production/units/names-unit.md"
         _ = template.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** beta\n\n## Phases"))
-        _ = self.doc.write_text(self.doc.read_text() + f"| product-unit | docs/product.md | {self.root / 'product'} | product |\n")
         _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "product-unit", self.root / "product")
+        _ = self.modules_unit()
 
         self.assertEqual(unit_plans.family_pilot_scopes(self.doc, self.repo), {
             "names": unit_plans.PilotCrates(frozenset({"crates/alpha"})), "modules": unit_plans.AllCrates(),
@@ -248,11 +249,7 @@ class StylePlanTests(StylePlanFixture):
         self.tip = self.commit()
         self.sync()
         _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
-        worktree = self.root / "modules"
-        _ = self.git("worktree", "add", "-q", "-b", "demo-style-modules", str(worktree))
-        plan = worktree / "docs/style-production/units/modules-unit.md"
-        plan.parent.mkdir(parents=True)
-        _ = plan.write_text(self.plan_header())
+        plan = self.modules_unit()
         preview = io.StringIO()
         with redirect_stdout(preview):
             self.assertEqual(style_plan.main(["queue", "--repo", str(self.repo), "--unit", "modules-unit"]), 0)
@@ -260,7 +257,7 @@ class StylePlanTests(StylePlanFixture):
 
         output = io.StringIO()
         with redirect_stdout(output):
-            code = style_plan.main(["next-phase", "--unit", "modules-unit", "--plan", str(plan), "--repo", str(worktree)])
+            code = style_plan.main(["next-phase", "--unit", "modules-unit", "--plan", str(plan), "--repo", str(self.root / "modules")])
 
         self.assertEqual((code, output.getvalue()), (0, "phase written: modules-unit-1\n"))
         ticket = self.ledger().ticket_open("modules-unit")[0]

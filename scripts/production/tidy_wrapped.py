@@ -16,12 +16,12 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import production_units
-from scripts.production import staff
-from scripts.copies import copies
-from scripts.lib import scratch
-from scripts.production.unit_table import unit_spellings
-from proposals_folder import issues_folder
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production import staff, unit_lookup  # noqa: E402
+from scripts.copies import copies  # noqa: E402
+from scripts.lib import scratch  # noqa: E402
+from scripts.production.production_doc import WRAPPED  # noqa: E402
+from proposals_folder import issues_folder  # noqa: E402
 
 if TYPE_CHECKING:
     from update_registration import QuestionStaff
@@ -72,8 +72,11 @@ def tidy(slug: str, document: Path | None = None, *, identities: QuestionStaff |
             raise TidyRefused(str(error)) from error
     owners = {slug}
     if document is not None:
-        lines = document.read_text(encoding="utf-8").splitlines()
-        owners.update(unit_spellings(lines).values())
+        record = staff.snapshot()
+        try:
+            owners.update(row.name for row in unit_lookup.doc_units(document, record))
+        except staff.StaffUnreadable:
+            pass  # a production with no showrunner row has no units
     try:
         for owner in sorted(owners):
             copies.remove_trees(owner)
@@ -98,7 +101,7 @@ def wrapped_slug(doc: Path) -> str:
         raise TidyRefused(f"{doc}: production doc name must end in -production.md")
     lines = doc.read_text(encoding="utf-8").splitlines()
     status = next((line for line in lines if line.startswith("> **Status:")), "")
-    if not status.startswith(production_units.WRAPPED):
+    if not status.startswith(WRAPPED):
         raise TidyRefused(f"{doc}: not wrapped")
     if (NOTIFIER_STATE_DIR / f"showrunner-{slug}").exists():
         raise TidyRefused(f"{doc}: {slug} still has an update timer")

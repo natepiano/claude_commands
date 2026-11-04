@@ -16,7 +16,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import unit_runs
 from scripts.usage import collect
 from scripts.production import session_staff, staff, staff_sources, unit_lookup
-from production_units import Refusal, cell_value, unit_table
 
 
 @dataclass(frozen=True)
@@ -139,16 +138,6 @@ def main(arguments: list[str]) -> int:
     _ = parser.add_argument("--no-mac", action="store_true")
     args = parser.parse_args(arguments)
     unit = cast(str, args.unit)
-    try:
-        lines = cast(Path, args.production).read_text(encoding="utf-8").splitlines()
-        rows = unit_table(lines)
-    except (OSError, UnicodeError, Refusal) as error:
-        print(f"unit_run: {error}", file=sys.stderr)
-        return 1
-    row = next((row for row in rows if cell_value(row.get("Unit", "")) == unit), None)
-    if row is None:
-        print(f"unit_run: no Units row for {unit}", file=sys.stderr)
-        return 1
     try:
         record = staff.snapshot()
         sources = unit_lookup.member_sources()

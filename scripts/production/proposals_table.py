@@ -33,10 +33,10 @@ from typing import NamedTuple, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import showrunners
-from production_units import Refusal
+from scripts.production.production_doc import Refusal
 from issues import Issue
 from proposal_issue import AwaitingApproval, InProgress, ProposalProgress, proposal_progress
-from proposals_folder import ledger, open_proposals, owners, scope_docs, slug_of
+from proposals_folder import ledger, owners, proposal_issues, proposer, scope_docs, slug_of
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 import phase_table
@@ -324,11 +324,11 @@ def queue(doc: Path) -> str:
 def scope_issues(doc: Path, below: bool = False) -> list[Issue]:
     """The open proposal issues of the production, and with `below` of each one below it, from each one's folder."""
     found: dict[Path, Issue] = {}
-    names = owners(doc, below)
     for each in scope_docs(doc, below):
-        for issue in open_proposals(each, names):
+        for issue in proposal_issues(each):
             _ = found.setdefault(issue.path, issue)
-    return list(found.values())
+    names = owners(doc, below) if found else frozenset[str]()
+    return [issue for issue in found.values() if proposer(issue) in names]
 
 
 def improvement_ledgers(doc: Path, below: bool = False) -> list[Path]:

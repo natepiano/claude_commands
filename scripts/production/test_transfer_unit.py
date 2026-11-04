@@ -1,4 +1,4 @@
-"""Change the staff parent and move the Units row without publishing work."""
+"""Change the staff parent without publishing work."""
 from __future__ import annotations
 
 import unittest
@@ -12,24 +12,7 @@ from scripts.production.transfer_unit_test_support import UnitTransferFixture
 
 
 class UnitTransferTests(UnitTransferFixture):
-    def test_transfer_uses_staff_after_the_worktree_column_is_removed(self) -> None:
-        from scripts.production.staff_test_support import without_worktree_column
-        document = self.giving / "docs/plans/demo-production.md"
-        without_worktree_column(document)
-        _ = self.git("add", str(document), cwd=self.giving)
-        _ = self.git("commit", "-m", "Remove the display column", cwd=self.giving)
-        self.assert_ok(self.transfer("apply"))
-        self.assertTrue(self.unit.is_dir())
-        self.assertFalse((self.root / "state/showrunner/demo/transfer_unit.json").exists())
-        row = unit_membership("other", "alpha-unit")
-        self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.unit))
-
-    def test_transfer_uses_the_absolute_plan_when_the_director_runs_elsewhere(self) -> None:
-        document = self.giving / "docs/plans/demo-production.md"
-        plan = self.unit / "docs/plans/alpha.md"
-        _ = document.write_text(document.read_text().replace("docs/plans/alpha.md", str(plan)))
-        _ = self.git("add", str(document), cwd=self.giving)
-        _ = self.git("commit", "-m", "Record the branch plan", cwd=self.giving)
+    def test_transfer_keeps_the_staff_folder_when_the_director_runs_elsewhere(self) -> None:
         director = self.root / "director-folder"
         director.mkdir()
         row = unit_membership("demo", "alpha-unit")
@@ -82,22 +65,16 @@ class UnitTransferTests(UnitTransferFixture):
         self.assert_ok(self.transfer("apply"))
         self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", row.name, parent.id, current_session=row.id,
                                 worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled()))
-        self.assertNotIn("alpha-unit", (self.giving / "docs/plans/demo-production.md").read_text())
-        self.assertIn("alpha-unit", (self.receiving / "docs/plans/other-production.md").read_text())
         self.assert_ok(self.transfer("verify"))
 
-    def test_transfer_changes_only_the_staff_parent_and_the_units_row(self) -> None:
+    def test_transfer_changes_only_the_staff_parent(self) -> None:
         row = unit_membership("demo", "alpha-unit")
         parent = next(item for item in staff.find(kind="showrunner") if item.name == "other")
         before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
         self.assert_ok(self.transfer("apply"))
         self.assertEqual(staff.by_id(row.id), replace(row, parent=parent.id))
-        giving = self.giving / "docs/plans/demo-production.md"
-        receiving = self.receiving / "docs/plans/other-production.md"
-        self.assertNotIn("| alpha-unit |", giving.read_text())
-        self.assertIn("| alpha-unit |", receiving.read_text())
         changed = {path for path in before if path.read_bytes() != before[path]}
-        self.assertEqual(changed, {self.staff_file, giving, receiving})
+        self.assertEqual(changed, {self.staff_file})
         self.assertEqual(self.messages(), [])
         self.assertFalse(any("shutdown.py" in word or "launch_agent" in word
                              for command in self.commands for word in command))
@@ -110,11 +87,6 @@ class UnitTransferTests(UnitTransferFixture):
         before = plan.read_bytes()
         tips = self.git("rev-parse", "demo", "other", "demo-alpha", "origin/demo-alpha")
         self.assert_ok(self.transfer("apply"))
-        receiving = (self.receiving / "docs/plans/other-production.md").read_text()
-        self.assertIn("| alpha-unit | docs/plans/alpha.md | — | demo-alpha | — | — |", receiving)
-        giving = (self.giving / "docs/plans/demo-production.md").read_text()
-        self.assertNotIn("alpha-unit", giving)
-        self.assertIn("beta-unit", giving)
         self.assertEqual(self.git("rev-parse", "demo", "other", "demo-alpha", "origin/demo-alpha"), tips)
         self.assertEqual(plan.read_bytes(), before)
         self.assertTrue(self.unit.is_dir())

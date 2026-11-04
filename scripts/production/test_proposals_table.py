@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import io
 import os
-import tempfile
 import unittest
 from collections.abc import Generator
 from pathlib import Path
@@ -21,6 +20,7 @@ import issues
 import proposals_folder
 import proposals_table
 from scripts.production import session_staff, showrunners, staff
+from scripts.production.staff_test_support import StaffTestCase, production_membership, recorded_showrunner
 import showrunner_tree
 from proposals_table import ADD_ON_STATE, IN_PROGRESS_STATE, REVIEW_STATE, Row
 
@@ -30,14 +30,10 @@ from scripts.direct import plan_history
 
 
 @final
-class ProposalsTableTests(unittest.TestCase):
-    root: Path = Path()
-
+class ProposalsTableTests(StaffTestCase):
     @override
     def setUp(self) -> None:
-        folder = tempfile.TemporaryDirectory()
-        self.addCleanup(folder.cleanup)
-        self.root = Path(folder.name)
+        super().setUp()
         # No live update timer names a production below the test's own.
         _ = self.enterContext(mock.patch.object(showrunners, "timer_docs", return_value={}))
         _ = self.enterContext(mock.patch.object(showrunner_tree, "descendants_of", return_value=[]))
@@ -198,7 +194,7 @@ class ProposalsTableTests(unittest.TestCase):
             "  Title: Selecting a new tool frames it the same way as the frame key",
             "  Need: two callers still use their own framing.",
             "- Action: change",
-            "  Target: `scripts/production/units_table.py`",
+            "  Target: `scripts/production/unit_phases.py`",
             "  Proposed: The units table names the phase a unit waits on. It reads the plan.",
             "- **remove**",
             "  - Why: The old footer line repeats the new one! Nothing reads it.",
@@ -271,8 +267,9 @@ class ProposalsTableTests(unittest.TestCase):
 
     def test_main_prints_the_three_sources_in_order(self) -> None:
         doc = self.write("trunk/docs/plans/footers-production.md", "# Production\n\n- **Proposals:** `issues`\n"
-                         + f"- **Improvement queue:** {self.root / 'backlog' / 'ledger.md'}\n\n"
-                         + "## Units\n\n| Unit | Plan |\n| --- | --- |\n| footer-unit | `docs/plans/footers.md` |\n")
+                         + f"- **Improvement queue:** {self.root / 'backlog' / 'ledger.md'}\n")
+        _ = recorded_showrunner("footers", doc)
+        production_membership("footers", "footer")
         _ = self.issue("footer colours", "date_created: 2026-10-09", "status: open", "tags: [issue, proposal]",
                        "proposed_by: footer-unit", folder="trunk/issues")
         # Another production's proposal in the same folder is not this one's.
