@@ -1,6 +1,9 @@
 """Transfer moves the unit's pane without stopping, closing or restarting it."""
 from pathlib import Path
 
+from scripts.herdr import herdr
+from scripts.production.staff_test_support import unit_membership
+
 from scripts.production.transfer_unit_test_support import UnitTransferFixture
 from scripts.production.fake_unit_host import PaneShellFixture, record_shutdown, calls
 
@@ -13,12 +16,19 @@ class TransferPaneShellTests(UnitTransferFixture):
         pane = PaneShellFixture(self, self.unit, Path(self.env['HERDR_PROC']), live=live, env=self.env)
         record_shutdown(self, pane, path, destination=('other','alpha-unit','alpha'))
         self.configure_tab_move()
+        row = unit_membership("demo", "alpha-unit")
         self.assert_ok(self.transfer('apply'))
         self.assert_ok(self.transfer('verify'))
         herdr_calls = calls(self.env)
-        self.assertEqual([call for call in herdr_calls if call[2:4] == ['pane', 'move']],
-                         [['--session', 'agents', 'pane', 'move', 'w1:p1', '--new-tab', '--workspace', 'w2']])
-        self.assertIn(['--session', 'agents', 'tab', 'rename', 'w2:t1', 'alpha'], herdr_calls)
+        moves = [call for call in herdr_calls if call[2:4] == ['pane', 'move']]
+        if live:
+            self.assertEqual(moves, [['--session', 'agents', 'pane', 'move', 'w1:p1', '--new-tab', '--workspace', 'w2']])
+            self.assertIn(['--session', 'agents', 'tab', 'rename', 'w2:t1', 'alpha'], herdr_calls)
+        else:
+            self.assertEqual(moves, [])
+            self.assertFalse(any(call[2:4] == ['tab', 'rename'] for call in herdr_calls), herdr_calls)
+            self.assertEqual([(space['name'], [tab['name'] for tab in space['tabs']])
+                              for space in herdr.saved_layout('agents')['workspaces']], [('other', [row.id])])
         self.assertEqual(pane.close_calls(), [])
         self.assertEqual(pane.stop_calls, [])
         self.assertFalse(shutdown_log.exists(), 'transfer ran a stop or restart command')
@@ -31,5 +41,5 @@ class TransferPaneShellTests(UnitTransferFixture):
     def test_live_director_in_pane_shell_moves_its_tab_and_transfers(self) -> None:
         self.pane_shell(live=True)
 
-    def test_exited_directors_pane_shell_moves_its_tab_and_transfers(self) -> None:
+    def test_exited_directors_pane_shell_gets_a_saved_binding_in_the_new_group(self) -> None:
         self.pane_shell(live=False)

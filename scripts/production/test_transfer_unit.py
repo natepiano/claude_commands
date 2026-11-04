@@ -347,11 +347,24 @@ class UnitTransferTests(UnitTransferFixture):
         self.assertEqual(self.messages(), [])
 
     def test_transfer_unit_rerun(self) -> None:
+        def comparable_files() -> dict[str, bytes]:
+            files = final_files(self.root)
+            path = str((Path(self.env["XDG_STATE_HOME"]) / "herdr/layout-agents.json").relative_to(self.root))
+            if path in files:
+                layout = cast(dict[str, object], json.loads(files[path]))
+                _ = layout.pop("at", None)
+                for workspace in cast(list[dict[str, object]], layout["workspaces"]):
+                    _ = workspace.pop("seen", None)
+                    for tab in cast(list[dict[str, object]], workspace["tabs"]):
+                        _ = tab.pop("seen", None)
+                files[path] = json.dumps(layout, sort_keys=True).encode()
+            return files
+
         self.env.update(GIT_AUTHOR_DATE="2026-10-29T12:00:00Z", GIT_COMMITTER_DATE="2026-10-29T12:00:00Z")
         with saved_fixture(self.root) as restore:
             self.assert_ok(self.transfer("apply"))
             self.assertEqual(len(self.messages()), 3)
-            expected = final_files(self.root)
+            expected = comparable_files()
             for after in (False, True):
                 with self.subTest(after=after):
                     restore()
@@ -360,11 +373,11 @@ class UnitTransferTests(UnitTransferFixture):
                     self.assertNotEqual(failed.returncode, 0)
                     self.assertIn("stopped at staff step", failed.stderr)
                     self.assert_ok(self.transfer("apply"))
-                    self.assertEqual(final_files(self.root), expected)
+                    self.assertEqual(comparable_files(), expected)
                     finished = self.transfer("apply")
                     self.assert_ok(finished)
                     self.assertIn("done", finished.stdout)
-                    self.assertEqual(final_files(self.root), expected)
+                    self.assertEqual(comparable_files(), expected)
                     self.assertEqual(len(self.messages()), 3)
 
     def test_seed_waits_between_staff_move_and_units_update(self) -> None:

@@ -30,6 +30,7 @@ from scripts.lib.atomic_file import write_text_atomic
 import transfer_unit
 import retire_unit
 import pane_record
+import herdr
 import progress_history
 import tidy_wrapped
 import stall_watch
@@ -388,7 +389,7 @@ class UnitTransferFixture(StaffTestCase):
                                                 {"workspace_id": "w2", "label": "other"}]},
             "pane list": {"panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "label": "alpha"}]},
             "pane move w1:p1 --new-tab --workspace w2": {
-                "move_result": {"created_tab": {"tab_id": "w2:t1"}, "pane": {"pane_id": "w1:p1"}}},
+                "move_result": {"changed": True, "created_tab": {"tab_id": "w2:t1"}, "pane": {"pane_id": "w1:p1"}}},
             "tab rename w2:t1 alpha": {},
             "tab list --workspace w2": {"tabs": [{"tab_id": "w2:t1", "label": "alpha", "workspace_id": "w2"}]},
             "tab list": {"tabs": [{"tab_id": "w2:t1", "label": "alpha", "workspace_id": "w2"}]},
@@ -401,3 +402,8 @@ class UnitTransferFixture(StaffTestCase):
         move = cast(dict[str, object], responses["--session agents pane move w1:p1 --new-tab --workspace w2"])
         move["write_files"] = {str(path): json.dumps(after)}
         self.write(path, json.dumps(responses))
+
+        def layout(method: str, **params: object) -> dict[str, object]:
+            self.assertEqual((method, params), ("layout.export", {"tab_id": "w1:t1"}))
+            return {"layout": {"zoomed": False, "root": {"type": "pane", "pane_id": "w1:p1"}}}
+        _ = self.enterContext(mock.patch.object(herdr.Herdr, "socket_request", side_effect=layout))

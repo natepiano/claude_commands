@@ -1467,7 +1467,7 @@ Test unchanged reruns and refusal when the recorded old value differs.
 
 **Retained launch contract:** preserve `pane_launch`'s validated kind, strict retirement, and restore completion checks.
 
-### Phase 4f — A transfer moves the unit's tabs into the new production's group  · status: todo
+### Phase 4f — A transfer moves the unit's tabs into the new production's group  · status: done
 
 **Depends on:** 4r. devtools 4b (5c895adae) rewrites `transfer_unit.apply`; devtools keeps one tab-move call after `staff.move` (told 2026-11-04).
 
