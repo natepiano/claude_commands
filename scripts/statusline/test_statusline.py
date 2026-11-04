@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 from scripts.accounts import new_account
 from scripts.production import session_labels, showrunners, staff
 from scripts.shutdown import remote
-from scripts.statusline import assignment
+from scripts.statusline import assignment, rebuild_row
 
 PROGRAM = Path(__file__).with_name("statusline.jq")
 SHIPPED_COLORS = PROGRAM.parents[2] / "config/statusline.conf"
@@ -34,7 +34,7 @@ ZONE_FILES = {"TZDIR": os.environ["TZDIR"]} if "TZDIR" in os.environ else {}
 
 def status_lines(*inputs: object, labels: Path | None = None, account: str = "claude1",
                  colors: Path | str = "",
-                 counts: str = "", staff_text: str = "", **marks: str) -> list[str]:
+                 counts: str = "", rebuild: str = "", staff_text: str = "", **marks: str) -> list[str]:
     """Run statusline.jq once over every input and return its output lines.
 
     `colors` is a file path or temporary config text; empty text omits the argument.
@@ -43,7 +43,7 @@ def status_lines(*inputs: object, labels: Path | None = None, account: str = "cl
     label, role = assignment.assignment(record, str(cast(dict[str, object], inputs[0]).get("session_id", "")) if isinstance(inputs[0], dict) else "")
     stdin = "\n".join(json.dumps(each) for each in inputs)
     stored = [] if labels is None else ["--slurpfile", "labels", str(labels)]
-    parent = ["--arg", "assignment", label, "--arg", "role", role, "--arg", "counts", counts]
+    parent = ["--arg", "assignment", label, "--arg", "role", role, "--arg", "counts", counts, "--arg", "rebuild", rebuild]
     with tempfile.TemporaryDirectory() as directory:
         configured: list[str] = []
         if colors:
@@ -58,6 +58,13 @@ def status_lines(*inputs: object, labels: Path | None = None, account: str = "cl
             env={"PATH": os.environ["PATH"], "HOME": os.environ["HOME"], "TZ": USER_ZONE.key, **ZONE_FILES, **marks},
         )
     return result.stdout.splitlines()
+
+
+def seed_rebuild_cache(home: Path) -> None:
+    """Keep shell tests on temporary answers without calling Nix or SSH."""
+    cache = home / ".local/state/showrunner/rebuilds"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    _ = cache.write_text("\n9999999999\n" + str(SHIPPED_COLORS) + "\n", encoding="utf-8")
 
 
 OWNER = staff.StaffRow(staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd"), "showrunner", "show", staff.StaffRoot(), current_session=staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd"))
@@ -425,6 +432,7 @@ class RoleTests(unittest.TestCase):
 
     def command_lines(self, payload: object, *, command: str = COMMAND, shell: str = "/bin/sh", **marks: str) -> list[str]:
         """Run the statusLine command as Claude Code does, with only `marks` beside a bare environment."""
+        seed_rebuild_cache(self.home)
         env = {"PATH": os.environ["PATH"], "HOME": str(self.home), **marks}
         result = subprocess.run(
             [shell, "-c", command], input=json.dumps(payload), capture_output=True, text=True,
@@ -704,6 +712,7 @@ class CountsRowTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        seed_rebuild_cache(self.home)
         doc = self.home / "docs/plans/show-production.md"
         doc.parent.mkdir(parents=True)
         self.ledger = self.home / "ledger.md"
@@ -807,6 +816,195 @@ class CountsRowTests(unittest.TestCase):
                                           encoding="utf-8")
                 os.utime(self.cache, ns=(built, built))
                 self.assertEqual(self.lines(shell=shell)[-1], "For you: 1 question")
+
+
+class RebuildRowTests(unittest.TestCase):
+    def settings(self) -> rebuild_row.RebuildSettings:
+        return rebuild_row.RebuildSettings(Path("/test/nixos"), "main", "natedev", "MacBook-Pro", "mac", 60)
+
+    def answer(self, local: str, mac: str, expected: str = "/nix/store/main-system") -> str:
+        def run(command: list[str]) -> str:
+            self.assertIn(command[0], ("realpath", "ssh"))
+            return local if command[0] == "realpath" else mac
+        paths = rebuild_row.ExpectedSystems("a" * 40, (), expected, expected)
+        return rebuild_row.row(self.settings(), paths, run)
+
+    def test_8ab801c_differs_from_613d31d_then_the_1628_rebuild_clears_the_item(self) -> None:
+        self.assertEqual(self.answer("/nix/store/8ab801c-system", "/nix/store/main-system"), "rebuild natedev")
+        self.assertEqual(self.answer("/nix/store/main-system", "/nix/store/main-system"), "")
+
+    def test_both_machines_need_a_rebuild(self) -> None:
+        self.assertEqual(self.answer("/nix/store/old-linux", "/nix/store/old-darwin"), "rebuild natedev, rebuild mac")
+
+    def test_unreachable_mac_does_not_hide_the_local_item(self) -> None:
+        self.assertEqual(self.answer("/nix/store/old-linux", ""), "rebuild natedev")
+
+    def test_comment_only_commit_has_the_same_outpath(self) -> None:
+        self.assertEqual(self.answer("/nix/store/unchanged", "/nix/store/unchanged", "/nix/store/unchanged"), "")
+
+    def test_failed_or_invalid_eval_never_reports_a_rebuild(self) -> None:
+        for invalid in ("", "error", "/run/current-system", "/nix/store/a\n/nix/store/b"):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(self.answer("/nix/store/old", "/nix/store/old", invalid), "")
+
+    def test_rebuild_items_follow_questions_and_changes(self) -> None:
+        line = status_lines({"session_id": "sid"}, counts="sid For you: 1 question, 2 changes, 1 proposal",
+                            rebuild="rebuild natedev, rebuild mac")[-1]
+        self.assertEqual(ANSI.sub("", line), "For you: 1 question, 2 changes, rebuild natedev, rebuild mac, 1 proposal")
+
+    def test_rebuild_alone_creates_the_row(self) -> None:
+        self.assertEqual(status_lines({}, rebuild="rebuild mac")[-1], "For you: rebuild mac")
+
+    def test_settings_read_values_at_use(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "statusline.conf"
+            text = ("rebuild.repo=/custom/repo\nrebuild.ref=custom\nrebuild.natedev=linux\n"
+                    + "rebuild.mac=darwin\nrebuild.ssh=remote\nrebuild.interval=17\n")
+            _ = path.write_text(text, encoding="utf-8")
+            settings = rebuild_row.RebuildSettings.read(path)
+            self.assertEqual(settings, rebuild_row.RebuildSettings(Path("/custom/repo"), "custom", "linux", "darwin", "remote", 17))
+            _ = path.write_text(text.replace("interval=17", "interval=29"), encoding="utf-8")
+            self.assertEqual(rebuild_row.RebuildSettings.read(path).interval, 29)
+
+    def test_cache_stores_the_last_evaluation_and_clears_after_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "statusline.conf"
+            cache = Path(directory) / "cache"
+            _ = config.write_text("rebuild.repo=/test/nixos\nrebuild.ref=main\nrebuild.natedev=natedev\n"
+                                  + f"rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.cache={cache}\n", encoding="utf-8")
+            commands: list[list[str]] = []
+            running = "/nix/store/old"
+
+            def run(command: list[str]) -> str:
+                commands.append(command)
+                if command[0] == "git":
+                    return "a" * 40
+                if command[0] == "nix":
+                    return json.dumps({"natedev": "/nix/store/main", "mac": "/nix/store/main"})
+                return running
+
+            rebuild_row.write(config, run)
+            line, due, source, details = cache.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(line, "rebuild natedev, rebuild mac")
+            self.assertGreater(int(due), time.time())
+            self.assertEqual(source, str(config))
+            self.assertEqual(rebuild_row.read(config).expected, rebuild_row.ExpectedSystems(
+                "a" * 40, ("/test/nixos", "main", "natedev", "MacBook-Pro"), "/nix/store/main", "/nix/store/main"))
+            commands.clear()
+            rebuild_row.write(config, run)
+            self.assertEqual(commands, [])
+            running = "/nix/store/main"
+            _ = cache.write_text("\n0\n" + str(config) + "\n" + details + "\n", encoding="utf-8")
+            rebuild_row.write(config, run)
+            self.assertEqual(cache.read_text(encoding="utf-8").splitlines()[0], "")
+
+    def test_read_command_prints_both_one_or_no_machines(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "statusline.conf"
+            cache = Path(directory) / "custom-cache"
+            _ = config.write_text(f"rebuild.cache={cache}\n", encoding="utf-8")
+            for line, machines in (("rebuild natedev, rebuild mac", "natedev\nmac\n"),
+                                   ("rebuild mac", "mac\n"), ("", "")):
+                with self.subTest(line=line):
+                    _ = cache.write_text(line + "\n9999999999\n" + str(config) + "\n", encoding="utf-8")
+                    result = subprocess.run(
+                        ["python3", str(PROGRAM.with_name("rebuild_row.py")), "read", "--config", str(config)],
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual((result.returncode, result.stdout, result.stderr), (0, machines, ""))
+                    self.assertEqual(rebuild_row.read(config).row(), line)
+
+    def test_reader_hides_missing_or_invalid_answers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "statusline.conf"
+            cache = Path(directory) / "cache"
+            _ = config.write_text(f"rebuild.cache={cache}\n", encoding="utf-8")
+            self.assertEqual(rebuild_row.read(config), rebuild_row.RebuildAnswer((), True))
+            for text in ("invalid\n9999999999\n", "rebuild mac\ninvalid\n"):
+                with self.subTest(text=text):
+                    _ = cache.write_text(text, encoding="utf-8")
+                    self.assertEqual(rebuild_row.read(config), rebuild_row.RebuildAnswer((), True))
+
+    def test_stale_cache_keeps_the_answer_for_the_reader_and_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "statusline.conf"
+            cache = Path(directory) / "cache"
+            _ = config.write_text(f"rebuild.cache={cache}\n", encoding="utf-8")
+            _ = cache.write_text("rebuild natedev, rebuild mac\n0\n" + str(config) + "\n", encoding="utf-8")
+            answer = rebuild_row.read(config)
+            self.assertTrue(answer.refresh_due)
+            self.assertEqual(answer.row(), "rebuild natedev, rebuild mac")
+            result = subprocess.run(
+                ["python3", str(PROGRAM.with_name("rebuild_row.py")), "read", "--config", str(config)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "natedev\nmac\n", ""))
+
+    def test_refresh_evaluates_once_per_commit_and_checks_running_systems_each_time(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "statusline.conf"
+            cache = Path(directory) / "cache"
+            _ = config.write_text("rebuild.repo=/test/nixos\nrebuild.ref=main\nrebuild.natedev=natedev\n"
+                                  + f"rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.cache={cache}\n", encoding="utf-8")
+            commands: list[list[str]] = []
+            commit = "a" * 40
+            running = "/nix/store/old"
+
+            def run(command: list[str]) -> str:
+                commands.append(command)
+                if command[0] == "git":
+                    self.assertEqual(command, ["git", "-C", "/test/nixos", "rev-parse", "--verify", "main^{commit}"])
+                    return commit
+                if command[0] == "nix":
+                    self.assertIn(f"?rev={commit}", command[-1])
+                    self.assertIn('nixosConfigurations."natedev"', command[-1])
+                    self.assertIn('darwinConfigurations."MacBook-Pro"', command[-1])
+                    return json.dumps({"natedev": "/nix/store/main", "mac": "/nix/store/main"})
+                return running
+
+            rebuild_row.write(config, run)
+            self.assertEqual([command[0] for command in commands], ["git", "nix", "realpath", "ssh"])
+            for changed in (False, True):
+                with self.subTest(changed=changed):
+                    lines = cache.read_text(encoding="utf-8").splitlines()
+                    lines[1] = "0"
+                    _ = cache.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                    commands.clear()
+                    running = "/nix/store/main"
+                    if changed:
+                        commit = "b" * 40
+                    rebuild_row.write(config, run)
+                    self.assertEqual([command[0] for command in commands],
+                                     ["git", "nix", "realpath", "ssh"] if changed else ["git", "realpath", "ssh"])
+                    self.assertEqual(rebuild_row.read(config).row(), "")
+
+    def test_failed_eval_is_cached_for_the_commit_without_a_false_item(self) -> None:
+        commands: list[list[str]] = []
+
+        def run(command: list[str]) -> str:
+            commands.append(command)
+            return "a" * 40 if command[0] == "git" else ""
+
+        expected = rebuild_row.expected_systems(self.settings(), rebuild_row.NoExpectedSystems(), run)
+        self.assertIsInstance(expected, rebuild_row.ExpectedSystems)
+        self.assertEqual(rebuild_row.row(self.settings(), expected, run), "")
+        commands.clear()
+        self.assertEqual(rebuild_row.expected_systems(self.settings(), expected, run), expected)
+        self.assertEqual([command[0] for command in commands], ["git"])
+
+    def test_shell_reads_a_fresh_cache_without_running_the_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            cache = home / ".local/state/showrunner/rebuilds"
+            cache.parent.mkdir(parents=True)
+            _ = cache.write_text("rebuild natedev\n9999999999\n/dev/null\n", encoding="utf-8")
+            built = cache.stat().st_mtime_ns
+            for shell in SHELLS:
+                result = subprocess.run([shell, "-c", COMMAND], input="{}", capture_output=True, text=True,
+                                        check=True, env={"HOME": directory, "PATH": os.environ["PATH"]}, cwd=home)
+                self.assertEqual(result.stdout.splitlines()[-1], "For you: rebuild natedev")
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(cache.stat().st_mtime_ns, built)
 
 if __name__ == "__main__":
     _ = unittest.main()
