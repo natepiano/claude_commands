@@ -627,7 +627,6 @@ Mac runs read `connect_timeout_s` from `mac_test.conf` and round it up for SSH.
 | `admin_secret_file` | `~/.config/aws-build/admin.gpg` | Encrypt AWS administrator keys and Tailscale OAuth values together with mode `0600`. |
 | `tailscale_key_expiry_s` | `300` | Expire an unused single-use join key after five minutes. |
 | `nixos_configuration_directory` | `/etc/nixos` | Read the reviewed box configuration from a clean `main` checkout. |
-| `box_shell_directory` | `~/rust/cargo-liner` | Select the repository for the configured shell parity checks. |
 | `box_setup_timeout_s` | `3600` | Bound each setup command and the idle shutdown hold. |
 | `box_check_attempts` | `60` | Bound SSM and SSH recovery checks. |
 | `box_check_delay_s` | `5` | Allow registration and Tailscale restarts between checks. |
@@ -638,7 +637,10 @@ The helper prints policy changes and preserves unrelated rules.
 
 `idle_stop_margin_s=120` allows two extra minutes for the box to finish its idle stop.
 The range is 0 through 600 seconds.
-`routing_proof_package=cargo-berth-test-support` selects the package for the pinned routing test in `box_shell_directory`.
+The routing proof uses `scripts/aws_target/proof_crate` in this repository.
+Its `default` development shell uses the host tools.
+The setup checks compare plain tool commands on both hosts.
+These stages need no other source repository.
 `deploy.py up` stores routing activation in `~/.local/state/build-targets/aws/routing.json`.
 The controller and sender use this record before the tracked `offload` value.
 The command edits no tracked file.

@@ -146,10 +146,12 @@ An interruption marker reports the instance generation.
    The helper resets the old idle timestamp before it restarts the remote service.
    It waits for the expected system and an active `aws-build-remote` service.
 4. `checks` confirms SSM, the EBS serial under `/home`, ext4, and the remote service.
-   It archives the repository named by `box_shell_directory` and copies its shell inputs.
-   It compares Rust, nextest, and mend inside the configured shell on both machines.
+   It compares `rustc -V`, `cargo nextest --version`, and `cargo mend --version` in the plain environment on both hosts.
+   Non-interactive SSH uses the box tools from `environment.systemPackages` in `/etc/nixos/hosts/aws-build.nix`.
+   The stage reads no other source repository and copies no shell inputs.
    It uses `normalize_tool_version` for both results.
-   `box-shell.json` records the public archive path and shell selector.
+   `box-tools.json` records the instance ID and normalized tool versions.
+   Each build still checks the tools inside its own repository shell.
 
 `admin_secret_file` names `~/.config/aws-build/admin.gpg` outside the repository, with mode `0600`.
 The encrypted JSON holds `aws_access_key_id`, `aws_secret_access_key`, `tailscale_client_id`, and `tailscale_client_secret`.
@@ -229,8 +231,12 @@ The controller activation and routing proof remain separate plan stages.
    The controller and the sender read the same record before the legacy `offload` value.
    The stage enables and starts `aws-target.service` with `systemctl --user`.
    It requires the reviewed AWS registry rows and edits no tracked file.
-3. `routing-proof` runs `verify.sh test cargo-berth-test-support --target aws --no-cache` in `box_shell_directory`.
-   `routing_proof_package` selects the package.
+3. `routing-proof` runs `verify.sh test aws-routing-proof --target aws --no-cache` in `scripts/aws_target/proof_crate`.
+   The crate has its own workspace, no Rust dependencies, and one test that runs the compiler.
+   The runner requires `flake.nix` and `flake.lock`, so the crate supplies a small locked shell.
+   The `default` shell retains the host tools on PATH.
+   The stage uses the existing `DOC_REPO_TOP` source override to copy only the crate.
+   The crate needs no other source repository.
    The normal queue retains admission, spending, and version checks.
    The stage requires a new successful pinned buildlog step with `target=aws` and `host=aws-build`.
 

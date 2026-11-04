@@ -31,6 +31,9 @@ It keeps decrypted values only in memory for that process.
 Symmetric AES256 encryption disables the GPG symmetric passphrase cache.
 The planned `down` command must use this same terminal credential boundary.
 
+`up` needs only this repository and the reviewed `/etc/nixos` checkout.
+The proof crate includes its own locked development shell and has no Rust dependencies.
+
 ## Stages of `up`
 
 Each stage checks the live state first. It acts only when the state is not complete.
@@ -44,10 +47,10 @@ Each stage checks the live state first. It acts only when the state is not compl
 5. **Tailscale policy.** A tracked policy source holds the `tag:build-aws` rules: natedev's user and the Mac's user reach the box and enter `natepiano` through Tailscale SSH; the box starts no connection. `up` applies it through the Tailscale API when the live policy differs. It changes only rules for `tag:build-aws`, and it prints each change it makes (showrunner ruling, 2026-11-03).
 6. **Box join.** Wait for the instance in SSM. Ask the Tailscale API for a single-use, pre-approved, short-lived auth key for `tag:build-aws`. Send `tailscale up --ssh --advertise-tags=tag:build-aws` to the box through SSM with that key. No key is stored on the box, in git or in CloudFormation.
 7. **Box configuration.** From natedev, switch the box to the `aws-build` output of natedev's `/etc/nixos` main with `nixos-rebuild --target-host`. The nixos repository is private, so the box does not fetch it. The box configuration lives only in `/etc/nixos`. A change to it goes to natedev as a branch, and `up` only reads that repository (showrunner ruling, 2026-11-03).
-8. **Checks.** Confirm SSM, the `/home` mount on the expected data volume, the remote lifecycle service, and `rustc`, `cargo nextest` and `cargo mend` inside the configured shell.
+8. **Checks.** Confirm SSM, the `/home` mount on the expected data volume, the remote lifecycle service, and plain `rustc`, `cargo nextest` and `cargo mend` versions on both hosts.
 9. **Idle stop.** Confirm the box stops itself within `idle_stop_minutes` plus a margin, through EC2.
 10. **Activation.** Turn on routing to AWS from state outside the repository, then start `aws-target.service`. The registry rows land in the tracked config by a reviewed commit, with the user's approval of each value.
-11. **Routing proof.** Run one small test through the normal queue. Confirm `target=aws` in its record.
+11. **Routing proof.** Run the in-repository `scripts/aws_target/proof_crate` through the normal pinned queue. Confirm `target=aws` in its record.
 
 ## Phases
 

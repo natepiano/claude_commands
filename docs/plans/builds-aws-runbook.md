@@ -256,8 +256,7 @@ Never paste its secret into a command, log, or tracked file.
 
 1. Confirm the natedev and Mac device names in `config/aws-build-tailscale.json`.
 2. Confirm the clean `main` checkout at `nixos_configuration_directory` contains the reviewed box configuration.
-3. Confirm `box_shell_directory` names the repository for the configured shell checks.
-4. Run `python3 scripts/aws_target/deploy.py up --approve-resources` yourself.
+3. Run `python3 scripts/aws_target/deploy.py up --approve-resources` yourself.
 
 The policy stage prints each change to `tag:build-aws` rules.
 It preserves unrelated rules and refuses a broad outbound rule that needs policy review.
@@ -267,7 +266,9 @@ The configuration stage uses substitutes during closure transfer.
 It holds idle shutdown during the copy and detached switch.
 A bounded poweroff timer protects a failed SSH reconnect.
 The stage confirms the running system and restarts `aws-build-remote` before it removes the timer.
-The checks stage confirms SSM, the expected `/home` volume, the remote service, and shell tool parity.
+The checks stage confirms SSM, the expected `/home` volume, the remote service, and plain tool versions on both hosts.
+The stage uses the tools on PATH without another repository or development shell.
+Each build still checks its own repository shell.
 A refusal stops `up` and records the stage in `up.json`.
 Correct the reported cause and run `up` again.
 Completed stages report `present`.
@@ -526,7 +527,10 @@ Run `python3 scripts/aws_target/deploy.py up --approve-resources` at your termin
 2. The activation stage writes `~/.local/state/build-targets/aws/routing.json` and enables `aws-target.service`.
    The reviewed registry already contains `targets=mac,natedev,aws`, `kind.aws=ssh`, `platform.aws=linux`, and `settings.aws=aws_target.conf`.
    The command refuses missing rows and edits no tracked file.
-3. The routing proof runs `verify.sh test cargo-berth-test-support --target aws --no-cache` through the normal queue.
+3. The routing proof runs `verify.sh test aws-routing-proof --target aws --no-cache` in `scripts/aws_target/proof_crate`.
+   The normal queue keeps spending, admission, and per-run tool checks.
+   The crate has no Rust dependencies and uses its own locked `default` shell with the host tools.
+   The stage needs no other source repository.
    The command requires a new successful pinned AWS step in the buildlog.
 
 A retry skips proofs recorded for the current instance ID.

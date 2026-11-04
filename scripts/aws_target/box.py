@@ -395,21 +395,14 @@ class BoxSetup:
         _ = self._run(['env', 'NIX_SSHOPTS=' + shlex.join(options), 'nix', 'copy', '--substitute-on-destination',
                       '--to', 'ssh://natepiano@' + self.joined.address, *paths])
 
-    def _shell(self) -> tuple[str, str]:
-        directory = Path(conf.read(self.settings).text('box_shell_directory')).expanduser().resolve()
-        selector = conf.read(self.settings).text('devshell.' + directory.name) if (
-            'devshell.' + directory.name in conf.read(self.settings).values()) else conf.read(self.settings).text('devshell')
-        return str(directory), selector
-
-    def _versions(self, source: str, selector: str, *, on_box: bool) -> dict[str, str]:
+    def _versions(self, *, on_box: bool) -> dict[str, str]:
         versions: dict[str, str] = {}
         for tool, command in (('rustc', ['rustc', '-V']), ('nextest', ['cargo', 'nextest', '--version']),
                               ('mend', ['cargo', 'mend', '--version'])):
-            arguments = ['nix', 'develop', '--no-write-lock-file', f'path:{source}#{selector}', '--command', *command]
-            output = self._ssh(shlex.join(arguments)) if on_box else self._run(arguments)
+            output = self._ssh(shlex.join(command)) if on_box else self._run(command)
             versions[tool] = linux_runner.normalize_tool_version(output)
             if not versions[tool]:
-                raise BoxRefused(f'{tool}: the configured shell returned no version')
+                raise BoxRefused(f'{tool}: the login environment returned no version')
         return versions
 
     def _health(self) -> bool:
@@ -430,41 +423,26 @@ class BoxSetup:
             return True
         if not self._health():
             return False
-        directory, selector = self._shell()
-        path = self.directory / 'box-shell.json'
+        path = self.directory / 'box-tools.json'
         if not path.exists():
             return False
         saved = json_record(path.read_text())
-        source = ledger.text(saved, 'source')
-        # The archive identity changes when shell inputs change.
-        archive = json_record(self._run(['nix', 'flake', 'archive', '--json', '--no-write-lock-file', 'path:' + directory]))
-        if archive.get('path') != source or saved.get('selector') != selector:
-            return False
-        expected = self._versions(directory, selector, on_box=False)
-        return self._versions(source, selector, on_box=True) == expected
+        expected = self._versions(on_box=False)
+        return (saved.get('instance_id') == self._instance() and saved.get('versions') == expected
+                and self._versions(on_box=True) == expected)
 
     def checks(self) -> None:
         if not self._health():
             raise BoxRefused('box checks require SSM, the expected /home volume, and aws-build-remote')
-        directory, selector = self._shell()
-        archive = json_record(self._run(['nix', 'flake', 'archive', '--json', '--no-write-lock-file', 'path:' + directory]))
-        paths: list[str] = []
-        def collect(row: dict[str, object]) -> None:
-            paths.append(ledger.text(row, 'path'))
-            for child in ledger.mapping(row.get('inputs', {})).values():
-                collect(ledger.mapping(child))
-        collect(archive)
-        if not all(re_store_path(path) for path in paths):
-            raise BoxRefused('the shell archive contains an invalid store path')
-        self._copy(paths)
-        expected = self._versions(directory, selector, on_box=False)
-        actual = self._versions(paths[0], selector, on_box=True)
+        expected = self._versions(on_box=False)
+        actual = self._versions(on_box=True)
         mismatches = [f'{tool} box={actual[tool]} natedev={version}' for tool, version in expected.items() if actual[tool] != version]
         if mismatches:
             raise BoxRefused('aws version mismatch: ' + '; '.join(mismatches) + '; move the box pins in /etc/nixos/hosts/aws-build.nix')
-        write_text_atomic(self.directory / 'box-shell.json', json.dumps({'source': paths[0], 'selector': selector}) + '\n')
         if not self._health():
             raise BoxRefused('box health changed during the tool checks')
+        write_text_atomic(self.directory / 'box-tools.json', json.dumps({
+            'instance_id': self._instance(), 'versions': expected}) + '\n')
 
 
     def _proof_present(self, stage: str) -> bool:
@@ -562,14 +540,14 @@ class BoxSetup:
             return
         if not self.activation_present():
             raise BoxRefused('routing proof requires active routing')
-        directory, _ = self._shell()
-        package = conf.read(self.settings).text('routing_proof_package')
-        if not package or any(character.isspace() for character in package):
-            raise BoxRefused('routing_proof_package: expected one package name')
+        directory = Path(__file__).resolve().parent / 'proof_crate'
+        package = 'aws-routing-proof'
         before = {path: store.read_last_whole_row_end(path) for path in store.root().glob('*/[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl')}
         verify = Path(__file__).resolve().parents[1] / 'direct/verify.sh'
-        command = 'cd ' + shlex.quote(directory) + ' && exec ' + shlex.join(
-            ['env', 'UNIT_DETACHED_RUN=1', str(verify), 'test', package, '--target', 'aws', '--no-cache'])
+        # The existing source override limits the copy to this nested workspace.
+        command = 'cd ' + shlex.quote(str(directory)) + ' && exec ' + shlex.join(
+            ['env', 'UNIT_DETACHED_RUN=1', 'DOC_REPO_TOP=' + str(directory),
+             str(verify), 'test', package, '--target', 'aws', '--no-cache'])
         _ = self._run(['bash', '-c', command])
         for path in store.root().glob('*/[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl'):
             for row in store.locked_rows(path, before.get(path, 0)):

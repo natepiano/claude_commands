@@ -19,7 +19,6 @@ from scripts.mac_test import mac_test, offload
 from scripts.lib import conf
 
 SYSTEM = '/nix/store/' + 'a' * 32 + '-nixos-system-aws-build'
-SOURCE = '/nix/store/' + 'b' * 32 + '-source'
 
 FAKE = r'''import json, os, pathlib, shlex, sys
 root = pathlib.Path(os.environ['BOX_FIXTURE'])
@@ -69,12 +68,19 @@ elif name == 'systemctl':
         s['controller'] = True; save()
     elif 'is-enabled' in args: print('enabled' if s.get('controller') else 'disabled')
     elif 'is-active' in args: print('active' if s.get('controller') else 'inactive')
+elif name in ('rustc', 'cargo'):
+    versions([name, *args])
 elif name == 'bash':
+    words = shlex.split(args[-1])
+    source = pathlib.Path(words[words.index('cd') + 1])
+    assert source.name == 'proof_crate' and (source / 'Cargo.toml').is_file()
+    assert 'DOC_REPO_TOP=' + str(source) in words
+    assert words[words.index('test') + 1] == 'aws-routing-proof'
     if s.get('proof_failure'): sys.exit(1)
     if not s.get('missing_record'):
         log = pathlib.Path(os.environ['BUILDLOG_DIR']) / 'aws-build' / '2026-11.jsonl'
         log.parent.mkdir(parents=True, exist_ok=True)
-        with log.open('a') as handle: handle.write(json.dumps({'kind': 'step', 'id': 'proof-step', 'target': 'aws', 'host': 'aws-build', 'package': 'cargo-berth-test-support', 'status': 0, 'pinned': True}) + '\n')
+        with log.open('a') as handle: handle.write(json.dumps({'kind': 'step', 'id': 'proof-step', 'target': 'aws', 'host': 'aws-build', 'package': 'aws-routing-proof', 'status': 0, 'pinned': True}) + '\n')
 elif name == 'tailscale':
     output({'Self': {'HostName': 'natedev', 'TailscaleIPs': ['100.64.0.1']},
             'Peer': {'mac': {'HostName': 'MacBook-Pro', 'TailscaleIPs': ['100.64.0.2']}}})
@@ -87,8 +93,6 @@ elif name == 'nix':
         assert '--substitute-on-destination' in args
         if s.get('copy_failure'): sys.exit(1)
         s['copies'] = s.get('copies', 0) + 1; save()
-    elif 'archive' in args: output({'path': s['source'], 'inputs': {}})
-    elif 'develop' in args: versions(args)
     else: raise AssertionError(args)
 elif name == 'ssh':
     command = args[-1]
@@ -113,7 +117,7 @@ elif name == 'ssh':
         assert 'volbox' in command and 'lsblk' in command and 'SERIAL' in command
         if s.get('wrong_volume'): sys.exit(1)
         print('healthy')
-    elif 'nix develop' in command: versions(shlex.split(command), True)
+    elif command in ('rustc -V', 'cargo nextest --version', 'cargo mend --version'): versions(shlex.split(command), True)
     else: raise AssertionError(command)
 else: raise AssertionError(name)
 '''
@@ -172,12 +176,12 @@ class BoxTests(unittest.TestCase):
             admin_secrets.AdminCredentials('fixture-admin-id', 'fixture-admin-secret', 'fixture-id', 'fixture-secret'))))
         config = (Path(__file__).resolve().parents[2] / 'config/aws_target.conf').read_text()
         values = {'admin_secret_file': str(self.root / 'admin.gpg'), 'box_check_attempts': '4', 'box_check_delay_s': '0.001', 'idle_stop_minutes': '0.001', 'idle_stop_margin_s': '0',
-                  'nixos_configuration_directory': str(self.root / 'nixos'), 'box_shell_directory': str(self.root / 'cargo-liner')}
+                  'nixos_configuration_directory': str(self.root / 'nixos')}
         _ = self.settings.write_text('\n'.join(key + '=' + values[key] if '=' in line and (key := line.partition('=')[0]) in values else line
                                              for line in config.splitlines()) + '\n')
         bin_path = self.root / 'bin'
         bin_path.mkdir()
-        for name in ('aws', 'ssh', 'git', 'nix', 'tailscale', 'systemctl', 'bash'):
+        for name in ('aws', 'ssh', 'git', 'nix', 'tailscale', 'systemctl', 'bash', 'rustc', 'cargo'):
             path = bin_path / name
             _ = path.write_text(f'#!{sys.executable}\n' + FAKE)
             path.chmod(0o700)
@@ -188,7 +192,7 @@ class BoxTests(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.object(target_config, 'read_targets', return_value=(target_config.SshTarget('aws', 'linux', self.settings),))))
         _ = cast(object, self.enterContext(mock.patch.object(mac_test, 'live_claims', return_value=())))
         self.save({'self_stop': True, 'stop_after': 2, 'online': True, 'joined': False, 'active': True, 'system': '/nix/store/old',
-                   'desired': SYSTEM, 'source': SOURCE})
+                   'desired': SYSTEM})
         self.tailnet = FakeTailnet()
         self.starts = 0
         self.subject = box.BoxSetup(self.settings, self.directory, self.start, admin=admin_secrets.AdminSecretSession(self.settings), tailnet=self.tailnet)
@@ -347,15 +351,19 @@ class BoxTests(unittest.TestCase):
         self.assertTrue(any('rm -f -- /home/natepiano/.local/state/build-target/aws-control/idle.json' in c[-1]
                             and 'sudo systemctl start' in c[-1] for c in self.commands()))
 
-    def test_checks_compare_multiline_versions_in_the_configured_shell(self) -> None:
+    def test_checks_compare_plain_environment_versions_without_another_repository(self) -> None:
         self.change(joined=True)
         self.assertFalse(self.subject.checks_present())
         self.subject.checks()
         self.assertTrue(self.subject.checks_present())
-        before = cast(int, self.live()['copies'])
+        before = [c for c in self.commands() if c[0] == 'nix']
         self.assertTrue(self.subject.checks_present())
-        self.assertEqual(self.live()['copies'], before)
+        self.assertEqual([c for c in self.commands() if c[0] == 'nix'], before)
+        for command in (['rustc', '-V'], ['cargo', 'nextest', '--version'], ['cargo', 'mend', '--version']):
+            self.assertIn(command, self.commands())
+        self.assertFalse(any(c[0] == 'nix' for c in self.commands()))
         self.change(mismatch=True)
+        self.assertFalse(self.subject.checks_present())
         with self.assertRaisesRegex(box.BoxRefused, 'nextest box=cargo-nextest wrong natedev=cargo-nextest fixture release fixture'):
             self.subject.checks()
         self.change(mismatch=False)
@@ -368,7 +376,7 @@ class BoxTests(unittest.TestCase):
                 self.change(joined=True, **values)
                 with self.assertRaises(box.BoxRefused):
                     self.subject.checks()
-                self.assertFalse(any(c[0] == 'nix' and 'develop' in c for c in self.commands()))
+                self.assertFalse(any(c[0] in ('rustc', 'cargo') for c in self.commands()))
 
 
     def test_idle_stop_records_the_instance_and_never_waits_again(self) -> None:
@@ -428,7 +436,9 @@ class BoxTests(unittest.TestCase):
         self.subject.routing_proof()
         self.assertEqual(len(self.commands()), commands)
         command = next(c[-1] for c in self.commands() if c[0] == 'bash')
-        self.assertIn('test cargo-berth-test-support --target aws --no-cache', command)
+        self.assertIn('test aws-routing-proof --target aws --no-cache', command)
+        self.assertIn(str(Path(box.__file__).resolve().parent / 'proof_crate'), command)
+        self.assertNotIn('cargo-liner', command)
 
     def test_replacement_instance_invalidates_both_proofs(self) -> None:
         self.change(joined=True)
