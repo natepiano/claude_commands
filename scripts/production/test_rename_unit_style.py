@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import final
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "style"))
 import style_ledger
 from scripts.style import unit_files
 from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner
