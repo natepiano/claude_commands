@@ -2,7 +2,19 @@
 
 Stop, resume and account move use `scripts/shutdown/stop_resume.py`.
 
-`stop(session)` ends only the selected local session's Claude process. It reads identity through `sessions.session_liveness`, keeps the pid and start time, checks that identity before each signal, sends TERM, and checks exit every 0.1 seconds and sends KILL after two seconds if the same process survives. After exit, `stall_watch.retire_session_prompt(session_id)` atomically publishes only `{session_id, at}` with no launch, pane or parent lookup. It takes no watcher lock and sends nothing; stall-watch finds saved prompts by their owning session id and retires their stored keys on its next pass, even after launch deletion. Any cancellation exception prints a separate warning and does not prevent intentional-stop bookkeeping or change the stop result. It waits up to five seconds after KILL. It waits for that pid and start time to leave. Registry removal alone does not prove exit. A surviving process returns `StopFailed`. Workers keep their threads. No stopping record, ready mark, account hold or conductor is created.
+`stop(session)` ends only the selected local session's process.
+It reads the session identity, pid, and start time before TERM.
+It checks the current conversation before each signal.
+It checks exit every 0.1 seconds and sends KILL after two seconds when the conversation proof remains valid.
+If TERM removes that proof, stop prints an anomaly and waits up to five more seconds without another signal.
+It waits up to five seconds after KILL.
+Registry removal alone does not prove exit.
+A surviving process returns `StopFailed` and does not resume.
+After exit, `stall_watch.retire_session_prompt(session_id)` publishes only `{session_id, at}`.
+It takes no watcher lock and sends no message.
+Stall-watch retires the saved prompt keys on its next pass, even after launch deletion.
+A cancellation error prints a separate warning and does not change the stop result.
+Workers keep their threads.
 
 `resume NAME [--why TEXT] [--to ACCOUNT]` works from any directory.
 The executable is `scripts/shutdown/resume`.
