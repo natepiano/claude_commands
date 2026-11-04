@@ -40,6 +40,7 @@ def run_gate(path: Path) -> int:
         with copies.standing(record["slug"], Path(record["checkout"]), record["tip"]) as clone:
             production = Production(Path(record["production_doc"]), record["slug"], record["merge_branch"],
                                     clone, Path(record["checkout"]) / record["production_log"], ZoneInfo(record["zone"]))
+            os.environ["BUILDLOG_UNIT"] = record["unit"]
             detail = run_checkpoint_test_steps(
                 production, tuple(record["paths"]), tuple(tuple(command) for command in record["merge_tests"]),
                 frozenset(record["flakes"]), frozenset(record["flaky_tests"]), Path(record["log"]),
