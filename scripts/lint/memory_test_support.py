@@ -1,22 +1,48 @@
 """Private memory readings for tests that use the admission gate."""
+from __future__ import annotations
 
 import os
 import sys
+from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
     from ..build_hold.override_guard import require_checkout
+    from .memory_admit import AdmissionPolicy, MemoryConfig
 else:
     from scripts.build_hold.override_guard import require_checkout
 
 require_checkout(Path(__file__))
 
 
+ADMISSION_CONFIG_FIXTURE = Path(__file__).with_name("fixtures") / "build_admission.conf"
+
+
+@cache
+def admission_configuration_fixture() -> MemoryConfig:
+    """Read the fixed test settings without the caller's live configuration."""
+    from unittest.mock import patch
+    from scripts.lint import memory_admit
+
+    with patch.dict(os.environ, {"CONF_DIR": str(ADMISSION_CONFIG_FIXTURE.parent)}):
+        return memory_admit.read_memory_config(report=False)
+
+
+def admission_policy_fixture() -> AdmissionPolicy:
+    return admission_configuration_fixture().policy
+
+
+def _template(name: str) -> Path:
+    if name == ADMISSION_CONFIG_FIXTURE.name:
+        return ADMISSION_CONFIG_FIXTURE
+    return Path(__file__).resolve().parents[2] / "config" / name
+
+
 def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
     """Write a complete private config, replacing named values without losing limits."""
-    source = Path(__file__).resolve().parents[2] / "config" / (f"{template}.conf" if template else path.name)
+    source = _template(f"{template}.conf" if template else path.name)
     lines = source.read_text().splitlines() if source.exists() else []
     for raw in overrides.splitlines():
         key, separator, value = raw.partition("=")
@@ -34,7 +60,7 @@ def write_config_fixture(path: Path, overrides: str = "", *, template: str | Non
 
 def write_config_fault(path: Path, source: str) -> int:
     """Keep revision limits when a test supplies a partial or damaged config."""
-    template = Path(__file__).resolve().parents[2] / "config" / path.name
+    template = _template(path.name)
     limits: dict[str, str] = {}
     previous = ""
     for line in template.read_text().splitlines():
@@ -67,11 +93,13 @@ def commit_config_fixture(path: Path) -> None:
 def config_environment(root: Path) -> dict[str, str]:
     """Give subprocess fixtures their own complete configuration folder."""
     folder = root
-    for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-        destination = folder / source.name
+    names = {source.name for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf")}
+    names.add(ADMISSION_CONFIG_FIXTURE.name)
+    for name in sorted(names):
+        destination = folder / name
         if not destination.exists():
             destination.parent.mkdir(parents=True, exist_ok=True)
-            _ = destination.write_bytes(source.read_bytes())
+            _ = destination.write_bytes(_template(name).read_bytes())
     return {"CONF_DIR": str(folder)}
 
 
@@ -92,7 +120,7 @@ def private_ci_environment(root: Path) -> dict[str, str]:
     """Keep CI slice readings inside the private fixture."""
     ci = root / "ci.slice"
     ci.mkdir(exist_ok=True)
-    for name, value in (("memory.current", "0"), ("memory.max", str(40 * 1024**3)), ("cgroup.procs", "")):
+    for name, value in (("memory.current", "0"), ("memory.stat", "inactive_file 0\n"), ("memory.max", str(40 * 1024**3)), ("cgroup.procs", "")):
         path = ci / name
         if not path.exists():
             _ = path.write_text(value)

@@ -18,6 +18,8 @@ from unittest.mock import patch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
+from scripts.copies.test_copy_guard import argv_policy_cases, repair_policy_cases, shell_policy_cases, unresolved_policy_cases
+
 HOOKS = Path(__file__).resolve().parent
 DISPATCH = HOOKS / "hook_dispatch.py"
 ROOT = HOOKS.parents[1]
@@ -568,6 +570,7 @@ class SettingsRegistrationTests(IsolatedHookTests):
         expected = {
             event: [list(row) for row in rows] for event, rows in LEGACY.items()
         }
+        expected["pre_tool_use"][-1][0] = "../copies/copy_guard.py"
         expected["post_tool_use"].append(["post-tool-use-push-delivered.py", "PushNotification", 600])
         expected["post_tool_use"].append(["post-tool-use-sendmessage-miss.py", "SendMessage", 600])
         self.assertEqual(parsed_output(result.stdout), expected)
@@ -743,6 +746,111 @@ class DispatcherRepairTests(IsolatedHookTests):
         self.assertIn("ValueError: root cause", message)
         self.assertIn("The above exception was the direct cause", message)
         self.assertTrue(message.endswith("RuntimeError: outer failure\nlater hook ran"))
+
+
+class CopyGuardDispatchTests(IsolatedHookTests):
+    def test_copy_guard_failure_preserves_a_later_hooks_refusal(self) -> None:
+        later = self.root / "later-guard.py"
+        marker = self.root / "later-ran"
+        _ = later.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n"
+                             + "import sys\nprint('later refusal', file=sys.stderr)\nraise SystemExit(2)\n")
+        driver = (
+            f"import sys\nsys.path.insert(0, {str(ROOT)!r})\n"
+            + "from scripts.hooks import hook_dispatch as dispatch\n"
+            + "original = dispatch._execute\n"
+            + "def execute(path):\n"
+            + "    if path.name == 'copy_guard.py':\n"
+            + "        raise RuntimeError('guard crashed')\n"
+            + "    original(path)\n"
+            + "dispatch._execute = execute\n"
+            + f"dispatch.EVENTS['pre_tool_use'] = (dispatch.CopyPolicyHook(), dispatch.HookSpec({str(later)!r}, None))\n"
+            + "sys.argv = ['hook_dispatch.py', 'pre_tool_use']\ndispatch.main()\n"
+        )
+        result = self.run_python(["-c", driver], {"tool_name": "Bash", "tool_input": {"command": "true"}})
+        self.assertEqual((result.returncode, result.stderr), (2, "later refusal\n"))
+        self.assertTrue(marker.exists())
+
+    def test_copy_guard_deadline_is_enforced_by_the_normal_runner(self) -> None:
+        completion = self.root / "timed-body-completed"
+        later = self.root / "later-hook-ran"
+        driver = (
+            f"import sys, time\nsys.path.insert(0, {str(ROOT)!r})\n"
+            + "from pathlib import Path\n"
+            + "from scripts.hooks import hook_dispatch as dispatch\n"
+            + "from scripts.copies import copy_guard\n"
+            + "copy_guard.hook_timeout = lambda: 0.01\n"
+            + "def execute(path):\n"
+            + "    if path.name == 'copy_guard.py':\n"
+            + "        time.sleep(60)\n"
+            + f"        Path({str(completion)!r}).touch()\n"
+            + "    else:\n"
+            + f"        Path({str(later)!r}).touch()\n"
+            + "dispatch._execute = execute\n"
+            + "dispatch.EVENTS['pre_tool_use'] = (dispatch.CopyPolicyHook(), dispatch.HookSpec('later.py', None))\n"
+            + "sys.argv = ['hook_dispatch.py', 'pre_tool_use']\ndispatch.main()\n"
+        )
+        result = self.run_python(["-c", driver], {"tool_name": "Bash", "tool_input": {"command": "true"}})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertFalse(completion.exists())
+        self.assertTrue(later.exists())
+
+    def test_registered_dispatch_distinguishes_literal_and_executable_substitutions(self) -> None:
+        for case in shell_policy_cases():
+            with self.subTest(command=case.command):
+                result = self.run_python([str(DISPATCH), "pre_tool_use"], {
+                    "tool_name": "Bash", "tool_input": {"command": case.command}, "cwd": str(self.root)})
+                self.assertEqual(result.returncode, 2 if case.operation else 0, result.stderr)
+                if case.operation:
+                    self.assertTrue(result.stderr.startswith(case.operation + ":"), result.stderr)
+                else:
+                    self.assertNotIn("copies.py run", result.stderr)
+
+    def test_pre_tool_use_refuses_repository_creation_through_dispatcher(self) -> None:
+        result = self.run_python([str(DISPATCH), "pre_tool_use"], {
+            "tool_name": "Bash", "tool_input": {"command": "git clone source destination"},
+            "cwd": str(self.root),
+        })
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("copies.py run", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_interpreter_vectors_and_unresolved_programs_reach_the_dispatcher_policy(self) -> None:
+        for command, operation in argv_policy_cases():
+            with self.subTest(command=command):
+                result = self.run_python([str(DISPATCH), "pre_tool_use"], {
+                    "tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(self.root)})
+                self.assertEqual(result.returncode, 2 if operation else 0, result.stderr)
+                self.assertEqual(result.stderr.split(":", 1)[0] if result.stderr else "", operation)
+        for command, reason in unresolved_policy_cases():
+            with self.subTest(command=command):
+                result = self.run_python([str(DISPATCH), "pre_tool_use"], {
+                    "tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(self.root)})
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertTrue(result.stderr.startswith("unresolved relevant operation: " + reason + ":"), result.stderr)
+
+    def test_recorded_commands_and_interpreter_descriptor_context_matrix(self) -> None:
+        for case in repair_policy_cases():
+            with self.subTest(case=case.name, provenance=case.provenance):
+                result = self.run_python([str(DISPATCH), "pre_tool_use"], {
+                    "tool_name": "Bash", "tool_input": {"command": case.command}, "cwd": str(self.root)})
+                self.assertEqual(result.returncode, 2 if case.expected else 0, result.stderr)
+                if case.expected:
+                    self.assertTrue(result.stderr.startswith(case.expected + ":"), result.stderr)
+                else:
+                    self.assertNotIn("copies.py run", result.stderr)
+
+    def test_service_command_and_other_events_pass_without_guard_refusal(self) -> None:
+        for event, command in (
+            ("pre_tool_use", "python3 ~/.claude/scripts/copies/copies.py run --owner verify-unit --repo . --commit HEAD -- true"),
+            ("post_tool_use", "git clone source destination"),
+        ):
+            with self.subTest(event=event):
+                result = self.run_python([str(DISPATCH), event], {
+                    "tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(self.root),
+                })
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("copies.py run", result.stderr)
 
 
 if __name__ == "__main__":

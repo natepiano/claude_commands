@@ -38,9 +38,10 @@ def wait_client_main() -> int:
     clock.epoch = time.time()
     def estimate(argv: list[str], cwd: str, profile: gate.InferFromArgv | gate.StepProfile | gate.ProgramProfile,
                  now: datetime | Callable[[], datetime], root: Path, policy: gate.AdmissionPolicy, *,
+                 first_peak_bytes: int, budget: int,
                  build_history_generation: Callable[[], gate.BuildHistoryGeneration | gate.NoBuildHistoryGeneration]
                  = gate.no_build_history_generation) -> gate.StepEstimate:
-        _ = argv, cwd, profile, now, root, policy, build_history_generation
+        _ = argv, cwd, profile, now, root, policy, first_peak_bytes, budget, build_history_generation
         previous = calls.read_text().splitlines() if calls.exists() else []
         action = actions[min(len(previous), len(actions) - 1)]
         owner = int(sys.argv[sys.argv.index("--pid") + 1])
@@ -87,7 +88,7 @@ class AdmissionClientWaitTests(unittest.TestCase):
             "UNIT_ACTIVE_DIR": str(self.root / "active"), "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "HOME": str(self.root)}
         from scripts.lint.test_memory_admit import write_memory_config
-        write_memory_config(self.root / "lint.conf", reconnect_seconds="1", waiting_pass_seconds="0.01")
+        write_memory_config(self.root / "build_admission.conf", reconnect_seconds="1", waiting_pass_seconds="0.01")
         def reply_filter(reply: wire.Reply) -> wire.Reply:
             calls = self.root / "calls.jsonl"
             if isinstance(reply, (wire.Wait, wire.Admitted)) and calls.exists():

@@ -275,8 +275,8 @@ async function queueRun($: EngineInterface, args: string[], isOpen = () => true)
     : await $.process.run(argv);
   if (!isOpen()) throw new Error('Build queue could not be read.');
   if (args[0] === 'bump' && result.exitCode === 3 && !result.isStdoutTruncated) {
-    const refusal = result.stdout.trim();
-    if (/^build queue: [^\r\n]+$/.test(refusal)) return refusal;
+    const selectorError = result.stdout.trim();
+    if (/^build queue: [^\r\n]+$/.test(selectorError)) return selectorError;
   }
   if (result.exitCode !== 0 || result.isStdoutTruncated) throw new Error('Build queue could not be read.');
   return result.stdout;

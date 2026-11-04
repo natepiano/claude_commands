@@ -152,11 +152,11 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        # The committed Mac fixture exposes setUp(), not a seed builder. Own
-        # the copying here so this suite needs only that public lifecycle.
+        # Copy files before starting the admission server for each test.
         builder = VerifyMacOffloadFixture()
         cls.addClassCleanup(builder.doCleanups)
-        builder.setUp()
+        builder.root = Path(builder.enterContext(tempfile.TemporaryDirectory(prefix="verify-hold-tools-")))
+        builder.build_fixture()
         cls.fixture_root = builder.root
         seed_directory = cls.enterClassContext(tempfile.TemporaryDirectory(prefix="verify-hold-seed-"))
         cls.fixture_seed = Path(seed_directory) / "seed"

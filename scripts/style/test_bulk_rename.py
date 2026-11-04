@@ -1154,6 +1154,17 @@ class ProtocolTests(CargoProjectTests):
         self.assertIsInstance(result, bulk.DefinitionUnavailable)
         self.assertIn("ambiguous definition", cast(bulk.DefinitionUnavailable, result).reason)
 
+    def test_batch_analyzer_keeps_build_admission(self) -> None:
+        analyzer = bulk.RustAnalyzer(self.repo, timeout=TEST_HANG_GUARD_SECS)
+        try:
+            self.assertEqual(self.queue.calls, [("rust-analyzer", self.repo)])
+            self.assertEqual(self.queue.batch_calls, [(("rust-analyzer",), True)])
+            place, = self.queue.places
+            self.assertEqual(place.arguments, [("rust-analyzer",)])
+        finally:
+            analyzer.close()
+        self.assertTrue(place.closed)
+
     def test_stdio_handshake_enables_build_scripts_and_proc_macros_and_prepares_each_rename(self) -> None:
         folder = self.root / "bin"
         folder.mkdir()

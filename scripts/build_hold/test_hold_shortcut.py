@@ -10,10 +10,11 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, override
 
-import test_build_hold
 if TYPE_CHECKING:
+    from . import test_build_hold
     from ..lib import test_hang_guard
 else:
+    from scripts.build_hold import test_build_hold
     from scripts.lib import test_hang_guard
 
 
@@ -86,6 +87,16 @@ printf '%s %s %s\\n' "$shortcut" "$wait_status" "$admission"
         (release / cycle_id).mkdir(parents=True, exist_ok=True)
         _ = (release / "current").write_text(cycle_id)
         _ = (release / cycle_id / "cycle.json").write_text('{"release_started_at":"2026-10-13T00:00:00+00:00"}')
+
+    def test_sourcing_memory_gate_without_a_hold_starts_no_python(self) -> None:
+        result = subprocess.run(
+            [BASH, "-c", 'set -euo pipefail; source "$1"', "bash", str(MEMORY_GATE)],
+            cwd=self.scratch, env={**self.environment, "BUILD_HOLD_DIR": str(self.holders),
+                                  "BUILDLOG_ADMISSION_CODE_VERSION": ""},
+            capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.starts.exists(), "Sourcing memory_gate.sh starts no Python process")
 
     def test_empty_holder_directory_starts_no_hold_check(self) -> None:
         self.assert_checks(shortcut=0, starts=False)

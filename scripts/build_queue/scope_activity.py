@@ -1,0 +1,149 @@
+"""Read build-run ownership and process evidence for the queue service."""
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+import os
+from pathlib import Path
+import re
+from typing import Protocol
+
+
+class ProcessIdentity(Protocol):
+    @property
+    def parent(self) -> int: ...
+    @property
+    def start(self) -> str: ...
+
+
+@dataclass(frozen=True)
+class NoLiveBuildRun:
+    pass
+
+
+@dataclass(frozen=True)
+class LiveBuildRun:
+    pid: int
+    start_time: str
+    started_at: float
+
+
+@dataclass(frozen=True)
+class EmptyBuildScope:
+    pass
+
+
+@dataclass(frozen=True)
+class ScopeProcesses:
+    count: int
+    session_id: str
+    session_name: str
+    folder: str
+    program: str
+    started_at: float
+    test_fixture: bool
+    run: LiveBuildRun | NoLiveBuildRun
+
+
+class ScopeActivityReader:
+    """Reuse one process table and cache process files for one service pass."""
+
+    def __init__(self, processes: Mapping[int, ProcessIdentity], proc: Path,
+                 runs: tuple[LiveBuildRun, ...] = ()) -> None:
+        self.processes: Mapping[int, ProcessIdentity] = processes
+        self.proc: Path = proc
+        self.environments: dict[int, dict[str, str]] = {}
+        self.commands: dict[int, tuple[str, ...]] = {}
+        self.runs: dict[int, LiveBuildRun] = {run.pid: run for run in runs}
+        self.boot: float = 0.0
+        try:
+            self.boot = float(next(line.split()[1] for line in (proc / "stat").read_text().splitlines()
+                                   if line.startswith("btime ")))
+        except (OSError, ValueError, StopIteration, IndexError):
+            pass
+        self.ticks: int = int(os.sysconf("SC_CLK_TCK"))
+
+    def environment(self, pid: int) -> dict[str, str]:
+        if pid not in self.environments:
+            try:
+                raw = (self.proc / str(pid) / "environ").read_bytes().decode(errors="replace")
+                self.environments[pid] = dict(item.split("=", 1) for item in raw.split("\0") if "=" in item)
+            except OSError:
+                self.environments[pid] = {}
+        return self.environments[pid]
+
+    def command(self, pid: int) -> tuple[str, ...]:
+        if pid not in self.commands:
+            try:
+                self.commands[pid] = tuple(item for item in
+                    (self.proc / str(pid) / "cmdline").read_bytes().decode(errors="replace").split("\0") if item)
+            except OSError:
+                self.commands[pid] = ()
+        return self.commands[pid]
+
+    def started_at(self, pid: int) -> float:
+        identity = self.processes.get(pid)
+        if identity is None or not self.boot:
+            return 0.0
+        try:
+            return self.boot + int(identity.start) / self.ticks
+        except ValueError:
+            return 0.0
+
+    def ancestors(self, pid: int) -> list[int]:
+        result: list[int] = []
+        seen: set[int] = set()
+        while pid in self.processes and pid not in seen:
+            seen.add(pid)
+            result.append(pid)
+            pid = self.processes[pid].parent
+        return result
+
+    def run(self, pid: int) -> LiveBuildRun | NoLiveBuildRun:
+        for ancestor in self.ancestors(pid):
+            known = self.runs.get(ancestor)
+            if known is not None and known.start_time == self.processes[ancestor].start:
+                return known
+            environment = self.environment(ancestor)
+            recorded = environment.get("BUILDLOG_RUN", "")
+            if recorded:
+                owner, separator, start = recorded.partition(":")
+                if separator and owner.isdecimal():
+                    identity = self.processes.get(int(owner))
+                    if identity is not None and identity.start == start:
+                        return LiveBuildRun(int(owner), start, self.started_at(int(owner)))
+                # An inherited run identity cannot name a different process lifetime.
+                return NoLiveBuildRun()
+            command = self.command(ancestor)
+            names = {Path(arg).name for arg in command}
+            if (names & {"verify.sh", "merge_gate.py"}
+                    or "mesh_runs.py" in names and "supervise" in command):
+                return LiveBuildRun(ancestor, self.processes[ancestor].start, self.started_at(ancestor))
+        return NoLiveBuildRun()
+
+    def scope(self, members: set[int], name: str = "") -> ScopeProcesses | EmptyBuildScope:
+        members = members.intersection(self.processes)
+        if not members:
+            return EmptyBuildScope()
+        oldest = min(members, key=lambda pid: (self.started_at(pid), pid))
+        leader = re.fullmatch(r"run-p([0-9]+)-i[0-9a-f]+\.scope", name)
+        owner = int(leader[1]) if leader else oldest
+        session, name, folder = "", "", ""
+        fixture = False
+        run = self.run(owner) if owner in members else NoLiveBuildRun()
+        program = Path(self.command(oldest)[0]).name if self.command(oldest) else "unknown program"
+        for pid in sorted(members):
+            for ancestor in self.ancestors(pid):
+                env = self.environment(ancestor)
+                session = session or env.get("CODEX_THREAD_ID") or env.get("CLAUDE_CODE_SESSION_ID", "")
+                name = name or env.get("CLAUDE_SESSION_NAME", "")
+                command = self.command(ancestor)
+                fixture = fixture or bool(env.get("PYTEST_CURRENT_TEST")) or any(
+                    arg in ("unittest", "pytest") or Path(arg).name.startswith("test_") for arg in command)
+            if not folder:
+                try:
+                    folder = str((self.proc / str(pid) / "cwd").readlink())
+                except OSError:
+                    pass
+        return ScopeProcesses(len(members), session, name, folder, program,
+                              self.started_at(oldest), fixture, run)

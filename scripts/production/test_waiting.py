@@ -541,7 +541,7 @@ class WaitingTests(unittest.TestCase):
         self.assertLess(verdict.index("stdout first"), verdict.index("stderr second"))
         self.assertLess(verdict.index("stderr second"), verdict.index("stdout third"))
 
-    def test_scratch_cleanup_failure_prints_verdict_before_cleanup_failure(self) -> None:
+    def test_scratch_uses_no_worktree_cleanup_and_reuses_the_checkout(self) -> None:
         _ = self.commit(self.alpha, "alpha.txt", "unit work\n")
         _ = self.commit(self.checkout, "merged.txt", "merge branch work\n")
         self.push_scratch_branches()
@@ -560,13 +560,50 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
 '''.replace("__PYTHON__", sys.executable))
         wrapper.chmod(0o755)
         self.env["WAITING_TEST_REAL_GIT"] = real_git or "git"
-        result = self.run_waiting("scratch-test", ALPHA, "--tests", "printf 'green marker\\n'",
+        observed = self.state / "checkout-paths"
+        command = f"pwd -P >> {shlex.quote(str(observed))}; printf 'green marker\\n'"
+        result = self.run_waiting("scratch-test", ALPHA, "--tests", command,
                                   "--state-dir", str(self.state))
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         lines = [line for line in result.stdout.splitlines() if line.startswith("scratch-test:")]
-        self.assertEqual(len(lines), 2, result.stdout)
+        self.assertEqual(len(lines), 1, result.stdout)
         self.assertIn("ok — green", lines[0])
-        self.assertIn("failed — temporary worktree cleanup: stderr: cleanup refused by test wrapper", lines[1])
+        result = self.run_waiting("scratch-test", ALPHA, "--tests", command,
+                                  "--state-dir", str(self.state))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        paths = observed.read_text().splitlines()
+        self.assertEqual(len(paths), 2)
+        self.assertEqual(paths[0], paths[1])
+
+    def test_scratch_post_use_failure_preserves_green_and_red_verdicts(self) -> None:
+        from scripts.copies import copies
+
+        _ = self.commit(self.alpha, "alpha.txt", "unit work\n")
+        _ = self.commit(self.checkout, "merged.txt", "merge branch work\n")
+        self.push_scratch_branches()
+        mark = copies.mark_target
+        for code, verdict in ((0, "ok — green"), (7, "failed — red")):
+            with self.subTest(code=code):
+                calls = 0
+
+                def fail_after_use(tree: Path) -> None:
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        raise OSError("cache marking refused")
+                    mark(tree)
+
+                with mock.patch.object(copies, "mark_target", side_effect=fail_after_use):
+                    result = self.run_waiting("scratch-test", ALPHA, "--tests",
+                                              f"printf 'tests ran\\n'; exit {code}",
+                                              "--state-dir", str(self.state))
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                lines = result.stdout.splitlines()
+                self.assertEqual(len(lines), 2, result.stdout)
+                self.assertIn(verdict, lines[0])
+                self.assertTrue(lines[1].startswith("scratch-test: failed — post-use step:"), result.stdout)
+                self.assertIn("cache marking refused", lines[1])
+                self.assertEqual(self.scratch_log(lines[0]).read_text(), "tests ran\n")
 
     def test_search_reports_other_unit_branch_and_uncommitted_worktree_sites(self) -> None:
         _ = self.commit(self.beta, "src/beta.py", "old_public_name()\n")
