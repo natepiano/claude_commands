@@ -136,9 +136,13 @@ class RegistrationTests(RegistrationFixture):
         self.assertIn("Reminder", output.getvalue())
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=1)
         with mock.patch.dict(os.environ, self.env):
-            self.assertIn(" ".join(full.split()), review.registered_questions(cutoff))
+            questions = review.registered_questions(cutoff)
+            assert isinstance(questions, list)
+            self.assertIn(" ".join(full.split()), questions)
             _ = self.run_questions(self.question_state([]))
-            self.assertIn(" ".join(full.split()), review.registered_questions(cutoff))
+            questions = review.registered_questions(cutoff)
+            assert isinstance(questions, list)
+            self.assertIn(" ".join(full.split()), questions)
 
     def test_blank_reviewer_rewrite_stores_original_as_review_unavailable(self) -> None:
         question = "Retry build 42?"

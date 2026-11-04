@@ -1,14 +1,9 @@
-"""Where a production's proposal issues live and which of them are its own.
-
-A leaf, so readers such as the footer counts import no cycle. Productions can share one issues
-folder, so a production's own proposals are those its proposer field names: the production or
-one of its units. A production below it answers for its own (user, 2026-10-27); `below` adds
-each production below it at any depth, and its units.
-"""
+"""Find proposal stores and join their proposers to the production's staff members."""
 from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import NamedTuple
 
 
 import sys
@@ -29,27 +24,56 @@ PRODUCTION_SUFFIX = "-production.md"
 UNIT_IN_PRODUCTION = re.compile(r".+?\s*\((?P<production>[^()]+)\)")
 
 
-def ledger(doc: Path) -> Path | None:
-    """The ledger the doc's Improvement queue line names, or None when it names none."""
-    try:
-        return Path(production_field(doc.read_text(encoding="utf-8").splitlines(),
-                                     IMPROVEMENT_QUEUE_FIELD)).expanduser()
-    except Refusal:
-        return None
+class ImprovementLedger(NamedTuple):
+    path: Path
 
 
-def issues_folder(doc: Path) -> Path | None:
-    """The folder the production doc's Proposals line names, or None when it names none."""
+class LedgerUnconfigured:
+    """The document has no improvement ledger."""
+
+
+class LedgerUnavailable(NamedTuple):
+    document: Path
+    reason: str
+
+
+class ProposalsFolder(NamedTuple):
+    path: Path
+
+
+class ProposalsUnconfigured:
+    """The document has no proposals folder."""
+
+
+class ProposalsUnavailable(NamedTuple):
+    document: Path
+    reason: str
+
+
+def ledger(doc: Path) -> ImprovementLedger | LedgerUnconfigured | LedgerUnavailable:
+    """Read the configured ledger and distinguish absence from a failed read."""
     try:
         lines = doc.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        lines = []
+    except (OSError, UnicodeError) as error:
+        return LedgerUnavailable(doc, str(error))
+    try:
+        return ImprovementLedger(Path(production_field(lines, IMPROVEMENT_QUEUE_FIELD)).expanduser())
+    except Refusal:
+        return LedgerUnconfigured()
+
+
+def issues_folder(doc: Path) -> ProposalsFolder | ProposalsUnconfigured | ProposalsUnavailable:
+    """Read the configured folder and distinguish absence from a failed read."""
+    try:
+        lines = doc.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        return ProposalsUnavailable(doc, str(error))
     try:
         folder = Path(production_field(lines, PROPOSALS_FIELD)).expanduser()
     except Refusal:
-        return None
+        return ProposalsUnconfigured()
     # The doc lives at `<checkout>/docs/plans/<name>.md`; a relative folder is under the checkout.
-    return folder if folder.is_absolute() else doc.parent.parent.parent / folder
+    return ProposalsFolder(folder if folder.is_absolute() else doc.parent.parent.parent / folder)
 
 
 def slug_of(doc: Path) -> str:
@@ -95,9 +119,11 @@ def proposer(issue: Issue) -> str:
 def proposal_issues(doc: Path) -> list[Issue]:
     """The open proposal issues in the production's folder, of any proposer."""
     folder = issues_folder(doc)
-    if folder is None or not folder.is_dir():
+    if isinstance(folder, ProposalsUnavailable):
+        raise OSError(f"{folder.document}: {folder.reason}")
+    if isinstance(folder, ProposalsUnconfigured) or not folder.path.is_dir():
         return []
-    return [issue for issue in open_issues(folder, PROPOSAL_TAG) if issue.value("record_type") != "question"]
+    return [issue for issue in open_issues(folder.path, PROPOSAL_TAG) if issue.value("record_type") != "question"]
 
 
 def open_proposals(doc: Path) -> list[Issue]:

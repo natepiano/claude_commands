@@ -36,7 +36,7 @@ from scripts.production import showrunners
 from scripts.production.production_doc import Refusal
 from issues import Issue
 from proposal_issue import AwaitingApproval, InProgress, ProposalProgress, proposal_progress
-from proposals_folder import ledger, owners, proposal_issues, proposer, scope_docs, slug_of
+from proposals_folder import ImprovementLedger, LedgerUnavailable, ledger, owners, proposal_issues, proposer, scope_docs, slug_of
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 import phase_table
@@ -333,7 +333,14 @@ def scope_issues(doc: Path, below: bool = False) -> list[Issue]:
 
 def improvement_ledgers(doc: Path, below: bool = False) -> list[Path]:
     """The Improvement queue ledger of the production, and with `below` of each one below it, once each."""
-    return list(dict.fromkeys(found for each in scope_docs(doc, below) if (found := ledger(each)) is not None))
+    paths: dict[Path, None] = {}
+    for each in scope_docs(doc, below):
+        found = ledger(each)
+        if isinstance(found, LedgerUnavailable):
+            raise OSError(f"{found.document}: {found.reason}")
+        if isinstance(found, ImprovementLedger):
+            paths[found.path] = None
+    return list(paths)
 
 
 def waiting_entries(doc: Path, below: bool = False) -> tuple[list[urgency.Entry[Row]], list[Row]]:

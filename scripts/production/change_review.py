@@ -842,22 +842,20 @@ def row_production(production: Path) -> str:
 
 
 def credited(production: Path) -> Path:
-    """The production a change of `production` belongs to. A style production's work lands on its parent's
-    merge branch through a hand-off, so its changes are its parent's, and its showrunner does not show them
-    (user, 2026-10-27). Any other production is its own."""
-    seen = {production}
-    while True:
+    """Credit a style production to its staff parent. Other productions keep their own credit."""
+    record = staff.initial_snapshot()
+    row = record.by_doc(remote.local_machine(), production)
+    while row is not None and row.parent is not None:
         try:
-            lines = production.read_text(encoding="utf-8").splitlines()
-            if production_field(lines, "Kind") != "style":
+            if production_field(production.read_text(encoding="utf-8").splitlines(), "Kind") != "style":
                 return production
-            parent = Path(production_field(lines, "Parent production")).expanduser()
         except (OSError, UnicodeError, Refusal):
             return production
-        if parent in seen:
+        row = record.by_id(row.parent)
+        if row is None or not isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)):
             return production
-        seen.add(parent)
-        production = parent
+        production = row.doc.path
+    return production
 
 
 @dataclass(frozen=True)

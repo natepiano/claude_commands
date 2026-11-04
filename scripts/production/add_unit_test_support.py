@@ -161,7 +161,7 @@ def configure_test_zone() -> None:
 
 
 from scripts.production.staff_test_support import (
-    StaffTestCase, fixture_runtime_id, fixture_showrunner_name, unit_membership,
+    StaffTestCase, fixture_runtime_id, fixture_showrunner_name, recorded_showrunner, unit_membership,
 )
 
 
@@ -304,6 +304,7 @@ class AddUnitTestCase(ShutdownTestCase):
                     "CODEX_CATALOG_SYNC_STATE_FILE": str(sync_state)}
         self.env["STAFF_FILE"] = str(self.staff.staff_file)
         self.env["HERDR_PANE_RECORD_DIR"] = str(self.staff.source_root / "panes")
+        _ = recorded_showrunner("director", self.doc)
         _ = self.staff.record_production("build-followups", self.doc)
         self.herdr_overrides = {}
         fake_path = self.bin / "fake-herdr"

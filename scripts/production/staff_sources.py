@@ -104,12 +104,6 @@ def _showrunner_key(slug: str) -> str:
     return f"showrunner:{slug}"
 
 
-def _seed_member(key: str, kind: Literal["showrunner", "unit"], name: str, found: MemberFound | NoSuchMember,
-                 parent: staff.SeedParent | staff.KeepSeedParent | staff.RootSeedParent, *, runtime_id: str = "") -> staff.SeedMember:
-    return staff.SeedMember(key, kind, name if isinstance(found, NoSuchMember) else found.row.name,
-                           staff.NewSeedMember() if isinstance(found, NoSuchMember) else found.row.id, parent, runtime_id)
-
-
 def _collect(record: staff.StaffSnapshot, sources: _MemberSources) -> staff.SeedInput:
     members: list[staff.SeedMember] = []
     for slug, source in sources.productions.items():
@@ -117,8 +111,10 @@ def _collect(record: staff.StaffSnapshot, sources: _MemberSources) -> staff.Seed
         owner = record.by_member_reference(runtime_id)
         found = (MemberFound(owner) if owner is not None and owner.kind == "showrunner"
                  else sources.member(ShowrunnerMember(slug), record))
-        members.append(_seed_member(_showrunner_key(slug), "showrunner", showrunners.space_from_text(slug, source.document),
-                                    found, staff.KeepSeedParent(), runtime_id=runtime_id))
+        members.append(staff.SeedMember(_showrunner_key(slug), "showrunner",
+                                       found.row.name if isinstance(found, MemberFound) else slug,
+                                       found.row.id if isinstance(found, MemberFound) else staff.NewSeedMember(),
+                                       staff.KeepSeedParent(), runtime_id))
     return staff.SeedInput(tuple(members), ())
 
 

@@ -29,7 +29,7 @@ from merge_checkpoint import NoMerge, merge_branch_history, report
 
 from scripts.production import showrunners, session_staff, showrunner_tree, staff, unit_lookup, unit_names
 from scripts.production.session_labels import StaffLabels
-from proposals_folder import issues_folder, slug_of
+from proposals_folder import ProposalsFolder, ProposalsUnavailable, issues_folder, slug_of
 from issues import Issue, frontmatter
 import urgency
 from urgency import Urgency, UrgencyError
@@ -811,10 +811,10 @@ def question_folder(document: Path, identities: QuestionStaff) -> QuestionFolder
         return QuestionOwnerUnavailable(document)
     assert isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
     folder = issues_folder(owner.doc.path)
-    if folder is None:
-        root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
-        folder = root / owner.id / "questions"
-    return QuestionFolder(folder, owner.id)
+    if isinstance(folder, ProposalsUnavailable):
+        raise OSError(f"{folder.document}: {folder.reason}")
+    root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
+    return QuestionFolder(folder.path if isinstance(folder, ProposalsFolder) else root / owner.id / "questions", owner.id)
 
 
 @dataclass(frozen=True)
@@ -1042,15 +1042,7 @@ def read_all_open_fields() -> list[OutstandingItem]:
     root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
     paths = {path.stem: path for path in (root / "outstanding").glob("*.json")}
     fields: list[OutstandingItem] = []
-    try:
-        identities = QuestionStaff.read()
-    except staff.StaffUnreadable:
-        for path in sorted(paths.values()):
-            try:
-                fields.extend(stored_entries(path))
-            except (OSError, InputError, ValueError):
-                continue
-        return fields
+    identities = QuestionStaff.for_record(staff.initial_snapshot())
     documents = identities.documents()
     for slug in sorted(set(paths) | set(documents)):
         try:

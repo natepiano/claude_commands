@@ -635,7 +635,10 @@ class ActionTest(unittest.TestCase):
         parent = self.path.parent / "parent-production.md"
         _ = parent.write_text("- **Merge branch:** main\n", encoding="utf-8")
         style = self.path.parent / "parent-style-production.md"
-        _ = style.write_text(f"- **Kind:** style\n- **Parent production:** {parent}\n", encoding="utf-8")
+        _ = style.write_text("- **Kind:** style\n- **Parent production:** /stale/parent-production.md\n", encoding="utf-8")
+        owner = fixture_member("showrunner", name="parent", doc=staff.LiveDoc("natedev", parent))
+        _ = fixture_member("showrunner", name="parent-style", parent=owner.id,
+                           doc=staff.LiveDoc("natedev", style))
         self.assertEqual(change_review.credited(style), parent)
         self.assertEqual(change_review.credited(parent), parent)
         rows = change_review.append_rows(self.path, [Visible("A", "B", "C")], date(2026, 10, 27), "216c4e1d", style,
@@ -1487,6 +1490,10 @@ class RepositoryTest(unittest.TestCase):
         _ = style.write_text(f"- **Repository:** {self.repo}\n- **Merge branch:** style/main\n- **Kind:** style\n"
                              + f"- **Parent production:** {top}\n", encoding="utf-8")
         _ = recorded_unit("top-style", "u-unit", self.repo / "u", style, plan="docs/u-plan.md")
+        owner = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", top))
+        child = staff.snapshot().by_doc("natedev", style)
+        assert child is not None
+        _ = staff.move(child.id, owner.id)
         path = folder / "change-review - top.md"
         _ = path.write_text("## To review\n\n| # | Change | Merged | How to check |\n| --- | --- | --- | --- |\n"
                             + f"| C1 | {GRID.change} | 2026-10-15 · {handoff} | x |\n\n"

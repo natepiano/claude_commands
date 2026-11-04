@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
-"""Delete a wrapped production's reminder state, counts, reports and state folder.
+"""Delete state for wrapped productions without active timers.
 
-Closed question records remain in the production's question folder.
-
-Usage: tidy_wrapped.py <production doc>...
-
-A production with an update timer or a status other than wrapped keeps its state.
+Closed questions remain in their question folders.
 """
 from __future__ import annotations
 
@@ -21,7 +17,7 @@ from scripts.production import staff, unit_lookup  # noqa: E402
 from scripts.copies import copies  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.production.production_doc import WRAPPED  # noqa: E402
-from proposals_folder import issues_folder  # noqa: E402
+from proposals_folder import ProposalsFolder, ProposalsUnavailable, issues_folder  # noqa: E402
 
 if TYPE_CHECKING:
     from update_registration import QuestionStaff
@@ -53,7 +49,10 @@ def owned_paths(slug: str) -> tuple[Path, ...]:
 
 def can_hold_questions(document: Path) -> bool:
     """Check for question storage before reading the staff record."""
-    return issues_folder(document) is not None or any(
+    folder = issues_folder(document)
+    if isinstance(folder, ProposalsUnavailable):
+        raise OSError(f"{folder.document}: {folder.reason}")
+    return isinstance(folder, ProposalsFolder) or any(
         path.is_dir() for path in STATE_DIR.glob("*/questions")
     )
 
