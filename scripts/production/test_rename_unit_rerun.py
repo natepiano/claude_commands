@@ -116,7 +116,7 @@ class UnitRenameRerunTests(UnitRenameFixture):
             with mock.patch.object(rename_unit, "run_shutdown", side_effect=interrupted):
                 failed = self.rename("apply")
             self.assert_refused(failed, "stopped after restart")
-            self.assertEqual(self.journal()["step"], 9)
+            self.assertEqual(self.journal()["step"], 8)
             self.assertEqual(len(live), 1)
             with mock.patch.object(rename_unit, "run_shutdown", side_effect=restart):
                 self.assert_ok(self.rename("apply"))
@@ -182,7 +182,7 @@ class UnitRenameRerunTests(UnitRenameFixture):
         save = rename_unit._save  # pyright: ignore[reportPrivateUsage]
 
         def interrupted(path: Path, renamed: rename_unit.UnitRename) -> None:
-            if renamed.step == 10:
+            if renamed.step == 9:
                 raise OSError("stopped before relaunch progress save")
             save(path, renamed)
 
@@ -190,7 +190,7 @@ class UnitRenameRerunTests(UnitRenameFixture):
             self.assert_refused(self.rename("apply"), "stopped before relaunch progress save")
         _ = self.mark_live("gamma-unit", "8ca61a08-5cf2-5401-b624-d90a6ca60358")
         self.assert_refused(self.rename("apply"), "gamma-unit has a live Claude")
-        self.assertEqual(self.journal()["step"], 9)
+        self.assertEqual(self.journal()["step"], 8)
 
 
 if __name__ == "__main__":

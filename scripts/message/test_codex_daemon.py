@@ -29,6 +29,18 @@ class CodexDaemonTests(unittest.TestCase):
         self.root = Path(self.enterContext(short_socket_directory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root)}, clear=True)))
 
+    def test_queue_default_uses_the_current_configured_timeout(self) -> None:
+        config = self.root / "config"
+        config.mkdir()
+        daemon = codex_daemon.CodexDaemon(self.root, self.root / "daemon.sock")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
+            for seconds in (0.15, 0.35):
+                _ = (config / "codex_daemon.conf").write_text(
+                    f"# range: 0.001..\nqueue_timeout_seconds={seconds}\n")
+                with mock.patch.object(codex_daemon, "_queue_socket", return_value=codex_daemon.Queued()) as queue:
+                    self.assertIsInstance(codex_daemon.queue(daemon, "thread", "body"), codex_daemon.Queued)
+                queue.assert_called_once_with(daemon.socket, "thread", "body", seconds)
+
     def test_loaded_sessions_initializes_pages_and_reads_each_thread(self) -> None:
         methods: list[str] = []
 
@@ -121,7 +133,7 @@ class CodexDaemonTests(unittest.TestCase):
 
         socket_path = self.root / "notifications.sock"
         with FakeDaemon(socket_path, conversation):
-            with mock.patch.object(codex_daemon, "TIMEOUT_SECONDS", 0.05):
+            with mock.patch.object(codex_daemon, "timeout_seconds", return_value=0.05):
                 found = codex_daemon.loaded_sessions(socket_path)
 
         self.assertEqual(
@@ -144,7 +156,7 @@ class CodexDaemonTests(unittest.TestCase):
 
         socket_path = self.root / "alternating-cursors.sock"
         with FakeDaemon(socket_path, conversation):
-            with mock.patch.object(codex_daemon, "TIMEOUT_SECONDS", 0.1):
+            with mock.patch.object(codex_daemon, "timeout_seconds", return_value=0.1):
                 found = codex_daemon.loaded_sessions(socket_path)
 
         self.assertEqual(requested_cursors, ["", "A", "B"])

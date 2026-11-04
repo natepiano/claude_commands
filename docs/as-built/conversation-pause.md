@@ -19,9 +19,24 @@ message_arrived(
 ) -> HookReply
 ```
 
-`PromptSource` is `TYPED`, `PEER`, `SCHEDULED` or `NOTICE`. Only a typed prompt pauses, and only its own session (`pauses(source)`). A peer message, a tick or a relay never pauses, and a peer's answer to the return question changes nothing: until 2026-10-13 a peer message paused a unit director, and a review unit's hourly health tick, relayed by another session, paused its timer and put the return question on screen six times while the user never typed in that pane. Scheduled prompts, notifier senders, task notices and system reminders do not pause anything; `JOB_SENDERS` includes `shutdown`, so `/shutdown` messages never pause a session. `/shutdown restart` and `add_unit.py` record a restored session's first prompt with `record_scheduled_prompts` before launch, so it is read as scheduled. The Stop hook records `session_crons[].prompt`; the prompt hook recognizes the next scheduled prompt by exact text or its recorded clipped prefix. These records expire after `SCHEDULED_PROMPT_RETENTION_SECONDS`, eight days.
+`PromptSource` is `TYPED`, `PEER`, `SCHEDULED` or `NOTICE`. Only a typed prompt pauses, and only its own session (`pauses(source)`). A peer message, a tick or a relay never pauses, and a peer's answer to the return question changes nothing: until 2026-10-13 a peer message paused a unit director, and a review unit's hourly health tick, relayed by another session, paused its timer and put the return question on screen six times while the user never typed in that pane. Scheduled prompts, notifier senders, task notices and system reminders do not pause anything; `JOB_SENDERS` includes `shutdown`, so `/shutdown` messages never pause a session. `/shutdown restart` records slash-command prompts before launch. It marks prose with the script envelope. `add_unit.py` records its initial command before launch. The Stop hook records `session_crons[].prompt`; the prompt hook recognizes the next scheduled prompt by exact text or its recorded clipped prefix. These records expire after `SCHEDULED_PROMPT_RETENTION_SECONDS`, eight days.
 
-**Only the user's own prompt is `TYPED`** (2026-10-22). A `TYPED` prompt in a showrunner or unit director also runs `auto_silence.py active`, which ends an auto silence. At 04:34 AST on 2026-10-22 a Claude Code `[Cross-session idle notice]` in the style showrunner ended one and pushed "You are back" while the user slept; four of the seven ends from 2026-10-20 20:21 to 2026-10-22 08:26 followed such a notice. Two rules now hold. Claude Code's own prompts, `[Cross-session <kind> notice]` (`HARNESS_NOTICE`) and the usage-reset continuation, are `NOTICE`. `Herdr.prompt`, the one call every script types a prompt through (`session_pane.py type`, launch and restore opening prompts), first records the pane and the words in `scripts/lib/script_prompts.py`; the prompt hook reads its own `HERDR_PANE_ID` and reads a recorded prompt as `SCHEDULED` for `KEEP_SECONDS`, six hours. The hook input cannot tell the user's keys from a script's: Claude Code sends only `prompt` and `session_title`, and a prompt typed into the pane is `promptSource: typed` in the transcript too.
+**Only the user's own prompt is `TYPED`.** The hook passes the source and session identity to `auto_silence.py active`.
+Only `UserTypedPrompt` changes `last_active` or ends automatic silence.
+Peer prompts, script prompts, harness notices, and unknown prompts preserve silence.
+Claude Code supplies no trusted keyboard-origin field in the hook input.
+
+`Herdr.prompt` encloses generated prose in a script envelope.
+`session_pane.type_place` uses the same producer.
+The classifier checks this envelope before it reads records.
+Enveloped prompts write no records.
+Only slash commands use records, with no time expiry.
+Each submission adds one record, and each hook use consumes one record per identity.
+A failed slash-command submission retains its record because input can still arrive.
+`config/script_prompts.conf` sets `max_records=4096`, read at use.
+At capacity, the store logs and removes the oldest record before it accepts a new record.
+Slash-command classification is a heuristic, as described in `session-roster.md`.
+Raw agent calls to `herdr send-text` remain outside this source-marking rule.
 
 `scripts/hooks/user-prompt-submit-conversation-pause.py` classifies the prompt, stamps typed activity through `escalate.typed()`, and calls `message_arrived`. `scripts/hooks/stop-conversation-pause.py` calls:
 
@@ -100,19 +115,27 @@ A unit's run state is stored nowhere. `unit_lookup.read_run_states()` reads each
 
 `docs/production_format.md`, `commands/showrunner/produce.md` and `docs/direct/final_gate_commit.md` allow any unit or showrunner to correct a file under `docs/as-built/` when it contradicts the code. No approval from the user, showrunner or owning unit is required. A unit still names the file as `also touches` in its checkpoint notice, and the showrunner does not delay a merge because of that correction.
 
-Every repository phone alert goes through `send.py --to user`. A session writes its own text:
+Message the user with `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id ID --value KEY=VALUE`. Use `decision.choices` for choices, `alert.blocked` for emergencies, and `nate.adhoc` for notes without an action. Each template supplies its need and action. Emergency pushes also need `--clears-when "<check>"`. A decision uses normal priority unless its explicit-offset `--due` falls inside the configured window. Use a specific registered template when one fits. Run `review.py show ID` for its values. For `decision.choices`, pass `choices` as a JSON list of objects with `label` and `effect`. Also supply `sender`, `title`, `session`, `machine`, `situation`, `recommended_choice`, and `recommendation_reason`.
 
-```text
-scripts/message/send.py --to user \
-  --need note|decision|blocked \
-  (--action "<what the user does>" | --no-action) \
-  --summary "<title>" \
-  --text "<message>"
-```
+For `decision.choices`, file the question with `/unit:question` or `/showrunner:question`, then pass its record path with `--question`.
+Filing a question alone never sends a push.
 
-`send.py` owns the user channel and maps `note`, `decision` and `blocked` to priorities 0, 1 and 2. A user message names the user's action or says none is needed: without `--action` or `--no-action` `send.py` exits 2 with a usage error, and `decision` and `blocked` require `--action`. The gate itself is `scripts/notify/pushover.py` (`docs/as-built/session-roster.md`, "Messages to the user"), and every push is reviewed for clarity before it is posted (`docs/as-built/message-clarity.md`); callers do not invoke `pushover.py` themselves. On the Mac they add `--machine natedev`.
+`send.py` owns the user channel.
+Notes use priority 0, and blocked pushes use priority 2.
+Decisions use priority 0 unless an explicit-offset `--due` satisfies `0 < due - now <= decision_high_priority_window_seconds`.
+`config/send.conf` sets this window to 1800 seconds.
+The channel recalculates decision priority when it releases a kept push.
+An overdue decision uses priority 0 and prints a diagnostic.
+`--priority 1` cannot bypass the deadline rule.
 
-A script never writes a literal phone text. It renders a catalog entry from `scripts/notify/push_catalog.py` and sends it with `push_texts.user_send_argv`, which becomes `send.py --to user --text-id ID --value k=v…`; the entry sets the need and the action. The script callers are `rust_release.send_release_text(push)` (`rust.*`), the phone branch of `sweep.send_floor_alert` (`sweep.disk_floor`), `codex_winddown` (`codex.reset_ready`), `quota_alert` (`quota.*`) and `restart_support.alert_user` (`shutdown.*`, the only phone path in `scripts/shutdown/`). `escalate.py`'s held messages send with the hold's own `--need` and action. `ci_points.review_watch` writes its alert to the production log and sends no push. The showrunner, build-report and fix instructions use the session command.
+A registered template supplies the action state.
+Decisions and blocked pushes require `--action`, including priority 0 decisions.
+Missing action flags cause a usage error with exit 2.
+`scripts/notify/pushover.py` reviews each push before delivery.
+Callers use `send.py`; they do not invoke `pushover.py` directly.
+Mac callers add `--machine natedev`.
+
+A script never writes a literal phone text. It renders a catalog entry from `scripts/notify/push_catalog.py` and sends it with `push_texts.user_send_argv`, which becomes `send.py --to user --text-id ID --value k=v…`; the entry sets the need and the action. The script callers are `rust_release.send_release_text(push)` (`rust.*`), the phone branch of `sweep.send_floor_alert` (`sweep.disk_floor`), `codex_winddown` (`codex.reset_ready`), `quota_alert` (`quota.*`) and `restart_support.alert_user` (`shutdown.*`, the only phone path in `scripts/shutdown/`). `escalate.py` delivers registered holds through the same helper. It retains legacy free-text holds without delivery. `ci_points.review_watch` writes its alert to the production log and sends no push. The showrunner, build-report and fix instructions use the session command.
 
 ## Invariants
 
@@ -127,7 +150,7 @@ A script never writes a literal phone text. It renders a catalog entry from `scr
 - Both hooks have a five-second budget, print at most one error line, and exit 0 so a prompt or reply cannot fail because the pause failed.
 - `unit_lookup.read_run_states().state(worktree)`, not prose in a production row, is authoritative for whether the stall watch monitors a unit.
 - Correcting an as-built doc that contradicts the code is always allowed; cross-unit notice rules still apply.
-- Every scripted phone alert enters `scripts/message/send.py --to user`, with `--action` or `--no-action` or with a catalog `--text-id`; channel choice stays inside `send.py`.
+- Every scripted phone alert enters `scripts/message/send.py --to user`, with a catalog `--text-id`; channel choice stays inside `send.py`.
 
 ## Gotchas
 

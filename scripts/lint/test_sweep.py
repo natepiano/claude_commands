@@ -2703,7 +2703,7 @@ raise SystemExit(int(os.environ[variable]))
               redirect_stdout(io.StringIO())):
             self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
                                                    phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB, PAGE_PATHS)))
-        self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list], [40, 220])
+        self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list], [170, 345])
         self.assertEqual(run.call_count, 2)
 
     def test_phone_disk_alert_keeps_action_and_build_shortfall_without_directory_dump(self) -> None:

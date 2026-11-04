@@ -91,7 +91,7 @@ class ProfileNotesPassTests(unittest.TestCase):
         )
         for module, attribute, value in paths:
             _ = self.enterContext(patch.object(module, attribute, value))
-        for attribute in ("CONFIG", "NOTIFIER_STATE_DIR", "SESSIONS_DIR", "SHOWRUNNER_STATE_DIR"):
+        for attribute in ("CONFIG", "NOTIFIER_STATE_DIR", "SHOWRUNNER_STATE_DIR"):
             _ = self.enterContext(patch.object(self.pass_.showrunners, attribute, self.home / attribute))
         _ = self.enterContext(patch.object(import_module("scripts.message.process_table"), "PS", [str(self.bin / "ps")]))
         _ = (self.home / "showrunners.json").write_text(json.dumps({
@@ -146,6 +146,7 @@ class ProfileNotesPassTests(unittest.TestCase):
             self.assertTrue(any(Path(file).name == "unit_watchdog.py" and name == "run"
                                 for file, _, name in functions))
             self.assertEqual(measured.calls["agent_notes.write_note"], 1)
+            self.assertEqual(measured.calls["agent_notes.write_sessions_seen"], 1)
             self.assertEqual(measured.calls["codex_pacer.write_atomic"], 3)
             self.assertEqual(measured.calls[timer_save_name], 0)
             self.assertGreater(measured.calls["scripts.accounts.refusal_watch._watch_lock"], 0)

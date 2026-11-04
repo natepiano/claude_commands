@@ -123,9 +123,6 @@ def find_unit(slug: str, given: str, *, record: staff.StaffSnapshot | None = Non
         raise Refused(f"{name}: staff worktree belongs to {location.machine}; run resume there")
     worktree = location.path
     retired = isinstance(location, staff.RemovedWorktree)
-    path_text = production_units.cell_value(row.get("Worktree", ""))
-    if path_text and path_text not in ("—", "-") and Path(path_text).expanduser() != worktree:
-        raise Refused(f"{name}: staff worktree {worktree} conflicts with Units row {path_text}")
     branch = production_units.cell_value(row.get("Branch", ""))
     saved = unit_config.read_parked(member.row.id, cleanup=False)
     current = unit_config.read(worktree, cleanup=False)

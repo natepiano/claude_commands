@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 import io
 import os
@@ -436,23 +436,22 @@ class ClientTests(unittest.TestCase):
     def test_down_alert_sends_once_per_outage_and_start_clears_the_claim(self) -> None:
         import time
         import subprocess
-        from scripts.accounts import outage_alerts
         with AdmissionFixture() as fixture:
             fixture.clock.epoch = time.time()
-            claim = outage_alerts.claim("build-admission")
-            self.assertIsInstance(claim, outage_alerts.AlertClaim)
-            assert isinstance(claim, outage_alerts.AlertClaim)
             commands: list[list[str]] = []
             def deliver(command: list[str], *, check: bool) -> subprocess.CompletedProcess[str]:
                 self.assertFalse(check)
                 commands.append(command)
+                with redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(client.down_alert(), 0)
+                self.assertRegex(output.getvalue(), r"^already claimed by [0-9a-f]+\n$")
+                self.assertEqual(len(commands), send.call_count)
                 return subprocess.CompletedProcess(command, 0)
             with mock.patch.object(client, "CLOCK", fixture.clock), \
                  mock.patch.object(client, "view", side_effect=wire.AdmissionUnavailable("no socket")), \
                  mock.patch.object(subprocess, "run", side_effect=deliver) as send:
                 self.assertEqual(client.down_alert(), 0)
-                send.assert_not_called()
-                outage_alerts.release(claim)
+                self.assertEqual(send.call_count, 1)
                 self.assertEqual(client.down_alert(), 0)
                 self.assertEqual(send.call_count, 1)
                 self.assertEqual(client.down_alert(), 0)

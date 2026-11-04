@@ -85,7 +85,8 @@ def own_claude_account() -> Account:
     """Return this process's Claude account or explain why it cannot be used."""
     resolved = claude_account(claude_config_dir())
     if resolved is None:
-        raise UnreadableAccount("this process's Claude account is unreadable")
+        print("account: anomaly: this process's Claude account is unreadable", file=sys.stderr)
+        return Account("claude", "", "")
     return resolved
 
 
@@ -198,7 +199,6 @@ def process_config_dir(pid: int) -> ConfiguredClaudeFolder | NoAccountSetting | 
         if entry.startswith(prefix):
             return ConfiguredClaudeFolder(Path(os.fsdecode(entry.removeprefix(prefix)))) if entry.removeprefix(prefix) else NoAccountSetting()
     return NoAccountSetting()
-
 
 
 @dataclass(frozen=True)

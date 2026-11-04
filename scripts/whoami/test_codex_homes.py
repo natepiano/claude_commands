@@ -500,9 +500,9 @@ class CodexHomesTests(unittest.TestCase):
             report = asyncio.run(agent_accounts.codex_live(home))
         self.assertIsNotNone(report.problem)
         self.assertIn("~/.codex1", report.problem or "")
-        self.assertIn('/showrunner:accounts setup codex1', report.problem or "")
+        self.assertIn('~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup codex1', report.problem or "")
         self.assertEqual(report.codex_startup, agent_accounts.CodexStartupFailure(
-            home, '/showrunner:accounts setup codex1'))
+            home, '~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup codex1'))
 
 
 if __name__ == "__main__":

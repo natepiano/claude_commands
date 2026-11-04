@@ -25,6 +25,11 @@ class LocalKeyNoticeTests(unittest.TestCase):
         self.ledger = self.root / notices.LEDGER
         config = self.root / "config"
         config.mkdir()
+        _ = (config / "send.conf").write_text(
+            (Path(__file__).resolve().parents[2] / "config/send.conf").read_text())
+        for name in ("postmaster", "codex_daemon"):
+            source = Path(__file__).resolve().parents[2] / "config" / f"{name}.conf"
+            _ = (config / source.name).write_text(source.read_text())
         _ = (config / "settings.conf").write_text("local_key_notice_to=fixture-destination\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "CONF_DIR": str(config),
                              "XDG_STATE_HOME": str(self.root / "state")})))
@@ -46,8 +51,15 @@ class LocalKeyNoticeTests(unittest.TestCase):
         arguments = cast(list[str], send.call_args.args[0])
         self.assertEqual(arguments[:2], [str(self.root / "scripts/lib/py"), str(self.root / "scripts/message/send.py")])
         self.assertEqual(arguments[arguments.index("--to") + 1], "fixture-destination")
-        from scripts.message.send import TIMEOUT
-        self.assertEqual(send.call_args.kwargs["timeout"], TIMEOUT + 40)
+        from scripts.lib import conf
+        self.assertEqual(send.call_args.kwargs["timeout"], conf.read("send").number("delivery_timeout")
+                         + 2 * conf.read("send").number("kill_grace")
+                         + conf.read("send").number("remote_transport_seconds")
+                         + conf.read("send").number("caller_margin_seconds")
+                         + conf.read("postmaster").number("wait_seconds")
+                         + conf.read("postmaster").number("claim_grace_seconds")
+                         + 2 * conf.read("send").number("waits_review_seconds")
+                         + 2 * conf.read("codex_daemon").number("timeout_seconds"))
         self.assertEqual(notices.read_history(self.ledger), {"fixture": {"firstKey": "accepted"}})
         _ = (self.root / "config/settings.conf").write_text("local_key_notice_to=changed-destination\n")
         notices.record(self.root, "fixture", ["firstKey", "secondKey"])

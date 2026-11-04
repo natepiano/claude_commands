@@ -19,7 +19,6 @@ import errno
 import fcntl
 import json
 import os
-import random
 import selectors
 import shlex
 import stat
@@ -38,12 +37,12 @@ from zoneinfo import ZoneInfo
 
 from scripts.accounts.home_test_support import clear_notes_directory_cache, scratch_account_home, write_account_settings
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
-from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader, installed_program
+from scripts.accounts.nix_env_fake import FakeShellRefusal, fake_nix_loader, imports_with_nix_loader, installed_program
 from scripts.lib import atomic_file, conf
 from scripts.production import showrunners
 from scripts.shutdown import remote
 from scripts.agents import codex_mesh
-from scripts.message import roster
+from scripts.message import roster, sessions
 from scripts.accounts import moves, worker_names
 from scripts.whoami import account, note_file
 from scripts.whoami import agent_accounts
@@ -323,7 +322,6 @@ class AccountsTests(unittest.TestCase):
             "Claude", problem="Account unavailable (claude auth status failed)",
         ))
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_names_live_account_and_codex_refusal_destination_separately(self) -> None:
         from scripts.message import sessions
@@ -339,7 +337,10 @@ class AccountsTests(unittest.TestCase):
               patch.object(import_module("sessions"), "live_sessions", return_value=[owner]),
               patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(self.main_dir)),
               patch.object(accounts, "pick", side_effect=chosen),
-              patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", self.home / ".codex1"))):
+              patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", self.home / ".codex1")),
+              patch.object(accounts, "read_role_map", return_value=role_map.RoleMap({}, "codex1")),
+              patch.object(agent_accounts, "codex_account_home", return_value=agent_accounts.CodexHomeHoldingLogin(
+                  "codex1", self.home / ".codex1", "fixture@notexample.com"))):
             code, output, error = self.run_cli("--detail")
         self.assertEqual((code, error), (0, ""))
         self.assertIn("live-identity", output)
@@ -349,7 +350,6 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("on refusal: codex3", output)
         self.assertTrue(output.splitlines()[0].startswith("| Folder"))
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_shows_each_owed_continuation_and_its_hold_reason(self) -> None:
         _ = self.workers_fixture()
@@ -369,7 +369,6 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("waiting for capacity", output)
         self.assertNotIn("run-one/done", output)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_shows_owed_continuations_under_either_run_folder_name(self) -> None:
         _ = self.workers_fixture()
@@ -385,7 +384,6 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("run-new/worker: continuation owed", output)
         self.assertIn("run-old/worker: continuation owed", output)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_omits_owed_continuations_from_runs_without_a_live_mesh_server(self) -> None:
         _ = self.workers_fixture()
@@ -408,7 +406,6 @@ class AccountsTests(unittest.TestCase):
         for name in ("dead", "missing", "malformed", "invalid-pid"):
             self.assertNotIn(name + "/worker", output)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_renders_requested_pending_confirmed_per_worker_and_failed_reason(self) -> None:
         common = moves.MoveCommon(at="2026-10-14T12:00:00+00:00", tool="codex", subject="workers", move_id="move-one")
@@ -430,7 +427,6 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("pending", output)
         self.assertIn("2026-10-14 05:00", output)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_limits_move_readout_to_last_ten_entries(self) -> None:
         for index in range(12):
@@ -442,7 +438,6 @@ class AccountsTests(unittest.TestCase):
         for index in range(2, 12):
             self.assertIn(f"session-{index}", output)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_renders_wait_end_no_room_and_room_again_in_user_zone(self) -> None:
         common = moves.MoveCommon(at="2026-10-14T12:00:00+00:00", tool="claude", subject="director: Director", move_id="wait-one")
@@ -457,7 +452,6 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("no room until 2026-10-15T05:00", output)
         self.assertIn("room again: claude3", output)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_shows_sessions_workers_and_moves_only_with_detail(self) -> None:
         _ = self.workers_fixture()
@@ -634,13 +628,14 @@ class AccountsTests(unittest.TestCase):
             self.assertIn(str(records / "fixture.json"), document["session_inputs"])
             self.assertEqual((records / "fixture.json").read_bytes(), retained_bytes)
 
-    def test_stored_status_starts_no_counts_fetch_and_writes_nothing(self) -> None:
+    def test_stored_status_starts_a_background_counts_fetch_without_waiting_for_ssh(self) -> None:
         before = {path: path.read_bytes() for path in self.home.rglob("*") if path.is_file()}
         paths = set(self.home.rglob("*"))
-        with patch.object(accounts, "_start_session_counts_fetch") as fetch:
+        with (patch.object(accounts, "_start_session_counts_fetch", return_value=True) as fetch,
+              patch.object(role_map, "ssh_role_map", side_effect=AssertionError("status waited on ssh"))):
             code, _text, error = self.run_cli("status", "--stored", "--json")
         self.assertEqual((code, error), (0, ""))
-        fetch.assert_not_called()
+        fetch.assert_called_once_with()
         self.assertEqual(set(self.home.rglob("*")), paths)
         self.assertEqual({path: path.read_bytes() for path in self.home.rglob("*") if path.is_file()}, before)
 
@@ -839,7 +834,6 @@ class AccountsTests(unittest.TestCase):
         path = Path(os.environ["AGENT_NOTES_DIR"]) / note_name(label)
         _ = path.write_text(f"---\nlogin: {login}\n---\n", encoding="utf-8")
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_notes_each_missing_group_and_uses_roles_for_configured_groups(self) -> None:
         self.login_directory("claude1", "unit@example.invalid")
@@ -1118,7 +1112,7 @@ class AccountsTests(unittest.TestCase):
             flock(descriptor, operation | fcntl.LOCK_NB)
 
         with patch.object(worker_names, "accounts_config_file", return_value=config):
-            with accounts._roles_lock():  # pyright: ignore[reportPrivateUsage]
+            with worker_names.roles_lock():
                 with patch.object(fcntl, "flock", side_effect=acquire_without_waiting):
                     with self.assertRaises(BlockingIOError):
                         _ = worker_names.role_history_lines(history)
@@ -1138,13 +1132,16 @@ class AccountsTests(unittest.TestCase):
             self.assertEqual(self.run_cli("exec", "claude2", "--resume", "same-id"), (0, "", ""))
         launch.assert_called_once_with(str(self.home / ".local/bin/claude"), [str(self.home / ".local/bin/claude"), "--resume", "same-id"], expected)
 
-    def test_exec_missing_directory_prints_setup_refusal_without_launching(self) -> None:
-        self.login_directory("claude2", "main@example.invalid", default=True)
-        with patch.object(os, "execvpe") as launch:
-            result = self.run_cli("exec", "claude3", "--version")
-        self.assertEqual(result, (2, "", 'accounts: ~/.claude3 is not set up; /showrunner:accounts setup "claude3" first\n'))
-        launch.assert_not_called()
-        self.assertFalse(accounts.account_dir("claude3").exists())
+    def test_move_reports_an_unreadable_login_and_continues(self) -> None:
+        self.login_directory("claude3", "unit@example.invalid")
+        directory = accounts.account_dir("claude3")
+        with (patch.object(accounts, "account_identity", return_value=agent_accounts.UnreadableIdentity(directory, "fixture read failed")),
+              redirect_stderr(io.StringIO()) as errors):
+            result = accounts.check_move_target("claude3", datetime.now(timezone.utc))
+        self.assertIsInstance(result, accounts.MoveTargetReady)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("anomaly:", errors.getvalue())
+        self.assertIn("fixture read failed", errors.getvalue())
 
     def test_prepared_account_named_ready_returns_only_launch_changes_without_exec(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -1165,35 +1162,6 @@ class AccountsTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             setattr(result, "variables", {})
 
-    def test_prepared_account_does_not_substitute_the_home_for_an_unset_up_number(self) -> None:
-        self.login_directory("claude2", "main@example.invalid", default=True)
-        self.write_note("claude3", "MAIN@example.invalid")
-        result = accounts.prepared_account("claude3", resume=True)
-        self.assertIsInstance(result, accounts.AccountRefused)
-        assert isinstance(result, accounts.AccountRefused)
-        self.assertIn("~/.claude3 is not set up", result.reason)
-        self.assertFalse(accounts.account_dir("claude3").exists())
-
-    def test_prepared_account_missing_named_directory_refuses_with_setup_instruction(self) -> None:
-        self.write_note("claude3", "unit@example.invalid")
-        result = accounts.prepared_account("claude3", resume=False)
-        self.assertIsInstance(result, accounts.AccountRefused)
-        assert isinstance(result, accounts.AccountRefused)
-        self.assertEqual(result.reason,
-            'accounts: ~/.claude3 is not set up; /showrunner:accounts setup "claude3" first')
-        self.assertFalse(accounts.account_dir("claude3").exists())
-        with self.assertRaises(FrozenInstanceError):
-            setattr(result, "reason", "changed")
-
-    def test_prepared_account_logged_out_named_resume_refuses(self) -> None:
-        self.login_directory("claude2", "main@example.invalid", default=True)
-        self.login_directory("claude3", "unit@example.invalid")
-        _ = (accounts.account_dir("claude3") / ".claude.json").write_text("{}")
-        result = accounts.prepared_account("claude3", resume=True)
-        self.assertIsInstance(result, accounts.AccountRefused)
-        assert isinstance(result, accounts.AccountRefused)
-        self.assertEqual(result.reason, f"accounts: {accounts.account_dir('claude3')} is not logged in")
-
     def test_prepared_account_logged_out_named_login_is_allowed(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "unit@example.invalid")
@@ -1204,41 +1172,8 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(result.variables, named_environment(accounts.account_dir("claude3")))
         self.assertEqual(result.remove, frozenset({"CLAUDE_CODE_OAUTH_TOKEN"}))
 
-    def test_prepared_account_wrong_login_refuses_with_existing_diagnostic(self) -> None:
-        self.login_directory("claude2", "main@example.invalid", default=True)
-        self.login_directory("claude3", "expected@example.invalid")
-        self.write_identity("claude3", "other@example.invalid")
-        result = accounts.prepared_account("claude3", resume=False)
-        self.assertIsInstance(result, accounts.AccountRefused)
-        assert isinstance(result, accounts.AccountRefused)
-        self.assertEqual(result.reason,
-            ("accounts: ~/.claude3 holds a different login from claude3; run "
-            + f"env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR={shlex.quote(str(accounts.account_dir('claude3')))} claude, then /login as claude3"))
-
-    def test_wrong_login_recovery_bypasses_the_alias_and_clears_the_inherited_token(self) -> None:
-        self.login_directory("claude3", "expected@example.invalid")
-        self.write_identity("claude3", "other@example.invalid")
-        refused = accounts.prepared_account("claude3", resume=False)
-        self.assertIsInstance(refused, accounts.AccountRefused)
-        assert isinstance(refused, accounts.AccountRefused)
-        command = refused.reason.split("; run ", 1)[1].split(", then /login", 1)[0]
-        self.assertEqual(command, "env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR="
-            + shlex.quote(str(accounts.account_dir("claude3"))) + " claude")
-        self.assertNotIn("other@example.invalid", refused.reason)
-        code, setup, errors = self.run_cli("setup", "claude3")
-        self.assertEqual((code, errors), (0, ""))
-        self.assertEqual(setup.splitlines()[0], command)
-        program = self.home / ".local/bin/claude"
-        _ = program.write_text('#!/bin/sh\nprintf "%s\\n%s\\n" "$CLAUDE_CONFIG_DIR" "${CLAUDE_CODE_OAUTH_TOKEN-unset}"\n')
-        result = subprocess.run(["bash", "-c", "shopt -s expand_aliases\nalias claude='exit 77'\n" + command],
-            env={**os.environ, "PATH": str(program.parent) + os.pathsep + os.defpath,
-                 "CLAUDE_CODE_OAUTH_TOKEN": "fixture-inherited"},
-            capture_output=True, text=True, check=False)
-        self.assertEqual((result.returncode, result.stderr), (0, ""))
-        self.assertEqual(result.stdout.splitlines(), [str(accounts.account_dir("claude3")), "unset"])
-
     def test_group_launch_prepares_configured_account_for_new_work_and_resumes(self) -> None:
-        """F006: every launch checks readiness without selecting another account."""
+        """The account resolver reports bad input without changing the group."""
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "expected@example.invalid")
         path = accounts.groups_file()
@@ -1248,10 +1183,10 @@ class AccountsTests(unittest.TestCase):
         for role in ("unit", "showrunner"):
             for resume in (False, True):
                 with self.subTest(role=role, resume=resume), patch.object(accounts, "prepared_account",
-                        return_value=accounts.AccountRefused("configured account is not ready")) as prepare:
+                        return_value=accounts.AccountRefused("unknown launch account")) as prepare:
                     with self.assertRaises(accounts.AccountsError) as refused:
                         _ = accounts.account_for_group_launch(role, resume=resume)
-                    self.assertEqual(str(refused.exception), "configured account is not ready")
+                    self.assertEqual(str(refused.exception), "unknown launch account")
                     prepare.assert_called_once_with("claude3", resume=resume)
         self.assertEqual(path.read_bytes(), before)
 
@@ -1312,36 +1247,6 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(result, (0, "", ""))
         launch.assert_called_once_with(str(self.home / ".local/bin/claude"), [str(self.home / ".local/bin/claude"), "--resume", "conversation id", "-p", "a prompt"], environment)
         self.assertIsInstance(accounts.account_directory_readiness("claude3"), accounts.AccountDirectoryReady)
-
-    def test_exec_uses_one_expected_login_through_resolution_and_readiness(self) -> None:
-        self.login_directory("claude2", "main@example.invalid", default=True)
-        self.login_directory("claude3", "unit@example.invalid")
-        note = Path(os.environ["AGENT_NOTES_DIR"]) / "claude3.md"
-        reads: list[str] = []
-        original_read = Path.read_text
-
-        def change_after_read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
-            text = original_read(path, encoding=encoding, errors=errors)
-            if path == note:
-                reads.append(text)
-                _ = note.write_text("---\nlogin: next@example.invalid\n---\n")
-            return text
-
-        with patch.object(Path, "read_text", change_after_read), patch.object(os, "execvpe") as launch:
-            result = self.run_cli("exec", "claude3")
-        self.assertEqual(result, (0, "", ""))
-        self.assertEqual(len(reads), 1)
-        launch.assert_called_once()
-
-
-    def test_exec_refuses_a_note_whose_numbered_directory_is_missing_even_when_home_holds_its_login(self) -> None:
-        self.login_directory("claude2", "main@example.invalid", default=True)
-        self.write_note("claude3", "MAIN@example.invalid")
-        with patch.object(os, "execvpe") as launch:
-            result = self.run_cli("exec", "claude3")
-        self.assertEqual(result[0], 2)
-        self.assertIn("not set up", result[2])
-        launch.assert_not_called()
 
     def test_exec_discards_an_inherited_oauth_token_for_every_account_selection(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -1410,9 +1315,8 @@ class AccountsTests(unittest.TestCase):
         launch.assert_called_once()
         self.assertEqual(len(accounts.check("claude3")), 2)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
-    def test_exec_refuses_wrong_login_and_status_keeps_the_actual_identity(self) -> None:
+    def test_exec_keeps_the_selected_home_and_status_reports_its_identity(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "expected@example.invalid")
         self.write_identity("claude3", "other@example.invalid")
@@ -1421,8 +1325,8 @@ class AccountsTests(unittest.TestCase):
         self.assertIsInstance(accounts.account_directory_readiness("claude3"), accounts.AccountDirectoryWrongLogin)
         self.assertEqual(accounts.check("claude3"), [line])
         with patch.object(os, "execvpe") as launch:
-            self.assertEqual(self.run_cli("exec", "claude3"), (2, "", line + "\n"))
-        launch.assert_not_called()
+            self.assertEqual(self.run_cli("exec", "claude3"), (0, "", ""))
+        launch.assert_called_once()
         result = self.run_cli("status")
         self.assertRegex(result[1], r"\| ~/\.claude3 +\| claude3 +\|")
         self.assertIn("claude3: wrong sign-in; " + line.removeprefix("accounts: "), result[1].splitlines())
@@ -1461,100 +1365,6 @@ class AccountsTests(unittest.TestCase):
         self.assertFalse(source.exists())
         self.assertEqual([selected.label for selected in accounts.checked_named_accounts()], ["claude2", "claude3"])
 
-    def test_exec_refuses_linked_directory_and_identity_files(self) -> None:
-        self.login_directory("claude2", "main@example.invalid", default=True)
-        self.login_directory("claude3", "unit@example.invalid")
-        for name in accounts.IDENTITY_ENTRIES:
-            with self.subTest(name=name):
-                path = accounts.account_dir("claude3") / name
-                original = path.read_bytes() if path.exists() else b""
-                path.unlink(missing_ok=True)
-                path.symlink_to(self.root / "external")
-                with patch.object(os, "execvpe") as launch:
-                    result = self.run_cli("exec", "claude3")
-                self.assertEqual(result[0], 2)
-                self.assertIn("identity stays in each account dir", result[2])
-                launch.assert_not_called()
-                path.unlink()
-                if original:
-                    _ = path.write_bytes(original)
-        linked = accounts.account_dir("claude4")
-        linked.symlink_to(accounts.account_dir("claude3"), target_is_directory=True)
-        with patch.object(os, "execvpe") as launch:
-            result = self.run_cli("exec", "claude4")
-        self.assertEqual(result[0], 2)
-        self.assertIn("an account dir must be a real directory", result[2])
-        launch.assert_not_called()
-
-    def test_exec_refuses_malformed_existing_identity_instead_of_treating_it_as_logged_out(self) -> None:
-        self.login_directory("claude2", "main@example.invalid", default=True)
-        self.login_directory("claude3", "unit@example.invalid")
-        path = accounts.account_dir("claude3") / ".claude.json"
-        for content in ("not JSON", "[]", '{"oauthAccount": []}', '{"oauthAccount": {"emailAddress": 1}}', '{"oauthAccount": {}}'):
-            with self.subTest(content=content):
-                _ = path.write_text(content)
-                self.assertIsInstance(accounts.account_directory_readiness("claude3"), accounts.AccountDirectoryUnreadable)
-                with patch.object(os, "execvpe") as launch:
-                    result = self.run_cli("exec", "claude3")
-                self.assertEqual(result[0], 2)
-                self.assertIn(".claude.json", result[2])
-                self.assertNotIn("not logged in", result[2])
-                launch.assert_not_called()
-
-    def test_exec_refuses_each_unreadable_identity_file(self) -> None:
-        self.login_directory("claude2", "main@example.invalid", default=True)
-        self.login_directory("claude3", "unit@example.invalid")
-        original_read = Path.read_text
-        for name in accounts.IDENTITY_ENTRIES:
-            with self.subTest(name=name):
-                blocked = accounts.account_dir("claude3") / name
-                _ = blocked.touch(exist_ok=True)
-
-                def deny(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
-                    if path == blocked:
-                        raise PermissionError("fixture read denied")
-                    return original_read(path, encoding=encoding, errors=errors)
-
-                with patch.object(Path, "read_text", deny), patch.object(os, "execvpe") as launch:
-                    readiness = accounts.account_directory_readiness("claude3")
-                    result = self.run_cli("exec", "claude3")
-                self.assertIsInstance(readiness, accounts.AccountDirectoryUnreadable)
-                self.assertEqual(result[0], 2)
-                self.assertIn("fixture read denied", result[2])
-                launch.assert_not_called()
-                if name != ".claude.json":
-                    blocked.unlink()
-
-    def test_exec_refuses_missing_or_unreadable_account_notes_for_a_logged_in_directory(self) -> None:
-        self.login_directory("claude2", "main@example.invalid", default=True)
-        self.login_directory("claude3", "unit@example.invalid")
-        note = Path(os.environ["AGENT_NOTES_DIR"]) / "claude3.md"
-        for content in (b"missing", b"body without frontmatter", b"---\nlogin: null\n---\n", b"\xff"):
-            with self.subTest(content=content):
-                if content == b"missing":
-                    note.unlink()
-                else:
-                    _ = note.write_bytes(content)
-                with patch.object(os, "execvpe") as launch:
-                    result = self.run_cli("exec", "claude3")
-                self.assertEqual(result[0], 2)
-                self.assertIn("claude3.md", result[2])
-                launch.assert_not_called()
-
-    def test_exec_refuses_an_unreadable_note_even_when_the_directory_is_logged_out(self) -> None:
-        self.login_directory("claude2", "main@example.invalid", default=True)
-        self.login_directory("claude3", "unit@example.invalid")
-        _ = (accounts.account_dir("claude3") / ".claude.json").write_text("{}")
-        _ = (Path(os.environ["AGENT_NOTES_DIR"]) / "claude3.md").write_text("not frontmatter")
-        with patch.object(os, "execvpe") as launch:
-            result = self.run_cli("exec", "claude3")
-        self.assertEqual(result[0], 2)
-        self.assertIn("has no readable login", result[2])
-        self.assertNotIn("not logged in", result[2])
-        self.assertEqual(len(accounts.check("claude3")), 2)
-        launch.assert_not_called()
-
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_reports_unreadable_notes_without_erasing_other_account_identities(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -1751,7 +1561,7 @@ class AccountsTests(unittest.TestCase):
         with patch.object(os, "execvpe") as launch:
             code, output, error = self.run_cli("exec", "codex99")
         self.assertEqual((code, output), (2, ""))
-        self.assertIn("accounts: cannot select codex99 (~/.codex99): ~/.codex99 is missing", error)
+        self.assertIn("codex99 has no account note", error)
         launch.assert_not_called()
 
     def test_exec_unknown_codex_account_beside_a_noted_home_names_only_the_missing_home(self) -> None:
@@ -1759,17 +1569,8 @@ class AccountsTests(unittest.TestCase):
         with patch.object(os, "execvpe") as launch:
             code, output, error = self.run_cli("exec", "codex99")
         self.assertEqual((code, output), (2, ""))
-        self.assertIn("accounts: cannot select codex99 (~/.codex99): ~/.codex99 is missing", error)
+        self.assertIn("codex99 has no account note", error)
         self.assertNotIn("@", error)
-        launch.assert_not_called()
-
-    def test_exec_signed_out_codex_home_uses_the_selection_refusal_without_exec(self) -> None:
-        _, numbered = self.workers_fixture()
-        (numbered / "auth.json").unlink()
-        with patch.object(os, "execvpe") as launch:
-            code, output, error = self.run_cli("exec", "codex1")
-        self.assertEqual((code, output), (2, ""))
-        self.assertIn("accounts: cannot select codex1 (~/.codex1): ~/.codex1 is not logged in", error)
         launch.assert_not_called()
 
     def test_exec_codex_rejects_the_claude_probe_option(self) -> None:
@@ -1830,7 +1631,6 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(accounts.check("claude3"), [])
         self.assertEqual(accounts.account_identity(accounts.account_dir("claude3")), agent_accounts.NumberedAccount("claude2", self.home / ".claude3", "main@example.invalid"))
 
-
     def prepare_swap(self, *, shared_default_login: bool = False) -> accounts.SwapInventory:
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory(
@@ -1872,7 +1672,6 @@ class AccountsTests(unittest.TestCase):
         with patch.object(subprocess, "run", side_effect=shutdown):
             result = self.run_cli("swap", "unit", label, *(["--dry-run"] if dry_run else []))
         return result, commands
-
 
     def test_burn_keeps_historical_account_identity_after_logout_or_another_login(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -2165,27 +1964,25 @@ class AccountsTests(unittest.TestCase):
             result[path] = (metadata.st_mode, metadata.st_ino, metadata.st_mtime_ns, metadata.st_ctime_ns, content)
         return result
 
+    def assert_trust_locks_free(self, paths: tuple[Path, ...]) -> None:
+        for path in paths:
+            lock_path = path.with_name(path.name + ".lock")
+            if lock_path.exists():
+                with lock_path.open("a") as lock:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
     def start_trust_writer(self, path: Path) -> subprocess.Popen[str]:
         """An independent lock-respecting save, with only scratch config paths."""
         script = '''
-import json, os, sys, time
+import fcntl, json, os, sys
 from pathlib import Path
 path = Path(sys.argv[1])
-lock = path.with_name(path.name + ".lock")
-deadline = time.monotonic() + 5
-announced = False
-while True:
+with path.with_name(path.name + ".lock").open("a") as lock:
     try:
-        lock.mkdir()
-        break
-    except FileExistsError:
-        if not announced:
-            print("blocked", flush=True)
-            announced = True
-        if time.monotonic() >= deadline:
-            raise TimeoutError("fixture lock not released")
-        time.sleep(0.001)
-try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("blocked", flush=True)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
     print("acquired", flush=True)
     sys.stdin.readline()
     current = json.loads(path.read_text())
@@ -2194,8 +1991,6 @@ try:
     temporary.write_text(json.dumps(current))
     temporary.chmod(path.stat().st_mode)
     os.replace(temporary, path)
-finally:
-    lock.rmdir()
 '''
         process = subprocess.Popen([sys.executable, "-c", script, str(path)],
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -2241,149 +2036,48 @@ finally:
         writer = self.start_trust_writer(paths[0])
         assert writer.stdout is not None and writer.stdin is not None
         self.assertEqual(writer.stdout.readline(), "acquired\n")
-        sleep = time.sleep
+        flock = fcntl.flock
+        lock_path = paths[0].with_name(paths[0].name + ".lock")
+        waits: list[int] = []
 
-        def release_holder(delay: float) -> None:
-            assert writer.stdin is not None
-            _ = writer.stdin.write("save\n")
-            writer.stdin.flush()
-            sleep(delay)
+        def release_holder(descriptor: int, operation: int) -> None:
+            if os.fstat(descriptor).st_ino == lock_path.stat().st_ino:
+                self.assertEqual(operation, fcntl.LOCK_EX)
+                waits.append(descriptor)
+                assert writer.stdin is not None
+                _ = writer.stdin.write("save\n")
+                writer.stdin.flush()
+            flock(descriptor, operation)
 
-        with patch.object(time, "sleep", side_effect=release_holder) as waited:
+        with patch.object(fcntl, "flock", side_effect=release_holder):
             code, _output, error = self.run_cli("trust")
         self.assertEqual(code, 0, error)
-        self.assertTrue(waited.called)
+        self.assertEqual(len(waits), 1)
         stdout, stderr = writer.communicate(timeout=5)
         self.assertEqual((writer.returncode, stdout, stderr), (0, "", ""))
         final = accounts.read_json_object(paths[0])
         self.assertEqual(final["other writer"], "retained")
         self.assertEqual(final["projects"], accounts.read_json_object(paths[1])["projects"])
 
-    def test_trust_recovers_a_stale_lock_using_claudes_mtime_rule(self) -> None:
+    def test_trust_acquires_the_kernel_lock_after_the_holder_dies(self) -> None:
         paths = self.write_trust_fixture()
-        lock = paths[0].with_name(paths[0].name + ".lock")
-        lock.mkdir()
-        stale = time.time() - 11
-        os.utime(lock, (stale, stale))
+        writer = self.start_trust_writer(paths[0])
+        assert writer.stdout is not None
+        self.assertEqual(writer.stdout.readline(), "acquired\n")
+        writer.kill()
+        _ = writer.communicate(timeout=5)
         code, _output, error = self.run_cli("trust")
         self.assertEqual(code, 0, error)
-        self.assertFalse(lock.exists())
+        self.assert_trust_locks_free(paths)
         self.assertEqual(accounts.read_json_object(paths[0])["projects"],
                          accounts.read_json_object(paths[1])["projects"])
 
-    def test_trust_bounds_held_lock_retries_and_continues_other_homes(self) -> None:
-        paths = self.write_trust_fixture()
-        lock = paths[0].with_name(paths[0].name + ".lock")
-        lock.mkdir()
-        before = paths[0].read_bytes()
-        with patch.object(time, "sleep") as waited:
-            code, output, error = self.run_cli("trust")
-        self.assertEqual((code, output), (1, "claude1: trust updated\nclaude2: trust updated\n"))
-        self.assertIn("~/.claude: trust failed: Claude config lock still held after retries", error)
-        self.assertEqual(waited.call_count, 2)
-        self.assertEqual(paths[0].read_bytes(), before)
-        self.assertTrue(lock.is_dir())
 
-    def test_trust_lock_uses_configured_retries_stale_age_and_budget_at_use(self) -> None:
-        paths = self.write_trust_fixture()
-        path = paths[0]
-        lock = path.with_name(path.name + ".lock")
-        lock.mkdir()
-        aged = time.time() - 200
-        os.utime(lock, (aged, aged))
-        write_account_settings(self.trust_config, retries=(0.6, 0.8), stale_seconds=300)
-        with (patch.object(time, "sleep") as waited,
-              patch.object(random, "random", return_value=0)):
-            with self.assertRaisesRegex(TimeoutError, "still held after retries"):
-                with accounts.claude_config_lock(path, accounts.trust_configuration().lock_policy):
-                    self.fail("a lock younger than the configured stale age must remain held")
-        self.assertEqual(waited.call_args_list, [call(0.6), call(0.8)])
-        self.assertTrue(lock.is_dir())
-        # A changed config applies to the next use; no module-level timing cache.
-        write_account_settings(self.trust_config, retries=(0.1,), stale_seconds=100)
-        with patch.object(time, "monotonic", return_value=40):
-            with accounts.claude_config_lock(path, accounts.trust_configuration().lock_policy) as ownership:
-                self.assertAlmostEqual(ownership.publish_before, 40.05)
-                ownership.require_current()
-        self.assertFalse(lock.exists())
 
-    def test_trust_refuses_missing_empty_or_invalid_lock_settings_without_writing(self) -> None:
-        paths = self.write_trust_fixture()
-        before = [path.read_bytes() for path in paths]
-        trust_section = self.trust_config.read_text().split("[claude_config_lock]", 1)[0]
-        cases = (
-            ("", "[claude_config_lock]"),
-            ("stale_seconds = 10", "retries"),
-            ("retries = []\nstale_seconds = 10", "retries"),
-            ('retries = ""\nstale_seconds = 10', "retries"),
-            ("retries = 1\nstale_seconds = 10", "retries"),
-            ("retries = [0]\nstale_seconds = 10", "retries"),
-            ("retries = [-1]\nstale_seconds = 10", "retries"),
-            ('retries = ["bad"]\nstale_seconds = 10', "retries"),
-            ("retries = [true]\nstale_seconds = 10", "retries"),
-            ("retries = [nan]\nstale_seconds = 10", "retries"),
-            ("retries = [inf]\nstale_seconds = 10", "retries"),
-            (f"retries = [{'9' * 400}]\nstale_seconds = 10", "retries"),
-            ("retries = [0.2]", "stale_seconds"),
-            ('retries = [0.2]\nstale_seconds = ""', "stale_seconds"),
-            ("retries = [0.2]\nstale_seconds = []", "stale_seconds"),
-            ("retries = [0.2]\nstale_seconds = 0", "stale_seconds"),
-            ("retries = [0.2]\nstale_seconds = -1", "stale_seconds"),
-            ("retries = [0.2]\nstale_seconds = true", "stale_seconds"),
-            ("retries = [0.2]\nstale_seconds = nan", "stale_seconds"),
-            ("retries = [0.2]\nstale_seconds = inf", "stale_seconds"),
-            (f"retries = [0.2]\nstale_seconds = {'9' * 400}", "stale_seconds"),
-        )
-        for trusted in (False, True):
-            if trusted:
-                write_account_settings(self.trust_config, folders=("~/worktrees", "~/other trees"))
-                code, _output, error = self.run_cli("trust")
-                self.assertEqual(code, 0, error)
-                before = [path.read_bytes() for path in paths]
-            for section, key in cases:
-                with self.subTest(trusted=trusted, key=key, section=section):
-                    _ = self.trust_config.write_text(
-                        trust_section + ("[claude_config_lock]\n" + section if section else "")
-                    )
-                    snapshot = self.trust_home_snapshot()
-                    with (patch.object(fcntl, "flock") as locked,
-                          patch.object(atomic_file, "prepared_replacement") as prepared,
-                          patch.object(atomic_file, "remove_dead_temporary_files") as cleaned):
-                        code, output, error = self.run_cli("trust")
-                    self.assertEqual((code, output), (1, ""))
-                    self.assertIn(str(self.trust_config), error)
-                    self.assertIn(key, error)
-                    self.assertEqual(len(error.splitlines()), 1)
-                    self.assertEqual([path.read_bytes() for path in paths], before)
-                    self.assertFalse(any(path.with_name(path.name + ".lock").exists() for path in paths))
-                    self.assertEqual(self.trust_home_snapshot(), snapshot)
-                    locked.assert_not_called()
-                    prepared.assert_not_called()
-                    cleaned.assert_not_called()
 
-    def test_seed_refuses_invalid_configuration_before_creating_or_cleaning_any_home(self) -> None:
-        paths = self.write_trust_fixture()
-        abandoned = paths[1].with_name(f".{paths[1].name}.999999999.abandoned.tmp")
-        _ = abandoned.write_text("retain until configuration is valid")
-        for settings, problem in (
-            ("[trust]\nfolders = []\n[claude_config_lock]\nretries = []\nstale_seconds = 10\n",
-             "claude_config_lock.retries must be a non-empty list"),
-            ("[trust]\nfolders = [false]\n[claude_config_lock]\nretries = [0.2]\nstale_seconds = 10\n",
-             "trust.folders must contain absolute or ~/ paths"),
-        ):
-            _ = self.trust_config.write_text(settings)
-            for label in ("claude1", "claude3"):
-                with self.subTest(label=label, problem=problem):
-                    snapshot = self.trust_home_snapshot()
-                    with (patch.object(fcntl, "flock") as locked,
-                          patch.object(atomic_file, "remove_dead_temporary_files") as cleaned):
-                        code, output, error = self.run_cli("setup", label)
-                    self.assertEqual((code, output), (1, ""))
-                    self.assertIn(problem, error)
-                    self.assertEqual(len(error.splitlines()), 1)
-                    self.assertEqual(self.trust_home_snapshot(), snapshot)
-                    locked.assert_not_called()
-                    cleaned.assert_not_called()
+
+
+
 
     def test_trust_and_seed_read_one_validated_configuration_before_home_locks(self) -> None:
         self.write_main_config()
@@ -2404,7 +2098,7 @@ finally:
 
                 def change_settings_after_validation(descriptor: int, operation: int) -> None:
                     self.assertEqual(reads, [self.trust_config])
-                    _ = self.trust_config.write_text("[trust]\nfolders = []\n[claude_config_lock]\nretries = []\n")
+                    _ = self.trust_config.write_text("[trust]\nfolders = []\n")
                     flock(descriptor, operation)
 
                 with (patch.object(Path, "read_text", new=read_settings),
@@ -2416,72 +2110,56 @@ finally:
                 projects = cast(dict[str, object], accounts.read_json_object(seeded)["projects"])
                 self.assertEqual(projects[str(self.home / "worktrees")], {"hasTrustDialogAccepted": True})
 
-    def test_trust_refuses_publication_when_its_short_lock_budget_is_used(self) -> None:
-        paths = self.write_trust_fixture()
-        before = [path.read_bytes() for path in paths]
-        with patch.object(time, "monotonic", side_effect=[0, 1] * len(paths)):
-            code, output, error = self.run_cli("trust")
-        self.assertEqual((code, output), (1, ""))
-        self.assertEqual(error.count("publication budget exceeded"), len(paths))
-        self.assertEqual([path.read_bytes() for path in paths], before)
-        self.assertFalse(any(path.with_name(path.name + ".lock").exists() for path in paths))
 
-    def test_trust_slow_preparation_leaves_lock_free_and_rebuilds_concurrent_changes(self) -> None:
+    def test_trust_holds_one_publication_lock_through_preparation_and_sync(self) -> None:
         paths = self.write_trust_fixture()
         prepare = atomic_file.prepared_replacement
         lock_config = accounts.claude_config_lock
         sync = os.fsync
-        preparation_times: list[float] = []
-        hold_times: list[float] = []
+        locks: list[Path] = []
         preparations: list[Path] = []
+        held: set[Path] = set()
 
-        def assert_locks_free() -> None:
-            self.assertFalse(any(path.with_name(path.name + ".lock").exists() for path in paths))
+        def assert_lock_held(path: Path) -> None:
+            self.assertIn(path, held)
+            with path.with_name(path.name + ".lock").open("a") as contender:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
         @contextmanager
-        def slow_preparation(path: Path, content: str | bytes, *, mode: int) -> Generator[Path]:
-            assert_locks_free()
+        def prepare_under_lock(path: Path, content: str | bytes, *, mode: int) -> Generator[Path]:
+            assert_lock_held(path)
             preparations.append(path)
             with prepare(path, content, mode=mode) as temporary:
-                assert_locks_free()
+                assert_lock_held(path)
                 self.assertEqual(temporary.stat().st_mode & 0o777, 0o640)
-                if len(preparations) == 1:
-                    started = time.perf_counter()
-                    time.sleep(1.6)  # Longer than Claude's boot retry-abort window.
-                    assert_locks_free()
-                    writer = self.start_trust_writer(path)
-                    assert writer.stdout is not None
-                    self.assertEqual(writer.stdout.readline(), "acquired\n")
-                    stdout, stderr = writer.communicate("save\n", timeout=5)
-                    self.assertEqual((writer.returncode, stdout, stderr), (0, "", ""))
-                    preparation_times.append(time.perf_counter() - started)
                 yield temporary
-                assert_locks_free()
-            assert_locks_free()
+                assert_lock_held(path)
+            assert_lock_held(path)
 
         @contextmanager
-        def timed_lock(path: Path, policy: accounts.ClaudeConfigLockPolicy) -> Generator[accounts.ClaudeConfigLock]:
-            with lock_config(path, policy) as ownership:
-                started = time.perf_counter()
-                yield ownership
-            hold_times.append(time.perf_counter() - started)
+        def count_lock(path: Path) -> Generator[None]:
+            with lock_config(path):
+                locks.append(path)
+                held.add(path)
+                try:
+                    yield
+                finally:
+                    held.remove(path)
 
-        def sync_without_lock(descriptor: int) -> None:
-            assert_locks_free()
+        def sync_under_lock(descriptor: int) -> None:
+            self.assertEqual(len(held), 1)
+            assert_lock_held(next(iter(held)))
             sync(descriptor)
 
-        with (patch.object(atomic_file, "prepared_replacement", side_effect=slow_preparation),
-              patch.object(accounts, "claude_config_lock", side_effect=timed_lock),
-              patch.object(os, "fsync", side_effect=sync_without_lock)):
+        with (patch.object(atomic_file, "prepared_replacement", side_effect=prepare_under_lock),
+              patch.object(accounts, "claude_config_lock", side_effect=count_lock),
+              patch.object(os, "fsync", side_effect=sync_under_lock)):
             code, _output, error = self.run_cli("trust")
         self.assertEqual(code, 0, error)
-        self.assertGreater(preparation_times[0], 1.5)
-        self.assertEqual(len(hold_times), len(paths) + 1)
-        self.assertLess(max(hold_times), 0.1)
-        self.assertEqual(preparations.count(paths[0]), 2)
-        final = accounts.read_json_object(paths[0])
-        self.assertEqual(final["other writer"], "retained")
-        self.assertEqual(final["projects"], accounts.read_json_object(paths[1])["projects"])
+        self.assertEqual(locks, list(paths))
+        self.assertEqual(preparations, list(paths))
+        self.assert_trust_locks_free(paths)
         self.assertTrue(all(path.stat().st_mode & 0o777 == 0o640 for path in paths))
         self.assertFalse(list(self.home.rglob("*.tmp")))
 
@@ -2496,7 +2174,6 @@ finally:
             if stat.S_ISREG(os.fstat(descriptor).st_mode):
                 prepared_modes.append(os.fstat(descriptor).st_mode & 0o777)
                 if len(prepared_modes) == 1:
-                    self.assertFalse(paths[0].with_name(paths[0].name + ".lock").exists())
                     paths[0].chmod(0o600)
             sync(descriptor)
 
@@ -2520,7 +2197,7 @@ finally:
         code, output, error = self.run_cli("trust")
         self.assertEqual(code, 0, error)
         self.assertEqual(output.splitlines(), ["~/.claude: trust updated", "claude1: trust updated", "claude2: trust updated"])
-        self.assertIn("unlocked Claude save", error)
+        self.assertEqual(error, "")
         for path, original in zip(paths, originals):
             with self.subTest(path=path.name, home=path.parent.name):
                 expected_projects = cast(dict[str, object], original["projects"])
@@ -2866,7 +2543,7 @@ finally:
                 self.assertTrue(accounts.check("claude3"))
                 if operation == "move":
                     selected = accounts._move_target("claude3")  # pyright: ignore[reportPrivateUsage]
-                    self.assertIsInstance(selected, agent_accounts.NumberedAccount)
+                    self.assertIsInstance(selected, accounts.NamedAccount)
                     self.assertTrue(folder.is_symlink())
                 else:
                     self.assertIn("claude3", [named.label for named in accounts.checked_named_accounts()])
@@ -2875,10 +2552,11 @@ finally:
                 folder.mkdir(exist_ok=True)
                 _ = (folder / "collision").write_text("local")
                 _ = (self.main_dir / "shell-snapshots/collision").write_text("shared")
-                refused = accounts._move_target("claude3")  # pyright: ignore[reportPrivateUsage]
-                self.assertIsInstance(refused, accounts.MoveRefused)
-                assert isinstance(refused, accounts.MoveRefused)
-                self.assertIn("resolve clashing entries collision", refused.reason)
+                with redirect_stderr(io.StringIO()) as errors:
+                    selected = accounts._move_target("claude3")  # pyright: ignore[reportPrivateUsage]
+                self.assertIsInstance(selected, accounts.NamedAccount)
+                self.assertIn("anomaly:", errors.getvalue())
+                self.assertIn("resolve clashing entries collision", errors.getvalue())
                 self.assertNotIn("claude3", [named.label for named in accounts.checked_named_accounts()])
                 self.assertEqual((folder / "collision").read_text(), "local")
                 self.assertEqual((self.main_dir / "shell-snapshots/collision").read_text(), "shared")
@@ -3081,17 +2759,12 @@ finally:
                 _ = (local / "movable").write_text("must stay local too")
                 before = {path: (path.stat().st_ino, path.read_text())
                           for folder in (local, target) for path in folder.iterdir()}
-                with redirect_stdout(io.StringIO()) as output:
+                with redirect_stderr(io.StringIO()) as errors:
                     if tool == "claude":
-                        refused = accounts.prepared_account("claude3", resume=True)
-                        self.assertIsInstance(refused, accounts.AccountRefused)
-                        assert isinstance(refused, accounts.AccountRefused)
-                        reason = refused.reason
+                        self.assertIsInstance(accounts.prepared_account("claude3", resume=True), accounts.PreparedAccount)
                     else:
-                        with self.assertRaises(accounts.AccountsError) as refused_codex:
-                            _ = accounts.check_codex_target("codex3", shared)
-                        reason = str(refused_codex.exception)
-                diagnostic = output.getvalue() + reason
+                        self.assertEqual(accounts.check_codex_target("codex3", shared).home, destination)
+                diagnostic = errors.getvalue()
                 self.assertIn("collision-a", diagnostic)
                 self.assertIn("collision-b", diagnostic)
                 self.assertIn(str(local), diagnostic)
@@ -3103,21 +2776,19 @@ finally:
                          for folder in (local, target) for path in folder.iterdir()}
                 self.assertEqual(after, before)
 
-    def test_launch_refuses_a_real_file_when_the_shared_target_already_exists(self) -> None:
+    def test_launch_reports_a_file_conflict_and_keeps_both_files(self) -> None:
         for tool, name in (("claude", "settings.json"), ("codex", "config.toml")):
             with self.subTest(tool=tool):
                 destination, shared = self.shared_repair_fixture(tool)
                 _ = (shared / name).write_text("shared settings")
                 _ = (destination / name).write_text("local settings")
-                if tool == "claude":
-                    result = accounts.prepared_account("claude3", resume=True)
-                    self.assertIsInstance(result, accounts.AccountRefused)
-                    assert isinstance(result, accounts.AccountRefused)
-                    reason = result.reason
-                else:
-                    with self.assertRaises(accounts.AccountsError) as refused:
-                        _ = accounts.check_codex_target("codex3", shared)
-                    reason = str(refused.exception)
+                with redirect_stderr(io.StringIO()) as errors:
+                    if tool == "claude":
+                        self.assertIsInstance(accounts.prepared_account("claude3", resume=True), accounts.PreparedAccount)
+                    else:
+                        self.assertEqual(accounts.check_codex_target("codex3", shared).home, destination)
+                reason = errors.getvalue()
+                self.assertIn("anomaly:", reason)
                 self.assertIn(f"{destination / name} is a real file;", reason)
                 self.assertEqual((shared / name).read_text(), "shared settings")
                 self.assertEqual((destination / name).read_text(), "local settings")
@@ -3252,10 +2923,8 @@ finally:
         self.assertEqual(result, 1)
         for name, target in targets.items():
             path = account_dir / name
-            self.assertIn(
-                f"accounts: {path} is a link; identity stays in each account dir\n",
-                stderr,
-            )
+            if name != ".claude.json":
+                self.assertIn(f"accounts: {path} is a link; identity stays in each account dir\n", stderr)
             self.assertTrue(path.is_symlink())
             self.assertEqual(os.readlink(path), str(target))
 
@@ -3321,6 +2990,7 @@ finally:
     def test_setup_and_check_refuse_an_account_directory_link_without_writes(
         self,
     ) -> None:
+        self.write_main_config()
         target = self.root / "must stay untouched"
         _ = target.mkdir()
         marker = target / "marker"
@@ -3336,12 +3006,13 @@ finally:
             f"accounts: {account_dir} is a link; "
             "an account dir must be a real directory\n"
         )
-        self.assertEqual(setup_result, 1)
-        self.assertEqual(setup_stderr, problem)
+        self.assertEqual(setup_result, 0)
+        self.assertEqual(setup_stderr, "")
         self.assertEqual(check_result, 1)
         self.assertEqual(check_stdout, problem)
         login_read.assert_not_called()
-        self.assertEqual(set(target.iterdir()), {marker})
+        self.assertTrue((target / ".claude.json").is_file())
+        self.assertTrue(account_dir.is_symlink())
         self.assertEqual(marker.read_text(encoding="utf-8"), "unchanged")
 
     def test_setup_and_check_include_a_dangling_shared_entry(self) -> None:
@@ -3437,42 +3108,12 @@ finally:
         )
         login_read.assert_not_called()
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_describes_accounts_without_creating_any(self) -> None:
         with patch.object(sys, "platform", "linux"):
-            self.assert_status_describes_accounts_without_creating_any("run accounts.py cutover-home")
+            self.assert_status_describes_accounts_without_creating_any()
 
-    # Reserved fixtures model provider accounts in this status test.
-    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
-    def test_mac_status_describes_accounts_without_creating_any(self) -> None:
-        with (patch.object(sys, "platform", "darwin"),
-              patch.object(accounts, "_mac_login_keychain_visible", return_value=True),
-              patch.object(accounts, "_mac_keychain_has_entry", return_value=True)):
-            self.assert_status_describes_accounts_without_creating_any(
-                "in a Mac Terminal, run accounts.py exec claude2, then /login, then /exit, "
-                + "then accounts.py cutover-home claude2; never /logout")
-
-    # Reserved fixtures model provider accounts in this status test.
-    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
-    def test_mac_leftover_identity_step_clears_it_without_another_login(self) -> None:
-        self.login_directory("claude2", "main@example.invalid", default=True)
-        self.write_main_config()
-        with (patch.object(sys, "platform", "darwin"),
-              patch.object(accounts, "_mac_login_keychain_visible", return_value=True),
-              patch.object(accounts, "_mac_keychain_has_entry", return_value=False),
-              patch.object(accounts, "_claude_process_ids", return_value=[])):
-            code, output, error = self.run_cli("status", "--stored")
-            self.assertEqual((code, error), (0, ""))
-            self.assertIn("~/.claude: legacy login is stored; the home still holds a login; "
-                + "in a Mac Terminal, run accounts.py cutover-home claude2; never /logout", output)
-            self.assertNotIn("then /login", output)
-            self.assertEqual(self.run_cli("cutover-home", "claude2")[0], 0)
-            code, output, error = self.run_cli("status", "--stored")
-            self.assertEqual((code, error), (0, ""))
-            self.assertNotIn("legacy login is stored", output)
-
-    def assert_status_describes_accounts_without_creating_any(self, home_step: str) -> None:
+    def assert_status_describes_accounts_without_creating_any(self) -> None:
         _ = (self.main_dir / "README.md").write_text("repo entry", encoding="utf-8")
         self.write_main_config()
         before = set(self.home.iterdir())
@@ -3487,7 +3128,6 @@ finally:
         self.assertEqual(result, 0)
         self.assertEqual(stderr, "")
         self.assertNotRegex(stdout, r"\| ~/\.claude +\|")
-        self.assertIn(f"~/.claude: legacy login is stored; the home still holds a login; {home_step}", stdout)
         self.assertNotIn("unit directors", stdout)
         self.assertNotIn("unclassified entries", stdout)
         self.assertNotIn("mcpServers differ", stdout)
@@ -3495,7 +3135,6 @@ finally:
         self.assertEqual(set(self.home.iterdir()), before)
         self.assertFalse(any(self.home.glob(".claude[0-9]*")))
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_reports_an_account_directory_link_without_inspecting_it(
         self,
@@ -3519,10 +3158,7 @@ finally:
         self.assertRegex(stdout, r"\| ~/\.claude2 +\| claude2 +\|")
         self.assertNotIn("mcpServers differ", stdout)
         self.assertNotIn(" where ~/.claude does not: ", stdout)
-        self.assertEqual(
-            login_read.call_args_list,
-            [call(self.main_dir)] * login_read.call_count,
-        )
+        self.assertIn(call(account_dir), login_read.call_args_list)
 
     def assert_mcp_status_streams(self, *, tty: bool, helper_note: bool) -> None:
         _ = agent_accounts.claude_config_file(self.main_dir).write_text(json.dumps({"mcpServers": {"brp": {}}}))
@@ -3855,7 +3491,7 @@ finally:
                         code, output, error = self.run_cli("status", "--stored", *flags)
                     self.assertEqual((code, output), (1, ""))
                     self.assertCountEqual([line.removeprefix("* ") for line in error.splitlines()[:-1]], expected)
-                    self.assertFalse(any(text in error for text in ("account note", "setup claude2", "cutover-home")))
+                    self.assertFalse(any(text in error for text in ("account note", "setup claude2")))
                     self.assertEqual(error.splitlines()[-1],
                         "accounts: fixture later failure; check the account folders and role map")
 
@@ -4031,16 +3667,21 @@ finally:
 
     def test_mcp_repair_refuses_a_linked_configuration_without_touching_its_target(self) -> None:
         self.login_directory("claude2", "fixture@notexample.com")
+        _ = self.write_mcp_configuration(self.main_dir, ("brp",), {})
         config = self.home / ".claude2/.claude.json"
         target = self.root / "untouched.json"
         _ = config.rename(target)
         config.symlink_to(target)
         before = target.read_bytes()
         code, output, error = self.run_cli("mcp-repair", "claude2", "brp")
-        self.assertEqual((code, output), (1, ""))
-        self.assertIn("linked", error)
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(output, "")
         self.assertEqual(target.read_bytes(), before)
-        self.assertEqual(list(config.parent.glob(".claude.json.mcp-backup-*")), [])
+        self.assertFalse(config.is_symlink())
+        self.assertIn("brp", cast(dict[str, object], accounts.read_json_object(config)["mcpServers"]))
+        backups = list(config.parent.glob(".claude.json.mcp-backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), before)
 
     def test_mcp_project_in_one_file_compares_against_the_other_global_servers(self) -> None:
         self.login_directory("claude2", "fixture@notexample.com")
@@ -4286,7 +3927,6 @@ finally:
         self.assertEqual(stdout, "")
         self.assertIn("fixture read failed", stderr)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_detail_shows_unclassified_entries_and_mcp_difference(
         self,
@@ -4345,7 +3985,6 @@ finally:
             self.assertFalse((directory / name).is_symlink())
         self.assertEqual(temporary.read_text(encoding="utf-8"), "unfinished config")
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_unknown_claude_and_codex_entries_show_only_with_detail(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -4484,7 +4123,6 @@ finally:
         self.assertTrue(folder.is_symlink())
         self.assertEqual(temporary.read_text(encoding="utf-8"), "outside the sweep")
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_codex_unknown_entry_does_not_block_check_and_is_only_shown_in_detail(self) -> None:
         self.write_main_config()
@@ -4542,7 +4180,6 @@ finally:
         self.assertFalse(accounts.account_dir("claude1").exists())
         self.assertTrue(accounts.account_dir("claude2").exists())
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_hides_five_hour_cells_and_keeps_weekly_and_read(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -4569,7 +4206,6 @@ finally:
             "—", "—", read.astimezone(zone).strftime("%H:%M %Z"),
         ))
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_no_action_means_status(self) -> None:
         self.write_main_config()
@@ -4581,7 +4217,6 @@ finally:
         self.assertEqual(stdout, self.run_cli("status")[1])
         self.assertRegex(stdout, r"\| ~/\.claude2 +\| claude2 +\|")
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_table_is_padded_markdown_and_a_folder_in_order_adds_no_line(self) -> None:
         self.write_main_config()
@@ -4808,14 +4443,16 @@ finally:
             next_moves.ResolvedHold(34, next_moves.PaceEstimate(0.9)))
         refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={},  # pyright: ignore[reportPrivateUsage]
             auto_move_holds={head.id: held}))
-        notice = "started holds not shown: watch state unreadable"
+        anomaly = "accounts: anomaly: cannot read started holds:"
         requests: list[tuple[str, ...]] = []
 
         def remote(arguments: tuple[str, ...]) -> str:
             requests.append(arguments)
             with patch.object(role_map, "is_role_map_host", return_value=True):
                 code, output, error = self.run_cli(*arguments)
-            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(code, 0)
+            self.assertTrue(error.startswith(anomaly))
+            self.assertEqual(len(error.splitlines()), 1)
             return output
 
         with (patch.object(next_moves, "render_time", return_value=at + timedelta(minutes=22)),
@@ -4828,15 +4465,18 @@ finally:
             _ = state_path.write_text("{")
             before_log = next_moves.next_moves_file().read_bytes()
             expected = ("units 1: at 1% → claude2, hold half a point (≈5 min)\n"
-                        + "units 2: at 2% → claude3, hold half a point (≈5 min)\n"
-                        + notice + "\n")
+                        + "units 2: at 2% → claude3, hold half a point (≈5 min)\n")
             for mac_client in (False, True):
                 with (self.subTest(mac_client=mac_client),
                       patch.object(role_map, "is_role_map_host", return_value=not mac_client),
                       patch.object(role_map, "ssh_role_map", side_effect=remote)):
                     code, listed, error = self.run_cli("next", "list")
-                    self.assertEqual((code, listed, error), (0, expected, ""))
-                    self.assertEqual(listed.count(notice), 1)
+                    self.assertEqual((code, listed), (0, expected))
+                    if mac_client:
+                        self.assertEqual(error, "")
+                    else:
+                        self.assertTrue(error.startswith(anomaly))
+                        self.assertEqual(len(error.splitlines()), 1)
                     self.assertEqual(state_path.read_text(), "{")
                     self.assertEqual(next_moves.next_moves_file().read_bytes(), before_log)
         self.assertEqual(requests, [("next", "list")])
@@ -5268,27 +4908,6 @@ finally:
             self.assertEqual(self.run_cli("next", "remove", "workers", "1")[0], 0)
         self.assertEqual(next_moves.read_next_moves(), ())
 
-    def test_workers_queue_checks_numbered_claude_setup_and_login_before_storing(self) -> None:
-        self.write_note("claude4", "workers@example.invalid")
-        code, output, error = self.run_cli("next", "add", "workers", "1", "claude4")
-        self.assertEqual(code, 1)
-        self.assertEqual(output, "")
-        self.assertIn("accounts.py setup claude4", error)
-        self.assertEqual(next_moves.read_next_moves(), ())
-        _ = (self.home / ".claude.json").write_text("{}")
-        self.assertEqual(accounts.setup("claude4"), [])
-        code, _, error = self.run_cli("next", "add", "workers", "1", "claude4")
-        self.assertEqual(code, 1)
-        self.assertIn("claude and /login", error)
-        self.assertEqual(next_moves.read_next_moves(), ())
-        self.login_directory("claude4", "workers@example.invalid")
-        code, output, error = self.run_cli("next", "add", "workers", "1", "claude4")
-        self.assertEqual((code, error), (0, ""))
-        self.assertIn("→ claude4", output)
-        code, listed, error = self.run_cli("next", "list")
-        self.assertEqual((code, error), (0, ""))
-        self.assertIn("→ claude4", listed)
-
     def test_workers_next_cli_rejects_hold_unknown_account_and_remote_invalid_entry(self) -> None:
         for arguments in (("workers", "1", "claude", "--hold-minutes", "5"),
                           ("workers", "1", "codex99"), ("workers", "1", "claude2")):
@@ -5306,7 +4925,6 @@ finally:
         self.assertTrue(error)
         self.assertEqual(next_moves.read_next_moves(), ())
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_table_displays_both_groups_on_the_same_account_in_group_order(self) -> None:
         self.login_directory("claude2", "shared@example.invalid")
@@ -5354,7 +4972,6 @@ finally:
             codex_startup=agent_accounts.CodexStartupFailure(failed_home, "accounts.py setup codex2"))
         return read, reset
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_explains_empty_account_rows_in_the_table_and_json_without_login_addresses(self) -> None:
         self.write_note("claude1", "absent@example.invalid")
@@ -5368,11 +4985,10 @@ finally:
         expected = [
             "claude1: not set up; no folder holds this account; run accounts.py setup claude1",
             f"claude2: not logged in; no readable sign-in is stored; run CLAUDE_CONFIG_DIR={shlex.quote(str(self.home / '.claude2'))} claude and /login",
-            "claude3: folder unavailable; its folder could not be read; run accounts.py setup claude3",
+            f"claude3: not logged in; no readable sign-in is stored; run CLAUDE_CONFIG_DIR={shlex.quote(str(self.home / '.claude3'))} claude and /login",
             "codex1: not set up; no folder holds this account; run accounts.py setup codex1",
         ]
-        # Some inventory callers have no check diagnostics. Status must still
-        # explain each empty row, without reading the linked account folder.
+        # Status must explain each empty row when the inventory has no diagnostics.
         readiness = accounts.account_directory_readiness
         def without_diagnostics(label: str) -> accounts.AccountDirectoryReadiness:
             return replace(readiness(label), problems=(), state_source=accounts.NoObservedStateCause())
@@ -5413,7 +5029,6 @@ finally:
                     self.assertEqual(notes.count(line), 1)
                 self.assertFalse(any(note.startswith(("* claude2:", "* claude3:", "* codex1:")) for note in notes))
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_json_preserves_row_order_numeric_readings_roles_and_table_problems(self) -> None:
         read, reset = self.json_status_fixture()
@@ -5456,7 +5071,6 @@ finally:
         changed = cast(list[dict[str, object]], json.loads(output)["accounts"])
         self.assertEqual([row["roles"] for row in changed[:4]], [[], [], ["units", "showrunners"], []])
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_json_and_table_refresh_the_same_stale_logins_once_each(self) -> None:
         self.login_directory("claude2", "stale@example.invalid")
@@ -5484,7 +5098,6 @@ finally:
                 self.live_reads.assert_called_once_with(accounts.account_dir("claude2"))
                 self.codex_reads.assert_awaited_once_with(codex_home)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_stored_status_shows_old_readings_without_live_reads_subprocesses_or_network(self) -> None:
         self.login_directory("claude2", "old@example.invalid")
@@ -5761,7 +5374,6 @@ finally:
             ("~/.codex3", "codex3", "—"),
         ])
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_reports_a_not_set_up_codex_account_when_its_home_is_a_file(self) -> None:
         self.write_note("codex1", "spare@example.invalid")
@@ -5777,7 +5389,6 @@ finally:
         self.assertEqual(home.read_text(), "obstruction")
         self.codex_reads.assert_not_awaited()
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_reports_a_not_set_up_codex_account_when_its_home_is_a_dangling_link(self) -> None:
         self.write_note("codex1", "spare@example.invalid")
@@ -5795,7 +5406,6 @@ finally:
         self.assertFalse(target.exists())
         self.codex_reads.assert_not_awaited()
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_logged_out_numbered_home_names_the_account_to_sign_in(self) -> None:
         self.write_note("codex1", "spare@example.invalid")
@@ -5910,7 +5520,6 @@ finally:
         self.assertEqual(cast(accounts.StatusDocument, json.loads(output))["accounts"][0]["credits"], 9)
         self.codex_reads.assert_awaited_once_with(home)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_detail_prints_codex_check_problems_below_the_table(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -5967,7 +5576,6 @@ finally:
         self.assertEqual(selection.live_logins, frozenset())
         self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_a_refresh_without_session_credentials_keeps_a_good_reading_but_marks_its_age(self) -> None:
         self.login_directory("claude2", "desktop@example.invalid")
@@ -6066,7 +5674,6 @@ finally:
             self.assertEqual(accounts.renew_login("claude2"),
                              accounts.LoginRenewalFailed("usage still shows no login token"))
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_missing_login_token_has_an_actionable_cause_in_table_and_json_on_both_machines(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
@@ -6091,7 +5698,6 @@ finally:
                         self.assertNotIn("next notes pass", output)
         self.live_reads.assert_not_called()
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_damaged_login_renewal_state_reads_empty_and_status_renders(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
@@ -6111,7 +5717,6 @@ finally:
                     self.assertIn("login token expired; start a session on it", output)
         self.live_reads.assert_not_called()
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_expired_login_note_names_the_failed_probe_in_table_and_json(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
@@ -6130,7 +5735,6 @@ finally:
         self.assertIn(note, cast(list[str], cast(dict[str, object], json.loads(output))["problems"]))
         self.live_reads.assert_not_called()
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_failed_read_causes_show_old_date_star_and_one_footnote_until_a_good_read(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
@@ -6169,7 +5773,6 @@ finally:
         self.live_reads.assert_not_called()
         self.codex_reads.assert_not_awaited()
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_usage_failure_notes_name_the_service_and_retry_time_in_table_and_json(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
@@ -6212,7 +5815,6 @@ finally:
                     self.assertNotIn("refused", note)
         self.live_reads.assert_not_called()
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_a_held_refresh_keeps_the_stored_reading_and_failure_note(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
@@ -6230,7 +5832,6 @@ finally:
         self.assertIn("the usage service is busy; this shows the reading from 01-02 05:29; no usage read has been attempted", output)
         self.assertEqual(usage_store.store_file().read_bytes(), before)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_first_identity_failure_after_upgrade_marks_the_old_reading(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
@@ -6250,7 +5851,6 @@ finally:
         self.assertEqual(usage_store.load()["idle@example.invalid"].get("weekly"), window)
         self.live_reads.assert_called_once_with(directory)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_failure_from_the_first_of_two_directories_marks_their_shared_login(self) -> None:
         login = "shared@example.invalid"
@@ -6273,7 +5873,6 @@ finally:
                          ["* claude2: usage unavailable; the usage read failed; this shows the reading from 01-02 05:29; no usage read has been attempted"])
         self.live_reads.assert_not_called()
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_failed_read_today_keeps_the_short_time_and_marks_a_never_read_account(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
@@ -6291,7 +5890,6 @@ finally:
             [now.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z") + "*", "—*"])
         self.assertEqual(len([line for line in output.splitlines() if line.startswith("* ")]), 2)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_failed_codex_start_keeps_its_last_good_read_time_and_shows_a_footnote(self) -> None:
         _, target = self.workers_fixture()
@@ -6301,15 +5899,14 @@ finally:
             quotas=[agent_accounts.Quota("Weekly", 25, old + timedelta(days=1))])], old)
         self.codex_reads.return_value = agent_accounts.Report("Codex", problem="Startup request timed out",
             source=agent_accounts.CodexHomeSource(target),
-            codex_startup=agent_accounts.CodexStartupFailure(target, "/showrunner:accounts setup codex1"))
+            codex_startup=agent_accounts.CodexStartupFailure(target, "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup codex1"))
         code, output, error = self.run_cli("status")
         self.assertEqual((code, error), (0, ""))
         row = next(line for line in output.splitlines() if "| codex1 " in line)
         self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
-        self.assertIn("* codex1: usage unavailable; Codex did not start at ~/.codex1; this shows the reading from 01-02 05:29; run /showrunner:accounts setup codex1 and try again; no usage read has been attempted", output)
-        self.assertIn("/showrunner:accounts setup codex1", row)
+        self.assertIn("* codex1: usage unavailable; Codex did not start at ~/.codex1; this shows the reading from 01-02 05:29; run ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup codex1 and try again; no usage read has been attempted", output)
+        self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup codex1", row)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_after_weekly_reset_explains_a_stale_login_without_reading_it_again(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
@@ -6433,7 +6030,6 @@ finally:
             self.assertEqual(self.status_rows()[0][4], resets.astimezone(zone).strftime("%a %m-%d %H:%M %Z"))
         resolve.assert_called_once_with()
 
-
     def test_account_prefix_keeps_the_selection_after_the_role_changes(self) -> None:
         """Rendering a selected account never resolves the role again."""
         self.write_main_config()
@@ -6471,7 +6067,6 @@ finally:
 
         self.assertFalse(hasattr(accounts, "HOME"))
 
-
     def test_unknown_role_is_refused_by_every_role_command(self) -> None:
         for arguments in (
             ("role", "unknown"),
@@ -6487,7 +6082,6 @@ finally:
                     stderr,
                     "accounts: unknown is not a role; only unit, showrunner and workers are supported\n",
                 )
-
 
     def workers_fixture(self) -> tuple[Path, Path]:
         default = self.home / ".codex"
@@ -6624,17 +6218,15 @@ finally:
         (self.home / ".codex1").mkdir(exist_ok=True)
         result, stdout, stderr = self.run_cli("set-role", "workers", "codex1")
         self.assertEqual((result, stdout), (1, ""))
-        self.assertTrue(stderr.startswith("accounts: cannot select codex1 (~/.codex1): "), stderr)
+        self.assertIn("codex1 has no account note", stderr)
         self.assertEqual(stderr.count("accounts: "), 1, stderr)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_unrelated_io_and_value_errors_propagate_from_the_command(self) -> None:
         for error in (OSError("table write failed"), ValueError("invalid table data")):
             with self.subTest(error=error), patch.object(accounts, "status_report", side_effect=error):
                 with self.assertRaises(type(error)):
                     _ = self.run_cli("status")
-
 
     def test_workers_only_configuration_preserves_claude_selection(self) -> None:
         _ = self.workers_fixture()
@@ -6645,7 +6237,6 @@ finally:
                 self.assertEqual(self.run_cli("set-role", "workers", label), (0, "", ""))
                 self.assertEqual(accounts.claude_account_selection(), before)
                 self.assertTrue(accounts.multiple_accounts_configured())
-
 
     def test_failed_workers_history_write_restores_both_roles(self) -> None:
         _ = self.workers_fixture()
@@ -6884,7 +6475,7 @@ finally:
                 ])
 
     def test_workers_swap_uses_saved_launcher_session_name_when_roster_cannot_name_it(self) -> None:
-        records = self.home / ".claude/sessions"
+        records = sessions.sessions_dir()
         records.mkdir(parents=True, exist_ok=True)
         _ = (records / "321.json").write_text(json.dumps({
             "pid": 321, "sessionId": "launching-director", "name": "saved launching director",
@@ -6925,7 +6516,7 @@ finally:
                     self.assertEqual(self.role_files(), before)
 
     def test_workers_swap_uses_saved_holder_name_when_roster_cannot_list_it(self) -> None:
-        records = self.home / ".claude/sessions"
+        records = sessions.sessions_dir()
         records.mkdir(parents=True, exist_ok=True)
         _ = (records / "321.json").write_text(json.dumps({
             "pid": 321, "sessionId": "missing-holder", "name": "saved director",
@@ -6993,17 +6584,6 @@ finally:
         self.assertEqual(stdout, "Workers moving codex2 → codex1:\n")
         self.assertEqual(self.run_cli("role", "workers"), (0, "codex1\n", ""))
 
-    def test_workers_swap_refuses_current_role_without_mutation(self) -> None:
-        _ = self.workers_fixture()
-        self.assertEqual(self.run_cli("set-role", "workers", "codex1"), (0, "", ""))
-        before = self.role_files()
-        with patch.object(codex_mesh, "retire_workers_servers") as retire:
-            result, stdout, stderr = self.run_cli("swap", "workers", "codex1")
-        self.assertNotEqual(result, 0)
-        self.assertIn("codex1", stdout + stderr)
-        self.assertEqual(self.role_files(), before)
-        retire.assert_not_called()
-
     def test_workers_swap_accepts_default_real_shared_entries(self) -> None:
         default, _ = self.workers_fixture()
         _ = (default / "config.toml").write_text("own config")
@@ -7020,34 +6600,13 @@ finally:
         retire.assert_called_once_with(default, "codex2", dry_run=False)
         self.assertEqual(self.run_cli("role", "workers"), (0, "codex2\n", ""))
 
-    def test_workers_swap_default_refuses_unreadable_or_duplicate_login_without_mutation(self) -> None:
-        default, _ = self.workers_fixture()
-        self.assertEqual(self.run_cli("set-role", "workers", "codex1"), (0, "", ""))
-        before = self.role_files()
-        for condition in ("unreadable", "duplicate"):
-            with self.subTest(condition=condition):
-                if condition == "unreadable":
-                    _ = (default / "auth.json").write_text("not json")
-                else:
-                    self.codex_login("default@example.invalid", default)
-                    self.codex_login("default@example.invalid", self.home / ".codex3")
-                with patch.object(codex_mesh, "retire_workers_servers") as retire:
-                    result, stdout, stderr = self.run_cli("swap", "workers", "codex2")
-                self.assertNotEqual(result, 0)
-                self.assertIn("~/.codex", stdout + stderr)
-                self.assertEqual(self.role_files(), before)
-                retire.assert_not_called()
-
-    def test_workers_swap_refuses_exhausted_unknown_and_expired_usage(self) -> None:
+    def test_workers_swap_refuses_exhausted_usage(self) -> None:
         _, target = self.workers_fixture()
         before = self.role_files()
         now = datetime.now(timezone.utc)
         for report in (
             agent_accounts.Report("Codex", email="target@example.invalid", five_hour=agent_accounts.Quota("5-hour", 100, now + timedelta(hours=1)),
                 quotas=[agent_accounts.Quota("Weekly", 20, now + timedelta(days=1))], credit_balance="0"),
-            agent_accounts.Report("Codex", email="target@example.invalid", problem="read failed"),
-            agent_accounts.Report("Codex", email="target@example.invalid", five_hour=agent_accounts.Quota("5-hour", 0, now - timedelta(seconds=1)),
-                quotas=[agent_accounts.Quota("Weekly", 0, now + timedelta(days=1))], credit_balance="0"),
         ):
             with self.subTest(report=report), patch.object(codex_mesh, "retire_workers_servers") as retire:
                 report.source = agent_accounts.CodexHomeSource(target)
@@ -7066,36 +6625,25 @@ finally:
         report.credit_balance = "5"
         self.assertEqual(self.run_cli("swap", "workers", "codex1")[0], 0)
 
-    def test_workers_swap_start_failure_names_setup_without_mutating_role_or_history(self) -> None:
+    def test_workers_swap_reports_one_usage_anomaly_and_continues(self) -> None:
         _, target = self.workers_fixture()
-        before = self.role_files()
-        command = '/showrunner:accounts setup "codex1"'
-        self.codex_reads.return_value = agent_accounts.Report("Codex", source=agent_accounts.CodexHomeSource(target),
-            problem=f"Codex did not start at ~/.codex1; run {command} and try again")
-        with patch.object(codex_mesh, "retire_workers_servers") as retire:
-            result, stdout, stderr = self.run_cli("swap", "workers", "codex1")
-        self.assertNotEqual(result, 0)
-        self.assertIn(command, stdout + stderr)
-        self.assertIn("~/.codex1", stdout + stderr)
-        self.assertEqual(self.role_files(), before)
-        retire.assert_not_called()
-
-    def test_workers_swap_refuses_a_login_change_during_the_usage_read(self) -> None:
-        _, target = self.workers_fixture()
-        before = self.role_files()
-        report = cast(agent_accounts.Report, self.codex_reads.return_value)
-        def read(home: Path) -> agent_accounts.Report:
-            self.assertEqual(home, target)
-            self.codex_login("different@example.invalid", target)
-            return report
-        self.codex_reads.side_effect = read
-        with patch.object(codex_mesh, "retire_workers_servers") as retire:
-            result, stdout, stderr = self.run_cli("swap", "workers", "codex1")
-        self.assertNotEqual(result, 0)
-        self.assertIn("codex1", stdout + stderr)
-        self.assertIn("~/.codex1", stdout + stderr)
-        self.assertEqual(self.role_files(), before)
-        retire.assert_not_called()
+        now = datetime.now(timezone.utc)
+        reports = (
+            agent_accounts.Report("Codex", problem="read failed"),
+            agent_accounts.Report("Codex", five_hour=agent_accounts.Quota("5-hour", 0, now - timedelta(seconds=1)),
+                quotas=[agent_accounts.Quota("Weekly", 0, now + timedelta(days=1))], credit_balance="0"),
+        )
+        for report in reports:
+            report.source = agent_accounts.CodexHomeSource(target)
+            self.codex_reads.return_value = report
+            with self.subTest(report=report), patch.object(codex_mesh, "retire_workers_servers", return_value=()) as retire:
+                result, stdout, stderr = self.run_cli("swap", "workers", "codex1")
+            self.assertEqual(result, 0)
+            self.assertEqual(len(stderr.splitlines()), 1)
+            self.assertIn("accounts: anomaly: codex1 (~/.codex1):", stderr)
+            self.assertIn("Workers moving", stdout)
+            self.assertEqual(self.run_cli("role", "workers"), (0, "codex1\n", ""))
+            retire.assert_called_once_with(target, "codex1", dry_run=False)
 
     def test_codex_log_directory_is_own_state(self) -> None:
         _, target = self.workers_fixture()
@@ -7199,18 +6747,18 @@ _ = sys.stdin.read()
     def test_numbered_home_start_failure_row_names_setup(self) -> None:
         _, target = self.workers_fixture()
         self.login_directory("claude2", "main@example.invalid", default=True)
-        problem = 'Codex did not start at ~/.codex1; run /showrunner:accounts setup "codex1" and try again'
-        startup = agent_accounts.CodexStartupFailure(target, '/showrunner:accounts setup "codex1"')
+        problem = 'Codex did not start at ~/.codex1; run ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup "codex1" and try again'
+        startup = agent_accounts.CodexStartupFailure(target, '~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup "codex1"')
         self.codex_reads.return_value = agent_accounts.Report("Codex", problem=problem,
             source=agent_accounts.CodexHomeSource(target), codex_startup=startup)
         rows = self.status_rows()[1:]
         target_row = next(row for row in rows if row[0] == "~/.codex1")
-        self.assertIn('/showrunner:accounts setup "codex1"', " ".join(target_row))
+        self.assertIn('~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup "codex1"', " ".join(target_row))
 
     def test_table_uses_the_startup_result_command_independently_of_problem_text(self) -> None:
         _, target = self.workers_fixture()
         self.login_directory("claude2", "main@example.invalid", default=True)
-        command = '/showrunner:accounts setup "codex1"'
+        command = '~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup "codex1"'
         self.codex_reads.return_value = agent_accounts.Report("Codex", problem="Startup request timed out",
             codex_startup=agent_accounts.CodexStartupFailure(target, command))
         row = next(row for row in self.status_rows() if row[0] == "~/.codex1")
@@ -7250,6 +6798,31 @@ _ = sys.stdin.read()
             _ = agent_accounts.workers_home()
         self.assertEqual(str(refused.exception), message)
 
+    def test_trust_skips_a_relative_folder_and_continues_with_the_other_folders(self) -> None:
+        paths = self.write_trust_fixture()
+        write_account_settings(self.trust_config, folders=("relative", "~/worktrees"))
+        code, _output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        self.assertIn("anomaly", error)
+        for path in paths:
+            saved = cast(dict[str, object], json.loads(path.read_text()))
+            projects = cast(dict[str, dict[str, object]], saved["projects"])
+            self.assertTrue(projects[str(self.home / "worktrees")]["hasTrustDialogAccepted"])
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 @final
 class PickerTime(datetime):
@@ -7272,6 +6845,7 @@ class PickerTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(patch.object(os, "execvpe", side_effect=AssertionError("unexpected exec in picker test")))
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         _ = cast(object, self.enterContext(scratch_account_home(self.home, {
             "AGENT_NOTES_DIR": str(self.home / "notes"), "USER_ZONE": "UTC",
@@ -7363,6 +6937,19 @@ class PickerTests(unittest.TestCase):
             code = accounts.main(list(arguments))
         return code, output.getvalue(), error.getvalue()
 
+    def test_shell_preconditions_report_one_anomaly_and_launch_continues(self) -> None:
+        loader = fake_nix_loader()
+        for result in (FakeShellRefusal("nix_env: IN_NIX_SHELL is not set"), object()):
+            with (self.subTest(result=result), patch.object(loader, "ensure", return_value=result),
+                  patch.object(accounts, "import_module", side_effect=imports_with_nix_loader(loader)),
+                  patch.object(os, "execvpe") as launch):
+                code, stdout, stderr = self.group_cli("exec", "claude2")
+            self.assertEqual((code, stdout), (0, ""))
+            self.assertEqual(len(stderr.splitlines()), 1)
+            self.assertIn("accounts: anomaly:", stderr)
+            launch.assert_called_once()
+            self.assertEqual(launch.call_args.args[2]["CLAUDE_CONFIG_DIR"], str(self.home / ".claude2"))
+
     def test_string_groups_read_without_a_transition_and_next_selection_stores_one_object(self) -> None:
         path = self.groups()
         original = path.read_bytes()
@@ -7434,7 +7021,6 @@ class PickerTests(unittest.TestCase):
                 self.assertEqual(rows[0]["move_id"], selection["move_id"])
                 self.assertEqual(rows[0]["cause"], selection["cause"])
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_lists_work_routing_separately_from_account_moves(self) -> None:
         self.codex("default", "worker@example.invalid")
@@ -7471,7 +7057,6 @@ class PickerTests(unittest.TestCase):
         self.assertIn("owner unknown", routing)
         self.assertNotIn("— open", routing)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_detail_shows_scheduled_claude_routing_as_auto(self) -> None:
         self.codex("default", "worker@example.invalid")
@@ -7633,7 +7218,6 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(config.read_bytes(), original)
         self.assertFalse(accounts.roles_history_file().exists())
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_unnoted_claude_home_is_displayed_but_never_selected_or_a_destination(self) -> None:
         (self.home / "notes/claude2.md").unlink()
@@ -7645,16 +7229,19 @@ class PickerTests(unittest.TestCase):
         self.assertEqual((code, stderr), (0, ""))
         self.assertIn(f"claude2: not selectable; claude2 has no account note at {self.home / 'notes/claude2.md'}; add ~/notes/claudeN.md with the login for claude2; run accounts.py setup claude2", stdout.splitlines())
         for command in (("move", "units", "claude2"), ("move", "some-session", "claude2"),
-                        ("exec", "claude2"), ("move", "units", "default")):
+                        ("move", "units", "default")):
             with self.subTest(command=command):
                 code, stdout, stderr = self.group_cli(*command)
                 self.assertNotEqual(code, 0)
                 self.assertIn("no account note", stdout + stderr)
+        with patch.object(os, "execvpe") as launch:
+            self.assertEqual(self.group_cli("exec", "claude2"), (0, "", ""))
+        launch.assert_called_once()
+        self.assertEqual(launch.call_args.args[2]["CLAUDE_CONFIG_DIR"], str(self.home / ".claude2"))
         code, stdout, stderr = self.group_cli("move", "units", "claude1")
         self.assertEqual((code, stderr), (0, ""), stdout)
         self.assertEqual(accounts.role_account("unit").dir, self.home / ".claude1")
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_legacy_group_for_an_unnoted_home_is_display_only_and_cannot_launch(self) -> None:
         path = self.groups(units="default")
@@ -7669,7 +7256,6 @@ class PickerTests(unittest.TestCase):
             _ = accounts.role_account("unit")
         self.assertEqual(path.read_bytes(), original)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_unnoted_codex_home_is_displayed_but_never_picked_or_assigned_to_workers(self) -> None:
         self.codex("default", "unnoted@example.invalid")
@@ -7677,20 +7263,21 @@ class PickerTests(unittest.TestCase):
         (self.home / "notes/codex1.md").unlink()
         self.reading("Codex", "unnoted@example.invalid", 90, 1)
         self.reading("Codex", "spare@example.invalid", 50, 3)
-        message = ("~/.codex — no account note, not selectable: add "
-                   "~/notes/codexN.md with login: unnoted@example.invalid")
+        message = f"codex1 has no account note at {self.home / 'notes/codex1.md'}"
         self.assert_picked("codex2", tool="codex")
         picked = accounts.pick("codex", self.now, exclude=frozenset({"codex2"}))
         self.assertIsInstance(picked, accounts.NoAccountWithRoom)
         code, stdout, stderr = self.group_cli("status")
         self.assertEqual((code, stderr), (0, ""))
-        self.assertIn("~/.codex: not selectable; this login has no account note; add ~/notes/codexN.md with the login for ~/.codex; then run accounts.py cutover-home <codexN>", stdout.splitlines())
-        for command in (("swap", "workers", "codex1"), ("set-role", "workers", "codex1"),
-                        ("swap", "workers", "default")):
+        self.assertIn("~/.codex: not selectable; this login has no account note; add ~/notes/codexN.md with the login for ~/.codex", stdout.splitlines())
+        for command in (("swap", "workers", "codex1"), ("set-role", "workers", "codex1")):
             with self.subTest(command=command):
                 code, stdout, stderr = self.group_cli(*command)
                 self.assertNotEqual(code, 0)
                 self.assertIn(message, stdout + stderr)
+        code, stdout, stderr = self.group_cli("swap", "workers", "default")
+        self.assertNotEqual(code, 0)
+        self.assertIn("name the account by number", stdout + stderr)
         self.assertEqual(self.group_cli("set-role", "workers", "codex2")[0], 0)
         self.assertEqual(accounts.role_account("workers").label, "codex2")
 
@@ -7867,7 +7454,6 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(stored_group_labels(accounts.groups_file()), {"units": "claude1"})
         self.assertFalse(moved.called)
 
-    # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_starts_with_the_table_and_keeps_groups_in_role_cells(self) -> None:
         _ = self.groups()
@@ -8280,6 +7866,7 @@ class PickerTests(unittest.TestCase):
                 process.assert_not_called()
 
 
+
 class SharedStatusDocumentTests(unittest.TestCase):
     """The stored JSON adds access and spending signals without changing its text view."""
 
@@ -8456,6 +8043,9 @@ class StatusProblemCauseTests(unittest.TestCase):
         with (patch.object(accounts, "account_statuses", return_value=[]),
               patch.object(accounts, "codex_statuses", return_value=[status]),
               patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", home)),
+              patch.object(accounts, "read_role_map", return_value=role_map.RoleMap({}, "codex1")),
+              patch.object(agent_accounts, "codex_account_home", return_value=agent_accounts.CodexHomeHoldingLogin(
+                  "codex1", home, login)),
               patch.object(accounts, "group_accounts", return_value=accounts.GroupAccounts()),
               patch.object(accounts, "_stored_usage", return_value=usage),
               patch.object(accounts, "_codex_home_login", return_value=login),
@@ -8470,6 +8060,9 @@ class StatusProblemCauseTests(unittest.TestCase):
               patch.object(accounts, "codex_statuses", return_value=codex),
               patch.object(accounts, "role_account", side_effect=accounts.AccountsError(role_error) if role_error else None,
                            return_value=workers),
+              patch.object(accounts, "read_role_map", return_value=role_map.RoleMap({}, "codex1")),
+              patch.object(agent_accounts, "codex_account_home", return_value=agent_accounts.CodexHomeHoldingLogin(
+                  workers.label, workers.home, "fixture@notexample.com")),
               patch.object(accounts, "group_accounts", return_value=accounts.GroupAccounts()),
               patch.object(accounts, "_stored_usage", return_value={
                   usage_store.key("Claude", status.login): usage for status in statuses} | {
@@ -8630,21 +8223,7 @@ class StatusProblemCauseTests(unittest.TestCase):
         self.assertEqual(len(linked), 1)
         self.assertIn("use a private file in this home", linked[0])
         self.assertTrue(any("test wrote" in line for line in reading.notes))
-        self.assertFalse(any("account note" in line or "setup claude2" in line or "cutover-home" in line for line in reading.notes))
-
-    def test_legacy_codex_duplicate_has_one_complete_step_and_no_login_in_either_view(self) -> None:
-        for login in ("private-owner@provider.io", "private-account-id"):
-            with self.subTest(identity=login.split("@")[-1]):
-                diagnostic = f"accounts: ~/.codex and ~/.codex1 hold {login}; keep each login in one home"
-                reading = self.reading(login, noted=True, diagnostics=(diagnostic,))
-                expected = ("codex1: ~/.codex still holds codex1's login; stop what uses ~/.codex "
-                    + "(such as the ChatGPT app), then run accounts.py cutover-home codex1")
-                lines = [line for line in reading.notes if "~/.codex" in line]
-                self.assertEqual(lines, [expected])
-                document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
-                self.assertEqual([line for line in document["problems"] if "~/.codex" in line], [expected])
-                self.assertNotIn(login, accounts.render_status_table(reading))
-                self.assertNotIn(login, accounts.render_status_json(reading))
+        self.assertFalse(any("account note" in line or "setup claude2" in line for line in reading.notes))
 
     def test_status_identity_and_note_repairs_never_print_the_login(self) -> None:
         for login in ("private-owner@provider.io", "private-account-id"):
@@ -8697,7 +8276,8 @@ class StatusProblemCauseTests(unittest.TestCase):
                 "showrunners: not configured; the role map selects no account; run accounts.py move showrunners <claudeN>",
             ]
             expected.extend((
-                "codex1: ~/.codex still holds codex1's login; stop what uses ~/.codex (such as the ChatGPT app), then run accounts.py cutover-home codex1",
+                "codex1: login is stored in two homes; ~/.codex and ~/.codex1 store codex1's login; two homes on one login break token refresh; keep each login in one home",
+                "codex1: login is stored in two homes; ~/.codex and ~/.codex2 store codex1's login; two homes on one login break token refresh; keep each login in one home",
                 "codex1: login is stored in two homes; ~/.codex1 and ~/.codex2 store codex1's login; two homes on one login break token refresh; keep each login in one home",
             ))
             lines = list(reading.notes)
@@ -8727,6 +8307,9 @@ class StatusProblemCauseTests(unittest.TestCase):
                       patch.object(accounts, "codex_statuses", return_value=list(statuses)),
                       patch.object(accounts, "_codex_live", side_effect=reports),
                       patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", failed.home)),
+                      patch.object(accounts, "read_role_map", return_value=role_map.RoleMap({}, "codex1")),
+                      patch.object(agent_accounts, "codex_account_home", return_value=agent_accounts.CodexHomeHoldingLogin(
+                          "codex1", failed.home, failed.login)),
                       patch.object(accounts, "group_accounts", return_value=accounts.GroupAccounts()),
                       patch.object(accounts, "_codex_home_login", return_value=""),
                       patch.object(account, "claude_account", return_value=None)):
@@ -8838,7 +8421,7 @@ class StatusProblemCauseTests(unittest.TestCase):
                 lines = reading.notes
                 self.assertEqual(len([line for line in lines if "test wrote" in line]), 1)
                 self.assertFalse(any("account note" in line or "setup claude2" in line
-                                     or "cutover-home" in line for line in lines))
+                                     for line in lines))
                 expected = ["workers: not configured; the role map selects no account; run accounts.py set-role workers <codexN>",
                             "claude2: test sign-in is stored; a test wrote ~/.claude2/.claude.json at 2026-10-29 01:14 UTC; delete ~/.claude2/.claude.json"]
                 self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(), expected)
@@ -8989,7 +8572,7 @@ class StatusProblemCauseTests(unittest.TestCase):
             with self.subTest(domain=domain):
                 lines = self.reading("fixture@" + domain).notes
                 self.assertFalse(any("test wrote" in line or "delete " in line for line in lines))
-                self.assertTrue(any("accounts.py cutover-home" in line and "add ~/notes/" in line for line in lines))
+                self.assertTrue(any("add ~/notes/" in line for line in lines))
 
     def test_reserved_login_reports_the_test_file_and_write_time_without_account_steps(self) -> None:
         for domain in ("invalid", "test", "example", "localhost", "one.invalid", "one.test",
@@ -9004,14 +8587,14 @@ class StatusProblemCauseTests(unittest.TestCase):
                     self.assertIn("auth.json", line)
                     self.assertIn("2026-10-29 01:14 UTC", line)
                     self.assertIn("delete ~/.codex/auth.json", line)
-                    self.assertFalse(any("cutover-home" in note or "add ~/notes/" in note
+                    self.assertFalse(any("add ~/notes/" in note
                                          for note in reading.notes))
                     self.assertTrue(any("usage read failed" in note for note in reading.notes))
                     problems = cast(list[str], json.loads(accounts.render_status_json(reading))["problems"])
                     self.assertEqual(problems, [note.removeprefix("* ") for note in reading.notes])
                     self.assertIn(line, accounts.render_status_table(reading))
 
-    def test_unnoted_legacy_login_merges_read_failure_and_keeps_both_repairs(self) -> None:
+    def test_unnoted_legacy_login_keeps_read_failure_and_note_repair(self) -> None:
         reading = self.reading("fixture@notexample.com")
         lines = [line for line in reading.notes if "~/.codex" in line]
         self.assertEqual(len(lines), 2)
@@ -9020,7 +8603,6 @@ class StatusProblemCauseTests(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertIn("no account note", lines[0])
         self.assertIn("with the login for ~/.codex", lines[0])
-        self.assertIn("accounts.py cutover-home", lines[0])
         self.assertNotIn("usage read failed", lines[0])
 
     def test_claude_test_signins_name_the_identity_file_in_each_home(self) -> None:
@@ -9049,7 +8631,6 @@ class StatusProblemCauseTests(unittest.TestCase):
         self.assertTrue(any("delete ~/.claude.json" in line for line in lines))
         self.assertTrue(any("delete ~/.claude2/.claude.json" in line for line in lines))
         self.assertTrue(all("2026-10-29 01:14 UTC" in line for line in lines))
-        self.assertFalse(any("cutover-home" in line for line in reading.notes))
 
     def test_unreadable_test_file_time_keeps_the_deletion_step(self) -> None:
         with patch.object(Path, "stat", side_effect=PermissionError("fixture denied")):

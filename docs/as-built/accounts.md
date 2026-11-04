@@ -68,7 +68,7 @@ An unreadable identity is never an absent identity.
 Codex identity resolution uses the account note's identity mapping.
 It handles numbered homes and a legacy `~/.codex` home through the same resolver.
 Status counts use that resolver too.
-Two homes with one sign-in can break token refresh, so setup and account checks detect duplicates.
+Setup and account checks detect duplicate sign-ins across homes.
 Cutover journals preserve interrupted identity moves and support an explicit undo.
 Setup waits for Codex to answer `initialize` before it reports success.
 Shared session indexing can require up to twenty minutes.
@@ -181,17 +181,27 @@ A failed renewal remains visible; it does not convert a stale reading into a fre
 
 ## Recovery and alert ownership
 
-The unit watchdog uses pane launch records and fresh process liveness.
-It preserves one pass of grace and dispatches bounded detached recovery jobs.
-An ended launch, intentional stop, retired unit, missing worktree, or finished run does not trigger recovery.
-Unknown liveness preserves pending evidence.
-A recovery worker rechecks the launch identity before it resumes the conversation.
-The current watchdog sends no phone push, showrunner notice, or message to a live session.
+The unit watchdog reads current names, parents, sessions, and folders from staff.
+It reads the account from the pane launch record and checks current process liveness.
+It saves pending jobs before it starts detached recovery services.
+Each child resolves the current staff session before resume.
+Historical jobs remain keyed by session id.
+Account notes keep historical rows without using them as current counts.
+A failed roster read reports one anomaly and sets the derived count to zero.
+Recovery keeps its grace period, dispatch limit, and result until a fresh observation confirms the session state.
+The watchdog sends no phone push, showrunner notice, or message to a live session.
 
 Retained record-driven restart paths share a durable alert ledger.
 The [shutdown design](shutdown-and-restart.md#outage-alert-ledger) describes claims, delivery, leases, machine ownership, and observation-scoped clearing.
 The ledger survives shutdown-record archival.
+Claim ownership prevents concurrent sends and stale updates.
+A second outage or five-hour delivery caller prints `already claimed by <id>` and does not repeat delivery.
 Its delivered state means a successful push, not an unfinished send claim.
+
+Config publication uses a blocking `fcntl.flock` with no time limit or retry settings.
+The kernel releases the lock when its holder exits.
+Usage and renewal schedules keep separate claims.
+A second schedule caller prints `already claimed by <id>` and exits with code 0.
 
 ## Status, counts, and notes
 
@@ -204,19 +214,20 @@ This preserves visible off-target members during a move.
 Local role counts read the registry, staff, pane launches, and worker records without writing state.
 `session-counts-read` prints the same live count document without publishing a file.
 Peer counts use the shared role-map transport in a detached fetch.
+One claim prevents concurrent fetches.
 The normal status path never waits for that fetch.
 The cache keeps each machine's counts separate and rejects copies older than ten minutes.
 Canonical `mac` and `natedev` names identify observations independently of a desktop hostname.
 The board sums available machine counts and identifies an unavailable peer.
 
 `status --stored` reads saved usage, role maps, and peer counts.
-It starts no discovery, SSH request, detached counts fetch, fetch lock, or cache write.
+It does not wait for the detached counts fetch.
 Local session counts still use current local registry evidence.
 The [board design](unit-board.md) owns the display contract and refresh lifecycle.
 
 Account notes use numbered filenames.
-Each note shows its roles, live session count, and attributed session rows.
-Retained peer rows carry a last-seen mark and do not count as live sessions.
+Each note shows its roles and live session count.
+Existing session rows remain as history and supply no current staff facts.
 Unchanged notes are not rewritten.
 Usage reads retain account identity and reading outcome; a failed read never becomes a zero-percent reading.
 Recent usage can be reused, but low quota, resets, queued moves, and identity changes require fresh checks.
@@ -286,7 +297,7 @@ Account and role changes preserve these boundaries:
 3. Keep unknown evidence distinct from absence or exhausted allowance.
 4. Validate the destination before a destructive move step.
 5. Preserve conversation identity and worker threads across account changes.
-6. Keep stored status free of transport and cache writes.
+6. Keep status reads independent of the background counts fetch.
 7. Mark an alert delivered only after successful delivery.
 8. Clear only alerts that precede the observation of a live session.
 9. Preserve shared settings and concurrent edits during local-key filtering.

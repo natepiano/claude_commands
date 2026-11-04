@@ -195,7 +195,7 @@ def seed(*, dry_run: bool = False) -> None:
 
 
 # The source scan is shared by seed and the live handler. It never writes source records.
-LiveRole = Literal["showrunner", "unit", "worker", "impl", "test", "review", "fix", "astra-designer", "astra-reviewer"]
+LiveRole = Literal["showrunner", "unit", "worker", "agent", "impl", "test", "review", "fix", "astra-designer", "astra-reviewer"]
 
 
 @dataclass(frozen=True)
@@ -448,7 +448,7 @@ class _WorkerSources:
             environment = launch["environment"]
             staff_id = launch["session_id"]
             row = self.record.by_current_session(staff_id) if staff_id else None
-            if (row is None or row.kind not in ("unit", "showrunner", "worker")) and environment.get("SHOWRUNNER_UNIT_ID"):
+            if row is None and environment.get("SHOWRUNNER_UNIT_ID"):
                 try:
                     owner = self.recorded_owner(staff_id=staff_id, unit=environment["SHOWRUNNER_UNIT_ID"],
                                                 production=environment.get("SHOWRUNNER_UNIT", ""))
@@ -465,7 +465,7 @@ class _WorkerSources:
                     self.sessions[launch["session_id"]] = WorkerOwner(f"staff:{row.id}", row)
 
         for row in self.record.rows:
-            if row.kind in ("unit", "showrunner") and row.current_session in self.native_running:
+            if row.kind != "worker" and row.current_session in self.native_running:
                 self.identities[row.id] = self.native_running[row.current_session]
                 self.sessions[row.current_session] = WorkerOwner(f"staff:{row.id}", row)
 
@@ -1083,14 +1083,14 @@ def live() -> dict[str, object]:
         except (OSError, ValueError, staff.StaffRefused) as error:
             incomplete = True
             _problem(str(run), error)
-    active_ids = {row.id for kind in ("unit", "showrunner") for row in staff.active(record, kind)}
+    active_ids = {row.id for kind in ("unit", "showrunner", "agent") for row in staff.active(record, kind)}
     resolver = session_staff.RowResolver(record, dependencies=dependencies)
     for row in record.rows:
         identity = scan.identities.get(row.id) if row.id in active_ids else None
         if row.kind != "worker" and identity is not None and row.current_session in identity.values():
             problems: list[str] = []
             document = resolver.production_doc(row)
-            if not isinstance(document, session_staff.ProductionDoc):
+            if row.kind != "agent" and not isinstance(document, session_staff.ProductionDoc):
                 problems.append(document.reason)
             if row.kind == "unit":
                 branch = resolver.unit_branch(row)
@@ -1300,7 +1300,7 @@ class _FillSources:
                 self.document(path)
                 self.repository(path)
         for row in self.record.rows:
-            location = row.worktree if row.kind == "unit" else row.doc
+            location = row.worktree if isinstance(row.worktree, (staff.PresentWorktree, staff.RemovedWorktree)) else row.doc
             if isinstance(location, (staff.PresentWorktree, staff.RemovedWorktree, staff.LiveDoc, staff.WrappedDoc)):
                 if location.machine == _fill_machine():
                     if location.path.exists():
@@ -1367,7 +1367,11 @@ def _fill_config(cells: dict[str, str]) -> unit_config.UnitConfig:
     return unit_config.UnitConfig(plan, port, duties)
 
 
-def _fill_worktree(cells: dict[str, str], machine: str) -> staff.PresentWorktree:
+def _fill_worktree(row: staff.StaffRow, cells: dict[str, str], machine: str) -> staff.PresentWorktree:
+    if isinstance(row.worktree, staff.PresentWorktree):
+        return row.worktree
+    if isinstance(row.worktree, staff.RemovedWorktree):
+        raise ValueError(f"{row.name}: staff worktree is removed")
     path_text = production_units.cell_value(cells.get("Worktree", ""))
     branch = production_units.cell_value(cells.get("Branch", ""))
     if not path_text or path_text in ("—", "-"):
@@ -1445,7 +1449,16 @@ def prepare_retirement(cells: dict[str, str], sources: _MemberSources,
         if identities:
             session_id = next(iter(identities))
         else:
-            worktree = Path(production_units.cell_value(cells.get("Worktree", ""))).expanduser()
+            if isinstance(selected, MemberFound) and not isinstance(selected.row.worktree, staff.WorktreeUnfilled):
+                location = selected.row.worktree
+                if location.machine != remote.local_machine():
+                    raise ValueError(f"staff worktree is on {location.machine}")
+                worktree = location.path
+            else:
+                path_text = production_units.cell_value(cells.get("Worktree", ""))
+                if not path_text or path_text in ("—", "-"):
+                    raise ValueError("missing legacy Worktree cell")
+                worktree = Path(path_text).expanduser()
             recover = cast(Callable[..., str], retirement.last_interactive_session)
             session_id = recover(worktree, dependencies=dependencies)
             if not session_id:
@@ -1536,14 +1549,22 @@ def retirement_plan(scan: _FillSources, documents: tuple[FillDocument, ...],
                     continue
                 try:
                     selected = joined.member(UnitMember(slug, name), scan.record)
-                    path_text = production_units.cell_value(cells.get("Worktree", ""))
-                    if not path_text or path_text in ("—", "-"):
-                        raise ValueError("missing Worktree cell")
-                    location = staff.RemovedWorktree(machine, Path(path_text).expanduser())
+                    if isinstance(selected, MemberFound) and isinstance(selected.row.worktree, staff.RemovedWorktree):
+                        location = selected.row.worktree
+                    else:
+                        path_text = production_units.cell_value(cells.get("Worktree", ""))
+                        if not path_text or path_text in ("—", "-"):
+                            raise ValueError("missing Worktree cell")
+                        location = staff.RemovedWorktree(machine, Path(path_text).expanduser())
+                        if (isinstance(selected, MemberFound)
+                                and isinstance(selected.row.worktree, staff.PresentWorktree)
+                                and (selected.row.worktree.machine, selected.row.worktree.path)
+                                != (location.machine, location.path)):
+                            raise ValueError(f"existing worktree {selected.row.worktree!r} conflicts with removed location {location!r}")
+                    if location.machine != machine:
+                        raise ValueError(f"{name}: staff worktree is on {location.machine}")
                     if location.path.exists():
                         raise ValueError(f"retired worktree still exists: {location.path}")
-                    if isinstance(selected, MemberFound) and not isinstance(selected.row.worktree, staff.WorktreeUnfilled) and selected.row.worktree != location:
-                        raise ValueError(f"existing worktree {selected.row.worktree!r} conflicts with removed location {location!r}")
                     config = prepare_retirement(cells, joined, selected, slug, dependencies=scan.dependencies)
                     repository = Path(_fill_git(document.path.parent, "rev-parse", "--show-toplevel"))
                     config = replace(config, formatting=unit_config.repository_formatting(repository))
@@ -1995,7 +2016,7 @@ class _LiveFillSources(_FillSources):
         if production_units.plan_cell_is_retired(cells.get("Plan", "")):
             return _RetiredUnitDeferred()
         try:
-            location = _fill_worktree(cells, selected.source.machine)
+            location = _fill_worktree(row, cells, selected.source.machine)
         except (OSError, ValueError) as error:
             try:
                 location = self.session_worktree(row, machine)
@@ -2115,7 +2136,7 @@ def require_worker_stopped(record: staff.StaffSnapshot, identity: staff.StaffId)
     # Remote process evidence belongs to the roster's one peer reader.
     row = record.by_id(identity)
     while row is not None:
-        location = row.worktree if row.kind == "unit" else row.doc
+        location = row.worktree if isinstance(row.worktree, (staff.PresentWorktree, staff.RemovedWorktree)) else row.doc
         if isinstance(location, (staff.PresentWorktree, staff.RemovedWorktree, staff.LiveDoc, staff.WrappedDoc)):
             if location.machine != remote.local_machine():
                 from scripts.message import roster

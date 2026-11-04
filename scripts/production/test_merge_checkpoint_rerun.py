@@ -4,7 +4,8 @@ from __future__ import annotations
 from pathlib import Path
 import shutil
 import sys
-from typing import final
+import json
+from typing import cast, final
 import unittest
 from unittest.mock import patch
 
@@ -166,6 +167,10 @@ class CheckpointRerunTests(MergeCheckpointFixture):
             "checkpoint(alpha): two changes\n\n"
             + "Change-Review: First change | Open first | First result\n"
             + "Change-Review: Second change | Open second | Second result")
+        staff_file = Path(self.env["STAFF_FILE"])
+        document = cast(dict[str, list[dict[str, object]]], json.loads(staff_file.read_text(encoding="utf-8")))
+        document["rows"] = [row for row in document["rows"] if row["name"] != "alpha"]
+        _ = staff_file.write_text(json.dumps(document), encoding="utf-8")
         result = self.run_checkpoint(checkpoint).process
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         notes = [line for line in result.stdout.splitlines() if line.startswith("change review: no staff row for unit")]
