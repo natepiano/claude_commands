@@ -1668,7 +1668,7 @@ Write a test that fails when docs/as-built/staff-accessors.md misses a file that
 6. Prove the test with a temporary doc copy that misses one file: it must fail and name that file.
 Files: scripts/production/test_staff_accessors.py (new). Edit nothing else.
 
-### Phase 4u — The input gate accepts a bridge_status turn  · status: todo
+### Phase 4u — The input gate accepts a bridge_status turn  · status: done
 
 **Depends on:** none; accounts-unit finding, 2026-11-04.
 

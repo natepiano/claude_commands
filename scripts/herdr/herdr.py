@@ -1968,6 +1968,12 @@ class Herdr:
             ready = False
         return {"agent_status": status, "interactive_ready": ready}
 
+    @staticmethod
+    def _remote_control_turn(row: dict[str, object]) -> bool:
+        """Identify a system turn that confirms Remote Control."""
+        return row.get("type") == "system" and (
+            row.get("subtype") == "bridge_status" or "/remote-control is active" in _turn_text(row))
+
     def prompt_input_state(self, pane: str, transcript: SessionTranscript | UnspecifiedPromptTranscript,
                            launched_at: datetime, *,
                            cursor: TranscriptCursor | UnspecifiedPromptTranscript = UNSPECIFIED_PROMPT_TRANSCRIPT,
@@ -1981,8 +1987,7 @@ class Herdr:
             pass
         if not ready and isinstance(transcript, SessionTranscript):
             reader = cursor if isinstance(cursor, TranscriptCursor) else TranscriptCursor(transcript, launched_at)
-            ready = any(row.get("type") == "system" and "/remote-control is active" in _turn_text(row)
-                        for _, row in reader.read_turns())
+            ready = any(self._remote_control_turn(row) for _, row in reader.read_turns())
         if not ready:
             return PromptInputNotReady("destination session is still loading")
         raw = self.run("pane", "read", pane, "--source", "visible", "--format", "ansi")
