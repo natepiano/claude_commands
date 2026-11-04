@@ -714,15 +714,15 @@ class ProductionRenameFixture(StaffTestCase):
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/old"), f"{self.old_tip}\trefs/heads/old")
         self.assertEqual(self.git("status", "--porcelain"), "")
 
-    def held_design(self, repository_id: str, checkout: Path, holder: design_roles.Holder) -> design_roles.HeldDesign:
-        """A design `holder` holds, with an open designer whose roster entry runs in `checkout`."""
+    def held_design(self, repository_id: str, checkout: Path) -> design_roles.HeldDesign:
+        """Save an open design with a private checkout."""
         with mock.patch.dict(os.environ, self.env):
             design_roles.register_repository(repository_id, {"fixture-host": str(checkout)}, inventory_complete=True)
             placement = design_roles.authority_request("reserve", {"repository_id": repository_id, "document": "design.md",
                                                             "host": "fixture-host", "request_id": repository_id})
             design = design_roles.HeldDesign(
                 design_roles.DesignPlacement(str(placement["design_id"]), "fixture-host", 1), repository_id, str(checkout),
-                str(checkout / "design.md"), "design", "2026-10-22T12:00:00+00:00", holder, design_roles.DesignUnbound(),
+                str(checkout / "design.md"), "design", "2026-10-22T12:00:00+00:00", design_roles.DesignUnbound(),
                 (design_roles.RoleInstance("designer", f"old-{repository_id}-astra-designer", design_roles.RoleOpen("designer-thread")),
                  design_roles.RoleInstance("reviewer", f"old-{repository_id}-astra-reviewer", design_roles.RoleNotOpened())))
             design_roles._save(design)  # pyright: ignore[reportPrivateUsage]

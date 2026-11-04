@@ -820,9 +820,26 @@ def _worker_assignment(run: Path, slot: str, record: Mapping[str, object]) -> Wo
     return WorkerAssignment(label, str(run), role, slot)
 
 
-def _held_location(holder: design_roles.Holder) -> tuple[ShowrunnerRelationship, DirectorRelationship]:
-    return (ProductionWithoutRunningShowrunner(holder.production_slug),
-            UnderDirector(holder.unit_name, "", "") if isinstance(holder, design_roles.UnitHolder) else NoDirector())
+def _held_location(parent: staff.StaffRow, membership: staff.StaffSnapshot,
+                   claude: Mapping[str, RosterEntry]) -> tuple[ShowrunnerRelationship, DirectorRelationship]:
+    """Read helper relationships from its staff parent."""
+    session = claude.get(parent.current_session)
+    director: DirectorRelationship = NoDirector()
+    runner = parent
+    if parent.kind == "unit":
+        director = UnderDirector(parent.name, session.name if session else parent.name,
+                                 _session_address(session) if session else "")
+        parent_runner = membership.by_id(parent.parent) if parent.parent is not None else None
+        if parent_runner is None or parent_runner.kind != "showrunner":
+            raise ValueError("design worker has no showrunner staff parent")
+        runner = parent_runner
+    elif parent.kind != "showrunner":
+        raise ValueError("design worker parent is not a unit or showrunner")
+    runner_session = claude.get(runner.current_session)
+    showrunner: ShowrunnerRelationship = (
+        UnderShowrunner(runner.name, runner_session.name, _session_address(runner_session))
+        if runner_session else ProductionWithoutRunningShowrunner(runner.name))
+    return showrunner, director
 
 
 def unit_worker_title(production: str, unit: str, job: JobKey, ordinal: int, address: str) -> str:
@@ -846,7 +863,18 @@ def mesh_shown_name(session_dir: str, name: str, record: Mapping[str, object]) -
             return ShownName(NoProduction(), NoUnit(), JobUnassigned("design unreadable"), name)
         if held_role not in ("designer", "reviewer"):
             return ShownName(NoProduction(), NoUnit(), JobUnassigned("held role unreadable"), name)
-        showrunner, director = _held_location(design.holder)
+        try:
+            membership = staff.snapshot()
+            if published_id := _as_string(record.get("staff_id")):
+                worker = membership.by_id(staff.StaffId(published_id))
+                parent = membership.by_id(worker.parent) if worker is not None and worker.parent is not None else None
+                if worker is None or worker.kind != "worker" or parent is None:
+                    raise ValueError("design worker parent is unavailable")
+            else:
+                parent = design_roles.worker_parent(design, held_role, membership)
+            showrunner, director = _held_location(parent, membership, {})
+        except (OSError, ValueError):
+            return ShownName(NoProduction(), NoUnit(), JobUnassigned("design worker parent unavailable"), name)
         return shown_name(RosterEntry(
             machine="", kind="codex", role="astra-designer" if held_role == "designer" else "astra-reviewer",
             name=name, status="", reach=Messageable(name), cwd=design.repository,
@@ -1262,28 +1290,20 @@ def _unit_workers(
     return entries, worker_threads
 
 
-def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: list[str]) -> tuple[list[RosterEntry], set[str]]:
+def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: list[str],
+                   membership: staff.StaffSnapshot) -> tuple[list[RosterEntry], set[str]]:
     entries: list[RosterEntry] = []
     threads: set[str] = set()
     for path in sorted(design_roles.state_root().glob('*/design.json')):
         try:
             design = design_roles.read_design(path.parent.name)
-            reach = design_roles.resolve_holder(design.holder)
-            session = claude.get(reach.session_id) if isinstance(reach, design_roles.HolderReach) else None
-            showrunner, director = _held_location(design.holder)
-            if isinstance(design.holder, design_roles.UnitHolder):
-                director = UnderDirector(design.holder.unit_name, session.name if session else design.holder.unit_name,
-                                         f'session:{reach.session_id}' if isinstance(reach, design_roles.HolderReach) else '')
-                if session:
-                    showrunner = session.showrunner
-            elif session:
-                showrunner = UnderShowrunner(design.holder.production_slug, session.name,
-                                              f'session:{reach.session_id}' if isinstance(reach, design_roles.HolderReach) else '')
             mesh = design_roles.mesh_directory(design.placement.design_id)
             roster = _read_object(mesh / 'mesh_roster.json') if (mesh / 'mesh_roster.json').exists() else {}
             for instance in design.roles:
                 if isinstance(instance.lifecycle, (design_roles.RoleNotOpened, design_roles.RoleEnded)):
                     continue
+                parent = design_roles.worker_parent(design, instance.role, membership)
+                showrunner, director = _held_location(parent, membership, claude)
                 thread = instance.lifecycle.thread_id
                 if thread in threads:
                     continue
@@ -1299,7 +1319,7 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: li
                 entries.append(RosterEntry(machine=machine, kind='codex',
                     role='astra-designer' if instance.role == 'designer' else 'astra-reviewer',
                     name=instance.name, status=status, reach=CannotReceiveMessages(
-                        'held role; its holder adds pending messages to an authorized assignment'),
+                        'held role; add pending messages through design_roles.py'),
                     cwd=design.repository, showrunner=showrunner, director=director,
                     assignment=HeldDesignRole(instance.role, str(mesh)), thread=CodexThread(thread),
                     account=AccountUnread('serving home not read')))
@@ -1394,7 +1414,7 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
     unit_workers, worker_threads = _unit_workers(
         machine, runs, claude, production_places, problems, home_state=home_state
     )
-    durable_roles, durable_threads = _durable_roles(machine, claude, warnings)
+    durable_roles, durable_threads = _durable_roles(machine, claude, warnings, membership)
     unit_workers.extend(durable_roles)
     worker_threads.update(durable_threads)
     codex_sessions: list[RosterEntry] = []

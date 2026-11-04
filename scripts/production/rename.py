@@ -208,7 +208,6 @@ def _describe(plan: RenamePlan) -> list[str]:
             *(f"4. showrunner state {moves(move)}" for move in plan.state),
             f"4. parent files {plan.state[-1].source.parent}/*/parent: {plan.old} -> {plan.new}",
             *(f"4. parent {path}: {plan.old} -> {plan.new}" for path in parents),
-            f"4. held design roles: holder {plan.old} showrunner -> {plan.new} showrunner",
             *rename_outside.describe(plan.old, plan.new, plan.old_doc, plan.new_doc),
             *(stretches or ["5. stall-watch: no units"]),
             (f"6. merge branch {plan.merge_branch} -> {plan.new} (git branch -m); commit {plan.message!r}; "
@@ -285,16 +284,9 @@ def _rename_showrunner_state(plan: RenamePlan) -> None:
         directory.source.rmdir()
     for child in showrunner_tree.stored_children(plan.new):
         write_text(directory.destination.parent / child / "parent", plan.new + "\n")
-    _move_held_roles(design_roles.ShowrunnerHolder(plan.old), design_roles.ShowrunnerHolder(plan.new))
     rename_outside.apply(plan.old, plan.new, plan.old_doc, plan.new_doc)
 
 
-def _move_held_roles(old: design_roles.Holder, new: design_roles.Holder, old_checkout: str = "", new_checkout: str = "") -> None:
-    """Held design roles name the renamed production as holder, so resume, rebind and end accept it."""
-    try:
-        design_roles.move_holder(old, new, old_checkout, new_checkout, reason="production rename")
-    except (OSError, ValueError, SystemExit) as error:
-        raise RenameRefused(f"held roles: {error}") from error
 
 
 def _rename_stall_watch(plan: RenamePlan) -> None:
@@ -420,8 +412,7 @@ def unit(new: str, name: str) -> None:
         destination = _destination(source, old_branch, new_branch)
         if destination != source:
             unit_move.move_folder(found.row.id, destination)
-            _move_held_roles(design_roles.UnitHolder(result.old, name), design_roles.UnitHolder(result.new, name),
-                             str(source), str(destination))
+            design_roles.move_checkout(str(source), str(destination), reason="production rename")
         renamed = unit_move.git(destination, "branch", "--show-current") == old_branch
         if renamed:
             _ = unit_move.git(destination, "branch", "-m", old_branch, new_branch)
