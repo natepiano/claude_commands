@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import signal
 import socket
 import subprocess
 import tempfile
@@ -17,7 +16,7 @@ from typing import cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from scripts.lib.process_group import send_process_group
+from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -30,6 +29,9 @@ MINUTE = NOW - NOW % 60
 class NotifierTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
+        self.owned: OwnedTestProcesses = OwnedTestProcesses()
+        self.launch_pids: Path = Path()
+        self.blocked_pids: Path = Path()
         self.root: Path = Path()
         self.state_dir: Path = Path()
         self.sessions_dir: Path = Path()
@@ -42,6 +44,12 @@ class NotifierTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.owned = OwnedTestProcesses()
+        self.addCleanup(self.owned.finish)
+        self.launch_pids = self.root / "launch-pids"
+        self.owned.group_markers.append(self.launch_pids)
+        self.blocked_pids = self.root / "blocked-pids"
+        self.owned.markers.append(self.blocked_pids)
         self.state_dir = self.root / "state"
         self.sessions_dir = self.root / "sessions"
         self.sessions_dir.mkdir()
@@ -56,10 +64,13 @@ class NotifierTests(unittest.TestCase):
             "\n".join((
                 "#!/usr/bin/env python3",
                 "import subprocess",
+                "from pathlib import Path",
                 "import sys",
-                "subprocess.Popen(sys.argv[sys.argv.index('--') + 1:], "
+                "# The caller installs the inherited ownership marker before launch.",
+                "child = subprocess.Popen(sys.argv[sys.argv.index('--') + 1:], "
                 + "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
                 + "stderr=subprocess.DEVNULL, start_new_session=True)",
+                f"with Path({str(self.launch_pids)!r}).open('a') as marker: marker.write(str(child.pid) + '\\n')",
             )) + "\n"
         )
         launcher.chmod(0o755)
@@ -122,9 +133,11 @@ class NotifierTests(unittest.TestCase):
         _ = (self.sessions_dir / "live.json").write_text(json.dumps(record))
 
     def run_cli(self, *args: str, now: int = NOW, send_rc: int = 0) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["zsh", str(SCRIPT), *args],
-            env={
+        owned = OwnedTestProcesses()
+        command = ["zsh", str(SCRIPT), *args]
+        child = subprocess.Popen(
+            command,
+            env=self.owned.environment({
                 **os.environ,
                 "NOTIFIER_STATE_DIR": str(self.state_dir),
                 "NOTIFIER_SESSIONS_DIR": str(self.sessions_dir),
@@ -133,9 +146,15 @@ class NotifierTests(unittest.TestCase):
                 "FAKE_SEND_ARGS": str(self.send_args),
                 "FAKE_SEND_RC": str(send_rc),
                 "PATH": f"{self.launcher_dir}{os.pathsep}{os.environ['PATH']}",
-            },
-            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+            }),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
         )
+        owned.track(child, group=True)
+        try:
+            output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+            return subprocess.CompletedProcess(command, child.wait(), output, errors)
+        finally:
+            owned.finish()
 
     def successful(self, *args: str, now: int = NOW, send_rc: int = 0) -> str:
         result = self.run_cli(*args, now=now, send_rc=send_rc)
@@ -357,7 +376,7 @@ class NotifierTests(unittest.TestCase):
         check = self.root / "slow-check"
         blocked = self.root / "check-blocked"
         os.mkfifo(blocked)
-        _ = check.write_text(f"#!/bin/sh\nexec /bin/cat < {blocked}\n")
+        _ = check.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$$\" >> {self.blocked_pids}\nexec /bin/cat < {blocked}\n")
         check.chmod(0o755)
         _ = self.new("--check", str(check), "--timeout", "1")
         result = self.run_cli("tick", now=MINUTE + 120)
@@ -404,7 +423,7 @@ class NotifierTests(unittest.TestCase):
         fake_mkdir.chmod(0o755)
         result = subprocess.run(
             ["zsh", str(SCRIPT), "tick"],
-            env={
+            env=self.owned.environment({
                 **os.environ,
                 "PATH": f"{fake_bin}:{os.environ['PATH']}",
                 "NOTIFIER_STATE_DIR": str(self.state_dir),
@@ -413,7 +432,7 @@ class NotifierTests(unittest.TestCase):
                 "NOTIFIER_NOW_EPOCH": str(NOW),
                 "FAKE_SEND_ARGS": str(self.send_args),
                 "FAKE_SEND_RC": "0",
-            },
+            }),
             capture_output=True, text=True, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -511,7 +530,7 @@ class NotifierTests(unittest.TestCase):
         slow = self.root / "slow-run"
         blocked = self.root / "run-blocked"
         os.mkfifo(blocked)
-        _ = slow.write_text(f"#!/bin/sh\nexec /bin/cat < {blocked}\n")
+        _ = slow.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$$\" >> {self.blocked_pids}\nexec /bin/cat < {blocked}\n")
         slow.chmod(0o755)
         _ = self.successful("new", "example", "--every", "1", "--run", str(slow), "--timeout", "1")
         _ = self.successful("tick", now=MINUTE + 120)
@@ -531,25 +550,25 @@ class NotifierTests(unittest.TestCase):
         _ = self.successful("new", "example", "--every", "1", "--run", str(job))
         tick = subprocess.Popen(
             ["zsh", str(SCRIPT), "tick"],
-            env={
+            env=self.owned.environment({
                 **os.environ,
                 "PATH": f"{self.launcher_dir}{os.pathsep}{os.environ['PATH']}",
                 "NOTIFIER_STATE_DIR": str(self.state_dir),
                 "NOTIFIER_SESSIONS_DIR": str(self.sessions_dir),
                 "NOTIFIER_NOW_EPOCH": str(MINUTE + 60),
-            },
+            }),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
         )
+        self.owned.track(tick, group=True)
         try:
             _, stderr = tick.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(tick.returncode, 0, stderr)
             _ = self.wait_for_text(started, "started")
             self.assertFalse(finished.exists())
         finally:
-            try:
-                send_process_group(tick.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            if tick.poll() is None:
+                tick.kill()
+            _ = tick.wait(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(self.wait_for_text(finished, "finished"), "finished")
         _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "run exit 7")
 
@@ -603,15 +622,7 @@ elif action == "remove":
         launch_state = self.root / "launchctl-state"
         launch_state.mkdir()
 
-        def stop_fake_job() -> None:
-            pid_file = launch_state / "pid"
-            if pid_file.exists():
-                try:
-                    send_process_group(int(pid_file.read_text()), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-
-        self.addCleanup(stop_fake_job)
+        self.owned.group_markers.append(launch_state / "pid")
         return launch_state
 
     def tick_mac_run_only(self, launch_state: Path, runs: Path, kickstart_rc: int = 0) -> Path:
