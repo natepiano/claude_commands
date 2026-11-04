@@ -108,8 +108,64 @@ MODULE_HISTORY_RUNS = 5
 MEMORY_SAMPLE_SECONDS = 0.25
 RUNNER = Path(__file__).resolve().parents[1] / "test_times" / "module_run.py"
 ROLLBACK_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
-# Restore dispositions and the mask in every child, including types. The runner
-# defers cancellation until the child is registered for cleanup.
+# Read the live roots before a module receives its private environment.
+LIVE_ROOTS = (str(Path.home().resolve()),
+              str(Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state").resolve()),
+              str(Path("/tmp/claude").resolve()))
+LIVE_PUSH_KEYS = tuple(str(path.resolve()) for path in (
+    Path(LIVE_ROOTS[0]) / ".config/pushover/env",
+    Path(os.environ.get("XDG_CONFIG_HOME") or Path(LIVE_ROOTS[0]) / ".config") / "pushover/env"))
+# Python children inherit this hook through PYTHONPATH, including launcher children.
+SUITE_GUARD = r'''import os, sys
+from urllib.parse import urlsplit
+
+def refuse(detail):
+    with open(marker, "a") as output:
+        output.write(detail + "\n")
+    raise PermissionError(detail)
+
+def refuse_external_effect(event, args):
+    if event == "urllib.Request":
+        host = urlsplit(args[0]).hostname
+    elif event == "socket.getaddrinfo":
+        host = args[0]
+    elif event == "http.client.connect":
+        host = args[1]
+    elif event == "socket.connect":
+        host = args[1][0] if isinstance(args[1], tuple) else ""
+    else:
+        host = ""
+    if isinstance(host, str) and host.lower().rstrip(".") == "api.pushover.net":
+        refuse("test refused a Pushover push: " + host)
+    writing = True
+    if event == "open":
+        writing = args[2] & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)
+        paths = ((args[0], -1),)
+    elif event in ("os.remove", "os.rmdir", "os.mkdir", "os.chmod", "os.chown", "os.utime"):
+        paths = ((args[0], args[-1]),)
+    elif event in ("os.rename", "os.link"):
+        paths = ((args[0], args[2]), (args[1], args[3]))
+    elif event == "os.symlink":
+        paths = ((args[1], args[2]),)
+    else:
+        return
+    for path, directory in paths:
+        if isinstance(path, int):
+            path = os.readlink("/proc/self/fd/" + str(path))
+        if not isinstance(path, (str, bytes)):
+            continue
+        path = os.fsdecode(path)
+        if not os.path.isabs(path) and isinstance(directory, int) and directory >= 0:
+            path = os.path.join(os.readlink("/proc/self/fd/" + str(directory)), path)
+        path = os.path.realpath(path)
+        if path in push_keys:
+            refuse("test refused Pushover credential access: " + path)
+        if writing and any(path == root or path.startswith(root + os.sep) for root in live_roots):
+            refuse("test refused a write to a live root: " + path)
+
+sys.addaudithook(refuse_external_effect)
+'''
+# Restore signals after the runner registers the child for cleanup.
 SUITE_BOOTSTRAP = """import os, signal, sys
 for disposition in signal.valid_signals():
     if disposition not in (signal.SIGKILL, signal.SIGSTOP):
@@ -653,6 +709,22 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     output = log.open("w+")
     started = time.monotonic()
     try:
+        if kind is GateJobKind.TEST_MODULE:
+            root = log.parent
+            home, state, claude, config = (root / name for name in ("home", "state", "claude", "config"))
+            for folder in (home, state, claude, config):
+                folder.mkdir()
+            guard = root / "python-startup"
+            guard.mkdir()
+            _ = (guard / "sitecustomize.py").write_text(
+                f"live_roots = {LIVE_ROOTS!r}\npush_keys = {LIVE_PUSH_KEYS!r}\n"
+                + f"marker = {str(root / 'refused-effects')!r}\n" + SUITE_GUARD)
+            environment = {**environment, "HOME": str(home), "XDG_STATE_HOME": str(state),
+                           "XDG_CONFIG_HOME": str(config), "SCRATCH_ROOT": str(claude / "scratch"),
+                           "PYTHONDONTWRITEBYTECODE": "1",
+                           "PYTHONPATH": str(guard) + os.pathsep + environment.get("PYTHONPATH", "")}
+            for name in ("PUSHOVER_USER", "PUSHOVER_TOKEN"):
+                _ = environment.pop(name, None)
         process = subprocess.Popen([sys.executable, "-c", SUITE_BOOTSTRAP, *argv],
                                    cwd=repo, env=environment, stdin=subprocess.DEVNULL,
                                    stdout=output, stderr=subprocess.STDOUT, text=True,
@@ -716,6 +788,10 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         except ValueError:
             detail = f"(unreadable record): {line}"
         captured += f"\n{job.module}: a test read live memory {detail}\n"
+    effects_marker = job.log.parent / "refused-effects"
+    effects = effects_marker.read_text().splitlines() if effects_marker.exists() else []
+    for detail in effects:
+        captured += f"\n{job.module}: {detail}\n"
     times = (gate_record.TimingNotApplicable() if job.kind is GateJobKind.TYPE_CHECK
              else gate_record.read_module_times(job.log.parent / "test-times.json"))
     shutil.rmtree(job.log.parent)
@@ -726,7 +802,7 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         status = 0
     if job.kind is GateJobKind.TYPE_CHECK:
         status = 0 if status == 0 and re.search(r"^0 errors, 0 warnings, 0 notes\s*$", captured, re.MULTILINE) else 1
-    tripwire_tripped = bool(calls or readings)
+    tripwire_tripped = bool(calls or readings or effects)
     if tripwire_tripped:
         status = 1
     return GateJobResult(job.suite, job.module, status, seconds, captured, job.killed_for,

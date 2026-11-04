@@ -30,7 +30,7 @@ RULE = "global:rust/comments-name-code-constructs.md"
 def live_unit(name: str, session: str = "") -> live_units.LiveUnit:
     if not session:
         return live_units.LiveUnit(name, None)
-    claude = unit_lookup.LiveClaude(session, session + "-id", "/tmp/claude/test.sock", 1)
+    claude = unit_lookup.LiveClaude(session, session + "-id", "test.sock", 1)
     marked = unit_lookup.MarkedUnit(name, claude, HerdrPlace("test", "w1:p1"))
     return live_units.LiveUnit(name, marked)
 
@@ -41,7 +41,7 @@ class StyleUnitsTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp/claude")))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.database = self.root / "ledger.sqlite"
         with closing(sqlite3.connect(self.database)) as connection:
             _ = connection.executescript("""

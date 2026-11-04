@@ -10,6 +10,8 @@ import io
 import os
 from pathlib import Path
 import re
+import sys
+import tempfile
 from typing import cast, final, override
 from contextlib import AbstractContextManager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
@@ -22,6 +24,102 @@ from scripts.production.staff_test_support import (
     fixture_unit_location, isolated_source_readers, isolated_staff_file, recorded_showrunner, source_environment,
 )
 from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
+
+
+@final
+class ModuleRootTests(unittest.TestCase):
+    def run_module(self, source: str, live: Path) -> merge_gate.GateJobResult:
+        with tempfile.TemporaryDirectory(dir="/dev/shm", prefix="gate-roots-") as temporary:
+            root = Path(temporary)
+            module = root / "test_roots.py"
+            _ = module.write_text("import unittest\n" + source)
+            job_root = root / "job"
+            job_root.mkdir()
+            environment = merge_gate.test_module_environment(job_root, dict(os.environ))
+            environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+            with mock.patch.object(merge_gate, "LIVE_ROOTS", (str(live),)):
+                job = merge_gate.start_gate_job(
+                    "fixture", module, [sys.executable, str(merge_gate.RUNNER), str(root), module.name],
+                    root, environment, job_root / "output.log")
+            status = job.process.wait(timeout=30)
+            result = merge_gate.finish_gate_job(job, status)
+            self.assertFalse(job_root.exists())
+            return result
+
+    def test_a_live_staff_write_fails_and_names_the_path(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as temporary:
+            live = Path(temporary)
+            staff_file = live / "staff" / "staff.json"
+            staff_file.parent.mkdir()
+            _ = staff_file.write_text("original")
+            result = self.run_module(f'''from pathlib import Path
+class Roots(unittest.TestCase):
+    def test_write(self):
+        Path({str(staff_file)!r}).write_text("fixture")
+''', live)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(result.tripwire_tripped)
+            self.assertIn(str(staff_file), result.output)
+            self.assertEqual(staff_file.read_text(), "original")
+
+    def test_private_roots_pass_and_are_removed(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as temporary:
+            result = self.run_module('''import os
+from pathlib import Path
+class Roots(unittest.TestCase):
+    def test_write(self):
+        home = Path(os.environ["HOME"])
+        state = Path(os.environ["XDG_STATE_HOME"])
+        scratch = Path(os.environ["SCRATCH_ROOT"])
+        config = Path(os.environ["XDG_CONFIG_HOME"])
+        self.assertFalse((home / ".config/pushover/env").exists())
+        self.assertFalse((config / "pushover/env").exists())
+        self.assertNotIn("PUSHOVER_USER", os.environ)
+        self.assertNotIn("PUSHOVER_TOKEN", os.environ)
+        for root in (home, state, scratch, config):
+            root.mkdir(parents=True, exist_ok=True)
+            (root / "fixture").write_text("private")
+        self.assertEqual(len({home, state, scratch, config}), 4)
+        self.assertTrue(all(root.is_relative_to(Path(os.environ["TMPDIR"]))
+                            for root in (home, state, scratch, config)))
+''', Path(temporary))
+            self.assertEqual(result.returncode, 0, result.output)
+
+    def test_a_push_attempt_fails_and_names_the_module_and_push(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as temporary, \
+             mock.patch.dict(os.environ, {"PUSHOVER_USER": "fixture-user", "PUSHOVER_TOKEN": "fixture-token"}):
+            notify = Path(__file__).resolve().parents[1] / "notify"
+            result = self.run_module(f'''import os, sys
+from unittest import mock
+sys.path.insert(0, {str(notify)!r})
+import pushover
+class Roots(unittest.TestCase):
+    def test_push(self):
+        self.assertNotIn("PUSHOVER_USER", os.environ)
+        self.assertNotIn("PUSHOVER_TOKEN", os.environ)
+        with mock.patch("socket.socket.connect", side_effect=AssertionError("push guard missed the request")):
+            try:
+                pushover.http_post(pushover.API_URL, b"token=fixture&user=fixture")
+            except PermissionError:
+                pass
+''', Path(temporary))
+            self.assertNotEqual(result.returncode, 0, result.output)
+            self.assertTrue(result.tripwire_tripped, result.output)
+            self.assertIn("test_roots.py: test refused a Pushover push", result.output)
+
+    def test_a_caught_live_write_in_a_child_still_fails(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as temporary:
+            live = Path(temporary)
+            target = live / "roster.json"
+            child = f"try:\n open({str(target)!r}, 'w')\nexcept PermissionError:\n pass"
+            result = self.run_module(f'''import subprocess, sys
+class Roots(unittest.TestCase):
+    def test_write(self):
+        subprocess.run([sys.executable, "-c", {child!r}], check=True)
+''', live)
+            self.assertNotEqual(result.returncode, 0, result.output)
+            self.assertIn(str(target), result.output)
+            self.assertFalse(target.exists())
 
 
 @final

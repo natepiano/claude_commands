@@ -39,10 +39,10 @@ class ProfileNotesPassTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        Path("/tmp/claude").mkdir(exist_ok=True)
-        directory = tempfile.TemporaryDirectory(prefix="profile-fixture-", dir="/tmp/claude")
+        directory = tempfile.TemporaryDirectory(prefix="profile-fixture-")
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+        _ = self.enterContext(patch.object(profile, "SCRATCH_ROOT", self.root))
         self.home = self.root / "home"
         self.home.mkdir()
         self.notes = self.home / "notes"
@@ -169,7 +169,7 @@ class ProfileNotesPassTests(unittest.TestCase):
         self.assertIn("below /tmp/claude/", error.getvalue())
         self.assertFalse((self.root / "unused.prof").exists())
         with self.assertRaises(ValueError):
-            _ = profile.private_scratch(Path("/tmp/claude"))
+            _ = profile.private_scratch(profile.SCRATCH_ROOT)
 
     def test_recovery_results_are_read_from_scratch_with_their_saved_job(self) -> None:
         state = profile.state_path(self.pass_.watchdog, "_state_file", True)
@@ -193,7 +193,7 @@ class ProfileNotesPassTests(unittest.TestCase):
         self.assertEqual(snapshot(self.home), before)
 
     def test_scratch_symlink_cannot_escape_the_private_root(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/tmp") as outside:
+        with tempfile.TemporaryDirectory() as outside:
             link = self.root / "escape"
             link.symlink_to(outside, target_is_directory=True)
             with self.assertRaises(ValueError):
@@ -232,7 +232,7 @@ class ProfileNotesPassTests(unittest.TestCase):
         self.assertFalse(profile.readonly_child(("py", str(Path(__file__).resolve().parents[1] / "message/sessions.py"), "socket", "target")))
 
     def test_private_scratch_accepts_a_resolved_symlink_root(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "claude"
             target.mkdir()
             link = self.root / "tmp-link"

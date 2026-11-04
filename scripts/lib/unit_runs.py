@@ -28,8 +28,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast
 
 RUN_TEMP_NAME = "tmp"
-RUN_ROOT = Path("/tmp/claude/unit")
-FORMER_RUN_ROOT = Path("/tmp/claude/delegate")
+# SCRATCH_ROOT also selects the parent folder for temporary unit runs.
+RUN_ROOT = Path(os.environ.get("SCRATCH_ROOT") or "/tmp/claude/scratch").parent / "unit"
+FORMER_RUN_ROOT = RUN_ROOT.parent / "delegate"
 # Notifier instances a unit run once had; conversation_pause names them "status reports".
 INSTANCE_PREFIXES = ("unit-", "delegate-")
 # A run's shared liveness log, beaten every 60 s per worker while one runs.
