@@ -28,11 +28,13 @@
   - Revealed by: verify-unit measurement (builds showrunner 2026-10-30: next)
 
 - [ ] **Use recorded Cargo output roots for trim matching**
-  - Target: `scripts/lint/sweep.py` and its tests.
-  - Dependency: Phase 17 exposes the recorded Cargo roots through the shared step-evidence reader during predictor measurement, whether it adopts or rejects compile bands.
-  - Why needed: trim attribution still uses saved workspace mappings instead of each step's recorded roots (`sweep.py` :3796, :3876).
-  - Completion condition: use the shared reader to match trims after copies disappear or mappings change. Keep named unknown states. Test both cases. Add no second mapping, join or recorder.
-  - Revealed by: Phase 4 (builds showrunner 2026-10-30: next); narrowed after the Phase 37, Phase 51 and 53, and Phase 11 architect reviews
+  - Target: `scripts/lint/sweep.py`, `scripts/lint/build_shape.py` and their tests.
+  - Dependency: reuse recorded-root evidence if another consumer has added it; otherwise add it with this consumer.
+  - Why needed: `_rebuild_causes()` matches trims through saved workspace mappings instead of each step's recorded roots.
+  - Completion condition: read both recorded roots through the shared reader, with named unknown states and coherent root pairs for repeated attempts.
+  - Test removed copies, changed mappings, repeated attempts with different roots and missing roots.
+  - Add no second mapping, join or recorder.
+  - Revealed by: Phases 4, 11 and 17 (builds showrunner 2026-10-30: next); Phase 17 shipped no reader extension.
 
 - [ ] **The working-set summary tells a Node script apart from a Node task or one-line program**
   - Target: `scripts/build_targets/working_set.py`, `scripts/build_targets/test_working_set.py`
@@ -51,8 +53,12 @@
   - Completion condition: typed `/build:queue bump <unit>` from any pane sets or replaces persistent priority through the existing writer, without a session-role check on the plugin route; tests cover a non-showrunner pane and replacement, while direct priority commands retain their existing caller checks.
   - Revealed by: Phase 26; approved by builds in `S/next_items_pending.md`.
 
-- [ ] **The floor sweep takes its target folders from the build queue record**
-  - Target: `scripts/lint/sweep.py` (`discover_cargo_outputs`, `_hold_floor`), the Phase 11 step-evidence reader, and their tests
-  - Why needed: the build queue owns build folders (user, 2026-11-03), and Phase 11 records each step's target folder. The sweep still finds folders by running `cargo metadata` per checkout, which made the floor pass run 37 minutes and delete nothing (Phase 58 part B).
-  - Completion condition: the floor pass reads its target folders from the recorded step rows, with a named state for a folder no record names; it runs no `cargo metadata`; a test pins the source, and a floor-only dry run on natedev stays under 120 s.
-  - Revealed by: Phase 58 part B (builds showrunner 2026-11-04: next, after the Phase 58 fix)
+- [ ] **The floor sweep takes its target folders from recorded step rows**
+  - Target: `scripts/lint/sweep.py` (`discover_cargo_outputs`, `_hold_floor`), the shared step-evidence reader and their tests.
+  - Dependency: follow Phase 58's C1008 fix and preserve its 30-second limit.
+  - Why needed: the build queue owns build folders (user, 2026-11-03). Output discovery still runs Cargo metadata for checkouts, although step rows record Cargo output roots.
+  - Completion condition: use both recorded roots through the shared reader and run no `cargo metadata` during the floor pass.
+  - Add reader fields only with their first consumer; reuse fields that another consumer already added.
+  - Represent missing folder evidence with a named state and preserve existing deletion protections.
+  - Test the evidence source and missing evidence; require a successful natedev floor-only dry run below 30 seconds.
+  - Revealed by: Phase 58 part B and C1008 (builds showrunner 2026-11-04: next, after the Phase 58 fix)
