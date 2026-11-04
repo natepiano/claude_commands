@@ -263,6 +263,122 @@ class QueuePlaceFixture(ExitStack):
 
 
 class QueuePlaceTests(unittest.TestCase):
+    def analyzer(self, fixture: QueuePlaceFixture, source: str) -> Path:
+        executable = fixture.root / "rust-analyzer"
+        _ = executable.write_text(f"#!{sys.executable}\n" + source)
+        executable.chmod(0o755)
+        return executable
+
+    def test_version_probe_starts_without_admission(self) -> None:
+        with QueuePlaceFixture() as fixture:
+            executable = self.analyzer(fixture, "print('private analyzer version')\n")
+            with fixture.admission.loop_turn():
+                fixture.admission.free(0)
+                older = fixture.admission.request(age=900)
+                _ = fixture.admission.server.handle_request(older)
+                self.assertTrue(fixture.admission.server.waiters)
+                saved = fixture.admission.state_text()
+            with mock.patch.object(client, "admit", side_effect=AssertionError("probe requested admission")), \
+                 mock.patch.object(client, "release", side_effect=AssertionError("probe released admission")), \
+                 mock.patch.object(queue, "probe_scope_prefix", side_effect=AssertionError("probe requested a scope")), \
+                 mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "1"}):
+                argv = [str(executable), "--version"]
+                started = time.monotonic()
+                with queue.queue_place(argv, fixture.root) as place:
+                    process = place.popen(argv, stdout=subprocess.PIPE)
+                    output, _ = process.communicate(timeout=2)
+                    self.assertEqual(process.returncode, 0)
+                    self.assertEqual(output, b"private analyzer version\n")
+                    self.assertEqual(place.peak_bytes, 0)
+                    self.assertFalse(place.path.with_suffix(".max").exists())
+                self.assertLess(time.monotonic() - started, 2)
+            self.assertEqual(fixture.admission.state_text(), saved)
+            self.assertFalse(fixture.admission.server.reservations)
+            self.assertEqual(fixture.history(), [])
+
+    def test_probe_arguments_are_exact_and_read_from_configuration(self) -> None:
+        with QueuePlaceFixture() as fixture:
+            for argument in ("--version", "--help", "-V", "-h"):
+                self.assertEqual(queue.program_purpose(["/tools/rust-analyzer", argument]), queue.ProgramPurpose.PROBE)
+            for argv in (["rust-analyzer", "--version", "analysis-stats"],
+                         ["rust-analyzer", "analysis-stats", "--help"],
+                         ["rust-analyzer", "--version=other"], ["cargo", "--version"]):
+                self.assertEqual(queue.program_purpose(argv), queue.ProgramPurpose.BATCH)
+            write_memory_config(fixture.config, **{"program_probe_arguments.rust-analyzer": "--private-probe"})
+            self.assertEqual(queue.program_purpose(["rust-analyzer", "--private-probe"]), queue.ProgramPurpose.PROBE)
+            self.assertEqual(queue.program_purpose(["rust-analyzer", "--version"]), queue.ProgramPurpose.BATCH)
+            self.assertEqual(queue.program_purpose(["rust-analyzer"]), queue.ProgramPurpose.EDITOR_SERVER)
+            self.assertEqual(queue.program_purpose(["rust-analyzer"], batch=True), queue.ProgramPurpose.BATCH)
+            with self.assertRaisesRegex(queue.QueuePlaceRefused, "empty"):
+                _ = queue.program_purpose([])
+
+    def test_editor_server_starts_while_builds_wait(self) -> None:
+        with QueuePlaceFixture() as fixture:
+            fixture.use_private_scope()
+            fixture.supply_scope_memory(2 * GIB)
+            with fixture.admission.loop_turn():
+                fixture.admission.free(0)
+                older = fixture.admission.request(age=900)
+                _ = fixture.admission.server.handle_request(older)
+                self.assertTrue(fixture.admission.server.waiters)
+                _ = (fixture.root / "pressure").write_text(
+                    "some avg10=50.0 avg60=50.0 avg300=50.0 total=1\n"
+                    + "full avg10=50.0 avg60=50.0 avg300=50.0 total=1\n")
+                # Editor startup does not require a configured fallback.
+                write_memory_config(fixture.config, **{"program_first_peak_gib.rust-analyzer": None})
+            executable = self.analyzer(fixture, BLOCKING_CHILD)
+            argv = [str(executable)]
+            with mock.patch.object(client, "admit", side_effect=AssertionError("editor joined the FIFO")), \
+                 mock.patch.object(client, "release", side_effect=AssertionError("editor released a reservation")), \
+                 mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "1"}):
+                with queue.queue_place(argv, fixture.root) as place:
+                    started = time.monotonic()
+                    child = place.popen(argv, stdout=subprocess.PIPE)
+                    assert child.stdout is not None
+                    self.assertTrue(select.select([child.stdout], [], [], 2)[0], "editor startup exceeded two seconds")
+                    self.assertEqual(child.stdout.readline(), b"ready\n")
+                    self.assertLess(time.monotonic() - started, 2)
+                    scope = Path(place.sidecar.read_text().strip())
+                    self.assertIn(child.pid, queue.scope_members(scope))
+                    self.assertFalse(fixture.admission.server.reservations)
+                    place.observe(2 * GIB, 2 * GIB)
+                    self.assertEqual(place.peak_bytes, 2 * GIB)
+            self.assertIsNotNone(child.poll())
+            self.assertEqual(queue.scope_members(scope), set())
+            self.assertEqual(fixture.history(), [])
+
+    def test_probe_history_does_not_size_server(self) -> None:
+        with QueuePlaceFixture() as fixture:
+            executable = self.analyzer(fixture, "print('probe')\n")
+            fixture.seed([4 * GIB] * 5)
+            history = fixture.history()
+            argv = [str(executable), "--version"]
+            with queue.queue_place(argv, fixture.root) as place:
+                process = place.popen(argv, stdout=subprocess.DEVNULL)
+                self.assertEqual(process.wait(timeout=2), 0)
+            self.assertEqual(fixture.history(), history)
+            with mock.patch.object(gate, "program_peak_estimate", side_effect=AssertionError("editor sized from history")):
+                with queue.queue_place([str(executable)], fixture.root) as place:
+                    self.assertEqual(place.purpose, queue.ProgramPurpose.EDITOR_SERVER)
+                    self.assertFalse(fixture.admission.server.reservations)
+            with queue.queue_place([str(executable), "analysis-stats"], fixture.root) as place:
+                _, row = fixture.reservation()
+                self.assertEqual(row["need"], 4 * GIB)
+                self.assertEqual(place.arguments, (str(executable), "analysis-stats"))
+
+    def test_batch_admission_receives_the_complete_command(self) -> None:
+        with QueuePlaceFixture() as fixture:
+            argv = ["rust-analyzer", "analysis-stats", ".", "--no-sysroot"]
+            with mock.patch.object(client, "step_request", wraps=client.step_request) as requests:
+                with queue.queue_place(argv, fixture.root) as place:
+                    _, row = fixture.reservation()
+                    self.assertEqual(row["need"], 18 * GIB)
+                    self.assertEqual(place.purpose, queue.ProgramPurpose.BATCH)
+                    with self.assertRaisesRegex(queue.QueuePlaceRefused, "arguments changed"):
+                        _ = place.popen(["rust-analyzer", "--version"])
+            self.assertTrue(requests.call_args_list)
+            self.assertTrue(all(call.args[0] == argv for call in requests.call_args_list))
+
     def require_transient_scope(self) -> None:
         if not Path("/sys/fs/cgroup/cgroup.controllers").exists():
             reason = "transient scope test needs cgroup v2 (not available on the Mac)"

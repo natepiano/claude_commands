@@ -81,16 +81,20 @@ class StyleQueueFake:
         self.real_startup: bool = False
         self.before_started: Callable[[], None] = lambda: None
         self.calls: list[tuple[str, Path]] = []
+        self.batch_calls: list[tuple[tuple[str, ...], bool]] = []
         self.refusals: dict[str, str] = {}
         self.places: list[UnqueuedStylePlace] = []
         self.before_start: Callable[[Path, Sequence[str]], None] = lambda _repo, _arguments: None
         self.after_close: Callable[[], None] = lambda: None
 
     @contextmanager
-    def __call__(self, program: str, repo: Path) -> Generator[queue_place.QueuePlace]:
-        self.calls.append((program, repo))
-        if program in self.refusals:
-            raise queue_place.QueuePlaceRefused(self.refusals[program])
+    def __call__(self, program: str | Sequence[str], repo: Path, *, batch: bool = False) -> Generator[queue_place.QueuePlace]:
+        arguments = (program,) if isinstance(program, str) else tuple(program)
+        name = Path(arguments[0]).name
+        self.calls.append((name, repo))
+        self.batch_calls.append((arguments, batch))
+        if name in self.refusals:
+            raise queue_place.QueuePlaceRefused(self.refusals[name])
         place = UnqueuedStylePlace(repo, self.before_start, self.real_startup, self.before_started)
         self.places.append(place)
         try:
