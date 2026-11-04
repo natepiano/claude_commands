@@ -2,9 +2,9 @@
 
 ## Items to consider
 
-- [ ] **Memory pressure is sampled every 5–10 s, not only at each admission poll**
-  - Target: `scripts/lint/memory_admit.py` (pressure reading), the buildlog sampler, `docs/as-built/build-memory-admission.md`
-  - Why needed: the pressure hold (full avg10 > 5.0) is judged only from readings taken when a step polls, so the record has no steady avg10 series to tell how long holds last or to replay another limit against a freeze.
+- [ ] **Record memory PSI avg10 every 5–10 seconds, independently of admission passes.**
+  - Target: `scripts/buildlog/sample.py`, `scripts/lint/memory_admit.py` (`read_pressure`), `scripts/build_queue/admission_service.py`, their tests, and `docs/as-built/build-memory-admission.md`.
+  - Why needed: The service reads PSI during admission passes. The buildlog sampler records cumulative stalls, but it does not record the required avg10 series.
   - Completion condition: `/proc/pressure/memory` some and full avg10 are recorded every 5–10 s on natedev with a time stamp, kept for at least 7 days, and the pressure replay reads them; a test fakes the pressure file and checks the series.
   - Revealed by: the pressure hold question during Phase 16 (builds showrunner 2026-10-30: limit 5.0 stays, the sampler is `next`)
 
@@ -15,10 +15,10 @@
   - Revealed by: Phase 25 review (Phase 4 Spec 6; builds showrunner 2026-10-30: next, dated on or after 2026-12-05)
 
 - [ ] **Measure EASY backfill against the deployed Rule A queue policy**
-  - Start after both Phase 39 checkpoints reach main and one day of observations exists.
+  - Start after both Phase 39 checkpoints reach main and seven days exist within one unchanged policy and configuration span. Calibrate the deployed model first. Stop comparison if calibration fails.
   - Bound the cohort at changes to queue priority, head policy, estimation, running charge, budget, or headroom settings.
   - Compare EASY with the deployed ordered walk, including Rule A and recovery spacing.
-  - Use the same admission function and cohort settings for both policies.
+  - Use the shipped `head_policy` for the deployed baseline. Add any alternate analysis rule explicitly; Phase 20 provides no alternate rule argument.
   - Report additional wait savings and head delay.
   - Revealed by: Phase 30; baseline corrected after Phase 31's Work Order and Phase 39.
 
