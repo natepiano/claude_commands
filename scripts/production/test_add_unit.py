@@ -114,6 +114,11 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(registry.get("procStart"), sessions.process_start(pid))
         self.assertEqual((row.id, row.current_session), (registry["sessionId"], registry["sessionId"]))
 
+    def assert_staff_folder(self, name: str, folder: Path) -> None:
+        with patch.dict(os.environ, self.env):
+            row = next(row for row in staff.find(kind="unit") if row.name == name)
+        self.assertEqual(row.worktree, staff.PresentWorktree("natedev", folder))
+
     def pin_launch_clock(self) -> None:
         def now(zone: tzinfo | None = None) -> datetime:
             return LAUNCHED_AT.astimezone(zone)
@@ -149,7 +154,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
             unit_config.PlanFile(Path("docs/plans/given.md")), before.port, before.responsibilities))
         prompts = [row[-1] for row in self.herdr_calls()[before_calls:] if row[2:4] == ["agent", "prompt"]]
         self.assertEqual(prompts, ["/unit:direct docs/plans/given.md"])
-        self.assertIn(self.unit_row(), self.doc.read_text())
+        self.assertIn(self.unit_row().replace(str(self.root / "project-alpha"), "—"), self.doc.read_text())
+        self.assert_staff_folder("alpha", self.root / "project-alpha")
         self.assertEqual(stub.read_bytes(), source)
 
     def test_adopting_a_prepared_row_without_a_port_flag_keeps_its_recorded_port(self) -> None:
@@ -475,7 +481,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertIsInstance(opening, herdr.OpeningPrompt)
         assert isinstance(opening, herdr.OpeningPrompt)
         self.assertEqual(opening.text, "/unit:direct docs/plans/given.md")
-        self.assertIn(self.unit_row(), self.doc.read_text())
+        self.assertIn(self.unit_row().replace(str(self.root / "project-alpha"), "—"), self.doc.read_text())
+        self.assert_staff_folder("alpha", self.root / "project-alpha")
         self.assertEqual(self.git("log", "-1", "--format=%s", "build-followups"),
                          "production(build-followups): add unit alpha-unit (plan)")
         self.assertEqual(self.git("rev-parse", "build-followups-alpha"),
@@ -518,8 +525,9 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.pin_launch_clock()
         _ = self.successful("alpha", "--standby", "--port", "8123", "--owns", "src/alpha", subprocess_cli=True)
         worktree = self.root / "project-alpha"
-        self.assertIn(self.unit_row(plan="standby", port="8123", owns="src/alpha"),
+        self.assertIn(self.unit_row(plan="standby", port="8123", owns="src/alpha").replace(str(self.root / "project-alpha"), "—"),
                       self.doc.read_text())
+        self.assert_staff_folder("alpha", self.root / "project-alpha")
         self.assertEqual(self.git("log", "-1", "--format=%s"),
                          "production(build-followups): add unit alpha-unit (standby)")
         self.assertEqual(self.git("show", "--pretty=format:", "--name-only", "HEAD"),
@@ -543,7 +551,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
 
     def test_permanent_launch_writes_a_permanent_row_and_says_wrap_keeps_it(self) -> None:
         _ = self.successful("alpha", "--permanent")
-        self.assertIn(self.unit_row(plan="permanent"), self.doc.read_text())
+        self.assertIn(self.unit_row(plan="permanent").replace(str(self.root / "project-alpha"), "—"), self.doc.read_text())
+        self.assert_staff_folder("alpha", self.root / "project-alpha")
         self.assertEqual(self.git("log", "-1", "--format=%s"),
                          "production(build-followups): add unit alpha-unit (permanent)")
         self.assertIn("on standby. You are permanent: wrap never retires you. Work only in your worktree",
@@ -594,7 +603,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
         result = self.successful("alpha", "--plan", "docs/plans/given.md", "--port", "8123",
                                  "--owns", "src/alpha")
         worktree = self.root / "project-alpha"
-        row = self.unit_row(port="8123", owns="src/alpha")
+        row = self.unit_row(port="8123", owns="src/alpha").replace(str(worktree), "—")
+        self.assert_staff_folder("alpha", worktree)
         self.assertIn(row, self.doc.read_text())
         self.assertEqual(self.git("show", "--pretty=format:", "--name-only", "HEAD"),
                          "docs/plans/build-followups-production.md")
@@ -774,7 +784,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertIn("## Source", content)
         self.assertIn(words, content)
         self.assertIn(f"{LAUNCHED_AT:%Y-%m-%d %H:%M %Z}", content)
-        self.assertIn(self.unit_row(plan="docs/plans/build-followups-alpha.md"), self.doc.read_text())
+        self.assertIn(self.unit_row(plan="docs/plans/build-followups-alpha.md").replace(str(self.root / "project-alpha"), "—"), self.doc.read_text())
+        self.assert_staff_folder("alpha", self.root / "project-alpha")
         self.assertEqual(set(self.git("show", "--pretty=format:", "--name-only", "HEAD").splitlines()),
                          {"docs/plans/build-followups-production.md", "docs/plans/build-followups-alpha.md"})
         prompt = self.opening_prompt()
@@ -795,7 +806,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
         _ = self.successful("lfo", "--brief", "Add the LFO tool")
         worktree = self.root / "project-lfo"
         self.assertIn(self.unit_row("lfo", branch="tool-based-ui-lfo", worktree=worktree,
-                                    plan="docs/hana/tool-based-ui-lfo.md"), self.doc.read_text())
+                                    plan="docs/hana/tool-based-ui-lfo.md").replace(str(worktree), "—"), self.doc.read_text())
+        self.assert_staff_folder("lfo", worktree)
         self.assertEqual(self.git("branch", "--show-current", cwd=worktree), "tool-based-ui-lfo")
         self.assertEqual(set(self.git("show", "--pretty=format:", "--name-only", "HEAD").splitlines()),
                          {"docs/hana/tool-based-ui-production.md", "docs/hana/tool-based-ui-lfo.md"})
@@ -1192,7 +1204,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
         _ = self.staff.record_production("build-followups", self.doc)
         _ = self.successful("mul_add", "--plan", "docs/plans/given.md")
         self.assertIn(self.unit_row("mul_add", branch="build-followups-mul-add",
-                                    worktree=self.root / "project-mul-add"), self.doc.read_text())
+                                    worktree=self.root / "project-mul-add").replace(str(self.root / "project-mul-add"), "—"), self.doc.read_text())
+        self.assert_staff_folder("mul_add", self.root / "project-mul-add")
         self.assertEqual(self.git("rev-parse", "--abbrev-ref", "HEAD",
                                   cwd=self.root / "project-mul-add"), "build-followups-mul-add")
 

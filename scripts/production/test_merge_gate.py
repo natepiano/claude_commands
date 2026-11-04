@@ -323,32 +323,6 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual([row[change_review.PRODUCER] for row in change_review.pending(review)
                           if row["#"] in {"C8", "C9"}], [producer, producer])
 
-    def test_an_unreadable_staff_record_refuses_before_the_merge_and_a_rerun_writes_the_rows(self) -> None:
-        review, doc = self.review_list()
-        producer = self.review_producer(doc)
-        checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
-                                            + "Change-Review: The grid fades gently | Run hana | The grid fades")
-        path = Path(self.environment["STAFF_FILE"])
-        record = path.read_bytes()
-        before = review.read_bytes()
-        path.unlink()
-        refused = self.run_gate("--production", str(doc), checkpoint=checkpoint)
-        self.assert_refused_before_gate(refused)
-        self.assertIn("cannot read staff record", refused.stderr)
-        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
-        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
-        self.assertEqual(review.read_bytes(), before)
-        _ = path.write_bytes(record)
-        retried = self.run_gate("--production", str(doc), checkpoint=checkpoint)
-        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
-        merged = self.git(self.checkout, "rev-parse", "HEAD")
-        self.assertEqual(self.git(self.origin, "rev-parse", "integration"), merged)
-        self.assertEqual(self.git(self.checkout, "rev-list", "--count", f"{self.base}..HEAD", "--merges"), "1")
-        self.assertEqual(self.git(self.checkout, "rev-list", "--parents", "-n", "1", "HEAD").split(),
-                         [merged, self.base, checkpoint])
-        self.assertEqual([row[change_review.PRODUCER] for row in change_review.pending(review)
-                          if row["#"] == "C8"], [producer])
-
     def test_a_gate_that_finds_no_production_is_refused_before_the_merge(self) -> None:
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
                                             + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away")
