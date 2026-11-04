@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import cast, final
 from unittest import mock
 from scripts.production import merge_gate
+from scripts.production.gate_modules import discover_test_modules, test_module_name
 from scripts.production.merge_gate_test_support import SUITE_MODULE, gate_suites
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 
@@ -19,14 +20,28 @@ from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 class MergeGateSuitesTests(GateSuitesFixture):
     def test_recovery_suites_include_their_real_regression_modules(self) -> None:
         repo = Path(__file__).resolve().parents[2]
-        found = {(suite, merge_gate.test_module_name(repo, suite, path))
-                 for suite, path in merge_gate.discover_test_modules(repo)}
+        found = {(suite, test_module_name(repo, suite, path))
+                 for suite, path in discover_test_modules(repo)}
         self.assertTrue({
             ("release", "test_release.py"), ("claude_to_codex", "test_sync.py"),
             ("new_rust_project", "test_rust_generate.py"), ("validate_and_push", "test_rerun.py"),
             ("exclude", "test_exclude.py"), ("prioritize", "tests/test_renumber.py"),
             ("prioritize", "tests/test_run_watcher.py"),
         }.issubset(found), found)
+
+    def test_discovery_keeps_path_order_and_skips_cache_folders(self) -> None:
+        repo = self.checkout / "discovery"
+        for name in ("z/test_last.py", "a/test_last.py", "a/nested/test_first.py",
+                     "a/__pycache__/test_hidden.py", "__pycache__/test_hidden.py"):
+            self.write(repo / "scripts" / name, "# A fixture module.\n")
+        found = discover_test_modules(repo)
+        self.assertEqual(found, [
+            ("a", repo / "scripts/a/nested/test_first.py"),
+            ("a", repo / "scripts/a/test_last.py"),
+            ("z", repo / "scripts/z/test_last.py"),
+        ])
+        self.assertEqual([test_module_name(repo, suite, path) for suite, path in found],
+                         ["nested/test_first.py", "test_last.py", "test_last.py"])
 
     @gate_suites("prioritize")
     def test_a_nested_suite_module_runs_and_retries_at_its_discovered_path(self) -> None:

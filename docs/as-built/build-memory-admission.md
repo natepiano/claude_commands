@@ -205,6 +205,48 @@ The AWS controller reads this snapshot without a live queue request.
 It refuses a start when the snapshot is missing, stale, or incomplete.
 Queue views continue to use the service.
 
+### Queue lifecycle and calibration
+
+The service records queue events in `admission/queue_times.jsonl` through `append_queue_time`.
+The same record holds Cargo steps and `merge-gate` steps.
+The append function locks the file and removes incomplete rows before an append.
+At 8 MiB, it retains the newest events from the last 14 days in less than 6 MiB.
+
+1. `admitted` records the original arrival, admission time, wait seconds, need, need source, applied budget, and head window.
+2. `left` records a cancelled waiter or a waiter whose owner is gone.
+3. `ended` records the reservation's end time, outcome, end kind, and sampled peak state.
+
+Each event identifies the logical step by `pid`, `start_time`, and the original `since`.
+Each admission and end also identifies its reservation interval by `reservation_id`.
+A token wait ends an interval with `TokenReturn`. It does not complete the step.
+A normal end uses `StepEnd`. An exit before a positive sample records `NoPositiveSample`.
+The saved finalization intent retains the facts for the end event across retries.
+The event identity prevents a retry from publishing the same end twice.
+The service saves pending admission and cancellation facts with each durable state transition.
+One lifecycle outbox publishes these facts after the state write and during restart.
+Reservation removal and removal of its non-token place use the same state write.
+
+`read_queue_lifetimes` joins these events into `QueueStepLifetime` records.
+Each record retains its reservation intervals, token gaps, and final end state.
+Memory wait includes the first wait and each wait after a token returns.
+It excludes the token gaps and running time.
+A missing return time gives `MemoryWaitIncomplete`; an unfinished step gives `StepStillOpen`.
+The Phase 16 comparison is due 24 hours after these lifecycle records reach main.
+It compares Cargo waits and pressure holds with and without overlapping gate intervals.
+
+`head_policy` resolves the deployed head rule and ordered walk from one frozen snapshot.
+Admission, queue readers, blocker searches, and release searches use that result.
+The active window supplies the shell wait text and admission records.
+The queue card preserves captured window evidence until the service saves its first priority mark.
+The deployed rule keeps the recovery slot, queue priority, and the head-admission override.
+
+The Phase 20 calibration has insufficient evidence.
+The calibration requires seven days under the deployed Phase 39 configuration.
+The phase review found no eligible days or cohort budget after that deployment boundary.
+Recorded wait minutes, replayed wait minutes, and their ratio are unavailable.
+The main reference has a 24 GiB build budget; this is not a calibration cohort.
+The comparative replay does not run. The capacity rule is not adopted.
+
 ### Estimates and charges
 
 The client calls `step_estimate` before admission and after `EstimateExpired`.
@@ -226,6 +268,109 @@ Its `ProgramMemoryCap("merge-gate")` evidence produces `the merge gate's memory 
 Both the budget charge and free-memory growth term use that promise.
 
 Other programs retain `HistoryPeakSizing` and `program_peak_estimate`.
+Cargo estimates separate compile history from no-compile history.
+`index_step_evidence` joins each anonymous peak by host, call id, and step.
+`StepEvidence` keeps its shape and compile count independent.
+For a test step (`TEST_STEPS`: `nextest`, `test`, `t`), it also keeps the decoded argv as `arguments`.
+`history_selection` gives each anonymous row its package, scope and filter set.
+A recorded field wins. Only a missing field is parsed from `arguments`, once, through `test_selection`.
+A row with neither keeps the recorder defaults: no package, `full`, no filters.
+Missing argv does not remove a compile count. A saved shape does not prove compilation.
+`CompiledCrates` identifies a compile run. `NoCratesCompiled` identifies known zero-count attempts.
+The join combines repeated attempts. Any positive count keeps the call in compile history.
+An unknown count or a missing join keeps the peak usable until the index supplies a known count.
+The peak's completion time controls its history window, including failed-build floors.
+Merge-gate peaks keep their separate class and remain in the anonymous history.
+The gate uses its own cap, so Cargo estimates do not use those peaks.
+
+Five keyed rows exclude the older unkeyed rows for the same repository.
+With one to four own rows, a non-build estimate uses their largest peak or a lower pool p90.
+A repository without own history keeps the pool and fallback order.
+A full test estimate with a package keeps only rows whose package and scope match.
+Other steps, and requests with no package, keep the recorded scope rule.
+A filtered compile estimate (`filtered_peak`) takes the larger of two anonymous p90 values:
+the exact filter set's rows and the package's filtered rows.
+Indexed peaks times `ANON_SHARE` come next, exact filter first. Check or build compile peaks come last.
+A full-suite estimate does not cap a filtered compile estimate.
+The 1 GiB filtered floor applies when the repository has no usable compile history.
+Fresh nextest estimates retain `fresh_test_peak` and its 1 GiB floor.
+Freshness still requires both Cargo output roots to survive.
+
+#### Phase 11 replay comparison
+
+The replay covers 2026-10-21 through 2026-11-04 with the same frozen inputs.
+It evaluates 15,053 runs and omits 195 runs without an index match.
+Another 617 merge-gate rows retain their separate cap class.
+Each estimate uses its historical budget: 21 GiB or 24 GiB.
+Under-half means below half the measured peak. Over-three means above three times the measured peak.
+
+| Compile class | Budget GiB | Runs | Under-half before | Under-half after | Over-three before | Over-three after |
+|---|---:|---:|---:|---:|---:|---:|
+| compile | 21 | 11,360 | 458 | 402 | 1,162 | 1,152 |
+| compile | 24 | 2,300 | 18 | 12 | 332 | 358 |
+| no compile | 21 | 1,185 | 12 | 12 | 937 | 937 |
+| no compile | 24 | 208 | 3 | 4 | 174 | 173 |
+| **Total** | | **15,053** | **491** | **430** | **2,605** | **2,620** |
+
+These repositories have a higher count. Each row combines their steps, compile classes, and budgets.
+
+| Repository | Under-half before | Under-half after | Over-three before | Over-three after |
+|---|---:|---:|---:|---:|
+| cargo-liner | 27 | 8 | 1,754 | 1,804 |
+| check-only | 1 | 2 | 5 | 3 |
+| clone | 1 | 2 | 15 | 14 |
+| clone85 | 1 | 2 | 0 | 0 |
+| fix | 3 | 3 | 20 | 22 |
+| hana | 71 | 31 | 592 | 595 |
+| lintproof_fix | 0 | 1 | 6 | 1 |
+| p31-gates-834aebb04-8015c7caf3 | 1 | 2 | 3 | 1 |
+| src | 0 | 2 | 46 | 40 |
+| work | 1 | 2 | 0 | 0 |
+
+Bar missed: under-half falls by 61, but over-three rises by 15.
+At least one count rises in 10 repositories and 19 repository, step, and compile-class groups.
+The largest rise is cargo-liner nextest compile runs at 21 GiB: under-half 27 to 7, over-three 101 to 166.
+A filtered compile run takes its estimate from compile history, and the full-run estimate no longer caps it.
+The showrunner accepted the miss (2026-11-04): an under-promise risks an out-of-memory kill; an over-promise only delays parallel starts.
+Phase 60 found the promise source of these over-three runs and fixed it there; see the Phase 60 replay below.
+Run `phases/11/replay.py before` and `after` in the session folder to regenerate the full grouped data for `replay_groups.md`.
+
+#### Phase 60 replay comparison
+
+The Phase 60 replay (`phases/60/replay.py`) rebuilds the Phase 11 replay with the same frozen inputs.
+It classifies each call through `index_step_evidence` and `combine_compile_counts`. The baseline is `82f5c90d4`, the Phase 11 checkpoint.
+The shared classification moves 51 runs from no compile to compile, so its class totals differ from the Phase 11 table.
+
+The cause is in the selection of history rows, not in the tier order:
+1. Anonymous rows recorded before 2026-10-29 have no package, scope or filter fields.
+   `filtered_peak` rejected them, so 90 high promises came from indexed peaks times `ANON_SHARE`.
+   Indexed peaks count memory outside the anonymous peak, so those promises were too high.
+2. A full test estimate with a package mixed every package and older filtered rows: 79 high promises.
+3. Three high promises came from large earlier samples. The fix keeps them.
+
+The fix recovers the missing fields from the indexed argv, selects full test rows by package and scope,
+and takes the larger of the exact-filter and package p90 before any indexed tier.
+
+| Compile class | Budget GiB | Runs | Under-half before | Under-half after | Over-three before | Over-three after |
+|---|---:|---:|---:|---:|---:|---:|
+| compile | 21 | 11,411 | 402 | 367 | 1,171 | 1,071 |
+| compile | 24 | 2,300 | 12 | 12 | 358 | 361 |
+| no compile | 21 | 1,134 | 12 | 12 | 918 | 920 |
+| no compile | 24 | 208 | 4 | 4 | 173 | 173 |
+| **Total** | | **15,053** | **430** | **395** | **2,620** | **2,525** |
+
+Bar met: cargo-liner nextest compile runs at 21 GiB go from under-half 7 to 0 and over-three 166 to 65 (bar: 101 or lower, under-half 7 or lower).
+At 24 GiB, the same group goes from over-three 6 to 2.
+Hana over-three rises 595 to 607 while its under-half falls 31 to 23. Six other repositories rise by one or two runs in one count.
+Run `phases/60/run_after.py` in the session folder to regenerate `after.json`.
+
+#### Phase 17 compile-band measurement (not adopted)
+
+Phase 17 replayed nextest promises split by compile count (bands 1–5, 6–20, 21–50 and more than 50 crates) against checkpoint `e88fb841d`.
+The band chosen from the last compile count of the same worktree and step was right for 54% of compile requests.
+Promises under half the peak rose from 395 to 423, and ten repositories got worse. Promises over three times the peak fell from 2,525 to 2,485.
+The adopt rule needs fewer under-half promises in total and no rise in any repository, so bands are not adopted and the estimate is unchanged.
+
 Build estimates use completed same-shape history from the last 14 days.
 Ten or more earlier runs supply p90. One to nine earlier runs supply their largest peak.
 The newest failed-build floor can raise that base.
@@ -239,7 +384,7 @@ Release builds use `release_headroom`, currently 1.314. A build without same-sha
 The retry after a memory kill stays unchanged.
 
 Each estimate stores its rule and the budget cap it applies.
-`DevSizeHeadroom` stores its factor and margin. `DevHeadroom` retains the older multiplier for saved records.
+`DevSizeHeadroom` stores its factor and margin. `LegacyDevMultiplierHeadroom` retains the older multiplier for saved records.
 `CappedAtBudget` stores the uncapped need and the applied cap.
 The reader checks those saved values without reading today's budget.
 An older record without a saved cap becomes `CapNotRecorded`.
@@ -266,13 +411,22 @@ The first selected charge evidence is persisted outside the pure pass. A failed 
 Each pass counts `sccache.service` and unowned child scopes under `builds.slice`.
 `ci_memory_slice` in `[memory]` of `config/build_admission.conf` names the system CI slice.
 `systemctl show` supplies its cgroup path. Each pass reads its `memory.current`, `memory.stat`, swap, and `memory.max` through `unowned_slice_memory`.
-Unowned scopes and the CI slice use one working-set rule: `max(0, memory.current - memory.stat inactive_file) + swap`.
-An idle CI slice charges this working set. Inactive file cache holds no build budget.
+Step scopes, unowned scopes, the compiler cache, and CI use one resident working-set rule: `max(0, memory.current - memory.stat inactive_file)`.
+An idle CI slice charges this resident working set. Inactive file cache and swap hold no build budget.
+Process-tree readings charge RSS and record swap separately. Every reading retains `swap_bytes` for display.
 A `Runner.Worker` adds `ci_memory_margin_gib` for growth between passes, capped at the live slice limit.
 The charge never falls below the working set. Each pass reads the margin and the limit again.
 The promise reserves free RAM for the added margin. An unavailable reading refuses new grants and retries on the next pass.
 Releases remain available during a reading refusal.
 `UnownedSliceMemory` names each unowned scope and its size. Process-tree charges are subtracted to prevent duplicate charges.
+The CI slice and compiler cache always have service rows, including zero RAM readings.
+`IdleService` shows `idle` without an age.
+`RunningServiceJob` records the oldest live `Runner.Worker` start time and shows `running job` with its age.
+Listener uptime never supplies the CI job age. The compiler cache always shows `idle`.
+The board and card show RAM and a separate `GiB swapped` label.
+`NotServiceSlice` retains the build-scope activity rules.
+Existing saved peaks and reservation promises keep their recorded values, including swap in peaks recorded before resident accounting.
+New CI promises use resident working set plus the configured margin, capped at the slice limit.
 The held head shows free memory, reserve, and need from `HeadExplanation`.
 
 ### Clients and program places
@@ -365,7 +519,36 @@ Durable `Waiter` rows keep their join and token clocks. `RankedWaiter.order` hol
 
 ### Cargo token reclaim (`scripts/direct/board.sh`)
 
-`verify.sh` acquires the board's `cargo` token with `--pid $$ --hold 3600` and no time limit: `acquire_token` repeats `--wait 3` (two tries 3 s apart) until the token is held, and adds the wait to the call's `token_wait_s`. The waits form one queue: a call tries only while no older call in the board's `token_waiters` folder still runs `verify.sh` (`count_token_waiters_ahead`, which also removes the files of ended calls), and `try_token_now` makes a wait when an older call waits. A call that gives the token back for a memory or hold wait waits again under its first start, in a file with an `.again` suffix, so it keeps its place and a newer call does not supersede it. The wait prints `waiting for the cargo token since <time>: <holder> holds it; calls ahead of this one: N`, a `still waiting` line every 5 min (`TOKEN_WAIT_NOTE_MIN`), and `took the cargo token after N min`. On 2026-10-22 about 25 calls polled one board's token, any of them took it when it came free, and two calls waited 3 and 3.5 h with logs that ended on "starting anyway", so their unit took them for dead. Each step gives the token back before `buildlog_wait_for_memory` and takes it again when the gate admits the step, so a peer builds while this run waits for memory; a step that leaves the wait for the Mac (`LeftQueue`) does not take it again. After admission the step tries the token once with `--wait 0` (`try_token_now`). When a peer holds it, the step gives its reservation back (`buildlog_release_memory 0`), waits for the token, and passes the gate again with the token held, so a step in the token queue promises no memory. The second pass sets `BUILDLOG_MEM_WAIT_SINCE` to the first pass's `BUILDLOG_MEM_WAIT_FROM`, so the step keeps its place in the waiter queue; `memory_wait` sums both passes. Kept reservations had promised 257 GiB that no build used on 2026-10-20, and every step waited the 15 min limit. The step's build hold wait (`build_hold_wait_local`, wrapped in `verify.sh`) does the same when a hold is present and the step holds the token: it gives the token back, waits out the hold, and takes it again, except after status 75 (left for the Mac). The hold time stays in the hold wait record; only the time to take the token again counts in `token_wait_s`. With no hold present, nothing is given back. The step runs in `run()`'s subshell, so its token wait reaches the call record through `TOKEN_WAIT_FILE`, and a token it gave back without taking it again leaves `TOKEN_WAIT_FILE.given_back`: `release_token` then counts the token as not held, so a call that ends after a Mac trip does not try to release a token a peer now holds (it only frees one a killed step took as its acquire returned). An INT, TERM or HUP during the token wait stops the waiting acquire and gives back a token it took in the last instant, and with `--pid N` `board.sh acquire` itself exits 4 (`gone <res>: pid N ended while it waited`) once N is gone. A step whose call is gone stops its token wait (`token_wait_orphaned`): each pass checks that the call's pid (`$$`) still runs, an acquire that exits 4 ends the wait too, and the step prints `verify.sh: the call that started this step is gone, so the step stops waiting for the cargo token.` and exits 1. On 2026-10-20 a test killed a call's group and left its step, which runs in a group of its own (`run()`'s `set -m`), trying again for 45 h with 15 GiB of deleted output still open; the test's cleanup now also ends every process in the call's session. A release moves the lock's `reclaimed_holders` lines whose holder still runs to `locks/<res>.reclaimed`, and the next acquire moves them back into its lock, so a reclaimed holder's late release still exits 3 after the token changed hands again. `board.sh acquire --pid N` (a positive integer, else exit 2) records N in `locks/<res>.d/holder_pid`. A waiter treats the token as stale when that process is gone, checked first, or when its hold has expired. Gone means `ps -p N -o stat=` exits 1 with empty output or reports a zombie; anything else, a failure of `ps` included, counts as alive, and a lock with no or a malformed `holder_pid` waits for expiry. So a `verify.sh` killed before its EXIT trap frees the token within one 3 s poll, posting `token cargo reclaimed from <holder>: holder pid <N> is gone`, while a manual holder is never reclaimed early. A newer call from the same worker, with the same verb and arguments in the same worktree (a lint key leaves out its package), ends an older one that still waits for its first token: each waiting call keeps `token_waiters/<slot>.<key>.<start>.<pid>` on the board, and a newer call sends SIGUSR1 to each older one whose pid still runs `verify.sh`. The older call gives back a token its acquire took in the last instant, prints `verify.sh: superseded by a newer <verb> call`, records outcome `superseded` and exits 76 (`VERIFY_SUPERSEDED_STATUS`); `mesh_runs.py` delivers that as `Result: SUPERSEDED (exit 76)`, not a failure, also when the run has a done message. A call whose acquire already won runs to the end, and a SIGUSR1 after the first wait does nothing. On 2026-10-21 one worker queued 27 calls this way, most on trees it had already left, and its peers waited up to 20 h for the token. Reclaiming a dead holder first SIGKILLs the step process group it recorded in `locks/<res>.d/owned` and fails closed (acquire exits 1, token left in place) when that group cannot be inspected or stopped; an expired hold whose holder is alive is reclaimed without touching its build. Reclaim and release run under an exclusive flock on `locks/<res>.guard`, taken by python3 `fcntl` on descriptor 9 (the Mac has no `flock(1)`) and dropped by the kernel when its holder dies: a reclaimer re-reads the lock under it, so two waiters cannot both reclaim and a release cannot remove a lock a reclaimer just made. Reclaim never waits for the guard; release retries for up to 10 s, then exits 1 (`board.sh: cannot guard <res> release`).
+`verify.sh` takes the board's `cargo` token before each local compiling attempt requests memory.
+`acquire_token()` waits in the existing FIFO queue and reuses a token that this call already holds.
+The attempt makes one memory request and retains the token during its memory wait.
+The client's periodic leave hook renews the token with `board.sh renew` while the attempt waits.
+The hook starts before the first connection attempt, so connection retries also renew the token.
+The execution guard still checks the token owner before cargo starts.
+`unreachable_limit_seconds` limits missing-socket and refused-connection retries to 60 seconds by default.
+The client reports the retry interval once when a connection fails.
+A successful connection resets that interval.
+At the limit, the client exits with status 2, and verify releases the token without starting cargo.
+A blocked token caller has no memory waiter or reservation.
+A memory wait can delay peer calls on the same board until memory becomes available.
+
+Admission failure, cancellation, a hold, and departure for the Mac release the token.
+A later local attempt takes the token before its next memory request.
+Each `run()` path releases tokens that it acquired, as required by verify Phase 36.
+Noncompiling local steps retain their existing token path and request no memory.
+The wait log names the holder and its PID, including holder files without a final newline.
+It says `this call holds it` when the recorded PID equals the call's PID.
+
+Old shells can still send `admit`, `token-wait`, and a second `admit` with `BUILDLOG_MEM_TOKEN_BACK_AT`.
+The service keeps this compatibility path and records its token gap.
+New shells generate neither the second request nor a token gap.
+
+A hold releases the token until the hold ends.
+A call that waits again keeps its original FIFO position through its `.again` waiter file.
+The hold wait and token wait retain separate history records.
+`TOKEN_WAIT_FILE` carries a step's token wait to the call record.
+`TOKEN_WAIT_FILE.given_back` records a subshell release for its parent.
+ An INT, TERM or HUP during the token wait stops the waiting acquire and gives back a token it took in the last instant, and with `--pid N` `board.sh acquire` itself exits 4 (`gone <res>: pid N ended while it waited`) once N is gone. A step whose call is gone stops its token wait (`token_wait_orphaned`): each pass checks that the call's pid (`$$`) still runs, an acquire that exits 4 ends the wait too, and the step prints `verify.sh: the call that started this step is gone, so the step stops waiting for the cargo token.` and exits 1. On 2026-10-20 a test killed a call's group and left its step, which runs in a group of its own (`run()`'s `set -m`), trying again for 45 h with 15 GiB of deleted output still open; the test's cleanup now also ends every process in the call's session. A release moves the lock's `reclaimed_holders` lines whose holder still runs to `locks/<res>.reclaimed`, and the next acquire moves them back into its lock, so a reclaimed holder's late release still exits 3 after the token changed hands again. `board.sh acquire --pid N` (a positive integer, else exit 2) records N in `locks/<res>.d/holder_pid`. A waiter treats the token as stale when that process is gone, checked first, or when its hold has expired. Gone means `ps -p N -o stat=` exits 1 with empty output or reports a zombie; anything else, a failure of `ps` included, counts as alive, and a lock with no or a malformed `holder_pid` waits for expiry. So a `verify.sh` killed before its EXIT trap frees the token within one 3 s poll, posting `token cargo reclaimed from <holder>: holder pid <N> is gone`, while a manual holder is never reclaimed early. A newer call from the same worker, with the same verb and arguments in the same worktree (a lint key leaves out its package), ends an older one that still waits for its first token: each waiting call keeps `token_waiters/<slot>.<key>.<start>.<pid>` on the board, and a newer call sends SIGUSR1 to each older one whose pid still runs `verify.sh`. The older call gives back a token its acquire took in the last instant, prints `verify.sh: superseded by a newer <verb> call`, records outcome `superseded` and exits 76 (`VERIFY_SUPERSEDED_STATUS`); `mesh_runs.py` delivers that as `Result: SUPERSEDED (exit 76)`, not a failure, also when the run has a done message. A call whose acquire already won runs to the end, and a SIGUSR1 after the first wait does nothing. On 2026-10-21 one worker queued 27 calls this way, most on trees it had already left, and its peers waited up to 20 h for the token. Reclaiming a dead holder first SIGKILLs the step process group it recorded in `locks/<res>.d/owned` and fails closed (acquire exits 1, token left in place) when that group cannot be inspected or stopped; an expired hold whose holder is alive is reclaimed without touching its build. Reclaim and release run under an exclusive flock on `locks/<res>.guard`, taken by python3 `fcntl` on descriptor 9 (the Mac has no `flock(1)`) and dropped by the kernel when its holder dies: a reclaimer re-reads the lock under it, so two waiters cannot both reclaim and a release cannot remove a lock a reclaimer just made. Reclaim never waits for the guard; release retries for up to 10 s, then exits 1 (`board.sh: cannot guard <res> release`).
 
 ### Build log: records and schema
 

@@ -49,10 +49,8 @@ def file_text(repo: Path, commit: str, path: str) -> str:
     return run_git(("git", "-C", str(repo), "cat-file", "blob", f"{commit}:{path}")).stdout.decode(errors="replace")
 
 
-def unit_worktrees(doc: Path, *,
-                   resolver: session_staff.RowResolver | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> tuple[UnitWorktree, ...]:
-    if isinstance(resolver, session_staff.ReadCurrentStaff):
-        resolver = session_staff.RowResolver(staff.snapshot())
+def unit_worktrees(doc: Path, *, resolver: session_staff.RowResolver | None = None) -> tuple[UnitWorktree, ...]:
+    resolver = session_staff.RowResolver(staff.snapshot()) if resolver is None else resolver
     return tuple(row for row in _unit_file_sources(unit_lookup.doc_owner(doc, resolver.record), resolver)
                  if isinstance(row, UnitWorktree))
 
@@ -119,7 +117,7 @@ def unit_file_holders(repo: Path, doc: Path, ledger: style_ledger.Ledger, own_un
     resolver = ledger.staff_resolver()
     record = resolver.record
     owner = unit_lookup.doc_owner(doc, record)
-    parent = record.by_id(owner.parent) if owner.parent else None
+    parent = record.parent_of(owner)
     units = _unit_file_sources(owner, resolver)
     if parent is not None:
         units = (*_unit_file_sources(parent, resolver), *units)

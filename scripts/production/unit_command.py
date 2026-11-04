@@ -171,9 +171,9 @@ def read_details(row: staff.StaffRow, holder: staff.StaffRow, machine: str) -> M
 
 def describe(row: staff.StaffRow, record: staff.StaffSnapshot) -> str:
     """Resolve ownership through the supplied snapshot."""
-    parent = record.by_id(row.parent) if row.parent is not None else None
+    parent = record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
     parent_name = parent.name if parent is not None else (
-        NOT_APPLICABLE if row.parent is None else unavailable(f"parent {row.parent} is missing"))
+        NOT_APPLICABLE if isinstance(row.parent, staff.StaffRoot) else unavailable(f"parent {row.parent} is missing"))
     holder = parent if row.kind == "worker" and parent is not None else row
     machine, worktree = unavailable("the machine is not recorded"), NOT_APPLICABLE
     if isinstance(holder.worktree, (staff.PresentWorktree, staff.RemovedWorktree)):

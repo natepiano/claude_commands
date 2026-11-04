@@ -34,6 +34,7 @@ from scripts.lib.process_failure import failure_detail  # noqa: E402
 from rename_state import RenameRefused, read_json, write_json  # noqa: E402
 from scripts.lib import conf  # noqa: E402
 from scripts.agents import worker_lifecycle  # noqa: E402
+from scripts.message import sessions  # noqa: E402
 from scripts.production import staff  # noqa: E402
 from scripts.shutdown import remote  # noqa: E402
 
@@ -183,13 +184,6 @@ def move_worktree(checkout: Path, old_branch: str, new_branch: str, old: Path, n
     _ = git(new, "switch", new_branch)
 
 
-def config_dirs() -> list[Path]:
-    directories = {path for path in Path.home().glob(".claude*") if path.is_dir()}
-    override = os.environ.get("CLAUDE_CONFIG_DIR")
-    if override:
-        directories.add(Path(override).expanduser())
-    return sorted(directories)
-
 
 def copy_trust(path: Path, old: str, new: str) -> None:
     config = json_object(read_json(path))
@@ -220,7 +214,7 @@ def project_folder(worktree: str) -> str:
 def move_configs(old: str, new: str) -> None:
     """Move the transcript folders and copy the trust entry in every Claude config dir."""
     old_project, new_project = project_folder(old), project_folder(new)
-    for directory in config_dirs():
+    for directory in sessions.config_dirs():
         move(PathMove(directory / "projects" / old_project, directory / "projects" / new_project))
         config = (Path.home() / ".claude.json" if directory == Path.home() / ".claude"
                   else directory / ".claude.json")
@@ -463,8 +457,9 @@ def prepare_move(row: staff.StaffRow, destination: Path, branch: str | KeepBranc
 def _recoverable_folder(record: staff.StaffSnapshot, row: staff.StaffRow, old: Path,
                         destination: Path, branch: str | KeepBranch) -> bool:
     """Require the same repository and the unit's registered branch."""
-    owner = record.by_id(row.parent) if row.parent is not None else None
-    if owner is None or isinstance(owner.doc, staff.DocUnfilled) or not (destination / ".git").is_file():
+    owner = record.parent_of(row)
+    if (owner is None or not isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
+            or owner.doc.machine != remote.local_machine() or not (destination / ".git").is_file()):
         return False
     try:
         repository = Path(git(owner.doc.path.parent, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()

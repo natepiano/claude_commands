@@ -17,7 +17,7 @@ for dependency in ("herdr", "message", "lib", "shutdown"):
 
 import herdr
 import sessions
-from scripts.production import staff, unit_move, session_staff
+from scripts.production import staff, session_staff
 from scripts.lib import nix_env
 from scripts.shutdown import shutdown_record, stop_resume, pane_record
 from scripts.shutdown.codex_trust import trust_arguments
@@ -82,7 +82,7 @@ def session_launch(identity: str) -> tuple[Literal["claude", "codex"], dict[str,
         for directory in entry.get("plugin_directories", []):
             arguments.extend(("--plugin-dir", directory))
         return kind, named_account_environment(Path(entry["config_dir"])), arguments
-    for directory in unit_move.config_dirs():
+    for directory in sessions.config_dirs():
         if any((directory / "projects").glob(f"*/{identity}.jsonl")):
             return "claude", named_account_environment(directory), ["--resume", identity]
     homes = list(Path.home().glob(".codex*"))
@@ -96,7 +96,7 @@ def session_launch(identity: str) -> tuple[Literal["claude", "codex"], dict[str,
 
 def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.Herdr, *,
               present: bool = False, target_account: str = "",
-              resolver: session_staff.RowResolver | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> str:
+              resolver: session_staff.RowResolver | None = None) -> str:
     live = sessions.session_liveness(str(row.current_session))
     if isinstance(live, sessions.LiveSessionProcess):
         print(f"{row.name}: unchanged")
@@ -168,11 +168,11 @@ def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[sta
 
 
 def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bool = False,
-              resolver: session_staff.RowResolver | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> list[staff.StaffRow]:
+              resolver: session_staff.RowResolver | None = None) -> list[staff.StaffRow]:
     import remote
 
     selected: list[staff.StaffRow] = []
-    resolver = session_staff.RowResolver(record) if isinstance(resolver, session_staff.ReadCurrentStaff) else resolver
+    resolver = session_staff.RowResolver(record) if resolver is None else resolver
     try:
         live = {session["sessionId"]: (session["name"] or session["sessionId"]) +
             (f" in {folder}" if (folder := session.get("cwd")) else "") for session in sessions.running_sessions()}

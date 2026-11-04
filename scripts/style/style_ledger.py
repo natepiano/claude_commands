@@ -2394,7 +2394,7 @@ def command_ticket_holder(reference: str, ledger: Ledger) -> staff.StaffRow:
     elif context.kind == "showrunner":
         owner = context
     else:
-        owner = record.by_id(context.parent) if context.parent is not None else None
+        owner = record.parent_of(context)
         if owner is None or owner.kind != "showrunner":
             raise LedgerError(f"{reference}: the command worktree's production ownership is unavailable")
     found = session_staff.unit_match(session_staff.UnitMember(owner.name, reference), record,
@@ -2407,7 +2407,7 @@ def command_ticket_holder(reference: str, ledger: Ledger) -> staff.StaffRow:
 class Ledger:
     def __init__(self, repo: Path, database: Path, *, git_cache: GitReadCache | NoGitReadCache = _NO_GIT_READ_CACHE,
                  access: LedgerAccess = LedgerAccess.READ_WRITE,
-                 resolver: session_staff.RowResolver | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> None:
+                 resolver: session_staff.RowResolver | None = None) -> None:
         self.repo: Path = repo
         self._git_operation_depth: int = 0
         self.database: Path = database
@@ -2449,7 +2449,7 @@ class Ledger:
         self._item_bodies: dict[tuple[str, str, DeclaredItem], declarations.ReadableBody | declarations.UnreadableBody] = {}
         if access == LedgerAccess.READ_WRITE:
             database.parent.mkdir(parents=True, exist_ok=True)
-        self._staff_resolver: session_staff.RowResolver | session_staff.ReadCurrentStaff = resolver
+        self._staff_resolver: session_staff.RowResolver | None = resolver
         self._connection: sqlite3.Connection = (
             sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=BUSY_TIMEOUT_SECONDS)
             if access != LedgerAccess.READ_WRITE else sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS))
@@ -2864,7 +2864,7 @@ class Ledger:
 
     def staff_resolver(self) -> session_staff.RowResolver:
         """Share one staff snapshot across the ledger command."""
-        if isinstance(self._staff_resolver, session_staff.ReadCurrentStaff):
+        if self._staff_resolver is None:
             self._staff_resolver = session_staff.RowResolver(staff.snapshot())
         return self._staff_resolver
 
@@ -2939,7 +2939,7 @@ class Ledger:
 
     def _migrate_staff_ids(self, references: tuple[Path, ...], stop_after_first: bool) -> tuple[str, ...]:
         # A migration cannot reuse ownership from before a clear or a rename.
-        self._staff_resolver = session_staff.ReadCurrentStaff.CURRENT
+        self._staff_resolver = None
         tickets = cast(list[tuple[str, str]], self._connection.execute(
             "SELECT id,unit FROM tickets ORDER BY created_at,id",
         ).fetchall())
@@ -2982,8 +2982,7 @@ class Ledger:
                     if self.staff_resolver().record.by_id(staff.StaffId(identity)) is None:
                         continue
                     row = self.unit_row(identity)
-                    resolver = self._staff_resolver
-                    assert isinstance(resolver, session_staff.RowResolver)
+                    resolver = self.staff_resolver()
                     if row.kind == "showrunner":
                         document = resolver.production_doc(row)
                         if not isinstance(document, session_staff.ProductionDoc):
@@ -3071,7 +3070,7 @@ class Ledger:
         return tuple(changes)
 
     def _check_migration_owners(self, owners: Mapping[str, str]) -> None:
-        self._staff_resolver = session_staff.ReadCurrentStaff.CURRENT
+        self._staff_resolver = None
         if self._migration_owners(report=False) != owners:
             raise LedgerError("staff ownership changed; rerun the migration")
 
@@ -7565,7 +7564,7 @@ def ledger_location(repo: Path) -> LedgerLocation:
 
 
 def open_ledger(repo: Path, *, access: LedgerAccess = LedgerAccess.READ_WRITE,
-                resolver: session_staff.RowResolver | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> Ledger:
+                resolver: session_staff.RowResolver | None = None) -> Ledger:
     location = ledger_location(repo)
     return Ledger(location.repo, location.database, access=access, resolver=resolver)
 

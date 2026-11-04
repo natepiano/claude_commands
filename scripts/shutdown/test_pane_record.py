@@ -241,7 +241,7 @@ class PaneRecordTests(unittest.TestCase):
               mock.patch.dict(os.environ, source_environment(self.root / "sources")),
               isolated_source_readers()):
             parent = staff.ensure("showrunner", name="demo", runtime_id="019b3a40-4250-7000-8000-000000000101")
-            owner = staff.ensure("unit", name="alpha", parent=parent.id, runtime_id="019b3a40-4250-7000-8000-000000000102")
+            owner = staff.ensure("unit", name="alpha", parent=staff.ReportsTo(parent.id), runtime_id="019b3a40-4250-7000-8000-000000000102")
             current = staff.native_id("019b3a40-4250-7000-8000-000000000103")
             _ = staff.update_current_session(owner.current_session, current)
             retained = pane_record.launch("w1:p2", owner.id, "/work/alpha", {}, ["claude"])
@@ -269,6 +269,27 @@ class PaneRecordTests(unittest.TestCase):
             self.assertEqual(pane_record.read("agents")["w1:p2"]["config_dir"], entry["config_dir"])
         self.assertEqual(entry["environment"]["STAFF_ID"], "parent")
 
+    def test_worker_resume_uses_the_typed_parent_for_its_folder(self) -> None:
+        from scripts.shutdown import launch_names, session_types
+
+        location = staff.PresentWorktree("natedev", self.root / "unit")
+        unit = staff.StaffRow(staff.StaffId("unit"), "unit", "alpha", staff.StaffRoot(),
+                             current_session=staff.StaffId("unit-session"),
+                             worktree=location)
+        for parent in (staff.ReportsTo(unit.id), staff.StaffRoot()):
+            with self.subTest(parent=parent):
+                worker = staff.StaffRow(staff.StaffId("worker"), "worker", "impl", parent,
+                                       current_session=staff.StaffId("worker-session"))
+                record = staff.StaffSnapshot((unit, worker))
+                retained = pane_record.launch("w1:p2", worker.id, "/saved", {}, ["claude"])
+                expected = str(location.path) if isinstance(parent, staff.ReportsTo) else "/saved"
+                with (mock.patch.object(staff, "initial_snapshot", return_value=record),
+                      mock.patch.object(staff, "snapshot", return_value=record)):
+                    self.assertEqual(pane_record.resume_launch(retained)["cwd"], expected)
+                    self.assertEqual(launch_names.LaunchNames(record).resume(retained)["cwd"], expected)
+                    self.assertEqual(session_types.unit_worktree(worker.id),
+                                     location if isinstance(parent, staff.ReportsTo) else staff.WORKTREE_UNFILLED)
+
     def current_owner(self) -> tuple[staff.StaffRow, staff.StaffId, Path]:
         from scripts.production.staff_test_support import isolated_staff_file, isolated_source_readers, source_environment
 
@@ -279,7 +300,7 @@ class PaneRecordTests(unittest.TestCase):
         _ = self.enterContext(isolated_source_readers())
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.records))
         parent = staff.ensure("showrunner", name="demo", runtime_id="019b3a40-4250-7000-8000-000000000101")
-        owner = staff.ensure("unit", name="alpha", parent=parent.id, runtime_id="019b3a40-4250-7000-8000-000000000102")
+        owner = staff.ensure("unit", name="alpha", parent=staff.ReportsTo(parent.id), runtime_id="019b3a40-4250-7000-8000-000000000102")
         current = staff.native_id("019b3a40-4250-7000-8000-000000000103")
         _ = staff.update_current_session(owner.current_session, current)
         return owner, current, path
@@ -445,8 +466,8 @@ class PaneRecordTests(unittest.TestCase):
     def test_restored_unit_id_comes_from_the_staff_row(self) -> None:
         from scripts.production import staff, session_staff, showrunners
 
-        parent = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "showrunner", "demo", None, current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"))
-        owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "unit", "alpha", parent.id, current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
+        parent = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "showrunner", "demo", staff.StaffRoot(), current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"))
+        owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "unit", "alpha", staff.ReportsTo(parent.id), current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
         source = showrunners.ShowrunnerSource(
             showrunners.Timer("demo", "session:runner", self.root / "demo.md", "UTC"), "# Production — demo\n")
         entry = pane_record.launch("new", "019b3a40-4250-7000-8000-000000000102", "/fixture", {"CLAUDE_CODE_SESSION_ID": owner.current_session}, ["claude"])
@@ -458,7 +479,7 @@ class PaneRecordTests(unittest.TestCase):
     def test_staff_owner_supersedes_a_promoted_showrunners_old_session_staff(self) -> None:
         from scripts.production import staff, session_staff, showrunners
 
-        owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "showrunner", "demo", None, current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
+        owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "showrunner", "demo", staff.StaffRoot(), current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
         source = showrunners.ShowrunnerSource(
             showrunners.Timer("demo", "session:019b3a40-4250-7000-8000-000000000102", self.root / "demo.md", "UTC"), "# demo\n")
         entry = pane_record.launch("new", "019b3a40-4250-7000-8000-000000000102", "/fixture", {

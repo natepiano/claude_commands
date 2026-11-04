@@ -194,8 +194,8 @@ class AddStyleTests(unittest.TestCase):
     def parent_document(self) -> Path:
         record = staff.snapshot()
         child = next(row for row in record.rows if row.name == "sample-style")
-        assert child.parent is not None
-        parent = record.by_id(child.parent)
+        assert isinstance(child.parent, staff.ReportsTo)
+        parent = record.parent_of(child)
         assert parent is not None and isinstance(parent.doc, staff.LiveDoc)
         return parent.doc.path
 

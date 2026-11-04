@@ -6,7 +6,7 @@ budget 21.0                                         ░░░░░░░░░�
 
   # showrunner        unit              step    min GiB: reserve/use; need
 run tool-based-ui     widget            nextest   0 █████▏░░░░░░ 11.1 / 5.1
-  1 tool-based-ui     ●cables           mend     36 ███████▋ 7.6 ⊘ pressure
+  1 tool-based-ui     ●cables           mend     36 ███████▋ 7.6 ↑ ≤13.4 10:00 pressure
   2 tool-based-ui     ●cables           nextest   6 ███████████▌ 11.5
   3 tool-based-ui     ●cables           nextest   6 ███████████▌ 11.5
   4 tool-based-ui     hana-migration    mend     39 ███████▋ 7.6
@@ -79,7 +79,7 @@ Bumps since it joined at 10:10:00: 4
   work-lead nextest, /tmp/work: 2 bumps; by work-lead; last bump 10:46:00
   widget-enhancements-title nextest, /tmp/widget: 1 bumps; by widget; last bump 10:43:00
   work-lead nextest, /tmp/measure-repair2: 1 bumps; by work-lead; last bump 10:40:00
-Order rule: head priority: window start not recorded; younger steps wait
+Order rule: younger steps may use 13.4 GiB of the budget until 10:56 (10 min 0 s left)
 Cargo token waits: unknown
 ✓ Build budget: charged 11.1 + need 7.6 = 18.7 GiB <= 21.0 GiB: pass; starts when charged falls to
   13.4 GiB

@@ -50,7 +50,7 @@ class UnitFilesTests(unittest.TestCase):
 
     def test_no_unit_rows_do_not_read_the_production_document(self) -> None:
         doc = Path('/unreadable.md')
-        row = staff.StaffRow(staff.StaffId('private-owner'), 'showrunner', 'private', None,
+        row = staff.StaffRow(staff.StaffId('private-owner'), 'showrunner', 'private', staff.STAFF_ROOT,
                              current_session=staff.StaffId('private-session'), doc=staff.LiveDoc(remote.local_machine(), doc))
         with mock.patch.object(staff, 'snapshot', return_value=staff.StaffSnapshot((row,))), mock.patch.object(
             Path, 'read_text', side_effect=PermissionError('document unreadable'),
@@ -84,7 +84,7 @@ class UnitWorktreeAvailabilityTests(StaffTestCase):
             _ = doc.write_text('# Production\n- **Merge branch:** main\n')
         parent = recorded_showrunner('parent', parent_doc)
         child = recorded_showrunner('child', child_doc)
-        _ = staff.move(child.id, parent.id)
+        _ = staff.move(child.id, staff.ReportsTo(parent.id))
         folder = self.root / 'parent-unit'
         _ = recorded_unit('parent', 'held', folder, parent_doc)
         _ = subprocess.run(['git', '-C', str(folder), 'branch', 'main'], check=True)

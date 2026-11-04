@@ -16,8 +16,8 @@ from scripts.shutdown.stop_results import shutdown_state_root
 
 
 def row_folder(row: staff.StaffRow, record: staff.StaffSnapshot, *,
-               resolver: session_staff.RowResolver | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> tuple[str, Path]:
-    facts = session_staff.RowResolver(record) if isinstance(resolver, session_staff.ReadCurrentStaff) else resolver
+               resolver: session_staff.RowResolver | None = None) -> tuple[str, Path]:
+    facts = session_staff.RowResolver(record) if resolver is None else resolver
     # A recorded worker folder remains valid for older stopped worker rows.
     tree = row.worktree if isinstance(row.worktree, (staff.PresentWorktree, staff.RemovedWorktree)) else facts.unit_worktree(row)
     if isinstance(tree, (staff.PresentWorktree, staff.RemovedWorktree)):

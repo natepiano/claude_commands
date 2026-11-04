@@ -98,7 +98,7 @@ class SessionLaunchTests(ShutdownTestCase):
         (project / f"{identity}.jsonl").touch()
         output = io.StringIO()
         with (patch.object(pane_record, "RECORD_DIR", records),
-              patch("restart.unit_move.config_dirs", return_value=[config]),
+              patch("restart.sessions.config_dirs", return_value=[config]),
               patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": "/account"}),
               redirect_stderr(output)):
             kind, environment, arguments = restart.session_launch(identity)
@@ -143,7 +143,7 @@ class RestartTests(ShutdownTestCase):
         }))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root),
                                                      "XDG_STATE_HOME": str(self.root)})))
-        self.rows = tuple(staff.StaffRow(staff.StaffId(f"row-{n}"), "unit", f"unit-{n}", None,
+        self.rows = tuple(staff.StaffRow(staff.StaffId(f"row-{n}"), "unit", f"unit-{n}", staff.StaffRoot(),
             current_session=staff.StaffId(f"conversation-{n}"),
             worktree=staff.PresentWorktree("natedev", self.root)) for n in range(3))
         self.running = {str(row.current_session) for row in self.rows}
@@ -317,9 +317,9 @@ class RestartTests(ShutdownTestCase):
 
     def test_restart_all_dry_run_lists_every_live_row_with_its_tab_position(self) -> None:
         self.rows = (replace(self.rows[0], name="unit"),
-            replace(self.rows[1], kind="worker", name="codex-worker", parent=self.rows[0].id,
+            replace(self.rows[1], kind="worker", name="codex-worker", parent=staff.ReportsTo(self.rows[0].id),
                     worktree=staff.WORKTREE_UNFILLED),
-            replace(self.rows[2], kind="agent", name="morty", parent=None,
+            replace(self.rows[2], kind="agent", name="morty", parent=staff.StaffRoot(),
                     worktree=staff.WORKTREE_UNFILLED, doc=staff.LiveDoc("natedev", self.root / "morty.md")))
         layout: herdr.SavedLayout = {"at": 1, "workspaces": [{"name": "saved", "seen": 1,
             "tabs": [{"name": "old", "seen": 1, "row_id": str(self.rows[1].id)}]}]}
@@ -597,10 +597,10 @@ class RestartTests(ShutdownTestCase):
             self.assertEqual(json.dumps(session), saved)
 
     def test_restart_skips_an_unknown_unit_folder_and_starts_the_other_rows(self) -> None:
-        parent = staff.StaffRow(staff.StaffId("parent"), "showrunner", "parent", None,
+        parent = staff.StaffRow(staff.StaffId("parent"), "showrunner", "parent", staff.StaffRoot(),
                                current_session=staff.StaffId("parent-session"),
                                doc=staff.LiveDoc("natedev", self.root / "production.md"))
-        self.rows = (replace(self.rows[0], parent=parent.id, worktree=staff.WORKTREE_UNFILLED), *self.rows[1:])
+        self.rows = (replace(self.rows[0], parent=staff.ReportsTo(parent.id), worktree=staff.WORKTREE_UNFILLED), *self.rows[1:])
         record = staff.StaffSnapshot((*self.rows, parent))
         self.running.clear()
         shutdown_record.save([str(row.id) for row in self.rows])
