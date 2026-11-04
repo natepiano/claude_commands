@@ -559,7 +559,8 @@ class ProductionRenameFixture(StaffTestCase):
         config.mkdir()
         (self.root / "state/sessions").mkdir(parents=True)
         self.write(self.root / "herdr-responses.json",
-                   json.dumps({"default": {"stdout": '{"sessions": []}', "code": 0}}))
+                   json.dumps({"default": {"stdout": '{"sessions": []}', "code": 0},
+                               "--session agents pane list": {"stdout": '{"result": {"panes": []}}', "code": 0}}))
         _ = self.git("init", "--bare", str(self.origin))
         _ = self.git("init", "-b", OLD)
         _ = self.git("config", "user.name", "Production Rename Test")

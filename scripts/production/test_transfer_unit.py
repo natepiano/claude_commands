@@ -5,6 +5,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from typing import override
+from unittest import mock
 
 from scripts.production import staff, staff_move, unit_config
 from scripts.production.staff_test_support import unit_membership
@@ -71,7 +72,10 @@ class UnitTransferTests(UnitTransferFixture):
         row = unit_membership("demo", "alpha-unit")
         parent = next(item for item in staff.find(kind="showrunner") if item.name == "other")
         before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
-        self.assert_ok(self.transfer("apply"))
+        with mock.patch.object(staff_move, "move_unit", wraps=staff_move.move_unit) as move_tab:
+            self.assert_ok(self.transfer("apply"))
+        move_tab.assert_called_once_with("demo", "alpha-unit", "other",
+                                         identity=staff_move.PinnedUnit(row.id, parent.id))
         self.assertEqual(staff.by_id(row.id), replace(row, parent=parent.id))
         changed = {path for path in before if path.read_bytes() != before[path]}
         self.assertEqual(changed, {self.staff_file})

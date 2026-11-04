@@ -11,7 +11,7 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scripts.production import showrunners, staff, staff_sources, unit_move, unit_names
+from scripts.production import showrunners, staff, staff_move, staff_sources, unit_move, unit_names
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.rename_state import RenameRefused
 
@@ -50,6 +50,8 @@ def apply(from_slug: str, unit: str, to_doc: Path) -> UnitTransfer:
         changed = request.member.parent != request.parent.id
         if changed:
             _ = staff.move(request.member.id, request.parent.id)
+        _ = staff_move.move_unit(from_slug, request.unit, request.receiving.slug,
+                                 identity=staff_move.PinnedUnit(request.member.id, request.parent.id))
         print("done" if changed else "unchanged")
         return request
 
