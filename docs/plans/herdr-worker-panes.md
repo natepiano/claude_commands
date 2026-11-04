@@ -940,7 +940,7 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 
 **Acceptance gate:** the search in item 1 finds nothing outside `herdr.py`'s mark setter (Phase 4e); basedpyright 0/0 on changed files and every caller module; each tree's suite passes; a real `working_set.py` run names the owning unit of a running gate by its worktree; full gate green. No rerun test: only reads change.
 
-### Phase 3w — Skills and commands describe the row and `.unit.toml`  · status: todo
+### Phase 3w — Skills and commands describe the row and `.unit.toml`  · status: done
 
 **Depends on:** 3s for the interface. Text lands with the command it describes, including the 4b header, Hub files and Gates deletions; before 4g.
 
