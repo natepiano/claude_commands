@@ -22,12 +22,14 @@ from urllib.request import Request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mac_test'))
 
-from scripts.aws_target import admin_secrets, aws_target, config as aws_config, deploy, ledger, measurement, remote
+from scripts.aws_target import admin_secrets, aws_target, box, config as aws_config, deploy, ledger, measurement, remote
 from scripts.aws_target.config import read_control_settings
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.aws_target.measurement_test_support import DAY, narrow
+from scripts.aws_target.test_box import FAKE as BOX_FAKE, SYSTEM, FakeTailnet
 from scripts.buildlog import sync
 from scripts.lib import conf
+from scripts.mac_test import mac_test
 from scripts.build_targets import target_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -38,6 +40,11 @@ args = sys.argv[1:]
 service_index = args.index('--region') + 2
 service = args[service_index]
 operation = args[service_index + 1]
+if service == 'ssm' and os.environ.get('BOX_FIXTURE'):
+    os.execv(sys.executable, [sys.executable, str(root / 'box-aws'), *args])
+if (root / ('fail-down-' + operation)).exists():
+    print('fixture removal failure: ' + operation, file=sys.stderr)
+    sys.exit(1)
 state_path = root / 'fake-stack.json'
 state = json.loads(state_path.read_text()) if state_path.exists() else {}
 clock = int((root / 'clock').read_text())
@@ -55,6 +62,9 @@ if override.exists():
 keys_path = root / 'fake-keys.json'
 keys = json.loads(keys_path.read_text()) if keys_path.exists() else ['old-key']
 if service == 'sts' and operation == 'get-caller-identity':
+    if '--profile' not in args:
+        reply({'Account': '123456789012'})
+        sys.exit(0)
     import configparser
     credentials = configparser.ConfigParser()
     credentials.read(os.environ['AWS_SHARED_CREDENTIALS_FILE'])
@@ -69,6 +79,8 @@ elif service == 'iam' and operation == 'create-access-key':
     keys_path.write_text(json.dumps(keys))
     reply({'AccessKey': {'AccessKeyId': 'new-key', 'SecretAccessKey': 'fixture-secret-only-in-credentials'}})
 elif service == 'iam' and operation == 'list-access-keys':
+    if (root / 'deleted-stack').exists():
+        print('NoSuchEntity', file=sys.stderr); sys.exit(1)
     reply({'AccessKeyMetadata': [{'AccessKeyId': key} for key in keys]})
 elif service == 'iam' and operation == 'delete-access-key':
     keys.remove(args[args.index('--access-key-id') + 1])
@@ -81,8 +93,19 @@ elif service == 'cloudformation' and operation == 'describe-stacks':
     if not state or state.get('stack_name') != args[args.index('--stack-name') + 1]:
         print('ValidationError: Stack does not exist', file=sys.stderr)
         sys.exit(1)
-    reply({'Stacks': [{'StackStatus': 'UPDATE_COMPLETE', 'Outputs': [
+    reply({'Stacks': [{'StackStatus': state.get('status', 'UPDATE_COMPLETE'),
+        'Parameters': [{'ParameterKey': k} for k in ('EnableCompute', 'NotificationEmail', 'ExistingDataVolumeId')], 'Outputs': [
         {'OutputKey': key, 'OutputValue': value} for key, value in state['outputs'].items()]}]})
+elif service == 'cloudformation' and operation == 'update-stack':
+    parameters = json.loads(args[args.index('--parameters') + 1])
+    assert all(p.get('UsePreviousValue') is True for p in parameters if p['ParameterKey'] != 'EnableCompute')
+    assert next(p for p in parameters if p['ParameterKey'] == 'EnableCompute')['ParameterValue'] == 'false'
+    state['outputs'].update(ComputeEnabled='false')
+    state['outputs'].pop('InstanceId', None); state['outputs'].pop('DataVolumeId', None)
+    state['instance_state'] = 'terminated'
+    state_path.write_text(json.dumps(state)); reply({})
+elif service == 'cloudformation' and operation == 'delete-stack':
+    state_path.unlink(); (root / 'deleted-stack').touch(); reply({})
 elif service == 'cloudformation' and operation == 'deploy':
     if 'EnableCompute=true' in args and (root / 'fail-compute').exists():
         print('Compute deploy failed', file=sys.stderr)
@@ -94,6 +117,9 @@ elif service == 'cloudformation' and operation == 'deploy':
     if params['EnableCompute'] == 'true':
         outputs.update(InstanceId='i-fixture', DataVolumeId=params['ExistingDataVolumeId'] or 'vol-created')
     state = {'outputs': outputs, 'stack_name': args[args.index('--stack-name') + 1]}
+    (root / 'deleted-stack').unlink(missing_ok=True)
+    (root / 'deleted-volume').unlink(missing_ok=True)
+    (root / 'deleted-budget').unlink(missing_ok=True)
     state_path.write_text(json.dumps(state))
     if params['EnableCompute'] == 'false' and (root / 'slow-foundation').exists():
         (root / 'clock').write_text(str(clock + 301))
@@ -104,19 +130,42 @@ elif operation == 'describe-images':
 elif operation == 'describe-subnets':
     reply({'Subnets': [{'VpcId': 'vpc-fixture', 'AvailabilityZone': 'us-east-1a'}]})
 elif operation == 'describe-volumes':
+    if (root / 'deleted-volume').exists():
+        print('InvalidVolume.NotFound', file=sys.stderr); sys.exit(1)
     reply({'Volumes': [{'AvailabilityZone': 'us-east-1a', 'Encrypted': True, 'State': 'available',
+                        'VolumeId': 'vol-created', 'Attachments': [],
                         'Size': 500, 'VolumeType': 'gp3', 'Iops': 6000, 'Throughput': 500,
                         'Tags': [{'Key': 'Project', 'Value': 'fixture-build'}]}]})
+elif operation == 'delete-volume':
+    (root / 'deleted-volume').touch(); reply({})
+elif service == 'budgets' and operation == 'describe-budget':
+    if (root / 'deleted-budget').exists():
+        print('NotFoundException', file=sys.stderr); sys.exit(1)
+    reply({'Budget': {'BudgetName': 'fixture-monthly'}})
+elif service == 'budgets' and operation == 'delete-budget':
+    (root / 'deleted-budget').touch(); reply({})
 elif operation == 'describe-instances':
     if (root / 'missing-instance').exists():
         print('InvalidInstanceID.NotFound: instance does not exist', file=sys.stderr)
         sys.exit(1)
+    if os.environ.get('BOX_FIXTURE'):
+        live_path = root / 'live.json'
+        live = json.loads(live_path.read_text())
+        live['observations'] = live.get('observations', 0) + 1
+        if live['observations'] >= 3: live['ec2'] = 'stopped'
+        live_path.write_text(json.dumps(live))
+        state['instance_state'] = live['ec2']
     reply({'Reservations': [{'Instances': [{'InstanceId': 'i-fixture', 'LaunchTime': 'fixture-boot',
                                             'State': {'Name': state.get('instance_state', 'stopped')}}]}]})
 elif operation == 'start-instances':
     assert args[args.index('--instance-ids') + 1] == state['outputs']['InstanceId']
     state['instance_state'] = 'pending'
     state_path.write_text(json.dumps(state))
+    if os.environ.get('BOX_FIXTURE'):
+        live_path = root / 'live.json'
+        live = json.loads(live_path.read_text())
+        live.update(ec2='running', observations=0)
+        live_path.write_text(json.dumps(live))
     reply({'StartingInstances': [{'InstanceId': 'i-fixture', 'CurrentState': {'Name': 'pending'}}]})
 elif operation == 'describe-spot-price-history':
     reply({'SpotPriceHistory': [{'Timestamp': datetime.datetime.fromtimestamp(clock, datetime.UTC).isoformat(),
@@ -206,8 +255,6 @@ class DeploymentTests(CostFixture):
         })))
         _ = cast(object, self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state)))
         self.set_clock(self.now)
-        # These tests cover the resource stages. test_box covers the box stages.
-        _ = cast(object, self.enterContext(mock.patch.object(deploy.Deployment, '_box_stages', return_value=())))
 
     @override
     def replace(self, key: str, value: str) -> None:
@@ -457,10 +504,15 @@ class DeploymentTests(CostFixture):
                 self.assertEqual([(r.start, r.end, r.usd, r.confirmed_uptime_s) for r in requests],
                                  [(start, midnight, Decimal('6'), 0), (midnight, self.now, Decimal('6.5'), 0)])
 
-    def up_output(self, subject: deploy.Deployment) -> tuple[bool, str]:
+    def up_output(self, subject: deploy.Deployment, *, include_box: bool = False) -> tuple[bool, str]:
         output = StringIO()
         with redirect_stdout(output):
-            success = subject.up(approve_resources=True)
+            if include_box:
+                success = subject.up(approve_resources=True)
+            else:
+                # Resource tests exclude box stages unless the test supplies box fakes.
+                with mock.patch.object(deploy.Deployment, '_box_stages', return_value=()):
+                    success = subject.up(approve_resources=True)
         return success, output.getvalue()
 
     def test_up_creates_each_stage_and_the_second_run_only_checks_live_state(self) -> None:
@@ -493,6 +545,195 @@ class DeploymentTests(CostFixture):
         results = remote.read_record(self.state / 'up.json')
         self.assertEqual(set(results), {'price', 'bootstrap', 'stacks', 'scaler-key'})
         self.assertTrue(all(ledger.mapping(result)['status'] == 'present' for result in results.values()))
+
+    def removal_fixture(self) -> dict[str, object]:
+        success, output = self.up_output(self.deployment())
+        self.assertTrue(success, output)
+        self.fake_commands(f'#!{sys.executable}\n' + r'''import json, os, pathlib, sys
+root = pathlib.Path(os.environ['DEPLOY_FIXTURE'])
+p = root / 'controller-enabled'
+args = sys.argv[1:]
+with (root / 'systemctl-commands').open('a') as log: log.write(' '.join(args) + '\n')
+if 'disable' in args:
+    if (root / 'fail-service').exists(): sys.exit(1)
+    p.unlink(missing_ok=True)
+elif 'enable' in args: p.touch()
+elif 'is-enabled' in args: print('enabled' if p.exists() else 'disabled')
+elif 'is-active' in args: print('active' if p.exists() else 'inactive')
+else: raise AssertionError(args)
+''', 'systemctl')
+        (self.root / 'controller-enabled').touch()
+        devices: dict[str, object] = {'devices': [{'id': 'device-box', 'hostname': 'aws-build', 'tags': ['tag:build-aws']},
+                                                {'id': 'device-other', 'hostname': 'other', 'tags': []}]}
+        policy = FakeTailnet()
+        def tailnet(method: str, endpoint: str, body: bytes, headers: dict[str, str], timeout: float) -> box.PolicyReply:
+            self.assertGreater(timeout, 0)
+            self.assertIn('Content-Type' if endpoint == 'oauth/token' else 'Authorization', headers)
+            self.assertTrue(body if method == 'POST' else not body)
+            if (self.root / 'fail-tailnet').exists():
+                raise box.BoxRefused('fixture device removal failure')
+            if endpoint == 'oauth/token':
+                return box.PolicyReply({'access_token': 'fixture-token'})
+            if method == 'GET' and endpoint == 'tailnet/-/devices':
+                return box.PolicyReply(devices)
+            if method == 'DELETE' and endpoint == 'device/device-box':
+                devices['devices'] = [row for row in ledger.rows(devices, 'devices') if row['id'] != 'device-box']
+                return box.PolicyReply({})
+            if endpoint.endswith('/keys') and method == 'POST':
+                existing = ledger.rows(devices, 'devices')
+                name = 'aws-build-1' if any(row['hostname'] == 'aws-build' for row in existing) else 'aws-build'
+                devices['devices'] = [*existing, {'id': 'new-device', 'hostname': name, 'tags': ['tag:build-aws']}]
+            if '/acl' in endpoint or '/keys' in endpoint:
+                return policy(method, endpoint, body, headers, timeout)
+            raise AssertionError((method, endpoint))
+        _ = cast(object, self.enterContext(mock.patch.object(box, 'tailnet_request', side_effect=tailnet)))
+        _ = cast(object, self.enterContext(mock.patch.object(mac_test, 'state_paths', return_value=mac_test.StatePaths(self.state, 'aws'))))
+        return devices
+
+    def down_output(self) -> tuple[bool, str]:
+        output = StringIO()
+        with redirect_stdout(output):
+            success = self.deployment().down(approve_destroy=True)
+        return success, output.getvalue()
+
+    def test_down_dry_run_changes_nothing_and_needs_no_credentials(self) -> None:
+        before = {path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
+        with mock.patch.dict(os.environ, {'AWS_SHARED_CREDENTIALS_FILE': ''}), redirect_stdout(StringIO()) as output:
+            self.assertTrue(self.deployment().down())
+        self.assertIn('/home build cache is lost', output.getvalue())
+        self.assertIn('--approve-destroy', output.getvalue())
+        self.assertEqual({path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}, before)
+
+    def test_down_removes_resources_and_preserves_spend_and_other_profiles(self) -> None:
+        devices = self.removal_fixture()
+        original = self.settings.read_bytes()
+        before = ledger.CostLedger(self.state).read_snapshot()
+        with self.credentials.open('a') as handle:
+            _ = handle.write('\n[unrelated]\naws_access_key_id=other-id\naws_secret_access_key=other-value\n')
+        (self.root / 'admin.gpg').touch()
+        charges = self.state / 'charges/day.json'
+        charges.parent.mkdir(exist_ok=True)
+        _ = charges.write_text('retained charge evidence')
+        success, output = self.down_output()
+        self.assertTrue(success, output)
+        self.assertIn('data volume; the /home build cache is lost', output)
+        self.assertIn('retained Budget', output)
+        self.assertEqual([row['hostname'] for row in ledger.rows(devices, 'devices')], ['other'])
+        self.assertEqual(admin_secrets.read_profiles(self.credentials).sections(), ['unrelated'])
+        self.assertEqual(self.credentials.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(charges.read_text(), 'retained charge evidence')
+        self.assertEqual(self.settings.read_bytes(), original)
+        self.assertFalse(remote.read_record(self.state / 'routing.json')['enabled'])
+        after = ledger.CostLedger(self.state).read_snapshot()
+        self.assertEqual(after.reconciliations, before.reconciliations)
+        self.assertEqual(after.events, before.events)
+        self.assertEqual(after.prices, before.prices)
+        self.assertEqual(after.observations[-1].state, 'terminated')
+        self.assertFalse((self.state / 'deployment.json').exists())
+        self.assertFalse((self.state / 'up.json').exists())
+        self.assertTrue((self.root / 'admin.gpg').exists())
+        operations = [cast(list[str], row['args'])[5] for row in self.commands()]
+        self.assertLess(operations.index('update-stack'), operations.index('delete-stack'))
+        self.assertLess(operations.index('delete-stack'), operations.index('delete-volume'))
+        before_commands = len(self.commands())
+        before_service = (self.root / 'systemctl-commands').read_text()
+        success, output = self.down_output()
+        self.assertTrue(success, output)
+        self.assertTrue(all(line.endswith(': present') for line in output.splitlines()), output)
+        later = [cast(list[str], row['args'])[5] for row in self.commands()[before_commands:]]
+        self.assertFalse(any(operation.startswith(('delete-', 'update-')) for operation in later))
+        self.assertNotIn('disable', (self.root / 'systemctl-commands').read_text()[len(before_service):])
+        self.assertNotIn('fixture-admin-secret', output)
+        self.assertNotIn('fixture-secret-only-in-credentials', output)
+
+    def test_down_resumes_after_each_removal_failure(self) -> None:
+        devices = self.removal_fixture()
+        self.assertIn('devices', devices)
+        failures = (('fail-service', 'routing-off'), ('fail-tailnet', 'tailscale-device'),
+                    ('fail-down-delete-access-key', 'scaler-keys'), ('fail-down-update-stack', 'compute'),
+                    ('fail-down-delete-stack', 'foundation'), ('fail-down-delete-volume', 'retained-resources'),
+                    ('fail-down-delete-budget', 'retained-resources'))
+        for filename, stage in failures:
+            with self.subTest(stage=stage, command=filename):
+                (self.root / filename).touch()
+                success, output = self.down_output()
+                self.assertFalse(success, output)
+                self.assertIn(stage + ': refused:', output)
+                self.assertTrue((self.state / 'deployment.json').exists())
+                self.assertFalse(remote.read_record(self.state / 'routing.json')['enabled'])
+                (self.root / filename).unlink()
+        success, output = self.down_output()
+        self.assertTrue(success, output)
+        self.assertEqual(len(self.commands('update-stack')), 1)
+        self.assertEqual(len(self.commands('delete-stack')), 1)
+        self.assertEqual(len(self.commands('delete-volume')), 1)
+
+    def test_down_refuses_a_live_claim_after_disabling_routing(self) -> None:
+        devices = self.removal_fixture()
+        self.assertIn('devices', devices)
+        before = len(self.commands())
+        with mock.patch.object(mac_test, 'live_claims', return_value=('live claim',)):
+            success, output = self.down_output()
+        self.assertFalse(success)
+        self.assertIn('AWS claims remain live', output)
+        self.assertFalse(remote.read_record(self.state / 'routing.json')['enabled'])
+        self.assertFalse((self.root / 'controller-enabled').exists())
+        self.assertEqual(len(self.commands()), before)
+        success, output = self.down_output()
+        self.assertTrue(success, output)
+
+    def test_up_after_down_recreates_foundation_compute_and_scaler_key(self) -> None:
+        devices = self.removal_fixture()
+        success, output = self.down_output()
+        self.assertTrue(success, output)
+        before = len(self.commands())
+        fake = BOX_FAKE.replace('i-box', 'i-fixture').replace('volbox', 'volcreated')
+        self.fake_commands(f'#!{sys.executable}\n' + fake, 'ssh', 'nix', 'git', 'tailscale', 'rustc', 'cargo', 'bash')
+        _ = (self.root / 'box-aws').write_text(fake.replace("name = pathlib.Path(sys.argv[0]).name", "name = 'aws'"))
+        _ = (self.root / 'live.json').write_text(json.dumps({'online': True, 'joined': False, 'active': True,
+            'system': '/nix/store/old', 'desired': SYSTEM, 'ec2': 'stopped'}))
+        for key, value in (('box_check_delay_s', '0.001'), ('idle_stop_minutes', '0.001'), ('idle_stop_margin_s', '0')):
+            self.replace(key, value)
+        original_setup = box.BoxSetup
+        def setup(settings: Path, directory: Path, start: Callable[[], object], *, execute: aws_target.AwsExecutor,
+                  admin: admin_secrets.AdminSecretSession) -> box.BoxSetup:
+            return original_setup(settings, directory, start, execute=execute, admin=admin, tailnet=box.tailnet_request)
+        with mock.patch.dict(os.environ, {'BOX_FIXTURE': str(self.root), 'BUILDLOG_DIR': str(self.root / 'buildlog')}), \
+             mock.patch.object(box, 'BoxSetup', side_effect=setup), \
+             mock.patch.object(target_config, 'read_targets', return_value=(target_config.SshTarget('aws', 'linux', self.settings),)):
+            success, output = self.up_output(self.deployment(), include_box=True)
+        self.assertTrue(success, output)
+        results = remote.read_record(self.state / 'up.json')
+        self.assertEqual(list(results), sorted(('price', 'bootstrap', 'stacks', 'scaler-key', 'tailscale-policy', 'box-join',
+                                              'box-configuration', 'checks', 'idle-stop', 'activation', 'routing-proof')))
+        self.assertTrue(all(ledger.mapping(row)['status'] == 'done' for name, row in results.items() if name != 'price'), output)
+        later = [cast(list[str], row['args']) for row in self.commands()[before:]]
+        self.assertEqual(sum('EnableCompute=false' in args for args in later), 1)
+        self.assertEqual(sum('EnableCompute=true' in args for args in later), 1)
+        self.assertEqual(sum('create-access-key' in args for args in later), 1)
+        self.assertEqual([row['hostname'] for row in ledger.rows(devices, 'devices')], ['other', 'aws-build'])
+
+    def test_down_resumes_local_cleanup_without_removing_spending_history(self) -> None:
+        devices = self.removal_fixture()
+        self.assertEqual(len(ledger.rows(devices, 'devices')), 2)
+        proof = self.state / 'box-tools.json'
+        _ = proof.write_text('{}')
+        unlink = Path.unlink
+        def remove(path: Path, missing_ok: bool = False) -> None:
+            if path == proof:
+                raise OSError('fixture proof removal failure')
+            unlink(path, missing_ok=missing_ok)
+        with mock.patch.object(Path, 'unlink', new=remove):
+            success, output = self.down_output()
+        self.assertFalse(success, output)
+        self.assertIn('local-state: refused: fixture proof removal failure', output)
+        before = len(self.commands())
+        with self.assertRaisesRegex(deploy.DeploymentRefused, 'removal is incomplete'):
+            _ = self.deployment().up(approve_resources=True)
+        success, output = self.down_output()
+        self.assertTrue(success, output)
+        self.assertFalse(any(cast(list[str], row['args'])[5].startswith(('delete-', 'update-')) for row in self.commands()[before:]))
+        self.assertEqual(ledger.CostLedger(self.state).read_snapshot().observations[-1].state, 'terminated')
 
     def test_up_retries_failed_compute_without_a_second_foundation(self) -> None:
         failure = self.root / 'fail-compute'

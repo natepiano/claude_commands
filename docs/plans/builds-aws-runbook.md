@@ -251,7 +251,7 @@ Repeat the idle-stop check after bootstrap or lifecycle changes.
 `deploy.py up --approve-resources` now runs the policy, join, configuration, and checks stages.
 The helper decrypts the OAuth values from `admin_secret_file`.
 The file stays outside the repository with mode `0600`.
-The OAuth client needs `auth_keys` for `tag:build-aws` and `policy_file` access.
+The OAuth client needs three scopes: `auth_keys` for `tag:build-aws`, `devices:core` for `tag:build-aws` (device deletion in `down`), and `policy_file`.
 Never paste its secret into a command, log, or tracked file.
 
 1. Confirm the natedev and Mac device names in `config/aws-build-tailscale.json`.
@@ -442,7 +442,7 @@ Use this replacement procedure from the deployment owner:
 
 Confirm the old instance stops before deleting its stack.
 Use the AWS console for manual stack deletion.
-The planned `deploy.py down` command does not exist yet.
+Use `deploy.py down --approve-destroy` only when you want to discard the build cache and remove the complete target.
 Do not restore a plain administrator profile.
 
 Keep the data volume in the same availability zone.
@@ -556,3 +556,31 @@ A remaining plain administrator profile or `tailscale-oauth` file causes a refus
 The helper stores decrypted values only in memory.
 The local AWS subprocess environment contains the AWS key while the subprocess runs.
 Do not inspect or capture that environment.
+
+## Remove the complete target
+
+The dry run changes nothing and requires no passphrase.
+
+```sh
+python3 scripts/aws_target/deploy.py down
+```
+
+The plan states that the `/home` build cache is lost.
+Run the approved removal at your terminal.
+
+```sh
+AWS_SHARED_CREDENTIALS_FILE="$HOME/.config/aws-build/credentials" python3 scripts/aws_target/deploy.py down --approve-destroy
+```
+
+The helper disables routing and the controller before checking live claims.
+Let active claims finish before another removal attempt.
+The helper deletes the tagged Tailscale device, scaler keys, compute resources, foundation, retained volume, and retained Budget.
+The helper removes only the scaler profile from the plain credentials file.
+It keeps the policy rules, encrypted administrator file, ledger, and charge history.
+The helper removes deployment records, proofs, and prepared bundle files after resource deletion.
+The OAuth client needs device deletion access for `tag:build-aws`.
+Enter the administrator passphrase once when requested.
+Correct any reported failure and repeat the same removal command.
+Do not remove `down.json` to bypass incomplete removal.
+Use the normal `up --approve-resources` command to create the target again.
+Past spending still counts against the same caps.

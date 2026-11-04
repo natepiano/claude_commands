@@ -84,6 +84,12 @@ class Tailnet:
                               json.dumps(value).encode() if value is not None else b'', headers,
                               conf.read(self.settings).number('aws_timeout_s'))
 
+    def delete_device(self, device_id: str) -> None:
+        authorization = self._authorization()
+        _ = self.transport('DELETE', 'device/' + device_id, b'',
+                           {'Authorization': 'Bearer ' + authorization.token},
+                           conf.read(self.settings).number('aws_timeout_s'))
+
 
 @dataclass(frozen=True)
 class JoinedBox:

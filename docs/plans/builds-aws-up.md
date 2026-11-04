@@ -19,7 +19,7 @@ The user creates these private files outside the repository.
 
 1. Run `deploy.py secrets` in a terminal to create `~/.config/aws-build/admin.gpg`, mode `0600`.
 2. Store the AWS administrator key and the Tailscale OAuth client in that encrypted file.
-3. Give the OAuth client `auth_keys` access for `tag:build-aws` and `policy_file` access.
+3. Give the OAuth client three scopes: `auth_keys` for `tag:build-aws`, `devices:core` for `tag:build-aws` (`down` deletes the device), and `policy_file`.
 4. Keep `~/.config/aws-build/credentials` for the unattended `build-scaler` profile only.
 5. Keep the existing private Budget address file outside the repository.
 
@@ -29,7 +29,10 @@ The user can retain stored values with Enter and replace one value.
 The helper asks for one passphrase when a deployment first needs administrator credentials.
 It keeps decrypted values only in memory for that process.
 Symmetric AES256 encryption disables the GPG symmetric passphrase cache.
-The planned `down` command must use this same terminal credential boundary.
+`down --approve-destroy` uses the same terminal credential boundary.
+Without that flag, `down` prints a plan and changes nothing.
+Removal preserves the spend history and encrypted credentials.
+The OAuth client also needs device deletion access for `tag:build-aws`.
 
 `up` needs only this repository and the reviewed `/etc/nixos` checkout.
 The proof crate includes its own locked development shell and has no Rust dependencies.
@@ -57,3 +60,10 @@ Each stage checks the live state first. It acts only when the state is not compl
 1. **Stack lifecycle.** Stages 1 to 4, `down`, the `up` stage runner and its state record. Fixes: `REVIEW_IN_PROGRESS`, the preparation age, and one settings reader for `price`.
 2. **Box join and configuration.** Stages 5 to 8.
 3. **Activation and proof.** Implementation complete; the user deployment proof remains. Stages 9 to 11. Then the user runs `down` and `up` once, to prove a rebuild from nothing.
+
+## Removal status
+
+`down` is implemented.
+It disables routing before removing the device, keys, compute, foundation, retained volume, and Budget.
+It removes setup state and preserves spend history.
+The user deployment proof remains.

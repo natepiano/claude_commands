@@ -23,7 +23,7 @@ from typing import Literal, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.aws_target import admin_secrets, box, ledger, remote
+from scripts.aws_target import admin_secrets, box, ledger, remote, teardown
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command
 from scripts.aws_target.config import (
     BudgetNotificationAddress, DeploymentSettings, deployment_price, deployment_price_path, money, read_budget_notification_address,
@@ -576,6 +576,8 @@ class Deployment:
             *self._box_stages(),
         )
         with control_lock(self.directory / 'up'):
+            if (self.directory / 'down.json').exists():
+                raise DeploymentRefused('target removal is incomplete; run deploy.py down --approve-destroy first')
             path = self.directory / 'up.json'
             results = remote.read_record(path) if path.exists() else {}
             for stage in stages:
@@ -596,6 +598,15 @@ class Deployment:
                 if result.status == 'refused':
                     return False
         return True
+
+    def down(self, *, approve_destroy: bool = False) -> bool:
+        if not approve_destroy:
+            print(teardown.DRY_RUN)
+            return True
+        self._check_credentials()
+        settings = read_deployment_settings(self.settings_path, self.directory)
+        return teardown.TargetRemoval(self.settings_path, self.directory, self.output, self.admin,
+                                      self._api(settings), self.execute, tailnet=box.tailnet_request, clock=self.clock).run()
 
     def _start_box(self) -> object:
         settings = read_deployment_settings(self.settings_path, self.directory)
@@ -672,15 +683,17 @@ class DeploymentArguments(argparse.Namespace):
         self.directory: Path = target_config.ssh_target_state_directory('aws')
         self.output: Path = Path.home() / '.local/state/aws-build/deployment'
         self.approve_resources: bool = False
+        self.approve_destroy: bool = False
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('secrets', 'up', 'price', 'prepare', 'apply', 'setup-start', 'bootstrap'))
+    _ = parser.add_argument('command', choices=('secrets', 'up', 'down', 'price', 'prepare', 'apply', 'setup-start', 'bootstrap'))
     _ = parser.add_argument('--settings', type=Path)
     _ = parser.add_argument('--directory', type=Path)
     _ = parser.add_argument('--output', type=Path)
     _ = parser.add_argument('--approve-resources', action='store_true')
+    _ = parser.add_argument('--approve-destroy', action='store_true')
     args = parser.parse_args(namespace=DeploymentArguments())
     deploy = Deployment(args.settings, args.directory, args.output)
     try:
@@ -688,6 +701,8 @@ def main() -> int:
             admin_secrets.configure(args.settings)
         elif args.command == 'up':
             return 0 if deploy.up(approve_resources=args.approve_resources) else 1
+        elif args.command == 'down':
+            return 0 if deploy.down(approve_destroy=args.approve_destroy) else 1
         elif args.command == 'price':
             print(json.dumps(deploy.price(), sort_keys=True))
         elif args.command == 'bootstrap':

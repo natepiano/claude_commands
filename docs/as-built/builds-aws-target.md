@@ -182,7 +182,7 @@ A process with sufficient access can inspect that memory or environment.
 Administrator subprocesses ignore the AWS configuration file to prevent CLI history from storing secret responses.
 The helper redacts administrator values from reported AWS errors.
 Administrator commands refuse a remaining plain administrator profile or legacy OAuth file and name `deploy.py secrets`.
-The planned `down` command does not exist yet.
+`deploy.py down --approve-destroy` uses the same encrypted administrator session.
 No deployment stage edits or pushes the NixOS checkout.
 The controller activation and routing proof remain separate plan stages.
 
@@ -245,3 +245,36 @@ A replacement instance invalidates both proofs.
 A later run skips completed proofs without another idle wait or test.
 A stopped instance retains its completed setup evidence for the same instance ID.
 The price stage still refreshes the public price.
+
+### Target removal
+
+`deploy.py down` prints the removal plan without reading credentials or changing state.
+`deploy.py down --approve-destroy` removes the target in this order.
+
+1. Write disabled `routing.json` and disable `aws-target.service` with `systemctl --user`.
+2. Refuse while an AWS claim remains live.
+3. Save public resource identities in `down.json` before removing any resource.
+4. Delete the tagged `aws-build` Tailscale device and keep the policy rules.
+5. Delete every scaler access key and remove only its credential profile.
+6. Update the existing stack with `EnableCompute=false` and wait for compute removal.
+7. Delete the foundation stack and wait for its removal.
+8. Delete the retained data volume and Budget.
+9. Remove deployment records, setup proofs, and the prepared bundle files.
+
+The template implements compute and foundation as two phases of one stack.
+The helper uses the previous template and parameter values during compute removal.
+It does not read the private notification address file.
+The helper excludes new claims and controller actions throughout resource removal.
+The helper reports the removed resource kinds.
+Deleting the data volume loses the `/home` build cache.
+The helper preserves `admin.gpg`, disabled routing, claims, the spend ledger, and charge history.
+It records confirmed termination without removing past spending evidence.
+It retains the conservative fixed cost inventory.
+The existing spending caps remain unchanged.
+
+A repeated command checks live state and skips each completed removal.
+`down.json` preserves identities after an interruption and prevents `up` until removal completes.
+A successful removal deletes this temporary record.
+The next `up` creates a new target and uses the existing monthly spending history.
+The helper shares one administrator decryption across AWS and Tailscale requests.
+The Tailscale OAuth client needs device deletion access for `tag:build-aws`.
