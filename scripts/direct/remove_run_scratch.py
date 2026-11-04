@@ -110,6 +110,10 @@ def git(common: Path, *arguments: str) -> bool:
 
 
 def remove(folder: Path) -> None:
+    scratch.remove_with_cargo_output(folder, remove_tree)
+
+
+def remove_tree(folder: Path) -> None:
     """Remove one scratch folder; a linked worktree through its source repo, so no entry stays."""
     source = worktree_source(folder)
     # Twice --force also removes a locked worktree: the run that locked it has ended.

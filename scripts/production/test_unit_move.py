@@ -470,6 +470,7 @@ class UnitFolderMoveTests(FolderMoveFixture):
             self.assertEqual((kind, pane), ("codex", "w1:p1"))
             commands.append(command.copy())
             backend.live = True
+            backend.publish_process_state()
             return subprocess.CompletedProcess(command, 0, "", "")
 
         with (mock.patch.object(herdr, "Herdr", client_type),

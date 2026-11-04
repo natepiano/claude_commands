@@ -226,6 +226,12 @@ class QueueTests(unittest.TestCase):
                           for line in path.read_text().splitlines() if '"queue_priority"' in line]
                 self.assertEqual(events[-1]["set_by"], actor)
 
+    def test_bump_passes_a_dash_unit_as_one_argparse_value(self) -> None:
+        with mock.patch.object(memory_admit, "queue_command_actor", return_value="showrunner"), \
+             mock.patch.object(build_queue, "bump", return_value=0) as run:
+            self.assertEqual(self.bump_output("-x"), (0, "", ""))
+        run.assert_called_once_with("-x", "showrunner")
+
     def test_bump_sets_the_units_priority_and_reports_its_resolved_place(self) -> None:
         first = self.fixture.waiter(100, "head-id", "head")
         second = self.fixture.waiter(200, "worker-id", "worker")
@@ -460,7 +466,7 @@ class QueueTests(unittest.TestCase):
         reading = head_reading(since=NOW - 1000, now=NOW)
         follower = replace(reading.view.waiting[0], pid=456, session_id="follower", step="clippy", since=NOW - 800)
         path, row = reading.ordered[0]
-        follower_row: memory_admit.Waiter = {**row, "pid": follower.pid,
+        follower_row: memory_admit.RankedWaiter = {**row, "pid": follower.pid,
             "start_time": str(follower.pid), "session_id": follower.session_id,
             "step": follower.step, "since": follower.since}
         reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, follower)),
@@ -719,7 +725,7 @@ class QueueTests(unittest.TestCase):
         )
         follower = memory_admit.WaitingStep(
             11, "follower-id", "", "doc", "/tmp/tree", now - 300,
-            int(11.6 * GIB), memory_admit.BehindHead(head_name="clone88ci", head_since=now - 2400, head_session_id="head-id"),
+            int(11.6 * GIB), memory_admit.BehindHead(head_name="clone88ci", joined_at=now - 2400, head_session_id="head-id"),
         )
         view = memory_admit.QueueView(
             (head, follower), (), int(23.1 * GIB), 0, 3 * GIB, now,

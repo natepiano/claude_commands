@@ -27,7 +27,7 @@ class RunProbe(TypedDict):
 
 class VerifyRunPlaceTests(unittest.TestCase):
     def script(self, fixture: AdmissionFixture) -> Path:
-        """Execute the real startup through detachment, before command dispatch."""
+        """Execute startup and detachment without the command guard."""
         scripts = fixture.root / "scripts"
         direct = scripts / "direct"
         direct.mkdir(parents=True)
@@ -50,9 +50,14 @@ print(json.dumps({"pid": int(sys.argv[1]), "run": os.environ.get("BUILDLOG_RUN",
 if not sys.stdin.readline():
     raise SystemExit("probe lost its controller")
 ''')
-        prefix = VERIFY.read_text().split('\nCMD="${1:-}"', 1)[0]
+        prefix, command_marker, dispatch = VERIFY.read_text().partition('\nCMD="${1:-}"\n')
+        self.assertTrue(command_marker, 'verify.sh startup marker is missing: CMD="${1:-}"')
+        _, detach_marker, after_detach_marker = dispatch.partition('\nMESH_RUNS_SCRIPT=')
+        self.assertTrue(detach_marker, "verify.sh startup marker is missing: MESH_RUNS_SCRIPT=")
+        detach_and_identity, shift_marker, _ = after_detach_marker.partition('\nshift\n')
+        self.assertTrue(shift_marker, "verify.sh startup marker is missing: shift after the run identity")
         script = direct / "verify.sh"
-        _ = script.write_text(prefix + '''
+        _ = script.write_text(prefix + detach_marker + detach_and_identity + '''
 "$PY" "${BASH_SOURCE[0]%/*}/probe.py" "$$" "$1"
 if [[ "$1" == outer ]]; then
     bash "${BASH_SOURCE[0]}" inner

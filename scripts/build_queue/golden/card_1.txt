@@ -1,6 +1,6 @@
 Build queue · 10:46
 
-queue priority: cables (the user's bump)
+queue priority: cables (captured priority)
                                                     free 9.9 │ taken 11.1
 budget 21.0                                         ░░░░░░░░░░███████████
 
@@ -53,11 +53,12 @@ Waits on
     pass
 
 Likely start ~10:47: 1st in line at 44 steps an hour, an estimate.
-  Each step moved up ahead of it adds about 1 min.
+  Each queue-priority step ahead of it adds about 1 min.
 
 Host: available RAM 24.5 GiB; total RAM 60.0 GiB
 ✗ memory pressure: full avg10 7.7%, some avg10 0.0%, swap used 0.0%; starts below full avg10 5.0%
 Host load: unavailable
+queue priority: cables (captured priority)
 Running:
 tool-based-ui / widget / widget-enhancements-title, nextest: admitted 10:45 (0 min ago); promise
   11.1 GiB, charge 11.1 GiB, using now 5.1 GiB; ramp promise: first 2 min after admission
