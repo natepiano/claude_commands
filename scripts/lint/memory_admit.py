@@ -3696,6 +3696,8 @@ def installed_snapshot_record(record: dict[str, object], schema: type) -> dict[s
         state = (SettledPriority() if transition is None else
                  PendingPriorityTransition(transition["id"], transition["action"], transition["at"]))
         return {**record, "transition": snapshot_value(state)}
+    if schema is BehindHead and "head_since" in record and "joined_at" in record:
+        raise ValueError("ambiguous snapshot head time")
     if (schema is BehindHead and record.get("kind") == "BehindHead"
             and record.keys() == snapshot_fields(LegacyBehindHead).keys() | {"kind"}):
         legacy = cast(LegacyBehindHead, parse_snapshot_value({**record, "kind": "LegacyBehindHead"}, LegacyBehindHead))

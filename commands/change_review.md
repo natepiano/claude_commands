@@ -240,21 +240,3 @@ A unit worktree stores its id.
 A showrunner directory or an unowned directory leaves the cell empty.
 The page, status line, and `/next` use one staff routing rule.
 The owner's staff showrunner supplies the production document, even when the list's document reference is missing.
-
-1. Run `change_review.py backfill-producer [--list <path>]` to inspect older rows.
-2. Run the command with `--write` to fill mapped Producer cells.
-3. Read each named report for an unmapped row.
-
-The command searches To review and Reviewed.
-It uses the checkpoint's Change-Review text when a merge contains several units.
-If no included checkpoint names the change, the command checks the merge commit's own checkpoint subject.
-It matches old Branch, Plan, and Unit names through retained Worktree paths.
-When that lookup fails, the command removes `build-followups-` from the checkpoint name.
-Exactly one staff unit with the remaining name supplies the id. Retired units count.
-Zero or several matches leave Producer empty. A valid Worktree result wins.
-It copies each changed list to `<name>.backup-<timestamp>` before the locked write.
-An unmapped row stays empty.
-A repeated run changes nothing.
-After the lists are filled, remove `scripts/production/producer_backfill.py`, including its adapter.
-Remove the `backfill-producer` CLI case and argparse choice from `change_review.py`.
-Remove `scripts/production/test_producer_backfill.py`.

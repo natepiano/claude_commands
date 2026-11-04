@@ -710,7 +710,7 @@ def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str,
     if not launcher.exists():
         launcher.symlink_to(Path(__file__).resolve().parents[1] / "lib/py")
     _ = environment.setdefault("LINT_CONFIG_READER", os.environ["LINT_CONFIG_READER"])
-    for key in ("ADMISSION_SOCKET", "LINT_CONFIG_FILE", "BUILDLOG_PROC", "BUILDLOG_MEMINFO",
+    for key in ("USER_ZONE", "ADMISSION_SOCKET", "LINT_CONFIG_FILE", "BUILDLOG_PROC", "BUILDLOG_MEMINFO",
                 "BUILDLOG_MEMORY_PRESSURE", "BUILDLOG_BUILDS_CGROUP", "BUILDLOG_LIVE_MEMORY_TRIPWIRE"):
         environment[key] = os.environ[key]
     _ = fixture.enter_context(fixture.serving())

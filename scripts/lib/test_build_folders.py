@@ -420,6 +420,27 @@ assert not loaded, loaded
         self.assertNotEqual(folders.repository_key(first), folders.repository_key(second))
         self.assertEqual(folders.repository_key(first), folders.repository_key(alias))
 
+    def test_private_config_without_folder_rules_uses_repository_without_git(self) -> None:
+        config = Path(os.environ["CONF_DIR"]) / "build_folders.conf"
+        original = config.read_text()
+        config.unlink()
+        with mock.patch("scripts.lib.conf.subprocess.run", side_effect=AssertionError("Git must not run")):
+            self.assertEqual(folders.FOLDER_PREFIXES["verify-hold"], "verify-hold.{owner}.")
+            path = folders.create_build_folder(folders.UniqueBuildFolder("private-"))
+        self.assertTrue(path.is_dir())
+        self.assertFalse(config.exists())
+        _ = config.write_text(original.replace("prefixes.verify-hold=verify-hold.{owner}.",
+                                               "prefixes.verify-hold=private.{owner}."))
+        self.assertEqual(folders.FOLDER_PREFIXES["verify-hold"], "private.{owner}.")
+
+    def test_folder_rules_keep_the_live_config_reader_without_a_private_override(self) -> None:
+        settings = conf.read(Path(__file__).resolve().parents[2] / "config" / "build_folders.conf")
+        with mock.patch.dict(os.environ):
+            _ = os.environ.pop("CONF_DIR", None)
+            with mock.patch.object(conf, "read", return_value=settings) as read:
+                self.assertTrue(folders.FOLDER_PREFIXES["verify-hold"])
+            read.assert_called_once_with("build_folders")
+
     def test_naming_reads_changed_configuration_at_use(self) -> None:
         config = Path(os.environ["CONF_DIR"]) / "build_folders.conf"
         _ = config.write_text(config.read_text().replace("patterns.temporary={repository}/{owner}-{purpose}-{suffix}",
