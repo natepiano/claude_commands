@@ -18,10 +18,10 @@ from threading import Event, current_thread
 from typing import cast, override
 from unittest import mock
 
+from scripts.copies import copies
+from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.lib import cargo_output, copy_record, scratch
 from scripts.lint import sweep
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "style"))
-from scripts.style import style_sync
 
 from scripts.lib import conf
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -183,19 +183,78 @@ class ScratchTests(unittest.TestCase):
         self.assertEqual(scratch.end("gate:clone-failure"), paths)
         self.assertFalse(paths[0].exists())
 
-    def test_style_build_folder_helper_creates_a_stamped_cache_the_sweep_accepts(self) -> None:
-        source = self.base / "source"
-        source.mkdir()
-        self.git(source, "init", "-q")
+    def test_standing_checkout_creates_a_stamped_cache_the_sweep_accepts(self) -> None:
+        seed = ImmutableGitSeed.create(self.base, "main", "Scratch tests", "scratch@example.invalid",
+                                       {"source.txt": "style source\n"})
         started = time.time()
-        target = style_sync.lint_target(source / ".git")
-        # Supply build output, but let the helper supply every cache marker.
-        fingerprint = target / "debug" / ".fingerprint" / "sample-0123456789abcdef"
-        fingerprint.mkdir(parents=True)
-        _ = (fingerprint / "bin-sample.json").write_text("{}")
-        self.assertFalse((target / sweep.RUSTC_INFO).exists())
-        self.assertTrue(sweep.is_cargo_target(str(target)), "The sweep must accept the helper's cache")
-        self.assertGreaterEqual((target / sweep.USE_STAMP).stat().st_mtime, started)
+        with mock.patch.dict(os.environ, {"HOME": str(self.base)}):
+            with copies.standing("style-unit", seed.checkout, "HEAD") as checkout:
+                target = checkout / "target"
+            # Supply build output, but let copies supply every cache marker.
+            fingerprint = target / "debug" / ".fingerprint" / "sample-0123456789abcdef"
+            fingerprint.mkdir(parents=True)
+            _ = (fingerprint / "bin-sample.json").write_text("{}")
+            self.assertFalse((target / sweep.RUSTC_INFO).exists())
+            self.assertTrue(sweep.is_cargo_target(str(target)), "The sweep must accept the standing cache")
+            self.assertGreaterEqual((target / sweep.USE_STAMP).stat().st_mtime, started)
+
+    def test_exported_busy_descriptors_keep_checkout_locked_in_command(self) -> None:
+        path = self.base / "held-checkout"
+        path.mkdir()
+        descriptors: list[int] = []
+        with scratch.busy_locks(path, create=True, inherited_fds=descriptors) as acquired:
+            self.assertTrue(acquired)
+            self.assertTrue(descriptors)
+            refused: list[int] = []
+            with scratch.busy_locks(path, create=False, inherited_fds=refused) as idle:
+                self.assertFalse(idle)
+                self.assertEqual(refused, [])
+            process = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"],
+                                       stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.PIPE, pass_fds=descriptors)
+        try:
+            with scratch.busy_locks(path, create=False) as idle:
+                self.assertFalse(idle)
+        finally:
+            _, errors = process.communicate(input=b"x", timeout=10)
+        self.assertEqual(process.returncode, 0, errors)
+        with scratch.busy_locks(path, create=False) as idle:
+            self.assertTrue(idle)
+
+    def test_blocking_busy_acquisition_waits_then_takes_released_mark(self) -> None:
+        path = self.base / "held-checkout"
+        path.mkdir()
+        attempted, acquired = Event(), Event()
+
+        def take() -> bool:
+            attempted.set()
+            with scratch.busy_locks(path, create=False, wait=True) as idle:
+                acquired.set()
+                return idle
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            with scratch.busy_locks(path, create=True) as idle:
+                self.assertTrue(idle)
+                future = executor.submit(take)
+                self.assertTrue(attempted.wait(timeout=10))
+                self.assertFalse(acquired.wait(timeout=0.02))
+            self.assertTrue(future.result(timeout=10))
+
+    def test_target_uses_the_loaded_namer_after_import_access_ends(self) -> None:
+        probe = """import builtins, sys
+from scripts.lib import scratch
+original_import = builtins.__import__
+def load(name, *args, **kwargs):
+    if name == 'scripts.lib.build_folders':
+        raise ImportError('helper imports are closed after startup')
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = load
+print(scratch.target('gate:proof', 'tree', False))
+"""
+        result = subprocess.run([sys.executable, "-c", probe], text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(result.stdout.strip()).parent, copy_record.root())
+        self.assertRegex(Path(result.stdout.strip()).name, r"^gate-proof-tree-[a-z0-9]{6}$")
 
     def test_copy_record_with_a_legacy_shared_target_still_loads(self) -> None:
         path = self.copy()

@@ -44,6 +44,25 @@ def build(record_id: str, seconds: float, **fields: object) -> Record:
     })
 
 
+def moment_fixture(test: unittest.TestCase) -> MomentTests:
+    fixture = MomentTests(methodName="runTest")
+    test.addCleanup(fixture.doCleanups)
+    fixture.setUp()
+    return fixture
+
+
+def read_only_cli(test: unittest.TestCase, args: list[str]) -> subprocess.CompletedProcess[str]:
+    database = index.index_path()
+    before = database.read_bytes()
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).with_name("cli.py")), *args],
+        env=dict(os.environ), capture_output=True, text=True, check=False, timeout=60,
+    )
+    test.assertEqual(result.returncode, 0, result.stderr)
+    test.assertEqual(database.read_bytes(), before)
+    return result
+
+
 class MomentTests(unittest.TestCase):
     fixture: report_fixtures.PowerProfileTests  # pyright: ignore[reportUninitializedInstanceVariable]
     journal: memory_fixtures.MemoryWindowTests  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -78,8 +97,8 @@ class MomentTests(unittest.TestCase):
                         )
         return index.read_only()
 
-    def progress(self, events: list[Record], *, root: Path | None = None) -> None:
-        path = (root if root is not None else self.fixture.root / "progress") / "fixture.jsonl"
+    def progress(self, events: list[Record], *, root: Path | None = None, filename: str = "fixture.jsonl") -> None:
+        path = (root if root is not None else self.fixture.root / "progress") / filename
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text("".join(json.dumps(event) + "\n" for event in events))
 
@@ -485,16 +504,9 @@ class MomentTests(unittest.TestCase):
             closing(self.connection(build("measured", 3600, repo="hana"))) as connection,
         ):
             expected = report.moments_section(connection, "2026-10-30")
-        database = self.fixture.root / "index.sqlite"
-        before = database.read_bytes()
-        result = subprocess.run(
-            [sys.executable, str(Path(report.__file__).with_name("cli.py")), "moments", "2026-10-30"],
-            env={**os.environ, "BUILDLOG_PROGRESS_DIR": str(self.fixture.root / "progress")},
-            capture_output=True, text=True, check=False, timeout=60,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        result = read_only_cli(self, ["moments", "2026-10-30"])
         self.assertEqual(result.stdout.splitlines(), expected)
-        self.assertEqual(database.read_bytes(), before)
+
 
 
 class MemoryMomentTests(unittest.TestCase):
@@ -503,9 +515,7 @@ class MemoryMomentTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture = MomentTests(methodName="runTest")
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        self.fixture = moment_fixture(self)
         self.journal = self.fixture.journal
         _ = cast(object, self.enterContext(mock.patch.object(store, "host_name", return_value="natedev")))
 

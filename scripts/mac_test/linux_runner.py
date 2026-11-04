@@ -658,6 +658,7 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         'LINT_SWEEP_BUDGET_GIB': f'{budget:g}',
         'BUILDLOG_CALLER': 'verify-linux', 'BUILDLOG_CALL_ID': call_id,
         'BUILDLOG_TARGET': values.get('selected_target', ''),
+        'BUILDLOG_PINNED_TARGET': values.get('pinned_target', ''),
         'BUILDLOG_SYNC': '0', 'LINT_SKIP_SWEEP': '1',
         'CARGO_TARGET_DIR': str(target),
         'BUILDLOG_WORKSPACE': str(mirror),

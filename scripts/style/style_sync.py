@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
 import re
@@ -29,6 +28,7 @@ import process_group
 
 from add_style import NoStyleProduction, standing_style_production
 from production_units import Refusal
+from scripts.copies import copies
 from scripts.message import send_result
 from scripts.message import send_budget
 from scripts.production import showrunners
@@ -344,22 +344,13 @@ def sweep_stale_lint_dirs() -> None:
             print(f"style_sync: sweep {directory}: " + " ".join(str(error).splitlines()))
 
 
-def lint_target(common_dir: Path) -> Path:
-    """One Cargo target per main repo, retained across style production tasks."""
-    target = common_dir / scratch.STYLE_TARGET_NAME
-    scratch.mark_cargo_cache(target)
-    scratch.mark_cargo_cache(target / "intermediates")
-    _ = scratch.release(target)
-    return target
-
-
-@contextmanager
-def locked_lint_target(common_dir: Path) -> Generator[Path]:
-    """Serialize checkout creation through cleanup, so source times postdate prior fingerprints."""
-    target = lint_target(common_dir)
-    with (target / scratch.STYLE_LOCK_NAME).open("a") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        yield target
+def gate_owner(repo: Path) -> str:
+    """Use the registered style production, or the calling production."""
+    standing = standing_style_production(repo)
+    if not isinstance(standing, NoStyleProduction):
+        return standing.slug
+    owner = showrunners.own_slug()
+    return owner or copies.fallback_owner("style")
 
 
 def lint(repo: Path, checkout: Path, tip: str) -> int:
@@ -370,29 +361,27 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
         raise Refusal("--repo and --checkout must belong to the same repository")
     sweep_stale_lint_dirs()
     # Signals stay held outside the work, so the dir never exists without its record and its cleanup path.
-    with stop_signals_raise(), locked_lint_target(Path(common_dir)) as target, signal_mask(signal.SIG_BLOCK):
+    with stop_signals_raise(), copies.standing(gate_owner(repo), checkout, tip) as snapshot, signal_mask(signal.SIG_BLOCK):
         directory = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
             LINT_PREFIX, build_folders.ExplicitBuildParent(lint_temp_parent())))
-        snapshot = directory / "checkout"
         try:
             OwnerRecord(os.getpid(), Path(common_dir)).write(directory)
             with signal_mask(signal.SIG_UNBLOCK):
-                _ = git(checkout, "worktree", "add", "--detach", str(snapshot), tip)
-                target_link = snapshot / "target"
-                target_link.symlink_to(target, target_is_directory=True)
-
+                (directory / "checkout").symlink_to(snapshot, target_is_directory=True)
+                intermediates = snapshot / "target/intermediates"
+                scratch.mark_cargo_cache(intermediates)
                 saved = subprocess.run(
                     [str(PYTHON), str(Path(scratch.__file__)), "cargo-save", str(snapshot)],
-                    env={**os.environ, "CARGO_BUILD_BUILD_DIR": str(target / "intermediates")},
+                    env={**os.environ, "CARGO_BUILD_BUILD_DIR": str(intermediates)},
                     capture_output=True, text=True, check=False,
                 )
                 if saved.returncode:
                     raise Refusal(saved.stderr.strip() or "cannot save Cargo output roots")
                 returncode, output = verify_lint(directory)
                 print(output, end="")
-                # The generated target link is ours, including in a repo without a target ignore rule.
+                # Build outputs are retained; only source changes invalidate coverage.
                 rewritten = bool(git(snapshot, "status", "--porcelain", "--", ".", ":(exclude)target"))
-                rewritten = rewritten or not target_link.is_symlink() or target_link.readlink() != target
+                rewritten = rewritten or (snapshot / "target").is_symlink()
                 records = lint_records(output, snapshot)
                 for record in records:
                     passed = record.passed and not rewritten
@@ -616,7 +605,7 @@ def main(argv: list[str] | None = None) -> int:
     except LintStopped as stopped:
         print(f"style_sync: {stopped}", file=sys.stderr)
         return 128 + stopped.signum
-    except (Refusal, style_ledger.LedgerError, scratch.ScratchError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+    except (copies.CopyError, Refusal, style_ledger.LedgerError, scratch.ScratchError, OSError, ValueError, subprocess.TimeoutExpired) as error:
         print("style_sync: " + " ".join(str(error).splitlines()), file=sys.stderr)
         return 2
 

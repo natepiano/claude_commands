@@ -1,3 +1,4 @@
+import selectedPageFixture from './selected_page_fixture';
 import { describe, expect, mock, test } from 'claude-code/testing';
 import type { Engine } from 'claude-code/testing';
 import type { CommandRunInput, EngineInterface, On, TurnCompleteInput, UiPane } from 'claude-code';
@@ -45,7 +46,10 @@ function snapshot(): QueueLines {
 function selectedPage(): QueueLines {
   const data = snapshot();
   data.lines.push([], [{ text: '#4 of 32 · cargo-liner · berth · clippy · 2.9 GiB', bold: true }],
-    [{ text: 'Next? No. 3 steps are ahead of it: 2 moved up, 1 joined earlier.' }]);
+    [{ text: 'Next? No. 3 steps are ahead of it: 2 moved up, 1 joined earlier.' }],
+    [{ text: 'Need source: same-shape p90 of 7 runs, last 14 days; failed-build floor 16.0 GiB.' }],
+    [{ text: 'Cargo token: worker nextest: waited 154 s (10:42-10:45).' }],
+    [{ text: 'Frees when: widget nextest end (budget charge drops 11.1 GiB).' }]);
   return data;
 }
 
@@ -215,6 +219,23 @@ describe('build queue pane', () => {
     });
   }
 
+  test('the recorded board paints running grants before numbered waiting rows', async ($, on) => {
+    const fake = queueHost(on);
+    fake.replace(selectedPageFixture as QueueLines);
+    await $.command.run(command());
+    const ui = await mount($, 'terminal');
+    const tree = await ui.drawn();
+    const lines = inspectDrawing(tree).lines;
+    expect(lines).toEqual(selectedPageFixture.lines.map(line => line.map(span => span.text).join('')));
+    const running = lines.findIndex(line => line.startsWith('run'));
+    const waiting = lines.findIndex(line => line.trimStart().startsWith('1 '));
+    expect(running).toBeGreaterThanOrEqual(0);
+    expect(waiting).toBeGreaterThan(running);
+    expect(lines.filter(line => line.startsWith('run'))).toHaveLength(1);
+    expect(lines.filter(line => /^\s+[12] /.test(line))).toHaveLength(2);
+    expect(lines.at(-1)).toContain('(unowned)');
+  });
+
   test('a span with omitted style fields paints with the default foreground, background and weight', async ($, on) => {
     const fake = queueHost(on);
     const data = snapshot();
@@ -231,6 +252,22 @@ describe('build queue pane', () => {
     expect(props.color ?? 'default').toBe('default');
     expect(props.backgroundColor ?? 'default').toBe('default');
     expect(props.bold).toBe(false);
+    expect(fake.processes).toEqual([READ]);
+  });
+
+  test('the pane preserves the bump mark supplied by the queue JSON', async ($, on) => {
+    const fake = queueHost(on);
+    const data = snapshot();
+    data.lines = [[{ text: ' 1 tool-based-ui ' }, { text: '●', tone: 'warning' },
+      { text: 'cables   nextest' }], [{ text: ' 2 tool-based-ui lfo       nextest' }]];
+    fake.replace(data);
+    await $.command.run(command());
+    const ui = await mount($);
+    const drawing = inspectDrawing(await ui.drawn());
+    expect(drawing.lines).toEqual(data.lines.map(line => line.map(part => part.text).join('')));
+    expect(drawing.spans.filter(part => part.text === '●')).toEqual([
+      { text: '●', color: 'warning', bold: false },
+    ]);
     expect(fake.processes).toEqual([READ]);
   });
 
@@ -318,6 +355,18 @@ describe('build queue pane', () => {
     await fake.clock.advance(2000);
     expect(drawnText(await ui.drawn())).toBe('0:00');
     expect(fake.processes).toEqual([READ]);
+  });
+
+  test('the pane paints the same recorded page as the terminal', async ($, on) => {
+    const fake = queueHost(on);
+    const data = selectedPage();
+    fake.replace(data);
+    await $.command.run(command('1'));
+    const ui = await mount($, 'terminal', 100);
+    const expected = data.lines.map(line => line.map(span => span.text).join(''));
+    expect(inspectDrawing(await ui.drawn()).lines).toEqual(expected);
+    expect(drawnText(await ui.drawn())).toContain('Frees when:');
+    expect(drawnText(await ui.drawn())).toContain('Need source: same-shape p90 of 7 runs, last 14 days; failed-build floor 16.0 GiB.');
   });
 
   test('a selector keeps the card below the queue through timer refresh and reload', async ($, on) => {
@@ -492,7 +541,10 @@ describe('build queue pane', () => {
       const ui = await mount($);
       const page = inspectDrawing(await ui.drawn()).lines;
       expect(page[0]).toBe(HEAD);
-      expect(page.at(-2)).toContain('#4 of 32');
+      expect(page).toContain('#4 of 32 · cargo-liner · berth · clippy · 2.9 GiB');
+      expect(page.at(-1)).toContain('Frees when:');
+      expect(page.join('\n')).toContain('failed-build floor 16.0 GiB');
+      expect(page.join('\n')).toContain('waited 154 s');
       fake.failNext(mode);
       await fake.clock.advance(10_000);
       expect(inspectDrawing(await ui.drawn()).lines).toEqual(page);
@@ -619,7 +671,7 @@ describe('build queue pane', () => {
     expect(fake.escaped).toEqual([]);
   });
 
-  for (const refusal of ["build queue: type /build:queue bump berth in a showrunner pane"]) {
+  for (const refusal of ["build queue: no waiting step matches berth"]) {
     test(`bump reports its refusal: ${refusal}`, async ($, on) => {
       const fake = queueHost(on);
       fake.refuseBump(refusal);

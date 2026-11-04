@@ -291,6 +291,12 @@ class LinuxShellTests(unittest.TestCase):
         self.assertEqual(evaluations[0]["inputs"], ["flake.lock", "flake.nix", "nix/shell.nix"])
         self.assertTrue(any(argument.endswith("#ci") for argument in evaluations[0]["args"]))
         self.assertEqual(event["environment"].get("TEST_SHELL_PROOF"), "loaded")
+
+    def test_pinned_selection_reaches_the_remote_step_environment(self) -> None:
+        with mock.patch.dict(os.environ, {"BUILDLOG_PINNED_TARGET": "aws"}):
+            event = self.assert_ran(self.request())
+        self.assertEqual(event["environment"]["BUILDLOG_TARGET"], "aws")
+        self.assertEqual(event["environment"]["BUILDLOG_PINNED_TARGET"], "aws")
         self.assertEqual(event["cwd"], str(self.mirror))
 
     def test_sigterm_prints_one_interruption_marker_and_preserves_the_child_status(self) -> None:

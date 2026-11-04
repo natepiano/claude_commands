@@ -14,7 +14,7 @@ from unittest import mock
 from scripts.lib import conf
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import change_review, change_routing, staff, unrouted_alert
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.production.test_change_review import ProducerFixture, producer_rows
 
 
@@ -64,6 +64,7 @@ class StaffRoutingTests(unittest.TestCase):
                          change_routing.ShowrunnerOwnChange(self.top.id, "top"))
 
     def test_an_unknown_producer_id_is_unrouted_and_alerts_with_the_row(self) -> None:
+        _ = self.enterContext(production_staff_record())
         _ = self.enterContext(mock.patch.object(change_routing, "configured_lists_directory", return_value=self.root))
         identity = fixture_runtime_id("missing-producer")
         owner = self.router().owner({"#": "C777", "Producer": identity}, self.root / "change-review - top.md")
@@ -73,7 +74,35 @@ class StaffRoutingTests(unittest.TestCase):
         self.assertEqual(owner.tab, "unrouted")
         self.assertEqual(cast(mock.Mock, self.alert).call_args.args[2]["#"], "C777")
 
+    def test_a_staff_override_record_sends_no_alert_for_a_real_list(self) -> None:
+        with (mock.patch.object(change_routing, "configured_lists_directory", return_value=self.root),
+              mock.patch.object(change_routing, "waits_for_user") as waiting):
+            owner = self.router().owner({"#": "C9", "Producer": "unknown"},
+                                        self.root / "change-review - top.md")
+        self.assertIsInstance(owner, change_routing.UnroutedChange)
+        cast(mock.Mock, self.alert).assert_not_called()
+        waiting.assert_not_called()
+
+    def test_a_scratch_router_sends_no_alert_after_the_staff_override_ends(self) -> None:
+        router = self.router()
+        with (mock.patch.dict(os.environ),
+              mock.patch.object(change_routing, "configured_lists_directory", return_value=self.root)):
+            del os.environ["STAFF_FILE"]
+            owner = router.owner({"#": "C9", "Producer": "unknown"}, self.root / "change-review - top.md")
+        self.assertIsInstance(owner, change_routing.UnroutedChange)
+        cast(mock.Mock, self.alert).assert_not_called()
+
+    def test_an_unreadable_staff_record_raises_and_sends_no_alert(self) -> None:
+        record = self.root / "unreadable-staff.json"
+        with mock.patch.dict(os.environ, {"STAFF_FILE": str(record)}):
+            with self.assertRaises(staff.StaffAbsent):
+                _ = self.router()
+            _ = record.write_text("not JSON", encoding="utf-8")
+            with self.assertRaises(staff.StaffUnreadable):
+                _ = self.router()
+
     def test_one_router_reads_the_configured_alert_folder_once(self) -> None:
+        _ = self.enterContext(production_staff_record())
         router = self.router()
         listing = self.root / "change-review - top.md"
         with mock.patch.object(change_routing, "configured_lists_directory", return_value=self.root) as configured:

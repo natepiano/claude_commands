@@ -338,6 +338,8 @@ class StopResumeTests(unittest.TestCase):
         cast(Mock, cast(Mock, self.wait.return_value).wait).side_effect = self.advance
         _ = self.enterContext(patch.object(self.client, "run", self.pane_run))
         _ = self.enterContext(patch.object(self.client, "result", self.pane_result))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PROC": str(self.root / "proc")})))
+        _ = self.enterContext(self.client.empty_shell(998042, self.root))
         _ = self.enterContext(patch.object(stop_resume, "monotonic", lambda: self.clock.elapsed))
         _ = self.enterContext(patch.object(time, "sleep", self.advance))
         _ = self.enterContext(patch("unit_runs.held", return_value=[]))
@@ -872,6 +874,20 @@ class StopResumeTests(unittest.TestCase):
         self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
         self.assertEqual(stop_resume.stop("019b3a40-4250-7000-8000-000000000102"), stop_resume.Stopped("019b3a40-4250-7000-8000-000000000102", 123))
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM)])
+
+    def test_stop_proves_the_staff_current_codex_process_without_a_claude_registry(self) -> None:
+        identity = self.entry["session_id"]
+        row = staff.StaffRow(staff.StaffId("stable-row"), "agent", "alpha", None,
+                             current_session=staff.StaffId(identity))
+        self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(self.client, "pane_activity", return_value=herdr.PaneRunning(("codex",))),
+              patch.object(self.client, "codex_launch", return_value={**self.entry, "pid": 123}),
+              patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                  identity, "generation-1", {})) as native):
+            self.assertEqual(stop_resume.stop("stable-row"), stop_resume.Stopped(identity, 123))
+        self.kill.assert_called_once_with(123, signal.SIGTERM)
+        self.assertTrue(all(item == call(123, "codex") for item in native.call_args_list))
 
     def test_registry_removal_does_not_resume_until_the_saved_process_exits(self) -> None:
         self.live.side_effect = [sessions.LiveSessionProcess(123), sessions.LiveSessionProcess(123),

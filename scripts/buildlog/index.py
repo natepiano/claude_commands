@@ -33,6 +33,13 @@ import store
 import parse
 
 SCHEMA_VERSION = 29
+# These indexes extend the current schema without rebuilding the recorded rows.
+COST_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS steps_session_previous ON steps (session, started_at_us DESC, id DESC) WHERE step = 'nextest'",
+    "CREATE INDEX IF NOT EXISTS steps_execution_end ON steps ((unixepoch(started_at,'subsec') + duration_s)) WHERE duration_s > 0",
+    "CREATE INDEX IF NOT EXISTS steps_wait_started ON steps ((unixepoch(started_at,'subsec'))) WHERE mem_wait_s > 0",
+    "CREATE INDEX IF NOT EXISTS calls_copy ON calls (copy, id)",
+)
 # Step and call fields under a former name, read as the current name.
 FORMER_FIELDS = (("seat", "worker"), ("delegate_session", "unit_session"))
 LOCK_NAME = "index.lock"
@@ -495,6 +502,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
     statements.append("CREATE INDEX memory_snapshots_at ON memory_snapshots (at)")
     for view, (_, select) in VIEWS.items():
         statements.append(f"CREATE VIEW {view} AS {select}")
+    statements.extend(COST_INDEXES)
     for statement in statements:
         _ = connection.execute(statement)
     _ = connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -512,6 +520,8 @@ def open_for_update() -> sqlite3.Connection:
         _ = connection.execute("BEGIN IMMEDIATE")
         create_schema(connection)
         _ = connection.execute("COMMIT")
+    for statement in COST_INDEXES:
+        _ = connection.execute(statement)
     _ = connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
     return connection
 

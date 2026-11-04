@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from contextlib import redirect_stdout
 from decimal import Decimal
@@ -50,6 +51,8 @@ class SshRunnerEvent(TypedDict):
     remote_output: str
     remote_status: int
     interruption_generation: str
+    token_held: bool
+    pinned: str
 
 
 class MacWaitRegistration(TypedDict):
@@ -124,13 +127,15 @@ def capture(arguments, deadline=offload.NO_COMMAND_TIME_LIMIT):
         return offload.CommandOutput(75, "aws_interrupted=fixture-generation\n", "")
     if mode == "probe-leftovers":
         return offload.CommandOutput(255, "", "host unavailable")
-    if mode == "disk":
-        return offload.CommandOutput(0, "free_gib=0\nhost=test-mac\nrc=0\n", "")
     if mode == "probe-refusal":
         (root / (request.target + ".marker")).touch()
         return offload.CommandOutput(75, "linux_startup=unresolved\n", "")
     wire = "free_gib=1000\nhost=aws-build\nrustc=rustc fixture\nnextest=nextest fixture\n"
     wire += "mend=mend fixture\nscripts_commit=fixture-commit\nrc=0\n"
+    if mode == "disk":
+        wire = wire.replace("free_gib=1000", "free_gib=0")
+    if mode == "version-mismatch":
+        wire = wire.replace("rustc=rustc fixture", "rustc=rustc other")
     if mode == "after-probe":
         wire += "mac_cleanup=unconfirmed\n"
         (root / (request.target + ".marker")).touch()
@@ -220,6 +225,8 @@ with mock.patch.object(controller, "complete_claim", side_effect=complete), \
     result = offload.run_offload(controller, config, request, started)
 
 event = dict(target=request.target, owner=args.claim_owner_pid, slot=controller.attempt_evidence.slot,
+             token_held=Path(os.environ["TEST_TOKEN_RECORD"]).exists(),
+             pinned=os.environ.get("BUILDLOG_PINNED_TARGET", ""),
              reserved=reserved, same_path=same_path, queued_at=os.environ.get("BUILDLOG_MEM_WAIT_SINCE", ""),
              memory_reservation=os.environ.get("BUILDLOG_MEM_RESERVATION", ""), actions=actions, mode=mode,
              result_type=type(result).__name__,
@@ -272,6 +279,93 @@ class VerifySshTargetsTests(VerifyMacOffloadFixture):
     def ssh_events(self) -> list[SshRunnerEvent]:
         path = self.runner_state / "ssh-events.jsonl"
         return [cast(SshRunnerEvent, json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_pinned_aws_test_skips_free_natedev_and_its_admission(self) -> None:
+        self.configure("natedev,aws")
+        result = self.verify("test", "sample", "--target", "aws")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        event, = self.ssh_events()
+        self.assertEqual((event["target"], event["pinned"]), ("aws", "aws"))
+        self.assertFalse(event["token_held"])
+        self.assertEqual(event["memory_reservation"], "")
+        self.assertEqual(self.local_runs(), [])
+        self.assertEqual(self.admission.history(), [])
+        self.assertEqual(self.routing_record()["target"], "aws")
+        self.assertTrue(self.attempts()[0]["pinned"])
+
+    def test_pinned_remote_step_records_the_target_host_and_selection(self) -> None:
+        from scripts.buildlog import record, store
+
+        self.configure("natedev,aws")
+        with mock.patch.dict(os.environ, {**self.environment, "BUILDLOG_TARGET": "aws",
+                                         "BUILDLOG_PINNED_TARGET": "aws"}), \
+             mock.patch.object(store, "host_name", return_value="aws-build"), \
+             mock.patch.object(os, "getcwd", return_value=str(self.root)), \
+             mock.patch.object(sys, "path", [str(REPOSITORY / "scripts/buildlog"), *sys.path]):
+            record.step(["0", "100", "101", "0", "", "", "cargo", "nextest", "run"])
+        rows = [cast(dict[str, object], json.loads(line))
+                for path in (self.root / "buildlog/aws-build").glob("*.jsonl")
+                for line in path.read_text().splitlines()]
+        step, = [row for row in rows if row["kind"] == "step"]
+        self.assertEqual((step["target"], step["host"], step["pinned"]), ("aws", "aws-build", True))
+
+    def test_pinned_check_skips_the_initial_local_token(self) -> None:
+        self.configure("natedev,aws")
+        result = self.verify("check", "sample", "--target", "aws")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        event, = self.ssh_events()
+        self.assertEqual(event["target"], "aws")
+        self.assertFalse(event["token_held"])
+        self.assertFalse(any(row["args"][:1] == ["check"] for row in self.cargo_events()))
+        self.assertEqual(self.admission.history(), [])
+
+    def test_pinned_target_refusal_keeps_the_reason_and_never_runs_locally(self) -> None:
+        self.configure("natedev,aws")
+        for mode, reason, detail in (
+            ("disk", "disk", "not running on the aws (disk)"),
+            ("version-mismatch", "unreachable", "public tools or tracked scripts differ"),
+            ("probe-leftovers", "busy", "2 leftover processes"),
+        ):
+            with self.subTest(mode=mode):
+                (self.home / ".local/state/build-targets/aws/unreachable_until").unlink(missing_ok=True)
+                result = self.verify("test", "sample", "--target", "aws",
+                                     extra={"TEST_SSH_MODES": json.dumps({"aws": mode})})
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("target aws refused: " + reason, result.stderr)
+                self.assertIn(detail, result.stdout + result.stderr)
+                self.assertEqual(self.local_runs(), [])
+                self.assertEqual(self.admission.history(), [])
+
+    def test_pinned_wait_keeps_its_live_record_until_aws_becomes_available(self) -> None:
+        self.configure("natedev,aws")
+        control = self.home / ".local/state/build-targets/aws/controller.json"
+        _ = control.write_text('{"state":"stopped"}')
+        self.write_executable(self.bin_directory / "sleep", r'''
+import json
+import os
+from pathlib import Path
+records = list(Path(os.environ["VERIFY_STEPS_DIR"]).glob("*.json"))
+assert len(records) == 1
+row = json.loads(records[0].read_text())
+Path(os.environ["TEST_RUNNER_STATE"], "waiting-step.json").write_text(json.dumps(row))
+Path(os.environ["HOME"], ".local/state/build-targets/aws/controller.json").write_text('{"state":"running"}')
+''')
+        result = self.verify("test", "sample", "--target", "aws")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row = cast(dict[str, object], json.loads((self.runner_state / "waiting-step.json").read_text()))
+        self.assertEqual((row["pinned_target"], row["state"]), ("aws", "waiting_ssh"))
+        self.assertEqual(self.local_runs(), [])
+        self.assertEqual(self.admission.history(), [])
+        self.assertEqual([event["target"] for event in self.ssh_events()], ["aws"])
+
+    def test_pinned_target_rejects_unknown_and_local_target_names(self) -> None:
+        for name in ("unknown", "natedev"):
+            with self.subTest(target=name):
+                result = self.verify("test", "sample", "--target", name)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("unknown SSH target: " + name, result.stderr)
+        self.assertEqual(self.ssh_events(), [])
+        self.assertEqual(self.local_runs(), [])
 
     def attempts(self) -> list[dict[str, object]]:
         return [cast(dict[str, object], json.loads(line))
@@ -939,6 +1033,12 @@ class SshResultBoundaryTests(unittest.TestCase):
 
 class VerifyLinuxStagedDocTests(doc_support.VerifyDocFixture):
     def test_linux_doc_judges_the_staged_tree_without_a_local_hold(self) -> None:
+        self.linux_doc_case(pinned=False)
+
+    def test_pinned_linux_doc_keeps_the_staged_tree_and_skips_local_admission(self) -> None:
+        self.linux_doc_case(pinned=True)
+
+    def linux_doc_case(self, *, pinned: bool) -> None:
         self.enable_held_mac_doc()
         for holder in Path(self.environment["BUILD_HOLD_DIR"]).iterdir():
             holder.unlink()
@@ -956,6 +1056,8 @@ elif words[0] == "platform":
     print("linux")
 elif words[0] == "reserve":
     Path(words[words.index("--reservation-file") + 1]).write_text("aws\t" + settings + "\n")
+elif words[0] in ("register-local", "check-local") and os.environ.get("TEST_PINNED_DOC") == "1":
+    raise AssertionError("pinned doc requested local admission")
 elif words[0] not in ("release-wait", "register-local", "check-local"):
     raise AssertionError(words)
 ''')
@@ -965,6 +1067,7 @@ elif words[0] not in ("release-wait", "register-local", "check-local"):
         _ = write_config_fixture(config.parent / "aws_target.conf", "offload=on\n", template="aws_target")
         runner = Path(self.environment["VERIFY_MAC_RUNNER"])
         self.environment["TEST_LINUX_DOC_RUN"] = str(self.root / "linux-doc-run")
+        self.environment["TEST_PINNED_DOC"] = "1" if pinned else "0"
         runner_source = runner.read_text().replace('"mac=" + result', '"outcome=" + result + "\\ntarget=aws"')
         runner_source = runner_source.replace('words = sys.argv[1:]', '''words = sys.argv[1:]
 assert words[words.index("--target") + 1] == "aws"
@@ -977,7 +1080,7 @@ Path(os.environ["TEST_LINUX_DOC_RUN"]).touch()''')
         _ = (self.repo / "notes.md").write_text("private fixture")
         original_index = (self.repo / ".git/index").read_bytes()
 
-        result = self.verify()
+        result = self.verify("--target", "aws") if pinned else self.verify()
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(Path(self.environment["TEST_LINUX_DOC_RUN"]).exists())

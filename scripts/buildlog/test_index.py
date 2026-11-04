@@ -225,6 +225,20 @@ class IndexTests(unittest.TestCase):
         self.host_file = self.root / "natedev" / "2026-10.jsonl"
         self.host_file.parent.mkdir(parents=True)
 
+    def test_cost_indexes_extend_an_existing_index_without_rebuilding_rows(self) -> None:
+        self.write(self.host_file, step("retained"))
+        self.assertEqual(index.update(), 1)
+        with closing(sqlite3.connect(index.index_path())) as connection:
+            for name in ("steps_session_previous", "steps_execution_end", "steps_wait_started", "calls_copy"):
+                _ = connection.execute(f"DROP INDEX {name}")
+            _ = connection.execute("UPDATE steps SET duration_s=123 WHERE id='retained'")
+            connection.commit()
+        self.assertEqual(index.update(), 0)
+        self.assertEqual(self.rows("SELECT duration_s FROM steps WHERE id='retained'"), [(123,)])
+        names = {row[1] for row in self.rows("PRAGMA index_list(steps)")}
+        self.assertTrue({"steps_session_previous", "steps_execution_end", "steps_wait_started"} <= names)
+        self.assertIn("calls_copy", {row[1] for row in self.rows("PRAGMA index_list(calls)")})
+
     def write(self, path: Path, *records: Record) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_bytes(b"".join(encode(record) for record in records))

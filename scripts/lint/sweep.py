@@ -181,11 +181,14 @@ from typing import TYPE_CHECKING, Literal, TypeGuard, cast, overload, override
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.message import send_budget
+from scripts.lib import file_lock
+from scripts.lib.file_lock import PROC_LOCKS as PROC_LOCKS
 import conf
 from process_failure import failure_detail
 from user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
     from . import tmp_sweep
+    from ..copies import copies
     from ..lib import scratch
     from ..lib.atomic_file import write_text_atomic
     from ..buildlog import record, store
@@ -194,6 +197,7 @@ if TYPE_CHECKING:
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.copies import copies
     from scripts.lint import tmp_sweep
     import scratch
     from atomic_file import write_text_atomic
@@ -223,9 +227,6 @@ MERGE_DIRS = ("search.index", "trait.impl", "type.impl")
 TARGET_DIR_FLAG = "--target-dir"
 LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
 PROC_DIR = "/proc"
-PROC_LOCKS = "/proc/locks"
-# The kernel writes /proc/locks one page per read and drops its lock between pages; a lock freed earlier in the
-# list moves the next page past one line. Each extra read gives a skipped line another chance to show.
 # The kernel adds this to an exe, cwd or maps path whose file was removed.
 DELETED_SUFFIX = " (deleted)"
 # cargo runs a subcommand as `cargo-nextest nextest …`; a wrapper may rename argv[0].
@@ -968,29 +969,10 @@ def process_use(target: str, owners: TargetOwnerIndex, proc: str = PROC_DIR) -> 
 def lock_holder(lock: str, locks: str = PROC_LOCKS, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> int | None:
-    """The pid that holds flock() on lock, read from /proc/locks; None without /proc or holder.
-
-    A read under load can skip a line (sweep_proc_locks_reads), so no holder is the answer only after every read agrees.
-    """
+    """Read the lock holder with the configured number of attempts."""
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
-    try:
-        stat = os.stat(lock)
-    except OSError:
-        return None
-    # "1: FLOCK  ADVISORY  WRITE <pid> <major>:<minor>:<inode> 0 EOF"; a waiter's line has "->".
-    device = f"{os.major(stat.st_dev):02x}:{os.minor(stat.st_dev):02x}:{stat.st_ino}"
-    for _ in range(lint_settings.whole("sweep_proc_locks_reads")):
-        try:
-            with open(locks, encoding="ascii", errors="replace") as handle:
-                lines = handle.read().splitlines()
-        except OSError:
-            return None
-        for line in lines:
-            fields = line.split()
-            if len(fields) > 5 and fields[1] == "FLOCK" and fields[5] == device and fields[4].isdigit():
-                return int(fields[4])
-    return None
+    return file_lock.lock_holder(lock, locks, reads=lint_settings.whole("sweep_proc_locks_reads"))
 
 
 def floor_lock_holder(path: str, *,
@@ -3094,6 +3076,13 @@ def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]]
     return protected
 
 
+def floor_roots(*, lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> tuple[str, ...]:
+    """Include the standing pool wherever copies configuration places it."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
+    return (*lint_settings.words("sweep_floor_roots"), str(copies.gates_root()))
+
+
 def floor_scan_targets(scan: Scan, idle: Sequence[str], target_uses: dict[str, float],
                        tree_targets: dict[str, str]) -> list[record.IdleFloorTarget]:
     """Estimate each target independently of the shortfall and all other takes."""
@@ -3199,17 +3188,17 @@ def mac_floor_settings(settings: conf.ConfigRead) -> tuple[int, tuple[str, ...]]
     return int(floor * GIB), roots
 
 
-def hold_floor(floor: int, dry_run: bool, *,
+def hold_floor(floor: int, dry_run: bool, roots: Sequence[str] = (), lock: str = "", *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     policy: MacFloor | NatedevFloor = NatedevFloor.CURRENT,
 ) -> int:
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     if isinstance(policy, NatedevFloor):
-        return _hold_floor(floor, dry_run, lint_settings=lint_settings, policy=policy).status
+        return _hold_floor(floor, dry_run, lint_settings=lint_settings, policy=policy, roots=roots, lock=lock).status
     output = io.StringIO()
     with redirect_stdout(output):
-        result = _hold_floor(floor, dry_run, lint_settings=lint_settings, policy=policy)
+        result = _hold_floor(floor, dry_run, lint_settings=lint_settings, policy=policy, roots=roots, lock=lock)
     if dry_run:
         for line in output.getvalue().splitlines():
             if "the floor would take" in line:
@@ -3255,13 +3244,14 @@ def filesystem_floors(floor: int, targets: Sequence[str], *, lint_settings: conf
 
 def _hold_floor(floor: int, dry_run: bool, *,
     lint_settings: conf.ConfigRead, policy: MacFloor | NatedevFloor,
+    roots: Sequence[str] = (), lock: str = "",
 ) -> FloorOutcome:
     if isinstance(policy, MacFloor):
-        return _hold_floor_pass(floor, dry_run, lint_settings=lint_settings, policy=policy)
+        return _hold_floor_pass(floor, dry_run, lint_settings=lint_settings, policy=policy, roots=roots, lock=lock)
     planned_at = time.time()
     token = OUTPUT_ROOTS.set(CargoOutputIndex())
     try:
-        targets, mappings = discover_cargo_outputs(lint_settings.words("sweep_floor_roots"), dry_run,
+        targets, mappings = discover_cargo_outputs(roots or floor_roots(lint_settings=lint_settings), dry_run,
                                                    lint_settings=lint_settings)
         _ = OUTPUT_ROOTS.set(mappings)
         ci_roots = [Path(path).expanduser().resolve() for path in lint_settings.words("sweep_ci_targets")]
@@ -3279,7 +3269,7 @@ def _hold_floor(floor: int, dry_run: bool, *,
             scope = FLOOR_FILESYSTEM.set(filesystem)
             try:
                 results.append(_hold_floor_pass(filesystem.floor_bytes, dry_run, lint_settings=lint_settings,
-                                                 policy=policy, planned_at=planned_at))
+                                                 policy=policy, planned_at=planned_at, roots=roots, lock=lock))
             except OSError as error:
                 print(f"lint sweep: filesystem {filesystem.probe_path}: {error}", file=sys.stderr)
                 results.append(FloorOutcome(1, 0, 0, 0, 0))
@@ -3297,14 +3287,15 @@ def _hold_floor(floor: int, dry_run: bool, *,
 
 def _hold_floor_pass(floor: int, dry_run: bool, *,
     lint_settings: conf.ConfigRead, policy: MacFloor | NatedevFloor,
+    roots: Sequence[str] = (), lock: str = "",
     planned_at: float | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> FloorOutcome:
     """Below the floor, take the shortfall from the least used idle targets."""
     if isinstance(planned_at, UseConfiguredValue):
         planned_at = time.time()
-    roots = policy.roots if isinstance(policy, MacFloor) else lint_settings.words("sweep_floor_roots")
+    roots = policy.roots if isinstance(policy, MacFloor) else roots or floor_roots(lint_settings=lint_settings)
     filesystem = FLOOR_FILESYSTEM.get()
-    lock = floor_record_path().with_suffix(".lock")
+    lock = lock or str(floor_record_path().with_suffix(".lock"))
     if not dry_run and isinstance(policy, NatedevFloor):
         recover_pending_trims(lint_settings=lint_settings)
     home = filesystem.probe_path if isinstance(filesystem, FilesystemFloor) else os.path.expanduser("~")

@@ -217,6 +217,24 @@ class CopyTests(TmpSweepCase):
         self.assertFalse(child.exists())
         self.assertFalse(parent.exists())
 
+    def test_failed_resumed_removal_keeps_its_borrowed_parent(self) -> None:
+        parent = self.copy("parent")
+        child = self.copy("child", borrows_from=str(parent / ".git"))
+
+        def stopped_removal(folder: str) -> None:
+            (Path(folder) / copy_record.RECORD).unlink()
+            raise OSError("stopped after record unlink")
+
+        with mock.patch.object(tmp_sweep, "delete_tree", side_effect=stopped_removal):
+            self.assertTrue(self.sweep().failed)
+        with mock.patch.object(tmp_sweep, "delete_tree", side_effect=OSError("still stopped")) as remove:
+            result = self.sweep()
+        remove.assert_called_once_with(str(child))
+        self.assertTrue(result.failed)
+        self.assertTrue(child.exists())
+        self.assertTrue(parent.exists())
+        self.assertIn(str(parent), result.kept[f"borrowed: {child} still uses its git objects"])
+
     def test_reused_path_with_unsaved_work_does_not_resume_the_old_copys_removal(self) -> None:
         path = self.copy("reused")
         descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)

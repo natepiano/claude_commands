@@ -34,6 +34,20 @@ RunsOn = MacAllowed | NatedevOnly | SshAllowed
 
 
 @dataclass(frozen=True)
+class Routed:
+    pass
+
+
+@dataclass(frozen=True)
+class Pinned:
+    target: str
+
+
+TargetSelection = Routed | Pinned
+ROUTED = Routed()
+
+
+@dataclass(frozen=True)
 class WorkspacePackages:
     """The command selects the workspace without a named package."""
 
@@ -82,14 +96,16 @@ class StepRecord:
     updated: str
     v: int = 1
     selected_target: str = ""
+    selection: TargetSelection = ROUTED
 
     def __init__(self, call_id: str, pid: int, proc_start: str, repo: Path, kind: str,
                  package: PackageSelection | str | None, runs_on: RunsOn, state: StepState,
-                 updated: str, v: int = 1, selected_target: str = "") -> None:
+                 updated: str, v: int = 1, selected_target: str = "",
+                 selection: TargetSelection = ROUTED) -> None:
         for name, value in (("call_id", call_id), ("pid", pid), ("proc_start", proc_start),
                             ("repo", repo), ("kind", kind), ("package", package_selection(package)),
                             ("runs_on", runs_on), ("state", state), ("updated", updated),
-                            ("v", v), ("selected_target", selected_target)):
+                            ("v", v), ("selected_target", selected_target), ("selection", selection)):
             object.__setattr__(self, name, value)
 
     @property
@@ -179,9 +195,14 @@ def _decode(value: object, call_id: str) -> StepRecord:
     selected = row.get("selected_target", "")
     if not isinstance(selected, str):
         raise ValueError("invalid selected target")
+    pinned = row.get("pinned_target", "")
+    if not isinstance(pinned, str):
+        raise ValueError("invalid pinned target")
+    if pinned and pinned not in (runs_on.targets if isinstance(runs_on, SshAllowed) else ("mac",)):
+        raise ValueError("pinned target is not eligible")
     return StepRecord(call_id, pid, _text(row.get("proc_start")), Path(_text(row.get("repo"))),
                       kind, package, runs_on, StepState(_text(row.get("state"))), _text(row.get("updated")),
-                      selected_target=selected)
+                      selected_target=selected, selection=Pinned(pinned) if pinned else Routed())
 
 
 def read(call_id: str) -> ReadResult:
@@ -221,6 +242,8 @@ def write(record: StepRecord) -> None:
                repo=str(record.repo), kind=record.kind, package=package_name(record.package) or None,
                eligible_targets=list(record.eligible_targets), selected_target=record.selected_target,
                runs_on=location, state=record.state.value, updated=record.updated)
+    if isinstance(record.selection, Pinned):
+        row["pinned_target"] = record.selection.target
     with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=".step-", delete=False) as output:
         temporary = Path(output.name)
         try:
@@ -284,6 +307,8 @@ def consume_stopped_build(call_id: str, consumed: Path) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    start = commands.add_parser("start")
+    _ = start.add_argument("pid", type=int)
     create = commands.add_parser("write")
     for flag in ("call-id", "pid", "kind", "runs-on", "state"):
         _ = create.add_argument("--" + flag, required=True)
@@ -292,6 +317,7 @@ def main() -> int:
     _ = create.add_argument("--reason", default="")
     _ = create.add_argument("--eligible-targets", default="")
     _ = create.add_argument("--mac-targets", default="")
+    _ = create.add_argument("--pinned-target", default="")
     update = commands.add_parser("state")
     _ = update.add_argument("--call-id", required=True)
     _ = update.add_argument("--target", default="")
@@ -303,8 +329,11 @@ def main() -> int:
     _ = stopped.add_argument("--consumed", required=True)
     args = parser.parse_args()
     try:
-        call_id = cast(str, args.call_id)
         command = cast(str, args.command)
+        if command == "start":
+            print(process_start(cast(int, args.pid)))
+            return 0
+        call_id = cast(str, args.call_id)
         if command == "remove":
             remove(call_id)
         elif command == "stopped":
@@ -316,6 +345,7 @@ def main() -> int:
             kind = cast(str, args.kind)
             location = cast(str, args.runs_on)
             reason = cast(str, args.reason)
+            pinned_target = cast(str, args.pinned_target)
             if kind not in KINDS or location not in ("mac_allowed", "natedev_only", "ssh_allowed"):
                 raise ValueError("invalid step kind or run location")
             if location == "natedev_only" and not reason:
@@ -325,7 +355,8 @@ def main() -> int:
                              SshAllowed(tuple(filter(None, cast(str, args.eligible_targets).split(","))),
                                         tuple(filter(None, cast(str, args.mac_targets).split(","))))
                              if location == "ssh_allowed" else NatedevOnly(reason),
-                             StepState(cast(str, args.state)), datetime.now(timezone.utc).isoformat()))
+                             StepState(cast(str, args.state)), datetime.now(timezone.utc).isoformat(),
+                             selection=Pinned(pinned_target) if pinned_target else ROUTED))
     except (OSError, ValueError, IndexError) as error:
         parser.exit(2, f"step record: {error}; step refused\n")
     return 0

@@ -626,7 +626,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
                     [*arguments, "--target", "missing", "--holder", "alice"])
                 self.assertEqual(status, 2)
                 self.assertEqual((output + errors).splitlines(),
-                                 ["unknown target missing; configured targets: mac, natedev"])
+                                 ["unknown target missing; configured targets: mac, natedev, aws"])
                 self.assertEqual(calls, [])
                 self.assert_no_natedev_record()
 
