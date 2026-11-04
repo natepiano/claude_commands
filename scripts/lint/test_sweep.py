@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from typing import TYPE_CHECKING, Literal, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
@@ -31,7 +31,7 @@ import sweep
 import cargo_target_config
 from scripts.lib import file_lock
 import conf
-from scripts.lib.cargo_output import CargoOutputRoots
+from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.mac_test import floor_claims
 from test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
@@ -1115,6 +1115,185 @@ class ReclamationTests(SweepCase):
 
 
 class FloorTests(SweepCase):
+    def test_nested_workspace_members_share_one_metadata_read(self) -> None:
+        base = self.base()
+        workspace = base / "workspace"
+        _ = write(workspace / "Cargo.toml", 0)
+        for name in ("member", "member/nested", "second"):
+            _ = write(workspace / name / "Cargo.toml", 0)
+        mapping = CargoOutputRoots(workspace, workspace / "target", base / "intermediates")
+        mapping.target_directory.mkdir()
+        mapping.build_directory.mkdir()
+        with (mock.patch.object(Path, "cwd", return_value=workspace),
+              mock.patch.object(sweep, "read_cargo_output_roots", return_value=mapping) as metadata):
+            roots, index = sweep.discover_cargo_outputs([str(workspace)], True, lint_settings=conf.read("lint"))
+        metadata.assert_called_once_with(workspace)
+        self.assertEqual(set(roots), {str(mapping.target_directory), str(mapping.build_directory)})
+        self.assertEqual(index.workspaces, (mapping,))
+        self.assertEqual(index.unresolved, frozenset())
+        self.assertEqual(index.history, ())
+
+    def test_workspace_skip_cost_does_not_grow_with_the_number_of_roots(self) -> None:
+        base = self.base()
+        mappings: dict[Path, CargoOutputRoots] = {}
+        for number in range(32):
+            workspace = base / f"workspace-{number:02}"
+            _ = write(workspace / "Cargo.toml", 0)
+            _ = write(workspace / "member" / "Cargo.toml", 0)
+            mappings[workspace] = CargoOutputRoots(workspace, workspace / "target", workspace / "target")
+        original = Path.is_relative_to
+        comparisons = 0
+
+        def compare(path: Path, other: Path) -> bool:
+            nonlocal comparisons
+            comparisons += 1
+            return original(path, other)
+
+        def read(path: Path) -> CargoOutputRoots:
+            return mappings[path]
+
+        with (mock.patch.object(Path, "cwd", return_value=base),
+              mock.patch.object(Path, "is_relative_to", compare),
+              mock.patch.object(sweep, "read_cargo_output_roots", side_effect=read) as metadata):
+            _, index = sweep.discover_cargo_outputs([str(base)], True, lint_settings=conf.read("lint"))
+        self.assertEqual(metadata.call_count, len(mappings))
+        self.assertEqual(set(index.workspaces), set(mappings.values()))
+        self.assertLessEqual(comparisons, 4 * len(mappings))
+
+    def test_independent_workspaces_resolve_together_with_a_bounded_reader_count(self) -> None:
+        base = self.base()
+        workspaces = [base / f"workspace-{number}" for number in range(4)]
+        for workspace in workspaces:
+            _ = write(workspace / "Cargo.toml", 0)
+        lock = Lock()
+        together = Event()
+        active = 0
+        maximum = 0
+
+        def read(workspace: Path) -> CargoOutputRoots:
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+                if active == 2:
+                    together.set()
+            try:
+                self.assertTrue(together.wait(3), "independent metadata reads did not overlap")
+                return CargoOutputRoots(workspace, workspace / "target", workspace / "target")
+            finally:
+                with lock:
+                    active -= 1
+
+        with (mock.patch.object(Path, "cwd", return_value=base),
+              mock.patch.object(os, "cpu_count", return_value=2),
+              mock.patch.object(sweep, "read_cargo_output_roots", side_effect=read) as metadata):
+            _, index = sweep.discover_cargo_outputs([str(base)], True, lint_settings=conf.read("lint"))
+        self.assertEqual(metadata.call_count, len(workspaces))
+        self.assertEqual(maximum, 2)
+        self.assertEqual({item.workspace_root for item in index.workspaces}, set(workspaces))
+
+    def test_changed_cargo_config_refreshes_cached_roots_and_keeps_history(self) -> None:
+        base = self.base()
+        workspace = base / "workspace"
+        _ = write(workspace / "Cargo.toml", 0)
+        old = CargoOutputRoots(workspace, workspace / "target", base / "old-build")
+        new = CargoOutputRoots(workspace, workspace / "target", base / "new-build")
+        unavailable = base / "unavailable"
+        _ = write(unavailable / "Cargo.toml", 0)
+        for path in (old.target_directory, old.build_directory, new.build_directory):
+            path.mkdir()
+        results = iter((old, new))
+
+        def read(checkout: Path) -> CargoOutputRoots | CargoOutputUnavailable:
+            if checkout == unavailable:
+                return CargoOutputUnavailable("the fixture manifest cannot be read")
+            return next(results)
+
+        with (mock.patch.object(Path, "cwd", return_value=workspace),
+              mock.patch.object(sweep, "read_cargo_output_roots", side_effect=read) as metadata):
+            _, first = sweep.discover_cargo_outputs([str(base)], False, lint_settings=conf.read("lint"))
+            config = workspace / ".cargo" / "config.toml"
+            config.parent.mkdir()
+            _ = config.write_text('[build]\nbuild-dir = "' + str(new.build_directory) + '"\n')
+            roots, index = sweep.discover_cargo_outputs([str(base)], True, lint_settings=conf.read("lint"))
+        self.assertEqual(metadata.call_count, 4)
+        self.assertEqual(index.workspaces, (new,))
+        self.assertEqual(index.unresolved, frozenset({str(unavailable)}))
+        self.assertEqual(index.unresolved, first.unresolved)
+        self.assertEqual(index.history, (old,))
+        self.assertEqual(set(roots), {str(old.target_directory), str(old.build_directory), str(new.build_directory)})
+
+    def test_parallel_workspace_reads_keep_the_first_sorted_mapping_without_extra_history(self) -> None:
+        for first_member in ("a", "a/deeper"):
+            with self.subTest(first_member=first_member):
+                base = self.base()
+                workspace = base / "workspace"
+                first = workspace / first_member
+                second = workspace / "z"
+                for path in (first, second):
+                    _ = write(path / "Cargo.toml", 0)
+                first_mapping = CargoOutputRoots(workspace, base / "first-target", base / "first-build")
+                second_mapping = CargoOutputRoots(workspace, base / "second-target", base / "second-build")
+                for mapping in (first_mapping, second_mapping):
+                    mapping.target_directory.mkdir()
+                    mapping.build_directory.mkdir()
+
+                def read(checkout: Path) -> CargoOutputRoots:
+                    return first_mapping if checkout == first else second_mapping
+
+                with (mock.patch.object(Path, "cwd", return_value=base),
+                      mock.patch.object(sweep, "read_cargo_output_roots", side_effect=read)):
+                    roots, index = sweep.discover_cargo_outputs(
+                        [str(first), str(second)], True, lint_settings=conf.read("lint"))
+                self.assertEqual(index.workspaces, (first_mapping,))
+                self.assertEqual(index.history, ())
+                self.assertEqual(index.unresolved, frozenset())
+                self.assertEqual(set(roots), {str(first_mapping.target_directory), str(first_mapping.build_directory)})
+
+    def test_unresolved_workspace_protection_does_not_compare_every_workspace_and_checkout(self) -> None:
+        base = self.base()
+        tree, _ = cargo_target(base, "idle", APP, time.time() - DAY)
+        target = str(tree.parent)
+        mappings = tuple(CargoOutputRoots(base / f"workspace-{number}", base / f"target-{number}",
+                                         base / f"build-{number}") for number in range(32))
+        unresolved = frozenset(str(base / f"unresolved-{number}") for number in range(32))
+        index = sweep.CargoOutputIndex(mappings, unresolved)
+        compared_paths = {item.workspace_root for item in mappings} | {Path(path) for path in unresolved}
+        original = Path.is_relative_to
+        comparisons = 0
+
+        def compare(path: Path, other: Path) -> bool:
+            nonlocal comparisons
+            if other in compared_paths:
+                comparisons += 1
+            return original(path, other)
+
+        with (mock.patch.object(sweep, "discover_cargo_outputs", return_value=([target], index)),
+              mock.patch.object(Path, "is_relative_to", compare),
+              mock.patch.object(sweep, "scan_floor_roots", wraps=sweep.scan_floor_roots) as scan):
+            status, _ = self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB], dry_run=True)
+        self.assertEqual(status, 0)
+        self.assertEqual(list(cast(sweep.DiscoveredTargetRoots, scan.call_args.args[0])), [target])
+        self.assertLessEqual(comparisons, 4 * (len(mappings) + len(unresolved) + 1))
+
+    def test_unresolved_workspace_keeps_its_outputs_busy_and_unrelated_output_idle(self) -> None:
+        base = self.base()
+        tree, _ = cargo_target(base, "workspace", APP, time.time() - DAY)
+        member_tree, _ = cargo_target(base / "workspace", "member", DEMO, time.time() - DAY)
+        build = base / "intermediates"
+        _ = unit(build / "debug", "deps", "app", APP, time.time() - DAY)
+        _ = write(build / sweep.RUSTC_INFO, 0)
+        idle_tree, _ = cargo_target(base, "idle", TOOL, time.time() - DAY)
+        mapping = CargoOutputRoots(base / "workspace", tree.parent, build)
+        targets = [str(path) for path in (tree.parent, member_tree.parent, build, idle_tree.parent)]
+        index = sweep.CargoOutputIndex((mapping,), frozenset({str(base / "workspace" / "member")}))
+        with (mock.patch.object(sweep, "discover_cargo_outputs", return_value=(targets, index)),
+              mock.patch.object(sweep, "scan_floor_roots", wraps=sweep.scan_floor_roots) as scan):
+            status, printed = self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB], dry_run=True)
+        self.assertEqual(status, 0)
+        self.assertEqual(list(cast(sweep.DiscoveredTargetRoots, scan.call_args.args[0])), [str(idle_tree.parent)])
+        self.assertIn("3 left alone", printed)
+
     def test_floor_fixture_supports_repeated_capacity_reads_during_the_scan(self) -> None:
         base = self.base()
         _, output = cargo_target(base, "repo", APP, time.time() - DAY)
