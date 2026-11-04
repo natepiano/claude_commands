@@ -1034,9 +1034,22 @@ def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool) -> bo
 def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR) -> Sweep:
     """Delete every idle entry no process uses, and record why each other entry stays."""
     result = Sweep()
+    resumed: set[str] = set()
+    if not dry_run:
+        pending = {str(path) for root in roots.copies for path in scratch.pending_copy_paths(Path(root))}
+        if pending:
+            interrupted = [entry for entry in timed_entries(roots, now, proc)
+                           if isinstance(entry, RemovableEntry) and entry.path in pending]
+            # Finish interrupted removals before judging their borrowed parents.
+            # A failed removal keeps its parent protected during the normal scan.
+            for entry in interrupted:
+                resumed.add(entry.path)
+                _ = remove_entry(entry, result, False)
     emptied: set[str] = set()
     removals: list[RemovableEntry] = []
     for entry in timed_entries(roots, now, proc):
+        if entry.path in resumed:
+            continue
         if isinstance(entry, KeptEntry):
             path = f"{entry.path}: {entry.use}" if entry.use else entry.path
             result.keep(path, entry.reason)

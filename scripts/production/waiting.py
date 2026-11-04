@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable, NamedTuple, TypeVar, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import build_folders
+from scripts.copies import copies
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 
@@ -103,14 +103,6 @@ class EventWithoutTime(NamedTuple):
 class LogEvent(NamedTuple):
     line: str
     moment: datetime
-
-
-class CleanupClean(NamedTuple):
-    pass
-
-
-class CleanupFailed(NamedTuple):
-    detail: str
 
 
 class BerthOverlap(NamedTuple):
@@ -270,40 +262,30 @@ def scratch_test(production: Production, name: str, tests: str, state_dir: Path)
     state_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(production.zone).strftime("%Y%m%d-%H%M%S-%f")
     log = state_dir / f"scratch-test-{unit.name}-{stamp}.log"
-    cleanup: CleanupClean | CleanupFailed = CleanupClean()
-    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["production-scratch"])) as parent:
-        worktree = parent / "checkout"
-        added = False
-        try:
-            add = git(production.checkout, "worktree", "add", "--detach", str(worktree), unit.branch)
-            if add.returncode:
-                raise WaitingFailure("scratch-test", detail(add))
-            added = True
-            merge = git(worktree, "merge", "--no-commit", "--no-ff", production.merge_branch)
-            if merge.returncode:
-                _ = log.write_text(merge.stdout + merge.stderr, encoding="utf-8")
-                state: ScratchGreen | ScratchRed | ScratchConflict = ScratchConflict(
-                    f"{detail(merge)} ({log})")
-            else:
-                try:
-                    with log.open("w", encoding="utf-8") as output:
-                        test = subprocess.run(["sh", "-c", tests], cwd=worktree, stdout=output,
-                                              stderr=subprocess.STDOUT, text=True, check=False)
-                    tail = tail_lines(log, 4) or f"exit {test.returncode}"
-                    state = ScratchGreen(log) if test.returncode == 0 else ScratchRed(tail, log)
-                except OSError as error:
-                    _ = log.write_text(f"{error}\n", encoding="utf-8")
-                    state = ScratchRed(str(error), log)
-        finally:
-            if added:
-                _ = git(worktree, "merge", "--abort")
-                removed = git(production.checkout, "worktree", "remove", "--force", str(worktree))
-                if removed.returncode:
-                    cleanup = CleanupFailed(detail(removed))
-    passed = scratch_verdict(state)
-    if isinstance(cleanup, CleanupFailed):
-        report("scratch-test", "failed", f"temporary worktree cleanup: {cleanup.detail}")
-    if not passed or isinstance(cleanup, CleanupFailed):
+    passed = False
+    try:
+        with copies.standing(production.slug, production.checkout, unit.branch,
+                             merge=production.merge_branch) as worktree:
+            try:
+                with log.open("w", encoding="utf-8") as output:
+                    test = subprocess.run(["sh", "-c", tests], cwd=worktree, stdout=output,
+                                          stderr=subprocess.STDOUT, text=True, check=False)
+                tail = tail_lines(log, 4) or f"exit {test.returncode}"
+                state: ScratchGreen | ScratchRed | ScratchConflict = (
+                    ScratchGreen(log) if test.returncode == 0 else ScratchRed(tail, log))
+            except OSError as error:
+                _ = log.write_text(f"{error}\n", encoding="utf-8")
+                state = ScratchRed(str(error), log)
+            passed = scratch_verdict(state)
+    except copies.PreparationError as error:
+        _ = log.write_text(f"{error}\n", encoding="utf-8")
+        _ = scratch_verdict(ScratchConflict(f"{error} ({log})"))
+        raise WaitingFailure("scratch-test", "") from error
+    except copies.PostUseError as error:
+        raise WaitingFailure("scratch-test", f"post-use step: {error}") from error
+    except copies.CopyError as error:
+        raise WaitingFailure("scratch-test", str(error)) from error
+    if not passed:
         raise WaitingFailure("scratch-test", "")
 
 

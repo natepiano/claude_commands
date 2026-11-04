@@ -130,6 +130,8 @@
 #                                          exact call already passed (or lint
 #                                          failed) on this tree, a flake hunt;
 #                                          the result replaces the record
+#   … --target <name>                      pin test, check, or doc to a configured SSH target;
+#                                          keep admission and version checks; never run locally
 #   verify.sh test <package> --local "<why>"   run on natedev; only for a test that cannot pass on macOS.
 #                                          Before CI either machine answers a test,
 #                                          merge gates included; CI is the protection
@@ -230,6 +232,7 @@ final_pass_finish() {
     FINAL_PASS_START=""
 }
 STEP_RECORD_ACTIVE=0
+STEP_RECORD_ARGS=()
 STEP_RUNS_ON=natedev_only
 STEP_TARGET_TABLE=""
 HOLD_LINT=0
@@ -288,11 +291,41 @@ step_writes_tree() {
     return 1
 }
 
+finish_step_token() {
+    local held_before=$1 status=$2
+    if [[ "${TOKEN_USED:-0}" == 1 ]]; then
+        sync_token_state
+        if [[ "$held_before" == 0 ]] && ! release_token; then
+            (( status != 0 )) || status=1
+        fi
+    fi
+    return "$status"
+}
+
 run() {
+    if [[ "${TOKEN_USED:-0}" == 1 ]]; then sync_token_state; fi
+    local held_before=${TOKEN_HELD:-0} status=0
+    run_step "$@" || status=$?
+    finish_step_token "$held_before" "$status" || status=$?
+    if [[ "${STEP_RECORD_ACTIVE:-0}" == 1 ]] && step_writes_tree "$@"; then
+        env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" "${STEP_RECORD_ARGS[@]}" --state local_noncompiling || exit 2
+    fi
+    if [[ "$status" != 0 && -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
+        exit "$status"
+    fi
+    return "$status"
+}
+
+run_step() {
     local attempt status started ended step_log monitor=0
     local STEP_WRITES_TREE=0
     if step_writes_tree "$@"; then
         STEP_WRITES_TREE=1
+        # Keep the call's decision for the next step.
+        if [[ "${STEP_RECORD_ACTIVE:-0}" == 1 ]]; then
+            env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" "${STEP_RECORD_ARGS[@]}" \
+                --runs-on natedev_only --reason 'step writes the tree' --state local_noncompiling || exit 2
+        fi
         # Both queue hooks must keep this step in the original tree.
         local LINT_QUEUE_LEAVE_HOOK=false BUILDLOG_MAC_IDLE_HOOK=false
         export LINT_QUEUE_LEAVE_HOOK BUILDLOG_MAC_IDLE_HOOK
@@ -324,7 +357,12 @@ run() {
             if [[ "$CMD" != test && "$STEP_RUNS_ON" != natedev_only && "$STEP_WRITES_TREE" == 0 ]] && buildlog_step_compiles "$@"; then
                 export LINT_QUEUE_LEAVE_HOOK="$(ssh_retry_hook)"
             fi
-            if run_once "$@" 2>&1 | tee "$step_log"; then
+            if (
+                step_token_before=${TOKEN_HELD:-0}
+                # The pipeline shell owns tokens taken during memory admission.
+                trap 'status=$?; finish_step_token "$step_token_before" "$status"; exit $?' EXIT
+                run_once "$@"
+            ) 2>&1 | tee "$step_log"; then
                 exit 0
             else
                 exit "${PIPESTATUS[0]}"
@@ -354,7 +392,7 @@ run() {
         # must end the call even when that tool's caller handles failures.
         if [[ -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
             rm -f "$step_log"
-            exit "$status"
+            return "$status"
         fi
         # A Mac copy that finished first stopped this step: no memory retry.
         if [[ -n "${VERIFY_STEP_INFO_FILE:-}" && -e "$VERIFY_STEP_INFO_FILE.stopped" ]]; then
@@ -962,6 +1000,14 @@ if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" ]]; then
     esac
 fi
 
+# Set the run identity after detachment so the run owns its queue place.
+if [[ "${OSTYPE:-}" != darwin* && -z "${BUILDLOG_RUN+x}" ]]; then
+    BUILDLOG_RUN_START="$("$PY" "$STEP_RECORD_SCRIPT" start "$$")"
+    if [[ -n "$BUILDLOG_RUN_START" ]]; then
+        export BUILDLOG_RUN="$$:$BUILDLOG_RUN_START"
+    fi
+fi
+
 CMD="${1:-}"
 if [[ -z "$CMD" ]]; then
     usage
@@ -983,9 +1029,18 @@ fi
 NO_CACHE=0
 LOCAL_ONLY=0
 LOCAL_REASON=""
+PINNED_TARGET=""
 ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --target)
+            if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == -* || -n "$PINNED_TARGET" ]]; then
+                echo 'verify.sh: --target needs one configured SSH target.' >&2
+                exit 2
+            fi
+            PINNED_TARGET=$2
+            shift 2
+            ;;
         --no-cache)
             NO_CACHE=1
             shift
@@ -1013,6 +1068,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 set -- "${ARGS[@]}"
+if [[ -n "$PINNED_TARGET" ]]; then
+    if [[ "$LOCAL_ONLY" == 1 || ! "$CMD" =~ ^(test|check|doc)$ ]]; then
+        echo 'verify.sh: --target supports test, check, and doc without --local.' >&2
+        exit 2
+    fi
+    NO_CACHE=1
+fi
+export BUILDLOG_PINNED_TARGET="$PINNED_TARGET"
 DEV_FEATURES="$("$PY" -c "$DEV_FEATURES_PY" "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/Cargo.toml")" || exit 2
 if [[ "$LOCAL_ONLY" -eq 1 ]]; then
     export BUILDLOG_LOCAL_REASON="$LOCAL_REASON"
@@ -1664,6 +1727,7 @@ initialize_step_record() {
     if [[ "$CMD" == doc || "$CMD" == final ]]; then PKG=""; fi
     if [[ "$CMD" == test ]]; then arguments+=(--package "$PKG"); fi
     if [[ "$LOCAL_ONLY" == 1 ]]; then arguments+=(--local "$LOCAL_REASON"); fi
+    if [[ -n "$PINNED_TARGET" ]]; then arguments+=(--target "$PINNED_TARGET"); fi
     answer=$(python3 "$BUILD_TARGETS_SCRIPT" "${arguments[@]}") || status=$?
     if (( status != 0 )); then
         printf 'verify.sh: target eligibility check failed (exit %s); step refused\n' "$status" >&2
@@ -1687,7 +1751,7 @@ initialize_step_record() {
             printf 'verify.sh: target eligibility check returned invalid targets; step refused\n' >&2
             exit 2
         fi
-        if [[ "$settings" != - && ( "$eligibility" == eligible || ( "$STEP_RUNS_ON" != natedev_only && "$reason" =~ ^(busy|blocked)$ ) ) ]]; then
+        if [[ "$settings" != - && ( "$eligibility" == eligible || ( "$STEP_RUNS_ON" != natedev_only && "$reason" =~ ^(busy|blocked)$ ) || ( -n "$PINNED_TARGET" && "$reason" == starting ) ) ]]; then
             if [[ "$STEP_RUNS_ON" == natedev_only ]]; then
                 printf 'verify.sh: target eligibility answer differs from its targets; step refused\n' >&2
                 exit 2
@@ -1706,6 +1770,9 @@ initialize_step_record() {
         exit 2
     fi
     STEP_TARGET_TABLE=$table
+    if [[ -n "$PINNED_TARGET" ]]; then
+        STEP_DEFER_LOCAL=1
+    fi
     if [[ "$STEP_RUNS_ON" != natedev_only ]]; then
         while IFS=$'\t' read -r name eligibility reason settings; do
             if [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ ^(busy|blocked)$ ) ]]; then
@@ -1714,14 +1781,15 @@ initialize_step_record() {
             fi
         done <<< "$table"
     fi
-    local record_args=(write --call-id "$BUILDLOG_CALL_ID" --pid "$$"
+    STEP_RECORD_ARGS=(write --call-id "$BUILDLOG_CALL_ID" --pid "$$"
         --repo "$(git rev-parse --show-toplevel)" --kind "$CMD"
         --runs-on "$STEP_RUNS_ON" --reason "$decision_reason" --state waiting_hold)
     if [[ "$STEP_RUNS_ON" == ssh_allowed ]]; then
-        record_args+=(--eligible-targets "$eligible_names" --mac-targets "$mac_names")
+        STEP_RECORD_ARGS+=(--eligible-targets "$eligible_names" --mac-targets "$mac_names")
     fi
-    if [[ "$CMD" == test ]]; then record_args+=(--package "$PKG"); fi
-    env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" "${record_args[@]}" || exit 2
+    if [[ -n "$PINNED_TARGET" ]]; then STEP_RECORD_ARGS+=(--pinned-target "$PINNED_TARGET"); fi
+    if [[ "$CMD" == test ]]; then STEP_RECORD_ARGS+=(--package "$PKG"); fi
+    env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" "${STEP_RECORD_ARGS[@]}" || exit 2
     STEP_RECORD_ACTIVE=1
     export BUILDLOG_MEM_WAIT_FIRST_FILE="${BUILDLOG_MEM_WAIT_FIRST_FILE:-$HOLD_WAIT_DIR/first-queued-at}"
     if [[ ! -s "$BUILDLOG_MEM_WAIT_FIRST_FILE" ]]; then
@@ -1746,7 +1814,7 @@ route_compiling_step() {
     local admission=0 command=$1
     STEP_RAN_ON_MAC=0
     step_state waiting_hold
-    check_routing_hold || admission=$?
+    if [[ -z "$PINNED_TARGET" ]]; then check_routing_hold || admission=$?; fi
     if [[ "${STEP_WRITES_TREE:-0}" == 1 ]]; then
         case "$admission" in
             0) return 0 ;;
@@ -1987,7 +2055,14 @@ route_test() {
         fi
     done <<< "$STEP_TARGET_TABLE"
     while true; do
-        if [[ "$retry" == 1 && "$STEP_RUNS_ON" != mac_allowed ]]; then
+        if [[ -n "$PINNED_TARGET" ]]; then
+            local pinned_answer
+            pinned_answer=$("$PY" "$BUILD_TARGETS_SCRIPT" eligible --kind "$CMD" \
+                --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG" --target "$PINNED_TARGET") || return $?
+            STEP_TARGET_TABLE=${pinned_answer#*$'\n'}
+            step_state waiting_ssh
+        fi
+        if [[ "$retry" == 1 && "$STEP_RUNS_ON" != mac_allowed && -z "$PINNED_TARGET" ]]; then
             admission=0
             check_routing_hold || admission=$?
             case "$admission" in
@@ -2009,6 +2084,10 @@ route_test() {
                 esac
             fi
             [[ "$STEP_RUNS_ON" != natedev_only ]] || continue
+            if [[ -n "$PINNED_TARGET" && "$reason" == starting ]]; then
+                remote_candidates=1
+                continue
+            fi
             if [[ "$eligibility" == excluded && ! "$reason" =~ ^(busy|blocked)$ ]]; then continue; fi
             [[ -f "$MAC_RUNNER" ]] || continue
             if [[ "$(ssh_reserve_hook "$name" "$settings")" == false ]]; then continue; fi
@@ -2029,6 +2108,10 @@ route_test() {
             if [[ -z "$MAC_IDLE_MARKER" ]]; then register_mac_wait "$settings" 0; fi
             reservation_status=0
             eval "$(ssh_reserve_hook "$name" "$settings")" || reservation_status=$?
+            if [[ -n "$PINNED_TARGET" && "$reservation_status" != 0 && "$eligibility" == eligible ]]; then
+                echo "verify.sh: target $PINNED_TARGET refused: admission changed." >&2
+                return 2
+            fi
             if [[ "$retry" == 1 && "$reservation_status" == 11 && "$STEP_RUNS_ON" == mac_allowed ]]; then
                 continue
             fi
@@ -2037,12 +2120,28 @@ route_test() {
                 MAC_LEAVE_SETTINGS=$settings
                 try_reserved_target || return $?
                 if [[ "$MAC_PASSED" == 1 ]]; then return 0; fi
+                if [[ -n "$PINNED_TARGET" ]]; then
+                    printf 'verify.sh: target %s refused: %s\n' "$PINNED_TARGET" "${LAST_TARGET_REASON:-runner}" >&2
+                    return 2
+                fi
                 if [[ "$retry" == 1 && "$BUILDLOG_MAC" == declined ]]; then
                     printf '%s\n' "${BUILDLOG_MAC_S:-0}" >> "$BUILDLOG_HOLD_WAIT_FILE"
                 fi
             fi
         done <<< "$STEP_TARGET_TABLE"
-        if [[ "$remote_candidates" == 0 ]]; then return 0; fi
+        if [[ "$remote_candidates" == 0 ]]; then
+            [[ -z "$PINNED_TARGET" ]] || { echo "verify.sh: target $PINNED_TARGET refused: no capacity" >&2; return 2; }
+            return 0
+        fi
+        if [[ -n "$PINNED_TARGET" ]]; then
+            if [[ "$announced_reason" != starting ]]; then
+                echo "verify.sh: waiting for target $PINNED_TARGET." >&2
+                announced_reason=starting
+            fi
+            sleep "${BUILD_TARGETS_POLL_S:-15}"
+            retry=1
+            continue
+        fi
         admission=0
         check_routing_hold || admission=$?
         case "$admission" in
@@ -2393,9 +2492,9 @@ if cache_lookup; then
 fi
 if [[ "$CMD" == test ]]; then
     compose_nextest_args
-    route_test
+    route_test || exit $?
 fi
-while ! build_hold_nothing_held; do
+while [[ -z "$PINNED_TARGET" ]] && ! build_hold_nothing_held; do
     step_state waiting_hold
     if [[ "$CMD" != test && "$STEP_RUNS_ON" != natedev_only ]]; then
         HOLD_WAIT_STATUS=0
@@ -2727,7 +2826,7 @@ acquire_token() {
     TOKEN_WAITED=$(( TOKEN_CLOCK_NOW - started ))
     (( noted < 0 )) || token_wait_note taken $(( TOKEN_WAITED / 60 ))
 }
-if [[ -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
+if [[ -z "$PINNED_TARGET" && -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
     TOKEN_USED=1
     TOKEN_WAITERS_DIR="${BOARD_DIR}/token_waiters"
     TOKEN_WAITER_PREFIX="${BOARD_SLOT}.$(token_waiters_key)"

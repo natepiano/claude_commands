@@ -62,7 +62,7 @@ In a terminal:
 
 Each Codex account can stay signed in in its own home. The table's `workers` role follows natedev's shared role map. An unset workers role refuses the launch. It does not select `~/.codex` as a fallback. A caller's `CODEX_HOME` does not change the `workers` role. Signed-in spares get usage readings too; their notes stay inactive and raise no quota alerts. Freestanding Codex sessions keep their own process home.
 
-Times are in the user's zone setting (`config/user_zone.conf`). The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and an account with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. Credits older than ten minutes show `stale since <time>` rather than a balance. The board fetches stale Codex readings itself on both Linux and the Mac; `--stored` makes no live request. Each Codex login has one row, even when two homes hold it; duplicate-home problems still name the homes. The Read cell shows the last good read. A `*` marks a failed latest attempt. An old read also shows its month and day, such as `10-17 20:15 EDT*`. One footnote per failed account gives the cause and the next step. Its reading time includes the month and day when it is not from today. It names the last usage attempt time, or says no usage read has been attempted; it does not promise when another read will run. A good read clears the star and footnote. The default table shows only accounts; `--detail` also shows unknown entries. Lines under the table name failed checks and MCP servers that differ from `~/.claude`.
+Times are in the user's zone setting (`config/user_zone.conf`). The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and an account with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. Credits older than ten minutes show `stale since <time>` rather than a balance. The board fetches stale Codex readings itself on both Linux and the Mac; `--stored` makes no live request. Each Codex login has one row, even when two homes hold it; duplicate-home problems still name the homes. The Read cell shows the last good read. A `*` marks a failed latest attempt. An old read also shows its month and day, such as `10-17 20:15 EDT*`. One footnote per failed account gives the cause and the next step. Its reading time includes the month and day when it is not from today. It names the last usage attempt time, or says "the attempt time is not recorded". It does not promise when another read will run. A good read clears the star and footnote. The default table shows only accounts; `--detail` also shows unknown entries. Lines under the table name failed checks and MCP servers that differ from `~/.claude`.
 
 `status --json` prints `{"accounts": [...], "problems": [...]}` from the same readings as the table, in the same account order. `problems` contains the lines below the normal table. Each account has `label`, `tool` (`claude` or `codex`), `roles`, `role_counts`, `weekly_left_percent`, `resets_at`, `credits`, `use_credits` and `read_at`. Roles are a list, so one Claude account can hold both `units` and `showrunners`; Codex roles are `workers` or `spare`. Each `role_counts` entry counts local members for the role at the same index, as `{busy, shell, idle, total}`: a Claude session takes its session-record state, and a Codex worker is busy while its turn runs or starts, else idle, with a null `shell`. `spare` has a null entry. Missing readings are null. Reset and read times are ISO 8601 UTC strings. Credits are a number, `"unlimited"`, or null; Claude has null credits and `use_credits: false`. Codex `use_credits` is true unless its note says `use_credits: off`.
 
@@ -159,15 +159,14 @@ A readable credential entry without a token requires a session or manual login.
 
 Natedev's `agent-notes` job runs `scripts/maintenance/agent_notes_job.py`.
 Notes, quota warnings, the Codex pacer, refusal moves, crash recovery, phase-note
-pruning, the hana hierarchy note and the vault commit each run in a separate
-process with a time limit. `config/agent_notes.toml` owns their intervals and
+pruning and the vault commit each run in a separate process.
+Each process has a time limit. `config/agent_notes.toml` owns their intervals and
 limits and is read on each run. A slow or failed part does not stop the other
 parts. Quota warnings and the pacer read after the notes part exits;
 the vault commit runs after the writers exit. A rerun skips completed parts
 until their next interval and retries failed parts.
-A part that leaves its note as it stands is logged as skipped and counts as
-completed for its interval; a source-command failure or timeout still fails
-the job. Completion times and the job lock live in `~/.local/state/agent-notes/job/`.
+A failed or timed-out part fails the job.
+Completion times and the job lock live in `~/.local/state/agent-notes/job/`.
 
 Notes reuse usage reports for less than ten minutes, keeping their original
 reading times. Each notes pass refreshes session counts from the roster. Usage reports without credentials stay in

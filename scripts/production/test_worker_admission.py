@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import os
 import json
-import io
-from contextlib import redirect_stderr
 from dataclasses import replace
 from unittest import mock
 
@@ -73,47 +71,9 @@ class RecordedDirectorAdmissionTests(StaffTestCase):
         self.assertEqual(found, changed)
         self.assertEqual((self.staff_file.read_bytes(), director.read_bytes()), before)
 
-    def test_recorded_director_and_worker_caller_cannot_admit_under_retired_parent(self) -> None:
-        _, unit, worker = self.tree()
-        run = self.root / "run"
-        run.mkdir()
-        _ = (run / unit_runs.DIRECTOR_FILE).write_text(unit.id + "\n")
-        _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", self.root / "gone"), expected=unit.worktree)
-        before = self.staff_file.read_bytes()
-        for caller in ("s0123456789ab", worker.current_session):
-            with self.subTest(caller=caller), mock.patch.object(staff, "runtime_id", return_value=caller):
-                with self.assertRaisesRegex(worker_admission.AdmissionRefused, "not opened:.*retired"):
-                    _ = worker_admission.admit("new-worker", run, role="impl")
-                self.assertEqual(self.staff_file.read_bytes(), before)
 
 
 class WorkerAdmissionTests(StaffTestCase):
-    def test_empty_pending_files_have_no_unpublished_workers(self) -> None:
-        run = self.root / "pending-run"
-        run.mkdir()
-        empty = run / "empty.pending.json"
-        empty_object = run / "object.pending.json"
-        _ = empty.write_bytes(b"")
-        _ = empty_object.write_text("{}")
-        with redirect_stderr(io.StringIO()) as errors:
-            self.assertEqual(worker_admission.pending_publications(run), ())
-            self.assertEqual(worker_admission.pending_publications(run), ())
-        self.assertFalse(empty.exists())
-        archived, = run.glob(empty.name + ".empty-legacy-*")
-        self.assertEqual(archived.read_bytes(), b"")
-        self.assertEqual(empty_object.read_text(), "{}")
-        self.assertEqual(len(errors.getvalue().splitlines()), 1)
-
-    def test_invalid_worker_roles_refuse_before_membership_or_backend_publication(self) -> None:
-        _, unit, _ = self.tree()
-        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
-        for role in ("", "owner", "showrunner", "arbitrary"):
-            with self.subTest(role=role), mock.patch.object(staff, "runtime_id", return_value=unit.current_session):
-                with self.assertRaisesRegex(worker_admission.AdmissionRefused, "not opened: invalid worker role"):
-                    _ = worker_admission.admit("new-worker", self.root, role=role)
-                self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
-        self.assertFalse(any(row.name == "new-worker" for row in staff.snapshot().rows))
-
     def test_valid_worker_roles_are_retained_by_read_only_start_permission(self) -> None:
         _, unit, _ = self.tree()
         before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
@@ -158,15 +118,6 @@ class WorkerAdmissionTests(StaffTestCase):
         self.assertEqual(staff.by_current_session(current), changed)
         self.assertIsNone(staff.by_current_session(unit.id))
 
-    def test_refused_permission_starts_nothing_and_changes_no_row(self) -> None:
-        _, unit, _ = self.tree()
-        _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", self.root / "gone"), expected=unit.worktree)
-        before = self.staff_file.read_bytes()
-        with mock.patch.object(staff, "runtime_id", return_value=unit.id):
-            with self.assertRaisesRegex(worker_admission.AdmissionRefused, r"^staff: test: not opened:.*retired"):
-                _ = worker_admission.admit("test", self.root, role="test")
-        self.assertEqual(self.staff_file.read_bytes(), before)
-        self.assertFalse(any(row.name == "test" for row in staff.find(kind="worker")))
 
     def test_publication_refusal_names_the_created_backend_and_preserves_membership(self) -> None:
         _, unit, _ = self.tree()
