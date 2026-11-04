@@ -130,124 +130,39 @@ The staff row is the one record of a worker, per the staff-lifecycle spec (`docs
 
 ### Phase 3o — Transcript handoff when a slot changes family  · status: done
 
-**Owner:** models-unit, the next phase after 3n (sdlc for the user, 2026-11-03). It goes before herdr Phases 7, 8, 9 and 12.
+#### As-built
 
-**User words (via sdlc, 2026-11-03):** "yes we need to be able to switch between claude and codex workers - and ideally they can have the same name and occupy the same slot and they can even read the transcript so they can start with the correct information".
+A worker switches between Claude and Codex in the same slot. Its staff `id`, `name`, `kind`, `parent` and worktree stay; only `current_session` changes.
 
-**Depends on:** 3n (a slot changes family in both directions; the worker keeps its id, name, parent and slot; only `current_session` changes on its staff row).
-
-#### Work Order
-
-**Goal:** Switch an existing worker between Claude and Codex while preserving its staff identity, name, parent, and slot. Give the destination worker a usable transcript extract.
-
-**Spec:**
-
-1. Use the fixed staff id to identify the worker throughout the operation.
-2. Read family, transcript, worktree, and ownership from the staff row and its existing resolvers.
-3. Hold the worker row's lock across transcript selection, source-session stop, destination creation, publication, and dispatch.
-4. Stop the source session through the shared lifecycle path before the destination session receives work.
-5. Replace `family_switch_context` with one shared extractor for Claude transcripts and Codex rollouts.
-6. Include every assignment, final reply, and changed-file path in the extract.
-7. Exclude tool output and tool request bodies from the extract.
-8. Identify changed files from transcript evidence; do not claim that the current Git diff proves authorship.
-9. Write the extract as an artifact in the existing run directory.
-10. Put the extract path first and the full source-transcript path second in the opening prompt.
-11. Instruct the worker to read the full transcript only when the extract does not answer its question.
-12. Represent missing or unreadable transcript evidence explicitly and print one anomaly line.
-13. Continue when transcript evidence is unavailable, unless a specification safety refusal applies.
-14. Create the destination session through the existing family launcher.
-15. Publish only `current_session` through `staff.update_current_session`, before dispatch.
-16. Preserve `id`, `name`, `kind`, and `parent`.
-17. Clean up a newly created destination session when publication fails, using the existing safe lifecycle path.
-18. Preserve the fixed staff references used by run records and held messages.
-19. Implement `accounts.py move workers <claudeN|codexN>` through this shared operation.
-20. Select workers from staff rows, including workers held by earlier director runs.
-21. Use existing account validation and selection functions for the target account.
-22. Report each worker's outcome and continue processing other workers after an anomaly.
-23. Make `--dry-run` report intended moves without account, session, staff, or artifact changes.
-24. Make a completed rerun print `unchanged` without starting another session.
-25. Keep same-family account movement on the existing lifecycle path.
-26. Preserve `assign.py`'s Codex restriction; use `implement.sh` for the required bidirectional launcher proof.
-27. Replace domain-level nulls with explicit slot and transcript states.
-28. Use `NewWorkerSlot | ExistingWorkerSlot(row)` for admission.
-29. Use `NoFamilyHandoff | TranscriptHandoff | TranscriptUnavailable(reason)` for handoff results.
+- `worker_admission.switch_worker(allowed, family, ...)` runs the switch under the worker row lock (`staff.row_operation`): it selects the transcript, stops the source through `stop_resume.stop` by staff id, creates the destination through the family launcher, publishes `current_session` with `staff.update_current_session` after the new process proves its native id, then dispatches. A failed start or publication keeps the old `current_session` and cleans up the new session.
+- `worker_admission.extract_transcript(row, run, backend) -> FamilyHandoff` is the one extractor for Claude transcripts and Codex rollouts. It keeps assignments, final replies and changed-file paths from transcript evidence, and drops tool output and tool request bodies. It writes the extract to the run directory; the opening prompt names the extract first and the full transcript second.
+- Admission uses `NewWorkerSlot | ExistingWorkerSlot`; handoff results are `NoFamilyHandoff | TranscriptHandoff | TranscriptUnavailable(reason)`. Unavailable evidence prints one anomaly line and the switch continues.
+- `accounts.py move workers <claudeN|codexN> [--dry-run]` (`accounts.move_workers`) selects workers from staff rows and uses one family check for the dry run and the real move. The dry run changes nothing and prints `not moved: <reason>` or `would stop; restart on <target> stays pending`. A cross-family move stops the worker and prints `<id>: stopped, resume pending on <account>: <reason>` (`move_result_line`). A locked row gives `SessionMoveRefused` for that worker; the loop continues. A completed rerun prints `unchanged`.
+- `worker_fill` refuses a Claude resend when the transcript has a torn JSON line and no matching prompt: "Claude prompt delivery is unknown: transcript has a torn JSON line; resend refused".
+- `implement.sh` runs worker admission before it records a pass; a refusal prints its message and exits 2.
+- The Codex row lock is released before streaming a turn; a sign-in pass stops each app-server once.
 
 **Files:**
-- `scripts/production/worker_admission.py` — shared switch, extractor, and semantic admission states.
-- `scripts/production/staff.py` — existing row lock and session writer; change only where integration requires it.
-- `scripts/production/session_staff.py` — staff-based session, folder, and inbox resolution.
-- `scripts/production/worker_fill.py` — admission and publication command adapter.
-- `scripts/agents/agent_bg.sh` — Claude handoff integration.
-- `scripts/agents/codex_mesh.py` — Codex handoff integration.
-- `scripts/direct/workers.py` — allocation and run integration.
-- `scripts/direct/implement.sh` — same-slot launcher integration.
-- `scripts/accounts/accounts.py` — explicit worker-group account routing.
-- `scripts/production/test_worker_admission.py`
-- `scripts/production/test_staff.py`
-- `scripts/production/test_staff_operation.py`
-- `scripts/production/test_staff_sources.py`
-- `scripts/production/test_retire_unit.py`
-- `scripts/agents/test_agent_bg.py`
-- `scripts/agents/test_codex_mesh.py`
-- `scripts/direct/test_workers.py`
-- `scripts/direct/test_implement_launcher.py`
-- `scripts/direct/test_implement_launcher_claude.py`
-- `scripts/accounts/test_moves.py`
+- `scripts/production/worker_admission.py` — switch, extractor, admission and handoff states.
+- `scripts/production/worker_fill.py` — admission and publication adapter; delivery-evidence check.
+- `scripts/accounts/accounts.py` — `move_workers`, `move_result_line`.
+- `scripts/agents/codex_mesh.py` — Codex handoff, row lock release before streaming, sign-in server stops.
+- `scripts/direct/workers.py` — allocation after a failed switch.
+- `scripts/direct/implement.sh` — admission before the pass record.
 
-**Workers:** `1 writer + 1 tester`
+**Binds later work:** assign.sh is the only start path; the plain launcher is removed. `assign.py` starts only Codex workers until the devtools one-launch-path change lands, so the live Codex-to-Claude and Claude-to-Codex proofs wait for it. `ResumePending` stays an explicit boundary until assign.sh accepts a fixed staff id and a destination account.
 
-`impl` — Own all source files above; the shared interface is in `worker_admission.py`.
+**Gotchas:**
+- Tests write only to a fixture state folder; a test batch that reached the live `mesh_roster.json` dropped every thread id. Run phase tests through a runner that compares the live roster before and after.
+- Changes to codex_mesh roster and pause code often open failures in other codex_mesh paths; run the full `test_codex_mesh.py` on a stable tree.
 
-`test` — Own the listed test files and transcript fixtures within those files; verify the complete caller paths.
-
-**Constraints from prior phases:**
-
-1. Follow `/home/natepiano/worktrees/claude-build-followups-sdlc/docs/plans/staff-lifecycle.md`.
-2. Store worker identity and ownership only in staff.
-3. Derive family from `current_session`; add no stored family, role, backend, thread-id, or worktree copies.
-4. Keep staff storage schema 2 and live-output schema 3.
-5. Preserve admission-before-dispatch and publication-before-dispatch.
-6. Preserve the operation deadline and configuration tunables.
-7. Preserve fixed staff references for ownership and held messages.
-8. Add no adoption journal, repair roster, or second lifecycle implementation.
-9. Apply only the specification's five safety refusals.
-10. Keep the phase net negative in code lines.
-11. Coordinate shared lifecycle interfaces with shutdown and herdr owners.
-12. Do not wait for herdr's later worker-pane implementation.
-13. herdr-unit (2026-11-04): stop the source through `stop_resume.stop` by staff id; it reaches herdr through `check_target` and `close_pane`. Start through the family launcher until herdr's `WorkerStart` lands; then start a worker pane with `Herdr.start_agent`.
-14. herdr-unit (2026-11-04): write `current_session` only after the new process proves its native id (Claude session id or Codex thread id), never the id the launcher asked for. A failed start leaves the row on the old `current_session`.
-15. shutdown-unit (2026-11-04): take the row lock with `staff.row_operation(<row id>)` in the same process; `stop_resume.stop` joins it through `STAFF_ROW_FD_<id>` and does not block.
-16. shutdown-unit (2026-11-04): start the destination with every `STAFF_ROW_FD_*` removed from its environment and the fd not passed on, so the long-lived launcher child does not keep the row locked (herdr `child_environment` does the same, d8e76084a).
-17. shutdown-unit (2026-11-04): `stop` by staff id covers a Claude source and a Codex TUI pane. A Codex source that is a no-pane mesh thread returns `NotRunning`; end it with codex_mesh's idle end. `Stopped` and `NotRunning` are done; on `StopFailed`, keep `current_session` and print one anomaly line.
-
-**Acceptance gate:**
-
-1. Test Claude-to-Codex and Codex-to-Claude through the launcher and account caller.
-2. Assert unchanged `id`, `name`, `kind`, `parent`, slot, and resolved worktree.
-3. Assert that only `current_session` changes in the staff row.
-4. Test two competing switches; prove that only one destination receives work.
-5. Test source-session stop and confirm that unrelated sessions remain running.
-6. Test destination creation failure and publication failure; prove no assignment dispatch.
-7. Test a completed rerun; prove unchanged staff bytes and no second destination session.
-8. Test preserved ownership and held messages across a director-run change.
-9. Test extract contents for both transcript formats, including long histories and malformed records.
-10. Assert complete assignments, final replies, and changed-file evidence, with no tool output.
-11. Assert extract-first and full-transcript-second prompt references.
-12. Test unavailable transcript evidence and the resulting visible anomaly.
-13. Test account dry runs, partial group failures, same-family moves, and both family directions.
-14. Test retained unresolved records and continued healthy allocation after an anomaly.
-15. Preserve live-output incomplete observations, listed workers, diagnostics, and exit status.
-16. Run affected suites with `unittest discover`.
-17. Pass basedpyright with zero errors and warnings on changed Python files and caller modules.
-18. Pass the Delegation Context merge gate.
-19. Prove one real Codex-to-Claude switch through `implement.sh`, with the worker using the extract. Moved to Phase 3p (sdlc, 2026-11-04): assign.sh starts only Codex workers.
-20. Prove the reverse direction and record the outcomes for sdlc. Moved to Phase 3p (sdlc, 2026-11-04): assign.sh starts only Codex workers.
+**Ruled out:** a plain launcher path for Claude workers; the roster adoption path (`adopted_to`, `handed_off`) and its tests.
 
 ### Phase 3p — 3o follow-ups: live switch proofs, regression tests, test cut  · status: todo
 
 **Owner:** models-unit. 3o routed these items here under the hard landing rule (repair round 11, 2026-11-04).
 
-**Depends on:** 3o. Spec items 1-2 also depend on assign.sh starting a Claude worker; today `assign.py:207` refuses any non-Codex worker. sdlc sent that change to devtools-unit (one-launch-path) on 2026-11-04 and tells models-unit when it lands.
+**Depends on:** 3o. Only Spec items 10-11 (live proofs) depend on assign.sh starting a Claude worker; today `assign.py:207` refuses any non-Codex worker. sdlc sent that change to devtools-unit (one-launch-path) on 2026-11-04 and tells models-unit when it lands. Spec items 1-9 start at once.
 
 #### Work Order
 
@@ -255,17 +170,65 @@ The staff row is the one record of a worker, per the staff-lifecycle spec (`docs
 
 **Spec:**
 
-1. Prove one real Codex-to-Claude switch through assign.sh, with the worker using the extract (3o spec 19).
-2. Prove the reverse direction and record both outcomes for sdlc (3o spec 20).
-3. F010: define "already stopped" evidence for a rerun after a partial switch. Distinguish a confirmed release from missing evidence. Keep the refusal for an unresolved identity or unknown server state. Test a source release followed by a failed destination creation (Astra review 20261104T173320Z, item 1).
-4. F008: test healthy allocation at `scripts/direct/workers.py:484` after a failed switch.
-5. F035: test that a caller acquires the worker row during a live Codex turn (`codex_mesh.py:4639` releases the lock before streaming).
-6. F012: test the done-record ownership guard in `codex_mesh.py`.
-7. F017: in the running regression in `test_codex_mesh.py`, exclude duplicate developer instructions.
-8. Simplify: F013 (one family comparison), F015 (`end_friend.sh` inline staff lookup), F016 (dummy callback; named admission states, not `bool | None`), F019 (duplicate filter and STAFF_ID removal in `test_worker_admission.py`), F026 (one admission path), F028, F034 (session equality in `test_implement_launcher_claude_effort.py`).
-9. Cut the 3o tests to one test per behavior, with table rows. 3o left tests net +309 lines against 5e72ab674.
+Milestone 1 (starts at once):
 
-**Acceptance gate:** basedpyright zero errors and warnings on changed files and callers; affected suites green; source net negative.
+1. F010: define "already stopped" evidence for a rerun after a partial switch. Use explicit confirmed, unresolved and unknown release states. Keep the refusal for an unresolved identity or unknown server state. Test a source release followed by a failed destination creation (Astra review 20261104T173320Z, item 1).
+2. F008: regression test for healthy allocation at `scripts/direct/workers.py:484` after a failed switch. The source fix landed in 3o.
+3. F035: regression test that a caller acquires the worker row during a live Codex turn (`codex_mesh.py:4644` releases the lock before streaming). The source fix landed in 3o.
+4. F012: regression test for the done-record ownership guard in `codex_mesh.py`.
+5. F017: in the running regression in `test_codex_mesh.py`, exclude duplicate developer instructions.
+6. F016: replace `bool | None` in `worker_admission.switch_worker` (`worker_admission.py:281`) with named states: backend published, dispatch deferred, assignment accepted. Convert stored strings at the roster boundary. Keep the Claude delivery callback; remove the Codex dummy callback (`codex_mesh.py:4262`).
+7. F028: move the Python parent out of the worker turn (`worker_fill.py:92`): a Bash parent with a Python coprocess. Cover dispatch, exit status, cancellation, detach and descriptor cleanup.
+8. Simplify: F013 (one family comparison), F015 (`end_friend.sh` inline staff lookup), F019 (duplicate filter and STAFF_ID removal in `test_worker_admission.py`), F026 (one admission path), F034 (session equality in `test_implement_launcher_claude_effort.py`).
+9. Cut the 3o tests to one test per behavior, with table rows. 3o left tests net +309 lines against 5e72ab674. Give a coverage reason for each removed assertion.
+
+Milestone 2 (after devtools one-launch-path lands, and after Milestone 1 and any 5a launcher change):
+
+10. Prove one real Codex-to-Claude switch through assign.sh, with the worker using the extract (3o Acceptance gate 19).
+11. Prove the reverse direction and record both outcomes for sdlc (3o Acceptance gate 20).
+
+**Files:**
+- `scripts/production/worker_admission.py`
+- `scripts/production/worker_fill.py`
+- `scripts/agents/codex_mesh.py`
+- `scripts/accounts/accounts.py`
+- `scripts/direct/workers.py`
+- `scripts/direct/implement.sh`
+- `scripts/ask_a_friend/end_friend.sh`
+- `scripts/production/test_worker_admission.py`
+- `scripts/production/test_worker_fill.py`
+- `scripts/agents/test_codex_mesh.py`
+- `scripts/accounts/test_moves.py`
+- `scripts/accounts/test_accounts.py`
+- `scripts/shutdown/test_account_move.py`
+- `scripts/shutdown/test_stop_resume.py`
+- `scripts/direct/test_workers.py`
+- `scripts/direct/test_implement_launcher_claude.py`
+- `scripts/direct/test_implement_launcher_claude_effort.py`
+
+**Workers:** `1 writer + 1 tester`
+
+`impl` — Own the source files above (F010, F016, F028 and the simplify items).
+
+`test` — Own the test files above. Start with the regressions (items 2-5), then the test cut (item 9).
+
+**Constraints from prior phases:**
+
+1. Keep fixed staff identities: a move never changes a worker's staff id.
+2. Test fixtures write only to a fixture state folder, never the live roster or state folder (3o F040). Run tests through a guarded runner that checks the live roster before and after.
+3. `implement.sh` runs worker admission before it records a pass.
+4. The plain launcher stays removed. Start workers only through assign.sh (one-door rule, sdlc 2026-11-04).
+5. `ResumePending` stays an explicit boundary until assign.sh accepts a fixed staff id and a destination account. Output: "stopped, resume pending on <account>: <reason>".
+6. A Claude resend needs readable delivery evidence (`worker_fill.py:66`): keep the matched, absent and unknown outcomes.
+7. A `StaffRefused` row gives one refusal line for that worker; healthy workers continue (`accounts.py:2834`).
+8. Overlap with 5a: both change `codex_mesh.py`, launcher code and their tests. Serialize the overlapping launcher edits.
+
+**Acceptance gate:**
+
+1. basedpyright zero errors and warnings on changed files and callers.
+2. Affected suites green; source net negative.
+3. These assertions stay: the dry-run preview lines (`test_moves.py:678`); the `ResumePending` text (`test_moves.py:668`); the locked-worker regression (`test_moves.py:709`); the matched, absent and unknown delivery outcomes (`test_worker_fill.py`); the fresh and attach admission refusals (`test_implement_launcher_claude.py:62`); the live-roster check of the guarded runner.
+4. Pass the Delegation Context merge gate.
 
 ### Phase 5a — Bash reads the resolved model registry in one call  · status: todo
 
@@ -291,7 +254,7 @@ The staff row is the one record of a worker, per the staff-lifecycle spec (`docs
 8. Preserve transformations that produce edited text through the existing publication writer.
 9. Define a `LaunchModelConfiguration` lifetime of one launch or assignment operation.
 10. Share that configuration across implementation, review, allocation, and thread creation within the same operation.
-11. Acquire a fresh configuration for the next launch, including the next launch in a long-running process.
+11. Acquire a fresh configuration for the next launch, including the next launch in a long-running process. Within one running launcher, each later submission (continuation, capacity retry, resident wake) also acquires a fresh configuration; the wake test at `test_codex_mesh.py:5164` requires a changed tier there. Today `codex_mesh.py:6181` resolves settings for each submission.
 12. Define a `RegistryEditBase` lifetime of one editor operation.
 13. Give editor validation and transformation the exact text and values from that same base.
 14. Preserve the existing locked delta replay against concurrent edits.
@@ -331,6 +294,10 @@ The staff row is the one record of a worker, per the staff-lifecycle spec (`docs
 - `scripts/direct/test_implement_launcher.py`
 - `scripts/direct/test_review_launcher.py`
 - `scripts/direct/test_assign_launcher.py`
+- `scripts/direct/test_assign_launcher_identity.py`
+- `scripts/direct/test_assign_launcher_reuse.py`
+- `scripts/direct/test_assign_launcher_review.py`
+- `scripts/direct/assign_launcher_test_support.py`
 - `scripts/direct/test_workers.py`
 - `scripts/production/test_unit_effort.py`
 
@@ -352,6 +319,8 @@ The staff row is the one record of a worker, per the staff-lifecycle spec (`docs
 8. Store no persistent configuration cache.
 9. Extend existing fixtures and publication tests.
 10. Keep staff identity changes outside this phase.
+11. Overlap with 3p and devtools one-launch-path: registry and editor work starts at once. Serialize edits to `codex_mesh.py`, `assign.py` and `implement.sh` with 3p and with the devtools launcher change. 3p's live switch proofs run on the combined result.
+12. `implement.sh` runs worker admission before it records a pass (3o merge).
 
 **Acceptance gate:**
 
@@ -365,7 +334,7 @@ The staff row is the one record of a worker, per the staff-lifecycle spec (`docs
 8. Preserve concurrent publication and additive catalog tests.
 9. Prove that `Use /agent.` fails the retired-name check.
 10. Assert `models` publication subjects and temporary prefixes.
-11. Pass affected Python and shell suites.
+11. Pass affected Python and shell suites, including `test_implement_launcher_claude_accounts.py`, `test_implement_launcher_claude_follow.py` and `test_implement_launcher_follow.py`.
 12. Pass basedpyright with zero errors and warnings on changed Python files and caller modules.
 13. Pass the Delegation Context merge gate.
 14. Give herdr-unit the checkpoint hash for routed findings F002, F003, F004, F006, and F008.
