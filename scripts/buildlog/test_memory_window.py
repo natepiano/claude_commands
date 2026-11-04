@@ -320,7 +320,7 @@ class MemoryWindowTests(unittest.TestCase):
         files = list(self.root.glob("*/*.jsonl"))
         self.assertEqual(len(files), 1)
         self.assertEqual([json.loads(line) for line in files[0].read_text().splitlines()], [recorded])
-        self.assertFalse((self.root / "index.sqlite").exists())
+        self.assertFalse(index.index_path_in(self.root).exists())
 
     def test_missing_or_unreadable_slice_pressure_has_named_unavailable_state(self) -> None:
         builds = self.base / "builds.slice"
@@ -355,7 +355,7 @@ class MemoryWindowTests(unittest.TestCase):
         row = next(line for line in result.stdout.splitlines() if "2026-10-02 05:00 -0700" in line)
         self.assertIn("12.0 (1)", row)
         self.assertIn("3.0 (1)", row)
-        self.assertTrue((self.root / "index.sqlite").is_file())
+        self.assertTrue(index.index_path_in(self.root).is_file())
 
     def test_slice_capture_keeps_whole_charge_components_and_stacked_devices_separate(self) -> None:
         builds = self.base / "builds.slice"

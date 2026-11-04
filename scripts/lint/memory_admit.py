@@ -2100,7 +2100,7 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
         return ExpectedPeak(percentile(measured), "measured", len(measured))
     peaks: list[int] = []
     try:
-        with closing(sqlite3.connect((root / store.INDEX_NAME).resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+        with closing(sqlite3.connect(file_marks.read_only_uri(root), uri=True)) as connection:
             if repository.legacy_name:
                 columns = {row[1] for row in cast(list[tuple[object, ...]],
                            connection.execute("PRAGMA table_info(steps)").fetchall())}
@@ -2171,7 +2171,7 @@ def compiling_history(root: Path, host: str, step: str,
                       now: datetime, *, include_current_end: bool = False) -> list[tuple[dict[str, object], StepEvidence]]:
     """Exclude only peaks whose known attempts compiled no crates."""
     cutoff = now - timedelta(days=HISTORY_DAYS)
-    evidence = index_step_evidence(root / store.INDEX_NAME, host, step,
+    evidence = index_step_evidence(file_marks.index_path_in(root), host, step,
                                    datetime.min.replace(tzinfo=now.tzinfo), now)
     peaks: list[tuple[dict[str, object], StepEvidence]] = []
     try:
@@ -2576,7 +2576,7 @@ def filtered_peak(repository: RepositoryIdentity, step: str, host: str, now: dat
     indexed_exact: list[int] = []
     if repository.legacy_name:
         try:
-            connection = sqlite3.connect(f"file:{root / store.INDEX_NAME}?mode=ro", uri=True)
+            connection = sqlite3.connect(file_marks.read_only_uri(root), uri=True)
             try:
                 columns = {str(row[1]) for row in cast(list[tuple[object, ...]],
                            connection.execute("PRAGMA table_info(steps)").fetchall())}
@@ -2628,7 +2628,7 @@ def current_worktree_steps(root: Path, host: str, worktree: str,
     prefixes: dict[str, tuple[int, str]] = {}
     indexed: dict[str, list[dict[str, object]]] = {}
     try:
-        with closing(sqlite3.connect(f"file:{root / store.INDEX_NAME}?mode=ro", uri=True)) as connection:
+        with closing(sqlite3.connect(file_marks.read_only_uri(root), uri=True)) as connection:
             _ = connection.execute("BEGIN")
             prefixes = {path: (offset, marks) for path, offset, marks in cast(
                 list[tuple[str, int, str]], connection.execute("SELECT path, offset, marks FROM files").fetchall())}
@@ -2743,7 +2743,7 @@ def fresh_test_peak(repository: RepositoryIdentity, step: str, host: str, now: d
     cutoff = store.utc_iso((now - timedelta(days=HISTORY_DAYS)).timestamp())
     before = store.utc_iso(now.timestamp())
     try:
-        with closing(sqlite3.connect(f"file:{root / store.INDEX_NAME}?mode=ro", uri=True)) as connection:
+        with closing(sqlite3.connect(file_marks.read_only_uri(root), uri=True)) as connection:
             rows = cast(list[tuple[str | None, str, int | None, str]], connection.execute(
                 "SELECT call_id, argv, peak_mem_bytes, repo FROM steps WHERE host = ? "
                 + "AND step = ? AND started_at >= ? AND started_at < ? AND ended_at < ? "

@@ -136,14 +136,19 @@ def usage($config; $label; $window; $fmt):
      usage($colors; "weekly"; window("weekly"; .rate_limits.seven_day?); "%a %H:%M")
    ] | join(" | ")) as $second_line
 | ((.session_id // "") as $id
-   | [$ARGS.named.counts // "" | split("\n")[]
-      | select($id != "" and startswith($id + " ")) | .[($id | length) + 1:]
+   | ([$ARGS.named.counts // "" | split("\n")[]
+       | select($id != "" and startswith($id + " ")) | .[($id | length) + 1:]
+       | sub("^For you: "; "") | split(", ")[]] ) as $parts
+   | ($ARGS.named.rebuild // "") as $rebuild
+   | (($parts | map(select(test("^[0-9]+ (question|change)s?$"))))
+      + (if $rebuild == "" then [] else [$rebuild] end)
+      + ($parts | map(select(test("^[0-9]+ (question|change)s?$") | not))))
+   | if length == 0 then "" else "For you: " + join(", ") end
       # The key is the plural word: counts.questions, counts.efficiency and so on.
       | gsub("(?<count>[0-9]+)(?: (?<word>question|change|efficiency|proposal|project)(?<s>s?))?";
              . as $part | "\u001b[1m\($part.count)\u001b[22m"
              | if $part.word == null then .
                else (. + " " + $part.word + $part.s)
                  | color($colors; "counts." + $part.word + (if $part.word == "efficiency" then "" else "s" end))
-               end)]
-   | join("\n")) as $counts_row
+               end)) as $counts_row
 | [$first_line, $second_line, $counts_row] | map(select(. != "")) | join("\n")
