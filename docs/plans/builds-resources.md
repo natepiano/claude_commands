@@ -517,7 +517,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 
 **Ruled out:** a split of cargo waits by gate presence from old logs (no gate recorded its start); the 24 h check after `queue_times.jsonl` reaches main makes it.
 
-### Phase 17 — The nextest promise splits by compile size  · status: todo
+### Phase 17 — The nextest promise splits by compile size  · status: done
 **Depends on:** Phase 11, including its compile classification and shared step-evidence reader; Phase 60, its rebuilt replay and its adopted promise rule. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its Spec 7 import repair lands before Phase 8, because both change `build_hold.py`. Phase 29 joins before Phase 11.
 
 **Approved:** showrunner 2026-10-29 (no ETA given).

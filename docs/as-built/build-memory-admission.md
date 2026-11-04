@@ -364,6 +364,13 @@ At 24 GiB, the same group goes from over-three 6 to 2.
 Hana over-three rises 595 to 607 while its under-half falls 31 to 23. Six other repositories rise by one or two runs in one count.
 Run `phases/60/run_after.py` in the session folder to regenerate `after.json`.
 
+#### Phase 17 compile-band measurement (not adopted)
+
+Phase 17 replayed nextest promises split by compile count (bands 1–5, 6–20, 21–50 and more than 50 crates) against checkpoint `e88fb841d`.
+The band chosen from the last compile count of the same worktree and step was right for 54% of compile requests.
+Promises under half the peak rose from 395 to 423, and ten repositories got worse. Promises over three times the peak fell from 2,525 to 2,485.
+The adopt rule needs fewer under-half promises in total and no rise in any repository, so bands are not adopted and the estimate is unchanged.
+
 Build estimates use completed same-shape history from the last 14 days.
 Ten or more earlier runs supply p90. One to nine earlier runs supply their largest peak.
 The newest failed-build floor can raise that base.
