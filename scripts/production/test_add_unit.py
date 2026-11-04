@@ -26,7 +26,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import add_unit
 import unit_lookup
-import session_pane
 import sessions
 from herdr import HerdrPlace
 import herdr
@@ -97,7 +96,7 @@ class NativeClaudeUnitTests(StaffTestCase):
         self.assertIsInstance(outcome, herdr.PromptSubmitted)
         row = backend.before_opening.by_id(staff.StaffId(identity))
         assert row is not None
-        self.assertEqual((row.id, row.name, row.parent), (identity, "fresh", runner.id))
+        self.assertEqual((row.id, row.name, row.parent), (identity, "fresh", staff.ReportsTo(runner.id)))
         self.assertNotIn("--session-id", backend.arguments)
         self.assertNotIn("--resume", backend.arguments)
         self.assertNotIn("STAFF_ID", backend.environment)
@@ -179,7 +178,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(unit_config.read(worktree), expected)
         path = worktree / ".unit.toml"
         before = path.read_bytes(), path.stat().st_mtime_ns
-        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        _ = self.doc.write_text(self.doc.read_text().split("## Units")[0])
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--responsibility", "nightly-review")
         self.assertEqual(unit_config.read(worktree), expected)
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
@@ -218,7 +218,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         worktree = self.root / "project-alpha"
         self.assertEqual(row.worktree, staff.PresentWorktree("natedev", worktree))
         self.assertEqual(unit_config.read(worktree), unit_config.UnitConfig(
-            unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.AppPort(8123), ("nightly", "build-check")))
+            unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.AppPort(8123), ("nightly", "build-check", unit_config.BOARD_FREE)))
         ignored = subprocess.run(["git", "-C", str(worktree), "check-ignore", "-q", ".unit.toml"], check=False)
         self.assertEqual(ignored.returncode, 0)
         tracked = subprocess.run(["git", "-C", str(worktree), "ls-files", "--error-unmatch", ".unit.toml"],
@@ -227,15 +227,50 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertNotIn("STAFF_ID", self.pane_environment())
         self.assert_observed_identity(row)
 
+    def test_owns_paths_and_named_responsibilities_are_written(self) -> None:
+        _ = self.doc.write_text(self.doc.read_text().replace(
+            "| alpha-unit | none — board-free |",
+            "| `alpha-unit` | `scripts/production/add_unit.py`, `owns_fill.py`, `settings.json` |"))
+        _ = self.successful("alpha-unit", "--standby", "--responsibility", "nightly-review")
+        config = unit_config.read(self.root / "project-alpha")
+        assert isinstance(config, unit_config.UnitConfig)
+        self.assertEqual(config.responsibilities, tuple(sorted((
+            "nightly-review", "scripts/production/add_unit.py", "scripts/production/owns_fill.py",
+            "scripts/production/settings.json"))))
+
+    def test_invalid_owns_refuses_without_writes(self) -> None:
+        original = self.doc.read_text()
+        for cell in ("", "all production scripts"):
+            with self.subTest(cell=cell):
+                _ = self.doc.write_text(original.replace("| alpha-unit | none — board-free |",
+                                                        f"| alpha-unit | {cell} |"))
+                before = self.repository_state(), self.staff.staff_file.read_bytes(), self.doc.read_bytes()
+                result = self.cli("alpha", "--brief", "Repair the scripts", "--responsibility", "nightly-review")
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("production build-followups, unit alpha-unit: fill the Owns cell", result.stderr)
+                self.assertEqual((self.repository_state(), self.staff.staff_file.read_bytes(), self.doc.read_bytes()), before)
+                self.assertFalse((self.root / "project-alpha").exists())
+                self.assertFalse((self.checkout / "docs/plans/build-followups-alpha.md").exists())
+                self.assertFalse(self.log.exists())
+
+    def test_missing_units_table_refuses_without_admission(self) -> None:
+        _ = self.doc.write_text(self.doc.read_text().split("## Units")[0])
+        before = self.repository_state(), self.staff.staff_file.read_bytes()
+        result = self.cli("alpha", "--standby")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("fill the Owns cell", result.stderr)
+        self.assertEqual((self.repository_state(), self.staff.staff_file.read_bytes()), before)
+        self.assertFalse((self.root / "project-alpha").exists())
+
     def test_standby_launch_writes_the_standby_plan_in_its_unit_config(self) -> None:
         _ = self.successful("alpha", "--standby")
         self.assertEqual(unit_config.read(self.root / "project-alpha"), unit_config.UnitConfig(
-            unit_config.StandbyPlan(), unit_config.NoAppPort(), ()))
+            unit_config.StandbyPlan(), unit_config.NoAppPort(), (unit_config.BOARD_FREE,)))
 
     def test_permanent_launch_writes_the_permanent_plan_in_its_unit_config(self) -> None:
         _ = self.successful("alpha", "--permanent")
         self.assertEqual(unit_config.read(self.root / "project-alpha"), unit_config.UnitConfig(
-            unit_config.PermanentPlan(), unit_config.NoAppPort(), ()))
+            unit_config.PermanentPlan(), unit_config.NoAppPort(), (unit_config.BOARD_FREE,)))
 
     def test_brief_launch_writes_its_existing_relative_stub_plan_in_the_unit_config(self) -> None:
         _ = self.successful("alpha", "--brief", "Build the missing reader.")
@@ -718,7 +753,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(first.returncode, 1, (first.stdout, first.stderr))
         self.assertIn("/remote-control did not become active", first.stderr)
         self.assertIn("(herdr agents:", first.stderr)
-        self.assertIn("Waiting for remote control", first.stdout + first.stderr)
+        self.assertEqual(first.stderr.count("anomaly: alpha-unit: registry has no remote-control evidence\n"), 1)
         self.assertFalse(self.config.exists())
         self.assertFalse(self.log.exists())
         commit = self.git("rev-parse", "HEAD")
@@ -1002,33 +1037,28 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(self.doc.read_text(), original)
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
 
-    def test_another_live_session_leaves_the_launch_alone_and_the_pane_is_read_by_its_id(self) -> None:
+    def test_another_live_session_leaves_the_launch_alone(self) -> None:
         self.herdr_overrides["--session default session list --json"] = CommandResponse(code=0, stdout=json.dumps(
             herdr.SessionListResult(sessions=[herdr.SessionEntry(name="alpha2", running=True, default=False,
                 session_dir="/fixture", socket_path="/fixture/socket")])))
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(len(self.servers_started()), 1)
-        self.assertIn(["--session", SHARED, "pane", "read", "w1:p1", "--source", "recent", "--lines", "60"], self.herdr_calls())
 
-    def test_remote_control_polling_reads_each_host_through_its_place(self) -> None:
+    def test_remote_control_timeout_names_the_unit_and_place(self) -> None:
         request = add_unit.UnitLaunch(
             production=read_production(self.doc), identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
             branch="build-followups-alpha", worktree=self.root / "project-alpha", plan=add_unit.Standby(),
             port=add_unit.OmittedCell(), session=add_unit.NewSession(), timeout=0,
         )
-        for place in (HerdrPlace("native", "w1:p1"),):
-            with self.subTest(place=place):
-                marked = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.ClaudeNotRunning(), place)
-                with patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)), \
-                        patch.object(session_pane, "read_place", return_value="/remote-control is active") as read:
-                    self.assertEqual(add_unit.wait_for_remote_control(request), marked)
-                read.assert_called_once_with(place)
-                with patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)), \
-                        patch.object(session_pane, "read_place", side_effect=session_pane.HerdrFailure("unreadable")):
-                    with self.assertRaisesRegex(RuntimeError, "did not become active\\nunreadable"):
-                        _ = add_unit.wait_for_remote_control(request)
+        marked = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.ClaudeNotRunning(), HerdrPlace("native", "w1:p1"))
+        errors = io.StringIO()
+        with patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)), redirect_stderr(errors):
+            with self.assertRaises(RuntimeError) as caught:
+                _ = add_unit.wait_for_remote_control(request)
+        self.assertEqual(str(caught.exception), "alpha-unit (herdr native:w1:p1): /remote-control did not become active")
+        self.assertEqual(errors.getvalue(), "anomaly: alpha-unit: registry has no remote-control evidence\n")
 
-    def test_remote_control_is_read_from_the_session_record_after_the_pane_line_scrolls_off(self) -> None:
+    def test_remote_control_reads_the_session_registry(self) -> None:
         request = add_unit.UnitLaunch(
             production=read_production(self.doc), identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
             branch="build-followups-alpha", worktree=self.root / "project-alpha", plan=add_unit.Standby(),
@@ -1040,7 +1070,6 @@ class AddUnitLaunchTests(AddUnitTestCase):
         live = unit_lookup.LiveClaude("alpha", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/socket", 4242)
         starting = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.ClaudeNotRunning(), place)
         marked = unit_lookup.MarkedUnit("alpha-unit", live, place)
-        busy_pane = "⏺ Reading the plan\n  ⎿  Read 400 lines"
         cases: tuple[tuple[str, dict[str, str], bool], ...] = (
             ("bridged", {"bridgeSessionId": "session_bridge"}, True),
             ("no bridge", {}, False),
@@ -1055,12 +1084,14 @@ class AddUnitLaunchTests(AddUnitTestCase):
                 with patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(registry)}), \
                         patch.object(add_unit, "launched_unit", side_effect=[
                             add_unit.MarkedUnitFound(starting), add_unit.MarkedUnitFound(marked)]), \
-                        patch.object(session_pane, "read_place", return_value=busy_pane):
+                        redirect_stderr(errors := io.StringIO()):
                     if active:
                         self.assertEqual(add_unit.wait_for_remote_control(request), marked)
+                        self.assertEqual(errors.getvalue(), "")
                     else:
-                        with self.assertRaisesRegex(RuntimeError, "did not become active\\n⏺ Reading the plan"):
+                        with self.assertRaisesRegex(RuntimeError, "did not become active$"):
                             _ = add_unit.wait_for_remote_control(request)
+                        self.assertEqual(errors.getvalue(), "anomaly: alpha-unit: registry has no remote-control evidence\n")
 
     def test_underscore_name_and_checkout_without_trunk_suffix(self) -> None:
         renamed = self.root / "project"

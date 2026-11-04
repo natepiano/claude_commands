@@ -27,6 +27,8 @@ import bulk_rename as bulk
 import fake_fmt
 from style_child_test_support import StyleQueueFake, install_refusal_tools, unqueued_style_children
 from scripts.build_queue import queue_place
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file, recorded_showrunner
+from style_plan_test_support import unit_staff_id
 import berth_board
 import rules
 from ledger_test_support import machine_rename_fixture, MACHINE_RENAME_AFTER
@@ -344,6 +346,9 @@ class WorkspaceRunTests(CargoProjectTests):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        owner = recorded_showrunner("sample-style", self.repo / "docs/sample-style-production.md")
+        _ = fixture_member("unit", name="names", parent=owner.id)
         self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root / "gate-home"),
             "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
@@ -482,7 +487,7 @@ class WorkspaceRunTests(CargoProjectTests):
         findings: list[ledger_api.HeldFinding] = []
         for index, path in enumerate(paths):
             issue = self.root / ("decision.md" if shared_proposal else f"decision-{index}.md")
-            _ = issue.write_text('---\nunit: names-unit\nplan: /tmp/standing-names.md\nstatus: open\n---\nApproved rename\n')
+            _ = issue.write_text(f'---\nunit: {unit_staff_id("names-unit")}\nplan: /tmp/standing-names.md\nstatus: open\n---\nApproved rename\n')
             finding = ledger.hold(definition.rule_id, path, 2, (self.repo / path).read_text().splitlines()[1],
                                   "rename", "old", "number", definition.blob, "read-1")
             ledger.file_held(finding.finding_id, issue)
@@ -903,7 +908,7 @@ class WorkspaceRunTests(CargoProjectTests):
                               (self.repo / path).read_text().splitlines()[line - 1],
                               'rename', old, new, definition.blob, 'read-extra-1')
         proposal = self.root / 'decision-extra.md'
-        _ = proposal.write_text('---\nunit: names-unit\nplan: /tmp/standing-names.md\nstatus: open\n---\nApproved extra rename\n')
+        _ = proposal.write_text(f'---\nunit: {unit_staff_id("names-unit")}\nplan: /tmp/standing-names.md\nstatus: open\n---\nApproved extra rename\n')
         ledger.file_held(finding.finding_id, proposal)
         ledger.ticket_drop('read-extra-1')
         return finding

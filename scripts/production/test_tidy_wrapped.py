@@ -15,7 +15,7 @@ from unittest import mock
 from scripts.lib import copy_record
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import (
-    fixture_member, isolated_source_readers, isolated_staff_file, source_environment,
+    fixture_member, isolated_source_readers, isolated_staff_file, recorded_showrunner, source_environment,
 )
 from scripts.production import staff
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
@@ -47,6 +47,7 @@ class TidyWrappedTests(unittest.TestCase):
             "SCRATCH_HOLDS": str(self.root / "copy-holds.json"),
         }))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = recorded_showrunner("fixture", self.doc("fixture", "running"))
 
     def write(self, path: Path, content: str) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -213,6 +214,7 @@ class TidyWrappedTests(unittest.TestCase):
 
     def test_a_running_production_keeps_every_file(self) -> None:
         own = self.state_files("live")
+        (self.root / "staff.json").unlink()
         result = self.run_tidy(self.doc("live", "running"))
         self.assertEqual(result.returncode, 1)
         self.assertIn("kept: ", result.stderr)
@@ -230,14 +232,50 @@ class TidyWrappedTests(unittest.TestCase):
 
     def test_a_wrapped_doc_whose_timer_remains_keeps_every_file(self) -> None:
         own = self.state_files("done")
-        (self.notifier / "showrunner-done").mkdir()
-        result = self.run_tidy(self.doc("done", "wrapped"))
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("done still has an update timer", result.stderr)
+        doc = self.doc("done", "wrapped")
+        owner = recorded_showrunner("renamed-owner", doc)
+        for name in (f"showrunner-{owner.id}", "showrunner-done"):
+            with self.subTest(timer=name):
+                timer = self.notifier / name
+                timer.mkdir()
+                result = self.run_tidy(doc)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("done still has an update timer", result.stderr)
+                self.assertTrue(all(path.exists() for path in own))
+                timer.rmdir()
+
+    def test_a_wrapped_production_without_a_staff_row_checks_its_legacy_timer(self) -> None:
+        own = self.state_files("unrecorded")
+        doc = self.doc("unrecorded", "wrapped")
+        timer = self.notifier / "showrunner-unrecorded"
+        timer.mkdir()
+        refused = self.run_tidy(doc)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("unrecorded still has an update timer", refused.stderr)
         self.assertTrue(all(path.exists() for path in own))
+        timer.rmdir()
+        result = self.run_tidy(doc)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(any(path.exists() for path in own))
+
+    def test_missing_or_unreadable_staff_keeps_every_file(self) -> None:
+        own = self.state_files("done")
+        doc = self.doc("done", "wrapped")
+        record = self.root / "staff.json"
+        record.unlink()
+        for state, reason in (("missing", "No such file"), ("unreadable", "invalid staff JSON:")):
+            with self.subTest(staff=state):
+                if state == "unreadable":
+                    _ = self.write(record, "{invalid")
+                result = self.run_tidy(doc)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("kept: cannot read staff record", result.stderr)
+                self.assertIn(reason, result.stderr)
+                self.assertTrue(all(path.exists() for path in own))
 
     def test_a_slug_naming_a_shared_folder_deletes_nothing(self) -> None:
         own = self.state_files("live")
+        (self.root / "staff.json").unlink()
         result = self.run_tidy(self.doc("outstanding", "wrapped"))
         self.assertEqual(result.returncode, 1)
         self.assertIn("'outstanding' is not a production slug", result.stderr)

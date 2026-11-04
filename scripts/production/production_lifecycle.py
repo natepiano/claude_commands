@@ -444,9 +444,8 @@ def capture_release(slug: str, *, record: staff.StaffSnapshot | None = None) -> 
 
 
 def release_edges(slug: str, *, record: staff.StaffSnapshot | None = None) -> None:
-    """Release captured edges and persist each completed notice before continuing."""
+    """Send captured wrap notices and save each completed delivery."""
     released = capture_release(slug, record=record)
-    showrunner_tree.release_edges(slug, released, record=record)
     notices: dict[str, str] = {}
     if isinstance(released.former_parent, showrunner_tree.ReportedTo):
         notices[released.former_parent.parent] = f"{slug} wrapped; its recorded parent is retained for history."
@@ -620,10 +619,6 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     held = retire_wrap_rows(rows, record, runner.row) or held
     if isinstance(status, ProductionRunning):
         release_edges(production.slug, record=record)
-        notifier = Path.home() / ".claude/scripts/message/notifier.sh"
-        # The update timer is the one record of the showrunner, so removing it unregisters it.
-        _ = command("notifier", production.checkout, str(notifier), "remove", f"showrunner-{production.slug}")
-        report("notifier", "ok", "update timer removed")
         archived = command(
             "phase-notes",
             production.checkout,
@@ -641,6 +636,9 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
             if count
             else "no phase notes to archive",
         )
+        notifier = Path.home() / ".claude/scripts/message/notifier.sh"
+        _ = command("notifier", production.checkout, str(notifier), "remove", showrunners.timer_name(production.slug))
+        report("notifier", "ok", "update timer removed")
         updated = [line.replace("**Status: PRODUCTION — running.**", "**Status: PRODUCTION — wrapped.**")
                    for line in lines]
         write_text_atomic(production.doc, "\n".join(updated) + "\n")

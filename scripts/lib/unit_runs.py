@@ -10,26 +10,30 @@ passes, since a run started before the rename may stay open past that date.
 
 A test points a reader at its own folder with an override, which replaces both names.
 
-A run's director is recorded in the run folder itself, not read off the markers: a director runs
-independent phases side by side, each in its own run folder, and its one marker names only one of
-them. implement.sh and review.sh call `record-director` on every dispatch, so no step depends on a
-model remembering to write it. `held` lists every run a director holds, so its run end stops the
-workers of each one, not only the run its marker names.
+Staff supplies each run's current owner. Run records keep task history.
 """
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from importlib import import_module
 from typing import TYPE_CHECKING, NamedTuple, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production import staff  # noqa: E402
+from scripts.lib import atomic_file  # noqa: E402
+
 RUN_TEMP_NAME = "tmp"
-RUN_ROOT = Path("/tmp/claude/unit")
-FORMER_RUN_ROOT = Path("/tmp/claude/delegate")
+# SCRATCH_ROOT also selects the parent folder for temporary unit runs.
+RUN_ROOT = Path(os.environ.get("SCRATCH_ROOT") or "/tmp/claude/scratch").parent / "unit"
+FORMER_RUN_ROOT = RUN_ROOT.parent / "delegate"
 # Notifier instances a unit run once had; conversation_pause names them "status reports".
 INSTANCE_PREFIXES = ("unit-", "delegate-")
 # A run's shared liveness log, beaten every 60 s per worker while one runs.
@@ -37,12 +41,9 @@ HEARTBEAT = "heartbeat.log"
 # A run whose log moved within this window is live. Ten beats of slack, because
 # worker cleanup that reads a live run as dead removes its working workers.
 LIVE_HEARTBEAT_SECS = 600
-# The Claude session that directs the run, one line, rewritten by each dispatch.
-DIRECTOR_FILE = "director"
-# The run's Claude worker launch log, separate from the unit's durable worker ledger.
-WORKERS_LOG = "workers"
 # Names the run's history, whose first line is the `run_started` event `start-run` writes.
 STATE_FILE = "progress_history_state.json"
+OWNER_FIELD = "owner_staff_id"
 # Every run's durable history: runs/, review_turns/, archives. The former name is read until
 # `unit_runs.py move-history` moves the folder; a test or a scratch run names its own with
 # UNIT_HISTORY_DIR. Both sit under the state folder, read at each call, since a caller may change HOME.
@@ -58,6 +59,28 @@ new, former = state / '{HISTORY_NAME}', state / '{FORMER_HISTORY_NAME}'
 root = Path(sys.argv[1] or os.environ.get('UNIT_HISTORY_DIR') or os.environ.get('PLAN_DELEGATE_HISTORY_DIR')
             or (former if not new.exists() and former.exists() else new)).expanduser()
 """
+
+
+@dataclass(frozen=True)
+class RunOwnerUnrecorded:
+    reason: str
+
+
+def run_owner(fields: Mapping[str, object], record: staff.StaffSnapshot) -> staff.StaffRow | RunOwnerUnrecorded:
+    """Resolve a fixed owner first; older runs can still name their director."""
+    reference = fields.get(OWNER_FIELD)
+    if isinstance(reference, str) and reference:
+        row = record.by_id(staff.StaffId(reference))
+        if row is None or row.kind != "unit":
+            raise staff.StaffUnreadable(f"run owner {reference}: unit staff row is unavailable")
+        return row
+    identity = fields.get("main_agent")
+    agent = cast(dict[str, object], identity) if isinstance(identity, dict) else {}
+    reference = agent.get("session_id") or fields.get("owner_session") or fields.get("director_session")
+    row = record.by_member_reference(reference) if isinstance(reference, str) and reference else None
+    if row is not None and row.kind == "worker":
+        row = record.parent_of(row)
+    return row if row is not None and row.kind == "unit" else RunOwnerUnrecorded("run has no unit staff owner")
 
 
 def environ(name: str) -> str:
@@ -136,48 +159,22 @@ def marker_must_stay(path: Path) -> bool:
     return not isinstance(sessions.session_liveness(path.name), sessions.SessionNotLive)
 
 
-def record_director(run: Path, session_id: str) -> None:
-    """Name the run's director. A Codex worker that dispatches a peer inherits the director's
-    session id, so it writes the same one; a Claude worker has its own, so a session the run lists
-    as its Claude worker writes nothing. The last write wins, so a director that takes over the
-    run under a new session id takes its edges with it."""
-    if not session_id or not run.is_dir() or _claude_worker(run, session_id):
-        return
-    staged = run / f".{DIRECTOR_FILE}.{os.getpid()}"
-    _ = staged.write_text(f"{session_id}\n", encoding="utf-8")
-    _ = staged.replace(run / DIRECTOR_FILE)
-
-
-def _claude_worker(run: Path, session_id: str) -> bool:
-    """Whether the run launched this session as a Claude worker: a launch record names it, or a
-    line of the `workers` ledger, whose short id prefixes its session id."""
-    for path in run.glob("impl_worker_*.json"):
-        try:
-            record = _json_object(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError):
-            continue
-        if record.get("family") == "claude" and record.get("worker_id") == session_id:
-            return True
-    try:
-        ledger = (run / WORKERS_LOG).read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        return False
-    return any(short and session_id.startswith(short) for short in (line.partition("\t")[0].strip() for line in ledger))
-
-
 def director(run: Path, *, dependencies: Callable[[Path], None] | None = None) -> str:
-    """The run's director: its recorded one, else the session that started it, from the
-    `run_started` event that opens its history, for a run nothing has dispatched in since
-    dispatches began recording it. The state's own `main_agent` is not used: in runs started before
-    2026-10-17 a pass opened inside a worker rewrote it with that worker's thread, and
-    progress_history reads the director from here to repair it."""
+    """Read the run owner's current session from staff."""
     if dependencies is not None:
-        dependencies(run / DIRECTOR_FILE)
+        dependencies(staff.record_path())
+        dependencies(run / STATE_FILE)
     try:
-        recorded = (run / DIRECTOR_FILE).read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
-        recorded = ""
-    return recorded or _started_by(run, dependencies=dependencies)
+        fields = _json_object((run / STATE_FILE).read_text(encoding="utf-8"))
+        record = staff.local_snapshot()
+        owner = run_owner(fields, record)
+        if isinstance(owner, staff.StaffRow):
+            return owner.current_session
+        find_parent = cast(Callable[..., staff.StaffRow], import_module("scripts.production.worker_admission").parent)
+        return find_parent(record, run=run).current_session
+    except (OSError, ValueError) as error:
+        print(f"anomaly: {run}: {error}", file=sys.stderr)
+        return ""
 
 
 def held_by_session(root_override: str | Path | None = None) -> dict[str, list[str]]:
@@ -237,22 +234,45 @@ def _json_object(text: str) -> dict[str, object]:
     return cast(dict[str, object], raw) if isinstance(raw, dict) else {}
 
 
-def _started_by(run: Path, *, dependencies: Callable[[Path], None] | None = None) -> str:
-    if dependencies is not None:
-        dependencies(run / STATE_FILE)
-    try:
-        history = _json_object((run / STATE_FILE).read_text(encoding="utf-8")).get("history_file")
-        if not isinstance(history, str) or not history:
-            return ""
-        if dependencies is not None:
-            dependencies(Path(history))
-        with Path(history).open(encoding="utf-8") as handle:
-            event = _json_object(handle.readline())
-    except (OSError, UnicodeError):
-        return ""
-    agent = event.get("main_agent") if event.get("event_type") == "run_started" else None
-    session = cast(dict[str, object], agent).get("session_id") if isinstance(agent, dict) else None
-    return session if isinstance(session, str) else ""
+def migrate_owners(root: Path, *, dry_run: bool = False) -> int:
+    """Replace active run names with proved staff ids; keep history files unchanged."""
+    unavailable = False
+    for path in sorted(root.glob(f"*/{STATE_FILE}")):
+        try:
+            with (path.parent / ".progress_history.lock").open("a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                fields = _json_object(path.read_text(encoding="utf-8"))
+                if not fields:
+                    raise ValueError(f"{path}: run state is unreadable")
+                if fields.get("status") != "active":
+                    continue
+                record = staff.snapshot()
+                owner = run_owner(fields, record)
+                if isinstance(owner, RunOwnerUnrecorded):
+                    production, unit = fields.get("production"), fields.get("unit")
+                    parents = {row.id for row in record.find(kind="showrunner") if row.name == production}
+                    matches = [row for row in record.find(kind="unit") if isinstance(row.parent, staff.ReportsTo) and row.parent.id in parents
+                               and isinstance(unit, str) and row.name.removesuffix("-unit") == unit.removesuffix("-unit")]
+                    if len(matches) != 1:
+                        raise staff.StaffUnreadable(f"{path}: run owner is unavailable")
+                    owner = matches[0]
+                changed = dict(fields)
+                changed[OWNER_FIELD] = owner.id
+                folder = fields.get("working_dir")
+                for key in ("plan_doc", "project_plan_doc"):
+                    value = fields.get(key)
+                    if isinstance(folder, str) and isinstance(value, str) and value.startswith(folder + "/"):
+                        changed[key] = str(Path(value).relative_to(folder))
+                for key in ("production", "unit", "working_dir", "worktree", "branch"):
+                    _ = changed.pop(key, None)
+                if changed != fields:
+                    if not dry_run:
+                        atomic_file.write_text_atomic(path, json.dumps(changed, indent=2, sort_keys=True) + "\n")
+                    print(f"{'would migrate' if dry_run else 'migrated'} {path}: {owner.id}")
+        except (OSError, ValueError) as error:
+            unavailable = True
+            print(f"run owner unavailable: {error}", file=sys.stderr)
+    return int(unavailable)
 
 
 class FormerOwner(NamedTuple):
@@ -291,10 +311,10 @@ def removal_check(running: Mapping[str, str]) -> int:
     return 1
 
 
-def live_run_folders(now: float) -> list[Path]:
+def live_run_folders(now: float, roots: Sequence[Path] | None = None) -> list[Path]:
     """Run folders under either name whose heartbeat moved in the live window."""
     live: list[Path] = []
-    for root in run_roots():
+    for root in run_roots() if roots is None else roots:
         for beat in sorted(root.glob(f"*/{HEARTBEAT}")):
             try:
                 if now - beat.stat().st_mtime < LIVE_HEARTBEAT_SECS:
@@ -345,6 +365,12 @@ def _held_main(argv: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
+    if argv and argv[0] == "migrate-owners":
+        parser = argparse.ArgumentParser(description="Migrate active run owners to staff ids.")
+        _ = parser.add_argument("--root", type=Path, required=True)
+        _ = parser.add_argument("--dry-run", action="store_true")
+        args = parser.parse_args(argv[1:])
+        return migrate_owners(cast(Path, args.root), dry_run=cast(bool, args.dry_run))
     if len(argv) == 3 and argv[0] == "activate":
         try:
             activate(Path(argv[1]), argv[2])
@@ -354,20 +380,13 @@ def main(argv: list[str]) -> int:
         return 0
     if argv and argv[0] == "held":
         return _held_main(argv[1:])
-    if len(argv) == 2 and argv[0] == "record-director":
-        try:
-            record_director(Path(argv[1]), os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
-        except OSError as error:
-            print(f"unit_runs: director not recorded in {argv[1]}: {error}", file=sys.stderr)
-            return 1
-        return 0
     if argv == ["history-root"]:
         print(history_root())
         return 0
     if argv == ["move-history"]:
         return move_history(time.time())
     if argv != ["removal-check"]:
-        print("usage: unit_runs.py removal-check | history-root | move-history | record-director <run folder> | activate <run folder> <session id> | held <session id>",
+        print("usage: unit_runs.py removal-check | history-root | move-history | activate <run folder> <session id> | held <session id>",
               file=sys.stderr)
         return 2
     if TYPE_CHECKING:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import fixture_runtime_id
+
 from scripts.lib.py_floor_test_support import cache_file_name
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -327,11 +329,9 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             json.loads((session_dir / "impl_worker_review2.json").read_text()),
         )
         self.assertEqual(identity, {
-            "name": worker,
+            "staff_id": roster[worker]["staff_id"],
             "slot": "review2",
-            "family": "codex",
             "model": "gpt-called",
-            "worker_id": f"thread-{worker}",
         })
 
         implementation = subprocess.run(
@@ -467,7 +467,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((session_dir / "mesh_events.txt").read_text().splitlines(), ["can-follow", "follow"])
         roster = cast(dict[str, dict[str, object]], json.loads((session_dir / "mesh_roster.json").read_text()))
-        self.assertEqual(roster[worker]["thread_id"], "thread-fixture")
+        self.assertEqual(roster[worker]["thread_id"], fixture_runtime_id("thread-fixture"))
         self.assertEqual((session_dir / "follow_message.txt").read_text(), "Review the diff.\n")
         self.assertEqual((session_dir / "review_status").read_text(), "reviewed\n")
 

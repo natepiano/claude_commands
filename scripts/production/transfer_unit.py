@@ -25,7 +25,7 @@ class UnitTransfer:
 
 
 def _production(slug: str) -> Production:
-    checked = showrunners.checked_doc(showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}")
+    checked = showrunners.checked_doc(showrunners.NOTIFIER_STATE_DIR / showrunners.timer_name(slug))
     if isinstance(checked, showrunners.NoCheckedDoc):
         raise ValueError(f"{slug}: {checked.reason}")
     return read_production(checked.path)
@@ -47,9 +47,9 @@ def build(from_slug: str, given: str, to_doc: Path) -> UnitTransfer:
 def apply(from_slug: str, unit: str, to_doc: Path) -> UnitTransfer:
     request = build(from_slug, unit, to_doc)
     with unit_move.folder_move_lock(request.member.id), staff.operation():
-        changed = request.member.parent != request.parent.id
+        changed = request.member.parent != staff.ReportsTo(request.parent.id)
         if changed:
-            _ = staff.move(request.member.id, request.parent.id)
+            _ = staff.move(request.member.id, staff.ReportsTo(request.parent.id))
         _ = staff_move.move_unit(from_slug, request.unit, request.receiving.slug,
                                  identity=staff_move.PinnedUnit(request.member.id, request.parent.id))
         print("done" if changed else "unchanged")

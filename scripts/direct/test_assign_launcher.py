@@ -1,7 +1,6 @@
 """Named assignment dispatches through the real recorder and loopback app-server."""
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import shutil
@@ -9,11 +8,9 @@ from pathlib import Path
 from typing import cast, final
 from unittest.mock import patch
 
-from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
-from scripts.direct import assign
-from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, AssignLauncherFixture, read_object
+from scripts.agents import test_codex_mesh as mesh_fixture
+from scripts.direct.assign_launcher_test_support import ASSIGN, AssignLauncherFixture, read_object
 from scripts.lint import style_review
-from scripts.production.cli_fixture import invoke_cli
 
 
 def setUpModule() -> None:
@@ -22,6 +19,19 @@ def setUpModule() -> None:
 
 @final
 class AssignLauncherTests(AssignLauncherFixture):
+    def test_only_a_live_claude_or_codex_ancestor_permits_assignment(self) -> None:
+        for family in ("claude", "codex"):
+            with self.subTest(family=family):
+                result = self.run_launcher(["bash", str(ASSIGN), "--help"], family=family)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for family in ("systemd", "bash", "codex-helper"):
+            with self.subTest(parent=family):
+                result = self.run_launcher(["bash", str(ASSIGN), "--help"], family=family,
+                                           isolate_ancestors=True)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("requires a live Claude or Codex ancestor", result.stderr)
+        self.assertEqual(self.methods("thread/start"), [])
+
     def test_dispatch_has_a_durable_worker_row_before_submitting_work(self) -> None:
         from scripts.production import staff
         _ = self.successful()
@@ -41,16 +51,16 @@ class AssignLauncherTests(AssignLauncherFixture):
         row = staff.by_id(staff.StaffId(thread))
         self.assertIsNotNone(row)
         assert row is not None
-        self.assertEqual((row.id, row.name, row.parent), (thread, name, os.environ["CODEX_THREAD_ID"]))
+        self.assertEqual((row.id, row.name, row.parent), (thread, name, staff.ReportsTo(staff.StaffId(os.environ["CODEX_THREAD_ID"]))))
         self.assertTrue(self.claims)
         self.assertTrue(all(str(entry["thread_id"]) == row.id for entry in self.claims))
 
     def test_unreadable_staff_starts_no_worker(self) -> None:
         record = Path(os.environ["STAFF_FILE"])
         _ = record.write_text("{broken")
-        result = self.launch(script=ASSIGN)
+        result = self.launch()
         self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
-        self.assertIn("staff: impl: not opened:", result.stderr)
+        self.assertIn("invalid staff JSON:", result.stderr)
         self.assertEqual(self.methods("thread/start"), [])
         self.assertEqual(record.read_text(), "{broken")
 
@@ -59,7 +69,6 @@ class AssignLauncherTests(AssignLauncherFixture):
         starts = self.methods("thread/start")
         self.assertEqual(cast(dict[str, object], starts[0]["params"])["sandbox"], "read-only")
         self.assertTrue((self.session_dir / "phases/7/review_status_rerun_1").exists())
-        self.assertEqual(next(iter(self.assignment_records().values()))["role"], "review")
 
     def test_recorder_ad_hoc_phase_dispatches_into_adhoc_directory(self) -> None:
         self.record("start-phase", "--phase-id", "ad hoc", "--phase-title", "Ad hoc review")
@@ -84,7 +93,7 @@ class AssignLauncherTests(AssignLauncherFixture):
     def test_missing_required_options_and_positionals_refuse_before_opening_a_thread(self) -> None:
         for options in ([], ["--prompt", str(self.prompt)], ["--role", "test"], ["test", str(self.prompt)]):
             with self.subTest(options=options):
-                result = invoke_cli(assign, assign.main, options, os.environ.copy(), ROOT)
+                result = self.run_launcher(["bash", str(ASSIGN), *options])
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertIn("usage", (result.stdout + result.stderr).lower())
         self.assertEqual(self.methods("thread/start"), [])
@@ -117,7 +126,7 @@ class AssignLauncherTests(AssignLauncherFixture):
         self.assertEqual(self.methods("thread/start"), [])
 
     def test_writer_dispatch_records_paths_rules_identity_and_a_finished_pass(self) -> None:
-        _ = self.successful(script=ASSIGN)
+        _ = self.successful()
         name, record = next(iter(self.assignment_records().items()))
         self.assertEqual(record["role"], "impl")
         self.assertEqual(self.turn_starts, 1)
@@ -141,8 +150,7 @@ class AssignLauncherTests(AssignLauncherFixture):
 
     def test_review_is_read_only_and_thread_board_and_summary_use_the_shown_context(self) -> None:
         _ = self.successful("review", "--lens", "contract", "--pass", "1")
-        name, record = next(iter(self.assignment_records().items()))
-        self.assertEqual(record["role"], "review")
+        name = next(iter(self.assignment_records()))
         starts = self.methods("thread/start")
         self.assertEqual(cast(dict[str, object], starts[0]["params"])["sandbox"], "read-only")
         names = [str(cast(dict[str, object], request["params"])["name"])
@@ -230,12 +238,12 @@ class AssignLauncherTests(AssignLauncherFixture):
         self.assertIn(f"- Range: {baseline}..{end}", (directory / "prompt.md").read_text())
 
     def test_missing_run_calls_prepare_and_prints_the_prepared_folder(self) -> None:
-        script, prepared = self.prepare_launcher()
+        prepared = self.prepare_launcher()
         environment = os.environ.copy()
         for key in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "UNIT_RUN_DIR", "UNIT_SESSION_DIR"):
             _ = environment.pop(key, None)
         with patch.dict(os.environ, environment, clear=True):
-            result = self.launch(session=False, script=script)
+            result = self.launch(session=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(prepared.exists())
         self.assertIn(str(self.session_dir), result.stdout)
@@ -245,7 +253,7 @@ class AssignLauncherTests(AssignLauncherFixture):
         (self.session_dir / "progress_history_state.json").unlink()
         shutil.rmtree(self.history)
         shutil.rmtree(self.session_dir / "phases", ignore_errors=True)
-        script, prepared = self.prepare_launcher()
+        prepared = self.prepare_launcher()
         director = os.environ["CODEX_THREAD_ID"]
         transcript = Path.home() / ".codex/sessions" / f"rollout-{director}.jsonl"
         transcript.parent.mkdir(parents=True, exist_ok=True)
@@ -259,7 +267,7 @@ class AssignLauncherTests(AssignLauncherFixture):
             _ = environment.pop(key, None)
         environment["CODEX_THREAD_ID"] = director
         with patch.dict(os.environ, environment, clear=True):
-            result = self.launch(session=False, script=script)
+            result = self.launch(session=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(prepared.exists())
         phase = cast(dict[str, object], read_object(self.session_dir / "progress_history_state.json")["phase"])
@@ -298,33 +306,3 @@ class AssignLauncherTests(AssignLauncherFixture):
         self.assertEqual(len(ended), 1, self.events())
         self.assertEqual(ended[0].get("status"), "error")
         self.assertNotIn("launcher_pid", next(iter(self.assignment_records().values())))
-
-    def test_handoff_records_the_destination_without_finishing_or_resending_the_assignment(self) -> None:
-        original = self.server.respond
-        destination = str(self.session_dir.parent / "taking-run")
-
-        @self.hang_guard.callback
-        def handoff(request: dict[str, object]) -> list[dict[str, object]] | None:
-            if request.get("method") != "turn/start":
-                return original(request)
-            with (self.session_dir / codex_mesh.ROSTER_FILE).open("r+") as handle:
-                fcntl.flock(handle, fcntl.LOCK_EX)
-                roster = cast(dict[str, dict[str, object]], json.load(handle))
-                record = next(iter(roster.values()))
-                record["adopted_to"] = destination
-                codex_mesh.advance_worker_roster_revision(record)
-                _ = handle.seek(0)
-                _ = handle.write(json.dumps(roster))
-                _ = handle.truncate()
-            return [{"id": request["id"], "result": {"turn": {"id": "handoff-turn"}}}]
-
-        self.server.respond = handoff
-        result = self.launch()
-        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
-        folder = self.session_dir / "phases/7"
-        self.assertEqual((folder / "impl_status").read_text().strip(), "handed_off")
-        self.assertIn(destination, (folder / "impl_summary.txt").read_text())
-        self.assertIn("completion unknown", result.stdout + result.stderr)
-        self.assertEqual(len(self.methods("turn/start")), 1)
-        self.assertFalse(any(event.get("event_type") == "pass_finished" and
-                             event.get("status") == "completed" for event in self.events()))

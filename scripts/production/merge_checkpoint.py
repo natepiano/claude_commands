@@ -370,8 +370,8 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
     rows = unit_lookup.doc_units(production.doc, record)
     selected = next((row for row in rows if row.name == unit_names.name(name)), None)
     selected = selected if selected is not None else unit_lookup.unit_row(name, record)
-    if selected.parent != unit_lookup.doc_owner(production.doc, record).id:
-        parent = record.by_id(selected.parent) if selected.parent is not None else None
+    if selected.parent != staff.ReportsTo(unit_lookup.doc_owner(production.doc, record).id):
+        parent = record.parent_of(selected)
         raise Refusal(f"unit {name}: staff parent is {parent.name if parent else 'unavailable'}; use that production")
     units = tuple(unit_from_row(row, resolver) for row in rows
                   if not isinstance(row.worktree, staff.RemovedWorktree))
@@ -538,7 +538,7 @@ def record_publication_changes(production: Production, commits: list[change_revi
                                report_unchanged: bool = True,
                                record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> None:
     """Register each visible change and report merges with missing rows."""
-    doc = change_review.list_path(production.doc)
+    doc = change_review.list_path(production.doc, record=record)
     if doc is None:
         if report_unchanged:
             report("change review", "ok", "the production doc has no Change review line; no rows written")
@@ -621,6 +621,11 @@ def _unit_paths(request: MergeRequest, paths: tuple[str, ...]) -> tuple[str, ...
 
 
 def scope(request: MergeRequest, paths: tuple[str, ...]) -> None:
+    if isinstance(request.kind, CodeCheckpoint) and not request.unit.owns:
+        raise Refusal(f"unit {request.unit.name}: .unit.toml has no responsibilities; "
+                      + "run python3 -m scripts.production.owns_fill, then rerun the checkpoint")
+    board_free = isinstance(request.kind, CodeCheckpoint) and unit_config.BOARD_FREE in request.unit.owns
+    outside: list[str] = []
     staged = good(git(request.production.checkout, "diff", "--cached", "--name-only"), "scope")
     if staged:
         raise Stop("scope", "held", f"staged paths in merge checkout: {staged.replace(chr(10), ', ')}",
@@ -642,14 +647,16 @@ def scope(request: MergeRequest, paths: tuple[str, ...]) -> None:
             raise Stop("scope", "held", f"an as-built commit carries only docs and must change or delete {plan}; "
                        + f"got {', '.join(paths)}",
                        "commit only the as-built docs and the plan's deletion, then resend the as-built")
-    else:
+    elif not board_free:
         hubs = hub_paths(request.lines, request.unit.name)
-        permitted = (*request.unit.owns, *request.also, *hubs)
-        unexpected = [path for path in paths if not allowed(path, permitted)]
+        outside = [path for path in paths if not allowed(path, (*request.unit.owns, *hubs))]
+        unexpected = [path for path in outside if not allowed(path, request.also)]
         if unexpected:
             raise Stop("scope", "held", f"outside responsibilities: {', '.join(unexpected)}",
                        f"explain why these paths changed: {', '.join(unexpected)}")
     report("scope", "ok", f"{len(paths)} changed paths are allowed"
+           + (" (board-free)" if board_free else "")
+           + (f"; {len(outside)} only by --also" if outside else "")
            + (f"; {imported} came from origin merge branches" if imported else ""))
 
 
@@ -698,20 +705,6 @@ def other_units(request: MergeRequest, paths: tuple[str, ...]) -> None:
         worktree_paths = {line[3:] for line in status.stdout.splitlines() if len(line) >= 4}
         overlap = sorted(set(paths) & (branch_paths | worktree_paths))
         report("other units", "ok", f"{unit.name}: {', '.join(overlap) if overlap else 'no overlap'}")
-
-
-def gate_names(request: MergeRequest, first_code_merge: bool) -> str:
-    if not first_code_merge or "## Gates" not in request.lines:
-        return "no gate"
-    start = request.lines.index("## Gates") + 1
-    found: list[str] = []
-    for line in request.lines[start:]:
-        if line.startswith("## "):
-            break
-        cells = [cell.strip() for cell in line.strip("|").split("|")]
-        if len(cells) >= 3 and cells[2].lower() == f"{request.unit.name} phase {request.phase}".lower():
-            found.append(f"{cells[0]}: {cells[1]}")
-    return ", ".join(found) if found else "no gate"
 
 
 def into(path: PurePath, branch: str, why: str, unblocks: str) -> None:
@@ -765,10 +758,16 @@ def tool(name: str, fallback: Path, override: str) -> str:
     return os.environ.get(override) or shutil.which(name) or str(fallback)
 
 
+class CheckpointTestStep(NamedTuple):
+    label: str
+    command: list[str]
+    folder: Path
+
+
 def test_steps(production: Production, paths: tuple[str, ...],
-               merge_tests: tuple[tuple[str, ...], ...]) -> list[tuple[str, list[str]]]:
+               merge_tests: tuple[tuple[str, ...], ...]) -> list[CheckpointTestStep]:
     checkout = production.checkout
-    packages: set[str] = set()
+    packages: set[Path] = set()
     examples: set[tuple[str, str]] = set()
     for raw in paths:
         path = checkout / raw
@@ -779,23 +778,25 @@ def test_steps(production: Production, paths: tuple[str, ...],
             if manifest.exists():
                 # A workspace root's manifest names no package: a path under it, such as docs, has no tests.
                 if "package" in tomllib.loads(manifest.read_text(encoding="utf-8")):
-                    packages.add(parent.name)
+                    packages.add(parent)
                 break
         match = re.search(r"(?:^|/)crates/([^/]+)/examples/([^/.]+)", raw)
         if match:
             examples.add((match.group(1), match.group(2)))
     verify = tool("verify.sh", Path.home() / ".claude/scripts/direct/verify.sh", "MERGE_CHECKPOINT_VERIFY")
     verify_command = [verify] if os.access(verify, os.X_OK) else ["bash", verify]
-    steps = [(f"package {package}", [*verify_command, "test", package]) for package in sorted(packages)]
-    steps.extend((f"example {package}/{name}", [*verify_command, "example", package, name])
+    steps = [CheckpointTestStep(f"package {package.name}", [*verify_command, "test", package.name], package)
+             for package in sorted(packages)]
+    steps.extend(CheckpointTestStep(f"example {package}/{name}", [*verify_command, "example", package, name], checkout)
                  for package, name in sorted(examples))
-    steps.extend((f"merge test {index}", list(command)) for index, command in enumerate(merge_tests, 1))
+    steps.extend(CheckpointTestStep(f"merge test {index}", list(command), checkout)
+                 for index, command in enumerate(merge_tests, 1))
     return steps
 
 
-def run_test_command(command: list[str], checkout: Path) -> subprocess.CompletedProcess[str]:
+def run_test_command(command: list[str], folder: Path) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(command, cwd=checkout, capture_output=True, text=True, check=False)
+        return subprocess.run(command, cwd=folder, capture_output=True, text=True, check=False)
     except OSError as error:
         return subprocess.CompletedProcess(command, 127, "", f"{error}\n")
 
@@ -863,22 +864,23 @@ def run_checkpoint_test_steps(production: Production, paths: tuple[str, ...],
     """Run checkpoint commands and their retries; the caller owns merge rollback."""
     steps = test_steps(production, paths, merge_tests)
     log.parent.mkdir(parents=True, exist_ok=True)
-    failed: list[tuple[str, list[str], frozenset[str]]] = []
+    failed: list[tuple[CheckpointTestStep, frozenset[str]]] = []
     with log.open("a", encoding="utf-8") as output:
-        for name, command in steps:
-            result = run_test_command(command, production.checkout)
+        for step in steps:
+            result = run_test_command(step.command, step.folder)
             _ = output.write(result.stdout + result.stderr)
-            _ = output.write(f"{name.replace(' ', '_')}_EXIT={result.returncode}\n")
+            _ = output.write(f"{step.label.replace(' ', '_')}_EXIT={result.returncode}\n")
             output.flush()
-            stop_cancelled_test(name, result, log)
+            stop_cancelled_test(step.label, result, log)
             if not test_passed(result):
-                failed.append((name, command, failed_tests(result.stdout + result.stderr)))
+                failed.append((step, failed_tests(result.stdout + result.stderr)))
     unresolved: list[str] = []
-    for name, command, tests in failed:
+    for step, tests in failed:
+        name, command, folder = step
         # Only known flaky tests failed: rerun those alone, not the whole command.
         alone = bool(tests) and tests <= flaky_tests
         with log.open("a", encoding="utf-8") as output:
-            result = run_test_command(only_tests(command, tests) if alone else command, production.checkout)
+            result = run_test_command(only_tests(command, tests) if alone else command, folder)
             _ = output.write(result.stdout + result.stderr)
             _ = output.write(f"{name.replace(' ', '_')}_RERUN_EXIT={result.returncode}\n")
         stop_cancelled_test(name, result, log)
@@ -897,7 +899,7 @@ def run_checkpoint_test_steps(production: Production, paths: tuple[str, ...],
         raise Stop("red", "failed", f"{', '.join(unresolved)} failed; log {log}",
                    f"repair {', '.join(unresolved)} and send a new checkpoint; test log: {log}")
     report("red", "ok", "all commands green or known flakes green alone")
-    return ", ".join(name for name, _ in steps) if steps else "no tests"
+    return ", ".join(step.label for step in steps) if steps else "no tests"
 
 
 def test_passed(result: subprocess.CompletedProcess[str]) -> bool:
@@ -1501,7 +1503,7 @@ def run(request: MergeRequest) -> int:
                 report(step, "ok", "checkpoint already merged; resuming promotion")
             paths = changed_paths(request, f"{merge_head}^1")
         changes: ChangesReadBeforePush | ReadChangesWhenWriting = _READ_CHANGES_WHEN_WRITING
-        if isinstance(pushed, NotYetPushed) and change_review.list_path(request.production.doc) is not None:
+        if isinstance(pushed, NotYetPushed) and change_review.list_path(request.production.doc, record=request.staff_record) is not None:
             try:
                 changes = ChangesReadBeforePush(change_review.publication_changes(commits, request.production.doc, record=request.staff_record))
             except (change_review.ChangeReviewError, OSError) as error:
@@ -1521,7 +1523,6 @@ def run(request: MergeRequest) -> int:
                 undo_unpushed_merge(request.production, merge_head)
                 raise Stop("red", "failed", str(error),
                            "repair the test logging failure and send a new checkpoint") from error
-        first_code_merge = isinstance(pushed, NotYetPushed) and isinstance(request.kind, CodeCheckpoint)
         promotion_done = checkpoint_step_record(request.production.checkout, merge_head, "promotion")
         tip = ""
         try:
@@ -1551,7 +1552,7 @@ def run(request: MergeRequest) -> int:
                     if request.bump:
                         deliver_gate_result(request, merge_head, tip)
                     into(request.production.checkout, request.production.merge_branch,
-                         "the merge branch collects every unit's checkpoints", gate_names(request, first_code_merge))
+                         "the merge branch collects every unit's checkpoints", "the unit’s next checkpoint")
             finish_promotion(request)
         finally:
             if tip:

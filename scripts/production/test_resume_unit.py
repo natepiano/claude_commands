@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import resume_unit
 import add_unit
 import retire_unit
+import sessions as retirement_sessions
 import unit_lookup
 import unit_move
 import test_retire_unit
@@ -36,6 +37,7 @@ from herdr import HerdrPlace
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.message import sessions
 from scripts.production import staff, unit_config
 from scripts.production.staff_test_support import unit_membership
 
@@ -150,7 +152,8 @@ class ResumeUnitTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(retire_unit, "production_of", production_of))
         _ = self.enterContext(mock.patch.object(retire_unit, "run", self.fake_run))
         _ = self.enterContext(mock.patch.object(unit_lookup, "marked_unit", not_marked))
-        _ = self.enterContext(mock.patch.object(unit_move, "config_dirs", lambda: self.configs))
+        _ = self.enterContext(mock.patch.object(sessions, "config_dirs", lambda: self.configs))
+        _ = self.enterContext(mock.patch.object(retirement_sessions, "config_dirs", lambda: self.configs))
         _ = cast(MutableMapping[str, str], self.enterContext(
             mock.patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
                                        "HERDR_PANE_RECORD_DIR": str(self.root / "pane-launches")})))
@@ -237,6 +240,7 @@ class ResumeUnitTests(unittest.TestCase):
         retirement = test_retire_unit.RetireUnitTests()
         self.addCleanup(retirement.doCleanups)
         retirement.setUp()
+        _ = self.enterContext(mock.patch.object(sessions, "config_dirs", lambda: [retirement.config]))
         unit = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         tip = git(retirement.checkout, "rev-parse", "main")
         code, output = retirement.retire()
@@ -266,7 +270,8 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertEqual(len(commands), 1)
         self.assertEqual(commands[0][commands[0].index("--resume") + 1], DIRECTOR)
         self.assertEqual(staff.by_id(unit.id), unit)
-        self.assertEqual(staff.find(kind="unit", parent=unit.parent), [unit])
+        assert isinstance(unit.parent, staff.ReportsTo)
+        self.assertEqual(staff.find(kind="unit", parent=unit.parent.id), [unit])
         self.assertEqual(git(retirement.worktree, "rev-parse", "HEAD"), tip)
         before = (retirement.staff.staff_file.read_bytes(), retirement.doc.read_bytes(),
                   git(retirement.checkout, "for-each-ref"))
@@ -376,7 +381,7 @@ class ResumeUnitTests(unittest.TestCase):
             finally:
                 child.close()
         process = context.Process(target=run)
-        seed: subprocess.Popen[str] | None = None
+        writer: subprocess.Popen[str] | None = None
         try:
             with self.staff.lock_notice(self.staff.staff_file.parent / "operation.lock") as listener:
                 process.start()
@@ -388,16 +393,16 @@ class ResumeUnitTests(unittest.TestCase):
                 staff_id = staff.StaffId(identity)
                 self.assertTrue(lock_held, "resume released its operation lock before discarding the parked facts")
                 self.assertTrue(unit_config.parked_path(staff_id).exists())
-                seed = self.staff.start_script(CHECKOUT / "scripts/production/staff_sources.py", "seed")
-                self.staff.assert_operation_blocks(seed, listener)
+                writer = self.staff.start_script(CHECKOUT / "scripts/production/staff.py", "rename", identity, "--name", "alpha")
+                self.staff.assert_operation_blocks(writer, listener)
                 parent.send("finish")
                 self.assertTrue(parent.poll(TEST_HANG_GUARD_SECS), "resume did not discard the parked facts")
                 code, output = cast(tuple[int, str], parent.recv())
                 self.assertEqual(code, 0, output)
                 process.join(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(process.exitcode, 0)
-                output, errors = seed.communicate(timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(seed.returncode, 0, output + errors)
+                output, errors = writer.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(writer.returncode, 0, output + errors)
             self.assertFalse(unit_config.parked_path(staff_id).exists())
             row = staff.by_id(staff_id)
             self.assertIsNotNone(row)
@@ -411,9 +416,9 @@ class ResumeUnitTests(unittest.TestCase):
                 process.terminate()
                 process.join(timeout=TEST_HANG_GUARD_SECS)
             process.close()
-            if seed is not None and seed.returncode is None:
-                seed.kill()
-                _ = seed.communicate(timeout=TEST_HANG_GUARD_SECS)
+            if writer is not None and writer.returncode is None:
+                writer.kill()
+                _ = writer.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def test_resumes_the_recorded_session_in_a_worktree_made_from_the_merge_branch(self) -> None:
         self.assert_resumed(*self.resume())

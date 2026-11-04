@@ -527,6 +527,13 @@ def showrunner(page: ReviewPage) -> str:
 
 def row_production(page: ReviewPage, row: dict[str, str]) -> Path:
     """Resolve the row's Production cell for the existing feature-log closeout rule."""
+    record = staff.snapshot()
+    if not row.get("Verdict") and (row.get("Producer")
+                                  or record.by_id(staff.StaffId(row.get(change_review.PRODUCTION, ""))) is not None):
+        assignment = change_routing.StaffRouting(record, {}).owner_and_production(page.review_list, row)
+        if isinstance(assignment.production, Path):
+            return assignment.production
+        raise AnswerRefused(assignment.production.reason)
     root = showrunner_tree.root_of(slug_of(page.production))
     docs = {**showrunners.timer_docs(), slug_of(page.production): page.production}
     docs.update({slug_of(doc): doc for doc in change_routing.list_documents(change_review.read(page.review_list))})

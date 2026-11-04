@@ -46,7 +46,7 @@ from scripts.production.production_doc import Refusal
 from scripts.message import unit_labels
 from scripts.shutdown import remote
 from scripts.production import unit_lookup
-from scripts.production.proposal_issue import proposal_progress, AwaitingApproval
+from scripts.production.proposal_issue import proposal_progress, proposal_unit, AwaitingApproval
 from scripts.production.proposals_table import backlog_rows, REVIEW_STATE
 from scripts.nightly_review import candidates
 from scripts.usage import collect, usage_report
@@ -1496,7 +1496,7 @@ def rank_coverage(found: Sequence[issues.Issue], rankings: Sequence[IssueRank], 
 
 
 def unit_names_issue(unit: Unit, issue: issues.Issue) -> bool:
-    if issue.value("unit") == unit.name and issue.value("showrunner") in (unit.production, unit.showrunner, ""):
+    if proposal_unit(issue).removesuffix("-unit") == unit.name and issue.value("showrunner") in (unit.production, unit.showrunner, ""):
         return True
     cell = unit.issue.strip().strip("`")
     wiki = re.fullmatch(r"\[\[([^]|]+)(?:\|[^]]+)?\]\]", cell)
@@ -1536,7 +1536,7 @@ def staff_units(problems: list[log_records.SourceProblem]) -> list[Unit]:
         live = {item["sessionId"] for item in unit_labels.newest_sessions()}
         running = running_phase_worktrees(unit_lookup.runs_dir(), problems)
         for row in staff.active(record, "unit"):
-            parent = record.by_id(row.parent) if row.parent is not None else None
+            parent = record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
             if parent is None:
                 problems.append(log_records.SourceProblem(row.name, "the staff parent is unavailable", event_source=log_records.SourceNotApplicable.STATE))
                 continue
@@ -1548,7 +1548,7 @@ def staff_units(problems: list[log_records.SourceProblem]) -> list[Unit]:
             except (OSError, ValueError) as error:
                 causes.append(str(error))
                 timer = showrunners.NoTimer(str(error))
-            slug = timer.slug if isinstance(timer, showrunners.Timer) else parent.name
+            slug = timer.slug if isinstance(timer, showrunners.TimerRegistration) else parent.name
             tree = resolver.unit_worktree(row)
             doc = resolver.production_doc(row)
             branch = resolver.unit_branch(row)

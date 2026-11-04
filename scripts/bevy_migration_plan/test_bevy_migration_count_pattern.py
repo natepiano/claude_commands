@@ -25,9 +25,7 @@ class MigrationPatternCountTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        temporary_root = Path("/tmp/claude")
-        temporary_root.mkdir(parents=True, exist_ok=True)
-        folder = tempfile.TemporaryDirectory(prefix="migration-counter-", dir=temporary_root)
+        folder = tempfile.TemporaryDirectory(prefix="migration-counter-")
         self.addCleanup(folder.cleanup)
         self.root = Path(folder.name)
         self.codebase = self.root / "project"

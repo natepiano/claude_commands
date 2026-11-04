@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""Bump idle unit directors and tell their running showrunners once per stretch.
+"""Bump idle unit directors and notify their showrunners once per stretch.
 
-A unit that herdr reports `blocked` waits at a permission, trust or question prompt: no bump can
-move it, so after PROMPT_ALERT_SECONDS its owner gets the request. Only a prompt still waiting after
-the configured grace gets a phone alert. The alert's
-request and wait start come from the session's transcript when it holds the pending tool call.
-Once that alert is sent, rca.py opens a case so the cause of the prompt is found and fixed, and each
-pass reminds the owner of a case still open after 30 minutes (`rca.remind`). The alert is an emergency
-push that repeats until the user acknowledges it, so when its prompt is gone `send.py retire` cancels it
-by its per-unit key.
+Notify the owner after PROMPT_ALERT_SECONDS at a permission prompt.
+Send a phone alert after the grace period and open an RCA case.
+Retire the alert when the prompt ends. Staff ids identify files and alert keys.
 """
 
 from __future__ import annotations
@@ -37,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 
+from scripts.lib import conf as tunables
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.process_group import send_process_group
@@ -73,7 +69,6 @@ HOLD_TIME = re.compile(r"\b(?:(?:(?P<year>\d{4})-)?(?P<month>\d{2})-(?P<day>\d{2
                        + r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\b(?:\s+(?P<utc>UTC|GMT)\b)?")
 WORK = {"zsh", "bash", "sh", "implement.sh", "review.sh", "verify.sh"}
 BLOCKED = herdr.AgentStatus.BLOCKED
-PROMPT_ALERT_SECONDS = 60
 PROMPT_TEXT_ID = "stall_watch.permission_prompt"
 # The prompt alert's sender, which its retire names too.
 SENDER = "stall-watch"
@@ -516,18 +511,36 @@ def stated_hold_end(line: str, now: float, zone: ZoneInfo) -> float | None:
     return max(instants, default=None)
 
 
+class WatchedUnit(NamedTuple):
+    slug: str
+    name: str
+    stretch_path: Path
+    prompt_path: Path
+    prompt_key: str
+
+
+def watched_unit(slug: str, unit: str, record: staff.StaffSnapshot) -> WatchedUnit:
+    found = record.by_path(f"{slug}/{unit_names.name(unit)}")
+    if found is None:
+        raise ValueError(f"{slug}/{unit}: no unique staff row")
+    path = STATE_DIR / f"{found.id}.json"
+    return WatchedUnit(slug, unit, path, path.with_suffix(".prompt.json"), f"stall-watch:prompt:{found.id}")
+
+
 def stretch_path(slug: str, unit: str) -> Path:
-    name = hashlib.sha256(f"{slug}\0{unit}".encode()).hexdigest()
-    return STATE_DIR / f"{name}.json"
+    return watched_unit(slug, unit, staff.snapshot()).stretch_path
 
 
 def prompt_path(slug: str, unit: str) -> Path:
-    return stretch_path(slug, unit).with_suffix(".prompt.json")
+    return watched_unit(slug, unit, staff.snapshot()).prompt_path
 
 
 def prompt_key(slug: str, unit: str) -> str:
-    """The key of the unit's prompt alert, which `send.py retire` cancels it by."""
-    return f"stall-watch:prompt:{slug}:{unit}"
+    return watched_unit(slug, unit, staff.snapshot()).prompt_key
+
+
+def prompt_alert_seconds() -> float:
+    return tunables.read("production").number("PROMPT_ALERT_SECONDS")
 
 
 def watch_config(*, status_defaults: bool = False, packaged_only: bool = False) -> dict[str, str]:
@@ -728,19 +741,14 @@ def finish_cancellations(requests: list[PromptCancellation]) -> None:
             print(f"stall-watch: cancellation {cancellation.request}: {error}; retained for retry", file=sys.stderr)
 
 
-def retire_alert(slug: str, unit: str) -> Delivery:
-    """Cancel the repeats of the unit's prompt alert; once that succeeds, its prompt state is removed."""
-    return retire_key(prompt_path(slug, unit), prompt_key(slug, unit))
-
-
 def retire_key(path: Path, key: str) -> Delivery:
     command = push_texts.user_retire_argv(SENDER, key)
     return Delivery(path, "retire", [sys.executable, str(SEND), *command[2:]])
 
 
-def end_prompt(slug: str, unit: str) -> Delivery | None:
-    """The prompt is gone: retire its alert when one went out, else remove its state."""
-    path = prompt_path(slug, unit)
+def end_prompt(watch: WatchedUnit) -> Delivery | None:
+    """Retire the alert or remove the prompt state when the prompt ends."""
+    path = watch.prompt_path
     record = prompt_record(path)
     if isinstance(record, InvalidPrompt):
         return retire_key(path, record.key) if record.key else None
@@ -750,12 +758,12 @@ def end_prompt(slug: str, unit: str) -> Delivery | None:
         return None
     saved["retiring"] = True
     save_prompt(path, saved)
-    return retire_alert(slug, unit)
+    return retire_key(path, saved["key"])
 
 
-def forget(slug: str, unit: str) -> Delivery | None:
-    stretch_path(slug, unit).unlink(missing_ok=True)
-    return end_prompt(slug, unit)
+def forget(watch: WatchedUnit) -> Delivery | None:
+    watch.stretch_path.unlink(missing_ok=True)
+    return end_prompt(watch)
 
 
 def finite_timestamp(value: object) -> float:
@@ -1033,9 +1041,8 @@ def machine_name() -> str:
     return gethostname().split(".", 1)[0]
 
 
-def prompt_report(slug: str, unit: str, session_id: str, pending: PendingTool | None, since: float) -> rca.Report:
-    """The facts rca.py opens its case with: the pending Bash call's command, else the pending tool's name,
-    when the wait started, and the alert's sender and key."""
+def prompt_report(watch: WatchedUnit, session_id: str, pending: PendingTool | None, since: float) -> rca.Report:
+    """Record the prompt request, wait time, sender, and key for the RCA case."""
     command = pending.input.get("command") if pending is not None else None
     if pending is None:
         commands: tuple[str, ...] = ()
@@ -1045,28 +1052,27 @@ def prompt_report(slug: str, unit: str, session_id: str, pending: PendingTool | 
         transcript = sessions.latest_transcript(session_id, PROJECTS_DIR)
     except OSError:
         transcript = None
-    return rca.Report(unit, machine_name(), "prompt", commands, str(transcript or ""), slug,
+    return rca.Report(watch.name, machine_name(), "prompt", commands, str(transcript or ""), watch.slug,
                       stopped=datetime.fromtimestamp(since, ZoneInfo("UTC")).isoformat(), source=SENDER,
-                      key=prompt_key(slug, unit))
+                      key=watch.prompt_key)
 
 
-def prompt_alert(slug: str, unit: str, pane: str, since: float, zone: ZoneInfo,
+def prompt_alert(watch: WatchedUnit, pane: str, since: float, zone: ZoneInfo,
                  pending: PendingTool | None = None, report: rca.Report | None = None) -> Delivery:
-    rendered = push_texts.render(PROMPT_TEXT_ID, unit=unit.removesuffix("-unit"), machine=machine_name(),
+    rendered = push_texts.render(PROMPT_TEXT_ID, unit=watch.name.removesuffix("-unit"), machine=machine_name(),
                                  since=datetime.fromtimestamp(since, zone).strftime("%H:%M %Z"),
                                  request=prompt_request(pane, pending))
     # end_prompt() retires the alert when its prompt is gone.
-    command = push_texts.user_send_argv(rendered, sender=SENDER, key=prompt_key(slug, unit), self_clearing=True)
-    # The send script is the one this watcher is set to use, so a test's stands in for it.
-    return Delivery(prompt_path(slug, unit), "alert", [sys.executable, str(SEND), *command[2:]], report)
+    command = push_texts.user_send_argv(rendered, sender=SENDER, key=watch.prompt_key, self_clearing=True)
+    return Delivery(watch.prompt_path, "alert", [sys.executable, str(SEND), *command[2:]], report)
 
 
-def prompt_owner(slug: str, unit: str, socket: str, pane: str, prompt: PromptWait,
+def prompt_owner(watch: WatchedUnit, socket: str, pane: str, prompt: PromptWait,
                  pending: PendingTool | None) -> Delivery:
-    """Tell the owner what waits; this message grants no permission to answer another pane."""
-    text = f"{unit} on {machine_name()} waits at a permission prompt: {prompt_request(pane, pending)}."
-    key = f"{prompt_key(slug, unit)}:owner:{prompt['tool'] or prompt['since']}"
-    return delivery(prompt_path(slug, unit), "prompt-owner", socket, key, text)
+    """Tell the owner which prompt needs a response."""
+    text = f"{watch.name} on {machine_name()} waits at a permission prompt: {prompt_request(pane, pending)}."
+    key = f"{watch.prompt_key}:owner:{prompt['tool'] or prompt['since']}"
+    return delivery(watch.prompt_path, "prompt-owner", socket, key, text)
 
 
 def saved_stretch(path: Path) -> Stretch:
@@ -1211,6 +1217,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
     cancellations = cancellation_requests()
     pending.extend(cancellations.deliveries)
     settings = showrunners.load_settings()
+    alert_seconds = prompt_alert_seconds()
     try:
         grace = prompt_grace_seconds()
     except (OSError, ValueError) as error:
@@ -1231,7 +1238,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
     else:
         runners = showrunners.registered_showrunners(deadline=inspection_deadline, membership=record)
     work: list[PaneInspection] = []
-    members_by_parent: dict[staff.StaffId | None, tuple[str, ...]] = {}
+    members_by_parent: dict[staff.ReportsTo | staff.StaffRoot, tuple[str, ...]] = {}
     for configured in runners:
         # A showrunner that is not running has no one to tell: its units are not watched.
         showrunner_socket = configured["socket"]
@@ -1251,7 +1258,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 row = unit_lookup.unit_row(name, record, reference=reference)
                 if row.parent not in members_by_parent:
                     members_by_parent[row.parent] = tuple(alias
-                        for member in record.find(kind="unit", parent=row.parent)
+                        for member in (record.find(kind="unit", parent=row.parent.id) if isinstance(row.parent, staff.ReportsTo) else ())
                         if not isinstance(member.worktree, staff.RemovedWorktree)
                         for alias in (member.name, unit_names.unit_id(member.name)))
                 work.append(PaneInspection(slug, configured, zone, members_by_parent[row.parent], name, unit, row))
@@ -1265,7 +1272,8 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
         if isinstance(rows, ProcessSnapshotFailure):
             continue
         showrunner_socket = configured["socket"]
-        if any(item.state_path == prompt_path(slug, name) for item in pending):
+        watch = watched_unit(slug, name, record)
+        if any(item.state_path == watch.prompt_path for item in pending):
             continue
         if not pane_budget_left(name, inspection_deadline):
             continue
@@ -1277,7 +1285,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
         if not pane_budget_left(name, inspection_deadline):
             continue
         if isinstance(run, unit_lookup.NoUnfinishedRun):
-            if (retire := forget(slug, name)) is not None:
+            if (retire := forget(watch)) is not None:
                 pending.append(retire)
             continue
         claude = unit.claude
@@ -1285,12 +1293,12 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
             if isinstance(claude, unit_lookup.ClaudeUnknown):
                 print(f"stall-watch: {name}: {claude.reason}", file=sys.stderr)
             # A prompt is not on screen without its Claude.
-            elif (retire := end_prompt(slug, name)) is not None:
+            elif (retire := end_prompt(watch)) is not None:
                 pending.append(retire)
             continue
         observed_at = time.time()
-        path = stretch_path(slug, name)
-        if isinstance(prompt_record(prompt_path(slug, name)), InvalidPrompt):
+        path = watch.stretch_path
+        if isinstance(prompt_record(watch.prompt_path), InvalidPrompt):
             continue
         if not pane_budget_left(name, inspection_deadline):
             continue
@@ -1312,7 +1320,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 print(f"stall-watch: {name}: {error}", file=sys.stderr)
                 continue
             pid, session_id, socket = claude.pid, claude.session_id, claude.socket
-            waiting = prompt_path(slug, name)
+            waiting = watch.prompt_path
             # None: herdr cannot say, so the unit is watched as not blocked, and its prompt is not ended.
             blocked: bool | None
             if not pane_budget_left(name, inspection_deadline):
@@ -1334,22 +1342,22 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                                            bump_sent=False, tell_sent=False, reported_status=""))
                 # Claude Code denies a prompt with the auto-deny banner by itself: the user gets no alert.
                 if auto_denied(pane):
-                    if (retire := end_prompt(slug, name)) is not None:
+                    if (retire := end_prompt(watch)) is not None:
                         pending.append(retire)
                     continue
                 call = pending_tool(session_id)
-                prompt = read_prompt(waiting, now, session_id, prompt_key(slug, name), observed_at, call)
+                prompt = read_prompt(waiting, now, session_id, watch.prompt_key, observed_at, call)
                 save_prompt(waiting, prompt)
                 if prompt["retiring"]:
-                    pending.append(retire_alert(slug, name))
-                elif not prompt["retiring"] and now - prompt["since"] >= PROMPT_ALERT_SECONDS:
+                    pending.append(retire_key(waiting, prompt["key"]))
+                elif not prompt["retiring"] and now - prompt["since"] >= alert_seconds:
                     if "told" not in prompt:
-                        pending.append(prompt_owner(slug, name, showrunner_socket, pane, prompt, call))
-                    if not prompt["alerted"] and now - prompt["since"] >= PROMPT_ALERT_SECONDS + grace:
-                        pending.append(prompt_alert(slug, name, pane, prompt["since"], zone, call,
-                                                    prompt_report(slug, name, session_id, call, prompt["since"])))
+                        pending.append(prompt_owner(watch, showrunner_socket, pane, prompt, call))
+                    if not prompt["alerted"] and now - prompt["since"] >= alert_seconds + grace:
+                        pending.append(prompt_alert(watch, pane, prompt["since"], zone, call,
+                                                    prompt_report(watch, session_id, call, prompt["since"])))
                 continue
-            if blocked is not None and (retire := end_prompt(slug, name)) is not None:
+            if blocked is not None and (retire := end_prompt(watch)) is not None:
                 pending.append(retire)
             stretch = read_stretch(path, hashlib.sha256(pane.encode()).hexdigest(), now)
             turns = list(TURN_END.finditer(pane))
@@ -1388,7 +1396,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 report.decision = "running" if running_work else "fresh"
                 continue
             since_text = datetime.fromtimestamp(since, zone).strftime("%H:%M %Z")
-            key = f"stall-watch:{name}:{int(since)}"
+            key = f"stall-watch:{row.id}:{int(since)}"
             if not stretch["reported_status"]:
                 stretch["reported_status"] = last
                 save_stretch(path, stretch)
@@ -1406,6 +1414,55 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
     return max(runners.exit_code, int(snapshot_failed), sender.exit_code)
 
 
+def migrate_staff_ids() -> int:
+    """Move known files and replace alert keys without changing their elapsed time."""
+    record = staff.snapshot()
+    targets: dict[str, tuple[staff.StaffRow, str]] = {}
+    for row in record.find(kind="unit"):
+        parent = record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
+        if parent is None:
+            continue
+        targets[str(row.id)] = (row, parent.name)
+        for name in (row.name, unit_names.unit_id(row.name)):
+            digest = hashlib.sha256(f"{parent.name}\0{name}".encode()).hexdigest()
+            targets[digest] = (row, parent.name)
+    result = 0
+    for source in sorted(STATE_DIR.glob("*.json")):
+        if source.name.endswith(".case.json"):
+            continue
+        stem = source.name.removesuffix(".json").removesuffix(".prompt")
+        if stem not in targets:
+            print(f"stall-watch: unmatched file: {source}", file=sys.stderr)
+            result = 1
+            continue
+        row, slug = targets[stem]
+        suffix = ".prompt.json" if source.name.endswith(".prompt.json") else ".json"
+        target = STATE_DIR / f"{row.id}{suffix}"
+        if source != target:
+            if target.exists():
+                raise ValueError(f"{source}: destination exists: {target}")
+            _ = source.replace(target)
+        if suffix == ".json":
+            continue
+        prompt = saved_prompt(target)
+        if prompt is None:
+            raise ValueError(f"{target}: no prompt record")
+        key = f"stall-watch:prompt:{row.id}"
+        if prompt["key"] == key:
+            continue
+        if prompt["alerted"]:
+            retire = retire_key(target, prompt["key"])
+            _ = subprocess.run(retire.command, check=True, timeout=30)
+            if not prompt["retiring"]:
+                alert = prompt_alert(watched_unit(slug, unit_names.unit_id(row.name), record), "", prompt["since"], ZoneInfo("UTC"))
+                _ = subprocess.run(alert.command, check=True, timeout=30)
+        prompt["key"] = key
+        if "case_pending" in prompt:
+            prompt["case_pending"] = prompt["case_pending"]._replace(key=key)
+        save_prompt(target, prompt)
+    return result
+
+
 def main() -> int:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with (STATE_DIR / "lock").open("a+", encoding="utf-8") as lock:
@@ -1413,6 +1470,8 @@ def main() -> int:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 0
+        if sys.argv[1:] == ["migrate-staff-ids"]:
+            return migrate_staff_ids()
         began = time.monotonic()
         now = float(os.environ.get("STALL_WATCH_NOW_EPOCH") or time.time())
         exit_code = tick(now, deadline=began + 110)

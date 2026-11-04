@@ -45,8 +45,7 @@ State:
   `chore(<slug>): rename unit <old> to <new>` commit carries the merges under
   `<old>` before it over to `<new>`.
 - `NOTIFIER` — `zsh ~/.claude/scripts/message/notifier.sh`.
-- `UPDATES` — `showrunner-<slug>`, where `<slug>` is the production doc's file
-  name less `-production.md`.
+- `UPDATES` — `showrunner-<staff id>`, where `<staff id>` is the showrunner row id.
 - `PROMPT_FILE` — `~/.local/state/showrunner/<slug>/prompt.txt`.
 - `SHOWRUNNER_STATE` — `<STATE_DIR>/showrunner_state.json`, one JSON object with
   optional `units` rows (`{"unit": "<unit session name>", "phase": "<text>",
@@ -87,8 +86,8 @@ State:
   and the `next` list.
 - **Compaction.** Keep `next` in `SHOWRUNNER_STATE` current: each action you owe,
   with what sets it off ("merge alpha phase 2 when its gate is green"). Write no
-  handoff doc. Before a compaction, a PreCompact hook writes the `### STATE`
-  block from that file. After it, a SessionStart hook tells you to run
+  handoff doc. No hook writes at compaction: `/showrunner:produce PRODUCTION_DOC
+  resume` reads `next` from that file and prints it. After it, a SessionStart hook tells you to run
   `/showrunner:produce PRODUCTION_DOC resume` and act first on what was in
   flight and the `Next:` line. The production doc, `LOG` and `STATE_DIR` are
   the whole state.
@@ -542,7 +541,7 @@ whatever arrived:
 | an update tick (a message starting `Scheduled update`) | the schedule prompt only, plus any merge whose shots are viewed and any BLOCK past its limit |
 | the user's words for a unit director | relay them (<Throughout/>) |
 | a unit waiting on another unit | <Dependencies/> |
-| a unit blocked on the showrunner | <ClearGate/>, <LandingCall/>, or answer it |
+| a unit blocked on the showrunner | <LandingCall/> or answer it |
 | a unit director's design choice, Pending decision or add-ons | settle it and tell the unit (<Throughout/> → Designs and add-ons) |
 | a unit director's decision only the user can settle | file it for that unit with `/showrunner:question`, never in a reply; relay the answer that `answer` names (<Throughout/> → Open questions) |
 | the user asks for a status | `/showrunner:dailies`, `gantt` unless they name a length |
@@ -676,13 +675,12 @@ message.
 
 5. **Report where it landed.** Include every `into:` line from the script in
    the user update. Each names the checkout, why it received the merge and
-   what gate it unblocks. If the showrunner then merges the merge branch into
+   what work it enables. If the showrunner then merges the merge branch into
    a unit worktree, add an `into:` line for that worktree with the same why
    and unblocks fields. A failed promote still reports each place already
    reached. A rerun of the same hash resumes promotion.
 
-6. **After the push.** Run <ClearGate/> for a code checkpoint's first merge;
-   run <CrossUnitChange/> when public items were renamed or removed or files
+6. **After the push.** Run <CrossUnitChange/> when public items were renamed or removed or files
    restructured. Run `python3 ~/.claude/scripts/production/ci_points.py due
    --production PRODUCTION_DOC --state-dir DAILIES_STATE_DIR` after each code
    merge; when it says due, run <CIPoint/>. Run `python3
@@ -875,29 +873,15 @@ Log `- HH:MM <zone>: main promoted to <short sha> (<n> commits)`, or
 
 ---
 
-<ClearGate>
-When a merged checkpoint clears a gate, run `python3
-~/.claude/scripts/production/ci_points.py notice clear G<k> --production
-PRODUCTION_DOC` and SendMessage its `send <unit>:` line. The unit director
-checks the merge in git before continuing.
-
-When a gate's test under <Dependencies/> rule 1 passes without that checkpoint,
-run `python3 ~/.claude/scripts/production/ci_points.py notice lift G<k>
---production PRODUCTION_DOC --log <test log path>` and SendMessage its
-`send <unit>:` line.
-</ClearGate>
-
----
-
 <Dependencies>
-Apply the user's rules (2026-09-29). A unit waits on another unit only for code
-it needs. Every other wait is yours to clear, and fast.
+A unit waits on another unit only for code it needs.
+Record a start-order wait as an owed action in your notes.
+Use `cargo-berth sequence` for merge order.
 
 1. **Only missing code blocks a unit.** When a unit director reports a wait on
    another unit, name in that turn what it needs:
    - **Code:** a function, fix or behavior that exists only in the other unit's
-     unmerged work. Only this is a block. A gate is a code block the producer
-     planned.
+     unmerged work. Only this is a block.
    - **Files:** cargo-berth reservations or shared files, with no code needed.
      Rule 3 clears it.
    - **Preference:** "to avoid conflicts", "to build on their version". Never a
@@ -907,8 +891,7 @@ it needs. Every other wait is yours to clear, and fast.
    <waiting unit> --tests "<command>" --production PRODUCTION_DOC
    --state-dir DAILIES_STATE_DIR`. It tests a detached scratch checkout with
    `MERGE_BRANCH`, without the other unit's unmerged work. Green means it is
-   not blocked: tell it to continue, or lift the gate (<ClearGate/>) using the
-   printed log path. A red test needs your classification; a merge conflict
+   not blocked: tell it to continue with the printed log path. A red test needs your classification; a merge conflict
    is not a red test.
 2. **The unit waited on lands what is needed now.** Send its unit director:
 

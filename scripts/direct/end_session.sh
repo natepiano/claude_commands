@@ -88,7 +88,7 @@ if (( ${#RUNS[@]} > 0 )); then
   done
   "$PY" "${SCRIPT_DIR}/remove_workers.py" "${REMOVE_ARGS[@]}" || true
   for run in "${RUNS[@]}"; do
-    if [[ -f "${run}/mesh_roster.json" || -f "${run}/mesh_server.json" || -f "${run}/mesh_retired.json" ]]; then
+    if [[ -f "${run}/mesh_roster.json" || -f "${run}/mesh_server.json" ]]; then
       "$PY" "${MESH}" stop --pause --session-dir "${run}" || true
     fi
   done

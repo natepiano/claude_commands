@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.production import staff, unit_lookup  # noqa: E402
+from scripts.production import showrunners, staff, unit_lookup  # noqa: E402
 from scripts.copies import copies  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.production.production_doc import WRAPPED  # noqa: E402
@@ -96,11 +96,20 @@ def wrapped_slug(doc: Path) -> str:
     slug = doc.name.removesuffix("-production.md")
     if slug == doc.name:
         raise TidyRefused(f"{doc}: production doc name must end in -production.md")
+    _ = outstanding_path(slug)
     lines = doc.read_text(encoding="utf-8").splitlines()
     status = next((line for line in lines if line.startswith("> **Status:")), "")
     if not status.startswith(WRAPPED):
         raise TidyRefused(f"{doc}: not wrapped")
-    if (NOTIFIER_STATE_DIR / f"showrunner-{slug}").exists():
+    record = staff.snapshot()
+    timers = [f"showrunner-{slug}"]
+    try:
+        owner = showrunners.owner_for(slug, record)
+    except ValueError:
+        pass
+    else:
+        timers.append(f"showrunner-{owner.id}")
+    if any((NOTIFIER_STATE_DIR / name).exists() for name in timers):
         raise TidyRefused(f"{doc}: {slug} still has an update timer")
     return slug
 

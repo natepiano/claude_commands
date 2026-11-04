@@ -1,7 +1,6 @@
 """Use private staff records and Git repositories for unit rename tests."""
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
@@ -96,12 +95,13 @@ class UnitRenameFixture(StaffTestCase):
             **config_environment(self.root),
             "UNIT_WORKERS_STATE": str(self.root / "state/unit-workers"),
             "RETIRE_UNIT_RUN_ROOT": str(self.root / "runs"),
+            "UNIT_RUN_ROOT": str(self.root / "sessions"),
             "HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(config),
+            "CODEX_HOME": str(self.root / "codex-home"),
             "XDG_CONFIG_HOME": str(self.home / ".config"), "XDG_STATE_HOME": str(self.root / "state"),
             "NOTIFIER_STATE_DIR": str(self.root / "state/notifier"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "state/sessions"),
             "SHOWRUNNER_STATE_DIR": str(self.state),
-            "STALL_WATCH_STATE_DIR": str(self.root / "state/stall-watch"),
             # No waits by default: a test that needs one sets it.
             "RENAME_UNIT_STOP_WAIT": "0", "RENAME_UNIT_LIVE_WAIT": "0",
             "DESIGN_ROLES_STATE": str(self.root / "state/astra/design-roles"),
@@ -168,7 +168,6 @@ class UnitRenameFixture(StaffTestCase):
 
     def seed_state(self) -> None:
         old = self.rust / "claude-demo-alpha"
-        self.write(self.stall_path("alpha-unit"), '{"stretch": 17}\n')
         run = self.root / "history/runs/run-1.jsonl"
         self.write(run, "\n".join(json.dumps(event) for event in (
             {"event_type": "run_started", "run_started_at": 1, "working_dir": str(old),
@@ -176,7 +175,7 @@ class UnitRenameFixture(StaffTestCase):
             {"event_type": "phase_started", "phase_instance_id": "p1", "phase_id": "1"},
             {"event_type": "phase_finished", "phase_instance_id": "p1", "phase_id": "1"})) + "\n")
         self.write(self.root / "sessions/s1/progress_history_state.json", json.dumps({
-            "history_file": str(run), "working_dir": str(old), "worktree": old.name, "branch": "demo-alpha",
+            "history_file": str(run), "production": SLUG, "unit": "alpha-unit", "worktree": old.name, "branch": "demo-alpha",
             "plan_doc": f"{old}/docs/plans/alpha.md"}))
         for name, plan in (("mine", "docs/plans/alpha.md"), ("other-production", "docs/plans/elsewhere.md")):
             self.write(self.root / f"issues/{name}.md", "\n".join([
@@ -197,9 +196,6 @@ class UnitRenameFixture(StaffTestCase):
         self.assertEqual(result.returncode, 0, (arguments, result.stdout, result.stderr))
         return result.stdout.strip()
 
-    def stall_path(self, unit: str) -> Path:
-        digest = hashlib.sha256(f"{SLUG}\0{unit}".encode()).hexdigest()
-        return self.root / "state/stall-watch" / f"{digest}.json"
 
     def rename(self, action: str, old: str = "alpha", new: str = "gamma", *,
                refuse: str = "") -> subprocess.CompletedProcess[str]:

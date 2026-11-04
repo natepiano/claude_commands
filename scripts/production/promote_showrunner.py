@@ -28,7 +28,7 @@ from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import completion_receipt, staff, staff_sources, session_staff, unit_config
+from scripts.production import completion_receipt, staff, staff_sources, unit_config
 from scripts.shutdown import remote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
@@ -106,7 +106,7 @@ def _committed(doc: Path) -> None:
 
 
 def checked(name: str, child_doc: Path, *,
-            record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> Promotion:
+            record: staff.StaffSnapshot | None = None) -> Promotion:
     """Everything the promotion needs. Raises Refusal naming what is in the way."""
     parent_doc = showrunners.production_of(staff.runtime_id())
     if parent_doc is None:
@@ -114,7 +114,7 @@ def checked(name: str, child_doc: Path, *,
     parent = read_production(parent_doc)
     unit = name if name.replace("_", "-").endswith("-unit") else f"{name}-unit"
     pending = promotion_record(parent, unit)
-    record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+    record = staff.snapshot() if record is None else record
     if pending.exists():
         fields = cast(dict[str, str], json.loads(pending.read_text(encoding="utf-8")))
         if Path(fields["child_doc"]).resolve() != child_doc.expanduser().resolve():
@@ -311,6 +311,8 @@ def _main(argv: list[str]) -> int:
     was_pending = pending.exists()
     if not was_pending:
         save_promotion(promotion, target_directory)
+        import showrunner_parent
+        showrunner_parent.save_notice(slug, showrunner_parent.PendingParentNotice("attach", promotion.parent.slug))
     try:
         current = unit_lookup.marked_unit(promotion.parent.slug, unit) if was_pending else promotion.marked
         if current is not None and isinstance(current.claude, unit_lookup.ClaudeUnknown):
@@ -336,7 +338,8 @@ def _main(argv: list[str]) -> int:
     document = staff.LiveDoc(remote.local_machine(), promotion.child.doc.resolve())
     retained = record.by_current_session(native)
     if (retained is not None and retained.kind == "showrunner"
-            and (retained.name, retained.parent, retained.doc) == (name, parent_row.id, document)):
+            and (retained.name, retained.parent, retained.doc) == (name, staff.ReportsTo(parent_row.id), document)):
+        print("unchanged", file=sys.stderr)
         new_member = staff_sources.MemberFound(retained)
     else:
         new_member = staff_sources.MemberFound(staff.promote_unit(

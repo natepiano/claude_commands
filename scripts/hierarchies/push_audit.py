@@ -327,11 +327,11 @@ def read_owners(problems: list[log_records.SourceProblem]) -> ProductionOwnershi
         resolver = session_staff.RowResolver(record)
         for row in staff.active(record, "showrunner"):
             timer = showrunners.timer_for(row, record)
-            slug = timer.slug if isinstance(timer, showrunners.Timer) else row.name
+            slug = timer.slug if isinstance(timer, showrunners.TimerRegistration) else row.name
             exact_names[row.name].add(slug)
             exact_names[slug].add(slug)
             for unit in staff.active(record, "unit"):
-                if unit.parent != row.id:
+                if unit.parent != staff.ReportsTo(row.id):
                     continue
                 state = resolver.unit_state(unit)
                 if not isinstance(state, session_staff.ActiveUnit):

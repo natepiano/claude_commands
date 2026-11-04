@@ -19,8 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import issues
 import proposals_folder
 import proposals_table
-from scripts.production import session_staff, showrunners, staff
-from scripts.production.staff_test_support import StaffTestCase, production_membership, recorded_showrunner
+from scripts.production import showrunners, staff
+from scripts.production.staff_test_support import StaffTestCase, production_membership, recorded_showrunner, fixture_member
 import showrunner_tree
 from proposals_table import ADD_ON_STATE, IN_PROGRESS_STATE, REVIEW_STATE, Row
 from scripts.lib import conf
@@ -44,7 +44,7 @@ class ProposalsTableTests(StaffTestCase):
     def runs_of(self, runs: dict[Path, list[Path]]) -> Generator[None]:
         """Give each plan path the run files named for it, and every other path none."""
         def plan_runs(plan: Path, *,
-                      record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> list[Path]:
+                      record: staff.StaffSnapshot | None = None) -> list[Path]:
             del record
             return runs.get(plan, [])
         with mock.patch.object(plan_history, "plan_runs", side_effect=plan_runs):
@@ -54,6 +54,8 @@ class ProposalsTableTests(StaffTestCase):
         path = self.root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(text, encoding="utf-8")
+        if path.name.endswith("-production.md"):
+            _ = recorded_showrunner(path.name.removesuffix("-production.md"), path)
         return path
 
     def test_the_backlog_gives_its_proposed_and_deferred_lines_only(self) -> None:
@@ -81,6 +83,21 @@ class ProposalsTableTests(StaffTestCase):
 
     def issue(self, name: str, *fields: str, folder: str = "issues") -> Path:
         """An issue file whose frontmatter holds the given lines, with a body below it."""
+        converted: list[str] = []
+        for field in fields:
+            key, _, value = field.partition(":")
+            value = value.strip().strip("\"'[]")
+            if key in ("unit", "proposed_by") and value:
+                production = value.split("(")[-1].rstrip(")") if "(" in value else "fixture"
+                value = value.split(" (")[0]
+                kind = "unit" if value.endswith("-unit") else "showrunner"
+                parent = fixture_member("showrunner", name=production).id if kind == "unit" else None
+                matches = [row for row in staff.snapshot().rows
+                           if row.kind == kind and row.name in (value, value.removesuffix("-unit"))]
+                member = matches[0] if matches else fixture_member(kind, name=value, parent=parent)
+                field = f"{key}: {member.id}"
+            converted.append(field)
+        fields = tuple(converted)
         return self.write(f"{folder}/{name}.md", "\n".join(["---", *fields, "---", "Body text.", ""]))
 
     def test_the_table_lists_waiting_proposals_before_in_progress_ones(self) -> None:
@@ -118,8 +135,9 @@ class ProposalsTableTests(StaffTestCase):
                          ["unscored", "blocking", "high score", "low score"])
         self.assertEqual(proposals_table.issue_rows(found)[1].state, f"{REVIEW_STATE} · blocks")
         doc = self.write("trunk/docs/plans/demo-production.md", f"- **Proposals:** `{self.root / 'issues'}`\n")
+        _ = recorded_showrunner("demo", doc)
         with mock.patch.dict(os.environ, {"NEXT_STATE_DIR": str(self.root / "next")}), \
-                mock.patch.object(proposals_table, "owners", return_value=frozenset({"organon-unit"})):
+                mock.patch.object(proposals_table, "owners", return_value=frozenset({next(row.id for row in staff.snapshot().rows if row.name == "organon-unit")})):
             self.assertEqual(self.run_main(["--production", str(doc), "--next"])[1].splitlines()[0], "unscored")
             _ = self.issue("now important", "date_created: 2026-10-05", *common, 'review_urgency: "user"')
             # The shown proposal stays until the user answers it.
@@ -131,12 +149,12 @@ class ProposalsTableTests(StaffTestCase):
     def test_a_production_reads_its_own_folder_and_queue_and_with_below_each_lower_one_never_above(self) -> None:
         docs: dict[str, Path] = {}
         for slug in ("top", "kid", "grand"):
-            _ = self.issue(f"{slug} idea", "date_created: 2026-10-01", "status: open", "tags: [issue, proposal]",
-                           f"proposed_by: {slug}", folder=f"{slug}-issues")
             _ = self.write(f"{slug}-backlog/ledger.md", f"- 2026-10-02 {slug} line — proposed\n")
             docs[slug] = self.write(f"trunk/docs/plans/{slug}-production.md",
                                     f"- **Proposals:** `{self.root / f'{slug}-issues'}`\n"
                                     + f"- **Improvement queue:** {self.root / f'{slug}-backlog' / 'ledger.md'}\n")
+            _ = self.issue(f"{slug} idea", "date_created: 2026-10-01", "status: open", "tags: [issue, proposal]",
+                           f"proposed_by: {slug}", folder=f"{slug}-issues")
         below = {"top": ["top", "kid", "grand"], "kid": ["kid", "grand"], "grand": ["grand"]}
 
         def owner_docs(doc: Path) -> list[Path]:
@@ -300,6 +318,7 @@ class ProposalsTableTests(StaffTestCase):
 
     def test_main_says_so_when_nothing_is_open(self) -> None:
         doc = self.write("trunk/docs/plans/footers-production.md", "# Production\n")
+        _ = recorded_showrunner("footers", doc)
         with mock.patch.object(phase_table, "show_production", return_value="{}"):
             self.assertEqual(self.run_main(["--production", str(doc)]), (0, "no open proposals\n", ""))
 

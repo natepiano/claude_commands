@@ -302,7 +302,7 @@ class QuestionStaff:
             return parent
         row = self.record.by_member_reference(unit)
         if row is not None:
-            if row.kind != "unit" or row.parent != parent.id:
+            if row.kind != "unit" or row.parent != staff.ReportsTo(parent.id):
                 raise RegistrationFailure("ask", f"{unit} is not a unit of {production.slug}")
             return row
         selector = session_staff.UnitMember(production.slug, unit)
@@ -380,7 +380,7 @@ def relay_line(production: Production, slug: str, asker: QuestionAsker,
                 return "relay: none; this showrunner asked it"
             loaded = names.runtime_names()
             label = loaded.job("showrunner") if isinstance(loaded, names.Names) else "requesting role (display name unavailable)"
-        elif row.parent == current_owner.id:
+        elif row.parent == staff.ReportsTo(current_owner.id):
             current_slug = production.slug
         if current_slug != production.slug:
             return f"relay: to the showrunner of {current_slug}, for {label} (staff {row.id})"
@@ -615,15 +615,16 @@ def register(production: Production) -> None:
     dirty = command("register", ["git", "status", "--porcelain", "--", str(relative)], cwd=production.checkout)
     if dirty:
         raise RegistrationFailure("register", "the production doc has uncommitted edits; commit or discard them first")
-    # Nothing registers the showrunner by name: its update timer, made below, is its one record.
+    # The staff row owns the timer.
+    owner = QuestionStaff.read().owner(production.doc)
     state_root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
     prompt_file = state_root / production.slug / "prompt.txt"
-    updates = f"showrunner-{production.slug}"
+    updates = f"showrunner-{owner.id}"
     prompt_file.parent.mkdir(parents=True, exist_ok=True)
     if not prompt_file.exists() or prompt_file.read_text(encoding="utf-8") != prompt:
         _ = prompt_file.write_text(prompt, encoding="utf-8")
-    check = f"zsh {Path.home()}/.claude/scripts/production/production_check.sh {production.doc}"
-    _ = notifier(["new", updates, "--to", f"session:{session_id}", "--every", str(minutes),
+    check = f"zsh {Path.home()}/.claude/scripts/production/production_check.sh {owner.id}"
+    _ = notifier(["new", updates, "--to", f"session:{owner.id}", "--every", str(minutes),
               "--prompt-file", str(prompt_file), "--from", f"showrunner-timer-{production.slug}",
               "--check", check, *(["--aligned"] if aligned else [])])
     if isinstance(schedule, UpdatesOnDemand):
@@ -1095,9 +1096,10 @@ class OpenLists(NamedTuple):
     unreadable: list[str]
 
 
-def question_queue(production: Production, below: bool = False) -> str:
+def question_queue(production: Production, below: bool = False, *, identities: QuestionStaff | None = None) -> str:
     """The name urgency.py pins the question /next showed under."""
-    return urgency.scope_queue(f"question-{production.slug}", below)
+    identities = identities if identities is not None else QuestionStaff.read()
+    return urgency.scope_queue(f"question-{identities.owner(production.doc).id}", below)
 
 
 def item_key(slug: str, text: str) -> str:
@@ -1111,7 +1113,12 @@ def open_lists(production: Production, below: bool = False, *, identities: Quest
     due: list[urgency.Entry[OpenItem]] = []
     deferred: list[OpenItem] = []
     unreadable: list[str] = []
+    documents = identities.documents()
     for slug in identities.slugs(production.slug, below):
+        if slug not in documents:
+            print(f"questions: {slug}: ownership evidence is unavailable", file=sys.stderr)
+            unreadable.append(slug)
+            continue
         try:
             items = read_open_items(outstanding_file(slug),
                                     production=production if slug == production.slug else None, identities=identities)
@@ -1127,10 +1134,11 @@ def open_lists(production: Production, below: bool = False, *, identities: Quest
             if isinstance(item.timing, DeferredUntil) and item.timing.at > now:
                 deferred.append(opened)
             else:
-                due.append(urgency.Entry(item_key(slug, item.text), opened, item.rank.urgency,
-                                         item.since, after=item_key(slug, item.rank.follows) if item.rank.follows else ""))
+                owner = identities.owner(documents[slug]).id
+                due.append(urgency.Entry(item_key(owner, item.text), opened, item.rank.urgency,
+                                         item.since, after=item_key(owner, item.rank.follows) if item.rank.follows else ""))
     deferred.sort(key=lambda found: (cast(DeferredUntil, found.item.timing).at, found.slug))
-    return OpenLists(urgency.queue_order(due, question_queue(production, below)), deferred, unreadable)
+    return OpenLists(urgency.queue_order(due, question_queue(production, below, identities=identities)), deferred, unreadable)
 
 
 def open_items(production: Production) -> None:

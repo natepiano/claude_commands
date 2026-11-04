@@ -64,11 +64,13 @@ from typing import Literal, NotRequired, TypedDict, cast
 from uuid import NAMESPACE_URL, uuid5
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.agents import codex_mesh
+from scripts.agents import codex_mesh, worker_lifecycle
 from scripts.buildlog import treekey
 from scripts.lib import conf, unit_runs
+from scripts.lib.process_failure import failure_detail
 from scripts.message import repeat_guard
 from scripts.message import send_budget
+from scripts.production import staff, session_staff
 
 # Exit status of `start` when the caller is not a mesh worker: run the command attached.
 NOT_A_MESH_WORKER = 3
@@ -76,10 +78,6 @@ NOT_A_MESH_WORKER = 3
 LIVE_RUN_LIMIT_REACHED = 4
 # Lines of the log the result message carries.
 RESULT_TAIL_LINES = 20
-# Characters the result message keeps of one log line, and of the whole tail: the message
-# is a Codex turn input, which Codex refuses over 1,048,576 characters.
-RESULT_LINE_CHARS = 2_000
-RESULT_TAIL_CHARS = 20_000
 # verify.sh's VERIFY_SUPERSEDED_STATUS: a newer call of the same verb from the same worker in the
 # same worktree replaced this one while it waited for the cargo token. It ran nothing, so it is
 # neither a pass nor a failure, and the newer call's result answers instead.
@@ -109,10 +107,9 @@ class RunRecord(TypedDict):
     status: Literal["running", "finished"]
     session_dir: str
     worker: str
-    thread_id: str
+    staff_id: str
     label: str
     command: list[str]
-    cwd: str
     log: str
     started_at: float
     pid: int
@@ -161,23 +158,40 @@ def caller_from_environment(environment: dict[str, str]) -> Caller:
     thread_id = environment.get("CODEX_THREAD_ID", "")
     if not thread_id:
         return NotMeshWorker()
+    membership = staff.local_snapshot()
+    member = membership.by_current_session(thread_id)
+    if member is None or member.kind != "worker":
+        return NotMeshWorker()
     found: list[tuple[bool, MeshCaller]] = []
     for folder in _roster_folders():
-        roster = codex_mesh._read_json_object(folder / codex_mesh.ROSTER_FILE)  # pyright: ignore[reportPrivateUsage]
+        roster = session_staff.read_worker_roster(folder / codex_mesh.ROSTER_FILE)
         for name, value in roster.items():
             entry = codex_mesh._as_dict(value)  # pyright: ignore[reportPrivateUsage]
-            if (entry.get("thread_id") != thread_id or entry.get("status") in ("ended", "adopted")
-                    or entry.get("adopted_to") or entry.get("transferring_role") or entry.get("role_redirect")):
+            reference = entry.get("staff_id")
+            if (reference != member.id or entry.get("status") == "ended"):
                 continue
             launcher = codex_mesh._pid_alive(codex_mesh._as_int(entry.get("launcher_pid")))  # pyright: ignore[reportPrivateUsage]
             caller = MeshCaller(str(folder), name, thread_id)
-            if entry.get("unit_ledger") or entry.get("unit_worker_ledger"):
-                return caller
             found.append((launcher, caller))
     if not found:
         return NotMeshWorker()
     found.sort(key=lambda item: not item[0])
     return found[0][1]
+
+
+def _worker_reference(session_dir: str, name: str) -> str:
+    roster = worker_lifecycle.read_worker_state(Path(session_dir) / codex_mesh.ROSTER_FILE)
+    entry = codex_mesh._as_dict(roster.get(name))  # pyright: ignore[reportPrivateUsage]
+    return str(entry["staff_id"])
+
+
+def _run_worker(record: RunRecord, membership: staff.StaffSnapshot) -> staff.StaffRow | None:
+    reference = record.get("staff_id", "")
+    member = membership.by_id(staff.StaffId(reference))
+    if member is None or member.kind != "worker":
+        print(f"anomaly: {record['worker']}: detached run has no worker staff row", file=sys.stderr)
+        return None
+    return member
 
 
 def _runs_dir(session_dir: str) -> Path:
@@ -202,7 +216,7 @@ def seat_name(session_dir: str, name: str) -> str:
     part of its roster name: on 2026-10-20 tool-based-ui-trunk-box started five runs with `--to box`,
     no roster entry matched at delivery, and each result was lost. A name the roster does not hold,
     such as a reviewer that registers after its run starts, stays as given."""
-    roster = codex_mesh._read_json_object(Path(session_dir) / codex_mesh.ROSTER_FILE)  # pyright: ignore[reportPrivateUsage]
+    roster = worker_lifecycle.read_worker_state(Path(session_dir) / codex_mesh.ROSTER_FILE)
     if name in roster:
         return name
     matches = [seat for seat in roster if seat.endswith(f"-{name}")]
@@ -278,7 +292,7 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> list[str]:
             if record["status"] != "running":
                 continue
             newer = any(other.get("worker") == record["worker"] and other.get("command") == record["command"]
-                        and other.get("cwd") == record["cwd"]
+                        and other.get("staff_id") == record["staff_id"]
                         and codex_mesh._as_float(other.get("started_at"), 0.0) > record["started_at"]  # pyright: ignore[reportPrivateUsage]
                         for _, other in records)
             delivery = ("nothing delivered: the supervisor is gone and a newer run of the same command answers"
@@ -295,7 +309,7 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> list[str]:
     return reaped
 
 
-def live_twin(runs: Path, worker: str, command: list[str], cwd: str, tree_key: str) -> RunRecord | None:
+def live_twin(runs: Path, worker: str, command: list[str], tree_key: str) -> RunRecord | None:
     """A running record of the same worker, command, folder and tree key whose supervisor lives.
     After an interrupt on 2026-10-21, hana_catalyst-inspectors started its lint run three times
     on one tree; each run took memory, the cargo token and build time."""
@@ -304,7 +318,7 @@ def live_twin(runs: Path, worker: str, command: list[str], cwd: str, tree_key: s
     for path in sorted(runs.glob("*.json")):
         raw = codex_mesh._read_json_object(path)  # pyright: ignore[reportPrivateUsage]
         if (raw.get("status") == "running" and raw.get("worker") == worker and raw.get("command") == command
-                and raw.get("cwd") == cwd and raw.get("tree_key") == tree_key
+                and raw.get("tree_key") == tree_key
                 and supervises(codex_mesh._as_int(raw.get("pid")), path)):  # pyright: ignore[reportPrivateUsage]
             return cast(RunRecord, cast(object, raw))
     return None
@@ -330,7 +344,6 @@ def command_start(args: argparse.Namespace) -> int:
         return 2
     session_dir = str(getattr(args, "session_dir", "") or "")
     name = str(getattr(args, "to", "") or "")
-    thread_id = ""
     if bool(session_dir) != bool(name):
         print("mesh_runs: --session-dir and --to go together", file=sys.stderr)
         return 2
@@ -338,7 +351,7 @@ def command_start(args: argparse.Namespace) -> int:
         caller = caller_from_environment(dict(os.environ))
         if isinstance(caller, NotMeshWorker):
             return NOT_A_MESH_WORKER
-        session_dir, name, thread_id = caller.session_dir, caller.name, caller.thread_id
+        session_dir, name = caller.session_dir, caller.name
     else:
         name = seat_name(session_dir, name)
     label = str(getattr(args, "label", "") or "") or " ".join(command)
@@ -351,7 +364,7 @@ def command_start(args: argparse.Namespace) -> int:
     with (runs / ".start.lock").open("a") as admission:
         fcntl.flock(admission, fcntl.LOCK_EX)
         _ = _reap_orphans_locked(runs)
-        if twin := live_twin(runs, name, command, cwd, tree_key):
+        if twin := live_twin(runs, name, command, tree_key):
             started = time.strftime("%H:%M:%S", time.localtime(twin["started_at"]))
             print(f"run {twin['run_id']} is already running for {name} on these files (started {started}, "
                   + f"log {twin['log']}); started nothing; its result arrives as your next message")
@@ -374,7 +387,7 @@ def command_start(args: argparse.Namespace) -> int:
         log_path = runs / f"{run_id}.log"
         record: RunRecord = {
             "run_id": run_id, "status": "running", "session_dir": session_dir, "worker": name,
-            "thread_id": thread_id, "label": label, "command": command, "cwd": cwd,
+            "staff_id": _worker_reference(session_dir, name), "label": label, "command": command,
             "log": str(log_path), "started_at": time.time(), "pid": 0,
             "director_dir": director_dir, "done_message_file": done_file, "tree_key": tree_key,
         }
@@ -397,22 +410,30 @@ def _exit_status(returncode: int) -> int:
 
 
 def _cut_line(line: str) -> str:
-    if len(line) <= RESULT_LINE_CHARS:
+    limit = conf.read("mesh_runs").whole("RESULT_LINE_CHARS")
+    if len(line) <= limit:
         return line
-    return f"{line[:RESULT_LINE_CHARS]} [cut: {len(line) - RESULT_LINE_CHARS} more characters]"
+    return f"{line[:limit]} [cut: {len(line) - limit} more characters]"
 
 
-def _tail(path: Path, count: int) -> list[str]:
-    """The log's last `count` lines, each cut to RESULT_LINE_CHARS, newest first kept within RESULT_TAIL_CHARS."""
+def _tail(path: Path, count: int, budget: int) -> list[str]:
+    """Keep the latest lines within the message budget. Collapse repeated memory waits."""
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return []
+    collapsed: list[str] = []
+    for line in lines:
+        if (collapsed and line.startswith("still waiting for memory")
+                and collapsed[-1].startswith("still waiting for memory")):
+            collapsed[-1] = line
+        else:
+            collapsed.append(line)
     kept: list[str] = []
     total = 0
-    for line in map(_cut_line, reversed(lines[-count:])):
+    for line in map(_cut_line, reversed(collapsed[-count:])):
         total += len(line) + 1
-        if total > RESULT_TAIL_CHARS:
+        if total > budget:
             break
         kept.append(line)
     return kept[::-1]
@@ -428,25 +449,38 @@ def result_text(record: RunRecord, exit_code: int | None) -> str:
                else SUPERSEDED_VERDICT if exit_code == SUPERSEDED_STATUS
                else TREE_CHANGED_VERDICT if exit_code == TREE_CHANGED_STATUS else f"FAIL (exit {exit_code})")
     heading = "Run ended with no result" if exit_code is None else "Run finished"
-    lines = [f"{heading}: {record['label']}", f"Result: {verdict}", f"Log: {record['log']}"]
-    tail = _tail(Path(record["log"]), RESULT_TAIL_LINES)
+    lines = [f"{heading}: ", f"Result: {verdict}", f"Log: {record['log']}"]
+    cancellation = ""
     if exit_code == TREE_CHANGED_STATUS:
-        # Keep verify's resubmit instruction verbatim even if cleanup pushed it
-        # out of the bounded tail. Delivery queues this same text for the worker.
+        # Keep the cancellation instruction when cleanup moves it outside the tail.
         try:
             with Path(record["log"]).open(encoding="utf-8", errors="replace") as log:
                 cancellation = next((line.rstrip("\n") for line in log
                                      if line.startswith("verify.sh: cancelled — ")), "")
         except OSError:
             cancellation = ""
-        if cancellation and cancellation not in tail:
+        if cancellation:
             lines.extend(["", cancellation])
-    if tail:
-        lines.extend(["", f"Last {len(tail)} log lines (lines over {RESULT_LINE_CHARS} characters are cut):", *tail])
-    return "\n".join(lines)
+    header = "\n".join(lines)
+    limits = conf.read("mesh_runs")
+    tail_heading = f"\n\nLast log lines (lines over {limits.whole('RESULT_LINE_CHARS')} characters are cut):\n"
+    tail = _tail(Path(record["log"]), RESULT_TAIL_LINES,
+                 limits.whole("RESULT_TEXT_CHARS") - len(header) - len(tail_heading))
+    if cancellation:
+        tail = [line for line in tail if line != _cut_line(cancellation)]
+    body = tail_heading + "\n".join(tail) if tail else ""
+    label_budget = max(0, limits.whole("RESULT_TEXT_CHARS") - len(header) - len(body))
+    lines[0] += record["label"][:label_budget]
+    header = "\n".join(lines)
+    return header + body
 
 
-def send_to_director(session_id: str, summary: str, text: str) -> bool:
+@dataclass(frozen=True)
+class DirectorNoticeQueued:
+    reason: str
+
+
+def send_to_director(session_id: str, summary: str, text: str) -> Literal["sent", "failed"] | DirectorNoticeQueued:
     """One send.py call to a Claude session; tests replace this."""
     try:
         sent = subprocess.run(
@@ -456,21 +490,24 @@ def send_to_director(session_id: str, summary: str, text: str) -> bool:
         )
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"mesh_runs: could not tell session {session_id}: {exc}", file=sys.stderr)
-        return False
+        return "failed"
+    detail = failure_detail(sent)
+    if sent.returncode == 1:
+        return DirectorNoticeQueued(detail.removeprefix("stdout: QUEUED:").strip())
     if sent.returncode:
-        print(f"mesh_runs: could not tell session {session_id}: {sent.stderr.strip()}", file=sys.stderr)
-        return False
-    return True
+        print(f"mesh_runs: could not tell session {session_id}: {detail}", file=sys.stderr)
+        return "failed"
+    return "sent"
 
 
 def _director_sessions(record: RunRecord) -> list[str]:
-    """The sessions whose run marker names the run folder, then the director the folder records.
-    A director that runs two folders has one marker, naming the other folder, so only the
-    recorded director finds it (trunk's phase 140 folder, 2026-10-20)."""
-    folder = Path(record["director_dir"])
-    marked = codex_mesh._marker_sessions(RUN_ROOTS, folder)  # pyright: ignore[reportPrivateUsage]
-    recorded = unit_runs.director(folder)
-    return [*marked, recorded] if recorded and recorded not in marked else marked
+    """Resolve the worker's current director from the staff record."""
+    membership = staff.local_snapshot()
+    member = _run_worker(record, membership)
+    if member is None or not isinstance(member.parent, staff.ReportsTo):
+        return []
+    parent = membership.by_id(member.parent.id)
+    return [parent.current_session] if parent is not None else []
 
 
 def deliver(record: RunRecord, exit_code: int | None) -> str:
@@ -489,21 +526,17 @@ def deliver(record: RunRecord, exit_code: int | None) -> str:
     else:
         text = result_text(record, exit_code)
     session_dir, name = record["session_dir"], record["worker"]
-    roster = codex_mesh._read_json_object(Path(session_dir) / codex_mesh.ROSTER_FILE)  # pyright: ignore[reportPrivateUsage]
+    membership = staff.local_snapshot()
+    member = _run_worker(record, membership)
+    if member is None:
+        return "finished: worker retired"
+    thread_id = member.current_session
+    roster = worker_lifecycle.read_worker_state(Path(session_dir) / codex_mesh.ROSTER_FILE)
     entry = codex_mesh._as_dict(roster.get(name))  # pyright: ignore[reportPrivateUsage]
     from scripts.astra import design_roles
-    destination = design_roles.transfer_route(record["thread_id"])
-    if destination:
-        destination_roster = codex_mesh._read_json_object(Path(destination) / codex_mesh.ROSTER_FILE)  # pyright: ignore[reportPrivateUsage]
-        for candidate_name, value in destination_roster.items():
-            candidate = codex_mesh._as_dict(value)  # pyright: ignore[reportPrivateUsage]
-            if candidate.get("thread_id") == record["thread_id"]:
-                entry = candidate
-                session_dir, name = destination, candidate_name
-                break
     design_id, role = entry.get("held_design_id"), entry.get("held_role")
     if isinstance(design_id, str) and design_id and role in ("designer", "reviewer"):
-        receiver = repeat_guard.recipient_identity("", thread_id=record["thread_id"])
+        receiver = repeat_guard.recipient_identity("", thread_id=thread_id)
         decision = repeat_guard.transport_check("mesh-runs", receiver, text)
         if decision.held:
             return f"held repeated run result: copy {decision.copies}"
@@ -513,21 +546,27 @@ def deliver(record: RunRecord, exit_code: int | None) -> str:
         repeat_guard.transport_result("mesh-runs", receiver, text, "queued")
         return f"queued for held role {name}; its holder controls the next assignment"
     held = codex_mesh.hold_message(session_dir, name, text, without_launcher=False, sender="mesh-runs")
-    if isinstance(held, codex_mesh.RepeatHeld):
-        return f"held repeated run result: copy {held.copies}"
-    if isinstance(held, codex_mesh.HeldForLauncher):
-        return f"held for {name}'s attached launcher on thread {held.thread_id}"
-    if isinstance(held, codex_mesh.HeldForNextDispatch):
-        return f"held for {name}'s next dispatch on thread {held.thread_id}"
-    state = held.reason if isinstance(held, codex_mesh.WorkerEnded) else f"{name} is {held.status or 'unknown'}"
+    match held:
+        case codex_mesh.RepeatHeld(copies):
+            return f"held repeated run result: copy {copies}"
+        case codex_mesh.HeldForLauncher(thread_id):
+            return f"held for {name}'s attached launcher on thread {thread_id}"
+        case codex_mesh.HeldForNextDispatch(thread_id):
+            return f"held for {name}'s next dispatch on thread {thread_id}"
+        case codex_mesh.WorkerEnded(reason):
+            state = reason
+        case codex_mesh.NoLauncherAttached(status=status):
+            state = f"{name} is {status or 'unknown'}"
     note = (f"Worker {name}'s run {record['label']} finished ({_exit_words(exit_code)}); no launcher is attached "
             + f"({state}), so the result comes to you. Dispatch the worker (implement.sh --to {name}) "
             + "when it should act on it.")
     message = "\n".join([note, f"Worker: {name}", f"Command: {' '.join(record['command'])}", "", text])
-    told = [session for session in _director_sessions(record)
-            if send_to_director(session, f"{name}: run {record['label']} finished ({_exit_words(exit_code)})", message)]
-    if told:
-        return "sent to director " + ", ".join(told)
+    for session in _director_sessions(record):
+        delivery = send_to_director(session, f"{name}: run {record['label']} finished ({_exit_words(exit_code)})", message)
+        if isinstance(delivery, DirectorNoticeQueued):
+            return f"queued for session {session}: {delivery.reason}"
+        if delivery == "sent":
+            return f"sent to director {session}"
     if isinstance(held, codex_mesh.WorkerEnded):
         return f"nothing delivered: {held.reason} and no director was found"
     # No director to tell: hold the result so the worker's next dispatch still reads it.
@@ -586,9 +625,10 @@ def command_supervise(args: argparse.Namespace) -> int:
     log = Path(record["log"])
     marker = log.with_suffix(".scope")
     prefix = scope_prefix(marker, environment)
-    exit_code = _run(prefix + record["command"], record["cwd"], environment, log)
+    cwd = str(session_staff.worker_directory(staff.local_snapshot(), staff.StaffId(record["staff_id"])))
+    exit_code = _run(prefix + record["command"], cwd, environment, log)
     if prefix and not marker.exists():
-        exit_code = _run(record["command"], record["cwd"], environment, log)
+        exit_code = _run(record["command"], cwd, environment, log)
     marker.unlink(missing_ok=True)
     # Deliver before marking finished: a launcher that reads the run as finished closes its inbox
     # unless the result is already held.

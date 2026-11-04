@@ -21,7 +21,7 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.accounts import accounts
 from scripts.whoami.account_test_support import write_claude_account
 from scripts.production import add_showrunner
-from scripts.production import showrunners
+from scripts.production import showrunners, showrunner_tree
 from scripts.herdr import herdr
 from scripts.message import sessions
 from scripts.herdr.fake_herdr import CommandResponse
@@ -404,8 +404,7 @@ class AddShowrunnerFixture(unittest.TestCase):
         return next(row for row in self.herdr_calls() if row[2:4] == ["workspace", "create"])
 
     def parent_of(self, slug: str) -> str:
-        path = self.root / "showrunner" / slug / "parent"
-        return path.read_text(encoding="utf-8").strip() if path.exists() else ""
+        return showrunner_tree.parent_of(slug)
 
     def refused(self, result: subprocess.CompletedProcess[str], cause: str) -> None:
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)

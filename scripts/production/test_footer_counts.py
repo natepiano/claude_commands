@@ -64,8 +64,8 @@ EFFICIENCY_LEDGER = """# Efficiency proposals
 """
 
 
-def issue(folder: Path, name: str, status: str, tags: str, proposed_by: str = "production", *fields: str) -> None:
-    """An issue with any extra frontmatter lines; its default proposer is the test doc's own production, `production.md`."""
+def issue(folder: Path, name: str, status: str, tags: str, proposed_by: str, *fields: str) -> None:
+    """Write an issue with a fixed proposer ID and the supplied fields."""
     extra = "".join(f"{field}\n" for field in fields)
     _ = (folder / f"{name}.md").write_text(f"---\nstatus: {status}\ntags: [{tags}]\nproposed_by: {proposed_by}\n{extra}---\n",
                                            encoding="utf-8")
@@ -84,12 +84,15 @@ def production_doc(folder: Path, slug: str, proposals: Path, *units: str) -> Pat
 @final
 class FooterCountsTests(unittest.TestCase):
     root: Path = Path()
+    production: staff.StaffId = staff.StaffId("")
     tree: dict[str, Path] = {}  # each setUp replaces it
     below: dict[str, list[str]] = {}  # each setUp replaces it
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr"})))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, source_environment(self.root / "sources"))))
         _ = self.enterContext(isolated_source_readers())
@@ -97,7 +100,8 @@ class FooterCountsTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"NEXT_STATE_DIR": str(self.root / "next")})))
         _ = self.enterContext(mock.patch.object(change_review, "lists_directory", return_value=self.root))
-        _ = fixture_member("showrunner", name="production")
+        self.production = fixture_member("showrunner", name="production",
+            doc=staff.LiveDoc("natedev", self.root / "production.md")).id
         # The doc's own line names the list; no live showrunner's list is looked up.
         _ = self.enterContext(mock.patch.object(change_review, "showrunner_of",
                                                 side_effect=change_review.ChangeReviewError("not running")))
@@ -123,6 +127,7 @@ class FooterCountsTests(unittest.TestCase):
     def doc(self, *fields: str) -> Path:
         path = self.root / "production.md"
         _ = path.write_text("# Production\n\n" + "".join(f"{field}\n" for field in fields), encoding="utf-8")
+        _ = recorded_showrunner("production", path)
         return path
 
     def test_a_footer_count_uses_one_staff_snapshot_for_scope_and_routing(self) -> None:
@@ -191,9 +196,9 @@ class FooterCountsTests(unittest.TestCase):
         _ = listing.write_text(LIST, encoding="utf-8")
         folder = self.root / "issues"
         folder.mkdir()
-        issue(folder, "wanted", "open", "proposal")
-        issue(folder, "closed", "closed", "proposal")
-        issue(folder, "bug", "open", "bug")
+        issue(folder, "wanted", "open", "proposal", self.production)
+        issue(folder, "closed", "closed", "proposal", self.production)
+        issue(folder, "bug", "open", "bug", self.production)
         ledger = self.root / "ledger.md"
         _ = ledger.write_text(LEDGER, encoding="utf-8")
         efficiency = self.root / "efficiency.md"
@@ -240,8 +245,8 @@ class FooterCountsTests(unittest.TestCase):
         child = production_doc(self.root, "child", folder, "child-unit")
         self.tree = {"top": top, "child": child}
         self.below = {"top": ["child"]}
-        issue(folder, "own issue", "open", "proposal", "top-unit")
-        issue(folder, "child issue", "open", "proposal", "child-unit")
+        issue(folder, "own issue", "open", "proposal", unit_membership("top", "top-unit").id)
+        issue(folder, "child issue", "open", "proposal", unit_membership("child", "child-unit").id)
         for doc, titles in ((top, ["Own plan"]), (child, ["Child plan", "Second child plan"])):
             ledger = doc.with_suffix(".ledger.md")
             _ = ledger.write_text("".join(f"- 2026-10-28 {title} — proposed\n" for title in titles),
@@ -282,28 +287,34 @@ class FooterCountsTests(unittest.TestCase):
         listing = self.root / "change-review.md"
         folder = self.root / "issues"
         folder.mkdir()
-        issue(folder, "wanted", "open", "proposal")
-        issue(folder, "closed", "closed", "proposal")
+        issue(folder, "wanted", "open", "proposal", self.production)
+        issue(folder, "closed", "closed", "proposal", self.production)
         ledger = self.root / "ledger.md"
         doc = self.doc(f"- **Change review:** `{listing}`", f"- **Proposals:** {folder}",
                        f"- **Improvement queue:** {ledger}")
         self.assertEqual(footer_counts.sources(doc), [doc, listing, folder, ledger, folder / "wanted.md"])
-        self.assertEqual(footer_counts.sources(self.doc()), [self.root / "production.md"])
+        empty_doc = self.doc()
+        owner = staff.snapshot().by_doc("natedev", empty_doc)
+        assert owner is not None
+        question_folder = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / owner.id / "questions"
+        self.assertEqual(footer_counts.sources(empty_doc), [empty_doc, question_folder])
 
     def test_a_shared_folder_counts_only_the_productions_own_proposals(self) -> None:
         folder = self.root / "issues"
         folder.mkdir()
-        for name, proposer in (("own", "trunk-unit"), ("by the production", "tool-based-ui"),
-                               ("by a child", "cargo-liner-style"), ("by a unit below", "types-unit"),
-                               ("named with its production", "types-unit (cargo-liner-style)"),
-                               ("quoted link", "'[[trunk-unit]]'"), ("other production", "followups-unit"),
-                               ("other unit in a known production", "trunk-unit (build-followups)"),
-                               ("no proposer", "")):
-            issue(folder, name, "open", "issue, proposal", proposer)
-        issue(folder, "closed own", "closed", "issue, proposal", "trunk-unit")
         top = production_doc(self.root, "tool-based-ui", folder, "trunk-unit")
         child = production_doc(self.root, "cargo-liner-style", folder, "types-unit")
         other = production_doc(self.root, "build-followups", folder, "followups-unit")
+        trunk = unit_membership("tool-based-ui", "trunk-unit").id
+        types = unit_membership("cargo-liner-style", "types-unit").id
+        for name, proposer in (("own", trunk), ("by the production", recorded_showrunner("tool-based-ui", top).id),
+                               ("by a child", recorded_showrunner("cargo-liner-style", child).id), ("by a unit below", types),
+                               ("named with its production", types), ("quoted link", f"'[[{trunk}]]'"),
+                               ("other production", unit_membership("build-followups", "followups-unit").id),
+                               ("other unit in a known production", unit_membership("build-followups", "trunk-unit").id),
+                               ("no proposer", "")):
+            issue(folder, name, "open", "issue, proposal", proposer)
+        issue(folder, "closed own", "closed", "issue, proposal", trunk)
         self.tree = {"tool-based-ui": top, "cargo-liner-style": child, "build-followups": other}
         self.below = {"tool-based-ui": ["cargo-liner-style"]}
         # The child's showrunner counts the child's proposals; the root never does (user, 2026-10-27).
@@ -447,11 +458,11 @@ class FooterCountsTests(unittest.TestCase):
     def test_the_proposal_count_leaves_out_approved_and_active_proposals(self) -> None:
         folder = self.root / "issues"
         folder.mkdir()
-        approval = ('unit: "names-unit"', 'plan: "docs/plans/names.md"')
-        issue(folder, "waiting", "open", "issue, proposal", "production", "stage: backlog")
-        issue(folder, "approved at backlog", "open", "issue, proposal", "production", "stage: backlog", *approval)
-        issue(folder, "approved at active", "open", "issue, proposal", "production", "stage: active", *approval)
-        issue(folder, "started without an approval", "open", "issue, proposal", "production", "stage: active")
+        approval = f'unit: "{unit_membership("production", "names-unit").id}"'
+        issue(folder, "waiting", "open", "issue, proposal", self.production, "stage: backlog")
+        issue(folder, "approved at backlog", "open", "issue, proposal", self.production, "stage: backlog", approval)
+        issue(folder, "approved at active", "open", "issue, proposal", self.production, "stage: active", approval)
+        issue(folder, "started without an approval", "open", "issue, proposal", self.production, "stage: active")
         doc = self.doc(f"- **Proposals:** {folder}")
         self.assertEqual(len(proposals_folder.open_proposals(doc)), 4)
         self.assertEqual(footer_counts.proposals(doc), 1)
@@ -460,11 +471,12 @@ class FooterCountsTests(unittest.TestCase):
     def test_an_approved_plain_proposal_leaves_the_footer_count(self) -> None:
         folder = self.root / "issues"
         folder.mkdir()
-        issue(folder, "plain", "open", "issue, proposal", "production", "stage: backlog")
+        issue(folder, "plain", "open", "issue, proposal", self.production, "stage: backlog")
         doc = self.doc(f"- **Proposals:** {folder}")
         self.assertEqual(footer_counts.proposals(doc), 1)
-        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(proposal_issue, "calling_showrunner", return_value="s"):
-            code = proposal_issue.main(["approve", str(folder / "plain.md"), "--by", "user", "--showrunner", "s", "--unit", "u", "--plan", "p"])
+        unit = unit_membership("production", "u").id
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(proposal_issue, "calling_showrunner", return_value=self.production):
+            code = proposal_issue.main(["approve", str(folder / "plain.md"), "--by", "user", "--unit", unit])
         self.assertEqual(code, 0)
         self.assertEqual(footer_counts.proposals(doc), 0)
 

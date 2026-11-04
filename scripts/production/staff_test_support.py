@@ -35,6 +35,7 @@ SOURCES_SCRIPT = Path(__file__).with_name("staff_sources.py")
 FixtureMachine = Literal["natedev", "mac"]
 UNFILLED_WORKTREE = staff.WorktreeUnfilled()
 UNFILLED_DOC = staff.DocUnfilled()
+CLAUDE_BACKEND = staff.ClaudeBackend()
 
 
 @contextmanager
@@ -54,39 +55,208 @@ def fixture_runtime_id(label: str) -> str:
     return str(uuid5(NAMESPACE_URL, "staff-test-backend:" + label))
 
 
-def fixture_member(kind: staff.Kind, *, name: str, parent: staff.StaffId | None = None,
+def _fixture_session_path(identity: str, backend: staff.ClaudeBackend | staff.CodexBackend) -> Path:
+    home = backend.codex_home if isinstance(backend, staff.CodexBackend) else Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+    return home / "sessions" / f"{identity}.jsonl" if isinstance(backend, staff.CodexBackend) else home / "projects/fixture" / f"{identity}.jsonl"
+
+
+def fixture_session(identity: str, backend: staff.ClaudeBackend | staff.CodexBackend) -> None:
+    """Create the private session file that supplies the worker family."""
+    path = _fixture_session_path(identity, backend)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch(exist_ok=True)
+    if isinstance(backend, staff.CodexBackend):
+        os.environ["CODEX_HOME"] = str(backend.codex_home)
+
+
+def transcript_fixture(row: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend, *,
+                       turns: int = 1, malformed: bool = False) -> tuple[Path, tuple[list[str], list[str], list[str]]]:
+    """Write source evidence with private tool data between assignments and final replies."""
+    path = _fixture_session_path(row.current_session, backend)
+    family = "codex" if isinstance(backend, staff.CodexBackend) else "claude"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    assignments = [f"Assignment {index}: preserve this complete requirement. " + "detail " * 90
+                   for index in range(turns)]
+    replies = [f"Final {index}: completed the required change. " + "proof " * 90
+               for index in range(turns)]
+    files = [f"src/changed-{index}.py" for index in range(turns)]
+    records: list[object] = []
+    moved: list[str] = []
+    for index, (assignment, reply, file) in enumerate(zip(assignments, replies, files, strict=True)):
+        if family == "claude":
+            records.extend([
+                {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": assignment}]}},
+                {"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "write", "name": "Edit",
+                     "input": {"file_path": file, "content": "PRIVATE_TOOL_REQUEST"}}]}},
+                {"type": "user", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "write", "content": "PRIVATE_TOOL_OUTPUT"}]}},
+                {"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": reply}], "stop_reason": "end_turn"}},
+            ])
+        else:
+            moved.append(file + ".moved")
+            patch = f"*** Begin Patch\n*** Update File: {file}\n*** Move to: {moved[-1]}\n+PRIVATE_TOOL_REQUEST\n*** End Patch"
+            tool, arguments = ("apply_patch", patch) if index % 2 == 0 else (
+                "exec", f"const example = 'tools.apply_patch(\"PRIVATE_TOOL_REQUEST\")'; await tools.apply_patch({json.dumps(patch)});")
+            records.extend([
+                {"type": "response_item", "payload": {"type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": assignment}]}},
+                {"type": "response_item", "payload": {"type": "custom_tool_call", "name": tool, "input": arguments}},
+                {"type": "response_item", "payload": {"type": "custom_tool_call_output",
+                    "output": "PRIVATE_TOOL_OUTPUT"}},
+                {"type": "event_msg", "payload": {"type": "agent_message", "message": reply}},
+            ])
+    lines = [json.dumps(record) for record in records]
+    if malformed:
+        lines.insert(1, '{"broken":')
+        lines.insert(3, json.dumps({"type": "assistant", "message": None}))
+        lines.insert(5, json.dumps(["unexpected record"]))
+        lines.append('{"torn":')
+    _ = path.write_text("\n".join(lines) + "\n")
+    return path, (assignments, replies, files + moved)
+
+
+def stopped_worker_module(directory: Path) -> Path:
+    """Install a child-process lifecycle stub that records the source row."""
+    directory.mkdir()
+    _ = (directory / "sitecustomize.py").write_text('''import json, os
+from pathlib import Path
+from scripts.production import staff
+from scripts.shutdown import stop_resume
+def stop(reference):
+    row = staff.by_id(staff.StaffId(reference))
+    if os.environ.get("FIXTURE_STOPPED"):
+        Path(os.environ["FIXTURE_STOPPED"]).write_text(json.dumps(row.to_json()))
+    return stop_resume.Stopped(row.current_session, 987654)
+stop_resume.stop = stop
+''')
+    return directory
+
+
+def switch_backend_stub() -> str:
+    """Create a native destination and check the staff row at dispatch."""
+    return r'''import os, sys
+from pathlib import Path
+from unittest.mock import patch
+from scripts.production import staff, worker_admission as admission
+from scripts.production.staff_test_support import fixture_runtime_id, fixture_session
+from scripts.shutdown import stop_resume
+args = sys.argv[1:]
+run = Path(args[args.index("--session-dir") + 1])
+allowed = admission.admit(args[args.index("--name") + 1], run, role="impl")
+row = allowed.slot.row
+def start(handoff):
+    identity = fixture_runtime_id("destination:" + row.id + "codex")
+    fixture_session(identity, staff.CodexBackend(Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))))
+    return identity
+def dispatch(published):
+    assert staff.by_id(row.id) == published.row
+with patch.object(stop_resume, "stop", return_value=stop_resume.Stopped(row.current_session, 987654)):
+    admission.switch_worker(allowed, "codex", start=start, dispatch=dispatch, cleanup=lambda identity: None)
+'''
+
+
+def fixture_member(kind: staff.Kind, *, name: str,
+                   parent: staff.StaffId | staff.ReportsTo | staff.StaffRoot | None = None,
                    worktree: staff.PresentWorktree | staff.RemovedWorktree | staff.WorktreeUnfilled = UNFILLED_WORKTREE,
                    doc: staff.LiveDoc | staff.WrappedDoc | staff.DocUnfilled = UNFILLED_DOC,
-                   runtime_id: str = "") -> staff.StaffRow:
+                   runtime_id: str = "",
+                   backend: staff.ClaudeBackend | staff.CodexBackend = CLAUDE_BACKEND) -> staff.StaffRow:
     """Publish the identity returned by the private fixture backend, never live evidence."""
-    existing = [row for row in staff.initial_snapshot().find(kind=kind, parent=parent)
-                if row.name == name and row.parent == parent]
+    relationship = (parent if isinstance(parent, (staff.ReportsTo, staff.StaffRoot)) else
+                    staff.ReportsTo(parent) if parent is not None else staff.StaffRoot())
+    parent_id = relationship.id if isinstance(relationship, staff.ReportsTo) else None
+    existing = [row for row in staff.initial_snapshot().find(kind=kind, parent=parent_id)
+                if row.name == name and row.parent == relationship]
     identity = runtime_id or (existing[0].current_session if len(existing) == 1 else
-                              fixture_runtime_id(f"{kind}:{parent or ''}:{name}"))
-    return staff.ensure(kind, name=name, parent=parent, worktree=worktree, doc=doc, runtime_id=identity)
+                              fixture_runtime_id(f"{kind}:{parent_id or ''}:{name}"))
+    if kind == "worker":
+        if parent_id is None:
+            raise staff.StaffRefused("a fixture worker requires a parent")
+        fixture_session(identity, backend)
+        return staff.ensure_worker(staff.native_id(identity), name, parent_id)
+    return staff.ensure(kind, name=name, parent=relationship,
+                        worktree=worktree, doc=doc, runtime_id=identity)
 
 
-def fixture_worker(name: str, parent: staff.StaffId, *, runtime_id: str = "") -> staff.StaffRow:
+def fixture_worker(name: str, parent: staff.StaffId, *, runtime_id: str = "",
+                   backend: staff.ClaudeBackend | staff.CodexBackend = CLAUDE_BACKEND) -> staff.StaffRow:
     """Publish the fake worker backend's native identity through the real writer."""
     existing = [row for row in staff.initial_snapshot().find(kind="worker", parent=parent)
-                if row.name == name and row.parent == parent]
+                if row.name == name and row.parent == staff.ReportsTo(parent)]
     identity = runtime_id or (existing[0].current_session if len(existing) == 1 else fixture_runtime_id(f"worker:{parent}:{name}"))
-    return staff.ensure_worker(name, parent, runtime_id=identity)
+    fixture_session(identity, backend)
+    return staff.ensure_worker(staff.native_id(identity), name, parent)
 
 
-def record_fixture_claude_start(arguments: list[str]) -> None:
+def fixture_roster(entries: dict[str, object], parent: staff.StaffId,
+                   codex_home: Path) -> dict[str, object]:
+    """Publish private workers before a reader receives their roster references."""
+    result: dict[str, object] = {}
+    for name, value in entries.items():
+        if not isinstance(value, dict):
+            result[name] = value
+            continue
+        entry = dict(cast(dict[str, object], value))
+        identity = entry.get("thread_id")
+        if not isinstance(identity, str) or not identity:
+            result[name] = entry
+            continue
+        try:
+            native = staff.native_id(identity)
+        except staff.StaffRefused:
+            result[name] = entry
+            continue
+        fixture_session(native, staff.CodexBackend(codex_home))
+        record = staff.initial_snapshot()
+        row = record.by_current_session(native)
+        if row is None:
+            former = next((item for item in record.find(kind="worker", parent=parent)
+                           if item.name == name), None)
+            row = (staff.update_current_session(former.current_session, native)
+                   if former is not None else
+                   fixture_worker(name, parent, runtime_id=native,
+                                  backend=staff.CodexBackend(codex_home)))
+        entry["staff_id"] = row.id
+        result[name] = entry
+    from scripts.production.session_staff import stored_worker_records
+    return stored_worker_records(result)
+
+
+def fixture_worker_records(entries: dict[str, object], membership: staff.StaffSnapshot) -> dict[str, object]:
+    """Read runtime identities for assertions from the current staff rows."""
+    from scripts.production import session_staff
+
+    result: dict[str, object] = {}
+    for name, raw in entries.items():
+        if not isinstance(raw, dict):
+            result[name] = raw
+            continue
+        entry = dict(cast(dict[str, object], raw))
+        member = session_staff.worker_row(entry, membership)
+        if member is not None:
+            entry.update(thread_id=member.current_session, session_id=member.current_session,
+                         codex_home=session_staff.worker_home(entry, membership))
+        result[name] = entry
+    return result
+
+
+def record_fixture_claude_start(arguments: list[str], *, remote_control: bool = True, messaging_socket: str = "") -> None:
     """The private backend records its own native identity before opening work."""
     from scripts.message import sessions
 
     identity = (arguments[arguments.index("--resume") + 1] if "--resume" in arguments
                 else os.environ["FAKE_CLAUDE_SESSION_ID"])
+    fixture_session(identity, CLAUDE_BACKEND)
     pid = int(os.environ["FAKE_CLAUDE_PID"])
     path = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{pid}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     write_text_atomic(path, json.dumps({
         "pid": pid, "procStart": sessions.process_start(pid), "sessionId": identity,
         "name": "fixture Claude", "updatedAt": 1, "formerNames": [], "tmux": "",
-        "entrypoint": "cli", "messagingSocketPath": "",
+        "entrypoint": "cli", "messagingSocketPath": messaging_socket,
+        "bridgeSessionId": "session_bridge" if remote_control else "",
     }) + "\n")
 
 
@@ -110,6 +280,7 @@ class ClaudeBackendFixture:
             raise AssertionError("new Claude admission needs an opening prompt")
         self.arguments = list(agent_arguments)
         self.environment = dict(environment)
+        fixture_session(self.identity, CLAUDE_BACKEND)
         _ = opening.before_prompt(herdr.SessionTranscript(self.configuration, self.identity))
         self.before_opening = staff.snapshot()
         return herdr.AgentLaunched("w1:p1", herdr.PromptSubmitted(datetime.fromtimestamp(0, UTC)))
@@ -119,8 +290,15 @@ class ClaudeBackendFixture:
 def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[None]:
     """Use the same private record in this process and its fixture children."""
     environment["STAFF_FILE"] = str(path)
+    _ = environment.setdefault("CLAUDE_CONFIG_DIR", str(path.parent / "claude"))
+    environment["STAFF_CONFIG"] = os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf"))
     with ExitStack() as contexts:
-        _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {"STAFF_FILE": str(path)})))
+        _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
+            "STAFF_FILE": str(path),
+            "CLAUDE_CONFIG_DIR": environment["CLAUDE_CONFIG_DIR"],
+            "CODEX_HOME": environment.get("CODEX_HOME", os.environ.get("CODEX_HOME", "")),
+            "STAFF_CONFIG": os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf")),
+        })))
         if "HERDR_PANE_RECORD_DIR" in environment:
             _ = contexts.enter_context(mock.patch.object(
                 pane_record, "RECORD_DIR", Path(environment["HERDR_PANE_RECORD_DIR"]),
@@ -139,13 +317,14 @@ def showrunner_relationship(name: str, parent: str = "") -> staff.StaffRow:
             return rows[short_name]
 
         child = intended_row(name)
-        parent_id = intended_row(parent).id if parent else None
-        return staff.move(child.id, parent_id) if child.parent != parent_id else child
+        destination = staff.ReportsTo(intended_row(parent).id) if parent else staff.StaffRoot()
+        return staff.move(child.id, destination) if child.parent != destination else child
 
 
 def recorded_showrunner(name: str, doc: Path, parent: str = "") -> staff.StaffRow:
     """Record the document that identifies one private production owner."""
-    row = showrunner_relationship(name, parent)
+    rows = [row for row in staff.initial_snapshot().find(kind="showrunner") if row.name == name]
+    row = rows[0] if rows and not parent else showrunner_relationship(name, parent)
     return staff.set_doc(row.id, staff.LiveDoc("natedev", doc))
 
 
@@ -308,7 +487,9 @@ if os.environ.get('STAFF_TEST_SSH_FAIL'):
     if reason:
         print(reason, file=sys.stderr)
     raise SystemExit(int(os.environ.get('STAFF_TEST_SSH_EXIT', '255')))
-if len(arguments) < 6 or arguments[:5] != ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', 'natedev']:
+if (len(arguments) < 6 or arguments[:3] != ['-o', 'BatchMode=yes', '-o']
+        or not arguments[3].startswith('ConnectTimeout=') or arguments[4] != 'natedev'
+        or int(arguments[3].split('=', 1)[1]) <= 0):
     raise SystemExit('unexpected SSH target or options')
 command = arguments[5:]
 if len(command) == 1:
@@ -349,6 +530,11 @@ class StaffTestCase(unittest.TestCase):
     mac_file: Path = Path()
     ssh_log: Path = Path()
 
+    def assert_only_current_session_changed(self, before: bytes, old: staff.StaffRow, identity: str) -> None:
+        self.assertEqual(self.staff_file.read_bytes(), before.replace(
+            f'"current_session": "{old.current_session}"'.encode(),
+            f'"current_session": "{identity}"'.encode(), 1))
+
     @override
     def setUp(self) -> None:
         _ = self.enterContext(redirect_stdout(io.StringIO()))
@@ -376,6 +562,7 @@ class StaffTestCase(unittest.TestCase):
             "STAFF_TEST_OWNER_SOURCE": str(self.root / "natedev-sources"),
             "STAFF_TEST_LOCK_NOTICE": "",
             "PYTHONDONTWRITEBYTECODE": "1",
+            "STAFF_CONFIG": str(CHECKOUT / "config/staff.conf"),
         })))
         _ = self.enterContext(isolated_staff_file(self.staff_file, {}))
         _ = self.enterContext(self.machine("natedev"))
@@ -435,10 +622,23 @@ class StaffTestCase(unittest.TestCase):
         self.write_json(self.staff_file, document)
         return self.staff_file.read_bytes()
 
+    def staff_config(self, *, lock_seconds: float = 0.2,
+                     remote_seconds: float = 2.0) -> Path:
+        """Write private limits that the staff writer reads at each use."""
+        path = self.root / "staff.conf"
+        write_text_atomic(path, "".join(
+            f"# range: 5e-324..\n{key}={value}\n" for key, value in (
+                ("OPERATION_LOCK_SECONDS", lock_seconds),
+                ("REMOTE_SECONDS", remote_seconds),
+            )
+        ))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"STAFF_CONFIG": str(path)})))
+        return path
+
     def forget_rows(self, *identities: staff.StaffId) -> None:
         """Model a missing legacy identity; production retirement deliberately keeps owners."""
         record = staff.snapshot()
-        _ = self.write_document({"schema": 2,
+        _ = self.write_document({"schema": record.schema,
             "rows": [row.to_json() for row in record.rows if row.id not in identities],
             "pending_retire": [identity for identity in record.pending_retire if identity not in identities]})
 
@@ -551,7 +751,9 @@ class StaffTestCase(unittest.TestCase):
         worker = fixture_worker("reader", unit.id)
         runner = staff.update_current_session(runner.current_session, staff.native_id(fixture_runtime_id("row-owner-current")))
         unit = staff.update_current_session(unit.current_session, staff.native_id(fixture_runtime_id("row-member-current")))
-        worker = staff.update_current_session(worker.current_session, staff.native_id(fixture_runtime_id("row-worker-current")))
+        current = staff.native_id(fixture_runtime_id("row-worker-current"))
+        fixture_session(current, CLAUDE_BACKEND)
+        worker = staff.update_current_session(worker.current_session, current)
         timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{slug}" / "conf"
         timer.parent.mkdir(parents=True)
         write_text_atomic(timer, f"TARGET=session:{runner.id}\n"
@@ -611,85 +813,8 @@ class StaffTestCase(unittest.TestCase):
         })
         write_text_atomic(run / "director", director + "\n")
         self.write_json(run / "mesh_roster.json", {})
-        self.write_json(run / "mesh_server.json", {"pid": os.getpid(), "codex_home": str(self.root / "codex")})
+        self.write_json(run / "mesh_server.json", {"pid": os.getpid(), "port": 12345, "codex_home": str(self.root / "codex")})
         return run
-
-    def ledger_worker(self, run: Path, slug: str, unit: str, name: str, role: str, identity: str, *,
-                      family: str = "codex", retired: bool = False, staff_id: str = "") -> Path:
-        """Write one unit-ledger entry and its run projection through the shared JSON writer."""
-        path = Path(os.environ["UNIT_WORKERS_STATE"]) / slug / f"{unit}.json"
-        ledger: dict[str, object] = (cast(dict[str, object], json.loads(path.read_text()))
-                                   if path.exists() else {"version": 1, "workers": {}})
-        entries = cast(dict[str, object], ledger["workers"])
-        backend = ({"kind": "CodexThread", "thread_id": identity, "codex_home": str(self.root / "codex")}
-                   if family == "codex" else {"kind": "ClaudeSession", "session_id": identity})
-        entries[name] = {
-            "name": name, "role": role, "family": family, "model": "", "effort": "",
-            "backend": backend, "ownership": {"kind": "Retired"} if retired else {"kind": "HeldBy", "run": str(run)},
-            "access_policy": {}, "events": [], **({"staff_id": staff_id} if staff_id else {}),
-        }
-        self.write_json(path, ledger)
-        _ = self.roster_worker(run, name, role, identity, status="ended" if retired else "done",
-                               family=family, staff_id=staff_id)
-        return path
-
-
-    def astra_worker(self, run: Path, name: str, thread: str, manager: str) -> Path:
-        """A live mesh Astra hold, using the same run roster as ordinary workers."""
-        from scripts.astra import astra_roles
-
-        _ = self.roster_worker(run, name, "review", thread)
-        _ = astra_roles.hold("reviewer", session_dir=run, worker=name, manager=manager)
-        path = Path(os.environ["ASTRA_ROLES_STATE"]) / f"{thread}.json"
-        return path
-
-    def roster_worker(self, run: Path, name: str, role: str, identity: str, *, status: str = "running",
-                      family: str = "codex", staff_id: str = "") -> Path:
-        """Write the mesh producer's standalone roster shape, without a unit ledger."""
-        path = run / "mesh_roster.json"
-        roster = cast(dict[str, object], json.loads(path.read_text()))
-        roster[name] = {"role": role, "status": status, "family": family,
-                        "thread_id" if family == "codex" else "worker_id": identity,
-                        "launcher_pid": os.getpid(), "port": 12345,
-                        **({"staff_id": staff_id} if staff_id else {})}
-        self.write_json(path, roster)
-        return path
-
-    def legacy_claude_worker(self, run: Path, session_id: str, *, prefix: str,
-                             role: str, kind: str = "impl") -> str:
-        """Use the launcher's name and board registration with agent_bg's TSV ledger."""
-        direct = CHECKOUT / "scripts/direct"
-        named = subprocess.run(
-            ["bash", str(direct / "worker_name.sh"), str(self.root), "impl", kind, prefix],
-            capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
-        )
-        name = named.stdout.strip()
-        _ = subprocess.run(
-            ["bash", str(direct / "board.sh"), "post", str(run), "impl", "register",
-             f"mesh={name}"], capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
-        )
-        if role:
-            _ = subprocess.run(
-                ["bash", str(direct / "board.sh"), "role", str(run), "impl", role],
-                capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
-            )
-        write_text_atomic(run / "workers", f"{session_id[:8]}\t{name}\n")
-        return name
-
-    def worker_design(self, slug: str, name: str, thread: str) -> Path:
-        """Persist the durable design producer's tagged record, without a ledger."""
-        from scripts.astra import design_roles
-
-        design_id = "12345678-1234-5678-1234-567812345678"
-        design = design_roles.HeldDesign(
-            design_roles.DesignPlacement(design_id, design_roles.local_host(), 1),
-            "fixture", str(self.source_root), str(self.source_root / "design.md"), "fixture",
-            "2026-10-31T00:00:00+00:00", design_roles.ShowrunnerHolder(slug), design_roles.DesignUnbound(),
-            (design_roles.RoleInstance("designer", name, design_roles.RoleOpen(thread)),
-             design_roles.RoleInstance("reviewer", "sdlc-design-astra-reviewer", design_roles.RoleNotOpened())),
-        )
-        design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
-        return design_roles.design_directory(design_id) / "design.json"
 
     @contextmanager
     def lock_notice(self, lock: Path) -> Generator[socket.socket]:
@@ -726,7 +851,9 @@ class StaffTestCase(unittest.TestCase):
         commands: list[list[str]] = []
         for line in self.ssh_log.read_text().splitlines():
             arguments = cast(list[str], json.loads(line))
-            self.assertEqual(arguments[:5], ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "natedev"])
+            self.assertEqual(arguments[:3], ["-o", "BatchMode=yes", "-o"])
+            self.assertEqual(arguments[4], "natedev")
+            self.assertRegex(arguments[3], r"^ConnectTimeout=[1-9][0-9]*$")
             command = shlex.split(arguments[5]) if len(arguments) == 6 else arguments[5:]
             self.assertEqual(command[:2], ["~/.claude/scripts/lib/py", "~/.claude/scripts/production/staff.py"])
             self.assertIn("--json", command[2:])

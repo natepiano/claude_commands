@@ -25,6 +25,7 @@ from scripts.production import staff, unit_names
 from scripts.production.production_doc import Production, Refusal, production_field, read_production
 from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
 from dailies_counts import CountsFailure, production_counts
+from scripts.production.store_owner import document_id
 from dailies_render import (LENGTHS, InputError, ReportsEvery, ReportsOnDemand, StateRefused, StyleSummary,
                             as_list, as_map, check_render_state, due, last_report,
                             local_now, parse_child_report, parse_range_end, parse_report, parse_time,
@@ -872,7 +873,7 @@ def run(args: argparse.Namespace) -> int:
     staff_record = staff.snapshot()
     production = read_production(production_path)
     # Before any state is read: a showrunner started before the state move gets its state copied here.
-    for line in adopt_moved_state(production):
+    for line in adopt_moved_state(production, staff_record):
         print(f"state-dir: ok — {line}", file=sys.stderr)
     now, _ = local_now(str(production.zone), "--zone", at)
     lines = production.doc.read_text(encoding="utf-8").splitlines()
@@ -885,7 +886,7 @@ def run(args: argparse.Namespace) -> int:
         )
     if isinstance(table_state, PhaseTablesUnavailable):
         report("phase tables", "unavailable", table_state.reason)
-    instance = f"showrunner-{production.slug}"
+    instance = showrunners.timer_name(production.slug, staff_record)
     blocks = status_blocks(status_path, units)
     report("status", "ok", f"{len(blocks)} units read")
     # A unit whose run is finished has nothing to report: it needs no judgment entry and is left out,
@@ -921,6 +922,7 @@ def run(args: argparse.Namespace) -> int:
     judgment = as_map(raw, str(judgment_path))
     supplied_units = as_list(judgment.get("units"), f"{judgment_path}.units")
     by_session: dict[str, JsonMap] = {}
+    owner_id = document_id(production.doc, record=staff_record)
     for index, supplied in enumerate(supplied_units):
         fields = as_map(supplied, f"{judgment_path}.units[{index}]")
         unit_name = fields.get("unit")
@@ -1070,8 +1072,8 @@ def run(args: argparse.Namespace) -> int:
         report("children", "ok", f"{len(children)} below: {', '.join(children)}")
     # A bad config line costs only the counts line, never the report.
     try:
-        counts = production_counts(production.slug)
-    except CountsFailure as failure:
+        counts = production_counts(owner_id)
+    except (CountsFailure, staff.StaffRefused, staff.StaffUnreadable) as failure:
         report("counts", "unavailable", str(failure))
     else:
         if counts:

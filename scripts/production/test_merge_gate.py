@@ -10,6 +10,8 @@ import io
 import os
 from pathlib import Path
 import re
+import sys
+import tempfile
 from typing import cast, final, override
 from contextlib import AbstractContextManager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
@@ -19,9 +21,105 @@ from scripts.production import change_review, merge_gate, staff
 from scripts.lint import memory_admit
 from scripts.production.test_change_review import ProducerFixture
 from scripts.production.staff_test_support import (
-    fixture_unit_location, isolated_source_readers, isolated_staff_file, recorded_showrunner, source_environment,
+    fixture_member, fixture_unit_location, isolated_source_readers, isolated_staff_file, recorded_showrunner, source_environment,
 )
 from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
+
+
+@final
+class ModuleRootTests(unittest.TestCase):
+    def run_module(self, source: str, live: Path) -> merge_gate.GateJobResult:
+        with tempfile.TemporaryDirectory(dir="/dev/shm", prefix="gate-roots-") as temporary:
+            root = Path(temporary)
+            module = root / "test_roots.py"
+            _ = module.write_text("import unittest\n" + source)
+            job_root = root / "job"
+            job_root.mkdir()
+            environment = merge_gate.test_module_environment(job_root, dict(os.environ))
+            environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+            with mock.patch.object(merge_gate, "LIVE_ROOTS", (str(live),)):
+                job = merge_gate.start_gate_job(
+                    "fixture", module, [sys.executable, str(merge_gate.RUNNER), str(root), module.name],
+                    root, environment, job_root / "output.log")
+            status = job.process.wait(timeout=30)
+            result = merge_gate.finish_gate_job(job, status)
+            self.assertFalse(job_root.exists())
+            return result
+
+    def test_a_live_staff_write_fails_and_names_the_path(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as temporary:
+            live = Path(temporary)
+            staff_file = live / "staff" / "staff.json"
+            staff_file.parent.mkdir()
+            _ = staff_file.write_text("original")
+            result = self.run_module(f'''from pathlib import Path
+class Roots(unittest.TestCase):
+    def test_write(self):
+        Path({str(staff_file)!r}).write_text("fixture")
+''', live)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(result.tripwire_tripped)
+            self.assertIn(str(staff_file), result.output)
+            self.assertEqual(staff_file.read_text(), "original")
+
+    def test_private_roots_pass_and_are_removed(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as temporary:
+            result = self.run_module('''import os
+from pathlib import Path
+class Roots(unittest.TestCase):
+    def test_write(self):
+        home = Path(os.environ["HOME"])
+        state = Path(os.environ["XDG_STATE_HOME"])
+        scratch = Path(os.environ["SCRATCH_ROOT"])
+        config = Path(os.environ["XDG_CONFIG_HOME"])
+        self.assertFalse((home / ".config/pushover/env").exists())
+        self.assertFalse((config / "pushover/env").exists())
+        self.assertNotIn("PUSHOVER_USER", os.environ)
+        self.assertNotIn("PUSHOVER_TOKEN", os.environ)
+        for root in (home, state, scratch, config):
+            root.mkdir(parents=True, exist_ok=True)
+            (root / "fixture").write_text("private")
+        self.assertEqual(len({home, state, scratch, config}), 4)
+        self.assertTrue(all(root.is_relative_to(Path(os.environ["TMPDIR"]))
+                            for root in (home, state, scratch, config)))
+''', Path(temporary))
+            self.assertEqual(result.returncode, 0, result.output)
+
+    def test_a_push_attempt_fails_and_names_the_module_and_push(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as temporary, \
+             mock.patch.dict(os.environ, {"PUSHOVER_USER": "fixture-user", "PUSHOVER_TOKEN": "fixture-token"}):
+            notify = Path(__file__).resolve().parents[1] / "notify"
+            result = self.run_module(f'''import os, sys
+from unittest import mock
+sys.path.insert(0, {str(notify)!r})
+import pushover
+class Roots(unittest.TestCase):
+    def test_push(self):
+        self.assertNotIn("PUSHOVER_USER", os.environ)
+        self.assertNotIn("PUSHOVER_TOKEN", os.environ)
+        with mock.patch("socket.socket.connect", side_effect=AssertionError("push guard missed the request")):
+            try:
+                pushover.http_post(pushover.API_URL, b"token=fixture&user=fixture")
+            except PermissionError:
+                pass
+''', Path(temporary))
+            self.assertNotEqual(result.returncode, 0, result.output)
+            self.assertTrue(result.tripwire_tripped, result.output)
+            self.assertIn("test_roots.py: test refused a Pushover push", result.output)
+
+    def test_a_caught_live_write_in_a_child_still_fails(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as temporary:
+            live = Path(temporary)
+            target = live / "roster.json"
+            child = f"try:\n open({str(target)!r}, 'w')\nexcept PermissionError:\n pass"
+            result = self.run_module(f'''import subprocess, sys
+class Roots(unittest.TestCase):
+    def test_write(self):
+        subprocess.run([sys.executable, "-c", {child!r}], check=True)
+''', live)
+            self.assertNotEqual(result.returncode, 0, result.output)
+            self.assertIn(str(target), result.output)
+            self.assertFalse(target.exists())
 
 
 @final
@@ -29,6 +127,8 @@ class MergeGateCheckpointTests(MergeGateFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        _ = fixture_member("showrunner", name="unrelated")
         environment = source_environment(self.root / "staff-sources")
         environment["NOTIFIER_STATE_DIR"] = self.environment["NOTIFIER_STATE_DIR"]
         self.environment.update(environment)
@@ -41,10 +141,9 @@ class MergeGateCheckpointTests(MergeGateFixture):
         exclude = Path(self.git(self.unit, "rev-parse", "--git-path", "info/exclude"))
         exclude = exclude if exclude.is_absolute() else self.unit / exclude
         self.write(exclude, (exclude.read_text() if exclude.exists() else "") + ".unit.toml\n")
-        path = Path(self.environment["HOME"]) / ".local/state/staff/staff.json"
-        with isolated_staff_file(path, self.environment):
-            runner = recorded_showrunner("fixture-showrunner", doc)
-            unit = fixture_unit_location(runner, "fixture-unit", self.unit)
+        runner = recorded_showrunner("fixture-showrunner", doc)
+        self.environment["CLAUDE_CODE_SESSION_ID"] = runner.current_session
+        unit = fixture_unit_location(runner, "fixture-unit", self.unit)
         return unit.id
 
     def test_checkout_holds_a_shared_copy_lock_through_suites_and_releases_it_on_error(self) -> None:
@@ -347,7 +446,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         merged = self.git(self.checkout, "rev-parse", "--short=8", "HEAD")
         written = review.read_text(encoding="utf-8").splitlines()[-1]
-        rows = {f"| C8 | The grid fades gently | {day} · {merged} | not yet | Run `hana` in a natedev terminal. You see: The grid lines fade out farther away | production | {producer} |" for day in days}
+        rows = {f"| C8 | The grid fades gently | {day} · {merged} | not yet | Run `hana` in a natedev terminal. You see: The grid lines fade out farther away | {producer} | {producer} |" for day in days}
         self.assertIn(written, rows)
         self.assertIn(f"Change review: {written}", result.stdout)
         self.assertNotIn("drift", result.stderr)
@@ -372,9 +471,11 @@ class MergeGateCheckpointTests(MergeGateFixture):
     def test_without_production_the_calling_showrunners_list_takes_the_rows(self) -> None:
         review, doc = self.review_list()
         producer = self.review_producer(doc)
-        timer = Path(self.environment["NOTIFIER_STATE_DIR"]) / "showrunner-fixture"
+        runner = staff.by_id(producer)
+        assert runner is not None and isinstance(runner.parent, staff.ReportsTo)
+        timer = Path(self.environment["NOTIFIER_STATE_DIR"]) / f"showrunner-{runner.parent.id}"
         timer.mkdir(parents=True)
-        self.write(timer / "conf", "TARGET=session:fixture-showrunner\n"
+        self.write(timer / "conf", f"TARGET=session:{runner.parent.id}\n"
                    + f"CHECK=bash /scripts/production/production_check.sh {doc}\n")
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
                                             + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away\n"
@@ -533,7 +634,7 @@ class MergeGateProducerTests(ProducerFixture):
             merge_gate.record_changes(self.repo, self.listing, self.doc,
                                       change_review.publication_changes(commits, self.doc), "main")
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], self.unit.id)
-        self.assertEqual(change_review.pending(self.listing)[0]["Production"], "top")
+        self.assertEqual(change_review.pending(self.listing)[0]["Production"], self.unit.id)
 
     def test_record_changes_keeps_an_unknown_producer_empty_and_prints_one_named_note(self) -> None:
         merged = self.merge()

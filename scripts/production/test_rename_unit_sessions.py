@@ -19,7 +19,12 @@ class UnitRenameSessionsTests(UnitRenameFixture):
             {"pane_id": "w1:p2", "workspace_id": "w1", "terminal_id": "t2",
              "label": "other", "session_id": "unrelated-session"},
         ]
+        def native_process(pane: str, _kind: str, _timeout: float) -> herdr.NativeAgentProcess:
+            session = row.current_session if pane == "w1:p1" else "unrelated-session"
+            return herdr.NativeAgentProcess(session, "fixture-generation", {})
+
         with (mock.patch.object(herdr.Herdr, "panes", return_value=panes),
+              mock.patch.object(herdr.Herdr, "native_pane_process", side_effect=native_process),
               mock.patch.object(herdr.Herdr, "retitle", return_value=True) as displays,
               mock.patch.object(herdr.Herdr, "start_agent") as launches):
             self.assert_ok(self.rename("apply"))

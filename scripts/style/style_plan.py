@@ -51,8 +51,8 @@ import style_footprint
 import style_proposals
 from issues import Issue, frontmatter
 from scripts.production.production_doc import Refusal, production_field
-from proposal_issue import ApprovedDecision, decision_answer, require_generated_body
-from unit_files import changed_files, git, unit_file_holders, unit_worktrees
+from proposal_issue import ApprovedDecision, decision_answer, proposal_unit, require_generated_body
+from unit_files import changed_files, git, report_unit_problems_once, unit_file_holders, unit_worktrees
 from unit_plans import (AllCrates, PilotScope, crate_in_scope, delegation_context, family_plan_texts, family_pilot_scopes,
                         parse_pilot_scope, unit_plan_path)
 
@@ -3097,7 +3097,7 @@ def classify_split(ledger: style_ledger.Ledger, unit: str, doc: Path, base: Unit
                 decisions[path] = False
             else:
                 issue = Issue(path, frontmatter(path))
-                decisions[path] = (rules.style_family(issue.value("unit")) == family
+                decisions[path] = (rules.style_family(proposal_unit(issue)) == family
                                    and isinstance(decision_answer(issue), ApprovedDecision))
         if decisions[path]:
             population.append((finding, path))
@@ -3252,6 +3252,7 @@ def refill_outcome(result: NextPhase) -> str:
             return "board unavailable"
 
 
+@report_unit_problems_once()
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)

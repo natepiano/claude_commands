@@ -7,16 +7,6 @@ from dataclasses import dataclass
 from scripts.production import staff, showrunners, unit_names
 
 
-def showrunner_owner(record: staff.StaffSnapshot, slug: str, document: str) -> staff.StaffRow | None:
-    """A timer names a staff path or a unique showrunner short name, including nested owners."""
-    name = showrunners.space_from_text(slug, document)
-    row = record.by_path(name)
-    if row is not None and row.kind == "showrunner":
-        return row
-    owners = [owner for owner in record.find(kind="showrunner") if owner.name == name]
-    return owners[0] if len(owners) == 1 else None
-
-
 @dataclass(frozen=True)
 class StaffLabels:
     record: staff.StaffSnapshot
@@ -35,7 +25,7 @@ class StaffLabels:
         parents: dict[str, staff.StaffRow] = {}
         for row in record.find(kind="showrunner"):
             timer = showrunners.timer_for(row, record, sources=sources)
-            if isinstance(timer, showrunners.Timer):
+            if isinstance(timer, showrunners.TimerRegistration):
                 parents[timer.slug] = row
         return cls(record, productions, parents)
 
@@ -50,7 +40,7 @@ class StaffLabels:
             _ = result.pop("SHOWRUNNER_UNIT", None)
             _ = result.pop("SHOWRUNNER_UNIT_ID", None)
         elif row.kind == "unit":
-            parent = self.record.by_id(row.parent) if row.parent is not None else None
+            parent = self.record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
             if parent is None or parent.kind != "showrunner":
                 return result
             slugs = [slug for slug, owner in self.showrunners.items() if owner.id == parent.id]

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+
 import json
 import os
 import shlex
@@ -11,8 +12,9 @@ import subprocess
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+from typing import Literal, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 # Sibling imports need this folder. Append it so a caller's own modules
@@ -27,14 +29,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami import account
 from probe_session import PROBE_ENV
 import unit_runs
-if TYPE_CHECKING:
-    from ..direct.worker_state import worker_ledger
-else:
-    from worker_state import worker_ledger
 import herdr
 import sessions
 from sessions import process_start as _process_start
-from scripts.production import showrunners
+from scripts.production import showrunners, staff, session_staff
+from scripts.usage import agents_log
 import unit_lookup
 from scripts.whoami.account import Account, label_for
 
@@ -368,7 +367,7 @@ def showrunner_registrations() -> ShowrunnerRegistrations:
             _ = doc.path.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             continue
-        found.append(ShowrunnerRegistration(target[8:], instance.name.removeprefix("showrunner-"), str(doc.path)))
+        found.append(ShowrunnerRegistration(target[8:], showrunners.production_slug(str(doc.path)), str(doc.path)))
     return ShowrunnerRegistrations(tuple(found))
 
 
@@ -443,20 +442,10 @@ def _active_run_directories() -> dict[str, list[Path]]:
 
 
 def _worker_owners(run_directories: dict[str, list[Path]], session_ids: set[str]) -> dict[str, str]:
-    short_to_session = {session_id[:8].casefold(): session_id for session_id in session_ids}
-    owners: dict[str, str] = {}
-    for owner, directories in run_directories.items():
-        for directory in directories:
-            try:
-                lines = worker_ledger(directory).read_text(encoding="utf-8").splitlines()
-            except (OSError, UnicodeError):
-                continue
-            for line in lines:
-                daemon_short = line.split("\t", 1)[0].strip().casefold()
-                worker = short_to_session.get(daemon_short)
-                if worker is not None:
-                    owners[worker] = owner
-    return owners
+    membership = staff.local_snapshot()
+    return {row.current_session: parent.current_session for row in membership.find(kind="worker")
+            if row.current_session in session_ids and (parent := membership.parent_of(row)) is not None
+            and parent.current_session in run_directories}
 
 
 def _newest_unit_plans() -> dict[str, str]:
@@ -819,18 +808,29 @@ def _left_since_offered(directory: Path, roster: dict[str, dict[str, object]]) -
     return board < offered
 
 
+
+
 class PausedSeat(TypedDict):
-    """A director's existing worker thread and the launcher that continues it."""
+    """A worker reference and the launcher that continues its task."""
+
     run_dir: str
     seat: str
     role: str
-    thread_id: str
+    staff_id: str
     turn_live: bool
     launcher_command: list[str]
 
 
 def codex_seats(run_directories: list[Path]) -> list[PausedSeat]:
     seats: list[PausedSeat] = []
+    if not run_directories:
+        return seats
+    try:
+        membership = staff.local_snapshot()
+    except staff.StaffUnreadable as error:
+        print(f"inventory: worker membership: {error}", file=sys.stderr)
+        return seats
+    tasks = agents_log.assignments(agents_log.state_dir() / "agents.jsonl")
     for directory in run_directories:
         run_dir = str(directory)
         roster = {
@@ -842,12 +842,13 @@ def codex_seats(run_directories: list[Path]) -> list[PausedSeat]:
         if _left_since_offered(directory, roster):
             continue
         for name, entry in roster.items():
-            thread_id, role = entry.get("thread_id", ""), entry.get("role", "impl")
+            reference = entry.get("staff_id", "")
+            task = agents_log.role_at(tasks, session_staff.worker_session(entry, membership), datetime.now(timezone.utc))
             launcher = entry.get("launcher_pid", 0)
             turn_live = entry.get("status") in {"running", "starting"} or entry.get("paused_turn") is True
             seat = PausedSeat(run_dir=run_dir, seat=name,
-                              role=role if isinstance(role, str) else "impl",
-                              thread_id=thread_id if isinstance(thread_id, str) else "",
+                              role=task.role if isinstance(task, agents_log.Assignment) else "",
+                              staff_id=reference if isinstance(reference, str) else "",
                               turn_live=turn_live,
                               launcher_command=_launcher_command(launcher) if isinstance(launcher, int) else [])
             seats.append(seat)

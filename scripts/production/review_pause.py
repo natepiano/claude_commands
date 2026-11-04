@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from scripts.production import showrunners
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
@@ -33,7 +34,7 @@ def notifier_command() -> list[str]:
 
 
 def notifier(action: str, slug: str) -> str:
-    result = subprocess.run([*notifier_command(), action, f"showrunner-{slug}"],
+    result = subprocess.run([*notifier_command(), action, showrunners.timer_name(slug)],
                             capture_output=True, text=True, check=False, timeout=10)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"notifier {action} failed for {slug}")
@@ -94,7 +95,7 @@ def reconcile_attempted(instance: Path, path: Path, record: ReviewPauseRecord) -
 
 
 def pause(instance: Path) -> str:
-    slug = instance.name.removeprefix("showrunner-")
+    slug = showrunners.production_slug(str(showrunner_footer.production_doc(instance)))
     path = record_path(slug)
     existing = path.exists()
     record = read_record(path) if existing else ReviewPauseRecord(dailies="untouched")
@@ -116,7 +117,7 @@ def pause(instance: Path) -> str:
 
 
 def status(instance: Path) -> str:
-    slug = instance.name.removeprefix("showrunner-")
+    slug = showrunners.production_slug(str(showrunner_footer.production_doc(instance)))
     path = record_path(slug)
     if not path.exists():
         return ""
@@ -126,7 +127,7 @@ def status(instance: Path) -> str:
 
 
 def resume(instance: Path, answer: str) -> str:
-    slug = instance.name.removeprefix("showrunner-")
+    slug = showrunners.production_slug(str(showrunner_footer.production_doc(instance)))
     path = record_path(slug)
     if not path.exists():
         return ""

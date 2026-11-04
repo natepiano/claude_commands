@@ -20,7 +20,7 @@ import berth_board
 import rules
 import style_ledger
 
-from style_plan_test_support import StylePlanFixture
+from style_plan_test_support import StylePlanFixture, unit_staff_id
 
 
 @final
@@ -373,7 +373,7 @@ class StylePlanTests(StylePlanFixture):
         _ = ledger.reconcile("main", "style/main")
         with mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources)):
             code, output, errors = self.run_next()
-        self.assertEqual((code, errors), (3, ""))
+        self.assertEqual((code, errors), (3, "style: names-unit: the unit worktree has a detached HEAD\n"))
         self.assertIn("discarded names-unit-1: dropped", output)
         self.assertNotIn("### Phase 1 — names-unit-1", self.plan.read_text())
 
@@ -409,7 +409,7 @@ class StylePlanTests(StylePlanFixture):
         finding = ledger.hold(rule, self.sources[0], 1, "value", "rename", "old", "new", blob, "outside")
         ledger.file_held(finding.finding_id, issue)
         _ = issue.write_text('---\nstatus: open\nstage: backlog\ntags: [issue, proposal, style]\n'
-                             + f'unit: names-unit\nplan: "{self.plan} Phase 1"\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n')
+                             + f'unit: {unit_staff_id("names-unit")}\nplan: "{self.plan} Phase 1"\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n')
         self.proposals_field(folder)
         unit_change = self.unit_commit(self.sources[0], "pub fn value() { unit(); }\n")
         with mock.patch.object(style_proposals, "proposal_command") as start:

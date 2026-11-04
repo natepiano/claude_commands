@@ -24,6 +24,7 @@ import herdr
 import sessions
 import top_level
 from scripts.message.process_test_support import OwnedTestProcesses
+from scripts.message import unit_labels
 from scripts.production import staff
 
 NO_SHOWRUNNER = roster.NoShowrunner()
@@ -213,7 +214,7 @@ class TopLevelTests(unittest.TestCase):
                                      f"solo\tuds:{solo}", f"orphaned unit\tuds:{orphaned}"})
         self.assertEqual({session_id for _, session_id in recorded}, {"showrunner", "ordinary", "solo", "orphaned unit"})
 
-    def test_stale_tmux_names_do_not_override_roster_unit_identity(self) -> None:
+    def test_roster_unit_identity_overrides_tmux_labels(self) -> None:
         _ = self.add("renamed unit", tmux="old-name:@3.%7", role="unit director",
                      showrunner=roster.UnderShowrunner("production", "runner", "session:runner"))
         ordinary = self.add("ordinary", tmux="unit-looking-name:@1.%1")
@@ -257,6 +258,20 @@ class TopLevelTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(lines, [f"reachable\tuds:{address}"])
         self.assertEqual(errors, ["top_level: roster: daemon closed mid-call"])
+        self.assertEqual(recorded, [("reachable", "reachable-id")])
+
+    def test_docless_staff_warning_keeps_other_top_level_recipients(self) -> None:
+        address = self.add("reachable", session_id="reachable-id")
+        bad = staff.StaffRow(staff.StaffId("bad"), "showrunner", "bad", staff.STAFF_ROOT,
+                             current_session=staff.StaffId("bad-session"))
+        diagnostics = unit_labels.StaffDiagnostics()
+        self.assertEqual(unit_labels.registered_showrunners(
+            diagnostics, known_sessions={}, membership=staff.StaffSnapshot((bad,))), [])
+        self.problems, self.warnings = diagnostics.problems, diagnostics.warnings
+        result, lines, errors, recorded = self.run_main()
+        self.assertEqual(result, 0)
+        self.assertEqual(lines, [f"reachable\tuds:{address}"])
+        self.assertEqual(errors, ["top_level: roster: warning: bad: the production document is not recorded"])
         self.assertEqual(recorded, [("reachable", "reachable-id")])
 
     def test_durable_warning_prints_once_without_losing_a_readable_recipient(self) -> None:

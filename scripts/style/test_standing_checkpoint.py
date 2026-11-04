@@ -20,6 +20,7 @@ import fake_fmt
 from style_child_test_support import style_cli_command
 import mechanical_classes
 import style_ledger
+from style_plan_test_support import unit_staff_id
 import style_rules
 from scripts.production import unit_config
 from scripts.production.staff_test_support import fixture_unit_location, isolated_staff_file, recorded_showrunner
@@ -95,9 +96,9 @@ class StandingCheckpointTests(unittest.TestCase):
         with (self.repo / ".git/info/exclude").open("a") as exclude:
             _ = exclude.write("/docs/product-production.md\n")
         self.write(parent, self.production("main", self.repo))
-        self.write(self.doc, self.production("style/main", self.style) + f"\n- **Parent production:** {parent}\n- **Branch point:** main\n")
+        self.write(self.doc, self.production("style/main", self.style) + "\n- **Branch point:** main\n")
         _ = recorded_showrunner("sample", parent)
-        owner = recorded_showrunner("sample-style", self.doc)
+        owner = recorded_showrunner("sample-style", self.doc, parent="sample")
         _ = fixture_unit_location(owner, "names-unit", self.unit)
         self.plan = self.unit / "docs/style-production/units/names-unit.md"
         _ = unit_config.write(self.unit, unit_config.UnitConfig(
@@ -178,7 +179,7 @@ class StandingCheckpointTests(unittest.TestCase):
                 finding = ledger.hold(self.rule, path, 2, "1", "type", "1", "2", rule_blob, "outside")
                 ledger.file_held(finding.finding_id, issue)
         _ = issue.write_text('---\nstatus: open\nstage: backlog\ntags: [issue, proposal, style]\n'
-                             + f'unit: names-unit\nplan: "{self.plan} Phase 1"\nstyle_rule: {self.rule}\nstyle_crate: alpha\n'
+                             + f'unit: {unit_staff_id("names-unit")}\nplan: "{self.plan} Phase 1"\nstyle_rule: {self.rule}\nstyle_crate: alpha\n'
                              + f'style_rule_blob: {rule_blob}\nstyle_count: 1\n---\n')
         _ = self.doc.write_text(self.doc.read_text() + f"- **Proposals:** {issue.parent}\n")
         result = self.refill()

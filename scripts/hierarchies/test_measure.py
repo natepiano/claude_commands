@@ -27,7 +27,7 @@ from scripts.production.cli_fixture import production_paths
 from scripts.production import fake_showrunner, staff, session_staff
 from scripts.production.staff_test_support import (
     fixture_member, isolated_staff_file, isolated_source_readers, source_environment,
-    recorded_showrunner, recorded_unit,
+    recorded_showrunner, recorded_unit, unit_membership,
 )
 from scripts.shutdown import remote
 
@@ -91,7 +91,7 @@ class RowUnitReadingTests(unittest.TestCase):
         destination, _ = self.production("new-owner", "new-alias")
         tree = self.root / "old-prefix-renderer"
         unit = recorded_unit("old-owner", "renderer", tree, old_doc)
-        _ = staff.move(unit.id, destination.id)
+        _ = staff.move(unit.id, staff.ReportsTo(destination.id))
         units, problems = self.staff_units()
         self.assertEqual([(unit.production, unit.name, unit.worktree) for unit in units],
                          [("new-alias", "renderer", str(tree))])
@@ -139,7 +139,7 @@ class RowUnitReadingTests(unittest.TestCase):
         destination, _ = self.production("new-owner", "new-alias")
         tree = self.root / "old-prefix-renderer"
         unit = recorded_unit("old-owner", "renderer", tree, doc)
-        _ = staff.move(unit.id, destination.id)
+        _ = staff.move(unit.id, staff.ReportsTo(destination.id))
         _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", tree), expected=unit.worktree)
         history = self.root / "history"
         history.mkdir()
@@ -294,7 +294,14 @@ class MeasuresTest(unittest.TestCase):
     window: log_records.Window = log_records.Window(start, start + timedelta(days=7))
     at: str = start.isoformat()
 
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(isolated_staff_file(root / "staff.json", {}))
+
     def issue(self, name: str, **fields: str) -> Issue:
+        if unit := fields.get("unit"):
+            fields["unit"] = unit_membership("hana", unit).id
         return Issue(Path(name + ".md"), {key: [value] for key, value in fields.items()})
 
     def test_capacity_groups_units_and_counts_workers_without_running_directors(self) -> None:
@@ -3722,9 +3729,10 @@ class CanonicalQuestionWaitingTests(RegistrationFixture):
         problems: list[log_records.SourceProblem] = []
         with patch.dict(os.environ, self.env), production_paths(self.env):
             waiting = m.read_waiting(self.state, self.root / "vault", [], problems)
+            opened = log_records.moment("2026-10-05T12:00")
         questions = [item for item in waiting if item.kind == "questions"]
         self.assertEqual(len(questions), 1)
-        self.assertEqual(questions[0].opened, log_records.moment("2026-10-05T12:00"))
+        self.assertEqual(questions[0].opened, opened)
         question_sources = (str(self.doc), str(self.root / "issues"), self.env["STAFF_FILE"],
                             "question", "staff")
         self.assertEqual([

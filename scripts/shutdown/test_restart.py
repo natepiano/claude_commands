@@ -23,6 +23,7 @@ import restart
 import shutdown
 from unit_staff_test_support import unit_host
 from scripts.production import staff
+from scripts.accounts import accounts
 from scripts.shutdown import shutdown_record, stop_resume, pane_record
 from test_support import ShutdownTestCase, registry_confirmation
 
@@ -97,7 +98,7 @@ class SessionLaunchTests(ShutdownTestCase):
         (project / f"{identity}.jsonl").touch()
         output = io.StringIO()
         with (patch.object(pane_record, "RECORD_DIR", records),
-              patch("restart.unit_move.config_dirs", return_value=[config]),
+              patch("restart.sessions.config_dirs", return_value=[config]),
               patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": "/account"}),
               redirect_stderr(output)):
             kind, environment, arguments = restart.session_launch(identity)
@@ -135,9 +136,14 @@ class RestartTests(ShutdownTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        config = self.root / ".claude2"
+        config.mkdir()
+        _ = (config / ".claude.json").write_text(json.dumps({
+            "projects": {str(self.root): {"hasTrustDialogAccepted": True}},
+        }))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root),
                                                      "XDG_STATE_HOME": str(self.root)})))
-        self.rows = tuple(staff.StaffRow(staff.StaffId(f"row-{n}"), "unit", f"unit-{n}", None,
+        self.rows = tuple(staff.StaffRow(staff.StaffId(f"row-{n}"), "unit", f"unit-{n}", staff.StaffRoot(),
             current_session=staff.StaffId(f"conversation-{n}"),
             worktree=staff.PresentWorktree("natedev", self.root)) for n in range(3))
         self.running = {str(row.current_session) for row in self.rows}
@@ -149,6 +155,10 @@ class RestartTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(sessions, "session_liveness", side_effect=self.liveness))
         _ = self.enterContext(patch.object(stop_resume, "stop", side_effect=self.stop))
         _ = self.enterContext(patch.object(restart, "session_launch", side_effect=self.session_launch))
+        _ = self.enterContext(patch.object(accounts, "accounts_home", return_value=self.root))
+        _ = self.enterContext(patch.object(accounts, "role_account", return_value=accounts.NamedAccount(
+            "claude2", self.root / ".claude2")))
+        _ = self.enterContext(patch.object(accounts, "trust_sources", return_value=[]))
         _ = self.enterContext(patch.object(herdr, "prepare_session_environment",
             return_value=herdr.PreparedAgentEnvironment(self.root, {})))
         _ = self.enterContext(patch.object(herdr, "launch_prepared_agent", side_effect=self.launch))
@@ -255,27 +265,34 @@ class RestartTests(ShutdownTestCase):
                 launch.assert_not_called()
 
     def test_start_row_uses_the_target_account_environment(self) -> None:
-        self.running.clear()
         source, target = self.root / ".claude3", self.root / ".claude4"
         environment = {"CLAUDE_CONFIG_DIR": str(self.root / ".claude4"), "ACCOUNT_SETTING": "target"}
-        with (patch.object(restart, "named_account_environment", return_value=environment) as account,
-              patch.object(restart, "session_launch", return_value=("claude", {"CLAUDE_CONFIG_DIR": str(source)},
-                  ["--resume", str(self.rows[0].current_session)])),
-              patch("scripts.accounts.accounts.trust_sources", return_value=[("claude3", source / ".claude.json")]) as sources,
-              patch.object(herdr, "heal_claude_trust", return_value=herdr.TrustCopied(self.root,
-                  target / ".claude.json", "claude3")) as trust,
-              patch.object(herdr, "prepare_session_environment",
-                  return_value=herdr.PreparedAgentEnvironment(self.root, environment)) as prepare,
-              patch("scripts.accounts.accounts.account_dir", return_value=target)):
-            pane = restart.start_row(self.rows[0], staff.StaffSnapshot(self.rows),
-                                     herdr.Herdr("agents"), target_account="claude4")
-        account.assert_called_once_with(target)
-        sources.assert_called_once_with(target, source)
-        trust.assert_called_once_with(self.root, target / ".claude.json",
-                                      [("claude3", source / ".claude.json")], dry_run=False)
-        prepare.assert_called_once_with(str(self.rows[0].current_session), str(self.root),
-                                        environment, herdr.NO_ENVIRONMENT_REMOVALS)
-        self.assertEqual(pane, "w1:p0")
+        for requested in ("claude4", ""):
+            with (self.subTest(target_account=requested),
+                  patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude4", target)) as selection,
+                  patch.object(restart, "named_account_environment", return_value=environment) as account,
+                  patch.object(restart, "session_launch", return_value=("claude", {"CLAUDE_CONFIG_DIR": str(source)},
+                      ["--resume", str(self.rows[0].current_session)])),
+                  patch("scripts.accounts.accounts.trust_sources", return_value=[("claude3", source / ".claude.json")]) as sources,
+                  patch.object(herdr, "heal_claude_trust", return_value=herdr.TrustCopied(self.root,
+                      target / ".claude.json", "claude3")) as trust,
+                  patch.object(herdr, "prepare_session_environment",
+                      return_value=herdr.PreparedAgentEnvironment(self.root, environment)) as prepare,
+                  patch("scripts.accounts.accounts.account_dir", return_value=target)):
+                self.running.clear()
+                pane = restart.start_row(self.rows[0], staff.StaffSnapshot(self.rows),
+                                         herdr.Herdr("agents"), target_account=requested)
+            if requested:
+                selection.assert_not_called()
+            else:
+                selection.assert_called_once_with("unit")
+            account.assert_called_once_with(target)
+            sources.assert_called_once_with(target, source)
+            trust.assert_called_once_with(self.root, target / ".claude.json",
+                                          [("claude3", source / ".claude.json")], dry_run=False)
+            prepare.assert_called_once_with(str(self.rows[0].current_session), str(self.root),
+                                            environment, herdr.NO_ENVIRONMENT_REMOVALS)
+            self.assertEqual(pane, "w1:p0")
 
     def test_start_row_trusts_the_codex_folder(self) -> None:
         self.running.clear()
@@ -300,9 +317,9 @@ class RestartTests(ShutdownTestCase):
 
     def test_restart_all_dry_run_lists_every_live_row_with_its_tab_position(self) -> None:
         self.rows = (replace(self.rows[0], name="unit"),
-            replace(self.rows[1], kind="worker", name="codex-worker", parent=self.rows[0].id,
+            replace(self.rows[1], kind="worker", name="codex-worker", parent=staff.ReportsTo(self.rows[0].id),
                     worktree=staff.WORKTREE_UNFILLED),
-            replace(self.rows[2], kind="agent", name="morty", parent=None,
+            replace(self.rows[2], kind="agent", name="morty", parent=staff.StaffRoot(),
                     worktree=staff.WORKTREE_UNFILLED, doc=staff.LiveDoc("natedev", self.root / "morty.md")))
         layout: herdr.SavedLayout = {"at": 1, "workspaces": [{"name": "saved", "seen": 1,
             "tabs": [{"name": "old", "seen": 1, "row_id": str(self.rows[1].id)}]}]}
@@ -484,10 +501,10 @@ class RestartTests(ShutdownTestCase):
             self.assertEqual(json.dumps(session), saved)
 
     def test_restart_skips_an_unknown_unit_folder_and_starts_the_other_rows(self) -> None:
-        parent = staff.StaffRow(staff.StaffId("parent"), "showrunner", "parent", None,
+        parent = staff.StaffRow(staff.StaffId("parent"), "showrunner", "parent", staff.StaffRoot(),
                                current_session=staff.StaffId("parent-session"),
                                doc=staff.LiveDoc("natedev", self.root / "production.md"))
-        self.rows = (replace(self.rows[0], parent=parent.id, worktree=staff.WORKTREE_UNFILLED), *self.rows[1:])
+        self.rows = (replace(self.rows[0], parent=staff.ReportsTo(parent.id), worktree=staff.WORKTREE_UNFILLED), *self.rows[1:])
         record = staff.StaffSnapshot((*self.rows, parent))
         self.running.clear()
         shutdown_record.save([str(row.id) for row in self.rows])

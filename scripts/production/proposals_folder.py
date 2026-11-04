@@ -1,7 +1,6 @@
 """Find proposal stores and join their proposers to the production's staff members."""
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 
@@ -9,7 +8,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import showrunners, staff, unit_lookup, unit_names
+from scripts.production import showrunners, staff, unit_lookup
 import showrunner_tree
 from issues import Issue, open_issues
 # Callers such as rename_unit read the tag here.
@@ -19,8 +18,6 @@ from scripts.production.production_doc import Refusal, production_field
 PROPOSALS_FIELD = "Proposals"
 IMPROVEMENT_QUEUE_FIELD = "Improvement queue"
 PRODUCTION_SUFFIX = "-production.md"
-# `types-unit (cargo-liner-style)`: a unit with the production it works in.
-UNIT_IN_PRODUCTION = re.compile(r".+?\s*\((?P<production>[^()]+)\)")
 
 
 def ledger(doc: Path) -> Path | None:
@@ -70,23 +67,19 @@ def scope_docs(doc: Path, below: bool = False) -> list[Path]:
 
 
 def owners(doc: Path, below: bool = False) -> frozenset[str]:
-    """The proposer names whose proposals are this production's: each production and its staff units."""
-    record = staff.initial_snapshot()
-    names: set[str] = set()
+    """Read the fixed ids of each production and its units."""
+    record = staff.snapshot()
+    identities: set[str] = set()
     for production in scope_docs(doc, below):
-        names.add(slug_of(production))
-        try:
-            names.update(unit_names.unit_id(row.name) for row in unit_lookup.doc_units(production, record))
-        except staff.StaffUnreadable:
-            continue
-    return frozenset(names)
+        owner = unit_lookup.doc_owner(production, record)
+        identities.add(owner.id)
+        identities.update(row.id for row in record.find(kind="unit", parent=owner.id))
+    return frozenset(identities)
 
 
 def proposer(issue: Issue) -> str:
-    """The name that owns a proposal: the production of `unit (production)`, else the proposer field."""
-    named = issue.value("proposed_by")
-    found = UNIT_IN_PRODUCTION.fullmatch(named)
-    return found["production"].strip() if found else named
+    """Read the proposer's fixed staff id."""
+    return issue.value("proposed_by")
 
 
 def proposal_issues(doc: Path) -> list[Issue]:

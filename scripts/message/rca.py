@@ -224,11 +224,11 @@ def production_of(report: Report) -> str:
     identity = known["sessionId"] if known is not None else ""
     row = record.by_current_session(identity)
     while row is not None and row.kind != "showrunner":
-        row = record.by_id(row.parent) if row.parent is not None else None
+        row = record.parent_of(row)
     if row is None:
         return ""
     timer = showrunners.timer_for(row, record)
-    return timer.slug if isinstance(timer, showrunners.Timer) else row.name
+    return timer.slug if isinstance(timer, showrunners.TimerRegistration) else row.name
 
 
 def owner_address(production: str, *, deadline: float = math.inf) -> str:
@@ -239,7 +239,7 @@ def owner_address(production: str, *, deadline: float = math.inf) -> str:
         record = staff.snapshot()
         for row in staff.active(record, "showrunner"):
             timer = showrunners.timer_for(row, record)
-            slug = timer.slug if isinstance(timer, showrunners.Timer) else row.name
+            slug = timer.slug if isinstance(timer, showrunners.TimerRegistration) else row.name
             if slug == production:
                 socket = showrunners.socket_for(f"session:{row.current_session}", deadline=deadline)
                 return f"uds:{socket}" if socket else NATEDEV

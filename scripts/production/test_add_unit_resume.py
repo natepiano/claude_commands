@@ -205,7 +205,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         arguments = self.agent_arguments()
         self.assertEqual(arguments[arguments.index("--resume") + 1], row.current_session)
         self.assertEqual(unit_config.read(self.root / "project-alpha"),
-                         unit_config.UnitConfig(unit_config.PermanentPlan(), unit_config.NoAppPort(), ()))
+                         unit_config.UnitConfig(unit_config.PermanentPlan(), unit_config.NoAppPort(), (unit_config.BOARD_FREE,)))
 
     def test_attach_requires_cwd_supported_mode_and_exclusive_session_flag(self) -> None:
         document, head = self.doc.read_text(), self.git("rev-parse", "HEAD")

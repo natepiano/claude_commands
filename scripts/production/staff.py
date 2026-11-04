@@ -27,14 +27,57 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if __name__ == "__main__":
     # Lazy runtime readers share these exact row and exception classes in the CLI.
     sys.modules["scripts.production.staff"] = sys.modules[__name__]
-from scripts.lib import atomic_file  # noqa: E402
+from scripts.lib import atomic_file, conf  # noqa: E402
 from scripts.shutdown import remote  # noqa: E402
+from scripts.agents import worker_lifecycle  # noqa: E402
 
 OWNER_MACHINE = "natedev"
-OPERATION_LOCK_TIMEOUT_SECONDS = 30.0
 StaffId = NewType("StaffId", str)
 Kind = Literal["showrunner", "unit", "worker", "agent"]
 _KINDS: tuple[Kind, ...] = ("showrunner", "unit", "worker", "agent")
+WorkerRole = Literal["impl", "test", "review", "fix", "astra-designer", "astra-reviewer"]
+WORKER_ROLES: tuple[WorkerRole, ...] = ("impl", "test", "review", "fix", "astra-designer", "astra-reviewer")
+
+
+@dataclass(frozen=True)
+class ReportsTo:
+    id: StaffId
+
+
+@dataclass(frozen=True)
+class StaffRoot:
+    """A top showrunner has no parent."""
+
+
+@dataclass(frozen=True)
+class ClaudeBackend:
+    """The worker runs in Claude."""
+
+
+@dataclass(frozen=True)
+class CodexBackend:
+    codex_home: Path
+
+
+@dataclass(frozen=True)
+class BackendUnavailable:
+    """No producer proved the worker backend."""
+
+
+
+
+def _seconds(key: str) -> float:
+    source = Path(os.environ["STAFF_CONFIG"]) if os.environ.get("STAFF_CONFIG") else "staff"
+    return conf.read(source).number(key)
+
+
+def _wait_seconds(key: str) -> float:
+    remaining = worker_lifecycle.effective_deadline() - time.monotonic()
+    if remaining <= 0:
+        raise worker_lifecycle.OperationDeadlineExpired("staff operation deadline expired")
+    return min(_seconds(key), remaining)
+
+
 def native_id(value: str) -> StaffId:
     """Validate an identity supplied by Claude or Codex, without assigning one."""
     try:
@@ -43,6 +86,10 @@ def native_id(value: str) -> StaffId:
     except ValueError as error:
         raise StaffRefused(f"invalid native runtime id: {value!r}") from error
     return StaffId(value)
+
+
+STAFF_ROOT = StaffRoot()
+BACKEND_UNAVAILABLE = BackendUnavailable()
 
 
 def _valid_id(value: str) -> bool:
@@ -78,13 +125,10 @@ def runtime_id(pid: int | None = None) -> str:
         if pid is not None or current <= 1:
             return ""
         try:
-            if sys.platform == "darwin":
-                result = subprocess.run(["ps", "-p", str(current), "-o", "ppid="], capture_output=True,
-                                        text=True, check=True, timeout=2)
-                current = int(result.stdout.strip())
-            else:
-                stat = (Path(os.environ.get("HERDR_PROC", "/proc")) / str(current) / "stat").read_text()
-                current = int(stat.rsplit(")", 1)[1].split()[1])
+            process_parent = cast(Callable[[int], int], import_module("scripts.shutdown.pane_record").process_parent)
+            current = process_parent(current)
+        except worker_lifecycle.OperationDeadlineExpired:
+            raise
         except (OSError, ValueError, IndexError, subprocess.SubprocessError):
             return ""
     return ""
@@ -185,14 +229,17 @@ class StaffRow:
     id: StaffId
     kind: Kind
     name: str
-    parent: StaffId | None
+    parent: ReportsTo | StaffRoot
     current_session: StaffId = field(kw_only=True)
 
     worktree: PresentWorktree | RemovedWorktree | WorktreeUnfilled = field(default_factory=WorktreeUnfilled)
     doc: LiveDoc | WrappedDoc | DocUnfilled = field(default_factory=DocUnfilled)
 
+    def reports_to(self, identity: StaffId) -> bool:
+        return self.parent == ReportsTo(identity)
+
     def to_json(self) -> dict[str, object]:
-        value: dict[str, object] = {"id": self.id, "kind": self.kind, "name": self.name, "parent": self.parent, "current_session": self.current_session}
+        value: dict[str, object] = {"id": self.id, "kind": self.kind, "name": self.name, "parent": self.parent.id if isinstance(self.parent, ReportsTo) else None, "current_session": self.current_session}
         if not isinstance(self.worktree, WorktreeUnfilled):
             value["worktree"] = {"machine": self.worktree.machine, "path": str(self.worktree.path),
                                  "state": "present" if isinstance(self.worktree, PresentWorktree) else "removed"}
@@ -222,7 +269,7 @@ class StaffRow:
             raise StaffUnreadable("invalid current session")
         worktree, doc = _row_locations(kind, fields)
         return cls(StaffId(staff_id), kind, name,
-                   StaffId(parent) if isinstance(parent, str) else None, worktree, doc, current_session=StaffId(current))
+                   ReportsTo(StaffId(parent)) if isinstance(parent, str) else StaffRoot(), worktree, doc, current_session=StaffId(current))
 
 
 def _row_locations(kind: str, fields: dict[str, object]) -> tuple[PresentWorktree | RemovedWorktree | WorktreeUnfilled, LiveDoc | WrappedDoc | DocUnfilled]:
@@ -335,11 +382,18 @@ class StaffSnapshot:
     production: bool = field(default=False, compare=False)
 
     @cached_property
+    def backends(self) -> Mapping[StaffId, ClaudeBackend | CodexBackend]:
+        return _found_backends(self.rows)
+
+    @cached_property
     def rows_by_id(self) -> dict[StaffId, StaffRow]:
         return {row.id: row for row in self.rows}
 
     def by_id(self, staff_id: StaffId) -> StaffRow | None:
         return self.rows_by_id.get(staff_id)
+
+    def parent_of(self, row: StaffRow) -> StaffRow | None:
+        return self.by_id(row.parent.id) if isinstance(row.parent, ReportsTo) else None
 
     def by_current_session(self, session_id: str) -> StaffRow | None:
         return next((row for row in self.rows if row.current_session == session_id), None)
@@ -394,7 +448,7 @@ class StaffSnapshot:
     def find(self, *, kind: Kind | None = None, parent: StaffId | None = None) -> list[StaffRow]:
         """An omitted kind or parent leaves that field unrestricted."""
         return [row for row in self.rows if (kind is None or row.kind == kind)
-                and (parent is None or row.parent == parent)]
+                and (parent is None or row.parent == ReportsTo(parent))]
 
 
 def active(record: StaffSnapshot, kind: Kind) -> tuple[StaffRow, ...]:
@@ -491,7 +545,7 @@ class SeedInput:
         for item in cast(list[object], raw_members):
             raw = cast(dict[str, object], item) if isinstance(item, dict) else {}
             keys = {"key", "kind", "name", "match", "parent"}
-            entry = _seed_fields(cast(object, item), keys | ({"runtime_id"} if "runtime_id" in raw else set()))
+            entry = _seed_fields(cast(object, item), keys | (set(raw) & {"runtime_id"}))
             runtime = entry.get("runtime_id", "")
             if not isinstance(runtime, str):
                 raise StaffRefused("invalid seed native runtime identity")
@@ -527,6 +581,8 @@ def _default_file() -> Path:
 
 def _file_override() -> str:
     return os.environ.get("STAFF_FILE", "")
+def record_path() -> Path:
+    return _file()
 
 
 def _file() -> Path:
@@ -542,6 +598,12 @@ def folder_move_path(unit: StaffId) -> Path:
 def is_owner() -> bool:
     """An explicit STAFF_FILE is local state owned by this process."""
     return bool(_file_override()) or remote.other_machine() != OWNER_MACHINE
+
+
+def child_environment(environment: Mapping[str, str]) -> dict[str, str]:
+    """Remove row lock proofs and retired staff hints from child environments."""
+    return {key: value for key, value in environment.items()
+            if not key.startswith("STAFF_ROW_FD_") and key != "STAFF_ID"}
 
 
 def operation_fds() -> tuple[int, ...]:
@@ -628,20 +690,14 @@ def _operation_lock_holder(path: Path) -> str:
 
 
 def _wait_for_operation_lock(descriptor: int, path: Path) -> None:
+    limit = _wait_seconds("OPERATION_LOCK_SECONDS")
     started = time.monotonic()
-    while True:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return
-        except BlockingIOError:
-            elapsed = time.monotonic() - started
-            remaining = OPERATION_LOCK_TIMEOUT_SECONDS - elapsed
-            if remaining <= 0:
-                raise StaffRefused(
-                    f"staff operation lock {path}: {_operation_lock_holder(path)}; " +
-                    f"refused after {elapsed:.2f}s (limit {OPERATION_LOCK_TIMEOUT_SECONDS:.2f}s)"
-                ) from None
-            time.sleep(min(0.05, remaining))
+    try:
+        worker_lifecycle.acquire_flock(descriptor, deadline=started + limit)
+    except worker_lifecycle.OperationDeadlineExpired as error:
+        raise worker_lifecycle.OperationDeadlineExpired(
+            f"staff operation lock {path}: refused after {time.monotonic() - started:.2f}s; "
+            + f"{_operation_lock_holder(path)}; limit {limit:.2f}s") from error
 
 
 def operation() -> AbstractContextManager[None]:
@@ -657,6 +713,8 @@ def operation() -> AbstractContextManager[None]:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 lock = resources.enter_context(path.open("a", encoding="utf-8"))
                 _wait_for_operation_lock(lock.fileno(), path)
+            except worker_lifecycle.OperationDeadlineExpired:
+                raise
             except OSError as error:
                 raise StaffUnreadable(f"staff operation: {error}") from error
             previous = os.environ.get("STAFF_OPERATION_FD")
@@ -681,7 +739,7 @@ def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = 
     indexed: dict[StaffId, StaffRow] = {}
     unknown = {cast(str, row["id"]) for row in unknown_rows}
     sessions = {cast(str, row.get("current_session", row["id"])) for row in unknown_rows}
-    names: set[tuple[Kind, StaffId | None, str]] = set()
+    names: set[tuple[Kind, ReportsTo | StaffRoot | None, str]] = set()
     worktrees: set[tuple[str, Path]] = set()
     for row in rows:
         if row.id in indexed or row.id in unknown:
@@ -714,13 +772,14 @@ def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = 
             raise StaffRefused(f"{row.kind} name already exists: {row.name}")
         names.add(key)
     for row in rows:
-        if row.parent is None and row.kind not in ("showrunner", "agent"):
-            raise StaffRefused(f"{row.kind} {row.name} requires a parent")
-        if row.parent is not None and row.parent not in unknown:
-            parent = indexed.get(row.parent)
+        if isinstance(row.parent, StaffRoot):
+            if row.kind not in ("showrunner", "agent"):
+                raise StaffRefused(f"{row.kind} {row.name} requires a parent")
+        elif row.parent.id not in unknown:
+            parent = indexed.get(row.parent.id)
             allowed = _parent_kinds(row.kind)
             if parent is None or parent.kind not in allowed:
-                raise StaffRefused(f"{row.kind} {row.name} requires a {' or '.join(allowed)} parent: {row.parent}")
+                raise StaffRefused(f"{row.kind} {row.name} requires a {' or '.join(allowed)} parent: {row.parent.id}")
     # Once a chain is checked, every later chain reaching it is already known to end.
     checked: set[StaffId] = set()
     for row in rows:
@@ -730,9 +789,9 @@ def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = 
             if current.id in chain:
                 raise StaffRefused(f"staff parent loop at {current.name}")
             chain.add(current.id)
-            if current.parent is None or current.parent in unknown:
+            if isinstance(current.parent, StaffRoot) or current.parent.id in unknown:
                 break
-            current = indexed[current.parent]
+            current = indexed[current.parent.id]
         checked.update(chain)
 
 
@@ -781,6 +840,33 @@ def _load(*, initial: bool = False) -> StaffSnapshot:
     return replace(_snapshot_value(fields), inputs=(str(_file().absolute()),))
 
 
+def _found_backends(rows: Sequence[StaffRow]) -> dict[StaffId, ClaudeBackend | CodexBackend]:
+    """Find worker sessions with one scan of each home."""
+    from scripts.message import sessions
+
+    accounts = import_module("scripts.whoami.agent_accounts")
+    observe_home = cast(Callable[[], object], accounts.observe_workers_home)
+    find_homes = cast(Callable[[object], list[Path]], accounts.codex_homes)
+    homes = find_homes(observe_home())
+    if os.environ.get("CODEX_HOME"):
+        homes.insert(0, Path(os.environ["CODEX_HOME"]))
+    wanted = {row.current_session: row.id for row in rows if row.kind == "worker"}
+    found: dict[StaffId, ClaudeBackend | CodexBackend] = {}
+    for home in dict.fromkeys(homes):
+        try:
+            for folder in ("sessions", "archived_sessions"):
+                for path in (home / folder).rglob("*.jsonl"):
+                    identity = wanted.get(StaffId(path.stem[-36:]))
+                    if identity is not None:
+                        _ = found.setdefault(identity, CodexBackend(home))
+        except OSError as error:
+            print(f"anomaly: {home}: {error}", file=sys.stderr)
+    for current, identity in wanted.items():
+        if identity not in found and bool(sessions.transcript_locations(current)):
+            found[identity] = ClaudeBackend()
+    return found
+
+
 def _snapshot_value(fields: dict[str, object]) -> StaffSnapshot:
     pending = fields.get("pending_retire", [])
     if not isinstance(pending, list) or any(not isinstance(item, str) or not _valid_id(item)
@@ -790,7 +876,8 @@ def _snapshot_value(fields: dict[str, object]) -> StaffSnapshot:
     if not isinstance(inputs, list) or any(not isinstance(path, str) or not Path(path).is_absolute()
                                          for path in cast(list[object], inputs)):
         raise StaffUnreadable("invalid staff input paths")
-    return StaffSnapshot(tuple(_rows(fields.get("rows"))),
+    rows = _rows(fields.get("rows"))
+    return StaffSnapshot(tuple(rows),
                          tuple(sorted({StaffId(item) for item in cast(list[str], pending)})),
                          tuple(cast(list[str], inputs)), cast(int, fields.get("schema", 2)),
                          all("current_session" in item for item in cast(list[dict[str, object]], fields.get("rows", []))))
@@ -799,18 +886,21 @@ def _snapshot_value(fields: dict[str, object]) -> StaffSnapshot:
 def _remote(arguments: list[str], *, input_text: str | None = None) -> object:
     # Direct worker writers run inside the caller's membership lock. Match the
     # local API's row transaction without entering the outer lifecycle operation.
-    if arguments[:2] == ["ensure", "worker"] or arguments[0] == "update-current-session":
+    if arguments[:2] == ["ensure", "worker"] or arguments[0] in ("update-current-session", "ensure-worker"):
         arguments = [*arguments, "--row-write"]
     elif arguments[0] == "retire":
         arguments = [*arguments, "--worker-row"]
-    command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", OWNER_MACHINE,
+    timeout = _wait_seconds("REMOTE_SECONDS")
+    command = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={max(1, int(timeout))}", OWNER_MACHINE,
                "~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py "
                + shlex.join([*arguments, "--json"])]
     try:
         done = subprocess.run(command, stdin=subprocess.DEVNULL if input_text is None else None,
                               input=input_text, capture_output=True,
-                              text=True, timeout=20, check=False)
+                              text=True, timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired) as error:
+        if time.monotonic() >= worker_lifecycle.effective_deadline():
+            raise worker_lifecycle.OperationDeadlineExpired("staff remote deadline expired") from error
         raise StaffUnreadable(f"{OWNER_MACHINE} not reached") from error
     reason = done.stderr.strip()
     if done.returncode != 0 and (done.returncode == 255 or not reason):
@@ -853,6 +943,14 @@ def local_snapshot() -> StaffSnapshot:
     return _load()
 
 
+def wait_for_writes() -> None:
+    """Read the local record after pending staff transactions finish."""
+    path = _file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
+        worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_SH)
+
+
 def initial_snapshot() -> StaffSnapshot:
     """Read a writer's starting record, including an installation not yet seeded."""
     try:
@@ -877,7 +975,7 @@ def _row_by_path(rows: Sequence[StaffRow], names: str) -> StaffRow | None:
             return None
         parent = row.id
         matches = [member for member in rows
-                   if member.kind != "showrunner" and member.parent == parent and member.name == name]
+                   if member.kind != "showrunner" and member.parent == ReportsTo(parent) and member.name == name]
         row = matches[0] if len(matches) == 1 else None
     return row
 
@@ -935,6 +1033,68 @@ def _store(rows: list[StaffRow], pending: set[StaffId]) -> None:
     if pending:
         document["pending_retire"] = sorted(pending)
     atomic_file.write_text_atomic(_file(), json.dumps(document, indent=2, sort_keys=True) + "\n")
+    _copy_to_mac()
+
+
+def _copy_to_mac(*, detached: bool = True) -> None:
+    """Send the latest default record under one lock, outside the writing process."""
+    try:
+        if "STAFF_FILE" in os.environ or remote.local_machine() != OWNER_MACHINE:
+            return
+        if detached:
+            code = (f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r}); "
+                    "from scripts.production import staff; staff._copy_to_mac(detached=False)")
+            # A retained stderr pipe would make captured CLI callers wait for SSH.
+            with _default_file().with_name("mac-copy.log").open("a", encoding="utf-8") as errors:
+                _ = subprocess.Popen(
+                    [sys.executable, "-c", code], stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=errors, start_new_session=True,
+                )
+            return
+        import signal
+
+        path = _default_file()
+        # Keep this lock through SSH so an older send cannot follow a newer send.
+        with path.with_name("mac-copy.lock").open("a", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            text = path.read_text(encoding="utf-8")
+            command = '''set -e
+directory="$HOME/.local/state/staff"
+mkdir -p "$directory"
+temporary=$(mktemp "$directory/staff.json.mac-copy.XXXXXXXX")
+trap 'rm -f "$temporary"' EXIT
+cat > "$temporary"
+mv -f "$temporary" "$directory/staff.json"
+'''
+            def stop(_number: int, _frame: object) -> None:
+                raise InterruptedError("copier terminated")
+
+            # Defer SIGTERM until the SSH child has a cleanup handler.
+            blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+            previous_handler = signal.signal(signal.SIGTERM, stop)
+            try:
+                with subprocess.Popen(
+                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                     "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
+                     remote.other_machine(), command],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                ) as process:
+                    try:
+                        _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+                        _, errors = process.communicate(input=text, timeout=remote.STANDARD_TIME_LIMIT["seconds"])
+                    except BaseException:
+                        _ = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+                        process.terminate()
+                        _ = process.wait()
+                        raise
+                    if process.returncode:
+                        reason = " ".join(errors.split()) or f"ssh exited {process.returncode}"
+                        raise OSError(reason)
+            finally:
+                _ = signal.signal(signal.SIGTERM, previous_handler)
+                _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"staff: Mac copy failed: {' '.join(str(error).split())}", file=sys.stderr)
 
 
 def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result]) -> _Result:
@@ -942,7 +1102,7 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            worker_lifecycle.acquire_flock(lock)
             for temporary in path.parent.glob(f".{path.name}.*"):
                 temporary.unlink()
             original = _load(initial=True)
@@ -956,6 +1116,9 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
                         for location in _location_paths(row):
                             if _under_test_root(location):
                                 raise StaffRefused(f"test-root path cannot enter the real staff record: {location}")
+                        # The fixture backend uses UUID version 5; native backends use versions 4 and 7.
+                        if any(identity[14:15] == "5" for identity in (row.id, row.current_session)):
+                            raise StaffRefused("fixture runtime id cannot enter the real staff record")
             proposed.sort(key=lambda row: row.id)
             if original.schema == 2 and original.current_sessions_recorded and proposed == list(original.rows) and pending == set(original.pending_retire):
                 # A prior replace may have succeeded before its folder sync failed.
@@ -964,6 +1127,8 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
             else:
                 _store(proposed, pending)
             return result
+    except worker_lifecycle.OperationDeadlineExpired:
+        raise
     except OSError as error:
         if isinstance(error, StaffUnreadable):
             raise
@@ -981,7 +1146,7 @@ def _required(rows: list[StaffRow], staff_id: StaffId) -> StaffRow:
     return row
 
 
-def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: StaffId | None, *,
+def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: ReportsTo | StaffRoot, *,
                 worktree: PresentWorktree | RemovedWorktree | WorktreeUnfilled = WORKTREE_UNFILLED,
                 doc: LiveDoc | WrappedDoc | DocUnfilled = DOC_UNFILLED,
                 runtime_id: str = "") -> StaffRow:
@@ -992,13 +1157,11 @@ def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: StaffId | N
     existing = next((row for row in rows
                      if (row.kind, row.name, row.parent) == (kind, name, parent)), None)
     if existing is not None:
-        if runtime_id and existing.current_session != native_id(runtime_id):
-            raise StaffRefused(f"{existing.id}: existing member has a different runtime identity: {runtime_id}")
         if not isinstance(worktree, WorktreeUnfilled) and not isinstance(existing.worktree, WorktreeUnfilled) and existing.worktree != worktree:
             raise StaffRefused(f"{existing.id}: existing worktree conflicts with admission")
         if not isinstance(doc, DocUnfilled) and not isinstance(existing.doc, DocUnfilled) and existing.doc != doc:
             raise StaffRefused(f"{existing.id}: existing doc conflicts with admission")
-        admitted = replace(existing,
+        admitted = replace(existing, current_session=native_id(runtime_id) if runtime_id else existing.current_session,
                            worktree=existing.worktree if isinstance(worktree, WorktreeUnfilled) else worktree,
                            doc=existing.doc if isinstance(doc, DocUnfilled) else doc)
         rows[rows.index(existing)] = admitted
@@ -1013,15 +1176,15 @@ def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: StaffId | N
     return row
 
 
-def ensure(kind: Kind, *, name: str, parent: StaffId | None = None,
+def ensure(kind: Kind, *, name: str, parent: ReportsTo | StaffRoot = STAFF_ROOT,
            worktree: PresentWorktree | RemovedWorktree | WorktreeUnfilled = WORKTREE_UNFILLED,
            doc: LiveDoc | WrappedDoc | DocUnfilled = DOC_UNFILLED,
                 runtime_id: str = "") -> StaffRow:
     """Admit the identity and its location in the same owner transaction."""
     if not is_owner():
         arguments = ["ensure", kind, f"--name={name}", f"--runtime-id={runtime_id}"]
-        if parent is not None:
-            arguments.extend(("--parent", parent))
+        if isinstance(parent, ReportsTo):
+            arguments.extend(("--parent", parent.id))
         if not isinstance(worktree, WorktreeUnfilled):
             arguments.extend(("--worktree", worktree.machine, str(worktree.path),
                               "present" if isinstance(worktree, PresentWorktree) else "removed"))
@@ -1032,13 +1195,12 @@ def ensure(kind: Kind, *, name: str, parent: StaffId | None = None,
     return _transaction(lambda rows: _ensure_row(rows, kind, name, parent, worktree=worktree, doc=doc, runtime_id=runtime_id))
 
 
-def ensure_worker(name: str, parent: StaffId, *, runtime_id: str) -> StaffRow:
-    """Ensure membership under staff.json.lock, after the caller's membership lock.
-
-    This writer takes no membership, operation or lifecycle lock. The caller may
-    hold membership; it must release lifecycle, inbox and roster first.
-    """
-    return ensure("worker", name=name, parent=parent, runtime_id=runtime_id)
+def ensure_worker(identity: StaffId, name: str, parent: StaffId) -> StaffRow:
+    """Publish worker membership before dispatch."""
+    identity = native_id(identity)
+    if not is_owner():
+        return _remote_row(["ensure-worker", identity, "--name", name, "--parent", parent])
+    return _transaction(lambda rows: _ensure_row(rows, "worker", name, ReportsTo(parent), runtime_id=identity))
 
 
 def update_current_session(old_session: StaffId, new_session: StaffId) -> StaffRow:
@@ -1073,12 +1235,12 @@ def promote_unit(identity: StaffId, *, name: str, parent: StaffId, doc: LiveDoc)
     def edit(rows: list[StaffRow]) -> StaffRow:
         row = _required(rows, identity)
         if row.kind == "showrunner":
-            if (row.name, row.parent, row.doc) != (name, parent, doc):
+            if (row.name, row.parent, row.doc) != (name, ReportsTo(parent), doc):
                 raise StaffRefused(f"{identity}: promotion destination conflicts")
             return row
         if row.kind != "unit":
             raise StaffRefused(f"{identity}: promotion requires a unit")
-        promoted = replace(row, kind="showrunner", name=name, parent=parent,
+        promoted = replace(row, kind="showrunner", name=name, parent=ReportsTo(parent),
                            worktree=WORKTREE_UNFILLED, doc=doc)
         rows[rows.index(row)] = promoted
         return promoted
@@ -1098,7 +1260,7 @@ def publish_native_ids(expected: StaffSnapshot, identities: Mapping[StaffId, Sta
         changed = [replace(row, id=identities.get(row.id, row.id),
                            current_session=(identities.get(row.id, row.current_session)
                                             if row.id.startswith("s") else row.current_session),
-                           parent=identities.get(row.parent, row.parent) if row.parent else None)
+                           parent=ReportsTo(identities.get(row.parent.id, row.parent.id)) if isinstance(row.parent, ReportsTo) else StaffRoot())
                    for row in rows]
         for row in additions:
             _ = native_id(row.id)
@@ -1111,7 +1273,8 @@ def publish_native_ids(expected: StaffSnapshot, identities: Mapping[StaffId, Sta
         retired = {identities.get(identity, identity) for identity in pending}
         pending.clear()
         pending.update(retired)
-        return StaffSnapshot(tuple(sorted(rows, key=lambda row: row.id)), tuple(sorted(pending)))
+        return StaffSnapshot(tuple(sorted(rows, key=lambda row: row.id)),
+                             tuple(sorted(pending)))
     return _record_transaction(edit)
 
 
@@ -1138,27 +1301,35 @@ def restore_unit(staff_id: StaffId, worktree: PresentWorktree) -> StaffRow:
 
 def rename(staff_id: StaffId, new_name: str) -> StaffRow:
     if not is_owner():
-        return _remote_row(["rename", staff_id, f"--name={new_name}"])
+        renamed = _remote_row(["rename", staff_id, f"--name={new_name}"])
+    else:
+        def edit(rows: list[StaffRow]) -> StaffRow:
+            row = _required(rows, staff_id)
+            renamed = replace(row, name=new_name)
+            rows[rows.index(row)] = renamed
+            return renamed
 
-    def edit(rows: list[StaffRow]) -> StaffRow:
-        row = _required(rows, staff_id)
-        if row.kind == "worker":
-            raise StaffRefused("a worker name is set once")
-        renamed = replace(row, name=new_name)
-        rows[rows.index(row)] = renamed
-        return renamed
+        renamed = _transaction(edit)
+    if renamed.kind == "worker":
+        herdr = import_module("scripts.herdr.herdr")
+        client = cast(Callable[[str], object], herdr.Herdr)
+        shared_session = cast(Callable[[], str], herdr.shared_session)
+        display_failure = cast(type[Exception], herdr.HerdrFailure)
 
-    return _transaction(edit)
+        try:
+            retitle = cast(Callable[[str], bool], getattr(client(shared_session()), "retitle_row"))
+            _ = retitle(renamed.id)
+        except (OSError, ValueError, display_failure) as error:
+            print(f"anomaly: worker display: {error}", file=sys.stderr)
+    return renamed
 
 
-def move(staff_id: StaffId, new_parent: StaffId | None) -> StaffRow:
+def move(staff_id: StaffId, new_parent: ReportsTo | StaffRoot) -> StaffRow:
     if not is_owner():
-        return _remote_row(["move", staff_id, f"--parent={new_parent if new_parent is not None else 'none'}"])
+        return _remote_row(["move", staff_id, f"--parent={new_parent.id if isinstance(new_parent, ReportsTo) else 'none'}"])
 
     def edit(rows: list[StaffRow]) -> StaffRow:
         row = _required(rows, staff_id)
-        if row.kind == "worker":
-            raise StaffRefused("a worker cannot move between units")
         moved = replace(row, parent=new_parent)
         rows[rows.index(row)] = moved
         return moved
@@ -1258,7 +1429,7 @@ def _remove_test_fixture(staff_id: StaffId) -> FixtureRemoved | FixtureAlreadyAb
     selected = {row.id: row}
     while True:
         children = {candidate.id: candidate for candidate in record.rows
-                    if candidate.parent in selected and candidate.id not in selected}
+                    if isinstance(candidate.parent, ReportsTo) and candidate.parent.id in selected and candidate.id not in selected}
         if not children:
             break
         selected.update(children)
@@ -1275,7 +1446,7 @@ def _remove_test_fixture(staff_id: StaffId) -> FixtureRemoved | FixtureAlreadyAb
     def edit(rows: list[StaffRow]) -> FixtureRemoved:
         if any(_row_by_id(rows, identity) != expected for identity, expected in selected.items()):
             raise StaffRefused(f"{staff_id}: the fixture changed before removal")
-        if any(candidate.parent in selected and candidate.id not in selected for candidate in rows):
+        if any(isinstance(candidate.parent, ReportsTo) and candidate.parent.id in selected and candidate.id not in selected for candidate in rows):
             raise StaffRefused(f"{staff_id}: the fixture gained a member before removal")
         rows[:] = [candidate for candidate in rows if candidate.id not in selected]
         return FixtureRemoved(row)
@@ -1295,7 +1466,7 @@ def _retire_row(rows: list[StaffRow], staff_id: StaffId) -> StaffRow | None:
 
 def _retain_retired(rows: list[StaffRow], row: StaffRow) -> bool:
     """Finish one unheld retirement without deleting a row or changing an edge."""
-    if any(child.kind == "worker" and child.parent == row.id for child in rows):
+    if any(child.kind == "worker" and child.parent == ReportsTo(row.id) for child in rows):
         return False
     if row.kind == "unit":
         if isinstance(row.worktree, WorktreeUnfilled):
@@ -1303,7 +1474,7 @@ def _retain_retired(rows: list[StaffRow], row: StaffRow) -> bool:
             return False
         changed = replace(row, worktree=RemovedWorktree(row.worktree.machine, row.worktree.path))
     elif row.kind == "showrunner":
-        if any(child.kind == "unit" and child.parent == row.id
+        if any(child.kind == "unit" and child.parent == ReportsTo(row.id)
                and not isinstance(child.worktree, RemovedWorktree) for child in rows):
             return False
         if isinstance(row.doc, DocUnfilled):
@@ -1387,7 +1558,7 @@ def apply_seed(seed_input: SeedInput) -> StaffSnapshot:
             elif entry.kind in ("showrunner", "agent"):
                 row = next((row for row in rows if row.kind == entry.kind and row.name == entry.name), None)
                 if row is None:
-                    row = _ensure_row(rows, entry.kind, entry.name, None, runtime_id=entry.runtime_id)
+                    row = _ensure_row(rows, entry.kind, entry.name, StaffRoot(), runtime_id=entry.runtime_id)
             else:
                 if not isinstance(entry.parent, SeedParent):
                     raise StaffRefused(f"a new seed {entry.kind} requires its parent")
@@ -1395,7 +1566,7 @@ def apply_seed(seed_input: SeedInput) -> StaffSnapshot:
                 allowed = _parent_kinds(entry.kind)
                 if parent.kind not in allowed:
                     raise StaffRefused(f"a seed {entry.kind} requires a {' or '.join(allowed)} parent")
-                row = _ensure_row(rows, entry.kind, entry.name, parent.id, runtime_id=entry.runtime_id)
+                row = _ensure_row(rows, entry.kind, entry.name, ReportsTo(parent.id), runtime_id=entry.runtime_id)
             if any(member.id == row.id for member in resolved.values()):
                 raise StaffRefused(f"seed names a member more than once: {row.id}")
             resolved[key] = row
@@ -1408,7 +1579,7 @@ def apply_seed(seed_input: SeedInput) -> StaffSnapshot:
             row = resolved[key]
             if isinstance(entry.parent, KeepSeedParent):
                 continue
-            parent = resolve(entry.parent.key).id if isinstance(entry.parent, SeedParent) else None
+            parent = ReportsTo(resolve(entry.parent.key).id) if isinstance(entry.parent, SeedParent) else StaffRoot()
             rows[rows.index(row)] = replace(row, parent=parent)
         retained = {row.id for row in resolved.values()}
         for retirement in seed_input.retire:
@@ -1418,14 +1589,15 @@ def apply_seed(seed_input: SeedInput) -> StaffSnapshot:
                 continue
             if row.kind != "unit" or staff_id in retained:
                 raise StaffRefused(f"seed can retire only an absent unit: {staff_id}")
-            if row.parent != retirement.parent:
+            if row.parent != ReportsTo(retirement.parent):
                 print(f"seed: keeping unit {row.name}: parent changed", file=sys.stderr)
-            elif any(child.kind == "worker" and child.parent == staff_id for child in rows):
+            elif any(child.kind == "worker" and child.parent == ReportsTo(staff_id) for child in rows):
                 print(f"seed: keeping unit {row.name}: worker rows remain", file=sys.stderr)
                 pending.add(staff_id)
             elif not _retain_retired(rows, row):
                 pending.add(staff_id)
-        return StaffSnapshot(tuple(sorted(rows, key=lambda row: row.id)), tuple(sorted(pending)))
+        return StaffSnapshot(tuple(sorted(rows, key=lambda row: row.id)),
+                             tuple(sorted(pending)))
 
     return _record_transaction(edit)
 
@@ -1436,8 +1608,9 @@ def _paths(rows: list[StaffRow]) -> dict[StaffId, str]:
     for row in rows:
         chain: list[str] = [row.name]
         member = row
-        while member.kind not in ("showrunner", "agent") and member.parent is not None and member.parent in indexed:
-            member = indexed[member.parent]
+        while (member.kind not in ("showrunner", "agent") and isinstance(member.parent, ReportsTo)
+               and member.parent.id in indexed):
+            member = indexed[member.parent.id]
             chain.append(member.name)
         paths[row.id] = "/".join(reversed(chain))
     return paths
@@ -1490,6 +1663,12 @@ def _parser() -> argparse.ArgumentParser:
     _ = add.add_argument("--worktree", nargs=3, metavar=("MACHINE", "PATH", "STATE"))
     _ = add.add_argument("--doc", nargs=3, metavar=("MACHINE", "PATH", "STATE"))
     _ = add.add_argument("--row-write", action="store_true", help=argparse.SUPPRESS)
+    worker_parser = verbs.add_parser("ensure-worker", help=argparse.SUPPRESS)
+    _ = worker_parser.add_argument("target")
+    _ = worker_parser.add_argument("--name", required=True)
+    _ = worker_parser.add_argument("--parent", required=True)
+    _ = worker_parser.add_argument("--json", action="store_true")
+    _ = worker_parser.add_argument("--row-write", action="store_true", help=argparse.SUPPRESS)
     session_parser = verbs.add_parser("update-current-session", help=argparse.SUPPRESS)
     _ = session_parser.add_argument("target")
     _ = session_parser.add_argument("new_id")
@@ -1539,8 +1718,8 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _parent(value: str | None) -> StaffId | None:
-    return None if value is None or value == "none" else StaffId(value)
+def _parent(value: str | None) -> ReportsTo | StaffRoot:
+    return StaffRoot() if value is None or value == "none" else ReportsTo(StaffId(value))
 
 
 def _print_row(row: StaffRow, path: str) -> None:
@@ -1548,6 +1727,9 @@ def _print_row(row: StaffRow, path: str) -> None:
 
 
 def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | tuple[StaffId, ...] | None:
+    if arguments.verb == "ensure-worker":
+        assert arguments.parent is not None
+        return ensure_worker(native_id(arguments.target), arguments.name, StaffId(arguments.parent))
     if arguments.verb == "update-current-session":
         return update_current_session(StaffId(arguments.target), native_id(arguments.new_id))
     if arguments.verb == "set-worktree":
@@ -1613,7 +1795,7 @@ def _main(arguments: _Arguments) -> int:
         if arguments.snapshot:
             record = snapshot()
             print(json.dumps({"rows": [row.to_json() for row in record.rows],
-                              "pending_retire": list(record.pending_retire), "inputs": list(record.inputs)}, sort_keys=True))
+                              "schema": record.schema, "pending_retire": list(record.pending_retire), "inputs": list(record.inputs)}, sort_keys=True))
             return 0
         rows = _all_rows()
         paths = _paths(rows)
@@ -1624,7 +1806,7 @@ def _main(arguments: _Arguments) -> int:
                 raise StaffNotFound(StaffId(arguments.under))
             parent = member.id
         selected = sorted((row for row in rows if (arguments.kind is None or row.kind == arguments.kind)
-                           and (parent is None or row.parent == parent)),
+                           and (parent is None or row.parent == ReportsTo(parent))),
                           key=lambda row: (paths[row.id], row.id))
         if arguments.json:
             print(json.dumps([row.to_json() for row in selected], sort_keys=True))
@@ -1648,7 +1830,7 @@ def _main(arguments: _Arguments) -> int:
             raise StaffRefused("row writes are for worker admission and retirement")
         if arguments.worker_row:
             arguments.row_write = row is None or row.kind == "worker"
-    if arguments.row_write and not (arguments.verb == "retire" or
+    if arguments.row_write and not (arguments.verb in ("retire", "ensure-worker", "update-current-session") or
                                     arguments.verb == "ensure" and arguments.kind == "worker"):
         raise StaffRefused("row writes are for worker admission and retirement")
     with operation() if is_owner() and not arguments.row_write else nullcontext():
@@ -1659,7 +1841,7 @@ def _main(arguments: _Arguments) -> int:
     if isinstance(result, StaffSnapshot):
         if arguments.json:
             print(json.dumps({"rows": [row.to_json() for row in result.rows],
-                              "pending_retire": list(result.pending_retire)}, sort_keys=True))
+                              "schema": result.schema, "pending_retire": list(result.pending_retire)}, sort_keys=True))
         else:
             paths = _paths(list(result.rows))
             for row in sorted(result.rows, key=lambda row: paths[row.id]):
@@ -1679,7 +1861,7 @@ def cli_result(action: Callable[[], int]) -> int:
     except StaffNotFound as error:
         print(str(error), file=sys.stderr)
         return 1
-    except (StaffRefused, StaffUnreadable) as error:
+    except (StaffRefused, StaffUnreadable, worker_lifecycle.OperationDeadlineExpired) as error:
         # The transport distinguishes the two errors that share exit code 2.
         print(f"{type(error).__name__}: {error}", file=sys.stderr)
         return 2

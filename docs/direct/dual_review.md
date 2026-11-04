@@ -47,7 +47,7 @@ The Codex lenses use the unit's own read-only reviewer. Dispatch with
 `assign.sh --role review`; it resumes `review`, or `review2` when `review` is
 busy. Keep both threads across phases and plans. Writers keep their own roles.
 
-The `simplify` lens uses the fresh reviewer path in `review.sh`, with task `direct.simplify` and no worker address.
+The `simplify` lens uses the fresh reviewer path in `assign.sh`, with task `direct.simplify` and no worker address.
 It keeps `Agent` for the agents in `SIMPLIFY_AGENTS`.
 This lens alone permits Claude subagents.
 `config/models.conf` selects its model and effort.
@@ -59,11 +59,11 @@ Every Claude print launch disables background tasks and returns an error for `is
 At each launch, the shared account picker selects a Claude account with room.
 The launcher prints its label on stderr and in the review log.
 No available quota, a Claude error, an empty report, or a busy run produces `error`; the phase continues under <DualReview/> step 6.
-`assign.py` replaces itself with `review.sh`.
-After it obtains the lock, `review.sh` clears the earlier report and writes the prompt.
+`assign.sh` retains its process until the review finishes.
+After it obtains the lock, `assign.sh` clears the earlier report and writes the prompt.
 Every simplify launch starts a fresh review, including a retry after failure.
 `SIMPLIFY_AGENTS` supplies the prompt names and the required number of completed agents.
-`review.sh` holds `${PHASE_DIR}/review_launch_simplify.lock` until the review child exits.
+`assign.sh` holds `${PHASE_DIR}/review_launch_simplify.lock` until the review child exits.
 The lock owner alone writes the report, status, and summary.
 The status file contains one atomic status line.
 A rejected launch reports its reason on stderr and changes none of the shared files.
@@ -156,8 +156,7 @@ if no repair needs closure, dispatch that reviewer with the owed assignment
 alone. The director reads the ledger and result for <RunSummary/> and never
 substitutes a guide load or rule walk. Early reviews cannot carry this option:
 style input requires the final phase diff.
-The alternate `review.sh` entry point accepts the same range options and uses the
-same preparation and capture module, `scripts/lint/style_review.py`.
+Use `assign.sh` for every review dispatch.
 
 Every code review prompt, under any lens and in a closure review, also asks
 this, verbatim:

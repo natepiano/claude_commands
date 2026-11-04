@@ -239,7 +239,6 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.promotions: str = ""
         self.known_flakes: str = ""
         self.known_flaky_tests: str = ""
-        self.gate: bool = True
 
     fixture_root: ClassVar[Path]
     fixture_snapshot: ClassVar[Path]
@@ -392,21 +391,13 @@ class MergeCheckpointFixture(unittest.TestCase):
             rows.append(f"- **Known flakes:** {self.known_flakes}")
         if self.known_flaky_tests:
             rows.append(f"- **Known flaky tests:** {self.known_flaky_tests}")
-        rows.extend([
-            "", "## Gates", "",
-            "| Gate | Waiting | Waits on | Clears when |",
-            "| --- | --- | --- | --- |",
-        ])
         if hub_files:
-            hub_start = rows.index("## Gates") - 1
-            rows[hub_start:hub_start] = [
+            rows.extend([
                 "## Hub files", "",
                 "| File | Owner unit | Other units that touch it |",
                 "| --- | --- | --- |",
                 "| `shared.txt` | beta-unit | alpha-unit |", "",
-            ]
-        if self.gate:
-            rows.append("| G1 | beta-unit Phase 4 | alpha-unit Phase 2 | checkpoint merged |")
+            ])
         rows.extend(["", "## Production rules", "", "- Merge each phase and push the merge branch."])
         _ = self.doc.write_text("\n".join(rows) + "\n", encoding="utf-8")
 
@@ -496,7 +487,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         assert git is not None
         self.executable(self.bin / "git", "#!/usr/bin/env python3\nimport os, sys\n"
                         + "arguments = sys.argv[1:]\n"
-                        + "if arguments[:1] == ['-C']: arguments = arguments[2:]\n"
+                        + "while arguments[:1] in (['-c'], ['-C']): arguments = arguments[2:]\n"
                         + "if arguments[:1] == ['clone']:\n"
                         + "    print('fixture clone refused', file=sys.stderr)\n    raise SystemExit(1)\n"
                         + f"os.execv({git!r}, [{git!r}, *sys.argv[1:]])\n")

@@ -388,13 +388,14 @@ class PromoteShowrunnerTests(unittest.TestCase):
               mock.patch.object(showrunners, "tell_others", return_value=showrunners.NoticeDelivery(("sent child", "sent parent"))),
               mock.patch.object(add_showrunner, "main") as restart):
             code, out, err = self.run_main()
-        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual((code, err), (0, "unchanged\n"), out)
         appeared.assert_called_once_with("child")
         restart.assert_not_called()
         prompt.assert_not_called()
         self.assertIn("sent child", out)
         self.assertIn("sent parent", out)
-        self.assertEqual((self.root / "showrunner-state/child/parent").read_text(), "parent\n")
+        self.assertEqual(showrunner_tree.parent_of("child"), "parent")
+        self.assertFalse((self.root / "showrunner-state/child/parent").exists())
         self.assertFalse(pending.exists())
 
     def test_saved_parent_after_interrupted_attach_still_sends_routing_notices(self) -> None:
@@ -416,13 +417,14 @@ class PromoteShowrunnerTests(unittest.TestCase):
                   mock.patch.object(showrunners, "tell_others", side_effect=RuntimeError("stopped before notices"))):
                 with self.assertRaisesRegex(RuntimeError, "stopped before notices"):
                     _ = self.run_main()
-            self.assertEqual((self.root / "showrunner-state/child/parent").read_text(), "parent\n")
+            self.assertEqual(showrunner_tree.parent_of("child"), "parent")
+            self.assertFalse((self.root / "showrunner-state/child/parent").exists())
             self.assertTrue(pending.exists())
             with (mock.patch.object(showrunners, "current_name", return_value="child"),
                   mock.patch.object(showrunners, "tell_others", side_effect=send_notices) as notices,
                   mock.patch.object(add_showrunner, "main") as restart):
                 code, out, err = self.run_main()
-        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual((code, err), (0, "unchanged\n"), out)
         restart.assert_not_called()
         notices.assert_called_once()
         self.assertIn("sent child", out)
