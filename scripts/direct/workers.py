@@ -1723,7 +1723,7 @@ def _run_unit(state: dict[str, object]) -> tuple[str, str]:
 
 
 def find_moved_unit_runs(units: tuple[UnitWorktree, ...], former: tuple[str, ...]) -> WorkerRepairSearch:
-    """Match missing run or worker paths to current Units rows without changing state."""
+    """Match missing run or worker paths to current unit staff rows without changing state."""
     from scripts.lib import unit_runs
     grouped: dict[tuple[UnitWorktree, Path], set[Path]] = {}
     skipped: list[str] = []

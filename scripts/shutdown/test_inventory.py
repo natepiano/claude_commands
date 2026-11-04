@@ -719,6 +719,7 @@ elif "comm=" in joined:
 
     def make_production_state(self) -> None:
         member = unit_membership("build-followups", "shutdown-unit")
+        _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", self.checkout), expected=member.worktree)
         assert member.parent is not None
         parent = staff.by_id(member.parent)
         assert parent is not None
