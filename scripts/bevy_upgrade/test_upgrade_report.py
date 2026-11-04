@@ -49,7 +49,7 @@ class ReportTests(unittest.TestCase):
         _ = doc.write_text(
             "# Demo\n\n- **Merge branch:** demo\n"
             + f"- **Showrunner checkout:** {checkout}\n"
-            + "- **Log:** log.md\n- **User zone:** America/New_York\n\n## Units\n",
+            + "- **Log:** log.md\n- **User zone:** America/New_York\n",
             encoding="utf-8",
         )
         self.current = {

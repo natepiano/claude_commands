@@ -19,9 +19,11 @@ from typing import TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "lib"))
+sys.path.insert(0, str(SCRIPTS.parent))
 
 import rules
 import style_ledger
+from scripts.production import staff, unit_lookup, unit_names
 from user_zone import user_zone
 
 
@@ -72,9 +74,8 @@ def production(ledger: style_ledger.Ledger, tip: str) -> StyleProduction:
         branch = re.search(r"^\s*-?\s*\*\*Branch point:\*\*\s*(.+)$", text, re.MULTILINE)
         if branch is None:
             raise style_ledger.LedgerError(f"{doc}: missing Branch point")
-        rows = text.split("## Units", 1)[-1].split("\n## ", 1)[0]
-        declared = tuple(match[1].strip(" `") for match in re.finditer(r"^\|\s*([^|]+)\|", rows, re.MULTILINE)
-                         if not isinstance(rules.style_family(match[1].strip(" `")), rules.NotStyleUnit))
+        declared = tuple(unit for unit in (unit_names.unit_id(row.name) for row in unit_lookup.doc_units(doc, staff.snapshot()))
+                         if not isinstance(rules.style_family(unit), rules.NotStyleUnit))
         return StyleProduction(slug, branch[1].strip().removeprefix("refs/heads/"), declared or units)
     branches = git(ledger.repo, "for-each-ref", "--format=%(refname:short)", "--points-at", tip, "refs/heads").splitlines()
     branch_point = next((branch for branch in branches if not branch.startswith("style/")), tip[:7])

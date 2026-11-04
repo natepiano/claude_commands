@@ -284,7 +284,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.git("rev-parse", "HEAD"), before)
         self.assertEqual(self.events("send.py"), [])
     def test_style_unit_none_owns_needs_explicit_ticket_file_allowance(self) -> None:
-        self.production_doc(owns_cell="none — takes what the board leaves free")
+        self.production_doc(owns=("none",))
         checkpoint = self.checkpoint(relative="src/lib.rs", content="fn fixed() {}\n")
         refused = self.run_checkpoint(checkpoint)
         self.assertNotEqual(refused.process.returncode, 0)

@@ -14,7 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, Literal, cast
 
-from scripts.production import production_units, session_staff, staff, unit_lookup, unit_names
+from scripts.production import session_staff, staff, unit_lookup
+from scripts.production.production_doc import cell_value
 from scripts.accounts.worker_names import journal_entry
 from scripts.usage.rollouts import parse_timestamp
 from scripts.whoami import run_out
@@ -41,11 +42,6 @@ def git_text(repo: Path, *arguments: str) -> str | None:
     return result.stdout if result.returncode == 0 else None
 
 
-def cell_value(value: str) -> str:
-    quoted = re.search(r"`([^`]+)`", value)
-    return quoted.group(1) if quoted else value.split(" — ", 1)[0].strip()
-
-
 def production_paths(path: Path, *, resolver: session_staff.RowResolver | None = None) -> tuple[Path, ...]:
     """Read the worktrees held by the document owner's staff rows."""
     try:
@@ -56,17 +52,13 @@ def production_paths(path: Path, *, resolver: session_staff.RowResolver | None =
                     if (value := cell_value(line.removeprefix("- **Repository:** "))))
     try:
         resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
-        cells = {cell_value(row.get("Unit", "")): row for row in production_units.unit_table(lines)}
-    except (staff.StaffUnreadable, production_units.Refusal) as error:
+        rows = unit_lookup.doc_units(path, resolver.record)
+    except staff.StaffUnreadable as error:
         print(f"outcomes: {path}: {error}", file=sys.stderr)
-        return headers
-    owner = resolver.record.by_doc(remote.local_machine(), path)
-    if owner is None:
-        print(f"outcomes: {path}: no staff owner binds the document", file=sys.stderr)
         return headers
     paths: list[Path] = []
     found_main = False
-    for row in resolver.record.find(kind="unit", parent=owner.id):
+    for row in rows:
         tree = resolver.unit_worktree(row)
         if isinstance(tree, staff.WorktreeUnfilled):
             print(f"outcomes: {row.name}: the worktree is not recorded", file=sys.stderr)
@@ -74,15 +66,6 @@ def production_paths(path: Path, *, resolver: session_staff.RowResolver | None =
         if tree.machine != remote.local_machine():
             continue
         folder = tree.path
-        for unit_cells in cells.values():
-            if unit_names.name(cell_value(unit_cells.get("Unit", ""))) != row.name:
-                continue
-            if cell_value(unit_cells.get("Plan", "")):
-                try:
-                    folder = unit_lookup.plan_worktree(unit_cells, session_staff.MemberFound(row))
-                except staff.StaffUnreadable as error:
-                    print(f"outcomes: {row.name}: {error}", file=sys.stderr)
-            break
         worktrees = git_text(folder, "worktree", "list", "--porcelain")
         if worktrees:
             first = worktrees.splitlines()[0]

@@ -2,17 +2,13 @@
 from __future__ import annotations
 
 import json
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
-
-# Production tools still share this sibling module's exception identity.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from production_units import Refusal
+from scripts.production.production_doc import Refusal
 
 
 @dataclass(frozen=True)

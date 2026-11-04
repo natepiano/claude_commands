@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for showrunner-compaction.py: the STATE block before a compaction and the resume text after it."""
+"""Check the showrunner resume text and the absence of PreCompact writes."""
 
 from __future__ import annotations
 
@@ -15,12 +15,11 @@ from typing import cast, final, override
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 HOOK = Path(__file__).resolve().parent / "showrunner-compaction.py"
-# Records each call; refuses a call with --state while REFUSE_STATE is set.
+# Record any call to the former PreCompact writer.
 FAKE_LOG = """\
 import json, os, sys
 with open(os.environ["CALLS"], "a") as output:
     output.write(json.dumps(sys.argv[1:]) + "\\n")
-sys.exit(1 if os.environ.get("REFUSE_STATE") and "--state" in sys.argv else 0)
 """
 
 
@@ -62,31 +61,22 @@ class ShowrunnerCompactionTests(unittest.TestCase):
             return []
         return [cast(list[str], json.loads(line)) for line in self.calls.read_text(encoding="utf-8").splitlines()]
 
-    def test_precompact_writes_the_state_block_from_the_state_file(self) -> None:
+    def test_precompact_writes_nothing(self) -> None:
         state = self.root / "showrunner" / "example" / "session" / "showrunner_state.json"
         state.parent.mkdir(parents=True)
         _ = state.write_text('{"next": ["merge alpha"]}\n', encoding="utf-8")
+        before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
         self.assertEqual(self.run_hook({"session_id": "showrunner-id", "hook_event_name": "PreCompact",
                                         "trigger": "auto"}), "")
-        self.assertEqual(self.logged(), [["log", "before compaction (auto)", "--production", str(self.doc),
-                                          "--before-compaction", "--state", str(state)]])
-
-    def test_a_refused_state_file_still_gives_a_state_block(self) -> None:
-        state = self.root / "showrunner" / "example" / "session" / "showrunner_state.json"
-        state.parent.mkdir(parents=True)
-        _ = state.write_text("{}\n", encoding="utf-8")
-        _ = self.run_hook({"session_id": "showrunner-id", "hook_event_name": "PreCompact", "trigger": "manual"},
-                          REFUSE_STATE="1")
-        calls = self.logged()
-        self.assertEqual(len(calls), 2)
-        self.assertNotIn("--state", calls[1])
+        self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
+        self.assertEqual(self.logged(), [])
 
     def test_session_start_after_compaction_names_the_resume(self) -> None:
         output = self.run_hook({"session_id": "showrunner-id", "hook_event_name": "SessionStart", "source": "compact"})
         context = cast(dict[str, dict[str, str]], json.loads(output))["hookSpecificOutput"]["additionalContext"]
         self.assertIn(f"run `/showrunner:produce {self.doc} resume`", context)
         self.assertIn("just compacted", context)
-        self.assertIn("`Next:` line", context)
+        self.assertIn("current `next` list from the state file. Act on it first.", context)
 
     def test_any_other_session_or_source_gets_nothing(self) -> None:
         self.assertEqual(self.run_hook({"session_id": "unit-id", "hook_event_name": "PreCompact"}), "")

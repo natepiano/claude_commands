@@ -412,6 +412,45 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(self.launches, [(row.name, herdr.NewTab("saved", row.name)) for row in self.rows])
         self.assertEqual(self.running, {str(row.current_session) for row in self.rows})
 
+    def test_inventory_keeps_sessions_with_unknown_staff_folders(self) -> None:
+        for session in (unit("unknown-unit"), worker_session("unknown-worker", owner=None)):
+            for record in (staff.StaffSnapshot(()), staff.StaffSnapshot((
+                    replace(self.rows[0], current_session=staff.StaffId(session["session_id"]),
+                            worktree=staff.WORKTREE_UNFILLED),))):
+                with self.subTest(kind=session["kind"], rows=len(record.rows)):
+                    with patch.object(staff, "snapshot", return_value=record):
+                        parsed = inventory.parse_session(session, "fixture")
+                    self.assertEqual(parsed["session_id"], session["session_id"])
+                    self.assertEqual(parsed["cwd"], {"kind": "unknown folder"})
+                    self.assertEqual(parsed["checkout"], {"kind": "not a checkout"})
+
+    def test_inventory_uses_the_current_staff_folder_without_rewriting_the_record(self) -> None:
+        session = unit(str(self.rows[0].current_session))
+        saved = json.dumps(session)
+        for folder in (self.root / "before", self.root / "after"):
+            record = staff.StaffSnapshot((replace(self.rows[0],
+                worktree=staff.PresentWorktree("natedev", folder)),))
+            with patch.object(staff, "snapshot", return_value=record):
+                parsed = inventory.parse_session(session, "fixture")
+            self.assertEqual(parsed["cwd"], str(folder))
+            self.assertEqual(json.dumps(session), saved)
+
+    def test_restart_skips_an_unknown_unit_folder_and_starts_the_other_rows(self) -> None:
+        parent = staff.StaffRow(staff.StaffId("parent"), "showrunner", "parent", None,
+                               current_session=staff.StaffId("parent-session"),
+                               doc=staff.LiveDoc("natedev", self.root / "production.md"))
+        self.rows = (replace(self.rows[0], parent=parent.id, worktree=staff.WORKTREE_UNFILLED), *self.rows[1:])
+        record = staff.StaffSnapshot((*self.rows, parent))
+        self.running.clear()
+        shutdown_record.save([str(row.id) for row in self.rows])
+        with (patch.object(staff, "initial_snapshot", return_value=record),
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(restart.restart(), 0)
+        self.assertEqual([name for name, _ in self.launches], [row.name for row in self.rows[1:]])
+        self.assertEqual(errors.getvalue().splitlines(), [
+            "unit-0: restart anomaly: unit-0: the staff worktree is unavailable"])
+        self.assertEqual(shutdown_record.read(), [str(self.rows[0].id)])
+
     def test_socketless_running_sessions_restart_or_print_and_unassigned_sessions_print_once(self) -> None:
         for dry_run in (True, False):
             with self.subTest(dry_run=dry_run):

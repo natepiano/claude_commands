@@ -30,7 +30,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         self.assertEqual(activity["status"], "active", "verify never opened an activity")
         self.assertIn("verify.sh test", str(activity["activity"]))
         self.edit_source()
-        self.assert_cancelled(process, "test")
+        _ = self.assert_cancelled(process, "test")
         closed = cast(dict[str, object], json.loads(state_file.read_text()))
         self.assertEqual(cast(dict[str, object], closed["activity"])["status"], "canceled")
         events = [cast(dict[str, object], json.loads(line)) for line in

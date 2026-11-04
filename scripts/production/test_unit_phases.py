@@ -1,4 +1,4 @@
-"""Tests for the showrunner's units table: session, current phase and task of each live unit."""
+"""Tests for the showrunner's unit phases: session, current phase and task of each live unit."""
 from __future__ import annotations
 
 import contextlib
@@ -22,14 +22,14 @@ import live_units
 from scripts.production import showrunners
 import unit_lookup
 from herdr import HerdrPlace
-import units_table
+import unit_phases
 import style_units
 import style_ledger
-import unit_table_cells
+import display_cells
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member
 
-# Importable once units_table has put scripts/direct on the path.
+# Importable once unit_phases has put scripts/direct on the path.
 import phase_table
 from scripts.direct import plan_history
 
@@ -57,7 +57,7 @@ def event(kind: str, **fields: str) -> str:
     return json.dumps({"event_type": kind, **fields})
 
 
-class UnitsTableTests(unittest.TestCase):
+class UnitPhasesTests(unittest.TestCase):
     root: Path = Path()
 
     @override
@@ -73,13 +73,13 @@ class UnitsTableTests(unittest.TestCase):
     def task(self, *events: str) -> str:
         record = open_record(self.root / "plan.md")
         with patch.object(plan_history, "plan_runs", return_value=[self.run_file(*events)]):
-            return units_table.task_cell(record)
+            return unit_phases.task_cell(record)
 
     def test_session_names_the_live_claude_or_says_why_there_is_none(self) -> None:
-        self.assertEqual(unit_table_cells.session_cell(unit("a", live("alpha"))), "alpha")
-        self.assertEqual(unit_table_cells.session_cell(unit("a", None)), "gone")
-        self.assertEqual(unit_table_cells.session_cell(unit("a", unit_lookup.ClaudeNotRunning())), "not running")
-        self.assertEqual(unit_table_cells.session_cell(unit("a", unit_lookup.ClaudeUnknown("no records"))), "unknown")
+        self.assertEqual(display_cells.session_cell(unit("a", live("alpha"))), "alpha")
+        self.assertEqual(display_cells.session_cell(unit("a", None)), "gone")
+        self.assertEqual(display_cells.session_cell(unit("a", unit_lookup.ClaudeNotRunning())), "not running")
+        self.assertEqual(display_cells.session_cell(unit("a", unit_lookup.ClaudeUnknown("no records"))), "unknown")
 
     def test_phase_names_the_open_phase_or_where_the_plan_stands(self) -> None:
         cases: list[tuple[object, str]] = [
@@ -93,7 +93,7 @@ class UnitsTableTests(unittest.TestCase):
         ]
         for record, expected in cases:
             with self.subTest(expected=expected):
-                self.assertEqual(units_table.phase_cell(record), expected)
+                self.assertEqual(unit_phases.phase_cell(record), expected)
 
     def test_task_is_the_newest_open_activity_before_the_open_pass(self) -> None:
         self.assertEqual(self.task(
@@ -129,18 +129,18 @@ class UnitsTableTests(unittest.TestCase):
             event("activity_started", activity_instance_id="a1", activity_label="Verification",
                   activity_text="verify.sh test hana " + "--filter one_long_test_name " * 10),
         )
-        self.assertEqual(len(task), units_table.TASK_WIDTH)
+        self.assertEqual(len(task), unit_phases.TASK_WIDTH)
         self.assertTrue(task.startswith("Verification: verify.sh test hana --filter"))
         self.assertTrue(task.endswith("…"))
 
     def test_a_unit_with_no_open_phase_shows_no_task(self) -> None:
         with patch.object(plan_history, "plan_runs") as runs:
-            self.assertEqual(units_table.task_cell({"plan": "/p.md", "current": None, "phases": []}), "—")
+            self.assertEqual(unit_phases.task_cell({"plan": "/p.md", "current": None, "phases": []}), "—")
         runs.assert_not_called()
 
     def test_table_has_one_row_per_unit_and_escapes_pipes(self) -> None:
         records: dict[str, object] = {"one-unit": {"current": None, "phases": phase_rows("todo")}}
-        self.assertEqual(units_table.table([unit("one-unit", live("a|b")), unit("two-unit", None)], records), "\n".join([
+        self.assertEqual(unit_phases.table([unit("one-unit", live("a|b")), unit("two-unit", None)], records), "\n".join([
             "| Unit | Phase | Task |",
             "| --- | --- | --- |",
             "| a\\|b | not started | — |",
@@ -170,11 +170,11 @@ class UnitsTableTests(unittest.TestCase):
             return "phase table"
 
         output = io.StringIO()
-        with (patch.object(live_units, "production_units", return_value=[unit("one-unit", live("one"))]),
+        with (patch.object(live_units, "units_of_doc", return_value=[unit("one-unit", live("one"))]),
               patch.object(phase_table, "show_production", side_effect=records),
-              patch.object(units_table, "table", side_effect=render),
+              patch.object(unit_phases, "table", side_effect=render),
               contextlib.redirect_stdout(output)):
-            self.assertEqual(units_table.main(["--production", str(doc)]), 0)
+            self.assertEqual(unit_phases.main(["--production", str(doc)]), 0)
         self.assertEqual(calls, ["records", "table"])
         self.assertEqual(output.getvalue(), "phase table\n")
         self.assertIs(plan_history.run_started_event, headers)
@@ -187,10 +187,10 @@ class UnitsTableTests(unittest.TestCase):
         out = io.StringIO()
         with (patch.dict("os.environ", {"CLAUDE_CODE_SESSION_ID": "caller"}),
               patch.object(showrunners, "production_of", return_value=doc) as found,
-              patch.object(live_units, "production_units", return_value=[unit("a-unit", live("a"))]),
+              patch.object(live_units, "units_of_doc", return_value=[unit("a-unit", live("a"))]),
               patch.object(phase_table, "show_production", return_value="{}"),
               contextlib.redirect_stdout(out)):
-            self.assertEqual(units_table.main([]), 0)
+            self.assertEqual(unit_phases.main([]), 0)
         found.assert_called_once_with("caller")
         self.assertIn("| a | — | — |", out.getvalue())
 
@@ -198,31 +198,28 @@ class UnitsTableTests(unittest.TestCase):
         err = io.StringIO()
         with (patch.object(showrunners, "production_of", return_value=None),
               contextlib.redirect_stderr(err)):
-            self.assertEqual(units_table.main([]), 1)
+            self.assertEqual(unit_phases.main([]), 1)
         self.assertIn("pass --production", err.getvalue())
 
     def test_style_kind_routes_to_the_ticket_table(self) -> None:
         doc = self.root / "style-production.md"
-        _ = doc.write_text("# Production\n- **Kind:** style\n\n## Units\n\n"
-                           + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
-                           + f"| names-unit | docs/names.md | {self.root} | style-names |\n", encoding="utf-8")
+        _ = doc.write_text(f"# Production\n- **Kind:** style\n- **Showrunner checkout:** `{self.root}`\n")
         _ = subprocess.run(["git", "init", "-q", str(self.root)], check=True, capture_output=True,
                            timeout=10)
-        _ = doc.write_text(doc.read_text() + f"\n- **Showrunner checkout:** `{self.root}`\n")
         owner = fixture_member("showrunner", name="style", doc=staff.LiveDoc("natedev", doc))
         _ = fixture_member("unit", name="names", parent=owner.id,
                            worktree=staff.PresentWorktree("natedev", self.root))
         units = [unit("names-unit", live("names"))]
         records: dict[str, object] = {"names-unit": {"plan": "/tmp/claude/names.md"}}
         output = io.StringIO()
-        with (patch.object(live_units, "production_units", return_value=units),
+        with (patch.object(live_units, "units_of_doc", return_value=units),
               patch.object(phase_table, "show_production", return_value=json.dumps(records)),
               patch.object(style_units, "table", return_value="ticket table") as tickets,
               patch.object(style_ledger, "ledger_location", return_value=style_ledger.LedgerLocation(
                   self.root, self.root / "ledger.sqlite")) as locate,
-              patch.object(units_table, "table") as phases,
+              patch.object(unit_phases, "table") as phases,
               contextlib.redirect_stdout(output)):
-            self.assertEqual(units_table.main(["--production", str(doc)]), 0)
+            self.assertEqual(unit_phases.main(["--production", str(doc)]), 0)
         tickets.assert_called_once_with(units, records, ledger_paths={"names-unit": self.root / "ledger.sqlite"})
         locate.assert_called_once_with(self.root)
         phases.assert_not_called()
@@ -235,10 +232,10 @@ class UnitsTableTests(unittest.TestCase):
                 _ = doc.write_text("# Production\n" + kind, encoding="utf-8")
                 units = [unit("a-unit", live("a"))]
                 output = io.StringIO()
-                with (patch.object(live_units, "production_units", return_value=units),
+                with (patch.object(live_units, "units_of_doc", return_value=units),
                       patch.object(phase_table, "show_production", return_value="{}"),
                       patch.object(style_units, "table") as tickets, contextlib.redirect_stdout(output)):
-                    self.assertEqual(units_table.main(["--production", str(doc)]), 0)
+                    self.assertEqual(unit_phases.main(["--production", str(doc)]), 0)
                 tickets.assert_not_called()
                 self.assertEqual(output.getvalue(), "| Unit | Phase | Task |\n| --- | --- | --- |\n| a | — | — |\n")
 
@@ -246,16 +243,11 @@ class UnitsTableTests(unittest.TestCase):
         _ = subprocess.run(["git", "init", "-q", str(self.root)], check=True, capture_output=True)
         _ = self.enterContext(patch.dict(os.environ, {"STYLE_LEDGER_STATE_DIR": str(self.root / "state")}))  # pyright: ignore[reportAny]
         doc = self.root / "style-production.md"
-        _ = doc.write_text("# Production\n- **Kind:** style\n\n## Units\n\n"
-                           + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
-                           + f"| names-unit | retained/names-plan.md | {self.root} | style-names |\n"
-                           + f"| types-unit | gone/types.md | {self.root / 'gone'} | style-types |\n")
-        _ = doc.write_text(doc.read_text() + f"\n- **Showrunner checkout:** `{self.root}`\n")
+        _ = doc.write_text(f"# Production\n- **Kind:** style\n- **Showrunner checkout:** `{self.root}`\n")
         owner = fixture_member("showrunner", name="style", doc=staff.LiveDoc("natedev", doc))
         for name, folder in (("names", self.root), ("types", self.root / "gone")):
             _ = fixture_member("unit", name=name, parent=owner.id,
                                worktree=staff.PresentWorktree("natedev", folder))
-        self.assertFalse((self.root / "retained").exists())
         decision = self.root / "decision.md"
         _ = decision.write_text("---\nstatus: open\nunit: names-unit\nplan: approved\n---\n")
         database = style_ledger.ledger_location(self.root).database
@@ -272,16 +264,15 @@ class UnitsTableTests(unittest.TestCase):
             """)
             _ = connection.execute("INSERT INTO held_findings VALUES (?,'filed','names-unit-12','')", (str(decision),))
         output = io.StringIO()
-        with (patch.object(live_units, "production_units", return_value=[unit("names-unit", live("names")),
+        with (patch.object(live_units, "units_of_doc", return_value=[unit("names-unit", live("names")),
                                                                         unit("types-unit", live("types"))]),
               patch.object(phase_table, "show_production", return_value=json.dumps({
                   "names-unit": {"unavailable": "plan cannot be read"},
                   "types-unit": {"unavailable": "worktree cannot be read"}})),
               contextlib.redirect_stdout(output)):
-            self.assertEqual(units_table.main(["--production", str(doc)]), 0)
+            self.assertEqual(unit_phases.main(["--production", str(doc)]), 0)
         self.assertIn("| names | #12 · read · alpha · 1 finding | starting 1 finding | — | 0 | 0 | 1 |", output.getvalue())
         self.assertIn("| types | idle | idle | — | 0 | 0 | 0 |", output.getvalue())
-        self.assertFalse((self.root / "retained").exists())
 
     def test_production_of_reads_the_timer_addressed_to_the_session(self) -> None:
         doc = self.root / "show-production.md"
@@ -296,27 +287,13 @@ class UnitsTableTests(unittest.TestCase):
 
 
 
-
-from scripts.production.staff_test_support import StaffTestCase, without_worktree_column
+from scripts.production.staff_test_support import StaffTestCase
 
 
 class BranchLedgerLocationTests(StaffTestCase):
-    def test_relative_plan_uses_the_staff_worktree_without_git(self) -> None:
+    def test_style_ledger_uses_the_staff_worktree(self) -> None:
         fixture = self.separated_unit_folders()
-        from scripts.production import staff_sources, unit_lookup
-        from scripts.direct import phase_reservation
-        cells = {"Unit": "member-unit", "Plan": "docs/plan.md", "Worktree": "/stale/cell"}
-        row = staff.snapshot().by_id(fixture.unit.id)
-        assert row is not None
-        selected = staff_sources.MemberFound(row)
-        with patch.object(phase_reservation, "repository_root") as git_root:
-            self.assertEqual(unit_lookup.plan_worktree(cells, selected), self.source_root / "director")
-        git_root.assert_not_called()
-
-    def test_style_ledger_uses_the_plan_worktree_without_the_worktree_column(self) -> None:
-        fixture = self.separated_unit_folders()
-        without_worktree_column(fixture.doc)
-        paths = units_table.style_ledger_paths(fixture.doc, [live_units.LiveUnit("member-unit", None)])
+        paths = unit_phases.style_ledger_paths(fixture.doc, [live_units.LiveUnit("member-unit", None)])
         self.assertEqual(paths, {"member-unit": style_ledger.ledger_location(fixture.worktree).database})
 
 
