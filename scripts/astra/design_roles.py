@@ -88,20 +88,6 @@ def _census_projection() -> AstraCensusProjection:
 
 
 @dataclass(frozen=True)
-class UnitHolder:
-    production_slug: str
-    unit_name: str
-
-
-@dataclass(frozen=True)
-class ShowrunnerHolder:
-    production_slug: str
-
-
-Holder = UnitHolder | ShowrunnerHolder
-
-
-@dataclass(frozen=True)
 class DesignUnbound:
     pass
 
@@ -184,7 +170,6 @@ class HeldDesign:
     document: str
     area: str
     created_at_utc: str
-    holder: Holder
     binding: Binding
     roles: tuple[RoleInstance, ...]
 
@@ -196,16 +181,6 @@ class PendingMessage:
     text: str
 
 
-@dataclass(frozen=True)
-class HolderReach:
-    session_id: str
-
-
-@dataclass(frozen=True)
-class HolderUnavailable:
-    reason: str
-
-
 class RoleRefused(ValueError):
     pass
 
@@ -213,12 +188,10 @@ class RoleRefused(ValueError):
 class DamagedDesignRecord(RoleRefused):
     path: Path
     field: str
-    holder: Holder
 
-    def __init__(self, path: Path, field: str, holder: Holder) -> None:
+    def __init__(self, path: Path, field: str) -> None:
         self.path = path
         self.field = field
-        self.holder = holder
         super().__init__('missing or invalid ' + field.rsplit('.', 1)[-1])
 
 
@@ -281,17 +254,8 @@ def _lock(directory: Path) -> Generator[None]:
             worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_UN)
 
 
-def _tag(value: Holder | Binding | Lifecycle | ThreadAccessPolicy | HolderReach | HolderUnavailable) -> dict[str, object]:
+def _tag(value: Binding | Lifecycle | ThreadAccessPolicy) -> dict[str, object]:
     return {'kind': type(value).__name__, **cast(dict[str, object], asdict(value))}
-
-
-def _holder(fields: dict[str, object]) -> Holder:
-    production = _text(fields, 'production_slug')
-    if fields.get('kind') == 'UnitHolder':
-        return UnitHolder(production, _text(fields, 'unit_name'))
-    if fields.get('kind') == 'ShowrunnerHolder':
-        return ShowrunnerHolder(production)
-    raise RoleRefused('unknown holder')
 
 
 def _binding(fields: dict[str, object]) -> Binding:
@@ -373,9 +337,9 @@ def _decode_design(design_id: str, fields: dict[str, object], *,
     design = HeldDesign(DesignPlacement(design_id, _text(placement, 'host'), _integer(placement, 'generation')),
                       _text(fields, 'repository_id'), _text(fields, 'repository'), _text(fields, 'document'),
                       _text(fields, 'area'), _text(fields, 'created_at_utc'),
-                      _holder(_object(fields.get('holder'))), _binding(binding_fields), tuple(instances))
+                      _binding(binding_fields), tuple(instances))
     if empty_repository and not repair_empty_repository:
-        raise DamagedDesignRecord(path, 'binding.repository', design.holder)
+        raise DamagedDesignRecord(path, 'binding.repository')
     return design
 
 
@@ -384,7 +348,6 @@ def _design_fields(design: HeldDesign) -> dict[str, object]:
         raise RoleRefused('missing or invalid binding.repository')
     fields = asdict(design)
     fields['schema'] = 1
-    fields['holder'] = _tag(design.holder)
     binding_fields = _tag(design.binding)
     if isinstance(design.binding, DesignBoundToPhase):
         binding_fields['output_paths'] = list(design.binding.output_paths)
@@ -540,42 +503,21 @@ def _authority_local(operation: str, payload: dict[str, object]) -> dict[str, ob
         return placement
 
 
-def resolve_holder(holder: Holder) -> HolderReach | HolderUnavailable:
-    """Resolve current local holder identity; never use a cached session after restart."""
-    sys.path.insert(0, str(ROOT / "scripts/production"))
-    from scripts.production import unit_lookup
-    if isinstance(holder, UnitHolder):
-        try:
-            marked = unit_lookup.every_marked_unit()
-        except OSError as error:
-            return HolderUnavailable('unit marks unreadable: ' + str(error))
-        unit = marked.units.get(holder.production_slug, {}).get(holder.unit_name)
-        if unit is None:
-            return HolderUnavailable('unit holder is not recorded')
-        if not isinstance(unit.claude, unit_lookup.LiveClaude):
-            return HolderUnavailable('unit holder has no live Claude session')
-        session = unit.claude.session_id
-    else:
-        lookup = cast(Callable[[], dict[str, str]],
-                      importlib.import_module('scripts.production.production_tree').showrunner_sessions)
-        session = lookup().get(holder.production_slug, '')
-        from scripts.message import sessions
-        if session not in {record['sessionId'] for record in sessions.running_sessions()}:
-            return HolderUnavailable('showrunner holder has no live local session')
-    if not session:
-        return HolderUnavailable('holder session is unavailable')
-    return HolderReach(session)
-
-
-def _authorize(design: HeldDesign) -> HolderReach:
+def _check_host(design: HeldDesign) -> None:
     if design.placement.host != local_host():
-        raise RoleRefused('pair host differs from holder host')
-    reach = resolve_holder(design.holder)
-    if isinstance(reach, HolderUnavailable):
-        raise RoleRefused(reach.reason)
-    if staff.runtime_id() != reach.session_id:
-        raise RoleRefused('only the current holder may dispatch or change this design')
-    return reach
+        raise RoleRefused('design host differs from local host')
+
+
+def worker_parent(design: HeldDesign, role: Role, record: staff.StaffSnapshot) -> staff.StaffRow:
+    """Read the parent of an opened helper from the staff record."""
+    instance = _instance(design, role)
+    if isinstance(instance.lifecycle, (RoleNotOpened, RoleEnded)):
+        raise RoleRefused('role has no active worker')
+    row = record.by_member_reference(instance.lifecycle.thread_id)
+    parent = record.by_id(row.parent) if row is not None and row.parent is not None else None
+    if row is None or row.kind != 'worker' or parent is None:
+        raise RoleRefused('role worker parent is unavailable')
+    return parent
 
 
 def resolve_model(role: Role) -> tuple[str, str]:
@@ -646,7 +588,7 @@ def _idle(design: HeldDesign) -> None:
     for value in _roster(design).values():
         entry = _object(value)
         if entry.get('transferring_role') or entry.get('role_redirect'):
-            raise RoleRefused('role transfer is fenced; use the destination holder')
+            raise RoleRefused('role transfer is fenced; use the destination design')
         if entry.get('status') in BUSY:
             raise RoleRefused('role is busy; finish its turn first')
 
@@ -681,13 +623,13 @@ def access_policy(design: HeldDesign, role: Role) -> ThreadAccessPolicy:
     return PhaseBoundDesigner(design.placement.generation, 'danger-full-access') if role == 'designer' else ReadOnlyReviewer()
 
 
-def _mesh_context(design: HeldDesign, reach: HolderReach) -> None:
-    _atomic(mesh_directory(design.placement.design_id) / 'design_context.json', _mesh_context_fields(design, reach))
+def _mesh_context(design: HeldDesign) -> None:
+    _atomic(mesh_directory(design.placement.design_id) / 'design_context.json', _mesh_context_fields(design))
 
 
-def _mesh_context_fields(design: HeldDesign, reach: HolderReach) -> dict[str, object]:
+def _mesh_context_fields(design: HeldDesign) -> dict[str, object]:
     return {'design_id': design.placement.design_id, 'generation': design.placement.generation,
-            'holder_session': reach.session_id, 'binding': _design_fields(design)['binding'], 'cwd': design.repository}
+            'binding': _design_fields(design)['binding'], 'cwd': design.repository}
 
 
 def launch_thread(design: HeldDesign, role: Role, prompt: Path, model: str, effort: str, *,
@@ -724,25 +666,24 @@ def dispatch_turn(design: HeldDesign, role: Role, prompt: Path, reply: Path, mod
         raise RoleRefused('RoleNeedsRecovery: held turn did not complete; pending input is retained')
 
 
-def _project_hold(design: HeldDesign, role: Role, reach: HolderReach) -> None:
+def _project_hold(design: HeldDesign, role: Role, record: staff.StaffSnapshot) -> None:
     astra_roles = _census_projection()
     instance = _instance(design, role)
     if isinstance(instance.lifecycle, (RoleNotOpened, RoleEnded)):
         return
     mesh = mesh_directory(design.placement.design_id)
-    record = mesh / 'mesh_server.json'
-    home = _text(_read(record if record.exists() else mesh / 'serving_home.json'), 'codex_home')
+    server = mesh / 'mesh_server.json'
+    home = _text(_read(server if server.exists() else mesh / 'serving_home.json'), 'codex_home')
     _atomic(mesh / 'serving_home.json', {'codex_home': home})
-    _ = astra_roles.hold(role, instance.lifecycle.thread_id, home, manager=reach.session_id,
+    _ = astra_roles.hold(role, instance.lifecycle.thread_id, home, manager=worker_parent(design, role, record).current_session,
                          design_id=design.placement.design_id, role_id=role)
 
 
 def refresh_census(design_id: str) -> None:
     design = read_design(design_id)
-    reach = resolve_holder(design.holder)
-    if isinstance(reach, HolderReach):
-        for instance in design.roles:
-            _project_hold(design, instance.role, reach)
+    record = staff.snapshot()
+    for instance in design.roles:
+        _project_hold(design, instance.role, record)
 
 
 def _allow_new_roles() -> None:
@@ -752,13 +693,13 @@ def _allow_new_roles() -> None:
         raise RoleRefused('new role opens and adoptions are disabled; keep existing identities and evidence')
 
 
-def open_role(repository: str, document: str, role: Role, holder: Holder, area: str, *,
+def open_role(repository: str, document: str, role: Role, area: str, *,
               host: str = '', binding: Binding = UNBOUND, request_id: str = '') -> HeldDesign:
     """Reserve identity before creation; retries never make a replacement thread."""
     _allow_new_roles()
     host = host or local_host()
     if host != local_host():
-        raise RoleRefused('pair host differs from holder host')
+        raise RoleRefused('pair host differs from local host')
     placement = authority_request('reserve', {'repository_id': repository, 'document': document,
                                              'host': host, 'request_id': request_id or str(uuid4())})
     design_id = _text(placement, 'design_id')
@@ -771,30 +712,27 @@ def open_role(repository: str, document: str, role: Role, holder: Holder, area: 
     with _lock(directory):
         if (directory / 'design.json').exists():
             design = read_design(design_id)
-            if design.holder != holder:
-                raise RoleRefused('design has another holder; rebind explicitly while idle')
         else:
             checkout = _text(placement, 'checkout')
             document_path = str((Path(checkout) / _text(placement, 'document')).resolve())
             design = HeldDesign(DesignPlacement(design_id, host, _integer(placement, 'generation')),
-                                repository, checkout, document_path, area, datetime.now(UTC).isoformat(), holder,
-                                binding, tuple(RoleInstance(kind, f'{holder.production_slug}-{area}-astra-{kind}',
+                                repository, checkout, document_path, area, datetime.now(UTC).isoformat(),
+                                binding, tuple(RoleInstance(kind, f'astra-{design_id}-{kind}',
                                                           RoleNotOpened()) for kind in ('designer', 'reviewer')))
             _save(design)
-        reach = _authorize(design)
+        _check_host(design)
         instance = _instance(design, role)
         if isinstance(instance.lifecycle, RoleEnded):
             raise RoleRefused('role ended; this design identity cannot be reopened.')
         if not isinstance(instance.lifecycle, RoleNotOpened) or instance.lifecycle.claim:
             if not isinstance(instance.lifecycle, RoleNotOpened):
-                _project_hold(design, role, reach)
+                _project_hold(design, role, staff.snapshot())
             return design
         _validate_binding(design.binding, design.repository, role)
     model, effort = resolve_model(role)
     prompt, _ = _prompt(design, role, '')
     admitted = worker_admission.admit(
-        instance.name, mesh_directory(design_id), role="astra-" + role, production=holder.production_slug,
-        unit=holder.unit_name if isinstance(holder, UnitHolder) else '')
+        instance.name, mesh_directory(design_id), role="astra-" + role)
     with _lock(directory):
         current = read_design(design_id)
         instance = _instance(current, role)
@@ -805,7 +743,7 @@ def open_role(repository: str, document: str, role: Role, holder: Holder, area: 
         claim = str(uuid4())
         design = _set_lifecycle(current, role, RoleNotOpened(claim))
         _save(design)
-        _mesh_context(design, reach)
+        _mesh_context(design)
     # A failed or uncertain launch keeps its reserved claim; it cannot authorize replacement.
     thread = launch_thread(design, role, prompt, model, effort, admitted=admitted)
     with _lock(directory):
@@ -814,7 +752,7 @@ def open_role(repository: str, document: str, role: Role, holder: Holder, area: 
             raise RoleRefused('RoleNeedsRecovery: thread creation claim changed')
         design = _set_lifecycle(current, role, RoleOpen(thread))
         _save(design)
-    _project_hold(design, role, reach)
+    _project_hold(design, role, staff.snapshot())
     return design
 
 
@@ -827,14 +765,14 @@ def recover(instance_id: str) -> HeldDesign:
     role = role_text
     with _lock(design_directory(design_id)):
         design = read_design(design_id)
-        _ = _authorize(design)
+        _check_host(design)
         instance = _instance(design, role)
         if isinstance(instance.lifecycle, RoleEnded):
             raise RoleRefused('role ended; this design identity cannot be reopened.')
         with worker_lifecycle.membership_operation(mesh_directory(design_id)), worker_lifecycle.lock_worker(mesh_directory(design_id), instance.name):
             entry = _object(_roster(design).get(instance.name))
             if entry.get('transferring_role') or entry.get('role_redirect'):
-                raise RoleRefused('role transfer is fenced; use the destination holder')
+                raise RoleRefused('role transfer is fenced; use the destination design')
             thread = _text(entry, 'thread_id')
             if not isinstance(instance.lifecycle, RoleNotOpened) and instance.lifecycle.thread_id != thread:
                 raise RoleRefused('RoleNeedsRecovery: recorded thread differs; replacement refused')
@@ -887,7 +825,7 @@ def resume(instance_id: str, prompt_file: str | Path) -> Path:
         _ = recover(instance_id)
     with _lock(directory):
         design = read_design(design_id)
-        reach = _authorize(design)
+        _check_host(design)
         instance = _instance(design, role)
         if not isinstance(instance.lifecycle, (RoleOpen, RolePausedForMove)):
             raise RoleRefused(type(instance.lifecycle).__name__ + ': role is unavailable')
@@ -912,13 +850,13 @@ def resume(instance_id: str, prompt_file: str | Path) -> Path:
             if entry.get('thread_id') != instance.lifecycle.thread_id or entry.get('status') in BUSY:
                 raise RoleRefused('RoleNeedsRecovery: roster thread or idle state changed')
             entry.update({'authorized_prompt': str(prompt), 'authorized_generation': generation,
-                          'authorized_holder': reach.session_id, 'access_policy': _tag(access_policy(current, role)),
+                          'access_policy': _tag(access_policy(current, role)),
                           'held_design_id': design_id, 'held_role': role})
             roster[instance.name] = entry
             current = replace(current, roles=tuple(replace(value, assignment_claim=str(prompt)) if value.role == role else value
                                                    for value in current.roles))
             _save(current)
-            _mesh_context(current, reach)
+            _mesh_context(current)
 
     try:
         dispatch_turn(design, role, prompt, reply, model, effort)
@@ -936,7 +874,7 @@ def resume(instance_id: str, prompt_file: str | Path) -> Path:
         identifiers = cast(list[str], worker_lifecycle.read_worker_value(prompt.with_suffix('.messages.json')))
         for identifier in identifiers:
             (directory / 'pending' / role / f'{identifier}.json').unlink(missing_ok=True)
-    _project_hold(design, role, reach)
+    _project_hold(design, role, staff.snapshot())
     return reply
 
 
@@ -947,26 +885,19 @@ def release_servers(design: HeldDesign) -> None:
 
 
 def rebind(design_id: str, *, expected_generation: int, reason: str,
-           holder: Holder | None = None, binding: Binding | None = None,
+           binding: Binding | None = None,
            repository: str = '', document: str = '') -> HeldDesign:
     if not reason.strip():
         raise RoleRefused('rebind needs a reason')
     directory = design_directory(design_id)
     design = _load_design(design_id, repair_empty_repository=binding is not None)
-    _ = _authorize(design)
-    if holder is not None:
-        reach = resolve_holder(holder)
-        if isinstance(reach, HolderUnavailable):
-            raise RoleRefused(reach.reason)
-        _ = authority_request('lookup', {'repository_id': design.repository_id, 'document': design.document,
-                                        'host': local_host()})
+    _check_host(design)
     transition = directory / 'transition.json'
     with _lock(directory):
         fields = _read(directory / 'design.json')
         design = _decode_design(design_id, fields, repair_empty_repository=binding is not None)
         damaged_binding = _object(fields.get('binding')).get('repository') == ''
-        target = replace(design, holder=holder or design.holder,
-                         binding=binding if binding is not None else design.binding,
+        target = replace(design, binding=binding if binding is not None else design.binding,
                          repository=repository or design.repository, document=document or design.document)
         # A target must pass the same rules as a saved record before lifecycle effects.
         _ = _decode_design(design_id, _design_fields(target))
@@ -981,11 +912,8 @@ def rebind(design_id: str, *, expected_generation: int, reason: str,
             if pending and (design.placement.generation != expected_generation + 1
                             or pending.get('target', _design_fields(design)) != _design_fields(design)):
                 raise RoleRefused('another lifecycle transition is incomplete')
-            reach = resolve_holder(design.holder)
-            if isinstance(reach, HolderUnavailable):
-                raise RoleRefused(reach.reason)
             context = mesh_directory(design_id) / 'design_context.json'
-            if not pending and context.exists() and _read(context) == _mesh_context_fields(design, reach):
+            if not pending and context.exists() and _read(context) == _mesh_context_fields(design):
                 return design
         else:
             if design.placement.generation != expected_generation:
@@ -1014,12 +942,10 @@ def _finish_rebind(design: HeldDesign) -> HeldDesign:
     with _lock(directory):
         if read_design(design.placement.design_id) != design:
             raise RoleRefused('binding changed during publication')
-        reach = resolve_holder(design.holder)
-        if isinstance(reach, HolderUnavailable):
-            raise RoleRefused(reach.reason)
-        _mesh_context(design, reach)
+        _mesh_context(design)
+    record = staff.snapshot()
     for instance in design.roles:
-        _project_hold(design, instance.role, reach)
+        _project_hold(design, instance.role, record)
     with _lock(directory):
         if read_design(design.placement.design_id) != design:
             raise RoleRefused('binding changed during publication')
@@ -1056,7 +982,7 @@ def end(instance_id: str) -> HeldDesign:
         raise RoleRefused('unknown role: ' + role_text)
     role = role_text
     design = read_design(design_id)
-    _ = _authorize(design)
+    _check_host(design)
     instance = _instance(design, role)
     if isinstance(instance.lifecycle, RoleEnded):
         if all(isinstance(item.lifecycle, (RoleNotOpened, RoleEnded)) for item in design.roles):
@@ -1192,7 +1118,7 @@ def _adoption_model(source: Path, name: str, thread_id: str, entry: dict[str, ob
     return cast(str, settings['model']), cast(str, settings['effort'])
 
 
-def adopt(repository: str, document: str, role: Role, holder: Holder, area: str, *,
+def adopt(repository: str, document: str, role: Role, area: str, *,
           source_mesh: str, name: str, thread_id: str, adoption_id: str,
           binding: Binding = UNBOUND, host: str = '') -> HeldDesign:
     """Fence and release the source, then install the exact thread at its destination."""
@@ -1211,31 +1137,32 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
                 or previous.get('name') != name or Path(_text(previous, 'source_mesh')).resolve() != Path(source_mesh).resolve()):
             raise RoleRefused('adoption identity differs from completed transfer')
         design = read_design(design_id)
-        if design.holder != holder or _instance(design, role).lifecycle != RoleOpen(thread_id):
-            raise RoleRefused('adoption holder or role differs from completed transfer')
-        reach = _authorize(design)
+        if _instance(design, role).lifecycle != RoleOpen(thread_id):
+            raise RoleRefused('adoption role differs from completed transfer')
+        _check_host(design)
         if placement.get('adoption_state') != 'completed':
             _ = authority_request('adopt-commit', {'repository_id': repository, 'document': document, 'host': host,
                                                   'adoption_id': adoption_id})
         (design_directory(design_id) / 'transition.json').unlink(missing_ok=True)
-        _project_hold(design, role, reach)
+        _project_hold(design, role, staff.snapshot())
         return design
     if not isinstance(placement.get('adoption_required'), dict):
         raise RoleRefused('AdoptionRequired: authority has no recorded source; complete its inventory first')
     recorded_source = _object(placement['adoption_required'])
     if (recorded_source.get('thread_id') != thread_id or recorded_source.get('name') != name
-            or Path(_text(recorded_source, 'mesh')).resolve() != Path(source_mesh).resolve()
-            or _holder(_object(recorded_source.get('holder'))) != holder):
-        raise RoleRefused('AdoptionRequired: source thread, mesh, name or holder differs from the authority record')
+            or Path(_text(recorded_source, 'mesh')).resolve() != Path(source_mesh).resolve()):
+        raise RoleRefused('AdoptionRequired: source thread, mesh or name differs from the authority record')
     checkout = _text(placement, 'checkout')
     binding = _resolved_binding(binding, checkout)
     candidate = HeldDesign(DesignPlacement(design_id, host, _integer(placement, 'generation')), repository,
                            checkout, str((Path(checkout) / _text(placement, 'document')).resolve()), area,
-                           datetime.now(UTC).isoformat(), holder, binding,
-                           tuple(RoleInstance(kind, name if kind == role else f'{holder.production_slug}-{area}-astra-{kind}',
+                           datetime.now(UTC).isoformat(), binding,
+                           tuple(RoleInstance(kind, name if kind == role else f'astra-{design_id}-{kind}',
                                               RoleOpen(thread_id) if kind == role else RoleNotOpened())
                                  for kind in ('designer', 'reviewer')))
-    reach = _authorize(candidate)
+    _check_host(candidate)
+    record = staff.snapshot()
+    _ = worker_parent(candidate, role, record)
     _validate_binding(binding, candidate.repository, role)
     model, effort = resolve_model(role)
     source = Path(source_mesh)
@@ -1252,7 +1179,7 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
             transfer = {'adoption_id': adoption_id, 'destination': str(mesh_directory(design_id))}
             if entry.get('transferring_role') is not None and entry.get('transferring_role') != transfer:
                 raise RoleRefused('source is fenced by another adoption')
-            prompt, _ = _prompt(candidate, role, 'Continue the adopted design in the same thread when the holder assigns work.')
+            prompt, _ = _prompt(candidate, role, 'Continue the adopted design in the same thread when the next assignment arrives.')
             _ = authority_request('adopt-reserve', {'repository_id': repository, 'document': document, 'host': host,
                                                     'adoption_id': adoption_id})
             with worker_lifecycle.locked_state(source_path) as source_lock:
@@ -1299,11 +1226,11 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
                 checkout = _text(placement, 'checkout')
                 design = HeldDesign(DesignPlacement(design_id, host, _integer(placement, 'generation')), repository,
                                     checkout, str((Path(checkout) / _text(placement, 'document')).resolve()), area,
-                                    datetime.now(UTC).isoformat(), holder, binding,
-                                    tuple(RoleInstance(kind, name if kind == role else f'{holder.production_slug}-{area}-astra-{kind}',
+                                    datetime.now(UTC).isoformat(), binding,
+                                    tuple(RoleInstance(kind, name if kind == role else f'astra-{design_id}-{kind}',
                                                        RoleOpen(thread_id) if kind == role else RoleNotOpened())
                                           for kind in ('designer', 'reviewer')))
-            reach = _authorize(design)
+            _check_host(design)
             _validate_binding(binding, design.repository, role)
             mesh = mesh_directory(design_id)
             mesh.mkdir(parents=True, exist_ok=True)
@@ -1321,7 +1248,7 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
                 with worker_lifecycle.locked_state(mesh / f'{name}.pending.json') as inbox:
                     inbox.publish(pending_text)
             _save(design)
-            _mesh_context(design, reach)
+            _mesh_context(design)
             confirm_adoption(design, role, thread_id)
             with worker_lifecycle.locked_state(source_path) as source_lock:
                 roster = source_lock.read_object()
@@ -1336,7 +1263,7 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
             (directory / 'transition.json').unlink(missing_ok=True)
             # The serving home is known even before a destination server is needed.
             astra_roles = _census_projection()
-            _ = astra_roles.hold(role, thread_id, _text(server, 'codex_home'), manager=reach.session_id,
+            _ = astra_roles.hold(role, thread_id, _text(server, 'codex_home'), manager=worker_parent(design, role, record).current_session,
                                  design_id=design_id, role_id=role)
         # Lifecycle, inbox and roster are released before the admission projection.
         return design
@@ -1359,7 +1286,6 @@ def list_roles() -> dict[str, object]:
     for path in sorted(state_root().glob('*/design.json')):
         try:
             design = read_design(path.parent.name)
-            reach = resolve_holder(design.holder)
             for role in design.roles:
                 lifecycle = role.lifecycle
                 transition = path.parent / 'transition.json'
@@ -1372,8 +1298,7 @@ def list_roles() -> dict[str, object]:
                     elif entry.get('status') == 'failed':
                         lifecycle = RoleNeedsRecovery(lifecycle.thread_id, 'mesh turn failed')
                 entries.append({'design_id': design.placement.design_id, 'instance_id': design.placement.design_id + '/' + role.role,
-                                'role': role.role, 'name': role.name, 'holder': _tag(design.holder),
-                                'holder_reach': _tag(reach), 'lifecycle': _tag(lifecycle),
+                                'role': role.role, 'name': role.name, 'lifecycle': _tag(lifecycle),
                                 'binding': _tag(design.binding), 'generation': design.placement.generation,
                                 'document': design.document, 'host': design.placement.host})
         except (OSError, ValueError, KeyError, TypeError) as error:
@@ -1384,16 +1309,10 @@ def list_roles() -> dict[str, object]:
 def render_roles(report: dict[str, object]) -> str:
     lines: list[str] = []
     for entry in cast(list[dict[str, object]], report['roles']):
-        holder = _holder(_object(entry['holder']))
-        holder_name = (f'{holder.unit_name} ({holder.production_slug})' if isinstance(holder, UnitHolder)
-                       else holder.production_slug + ' showrunner')
-        reach = _object(entry['holder_reach'])
-        route = ('session ' + _text(reach, 'session_id') if reach.get('kind') == 'HolderReach'
-                 else 'unavailable: ' + _text(reach, 'reason'))
         lifecycle = _object(entry['lifecycle'])
         thread = ' | thread ' + _text(lifecycle, 'thread_id') if lifecycle.get('thread_id') else ''
         lines.append(f"{entry['instance_id']} | {entry['role']} | {_text(lifecycle, 'kind')} | "
-                     + f"{holder_name} | {route}{thread} | {entry['document']}")
+                     + f"{thread} | {entry['document']}")
     if not lines:
         lines.append('no held roles')
     for problem in cast(list[dict[str, str]], report['problems']):
@@ -1419,14 +1338,6 @@ def _has_live_roles(fields: dict[str, object]) -> bool:
                 'RoleOpen', 'RolePausedForMove', 'RoleNeedsRecovery'):
             return True
     return False
-
-
-def _held_by(fields: dict[str, object], *holders: Holder) -> bool:
-    value = fields.get('holder')
-    if not isinstance(value, dict):
-        return False
-    holder_fields = cast(dict[str, object], value)
-    return any(all(holder_fields.get(key) == value for key, value in _tag(holder).items()) for holder in holders)
 
 
 @dataclass
@@ -1498,34 +1409,6 @@ def unbind_run(run_directory: str) -> None:
                        reason='run ended after reservation release', binding=DesignUnbound())
 
 
-def end_holder(production: str, unit: str) -> None:
-    holder = UnitHolder(production, unit)
-    for design in _read_designs(lambda fields: _held_by(fields, holder), refuse_matching_damage=True):
-        if design.holder == holder:
-            reach = resolve_holder(ShowrunnerHolder(production))
-            if not isinstance(reach, HolderReach) or reach.session_id != staff.runtime_id():
-                raise RoleRefused('only the production showrunner may retire held roles')
-            for instance in design.roles:
-                if not isinstance(instance.lifecycle, (RoleNotOpened, RoleEnded)):
-                    _end_retired_instance(design, instance)
-
-
-def _end_retired_instance(design: HeldDesign, instance: RoleInstance) -> None:
-    astra_roles = _census_projection()
-    _idle(design)
-    result = subprocess.run([sys.executable, str(ROOT / 'scripts/agents/codex_mesh.py'), 'end',
-                             '--session-dir', str(mesh_directory(design.placement.design_id)), '--to', instance.name],
-                            capture_output=True, text=True, check=False)
-    if result.returncode:
-        raise RoleRefused('RoleNeedsRecovery: retired role cleanup failed; retry after its turn finishes')
-    if isinstance(instance.lifecycle, RoleNotOpened):
-        return
-    with _lock(design_directory(design.placement.design_id)):
-        current = read_design(design.placement.design_id)
-        _save(_set_lifecycle(current, instance.role, RoleEnded(instance.lifecycle.thread_id)))
-    astra_roles.release(instance.lifecycle.thread_id)
-
-
 def check_patch(design_id: str, generation: int, cwd: Path, paths: list[str]) -> DesignBoundToPhase:
     """Reject the whole patch before attribution, including symlink and rename escapes."""
     design = read_design(design_id)
@@ -1533,7 +1416,7 @@ def check_patch(design_id: str, generation: int, cwd: Path, paths: list[str]) ->
         raise RoleRefused('binding transition is incomplete')
     if design.placement.generation != generation:
         raise RoleRefused('stale binding generation')
-    _ = _authorize(design)
+    _check_host(design)
     if not isinstance(design.binding, DesignBoundToPhase):
         raise RoleRefused('designer is unbound')
     binding = design.binding
@@ -1554,25 +1437,17 @@ def check_patch(design_id: str, generation: int, cwd: Path, paths: list[str]) ->
     return binding
 
 
-def rename_holder(production: str, old_unit: str, new_unit: str, old_checkout: str, new_checkout: str) -> None:
-    """Rebind live routes only. Saved prompt/reply paths and aliases retain their history."""
-    move_holder(UnitHolder(production, old_unit), UnitHolder(production, new_unit), old_checkout, new_checkout,
-                reason='unit rename')
-
-
-def move_holder(old_holder: Holder, new_holder: Holder, old_checkout: str = '', new_checkout: str = '', *,
+def move_checkout(old_checkout: str, new_checkout: str, *,
                 reason: str) -> None:
-    """Give each design `old_holder` holds to `new_holder`, and move its live paths from `old_checkout` to
-    `new_checkout` when both are given. A unit transfer or a production rename changes the holder only;
-    a unit rename changes both. Role names, saved prompt/reply paths and aliases retain their history."""
+    """Move live document paths and preserve saved prompts and replies."""
     moves_checkout = bool(old_checkout) and old_checkout != new_checkout
-    for design in _read_designs(lambda fields: _held_by(fields, old_holder, new_holder), refuse_matching_damage=True):
+    if not moves_checkout:
+        return
+    for design in _read_designs(lambda fields: fields.get('repository') == old_checkout, refuse_matching_damage=True):
         path = design_directory(design.placement.design_id) / 'design.json'
-        if design.holder not in (old_holder, new_holder):
+        if design.repository != old_checkout:
             continue
         _idle(design)
-        if design.holder == new_holder and (not moves_checkout or design.repository == new_checkout):
-            continue
         if moves_checkout:
             _ = authority_request('checkout', {'repository_id': design.repository_id, 'host': local_host(),
                                               'old_checkout': old_checkout, 'new_checkout': new_checkout})
@@ -1605,13 +1480,12 @@ def move_holder(old_holder: Holder, new_holder: Holder, old_checkout: str = '', 
             if current.placement.generation != design.placement.generation:
                 raise RoleRefused(f'binding changed during {reason}')
             _idle(current)
-            updated = replace(current, holder=new_holder, repository=new_checkout if moves_checkout else current.repository,
+            updated = replace(current, repository=new_checkout if moves_checkout else current.repository,
                               document=moved(current.document),
                               binding=binding, placement=replace(current.placement, generation=current.placement.generation + 1))
             _save(updated)
             (path.parent / 'transition.json').unlink(missing_ok=True)
-            reach = resolve_holder(new_holder)
-            _mesh_context(updated, reach if isinstance(reach, HolderReach) else HolderReach('HolderRestartPending'))
+            _mesh_context(updated)
             with _edit_roster(path.parent.name) as roster:
                 for value in roster.values():
                     entry = _object(value)
@@ -1622,21 +1496,13 @@ def move_holder(old_holder: Holder, new_holder: Holder, old_checkout: str = '', 
                     _ = entry.pop('authorized_generation', None)
 
 
-def rename_failures(production: str, old_unit: str, old_checkout: str) -> list[str]:
-    return holder_failures(UnitHolder(production, old_unit), old_checkout)
-
-
-def holder_failures(old_holder: Holder, old_checkout: str = '') -> list[str]:
-    """Each place a design still names `old_holder`, or `old_checkout` when one is given."""
+def checkout_failures(old_checkout: str) -> list[str]:
+    """List live document paths that still use the old checkout."""
     failures: list[str] = []
     try:
-        for design in _read_designs(lambda fields: _held_by(fields, old_holder)):
+        for design in _read_designs(lambda fields: fields.get('repository') == old_checkout):
             path = design_directory(design.placement.design_id) / 'design.json'
             try:
-                if design.holder.production_slug != old_holder.production_slug:
-                    continue
-                if design.holder == old_holder:
-                    failures.append(str(path) + ': holder still names ' + _holder_name(old_holder))
                 if old_checkout:
                     values = [design.repository, design.document]
                     if isinstance(design.binding, DesignBoundToPhase):
@@ -1661,18 +1527,13 @@ def holder_failures(old_holder: Holder, old_checkout: str = '') -> list[str]:
     return failures
 
 
-def _holder_name(holder: Holder) -> str:
-    return holder.unit_name if isinstance(holder, UnitHolder) else holder.production_slug + ' showrunner'
-
-
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
     for command in ('open', 'adopt'):
         p = commands.add_parser(command)
-        for flag in ('repository', 'document', 'role', 'production', 'area'):
+        for flag in ('repository', 'document', 'role', 'area'):
             _ = p.add_argument('--' + flag, required=True)
-        _ = p.add_argument('--unit', default='')
         _ = p.add_argument('--host', default='')
         _ = p.add_argument('--run-directory', default='')
         _ = p.add_argument('--phase', default='')
@@ -1693,7 +1554,7 @@ def main(argv: list[str]) -> int:
     _ = p.add_argument('--expected-generation', type=int, required=True)
     _ = p.add_argument('--reason', required=True)
     _ = p.add_argument('--unbind', action='store_true')
-    for flag in ('run-directory', 'phase', 'checkout', 'document', 'production', 'unit'):
+    for flag in ('run-directory', 'phase', 'checkout', 'document'):
         _ = p.add_argument('--' + flag, default='')
     _ = p.add_argument('--output-path', action='append', default=[])
     p = commands.add_parser('unbind-run')
@@ -1716,7 +1577,6 @@ def main(argv: list[str]) -> int:
             role = argument('role')
             if role not in ('designer', 'reviewer'):
                 raise RoleRefused('unknown role')
-            holder = UnitHolder(argument('production'), argument('unit')) if argument('unit') else ShowrunnerHolder(argument('production'))
             binding: Binding = UNBOUND
             if argument('run_directory') or argument('phase'):
                 if not argument('run_directory') or not argument('phase'):
@@ -1724,10 +1584,10 @@ def main(argv: list[str]) -> int:
                 binding = DesignBoundToPhase(str(Path(argument('run_directory')).resolve()), argument('phase'),
                                              argument('checkout'), tuple(cast(list[str], args['output_path'])))
             if command == 'open':
-                design = open_role(argument('repository'), argument('document'), role, holder, argument('area'),
+                design = open_role(argument('repository'), argument('document'), role, argument('area'),
                                    host=argument('host'), binding=binding)
             else:
-                design = adopt(argument('repository'), argument('document'), role, holder, argument('area'),
+                design = adopt(argument('repository'), argument('document'), role, argument('area'),
                                source_mesh=argument('source_mesh'), name=argument('name'), thread_id=argument('thread_id'),
                                adoption_id=argument('adoption_id'), binding=binding, host=argument('host'))
             print(design.placement.design_id + '/' + role)
@@ -1747,11 +1607,8 @@ def main(argv: list[str]) -> int:
                                                  argument('checkout') or current.repository,
                                                  tuple(cast(list[str], args['output_path'])) or
                                                  (current.binding.output_paths if isinstance(current.binding, DesignBoundToPhase) else ()))
-            next_holder = current.holder
-            if argument('production'):
-                next_holder = UnitHolder(argument('production'), argument('unit')) if argument('unit') else ShowrunnerHolder(argument('production'))
             updated = rebind(argument('design_id'), expected_generation=cast(int, args['expected_generation']),
-                       reason=argument('reason'), binding=next_binding, holder=next_holder,
+                       reason=argument('reason'), binding=next_binding,
                        repository=argument('checkout'), document=argument('document'))
             print(f'{updated.placement.design_id} rebound at generation {updated.placement.generation}')
         elif command == 'end':

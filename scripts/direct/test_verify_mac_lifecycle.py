@@ -55,9 +55,9 @@ class VerifyMacLifecycleTests(VerifyMacOffloadFixture):
             "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
         self.addCleanup(self.stop_verify, process)
         self.wait_for_path(self.runner_state / "free-now-events", (process,))
-        # The step gave the token back for its memory wait, and a peer takes it.
+        # The memory waiter keeps the token until it leaves for the Mac.
         lock = self.board / "locks" / "cargo.d"
-        self.assertFalse(lock.exists())
+        self.assertEqual((lock / "holder_pid").read_text(), str(process.pid))
         peer = subprocess.Popen(["bash", "-c", 'read -r -t "$1" _; :', "peer", str(TEST_HANG_GUARD_SECS)],
                                 stdin=subprocess.PIPE)
 
@@ -67,11 +67,14 @@ class VerifyMacLifecycleTests(VerifyMacOffloadFixture):
             _ = peer.wait(timeout=TEST_HANG_GUARD_SECS)
 
         self.addCleanup(stop_peer)
-        acquired = subprocess.run(["bash", str(VERIFY.with_name("board.sh")), "acquire", str(self.board),
-                                   "peer", "cargo", "--pid", str(peer.pid)],
-                                  capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(acquired.returncode, 0, acquired.stderr)
+        acquired = subprocess.Popen(["bash", str(VERIFY.with_name("board.sh")), "acquire", str(self.board),
+                                   "peer", "cargo", "--pid", str(peer.pid),
+                                   "--wait", str(TEST_HANG_GUARD_SECS)],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(acquired.wait, TEST_HANG_GUARD_SECS)
         _ = mac_free.write_text("free\n")
+        acquired_out, acquired_err = acquired.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(acquired.returncode, 0, acquired_out + acquired_err)
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(self.local_runs(), [])

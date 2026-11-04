@@ -69,3 +69,18 @@ Anything else unexpected prints one anomaly line and the operation continues.
 | shutdown | refusals in `restart.py` and `shutdown_record.py`; the restore record keeps only the list of row ids that were live. Done: the `launch_permission.py` and `folder_trust.py` gates (deleted in b9fd6ada4) |
 | accounts | `cutover-home` (after the Mac cutover); the Mac session counts fetch; the resume retry loop |
 | phases | wait recovery; unknown-owner states; queue_place cleanup redesign; verify staging recovery; `process_start.py` unless it deletes the `/proc` copies (net negative) |
+
+## 6. Every accessor
+
+`docs/as-built/staff-accessors.md` lists every file that reads or writes the staff file, and each copy the user approved. Use it for a staff migration.
+
+## 7. One way to start a worker
+
+User rule, 2026-11-04: "it should be impossible to start a worker in more than one way". The sdlc showrunner owns this rule.
+
+- The one way is `assign.sh`, run by the director as a background shell of its own session (a Claude background Bash, a Codex unified-exec terminal). It covers every role (implement, test, fix, review, follow-up, resume after a move) and both families.
+- `implement.sh`, `review.sh` and the `codex_mesh.py` start, follow, reopen, fork, adopt, prime and resume-account-move subcommands refuse when `assign.sh` did not call them.
+- `assign.sh` refuses when no live Claude or Codex process is in its parent chain (a `nohup`, `setsid` or `&` start).
+- The launcher stays alive while its worker has a live detached run, and puts the result into the same turn.
+- `scripts/direct/test_one_launch_path.py` fails when a file outside the launcher starts or follows a worker.
+- Worker panes (herdr-worker-panes decision 11) change what is behind `assign.sh`; they add no second way.

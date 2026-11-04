@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from scripts.lint.memory_test_support import admission_configuration_fixture, admission_policy_fixture
 
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
 import io
@@ -70,6 +71,302 @@ def installed_snapshot(value: object) -> object:
             record["transition"] = {key: transition[key] for key in ("id", "action", "at")}
     return {key: installed_snapshot(item) for key, item in record.items()}
 
+class QueueLifecycleTests(unittest.TestCase):
+    @staticmethod
+    def interrupt_append(kind: str) -> Callable[[Path, dict[str, object], float], None]:
+        append = gate.append_queue_time
+
+        def append_then_stop(directory: Path, event: dict[str, object], now: float) -> None:
+            append(directory, event, now)
+            if event.get("kind") == kind:
+                raise InjectedCrash("after " + kind + " append")
+
+        return append_then_stop
+
+    def events(self, fixture: AdmissionFixture, kind: str) -> list[dict[str, object]]:
+        path = fixture.state_dir / "queue_times.jsonl"
+        if not path.exists():
+            return []
+        with path.open("rb") as stream:
+            return [row for row in reversed(list(gate.queue_times_backward(stream))) if row.get("kind") == kind]
+
+    def test_gate_admission_keeps_original_arrival_and_applied_budget(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            request = fixture.request(step="merge-gate", since=fixture.clock.now() - 30)
+            self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+            fixture.clock.advance(10)
+            fixture.free(60 * GIB)
+            _ = fixture.server.run_pass()
+            granted = only_admitted([fixture.server.ledger[request.episode].reply])
+            rows = self.events(fixture, "admitted")
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual((row["pid"], row["start_time"], row["since"]),
+                             (request.owner.pid, request.owner.start_time, request.since))
+            self.assertEqual(row["reservation_id"], granted.reservation)
+            self.assertEqual(row["admitted_at"], fixture.clock.now())
+            self.assertEqual(row["wait_seconds"], 40)
+            self.assertEqual(row["need"], request.profile.peak.bytes)
+            self.assertEqual(row["need_source"], request.profile.peak.source)
+            self.assertEqual(row["budget"], 21 * GIB)
+            self.assertTrue(row["is_head"])
+
+    def test_admission_recovery_keeps_one_event_for_the_durable_grant(self) -> None:
+        for boundary in ("after_state_write", "after_admitted_append"):
+            with self.subTest(boundary=boundary), AdmissionFixture() as fixture:
+                request = fixture.request(step="merge-gate", since=fixture.clock.now() - 7)
+                fixture.fault.stage = boundary
+                with self.assertRaises(InjectedCrash):
+                    _ = fixture.server.handle_request(request)
+                admitted_at = fixture.clock.now()
+                fixture.clock.advance(10)
+                fixture.restart()
+                grant = only_admitted(fixture.server.handle_request(request))
+                self.assertEqual(only_admitted(fixture.server.handle_request(request)), grant)
+                rows = self.events(fixture, "admitted")
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["reservation_id"], grant.reservation)
+                self.assertEqual(rows[0]["admitted_at"], admitted_at)
+                self.assertEqual(rows[0]["since"], request.since)
+                self.assertEqual(rows[0]["wait_seconds"], 7)
+
+    def test_gate_exit_before_a_positive_sample_still_records_its_end(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request(step="merge-gate")
+            grant = only_admitted(fixture.server.handle_request(request))
+            fixture.clock.advance(3)
+            _ = fixture.server.handle_request(wire.ReleaseRequest("gate-end", grant.reservation, 0))
+            rows = self.events(fixture, "ended")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["reservation_id"], grant.reservation)
+            self.assertEqual(rows[0]["since"], request.since)
+            self.assertEqual(rows[0]["ended_at"], fixture.clock.now())
+            self.assertEqual(rows[0]["end_kind"], {"kind": "StepEnd"})
+            self.assertEqual(rows[0]["peak"], {"kind": "NoPositiveSample"})
+            self.assertFalse(fixture.history())
+
+    def test_token_return_recovery_publishes_one_end_for_each_reservation(self) -> None:
+        for boundary in ("after_finalization_intent", "after_history_append"):
+            with self.subTest(boundary=boundary), AdmissionFixture() as fixture:
+                request = fixture.request()
+                request = replace(request, sidecar=str(fixture.scope(request.owner)))
+                grant = only_admitted(fixture.server.handle_request(request))
+                fixture.scoped_peak(grant)
+                fixture.clock.advance(2)
+                token = wire.TokenWaitRequest("token-crash", grant.reservation)
+                fixture.fault.stage = boundary
+                with self.assertRaises(InjectedCrash):
+                    _ = fixture.server.handle_request(token)
+                fixture.restart()
+                self.assertEqual(fixture.server.handle_request(token), [wire.Ok()])
+                self.assertEqual(fixture.server.handle_request(token), [wire.Ok()])
+                rows = self.events(fixture, "ended")
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["reservation_id"], grant.reservation)
+                self.assertEqual(rows[0]["end_kind"], {"kind": "TokenReturn"})
+                fixture.clock.advance(3)
+                again = replace(request, episode="recovered", token_back_at=fixture.clock.now())
+                later = only_admitted(fixture.server.handle_request(again))
+                self.assertNotEqual(later.reservation, grant.reservation)
+                self.assertEqual(len(self.events(fixture, "admitted")), 2)
+                lifetime, = gate.read_queue_lifetimes(fixture.state_dir)
+                self.assertEqual((lifetime.pid, lifetime.start_time, lifetime.since),
+                                 (request.owner.pid, request.owner.start_time, request.since))
+                self.assertEqual([interval.reservation_id for interval in lifetime.intervals],
+                                 [grant.reservation, later.reservation])
+                self.assertEqual(len(lifetime.token_gaps), 1)
+                self.assertIsInstance(lifetime.end, gate.StepStillOpen)
+
+    def test_an_end_append_retry_preserves_the_saved_time_and_publishes_once(self) -> None:
+        for sampled in (False, True):
+            with self.subTest(sampled=sampled), AdmissionFixture() as fixture:
+                request = fixture.request(step="merge-gate")
+                if sampled:
+                    request = replace(request, sidecar=str(fixture.scope(request.owner)))
+                grant = only_admitted(fixture.server.handle_request(request))
+                if sampled:
+                    fixture.scoped_peak(grant, 2 * GIB)
+                fixture.clock.advance(5)
+                ended_at = fixture.clock.now()
+                release = wire.ReleaseRequest("end-crash", grant.reservation, 137)
+                with mock.patch.object(gate, "append_queue_time", side_effect=self.interrupt_append("ended")):
+                    with self.assertRaises(InjectedCrash):
+                        _ = fixture.server.handle_request(release)
+                fixture.clock.advance(100)
+                fixture.restart()
+                self.assertEqual(fixture.server.handle_request(release), [wire.Ok()])
+                rows = self.events(fixture, "ended")
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["reservation_id"], grant.reservation)
+                self.assertEqual(rows[0]["ended_at"], ended_at)
+                self.assertEqual(rows[0]["outcome"], "killed")
+                self.assertEqual(rows[0]["end_kind"], {"kind": "StepEnd"})
+                self.assertEqual(len(fixture.history()), int(sampled))
+
+    def test_cancellation_keeps_its_end_after_the_owner_exits(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            request = fixture.request(step="merge-gate")
+            peer = fixture.connect(request)
+            self.assertIsInstance(peer.replies()[0], wire.Wait)
+            fixture.clock.advance(10)
+            cancelled_at = fixture.clock.now()
+            peer.close()
+            fixture.server.run_once(0)
+            fixture.clock.advance(100)
+            fixture.end_owner(request.owner)
+            fixture.restart()
+            rows = self.events(fixture, "left")
+            self.assertEqual([(row["reason"], row["ended_at"]) for row in rows],
+                             [("cancelled", cancelled_at)])
+            lifetime, = gate.read_queue_lifetimes(fixture.state_dir)
+            self.assertEqual(lifetime.end, gate.LeftQueue(cancelled_at, "cancelled"))
+            self.assertEqual(lifetime.memory_wait_s, 10)
+            self.assertFalse(self.events(fixture, "ended"))
+
+    def test_restart_after_reservation_removal_keeps_the_completed_end(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request(step="merge-gate")
+            grant = only_admitted(fixture.server.handle_request(request))
+            fixture.clock.advance(5)
+            ended_at = fixture.clock.now()
+            clear = service.StateIntents.clear
+
+            def clear_then_stop(intents: service.StateIntents, row: gate.Reservation) -> None:
+                clear(intents, row)
+                raise InjectedCrash("after reservation removal")
+
+            with mock.patch.object(service.StateIntents, "clear", new=clear_then_stop):
+                with self.assertRaises(InjectedCrash):
+                    _ = fixture.server.handle_request(wire.ReleaseRequest("clear-stop", grant.reservation, 0))
+            fixture.proc.kill(request.owner)
+            fixture.clock.advance(100)
+            fixture.restart()
+            self.assertFalse(self.events(fixture, "left"))
+            rows = self.events(fixture, "ended")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["reservation_id"], grant.reservation)
+            lifetime, = gate.read_queue_lifetimes(fixture.state_dir)
+            self.assertEqual(lifetime.end,
+                gate.ReservationEnded(ended_at, "completed", gate.StepEnd(), gate.NoPositiveSample()))
+
+    def test_restart_retries_an_interrupted_cancellation_with_its_original_time(self) -> None:
+        for appended in (False, True):
+            with self.subTest(appended=appended), AdmissionFixture() as fixture:
+                fixture.free(0)
+                request = fixture.request(step="merge-gate")
+                peer = fixture.connect(request)
+                self.assertIsInstance(peer.replies()[0], wire.Wait)
+                fixture.clock.advance(10)
+                cancelled_at = fixture.clock.now()
+                failure = self.interrupt_append("left") if appended else InjectedCrash("before cancellation append")
+                with mock.patch.object(gate, "append_queue_time", side_effect=failure):
+                    peer.close()
+                    with self.assertRaises(InjectedCrash):
+                        fixture.server.run_once(0)
+                fixture.clock.advance(100)
+                fixture.restart()
+                fixture.end_owner(request.owner)
+                fixture.restart()
+                rows = self.events(fixture, "left")
+                self.assertEqual([(row["reason"], row["ended_at"]) for row in rows],
+                                 [("cancelled", cancelled_at)])
+                lifetime, = gate.read_queue_lifetimes(fixture.state_dir)
+                self.assertEqual(lifetime.end, gate.LeftQueue(cancelled_at, "cancelled"))
+                self.assertEqual(lifetime.memory_wait_s, 10)
+                self.assertFalse(self.events(fixture, "ended"))
+
+    def test_imported_and_restored_places_record_one_owner_exit_after_restarts(self) -> None:
+        for form in ("waiting", "token_wait", "missing_identity", "empty_identity", "missing_waiting_row"):
+            with self.subTest(form=form), AdmissionFixture() as fixture:
+                if form == "token_wait":
+                    request, intent, row = fixture.legacy_token_wait()
+                    row.update(session_id=request.identity.session_id, session_name=request.identity.name,
+                               step=request.identity.step, folder=request.identity.folder)
+                    record = cast(dict[str, object], json.loads(intent.read_text()))
+                    record["waiter"] = row
+                    _ = intent.write_text(json.dumps(record))
+                    with mock.patch.object(gate, "finalize_reservation", side_effect=OSError("retry finalization")):
+                        with mock.patch("sys.stderr", io.StringIO()):
+                            fixture.server = fixture.new_server()
+                    place, = fixture.server.places.values()
+                    self.assertEqual(place.queue_identity, gate.queue_life_identity(row))
+                else:
+                    fixture.free(0)
+                    request = fixture.request()
+                    _ = fixture.server.handle_request(request)
+                    row = fixture.server.waiters[request.episode].row.copy()
+                    fixture.server.close()
+                    state_path = fixture.state_dir / "state.json"
+                    waiting_path = fixture.state_dir / (request.episode + ".waiting")
+                    if form != "missing_waiting_row":
+                        _ = waiting_path.write_text(json.dumps(row))
+                    if form == "waiting":
+                        state_path.unlink()
+                    else:
+                        record = cast(dict[str, object], json.loads(state_path.read_text()))
+                        places = cast(dict[str, dict[str, object]], record["places"])
+                        for place in places.values():
+                            if form in ("missing_identity", "missing_waiting_row"):
+                                del place["queue_identity"]
+                            else:
+                                place["queue_identity"] = {"kind": "NoWaiter"}
+                        _ = state_path.write_text(json.dumps(record))
+                    fixture.server = fixture.new_server()
+                fixture.restart()
+                self.assertEqual(len(fixture.server.places), 1)
+                fixture.proc.kill(request.owner)
+                fixture.restart()
+                fixture.restart()
+                events = self.events(fixture, "left")
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["reason"], "owner_gone")
+                identity_row: gate.Waiter = ({"pid": row["pid"], "start_time": row["start_time"],
+                                 "need": row["need"], "since": row["since"]}
+                                if form == "missing_waiting_row" else row)
+                identity = gate.queue_life_identity(identity_row)
+                self.assertEqual({key: events[0][key] for key in identity}, identity)
+                self.assertFalse(fixture.server.places)
+
+    def test_the_first_head_mark_records_the_same_window_as_the_wait_reason(self) -> None:
+        with AdmissionFixture() as fixture:
+            policy = gate.read_memory_config().policy
+            request = fixture.request(step="merge-gate",
+                since=fixture.clock.now() - policy.timing.head_seconds - 1)
+            _ = only_admitted(fixture.server.handle_request(request))
+            result = fixture.server.last_result
+            assert isinstance(result, gate.PassResult)
+            reason = result.rows[0].reason
+            assert isinstance(reason, gate.HeadAdmissionStatus)
+            self.assertIsInstance(reason.backfill, gate.StrictUntil)
+            self.assertEqual(result.policy.window, reason.backfill)
+            rows = self.events(fixture, "admitted")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["window"], gate.snapshot_value(reason.backfill))
+
+    def test_a_waiting_owner_exit_and_socket_cancel_record_distinct_left_reasons(self) -> None:
+        for reason in ("cancelled", "owner_gone"):
+            with self.subTest(reason=reason), AdmissionFixture() as fixture:
+                fixture.free(0)
+                request = fixture.request(step="merge-gate")
+                peer = fixture.connect(request)
+                self.assertIsInstance(peer.replies()[0], wire.Wait)
+                fixture.clock.advance(4)
+                if reason == "cancelled":
+                    peer.close()
+                    fixture.server.run_once(0)
+                else:
+                    fixture.end_owner(request.owner)
+                rows = self.events(fixture, "left")
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["reason"], reason)
+                self.assertEqual((rows[0]["pid"], rows[0]["start_time"], rows[0]["since"]),
+                                 (request.owner.pid, request.owner.start_time, request.since))
+                self.assertFalse(self.events(fixture, "ended"))
+                self.assertFalse(fixture.history())
+
+
 class CiSliceAdmissionTests(unittest.TestCase):
     def test_idle_ci_use_reduces_the_admission_budget(self) -> None:
         with AdmissionFixture() as fixture:
@@ -80,7 +377,7 @@ class CiSliceAdmissionTests(unittest.TestCase):
             self.assertNotIn(request.episode, fixture.server.reservations)
             result = fixture.server.last_result
             assert isinstance(result, gate.PassResult)
-            self.assertEqual(result.totals.charged, 4 * GIB)
+            self.assertEqual(result.policy.totals.charged, 4 * GIB)
 
     def test_running_ci_job_uses_the_current_limit_on_every_pass(self) -> None:
         with AdmissionFixture() as fixture:
@@ -89,7 +386,7 @@ class CiSliceAdmissionTests(unittest.TestCase):
             _ = (ci / "memory.current").write_text(str(2 * GIB))
             _ = (ci / "memory.stat").write_text("inactive_file 0\n")
             _ = (ci / "memory.max").write_text(str(18 * GIB))
-            (fixture.proc.path / "123").mkdir()
+            _ = fixture.fixture_owner(123, "100")
             _ = (fixture.proc.path / "123/comm").write_text("Runner.Worker\n")
             _ = (ci / "cgroup.procs").write_text("123\n")
             request = fixture.request(need=8 * GIB)
@@ -97,7 +394,7 @@ class CiSliceAdmissionTests(unittest.TestCase):
             self.assertNotIn(request.episode, fixture.server.reservations)
             result = fixture.server.last_result
             assert isinstance(result, gate.PassResult)
-            self.assertEqual(result.totals.charged, 18 * GIB)
+            self.assertEqual(result.policy.totals.charged, 18 * GIB)
             _ = (ci / "memory.max").write_text(str(12 * GIB))
             _ = fixture.server.run_pass()
             self.assertIn(request.episode, fixture.server.reservations)
@@ -108,7 +405,7 @@ class CiSliceAdmissionTests(unittest.TestCase):
             ci = fixture.root / "ci.slice"
             _ = (ci / "memory.current").write_text(str(2 * GIB))
             _ = (ci / "memory.stat").write_text("inactive_file 0\n")
-            (fixture.proc.path / "123").mkdir()
+            _ = fixture.fixture_owner(123, "100")
             _ = (fixture.proc.path / "123/comm").write_text("Runner.Worker\n")
             _ = (ci / "cgroup.procs").write_text("123\n")
             request = fixture.request(need=14 * GIB)
@@ -116,13 +413,13 @@ class CiSliceAdmissionTests(unittest.TestCase):
             self.assertNotIn(request.episode, fixture.server.reservations)
             result = fixture.server.last_result
             assert isinstance(result, gate.PassResult)
-            self.assertEqual(result.totals.charged, 8 * GIB)
+            self.assertEqual(result.policy.totals.charged, 8 * GIB)
             fixture.configure(ci_memory_margin_gib=3)
             _ = fixture.server.run_pass()
             self.assertIn(request.episode, fixture.server.reservations)
             result = fixture.server.last_result
             assert isinstance(result, gate.PassResult)
-            self.assertEqual(result.totals.charged, 5 * GIB)
+            self.assertEqual(result.policy.totals.charged, 5 * GIB)
 
     def test_missing_ci_limit_refuses_grants_but_keeps_cleanup_and_recovers(self) -> None:
         with AdmissionFixture() as fixture:
@@ -1917,7 +2214,7 @@ class CutoverServiceTests(unittest.TestCase):
             _ = Path(grant.wave_path).write_text(f"{5 * GIB} {int(fixture.clock.now())}")
             record = fixture.server.reservations[request.episode]
             scope = Path(Path(record.sidecar).read_text())
-            _ = (scope / "memory.stat").write_text(f"anon {GIB}\n")
+            _ = (scope / "memory.stat").write_text(f"anon {GIB}\ninactive_file 0\n")
             policy = gate.read_memory_config().policy
             fixture.clock.advance(max(policy.timing.ramp_seconds,
                 policy.timing.head_seconds, policy.peak_hold.seconds_for("merge-gate")) + 1)
@@ -1935,7 +2232,9 @@ class CutoverServiceTests(unittest.TestCase):
                 assert isinstance(viewed, wire.ViewReply)
                 assert isinstance(explained, wire.ExplainReply)
                 self.assertEqual(viewed.reading.explanation, explained.explanation)
-                running, = explained.explanation.running
+                self.assertEqual(len(explained.explanation.running), 2)
+                running, = (row for row in explained.explanation.running
+                            if gate.running_has_reservation(row.step))
                 self.assertEqual((running.basis, running.charged), (gate.LifetimePromise(6 * GIB), 6 * GIB))
                 self.assertEqual(gate.growth_headroom(running.step.measured), 5 * GIB)
                 head = explained.explanation.head
@@ -2369,10 +2668,11 @@ class CutoverServiceTests(unittest.TestCase):
             self.assertEqual(fixture.history(), [])
             finalize = gate.finalize_reservation
             def record_before_retirement(path: Path, row: gate.Reservation, outcome: gate.FinalOutcome,
-                    now: datetime, status: int | gate.OutcomeNotRecorded = gate.OUTCOME_NOT_RECORDED, *, intents: gate.FinalizationIntents
+                    now: datetime, status: int | gate.OutcomeNotRecorded = gate.OUTCOME_NOT_RECORDED, *,
+                    intents: gate.FinalizationIntents, end_kind: gate.StepEnd | gate.TokenReturn
                     ) -> gate.HistoryRecorded | gate.NoHistoryRecorded:
                 self.assertTrue((fixture.state_dir / "state.json").exists())
-                return finalize(path, row, outcome, now, status, intents=intents)
+                return finalize(path, row, outcome, now, status, intents=intents, end_kind=end_kind)
             with mock.patch.object(service, "SystemProc", return_value=fixture.proc), \
                  mock.patch.object(gate, "finalize_reservation", side_effect=record_before_retirement) as finished:
                 service.export_priority(fixture.state_dir)
@@ -2750,7 +3050,8 @@ class CutoverServiceTests(unittest.TestCase):
             self.assertEqual(gate.read_test_phase_need(evidence["need"]), need)
             inputs = fixture.server.last_inputs
             assert isinstance(inputs, gate.QueueInputs)
-            self.assertEqual(gate.build_charge(inputs.running[0].measured), expected)
+            memory, = (step for step in inputs.running if gate.running_has_reservation(step))
+            self.assertEqual(gate.build_charge(memory.measured), expected)
             fields = wire.parse_record(phase.read_text(), dict[str, object])
             fields["test_phase_peak_bytes"] = 5 * GIB
             _ = phase.write_text(wire.encode_record(fields))
@@ -2759,7 +3060,8 @@ class CutoverServiceTests(unittest.TestCase):
             self.assertEqual(fixture.server.reservations[request.episode].charge_use, evidence)
             inputs = fixture.server.last_inputs
             assert isinstance(inputs, gate.QueueInputs)
-            memory, = inputs.running
+            self.assertEqual(len(inputs.running), 2)
+            memory, = (step for step in inputs.running if gate.running_has_reservation(step))
             self.assertEqual(gate.build_charge(memory.measured), 6 * GIB)
             self.assertFalse(list(fixture.state_dir.glob("*.test-phase-charge.json")))
             self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest("release", grant.reservation, 0)), [wire.Ok()])
@@ -2778,7 +3080,8 @@ class CutoverServiceTests(unittest.TestCase):
                 write_memory_config(fixture.root / "build_admission.conf", test_phase_margin="2")
                 inputs = fixture.server.last_inputs
                 assert isinstance(inputs, gate.QueueInputs)
-                memory, = inputs.running
+                self.assertEqual(len(inputs.running), 2)
+                memory, = (step for step in inputs.running if gate.running_has_reservation(step))
                 self.assertEqual(gate.build_charge(memory.measured), math.ceil(3 * GIB * need.margin))
                 fixture.fault.stage = stage
                 with self.assertRaises(InjectedCrash):
@@ -2798,7 +3101,8 @@ class CutoverServiceTests(unittest.TestCase):
             _ = fixture.server.run_pass()
             inputs = fixture.server.last_inputs
             assert isinstance(inputs, gate.QueueInputs)
-            memory, = inputs.running
+            self.assertEqual(len(inputs.running), 2)
+            memory, = (step for step in inputs.running if gate.running_has_reservation(step))
             self.assertEqual(gate.charge_basis(memory.measured), gate.RampPromise(11 * GIB))
             self.assertIsInstance(fixture.server.reservations[request.episode].charge_use, gate.NoTestPhaseChargeUse)
             fixture.proc.kill(request.owner)
@@ -3120,7 +3424,7 @@ class CutoverServiceTests(unittest.TestCase):
                 result = fixture.server.run_pass()
             tables.assert_called_once_with()
             assert isinstance(result, gate.PassResult)
-            self.assertEqual((result.totals.promised, result.totals.measured), (7 * GIB // 2, 3 * GIB // 2))
+            self.assertEqual((result.policy.totals.promised, result.policy.totals.measured), (7 * GIB // 2, 3 * GIB // 2))
             self.assertEqual({record.owner.pid for record in fixture.server.reservations.values()},
                 {fresh.owner.pid, mature.owner.pid})
             self.assertFalse(Path(old.max_path).exists())
@@ -3442,7 +3746,6 @@ class RunPlaceTests(unittest.TestCase):
             self.assertEqual(restored.reservations[request.episode].ending, saved.reservations[request.episode].ending)
 
     def test_display_age_and_aws_wait_threshold_use_child_arrival_not_run_order(self) -> None:
-        from collections.abc import Callable
         from zoneinfo import ZoneInfo
         from scripts.aws_target import aws_target
         from scripts.aws_target.config import ControlSettings, read_control_settings

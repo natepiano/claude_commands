@@ -20,7 +20,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.prepare_unit_moves()
         self.env['DESIGN_ROLES_STATE'] = str(self.root / 'state/astra/design-roles')
         with mock.patch.dict(os.environ, self.env):
-            bad = write_empty_binding_record(self.checkout, design_roles.UnitHolder('unrelated', 'other-unit'),
+            bad = write_empty_binding_record(self.checkout,
                                              lifecycle=design_roles.RoleOpen('unrelated-thread'))
         with design_roles.record_operation():
             results = [self.run_rename('apply'), self.run_command('unit', NEW, 'alpha-unit'),
@@ -58,17 +58,17 @@ class ProductionRenameTests(support.ProductionRenameFixture):
                          "DESIGN_ROLES_STATE": str(self.root / "state/astra/design-roles"),
                          "DESIGN_OWNERSHIP_STATE": str(self.root / "state/astra/design-ownership")})
         old_unit, new_unit = self.unit_worktree(OLD, "alpha-unit"), self.unit_worktree(NEW, "alpha-unit")
-        showrunner = self.held_design("showrunner-repo", self.checkout, design_roles.ShowrunnerHolder(OLD))
-        unit = self.held_design("unit-repo", old_unit, design_roles.UnitHolder(OLD, "alpha-unit"))
+        showrunner = self.held_design("showrunner-repo", self.checkout)
+        unit = self.held_design("unit-repo", old_unit)
         self.assert_success(self.run_rename("apply"))
         current, cwd = self.read_held(showrunner)
-        self.assertEqual(current.holder, design_roles.ShowrunnerHolder(NEW))
+        self.assertFalse(hasattr(current, "holder"))
         self.assertEqual((current.repository, current.roles, cwd), (str(self.checkout), showrunner.roles, str(self.checkout)))
-        self.assertEqual(self.read_held(unit)[0].holder, design_roles.UnitHolder(OLD, "alpha-unit"))
+        self.assertEqual(self.read_held(unit)[0], unit)
         self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
         self.assert_unit_moved("alpha-unit")
         current, cwd = self.read_held(unit)
-        self.assertEqual(current.holder, design_roles.UnitHolder(NEW, "alpha-unit"))
+        self.assertFalse(hasattr(current, "holder"))
         self.assertEqual((current.repository, current.document, cwd), (str(new_unit), str(new_unit / "design.md"), str(new_unit)))
         self.assertEqual((current.roles, current.placement.generation), (unit.roles, 2))
 

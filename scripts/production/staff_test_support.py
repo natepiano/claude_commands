@@ -682,11 +682,13 @@ class StaffTestCase(unittest.TestCase):
         """Persist the durable design producer's tagged record, without a ledger."""
         from scripts.astra import design_roles
 
+        parent = showrunner_relationship(slug)
+        _ = fixture_worker(name, parent.id, runtime_id=thread)
         design_id = "12345678-1234-5678-1234-567812345678"
         design = design_roles.HeldDesign(
             design_roles.DesignPlacement(design_id, design_roles.local_host(), 1),
             "fixture", str(self.source_root), str(self.source_root / "design.md"), "fixture",
-            "2026-10-31T00:00:00+00:00", design_roles.ShowrunnerHolder(slug), design_roles.DesignUnbound(),
+            "2026-10-31T00:00:00+00:00", design_roles.DesignUnbound(),
             (design_roles.RoleInstance("designer", name, design_roles.RoleOpen(thread)),
              design_roles.RoleInstance("reviewer", "sdlc-design-astra-reviewer", design_roles.RoleNotOpened())),
         )

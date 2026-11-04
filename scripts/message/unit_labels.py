@@ -5,7 +5,7 @@ import json
 import sys
 import time
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict, cast
 
@@ -188,6 +188,44 @@ def problem(problems: list[str], source: str, error: BaseException | str) -> Non
         problems.append(message)
 
 
+@dataclass(frozen=True)
+class StaffRowAnomaly:
+    """Recorded facts are incomplete for this staff row."""
+
+    row: staff.StaffRow
+    reason: str
+
+    @property
+    def diagnostic(self) -> str:
+        return f"{self.row.name}: {self.reason}"
+
+
+@dataclass
+class StaffDiagnostics:
+    """Keep incomplete rows separate from reads that can hide sessions."""
+
+    problems: list[str] = field(default_factory=list)
+    anomalies: dict[staff.StaffId, StaffRowAnomaly] = field(default_factory=dict)
+
+    def anomaly(self, row: staff.StaffRow, reason: str) -> None:
+        _ = self.anomalies.setdefault(row.id, StaffRowAnomaly(row, reason))
+
+    def document(self, row: staff.StaffRow,
+                 result: session_staff.DocumentUnavailable | session_staff.LocationUnfilled) -> None:
+        if isinstance(result, session_staff.LocationUnfilled):
+            self.anomaly(row, result.reason)
+        else:
+            problem(self.problems, row.name, result.reason)
+
+    @property
+    def warnings(self) -> list[str]:
+        return [anomaly.diagnostic for anomaly in self.anomalies.values()]
+
+    @property
+    def excluded_sessions(self) -> set[str]:
+        return {anomaly.row.current_session for anomaly in self.anomalies.values()}
+
+
 def newest_sessions() -> list[SessionRecord]:
     newest: dict[str, SessionRecord] = {}
     for record in running_sessions():
@@ -196,7 +234,7 @@ def newest_sessions() -> list[SessionRecord]:
 
 
 def registered_showrunners(
-    problems: list[str],
+    diagnostics: StaffDiagnostics,
     *, known_sessions: Mapping[str, SessionRecord] | showrunners.DiscoverSessions = showrunners.DISCOVER_SESSIONS,
     membership: staff.StaffSnapshot | showrunners.DiscoverMembership = showrunners.DISCOVER_MEMBERSHIP,
     resolver: session_staff.RowResolver | None = None,
@@ -211,12 +249,12 @@ def registered_showrunners(
     for row in staff.active(record, "showrunner"):
         doc = resolver.production_doc(row)
         if not isinstance(doc, session_staff.ProductionDoc):
-            problem(problems, row.name, doc.reason)
+            diagnostics.document(row, doc)
             continue
         try:
             timer = showrunners.timer_for(row, record)
         except (OSError, ValueError) as error:
-            problem(problems, row.name, error)
+            problem(diagnostics.problems, row.name, error)
             continue
         live = sessions_by_id.get(row.current_session)
         registered.append(showrunners.Showrunner(
@@ -259,7 +297,7 @@ def every_marked_unit(record: staff.StaffSnapshot | None = None, *,
 def production_places(
     records: list[SessionRecord],
     ledger_workers: set[str],
-    problems: list[str],
+    diagnostics: StaffDiagnostics,
     *, record: staff.StaffSnapshot, resolver: session_staff.RowResolver | None = None,
 ) -> dict[str, ProductionPlace]:
     """Join native session identities to their current staff parents."""
@@ -272,17 +310,18 @@ def production_places(
             continue
         parent = record.by_id(row.parent)
         if parent is None or parent.kind != "showrunner":
-            problem(problems, row.name, "the staff parent is unavailable")
+            problem(diagnostics.problems, row.name, "the staff parent is unavailable")
             continue
         if isinstance(parent.doc, staff.WrappedDoc):
             continue
         doc = resolver.production_doc(row)
         if not isinstance(doc, session_staff.ProductionDoc):
-            problem(problems, row.name, doc.reason)
+            diagnostics.document(row, doc)
+            continue
         try:
             timer = showrunners.timer_for(parent, record)
         except (OSError, ValueError) as error:
-            problem(problems, parent.name, error)
+            problem(diagnostics.problems, parent.name, error)
             continue
         slug = timer.slug if isinstance(timer, showrunners.Timer) else parent.name
         owner = by_id.get(parent.current_session)
@@ -303,15 +342,17 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
         resolver = session_staff.RowResolver(record)
         records = newest_sessions()
         problems: list[str] = []
-        registered = registered_showrunners(problems,
+        diagnostics = StaffDiagnostics(problems)
+        registered = registered_showrunners(diagnostics,
                                             known_sessions={record["sessionId"]: record for record in records},
                                             membership=record, resolver=resolver)
         runners = showrunner_ids(records, registered, membership=record)
         directors: dict[str, str] = {
             row.current_session: parent.current_session for row in record.find(kind="worker")
             if row.parent is not None and (parent := record.by_id(row.parent)) is not None}
-        places = production_places(records, set(directors), problems,
+        places = production_places(records, set(directors), diagnostics,
                                    record=record, resolver=resolver)
+        # Label readers stay silent and retain each session's recorded name.
         names: dict[str, str] = {item["sessionId"]: item["name"] for item in records}
         labels: dict[str, UnitLabels] = {}
         for session_id in wanted & names.keys():

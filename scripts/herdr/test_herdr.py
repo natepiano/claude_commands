@@ -894,6 +894,32 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertEqual(len(self.typed), 1)
         self.assertEqual(self.enters, [])
 
+    def test_bridge_status_system_turn_makes_the_destination_ready(self) -> None:
+        self.ready_at = 60
+        row = {"type": "system", "subtype": "bridge_status",
+               "timestamp": (self.launched_at + timedelta(seconds=1)).isoformat()}
+        write_text_atomic(self.path, json.dumps(row) + "\n")
+        state = self.client.prompt_input_state("destination:p1", self.transcript, self.launched_at)
+        self.assertIsInstance(state, herdr.PromptInputReady)
+        self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_bridge_status_requires_a_system_turn_and_an_empty_composer(self) -> None:
+        self.ready_at = 60
+        for kind, screen in (
+            ("user", "────────\n❯ \n────────"),
+            ("assistant", "────────\n❯ \n────────"),
+            ("system", "Restoring conversation"),
+            ("system", "────────\n❯ another task\n────────"),
+        ):
+            with self.subTest(kind=kind, screen=screen):
+                row = {"type": kind, "subtype": "bridge_status",
+                       "timestamp": (self.launched_at + timedelta(seconds=1)).isoformat()}
+                write_text_atomic(self.path, json.dumps(row) + "\n")
+                self.screen = screen
+                state = self.client.prompt_input_state("destination:p1", self.transcript, self.launched_at)
+                self.assertIsInstance(state, herdr.PromptInputNotReady)
+                self.assertEqual((self.typed, self.enters), ([], []))
+
     def test_remote_control_signal_still_requires_a_visible_empty_composer(self) -> None:
         self.ready_at = 60
         self.write_turn("/remote-control is active", kind="system")
@@ -1377,6 +1403,29 @@ class LaunchDestinationTests(StaffTestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PROC": str(proc), "HERDR_BIN": "/nonexistent/herdr"})))
         _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         _ = self.enterContext(patch.object(herdr, "_startup_processes", return_value=herdr.PaneAtShell()))
+
+    def test_pane_launch_waits_for_shell_cleanup_before_sending_the_command(self) -> None:
+        client = herdr.Herdr("agents")
+        clock = StartupClock()
+
+        def advance(seconds: float) -> None:
+            clock.elapsed += seconds
+
+        def checked(*_args: object, **_kwargs: object) -> bool:
+            self.assertFalse(run.called)
+            if clock.elapsed < 0.2:
+                raise herdr.HerdrFailure("pane runs other work: direnv, bash", "wrong_target")
+            return clock.elapsed >= 0.4
+
+        with (patch.object(herdr, "check_target", side_effect=checked) as check,
+              patch.object(herdr, "_pane_row", return_value=herdr.NoPane("worker")),
+              patch.object(time, "monotonic", lambda: clock.elapsed),
+              patch.object(time, "sleep", side_effect=advance),
+              patch.object(client, "run") as run):
+            client.run_in_pane("worker", ["claude", "--resume", "thread"])
+        self.assertGreaterEqual(check.call_count, 5)
+        self.assertGreaterEqual(clock.elapsed, 0.4)
+        run.assert_called_once_with("pane", "run", "worker", "claude --resume thread")
 
     def test_all_destinations_start_and_label_before_start(self) -> None:
         run_in_pane = herdr.Herdr.run_in_pane

@@ -1,0 +1,54 @@
+"""Read the session's assignment from its staff row."""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+from typing import cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production import staff
+
+
+def assignment(record: staff.StaffSnapshot, session_id: str) -> tuple[str, str]:
+    """Return the assignment text and its color role."""
+    row = record.by_current_session(session_id)
+    if row is None:
+        return "unassigned", "unassigned"
+    if row.kind == "showrunner":
+        return f"{row.name} showrunner", "showrunner"
+    if row.kind == "worker":
+        return "worker", "worker"
+    parent = record.by_id(row.parent) if row.parent is not None else None
+    label = f"{row.name} unit"
+    if parent is not None:
+        label += f" for {parent.name}"
+    return label, "unit-director"
+
+
+def staff_record(text: str) -> staff.StaffSnapshot:
+    """Read staff rows without requiring each parent row in the display snapshot."""
+    try:
+        value = cast(dict[str, object], json.loads(text))
+        if value["schema"] not in (1, 2):
+            return staff.StaffSnapshot(())
+        rows = cast(list[object], value["rows"])
+        return staff.StaffSnapshot(tuple(staff.StaffRow.from_json(row) for row in rows))
+    except (ValueError, KeyError, TypeError, staff.StaffUnreadable):
+        return staff.StaffSnapshot(())
+
+
+def main() -> None:
+    payload = cast(dict[str, object], json.load(sys.stdin))
+    try:
+        record = staff_record(Path(os.environ["STAFF_FILE"]).read_text(encoding="utf-8"))
+    except OSError:
+        record = staff.StaffSnapshot(())
+    label, role = assignment(record, str(payload.get("session_id", "")))
+    os.execvp("jq", ["jq", "-n", "--argjson", "payload", json.dumps(payload),
+                     "--arg", "assignment", label, "--arg", "role", role, *sys.argv[1:]])
+
+
+if __name__ == "__main__":
+    main()

@@ -92,6 +92,7 @@ State:
   `/showrunner:produce PRODUCTION_DOC resume` and act first on what was in
   flight and the `Next:` line. The production doc, `LOG` and `STATE_DIR` are
   the whole state.
+  Compaction runs by itself during work. The per-call context message is off in `config/context_usage.conf`.
 - **Unit worktrees.** Never `cd` into one; use `git -C`. Never commit, reset or
   edit files there.
 - **A unit's pane** is looked up each time it is needed, never remembered:
@@ -404,7 +405,8 @@ When the production doc's **Production rules** say CI does not apply, pass
 For a planned production, run
 `python3 ~/.claude/scripts/production/production_lifecycle.py open
 --production PRODUCTION_DOC`. The command creates and pushes the merge
-branch, records the running doc and plans, and initializes `LOG`. Rerun it
+branch, records the running doc, finds the plans from staff rows and
+`.unit.toml`, and initializes `LOG`. Rerun it
 after a failed step; it resumes at the first unfinished step.
 </OpenMergeBranch>
 

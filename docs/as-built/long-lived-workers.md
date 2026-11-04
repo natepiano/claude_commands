@@ -344,7 +344,12 @@ Other public functions: `queue_message`, `pending_messages`, `held_document`, `e
 
 **Ownership authority.** `config/design_roles.conf` pins `[ownership] host=natedev` (override file: `DESIGN_ROLES_CONFIG`; local host: `DESIGN_ROLES_HOST`, else the short hostname). `authority_request` runs locally on that host, else over `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> … design_roles.py authority <op>` with a 30 s limit; failure is `RoleRefused('ownership authority unavailable: …')`. Only the authority writes `DESIGN_OWNERSHIP_STATE`, else `~/.local/state/astra/design-ownership/`: `repositories.json` (ID to per-host absolute checkouts and `inventory_complete`) and `placements/<sha256(repository_id \0 relative document)>.json`. Operations: `register`, `reserve`, `lookup`, `advance` (generation +1 on the placement and its aliases), `checkout` (move a host's checkout mapping), `alias`, `legacy` (record `adoption_required`), `adopt-reserve`, `adopt-commit`. Every operation except `register` refuses until `inventory_complete` is true, and refuses a host with no explicit checkout mapping or a document outside it. A placement on another host refuses: the pair always lives on its holder's host. `[roles] new_open=false` makes `open_role` and `adopt` refuse and keeps every existing identity.
 
-**Authorization.** `_authorize` requires placement host = local host, a live holder from `resolve_holder` (unit holder: `unit_lookup.every_marked_unit` with a `LiveClaude`; showrunner holder: `production_tree.showrunner_sessions` and `sessions.running_sessions`), and `CLAUDE_CODE_SESSION_ID` equal to that session. A missing or ambiguous holder blocks dispatch but does not change the holder.
+**Authorization.** `_check_host` requires the design host to equal the local host.
+`worker_parent` reads the helper's worker row from the staff record.
+The worker row's `parent` identifies the current holder.
+`worker_parent` refuses if the worker or its parent is unavailable.
+The design record stores no holder identity.
+A different caller can resume the role.
 
 **Models.** `resolve_model(role)` sources `scripts/agents/models_config.sh` and runs `agents_resolve "design_roles.<role>"`; the family must be `codex`. `config/models.conf` has `[assignments] design_roles=codex` and `[design_roles.codex] designer=astra:xhigh`, `reviewer=astra:xhigh` (the `astra` word resolves to `gpt-6-astra`). A missing or invalid row refuses; there is no fallback model.
 
@@ -398,7 +403,8 @@ Other public functions: `queue_message`, `pending_messages`, `held_document`, `e
 - `hold(role, thread_id, codex_home, *, session_dir, worker, pid, manager, design_id, role_id) -> HeldRole`, `release(thread_id)`, `live_roles() -> list[LiveRole]`; CLI `hold`, `release`, `list [--json]`, exit 2 on a refusal.
 - `live_roles` removes a mesh hold whose run folder, roster worker or thread is gone or whose status is `ended`/`failed`, and an exec hold whose pid is gone. A `HeldDesignRole` hold ends only when the durable role is `RoleEnded`; a missing run folder cannot end it. Its `manager` is refreshed to the current holder session. `busy` means status `starting`, `running` or `waiting_capacity` (or a live exec pid). A bad record is one stderr line; other records still return.
 - `astra_review.py` `run_review` holds an `ExecProcess` reviewer during its one-turn `codex exec` when `CLAUDE_CODE_SESSION_ID` is set, after reading `session id:` from `codex.log` (30 s), with `codex_home` from `accounts.py env workers`, and releases in `finally`. For a document with a held design (`design_roles.held_document`), `held_review` sends it to the sole reviewer through `design_roles.resume`; busy or unavailable exits 1 and starts no other reviewer.
-- `scripts/production/production_tree.py --json` keeps schema 1 and adds one `AstraEdge` (`manager`, `member` = thread ID, `role` `astra-designer` | `astra-reviewer`, `codex_home`, `state`) per live hold, and drops the Codex worker edge for that thread.
+- Cargo-handler reads manager relationships and staff names directly from `~/.local/state/staff/staff.json` through `[census] staff_file`.
+- Staff schema 2 supplies the member IDs, parent IDs, kinds, names, and current sessions. The handler reads the file again when it changes.
 - `scripts/message/roster.py` `_durable_roles` adds one Codex entry per open held role (role `astra-designer` / `astra-reviewer`, reach `CannotReceiveMessages`, director or showrunner from the holder), skipping fenced threads. `scripts/agents/mesh_runs.py` `_roster_folders` lists durable meshes.
 - Colors: `config/statusline.conf` `role.astra-designer=mauve`, `role.astra-reviewer=bright-green`.
 
@@ -412,8 +418,8 @@ Other public functions: `queue_message`, `pending_messages`, `held_document`, `e
 - Access comes from the roster `access_policy`, never from the instructions text. Reviews stay `ReadOnlyReviewer`.
 - The berth check covers `apply_patch` only. Designers edit by patch; shell or Python writes are outside the check. Do not copy reservation state into the role store.
 - Role records outlive run folders. Ordinary run cleanup unbinds; it never ends a held role or stops a durable mesh.
-- A census hold is a projection of the durable role, repeatable on the next lifecycle action. Removing it cannot delete a design. `AstraEdge` fields and `production_tree.py` schema 1 stay; cargo-handler reads them.
-- `production_tree.py --json` reads only local records, never prompts, answers well under a second, and drops only the edge it cannot read, with a stderr line.
+- A census hold represents the durable role. The next lifecycle action can restore the hold. Removing the hold cannot delete a design.
+- Cargo-handler reads the staff file directly. It runs no command for the manager tree.
 - A showrunner may hold a read-only role but cannot launch an unbound writer, because no production-design phase exists yet. A writer needs an authorized phase with exact output paths, baseline and reservation.
 - Tests use fixtures and environment overrides (`DESIGN_ROLES_STATE`, `DESIGN_OWNERSHIP_STATE`, `DESIGN_ROLES_CONFIG`, `DESIGN_ROLES_HOST`, `ASTRA_ROLES_STATE`, `ASTRA_REVIEW_DIR`), never real state or a live Codex.
 - Stored stamps are UTC; user-facing times use `scripts/lib/user_zone.py`.

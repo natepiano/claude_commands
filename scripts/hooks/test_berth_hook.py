@@ -21,6 +21,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "direct"))
 import phase_reservation  # noqa: E402
 from scripts.astra import design_roles  # noqa: E402
 from scripts.production import staff  # noqa: E402
+from scripts.production.staff_test_support import (  # noqa: E402
+    fixture_runtime_id, fixture_worker, isolated_staff_file, unit_membership,
+)
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 HOOK = Path(__file__).with_name("pre-tool-use-berth.py")
@@ -93,7 +96,10 @@ class BerthHookTests(unittest.TestCase):
             "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
             "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership"),
             "DESIGN_ROLES_HOST": "fixture-host",
+            "HOME": str(self.root),
+            "HERDR_BIN": "/nonexistent/herdr",
         }
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
         _ = self.environment.pop("CARGO_BERTH_SESSION_ID", None)
         # A test run from inside a seat inherits its run; each test names the run it wants.
         _ = self.environment.pop("UNIT_RUN_DIR", None)
@@ -146,10 +152,13 @@ class BerthHookTests(unittest.TestCase):
     def bind_designer(self, directory: Path, phase: str) -> None:
         design_id = "00000000-0000-4000-8000-000000000036"
         binding = design_roles.DesignBoundToPhase(str(directory), phase, str(self.repo), ("src/lib.rs",))
+        parent = unit_membership("demo", "design-unit")
+        thread = fixture_runtime_id("berth-designer")
+        _ = fixture_worker("lasting-designer", parent.id, runtime_id=thread)
         design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 2), "fixture-repo",
                                   str(self.repo), str(self.repo / "design.md"), "design",
-                                  "2026-10-21T12:00:00+00:00", design_roles.UnitHolder("demo", "design-unit"), binding,
-                                  (design_roles.RoleInstance("designer", "lasting-designer", design_roles.RoleOpen("designer-thread")),
+                                  "2026-10-21T12:00:00+00:00", binding,
+                                  (design_roles.RoleInstance("designer", "lasting-designer", design_roles.RoleOpen(thread)),
                                    design_roles.RoleInstance("reviewer", "lasting-reviewer", design_roles.RoleNotOpened())))
         self.environment.update({"HELD_DESIGN_ID": design_id, "DESIGN_BINDING_GENERATION": "2"})
         with mock.patch.dict(os.environ, self.environment):
@@ -166,7 +175,6 @@ class BerthHookTests(unittest.TestCase):
         payload = json.dumps({"tool_name": "apply_patch", "cwd": str(self.repo), "tool_input": {"command": patch}})
         with mock.patch.dict(os.environ, self.environment), \
                 mock.patch.object(staff, "runtime_id", return_value=DIRECTOR), \
-                mock.patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach(DIRECTOR)), \
                 contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(decide(payload), 0)
         return output.getvalue()

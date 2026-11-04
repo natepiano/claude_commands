@@ -515,9 +515,40 @@ class AccountsTests(unittest.TestCase):
     def test_stored_role_counts_treat_unknown_claude_activity_as_idle(self) -> None:
         self.assert_stored_role_counts("unknown status")
 
+    def test_stored_role_counts_use_the_native_current_session_without_a_launch_record(self) -> None:
+        self.assert_stored_role_counts("native session")
+
+    def test_missing_or_unreadable_staff_keeps_showrunner_counts(self) -> None:
+        from scripts.production import staff
+        from scripts.herdr import pane_launch
+        from scripts.shutdown import inventory
+        read = cast(Callable[[], tuple[dict[tuple[Path, str], dict[str, str]], tuple[str, ...]]],
+                    getattr(accounts, "_local_session_counts"))
+        records = self.root / "private-records"
+        records.mkdir()
+        owner = sessions.SessionRecord(pid=991101, sessionId="runner", name="runner", status="busy",
+            messagingSocketPath="/private.sock", updatedAt=1, tmux="", formerNames=[])
+        for missing in (True, False):
+            failure = staff.StaffUnreadable("private staff unavailable")
+            if missing:
+                failure.__cause__ = FileNotFoundError("private file absent")
+            with (self.subTest(missing=missing),
+                  patch.object(staff, "local_snapshot", side_effect=failure),
+                  patch.object(pane_launch, "record_directory", return_value=records),
+                  patch.object(sessions, "live_sessions", return_value=[owner]),
+                  patch.object(inventory, "showrunner_registrations", return_value=inventory.ShowrunnerRegistrations((
+                      inventory.ShowrunnerRegistration("runner", "runner", ""),))),
+                  patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(self.main_dir)),
+                  patch.object(accounts, "_worker_status_records", return_value=[]),
+                  redirect_stderr(io.StringIO()) as errors):
+                counts, _inputs = read()
+            self.assertEqual(counts, {(self.main_dir, "showrunners"): {"runner": "busy"}})
+            self.assertEqual(errors.getvalue(), "" if missing else
+                             "accounts: unit counts are incomplete: private staff unavailable\n")
+
     def assert_stored_role_counts(self, evidence: Literal[
         "unit marks", "staff identity", "damaged history", "damaged sibling", "damaged folder", "legacy flags",
-        "cleared unit marks", "cleared staff identity", "unknown status",
+        "cleared unit marks", "cleared staff identity", "unknown status", "native session",
     ]) -> None:
         from scripts.message import sessions
         from scripts.shutdown import inventory
@@ -546,6 +577,8 @@ class AccountsTests(unittest.TestCase):
                                   ("stopped", "claude1", "c"), ("plain", "claude1", "")):
             identity = pane
             marked = {"SHOWRUNNER_UNIT_ID": unit} if unit else {}
+            if unit:
+                identity = members[unit].current_session
             if evidence == "staff identity" and unit:
                 # No unit mark: the session id is the row's current session.
                 identity, marked = members[unit].current_session, {}
@@ -571,13 +604,14 @@ class AccountsTests(unittest.TestCase):
                     owners[-1]["status"] = "unrecognized"
         # A repeated registry identity is still one session.
         owners.append(owners[0])
-        history: dict[str, object] = dict(launches)
+        history: dict[str, object] = {key: launch for key, launch in launches.items()
+            if evidence != "native session" or key not in {row.current_session for row in members.values()}}
         if evidence == "legacy flags":
-            history["unit-a"] = {key: value for key, value in launches["unit-a"].items() if key != "flags_read"}
+            history[members["a"].current_session] = {key: value for key, value in launches[members["a"].current_session].items() if key != "flags_read"}
         elif evidence == "damaged sibling":
             history["broken-pane"] = {}
         elif evidence == "damaged folder":
-            damaged: dict[str, object] = dict(launches["unit-a"])
+            damaged: dict[str, object] = dict(launches[members["a"].current_session])
             damaged.update(config_dir=[], written_at="2026-10-02T00:00:00Z")
             history["broken-pane"] = damaged
         _ = (records / "fixture.json").write_text(json.dumps(history))
@@ -612,6 +646,7 @@ class AccountsTests(unittest.TestCase):
             with (self.subTest(runner_label=runner_label),
                   patch.object(sessions, "live_sessions", return_value=owners),
                   patch.object(pane_launch, "record_directory", return_value=records),
+                  patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(self.home / ".claude1")),
                   # Even on a client machine, counts use only the retained local record.
                   patch.object(staff, "snapshot", side_effect=AssertionError("no owner fetch")),
                   patch.object(inventory, "showrunner_registrations", return_value=runners),
@@ -980,11 +1015,14 @@ class AccountsTests(unittest.TestCase):
 
     def test_exec_probe_marks_the_launched_environment_and_consumes_its_option(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
-        cases = ((False, ["claude2"]), (True, ["--probe", "claude2"]))
+        cases = ((False, ["claude2"]), (True, ["--probe", "claude2"]), (True, ["--probe", "claude"]))
         for probe, account_options in cases:
             with self.subTest(account_options=account_options), patch.dict(os.environ):
                 _ = os.environ.pop("CLAUDE_PROBE_SESSION", None)
                 os.environ.update(SHOWRUNNER_UNIT="show/demo-unit", SHOWRUNNER_UNIT_ID="id-demo")
+                inherited = {"SHOWRUNNER_PRIVATE_TEST": "private", "CLAUDE_CODE_SESSION_ID": "old-claude",
+                             "CODEX_THREAD_ID": "old-codex"}
+                os.environ.update(inherited)
                 with patch.object(os, "execvpe") as launch:
                     self.assertEqual(self.run_cli("exec", *account_options,
                                                   "-n", "throwaway", "--version"), (0, "", ""))
@@ -995,9 +1033,13 @@ class AccountsTests(unittest.TestCase):
                     self.assertEqual(environment["CLAUDE_PROBE_SESSION"], "1")
                     self.assertNotIn("SHOWRUNNER_UNIT", environment)
                     self.assertNotIn("SHOWRUNNER_UNIT_ID", environment)
+                    for name in inherited:
+                        self.assertNotIn(name, environment)
                 else:
                     self.assertNotIn("CLAUDE_PROBE_SESSION", environment)
-                    self.assertEqual(environment["SHOWRUNNER_UNIT"], "show/demo-unit")
+                    self.assertFalse(any(name.startswith("SHOWRUNNER_") for name in environment))
+                    for name in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
+                        self.assertEqual(environment[name], inherited[name])
 
     def test_exec_probe_preserves_claude_options_that_share_accounts_option_names(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
