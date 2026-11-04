@@ -846,7 +846,7 @@ class AdmissionServer:
                                              self.readings.compilers(), policy=policy)
         ordered, priority = self._queue_order()
         unowned = gate.unowned_slice_memory([item[0] for item in memories], processes, self.proc.path,
-                                           activity_reader=activity)
+                                           activity_reader=activity, ci_memory_slice=config.ci_memory_slice)
         inputs = gate.build_queue_inputs(ordered, memories, readings, self.override, now, priority, unowned)
         represented = {(step.run.pid, step.run.start_time) for step in inputs.running
                        if isinstance(step.run, LiveBuildRun)}
@@ -924,7 +924,12 @@ class AdmissionServer:
                                      self.clock.monotonic() + config.source_check_seconds)
         policy = config.policy
         self.last_diagnostics = config.diagnostics
-        inputs, limits = self._inputs(config)
+        try:
+            inputs, limits = self._inputs(config)
+        except gate.SliceMemoryUnavailable as error:
+            refusal = self._run_pass(gate.UnusableAdmissionConfiguration(str(error)))
+            self.next_pass = self.clock.monotonic() + config.waiting_pass_seconds
+            return refusal
         if self.launches and (self.waiters or self.reservations or isinstance(inputs.pressure, gate.MemoryPressure)):
             for episode, waiting in list(self.launches.items()):
                 self.waiters[episode] = waiting

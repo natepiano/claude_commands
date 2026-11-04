@@ -107,12 +107,24 @@ def gate_isolation_environment(root: Path) -> dict[str, str]:
     """Keep a gate subprocess outside the caller's holds and session records."""
     return {
         **config_environment(root),
+        **private_ci_environment(root),
         "BUILD_HOLD_DIR": str(root / "holders"),
         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
         "UNIT_ACTIVE_DIR": str(root / "active"),
         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
     }
+
+
+def private_ci_environment(root: Path) -> dict[str, str]:
+    """Keep CI slice readings inside the private fixture."""
+    ci = root / "ci.slice"
+    ci.mkdir(exist_ok=True)
+    for name, value in (("memory.current", "0"), ("memory.max", str(40 * 1024**3)), ("cgroup.procs", "")):
+        path = ci / name
+        if not path.exists():
+            _ = path.write_text(value)
+    return {"BUILDLOG_CI_CGROUP": str(ci)}
 
 
 def fake_memory_readings(root: Path, *, available_kib: int = 67108864,
@@ -128,6 +140,7 @@ def fake_memory_readings(root: Path, *, available_kib: int = 67108864,
     )
     return {
         **config_environment(root),
+        **private_ci_environment(root),
         "BUILDLOG_MEMINFO": str(meminfo),
         "BUILDLOG_BUILDS_CGROUP": str(root / "builds.slice"),
         "BUILDLOG_MEMORY_PRESSURE": str(pressure),

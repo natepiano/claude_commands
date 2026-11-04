@@ -5196,5 +5196,77 @@ class ServiceAdmissionRuleTests(unittest.TestCase):
                     admission_policy_fixture()))
 
 
+class CiSliceMemoryTests(unittest.TestCase):
+    root: Path = Path()
+    ci: Path = Path()
+    proc: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        environment = fake_memory_readings(self.root)
+        _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
+        self.ci = self.root / "ci.slice"
+        self.proc = self.root / "proc"
+        (self.proc / "123").mkdir(parents=True)
+        _ = (self.proc / "123/comm").write_text("Runner.Listener\n")
+        _ = (self.ci / "cgroup.procs").write_text("123\n")
+        _ = (self.ci / "memory.current").write_text(str(3 * GIB))
+        _ = (self.ci / "memory.max").write_text(str(18 * GIB))
+
+    def reading(self) -> gate.UnownedSliceMemory:
+        reading, = gate.unowned_slice_memory([], {}, self.proc, ci_memory_slice="hana-ci.slice")
+        return reading
+
+    def test_idle_ci_charges_live_memory_and_swap(self) -> None:
+        _ = (self.ci / "memory.swap.current").write_text(str(GIB))
+        reading = self.reading()
+        self.assertEqual(reading.bytes, 4 * GIB)
+        self.assertEqual(gate.build_charge(reading), 4 * GIB)
+        self.assertEqual(reading.swap_bytes, GIB)
+        self.assertEqual(gate.growth_headroom(reading), 0)
+
+    def test_running_job_reserves_the_slice_limit_and_free_memory_growth(self) -> None:
+        _ = (self.proc / "123/comm").write_text("Runner.Worker\n")
+        reading = self.reading()
+        self.assertEqual(reading.bytes, 3 * GIB)
+        self.assertEqual(reading.promise, gate.LifetimePromise(18 * GIB))
+        self.assertEqual(gate.build_charge(reading), 18 * GIB)
+        self.assertEqual(gate.growth_headroom(reading), 15 * GIB)
+        decision = gate.decide(60 * GIB, 64 * GIB, 7 * GIB, [reading],
+                               limits=gate.AdmissionLimits(24 * GIB, 0))
+        self.assertEqual(decision.state, "hold")
+
+    def test_slice_limit_is_read_again_for_each_measurement(self) -> None:
+        _ = (self.proc / "123/comm").write_text("Runner.Worker\n")
+        self.assertEqual(gate.build_charge(self.reading()), 18 * GIB)
+        _ = (self.ci / "memory.max").write_text(str(40 * GIB))
+        self.assertEqual(gate.build_charge(self.reading()), 40 * GIB)
+
+    def test_missing_or_unbounded_limit_refuses_the_reading(self) -> None:
+        for content in (None, "max"):
+            with self.subTest(content=content):
+                limit = self.ci / "memory.max"
+                if content is None:
+                    limit.unlink()
+                else:
+                    _ = limit.write_text(content)
+                with self.assertRaisesRegex(gate.SliceMemoryUnavailable, "hana-ci.slice.*memory.max"):
+                    _ = self.reading()
+
+    def test_systemd_supplies_the_slice_path(self) -> None:
+        with patch.dict(os.environ, {"BUILDLOG_CI_CGROUP": ""}), patch.object(
+                subprocess, "run", return_value=subprocess.CompletedProcess(
+                    [], 0, "/hana.slice/hana-ci.slice\n", "")) as run:
+            self.assertEqual(gate.ci_slice_cgroup("hana-ci.slice"), Path("/sys/fs/cgroup/hana.slice/hana-ci.slice"))
+        self.assertEqual(run.call_args.args[0],
+                         ["systemctl", "show", "--property=ControlGroup", "--value", "hana-ci.slice"])
+
+    def test_empty_slice_name_cannot_disable_ci_accounting(self) -> None:
+        write_memory_config(self.root / "build_admission.conf", ci_memory_slice="")
+        with self.assertRaisesRegex(conf.Unusable, "ci_memory_slice"):
+            _ = gate.read_memory_config()
+
+
 if __name__ == "__main__":
     _ = unittest.main()

@@ -1463,6 +1463,7 @@ def warn_configuration_diagnostics(diagnostics: tuple[ConfigurationDiagnostic, .
 @dataclass(frozen=True)
 class MemoryConfig:
     policy: AdmissionPolicy
+    ci_memory_slice: str
     test_phase_margin: float
     build_budget_bytes: int
     running_pass_seconds: float
@@ -1486,6 +1487,12 @@ class MemoryConfig:
 
 def _gib_bytes(value: float) -> int:
     return max(1, int(value * GIB))
+
+
+def _ci_slice_name(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@:-]*\.slice", value) is None:
+        raise ValueError("expected a systemd slice name")
+    return value
 
 
 def build_budget_bytes() -> int:
@@ -1535,6 +1542,7 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 first_peaks["cargo"] = gib("program_first_peak_gib.cargo")
             config = MemoryConfig(
                 policy=AdmissionPolicy(timing, pressure, PeakHold(whole("peak_hold_seconds"), kinds)),
+                ci_memory_slice=value("ci_memory_slice", _ci_slice_name),
                 test_phase_margin=number("test_phase_margin"), build_budget_bytes=gib("build_budget_gib"),
                 running_pass_seconds=running_interval, waiting_pass_seconds=number("waiting_pass_seconds"),
                 wait_reply_seconds=number("wait_reply_seconds"), query_timeout_seconds=number("query_timeout_seconds"),
@@ -3894,8 +3902,29 @@ def inputs_after_reservations_end(inputs: QueueInputs, live_reservations: set[st
         running=tuple(step for step in inputs.running if not running_has_reservation(step) or id(step) in kept_steps))
 
 
+class SliceMemoryUnavailable(RuntimeError):
+    """A required slice reading cannot authorize another grant."""
+
+
+def ci_slice_cgroup(name: str) -> Path:
+    """Resolve the configured system slice through systemd."""
+    private = os.environ.get("BUILDLOG_CI_CGROUP", "")
+    if private:
+        return Path(private)
+    try:
+        reply = subprocess.run(["systemctl", "show", "--property=ControlGroup", "--value", name],
+                               capture_output=True, text=True, check=True, timeout=5)
+        group = reply.stdout.strip()
+        if not group.startswith("/") or group == "/" or ".." in Path(group).parts:
+            raise ValueError("systemd returns no slice cgroup")
+        return Path("/sys/fs/cgroup") / group.lstrip("/")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        raise SliceMemoryUnavailable(f"{name}: cannot read ControlGroup: {error}") from error
+
+
 def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessIdentity], proc: Path,
-                         *, activity_reader: ScopeActivityReader | None = None) -> tuple[UnownedSliceMemory, ...]:
+                         *, activity_reader: ScopeActivityReader | None = None,
+                         ci_memory_slice: str = "") -> tuple[UnownedSliceMemory, ...]:
     """Count child scopes that no reservation owns, without duplicate process charges."""
     directory = Path(os.environ.get("BUILDLOG_BUILDS_CGROUP",
         f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/builds.slice"))
@@ -3915,9 +3944,12 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
     try:
         children = list(directory.iterdir())
     except OSError:
-        return ()
+        children = []
+    ci_groups = (ci_slice_cgroup(ci_memory_slice),) if ci_memory_slice else ()
+    children.extend(group for group in ci_groups if group not in children)
     for child in children:
-        if child in owned or child.name == "sccache.service" or not child.is_dir():
+        required = child in ci_groups
+        if not required and (child in owned or child.name == "sccache.service" or not child.is_dir()):
             continue
         try:
             current = child / "memory.current"
@@ -3929,10 +3961,32 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
             members = {int(pid) for membership in child.rglob("cgroup.procs") for pid in membership.read_text().split()}
             duplicate = process_memory(members & tree_pids, proc).bytes
             amount = max(0, amount + swapped - duplicate)
+            promise: MemoryPromise = NoPromise()
+            if required:
+                limit_path = child / "memory.max"
+                check_memory_reading(limit_path)
+                try:
+                    limit = int(limit_path.read_text().strip())
+                except ValueError as error:
+                    raise ValueError(f"{limit_path}: expected a finite memory limit") from error
+                if limit <= 0:
+                    raise ValueError(f"{limit_path}: no finite positive memory limit")
+                for pid in members:
+                    try:
+                        program = (proc / str(pid) / "comm").read_text().strip()
+                    except FileNotFoundError:
+                        continue
+                    if program == "Runner.Worker":
+                        promise = LifetimePromise(limit + swapped)
+                        break
             if amount or members:
-                result.append(UnownedSliceMemory(amount, cgroup=str(child), owner=child.name,
+                result.append(UnownedSliceMemory(amount, promise=promise,
+                                                 swap_bytes=swapped if required else 0,
+                                                 cgroup=str(child), owner=child.name,
                                                  activity=activity_reader.scope(members, child.name)))
-        except (OSError, ValueError):
+        except (OSError, ValueError) as error:
+            if required:
+                raise SliceMemoryUnavailable(f"{ci_memory_slice}: cannot read slice memory at {child}: {error}") from error
             continue
     return tuple(result)
 
