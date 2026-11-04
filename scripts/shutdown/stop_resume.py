@@ -292,8 +292,6 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
     client = herdr.Herdr(herdr.shared_session())
     command = _pane_command(tab, entry, account)
     launched_at = datetime.now(timezone.utc)
-    if not isinstance(client.pane_activity(tab.pane_id), herdr.PaneAtShell):
-        raise herdr.HerdrFailure(f"{entry['session_id']}: target pane has live work")
     client.run_in_pane(tab.pane_id, command)
     deadline = monotonic() + START_SECONDS
     live = sessions.session_liveness(entry["session_id"])
@@ -722,6 +720,19 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                         outcomes.append(ResumePending(identity, target, resumed.reason))
                 except Exception as error:
                     outcomes.append(ResumePending(identity, target, str(error)))
+            record = staff.initial_snapshot()
+            for index, (session, outcome) in enumerate(zip(selected, outcomes)):
+                identity = outcome.name if isinstance(outcome, SessionNotFound) else outcome.session_id
+                running = _running_on_account(identity, "")
+                if isinstance(running, ClaudeUp) and running.account == target:
+                    continue
+                member = record.by_member_reference(identity)
+                name = member.name if member is not None else session
+                line = (f"{name}: not running on {target} after the move; resume it with: "
+                        + f"accounts.py move {identity} {target}")
+                print(line, file=sys.stderr)
+                if isinstance(outcome, ClaudeUp):
+                    outcomes[index] = ResumePending(identity, target, line)
             return outcomes
 
 
