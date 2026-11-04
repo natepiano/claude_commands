@@ -712,7 +712,7 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
     if status == 5 and re.search(r"^Ran 0 tests in", captured, re.MULTILINE) and "NO TESTS RAN" in captured:
         status = 0
     if job.kind is GateJobKind.TYPE_CHECK:
-        status = 0 if status in (0, 3) and re.search(r"^0 errors, 0 warnings, 0 notes\s*$", captured, re.MULTILINE) else 1
+        status = 0 if status == 0 and re.search(r"^0 errors, 0 warnings, 0 notes\s*$", captured, re.MULTILINE) else 1
     tripwire_tripped = bool(calls or readings)
     if tripwire_tripped:
         status = 1
